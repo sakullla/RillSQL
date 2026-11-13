@@ -44,9 +44,49 @@ pub enum StatementStop {
     Cancelled { message: String },
 }
 
+/// 执行前的读取上限改写：驱动实际发出的语句比用户写的那条多了什么。
+/// 只描述这一处改写，不改写规则本身（LIMIT/TOP/FETCH 的判定仍是 cap_result_sql_detail）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRewrite {
+    /// limit（追加 LIMIT 或改大 LIMIT 数字）、fetch（改大 FETCH 数字）、top（追加 TOP 或改大 TOP 数字）。
+    pub kind: String,
+    /// 原语句里的字节位置：追加时是插入点（它之前的内容不变），替换时是被替换数字的起点。
+    pub at: usize,
+    /// 原语句里被替换掉的字节长度；追加时为 0。
+    pub replaced: usize,
+    /// 实际插入或替换进去的文本（含补的空格）。
+    pub added: String,
+}
+
+impl AutoRewrite {
+    /// 改写让实际语句比原语句多出的字节数。
+    pub fn inserted_len(&self) -> usize {
+        self.added.len().saturating_sub(self.replaced)
+    }
+}
+
+/// 一条语句实际上会发出去的文本，以及它被自动改写过的地方。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedSql {
+    pub sql: String,
+    pub rewrite: Option<AutoRewrite>,
+}
+
+impl CappedSql {
+    fn unchanged(sql: &str) -> Self {
+        Self { sql: sql.to_owned(), rewrite: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementReport {
+    /// 用户写的那条语句（草稿里的原文）；界面展示和定位都以它为准。
     pub sql: String,
+    /// 驱动实际发出的语句：等于 sql，或带上了自动追加/放大的读取上限。
+    pub sent_sql: String,
+    /// 自动改写信息；没有改写时为 None（手写 LIMIT 且不超过上限也属于没有改写）。
+    pub rewrite: Option<AutoRewrite>,
     pub status: &'static str,
     pub message: String,
     pub columns: Vec<String>,
@@ -288,9 +328,24 @@ pub fn is_disconnect(message: &str) -> bool {
         || message.contains("连接被关闭")
 }
 
+/// 驱动一次执行的结果：实际发出的语句与执行结果一起交回，
+/// 执行层据此记录“真正跑的是哪条 SQL”，不再靠调用方猜。
+pub struct DriverReport {
+    pub sent: CappedSql,
+    pub outcome: Result<StatementValue, StatementStop>,
+}
+
+impl DriverReport {
+    /// 没有改写、直接发出原语句的结果。给测试替身用：真实驱动都经 cap_result_sql_detail。
+    #[cfg(test)]
+    pub fn unchanged(sql: &str, outcome: Result<StatementValue, StatementStop>) -> Self {
+        Self { sent: CappedSql::unchanged(sql), outcome }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait StatementDriver: Send + Sync {
-    async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop>;
+    async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport;
 
     /// 累计等待调用方“继续读取”的时间。语句耗时要扣掉它，不把用户停留算成执行时间。
     fn paused(&self) -> Duration {
@@ -325,12 +380,16 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
         calls += 1;
         let paused_before = driver.paused();
         let started = Instant::now();
-        let outcome = driver.run(&piece.text, limit, cancel_flag).await;
+        let report = driver.run(&piece.text, limit, cancel_flag).await;
         let spent = started.elapsed().saturating_sub(driver.paused().saturating_sub(paused_before));
-        match outcome {
+        let sent_sql = report.sent.sql;
+        let rewrite = report.sent.rewrite;
+        match report.outcome {
             Ok(value) => {
                 statements.push(StatementReport {
                     sql: piece.text.clone(),
+                    sent_sql,
+                    rewrite,
                     status: "ok",
                     message: String::new(),
                     columns: value.columns,
@@ -371,6 +430,8 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                 }
                 statements.push(StatementReport {
                     sql: piece.text.clone(),
+                    sent_sql,
+                    rewrite,
                     status: statement_status,
                     message,
                     columns: Vec::new(),
@@ -408,6 +469,9 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
 fn skipped(sql: String, message: &str) -> StatementReport {
     StatementReport {
         sql,
+        // 没有发送到数据库，所以没有实际语句，也没有改写。
+        sent_sql: String::new(),
+        rewrite: None,
         status: "skipped",
         message: message.to_owned(),
         columns: Vec::new(),
@@ -698,18 +762,21 @@ impl LiveDriver {
 
 #[async_trait::async_trait]
 impl StatementDriver for LiveDriver {
-    async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
+    async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport {
         let index = self.statement_index.fetch_add(1, Ordering::SeqCst);
+        // 读取上限改写只在这里做一次：驱动收到的就是要发出去的文本，报告里也用它。
+        let capped = cap_result_sql_detail(&self.engine, sql, limit);
+        let sent = capped.sql.as_str();
         let mut attached = self.session.lock().await;
         let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
         let result: Result<StatementValue, Failure> = match &mut *attached {
             Attached::Scripted => Err(Failure::from("这个连接没有连着可查询的数据库".to_owned())),
-            Attached::Sqlite(pool) => sqlite_run(pool, &self.engine, sql, limit, cancel, &sink, index).await.map_err(Failure::from),
-            Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, &sink, index)
+            Attached::Sqlite(pool) => sqlite_run(pool, sent, limit, cancel, &sink, index).await.map_err(Failure::from),
+            Attached::Mysql(conn) => mysql_run(conn, &self.transport, sent, limit, cancel, &sink, index)
                 .await
                 .map_err(|message| Failure { at: mysql_error_line(&message).map(ErrorAt::Line), message }),
-            Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, &sink, index).await,
-            Attached::Sqlserver(client) => sqlserver_run(client, &self.engine, sql, limit, cancel, &sink, index).await,
+            Attached::Postgres(client) => postgres_run(client, sent, sql, limit, cancel, &sink, index).await,
+            Attached::Sqlserver(client) => sqlserver_run(client, sent, limit, cancel, &sink, index).await,
         };
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。
@@ -721,10 +788,11 @@ impl StatementDriver for LiveDriver {
                 }
             }
         }
-        result.map_err(|failure| match classify_failure(sql, failure.message, cancel.load(Ordering::SeqCst)) {
+        let outcome = result.map_err(|failure| match classify_failure(sql, failure.message, cancel.load(Ordering::SeqCst)) {
             StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at },
             other => other,
-        })
+        });
+        DriverReport { sent: capped, outcome }
     }
 
     fn paused(&self) -> Duration {
@@ -778,17 +846,16 @@ async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::con
 /// 其中的 SET 只作用于内层批次、结束后即还原，外层会话上的 SHOWPLAN_ALL 不会生效。
 async fn sqlserver_run(
     client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>,
-    engine: &str,
-    sql: &str,
+    bounded: &str,
     limit: usize,
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
 ) -> Result<StatementValue, Failure> {
-    let bounded = cap_result_sql(engine, sql, limit);
+    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
     let mut locked = client.lock().await;
-    if !sqlserver_wants_rows(&bounded) {
-        let done = locked.execute(bounded, &[]).await.map_err(|err| tds_failure(&err))?;
+    if !sqlserver_wants_rows(bounded) {
+        let done = locked.execute(bounded.to_owned(), &[]).await.map_err(|err| tds_failure(&err))?;
         let value = StatementValue {
             columns: Vec::new(),
             column_types: Vec::new(),
@@ -1004,7 +1071,6 @@ fn quote_mysql(name: &str) -> String {
 
 async fn sqlite_run(
     pool: &sqlx::SqlitePool,
-    engine: &str,
     sql: &str,
     limit: usize,
     cancel: &Arc<AtomicBool>,
@@ -1017,7 +1083,7 @@ async fn sqlite_run(
         .await
         .map_err(|err| err.to_string())?
         .set_progress_handler(64, move || !watched.load(Ordering::SeqCst));
-    let outcome = sqlite_dispatch(&mut conn, engine, sql, limit, cancel, sink, index).await;
+    let outcome = sqlite_dispatch(&mut conn, sql, limit, cancel, sink, index).await;
     if let Ok(mut handle) = conn.lock_handle().await {
         handle.remove_progress_handler();
     }
@@ -1026,14 +1092,14 @@ async fn sqlite_run(
 
 async fn sqlite_dispatch(
     conn: &mut sqlx::SqliteConnection,
-    engine: &str,
     sql: &str,
     limit: usize,
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
 ) -> Result<StatementValue, String> {
-    let safe = sqlx::AssertSqlSafe(cap_result_sql(engine, sql, limit));
+    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
+    let safe = sqlx::AssertSqlSafe(sql);
     if looks_like_rows(sql) {
         let mut stream = sqlx::query(safe).fetch(&mut *conn);
         let mut columns = Vec::new();
@@ -1174,8 +1240,7 @@ fn to_hex(bytes: Vec<u8>) -> String {
 async fn mysql_run(
     conn: &mut mysql_async::Conn,
     transport: &CancelTransport,
-    engine: &str,
-    sql: &str,
+    bounded: &str,
     limit: usize,
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
@@ -1184,8 +1249,8 @@ async fn mysql_run(
     if let Ok(Some(id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()").await {
         transport.set_mysql_connection_id(id);
     }
-    let bounded = cap_result_sql(engine, sql, limit);
-    let mut result = conn.query_iter(bounded).await.map_err(|err| err.to_string())?;
+    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
+    let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| err.to_string())?;
     let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
         .columns_ref()
         .iter()
@@ -1400,17 +1465,18 @@ fn mysql_date_text(kind: mysql_async::consts::ColumnType, year: u16, month: u8, 
     }
 }
 
+/// sent 是实际发出的文本（可能带上读取上限），sql 是用户写的那条：错误位置先在 sent 里换算，
+/// 再映射回 sql，界面因此永远定位到草稿里自己的语句。
 async fn postgres_run(
     client: &tokio_postgres::Client,
-    engine: &str,
+    sent: &str,
     sql: &str,
     limit: usize,
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
 ) -> Result<StatementValue, Failure> {
-    let bounded = cap_result_sql(engine, sql, limit);
-    let prepared = match client.prepare(&bounded).await {
+    let prepared = match client.prepare(sent).await {
         Ok(statement) => {
             let columns = statement.columns().iter().map(|column| column.name().to_owned()).collect::<Vec<_>>();
             let types = statement.columns().iter().map(|column| column.type_().name().to_owned()).collect::<Vec<_>>();
@@ -1419,7 +1485,7 @@ async fn postgres_run(
         }
         Err(_) => None,
     };
-    let messages = client.simple_query(&bounded).await.map_err(|err| pg_failure(&err, &bounded, sql))?;
+    let messages = client.simple_query(sent).await.map_err(|err| pg_failure(&err, sent, sql))?;
     let mut columns = prepared.as_ref().map(|item| item.0.clone()).unwrap_or_default();
     let mut types = prepared.as_ref().map(|item| item.1.clone()).unwrap_or_default();
     let mut rows = Vec::new();
@@ -1511,105 +1577,115 @@ pub fn clamp_limit(limit: u64) -> usize {
     usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000)
 }
 
-/// 给会返回行的语句加上不超过 `cap + 1` 的 LIMIT。多出来的一行只用来判断截断。
+/// 给会返回行的语句加上不超过 cap + 1 的 LIMIT。多出来的一行只用来判断截断。
 /// SQL Server 走 TOP：语句以 SELECT 开头时改写第一个 SELECT，其余（WITH、FETCH 已有）不改写或按计数改写。
+/// 只返回文本；改写规则的对照断言用它，运行路径统一走 cap_result_sql_detail。
+#[cfg(test)]
 pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
+    cap_result_sql_detail(engine, sql, cap).sql
+}
+
+/// 与 cap_result_sql 同一套规则，另外说明这句 SQL 被自动改写了哪一处（追加还是替换数字）。
+pub fn cap_result_sql_detail(engine: &str, sql: &str, cap: usize) -> CappedSql {
     if engine == "sqlserver" {
-        return cap_result_sql_sqlserver(sql, cap);
+        return cap_result_sql_detail_sqlserver(sql, cap);
     }
     let probe = cap.saturating_add(1);
     let (body, suffix) = peel_trailing_semi(sql);
     if !limit_target(body) {
-        return sql.to_owned();
+        return CappedSql::unchanged(sql);
     }
     let scan = scan_top(engine, body);
     if scan.unsafe_limit || scan.has_into {
-        return sql.to_owned();
+        return CappedSql::unchanged(sql);
     }
     if let Some(count) = scan.limit {
         if count.value <= probe as u64 {
-            return sql.to_owned();
+            return CappedSql::unchanged(sql);
         }
-        let mut rewritten = String::new();
-        rewritten.push_str(&body[..count.span.0]);
-        rewritten.push_str(&probe.to_string());
-        rewritten.push_str(&body[count.span.1..]);
-        rewritten.push_str(suffix);
-        return rewritten;
+        return replace_count(body, suffix, count.span, probe, "limit");
     }
     if let Some(fetch) = scan.fetch {
         if fetch.value <= probe as u64 {
-            return sql.to_owned();
+            return CappedSql::unchanged(sql);
         }
-        let mut rewritten = String::new();
-        rewritten.push_str(&body[..fetch.span.0]);
-        rewritten.push_str(&probe.to_string());
-        rewritten.push_str(&body[fetch.span.1..]);
-        rewritten.push_str(suffix);
-        return rewritten;
+        return replace_count(body, suffix, fetch.span, probe, "fetch");
     }
     let insert_at = scan.insert_at.unwrap_or(scan.end_of_code);
-    let mut rewritten = String::new();
-    rewritten.push_str(&body[..insert_at]);
-    if insert_at > 0 && !ends_with_whitespace(&body[..insert_at]) {
-        rewritten.push(' ');
+    let mut text = String::from("LIMIT ");
+    text.push_str(&probe.to_string());
+    insert_text(body, suffix, insert_at, &text, "limit")
+}
+
+/// 把替换数字的改写落成文本和改写记录。
+fn replace_count(body: &str, suffix: &str, span: (usize, usize), probe: usize, kind: &str) -> CappedSql {
+    let mut sql = String::new();
+    sql.push_str(&body[..span.0]);
+    sql.push_str(&probe.to_string());
+    sql.push_str(&body[span.1..]);
+    sql.push_str(suffix);
+    let rewrite = AutoRewrite { kind: kind.to_owned(), at: span.0, replaced: span.1 - span.0, added: probe.to_string() };
+    CappedSql { sql, rewrite: Some(rewrite) }
+}
+
+/// 在语句里的某一点追加改写文本；两侧按需补一个空格，避免和相邻标识符粘连。
+fn insert_text(body: &str, suffix: &str, at: usize, text: &str, kind: &str) -> CappedSql {
+    let mut added = String::new();
+    if at > 0 && !ends_with_whitespace(&body[..at]) {
+        added.push(' ');
     }
-    rewritten.push_str("LIMIT ");
-    rewritten.push_str(&probe.to_string());
-    if insert_at < body.len() && !starts_with_whitespace(&body[insert_at..]) {
-        rewritten.push(' ');
+    added.push_str(text);
+    if at < body.len() && !starts_with_whitespace(&body[at..]) {
+        added.push(' ');
     }
-    rewritten.push_str(&body[insert_at..]);
-    rewritten.push_str(suffix);
-    rewritten
+    let mut sql = String::new();
+    sql.push_str(&body[..at]);
+    sql.push_str(&added);
+    sql.push_str(&body[at..]);
+    sql.push_str(suffix);
+    let rewrite = AutoRewrite { kind: kind.to_owned(), at, replaced: 0, added };
+    CappedSql { sql, rewrite: Some(rewrite) }
 }
 
 /// T-SQL 的行数上限：SELECT 直接改写为 SELECT TOP (n)；FETCH NEXT 已有时只改数字；
 /// TOP 已有时只改数字；WITH 开头的语句不改写（TOP 需要落在内层 SELECT，盲改会破坏语义）。
-fn cap_result_sql_sqlserver(sql: &str, cap: usize) -> String {
+fn cap_result_sql_detail_sqlserver(sql: &str, cap: usize) -> CappedSql {
     let probe = cap.saturating_add(1);
     let (body, suffix) = peel_trailing_semi(sql);
     if !limit_target(body) {
-        return sql.to_owned();
+        return CappedSql::unchanged(sql);
     }
     let scan = scan_top("sqlserver", body);
     if scan.has_into {
-        return sql.to_owned();
+        return CappedSql::unchanged(sql);
     }
     if let Some(fetch) = scan.fetch {
         if fetch.value <= probe as u64 {
-            return sql.to_owned();
+            return CappedSql::unchanged(sql);
         }
-        let mut rewritten = String::new();
-        rewritten.push_str(&body[..fetch.span.0]);
-        rewritten.push_str(&probe.to_string());
-        rewritten.push_str(&body[fetch.span.1..]);
-        rewritten.push_str(suffix);
-        return rewritten;
+        return replace_count(body, suffix, fetch.span, probe, "fetch");
     }
     if let Some(top) = scan_top_n(body) {
         if top.value <= probe as u64 {
-            return sql.to_owned();
+            return CappedSql::unchanged(sql);
         }
-        let mut rewritten = String::new();
-        rewritten.push_str(&body[..top.span.0]);
-        rewritten.push_str(&probe.to_string());
-        rewritten.push_str(&body[top.span.1..]);
-        rewritten.push_str(suffix);
-        return rewritten;
+        return replace_count(body, suffix, top.span, probe, "top");
     }
     if split::first_keyword(body) != "SELECT" {
-        return sql.to_owned();
+        return CappedSql::unchanged(sql);
     }
-    let mut rewritten = String::new();
+    // TOP 紧跟在第一个 SELECT 之后：插入点之前的文本原样保留，之后的全部后移。
     let cut = body.to_ascii_uppercase().find("SELECT").unwrap_or(0) + "SELECT".len();
+    let mut added = String::from(" TOP (");
+    added.push_str(&probe.to_string());
+    added.push(')');
+    let mut rewritten = String::new();
     rewritten.push_str(&body[..cut]);
-    rewritten.push_str(" TOP (");
-    rewritten.push_str(&probe.to_string());
-    rewritten.push(')');
+    rewritten.push_str(&added);
     rewritten.push_str(&body[cut..]);
     rewritten.push_str(suffix);
-    rewritten
+    let rewrite = AutoRewrite { kind: "top".to_owned(), at: cut, replaced: 0, added };
+    CappedSql { sql: rewritten, rewrite: Some(rewrite) }
 }
 
 /// 顶层 TOP n 的数量区间。TOP 与数量之间允许括号。

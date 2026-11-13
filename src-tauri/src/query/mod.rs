@@ -6,7 +6,7 @@ mod cancel;
 pub(crate) mod complete;
 pub mod commands;
 pub(crate) mod desk;
-mod exec;
+pub(crate) mod exec;
 pub(crate) mod functions;
 mod history;
 pub(crate) mod meta;

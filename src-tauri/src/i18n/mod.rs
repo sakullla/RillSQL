@@ -486,6 +486,13 @@ dict! {
     "query.log.rows" => "{count} 行", "{count} rows";
     "query.log.affected" => "影响 {count} 行", "{count} affected";
     "query.log.noPosition" => "草稿在执行后改过，或这条错误没有位置，无法定位。", "The draft changed after the run, or this error has no position, so it can't be located.";
+    "query.rewrite.note" => "执行前被自动改写（{clause}）。草稿不变，改的只是实际发出去的语句。", "Rewritten before execution ({clause}). Your draft is unchanged; only the statement actually sent differs.";
+    "query.rewrite.sent" => "实际执行的语句", "Statement actually executed";
+    "query.rewrite.limitAppend" => "追加 LIMIT {value}", "appended LIMIT {value}";
+    "query.rewrite.limitReplace" => "把 LIMIT 改成 {value}", "changed LIMIT to {value}";
+    "query.rewrite.topAppend" => "加上 TOP ({value})", "added TOP ({value})";
+    "query.rewrite.topReplace" => "把 TOP 改成 {value}", "changed TOP to {value}";
+    "query.rewrite.fetchReplace" => "把 FETCH 行数改成 {value}", "changed FETCH rows to {value}";
     "query.side.toggle" => "显示 / 隐藏右侧面板", "Show / hide the side panel";
     "query.side.close" => "收起右侧面板", "Collapse the side panel";
     "query.side.object" => "对象", "Object";
@@ -1121,6 +1128,20 @@ dict! {
     "redis.console.toggle" => "命令控制台", "Command console";
     "redis.console.history" => "命令历史", "Command history";
     "redis.key.name" => "键名", "Key name";
+    "structure.error.heading" => "读取结构失败", "Could not read the structure";
+    "structure.empty.columns" => "这张表还没有字段", "This table has no columns";
+    "structure.empty.columnsHint" => "在下方「新增」里填写字段名与类型，预览 SQL 后再确认执行。", "Add a column name and type below, then preview the SQL before confirming.";
+    "structure.empty.indexes" => "还没有索引", "No indexes yet";
+    "structure.empty.indexesHint" => "在下方挑选字段并命名索引，预览 SQL 后再确认执行。", "Pick columns and name an index below, then preview the SQL before confirming.";
+    "structure.empty.foreignKeys" => "还没有外键", "No foreign keys yet";
+    "structure.empty.foreignKeysHint" => "在下方选择本表字段与引用表，预览 SQL 后再确认执行。", "Choose a local column and a referenced table below, then preview the SQL before confirming.";
+    "structure.empty.definition" => "这个对象没有可显示的 SQL 定义。", "This object has no SQL definition to show.";
+    "structure.menu.copyName" => "复制名称", "Copy name";
+    "structure.menu.dropColumn" => "标记删除此字段（需预览）", "Mark this column for deletion (preview)";
+    "structure.menu.restoreColumn" => "取消删除标记", "Clear the deletion mark";
+    "structure.summary" => "{columns} 个字段 · {indexes} 个索引", "{columns} columns · {indexes} indexes";
+    "structure.action.hint" => "预览只生成 SQL，确认后才执行。", "The preview only builds SQL; nothing runs until you confirm.";
+    "structure.danger.typeHint" => "输入的对象名完全一致后才能确认执行。", "The name must match exactly before you can confirm.";
 }
 
 #[cfg(test)]

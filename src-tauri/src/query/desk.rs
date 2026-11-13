@@ -16,7 +16,7 @@ use super::assist::{
 };
 use super::complete;
 use super::commands::{self, RunDto, StartRequest};
-use super::exec::{ErrorAt, LiveDriver, StatementDriver};
+use super::exec::{AutoRewrite, ErrorAt, LiveDriver, StatementDriver};
 
 /// 词频表上限；超出时按次数与名称稳定截断。
 const FREQUENCY_LIMIT: usize = 200;
@@ -41,6 +41,13 @@ pub struct Target {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatementView {
     pub sql: String,
+    /// 驱动实际发出的语句（带读取上限的改写文本）。没有改写或没有执行时为 None。
+    /// 它只用于展示"实际执行了什么"，定位和错误标记始终换算回草稿里的 sql。
+    pub sent_sql: Option<String>,
+    /// 执行前对这条语句做的自动改写（读取上限）；用户手写 LIMIT 且不超过上限时为 None。
+    pub rewrite: Option<AutoRewrite>,
+    /// 自动插入/替换的位置在草稿里的字节偏移；草稿对不上时为 None，不伪造位置。
+    pub rewrite_anchor: Option<usize>,
     pub status: String,
     pub message: String,
     pub columns: Vec<String>,
@@ -75,6 +82,10 @@ pub struct LogEntry {
     /// 这条记录对应的结果序号（从 0 开始）；整次执行的失败/取消记录为 None。
     pub statement: Option<usize>,
     pub sql: String,
+    /// 实际执行过的语句（被自动改写时与 sql 不同）；消息页据此展示改写后的语句。
+    pub sent_sql: Option<String>,
+    /// 执行前的自动改写；没有改写时为 None，消息页不附加说明。
+    pub rewrite: Option<AutoRewrite>,
     /// ok / error / skipped / cancelled / unknown，与结果状态同一套写法。
     pub status: String,
     /// 有结果集时读取到的行数。
@@ -135,6 +146,8 @@ pub fn log_entries(results: &[StatementView]) -> Vec<LogEntry> {
         .map(|(index, view)| LogEntry {
             statement: Some(index),
             sql: view.sql.clone(),
+            sent_sql: view.sent_sql.clone(),
+            rewrite: view.rewrite.clone(),
             status: view.status.clone(),
             rows: (!view.columns.is_empty()).then_some(view.rows.len()),
             affected: view.affected,
@@ -629,6 +642,9 @@ impl Desk {
         let wrote = self.active_mut().map(|tab| {
             tab.results = vec![StatementView {
                 sql: String::new(),
+                sent_sql: None,
+                rewrite: None,
+                rewrite_anchor: None,
                 status: "ok".to_owned(),
                 message: String::new(),
                 columns,
@@ -850,15 +866,20 @@ impl Desk {
             // 已经流式到达的语句先按顺序记进消息页，再记整次执行的失败。
             fill_partial_log(tab);
             // 整次执行没有结果就失败（连接中断等）：消息页也要有这一条。
-            tab.log.push(LogEntry {
-                statement: None,
-                sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
-                status: "error".to_owned(),
-                rows: None,
-                affected: None,
-                elapsed_ms: None,
-                message: note.to_owned(),
-            });
+            push_run_log(
+                tab,
+                LogEntry {
+                    statement: None,
+                    sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
+                    sent_sql: None,
+                    rewrite: None,
+                    status: "error".to_owned(),
+                    rows: None,
+                    affected: None,
+                    elapsed_ms: None,
+                    message: note.to_owned(),
+                },
+            );
             true
         });
         if applied {
@@ -1166,15 +1187,20 @@ impl Desk {
         if was_running {
             // 取消前已经完成的语句先按顺序记进消息页，再记整次执行被取消。
             fill_partial_log(tab);
-            tab.log.push(LogEntry {
-                statement: None,
-                sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
-                status: "cancelled".to_owned(),
-                rows: None,
-                affected: None,
-                elapsed_ms: None,
-                message: String::new(),
-            });
+            push_run_log(
+                tab,
+                LogEntry {
+                    statement: None,
+                    sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
+                    sent_sql: None,
+                    rewrite: None,
+                    status: "cancelled".to_owned(),
+                    rows: None,
+                    affected: None,
+                    elapsed_ms: None,
+                    message: String::new(),
+                },
+            );
         }
         tab.run_id.clone()
     }
@@ -1768,6 +1794,7 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
                     &flag,
                 )
                 .await
+                .outcome
                 .map_err(|err| err.to_string())?;
             let _ = driver.finish().await;
             for row in listed.rows {
@@ -1814,7 +1841,7 @@ async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) 
     let driver = LiveDriver::attach(session, "sqlite", "main", transport, None).await?;
     let sql = format!("PRAGMA table_info({})", assist::quote_ident("sqlite", table));
     let flag = Arc::new(AtomicBool::new(false));
-    let info = driver.run(&sql, 200, &flag).await.map_err(|stop| match stop {
+    let info = driver.run(&sql, 200, &flag).await.outcome.map_err(|stop| match stop {
         super::exec::StatementStop::Error { message, .. } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message,
     })?;
     let _ = driver.finish().await;
@@ -1851,6 +1878,9 @@ pub fn run_pending(status: &str) -> bool {
 fn statement_view(statement: commands::StatementDto) -> StatementView {
     StatementView {
         sql: statement.sql,
+        sent_sql: statement.sent_sql,
+        rewrite: statement.rewrite,
+        rewrite_anchor: None,
         status: statement.status,
         message: statement.message,
         columns: statement.columns,
@@ -1861,6 +1891,16 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         error_at: statement.error_at,
         range: None,
         error_mark: None,
+    }
+}
+
+/// 消息页的一条整次执行记录：同一条长错误只说一次。语句记录里已经写了同样的文本时不再堆一条，
+/// 避免结果头、语句记录和整次执行记录里同一段报错重复出现。
+fn push_run_log(tab: &mut TabState, entry: LogEntry) {
+    let message = entry.message.trim();
+    let repeated = !message.is_empty() && tab.log.iter().any(|have| have.message.trim() == message);
+    if !repeated {
+        tab.log.push(entry);
     }
 }
 
@@ -1918,6 +1958,8 @@ fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementVie
             continue;
         }
         view.range = Some((start, end));
+        // 自动插入/替换的位置只落到原草稿这一条语句里；越界时停在语句末尾，不外延。
+        view.rewrite_anchor = view.rewrite.as_ref().map(|rewrite| start.saturating_add(rewrite.at).min(end));
         if view.status == "error" {
             let at = if exact { view.error_at } else { None };
             view.error_mark = Some(error_mark(draft, (start, end), at));
@@ -2300,6 +2342,8 @@ mod tests {
             fresh_channel: false,
             statements: vec![commands::StatementDto {
                 sql: "SELECT 1".to_owned(),
+                sent_sql: None,
+                rewrite: None,
                 status: "ok".to_owned(),
                 message: String::new(),
                 columns: vec!["n".to_owned()],
@@ -2414,6 +2458,8 @@ mod tests {
     fn truncated_result_is_kept_for_load_more() {
         let view = statement_view(commands::StatementDto {
             sql: "SELECT * FROM item".to_owned(),
+            sent_sql: None,
+            rewrite: None,
             status: "ok".to_owned(),
             message: String::new(),
             columns: vec!["id".to_owned()],

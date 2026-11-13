@@ -17,9 +17,9 @@ struct Scripted {
 
 #[async_trait::async_trait]
 impl StatementDriver for Scripted {
-    async fn run(&self, sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
+    async fn run(&self, sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> exec::DriverReport {
         self.calls.lock().expect("calls").push(sql.to_owned());
-        self.steps.lock().expect("steps").remove(0)
+        exec::DriverReport::unchanged(sql, self.steps.lock().expect("steps").remove(0))
     }
 }
 
@@ -388,6 +388,8 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
         fresh_channel: false,
         statements: vec![StatementDto {
             sql: "select 1".to_owned(),
+            sent_sql: None,
+            rewrite: None,
             status: "ok".to_owned(),
             message: String::new(),
             columns: vec!["one".to_owned()],
@@ -709,7 +711,7 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
     let check = exec::LiveDriver::attach(session, "sqlite", "main", service.cancel_transport("notes").unwrap(), None)
         .await
         .unwrap();
-    let rows = check.run("SELECT id, name FROM t", 10, &Arc::new(AtomicBool::new(false))).await.unwrap();
+    let rows = check.run("SELECT id, name FROM t", 10, &Arc::new(AtomicBool::new(false))).await.outcome.unwrap();
     assert_eq!(rows.rows.len(), 1);
     assert_eq!(rows.rows[0][1], Some(String::new()));
     let history = state.history().await.unwrap().list().await.unwrap();
@@ -930,9 +932,12 @@ fn mysql_batch_checks_out_once_and_does_not_reset_on_return() {
     assert!(!truncated.contains("while"), "截断之后不能把剩余行读完");
     let postgres = exec.split("async fn postgres_run").nth(1).unwrap();
     let postgres = postgres.split("pub fn clamp_limit").next().unwrap();
-    assert!(postgres.contains("let bounded = cap_result_sql"));
-    assert!(postgres.contains("prepare(&bounded)"));
-    assert!(postgres.contains("simple_query(&bounded)"));
+    // 读取上限只在 LiveDriver 里改写一次；驱动收到什么就发什么，不会第二次改写。
+    assert!(!postgres.contains("cap_result_sql"), "驱动不再自己改写");
+    assert!(postgres.contains("prepare(sent)"));
+    assert!(postgres.contains("simple_query(sent)"));
+    let live = exec.split("impl StatementDriver for LiveDriver").nth(1).unwrap();
+    assert!(live.contains("cap_result_sql_detail(&self.engine, sql, limit)"), "改写点只剩一处，并且实际语句会随结果返回");
     assert!(postgres.contains("类型未知"));
     assert!(postgres.contains("if rows.len() >= limit"));
     assert!(!postgres.contains("query_raw"));
@@ -1410,10 +1415,10 @@ struct Pausing {
 
 #[async_trait::async_trait]
 impl StatementDriver for Pausing {
-    async fn run(&self, _sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
+    async fn run(&self, sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> exec::DriverReport {
         tokio::time::sleep(Duration::from_millis(60)).await;
         *self.paused.lock().expect("paused") += Duration::from_millis(60);
-        Ok(ok_count())
+        exec::DriverReport::unchanged(sql, Ok(ok_count()))
     }
 
     fn paused(&self) -> Duration {
@@ -1557,6 +1562,8 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
     let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
     let statement = |sql: &str, status: &str, at: Option<exec::ErrorAt>| StatementDto {
         sql: sql.to_owned(),
+        sent_sql: None,
+        rewrite: None,
         status: status.to_owned(),
         message: String::new(),
         columns: Vec::new(),
@@ -1604,6 +1611,8 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
 
     let statement = |sql: &str, status: &str, at: Option<exec::ErrorAt>, truncated: bool| StatementDto {
         sql: sql.to_owned(),
+        sent_sql: None,
+        rewrite: None,
         status: status.to_owned(),
         message: String::new(),
         columns: Vec::new(),
@@ -1726,4 +1735,333 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
     let results = desk.results();
     assert_eq!(results[0].range, Some((start, draft.len())), "光标移走后加载更多仍按上次的范围");
     assert_eq!(results[0].error_mark, Some(ErrorMark::Line(2)), "文本一致时按驱动位置标行");
+}
+
+/// 测试替身：像真实驱动一样先做读取上限改写，再把实际发出的语句和结果一起交回。
+struct Capping {
+    engine: &'static str,
+}
+
+#[async_trait::async_trait]
+impl StatementDriver for Capping {
+    async fn run(&self, sql: &str, limit: usize, _cancel: &Arc<AtomicBool>) -> exec::DriverReport {
+        let capped = exec::cap_result_sql_detail(self.engine, sql, limit);
+        // 自动追加的 LIMIT 接在残缺语句后面时，服务端报的就是这条错误。
+        let outcome = if sql.trim_end().ends_with("WHERE") {
+            Err(StatementStop::Error { message: "near \"LIMIT\": syntax error".to_owned(), at: None })
+        } else {
+            Ok(ok_count())
+        };
+        exec::DriverReport { sent: capped, outcome }
+    }
+}
+
+#[test]
+fn auto_limit_rewrite_reports_what_it_appended_or_replaced() {
+    // 追加 LIMIT：改写规则和读取上限不变，只多一份可以解释的说明。
+    let appended = exec::cap_result_sql_detail("postgres", "SELECT * FROM logs WHERE", 100);
+    assert_eq!(appended.sql, "SELECT * FROM logs WHERE LIMIT 101");
+    assert_eq!(appended.sql, exec::cap_result_sql("postgres", "SELECT * FROM logs WHERE", 100), "规则与 cap_result_sql 一致");
+    let rewrite = appended.rewrite.expect("自动追加 LIMIT 要留下来源");
+    assert_eq!(rewrite.kind, "limit");
+    assert_eq!(rewrite.at, "SELECT * FROM logs WHERE".len(), "插入点是原语句末尾");
+    assert_eq!(rewrite.replaced, 0);
+    assert_eq!(rewrite.added, " LIMIT 101");
+    assert_eq!(rewrite.inserted_len(), rewrite.added.len());
+
+    // 替换数字：只认被替换数字的起点，后面 OFFSET 之类原样保留。
+    let replaced = exec::cap_result_sql_detail("postgres", "SELECT a FROM t LIMIT 5000 OFFSET 0", 100);
+    assert_eq!(replaced.sql, "SELECT a FROM t LIMIT 101 OFFSET 0");
+    let rewrite = replaced.rewrite.expect("改小读取上限也是自动改写");
+    assert_eq!(rewrite.kind, "limit");
+    assert_eq!(rewrite.at, "SELECT a FROM t LIMIT ".len());
+    assert_eq!(rewrite.replaced, 4);
+    assert_eq!(rewrite.added, "101");
+
+    // 手写 LIMIT 且不超过上限：一个字都不改，也不附说明。
+    let untouched = exec::cap_result_sql_detail("postgres", "SELECT * FROM t LIMIT 10", 100);
+    assert_eq!(untouched.sql, "SELECT * FROM t LIMIT 10");
+    assert!(untouched.rewrite.is_none(), "手写 LIMIT 不附加改写说明");
+
+    // 读取上限仍是 1..=10000，探测用的是 cap + 1。
+    let ceiling = exec::clamp_limit(50_000);
+    assert_eq!(ceiling, 10_000);
+    assert_eq!(exec::cap_result_sql_detail("postgres", "SELECT 1", ceiling).sql, "SELECT 1 LIMIT 10001");
+
+    // SQL Server 走 TOP，追加在第一个 SELECT 之后。
+    let top = exec::cap_result_sql_detail("sqlserver", "SELECT [limit] FROM t", 10);
+    assert_eq!(top.sql, "SELECT TOP (11) [limit] FROM t");
+    let rewrite = top.rewrite.expect("TOP 也是自动改写");
+    assert_eq!(rewrite.kind, "top");
+    assert_eq!(rewrite.at, "SELECT".len());
+    assert_eq!(rewrite.added, " TOP (11)");
+    // 已有 TOP：只换数字。
+    let top_replaced = exec::cap_result_sql_detail("sqlserver", "SELECT TOP (5000) id FROM t", 10);
+    assert_eq!(top_replaced.sql, "SELECT TOP (11) id FROM t");
+    assert_eq!(top_replaced.rewrite.expect("换数字").kind, "top");
+
+    // FETCH NEXT 已有：只改行数。
+    let fetch = exec::cap_result_sql_detail("postgres", "SELECT * FROM t OFFSET 0 ROWS FETCH NEXT 5000 ROWS ONLY", 100);
+    assert_eq!(fetch.sql, "SELECT * FROM t OFFSET 0 ROWS FETCH NEXT 101 ROWS ONLY");
+    assert_eq!(fetch.rewrite.expect("FETCH 行数改写").kind, "fetch");
+
+    // 不会返回行的语句不改写。
+    let write = exec::cap_result_sql_detail("postgres", "UPDATE t SET n = 1", 100);
+    assert_eq!(write.sql, "UPDATE t SET n = 1");
+    assert!(write.rewrite.is_none());
+}
+
+#[tokio::test]
+async fn batch_carries_the_statement_it_sent_and_the_rewrite_source() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let driver = Capping { engine: "sqlite" };
+    let parts = vec![piece("SELECT * FROM t"), piece("SELECT * FROM logs WHERE"), piece("SELECT 3")];
+    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    // 成功语句：原文、实际语句、改写来源三者都能对上。
+    assert_eq!(report.statements[0].status, "ok");
+    assert_eq!(report.statements[0].sql, "SELECT * FROM t");
+    assert_eq!(report.statements[0].sent_sql, "SELECT * FROM t LIMIT 101");
+    let rewrite = report.statements[0].rewrite.clone().expect("自动追加 LIMIT");
+    assert_eq!(rewrite.at, "SELECT * FROM t".len());
+    // 失败语句：错误原文照旧，实际发出的语句仍然带回来。
+    assert_eq!(report.statements[1].status, "error");
+    assert_eq!(report.statements[1].sql, "SELECT * FROM logs WHERE");
+    assert_eq!(report.statements[1].sent_sql, "SELECT * FROM logs WHERE LIMIT 101");
+    assert!(report.statements[1].rewrite.is_some(), "失败的那条也要说明被改写过");
+    assert!(report.statements[1].message.contains("near"), "{:?}", report.statements[1].message);
+    // 没有执行的语句：没有实际语句，也没有改写。
+    assert_eq!(report.statements[2].status, "skipped");
+    assert!(report.statements[2].sent_sql.is_empty());
+    assert!(report.statements[2].rewrite.is_none());
+}
+
+#[tokio::test]
+async fn hand_written_limit_keeps_the_sent_sql_and_adds_no_note() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let driver = Capping { engine: "sqlite" };
+    let report = run_batch(&[piece("SELECT * FROM t LIMIT 10")], 100, &flag, false, &driver).await;
+    assert_eq!(report.statements[0].status, "ok");
+    assert!(report.statements[0].rewrite.is_none(), "手写 LIMIT 不附加改写说明");
+    assert_eq!(report.statements[0].sent_sql, "SELECT * FROM t LIMIT 10");
+}
+
+/// 自动改写的位置映射回草稿：插入点落在原语句边界上，定位和错误标记用的是同一段范围。
+#[test]
+fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{BeginRun, Desk, ErrorMark, Target, Ticket};
+
+    let draft = "SELECT 1;\nSELECT * FROM logs WHERE;";
+    let second = "SELECT * FROM logs WHERE;";
+    let start = draft.find("SELECT * FROM logs").unwrap();
+    let rewrite = exec::AutoRewrite { kind: "limit".to_owned(), at: "SELECT * FROM logs WHERE".len(), replaced: 0, added: " LIMIT 101".to_owned() };
+    let statement = |status: &str, at: Option<exec::ErrorAt>| StatementDto {
+        sql: second.to_owned(),
+        sent_sql: Some("SELECT * FROM logs WHERE LIMIT 101;".to_owned()),
+        rewrite: Some(rewrite.clone()),
+        status: status.to_owned(),
+        message: if status == "error" { "near \"LIMIT\": syntax error".to_owned() } else { String::new() },
+        columns: Vec::new(),
+        column_types: Vec::new(),
+        rows: Vec::new(),
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(2),
+        error_at: at,
+    };
+    let run = |statements: Vec<StatementDto>| RunDto {
+        id: "run".to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: "error".to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements,
+        started_at: String::new(),
+        elapsed_ms: 3,
+    };
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    desk.import_tab("a", draft, Some(target));
+    desk.focus_tab(Some("a"));
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应开始执行");
+    };
+    let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    // SQLite 不给错误位置：整条语句标错，但仍然能指出自动插入的边界。
+    desk.finish_polled(&tasks, &ticket, Ok(run(vec![statement("ok", None), statement("error", None)])), "已取消");
+    let results = desk.results();
+    assert_eq!(results[1].sql, second, "展示和定位都用草稿里的原文");
+    assert_eq!(results[1].sent_sql.as_deref(), Some("SELECT * FROM logs WHERE LIMIT 101;"), "同时带回实际执行的语句");
+    assert_eq!(results[1].range, Some((start, draft.len())), "落在草稿里这条语句上");
+    assert_eq!(results[1].rewrite_anchor, Some(start + "SELECT * FROM logs WHERE".len()), "改写位置映射到原草稿的插入边界");
+    assert_eq!(results[1].error_mark, Some(ErrorMark::Statement), "驱动没给位置时不伪造精确位置");
+    let anchor = results[1].rewrite_anchor.unwrap();
+    assert_eq!(&draft[anchor..], ";", "边界正好在语句末尾的分号之前");
+
+    // 驱动给了位置（行号）时照常换算，改写位置不受影响。
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应再次执行");
+    };
+    let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    desk.finish_polled(&tasks, &ticket, Ok(run(vec![statement("ok", None), statement("error", Some(exec::ErrorAt::Line(1)))])), "已取消");
+    let results = desk.results();
+    assert_eq!(results[1].error_mark, Some(ErrorMark::Line(1)));
+    assert_eq!(results[1].rewrite_anchor, Some(start + "SELECT * FROM logs WHERE".len()));
+}
+
+/// 过期的执行不能把它的改写信息写到更新的结果上。
+#[test]
+fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{BeginRun, Desk, Target, Ticket};
+
+    let draft = "SELECT * FROM logs WHERE;";
+    let rewrite = |added: &str| exec::AutoRewrite { kind: "limit".to_owned(), at: draft.len() - 1, replaced: 0, added: added.to_owned() };
+    let statement = |sent: &str, added: &str| StatementDto {
+        sql: draft.to_owned(),
+        sent_sql: Some(sent.to_owned()),
+        rewrite: Some(rewrite(added)),
+        status: "error".to_owned(),
+        message: "near \"LIMIT\": syntax error".to_owned(),
+        columns: Vec::new(),
+        column_types: Vec::new(),
+        rows: Vec::new(),
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(1),
+        error_at: None,
+    };
+    let run = |sql: &str, sent: &str, added: &str| RunDto {
+        id: sql.to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: "error".to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements: vec![statement(sent, added)],
+        started_at: String::new(),
+        elapsed_ms: 1,
+    };
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    desk.import_tab("a", draft, Some(target));
+    desk.focus_tab(Some("a"));
+    let BeginRun::Ready(first) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应开始执行");
+    };
+    let first_ticket = Ticket { tab_id: first.tab_id.clone(), token: first.token, version: first.version };
+    desk.finish_polled(&tasks, &first_ticket, Ok(run("run-1", "SELECT * FROM logs WHERE LIMIT 101;", " LIMIT 101")), "已取消");
+    assert_eq!(desk.results()[0].sent_sql.as_deref(), Some("SELECT * FROM logs WHERE LIMIT 101;"));
+
+    let BeginRun::Ready(second) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应再次执行");
+    };
+    let second_ticket = Ticket { tab_id: second.tab_id.clone(), token: second.token, version: second.version };
+    desk.finish_polled(&tasks, &second_ticket, Ok(run("run-2", "SELECT * FROM logs WHERE LIMIT 201;", " LIMIT 201")), "已取消");
+    // 旧的执行结果晚到：不能把 LIMIT 101 的说明写回新结果。
+    desk.finish_polled(&tasks, &first_ticket, Ok(run("run-1", "SELECT * FROM logs WHERE LIMIT 101;", " LIMIT 101")), "已取消");
+    let results = desk.results();
+    assert_eq!(results[0].sent_sql.as_deref(), Some("SELECT * FROM logs WHERE LIMIT 201;"), "过期结果不覆盖新结果");
+    assert_eq!(results[0].rewrite.as_ref().map(|rewrite| rewrite.added.as_str()), Some(" LIMIT 201"));
+}
+
+/// 同一段长错误在消息页只记一次：整次执行的失败和语句记录说同一件事时不重复堆。
+#[test]
+fn the_same_long_error_is_logged_once_in_messages() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::desk::{Desk, StatementView, Target};
+
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    desk.import_tab("a", "select nope;", Some(target));
+    desk.focus_tab(Some("a"));
+    // 语句记录里已经有这段错误。
+    desk.plant_run(vec![StatementView {
+        sql: "select nope;".to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        rewrite_anchor: None,
+        status: "error".to_owned(),
+        message: "no such column: nope".to_owned(),
+        columns: Vec::new(),
+        rows: Vec::new(),
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(1),
+        error_at: None,
+        range: None,
+        error_mark: None,
+    }]);
+    let ticket = desk.issue(&tasks).expect("ticket");
+    assert!(desk.stop_run("a", ticket.token, "no such column: nope"));
+    assert_eq!(desk.log().len(), 1, "同一段长错误不堆两条：{:?}", desk.log());
+    assert_eq!(desk.log()[0].message, "no such column: nope");
+
+    // 不同的整体失败照常单独记一条。
+    let mut desk = Desk::new();
+    desk.import_tab("b", "select 1;", Some(Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    }));
+    desk.focus_tab(Some("b"));
+    desk.plant_run(vec![StatementView {
+        sql: "select 1;".to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        rewrite_anchor: None,
+        status: "ok".to_owned(),
+        message: String::new(),
+        columns: vec!["n".to_owned()],
+        rows: vec![vec![Some("1".to_owned())]],
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(1),
+        error_at: None,
+        range: None,
+        error_mark: None,
+    }]);
+    let ticket = desk.issue(&tasks).expect("ticket");
+    assert!(desk.stop_run("b", ticket.token, "连接中断，无法确认写入是否完成。"));
+    assert_eq!(desk.log().len(), 2, "不同的失败仍然要记下来：{:?}", desk.log());
 }

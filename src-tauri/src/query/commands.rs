@@ -52,7 +52,12 @@ pub struct RunDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatementDto {
+    /// 用户写的那条语句（草稿原文）；界面展示和定位以它为准。
     pub sql: String,
+    /// 驱动实际发出的语句；被自动改写时与 sql 不同，未执行时为 None。
+    pub sent_sql: Option<String>,
+    /// 自动改写说明；手写 LIMIT 或不改写时为 None。
+    pub rewrite: Option<exec::AutoRewrite>,
     pub status: String,
     pub message: String,
     pub columns: Vec<String>,
@@ -167,6 +172,8 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         .iter()
         .map(|piece| StatementDto {
             sql: piece.text.clone(),
+            sent_sql: None,
+            rewrite: None,
             status: "pending".to_owned(),
             message: String::new(),
             columns: Vec::new(),
@@ -290,8 +297,12 @@ fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
 }
 
 fn statement_dto(statement: StatementReport) -> StatementDto {
+    // 没有改写时实际语句就是原文，不给前端多一份重复文本；没执行过的语句为空。
+    let sent_sql = (!statement.sent_sql.is_empty() && statement.sent_sql != statement.sql).then_some(statement.sent_sql);
     StatementDto {
         sql: statement.sql,
+        sent_sql,
+        rewrite: statement.rewrite,
         status: statement.status.to_owned(),
         message: statement.message,
         columns: statement.columns,
@@ -507,6 +518,8 @@ mod resource_tests {
             cancel: "none".to_owned(), cancel_message: String::new(), via_ssh: false, fresh_channel: false,
             statements: vec![StatementDto {
                 sql: "SELECT value".to_owned(), status: "ok".to_owned(), message: String::new(),
+                sent_sql: None,
+                rewrite: None,
                 columns: vec!["value".to_owned()], column_types: vec!["text".to_owned()],
                 rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
                 elapsed_ms: Some(1), error_at: None,

@@ -11,7 +11,7 @@ use crate::i18n::{self, Locale};
 use crate::query::desk::LogEntry;
 use crate::ui::kit::{self, Metrics, Palette, TypeScale};
 
-use super::{elapsed_label, QueryPane};
+use super::{elapsed_label, rewrite_note, QueryPane};
 
 /// 一条记录的状态文案。
 pub fn status_text(locale: Locale, entry: &LogEntry) -> String {
@@ -45,6 +45,12 @@ pub fn entry_text(locale: Locale, entry: &LogEntry) -> String {
     // 没执行到的语句只说状态：执行层写的说明与状态词重复，而且不随界面语言变化。
     if !entry.message.is_empty() && entry.status != "skipped" {
         parts.push(entry.message.clone());
+    }
+    // 失败且被自动改写时，读屏也要听到“语句被执行前改过”。
+    if entry.failed() {
+        if let Some(rewrite) = entry.rewrite.as_ref() {
+            parts.push(rewrite_note(locale, rewrite));
+        }
     }
     parts.join(" · ")
 }
@@ -168,7 +174,32 @@ impl LogPanel<'_> {
                                         .text_color(if failed { p.danger } else { p.text_muted })
                                         .child(SharedString::from(entry.message.clone())),
                                 )
-                            }),
+                            })
+                            // 失败且被自动改写时才补说明和实际语句：手写 LIMIT 的报错原文不动，
+                            // 成功语句也不为一条本来就有的读取上限加噪声。
+                            .when_some(
+                                failed.then(|| entry.rewrite.clone()).flatten().zip(entry.sent_sql.clone()),
+                                |this, (rewrite, sent)| {
+                                    let note = rewrite_note(locale, &rewrite);
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!("query-log-rewrite-{index}")))
+                                            .test_support()
+                                            .aria_label(SharedString::from(note.clone()))
+                                            .text_color(p.warn)
+                                            .child(SharedString::from(note)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("query-log-sent-{index}")))
+                                            .test_support()
+                                            .aria_label(SharedString::from(sent.clone()))
+                                            .font_family(self.mono.clone())
+                                            .text_color(p.text_muted)
+                                            .child(SharedString::from(sent)),
+                                    )
+                                },
+                            ),
                     ),
             );
         }

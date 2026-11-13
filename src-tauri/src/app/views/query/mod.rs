@@ -32,6 +32,7 @@ use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
 use crate::query::commands::RunDto;
 use crate::query::desk::{self, BeginRun, Desk, DraftLink, DraftSync, ErrorMark, PreparedRun, ResultView, Target, Ticket};
+use crate::query::exec::AutoRewrite;
 
 pub use side::{SideMode, SideState};
 use crate::ui::{ObjectHandler, ObjectLink, SqlEditor};
@@ -237,6 +238,67 @@ pub fn statement_message(locale: Locale, status: &str, message: &str) -> String 
     } else {
         message.to_owned()
     }
+}
+
+/// 自动改写让实际语句多出/改掉的那段文字里的读取上限数字；取不到时退回原文，不编造。
+fn rewrite_value(added: &str) -> String {
+    let digits: String = added.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() { added.trim().to_owned() } else { digits }
+}
+
+/// 自动改写的一句话说明：追加还是替换、改成了多少。
+pub fn rewrite_clause(locale: Locale, rewrite: &AutoRewrite) -> String {
+    let key = match (rewrite.kind.as_str(), rewrite.replaced) {
+        ("limit", 0) => "query.rewrite.limitAppend",
+        ("limit", _) => "query.rewrite.limitReplace",
+        ("top", 0) => "query.rewrite.topAppend",
+        ("top", _) => "query.rewrite.topReplace",
+        _ => "query.rewrite.fetchReplace",
+    };
+    i18n::fill(&i18n::text(locale, key), &[("value", &rewrite_value(&rewrite.added))])
+}
+
+/// “这条语句被执行前改写过”的完整说明；手写 LIMIT 且没被改写时不产生说明。
+pub fn rewrite_note(locale: Locale, rewrite: &AutoRewrite) -> String {
+    i18n::fill(&i18n::text(locale, "query.rewrite.note"), &[("clause", &rewrite_clause(locale, rewrite))])
+}
+
+/// 失败语句的改写说明与实际执行的语句。没有改写或没有实际语句时不占位置，
+/// 手写 LIMIT 的报错因此不带任何改写说明。
+#[inline(never)]
+fn rewrite_block(result: &desk::StatementView, locale: Locale, mono: &SharedString, p: &Palette) -> Option<AnyElement> {
+    let rewrite = result.rewrite.as_ref()?;
+    let sent = result.sent_sql.clone()?;
+    let note = rewrite_note(locale, rewrite);
+    Some(
+        div()
+            .id("query-rewrite")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .id("query-rewrite-note")
+                    .test_support()
+                    .aria_label(SharedString::from(note.clone()))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.warn)
+                    .child(SharedString::from(note)),
+            )
+            .child(div().id("query-rewrite-label").text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(i18n::text(locale, "query.rewrite.sent"))))
+            .child(
+                div()
+                    .id("query-rewrite-sql")
+                    .test_support()
+                    .aria_label(SharedString::from(sent.clone()))
+                    .font_family(mono.clone())
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(sent)),
+            )
+            .into_any_element(),
+    )
 }
 
 pub fn elapsed_label(ms: u64) -> String {
@@ -2725,23 +2787,27 @@ fn pinned_tab(
         .into_any_element()
 }
 
+/// 结果头里的失败状态。这里只留一句短状态：完整错误在下面的语句面板或消息页里显示一次，
+/// 头部再堆一遍同一段长错误就是重复。完整原文留在悬停提示里，需要时悬停即可读到。
 #[inline(never)]
 fn failure_status(result: &desk::StatementView, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
-    let summary = failure_summary(locale, result);
+    let detail = failure_summary(locale, result);
+    let label = i18n::text(locale, "query.log.error");
     let jump = entity.clone();
     vec![
         div()
             .id("query-error-summary")
             .test_support()
-            .aria_label(SharedString::from(summary.clone()))
+            // 读屏也只读这句短状态；完整原文在下面的语句面板和消息页里各出现一次。
+            .aria_label(SharedString::from(label.clone()))
             .min_w(px(0.))
             .max_w(px(360.))
             .truncate()
             .px(px(6.))
             .text_size(px(TypeScale::SM))
             .text_color(p.danger)
-            .tooltip_text(SharedString::from(summary.clone()))
-            .child(SharedString::from(summary))
+            .tooltip_text(SharedString::from(detail))
+            .child(SharedString::from(label))
             .into_any_element(),
         error_jump_button("query-error-jump", locale, p, metrics, &jump),
     ]
@@ -2805,6 +2871,9 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
         .gap(px(10.))
         .child(
             div()
+                .id("query-error-message")
+                .test_support()
+                .aria_label(SharedString::from(message.clone()))
                 .flex()
                 .items_center()
                 .gap(px(8.))
@@ -2814,6 +2883,8 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
                 .child(SharedString::from(message)),
         )
         .when(failed, |this| this.child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity)))
+        // 失败且被自动改写时，说明改写并给出真正执行过的语句；手写 LIMIT 没有这一段。
+        .when_some(if failed { rewrite_block(result, locale, mono, p) } else { None }, |this, block| this.child(block))
         .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
         .into_any_element()
 }
@@ -2938,6 +3009,8 @@ mod tests {
         let entry = crate::query::desk::LogEntry {
             statement: Some(2),
             sql: "select 3".to_owned(),
+            sent_sql: None,
+            rewrite: None,
             status: "skipped".to_owned(),
             rows: None,
             affected: None,
@@ -2971,6 +3044,9 @@ mod tests {
     fn sheet(sql: &str, truncated: bool, status: &str) -> desk::StatementView {
         desk::StatementView {
             sql: sql.to_owned(),
+            sent_sql: None,
+            rewrite: None,
+            rewrite_anchor: None,
             status: status.to_owned(),
             message: String::new(),
             columns: vec!["id".to_owned()],
@@ -3088,6 +3164,11 @@ mod tests {
     }
 
     fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {
+        open_sized(cx, 1100., 720.)
+    }
+
+    /// 指定窗口尺寸的查询工作台，供 1360/900/640 三档宽度验证使用。
+    fn open_sized(cx: &mut TestAppContext, width: f32, height: f32) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {
         let dir = std::env::temp_dir().join(format!("rillsql-pane-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
@@ -3095,7 +3176,7 @@ mod tests {
         cx.update(|cx| {
             let bounds = gpui_kit::Bounds {
                 origin: Point::default(),
-                size: size(px(1100.), px(720.)),
+                size: size(px(width), px(height)),
             };
             let (window, pane) = gpui_kit::open_window(
                 WindowOptions {
@@ -3684,6 +3765,8 @@ mod tests {
             fresh_channel: false,
             statements: vec![crate::query::commands::StatementDto {
                 sql: "SELECT * FROM thread_items".to_owned(),
+                sent_sql: None,
+                rewrite: None,
                 status: if desk::run_pending(status) { "running" } else { "ok" }.to_owned(),
                 message: String::new(),
                 columns: vec!["id".to_owned()],
@@ -3918,13 +4001,19 @@ mod tests {
                 failed.error_mark = Some(ErrorMark::Statement);
                 let skipped = result("select 3;", "skipped", &[], &[], None, "未执行");
                 pane.desk.plant_run(vec![result("select 1;", "ok", &["n"], &["1"], None, ""), failed, skipped]);
+                // 失败的是第二条：切到它才看得到语句面板里的完整错误。
+                pane.desk.set_statement(1);
                 pane.desk.remember_executed_draft();
             });
             window.render_frame(cx);
             let skipped = window.find("query-act-statement-2");
             assert!(skipped.label().is_some_and(|label| label.contains("未执行")), "{:?}", skipped.label());
+            // 结果头只留一句短状态：同一段长错误不在头部和下面的面板里各堆一遍。
             let summary = window.find("query-error-summary");
-            assert!(summary.label().unwrap_or_default().contains("no such table: missing"), "{:?}", summary.label());
+            assert_eq!(summary.label(), Some("失败"), "{:?}", summary.label());
+            assert!(!summary.label().unwrap_or_default().contains("no such table"), "{:?}", summary.label());
+            let panel = window.find("query-error-message");
+            assert!(panel.label().unwrap_or_default().contains("no such table: missing"), "{:?}", panel.label());
             window.click("query-error-jump", cx);
             window.render_frame(cx);
             let editor = pane.read(cx).editors.get("q").cloned().unwrap();
@@ -4110,6 +4199,9 @@ mod tests {
     fn result(sql: &str, status: &str, columns: &[&str], rows: &[&str], affected: Option<u64>, message: &str) -> desk::StatementView {
         desk::StatementView {
             sql: sql.to_owned(),
+            sent_sql: None,
+            rewrite: None,
+            rewrite_anchor: None,
             status: status.to_owned(),
             message: message.to_owned(),
             columns: columns.iter().map(|name| (*name).to_owned()).collect(),
@@ -4469,5 +4561,133 @@ mod tests {
             assert!(window.try_find("query-side-panel").is_some(), "工具条按钮重新打开");
         })
         .unwrap();
+    }
+
+    /// 自动追加 LIMIT 导致的报错：说明改写、展示实际执行的语句，长错误只在面板里完整出现一次。
+    #[gpui_kit::test]
+    fn an_auto_rewritten_error_explains_the_rewrite_and_shows_the_sent_sql(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "select 1;\nselect * from logs where;";
+        let statement = "select * from logs where;";
+        let start = draft.find("select * from logs").unwrap();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                let mut failed = result(statement, "error", &[], &[], None, "near \"LIMIT\": syntax error");
+                failed.range = Some((start, start + statement.len()));
+                failed.error_mark = Some(ErrorMark::Statement);
+                failed.sent_sql = Some("select * from logs where LIMIT 101;".to_owned());
+                failed.rewrite = Some(AutoRewrite { kind: "limit".to_owned(), at: "select * from logs where".len(), replaced: 0, added: " LIMIT 101".to_owned() });
+                pane.desk.plant_run(vec![result("select 1;", "ok", &["n"], &["1"], None, ""), failed]);
+                pane.desk.set_statement(1);
+                pane.desk.remember_executed_draft();
+            });
+            window.render_frame(cx);
+            let note = window.find("query-rewrite-note").label().unwrap_or_default().to_owned();
+            assert!(note.contains("自动改写") && note.contains("LIMIT 101"), "{note}");
+            assert_eq!(window.find("query-rewrite-sql").label(), Some("select * from logs where LIMIT 101;"));
+            // 结果头只留短状态，完整的错误原文只出现在语句面板里。
+            assert_eq!(window.find("query-error-summary").label(), Some("失败"));
+            assert_eq!(window.find("query-error-message").label(), Some("near \"LIMIT\": syntax error"));
+            // 定位按钮与错误标记一致：选中草稿里的整条语句（驱动没给位置，不伪造精确位置）。
+            window.click("query-error-jump-panel", cx);
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).selected_text(cx), statement, "跳到草稿里的原语句");
+            assert_eq!(window.find("query-error-summary").label(), Some("失败"), "跳转后头部仍是短状态");
+        })
+        .unwrap();
+    }
+
+    /// 手写 LIMIT 的报错按原文展示：没有改写说明，也没有“实际执行的语句”。
+    #[gpui_kit::test]
+    fn a_hand_written_limit_error_gets_no_rewrite_note(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "select * from logs limit 10;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                let mut failed = result(draft, "error", &[], &[], None, "syntax error at or near \"limit\"");
+                failed.range = Some((0, draft.len()));
+                failed.error_mark = Some(ErrorMark::Statement);
+                pane.desk.plant_run(vec![failed]);
+                pane.desk.remember_executed_draft();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-rewrite").is_none(), "手写 LIMIT 不附加改写说明");
+            assert!(window.try_find("query-rewrite-note").is_none());
+            assert_eq!(window.find("query-error-message").label(), Some("syntax error at or near \"limit\""));
+            // 消息页同样不带改写说明。
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-log-rewrite-0").is_none());
+            assert!(window.find("query-log-0").label().unwrap_or_default().contains("syntax error"));
+        })
+        .unwrap();
+    }
+
+    /// 消息页：失败的改写语句各带一次说明和实际语句，同一段长错误不重复堆两条。
+    #[gpui_kit::test]
+    fn the_message_page_shows_the_rewrite_once_without_stacking_the_same_error(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "select * from logs where;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                let mut failed = result(draft, "error", &[], &[], None, "near \"LIMIT\": syntax error");
+                failed.sent_sql = Some("select * from logs where LIMIT 101;".to_owned());
+                failed.rewrite = Some(AutoRewrite { kind: "limit".to_owned(), at: draft.len() - 1, replaced: 0, added: " LIMIT 101".to_owned() });
+                pane.desk.plant_run(vec![failed]);
+            });
+            window.render_frame(cx);
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.log().len(), 1, "一次失败只记一条");
+            let note = window.find("query-log-rewrite-0").label().unwrap_or_default().to_owned();
+            assert!(note.contains("自动改写") && note.contains("LIMIT 101"), "{note}");
+            assert_eq!(window.find("query-log-sent-0").label(), Some("select * from logs where LIMIT 101;"));
+            let entry = window.find("query-log-0").label().unwrap_or_default().to_owned();
+            assert_eq!(entry.matches("near \"LIMIT\": syntax error").count(), 1, "同一段长错误只出现一次：{entry}");
+            assert_eq!(entry.matches("自动改写").count(), 1, "{entry}");
+        })
+        .unwrap();
+    }
+
+    /// 1360/900/640：改写说明、实际语句、定位按钮与错误标记在每档宽度下都在，且指向同一段范围。
+    #[gpui_kit::test]
+    fn rewritten_error_evidence_holds_at_1360_900_and_640(cx: &mut TestAppContext) {
+        for (width, height) in [(1360., 900.), (900., 900.), (640., 900.)] {
+            let (window, pane) = open_sized(cx, width, height);
+            let draft = "select 1;\nselect * from logs where;";
+            let statement = "select * from logs where;";
+            let start = draft.find("select * from logs").unwrap();
+            cx.update_window(window, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                    let mut failed = result(statement, "error", &[], &[], None, "near \"LIMIT\": syntax error");
+                    failed.range = Some((start, start + statement.len()));
+                    failed.error_mark = Some(ErrorMark::Statement);
+                    failed.sent_sql = Some("select * from logs where LIMIT 101;".to_owned());
+                    failed.rewrite = Some(AutoRewrite { kind: "limit".to_owned(), at: "select * from logs where".len(), replaced: 0, added: " LIMIT 101".to_owned() });
+                    pane.desk.plant_run(vec![result("select 1;", "ok", &["n"], &["1"], None, ""), failed]);
+                    pane.desk.set_statement(1);
+                    pane.desk.remember_executed_draft();
+                });
+                window.render_frame(cx);
+                let note = window.find("query-rewrite-note");
+                assert!(note.visible(), "{width}: 改写说明要可见");
+                assert!(note.label().unwrap_or_default().contains("LIMIT 101"), "{width}: {:?}", note.label());
+                assert_eq!(window.find("query-rewrite-sql").label(), Some("select * from logs where LIMIT 101;"));
+                let jump = window.find("query-error-jump-panel");
+                assert!(jump.visible(), "{width}: 定位按钮要可见");
+                assert_eq!(window.find("query-error-summary").label(), Some("失败"));
+                // 定位和错误标记是同一段范围：跳过去选中的就是整条失败语句。
+                window.click("query-error-jump-panel", cx);
+                window.render_frame(cx);
+                let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+                assert_eq!(editor.read(cx).selected_text(cx), statement, "{width}: 跳转范围和错误标记一致");
+            })
+            .unwrap();
+        }
     }
 }
