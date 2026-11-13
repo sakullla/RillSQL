@@ -1587,29 +1587,32 @@ impl SharedGrid {
         item.locator.clone()
     }
 
-    /// 按稳定行 id 读当前值（含暂存修改）：导出扫描会用到被本地查找/筛选隐藏的行，
-    /// 只能靠行 id 找到它们，显示位置在那种行上不存在。
-    fn value_of(&self, row_id: &str, column: usize) -> Option<Option<String>> {
+    /// 已知行直接借用当前值，避免在逐格扫描时反复按 id 查找行、复制长文本。
+    fn value_in_row<'a>(&'a self, row: &'a GridRow, column: usize) -> Option<Option<&'a str>> {
         let column_name = self.columns.get(column)?.name.as_str();
-        if let Some(item) = self.overlays.iter().find(|item| item.row_id == row_id && item.column_name == column_name && item.kind == "update") {
-            return Some(item.value.clone());
+        if let Some(item) = self.overlays.iter().find(|item| item.row_id == row.id && item.column_name == column_name && item.kind == "update") {
+            return Some(item.value.as_deref());
         }
-        self.any_row(row_id)?.values.get(column).cloned()
+        row.values.get(column).map(|value| value.as_deref())
+    }
+
+    fn row_needs_full(&self, row: &GridRow, column: usize) -> bool {
+        let Some(Some(text)) = self.value_in_row(row, column) else {
+            return false;
+        };
+        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
+        crate::grid::preview_envelope(text, type_name, self.sheet_preview_bytes).is_some()
     }
 
     /// 这一格（按行 id）显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
     pub fn needs_full_of(&self, row_id: &str, column: usize) -> bool {
-        let Some(Some(text)) = self.value_of(row_id, column) else {
-            return false;
-        };
-        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes).is_some()
+        self.any_row(row_id).is_some_and(|row| self.row_needs_full(row, column))
     }
 
     /// 这一格（按行 id）已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
     pub fn full_text_of(&self, row_id: &str, column: usize) -> Option<Option<String>> {
-        let column_name = self.columns.get(column)?.name.clone();
-        match self.full_state(row_id, &column_name) {
+        let column_name = self.columns.get(column)?.name.as_str();
+        match self.full_state(row_id, column_name) {
             Some(FullState::Ready(value)) => Some(value.clone()),
             _ => None,
         }
@@ -1617,10 +1620,7 @@ impl SharedGrid {
 
     /// 这一格显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
     pub fn needs_full(&self, row: usize, column: usize) -> bool {
-        let Some(row_id) = self.rows.get(row).map(|item| item.id.as_str()) else {
-            return false;
-        };
-        self.needs_full_of(row_id, column)
+        self.rows.get(row).is_some_and(|row| self.row_needs_full(row, column))
     }
 
     /// 已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
@@ -1755,21 +1755,22 @@ impl SharedGrid {
     /// 还没有原值的格子（行 id + 列序号）：扫描范围与 exchange_sheet 给出的导出行完全一致，
     /// 只看当前来源行、跳过还没写库的新增行，并且包含被本地查找/筛选隐藏的行。
     /// 导出会写出隐藏行，所以它们也必须算进"还有多少预览"，否则导出被挡而网格没有读取入口。
-    fn unresolved_source_cells(&self) -> Vec<(String, usize)> {
-        let mut cells = Vec::new();
-        for row in self.source.iter().filter(|row| !row.inserted) {
-            for column in 0..self.columns.len() {
-                if self.needs_full_of(&row.id, column) && self.full_text_of(&row.id, column).is_none() {
-                    cells.push((row.id.clone(), column));
-                }
-            }
-        }
-        cells
+    fn unresolved_source_iter(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.source.iter().filter(|row| !row.inserted).flat_map(move |row| {
+            self.columns.iter().enumerate().filter_map(move |(column, origin)| {
+                (self.row_needs_full(row, column) && !matches!(self.full_state(&row.id, &origin.name), Some(FullState::Ready(_))))
+                    .then_some((row.id.as_str(), column))
+            })
+        })
     }
 
-    /// 当前读取窗口里还没有原值的格子数：导出前用它判断要不要先读完整值。
+    fn unresolved_source_cells(&self) -> Vec<(String, usize)> {
+        self.unresolved_source_iter().map(|(row_id, column)| (row_id.to_owned(), column)).collect()
+    }
+
+    /// 仅计数不分配行 id，也不复制已经缓存的完整值（包括数据库 NULL）。
     pub fn unresolved_previews(&self) -> usize {
-        self.unresolved_source_cells().len()
+        self.unresolved_source_iter().count()
     }
 
     /// 当前视图里能看到的未读格子（显示行列）：界面用它说明预览位置。
@@ -2367,9 +2368,22 @@ impl SharedGrid {
         (start..end).map(|row| self.sheet_line(row)).collect()
     }
 
-    /// DataTable 自己虚拟化。这里交出全部已加载行，行号仍按页偏移计算。
-    pub fn sheet_labels(&self) -> Vec<Vec<String>> {
-        (0..self.rows.len()).map(|row| self.sheet_line(row)).collect()
+    /// 自适应列宽只保留最长的 64 项；相同字符数保持行顺序，与稳定排序后取前 64 项一致。
+    pub fn fit_column_labels(&self, column: usize) -> Vec<String> {
+        if column >= self.columns.len() {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(usize, String)> = Vec::with_capacity(65);
+        for row in 0..self.rows.len() {
+            let text = self.cell_label(row, column);
+            let length = text.chars().count();
+            let index = candidates.partition_point(|(other, _)| *other >= length);
+            if index < 64 {
+                candidates.insert(index, (length, text));
+                candidates.truncate(64);
+            }
+        }
+        candidates.into_iter().map(|(_, text)| text).collect()
     }
 
     /// 换了目标表又读失败时丢弃上一张表的快照，避免旧行被当成新表的数据导出。
@@ -4019,6 +4033,123 @@ mod tests {
         schema_from_parts("sqlite", "", "customers", "table", vec![column_of("id", "integer", true), column_of("name", "text", false)], vec!["id".to_owned()]).unwrap()
     }
 
+    // 旧统计路径用于语义对照和显式基准：按 id 找行，并复制值/完整值及未读行 id。
+    fn legacy_unresolved_source_cells(grid: &SharedGrid) -> Vec<(String, usize)> {
+        let mut cells = Vec::new();
+        for row in grid.source.iter().filter(|row| !row.inserted) {
+            for (column, origin) in grid.columns.iter().enumerate() {
+                let value = grid.overlays.iter()
+                    .find(|item| item.row_id == row.id && item.column_name == origin.name && item.kind == "update")
+                    .map(|item| item.value.clone())
+                    .or_else(|| grid.any_row(&row.id).and_then(|item| item.values.get(column).cloned()));
+                if value.flatten().is_some_and(|text| crate::grid::preview_envelope(&text, &origin.type_name, grid.sheet_preview_bytes).is_some())
+                    && grid.full_text_of(&row.id, column).is_none()
+                {
+                    cells.push((row.id.clone(), column));
+                }
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn preview_scan_matches_original_with_overlays_hidden_rows_and_ready_null() {
+        let envelope = "\u{1}t:3000:preview";
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            (1..=5).map(|id| row(&id.to_string(), vec![Some(&id.to_string()), Some(envelope)], true)).collect(),
+            Some(5), Some(schema()),
+        );
+        let reads = grid.begin_unresolved_full();
+        assert_eq!(reads.len(), 5);
+        assert!(grid.apply_full(&reads[0], None), "缓存的数据库 NULL 是完整值");
+        assert!(grid.apply_full(&reads[1], Some("完整值".repeat(10_000))));
+        assert!(grid.fail_full(&reads[2], "retry"));
+        assert_eq!(grid.stage_text(3, 1, Some("替换值".to_owned())), Gate::Writable);
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        grid.set_search("1");
+        let expected = legacy_unresolved_source_cells(&grid);
+        assert_eq!(expected, vec![("3".to_owned(), 1), ("5".to_owned(), 1)]);
+        assert_eq!(grid.unresolved_source_cells(), expected);
+        assert_eq!(grid.unresolved_previews(), expected.len());
+        assert_eq!(grid.full_text_of("1", 1), Some(None));
+        grid.revert_cell("4", 1);
+        assert_eq!(grid.unresolved_source_cells(), legacy_unresolved_source_cells(&grid));
+        assert_eq!(grid.unresolved_previews(), 3);
+    }
+
+    #[test]
+    fn fit_candidates_match_stable_unicode_sort_and_keep_staged_values() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            (0..150).map(|id| {
+                let value = if id % 3 == 0 { format!("中文{id:03}") } else { format!("ascii{id:03}") };
+                row(&id.to_string(), vec![Some(&id.to_string()), Some(&value)], true)
+            }).collect(),
+            Some(150), Some(schema()),
+        );
+        assert_eq!(grid.stage_text(149, 1, Some("最长的暂存内容".repeat(40))), Gate::Writable);
+        let mut expected: Vec<String> = (0..grid.loaded_len()).map(|row| grid.cell_label(row, 1)).collect();
+        expected.sort_by_key(|text| std::cmp::Reverse(text.chars().count()));
+        expected.truncate(64);
+        assert_eq!(grid.fit_column_labels(1), expected, "包含同长度项的稳定顺序");
+        assert!(grid.fit_column_labels(2).is_empty());
+        grid.set_search("missing");
+        assert!(grid.fit_column_labels(1).is_empty());
+    }
+
+    /// Run with --ignored --nocapture. Compares display/mark/preview preparation only;
+    /// it does not measure TableState refresh, frame rendering, database I/O or process RSS.
+    #[test]
+    #[ignore = "manual grid preparation benchmark"]
+    fn benchmark_grid_display_preparation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut grid = SharedGrid::new();
+        let row_count = 3_000;
+        let column_count = 8;
+        let visible_rows = 30;
+        let text = "x".repeat(128);
+        let columns = (0..column_count).map(|column| text_column(&format!("c{column}"))).collect();
+        let rows = (0..row_count).map(|id| row(&id.to_string(), vec![Some(&text); column_count], false)).collect();
+        grid.load_local(columns, rows, Some(row_count as i64), None);
+        grid.set_viewport(visible_rows);
+        // Shared formatter keeps this comparison conservative: the legacy preparation also
+        // benefits from the optimized direct-row preview check, but still materializes all cells.
+        let legacy = || {
+            let labels: Vec<Vec<String>> = (0..grid.loaded_len()).map(|row| grid.sheet_line(row)).collect();
+            let marks: Vec<Vec<CellDirty>> = (0..grid.loaded_len())
+                .map(|row| (0..column_count).map(|column| grid.cell_dirty_state(row, column)).collect()).collect();
+            let unresolved = legacy_unresolved_source_cells(&grid);
+            (labels, marks, unresolved)
+        };
+        let current = || {
+            let labels = grid.rendered_labels();
+            let marks: Vec<Vec<CellDirty>> = (0..visible_rows)
+                .map(|row| (0..column_count).map(|column| grid.cell_dirty_state(row, column)).collect()).collect();
+            (labels, marks, grid.unresolved_previews())
+        };
+        let baseline = legacy();
+        let optimized = current();
+        assert_eq!(baseline.0[..visible_rows], optimized.0);
+        assert_eq!(baseline.1[..visible_rows], optimized.1);
+        assert_eq!(baseline.2.len(), optimized.2);
+        let payload_bytes: usize = baseline.0.iter().flatten().map(String::len).sum();
+        let capacity_bytes: usize = baseline.0.iter().flatten().map(String::capacity).sum();
+        let visible_payload: usize = optimized.0.iter().flatten().map(String::len).sum();
+        drop((baseline, optimized));
+        let rounds = 3;
+        let started = Instant::now();
+        for _ in 0..rounds { black_box(legacy()); }
+        let legacy_elapsed = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..rounds { black_box(current()); }
+        let current_elapsed = started.elapsed();
+        eprintln!("grid-preparation rows={row_count} columns={column_count} visible_rows={visible_rows} rounds={rounds} legacy_us={} current_us={} legacy_display_payload_bytes={payload_bytes} legacy_display_string_capacity_bytes={capacity_bytes} current_delegate_retained_display_bytes=0 visible_temporary_payload_bytes={visible_payload}", legacy_elapsed.as_micros(), current_elapsed.as_micros());
+    }
+
     #[test]
     fn window_selection_and_tsv_do_not_use_the_full_count() {
         let mut grid = SharedGrid::new();
@@ -4027,7 +4158,6 @@ mod tests {
         grid.set_viewport(8);
         grid.scroll_to(40);
         assert_eq!(grid.rendered_len(), 8);
-        assert_eq!(grid.sheet_labels().len(), 100);
         assert_eq!(grid.loaded_len(), 100);
         assert_eq!(grid.full_count(), Some(1000));
         assert!(grid.range_text().contains("40-48/100"));

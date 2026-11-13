@@ -1764,7 +1764,7 @@ impl GridPane {
     fn sync_table(&mut self, cx: &mut App) {
         let names = self.session.column_names();
         let widths = self.session.widths();
-        let rows = self.session.sheet_labels();
+        let row_count = self.session.loaded_len();
         let loading = self.loading_more || self.fetching;
         let has_more = self.session.continuation(loading) == Continuation::More;
         let locale = self.locale;
@@ -1787,15 +1787,6 @@ impl GridPane {
         let has_selection = self.session.selection_count() > 0;
         let logical_count = names.len();
         let headers = (0..names.len()).filter_map(|column| self.session.column_header(column)).collect::<Vec<_>>();
-        let cell_marks = (0..self.session.loaded_len())
-            .map(|row| (0..names.len()).map(|column| dirty_mark(self.session.cell_dirty_state(row, column))).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let row_marks = (0..self.session.loaded_len())
-            .map(|row| {
-                let state = self.session.cell_dirty_state(row, 0);
-                if matches!(state, session::CellDirty::Inserted | session::CellDirty::Deleted) { dirty_mark(state) } else { 0 }
-            })
-            .collect::<Vec<_>>();
         let (cell_dirty, row_dirty) = self
             .session
             .focus_cell()
@@ -1820,12 +1811,10 @@ impl GridPane {
             state.delegate_mut().hidden = hidden;
             state.delegate_mut().has_selection = has_selection;
             state.delegate_mut().headers = headers;
-            state.delegate_mut().cell_marks = cell_marks;
-            state.delegate_mut().row_marks = row_marks;
             state.delegate_mut().cell_dirty = cell_dirty;
             state.delegate_mut().row_dirty = row_dirty;
             state.delegate_mut().write_reason = write_reason;
-            state.delegate_mut().rows = rows;
+            state.delegate_mut().row_count = row_count;
             state.delegate_mut().sort = sort;
             state.delegate_mut().fk = fk;
             state.delegate_mut().unresolved = unresolved;
@@ -1921,8 +1910,12 @@ impl Render for GridPane {
         // 自适应列宽要用窗口量字宽：表格量完发出列宽事件，会话按逻辑列记下新宽度。
         if let Some(logical) = self.pending_fit.take() {
             if let Some(display) = self.session.logical_to_display(logical) {
+                // 此时 GridPane 正在 render，delegate 不能再读 owner；先准备有界候选。
+                let texts = self.session.fit_column_labels(logical);
                 self.table.update(cx, |state, cx| {
+                    state.delegate_mut().fit_labels = Some((logical, texts));
                     let _ = state.fit_col(display + 1, window, cx);
+                    state.delegate_mut().fit_labels = None;
                 });
             }
         }
@@ -2855,7 +2848,9 @@ fn grid_button(id: &'static str, primary: bool, label: SharedString, entity: Ent
 #[derive(Default)]
 struct SheetDelegate {
     columns: Vec<(String, f32, bool)>,
-    rows: Vec<Vec<String>>,
+    row_count: usize,
+    /// 从 GridPane 内发起自适应时使用，避免读取正在更新的父实体；调用后立即释放。
+    fit_labels: Option<(usize, Vec<String>)>,
     /// 当前排序列（数据列下标）与方向。表头据此标出 ↑/↓，与焦点无关。
     sort: Option<(usize, bool)>,
     has_more: bool,
@@ -2873,7 +2868,7 @@ struct SheetDelegate {
     fk: bool,
     /// 当前窗口里还没读到原值的预览格子数：大于零才给"读取完整值"入口。
     unresolved: usize,
-    /// 界面第 n 个数据列对应的逻辑列；隐藏列不在里面。rows 仍按逻辑列存。
+    /// 界面第 n 个数据列对应的逻辑列；隐藏列不在里面。
     visible: Vec<usize>,
     /// 逻辑列总数：选区矩形和"整行点亮行号"都按逻辑列算。
     logical_count: usize,
@@ -2883,9 +2878,6 @@ struct SheetDelegate {
     has_selection: bool,
     /// 与可见数据列对齐的表头：类型缩写、主键、外键。
     headers: Vec<session::ColumnHeader>,
-    /// 逻辑列上的暂存标记：1 新增、2 修改、3 删除。
-    cell_marks: Vec<Vec<u8>>,
-    row_marks: Vec<u8>,
     cell_dirty: bool,
     row_dirty: bool,
     /// 只读时写操作禁用的原因，悬停时显示。
@@ -2898,14 +2890,26 @@ impl SheetDelegate {
         col_ix.checked_sub(1).and_then(|display| self.visible.get(display).copied())
     }
 
-    /// 格子里的文字：rows 的第 0 项是行号，之后按逻辑列。
-    fn text_at(&self, row_ix: usize, col_ix: usize) -> Option<&String> {
-        let line = self.rows.get(row_ix)?;
-        if col_ix == 0 {
-            return line.first();
+    /// DataTable 只请求可见格；文字与暂存标记直接来自会话，不保留全量显示副本。
+    fn cell_at(&self, row_ix: usize, col_ix: usize, cx: &App) -> Option<(String, u8)> {
+        if row_ix >= self.row_count {
+            return None;
         }
-        line.get(self.logical(col_ix)? + 1)
+        let owner = self.owner.as_ref()?.upgrade()?;
+        let grid = &owner.read(cx).session;
+        if row_ix >= grid.loaded_len() {
+            return None;
+        }
+        if col_ix == 0 {
+            let state = grid.cell_dirty_state(row_ix, 0);
+            let mark = if matches!(state, session::CellDirty::Inserted | session::CellDirty::Deleted) { dirty_mark(state) } else { 0 };
+            return Some((grid.row_number(row_ix), mark));
+        }
+        let column = self.logical(col_ix)?;
+        grid.column_type(column)?;
+        Some((grid.cell_label(row_ix, column), dirty_mark(grid.cell_dirty_state(row_ix, column))))
     }
+
 }
 
 /// 一个格子是否落在会话选择的矩形里。列 0 是行号列，它只表示"整行被选中"：
@@ -3317,7 +3321,7 @@ impl TableDelegate for SheetDelegate {
     }
 
     fn rows_count(&self, _: &App) -> usize {
-        self.rows.len()
+        self.row_count
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
@@ -3336,7 +3340,7 @@ impl TableDelegate for SheetDelegate {
     }
 
     fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let text = self.text_at(row_ix, col_ix).cloned().unwrap_or_default();
+        let (text, mark) = self.cell_at(row_ix, col_ix, cx).unwrap_or_default();
         let null = text == "NULL" || text == i18n::text(Locale::ZhCn, "grid.value.null") || text == i18n::text(Locale::En, "grid.value.null");
         let p = Palette::of(cx);
         // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
@@ -3348,10 +3352,6 @@ impl TableDelegate for SheetDelegate {
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
         // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
         let selected = cell_selected(self.selected, row_ix, logical, self.logical_count);
-        let mark = match logical {
-            Some(column) => self.cell_marks.get(row_ix).and_then(|line| line.get(column)).copied().unwrap_or(0),
-            None => self.row_marks.get(row_ix).copied().unwrap_or(0),
-        };
         let (tone_bg, tone_line) = match mark {
             1 => (Some(p.ok_soft), Some(p.ok)),
             2 => (Some(p.warn_soft), Some(p.warn)),
@@ -3480,8 +3480,8 @@ impl TableDelegate for SheetDelegate {
         cell_menu(menu, self.owner.clone(), self.locale, state, self.write_reason.clone(), self.cell_dirty, self.row_dirty, window, cx)
     }
 
-    fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
-        self.text_at(row_ix, col_ix).map(|text| SharedString::from(text.clone()))
+    fn cell_label(&self, row_ix: usize, col_ix: usize, cx: &App) -> Option<SharedString> {
+        self.cell_at(row_ix, col_ix, cx).map(|(text, _)| SharedString::from(text))
     }
 
     /// 自适应列宽：用表格正文的字体量已加载行里这一列的文字和列名，取最宽的。
@@ -3491,13 +3491,14 @@ impl TableDelegate for SheetDelegate {
         let font = gpui_kit::Font { family: cx.theme().font_family.clone(), ..Default::default() };
         let size = window.rem_size() * 0.875;
         let color = cx.theme().foreground;
-        let mut texts: Vec<&str> = self.rows.iter().filter_map(|line| line.get(logical + 1)).map(String::as_str).collect();
-        // 只量字数最多的一批候选，大结果也不会逐行排版。
-        texts.sort_by_key(|text| std::cmp::Reverse(text.chars().count()));
-        texts.truncate(64);
+        let texts = match self.fit_labels.take().filter(|(column, _)| *column == logical) {
+            Some((_, texts)) => texts,
+            // 表头双击从 TableState 发起，此时父实体没有处于更新中。
+            None => self.owner.as_ref()?.upgrade()?.read(cx).session.fit_column_labels(logical),
+        };
         let header = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
         let widest = std::iter::once(header.as_str())
-            .chain(texts)
+            .chain(texts.iter().map(String::as_str))
             .map(|text| {
                 let line = text.lines().next().unwrap_or("").to_owned();
                 let run = gpui_kit::TextRun { len: line.len(), font: font.clone(), color, background_color: None, underline: None, strikethrough: None };
@@ -3812,6 +3813,66 @@ mod pane_tests {
                 cx,
             );
         });
+    }
+
+    #[gpui_kit::test]
+    fn lazy_cells_follow_the_session_and_hidden_column_mapping(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+            let table = pane.read(cx).table.clone();
+            assert_eq!(table.read(cx).delegate().cell_at(0, 2, cx), Some(("甲".to_owned(), 0)));
+            assert_eq!(table.read(cx).delegate().cell_label(0, 2, cx).as_deref(), Some("甲"));
+            pane.update(cx, |pane, _| {
+                assert_eq!(pane.session.stage_text(0, 1, Some("新值".to_owned())), Gate::Writable);
+            });
+            // 不必重建显示快照：文字和暂存标记在下一次读取时就来自同一会话。
+            assert_eq!(table.read(cx).delegate().cell_at(0, 2, cx), Some(("新值".to_owned(), 2)));
+            pane.update(cx, |pane, cx| {
+                assert!(pane.session.hide_column(0));
+                pane.sync_table(cx);
+            });
+            assert_eq!(table.read(cx).delegate().cell_at(0, 1, cx), Some(("新值".to_owned(), 2)));
+            assert!(table.read(cx).delegate().cell_at(0, 2, cx).is_none());
+            assert!(table.read(cx).delegate().cell_at(2, 1, cx).is_none());
+            pane.update(cx, |pane, cx| {
+                assert_eq!(pane.session.stage_delete(1), Gate::Writable);
+                pane.sync_table(cx);
+            });
+            assert_eq!(table.read(cx).delegate().cell_at(1, 0, cx), Some(("2".to_owned(), 3)));
+            assert_eq!(table.read(cx).delegate().cell_at(1, 1, cx), Some(("乙".to_owned(), 3)));
+            window.render_frame(cx);
+            assert_eq!(table.read(cx).delegate().row_count, 2);
+            assert!(table.read(cx).delegate().fit_labels.is_none());
+            let detached = SheetDelegate { row_count: 1, ..Default::default() };
+            assert!(detached.cell_at(0, 0, cx).is_none());
+        }).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn lazy_delegate_survives_owner_release_and_direct_header_fit(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let orphan = cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            let table = pane.read(cx).table.clone();
+            // 与表头双击相同的 TableState 入口；这里没有父实体的更新借用。
+            assert!(table.update(cx, |state, cx| state.fit_col(2, window, cx)));
+            assert!(table.read(cx).delegate().fit_labels.is_none());
+            let services = Arc::clone(&pane.read(cx).services);
+            let temporary = cx.new(|cx| GridPane::new(services, window, cx));
+            plant(&temporary, cx);
+            let orphan = temporary.read(cx).table.clone();
+            assert!(orphan.read(cx).delegate().cell_at(0, 1, cx).is_some());
+            orphan
+        }).unwrap();
+        // GPUI 在更新边界之后处理待发送事件和实体释放。
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            assert!(orphan.read(cx).delegate().cell_at(0, 1, cx).is_none());
+            assert!(!orphan.update(cx, |state, cx| state.fit_col(2, window, cx)));
+            window.render_frame(cx);
+        }).unwrap();
     }
 
     /// 640 宽的窗口里网格只有约 560 宽：工具条换行，“预览变更”等右端动作完整可见、可点，不被裁掉。
