@@ -520,7 +520,9 @@ impl ExchangePane {
                 SaveKind::Loaded => {}
             }
         }
-        if self.source.running {
+        // 全库导出读的是整个库（连接、引擎、库名），与当前来源已读取的行无关，读取中也可以开始；
+        // 导出已读取的行与全量导出必须等这次读取结束，否则会写出半份数据。
+        if self.source.running && !matches!(kind, SaveKind::Dump) {
             let (id, owner) = save_slot(kind);
             self.block(id, owner, i18n::text(self.locale, "ui.exchange.sourceRunning"));
             return;
@@ -1258,15 +1260,10 @@ impl Render for ExchangePane {
                     .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("ui.exchange.next.waitRead")));
             }
             SourceState::NoTable => {
+                // 没有表时"重新读取来源"产不出表来，所以这一步只给说明（下一步在对象树里打开一张表），
+                // 不摆一个点了也没用的按钮；重新读取来源留给"有目标但没结果"那种可恢复的情况。
                 source_body = source_body.child(
-                    kit::empty_state_with_action(
-                        IconName::Table,
-                        t("ui.exchange.state.noTableTitle"),
-                        t("ui.exchange.noTableData"),
-                        refresh("exchange-source-refresh-no-table"),
-                        &p,
-                    )
-                    .into_any_element(),
+                    kit::empty_state(IconName::Table, t("ui.exchange.state.noTableTitle"), t("ui.exchange.noTableData"), &p).into_any_element(),
                 );
             }
             SourceState::NoResult => {
@@ -2331,8 +2328,10 @@ mod unified_state_tests {
                 {
                     let source = window.within("exchange-source-card");
                     assert!(source.try_find("empty-state").is_some(), "{tag}：没有表要有空态");
-                    assert!(source.try_find("state-action").is_some(), "{tag}：空态要有下一步");
-                    assert!(source.try_find("exchange-source-refresh-no-table").is_some(), "{tag}：空态的主操作是重新读取来源");
+                    assert!(source.try_find("empty-state-detail").is_some(), "{tag}：空态要说明原因与下一步");
+                    // 重新读取来源在"没有表"这种状态里产不出表来，所以不摆动作——和下一步的说法一致。
+                    assert!(source.try_find("state-action").is_none(), "{tag}：没有表时不提供点了没用的动作");
+                    assert!(source.try_find("exchange-source-refresh-no-table").is_none(), "{tag}：没有表时没有重新读取按钮");
                 }
                 let dump = window.within("exchange-export-card").try_find("exchange-exchange-dump").expect("被挡住的全库导出");
                 let label = dump.label().unwrap_or_default().to_owned();
@@ -2394,5 +2393,38 @@ mod unified_state_tests {
             assert!(tasks.try_find("exchange-tasks-export").is_none(), "来源没就绪时任务空态不提供导出动作");
         })
         .unwrap();
+    }
+
+    /// 面板上「全库导出」与「跨库迁移」读的是同一个来源，但执行守卫不同：全库导出只依赖连接/引擎/库名，
+    /// 读取中可以开始；跨库迁移要读当前来源的行，必须等读取结束。这条用例把"画出来的动作"与
+    /// "真的能做"钉在一起，避免再出现能点却一定失败的入口。
+    #[gpui_kit::test]
+    fn dump_action_matches_its_execution_guard_while_the_source_is_running(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (window, pane) = open_pane(cx, 900.);
+        bind(cx, &pane, table_source(Some("orders"), &["id"], true));
+        frame(cx, window);
+
+        // 1) 呈现：读取中「全库导出」是可点动作（可访问名称只有标题），「跨库迁移」是带原因与下一步的被挡住的行。
+        cx.update_window(window, |_, window, _cx| {
+            let dump = window.try_find("exchange-exchange-dump").expect("全库导出");
+            assert_eq!(dump.label(), Some("开始全库导出"), "读取中「全库导出」必须是可点动作");
+            let migrate = window.try_find("exchange-exchange-migrate").expect("跨库迁移");
+            assert!(migrate.label().unwrap_or_default().contains("下一步"), "相邻的「跨库迁移」在读取中仍被挡住");
+        })
+        .unwrap();
+
+        // 2) 执行守卫：读取中的「导出已读取的行」被挡下来，而且不会先弹保存对话框。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.prompt_save(SaveKind::Loaded, cx)));
+        let blocked = cx.update(|cx| pane.read(cx).tasks().iter().filter(|task| task.phase == Phase::Blocked).count());
+        assert_eq!(blocked, 1, "读取中「导出已读取的行」必须被挡下");
+        assert!(!cx.did_prompt_for_new_path(), "被挡下的动作不能先弹保存对话框");
+
+        // 3) 同一时刻「全库导出」真的能开始：守卫放行、弹出保存对话框、不产生被挡住的记录。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.prompt_save(SaveKind::Dump, cx)));
+        assert!(cx.did_prompt_for_new_path(), "读取中的「全库导出」必须真的打开保存对话框");
+        let blocked_after_dump = cx.update(|cx| pane.read(cx).tasks().iter().filter(|task| task.phase == Phase::Blocked).count());
+        assert_eq!(blocked_after_dump, blocked, "全库导出不应在读取中被挡下");
     }
 }

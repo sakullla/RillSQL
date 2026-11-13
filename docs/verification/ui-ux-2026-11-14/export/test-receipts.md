@@ -1,7 +1,7 @@
 # 测试回执（T12 导入导出抽屉）
 
 - 工作目录：`/Users/yanggeng/github/RillSQL`
-- HEAD：收到 Recipe 时为 `c3220e9`（`feat: 连接改为全局模态并收敛启动台与按需连接`）；实现与测试在随后被 Runtime 推进到 `df79f24` 的同一工作区上完成（改动未提交，仅本任务两个源码文件 + 本目录）
+- HEAD：收到 Recipe 时为 `c3220e9`；实现与测试在 Runtime 推进到 `df79f24` 的工作区上完成。本轮修复（T12-A2）的写入范围只有 `src-tauri/src/app/views/export/mod.rs` 与本目录——所需文案键已由基线共享 i18n 提交 `915cca9` 提供，本次不再改 `src-tauri/src/i18n/mod.rs`
 - 全部命令都带 `--manifest-path src-tauri/Cargo.toml --locked`，`src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock` 未改动（`git diff --exit-code` 对这两个文件为空）
 
 ## 实际运行的命令与结果
@@ -9,23 +9,24 @@
 | # | 命令 | 结果 |
 | --- | --- | --- |
 | 1 | `cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets` | 0 error；剩余 warning 全部位于其它任务的视图文件（`app/views/mongo`、`app/views/grid`、`app/views/diagram`、`ui/editor_proto` 等），本任务两个文件无 warning |
-| 2 | `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::export` | **ok. 15 passed; 0 failed**（958 filtered out） |
-| 3 | `cargo test --manifest-path src-tauri/Cargo.toml --locked exchange` | **ok. 16 passed; 0 failed**（含 `app::shell::tests` 的 9 条、`app::views::grid` 的 1 条、`export::tests` 的 2 条与本任务三档宽度的 3 条） |
+| 2 | `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::export` | **ok. 16 passed; 0 failed**（959 filtered out） |
+| 3 | `cargo test --manifest-path src-tauri/Cargo.toml --locked exchange` | **ok. 16 passed; 0 failed**（含 `app::shell::tests` 的 9 条、`app::views::grid` 的 1 条、`export::tests` 的 2 条与本任务的 4 条：三档宽度 + 执行守卫） |
 | 4 | `cargo test --manifest-path src-tauri/Cargo.toml --locked i18n` | ok. 1 passed（`both_locales_translate_every_catalog_key`） |
 | 5 | `cargo test --manifest-path src-tauri/Cargo.toml --locked style_literals` | ok. 1 passed（`ui::kit::token_tests::style_literals_follow_design_tokens`） |
-| 6 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | `app/views/export/mod.rs` 与 `i18n/mod.rs` 0 warning（其余告警属其它任务文件） |
+| 6 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 0 error；`app/views/export/mod.rs` 0 warning（其余告警属其它任务文件） |
 
 **没有运行**完整 `cargo test --locked` 全量套件：按计划由 Delivery 在集成后的同一 candidate 上执行（本任务只跑与变更直接相关的过滤器）。
 
-## 用例清单（`app::views::export`，15 条全部通过）
+## 用例清单（`app::views::export`，16 条全部通过）
 
-新增（`mod unified_state_tests`，7 条）：
+新增（`mod unified_state_tests`，8 条）：
 
 - `source_state_separates_running_no_table_no_result_and_ready`：表/查询 × 有列/无列/运行中七种组合的四态判定；运行中优先于"无结果"。
 - `blocked_actions_name_the_reason_and_the_next_step`：四个被挡住的行动作在查询运行中、无表、查询无结果、表读取中、查询就绪五种来源下各自的原因键；并断言原因与"下一步"是两句不同的话。
-- `state_copy_differs_per_case_and_english_has_no_chinese`：12 条新文案在两语言都非空、英文不含 CJK、任意两条不重复（"没有表"≠"没有结果"）。
+- `state_copy_differs_per_case_and_english_has_no_chinese`：本条状态用到的 12 条文案（由基线共享 i18n 提交提供）在两语言都非空、英文不含 CJK、任意两条不重复（"没有表"≠"没有结果"）。
 - `exchange_states_hold_at_1360` / `_900` / `_640`：三档宽度 × 浅/深色 × 紧凑/标准（4 组合）下逐格断言就绪/运行中/无表/无结果四态的呈现、被挡住行动作的可访问名称、任务空态与禁用按钮、以及动作不越过抽屉左右边缘；并比对抽屉宽度 = `min(520, 视口-60)`。
 - `tasks_empty_state_drops_the_export_action_when_the_source_is_not_ready`：来源未就绪时任务空态不提供"导出已读取的行"动作。
+- `dump_action_matches_its_execution_guard_while_the_source_is_running`：读取中的表来源下，`exchange-exchange-dump` 的可访问名称只有标题（可点动作），走 `prompt_save(Dump)` 真的弹保存对话框、不产生 Blocked 记录；同一时刻 `prompt_save(Loaded)` 被挡下且不弹对话框；相邻的 `exchange-exchange-migrate` 仍是带"下一步"的被挡住的行。把"画出来的动作"与执行守卫钉在一起。
 
 既有（`mod tests` 7 条 + `background_export_tests` 1 条，全部保持通过，用于证明导入导出与文件行为没回退）：
 
@@ -49,4 +50,4 @@
 
 - **原生像素截图**（浅/深色 × 紧凑/标准、1360/900/640）：本轮没有原生窗口与截屏通道授权，未生成 PNG，也未用历史截图替代；由交付阶段在最终集成 candidate 上采集。
 - **抽屉层的原生交互**（Esc、外点关闭、occlude、内部滚动）：这些代码在 `src-tauri/src/app/shell/chrome.rs`，属本任务范围外，本轮没有改动也没有新增用例；审计文档给出了源码定位。
-- **新按钮的端到端结果**（"重新读取来源"、"切到当前表数据"经外壳重新绑定来源后的表现）：需要完整 `Workbench`，本轮只断言面板侧按钮存在且 id 唯一，端到端由交付阶段复核。
+- **新按钮的端到端结果**（NoResult 的"重新读取来源"、查询来源导入区的"切到当前表数据"经外壳重新绑定来源后的表现）：需要完整 `Workbench`，本轮只断言面板侧按钮存在且 id 唯一，端到端由交付阶段复核。
