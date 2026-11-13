@@ -320,8 +320,9 @@ impl Desk {
         self.tabs.iter().filter(|tab| tab.running).map(|tab| tab.id.clone()).collect()
     }
 
-    pub fn results(&self) -> Vec<StatementView> {
-        self.active_tab().map(|tab| tab.results.clone()).unwrap_or_default()
+    /// 只读展示借用当前结果，刷新标题和状态时不复制整份单元格数据。
+    pub fn results(&self) -> &[StatementView] {
+        self.active_tab().map(|tab| tab.results.as_slice()).unwrap_or_default()
     }
 
     pub fn status(&self) -> String {
@@ -684,8 +685,8 @@ impl Desk {
         self.active_tab().map(|tab| tab.log_batch).unwrap_or(0)
     }
 
-    pub fn pinned(&self) -> Vec<PinnedResult> {
-        self.active_tab().map(|tab| tab.pinned.clone()).unwrap_or_default()
+    pub fn pinned(&self) -> &[PinnedResult] {
+        self.active_tab().map(|tab| tab.pinned.as_slice()).unwrap_or_default()
     }
 
     pub fn result_view(&self) -> ResultView {
@@ -772,17 +773,17 @@ impl Desk {
     }
 
     /// 结果表格要显示的那一条：看固定结果时是它的快照，否则是当前结果里选中的语句。
-    pub fn shown_result(&self) -> Option<StatementView> {
+    pub fn shown_result(&self) -> Option<&StatementView> {
         let tab = self.active_tab()?;
         if let ResultView::Pinned(id) = tab.result_view {
             if let Some(pinned) = tab.pinned.iter().find(|pinned| pinned.id == id) {
-                return Some(pinned.view.clone());
+                return Some(&pinned.view);
             }
         }
         if tab.results.is_empty() {
             return None;
         }
-        tab.results.get(tab.statement.min(tab.results.len() - 1)).cloned()
+        tab.results.get(tab.statement.min(tab.results.len() - 1))
     }
 
     /// 正在看固定结果时它自己的来源目标：Some(Some) 是产生它的那次执行的目标，Some(None) 是来源无法证明；
@@ -2652,6 +2653,105 @@ mod tests {
         assert!(desk.pinned().is_empty());
         assert_eq!(desk.result_view(), ResultView::Current);
         assert!(!desk.unpin(pin));
+    }
+
+    #[test]
+    fn result_accessors_borrow_storage_and_keep_pinned_snapshot_independent() {
+        let mut desk = Desk::new();
+        assert!(desk.results().is_empty());
+        assert!(desk.pinned().is_empty());
+        assert!(desk.shown_result().is_none());
+        desk.new_query();
+        desk.set_active_sheet(vec!["value".into()], vec![vec![Some("a".repeat(4096))], vec![None], vec![Some(String::new())]]);
+        let mut second = desk.results()[0].clone();
+        second.sql = "SELECT second".into();
+        second.rows = vec![vec![Some("second".into())]];
+        desk.active_mut().unwrap().results.push(second);
+        let stored = &desk.active_tab().unwrap().results;
+        assert!(std::ptr::eq(desk.results().as_ptr(), stored.as_ptr()));
+        assert!(std::ptr::eq(desk.shown_result().unwrap(), &stored[0]));
+        let current_text = stored[0].rows[0][0].as_ref().unwrap().as_ptr();
+        for _ in 0..32 {
+            assert_eq!(desk.results()[0].rows[0][0].as_ref().unwrap().as_ptr(), current_text);
+        }
+        desk.set_statement(1);
+        assert!(std::ptr::eq(desk.shown_result().unwrap(), &desk.results()[1]));
+        desk.set_statement(0);
+        let pin_id = desk.pin_current().unwrap();
+        let stored_pin = &desk.active_tab().unwrap().pinned[0];
+        assert!(std::ptr::eq(desk.pinned().as_ptr(), stored_pin));
+        assert!(std::ptr::eq(desk.shown_result().unwrap(), &stored_pin.view));
+        let pinned_text = stored_pin.view.rows[0][0].as_ref().unwrap().as_ptr();
+        assert_ne!(pinned_text, current_text, "固定时仍建立独立快照");
+        for _ in 0..32 {
+            assert_eq!(desk.pinned()[0].view.rows[0][0].as_ref().unwrap().as_ptr(), pinned_text);
+            assert_eq!(desk.shown_result().unwrap().rows[0][0].as_ref().unwrap().as_ptr(), pinned_text);
+        }
+        desk.set_active_sheet(vec!["value".into()], vec![vec![Some("new".into())]]);
+        assert_eq!(desk.pinned()[0].view.rows[0][0].as_deref(), Some("a".repeat(4096).as_str()));
+        assert_eq!(desk.pinned()[0].view.rows[1][0], None);
+        assert_eq!(desk.pinned()[0].view.rows[2][0].as_deref(), Some(""));
+        assert!(desk.set_result_view(ResultView::Pinned(pin_id)));
+        assert_eq!(desk.shown_result().unwrap().rows[0][0].as_ref().unwrap().as_ptr(), pinned_text);
+        assert!(desk.unpin(pin_id));
+        assert!(desk.pinned().is_empty());
+        assert_eq!(desk.shown_result().unwrap().rows[0][0].as_deref(), Some("new"));
+    }
+
+    /// 手动运行：cargo test --manifest-path src-tauri/Cargo.toml --locked query_result_access_benchmark -- --ignored --nocapture
+    /// 对照保留旧 getter 的深拷贝操作；字节数只计复制的单元格文本，不代表进程 RSS。
+    #[test]
+    #[ignore = "manual synthetic result-access benchmark"]
+    fn query_result_access_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: usize = 10_000;
+        const COLUMNS: usize = 8;
+        const BYTES: usize = 128;
+        const READS: usize = 12;
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.set_active_sheet(
+            (0..COLUMNS).map(|column| format!("column_{column}")).collect(),
+            (0..ROWS).map(|row| (0..COLUMNS).map(|column| Some(format!("{row:08}:{column:02}:{}", "x".repeat(BYTES - 12)))).collect()).collect(),
+        );
+        desk.pin_current().unwrap();
+        let checksum = |view: &StatementView| {
+            let middle = view.rows.len() / 2;
+            view.rows.len() + view.columns.len()
+                + [0, middle, view.rows.len() - 1].into_iter().map(|row| {
+                    view.rows[row].iter().flatten().flat_map(|value| value.bytes()).map(usize::from).sum::<usize>()
+                }).sum::<usize>()
+        };
+        let copied_bytes: usize = desk.results()[0].rows.iter().flatten().flatten().map(String::len).sum();
+        assert_eq!(copied_bytes, ROWS * COLUMNS * BYTES);
+        let old_read = || {
+            let results = black_box(desk.results().to_vec());
+            let pinned = black_box(desk.pinned().to_vec());
+            let shown = black_box(desk.shown_result().cloned().unwrap());
+            black_box(checksum(&results[0]) + checksum(&pinned[0].view) + checksum(&shown))
+        };
+        let borrowed_read = || {
+            let results = black_box(desk.results());
+            let pinned = black_box(desk.pinned());
+            let shown = black_box(desk.shown_result().unwrap());
+            black_box(checksum(&results[0]) + checksum(&pinned[0].view) + checksum(shown))
+        };
+        assert_eq!(old_read(), borrowed_read(), "两条路径读取相同数据");
+        for trial in 1..=3 {
+            let start = Instant::now();
+            let old_sum: usize = (0..READS).map(|_| old_read()).sum();
+            let old_elapsed = start.elapsed();
+            let start = Instant::now();
+            let borrowed_sum: usize = (0..READS).map(|_| borrowed_read()).sum();
+            let borrowed_elapsed = start.elapsed();
+            assert_eq!(old_sum, borrowed_sum);
+            println!(
+                "query-access trial={trial} rows={ROWS} columns={COLUMNS} cell_bytes={BYTES} reads={READS} old_us={} borrowed_us={} old_cell_text_bytes_copied={} borrowed_cell_text_bytes_copied=0 checksum={old_sum}",
+                old_elapsed.as_micros(), borrowed_elapsed.as_micros(), copied_bytes * 3 * READS,
+            );
+        }
     }
 
     #[test]

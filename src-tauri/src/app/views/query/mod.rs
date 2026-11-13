@@ -1019,7 +1019,7 @@ impl QueryPane {
     }
 
     fn begin_pin_rename(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pin) = self.desk.pinned().into_iter().find(|pin| pin.id == id) else {
+        let Some(pin) = self.desk.pinned().iter().find(|pin| pin.id == id) else {
             return;
         };
         let initial = SharedString::from(pin.custom_title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_default());
@@ -1099,14 +1099,14 @@ impl QueryPane {
     }
 
     /// 结果头和错误面板的定位：优先当前正在看的失败语句，否则这批里第一条失败。
-    fn failure_view(&self) -> Option<desk::StatementView> {
+    fn failure_view(&self) -> Option<&desk::StatementView> {
         match self.desk.result_view() {
             ResultView::Messages => None,
-            ResultView::Pinned(_) => self.desk.shown_result().filter(statement_failed),
+            ResultView::Pinned(_) => self.desk.shown_result().filter(|view| statement_failed(view)),
             ResultView::Current => {
                 let results = self.desk.results();
-                let current = results.get(self.desk.statement()).filter(|view| statement_failed(view)).cloned();
-                current.or_else(|| results.into_iter().find(statement_failed))
+                let current = results.get(self.desk.statement()).filter(|view| statement_failed(view));
+                current.or_else(|| results.iter().find(|view| statement_failed(view)))
             }
         }
     }
@@ -1115,22 +1115,24 @@ impl QueryPane {
         let Some(view) = self.failure_view() else {
             return false;
         };
-        if self.desk.result_view() == ResultView::Current {
-            if let Some(index) = self.desk.results().iter().position(|item| item.status == view.status && item.sql == view.sql && item.message == view.message) {
-                self.desk.set_statement(index);
+        let statement = (self.desk.result_view() == ResultView::Current)
+            .then(|| self.desk.results().iter().position(|item| item.status == view.status && item.sql == view.sql && item.message == view.message))
+            .flatten();
+        // 先从借用的结果计算定位，只保留编辑器和范围；切换语句不需要复制结果行。
+        let jump = (|| {
+            let id = self.desk.active_id()?;
+            let editor = self.editors.get(id)?.clone();
+            let text = editor.read(cx).value(cx);
+            if self.desk.executed_sql(id).as_deref() != Some(text.as_str()) {
+                return None;
             }
+            let range = error_ranges(&text, std::slice::from_ref(view)).into_iter().next()?;
+            Some((editor, range))
+        })();
+        if let Some(index) = statement {
+            self.desk.set_statement(index);
         }
-        let Some(id) = self.desk.active_id().map(str::to_owned) else {
-            return false;
-        };
-        let Some(editor) = self.editors.get(&id).cloned() else {
-            return false;
-        };
-        let text = editor.read(cx).value(cx);
-        if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
-            return false;
-        }
-        let Some(range) = error_ranges(&text, std::slice::from_ref(&view)).into_iter().next() else {
+        let Some((editor, range)) = jump else {
             return false;
         };
         editor.update(cx, |editor, cx| editor.select_range(range, cx));
@@ -1159,7 +1161,7 @@ impl QueryPane {
         if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
             return;
         }
-        let marked = error_marks(&text, &self.desk.results());
+        let marked = error_marks(&text, self.desk.results());
         if !marked.is_empty() {
             editor.update(cx, |editor, cx| editor.mark_error_messages(marked, cx));
         }
@@ -1298,7 +1300,7 @@ impl QueryPane {
         if !self.load_more_allowed() {
             return;
         }
-        let Some((sql, limit)) = load_more_plan(&self.desk.results(), self.page_size) else {
+        let Some((sql, limit)) = load_more_plan(self.desk.results(), self.page_size) else {
             return;
         };
         match self.desk.begin_run_limited(&self.services.tasks, RunScope::Current, Some(sql), limit) {
@@ -1557,7 +1559,7 @@ impl QueryPane {
             self.grid.update(cx, |grid, cx| grid.clear_sheet(cx));
             return;
         };
-        let sheet = &shown;
+        let sheet = shown;
         let columns = if sheet.columns.is_empty() { vec!["status".to_owned()] } else { sheet.columns.clone() };
         let rows = if sheet.columns.is_empty() {
             vec![vec![Some(statement_message(self.locale, &sheet.status, &sheet.message))]]
@@ -2070,7 +2072,7 @@ impl QueryPane {
             .flex()
             .items_center()
             .gap(px(2.));
-        for pin in &pinned {
+        for pin in pinned {
             let renaming = self.pin_rename.as_ref().filter(|item| item.id == pin.id).map(|item| item.input.clone());
             strip = strip.child(pinned_tab(pin, result_view == ResultView::Pinned(pin.id), renaming.as_ref(), locale, p, metrics, entity));
         }
@@ -2155,7 +2157,7 @@ impl QueryPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let mut items: Vec<AnyElement> = vec![div().flex_1().into_any_element()];
         let active_result = self.desk.shown_result();
-        let summary = active_result.as_ref().map(|result| {
+        let summary = active_result.map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
                 format!("{affected} ✓")
             } else {
@@ -2198,7 +2200,7 @@ impl QueryPane {
             );
         }
         if let Some(failure) = self.failure_view() {
-            items.extend(failure_status(&failure, locale, p, metrics, entity));
+            items.extend(failure_status(failure, locale, p, metrics, entity));
         }
         let note = self.desk.active_note();
         if !note.is_empty() {
@@ -2232,7 +2234,7 @@ impl QueryPane {
         if running || self.desk.result_view() != ResultView::Current || results.len() != 1 || !is_pageable(&results[0]) || !self.load_more_allowed() {
             return None;
         }
-        Some(match load_more_plan(&results, self.page_size) {
+        Some(match load_more_plan(results, self.page_size) {
             Some((_, limit)) => {
                 let loaded = results[0].rows.len() as u64;
                 let more = entity.clone();
@@ -2323,7 +2325,7 @@ impl QueryPane {
                 .into_any_element();
         };
         if result.columns.is_empty() {
-            return statement_outcome(&result, &self.desk.active_note(), locale, mono, p, metrics, entity);
+            return statement_outcome(result, &self.desk.active_note(), locale, mono, p, metrics, entity);
         }
         let grid_entity = entity.clone();
         div()
@@ -3794,7 +3796,7 @@ mod tests {
                 !pane.running() && pane.desk.log().len() == 3
             })
         });
-        assert!(done, "执行没有结束：{} {:?}", cx.update(|cx| pane.read(cx).note()), cx.update(|cx| pane.read(cx).desk.results()));
+        assert!(done, "执行没有结束：{} {:?}", cx.update(|cx| pane.read(cx).note()), cx.update(|cx| format!("{:?}", pane.read(cx).desk.results())));
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             let tab = window.find("query-log-tab");
