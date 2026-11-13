@@ -80,6 +80,14 @@ pub fn table_comments_sql(engine: Engine, database: &str, schema: &str) -> Optio
     }
 }
 
+/// SQL 补全只读取当前涉及对象的注释，不预读整个库。
+pub fn table_comment_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
+    let sql = table_comments_sql(engine, database, schema)?;
+    let (select, order) = sql.rsplit_once(" ORDER BY ")?;
+    let column = match engine { Engine::Postgres => "t.relname", Engine::Sqlserver => "o.name", _ => "table_name" };
+    Some(format!("{select} AND {column} = {} ORDER BY {order}", literal(table)))
+}
+
 /// 主键列查询。没有主键就是空集，不是失败。
 pub fn primary_key_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
     let scope = match engine {
@@ -425,6 +433,12 @@ pub async fn read_table_comments(session: &CatalogSession, engine: Engine, datab
     Ok(comments_from_rows(&rows))
 }
 
+pub async fn read_table_comment(session: &CatalogSession, engine: Engine, database: &str, schema: &str, table: &str) -> Result<Option<String>, String> {
+    let Some(sql) = table_comment_sql(engine, database, schema, table) else { return Ok(None) };
+    let rows = rows_for(session, &sql).await?;
+    Ok(comments_from_rows(&rows).into_iter().next().map(|(_, comment)| comment))
+}
+
 /// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；
 /// 两者都不碰同级的其它节点。
 pub async fn read_object_details(
@@ -485,6 +499,15 @@ mod tests {
             let meta = read_column_meta(&CatalogSession::Scripted, engine, "app", "", "users").await;
             assert_eq!(meta, Ok(Vec::new()), "{engine:?}");
         }
+    }
+
+    #[test]
+    fn table_comment_is_scoped_and_quotes_untrusted_names() {
+        for engine in [Engine::Mysql, Engine::Mariadb, Engine::Postgres, Engine::Sqlserver] {
+            let sql = table_comment_sql(engine, "shop", "public", "a'b").unwrap();
+            assert!(sql.contains(" = 'a''b' ORDER BY "), "{sql}");
+        }
+        assert!(table_comment_sql(Engine::Sqlite, "main", "", "item").is_none());
     }
 
     #[test]

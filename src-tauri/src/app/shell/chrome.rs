@@ -483,8 +483,9 @@ impl Workbench {
             );
         }
         // 读取失败只留一条带原因的提示和重试入口，不在每个连接下重复。
-        if !self.model.catalog_error.is_empty() {
-            let error = self.model.catalog_error.clone();
+        let catalog_error = if self.model.nav_error.is_empty() { &self.model.catalog_error } else { &self.model.nav_error };
+        if !catalog_error.is_empty() {
+            let error = self.model.text(catalog_error);
             let full_error = format!("{}: {}", self.model.text("ui.explorer.error"), error);
             children += 1;
             list = list.child(
@@ -730,6 +731,7 @@ impl Workbench {
 
     /// 连接级的读取失败：原因写在连接下面，重试只重读这条连接。
     fn connection_error_row(&self, id: &str, error: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let error = self.model.text(error);
         let node_id = crate::catalog::hierarchy::connection_node_id(id);
         let full = format!("{}: {error}", self.t("catalog.tree.nodeError"));
         div()
@@ -896,7 +898,7 @@ impl Workbench {
             .when(leaf_column && column_marks.contains("not null") && !row.primary, |this| {
                 this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from("*")))
             })
-            .when(is_group && row.total > 0, |this| {
+            .when(is_group && !row.unloaded && row.error.is_none(), |this| {
                 this.child(
                     div()
                         .flex_none()
@@ -913,6 +915,7 @@ impl Workbench {
             })
             .when(row.loading, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
             .when_some(row.error.clone(), |this, error| {
+                let error = self.model.text(&error);
                 let full = format!("{}: {error}", self.t("catalog.tree.nodeError"));
                 this.child(
                     div()
@@ -1865,6 +1868,7 @@ impl Workbench {
         // 表单可滚动，但测试 / 保存 / 连接固定在底部，高度不足时也不用先滚到底。
         div()
             .id("conn-form")
+            .test_support()
             .size_full()
             .flex()
             .flex_col()
@@ -3178,6 +3182,7 @@ impl Workbench {
             list = list.child(
                 div()
                     .id(SharedString::from(element))
+                    .test_support()
                     .role(gpui_kit::Role::MenuItem)
                     .aria_label(label.clone())
                     .aria_selected(selected)

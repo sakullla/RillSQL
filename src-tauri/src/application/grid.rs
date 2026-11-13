@@ -18,6 +18,7 @@ pub fn require_commit(confirmed: bool) -> Result<(), String> {
 }
 
 pub async fn describe(service: &Service, request: &TableRef) -> Result<SchemaDto, String> {
+    let _busy = service.busy_scope(&request.connection_id);
     if request.table.is_empty() {
         return Err("没有表名".to_owned());
     }
@@ -33,6 +34,7 @@ pub async fn describe(service: &Service, request: &TableRef) -> Result<SchemaDto
 }
 
 pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, String> {
+    let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
     let sort = sort_of(request.sort.as_ref());
     let session = session_of(service, &request.table.connection_id)?;
@@ -50,7 +52,21 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
     )
     .await?;
-    Ok(PageDto {
+    Ok(page_dto(page))
+}
+
+pub async fn page_described(service: &Service, request: &PageRequest, schema: &crate::grid::TableSchema) -> Result<PageDto, String> {
+    let _busy = service.busy_scope(&request.table.connection_id);
+    let filters = filters_of(&request.filters)?;
+    let sort = sort_of(request.sort.as_ref());
+    let session = session_of(service, &request.table.connection_id)?;
+    let page = crate::grid::query_page_with_schema(&session, schema, &filters, sort.as_ref(), request.search.as_deref(), request.offset, request.limit,
+        usize::try_from(request.preview_bytes).unwrap_or(1024).max(1)).await?;
+    Ok(page_dto(page))
+}
+
+fn page_dto(page: crate::grid::LivePage) -> PageDto {
+    PageDto {
         truncated: page.truncated,
         sql: page.sql,
         rows: page
@@ -58,16 +74,17 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
             .into_iter()
             .map(|row| RowDto {
                 id: row.id,
-                cells: row.cells.iter().map(|(name, cell)| (name.clone(), cell_dto(cell))).collect(),
+                cells: row.cells.into_iter().map(|(name, cell)| (name, match cell { Cell::Null => None, Cell::Text(text) => Some(text) })).collect(),
                 located: row.located,
                 locator_columns: row.locator.iter().map(|(name, _)| name.clone()).collect(),
                 locator_values: row.locator.iter().map(|(_, cell)| cell_dto(cell)).collect(),
             })
             .collect(),
-    })
+    }
 }
 
 pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto, String> {
+    let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
     let session = session_of(service, &request.table.connection_id)?;
     let matched = count_rows_search(

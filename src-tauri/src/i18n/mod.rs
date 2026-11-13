@@ -211,6 +211,7 @@ dict! {
     "connections.importReport.skippedTitle" => "已跳过", "Skipped";
     "connections.deleteDialog.confirm" => "删除配置", "Delete configuration";
     "connections.deleteDialog.willKeepDb" => "不会删除：数据库本身和其中的任何数据", "Does not delete the database or any of its data";
+    "connections.editor.test.running" => "正在测试连接…", "Testing connection…";
     "connections.editor.test.button" => "测试连接", "Test connection";
     "connections.editor.test.ok" => "连接成功", "Connection succeeded";
     "connections.editor.test.wait" => "第一次连接这台 SSH 跳板机，需要先确认它的身份", "First connection to this SSH jump host; confirm its identity first";
@@ -279,6 +280,7 @@ dict! {
     "catalog.tree.actionUnavailable" => "这一行没有这个动作", "This row does not support this action";
     "catalog.tree.expand" => "展开", "Expand";
     "catalog.tree.collapse" => "折叠", "Collapse";
+    "catalog.tree.readTimeout" => "目录读取超时（30 秒），已有内容已保留，请重试。", "Catalog read timed out after 30 seconds. Existing content was kept; retry the read.";
     "catalog.tree.loading" => "读取中…", "Loading…";
     "catalog.tree.nodeError" => "这一段读取失败", "This part could not be read";
     "catalog.tree.loadMore" => "读取更多", "Load more";
@@ -535,6 +537,9 @@ dict! {
     "grid.action.sort" => "排序", "Sort";
     "grid.action.filter" => "筛选", "Filter";
     "grid.action.pageNext" => "下一页", "Next page";
+    "grid.count.hint" => "点击统计总行数（大表可能耗时较长）", "Click to count all rows (large tables may take time)";
+    "grid.count.running" => "正在统计总行数…", "Counting all rows…";
+    "grid.count.failed" => "统计总行数失败", "Row count failed";
     "grid.action.pagePrev" => "上一页", "Previous page";
     "grid.action.insert" => "插入行", "Insert row";
     "grid.action.preview" => "预览变更", "Preview changes";
@@ -709,7 +714,7 @@ dict! {
     "mongo.docJson.invalid" => "这份文档不是合法 JSON：", "This document is not valid JSON:";
     "ui.search.placeholder" => "搜索命令、连接…", "Search commands, connections…";
     "ui.explorer.filter" => "筛选连接", "Filter connections";
-    "ui.explorer.filterObjects" => "筛选对象", "Filter objects";
+    "ui.explorer.filterObjects" => "筛选已加载对象", "Filter loaded objects";
     "ui.explorer.noObjects" => "尚未读取对象", "No objects loaded yet";
     "ui.explorer.noMatch" => "没有匹配的对象", "No matching objects";
     "ui.explorer.error" => "读取对象失败", "Could not load objects";

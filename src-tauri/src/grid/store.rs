@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::sql::{browse_sql, delete_sql, insert_sql, update_sql};
 
 pub use crate::connections::model::Engine;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Cell {
     Null,
     Text(String),
@@ -30,7 +30,7 @@ pub struct TableSchema {
     pub key: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Locator {
     pub columns: Vec<String>,
     pub values: Vec<Cell>,
@@ -249,21 +249,16 @@ fn locator_from(schema: &TableSchema, cells: &BTreeMap<String, Cell>) -> Option<
     Some(Locator { columns: schema.key.clone(), values })
 }
 
-fn same_locator(left: &Locator, right: &Locator) -> bool {
-    left.columns == right.columns && left.values == right.values
-}
-
 pub fn refresh_located(schema: &TableSchema, rows: &mut [Row]) {
     let locators: Vec<Option<Locator>> = rows.iter().map(|row| locator_from(schema, &row.cells)).collect();
-    for (index, row) in rows.iter_mut().enumerate() {
-        let Some(locator) = locators[index].clone() else {
-            row.locator = None;
-            row.located = false;
-            continue;
-        };
-        let copies = locators.iter().filter(|item| item.as_ref().is_some_and(|candidate| same_locator(candidate, &locator))).count();
-        row.located = copies == 1;
-        row.locator = if copies == 1 { Some(locator) } else { None };
+    let unique = {
+        let mut counts: HashMap<&Locator, usize> = HashMap::new();
+        for locator in locators.iter().flatten() { *counts.entry(locator).or_default() += 1; }
+        locators.iter().map(|locator| locator.as_ref().is_some_and(|key| counts.get(key) == Some(&1))).collect::<Vec<_>>()
+    };
+    for ((row, locator), unique) in rows.iter_mut().zip(locators).zip(unique) {
+        row.located = unique;
+        row.locator = if unique { locator } else { None };
     }
 }
 
@@ -403,7 +398,7 @@ pub fn commit_changes(store: &mut TableStore, changes: &[Change]) -> CommitRepor
                     return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能修改".to_owned(), pending);
                 }
                 let locator = store.rows[position].locator.clone().unwrap();
-                let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| same_locator(item, &locator))).count();
+                let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| item == &locator)).count();
                 let pairs = locator.columns.iter().cloned().zip(locator.values.iter().cloned()).collect::<Vec<_>>();
                 let set_pairs = sets.iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>();
                 let sql = update_sql(&store.schema, &set_pairs, &pairs);
@@ -430,7 +425,7 @@ pub fn commit_changes(store: &mut TableStore, changes: &[Change]) -> CommitRepor
                     return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能删除".to_owned(), pending);
                 }
                 let locator = store.rows[position].locator.clone().unwrap();
-                let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| same_locator(item, &locator))).count();
+                let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| item == &locator)).count();
                 let pairs = locator.columns.iter().cloned().zip(locator.values.clone()).collect::<Vec<_>>();
                 let sql = delete_sql(&store.schema, &pairs);
                 if hits != 1 {

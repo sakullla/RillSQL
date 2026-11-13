@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use futures::{stream, StreamExt};
 
 use crate::connections::drivers::{self, TunnelFault, TdsClient};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
@@ -418,6 +419,8 @@ pub struct Service {
     logs: Mutex<Vec<String>>,
     cell: tokio::sync::OnceCell<Store>,
     sessions: Mutex<HashMap<String, Session>>,
+    operation_sequence: AtomicU64,
+    operation_epochs: Mutex<HashMap<String, u64>>,
     pending: Mutex<HashMap<String, PendingHostKey>>,
     probes: Probes,
     /// lost 会话的自动重连计划：有限次退避，确定性错误直接放弃（R4）。
@@ -437,6 +440,8 @@ impl Service {
             logs: Mutex::new(Vec::new()),
             cell: tokio::sync::OnceCell::new(),
             sessions: Mutex::new(HashMap::new()),
+            operation_sequence: AtomicU64::new(1),
+            operation_epochs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             probes,
             reconnects: Mutex::new(HashMap::new()),
@@ -744,8 +749,13 @@ impl Service {
     }
 
     pub fn disconnect(&self, id: &str) {
-        let session = self.sessions.lock().expect("sessions").remove(id);
-        self.reconnects.lock().expect("reconnects").remove(id);
+        let session = {
+            let mut epochs = self.operation_epochs.lock().expect("connection epochs");
+            epochs.insert(id.to_owned(), self.operation_sequence.fetch_add(1, Ordering::SeqCst));
+            let session = self.sessions.lock().expect("sessions").remove(id);
+            self.reconnects.lock().expect("reconnects").remove(id);
+            session
+        };
         if let Some(session) = session {
             if let Some(shutdown) = session.shutdown {
                 let _ = shutdown.send(());
@@ -836,6 +846,17 @@ impl Service {
         open: bool,
         database: Option<String>,
     ) -> Result<OpenOutcome, String> {
+        let epoch = if open {
+            let mut epochs = self.operation_epochs.lock().expect("connection epochs");
+            let epoch = self.operation_sequence.fetch_add(1, Ordering::SeqCst);
+            epochs.insert(id.to_owned(), epoch);
+            self.reconnects.lock().expect("reconnects").remove(id);
+            Some(epoch)
+        } else { None };
+        self.exercise_versioned(id, input, open, database, epoch).await
+    }
+
+    async fn exercise_versioned(&self, id: &str, input: SecretInput, open: bool, database: Option<String>, epoch: Option<u64>) -> Result<OpenOutcome, String> {
         let store = self.store().await?;
         let mut config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
         if let Some(database) = database {
@@ -894,6 +915,9 @@ impl Service {
         let connected = open && report.status == TestStatus::Ok;
         let foreign_keys = attempt.foreign_keys;
         if connected {
+            // 提交会话与断开操作使用同一把短锁；迟到握手不能恢复已断开/被更新的会话。
+            let epochs = self.operation_epochs.lock().expect("connection epochs");
+            if epochs.get(id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
             let kind = if let Some(pool) = attempt.sqlite_pool.take() {
                 SessionKind::Sqlite(pool)
             } else if let Some(pool) = attempt.mysql_pool.take() {
@@ -950,6 +974,12 @@ impl Service {
 
     /// 会话当前状态：Some(Connected) / Some(Lost) / None（未打开）。lost 会话仍留在表里，
     /// 树上显示断开前读到的内容，但不再接受新的执行（R4：不静默排队重放）。
+    pub(crate) fn busy_scope(&self, id: &str) -> Option<SessionActivity> {
+        let health = self.sessions.lock().expect("sessions").get(id).map(|session| Arc::clone(&session.health))?;
+        health.note_busy();
+        Some(SessionActivity(health))
+    }
+
     pub fn session_condition(&self, id: &str) -> Option<SessionCondition> {
         let sessions = self.sessions.lock().expect("sessions");
         let session = sessions.get(id)?;
@@ -1024,64 +1054,24 @@ impl Service {
     /// 前端 1s 轮询的落点：返回全部会话状态，并按需探活、驱动有限次退避重连（R4）。
     pub async fn session_statuses(self: &Arc<Self>) -> Vec<SessionStatus> {
         let targets: Vec<SessionHealthProbe> = {
+            let epochs = self.operation_epochs.lock().expect("connection epochs");
             let sessions = self.sessions.lock().expect("sessions");
-            sessions
-                .iter()
-                .map(|(id, session)| SessionHealthProbe {
-                    id: id.clone(),
-                    sqlite: matches!(session.kind, SessionKind::Sqlite(_)),
-                    health: Arc::clone(&session.health),
-                })
-                .collect()
+            sessions.iter().map(|(id, session)| SessionHealthProbe {
+                id: id.clone(), sqlite: matches!(session.kind, SessionKind::Sqlite(_)),
+                health: Arc::clone(&session.health), epoch: epochs.get(id).copied(),
+            }).collect()
         };
-        let mut out = Vec::with_capacity(targets.len());
-        for target in targets {
-            if !target.health.is_lost() && target.health.needs_probe(target.sqlite) {
-                self.probe_session(&target).await;
-            }
-            let Some(condition) = self.session_condition(&target.id) else {
-                // 快照与状态之间会话被显式断开：不再报告。
-                continue;
-            };
-            match condition {
-                SessionCondition::Connected => out.push(SessionStatus {
-                    id: target.id,
-                    status: "connected",
-                    reason: None,
+        stream::iter(targets).map(|target| async move {
+            if !target.health.is_lost() && target.health.needs_probe(target.sqlite) { self.probe_session(&target).await; }
+            let condition = self.session_condition(&target.id)?;
+            if matches!(condition, SessionCondition::Lost { .. }) { self.run_reconnect_if_due(&target.id).await; }
+            match self.session_condition(&target.id)? {
+                SessionCondition::Connected => Some(SessionStatus { id: target.id, status: "connected", reason: None }),
+                SessionCondition::Lost { reason } => Some(SessionStatus {
+                    status: if self.reconnect_pending(&target.id) { "reconnecting" } else { "lost" }, id: target.id, reason,
                 }),
-                SessionCondition::Lost { .. } => {
-                    self.run_reconnect_if_due(&target.id).await;
-                    // 重连可能就发生在这次调用里：成功后按 connected 报告
-                    match self.session_condition(&target.id) {
-                        Some(SessionCondition::Connected) => out.push(SessionStatus {
-                            id: target.id,
-                            status: "connected",
-                            reason: None,
-                        }),
-                        _ => {
-                            if self.reconnect_pending(&target.id) {
-                                out.push(SessionStatus {
-                                    id: target.id,
-                                    status: "reconnecting",
-                                    reason: None,
-                                });
-                            } else {
-                                let reason = self.session_condition(&target.id).and_then(|item| match item {
-                                    SessionCondition::Lost { reason } => reason,
-                                    _ => None,
-                                });
-                                out.push(SessionStatus {
-                                    id: target.id,
-                                    status: "lost",
-                                    reason,
-                                });
-                            }
-                        }
-                    }
-                }
             }
-        }
-        out
+        }).buffer_unordered(4).filter_map(|status| async { status }).collect().await
     }
 
     /// 探活一个会话：失败标记 lost 并安排重连；超时无法判定，不动状态下一轮再试。
@@ -1089,20 +1079,23 @@ impl Service {
         if target.health.busy() > 0 || !target.health.begin_probe() {
             return;
         }
+        let _probe = ProbeGuard(Arc::clone(&target.health));
         let session = {
+            let epochs = self.operation_epochs.lock().expect("connection epochs");
+            if epochs.get(&target.id).copied() != target.epoch { return; }
             let sessions = self.sessions.lock().expect("sessions");
             match sessions.get(&target.id) {
                 Some(session) if !session.health.is_lost() => Some(clone_catalog_handle(&session.kind)),
                 _ => None,
             }
         };
-        let Some(session) = session else {
-            target.health.end_probe();
-            return;
-        };
+        let Some(session) = session else { return };
         let probe = self.probes.health.as_deref().unwrap_or(&SelectOneProbe);
         let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe.check(&session)).await;
-        target.health.end_probe();
+        let epochs = self.operation_epochs.lock().expect("connection epochs");
+        if epochs.get(&target.id).copied() != target.epoch { return; }
+        let current = self.sessions.lock().expect("sessions").get(&target.id).is_some_and(|session| Arc::ptr_eq(&session.health, &target.health));
+        if !current || target.health.busy() > 0 { return; }
         match outcome {
             Ok(Ok(())) => {
                 target.health.clear_suspect();
@@ -1142,13 +1135,14 @@ impl Service {
 
     /// 拨一次重连并按结果推进计划：确定性错误立即放弃，网络类按退避重试到上限。
     pub(crate) async fn attempt_reconnect(&self, id: &str) {
+        let Some(epoch) = self.operation_epochs.lock().expect("connection epochs").get(id).copied() else { return };
         let config = match self.store().await {
             Ok(store) => store.get(id).await.ok().flatten(),
             Err(_) => None,
         };
         let Some(config) = config else {
             self.finish_reconnect(
-                id,
+                id, epoch,
                 DecisionWithMessage {
                     decision: RetryDecision::Stop {
                         reason: "连接配置已删除或读不出来，不再自动重连。".to_owned(),
@@ -1162,7 +1156,7 @@ impl Service {
         let passwordless_ok = matches!(config.engine, Engine::Sqlite | Engine::Redis | Engine::Mongodb);
         if !passwordless_ok && !config.password_saved {
             self.finish_reconnect(
-                id,
+                id, epoch,
                 DecisionWithMessage {
                     decision: RetryDecision::Stop {
                         reason: "凭据库里没有保存的密码，已停在断开状态，请手动重连。".to_owned(),
@@ -1172,11 +1166,11 @@ impl Service {
             );
             return;
         }
-        let outcome = match self.exercise_overriding(id, SecretInput::default(), true, None).await {
+        let outcome = match self.exercise_versioned(id, SecretInput::default(), true, None, Some(epoch)).await {
             Ok(outcome) => outcome,
             Err(reason) => {
                 self.finish_reconnect(
-                    id,
+                    id, epoch,
                     DecisionWithMessage {
                         decision: RetryDecision::Stop { reason },
                         message: String::new(),
@@ -1191,13 +1185,15 @@ impl Service {
         }
         let message = report_failure_text(&outcome.report);
         let decision = classify_reconnect_failure(&outcome.report);
-        self.finish_reconnect(id, DecisionWithMessage { decision, message });
+        self.finish_reconnect(id, epoch, DecisionWithMessage { decision, message });
     }
 
-    fn finish_reconnect(&self, id: &str, decision: DecisionWithMessage) {
+    fn finish_reconnect(&self, id: &str, epoch: u64, decision: DecisionWithMessage) {
+        let epochs = self.operation_epochs.lock().expect("connection epochs");
+        if epochs.get(id).copied() != Some(epoch) { return; }
         let DecisionWithMessage { decision, message } = decision;
         let mut plans = self.reconnects.lock().expect("reconnects");
-        let plan = plans.entry(id.to_owned()).or_insert_with(ReconnectPlan::fresh);
+        let Some(plan) = plans.get_mut(id) else { return };
         plan.in_flight = false;
         match decision {
             RetryDecision::Stop { reason } => {
@@ -1293,8 +1289,19 @@ pub enum SessionCondition {
     Lost { reason: Option<String> },
 }
 
+pub(crate) struct SessionActivity(Arc<SessionHealth>);
+impl Drop for SessionActivity {
+    fn drop(&mut self) { self.0.note_idle(); }
+}
+
+struct ProbeGuard(Arc<SessionHealth>);
+impl Drop for ProbeGuard {
+    fn drop(&mut self) { self.0.end_probe(); }
+}
+
 struct SessionHealthProbe {
     id: String,
+    epoch: Option<u64>,
     sqlite: bool,
     health: Arc<SessionHealth>,
 }
@@ -1394,6 +1401,11 @@ pub fn report_failure_text(report: &TestReport) -> String {
 }
 
 pub fn default_config_path() -> PathBuf {
+    // 原生启动验证使用独立资料目录；正式发布构建始终使用系统应用数据目录。
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("RILLSQL_DEBUG_DATA_DIR").map(PathBuf::from).filter(|path| path.is_absolute()) {
+        return path.join("connections.sqlite");
+    }
     directories::ProjectDirs::from("app", "RillSQL", "RillSQL")
         .map(|dirs| dirs.data_dir().join("connections.sqlite"))
         .unwrap_or_else(|| PathBuf::from("connections.sqlite"))

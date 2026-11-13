@@ -28,6 +28,7 @@ pub struct AppServices {
     pub connections: Arc<Service>,
     pub query: crate::query::QueryState,
     pub tasks: TaskBoard,
+    pub metadata_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     pub state: StateStore,
 }
 
@@ -40,6 +41,7 @@ impl AppServices {
             connections,
             query,
             tasks: TaskBoard::new(),
+            metadata_gate: Arc::new(crate::catalog::nav_read::MetadataGate::new()),
         }
     }
 

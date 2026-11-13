@@ -231,7 +231,6 @@ pub async fn read_object_kind_page(
     limit: usize,
 ) -> ObjectPageBody {
     let limit = read_limit(limit, 0);
-    let window = offset.saturating_add(limit);
     match session {
         CatalogSession::Scripted => empty_page(scripted_message()),
         // SQLite 的 sqlite_master 按库分开，只读这一类的一页就够了。
@@ -287,7 +286,7 @@ pub async fn read_object_kind_page(
                 Ok(conn) => conn,
                 Err(err) => return empty_page(read_failure(err)),
             };
-            match read_mysql_kind(&mut conn, engine, database, kind, window).await {
+            match read_mysql_kind_slice(&mut conn, engine, database, kind, offset, limit).await {
                 Ok((total, objects)) => ObjectPageBody {
                     objects,
                     total,
@@ -297,7 +296,7 @@ pub async fn read_object_kind_page(
                 Err(message) => empty_page(message),
             }
         }
-        CatalogSession::Postgres(client) => match read_postgres_kind(client, schema, kind, window).await {
+        CatalogSession::Postgres(client) => match read_postgres_kind_slice(client, schema, kind, offset, limit).await {
             Ok((total, objects)) => ObjectPageBody {
                 objects,
                 total,
@@ -306,7 +305,7 @@ pub async fn read_object_kind_page(
             },
             Err(message) => empty_page(message),
         },
-        CatalogSession::Sqlserver(client) => match read_sqlserver_kind(client, schema, kind, window).await {
+        CatalogSession::Sqlserver(client) => match read_sqlserver_kind_slice(client, schema, kind, offset, limit).await {
             Ok((total, objects)) => ObjectPageBody {
                 objects,
                 total,
@@ -662,6 +661,10 @@ async fn read_mysql_objects(conn: &mut mysql_async::Conn, engine: Engine, databa
 }
 
 async fn read_mysql_kind(conn: &mut mysql_async::Conn, engine: Engine, database: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    read_mysql_kind_slice(conn, engine, database, kind, 0, window).await
+}
+
+async fn read_mysql_kind_slice(conn: &mut mysql_async::Conn, engine: Engine, database: &str, kind: ObjectKind, offset: usize, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
     let sql = kind_sql(engine, kind);
     let count_row: Option<mysql_async::Row> = conn
         .exec_first(sql.count, (database.to_owned(),))
@@ -672,7 +675,7 @@ async fn read_mysql_kind(conn: &mut mysql_async::Conn, engine: Engine, database:
         None => return Err(read_failure("没有对象数量")),
     };
     let rows: Vec<mysql_async::Row> = conn
-        .exec(sql.list, (database.to_owned(), i64::try_from(window).unwrap_or(i64::MAX)))
+        .exec(format!("{} OFFSET ?", sql.list), (database.to_owned(), i64::try_from(window).unwrap_or(i64::MAX), i64::try_from(offset).unwrap_or(i64::MAX)))
         .await
         .map_err(read_failure)?;
     let mut objects = Vec::new();
@@ -937,6 +940,10 @@ async fn read_postgres_schema(client: &tokio_postgres::Client, schema: &str, off
 }
 
 async fn read_postgres_kind(client: &tokio_postgres::Client, schema: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    read_postgres_kind_slice(client, schema, kind, 0, window).await
+}
+
+async fn read_postgres_kind_slice(client: &tokio_postgres::Client, schema: &str, kind: ObjectKind, offset: usize, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
     let sql = kind_sql(Engine::Postgres, kind);
     let count_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&schema];
     let count_rows = client.query(sql.count, &count_params).await.map_err(read_failure)?;
@@ -946,8 +953,10 @@ async fn read_postgres_kind(client: &tokio_postgres::Client, schema: &str, kind:
         None => return Err(read_failure("没有对象数量")),
     };
     let window_i = i64::try_from(window).unwrap_or(i64::MAX);
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &window_i];
-    let rows = client.query(sql.list, &params).await.map_err(read_failure)?;
+    let offset_i = i64::try_from(offset).unwrap_or(i64::MAX);
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] = [&schema, &window_i, &offset_i];
+    let page_sql = format!("{} OFFSET $3", sql.list);
+    let rows = client.query(&page_sql, &params).await.map_err(read_failure)?;
     let mut objects = Vec::new();
     for row in &rows {
         objects.push(postgres_object(row)?);
@@ -1308,11 +1317,17 @@ async fn read_sqlserver_schema(client: &TdsHandle, schema: &str, offset: usize, 
 }
 
 async fn read_sqlserver_kind(client: &TdsHandle, schema: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    read_sqlserver_kind_slice(client, schema, kind, 0, window).await
+}
+
+async fn read_sqlserver_kind_slice(client: &TdsHandle, schema: &str, kind: ObjectKind, offset: usize, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
     let sql = kind_sql(Engine::Sqlserver, kind);
     let count_rows = tds_query_rows(client, sql.count, &[&schema]).await?;
     let total = tds_i64(count_rows.first().ok_or_else(|| read_failure("没有对象数量"))?, 0).unwrap_or(0) as usize;
     let window_i = i64::try_from(window).unwrap_or(i64::MAX);
-    let rows = tds_query_rows(client, sql.list, &[&schema, &window_i]).await?;
+    let offset_i = i64::try_from(offset).unwrap_or(i64::MAX);
+    let page_sql = sql.list.replace("OFFSET 0 ROWS", "OFFSET @P3 ROWS");
+    let rows = tds_query_rows(client, &page_sql, &[&schema, &window_i, &offset_i]).await?;
     let mut objects = Vec::new();
     for row in &rows {
         objects.push(sqlserver_object(row)?);
@@ -1388,5 +1403,39 @@ async fn read_sqlserver_definition(client: &TdsHandle, schema: &str, name: &str,
         }
         "enum" | "domain" => Err(definition_failure("SQL Server 没有独立的枚举或域")),
         _ => Err(definition_failure("只有函数、存储过程、触发器、视图和序列可以读取只读定义")),
+    }
+}
+
+#[cfg(test)]
+mod latency_fixture_tests {
+    use super::*;
+
+    /// Uses scripts/verify-catalog-mysql.py, which rejects growing-prefix/eager reads.
+    #[tokio::test]
+    #[ignore = "requires local MySQL latency protocol fixture on port 33067"]
+    async fn mysql_catalog_latency_fixture() {
+        let pool = mysql_async::Pool::new(mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1").tcp_port(33067).user(Some("fixture")).pass(Some("fixture")));
+        let session = CatalogSession::Mysql(pool.clone());
+        let outline = crate::catalog::nav_read::metadata_read(read_catalog_outline(Engine::Mysql, &session)).await.unwrap();
+        assert!(outline.error.is_none(), "{:?}", outline.error);
+        assert_eq!(outline.databases.len(), 2);
+        assert!(outline.databases.iter().flat_map(|db| &db.schemas).all(|schema| schema.objects.is_empty()));
+        for offset in [0, 100, 99_900] {
+            let page = crate::catalog::nav_read::metadata_read(read_object_kind_page(&session, Engine::Mysql, "shop", "", ObjectKind::Table, offset, 100)).await.unwrap();
+            assert!(page.error.is_none(), "{:?}", page.error);
+            assert_eq!(page.total, 100_000);
+            assert_eq!(page.objects.len(), 100);
+            assert_eq!(page.objects[0].name, format!("table_{offset:06}"));
+            assert_eq!(page.objects[99].name, format!("table_{:06}", offset + 99));
+        }
+        // 与目录 deadline 相同的 future 丢弃路径，缩短到 50 ms 以验证客户端恢复。
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), read_object_kind_page(&session, Engine::Mysql, "shop", "", ObjectKind::Table, 200, 100)).await;
+        assert!(timed_out.is_err());
+        let recovered = crate::catalog::nav_read::metadata_read(read_object_kind_page(&session, Engine::Mysql, "shop", "", ObjectKind::Table, 200, 100)).await.unwrap();
+        assert!(recovered.error.is_none(), "{:?}", recovered.error);
+        assert_eq!(recovered.objects[0].name, "table_000200");
+        drop(session);
+        pool.disconnect().await.unwrap();
     }
 }

@@ -184,6 +184,9 @@ pub struct NavNode {
     pub cursor: Option<String>,
     pub error: Option<String>,
     pub loading: bool,
+    /// 对象种类尚未读取；展开时只取这个分组的第一页。
+    pub unloaded: bool,
+    pub paged: bool,
     pub stale: bool,
     pub children: Vec<String>,
     /// PostgreSQL 重载函数的参数签名；读定义时用来定位同名对象。其余为空。
@@ -217,6 +220,8 @@ impl NavNode {
             cursor: None,
             error: None,
             loading: false,
+            unloaded: false,
+            paged: false,
             stale: false,
             children: Vec::new(),
             signature: String::new(),
@@ -248,6 +253,7 @@ pub struct NavConnection {
     pub error: Option<String>,
     /// 连接默认所在的库（Redis 就是 SELECT 的库号），没有时为空。
     pub default_database: Option<String>,
+    pub outline_only: bool,
     pub databases: Vec<DatabaseNode>,
 }
 
@@ -260,6 +266,7 @@ impl NavConnection {
             status,
             error: None,
             default_database: None,
+            outline_only: false,
             databases: Vec::new(),
         }
     }
@@ -283,6 +290,7 @@ pub struct NavRow {
     pub object_kind: Option<ObjectKind>,
     pub stale: bool,
     pub loading: bool,
+    pub unloaded: bool,
     pub error: Option<String>,
     pub has_more: bool,
     pub total: usize,
@@ -380,13 +388,28 @@ impl NavTree {
     /// 整个重建，同时保留展开、焦点，以及对象已有的列/索引子节点。
     /// 返回 true 表示可见内容确实变了。
     pub fn apply(&mut self, connections: &[NavConnection]) -> bool {
+        let changed = connections.iter().map(|connection| connection.id.clone()).collect();
+        self.apply_changed(connections, &changed)
+    }
+
+    pub fn apply_changed(&mut self, connections: &[NavConnection], changed: &BTreeSet<String>) -> bool {
         let previous = std::mem::take(&mut self.nodes);
         let previous_roots = std::mem::take(&mut self.roots);
         let previous_ids: Vec<String> = previous.values().map(|node| node.id.clone()).collect();
         for connection in connections {
             let root_id = connection_node_id(&connection.id);
             self.roots.push(root_id.clone());
-            self.push_connection(connection, &root_id, &previous);
+            if !changed.contains(&connection.id) && previous.contains_key(&root_id) {
+                let mut pending = vec![root_id];
+                while let Some(id) = pending.pop() {
+                    if let Some(node) = previous.get(&id) {
+                        pending.extend(node.children.iter().cloned());
+                        self.nodes.insert(id, node.clone());
+                    }
+                }
+            } else {
+                self.push_connection(connection, &root_id, &previous);
+            }
         }
         self.expanded.retain(|id| self.nodes.contains_key(id));
         if self.focus.as_deref().is_some_and(|id| !self.nodes.contains_key(id)) {
@@ -552,7 +575,7 @@ impl NavTree {
             // 这一类没读到、也没有任何行：只有当读取明确失败时才留错误节点；
             // 引擎本来没有这一类（kind_sql 返回空集）就不画空分组。
             let failed = report.and_then(|report| report.error.clone());
-            if objects.is_empty() && failed.is_none() {
+            if objects.is_empty() && failed.is_none() && !connection.outline_only {
                 continue;
             }
             let group_id = group_node_id(&connection.id, database, &schema.name, *kind);
@@ -577,16 +600,18 @@ impl NavTree {
             group.loaded = objects.len();
             // 续读按模式/库的整页游标走，分组只用于展示数量。
             group.has_more = false;
+            group.unloaded = connection.outline_only;
+            group.paged = connection.outline_only;
             let _ = index;
             self.attach(parent_id, group);
-            if failed.is_some() {
+            if failed.is_some() || connection.outline_only {
                 // 这一类本轮读取失败：上一轮已读到的对象原样保留（不标 stale、不移除），
                 // 原因只挂在分组上；下一次读取成功时再按正常规则判断缺失。
-                let kept: Vec<NavNode> = previous
-                    .values()
-                    .filter(|old| old.kind == NavKind::Object && old.parent.as_deref() == Some(group_id.as_str()))
-                    .cloned()
-                    .collect();
+                let kept: Vec<NavNode> = previous.get(&group_id).into_iter()
+                    .flat_map(|group| &group.children)
+                    .filter_map(|id| previous.get(id))
+                    .filter(|old| old.kind == NavKind::Object)
+                    .cloned().collect();
                 for mut old in kept {
                     let object_id = old.id.clone();
                     old.children = Vec::new();
@@ -596,6 +621,13 @@ impl NavTree {
                 if let Some(group) = self.nodes.get_mut(&group_id) {
                     group.loaded = group.children.len();
                     group.total = group.total.max(group.loaded);
+                    if connection.outline_only {
+                        if let Some(old) = previous.get(&group_id) {
+                            group.loaded = old.loaded;
+                            group.total = old.total;
+                            group.has_more = old.has_more;
+                        }
+                    }
                 }
                 continue;
             }
@@ -687,8 +719,9 @@ impl NavTree {
 
     fn attach(&mut self, parent_id: &str, mut node: NavNode) {
         node.parent = Some(parent_id.to_owned());
+        let already_attached = self.nodes.get(&node.id).is_some_and(|old| old.parent.as_deref() == Some(parent_id));
         if let Some(parent) = self.nodes.get_mut(parent_id) {
-            if !parent.children.contains(&node.id) {
+            if !already_attached {
                 parent.children.push(node.id.clone());
             }
         }
@@ -969,6 +1002,37 @@ impl NavTree {
         added > 0
     }
 
+    /// 按种类的独立游标。失败保留旧页；成功刷新仅替换这一组已读取窗口。
+    pub fn set_kind_slice(&mut self, group_id: &str, objects: &[ObjectRow], total: usize, offset: usize, error: Option<String>) {
+        if let Some(error) = error {
+            self.set_error(group_id, error);
+            return;
+        }
+        let Some(group) = self.nodes.get(group_id).cloned() else { return };
+        if offset == 0 {
+            let incoming: BTreeSet<String> = objects.iter().map(|object| object_node_id(&group.connection_id, &group.database, &group.schema, object)).collect();
+            let removed: Vec<_> = group.children.iter().filter(|id| !incoming.contains(*id)).cloned().collect();
+            if let Some(parent) = self.nodes.get_mut(group_id) { parent.children.retain(|id| incoming.contains(id)); }
+            for old in removed {
+                // 父列表一次过滤，避免删除大页时逐项扫描同一个子列表。
+                if let Some(node) = self.nodes.get_mut(&old) { node.parent = None; }
+                self.remove_subtree(&old);
+            }
+            if self.focus.as_ref().is_none_or(|id| !self.nodes.contains_key(id)) { self.focus = Some(group_id.to_owned()); }
+        }
+        self.append_objects(group_id, objects, total, None);
+        if let Some(node) = self.nodes.get_mut(group_id) {
+            node.unloaded = false;
+            node.loaded = offset.saturating_add(objects.len());
+            node.total = total.max(node.loaded);
+            node.has_more = !objects.is_empty() && node.loaded < node.total;
+        }
+    }
+
+    pub fn needs_group(&self, id: &str) -> bool {
+        self.nodes.get(id).is_some_and(|node| node.kind == NavKind::Group && node.unloaded && !node.loading && node.error.is_none())
+    }
+
     /// 一个分组下没有在完整读取里出现的对象：第一次标 stale，已经 stale 的这次移除。
     fn retire_missing(&mut self, group_id: &str, read_ids: &BTreeSet<String>) {
         let children = self.nodes.get(group_id).map(|node| node.children.clone()).unwrap_or_default();
@@ -1204,6 +1268,17 @@ impl NavTree {
         }
     }
 
+    /// 普通资源管理器只遍历本连接展开的子树，避免逐连接重建整棵树。
+    pub fn visible_under(&self, root_id: &str) -> Vec<NavRow> {
+        let mut rows = Vec::new();
+        if self.expanded.contains(root_id) {
+            if let Some(root) = self.nodes.get(root_id) {
+                for child in &root.children { self.walk(child, 0, &mut rows); }
+            }
+        }
+        rows
+    }
+
     /// 可见行。没有搜索词时按展开状态展开整棵树；有搜索词时保留树结构：
     /// 命中的对象连同它的连接 / 库 / 模式 / 分组一起显示，祖先自动展开，命中处高亮。
     pub fn visible(&self) -> Vec<NavRow> {
@@ -1278,6 +1353,7 @@ impl NavTree {
             object_kind: node.object_kind,
             stale: node.stale,
             loading: node.loading,
+            unloaded: node.unloaded,
             error: node.error.clone(),
             has_more: node.has_more,
             total: node.total,
@@ -1565,6 +1641,60 @@ mod tests {
 
     fn labels(tree: &NavTree) -> Vec<(NavKind, String)> {
         tree.visible().into_iter().map(|row| (row.kind, row.label)).collect()
+    }
+
+    #[test]
+    fn progressive_connections_preserve_other_inflight_and_loaded_groups() {
+        let mut first = NavConnection::new("first", "First", Engine::Mysql, ConnStatus::Connected);
+        first.outline_only = true;
+        first.databases = vec![DatabaseNode { name: "shop".into(), error: None, schemas: vec![SchemaNode::empty("")] }];
+        let mut second = first.clone();
+        second.id = "second".into();
+        let mut tree = NavTree::new();
+        tree.apply(&[first.clone(), second.clone()]);
+        let group = group_node_id("first", "shop", "", ObjectKind::Table);
+        assert!(tree.begin_group(&group));
+        let changed = std::iter::once("second".to_owned()).collect();
+        tree.apply_changed(&[first.clone(), second.clone()], &changed);
+        assert!(tree.node(&group).unwrap().loading, "另一个连接到达不能清除在途读取");
+        assert!(!tree.needs_group(&group));
+        tree.set_kind_slice(&group, &[ObjectRow::table("orders", None)], 1, 0, None);
+        tree.apply_changed(&[first, second], &changed);
+        assert!(!tree.node(&group).unwrap().unloaded);
+        assert_eq!(tree.node(&group).unwrap().loaded, 1);
+    }
+
+    #[test]
+    fn huge_outline_stays_lazy_and_kind_pages_have_independent_cursors() {
+        let mut connection = NavConnection::new("huge", "Huge", Engine::Mysql, ConnStatus::Connected);
+        connection.outline_only = true;
+        connection.databases = vec![DatabaseNode { name: "shop".into(), error: None, schemas: vec![SchemaNode::empty("")] }];
+        let mut tree = NavTree::new();
+        tree.apply(&[connection.clone()]);
+        assert!(tree.nodes.len() < 12, "未知的十万对象目录不创建对象行");
+        let group = group_node_id("huge", "shop", "", ObjectKind::Table);
+        let views = group_node_id("huge", "shop", "", ObjectKind::View);
+        assert!(tree.needs_group(&group));
+        assert!(tree.begin_group(&group));
+        assert!(!tree.begin_group(&group), "重复展开不产生第二个请求");
+        let page: Vec<_> = (0..100).map(|i| ObjectRow::table(format!("table_{i:06}"), None)).collect();
+        tree.set_kind_slice(&group, &page, 100_000, 0, None);
+        assert_eq!(tree.node(&group).unwrap().loaded, 100);
+        assert!(tree.node(&group).unwrap().has_more);
+        assert!(!tree.needs_group(&group));
+        assert!(tree.needs_group(&views), "读取表不会预读视图、函数或触发器");
+        let next: Vec<_> = (100..200).map(|i| ObjectRow::table(format!("table_{i:06}"), None)).collect();
+        tree.set_kind_slice(&group, &next, 100_000, 100, Some("slow".into()));
+        assert_eq!(tree.node(&group).unwrap().loaded, 100, "失败不推进游标");
+        tree.set_kind_slice(&group, &next, 100_000, 100, None);
+        assert_eq!(tree.node(&group).unwrap().loaded, 200);
+        assert_eq!(tree.node(&group).unwrap().children.len(), 200);
+        assert!(tree.nodes.len() < 215);
+        tree.apply(&[connection]);
+        assert_eq!(tree.node(&group).unwrap().children.len(), 200, "概要刷新期间保留已读内容");
+        tree.set_kind_slice(&group, &page, 100_000, 0, None);
+        assert_eq!(tree.node(&group).unwrap().loaded, 100);
+        assert_eq!(tree.node(&group).unwrap().children.len(), 100, "刷新成功后重新从第一页续读");
     }
 
     #[test]

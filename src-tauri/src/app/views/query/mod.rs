@@ -4,7 +4,7 @@
 mod log;
 mod side;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -72,8 +72,20 @@ pub struct SyncEffect {
     pub selected_object: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CountIdentity {
+    tab: String,
+    run: u64,
+    target: Target,
+}
+
 pub struct QueryPane {
     desk: Desk,
+    metadata_seen: HashSet<String>,
+    metadata_reads: HashMap<String, futures::future::AbortHandle>,
+    metadata_context: Option<(String, u64, Option<Target>)>,
+    metadata_epoch: u64,
+    metadata_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     services: Arc<AppServices>,
     editors: HashMap<String, Entity<SqlEditor>>,
     links: HashMap<String, DraftLink>,
@@ -124,8 +136,8 @@ pub struct QueryPane {
     marks_seen: HashMap<String, u64>,
     /// 正在重命名的固定结果页签。
     pin_rename: Option<PinRename>,
-    /// 点击行数后统计的完整行数：(统计的 SQL, 状态)。结果换了 SQL 就不再显示。
-    row_count: Option<(String, RowCount)>,
+    /// 统计绑定结果代次和来源；同一 SQL 再执行或切换目标后不复用旧计数。
+    row_count: Option<(CountIdentity, RowCount)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -297,6 +309,12 @@ fn load_more_targets_match(results_target: Option<&desk::Target>, current: Optio
     }
 }
 
+impl Drop for QueryPane {
+    fn drop(&mut self) {
+        for handle in self.metadata_reads.values() { handle.abort(); }
+    }
+}
+
 impl QueryPane {
     /// 当前结果能否在标签此刻的目标上续读。
     fn load_more_allowed(&self) -> bool {
@@ -307,6 +325,11 @@ impl QueryPane {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         Self {
             desk: Desk::new(),
+            metadata_seen: HashSet::new(),
+            metadata_reads: HashMap::new(),
+            metadata_context: None,
+            metadata_epoch: 0,
+            metadata_gate: Arc::clone(&services.metadata_gate),
             services,
             editors: HashMap::new(),
             links: HashMap::new(),
@@ -510,16 +533,24 @@ impl QueryPane {
     /// 直接读 Desk 的结果，避免交换面板取到上一帧的网格快照。
     #[allow(clippy::type_complexity)]
     pub fn exchange_result(&self) -> (Vec<String>, Vec<Vec<Option<String>>>, bool) {
-        let results = self.desk.results();
-        let Some(sheet) = results.get(self.desk.statement().min(results.len().saturating_sub(1))) else {
+        let Some(sheet) = self.desk.shown_result() else {
             return (Vec::new(), Vec::new(), false);
         };
         (sheet.columns.clone(), sheet.rows.clone(), !sheet.columns.is_empty())
     }
 
+    pub fn exchange_columns(&self) -> Vec<String> { self.desk.shown_result().map(|sheet| sheet.columns.clone()).unwrap_or_default() }
+
+    pub fn exchange_truncated(&self) -> bool { self.desk.shown_result().is_some_and(|sheet| sheet.truncated) }
+
+    pub fn exchange_stamp(&self) -> (Option<String>, u64, usize, bool, String) {
+        (self.desk.active_id().map(str::to_owned), self.desk.view_gen(), self.desk.statement(), self.busy(), self.exchange_context())
+    }
+
     /// 当前查询目标的连接 / 库，用于交换面板标明来源。
     pub fn exchange_context(&self) -> String {
-        self.desk.target().map(|target| {
+        let target = match self.desk.shown_pinned_target() { Some(target) => target, None => self.desk.results_target().or_else(|| self.desk.target()) };
+        target.map(|target| {
             let name = if target.connection_name.is_empty() { target.connection_id } else { target.connection_name };
             if target.database.is_empty() {
                 name
@@ -1317,6 +1348,14 @@ impl QueryPane {
     /// 结果被读取上限截断时，再执行一次同一条只读语句并放大窗口。
     /// 写语句不会因为翻页被自动重放。
     /// 统计当前结果的完整行数：在结果来自的目标上执行一次 COUNT(*)，不改动已显示的结果。
+    fn count_identity(&self) -> Option<CountIdentity> {
+        if self.desk.results().len() != 1 { return None; }
+        Some(CountIdentity {
+            tab: self.desk.active_id()?.to_owned(), run: self.desk.view_gen(),
+            target: self.desk.results_target().or_else(|| self.desk.target())?,
+        })
+    }
+
     fn count_total(&mut self, cx: &mut Context<Self>) {
         let source = match self.desk.results() {
             [sheet] if is_pageable(sheet) => sheet.sql.clone(),
@@ -1325,13 +1364,14 @@ impl QueryPane {
         if !self.load_more_allowed() {
             return;
         }
-        if matches!(&self.row_count, Some((sql, RowCount::Running)) if *sql == source) {
+        let Some(identity) = self.count_identity() else { return };
+        if matches!(&self.row_count, Some((key, RowCount::Running)) if *key == identity) {
             return;
         }
         let Some(target) = self.desk.results_target().or_else(|| self.desk.target()) else {
             return;
         };
-        self.row_count = Some((source.clone(), RowCount::Running));
+        self.row_count = Some((identity.clone(), RowCount::Running));
         cx.notify();
         let services = Arc::clone(&self.services);
         let timeout_ms = self.timeout_ms;
@@ -1374,8 +1414,8 @@ impl QueryPane {
             cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
-                        if this.row_count.as_ref().is_some_and(|(sql, _)| *sql == source) {
-                            this.row_count = Some((source, match outcome {
+                        if this.count_identity().as_ref() == Some(&identity) && this.row_count.as_ref().is_some_and(|(key, _)| *key == identity) {
+                            this.row_count = Some((identity, match outcome {
                                 Ok(total) => RowCount::Done(total),
                                 Err(message) => RowCount::Failed(message),
                             }));
@@ -1466,6 +1506,8 @@ impl QueryPane {
     }
 
     fn complete(&mut self, cx: &mut Context<Self>) {
+        self.metadata_context = None;
+        self.request_statement_metadata(cx);
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
@@ -1501,6 +1543,111 @@ impl QueryPane {
         };
         self.variable_values.clear();
         self.start(RunScope::Script, Some(sql), cx);
+    }
+
+    pub fn adopt_navigation(&mut self, connections: &[crate::catalog::NavConnection], objects: Vec<TreeObject>, cx: &mut Context<Self>) {
+        let mut databases = Vec::new();
+        let links = connections.iter().filter(|connection| connection.status == crate::catalog::model::ConnStatus::Connected).map(|connection| {
+            let mut names: Vec<String> = connection.databases.iter().map(|database| database.name.clone()).collect();
+            if let Some(name) = connection.default_database.as_ref().filter(|name| !name.is_empty()) {
+                if !names.contains(name) { names.push(name.clone()); }
+            }
+            for name in &names { if !databases.contains(name) { databases.push(name.clone()); } }
+            desk::OpenLink { id: connection.id.clone(), name: connection.name.clone(), engine: connection.engine.as_str().to_owned(), databases: names, environment: String::new() }
+        }).collect();
+        self.desk.set_objects(objects, databases);
+        self.desk.set_links(links);
+        self.desk.set_tree_error("");
+        self.metadata_context = None;
+        cx.notify();
+    }
+
+    pub fn invalidate_metadata(&mut self) {
+        for (_, handle) in self.metadata_reads.drain() { handle.abort(); }
+        self.metadata_epoch = self.metadata_epoch.wrapping_add(1);
+        self.metadata_seen.clear();
+        self.metadata_context = None;
+    }
+
+    fn request_statement_metadata(&mut self, cx: &mut Context<Self>) {
+        let context = (self.desk.active_id().unwrap_or_default().to_owned(), self.desk.version(), self.desk.target());
+        if self.metadata_context.as_ref() == Some(&context) { return; }
+        self.metadata_context = Some(context.clone());
+        let Some(target) = context.2 else {
+            for (key, handle) in self.metadata_reads.drain() { handle.abort(); self.metadata_seen.remove(&key); }
+            return;
+        };
+        if !matches!(self.services.connections.session_condition(&target.connection_id), Some(crate::connections::SessionCondition::Connected)) {
+            for (key, handle) in self.metadata_reads.drain() { handle.abort(); self.metadata_seen.remove(&key); }
+            return;
+        }
+        let Ok(engine) = crate::catalog::Engine::parse(&target.engine) else { return };
+        if !engine.is_relational() { return; }
+        let parsed = crate::query::complete::parse_scope(&self.desk.draft());
+        let mut requests = Vec::new();
+        for table in parsed.tables.into_iter().chain(parsed.target) {
+            if parsed.ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&table.name)) { continue; }
+            let mysql = matches!(engine, crate::catalog::Engine::Mysql | crate::catalog::Engine::Mariadb);
+            let database = if mysql && !table.schema.is_empty() { table.schema.clone() } else { target.database.clone() };
+            let mut schema = if mysql { String::new() } else if table.schema.is_empty() { target.schema.clone() } else { table.schema };
+            if schema.is_empty() && matches!(engine, crate::catalog::Engine::Postgres | crate::catalog::Engine::Sqlserver) {
+                let candidates: Vec<_> = self.desk.objects().iter().filter(|object| object.connection_id == target.connection_id && object.database == database && object.name.eq_ignore_ascii_case(&table.name)).collect();
+                if candidates.len() == 1 { schema = candidates[0].schema.clone(); }
+            }
+            let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", target.connection_id, database, schema, table.name);
+            requests.push((key, target.connection_id.clone(), database, schema, table.name));
+        }
+        let wanted: HashSet<&str> = requests.iter().map(|request| request.0.as_str()).collect();
+        let seen = &mut self.metadata_seen;
+        self.metadata_reads.retain(|key, handle| {
+            if wanted.contains(key.as_str()) { true } else { handle.abort(); seen.remove(key); false }
+        });
+        for (key, connection, database, schema, name) in requests {
+            if !self.metadata_seen.insert(key.clone()) { continue; }
+            let services = Arc::clone(&self.services);
+            let gate = Arc::clone(&self.metadata_gate);
+            let epoch = self.metadata_epoch;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task_connection = connection.clone();
+            let task_database = database.clone();
+            let task_schema = schema.clone();
+            let task_name = name.clone();
+            let (handle, abort) = futures::future::AbortHandle::new_pair();
+            let cancelled = handle.clone();
+            self.metadata_reads.insert(key.clone(), handle);
+            runtime().spawn(futures::future::Abortable::new(async move {
+                // 输入表名时合并连续前缀；过期目标在上面取消，不占用数据库连接。
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let result = crate::catalog::nav_read::limited_metadata(gate, &task_connection, async {
+                    let session = services.connections.catalog_session(&task_connection).ok_or_else(|| "连接没有打开".to_owned())?;
+                    let columns = crate::catalog::detail::read_column_meta(&session, engine, &task_database, &task_schema, &task_name).await?;
+                    let keys = crate::query::meta::read_table_keys(&session, engine, &task_database, &task_schema, &task_name).await.unwrap_or_default();
+                    let comment = crate::catalog::detail::read_table_comment(&session, engine, &task_database, &task_schema, &task_name).await.ok().flatten();
+                    Ok::<_, String>((columns, keys, comment))
+                }).await.and_then(|value| value);
+                let _ = tx.send(result);
+            }, abort));
+            let owner = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let result = rx.await;
+                cx.update(|cx| {
+                    let Some(owner) = owner.upgrade() else { return };
+                    owner.update(cx, |pane, cx| {
+                        if pane.metadata_epoch != epoch || cancelled.is_aborted() { return; }
+                        pane.metadata_reads.remove(&key);
+                        match result {
+                            Ok(Ok((columns, keys, comment))) => {
+                                pane.desk.remember_table_columns(&connection, &database, &schema, &name, columns);
+                                pane.desk.remember_table_keys(&connection, &database, &schema, &name, keys);
+                                pane.desk.remember_table_comment(&connection, &database, &schema, &name, comment);
+                            }
+                            _ => { pane.metadata_seen.remove(&key); }
+                        }
+                        cx.notify();
+                    });
+                });
+            }).detach();
+        }
     }
 
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
@@ -1725,6 +1872,7 @@ impl QueryPane {
     }
 
     fn apply_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_statement_metadata(cx);
         let id = self.desk.active_id().map(str::to_owned);
         if let Some(editor) = id.as_deref().and_then(|id| self.editors.get(id)) {
             let scope = self.desk.completion_scope();
@@ -2342,7 +2490,8 @@ impl QueryPane {
         }
         let loaded = results[0].rows.len() as i64;
         let unit = i18n::text(locale, "ui.grid.rows");
-        let state = self.row_count.as_ref().filter(|(sql, _)| *sql == results[0].sql).map(|(_, state)| state.clone());
+        let identity = self.count_identity();
+        let state = self.row_count.as_ref().filter(|(key, _)| Some(key) == identity.as_ref()).map(|(_, state)| state.clone());
         let (label, tip, tone) = match &state {
             Some(RowCount::Done(total)) => (
                 format!("{} / {} {unit}", crate::app::views::grid::group_digits(loaded), crate::app::views::grid::group_digits(*total)),

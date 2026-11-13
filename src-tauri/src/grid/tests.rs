@@ -174,7 +174,7 @@ use std::path::PathBuf;
 fn grid_commands_are_registered_beside_catalog() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let view = fs::read_to_string(root.join("src/app/views/grid/mod.rs")).unwrap();
-    for name in ["application::grid::describe(", "application::grid::page(", "application::grid::count(", "application::grid::commit("] {
+    for name in ["application::grid::describe(", "application::grid::page_described(", "application::grid::count(", "application::grid::commit("] {
         assert!(view.contains(name), "{name}");
     }
     let drivers = fs::read_to_string(root.join("src/connections/drivers.rs")).unwrap();
@@ -1290,4 +1290,39 @@ mod fk_limits {
         drop(service);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn locating_large_results_only_copies_keys_and_rejects_duplicates_and_nulls() {
+    let schema = super::store::customers_fixture(0).schema;
+    let columns = vec!["id".to_owned(), "name".to_owned()];
+    let mut rows: Vec<_> = (0..100_000).map(|id| vec![Some(id.to_string()), Some("payload".repeat(32))]).collect();
+    rows.push(rows[10].clone());
+    rows.push(vec![None, Some("null key".into())]);
+    let located = super::locate_sheet(&schema, &columns, &rows);
+    assert_eq!(located.len(), 100_002);
+    assert!(!located[10].located);
+    assert!(!located[100_000].located);
+    assert!(!located[100_001].located);
+    assert!(located[99_999].located);
+    assert_eq!(located[99_999].locator, vec![("id".into(), Some("99999".into()))]);
+    let duplicate_names = super::locate_sheet(&schema, &["id".into(), "id".into()], &[vec![Some("1".into()), Some("2".into())]]);
+    assert_eq!(duplicate_names[0].locator[0].1.as_deref(), Some("2"));
+    let short = super::locate_sheet(&schema, &["id".into(), "id".into()], &[vec![Some("1".into())]]);
+    assert_eq!(short[0].locator[0].1.as_deref(), Some("1"));
+}
+
+#[test]
+#[ignore = "manual result-locator comparison benchmark"]
+fn benchmark_result_location() {
+    let schema = super::store::customers_fixture(0).schema;
+    let columns: Vec<String> = std::iter::once("id".to_owned()).chain((0..7).map(|i| format!("payload{i}"))).collect();
+    let rows: Vec<Vec<Option<String>>> = (0..10_000).map(|id| std::iter::once(Some(id.to_string())).chain((0..7).map(|_| Some("x".repeat(256)))).collect()).collect();
+    let start = std::time::Instant::now();
+    let result = super::locate_sheet(&schema, &columns, &rows);
+    std::hint::black_box(&result);
+    let elapsed = start.elapsed();
+    assert_eq!(result.len(), 10_000);
+    assert!(result.iter().all(|row| row.located && row.locator.len() == 1));
+    eprintln!("locator-benchmark rows=10000 columns=8 elapsed_us={} non_key_payload_bytes=17920000", elapsed.as_micros());
 }

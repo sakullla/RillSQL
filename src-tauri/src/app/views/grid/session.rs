@@ -416,6 +416,7 @@ pub struct SharedGrid {
     /// 快照代次：每次载入或替换行列都加一。按定位读完整值的批次带着它，
     /// 目标、行列一变，迟到的读取结果就会被丢弃。
     sheet_serial: u64,
+    export_revision: u64,
     /// TSV 里数据库 NULL 的显示文本；SQL 字面量始终是 NULL。
     null_copy: String,
     readonly_reason: String,
@@ -480,6 +481,7 @@ impl SharedGrid {
             preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES,
             sheet_preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES,
             sheet_serial: 0,
+            export_revision: 0,
             null_copy: "NULL".to_owned(),
             readonly_reason: String::new(),
             seq: 0,
@@ -619,9 +621,8 @@ impl SharedGrid {
             return false;
         }
         let names: Vec<String> = self.columns.iter().map(|column| column.name.clone()).collect();
-        let values: Vec<Vec<Option<String>>> = self.source.iter().map(|row| row.values.clone()).collect();
-        let located = locate_sheet(&schema, &names, &values);
-        if !values.is_empty() && located.iter().all(|row| !row.located) {
+        let located = locate_sheet(&schema, &names, self.source.iter().map(|row| &row.values));
+        if !self.source.is_empty() && located.iter().all(|row| !row.located) {
             self.readonly_reason = "grid.status.unlocated".to_owned();
             self.rows.clear();
             for (row, item) in self.source.iter_mut().zip(located) {
@@ -1735,6 +1736,7 @@ impl SharedGrid {
     }
 
     fn store_full(&mut self, row_id: &str, column_name: &str, state: FullState, phase: CellPhase, message: String) {
+        self.export_revision = self.export_revision.wrapping_add(1);
         self.full.entry(row_id.to_owned()).or_default().insert(column_name.to_owned(), state);
         if let Some(viewer) = self.viewer.as_mut().filter(|viewer| viewer.row_id == row_id && viewer.column_name == column_name) {
             viewer.phase = phase;
@@ -2328,6 +2330,15 @@ impl SharedGrid {
         self.columns.get(column).map(|item| item.type_name.as_str())
     }
 
+    pub fn exchange_stamp(&self) -> (u64, usize, u64, bool) {
+        (self.sheet_serial, self.source.len(), self.export_revision, self.has_more_rows())
+    }
+
+    pub fn exchange_metadata(&self) -> (Option<TableRef>, Vec<String>, bool) {
+        let table = if self.target.connection_id.is_empty() || self.target.table.is_empty() { None } else { Some(self.table_ref()) };
+        (table, self.column_names(), self.has_more_rows())
+    }
+
     /// 当前已读取的表、列和行。没有连接或表名时不给出导入目标。
     #[allow(clippy::type_complexity)]
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
@@ -2414,14 +2425,14 @@ impl SharedGrid {
     #[cfg(test)]
     pub fn set_total_rows_for_test(&mut self, total: i64) {
         self.full_count = Some(total);
+        self.truncated = self.page_offset().saturating_add(self.source_len() as u64) < total.max(0) as u64;
     }
 
+    pub fn set_full_count(&mut self, count: Option<i64>) { self.full_count = count.filter(|count| *count >= 0); }
+
     pub fn has_more_rows(&self) -> bool {
-        if let Some(count) = self.full_count {
-            (self.offset as i64) + (self.source_len() as i64) < count
-        } else {
-            self.truncated
-        }
+        // 是否还有页以最近一次服务器的 limit+1 探测为准，不能被过期计数驱动循环续读。
+        self.truncated
     }
 
     /// 追加下一页。只对表数据成立；查询结果延续由查询页自己负责，网格不重新执行 SQL。
@@ -4049,6 +4060,15 @@ mod tests {
             }
         }
         cells
+    }
+
+    #[test]
+    fn end_of_page_stops_continuation_even_when_a_cached_count_is_stale() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(vec![text_column("id")], vec![row("1", vec![Some("1")], true)], Some(1000), None);
+        assert!(grid.has_more_rows());
+        grid.append_page(Vec::new(), None, false);
+        assert!(!grid.has_more_rows(), "空的终页不能因旧计数继续自动请求同一页");
     }
 
     #[test]

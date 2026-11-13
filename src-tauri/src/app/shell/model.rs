@@ -652,8 +652,13 @@ impl WorkbenchModel {
             "activity-settings" => {
                 let _ = self.shell.dispatch("settings");
             }
-            "conn-edit" => self.connections.edit_selected(),
-            "conn-duplicate" => self.connections.duplicate_selected(),
+            "conn-edit" | "conn-duplicate" => {
+                if id == "conn-edit" { self.connections.edit_selected(); } else { self.connections.duplicate_selected(); }
+                if self.connections.editor.is_some() {
+                    self.shell.page = AppPage::Connections;
+                    self.focused_field = Some(DraftField::Name);
+                }
+            },
             "conn-delete" => {
                 if self.connections.arm_delete() {
                     self.notice_key = Some("connections.deleteDialog.title");
@@ -673,6 +678,12 @@ impl WorkbenchModel {
             }
             "conn-test" => {
                 if self.connections.selected.is_some() {
+                    if self.shell.page != AppPage::Connections || self.connections.editor.as_ref().and_then(|draft| draft.id.as_deref()) != self.connections.selected.as_deref() { self.connections.edit_selected(); }
+                    self.shell.page = AppPage::Connections;
+                    self.connections.message_key = Some("connections.editor.test.running");
+                    self.connections.message_detail.clear();
+                    self.notice_key = self.connections.message_key;
+                    self.notice_detail.clear();
                     self.enqueue(PendingJob::TestConnection);
                 }
             }
@@ -1437,7 +1448,8 @@ impl WorkbenchModel {
         }
         let changed = if updated {
             let snapshot = self.nav_source.clone();
-            self.nav.apply(&snapshot)
+            let changed = connections.iter().map(|connection| connection.id.clone()).collect();
+            self.nav.apply_changed(&snapshot, &changed)
         } else {
             false
         };
@@ -1536,6 +1548,12 @@ impl WorkbenchModel {
         self.nav_requests.push_back(NavRequest::Refresh { connection });
     }
 
+    pub fn request_lazy_group(&mut self, node_id: &str) {
+        if self.nav.needs_group(node_id) && self.nav.begin_group(node_id) {
+            self.nav_requests.push_back(NavRequest::Group(node_id.to_owned()));
+        }
+    }
+
     pub fn request_nav_details(&mut self, node_id: &str) {
         if self.nav.begin_details(node_id) {
             self.nav_requests.push_back(NavRequest::Details(node_id.to_owned()));
@@ -1556,24 +1574,7 @@ impl WorkbenchModel {
 
     /// 一条连接下面的树行，深度从连接下一层开始，供资源管理器缩进使用。
     pub fn nav_rows_for(&self, connection_id: &str) -> Vec<NavRow> {
-        let root = crate::catalog::hierarchy::connection_node_id(connection_id);
-        self.nav
-            .visible()
-            .into_iter()
-            .filter(|row| row.depth > 0)
-            .filter(|row| {
-                // 只保留真正挂在这条连接下的行：父链必须经过连接节点。
-                self.nav
-                    .node(&row.id)
-                    .and_then(|node| node.parent.as_deref())
-                    .map(|parent| self.nav_within(parent, &root))
-                    .unwrap_or(false)
-            })
-            .map(|row| NavRow {
-                depth: row.depth.saturating_sub(1),
-                ..row
-            })
-            .collect()
+        self.nav.visible_under(&crate::catalog::hierarchy::connection_node_id(connection_id))
     }
 
     /// 资源管理器连接行的展开状态就存在树上：鼠标、键盘和渲染读同一份。
@@ -1607,21 +1608,7 @@ impl WorkbenchModel {
         command
     }
 
-    fn nav_within(&self, parent: &str, root: &str) -> bool {
-        let mut current = parent.to_owned();
-        loop {
-            if current == root {
-                return true;
-            }
-            let Some(node) = self.nav.node(&current) else { return false };
-            match node.parent.clone() {
-                Some(next) => current = next,
-                None => return false,
-            }
-        }
-    }
-
-    /// 搜索：完整路径 + 高亮由树给出；清除后恢复原来的展开与选择。
+    /// 搜索：完整路径与高亮由树提供；清除后恢复展开和选择。
     pub fn nav_search(&mut self, text: &str) -> bool {
         let changed = self.nav.search(text);
         if !text.trim().is_empty() {
@@ -1770,7 +1757,8 @@ impl WorkbenchModel {
         match action {
             NavAction::None | NavAction::FocusParent => None,
             NavAction::Load(id) => {
-                // 展开已经由树自己完成；对象节点这时按需读列/索引，别的层级不额外发命令。
+                self.request_lazy_group(&id);
+                // 对象节点按需读列/索引。
                 if self.nav.node(&id).map(|node| node.kind) == Some(NavKind::Object) {
                     self.request_nav_details(&id);
                 }
@@ -1895,7 +1883,11 @@ impl WorkbenchModel {
                 NavKind::Object => self.request_nav_details(rest),
                 // 种类分组只在失败的那一类上重试；加载态也只留在这个分组。
                 NavKind::Group if has_kind => {
-                    if self.nav.begin_group(rest) {
+                    let more = node.paged && !node.unloaded && node.has_more;
+                    if more && !node.loading {
+                        self.nav.begin_scope(rest);
+                        self.nav_requests.push_back(NavRequest::More(rest.to_owned()));
+                    } else if self.nav.begin_group(rest) {
                         self.nav_requests.push_back(NavRequest::Group(rest.to_owned()));
                     }
                 }
@@ -1918,8 +1910,9 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-toggle:") {
-            if self.nav.toggle(rest) && self.nav.needs_details(rest) {
-                self.request_nav_details(rest);
+            if self.nav.toggle(rest) && self.nav.is_expanded(rest) {
+                if self.nav.needs_details(rest) { self.request_nav_details(rest); }
+                self.request_lazy_group(rest);
             }
             self.nav.set_focus(rest);
             self.sync_object_spec_from_focus();
@@ -2387,6 +2380,7 @@ impl WorkbenchModel {
         }
         let prompt = self.danger.take().expect("prompt");
         if matches!(prompt.kind, DangerKind::DropTable | DangerKind::DropView | DangerKind::Rename) {
+            self.forget_cached_object(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name, prompt.object.kind);
             self.nav.forget(&prompt.node_id);
         }
         self.request_nav_refresh(Some(prompt.object.connection_id.clone()));
@@ -2413,7 +2407,24 @@ impl WorkbenchModel {
         }
     }
 
+    fn forget_cached_object(&mut self, connection_id: &str, database: &str, schema: &str, name: &str, kind: crate::catalog::model::ObjectKind) {
+        for connection in self.nav_source.iter_mut().filter(|connection| connection.id == connection_id) {
+            for database in connection.databases.iter_mut().filter(|item| item.name == database) {
+                for scope in database.schemas.iter_mut().filter(|item| item.name == schema) {
+                    let before = scope.objects.len();
+                    scope.objects.retain(|object| !(object.name == name && object.kind == kind));
+                    let removed = before - scope.objects.len();
+                    scope.total = scope.total.saturating_sub(removed);
+                    for report in scope.kind_reports.iter_mut().filter(|report| report.kind == kind) {
+                        report.total = report.total.saturating_sub(removed);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn table_dropped(&mut self, connection_id: &str, database: &str, schema: &str, table: &str) {
+        self.forget_cached_object(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table);
         let id = self
             .nav
             .object_by_key(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table)
@@ -2429,6 +2440,7 @@ impl WorkbenchModel {
         let mut current = node_id.to_owned();
         loop {
             let Some(node) = self.nav.node(&current) else { return node_id.to_owned() };
+            if node.kind == NavKind::Group && node.paged { return current; }
             match node.kind {
                 NavKind::Group | NavKind::Column | NavKind::ColumnGroup | NavKind::Index | NavKind::IndexGroup => {
                     match node.parent.clone() {

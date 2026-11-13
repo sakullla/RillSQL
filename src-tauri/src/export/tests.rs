@@ -554,3 +554,51 @@ fn render_formats_keep_nulls_quotes_and_column_order_byte_for_byte() {
     let exported = String::from_utf8(render("insert", &table, ',', "NULL", false, "", "people").unwrap()).unwrap();
     assert!(exported.starts_with("INSERT INTO \"people\" (\"name\", \"id\", \"note\") VALUES ('甲', '1', NULL);"), "{exported}");
 }
+
+#[test]
+fn streaming_export_preserves_duplicate_json_keys_and_cancel_keeps_existing_file() {
+    let dir = std::env::temp_dir().join(format!("rillsql-stream-export-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rows.json");
+    let spec = stage_loaded("stream", "json", &path, vec!["z".into(), "a".into(), "z".into()],
+        vec![vec![Some("old".into()), Some("雪\n\"".into()), Some("new".into())], vec![Some("discarded".into())]], false, "items");
+    assert!(spec.write().success);
+    let content = fs::read_to_string(&path).unwrap();
+    assert_eq!(content, "[{\"z\":\"new\",\"a\":\"雪\\n\\\"\"},{\"z\":null,\"a\":null}]");
+    let control = super::ExportControl::default();
+    control.cancel();
+    let cancelled = spec.write_controlled(&control);
+    assert_eq!(cancelled.phase, Phase::Cancelled);
+    assert_eq!(cancelled.done_rows, 0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), content);
+    assert!(!fs::read_dir(&dir).unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "partial")));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "manual process-memory and export throughput benchmark"]
+fn benchmark_loaded_export_memory() {
+    use std::io::Read;
+    let path = std::env::temp_dir().join(format!("rillsql-export-bench-{}.csv", uuid::Uuid::new_v4()));
+    let payload = "x".repeat(128);
+    let rows = (0..100_000).map(|index| (0..4).map(|column| Some(format!("{index}-{column}-{payload}"))).collect()).collect();
+    let spec = stage_loaded("memory-benchmark", "csv", &path, vec!["a".into(), "b".into(), "c".into(), "d".into()], rows, false, "items");
+    let start = std::time::Instant::now();
+    let result = spec.write();
+    let elapsed = start.elapsed();
+    assert!(result.success, "{}", result.detail);
+    assert_eq!(result.done_rows, 100_000);
+    let mut file = std::fs::File::open(&path).unwrap();
+    let mut buffer = [0u8; 65536];
+    let mut bytes = 0u64;
+    let mut checksum = 14695981039346656037u64;
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 { break; }
+        bytes += count as u64;
+        for byte in &buffer[..count] { checksum = (checksum ^ u64::from(*byte)).wrapping_mul(1099511628211); }
+    }
+    drop(file);
+    eprintln!("export-benchmark rows=100000 columns=4 elapsed_us={} bytes={bytes} checksum={checksum:016x}", elapsed.as_micros());
+    std::fs::remove_file(path).unwrap();
+}

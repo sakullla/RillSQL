@@ -7,9 +7,9 @@ mod sql;
 mod store;
 
 pub(crate) use live::{
-    commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview,
+    commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview, query_page_with_schema,
     read_full_cell, request_cancel as request_grid_export_cancel, run_export, sqlserver_rows, ExportMode, ExportSpec, ForeignKey, Mutation,
-    MutationKind,
+    MutationKind, LivePage,
 };
 pub(crate) use sql::{
     delete_sql, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal, reject_literal_with, select_list,
@@ -18,18 +18,21 @@ pub(crate) use sql::{
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 /// 用现有定位规则判断结果行。调用方只提供列名和单元格，不复制主键比较。
-pub(crate) fn locate_sheet(schema: &TableSchema, columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<LocatedSheetRow> {
+pub(crate) fn locate_sheet<'a>(schema: &TableSchema, columns: &[String], rows: impl IntoIterator<Item = &'a Vec<Option<String>>>) -> Vec<LocatedSheetRow> {
+    // 同名列沿用原来的最后一列取值规则；定位只需要唯一键，不能复制正文/BLOB。
+    let keys: Vec<_> = schema.key.iter().map(|name| (name, columns.iter().enumerate().filter_map(|(index, column)| (column == name).then_some(index)).collect::<Vec<_>>())).collect();
     let mut stored = rows
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(index, values)| {
             let mut cells = std::collections::BTreeMap::new();
-            for (name, value) in columns.iter().zip(values.iter()) {
+            for (name, indices) in &keys {
+                let Some(value) = indices.iter().rev().find_map(|index| values.get(*index)) else { continue };
                 let cell = match value {
                     Some(text) => Cell::Text(text.clone()),
                     None => Cell::Null,
                 };
-                cells.insert(name.clone(), cell);
+                cells.insert((*name).clone(), cell);
             }
             store::Row { id: index.to_string(), cells, locator: None, located: false }
         })

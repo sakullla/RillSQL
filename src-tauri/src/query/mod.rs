@@ -9,7 +9,7 @@ pub(crate) mod desk;
 mod exec;
 pub(crate) mod functions;
 mod history;
-mod meta;
+pub(crate) mod meta;
 mod saved;
 mod split;
 

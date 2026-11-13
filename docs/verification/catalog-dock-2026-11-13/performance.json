@@ -1,0 +1,25 @@
+{
+  "old": {
+    "benchmark_loaded_export_memory": {
+      "measurement": "test export::tests::benchmark_loaded_export_memory ... export-benchmark rows=100000 columns=4 elapsed_us=204436 bytes=55655578 checksum=247c011bdc12e508",
+      "maximum_resident_set_size_bytes": 353222656
+    },
+    "benchmark_result_location": {
+      "measurement": "test grid::tests::benchmark_result_location ... locator-benchmark rows=10000 columns=8 elapsed_us=3122899 non_key_payload_bytes=17920000",
+      "maximum_resident_set_size_bytes": 71712768
+    }
+  },
+  "new": {
+    "benchmark_loaded_export_memory": {
+      "measurement": "test export::tests::benchmark_loaded_export_memory ... export-benchmark rows=100000 columns=4 elapsed_us=83415 bytes=55655578 checksum=247c011bdc12e508",
+      "maximum_resident_set_size_bytes": 96288768
+    },
+    "benchmark_result_location": {
+      "measurement": "test grid::tests::benchmark_result_location ... locator-benchmark rows=10000 columns=8 elapsed_us=22719 non_key_payload_bytes=17920000",
+      "maximum_resident_set_size_bytes": 53198848
+    }
+  },
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "baseline": "275fa536dd53ee3f152b3b005f434e8991fe679a",
+  "profile": "debug; single run; independent test processes; no concurrent compilation"
+}

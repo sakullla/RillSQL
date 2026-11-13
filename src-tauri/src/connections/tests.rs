@@ -1143,3 +1143,75 @@ fn redis_fixture_seed_covers_all_value_types_and_tls_free_healthcheck() {
     assert!(seed.contains("EXPIRE"), "seed 设置不同 TTL");
     assert!(!seed.contains("\nKEYS ") && !seed.starts_with("KEYS "), "seed 不使用 KEYS");
 }
+
+struct GatedVersionDb {
+    pause: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl DatabaseProbe for GatedVersionDb {
+    async fn check_tls(&self, _: &route::Route) -> Result<String, StageError> { Ok("verified".into()) }
+    async fn authenticate(&self, _: &model::SavedConnection, _: &route::Route, _: &str) -> Result<String, StageError> { Ok("ok".into()) }
+    async fn server_version(&self, _: &model::SavedConnection, _: &route::Route) -> Result<String, StageError> {
+        if self.pause.load(Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok("PostgreSQL 16.2".into())
+    }
+}
+
+#[tokio::test]
+async fn late_open_and_reconnect_cannot_restore_a_disconnected_session() {
+    for reconnect in [false, true] {
+        let dir = temp_workspace();
+        let db = Arc::new(GatedVersionDb { pause: std::sync::atomic::AtomicBool::new(!reconnect), entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+        let service = Arc::new(Service::with_probes(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()), health_probes(db.clone(), health)));
+        let mut draft = remote_draft(Engine::Postgres);
+        draft.id = Some("late".into());
+        service.save(draft, secrets("fixture", "", "")).await.unwrap();
+        if reconnect {
+            assert!(service.open("late", SecretInput::default()).await.unwrap().connected);
+            service.session_health("late").unwrap().rewind_idle(std::time::Duration::from_secs(60));
+            db.pause.store(true, Ordering::SeqCst);
+        }
+        let running = Arc::clone(&service);
+        let task = tokio::spawn(async move {
+            if reconnect { assert!(running.session_statuses().await.is_empty()); }
+            else { assert!(running.open("late", SecretInput::default()).await.is_err()); }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), db.entered.notified()).await.unwrap();
+        service.disconnect("late");
+        db.release.notify_one();
+        task.await.unwrap();
+        assert!(service.session_condition("late").is_none());
+        assert!(service.session_statuses().await.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn read_activity_guard_defers_health_probes_until_the_read_finishes() {
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+    let service = Arc::new(Service::with_probes(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()), health_probes(db.clone(), health)));
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some("busy".into());
+    service.save(draft, secrets("fixture", "", "")).await.unwrap();
+    service.open("busy", SecretInput::default()).await.unwrap();
+    let health = service.session_health("busy").unwrap();
+    health.rewind_idle(std::time::Duration::from_secs(60));
+    let guard = service.busy_scope("busy").unwrap();
+    assert_eq!(health.busy(), 1);
+    assert_eq!(service.session_statuses().await[0].status, "connected");
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), 1, "读数据时不探活和重连");
+    drop(guard);
+    assert_eq!(health.busy(), 0);
+    assert_eq!(service.session_statuses().await[0].status, "connected");
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), 2, "空闲时恢复正常探活和有限重连");
+    let _ = std::fs::remove_dir_all(dir);
+}

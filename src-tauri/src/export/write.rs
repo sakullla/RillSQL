@@ -1,8 +1,10 @@
 //! 已读取范围的文件写入：绝对路径、先写 `.partial`，再原子 rename。
 
 use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::grid::{insert_line, Cell, Column, Engine};
 
@@ -25,33 +27,6 @@ pub fn partial_name(file_name: &str) -> String {
     format!("{file_name}{MARK}")
 }
 
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if !path.is_absolute() || path.file_name().is_none() {
-        return Err("请选择完整的文件保存路径".to_owned());
-    }
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or_else(|| "请选择完整的文件保存路径".to_owned())?;
-    if !parent.exists() {
-        return Err(format!("路径不可写：目录不存在 {}。没有生成完整结果。", parent.display()));
-    }
-    let staging = path.with_file_name(format!(".rillsql-{}.partial", uuid::Uuid::new_v4()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = File::create(&staging)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&staging, path)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&staging);
-        return Err(format!("无法保存文件：{error}。目标文件未被替换。"));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug)]
 pub struct LoadedExport {
     pub id: String,
@@ -69,184 +44,202 @@ pub struct LoadedExport {
     pub fail_after_rows: Option<u64>,
 }
 
+#[derive(Default)]
+pub struct ExportControl {
+    cancelled: AtomicBool,
+    done: AtomicU64,
+}
+
+impl ExportControl {
+    pub fn cancel(&self) { self.cancelled.store(true, Ordering::Release); }
+    pub fn is_cancelled(&self) -> bool { self.cancelled.load(Ordering::Acquire) }
+    pub fn done_rows(&self) -> u64 { self.done.load(Ordering::Relaxed) }
+}
+
 impl LoadedExport {
-    pub fn write(&self) -> TaskView {
-        if !self.path.is_absolute() {
+    pub fn write(&self) -> TaskView { self.write_controlled(&ExportControl::default()) }
+
+    pub fn write_controlled(&self, control: &ExportControl) -> TaskView {
+        if !self.path.is_absolute() || self.path.file_name().is_none() {
             return TaskView::finish(self.id.clone(), "export", Phase::Blocked, 0, "请选择完整的文件保存路径", None);
         }
         if self.format == "insert" && self.table.trim().is_empty() {
             return TaskView::finish(self.id.clone(), "export", Phase::Blocked, 0, "INSERT 导出需要一张表的名字", None);
         }
+        if !matches!(self.format.as_str(), "csv" | "" | "json" | "markdown" | "insert" | "xlsx") {
+            return TaskView::finish(self.id.clone(), "export", Phase::Failed, 0, format!("未知导出格式 {}", self.format), None);
+        }
         let mut target = self.path.clone();
         if self.truncated {
-            if let Some(name) = target.file_name().and_then(|name| name.to_str()) {
-                target.set_file_name(partial_name(name));
-            }
+            if let Some(name) = target.file_name().and_then(|name| name.to_str()) { target.set_file_name(partial_name(name)); }
         }
-        let limit = self.cancel_after_rows.or(self.fail_after_rows);
-        let rows = match limit {
-            Some(limit) => self.rows.iter().take(limit as usize).cloned().collect(),
-            None => self.rows.clone(),
+        let length = self.cancel_after_rows.or(self.fail_after_rows).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX).min(self.rows.len())).unwrap_or(self.rows.len());
+        let rows = &self.rows[..length];
+        let staging = target.with_file_name(format!(".rillsql-{}.partial", uuid::Uuid::new_v4()));
+        let result = if self.format == "xlsx" {
+            super::xlsx::write_xlsx_file(&self.columns, rows, &staging, |done| {
+                control.done.store(done as u64, Ordering::Relaxed);
+                if control.is_cancelled() { Err("已取消导出".to_owned()) } else { Ok(()) }
+            }).and_then(|()| File::options().write(true).open(&staging).and_then(|file| file.sync_all()).map_err(|error| error.to_string()))
+        } else {
+            (|| -> io::Result<()> {
+                let file = File::options().write(true).create_new(true).open(&staging)?;
+                let mut writer = BufWriter::with_capacity(64 * 1024, file);
+                render_text(&mut writer, &self.columns, rows, FormatOptions { format: &self.format, delimiter: self.delimiter, null_token: &self.null_token, bom: self.bom, schema: &self.schema, table: &self.table }, control)?;
+                writer.flush()?;
+                writer.get_ref().sync_all()
+            })().map_err(|error| error.to_string())
         };
-        let table = ParsedTable { columns: self.columns.clone(), rows };
-        let bytes = match render(&self.format, &table, self.delimiter, &self.null_token, self.bom, &self.schema, &self.table) {
-            Ok(bytes) => bytes,
-            Err(message) => return TaskView::finish(self.id.clone(), "export", Phase::Failed, 0, message, None),
-        };
-        if let Some(stop) = self.cancel_after_rows {
-            let staging = target.with_file_name(format!(".rillsql-{}.partial", uuid::Uuid::new_v4()));
-            if File::create(&staging).and_then(|mut file| file.write_all(&bytes)).is_ok() {
-                let _ = fs::remove_file(&staging);
-            }
-            return TaskView::finish(
-                self.id.clone(),
-                "export",
-                Phase::Cancelled,
-                stop.min(self.rows.len() as u64),
-                format!("已取消：实际写入 {} 行后停止，未完成的文件已删除。", stop.min(self.rows.len() as u64)),
-                None,
-            );
+        let done = control.done_rows();
+        if control.is_cancelled() || self.cancel_after_rows.is_some() {
+            let residual = if staging.exists() && fs::remove_file(&staging).is_err() { Some(staging.display().to_string()) } else { None };
+            let detail = match &residual {
+                Some(path) => format!("已取消，已处理 {done} 行。部分文件未能删除：{path}"),
+                None => format!("已取消：实际完成 {done} 行，未完成的文件已删除。"),
+            };
+            return TaskView::finish(self.id.clone(), "export", Phase::Cancelled, done, detail, residual);
         }
-        if let Some(stop) = self.fail_after_rows {
-            let staging = target.with_file_name(format!(".rillsql-{}.partial", uuid::Uuid::new_v4()));
-            let _ = File::create(&staging).and_then(|mut file| file.write_all(&bytes));
-            return TaskView::finish(
-                self.id.clone(),
-                "export",
-                Phase::Failed,
-                stop.min(self.rows.len() as u64),
-                format!("写入失败。已写入 {} 行，不完整的文件保留为 {}，不会冒充完整结果。", stop, staging.display()),
-                Some(staging.display().to_string()),
-            );
+        if let Err(error) = result {
+            let residual = staging.exists().then(|| staging.display().to_string());
+            return TaskView::finish(self.id.clone(), "export", Phase::Failed, done, format!("写入失败：{error}。已处理 {done} 行，目标文件未被替换。"), residual);
         }
-        match write_atomic(&target, &bytes) {
-            Ok(()) => {
-                let phase = if self.truncated { Phase::Partial } else { Phase::Done };
-                let note = if self.truncated { "仅已读取的行，不是完整结果。" } else { "已导出全部给出的行。" };
-                TaskView::finish(
-                    self.id.clone(),
-                    "export",
-                    phase,
-                    table.rows.len() as u64,
-                    format!("已导出 {} 行到 {}。{note}", table.rows.len(), target.display()),
-                    Some(target.display().to_string()),
-                )
-            }
-            Err(message) => TaskView::finish(self.id.clone(), "export", Phase::Failed, 0, message, None),
+        if self.fail_after_rows.is_some() {
+            return TaskView::finish(self.id.clone(), "export", Phase::Failed, done,
+                format!("写入失败。已处理 {done} 行，不完整的文件保留为 {}，不会冒充完整结果。", staging.display()), Some(staging.display().to_string()));
         }
+        if let Err(error) = fs::rename(&staging, &target) {
+            return TaskView::finish(self.id.clone(), "export", Phase::Failed, done,
+                format!("无法保存文件：{error}。目标文件未被替换，部分文件保留为 {}。", staging.display()), Some(staging.display().to_string()));
+        }
+        let phase = if self.truncated { Phase::Partial } else { Phase::Done };
+        let note = if self.truncated { "仅已读取的行，不是完整结果。" } else { "已导出全部给出的行。" };
+        TaskView::finish(self.id.clone(), "export", phase, done, format!("已导出 {done} 行到 {}。{note}", target.display()), Some(target.display().to_string()))
     }
+}
+
+struct FormatOptions<'a> {
+    format: &'a str,
+    delimiter: char,
+    null_token: &'a str,
+    bom: bool,
+    schema: &'a str,
+    table: &'a str,
 }
 
 pub fn render(format: &str, table: &ParsedTable, delimiter: char, null_token: &str, bom: bool, schema: &str, table_name: &str) -> Result<Vec<u8>, String> {
-    let text = match format {
-        "csv" | "" => render_csv(table, delimiter, null_token, bom),
-        "json" => render_json(table),
-        "markdown" => render_markdown(table, null_token),
-        "insert" => render_insert(table, schema, table_name),
-        "xlsx" => return write_xlsx(&table.columns, &table.rows),
-        other => return Err(format!("未知导出格式 {other}")),
-    };
-    Ok(text.into_bytes())
+    if format == "xlsx" { return write_xlsx(&table.columns, &table.rows); }
+    let mut output = Vec::new();
+    render_text(&mut output, &table.columns, &table.rows, FormatOptions { format, delimiter, null_token, bom, schema, table: table_name }, &ExportControl::default()).map_err(|error| error.to_string())?;
+    Ok(output)
 }
 
-fn render_csv(table: &ParsedTable, delimiter: char, null_token: &str, bom: bool) -> String {
-    let mut lines = Vec::new();
-    lines.push(table.columns.iter().map(|name| quote_csv(name)).collect::<Vec<_>>().join(&delimiter.to_string()));
-    for row in &table.rows {
-        let fields = table.columns.iter().enumerate().map(|(index, _)| match row.get(index) {
-            Some(Some(value)) => quote_csv(value),
-            _ => null_token.to_owned(),
-        });
-        lines.push(fields.collect::<Vec<_>>().join(&delimiter.to_string()));
+fn write_csv_field(writer: &mut impl Write, value: &str) -> io::Result<()> {
+    writer.write_all(b"\"")?;
+    for (index, part) in value.split('"').enumerate() {
+        if index > 0 { writer.write_all(b"\"\"")?; }
+        writer.write_all(part.as_bytes())?;
     }
-    let body = lines.join("\r\n");
-    if bom { format!("\u{feff}{body}") } else { body }
+    writer.write_all(b"\"")
 }
 
-fn quote_csv(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
+fn write_markdown_field(writer: &mut impl Write, value: &str) -> io::Result<()> {
+    let mut start = 0;
+    for (index, ch) in value.char_indices().filter(|(_, ch)| matches!(ch, '|' | '\n' | '\r')) {
+        writer.write_all(&value.as_bytes()[start..index])?;
+        writer.write_all(if ch == '|' { b"\\|" } else { b" " })?;
+        start = index + ch.len_utf8();
+    }
+    writer.write_all(&value.as_bytes()[start..])
 }
 
-/// 对象数组，键按列顺序写出（serde_json 的 Map 会按字母重排）；同名列以后出现的值为准，位置不变。
-fn render_json(table: &ParsedTable) -> String {
-    let rows = table
-        .rows
-        .iter()
-        .map(|row| {
-            let mut fields: Vec<(&str, serde_json::Value)> = Vec::new();
-            for (index, name) in table.columns.iter().enumerate() {
-                let value = match row.get(index) {
-                    Some(Some(text)) => serde_json::Value::String(text.clone()),
-                    _ => serde_json::Value::Null,
-                };
-                match fields.iter_mut().find(|(key, _)| *key == name.as_str()) {
-                    Some(slot) => slot.1 = value,
-                    None => fields.push((name.as_str(), value)),
+fn render_text(writer: &mut impl Write, columns: &[String], rows: &[Vec<Option<String>>], options: FormatOptions<'_>, control: &ExportControl) -> io::Result<()> {
+    let mut json_fields = Vec::<(&str, usize)>::new();
+    let mut positions = HashMap::<&str, usize>::new();
+    let sql_columns: Vec<Column> = if options.format == "insert" { columns.iter().map(|name| Column { name: name.clone(), type_name: "TEXT".into(), nullable: true, primary: false, unique: false, auto: false }).collect() } else { Vec::new() };
+    match options.format {
+        "csv" | "" => {
+            if options.bom { writer.write_all("\u{feff}".as_bytes())?; }
+            for (index, name) in columns.iter().enumerate() {
+                if index > 0 { write!(writer, "{}", options.delimiter)?; }
+                write_csv_field(writer, name)?;
+            }
+        }
+        "json" => {
+            for (index, name) in columns.iter().enumerate() {
+                if let Some(position) = positions.get(name.as_str()) { json_fields[*position].1 = index; }
+                else { positions.insert(name, json_fields.len()); json_fields.push((name, index)); }
+            }
+            writer.write_all(b"[")?;
+        }
+        "markdown" => {
+            writer.write_all(b"| ")?;
+            for (index, name) in columns.iter().enumerate() {
+                if index > 0 { writer.write_all(b" | ")?; }
+                write_markdown_field(writer, name)?;
+            }
+            writer.write_all(b" |\r\n| ")?;
+            for index in 0..columns.len() {
+                if index > 0 { writer.write_all(b" | ")?; }
+                writer.write_all(b"---")?;
+            }
+            writer.write_all(b" |")?;
+        }
+        "insert" => {},
+        other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("未知导出格式 {other}"))),
+    }
+    for (row_index, row) in rows.iter().enumerate() {
+        if control.is_cancelled() { return Err(io::Error::new(io::ErrorKind::Interrupted, "已取消导出")); }
+        match options.format {
+            "csv" | "" => {
+                writer.write_all(b"\r\n")?;
+                for index in 0..columns.len() {
+                    if index > 0 { write!(writer, "{}", options.delimiter)?; }
+                    match row.get(index).and_then(Option::as_deref) {
+                        Some(text) => write_csv_field(writer, text)?,
+                        None => writer.write_all(options.null_token.as_bytes())?,
+                    }
                 }
             }
-            let body = fields
-                .iter()
-                .map(|(key, value)| format!("{}:{}", serde_json::Value::String((*key).to_owned()), value))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", rows.join(","))
-}
-
-fn render_markdown(table: &ParsedTable, null_token: &str) -> String {
-    if !null_token.is_empty() {
-        return render_markdown_token(table, null_token);
+            "json" => {
+                if row_index > 0 { writer.write_all(b",")?; }
+                writer.write_all(b"{")?;
+                for (index, (name, column)) in json_fields.iter().enumerate() {
+                    if index > 0 { writer.write_all(b",")?; }
+                    serde_json::to_writer(&mut *writer, name).map_err(io::Error::other)?;
+                    writer.write_all(b":")?;
+                    serde_json::to_writer(&mut *writer, &row.get(*column).and_then(Option::as_deref)).map_err(io::Error::other)?;
+                }
+                writer.write_all(b"}")?;
+            }
+            "markdown" => {
+                writer.write_all(b"\r\n| ")?;
+                for index in 0..columns.len() {
+                    if index > 0 { writer.write_all(b" | ")?; }
+                    match row.get(index).and_then(Option::as_deref) {
+                        Some(text) => write_markdown_field(writer, text)?,
+                        None => writer.write_all(options.null_token.as_bytes())?,
+                    }
+                }
+                writer.write_all(b" |")?;
+            }
+            "insert" => {
+                if row_index > 0 { writer.write_all(b"\r\n")?; }
+                let cells = (0..columns.len()).map(|index| match row.get(index).and_then(Option::as_ref) { Some(text) => Cell::Text(text.clone()), None => Cell::Null }).collect::<Vec<_>>();
+                writer.write_all(insert_line(Engine::Sqlite, options.schema, options.table, &sql_columns, columns, &cells).as_bytes())?;
+            }
+            _ => unreachable!(),
+        }
+        control.done.store(row_index as u64 + 1, Ordering::Relaxed);
     }
-    let mut lines = vec![markdown_row(table.columns.iter().map(|name| Some(name.as_str()))), format!("| {} |", vec!["---"; table.columns.len()].join(" | "))];
-    for row in &table.rows {
-        lines.push(markdown_row(table.columns.iter().enumerate().map(|(index, _)| match row.get(index) {
-            Some(Some(text)) => Some(text.as_str()),
-            _ => None,
-        })));
-    }
-    lines.join("\r\n")
-}
-
-fn render_markdown_token(table: &ParsedTable, null_token: &str) -> String {
-    let header = markdown_row(table.columns.iter().map(|name| Some(name.as_str())));
-    let rule = format!("| {} |", vec!["---"; table.columns.len()].join(" | "));
-    let mut lines = vec![header, rule];
-    for row in &table.rows {
-        let cells = table.columns.iter().enumerate().map(|(index, _)| match row.get(index) {
-            Some(Some(text)) => text.replace('|', "\\|").replace(['\n', '\r'], " "),
-            _ => null_token.to_owned(),
-        });
-        lines.push(format!("| {} |", cells.collect::<Vec<_>>().join(" | ")));
-    }
-    lines.join("\r\n")
-}
-
-fn markdown_row<'a>(cells: impl Iterator<Item = Option<&'a str>>) -> String {
-    let fields = cells
-        .map(|cell| match cell {
-            Some(text) => text.replace('|', "\\|").replace(['\n', '\r'], " "),
-            None => String::new(),
-        })
-        .collect::<Vec<_>>();
-    format!("| {} |", fields.join(" | "))
-}
-
-fn render_insert(table: &ParsedTable, schema: &str, table_name: &str) -> String {
-    let columns: Vec<Column> = table
-        .columns
-        .iter()
-        .map(|name| Column { name: name.clone(), type_name: "TEXT".to_owned(), nullable: true, primary: false, unique: false, auto: false })
-        .collect();
-    render_insert_for(Engine::Sqlite, schema, table_name, &columns, table)
+    if options.format == "json" { writer.write_all(b"]")?; }
+    Ok(())
 }
 
 /// 按目标引擎写 INSERT：标识符用该引擎的引号，列类型决定字面量（数值不加引号，NULL 写 NULL）。
 /// 文件导出沿用 SQLite 写法；网格"复制为 INSERT"带上真实引擎和列类型。
 pub fn render_insert_for(engine: Engine, schema: &str, table_name: &str, columns: &[Column], table: &ParsedTable) -> String {
-    let mut lines = Vec::new();
-    for row in &table.rows {
+    let mut output = String::new();
+    for (index, row) in table.rows.iter().enumerate() {
         let cells: Vec<Cell> = table
             .columns
             .iter()
@@ -256,7 +249,8 @@ pub fn render_insert_for(engine: Engine, schema: &str, table_name: &str, columns
                 _ => Cell::Null,
             })
             .collect();
-        lines.push(insert_line(engine, schema, table_name, columns, &table.columns, &cells));
+        if index > 0 { output.push_str("\r\n"); }
+        output.push_str(&insert_line(engine, schema, table_name, columns, &table.columns, &cells));
     }
-    lines.join("\r\n")
+    output
 }

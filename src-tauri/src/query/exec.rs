@@ -550,36 +550,17 @@ async fn reveal_rows(
     cancel: &AtomicBool,
 ) -> Result<StatementValue, String> {
     let step = chunk_rows(limit);
-    if rows.is_empty() {
-        let value = StatementValue {
-            columns,
-            column_types,
-            rows,
-            truncated: false,
-            affected,
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    let mut shown = 0usize;
+    let total = rows.len();
+    let mut remaining = rows.into_iter();
+    let mut value = StatementValue { columns, column_types, rows: Vec::with_capacity(total), truncated: false, affected: None };
     loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("已取消".to_owned());
-        }
-        let next = (shown + step).min(rows.len());
-        let done = next == rows.len();
-        let value = StatementValue {
-            columns: columns.clone(),
-            column_types: column_types.clone(),
-            rows: rows[..next].to_vec(),
-            truncated: truncated && done,
-            affected: if done { affected } else { None },
-        };
+        if cancel.load(Ordering::SeqCst) { return Err("已取消".to_owned()); }
+        value.rows.extend(remaining.by_ref().take(step));
+        let done = value.rows.len() == total;
+        value.truncated = truncated && done && total > 0;
+        value.affected = if done { affected } else { None };
         sink.publish(index, &value).await;
-        shown = next;
-        if done {
-            return Ok(value);
-        }
+        if done { return Ok(value); }
         sink.pause(cancel).await?;
     }
 }
@@ -625,6 +606,11 @@ fn attach_failure(transport: &CancelTransport, message: String) -> String {
 impl LiveDriver {
     /// 整批只借出池里已有的那条连接。MySQL / MariaDB 归还时不发 COM_RESET_CONNECTION。
     pub async fn attach(session: CatalogSession, engine: &str, database: &str, transport: CancelTransport, timeout_ms: Option<u64>) -> Result<Self, String> {
+        // 从借连接和会话初始化开始保护探活；高延迟握手也属于正在执行。
+        let busy = transport.health().map(|health| {
+            health.note_busy();
+            BusyGuard(Arc::clone(health))
+        });
         let setup = timeout_statements(engine, timeout_ms);
         let attached = match session {
             CatalogSession::Scripted => Attached::Scripted,
@@ -642,9 +628,8 @@ impl LiveDriver {
                     .await
                     .map_err(|err| attach_failure(&transport, err.to_string()))?;
                 conn.reset_connection(false);
-                if let Ok(Some(id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()").await {
-                    transport.set_mysql_connection_id(id);
-                }
+                // 握手已经提供真实连接 id，无需再花一次网络往返查询。
+                transport.set_mysql_connection_id(u64::from(conn.id()));
                 if let Err(err) = align_mysql(&mut conn, engine, database).await {
                     return Err(attach_failure(&transport, err));
                 }
@@ -677,10 +662,6 @@ impl LiveDriver {
                 }
             }
         };
-        let busy = transport.health().map(|health| {
-            health.note_busy();
-            BusyGuard(Arc::clone(health))
-        });
         Ok(Self {
             session: tokio::sync::Mutex::new(attached),
             transport,
@@ -1089,7 +1070,7 @@ async fn sqlite_dispatch(
                 let partial = StatementValue {
                     columns: columns.clone(),
                     column_types: column_types.clone(),
-                    rows: rows.clone(),
+                    rows: std::mem::take(&mut rows),
                     truncated: false,
                     affected: None,
                 };
@@ -1101,6 +1082,7 @@ async fn sqlite_dispatch(
                     }
                     Some(next) => {
                         sink.pause(cancel).await?;
+                        rows = partial.rows;
                         pending = Some(next);
                     }
                 }
@@ -1255,7 +1237,7 @@ async fn mysql_run(
             let partial = StatementValue {
                 columns: columns.clone(),
                 column_types: column_types.clone(),
-                rows: rows.clone(),
+                rows: std::mem::take(&mut rows),
                 truncated: false,
                 affected: None,
             };
@@ -1264,6 +1246,7 @@ async fn mysql_run(
                 None => return Ok(partial),
                 Some(next) => {
                     sink.pause(cancel).await?;
+                    rows = partial.rows;
                     pending = Some(next);
                 }
             }
@@ -1962,5 +1945,20 @@ mod mysql_value_tests {
         assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"abc".to_vec()), MYSQL_TYPE_VAR_STRING, 45).as_deref(), Some("abc"));
         assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"12.50".to_vec()), MYSQL_TYPE_NEWDECIMAL, 63).as_deref(), Some("12.50"));
         assert_eq!(mysql_cell(&mysql_async::Value::Date(2024, 1, 2, 0, 0, 0, 0), MYSQL_TYPE_DATE, 63).as_deref(), Some("2024-01-02"));
+    }
+}
+
+#[cfg(test)]
+mod buffer_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revealing_rows_moves_the_payload_instead_of_copying_each_prefix() {
+        let rows: Vec<_> = (0..10_000).map(|index| vec![Some(index.to_string()), Some("x".repeat(256))]).collect();
+        let original = rows[0][1].as_ref().unwrap().as_ptr();
+        let value = reveal_rows(&NopSink, 0, vec!["id".into(), "body".into()], vec!["int".into(), "text".into()], rows, true, None, 10_000, &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(value.rows.len(), 10_000);
+        assert!(value.truncated);
+        assert_eq!(value.rows[0][1].as_ref().unwrap().as_ptr(), original);
     }
 }

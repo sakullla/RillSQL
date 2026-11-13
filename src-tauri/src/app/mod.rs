@@ -75,16 +75,12 @@ pub fn run() {
         std::env::consts::ARCH
     );
     // gpui_platform is the 0.3.11 snapshot (Win32/DirectWrite, X11/Wayland, macOS font-kit).
-    gpui_platform::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    let application = gpui_platform::application().with_assets(gpui_kit::assets::AllAssets);
+    application.on_reopen(|cx| reopen_workbench(cx, |cx| { open_workbench_window(cx); }));
+    application.run(move |cx| {
         gpui_kit::init(cx);
         bind_keys(cx);
-        let (_window, root) = gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| Workbench::new(window, cx))
-        })
-        .expect("open GPUI window");
-        let shell = root.read(cx).shell().clone();
-        install_workbench_actions(cx, &root);
-        install_menus(cx, &shell);
+        let root = open_workbench_window(cx);
         if dialog {
             root.update(cx, |view, cx| view.perform("open-sqlite", cx));
         }
@@ -97,6 +93,38 @@ pub fn run() {
     });
     println!("gpui-window: stopped os={}", std::env::consts::OS);
 }
+
+struct WorkbenchServices(std::sync::Arc<crate::application::AppServices>);
+impl gpui_kit::Global for WorkbenchServices {}
+
+fn open_workbench_window(cx: &mut App) -> gpui_kit::Entity<Workbench> {
+    if !cx.has_global::<WorkbenchServices>() {
+        cx.set_global(WorkbenchServices(std::sync::Arc::new(crate::application::AppServices::from_state(&crate::connections::commands::ConnectionsState::new()))));
+    }
+    let services = std::sync::Arc::clone(&cx.global::<WorkbenchServices>().0);
+    let (window, root) = gpui_kit::open_window(window_options(), cx, |window, cx| {
+        cx.new(|cx| Workbench::with_services(window, cx, services, true))
+    }).expect("open GPUI window");
+    let shell = root.read(cx).shell().clone();
+    install_workbench_actions(cx, &root);
+    install_menus(cx, &shell);
+    let _ = window.update(cx, |_, window, _| window.activate_window());
+    cx.activate(true);
+    root
+}
+
+/// LaunchServices / Dock 再次打开：已有窗口直接激活，关闭了最后一个窗口则重新创建。
+pub(crate) fn reopen_workbench(cx: &mut App, open: impl FnOnce(&mut App)) {
+    if let Some(window) = cx.windows().first().copied() {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+    } else {
+        open(cx);
+    }
+    cx.activate(true);
+}
+
+struct WorkbenchActionTarget(gpui_kit::WeakEntity<Workbench>);
+impl gpui_kit::Global for WorkbenchActionTarget {}
 
 fn window_options() -> WindowOptions {
     WindowOptions {
@@ -233,11 +261,15 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
 }
 
 pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench>) {
+    let installed = cx.has_global::<WorkbenchActionTarget>();
+    cx.set_global(WorkbenchActionTarget(root.downgrade()));
+    if installed { return; }
     macro_rules! bind {
         ($action:ty, $id:expr) => {{
-            let root = root.clone();
             cx.on_action(move |_: &$action, cx: &mut App| {
-                root.update(cx, |view, cx| view.perform($id, cx));
+                if let Some(root) = cx.global::<WorkbenchActionTarget>().0.upgrade() {
+                    root.update(cx, |view, cx| view.perform($id, cx));
+                }
             });
         }};
     }
@@ -278,8 +310,8 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(CopyRegion, "copy-region");
     bind!(CopySqlValue, "copy-sql-value");
     {
-        let root = root.clone();
         cx.on_action(move |_: &Dismiss, cx: &mut App| {
+            let Some(root) = cx.global::<WorkbenchActionTarget>().0.upgrade() else { return };
             root.update(cx, |view, cx| {
                 let effect = view.model.dismiss();
                 view.apply_effect(effect, cx);
@@ -287,9 +319,12 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
             });
         });
     }
-    let root = root.clone();
     cx.on_action(move |_: &Quit, cx: &mut App| {
-        root.update(cx, |view, cx| view.perform("quit-window", cx));
+        if let Some(root) = cx.global::<WorkbenchActionTarget>().0.upgrade() {
+            root.update(cx, |view, cx| view.perform("quit-window", cx));
+        } else {
+            cx.quit();
+        }
     });
 }
 

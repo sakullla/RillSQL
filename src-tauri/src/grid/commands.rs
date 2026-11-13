@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableRef {
     pub connection_id: String,
@@ -17,7 +17,7 @@ pub struct TableRef {
     pub include_foreign_keys: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterArg {
     pub column: String,
@@ -57,7 +57,7 @@ pub struct PageRequest {
     pub search: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CountRequest {
     #[serde(flatten)]
@@ -123,7 +123,7 @@ pub struct ExportRequest {
     pub format: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnDto {
     pub name: String,
@@ -134,7 +134,7 @@ pub struct ColumnDto {
     pub auto: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaDto {
     pub engine: String,
@@ -148,7 +148,7 @@ pub struct SchemaDto {
     pub foreign_keys: Option<Vec<ForeignKeyDto>>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForeignKeyDto {
     pub name: String,

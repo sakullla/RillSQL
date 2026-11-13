@@ -6633,3 +6633,197 @@ fn switching_to_settings_restores_focus_on_the_workbench_content(cx: &mut gpui_k
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn sidebar_connection_menu_opens_the_visible_editor(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::Workspace;
+            view.model.connections.editor = None;
+            view.model.shell.sidebar_open = true;
+        });
+        window.render_frame(cx);
+        window.right_click("side-notes", cx);
+        window.render_frame(cx);
+        window.click("ctx-conn-edit", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Connections);
+        assert!(window.find("conn-form").visible());
+        assert_eq!(view.read(cx).model.connections.editor.as_ref().unwrap().id.as_deref(), Some("notes"));
+    }).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn newly_connected_navigation_is_dispatched_in_the_same_frame(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.connections.status.insert("notes".into(), crate::app::views::connections::LinkStatus::Connected);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).model.nav_requests.is_empty(), "连接成功后不能把目录任务留到下一次鼠标事件才派发");
+    }).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn dock_reopen_reuses_existing_window_and_retargets_actions_after_close(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-reopen-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    let weak = view.downgrade();
+    cx.update(|cx| crate::app::reopen_workbench(cx, |_| panic!("已有窗口不能再创建窗口")));
+    cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
+    drop(view);
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "全局菜单动作不能持有已关闭工作台及其结果集");
+    let new_view = cx.update(|cx| {
+        let mut opened = None;
+        crate::app::reopen_workbench(cx, |cx| {
+            let (_, view) = gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| super::view::Workbench::with_services(window, cx, services, false))
+            }).unwrap();
+            crate::app::install_workbench_actions(cx, &view);
+            opened = Some(view);
+        });
+        opened.expect("关闭最后窗口后应重新打开")
+    });
+    let new_window = cx.update(|cx| cx.windows()[0]);
+    cx.update_window(new_window, |_, window, cx| {
+        window.render_frame(cx);
+        window.dispatch_action(Box::new(crate::app::NewQuery), cx);
+    }).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let calls = new_view.read(cx).model.commands.iter().filter(|id| id.as_str() == "new-query").count();
+        assert_eq!(calls, 1, "Dock 重开后菜单只路由到新窗口一次");
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn sidebar_copy_and_test_remain_usable_while_catalog_is_loading(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    assert!(pump_until(cx, window, &view, |view, _| view.model.running_jobs == 0 && view.model.nav_loading == 0));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::Workspace;
+            view.model.connections.editor = None;
+            view.model.nav_loading = 1;
+        });
+        window.render_frame(cx);
+        window.right_click("side-notes", cx);
+        window.render_frame(cx);
+        window.click("ctx-conn-duplicate", cx);
+        window.render_frame(cx);
+        assert!(window.find("conn-form").visible());
+        let draft = view.read(cx).model.connections.editor.as_ref().unwrap();
+        assert!(draft.id.is_none());
+        assert!(draft.name.ends_with(" copy"));
+        view.update(cx, |view, _| view.model.shell.page = AppPage::Workspace);
+        window.render_frame(cx);
+        window.right_click("side-notes", cx);
+        window.render_frame(cx);
+        window.click("ctx-conn-test", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Connections);
+        assert!(window.find("conn-form").visible());
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.connections.message_key == Some("connections.editor.test.ok")));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+#[ignore = "requires scripts/verify-catalog-mysql.py on loopback port 33067"]
+fn mysql_lazy_navigation_latency_fixture(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::{database_node_id, group_node_id, NavKind};
+    use crate::catalog::model::ObjectKind;
+    use gpui_kit::SharedString;
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-mysql-ui-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let task = Arc::clone(&services);
+    let (tx, rx) = std::sync::mpsc::channel();
+    jobs::runtime().spawn(async move {
+        let mut draft = crate::connections::model::ConnectionDraft::blank(Engine::Mysql);
+        draft.id = Some("fixture".into());
+        draft.name = "Latency fixture".into();
+        draft.host = "127.0.0.1".into();
+        draft.port = "33067".into();
+        draft.username = "fixture".into();
+        draft.database = "shop".into();
+        draft.tls_mode = crate::connections::model::TlsMode::Off;
+        draft.save_password = false;
+        task.connections.save(draft, crate::connections::model::SecretInput::default()).await.unwrap();
+        let opened = task.connections.open("fixture", crate::connections::model::SecretInput { password: Some(crate::connections::model::Secret::new("fixture")), ..Default::default() }).await.unwrap();
+        assert!(opened.connected, "{:?}", opened.report);
+        tx.send(task.list_connections().await.unwrap()).unwrap();
+    });
+    let rows = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("fixture setup");
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.connections.rows = rows;
+            view.model.connections.status.insert("fixture".into(), crate::app::views::connections::LinkStatus::Connected);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).model.nav_requests.is_empty());
+    }).unwrap();
+    let database = database_node_id("fixture", "shop");
+    let group = group_node_id("fixture", "shop", "", ObjectKind::Table);
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav.node(&group).is_some() && view.model.nav_loading == 0));
+    cx.update(|cx| assert_eq!(view.read(cx).model.nav.nodes().filter(|node| node.kind == NavKind::Object).count(), 0));
+    cx.update_window(window, |_, window, cx| {
+        window.click(SharedString::from(format!("nav-chevron-{database}")), cx);
+        window.render_frame(cx);
+        window.click(SharedString::from(format!("nav-chevron-{group}")), cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav.node(&group).is_some_and(|node| !node.loading && node.loaded == 100)));
+    cx.update_window(window, |_, window, cx| {
+        window.click(SharedString::from(format!("nav-more-{group}")), cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav.node(&group).is_some_and(|node| !node.loading && node.loaded == 200)));
+    cx.update(|cx| assert!(view.read(cx).query_has_object("table_000199", cx), "查询索引应复用已加载页面"));
+    // 续读途中刷新多次：旧页取消，刷新合并为有限请求，最终只保留新一轮第一页。
+    cx.update_window(window, |_, window, cx| {
+        window.click(SharedString::from(format!("nav-more-{group}")), cx);
+        view.update(cx, |view, cx| { for _ in 0..20 { view.perform("refresh-tree", cx); } });
+        window.render_frame(cx);
+        assert!(view.read(cx).model.nav_loading <= 1, "重复刷新不能排队二十份扫描");
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav_loading == 0 && view.model.nav_requests.is_empty() && view.model.nav.node(&group).is_some_and(|node| !node.loading && !node.unloaded && node.loaded == 100)));
+    services.connections.disconnect("fixture");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn exchange_rows_are_lazy_cached_and_released_when_hidden(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-lazy-export-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.plant_exchange_sheet("notes|Notes|main||items|sqlite|local", vec!["body".into()], (0..10_000).map(|_| vec![Some("x".repeat(256))]).collect(), cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).exchange.read(cx).source().rows.is_empty(), "隐藏面板不应保留整表副本");
+        view.update(cx, |view, cx| view.perform("open-exchange", cx));
+        window.render_frame(cx);
+        let rows = &view.read(cx).exchange.read(cx).source().rows;
+        assert_eq!(rows.len(), 10_000);
+        let first = rows[0][0].as_ref().unwrap().as_ptr();
+        view.update(cx, |_, cx| cx.notify());
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).exchange.read(cx).source().rows[0][0].as_ref().unwrap().as_ptr(), first, "无数据变化的重绘不得复制整表");
+        view.update(cx, |view, cx| view.perform("open-exchange", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).exchange.read(cx).source().rows.is_empty());
+    }).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

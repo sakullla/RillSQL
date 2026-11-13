@@ -110,6 +110,11 @@ pub struct GridPane {
     focus_inside: bool,
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
     fetching: bool,
+    schema_cache: Option<(GridTarget, Option<Arc<crate::connections::SessionHealth>>, SchemaDto)>,
+    next_offset: u64,
+    counting: Option<u64>,
+    count_sequence: u64,
+    count_scope: Option<CountRequest>,
     /// 正在请求的翻页偏移。偏移在结果读回来之前不改，失败重试仍是同一页。
     pending_page: Option<u64>,
     /// 筛选条每一行的取值输入（值、上界/集合）；结构变化时整体重建。
@@ -248,6 +253,11 @@ impl GridPane {
             table_resync: false,
             focus_inside: false,
             fetching: false,
+            schema_cache: None,
+            next_offset: 0,
+            counting: None,
+            count_sequence: 0,
+            count_scope: None,
             pending_page: None,
             filter_inputs: Vec::new(),
             filter_subscriptions: Vec::new(),
@@ -327,6 +337,10 @@ impl GridPane {
         let preview_bytes = self.session.preview_bytes();
         let null_copy = self.session.null_copy().to_owned();
         self.fetching = false;
+        self.schema_cache = None;
+        self.next_offset = 0;
+        self.counting = None;
+        self.count_scope = None;
         self.pending_page = None;
         self.session = SharedGrid::new();
         self.session.locale = locale;
@@ -406,6 +420,12 @@ impl GridPane {
         body(&mut self.session)
     }
 
+    pub fn exchange_metadata(&self) -> (Option<TableRef>, Vec<String>, bool) { self.session.exchange_metadata() }
+
+    pub fn exchange_stamp(&self) -> (GridTarget, (u64, usize, u64, bool), bool) {
+        (self.session.target.clone(), self.session.exchange_stamp(), self.fetching)
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         self.session.exchange_sheet()
@@ -419,6 +439,8 @@ impl GridPane {
     /// 查询结果进网格。截断与完整行数由查询页给出：网格据此区分"已到末尾"与
     /// "这个结果不能由网格继续"，不会把被截断的结果说成已读完。
     pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
+        self.counting = None;
+        self.count_scope = None;
         self.session.target = target;
         self.session.locale = self.locale;
         // 新的结果集意味着旧的编辑目标不再存在，先结束编辑。
@@ -459,6 +481,7 @@ impl GridPane {
         // 外键跳转的目标先记下来，网格自己的状态更新完再交给外壳打开工作项。
         let mut navigation: Option<GridNavigation> = None;
         let copied = match id {
+            "grid-count" => { self.count_rows(cx); None }
             "edit-cell" => {
                 self.select_first_if_needed();
                 self.request_edit(false);
@@ -1650,6 +1673,16 @@ impl GridPane {
         if replace {
             self.fetching = true;
         }
+        let health = self.services.connections.cancel_transport(&request.table.connection_id).and_then(|transport| transport.health().cloned());
+        let paging = !replace || self.pending_page.is_some();
+        let cached_total = if paging { self.session.full_count() } else { None };
+        let cached = self.schema_cache.as_ref().filter(|(target, old_health, _)| {
+            paging && target == &self.session.target && matches!((old_health, &health), (Some(old), Some(current)) if Arc::ptr_eq(old, current))
+        }).map(|(_, _, schema)| schema.clone());
+        if !paging || self.count_scope.as_ref().is_some_and(|scope| scope != &count_of(&request)) {
+            self.counting = None;
+            self.count_scope = None;
+        }
         self.session.token = self.session.token.saturating_add(1);
         let token = self.session.token;
         self.scheduled = token;
@@ -1658,9 +1691,16 @@ impl GridPane {
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             runtime().spawn(async move {
-                let described = crate::application::grid::describe(&services.connections, &request.table).await;
-                let counted = crate::application::grid::count(&services.connections, &count_of(&request)).await;
-                let paged = crate::application::grid::page(&services.connections, &request).await;
+                let described = match cached {
+                    Some(schema) => Ok(schema),
+                    None => crate::application::grid::describe(&services.connections, &request.table).await,
+                };
+                let paged = match described.as_ref().map_err(Clone::clone).and_then(schema_from_dto) {
+                    Ok(schema) => crate::application::grid::page_described(&services.connections, &request, &schema).await,
+                    Err(error) => Err(error),
+                };
+                // 大表首屏和翻页不执行 COUNT(*)；用户可以按需统计。
+                let counted = cached_total.map(|matched| CountDto { matched }).ok_or_else(|| "count not requested".to_owned());
                 let _ = tx.send((described, paged, counted));
             });
             if let Ok((described, paged, counted)) = rx.await {
@@ -1675,8 +1715,13 @@ impl GridPane {
                             // 这次读取无论成败都已经结束：翻页请求不再挂着，失败时也不落新偏移。
                             let landed_page = this.pending_page.take().is_some();
                             // 结构或分页任一失败都算这次读取失败；计数失败只让完整行数未知。
+                            let counted = if paging {
+                                this.session.full_count().map(|matched| Ok(CountDto { matched })).unwrap_or(counted)
+                            } else { counted };
                             let read = described.and_then(|schema| paged.map(|page| (schema, page, counted)));
-                            this.apply_page_result(offset, replace, landed_page, read, cx);
+                            if this.apply_page_result(offset, replace, landed_page, read, cx) {
+                                if let Some((_, cached_health, _)) = this.schema_cache.as_mut() { *cached_health = health; }
+                            }
                         });
                     }
                 });
@@ -1694,7 +1739,7 @@ impl GridPane {
         landed_page: bool,
         read: Result<(SchemaDto, PageDto, Result<CountDto, String>), String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let stale = self.session.stale_target();
         let (schema_dto, page, counted) = match read {
             Ok(read) => read,
@@ -1702,19 +1747,28 @@ impl GridPane {
                 // 读取失败：旧页、条件、选择、滚动、暂存和偏移都不动。
                 self.keep_sheet_after_failure(failure, stale);
                 self.sync_table(cx);
-                return;
+                return false;
             }
         };
         let Ok(schema) = schema_from_dto(&schema_dto) else {
             self.keep_sheet_after_failure(i18n::text(self.locale, "grid.state.schemaUnknown"), stale);
             self.sync_table(cx);
-            return;
+            return false;
         };
         let columns = columns_from_schema(&schema, true);
         // 外键来自这次读取的真实结构；没有读到就清空，不沿用上一张表的键。
         self.session.set_foreign_keys(foreign_keys_of(&schema_dto));
-        let full = counted.ok().map(|item| item.matched);
         let truncated = page.truncated;
+        let end = offset.saturating_add(page.rows.len() as u64);
+        let full = if !truncated && (!page.rows.is_empty() || offset == 0) {
+            i64::try_from(end).ok()
+        } else {
+            counted.ok().map(|item| item.matched).filter(|count| u64::try_from(*count).is_ok_and(|count| {
+                if truncated { count > end } else { count <= end }
+            }))
+        };
+        self.next_offset = end;
+        self.schema_cache = Some((self.session.target.clone(), None, schema_dto.clone()));
         let rows = rows_from_page(&columns, &page);
         if replace {
             self.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
@@ -1723,12 +1777,14 @@ impl GridPane {
                 self.session.reset_page_view();
             }
         } else {
+            self.session.set_full_count(full);
             self.session.append_page(rows, full, truncated);
         }
         self.notice.clear();
         self.loading_more = false;
         self.fetching = false;
         self.sync_table(cx);
+        true
     }
 
     /// 读取失败后决定保留还是丢弃：同一目标的刷新/追加/排序/筛选/翻页失败保留上次有效内容；
@@ -1745,6 +1801,39 @@ impl GridPane {
         }
     }
 
+    fn count_rows(&mut self, cx: &mut Context<Self>) {
+        if self.fetching || self.counting.is_some() || self.session.mode != GridMode::Table { return; }
+        let request = match self.session.page_request() { Ok(request) => count_of(&request), Err(error) => { self.notice = error; return; } };
+        self.count_sequence = self.count_sequence.wrapping_add(1);
+        let token = self.count_sequence;
+        let scope = request.clone();
+        self.counting = Some(token);
+        self.count_scope = Some(scope.clone());
+        self.notice = i18n::text(self.locale, "grid.count.running");
+        let services = Arc::clone(&self.services);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime().spawn(async move { let _ = tx.send(crate::application::grid::count(&services.connections, &request).await); });
+        let owner = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(owner) = owner.upgrade() else { return };
+                owner.update(cx, |pane, cx| {
+                    let current = pane.session.page_request().ok().map(|request| count_of(&request));
+                    if pane.counting != Some(token) || current.as_ref() != Some(&scope) { return; }
+                    pane.counting = None;
+                    match result {
+                        Ok(Ok(count)) => { pane.session.set_full_count(Some(count.matched)); pane.notice.clear(); }
+                        Ok(Err(error)) => pane.notice = error,
+                        Err(_) => pane.notice = i18n::text(pane.locale, "grid.count.failed"),
+                    }
+                    pane.sync_table(cx);
+                    cx.notify();
+                });
+            });
+        }).detach();
+    }
+
     fn load_next_page(&mut self, cx: &mut Context<Self>) {
         if self.loading_more || self.fetching || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
             return;
@@ -1755,8 +1844,7 @@ impl GridPane {
         }
         self.loading_more = true;
         self.pending_page = None;
-        let offset = self.session.page_offset() + self.session.source_len() as u64;
-        self.fetch_at(offset, false, cx);
+        self.fetch_at(self.next_offset, false, cx);
     }
 
     fn schedule_locate(&mut self, token: u64, cx: &mut Context<Self>) {
@@ -2270,7 +2358,9 @@ impl GridPane {
             tools = tools
                 .child(kit::vline(p))
                 .child(grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone()))
-                .child(div().id("grid-range-label").px(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(range.clone()))
+                .child(div().id("grid-range-label").test_support().role(gpui_kit::Role::Button).cursor_pointer()
+                    .tooltip_text(t("grid.count.hint")).px(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(range.clone())
+                    .on_click({ let entity = entity.clone(); move |_, _, cx| { entity.update(cx, |pane, cx| { let _ = pane.command("grid-count", cx); }); } }))
                 .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()));
         }
         if !state_text.is_empty() {
@@ -4112,6 +4202,39 @@ mod pane_tests {
         });
         let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite 夹具");
         (dir, services)
+    }
+
+    #[gpui_kit::test]
+    fn large_view_loads_without_counting_and_counts_only_on_request(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services("on-demand-count", &["CREATE VIEW numbers AS WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 1000000) SELECT n FROM seq".to_owned()]);
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| pane.update(cx, |pane, cx| {
+            let mut target = target();
+            target.table = "numbers".into();
+            pane.open_table(target, 100, cx);
+        })).unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(pane.read(cx).loaded_len(), 100);
+            assert_eq!(pane.read(cx).full_count(), None, "首屏不能隐式扫描百万行计数");
+            window.render_frame(cx);
+            window.click("grid-range-label", cx);
+            assert!(pane.read(cx).counting.is_some(), "点击行数应启动统计：{}", pane.read(cx).notice);
+            pane.update(cx, |pane, cx| pane.load_next_page(cx));
+        }).unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| pane.read(cx).counting.is_none() && !pane.read(cx).loading_more) { break; }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).full_count(), Some(1000000), "{}", pane.read(cx).notice);
+            assert_eq!(pane.read(cx).loaded_len(), 200, "统计与翻页并行，但不把全表行加载到内存");
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 只读原因必须画在界面上：联接、聚合、多语句、括号和多表各显示各自那句，

@@ -423,7 +423,7 @@ fn query_commands_are_appended_without_dropping_catalog_or_grid() {
         assert!(history.contains(name), "{name}");
     }
     let grid = std::fs::read_to_string(root.join("src/app/views/grid/mod.rs")).unwrap();
-    for name in ["application::grid::describe(", "application::grid::page(", "application::grid::count(", "application::grid::commit("] {
+    for name in ["application::grid::describe(", "application::grid::page_described(", "application::grid::count(", "application::grid::commit("] {
         assert!(grid.contains(name), "{name}");
     }
     let compare = std::fs::read_to_string(root.join("src/app/views/compare/mod.rs")).unwrap();

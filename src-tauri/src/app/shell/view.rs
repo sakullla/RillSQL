@@ -31,6 +31,12 @@ use super::menus::NavKey;
 use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
 use crate::app::Shell;
 
+#[derive(PartialEq, Eq)]
+enum ExchangeStamp {
+    Query(Option<String>, bool, (Option<String>, u64, usize, bool, String)),
+    Table(Option<String>, bool, (GridTarget, (u64, usize, u64, bool), bool)),
+}
+
 pub struct Workbench {
     pub model: WorkbenchModel,
     foundation: Entity<Foundation>,
@@ -50,6 +56,7 @@ pub struct Workbench {
     /// 交换面板显式选择的来源；切换工作项后按新工作项重建。
     exchange_kind: ExchangeSourceKind,
     exchange_item: Option<String>,
+    exchange_stamp: Option<ExchangeStamp>,
     applied_diagram: Option<String>,
     applied_redis: Option<String>,
     applied_mongo: Option<String>,
@@ -59,6 +66,7 @@ pub struct Workbench {
     pub(super) nav_focus: FocusHandle,
     close_hooked: bool,
     booted: bool,
+    health_task: Option<gpui_kit::Task<()>>,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -69,6 +77,12 @@ pub struct Workbench {
     pub(super) palette_focused: bool,
     pub(super) pending_browser: Option<String>,
     connected_seen: std::collections::BTreeSet<String>,
+    nav_refresh_active: std::collections::BTreeSet<Option<String>>,
+    nav_refresh_again: std::collections::BTreeSet<Option<String>>,
+    nav_refresh_tasks: std::collections::HashMap<Option<String>, futures::future::AbortHandle>,
+    nav_revision: std::collections::HashMap<String, u64>,
+    nav_reads: std::collections::HashMap<String, (String, futures::future::AbortHandle)>,
+    nav_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     /// 定义查看器的只读编辑器（SQL 高亮），按读取编号填入文本。
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
     /// 对象树列表的滚动；跳转定义后把选中行滚进可见区。
@@ -79,6 +93,14 @@ pub struct Workbench {
     admin_link: Option<(String, bool)>,
     /// 历史预览的只读 SQL 编辑器，按条目 id 与原文重建。
     pub(super) history_editor: Option<(String, Entity<gpui_kit::component::input::EditorState>)>,
+    _child_subscriptions: Vec<gpui_kit::Subscription>,
+}
+
+impl Drop for Workbench {
+    fn drop(&mut self) {
+        for (_, handle) in self.nav_reads.values() { handle.abort(); }
+        for handle in self.nav_refresh_tasks.values() { handle.abort(); }
+    }
 }
 
 impl Workbench {
@@ -88,6 +110,7 @@ impl Workbench {
     }
 
     pub fn with_services(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
+        let metadata_gate = Arc::clone(&services.metadata_gate);
         let foundation = cx.new(|cx| Foundation::new(window, cx));
         let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
         let table = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
@@ -117,6 +140,16 @@ impl Workbench {
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
         let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
+        let child_subscriptions = vec![
+            cx.observe(&query, |_, _, cx| cx.notify()),
+            cx.observe(&table, |_, _, cx| cx.notify()),
+            cx.observe(&exchange, |_, _, cx| cx.notify()),
+            cx.observe(&structure, |_, _, cx| cx.notify()),
+            cx.observe(&compare, |_, _, cx| cx.notify()),
+            cx.observe(&diagram, |_, _, cx| cx.notify()),
+            cx.observe(&redis, |_, _, cx| cx.notify()),
+            cx.observe(&mongo, |_, _, cx| cx.notify()),
+        ];
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -141,6 +174,7 @@ impl Workbench {
             table_view_spec: None,
             exchange_kind: ExchangeSourceKind::Table,
             exchange_item: None,
+            exchange_stamp: None,
             applied_diagram: None,
             applied_redis: None,
             applied_mongo: None,
@@ -149,6 +183,7 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             close_hooked: false,
             booted: false,
+            health_task: None,
             boot,
             sized: false,
             last_state: String::new(),
@@ -159,12 +194,19 @@ impl Workbench {
             palette_focused: false,
             pending_browser: None,
             connected_seen: std::collections::BTreeSet::new(),
+            nav_refresh_active: std::collections::BTreeSet::new(),
+            nav_refresh_again: std::collections::BTreeSet::new(),
+            nav_refresh_tasks: std::collections::HashMap::new(),
+            nav_revision: std::collections::HashMap::new(),
+            nav_reads: std::collections::HashMap::new(),
+            nav_gate: metadata_gate,
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
             restore_pending: false,
             seen_page: AppPage::Workspace,
             admin_link: None,
             history_editor: None,
+            _child_subscriptions: child_subscriptions,
         }
     }
 
@@ -173,10 +215,12 @@ impl Workbench {
     }
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.refresh_exchange(cx);
+        self.refresh_exchange_data(cx, self.model.exchange_open || id == "exchange-export-loaded");
         if id == "refresh-tree" {
             // 目录树与查询页的对象索引各自刷新；树保留展开、焦点与已读子节点。
             self.model.request_nav_refresh(None);
+            cx.notify();
+            return;
         }
         if id.starts_with("nav-insert-")
             || matches!(
@@ -260,7 +304,7 @@ impl Workbench {
                 };
                 self.exchange_item = self.model.active_tab.clone();
             }
-            let source = self.exchange_source(cx);
+            let source = self.exchange_source(cx, true);
             self.exchange.update(cx, |pane, cx| {
                 pane.set_locale(locale);
                 pane.open = open;
@@ -929,24 +973,31 @@ impl Workbench {
     /// 库/模式“刷新此节点”：从第一页重读这个范围。加载态已由模型标好。
     fn spawn_nav_reload(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        let (abort, cancelled) = self.track_nav_read(&node);
+        let revision = self.nav_revision.get(&node.connection_id).copied();
+        let connection_id = node.connection_id.clone();
+        let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        jobs::runtime().spawn(async move {
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
             let Some(session) = services.connections.catalog_session(&node.connection_id) else {
                 let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned()), Vec::new()));
                 return;
             };
-            let body = crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page).await;
+            let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page)).await
+                .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
             // 按种类的失败一并带回：失败的种类不能当成“整类都被删了”。
             let _ = tx.send((body.objects, body.total, body.error, body.kind_reports));
-        });
+        }, abort));
         cx.spawn(async move |_, cx| {
             let result = rx.await;
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    this.nav_reads.remove(&node_id);
                     match result {
                         Ok((objects, total, error, kind_reports)) => {
                             this.model.nav.reload_scope(&node_id, &objects, total, error, &kind_reports);
@@ -955,6 +1006,7 @@ impl Workbench {
                             this.model.nav.reload_scope(&node_id, &[], 0, Some("刷新对象失败".to_owned()), &[]);
                         }
                     }
+                    this.sync_navigation_index(cx);
                     cx.notify();
                 });
             });
@@ -1067,54 +1119,159 @@ impl Workbench {
         }
     }
 
+    fn track_nav_read(&mut self, node: &crate::catalog::hierarchy::NavNode) -> (futures::future::AbortRegistration, futures::future::AbortHandle) {
+        let (handle, registration) = futures::future::AbortHandle::new_pair();
+        let cancelled = handle.clone();
+        if let Some((_, old)) = self.nav_reads.insert(node.id.clone(), (node.connection_id.clone(), handle)) { old.abort(); }
+        (registration, cancelled)
+    }
+
+    fn finish_nav_refresh(&mut self, scope: &Option<String>) {
+        self.nav_refresh_active.remove(scope);
+        self.nav_refresh_tasks.remove(scope);
+        if self.nav_refresh_active.contains(&None) { return; }
+        if self.nav_refresh_again.contains(&None) {
+            self.nav_refresh_again.clear();
+            self.model.request_nav_refresh(None);
+        } else {
+            let queued: Vec<_> = self.nav_refresh_again.iter().filter(|scope| !self.nav_refresh_active.contains(*scope)).cloned().collect();
+            for next in queued {
+                self.nav_refresh_again.remove(&next);
+                self.model.request_nav_refresh(next);
+            }
+        }
+    }
+
     fn spawn_nav_refresh(&mut self, connection: Option<String>, cx: &mut Context<Self>) {
+        if self.nav_refresh_active.contains(&None) || !self.nav_refresh_active.insert(connection.clone()) {
+            self.nav_refresh_again.insert(connection);
+            self.model.nav_loading = self.model.nav_loading.saturating_sub(1);
+            return;
+        }
+        self.nav_reads.retain(|_, (id, handle)| {
+            if connection.as_ref().is_none_or(|scope| scope == id) { handle.abort(); false } else { true }
+        });
+        let ids: std::collections::BTreeSet<String> = match &connection {
+            Some(id) => std::iter::once(id.clone()).collect(),
+            None => self.model.connections.rows.iter().map(|row| row.saved.id.clone())
+                .chain(self.model.nav_source.iter().map(|connection| connection.id.clone()))
+                .chain(self.nav_revision.keys().cloned()).collect(),
+        };
+        for id in ids { *self.nav_revision.entry(id).or_default() += 1; }
+        self.query.update(cx, |pane, _| pane.invalidate_metadata());
+        let revisions = self.nav_revision.clone();
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
         let view = cx.entity().downgrade();
         let partial = connection.is_some();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        jobs::runtime().spawn(async move {
-            let result = crate::catalog::read_navigation(&services.connections, page, connection.as_deref()).await;
-            let _ = tx.send(result);
-        });
+        let scope = connection.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (handle, abort) = futures::future::AbortHandle::new_pair();
+        self.nav_refresh_tasks.insert(scope.clone(), handle);
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
+            crate::catalog::nav_read::stream_navigation(&services.connections, page, connection.as_deref(), Arc::clone(&services.metadata_gate), tx).await;
+        }, abort));
         cx.spawn(async move |_, cx| {
-            let result = rx.await;
-            cx.update(|cx| {
-                let Some(view) = view.upgrade() else { return };
-                view.update(cx, |this, cx| {
-                    match result {
-                        Ok(Ok(connections)) => {
-                            this.model.apply_navigation(&connections, partial);
+            let mut finished = false;
+            while let Some(event) = rx.recv().await {
+                let mut alive = false;
+                cx.update(|cx| {
+                    let Some(view) = view.upgrade() else { return };
+                    alive = true;
+                    view.update(cx, |this, cx| {
+                        use crate::catalog::nav_read::NavigationEvent;
+                        let pending = this.model.nav_loading;
+                        match event {
+                            NavigationEvent::Started(mut roots) => {
+                                roots.retain(|root| this.nav_revision.get(&root.id) == revisions.get(&root.id));
+                                for root in &mut roots {
+                                    if let Some(old) = this.model.nav_source.iter().find(|old| old.id == root.id) {
+                                        root.databases = old.databases.clone();
+                                    }
+                                }
+                                this.model.apply_navigation(&roots, partial);
+                                this.model.nav_loading = pending;
+                            }
+                            NavigationEvent::Connection(mut connection) => {
+                                if this.nav_revision.get(&connection.id) != revisions.get(&connection.id) { return; }
+                                if connection.error.is_some() && connection.databases.is_empty() {
+                                    if let Some(old) = this.model.nav_source.iter().find(|old| old.id == connection.id) {
+                                        connection.databases = old.databases.clone();
+                                    }
+                                }
+                                this.model.apply_navigation(&[connection], true);
+                                this.model.nav_loading = pending;
+                                let expanded: Vec<_> = this.model.nav_rows().into_iter()
+                                    .filter(|row| row.expanded).map(|row| row.id).collect();
+                                for id in expanded { this.model.request_lazy_group(&id); }
+                                this.sync_navigation_index(cx);
+                            }
+                            NavigationEvent::Finished(_ids) => {
+                                this.model.nav_loading = pending.saturating_sub(1);
+                                this.finish_nav_refresh(&scope);
+                                finished = true;
+                                this.sync_navigation_index(cx);
+                            }
+                            NavigationEvent::Failed(message) => {
+                                this.model.nav_failed(message);
+                                this.finish_nav_refresh(&scope);
+                                finished = true;
+                            }
                         }
-                        // 读取失败保留上一份树，只说明原因；不清空已读对象。
-                        Ok(Err(message)) => this.model.nav_failed(message),
-                        Err(_) => this.model.nav_failed("读取对象目录失败"),
-                    }
-                    cx.notify();
+                        cx.notify();
+                    });
                 });
-            });
-        })
-        .detach();
+                if !alive { break; }
+            }
+            if !finished {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            this.finish_nav_refresh(&scope);
+                            this.model.nav_failed("读取对象目录失败");
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        }).detach();
+    }
+
+    fn sync_navigation_index(&mut self, cx: &mut Context<Self>) {
+        let objects = self.model.nav.nodes().filter(|node| node.kind == crate::catalog::hierarchy::NavKind::Object && !node.stale)
+            .map(|node| crate::query::assist::TreeObject {
+                connection_id: node.connection_id.clone(), connection_name: node.connection_name.clone(),
+                engine: node.engine.as_str().to_owned(), database: node.database.clone(), schema: node.schema.clone(),
+                name: node.name.clone(), kind: crate::catalog::model::kind_name(node.object_kind.unwrap_or(crate::catalog::model::ObjectKind::Table)).to_owned(),
+            }).collect();
+        self.query.update(cx, |pane, cx| pane.adopt_navigation(&self.model.nav_source, objects, cx));
     }
 
     fn spawn_nav_details(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        let (abort, cancelled) = self.track_nav_read(&node);
+        let revision = self.nav_revision.get(&node.connection_id).copied();
+        let connection_id = node.connection_id.clone();
+        let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        jobs::runtime().spawn(async move {
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
             let Some(session) = services.connections.catalog_session(&node.connection_id) else {
                 let _ = tx.send((Err("这条连接还没有打开".to_owned()), Err("这条连接还没有打开".to_owned())));
                 return;
             };
-            let result = crate::catalog::read_object_details(&session, node.engine, &node.database, &node.schema, &node.name).await;
+            let result = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_details(&session, node.engine, &node.database, &node.schema, &node.name)).await
+                .unwrap_or_else(|error| (Err(error.clone()), Err(error)));
             let _ = tx.send(result);
-        });
+        }, abort));
         cx.spawn(async move |_, cx| {
             let result = rx.await;
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    this.nav_reads.remove(&node_id);
                     let (columns, indexes) = match result {
                         Ok(pair) => pair,
                         Err(_) => (Err("读取列表失败".to_owned()), Err("读取列表失败".to_owned())),
@@ -1133,27 +1290,38 @@ impl Workbench {
 
     fn spawn_nav_more(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        if node.paged && node.kind == crate::catalog::hierarchy::NavKind::Group {
+            self.spawn_nav_kind(node_id, if node.unloaded { 0 } else { node.loaded }, cx);
+            return;
+        }
         // 排队的 More 请求已经由模型标好加载态（并且在那里去重）；这里再按 loading
         // 提前返回会让“读取更多”永远不发请求、加载态也永远不落。
         self.model.nav.begin_scope(&node_id);
+        let (abort, cancelled) = self.track_nav_read(&node);
+        let revision = self.nav_revision.get(&node.connection_id).copied();
+        let connection_id = node.connection_id.clone();
+        let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
         let offset = node.loaded;
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        jobs::runtime().spawn(async move {
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
             let Some(session) = services.connections.catalog_session(&node.connection_id) else {
                 let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned())));
                 return;
             };
-            let body = crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, offset, page).await;
+            let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, offset, page)).await
+                .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
             let _ = tx.send((body.objects, body.total, body.error));
-        });
+        }, abort));
         cx.spawn(async move |_, cx| {
             let result = rx.await;
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    this.nav_reads.remove(&node_id);
                     match result {
                         Ok((objects, total, error)) => {
                             this.model.nav.append_objects(&node_id, &objects, total, error);
@@ -1162,6 +1330,7 @@ impl Workbench {
                             this.model.nav.set_error(&node_id, "读取更多对象失败");
                         }
                     }
+                    this.sync_navigation_index(cx);
                     cx.notify();
                 });
             });
@@ -1173,45 +1342,50 @@ impl Workbench {
     /// 排队的 Group 请求已经由模型标好加载态，这里不能再按 loading 提前返回，
     /// 否则排队的重试永远不发读取请求、加载态也永远不落。
     fn spawn_nav_group(&mut self, group_id: String, cx: &mut Context<Self>) {
+        self.spawn_nav_kind(group_id, 0, cx);
+    }
+
+    fn spawn_nav_kind(&mut self, group_id: String, offset: usize, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&group_id).cloned() else { return };
         let Some(kind) = node.object_kind else { return };
         self.model.nav.begin_group(&group_id);
+        let (abort, cancelled) = self.track_nav_read(&node);
+        let revision = self.nav_revision.get(&node.connection_id).copied();
+        let connection_id = node.connection_id.clone();
         let services = Arc::clone(&self.services);
+        let gate = Arc::clone(&self.nav_gate);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        jobs::runtime().spawn(async move {
-            let body = match services.connections.catalog_session(&node.connection_id) {
-                Some(session) => {
-                    crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, 0, page).await
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
+            let result = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, async {
+                match services.connections.catalog_session(&node.connection_id) {
+                    Some(session) => crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, offset, page).await,
+                    None => crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some("这条连接还没有打开".to_owned()), kind_reports: Vec::new() },
                 }
-                None => crate::catalog::read::ObjectPageBody {
-                    objects: Vec::new(),
-                    total: 0,
-                    error: Some("这条连接还没有打开".to_owned()),
-                    kind_reports: Vec::new(),
-                },
-            };
-            let _ = tx.send(body);
-        });
+            }).await;
+            let _ = tx.send(result);
+        }, abort));
         cx.spawn(async move |_, cx| {
             let result = rx.await;
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    this.nav_reads.remove(&group_id);
                     match result {
-                        Ok(body) => {
-                            this.model.nav.set_kind_page(&group_id, &body.objects, body.total, body.error);
+                        Ok(Ok(body)) => {
+                            if node.paged { this.model.nav.set_kind_slice(&group_id, &body.objects, body.total, offset, body.error); }
+                            else { this.model.nav.set_kind_page(&group_id, &body.objects, body.total, body.error); }
                         }
-                        Err(_) => {
-                            this.model.nav.set_kind_page(&group_id, &[], 0, Some("读取这一类对象失败".to_owned()));
-                        }
+                        Ok(Err(error)) => { this.model.nav.set_error(&group_id, error); }
+                        Err(_) => { this.model.nav.set_error(&group_id, "读取这一类对象失败"); }
                     }
+                    this.sync_navigation_index(cx);
                     cx.notify();
                 });
             });
-        })
-        .detach();
+        }).detach();
     }
 
     fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
@@ -1230,14 +1404,62 @@ impl Workbench {
             }
             let browse = self.pending_browser.take_if(|id| connected.contains(id));
             self.connected_seen = connected;
-            self.forward_query("refresh-tree", cx);
             self.model.request_nav_refresh(None);
+            self.pump_nav(cx);
             if let Some(id) = browse {
                 if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(super::chrome::browser_command) {
                     self.perform(&command, cx);
                 }
             }
         }
+    }
+
+    fn monitor_connections(&mut self, cx: &mut Context<Self>) {
+        if !self.boot || self.health_task.is_some() { return; }
+        let services = Arc::clone(&self.services);
+        let owner = cx.entity().downgrade();
+        self.health_task = Some(cx.spawn(async move |_, cx| {
+            let mut first = true;
+            loop {
+                let service = Arc::clone(&services.connections);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                jobs::runtime().spawn(async move {
+                    if !first { tokio::time::sleep(std::time::Duration::from_secs(5)).await; }
+                    if tx.is_closed() { return; }
+                    let _ = tx.send(service.session_statuses().await);
+                });
+                first = false;
+                let Ok(statuses) = rx.await else { break };
+                let mut alive = false;
+                cx.update(|cx| {
+                    let Some(owner) = owner.upgrade() else { return };
+                    alive = true;
+                    owner.update(cx, |view, cx| {
+                        use crate::app::views::connections::LinkStatus;
+                        let mut changed = false;
+                        for status in statuses {
+                            let Some(current) = view.services.connections.session_condition(&status.id) else { continue };
+                            let next = match current {
+                                crate::connections::SessionCondition::Connected => LinkStatus::Connected,
+                                crate::connections::SessionCondition::Lost { .. } if status.status == "reconnecting" => LinkStatus::Connecting,
+                                crate::connections::SessionCondition::Lost { .. } => LinkStatus::Failed,
+                            };
+                            if next == LinkStatus::Failed && view.model.running_jobs > 0 && view.model.connections.status.get(&status.id) == Some(&LinkStatus::Connecting) { continue; }
+                            if view.model.connections.status.get(&status.id) != Some(&next) {
+                                view.model.connections.status.insert(status.id.clone(), next);
+                                changed = true;
+                                if next == LinkStatus::Failed && view.model.connections.selected.as_deref() == Some(status.id.as_str()) {
+                                    view.model.notice_key = Some("connections.status.error");
+                                    view.model.notice_detail = status.reason.unwrap_or_default();
+                                }
+                            }
+                        }
+                        if changed { cx.notify(); }
+                    });
+                });
+                if !alive { break; }
+            }
+        }));
     }
 
     fn hook_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1572,12 +1794,21 @@ impl Workbench {
     }
 
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
+        self.refresh_exchange_data(cx, self.model.exchange_open);
+    }
+
+    fn refresh_exchange_data(&mut self, cx: &mut Context<Self>, include_rows: bool) {
         self.sync_exchange_selection();
-        let source = self.exchange_source(cx);
-        self.exchange.update(cx, |pane, cx| {
-            pane.bind_source(source);
-            pane.ensure_mapping(cx);
-        });
+        let stamp = match self.exchange_kind {
+            ExchangeSourceKind::Query => ExchangeStamp::Query(self.exchange_item.clone(), include_rows, self.query.read(cx).exchange_stamp()),
+            ExchangeSourceKind::Table => ExchangeStamp::Table(self.exchange_item.clone(), include_rows, self.table.read(cx).exchange_stamp()),
+        };
+        if self.exchange_stamp.as_ref() != Some(&stamp) {
+            let source = self.exchange_source(cx, include_rows);
+            self.exchange.update(cx, |pane, _| pane.bind_source(source));
+            self.exchange_stamp = Some(stamp);
+        }
+        if self.model.exchange_open { self.exchange.update(cx, |pane, cx| pane.ensure_mapping(cx)); }
         self.model.exchange_running = self.exchange.read(cx).running();
     }
 
@@ -1605,18 +1836,18 @@ impl Workbench {
 
     /// 来源只取所选工作项的数据：查询来自 QueryPane 的当前语句结果，表来自共享网格。
     /// 不再用 shell 的 table_spec 兜底，查询页不会拿到上一张表的目标。
-    fn exchange_source(&self, cx: &App) -> ExchangeSource {
+    fn exchange_source(&self, cx: &App, include_rows: bool) -> ExchangeSource {
         match self.exchange_kind {
             ExchangeSourceKind::Query => {
                 let pane = self.query.read(cx);
-                let (columns, rows, _) = pane.exchange_result();
+                let (columns, rows) = if include_rows { let (columns, rows, _) = pane.exchange_result(); (columns, rows) } else { (pane.exchange_columns(), Vec::new()) };
                 ExchangeSource {
                     kind: ExchangeSourceKind::Query,
                     item: self.exchange_item.clone(),
                     table: None,
                     columns,
                     rows,
-                    truncated: false,
+                    truncated: pane.exchange_truncated(),
                     running: pane.busy(),
                     label: "查询结果".to_owned(),
                     context: pane.exchange_context(),
@@ -1625,7 +1856,7 @@ impl Workbench {
                 }
             }
             ExchangeSourceKind::Table => {
-                let (table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
+                let (table, columns, truncated) = self.table.read(cx).exchange_metadata();
                 let running = self.table.read(cx).fetching();
                 let preview_bytes = self.table.read(cx).sheet_preview_bytes();
                 // 只有当前工作项的目标与网格实际表一致时才能把网格当来源；
@@ -1653,6 +1884,7 @@ impl Workbench {
                         preview_bytes: None,
                     };
                 }
+                let rows = if include_rows { self.table.read(cx).exchange_sheet().2 } else { Vec::new() };
                 let label = table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
                 let context = table
                     .as_ref()
@@ -1801,6 +2033,7 @@ impl Render for Workbench {
         self.hook_close(window, cx);
         self.measure(window);
         self.boot_state(cx);
+        self.monitor_connections(cx);
         self.pump_jobs(cx);
         self.pump_nav(cx);
         self.pump_danger(cx);

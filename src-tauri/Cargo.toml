@@ -1,6 +1,6 @@
 [package]
 name = "rillsql"
-version = "0.2.25"
+version = "0.2.26"
 description = "RillSQL"
 authors = ["RillSQL"]
 edition = "2021"
@@ -34,7 +34,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 uuid = { version = "1.28.0", features = ["serde", "v4"] }
 csv = "1.4.0"
 calamine = "=0.38.0"
-rust_xlsxwriter = "=0.102.0"
+rust_xlsxwriter = { version = "=0.102.0", features = ["constant_memory"] }
 tracing = "0.1.44"
 async-trait = "0.1.92"
 futures = "0.3.34"

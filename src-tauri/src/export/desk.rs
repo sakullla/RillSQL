@@ -187,6 +187,7 @@ pub fn mapping_for(schema_fields: &[TableField], preview: &ParsedTable) -> BTree
     suggest_mapping(schema_fields, &preview.columns)
 }
 
+#[cfg(test)]
 pub fn export_loaded(spec: &LoadedExport) -> TaskView {
     spec.write()
 }

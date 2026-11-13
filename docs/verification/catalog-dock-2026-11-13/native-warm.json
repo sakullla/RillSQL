@@ -1,0 +1,75 @@
+{
+  "accessibility": false,
+  "active": true,
+  "finishedLaunching": true,
+  "pid": 89736,
+  "policy": 0,
+  "windows": [
+    {
+      "bounds": {
+        "Height": 33,
+        "Width": 1470,
+        "X": 0,
+        "Y": 0
+      },
+      "id": 1203,
+      "layer": 0,
+      "onscreen": false
+    },
+    {
+      "bounds": {
+        "Height": 820,
+        "Width": 1280,
+        "X": 0,
+        "Y": 33
+      },
+      "id": 1206,
+      "layer": 0,
+      "onscreen": true
+    },
+    {
+      "bounds": {
+        "Height": 33,
+        "Width": 1470,
+        "X": 0,
+        "Y": 0
+      },
+      "id": 1205,
+      "layer": 0,
+      "onscreen": false
+    },
+    {
+      "bounds": {
+        "Height": 33,
+        "Width": 1470,
+        "X": 0,
+        "Y": 0
+      },
+      "id": 1204,
+      "layer": 0,
+      "onscreen": false
+    },
+    {
+      "bounds": {
+        "Height": 33,
+        "Width": 1470,
+        "X": 0,
+        "Y": 0
+      },
+      "id": 1202,
+      "layer": 0,
+      "onscreen": false
+    },
+    {
+      "bounds": {
+        "Height": 500,
+        "Width": 500,
+        "X": 0,
+        "Y": 456
+      },
+      "id": 1207,
+      "layer": 0,
+      "onscreen": false
+    }
+  ]
+}

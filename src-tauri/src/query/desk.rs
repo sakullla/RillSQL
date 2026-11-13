@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::application::tasks::{TaskBoard, TaskOutcome, TaskToken};
 use crate::i18n::Locale;
-use crate::catalog::{read_catalog_session, ConnectionBody, ObjectKind};
+use crate::catalog::{ConnectionBody, ObjectKind};
 use crate::connections::model::Engine;
 use crate::connections::{CatalogSession, Service};
 
@@ -1291,9 +1291,19 @@ impl Desk {
         self.remember_table_columns(connection_id, database, "", table, columns.into_iter().map(ColumnMeta::named).collect());
     }
 
+    pub fn remember_table_comment(&mut self, connection: &str, database: &str, schema: &str, table: &str, comment: Option<String>) {
+        let key = column_key(connection, database, schema, table);
+        if let Some(comment) = comment { self.comments.insert(key, comment); } else { self.comments.remove(&key); }
+    }
+
     /// 对象注释随目录一起替换；键与列相同（连接/库/模式/表）。
     pub fn set_object_comments(&mut self, comments: HashMap<String, String>) {
         self.comments = comments;
+    }
+
+    pub fn remember_table_keys(&mut self, connection: &str, database: &str, schema: &str, table: &str, keys: Vec<super::meta::TableKey>) {
+        self.foreign_keys.retain(|key| !(key.connection_id == connection && key.database == database && key.from_schema == schema && key.from_table == table));
+        collect_keys(&mut self.foreign_keys, connection, database, schema, table, keys);
     }
 
     /// 真实外键随目录一起替换；空集表示还没读到或引擎没有外键。
@@ -1691,7 +1701,7 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
         }
         if engine != "sqlite" {
             if let Ok(parsed) = Engine::parse(&engine) {
-                let body = read_catalog_session(parsed, &session, page, &[]).await;
+                let body = crate::catalog::nav_read::metadata_read(crate::catalog::read::read_catalog_outline(parsed, &session)).await?;
                 let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
                 // 目录只给对象名；列和外键按对象按需再读，单个对象失败只记原因，不清空兄弟节点。
                 for object in &listing.objects {

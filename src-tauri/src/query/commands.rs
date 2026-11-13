@@ -315,9 +315,14 @@ impl RowSink for SlotSink {
             let mut snap = self.slot.snapshot.lock().expect("snapshot");
             if let Some(statement) = snap.statements.get_mut(index) {
                 statement.status = "running".to_owned();
-                statement.columns = value.columns.clone();
-                statement.column_types = value.column_types.clone();
-                statement.rows = value.rows.clone();
+                // 同一语句的中间快照是累积行；已经发布的前缀保持原存储。
+                if statement.columns == value.columns && statement.rows.len() <= value.rows.len() {
+                    statement.rows.extend(value.rows[statement.rows.len()..].iter().cloned());
+                } else {
+                    statement.rows = value.rows.clone();
+                }
+                statement.columns.clone_from(&value.columns);
+                statement.column_types.clone_from(&value.column_types);
                 statement.truncated = value.truncated;
                 statement.affected = value.affected;
             }
@@ -508,6 +513,29 @@ mod resource_tests {
             }],
             started_at: String::new(), elapsed_ms: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn cumulative_publication_keeps_the_existing_row_allocations() {
+        let state = QueryState::new(PathBuf::new());
+        let mut run = snapshot("stream", "running");
+        run.statements[0].rows.clear();
+        let reservation = reserve_run(&state, run, Arc::new(AtomicBool::new(false))).unwrap();
+        let sink = SlotSink { slot: Arc::clone(&reservation.slot) };
+        let mut value = StatementValue { columns: vec!["value".into()], column_types: vec!["text".into()], rows: vec![vec![Some("payload".repeat(1000))]], truncated: false, affected: None };
+        sink.publish(0, &value).await;
+        let before = reservation.slot.snapshot.lock().unwrap().statements[0].rows[0][0].as_ref().unwrap().as_ptr();
+        value.rows.push(vec![Some("next".into())]);
+        sink.publish(0, &value).await;
+        {
+            let snap = reservation.slot.snapshot.lock().unwrap();
+            assert_eq!(snap.statements[0].rows, value.rows);
+            assert_eq!(before, snap.statements[0].rows[0][0].as_ref().unwrap().as_ptr(), "已发布的正文不应再次复制");
+        }
+        value.columns = vec!["changed".into()];
+        value.rows = vec![vec![Some("replacement".into())]];
+        sink.publish(0, &value).await;
+        assert_eq!(reservation.slot.snapshot.lock().unwrap().statements[0].rows, value.rows);
     }
 
     #[test]

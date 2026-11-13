@@ -199,17 +199,25 @@ pub async fn query_page_search_preview(
     preview_bytes: usize,
 ) -> Result<LivePage, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
+    query_page_with_schema(session, &schema, filters, sort, search, offset, limit, preview_bytes).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn query_page_with_schema(
+    session: &CatalogSession, schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>,
+    search: Option<&str>, offset: u64, limit: u64, preview_bytes: usize,
+) -> Result<LivePage, String> {
     let limit = limit.min(MAX_PAGE);
     if let Some(sort) = sort {
         if !schema.columns.iter().any(|column| column.name == sort.column) {
             return Err(format!("未知排序列 {}", sort.column));
         }
     }
-    let display = page_sql(&schema, filters, search, sort, limit, offset, preview_bytes)?;
+    let display = page_sql(schema, filters, search, sort, limit, offset, preview_bytes)?;
     if limit == 0 {
         return Ok(LivePage { rows: Vec::new(), truncated: false, sql: display });
     }
-    let executed = page_sql(&schema, filters, search, sort, limit.saturating_add(1), offset, preview_bytes)?;
+    let executed = page_sql(schema, filters, search, sort, limit.saturating_add(1), offset, preview_bytes)?;
     let width = schema.columns.len();
     let mut fetched = fetch_cells(session, &executed, width).await?;
     let truncated = fetched.len() as u64 > limit;
@@ -219,7 +227,7 @@ pub async fn query_page_search_preview(
     let rows = fetched
         .into_iter()
         .enumerate()
-        .map(|(index, cells)| live_row(&schema, cells, offset, index))
+        .map(|(index, cells)| live_row(schema, cells, offset, index))
         .collect();
     Ok(LivePage { rows, truncated, sql: display })
 }

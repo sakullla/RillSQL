@@ -16,7 +16,7 @@ use crate::ui::kit::{self, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::export::{
-    commit_import_guarded, export_full, export_loaded, open_import, prefer_cancel, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview, LoadedExport, Phase, TaskLog,
+    commit_import_guarded, export_full, open_import, prefer_cancel, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview, LoadedExport, Phase, TaskLog,
     TaskView,
 };
 use crate::grid::commands::{ExportRequest, TableRef};
@@ -100,12 +100,19 @@ pub struct ExchangePane {
     /// 已读取行的导出上限；None 表示整个已读取范围。
     row_limit: Option<usize>,
     export_request: Option<ExportRequest>,
-    loaded: Option<crate::export::LoadedExport>,
+    loaded: Option<Arc<crate::export::LoadedExport>>,
+    loaded_control: Option<(String, Arc<crate::export::ExportControl>)>,
     dump_request: Option<DumpRequest>,
     migrate_request: Option<MigrateRequest>,
     pub notice: String,
     /// 来源切换由外壳决定工作项与来源，面板只把请求交回 Workbench。
     owner: Option<gpui_kit::WeakEntity<crate::app::shell::Workbench>>,
+}
+
+impl Drop for ExchangePane {
+    fn drop(&mut self) {
+        if let Some((_, control)) = &self.loaded_control { control.cancel(); }
+    }
 }
 
 impl ExchangePane {
@@ -142,6 +149,7 @@ impl ExchangePane {
             row_limit: None,
             export_request: None,
             loaded: None,
+            loaded_control: None,
             dump_request: None,
             migrate_request: None,
             notice: String::new(),
@@ -170,7 +178,7 @@ impl ExchangePane {
     }
 
     pub fn stage_loaded(&mut self, loaded: crate::export::LoadedExport) {
-        self.loaded = Some(loaded);
+        self.loaded = Some(Arc::new(loaded));
     }
 
     pub fn stage_dump(&mut self, request: DumpRequest) {
@@ -252,12 +260,8 @@ impl ExchangePane {
 
     /// 已读取行的导出范围。上限小于当前行数时标记为截断，任务和文件都只写这段。
     fn rows_for_export(&self) -> (Vec<Vec<Option<String>>>, bool) {
-        let mut rows = self.source.rows.clone();
-        let limited = self.row_limit.is_some_and(|limit| limit < rows.len());
-        if let Some(limit) = self.row_limit {
-            rows.truncate(limit);
-        }
-        (rows, limited)
+        let limit = self.row_limit.unwrap_or(self.source.rows.len()).min(self.source.rows.len());
+        (self.source.rows[..limit].to_vec(), limit < self.source.rows.len())
     }
 
     pub fn preview_file(&mut self, path: PathBuf, entry: ImportEntry, cx: &mut Context<Self>) {
@@ -493,11 +497,10 @@ impl ExchangePane {
             self.block(id, owner, i18n::text(self.locale, "ui.exchange.sourceRunning"));
             return;
         }
-        if let Some(loaded) = self.loaded.clone() {
-            if matches!(kind, SaveKind::Loaded) {
-                let task = export_loaded(&loaded);
-                self.notice = task.detail.clone();
-                self.log.push(task);
+        if matches!(kind, SaveKind::Loaded) {
+            if self.loaded_control.is_some() { self.notice = i18n::text(self.locale, "export.task.running"); return; }
+            if let Some(loaded) = self.loaded.take() {
+                self.launch_loaded(loaded, cx);
                 return;
             }
         }
@@ -560,21 +563,22 @@ impl ExchangePane {
             }
         };
         match kind {
-            SaveKind::Loaded => self.start_loaded(path),
+            SaveKind::Loaded => { if let Some(spec) = self.prepare_loaded(path) { self.launch_loaded(Arc::new(spec), cx); } },
             SaveKind::Full => self.start_full(path, cx),
             SaveKind::Dump => self.start_dump(path, cx),
         }
         cx.notify();
     }
 
-    fn start_loaded(&mut self, path: PathBuf) {
+    fn prepare_loaded(&mut self, path: PathBuf) -> Option<LoadedExport> {
+        if self.loaded_control.is_some() { self.notice = i18n::text(self.locale, "export.task.running"); return None; }
         if self.source.running {
             self.block("loaded", "export", i18n::text(self.locale, "ui.exchange.queryRunningExport"));
-            return;
+            return None;
         }
         if !self.source.has_columns() {
             self.block("loaded", "export", self.empty_reason());
-            return;
+            return None;
         }
         // 预览信封不是原值：先在网格里读取完整值，导出写的是同一次定位读到的原值。
         if self
@@ -586,7 +590,7 @@ impl ExchangePane {
             .any(|value| crate::grid::looks_like_preview(value, self.source.preview_bytes))
         {
             self.block("loaded", "export", i18n::text(self.locale, "grid.export.needFull").to_owned());
-            return;
+            return None;
         }
         let table_name = self.source.table.as_ref().map(|table| table.table.clone()).unwrap_or_else(|| "查询结果".to_owned());
         let schema = self.source.table.as_ref().map(|table| table.schema.clone()).unwrap_or_default();
@@ -606,9 +610,48 @@ impl ExchangePane {
             cancel_after_rows: None,
             fail_after_rows: None,
         };
-        let task = export_loaded(&spec);
+        Some(spec)
+    }
+
+    fn finish_loaded(&mut self, task: TaskView) {
         self.notice = task.detail.clone();
         self.log.push(task);
+    }
+
+    #[cfg(test)]
+    fn start_loaded(&mut self, path: PathBuf) {
+        if let Some(spec) = self.prepare_loaded(path) { self.finish_loaded(crate::export::export_loaded(&spec)); }
+    }
+
+    fn launch_loaded(&mut self, spec: Arc<LoadedExport>, cx: &mut Context<Self>) {
+        if self.loaded_control.is_some() {
+            self.notice = i18n::text(self.locale, "export.task.running");
+            return;
+        }
+        let control = Arc::new(crate::export::ExportControl::default());
+        self.loaded_control = Some((spec.id.clone(), Arc::clone(&control)));
+        self.log.push(TaskView::running(&spec.id, "export", i18n::text(self.locale, "export.task.running")));
+        let id = spec.id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crate::app::views::grid::runtime_for_views().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || spec.write_controlled(&control)).await;
+            let task = result.unwrap_or_else(|error| TaskView::finish(id, "export", Phase::Failed, 0, error.to_string(), None));
+            let _ = tx.send(task);
+        });
+        let owner = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let Ok(task) = rx.await else { return };
+            cx.update(|cx| {
+                let Some(owner) = owner.upgrade() else { return };
+                owner.update(cx, |pane, cx| {
+                    let cancelled = pane.log.tasks.iter().any(|old| old.id == task.id && old.phase == Phase::Cancelled);
+                    if pane.loaded_control.as_ref().is_some_and(|(id, _)| id == &task.id) { pane.loaded_control = None; }
+                    pane.finish_loaded(prefer_cancel(task, cancelled));
+                    cx.notify();
+                });
+            });
+        }).detach();
+        cx.notify();
     }
 
     fn start_full(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -927,6 +970,9 @@ impl ExchangePane {
     fn cancel_current(&mut self) {
         if let Some(task) = self.log.tasks.iter_mut().rev().find(|task| task.running_now()) {
             let id = task.id.clone();
+            if let Some((running, control)) = &self.loaded_control {
+                if running == &id { control.cancel(); }
+            }
             let kind = task.kind;
             let done = task.done_rows;
             task.phase = Phase::Cancelled;
@@ -1012,6 +1058,9 @@ impl ExchangePane {
 
 impl Render for ExchangePane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((id, control)) = &self.loaded_control {
+            if let Some(task) = self.log.tasks.iter_mut().find(|task| &task.id == id) { task.done_rows = control.done_rows(); }
+        }
         if !self.open {
             return div().id("exchange-idle");
         }
@@ -1729,3 +1778,45 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod background_export_tests {
+    use super::*;
+    use gpui_kit::AppContext as _;
+
+    #[gpui_kit::test]
+    fn loaded_file_write_runs_in_background_and_releases_its_snapshot(cx: &mut gpui_kit::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-background-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.csv");
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let pane = cx.update(|cx| cx.new(|_| ExchangePane::new(services)));
+        let spec = Arc::new(crate::export::LoadedExport {
+            id: "background".into(), format: "csv".into(), path: path.clone(), columns: vec!["body".into()],
+            rows: (0..10_000).map(|_| vec![Some("x".repeat(1024))]).collect(), truncated: false,
+            delimiter: ',', null_token: "NULL".into(), bom: false, table: "items".into(), schema: String::new(), cancel_after_rows: None, fail_after_rows: None,
+        });
+        let snapshot = Arc::downgrade(&spec);
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            pane.launch_loaded(spec, cx);
+            assert!(pane.running());
+            pane.command("exchange-format:json", cx);
+            assert_eq!(pane.format_name, "json", "写文件期间仍能操作界面状态");
+        }));
+        let start = std::time::Instant::now();
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| !pane.read(cx).running()) { break; }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).tasks()[0].phase, Phase::Done);
+            assert_eq!(pane.read(cx).tasks()[0].done_rows, 10_000);
+        });
+        assert!(std::fs::metadata(&path).unwrap().len() > 10_000_000);
+        assert!(snapshot.upgrade().is_none(), "完成后不得继续持有导出数据快照");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

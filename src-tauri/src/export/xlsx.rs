@@ -37,19 +37,34 @@ pub enum TypedCell {
 }
 
 pub fn write_xlsx(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, String> {
-    let typed = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|cell| match cell {
-                    Some(text) if !text.is_empty() => TypedCell::Text(text.clone()),
-                    _ => TypedCell::Empty,
-                })
-                .collect()
-        })
-        .collect::<Vec<_>>();
-    let header = columns.iter().cloned().map(TypedCell::Text).collect::<Vec<_>>();
-    write_book(&[("First", &header, &typed)])
+    string_workbook(columns, rows, |_| Ok(()))?.save_to_buffer().map_err(|error| error.to_string())
+}
+
+pub(crate) fn write_xlsx_file(columns: &[String], rows: &[Vec<Option<String>>], path: &std::path::Path, progress: impl FnMut(usize) -> Result<(), String>) -> Result<(), String> {
+    string_workbook(columns, rows, progress)?.save(path).map_err(|error| error.to_string())
+}
+
+fn string_workbook(columns: &[String], rows: &[Vec<Option<String>>], mut progress: impl FnMut(usize) -> Result<(), String>) -> Result<Workbook, String> {
+    touch_workbook();
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet_with_constant_memory().map_err(|error| error.to_string())?;
+    sheet.set_name("First").map_err(|error| error.to_string())?;
+    for (column, name) in columns.iter().enumerate() {
+        let column = u16::try_from(column).map_err(|error| error.to_string())?;
+        sheet.write_string(0, column, name).map_err(|error| error.to_string())?;
+    }
+    for (index, row) in rows.iter().enumerate() {
+        progress(index)?;
+        let row_number = u32::try_from(index + 1).map_err(|error| error.to_string())?;
+        for (column, value) in row.iter().enumerate() {
+            if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
+                let column = u16::try_from(column).map_err(|error| error.to_string())?;
+                sheet.write_string(row_number, column, value).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    progress(rows.len())?;
+    Ok(workbook)
 }
 
 #[allow(dead_code)]
