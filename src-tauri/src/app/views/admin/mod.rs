@@ -438,9 +438,10 @@ impl AdminPane {
         self.refresh(cx);
     }
 
+    /// 重新读取清单：不清"已读过"，旧清单留着，页面顶部给一行增量指示，读完再整体替换；
+    /// 只有换目标/换工作项（`bind_item`）才回到首屏骨架。
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.probing = false;
-        self.session.inventory.probed = false;
         self.request_inventory(cx);
     }
 
@@ -1586,9 +1587,11 @@ mod tests {
         assert!(header, "表头要有可见的读取指示");
         assert!(cards, "加载中也不能收起管理入口");
 
-        // 已读过内容的刷新：内容留着，只在顶部给一行增量指示。
+        // 刷新（refresh）不清"已读过"（见 refresh_keeps_the_read_inventory）：所以刷新时状态就是
+        // probing + probed，页面给增量指示而不是整块骨架；只有换目标/换工作项才回到首屏骨架。
         pane.update(cx, |pane, cx| {
             pane.session.inventory = inventory_from_extras(&target("sqlite"), &crate::catalog::ExtrasBody::default());
+            assert!(pane.session.inventory.probed, "已读过的清单");
             pane.probing = true;
             cx.notify();
         });
@@ -1628,6 +1631,36 @@ mod tests {
         cx.update_window(window, |_, window, cx| window.click("admin-body-connect", cx)).unwrap();
         let request = pane.update(cx, |pane, _| pane.take_connect_request());
         assert_eq!(request.as_deref(), Some("notes"), "空态主操作要真的发起连接");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 刷新不清"已读过"：`refresh` 只清"读取中"再发起一次读取，不清 `inventory.probed`。
+    /// 因此"读取中 + 已读过的清单"是真能出现的状态，页面给的是增量指示而不是整块骨架；
+    /// 首屏骨架只留给换目标/换工作项（`bind_item` 会重建会话）。
+    #[gpui_kit::test]
+    fn refresh_keeps_the_read_inventory(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("refresh");
+        cx.update(gpui_kit::init);
+        let pane = cx.update(|cx| {
+            cx.new(|_| {
+                let mut pane = AdminPane::new(services.clone());
+                pane.bind(target("sqlite"));
+                pane.session.inventory = inventory_from_extras(&target("sqlite"), &crate::catalog::ExtrasBody::default());
+                pane
+            })
+        });
+        pane.update(cx, |pane, cx| {
+            assert!(pane.session.inventory.probed);
+            // 这条目标没有可读的连接：refresh 不会真的发起读取，正好只观察它对状态的影响。
+            pane.session.target.connection_id.clear();
+            pane.refresh(cx);
+            assert!(pane.session.inventory.probed, "刷新不能把已读过的清单退回未读");
+            assert!(!pane.probing, "没有可读的连接时不留在读取中");
+            // 换目标才回到未读：首屏骨架只属于新目标。
+            pane.bind_item(target("postgres"), "item-2");
+            assert!(!pane.session.inventory.probed, "换目标要重新读清单");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

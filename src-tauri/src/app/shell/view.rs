@@ -2060,6 +2060,12 @@ impl Workbench {
     }
 
     fn note_admin_link(&mut self, cx: &mut Context<Self>) {
+        // 管理页空态（以及表头）的「立即连接」只表达意图：这里取走请求，接到树/连接行同一个
+        // 按需连接入口（queue_connect → PendingJob::OpenConnection）；连上后回到下面的
+        // note_connection，管理页自己重读清单。请求只消费一次，不在这里另开连接路径。
+        if let Some(id) = self.admin.update(cx, |pane, _| pane.take_connect_request()) {
+            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+        }
         let Some(id) = self.model.active_tab().and_then(|tab| tab.connection_id.clone()).filter(|id| !id.is_empty()) else {
             return;
         };

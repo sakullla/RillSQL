@@ -1459,6 +1459,69 @@ fn grid_edits_block_close_and_structure_admin_bind_the_target(cx: &mut gpui_kit:
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 管理页空态（和表头）的「立即连接」不是死路：外壳取走请求，走树/连接行同一条按需连接入口，
+/// 连上后由 note_connection 让管理页自己重读清单。请求只消费一次，不重复排队。
+#[gpui_kit::test]
+fn admin_connect_action_enters_the_shared_on_demand_flow(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-admin-connect-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            // 未连接的 SQLite 连接：与对象树的「数据库管理」是同一个目标。
+            view.model.connections.rows.push(record_for("notes", "笔记", Engine::Sqlite));
+            view.model.connections.status.remove("notes");
+            view.perform("open-structure-for:notes|笔记|main||customers|sqlite|dev", cx);
+            view.perform("open-admin", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    // 外壳同步连接状态会触发一次重读；读到"清单读完、但没连上"的状态后空态才出现。
+    // 读取跑在 tokio 上，按本文件既有做法放行等待，不靠猜时间。
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(10) {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        if cx.update(|cx| view.read(cx).admin.read(cx).session.inventory.probed) {
+            break;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    let empty = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("admin-offline").is_some()
+        })
+        .unwrap();
+    assert!(empty, "未连接的管理页要先给出带「立即连接」的空态");
+    // 点空态主操作：页面只写意图并重绘。
+    cx.update_window(window, |_, window, cx| window.click("admin-body-connect", cx)).unwrap();
+    // 下一帧外壳取走请求，接到同一条按需连接入口。
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(
+            view.model.connections.status.get("notes"),
+            Some(&LinkStatus::Connecting),
+            "空态主操作要真的发起连接，不能只写进 AdminPane::connect_request"
+        );
+        let queued: Vec<_> = view.model.connect_intents.iter().filter(|intent| intent.connection_id == "notes").collect();
+        assert_eq!(queued.len(), 1, "请求只排一次");
+        assert_eq!(queued[0].action, super::conn_modal::ConnectAction::Expand, "接的是树/连接行同一条入口：连上后停在管理页并刷新清单");
+        assert!(view.admin.read(cx).connect_request.is_none(), "请求已被外壳消费");
+    });
+    // 再渲染一帧不重复排队：消费一次就够。
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.connect_intents.iter().filter(|intent| intent.connection_id == "notes").count(), 1, "不重复排队");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[gpui_kit::test]
 fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();

@@ -10,7 +10,7 @@
 | probing | inventory.probed | connected | 状态 | 呈现 | 页面其余部分 |
 | --- | --- | --- | --- | --- | --- |
 | 是 | 否 | 未读完，按离线 | Loading（首屏） | `kit::skeleton_state(3, …)` | 表头 `admin-probing` 转圈 + 全部操作卡 |
-| 是 | 是 | 任意 | Loading（增量） | `kit::inline_loading`（`admin-refreshing`） | 已读到的清单、草稿、卡片都留着 |
+| 是 | 是 | 任意 | Loading（增量） | `kit::inline_loading`（`admin-refreshing`） | 已读到的清单、草稿、卡片都留着（`refresh` 不清 `inventory.probed`，所以这一档在真实刷新里可达；首屏骨架只属于换目标/换工作项） |
 | 否 | 是 | 否 | NoData（未连接） | `kit::empty_state_with_action`（`admin-offline`）+ 「立即连接」 | 操作卡仍在，说明"预览不会执行" |
 | 否 | 是 | 是 | Error（某分区读取失败） | `kit::error_state_with_action`（`admin-fault-{i}`）+ 「重试」 | 其余分区照常 |
 | 否 | 是 | 是 | NoData（某分区为空） | 该节卡片内 `kit::empty_state`（`{id}-empty`） | 该节的表单与「预览 SQL」仍在其下 |
