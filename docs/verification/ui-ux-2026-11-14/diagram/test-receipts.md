@@ -10,12 +10,13 @@
 cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagram
 ```
 
-结果：**10 passed; 0 failed; 0 ignored**（927 filtered out）。
+结果：**11 passed; 0 failed; 0 ignored**（967 filtered out；被过滤的用例总数随邻接任务新增用例变化，本目录只认领关系图的 11 个）。
 
 | 用例 | 覆盖 |
 | --- | --- |
 | `card_keyboard_equivalents_match_the_mouse_gestures` | Enter / Shift+Enter / 菜单键 / Shift+F10 / Esc 的等价语义；未知表不产生打开请求；四态取值来自 `kit::interaction_style`（hover、active、2px 强调色焦点环、可聚焦） |
 | `pane_keys_zoom_and_dismiss_without_touching_the_diagram` | 页面级 `+`/`-`/`0` 缩放与复位、Esc 收起菜单与悬停、无关键不吞 |
+| `clicking_outside_the_card_menu_dismisses_it` | 1360 × 900 headless 窗口：卡片菜单摆出后点画布空白要收起（页面根节点 `on_mouse_down`）；菜单条里的“打开数据”照常发出打开请求（菜单条停掉按下事件传播） |
 | `four_states_carry_the_matching_next_step` | `PaneState` 五种判定；空图说明为什么空；失败带原因；无目标不是“读取失败” |
 | `diagram_four_states_and_keyboard_hold_at_1360` | 1360 × 900：卡片、单行页头、缩放按钮、Tab+Enter、搜索无命中提示条与清除（含输入控件真实文字）、四态 |
 | `diagram_four_states_and_keyboard_hold_at_900` | 900 × 900：同上 |
@@ -32,6 +33,16 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagr
 第一次提交的 `clear_search` 把 `field.sync` 也一起清空，导致 `search_field` 的“同步才写回”条件（`field.sync != wanted`）不成立，点“清除搜索”或框内按 Esc 后输入框仍留着旧词。修复后 `clear_search` 只改模型，回写交给既有路径。
 
 用例补强：三个宽度用例都通过 `search_control_text` 读 `InputState` 里的真实文字——条件生效时断言控件显示 `zzz`，点“清除搜索”后断言控件为空串，同时断言提示条消失、画布仍在。只断言 `pane.search` 正是漏掉这个 bug 的原因。没有把旧代码临时塞回共享工作区去“验证用例会红”（其他人正在同一工作区提交），结论按代码路径推理 + 控件值断言给出。
+
+### A2 之后：点菜单外要收起卡片菜单（2026-11-14 追加）
+
+上一版卡片菜单只有三条关闭路径：Esc、菜单条的关闭按钮、再点一次卡片。点画布空白、页头、页脚都不生效，与启动器筛选浮层、导出抽屉“点别处关闭”的习惯不一致。
+
+修复：页面根节点 `diagram-pane` 加 `on_mouse_down(Left)` 收起 `card_menu`；菜单条 `diagram-card-menu` 自己在按下事件上 `stop_propagation()`，所以点菜单里的按钮不会被这条路径抢先拆掉（先关闭再点击会导致按钮消失、点击落空）。为让 headless 用例能点到画布空白，`diagram-board` 补 `.test_support()`。
+
+用例：`clicking_outside_the_card_menu_dismisses_it`——先断言点菜单里的“打开数据”确实发出打开请求（证明停传播没有吃掉点击），再点画布左上角空白（`click_at("diagram-board", (6, 6))`），断言菜单元素消失且 `card_menu` 为 `None`。
+
+复跑：`cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagram` → **11 passed / 0 failed**（用例内 0.50 s）。`cargo clippy --all-targets --locked` → 退出码 0；关系图测试模块的 `AppContext` 未使用导入是改动前就有的 warning（本目录上一轮已记录）。
 
 ### 运行时间与“挂住”事故（2026-11-14 04:xx 追加）
 

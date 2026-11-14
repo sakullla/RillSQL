@@ -590,7 +590,8 @@ impl Workbench {
             }
             let _ = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.apply_grid_locale(locale, cx);
-            pane.command(id, cx);
+            // 外壳已经过按需连接这道门；这里直接执行，避免面板再回一次外壳。
+            pane.forwarded_command(id, cx);
             let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.apply_grid_locale(locale, cx);
             effect
@@ -2148,7 +2149,9 @@ impl Render for Workbench {
             });
         }
         let owner = cx.entity().downgrade();
-        self.exchange.update(cx, |pane, _| pane.attach_owner(owner));
+        self.exchange.update(cx, |pane, _| pane.attach_owner(owner.clone()));
+        // 查询工具条的「运行」同样只能走 Workbench::perform 这份门。
+        self.query.update(cx, |pane, _| pane.attach_owner(owner));
         self.ensure_tool(cx);
         self.ensure_redis(cx);
         self.ensure_mongo(cx);

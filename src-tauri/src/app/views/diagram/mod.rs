@@ -1149,6 +1149,52 @@ mod tests {
         diagram_holds_at(cx, 640.);
     }
 
+    /// 卡片菜单不只能用 Esc 或再点卡片关掉：点页面其它位置也要收起，
+    /// 而菜单条里的按钮不能被这条“点别处收起”抢先拆掉。
+    #[gpui_kit::test]
+    fn clicking_outside_the_card_menu_dismisses_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, pane) = open_diagram_window(cx, 1360.);
+        cx.update(|cx| fill_state(&pane, "cards", cx));
+        let open_menu = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.card_menu = Some("orders".into());
+                    cx.notify();
+                })
+            });
+        };
+
+        open_menu(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("diagram-card-menu").is_some(), "卡片菜单要先摆出来");
+            // 菜单条里的按钮照常可用：这里要证明按下事件在菜单条上停住，不会被“点别处收起”抢走。
+            window.click("diagram-open-data:orders", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(cx.update(|cx| pane.read(cx).navigation.is_some()), "菜单里的“打开数据”要照常发出打开请求");
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.navigation = None;
+                cx.notify();
+            })
+        });
+        open_menu(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("diagram-card-menu").is_some(), "第二次摆出菜单");
+            // 画布空白处：既不在卡片上，也不在菜单条上，点下去菜单要收起。
+            window.click_at("diagram-board", gpui_kit::point(px(6.), px(6.)), cx);
+            window.render_frame(cx);
+            assert!(window.try_find("diagram-card-menu").is_none(), "点画布空白要收起卡片菜单");
+        })
+        .unwrap();
+        assert!(cx.update(|cx| pane.read(cx).card_menu.is_none()), "收起时菜单状态要一起清掉");
+    }
+
     fn pump(
         cx: &mut TestAppContext,
         window: gpui_kit::AnyWindowHandle,
@@ -1473,6 +1519,7 @@ impl Render for DiagramPane {
                 let board_entity = entity.clone();
                 let mut canvas_box = div()
                     .id("diagram-board")
+                    .test_support()
                     .relative()
                     .w(px(board_w))
                     .h(px(board_h))
@@ -1784,6 +1831,9 @@ impl Render for DiagramPane {
                         .bg(p.surface)
                         .border_t_1()
                         .border_color(p.line)
+                        // 菜单条是页面内的一个岛：按下事件停在这里，页面根节点的“点别处收起”不会
+                        // 在按钮自己的点击合成完之前把它拆掉。
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(div().text_size(px(TypeScale::SM)).child(SharedString::from(name)))
                         .child(open_data)
                         .child(open_structure)
@@ -1852,6 +1902,14 @@ impl Render for DiagramPane {
                 }
                 if this.pane_key(key) {
                     cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                // 卡片菜单是页面里的一条菜单条，点其它位置（画布、页头、页脚）都要收起：
+                // 与启动器筛选浮层、导出抽屉一样，靠“点别处”关闭，不只靠 Esc 或再点一次卡片。
+                // 菜单条自己在按下事件上停了传播，所以菜单里的按钮不受这条路径影响。
+                if this.card_menu.take().is_some() {
                     cx.notify();
                 }
             }))
