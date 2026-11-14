@@ -44,6 +44,8 @@ pub struct Palette {
     pub accent_active: Hsla,
     pub accent_soft: Hsla,
     pub accent_text: Hsla,
+    /// 实心强调底上的前景（主按钮文字与图标）。
+    pub on_accent: Hsla,
     pub selection: Hsla,
     pub zebra: Hsla,
     pub ok: Hsla,
@@ -91,6 +93,7 @@ impl Palette {
             accent_active: hex(0x3a45ad),
             accent_soft: hex(0xeceefc),
             accent_text: hex(0x3a45ad),
+            on_accent: hex(0xffffff),
             selection: alpha(0x4f5bd5, 0.14),
             zebra: hex(0xfafbfc),
             // 状态色同时作为小号文字使用，压深到 soft 底也过 4.5:1。
@@ -127,6 +130,7 @@ impl Palette {
             accent_active: hex(0x6670e6),
             accent_soft: hex(0x262a45),
             accent_text: hex(0xaab1ff),
+            on_accent: hex(0xffffff),
             selection: alpha(0x7c86f5, 0.22),
             zebra: hex(0x1a1b20),
             ok: hex(0x3ccf8e),
@@ -788,8 +792,8 @@ impl StateKind {
 
 /// 图标块的边长：规范 S8.5 的 16px 图标放在方形浅底里。
 const STATE_ICON_BOX: f32 = 30.;
-/// 主操作与标题文字左对齐时的左边距：图标块 30 + 间距 8。
-pub const STATE_ACTION_INSET: f32 = 38.;
+/// 主操作相对说明文字的左缩进。图标块在标题上方（同一列），所以主操作与标题、说明同列贴齐。
+pub const STATE_ACTION_INSET: f32 = 0.;
 /// 说明文字的最大宽度：窄面板里按面板宽换行，宽页面里不拉成一整行。
 pub const STATE_DETAIL_MAX_W: f32 = 360.;
 
@@ -831,7 +835,8 @@ fn state_block(kind: StateKind, icon_name: IconName, heading: impl Into<SharedSt
                 .child(detail.into()),
         );
     if let Some(action) = action {
-        block = block.child(div().id("state-action").test_support().w_full().pl(px(STATE_ACTION_INSET)).child(action));
+        // 行容器按内容宽排列按钮：主操作是一个按钮，不被拉成整行宽的横条。
+        block = block.child(div().id("state-action").test_support().w_full().pt(px(2.)).pl(px(STATE_ACTION_INSET)).flex().items_center().gap(px(8.)).child(action));
     }
     block
 }
@@ -962,6 +967,8 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
 }
 
 pub fn shortcut(key: &str) -> String {
+    // 菜单表里的组合键用平台无关的 Mod+ 记法；显示时换成本平台的修饰键。
+    let key = key.replace("Mod+", "Ctrl+");
     if cfg!(target_os = "macos") {
         key.replace("Ctrl+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥")
     } else {
@@ -1737,6 +1744,7 @@ mod state_tests {
             assert!((f32::from(action.origin.x - detail.origin.x)).abs() < 0.5, "{width}: 主操作与说明同一列");
             let button_inset = f32::from(button.origin.x - detail.origin.x);
             assert!((button_inset - STATE_ACTION_INSET).abs() < 0.5, "{width}: 主操作与标题文字左对齐（实际 {button_inset}）");
+            assert!(f32::from(button.size.width) < 200., "{width}: 主操作按内容宽，不被拉成整行（实际 {}）", f32::from(button.size.width));
             assert!(f32::from(detail.size.width) <= STATE_DETAIL_MAX_W + 0.5, "{width}: 说明最宽 {STATE_DETAIL_MAX_W}");
             let right = f32::from(detail.origin.x + detail.size.width);
             assert!(right <= f32::from(host.origin.x + host.size.width) + 0.5, "{width}: 说明右缘 {right} 越出视口");

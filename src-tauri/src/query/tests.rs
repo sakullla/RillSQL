@@ -2081,3 +2081,35 @@ fn the_same_long_error_is_logged_once_in_messages() {
     assert!(desk.stop_run("b", ticket.token, "连接中断，无法确认写入是否完成。"));
     assert_eq!(desk.log().len(), 2, "不同的失败仍然要记下来：{:?}", desk.log());
 }
+
+/// 回归：SQLite 的浮点结果（avg()、带小数的表达式、REAL 列）在查询结果里是数字，不是 NULL；
+/// TEXT 列里存的数字也按实际值读出来。
+#[tokio::test]
+async fn sqlite_query_results_keep_real_values() {
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-query-real-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("numbers.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, price REAL, label TEXT)").execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO t VALUES (1, 1.5, 'a'), (2, 2.5, 42)").execute(&setup).await.unwrap();
+    setup.close().await;
+
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    service.open_sqlite_for_test("numbers", "数字", &database).await.unwrap();
+    let session = service.catalog_session("numbers").unwrap();
+    let driver = exec::LiveDriver::attach(session, "sqlite", "main", service.cancel_transport("numbers").unwrap(), None).await.unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let rows = driver.run("SELECT avg(price), price * 2, price, label FROM t ORDER BY id", 10, &cancel).await.outcome.unwrap();
+    assert_eq!(rows.rows[0][0], Some("2".to_owned()), "avg() 是浮点结果：{:?}", rows.rows);
+    let rows = driver.run("SELECT price * 2, price, label FROM t ORDER BY id", 10, &cancel).await.outcome.unwrap();
+    assert_eq!(rows.rows[0][0], Some("3".to_owned()));
+    assert_eq!(rows.rows[1][1], Some("2.5".to_owned()));
+    assert_eq!(rows.rows[1][2], Some("42".to_owned()), "TEXT 列里的数字按实际值读出");
+    let _ = std::fs::remove_dir_all(&dir);
+}

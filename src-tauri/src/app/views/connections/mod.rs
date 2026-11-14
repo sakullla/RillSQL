@@ -424,9 +424,11 @@ impl ConnectionPage {
         let Some(id) = self.selected.clone() else { return true };
         match outcome {
             Ok(outcome) if outcome.connected => {
+                // 成功提示说连上了哪条连接；最后一个检查阶段的内部说明（如 foreign_keys ON）不放进状态栏。
+                let name = self.rows.iter().find(|row| row.saved.id == id).map(|row| row.saved.name.clone()).unwrap_or_default();
                 self.status.insert(id, LinkStatus::Connected);
                 self.message_key = Some("connections.status.connected");
-                self.message_detail = outcome.report.summary.unwrap_or_default();
+                self.message_detail = if name.is_empty() { String::new() } else { format!("· {name}") };
             }
             Ok(outcome) => {
                 self.status.insert(id, LinkStatus::Failed);

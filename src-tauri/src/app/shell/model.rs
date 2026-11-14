@@ -4066,7 +4066,60 @@ impl WorkbenchModel {
     }
 
     fn open_blank_query(&mut self) {
+        // 新查询沿用当前上下文的目标：当前标签连着哪个库就写到哪个库；
+        // 没有当前目标、但恰好只有一条已打开的连接时就用它。不替用户在多条连接里猜。
+        let inherited = self.blank_query_target();
         self.open_query_draft(String::new(), true);
+        if let Some((connection_id, connection_name, database, engine)) = inherited {
+            if let Some(tab) = self.active_mut() {
+                tab.connection_id = Some(connection_id);
+                tab.connection_name = Some(connection_name);
+                tab.database = database;
+                tab.engine = Some(engine);
+            }
+        }
+    }
+
+    fn blank_query_target(&self) -> Option<(String, String, Option<String>, String)> {
+        if let Some(tab) = self.active_tab().filter(|tab| tab.connection_id.as_deref().is_some_and(|id| !id.is_empty())) {
+            let id = tab.connection_id.clone()?;
+            let row = self.connections.rows.iter().find(|row| row.saved.id == id)?;
+            let engine = tab.engine.clone().unwrap_or_else(|| row.saved.engine.as_str().to_owned());
+            // 文档库与键值库没有 SQL 编辑器，不把它们带进新查询。
+            if matches!(row.saved.engine, crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb) {
+                return None;
+            }
+            let database = tab.database.clone().filter(|db| !db.is_empty()).or_else(|| self.only_database(&id));
+            return Some((id, tab.connection_name.clone().unwrap_or_else(|| row.saved.name.clone()), database, engine));
+        }
+        let mut connected = self.connections.rows.iter().filter(|row| {
+            self.connections.row_status(&row.saved.id) == LinkStatus::Connected
+                && !matches!(row.saved.engine, crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb)
+        });
+        let row = connected.next()?;
+        if connected.next().is_some() {
+            return None;
+        }
+        let database = row.saved.database.clone().filter(|db| !db.is_empty()).or_else(|| self.only_database(&row.saved.id));
+        Some((row.saved.id.clone(), row.saved.name.clone(), database, row.saved.engine.as_str().to_owned()))
+    }
+
+    /// 树上这条连接只有一个库时返回它（SQLite 的 main、只配了一个库的服务器）；多个库不替用户选。
+    fn only_database(&self, connection_id: &str) -> Option<String> {
+        let root = self.nav.node(&crate::catalog::hierarchy::connection_node_id(connection_id))?;
+        let mut names: Vec<&str> = root
+            .children
+            .iter()
+            .filter_map(|child| self.nav.node(child))
+            .map(|node| node.database.as_str())
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        match names.as_slice() {
+            [only] => Some((*only).to_owned()),
+            _ => None,
+        }
     }
 
     /// 对象树或文件打开查询：写入草稿和目标，不执行。

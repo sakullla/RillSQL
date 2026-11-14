@@ -1227,8 +1227,20 @@ fn sqlite_text(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
             }
             row.try_get::<Option<String>, _>(index).ok().flatten()
         }
+        // 浮点（含 avg()、带小数的表达式）：按 f64 读，不再落到文本解码而被当成 NULL。
+        "REAL" | "FLOAT" | "DOUBLE" => {
+            if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
+                return value.map(|number| number.to_string());
+            }
+            row.try_get::<Option<String>, _>(index).ok().flatten()
+        }
         "BLOB" => row.try_get::<Option<Vec<u8>>, _>(index).ok().flatten().map(to_hex),
-        _ => row.try_get::<Option<String>, _>(index).ok().flatten(),
+        _ => row
+            .try_get::<Option<String>, _>(index)
+            .ok()
+            .flatten()
+            // 声明类型与存储类不一致时（如 TEXT 列里存了数字），按实际值再读一次，不静默变成 NULL。
+            .or_else(|| row.try_get_unchecked::<Option<String>, _>(index).ok().flatten()),
     }
 }
 

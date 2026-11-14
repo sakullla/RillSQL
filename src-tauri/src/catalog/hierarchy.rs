@@ -1507,10 +1507,8 @@ impl NavTree {
                     return NavAction::OpenDocuments(node.id.clone());
                 }
                 if object.opens_data() {
-                    if self.needs_details(&node.id) {
-                        let _ = self.expand(&node.id);
-                        return NavAction::Load(node.id.clone());
-                    }
+                    // 双击/回车的意图是看数据：列与索引没读过也直接打开，不要求再操作一次。
+                    // 列/索引在展开箭头上按需读取。
                     NavAction::OpenData(node.id.clone())
                 } else {
                     NavAction::OpenStructure(node.id.clone())
@@ -1918,8 +1916,9 @@ mod tests {
         assert!(tree.node(&table_id).unwrap().object().unwrap().opens_data());
         assert_eq!(tree.activate(&trigger_id), NavAction::OpenStructure(trigger_id.clone()));
         assert_eq!(tree.activate(&function_id), NavAction::OpenStructure(function_id));
-        // 表先读按需子节点，再打开数据页。
-        assert_eq!(tree.activate(&table_id), NavAction::Load(table_id.clone()));
+        // 表一次激活就打开数据页，不先停在读取列/索引上。
+        assert_eq!(tree.activate(&table_id), NavAction::OpenData(table_id.clone()));
+        assert!(tree.needs_details(&table_id), "列/索引仍留给展开箭头按需读取");
     }
 
     #[test]

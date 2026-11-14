@@ -53,6 +53,10 @@ pub struct GridNavigation {
 /// 外键跳转的出口签名：外壳注入，网格只调用。
 pub type NavigationSink = Arc<dyn Fn(GridNavigation, &mut App)>;
 
+/// 单元格右键的出口：表格组件在格子上截住右键（stop_propagation），外层容器收不到；
+/// 格子自己把指针位置交给外壳，由外壳弹出网格菜单。
+pub type MenuSink = Arc<dyn Fn(gpui_kit::Point<gpui_kit::Pixels>, &mut App)>;
+
 /// 查看阶段里的 Preview 不等于截断。完整原值保持可编辑；真预览在读完原值前锁定。
 fn truncation_for_open_cell(phase: CellPhase, truncated: bool, total_bytes: u64, can_load_full: bool, error: &str) -> TruncationState {
     match phase {
@@ -134,6 +138,8 @@ pub struct GridPane {
     count_scope: Option<CountRequest>,
     /// 正在请求的翻页偏移。偏移在结果读回来之前不改，失败重试仍是同一页。
     pending_page: Option<u64>,
+    /// 读取失败是因为连接没打开时，“重试”先请外壳打开这条连接；外壳取走后连上自动重读。
+    connect_request: Option<String>,
     /// 筛选条每一行的取值输入（值、上界/集合）；结构变化时整体重建。
     filter_inputs: Vec<FilterRowInputs>,
     filter_subscriptions: Vec<gpui_kit::Subscription>,
@@ -145,6 +151,7 @@ pub struct GridPane {
     pending_full: Option<PendingFull>,
     /// 外键跳转的出口：由外壳（直接消费者）注入，网格只负责生成目标和定位查询。
     navigation: Option<NavigationSink>,
+    menu_sink: Option<MenuSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
     /// 右侧纵向记录视图是否打开；它始终显示网格的焦点行。
@@ -302,12 +309,14 @@ impl GridPane {
             count_sequence: 0,
             count_scope: None,
             pending_page: None,
+            connect_request: None,
             filter_inputs: Vec::new(),
             filter_subscriptions: Vec::new(),
             search: None,
             clear_search: false,
             pending_full: None,
             navigation: None,
+            menu_sink: None,
             pending_viewer: false,
             record_open: false,
             side_width: RECORD_SIDE_DEFAULT,
@@ -338,6 +347,15 @@ impl GridPane {
     /// 外键跳转的出口由外壳注入：网格不知道工作项，只把目标和定位查询交出去。
     pub fn set_navigation_sink(&mut self, sink: NavigationSink) {
         self.navigation = Some(sink);
+    }
+
+    /// 单元格右键菜单的出口由外壳注入。
+    pub fn set_menu_sink(&mut self, sink: MenuSink) {
+        self.menu_sink = Some(sink);
+    }
+
+    pub fn menu_sink(&self) -> Option<MenuSink> {
+        self.menu_sink.clone()
     }
 
     /// 大字段预览上限来自设置 preview_kb。上限一变，旧行列是按别的上限截断出来的，
@@ -524,6 +542,25 @@ impl GridPane {
         self.fetch_current(true, cx);
     }
 
+    /// 外壳取走“先连接再重读”的请求；只消费一次。
+    pub fn take_connect_request(&mut self) -> Option<String> {
+        self.connect_request.take()
+    }
+
+    /// 连接刚打开：这张表此前因连接未打开而读取失败、又还没有任何行时，按当前条件重读一次。
+    /// 恢复会话时标签先于连接出现，用户不必再手动点重试。
+    pub fn retry_after_connect(&mut self, connection_id: &str, cx: &mut Context<Self>) -> bool {
+        let waiting = self.session.mode == GridMode::Table
+            && self.session.target.connection_id == connection_id
+            && self.session.read_failure().is_some()
+            && self.session.source_len() == 0
+            && !self.fetching;
+        if waiting {
+            self.fetch_current(true, cx);
+        }
+        waiting
+    }
+
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
         // 先对齐连接状态：连接在整表筛选期间丢失时，这个命令里的查找/翻页都按已读取行处理。
         self.sync_find_scope();
@@ -541,7 +578,13 @@ impl GridPane {
             // 读取失败后按当前条件重读同一窗口；查询结果不重新执行语句，只把原因继续留在屏幕上。
             "grid-retry" => {
                 if self.session.mode == GridMode::Table && !self.fetching {
-                    self.fetch_current(true, cx);
+                    if !self.live_target() && !self.session.target.connection_id.is_empty() {
+                        // 连接没打开时重读只会再失败一次：先连接，连上后由外壳触发重读。
+                        self.connect_request = Some(self.session.target.connection_id.clone());
+                        self.notice = i18n::text(self.locale, "ui.conn.connecting");
+                    } else {
+                        self.fetch_current(true, cx);
+                    }
                 }
                 None
             }
@@ -2092,10 +2135,11 @@ impl GridPane {
         self.pending_page = None;
         self.notice = message.clone();
         if stale {
+            // 换了表又读失败：旧快照丢掉，但这次失败的原因要留下，
+            // 否则空网格会被画成“表里没有行”，把读取失败说成了空表。
             self.session.drop_stale_sheet();
-        } else {
-            self.session.keep_after_failure(&message);
         }
+        self.session.keep_after_failure(&message);
     }
 
     fn count_rows(&mut self, cx: &mut Context<Self>) {
@@ -4146,6 +4190,9 @@ impl TableDelegate for SheetDelegate {
         let kind = self.cell_kind_at(row_ix, col_ix, cx);
         let null = kind == session::CellKind::Null;
         let tooltip = cell_tooltip(self.locale, kind, &text);
+        // 行号与数字列右对齐、行号用弱色：数据列的位数可比，行号不和数据抢视线。
+        let row_number = self.logical(col_ix).is_none();
+        let numeric = row_number || self.logical(col_ix).and_then(|logical| self.headers.get(logical)).is_some_and(|header| header.numeric);
         let p = Palette::of(cx);
         // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
         // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
@@ -4198,6 +4245,8 @@ impl TableDelegate for SheetDelegate {
             .debug_selector(move || format!("grid-cell-{row_ix}-{col_ix}"))
             .size_full()
             .truncate()
+            .when(numeric && !null, |this| this.text_right())
+            .when(row_number, |this| this.text_color(p.text_faint))
             .when(null, |this| this.text_color(p.text_faint).italic())
             .when(mark == 3, |this| this.line_through())
             .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
@@ -4246,6 +4295,15 @@ impl TableDelegate for SheetDelegate {
                 .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
                     if let Some(pane) = release_out.upgrade() {
                         pane.update(cx, |pane, _| pane.cell_release());
+                    }
+                })
+            })
+            // 右键：表格组件随后会在格子上截住这次右键并选中该格；菜单由外壳在指针处弹出。
+            .when_some(self.owner.clone(), |this, owner| {
+                this.on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+                    let sink = owner.upgrade().and_then(|pane| pane.read(cx).menu_sink());
+                    if let Some(sink) = sink {
+                        sink(event.position, cx);
                     }
                 })
             })
@@ -5320,7 +5378,8 @@ mod pane_tests {
         cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
         cx.run_until_parked();
         let after = cx.update(|cx| pane.read(cx).session.column_width(1));
-        assert!(after > before + 100.0, "自适应后列宽应跟着变：{before} -> {after}");
+        // 首屏估宽已经把长文本列放宽到初始上限；自适应按实际字形量出更宽的一档。
+        assert!(after > before, "自适应后列宽应跟着变：{before} -> {after}");
         // 行号列没有可量的内容，双击它不做任何事。
         let rownum = cx.update_window(window, |_, window, cx| table.update(cx, |state, cx| state.fit_col(0, window, cx)));
         assert!(!rownum.unwrap(), "行号列不参与自适应");
@@ -5760,7 +5819,7 @@ mod pane_tests {
                 // 换了目标又失败：旧表快照不能留下来。
                 pane.keep_sheet_after_failure("表不存在".to_owned(), true);
                 assert_eq!(pane.loaded_len(), 0);
-                assert!(pane.session.read_failure().is_none(), "旧快照不带着失败原因一起留下");
+                assert_eq!(pane.session.read_failure(), Some("表不存在"), "新目标的失败原因要显示，不能把读取失败画成空表");
             });
         });
     }
@@ -7030,7 +7089,7 @@ mod workbench_tests {
         cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
         cx.run_until_parked();
         let after = cx.update(|cx| pane.read(cx).session.column_width(1));
-        assert!(after > before + 100.0, "长文本列应变宽：{before} -> {after}");
+        assert!(after > before, "长文本列应变宽：{before} -> {after}");
         assert!(after <= 640.0);
         let measured = cx.update_window(window, |_, window, cx| {
             let font = gpui_kit::Font { family: cx.theme().font_family.clone(), ..Default::default() };

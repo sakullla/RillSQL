@@ -9314,3 +9314,33 @@ fn quick_open_renders_context_and_type_for_every_result_kind(cx: &mut gpui_kit::
     assert!(f32::from(palette.size.width) <= 620.);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 新建查询沿用上下文目标：唯一已打开的连接（含它唯一的库）直接带进来；
+/// 多条已打开连接时不替用户猜；当前标签已有目标时沿用当前标签。
+#[test]
+fn blank_query_inherits_the_obvious_target() {
+    use crate::app::views::connections::LinkStatus;
+    let (mut model, _) = pg_orders_model();
+    let mut pg = pg_saved("pg", "dev");
+    pg.saved.database = None;
+    model.connections.rows.push(pg);
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    assert!(model.dispatch("new-query").is_some());
+    let tab = model.active_tab().unwrap();
+    assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+    assert_eq!(tab.database.as_deref(), Some("shop"), "树上唯一的库作为默认库");
+    assert_eq!(tab.engine.as_deref(), Some("postgres"));
+
+    // 当前标签有目标：下一个新查询沿用它。
+    assert!(model.dispatch("new-query").is_some());
+    assert_eq!(model.active_tab().unwrap().connection_id.as_deref(), Some("pg"));
+
+    // 两条已打开连接、当前标签没有目标：不猜。
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.connections.rows.push(pg_saved("a", "dev"));
+    model.connections.rows.push(pg_saved("b", "dev"));
+    model.connections.status.insert("a".into(), LinkStatus::Connected);
+    model.connections.status.insert("b".into(), LinkStatus::Connected);
+    assert!(model.dispatch("new-query").is_some());
+    assert_eq!(model.active_tab().unwrap().connection_id, None);
+}

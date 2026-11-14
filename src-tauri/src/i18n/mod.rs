@@ -776,7 +776,7 @@ dict! {
     "ui.conn.general" => "连接信息", "Connection";
     "ui.conn.security" => "安全", "Security";
     "ui.conn.url" => "连接串（可选）", "Connection string (optional)";
-    "ui.conn.urlHint" => "粘贴后点“解析”，如 postgres://user@host:5432/db", "Paste and parse, e.g. postgres://user@host:5432/db";
+    "ui.conn.urlHint" => "粘贴后点“解析”，如", "Paste and parse, e.g.";
     "ui.conn.parse" => "解析", "Parse";
     "ui.conn.name" => "名称", "Name";
     "ui.conn.namePlaceholder" => "给连接起个名字", "Name this connection";
@@ -954,7 +954,7 @@ dict! {
     "grid.record.selectionMany" => "选区：多格", "Many cells selected";
     "grid.record.copySelection" => "复制选区（多格含表头）", "Copy selection (headers included for multiple cells)";
     "grid.record.filtered" => "筛选 {count} 条", "{count} filters";
-    "grid.menu.copySelection" => "复制选区（单格为值，多格含表头）", "Copy selection (value for one cell, with headers for many)";
+    "grid.menu.copySelection" => "复制选区", "Copy selection";
     "grid.write.clone" => "复制为新行", "Clone as new row";
     "grid.write.paste" => "粘贴", "Paste";
     "grid.write.setValue" => "选区设值…", "Set value on selection…";

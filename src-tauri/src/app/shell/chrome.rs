@@ -195,7 +195,26 @@ impl Workbench {
                     )
                     .when(overlay_sidebar, |this| {
                         let sidebar = self.explorer(window, cx);
-                        this.child(
+                        let entity = cx.entity();
+                        // 覆盖式侧栏下面压一层轻遮罩：看得出侧栏浮在内容上方，点遮罩收起侧栏。
+                        let scrim = div()
+                            .id("sidebar-scrim")
+                            .test_support()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(RAIL_W))
+                            .right_0()
+                            .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.18 }))
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.model.shell.sidebar_open = false;
+                                    this.persist_if_needed();
+                                    cx.notify();
+                                });
+                            });
+                        this.child(scrim).child(
                             div()
                                 .id("sidebar-overlay")
                                 .absolute()
@@ -608,8 +627,9 @@ impl Workbench {
                 self.t("ui.explorer.emptyHint"),
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(4.))
                     .child(self.launcher_action(
                         "explorer-new",
                         IconName::Plus,
@@ -711,7 +731,10 @@ impl Workbench {
                                     .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("new-connection", cx)).xsmall()),
                             ),
                     )
-                    .child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                    // 没有连接时没有可筛的对象，筛选框不出现。
+                    .when(!self.model.connections.rows.is_empty(), |this| {
+                        this.child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                    })
                     .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
             )
@@ -962,7 +985,7 @@ impl Workbench {
             .aria_expanded(expanded)
             // 状态不只靠圆点颜色：无障碍描述和提示都写出同一句状态文案。
             .aria_description(SharedString::from(format!("{} · {}", full_name, self.t(state_key))))
-            .tooltip_text(full_name)
+            .when(self.model.menu.is_none(), |this| this.tooltip_text(full_name))
             .flex_none()
             .h(px(m.row_h))
             .px(px(6.))
@@ -1154,7 +1177,8 @@ impl Workbench {
             .aria_label(label.clone())
             .aria_selected(row.focused)
             .aria_expanded(row.expanded)
-            .tooltip_text(tooltip)
+            // 右键菜单打开时不再挂悬停提示：提示浮层会盖住菜单的第一项。
+            .when(self.model.menu.is_none(), |this| this.tooltip_text(tooltip))
             .flex_none()
             .h(px(m.tree_row_h))
             .pl(px(indent))
@@ -1603,15 +1627,6 @@ impl Workbench {
                     })),
             );
         }
-        if recent_runs.is_empty() {
-            history_rows = history_rows.child(
-                div()
-                    .py(px(8.))
-                    .text_size(px(TypeScale::SM))
-                    .text_color(p.text_faint)
-                    .child(self.t("ui.welcome.noRecent")),
-            );
-        }
 
         div()
             .id("welcome-page")
@@ -1650,7 +1665,8 @@ impl Workbench {
             )
             .child(self.launcher_header(window, cx))
             .child(self.launcher_body(cx))
-            .child(
+            // 没有执行记录时不留一张只写着“没有记录”的卡片。
+            .when(!recent_runs.is_empty(), |this| this.child(
                 kit::card(&p)
                     .flex_none()
                     .mx(px(m.page_pad))
@@ -1662,7 +1678,7 @@ impl Workbench {
                     .gap(px(4.))
                     .child(section_label(self.t("shell.welcome.recent"), &p))
                     .child(div().id("welcome-recent-runs").flex_1().min_h(px(0.)).overflow_y_scroll().child(history_rows)),
-            )
+            ))
             .into_any_element()
     }
 
@@ -1765,15 +1781,18 @@ impl Workbench {
                         cx,
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(div().flex_1().min_w(px(160.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
-                    .child(self.connection_filters(&p, cx)),
-            )
+            // 一条连接都没有时，搜索与筛选没有可作用的对象，不占一行。
+            .when(total > 0, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(160.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                        .child(self.connection_filters(&p, cx)),
+                )
+            })
             .into_any_element()
     }
 
@@ -1799,20 +1818,8 @@ impl Workbench {
             .gap(px(2.));
         if self.model.connections.rows.is_empty() {
             // 一条连接都没有：空态给下一步，而不是只留一句"没有连接"。
-            body = body.child(
-                kit::empty_state_with_action(
-                    IconName::Database,
-                    self.t("ui.explorer.empty"),
-                    self.t("ui.explorer.emptyHint"),
-                    kit::primary_button(
-                        "launcher-empty-new",
-                        Some(IconName::Plus),
-                        self.t("common.newConnection"),
-                        act("conn-new-launcher", cx),
-                    ),
-                    &p,
-                ),
-            );
+            // 头部已经给出新建连接与打开 SQLite 两个入口；空态只说明，不在同一屏再放一个同名主按钮。
+            body = body.child(kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p));
             return body.into_any_element();
         }
         // 连接失败的待办动作：原因与重试入口留在启动台上，不把用户想打开的对象丢掉。
@@ -1856,7 +1863,8 @@ impl Workbench {
                     )),
             );
         }
-        if !recent.is_empty() && !filtering {
+        // 最近一栏只在它是全部连接的子集时才有意义；连接不多时同一行列两遍只是噪音。
+        if !recent.is_empty() && !filtering && all.len() > recent.len() {
             body = body.child(section_label(self.t("connections.launcher.recent"), &p));
             for row in &recent {
                 body = body.child(self.launcher_row(row, &p, cx, "recent"));
@@ -1895,6 +1903,10 @@ impl Workbench {
         let status = self.model.connections.row_status(&id);
         let (dot, state_key) = status_parts(status, p);
         let detail = connection_detail(row);
+        let shown_detail = match row.saved.file_path.as_deref() {
+            Some(path) if !path.is_empty() => short_path(path),
+            _ => detail.clone(),
+        };
         let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
         let label = format!("{} {} {}", row.saved.name, row.saved.engine.as_str(), self.model.text(state_key));
         let aware = format!("{detail} · {}", self.model.text(state_key));
@@ -1932,11 +1944,11 @@ impl Workbench {
             .child(
                 div()
                     .flex_none()
-                    .max_w(px(240.))
+                    .max_w(px(280.))
                     .truncate()
                     .text_size(px(TypeScale::XS))
                     .text_color(p.text_faint)
-                    .child(SharedString::from(detail)),
+                    .child(SharedString::from(shown_detail)),
             )
             // 状态不只靠圆点：文字与 tooltip 说同一句话。
             .child(
@@ -2015,9 +2027,9 @@ impl Workbench {
             .rounded(px(Radius::CONTROL))
             .border_1()
             .text_size(px(TypeScale::SM))
-            .when(primary, |this| this.bg(p.accent).text_color(p.accent_text).border_color(p.accent))
+            .when(primary, |this| this.bg(p.accent).text_color(p.on_accent).border_color(p.accent).hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover)).active(|style| style.bg(p.accent_active)))
             .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
-            .child(kit::icon(icon, 14., if primary { p.accent_text } else { p.text_muted }))
+            .child(kit::icon(icon, 14., if primary { p.on_accent } else { p.text_muted }))
             .child(label)
             .on_click(act(command, cx));
         if let Some(handle) = handle {
@@ -2052,7 +2064,9 @@ impl Workbench {
         let view_w = self.model.viewport_width.max(240) as f32;
         let view_h = self.model.viewport_height.max(240) as f32;
         let panel_w = if narrow { (view_w - 40.).max(240.) } else { 640_f32.min(view_w - 80.) };
-        let panel_h = (view_h - 80.).max(200.);
+        // 顶部锚定：换引擎时表单高度会变，居中会让整块上下跳；固定上沿只让下沿伸缩。
+        let panel_top = (view_h * 0.1).clamp(20., 96.);
+        let panel_h = (view_h - panel_top - 40.).max(200.);
         let pad = if narrow { 16. } else { m.page_pad };
         let focus_first = std::mem::take(&mut self.model.conn_modal.focus_first_pending);
 
@@ -2064,7 +2078,7 @@ impl Workbench {
         }
 
         let envs = conn_modal::env_ids(&self.model.env_tags);
-        let mut env_items = div().flex().flex_wrap().gap(px(6.));
+        let mut env_items = segment_track(&p);
         for env in &envs {
             env_items = env_items.child(self.modal_segment_item(
                 conn_modal::env_control_id(env),
@@ -2173,7 +2187,7 @@ impl Workbench {
         // 安全：TLS 与 SSH。
         let mut security = div().flex().flex_col().gap(px(14.));
         if !file_based {
-            let mut tls_items = div().flex().flex_wrap().gap(px(6.));
+            let mut tls_items = segment_track(&p);
             for (mode, key) in [(TlsMode::Off, "connections.page.tlsOff"), (TlsMode::Require, "ui.conn.tlsRequire"), (TlsMode::Verify, "ui.conn.tlsVerify")] {
                 tls_items = tls_items.child(self.modal_segment_item(
                     conn_modal::tls_control_id(mode),
@@ -2186,7 +2200,7 @@ impl Workbench {
             }
             security = security.child(kit::form_row(self.t("connections.editor.tls.title"), tls_items, &p));
             if draft.tls_mode == TlsMode::Verify {
-                let mut ca_items = div().flex().flex_wrap().gap(px(6.));
+                let mut ca_items = segment_track(&p);
                 for (mode, key) in [(CaMode::System, "connections.editor.tls.caSystem"), (CaMode::File, "connections.editor.tls.caFile")] {
                     ca_items = ca_items.child(self.modal_segment_item(
                         conn_modal::ca_control_id(mode),
@@ -2269,7 +2283,7 @@ impl Workbench {
                 let (ssh_port, _) = self.field_input(DraftField::SshPort, &ssh_port_hint, ssh_port_masked, window, cx);
                 let (ssh_user_hint, ssh_user_masked) = self.field_hint(DraftField::SshUser);
                 let (ssh_user, _) = self.field_input(DraftField::SshUser, &ssh_user_hint, ssh_user_masked, window, cx);
-                let mut auth_items = div().flex().flex_wrap().gap(px(6.));
+                let mut auth_items = segment_track(&p);
                 for (kind, key) in [
                     (SshAuthKind::Key, "connections.editor.ssh.authKey"),
                     (SshAuthKind::Password, "connections.editor.ssh.authPassword"),
@@ -2520,10 +2534,11 @@ impl Workbench {
 
         backdrop("conn-modal-backdrop", 0.32, cx)
             .flex()
-            .items_center()
+            .items_start()
             .justify_center()
             .px(px(20.))
-            .py(px(20.))
+            .pt(px(panel_top))
+            .pb(px(20.))
             .child(panel)
             .into_any_element()
     }
@@ -2646,7 +2661,8 @@ impl Workbench {
     ) -> AnyElement {
         let id = id.into();
         let handle = self.modal_control(cx, &id, action);
-        let height = self.metrics().control_h;
+        // 分段项放在 2px 内边距的槽里：整组高度与旁边的输入框一致。
+        let height = self.metrics().control_h - 4.;
         let click_id = id.clone();
         kit::interactive_states(div().id(SharedString::from(id)), p, false)
             .test_support()
@@ -2698,10 +2714,10 @@ impl Workbench {
             .rounded(px(Radius::CONTROL))
             .border_1()
             .text_size(px(TypeScale::SM))
-            .when(primary, |this| this.bg(p.accent).text_color(p.accent_text).border_color(p.accent))
+            .when(primary, |this| this.bg(p.accent).text_color(p.on_accent).border_color(p.accent).hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover)).active(|style| style.bg(p.accent_active)))
             .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)));
         if let Some(icon) = icon {
-            button = button.child(kit::icon(icon, 13., if primary { p.accent_text } else { p.text_muted }));
+            button = button.child(kit::icon(icon, 13., if primary { p.on_accent } else { p.text_muted }));
         }
         button
             .child(label)
@@ -2804,7 +2820,8 @@ impl Workbench {
     /// 每个草稿字段的占位符与掩码：渲染与 Tab 聚焦读同一份，避免两处写不同文案。
     fn field_hint(&self, field: DraftField) -> (String, bool) {
         let existing = self.model.connections.editor.as_ref().is_some_and(|draft| draft.id.is_some());
-        let redis = self.model.connections.editor.as_ref().is_some_and(|draft| draft.engine == Engine::Redis);
+        let engine = self.model.connections.editor.as_ref().map(|draft| draft.engine);
+        let redis = engine == Some(Engine::Redis);
         let key = match field {
             DraftField::Url => "ui.conn.urlHint",
             DraftField::Name => "ui.conn.namePlaceholder",
@@ -2825,6 +2842,8 @@ impl Workbench {
             DraftField::SshKey => "~/.ssh/id_ed25519".to_owned(),
             DraftField::CaFile => "ca.pem".to_owned(),
             DraftField::Password if existing => self.model.text("ui.conn.passwordKeep"),
+            // 示例跟着当前引擎走：选了 SQLite 不再提示一个 postgres 连接串。
+            DraftField::Url => format!("{} {}", self.model.text(key), url_example(engine.unwrap_or(Engine::Postgres))),
             _ if key.is_empty() => String::new(),
             _ => self.model.text(key),
         };
@@ -3617,18 +3636,25 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
+                    // 标题行只放标题与关闭；动作单独一行左对齐。预览面板窄，四个按钮挤在标题旁会把关闭按钮折到下一行。
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::title(self.t("history.page.sqlPreview"), TypeScale::MD, p))
+                            .child(div().flex_1())
+                            .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap(px(8.))
-                            .child(kit::title(self.t("history.page.sqlPreview"), TypeScale::MD, p))
-                            .child(div().flex_1())
+                            .gap(px(6.))
                             .child(kit::primary_button("history-preview-load", Some(IconName::SquarePen), self.t("history.page.loadToEditor"), act("history-load", cx)))
                             .child(kit::tool_button("history-preview-copy", Some(IconName::Copy), self.t("history.preview.copy"), act("history-copy", cx)))
-                            .child(kit::tool_button("history-preview-save", Some(IconName::Save), self.t("history.preview.saveQuery"), act("history-save-preview", cx)))
-                            .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
+                            .child(kit::tool_button("history-preview-save", Some(IconName::Save), self.t("history.preview.saveQuery"), act("history-save-preview", cx))),
                     )
                     .child(
                         div()
@@ -4340,7 +4366,7 @@ impl Workbench {
                 Some(text) if !text.is_empty() => SharedString::from(text.clone()),
                 _ => self.t(item.label_key),
             };
-            let shortcut = item.shortcut.map(SharedString::from);
+            let shortcut = item.shortcut.map(|chord| SharedString::from(kit::shortcut(chord)));
             let enabled = item.enabled;
             let selected = index == selected_index;
             let state = if enabled { "enabled" } else { "disabled" };
@@ -5160,6 +5186,12 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
 }
 
 /// 全窗口遮罩；点空白处关闭当前浮层。
+/// 模态里分段选择的槽：浅底圆角，选中项浮起（与 kit::segmented_sized 同一外观）。
+/// 选项多时整槽换行，不被裁切。
+fn segment_track(p: &Palette) -> gpui_kit::Div {
+    div().flex().flex_wrap().flex_none().self_start().max_w_full().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover)
+}
+
 fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit::Stateful<gpui_kit::Div> {
     let entity = cx.entity();
     div()
@@ -5243,6 +5275,28 @@ pub(super) fn browser_command(row: &crate::connections::ConnectionRecord) -> Opt
         Engine::Mongodb => Some((format!("open-mongo:{}|{name}", row.saved.id), "mongo.open", format!("side-open-mongo-{}", row.saved.id))),
         _ => None,
     }
+}
+
+/// 连接串占位示例：与解析器支持的写法一致。
+fn url_example(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "postgres://user@host:5432/db",
+        Engine::Mysql => "mysql://user@host:3306/db",
+        Engine::Mariadb => "mariadb://user@host:3306/db",
+        Engine::Sqlserver => "sqlserver://user@host:1433/db",
+        Engine::Sqlite => "sqlite:///path/to/file.db",
+        Engine::Redis => "redis://host:6379/0",
+        Engine::Mongodb => "mongodb://user@host:27017/db",
+    }
+}
+
+/// 列表里显示的文件路径：长路径只留最后两段（目录/文件名），完整路径放在提示里。
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|part| !part.is_empty()).collect();
+    if parts.len() <= 2 || path.chars().count() <= 40 {
+        return path.to_owned();
+    }
+    format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
 }
 
 fn connection_detail(row: &crate::connections::ConnectionRecord) -> String {

@@ -2961,6 +2961,11 @@ impl QueryPane {
     }
 
     /// 结果表格上的右键：外壳据此打开表格菜单而不是编辑器菜单。
+    /// 结果网格的单元格右键出口（与表数据页同一个外壳菜单）。
+    pub fn set_grid_menu_sink(&mut self, sink: crate::app::views::grid::MenuSink, cx: &mut Context<Self>) {
+        self.grid.update(cx, |grid, _| grid.set_menu_sink(sink));
+    }
+
     pub fn take_grid_menu_request(&mut self) -> bool {
         std::mem::take(&mut self.grid_menu_requested)
     }

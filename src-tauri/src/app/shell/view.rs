@@ -162,6 +162,19 @@ impl Workbench {
                 }
             }));
         });
+        // 单元格右键：表格组件截住了右键，外层的 table-host / editor-host 收不到；
+        // 网格把指针位置交过来，这里弹出同一个网格菜单（表数据页与查询结果共用）。
+        let menu_owner = cx.entity().downgrade();
+        let grid_menu: crate::app::views::grid::MenuSink = Arc::new(move |position, cx: &mut App| {
+            if let Some(owner) = menu_owner.upgrade() {
+                owner.update(cx, |view, cx| {
+                    view.menu_at = position;
+                    view.perform("menu-grid", cx);
+                });
+            }
+        });
+        table.update(cx, |pane, _| pane.set_menu_sink(Arc::clone(&grid_menu)));
+        query.update(cx, |pane, cx| pane.set_grid_menu_sink(grid_menu, cx));
         // 编辑器里 Ctrl/⌘+点击对象的出口：查询页只解析出对象，树定位和结构页由外壳负责。
         let definition_owner = cx.entity().downgrade();
         query.update(cx, |pane, _| {
@@ -491,7 +504,11 @@ impl Workbench {
             }
             return;
         };
-        if matches!(effect, Effect::FocusEditor) {
+        // 新建查询后光标直接落在编辑器里：点完“新建查询”就能打字。
+        if matches!(effect, Effect::FocusEditor) || (id == "new-query" && self.model.tool == super::model::WorkTool::Query) {
+            if id == "new-query" {
+                self.model.shell.focus = crate::app::FocusTarget::Editor;
+            }
             self.adopt_shell(Effect::None, cx);
             self.query.update(cx, |pane, _| pane.request_focus());
         } else if query_command(id) {
@@ -1541,6 +1558,11 @@ impl Workbench {
                     {
                         self.pending_browser = Some(intent.connection_id.clone());
                     }
+                    // 连接页没有资源管理器：在那里“保存并连接”成功后进入工作区，
+                    // 刚展开的连接树就在眼前，而不是停在列表上只换一个状态点。
+                    if self.model.shell.page == AppPage::Connections {
+                        self.perform("activity-workspace", cx);
+                    }
                     cx.notify();
                 }
                 _ => {
@@ -1567,6 +1589,11 @@ impl Workbench {
             for id in connected.difference(&self.connected_seen) {
                 // 展开状态存在树上，连接成功后资源管理器就能看到下一层。
                 self.model.expand_nav_connection(id);
+                // 恢复出来的表标签可能在连接打开前读过一次并失败：连上后自动重读。
+                let id = id.clone();
+                self.table.update(cx, |pane, cx| {
+                    pane.retry_after_connect(&id, cx);
+                });
             }
             let browse = self.pending_browser.take_if(|id| connected.contains(id));
             self.connected_seen = connected;
@@ -2250,6 +2277,10 @@ impl Workbench {
         // 按需连接入口（queue_connect → PendingJob::OpenConnection）；连上后回到下面的
         // note_connection，管理页自己重读清单。请求只消费一次，不在这里另开连接路径。
         if let Some(id) = self.admin.update(cx, |pane, _| pane.take_connect_request()) {
+            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+        }
+        // 表数据页的“重试”在连接没打开时同样走按需连接；连上后 refresh_tree_on_connect 触发重读。
+        if let Some(id) = self.table.update(cx, |pane, _| pane.take_connect_request()) {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
         }
         let Some(id) = self.model.active_tab().and_then(|tab| tab.connection_id.clone()).filter(|id| !id.is_empty()) else {

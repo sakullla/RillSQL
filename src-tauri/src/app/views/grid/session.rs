@@ -530,7 +530,7 @@ impl SharedGrid {
 
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
         self.mode = GridMode::Table;
-        self.columns = merge_widths(&self.columns, columns);
+        self.columns = merge_widths(&self.columns, columns, &rows);
         self.source = rows.into_iter().map(Arc::new).collect();
         self.schema = schema;
         self.full_count = full_count;
@@ -558,7 +558,7 @@ impl SharedGrid {
     /// 选择和完整值查看也按行 id 重新挂回；只有那一行真的不在新窗口里才消失。
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
         self.retain_staged_rows();
-        self.columns = merge_widths(&self.columns, columns);
+        self.columns = merge_widths(&self.columns, columns, &rows);
         self.source = rows.into_iter().map(Arc::new).collect();
         self.schema = schema;
         self.offset = offset;
@@ -588,15 +588,22 @@ impl SharedGrid {
         };
         self.columns = columns
             .iter()
-            .map(|name| GridColumn {
-                name: name.clone(),
-                type_name: "text".to_owned(),
-                nullable: true,
-                primary: false,
-                unique: false,
-                auto: false,
-                width: 140.0,
-                editable: false,
+            .enumerate()
+            .map(|(index, name)| {
+                let mut column = GridColumn {
+                    name: name.clone(),
+                    type_name: "text".to_owned(),
+                    nullable: true,
+                    primary: false,
+                    unique: false,
+                    auto: false,
+                    width: 140.0,
+                    editable: false,
+                };
+                // 查询结果的类型名是占位，不进表头宽度；只按列名与首屏值估宽。
+                let probe = GridColumn { type_name: String::new(), ..column.clone() };
+                column.width = estimate_width(&probe, rows.iter().map(|row| row.get(index).and_then(|value| value.as_deref())));
+                column
             })
             .collect();
         self.source = rows
@@ -3878,17 +3885,58 @@ pub struct ColumnHeader {
     pub abbr: String,
     pub primary: bool,
     pub foreign: bool,
+    /// 数字列：值右对齐，位数一眼可比。
+    pub numeric: bool,
 }
 
 impl SharedGrid {
     pub fn column_header(&self, column: usize) -> Option<ColumnHeader> {
         let item = self.columns.get(column)?;
         Some(ColumnHeader {
-            abbr: type_abbr(&item.type_name),
+            // 查询结果的列类型是占位的 text，画出来会把整数列也标成 TEXT；没有可靠类型就不标。
+            abbr: if self.mode == GridMode::Query { String::new() } else { type_abbr(&item.type_name) },
             primary: item.primary,
             foreign: self.foreign_key_for(&item.name).is_some(),
+            numeric: if self.mode == GridMode::Query { self.values_look_numeric(column) } else { numeric_type(&item.type_name) },
         })
     }
+
+    /// 查询结果没有可靠的列类型：首屏非空值全是数字时按数字列对齐。
+    fn values_look_numeric(&self, column: usize) -> bool {
+        let mut seen = false;
+        for row in self.rows.iter().take(COLUMN_SAMPLE_ROWS) {
+            match row.values.get(column).and_then(|value| value.as_deref()) {
+                None => continue,
+                Some(text) if looks_numeric(text) => seen = true,
+                Some(_) => return false,
+            }
+        }
+        seen
+    }
+}
+
+/// 数字类型（整数、定点、浮点、货币）。布尔、日期不算：它们不按位数比较。
+pub fn numeric_type(type_name: &str) -> bool {
+    let lower = type_name.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "int" | "integer" | "int2" | "int4" | "int8" | "bigint" | "smallint" | "tinyint" | "mediumint" | "serial" | "bigserial" | "smallserial"
+            | "numeric" | "decimal" | "dec" | "number" | "real" | "float" | "float4" | "float8" | "double" | "money" | "smallmoney"
+    )
+}
+
+/// 一段文本是否是普通的十进制数字（可带符号、小数点、指数）。前导零的编号（如 007）不算。
+fn looks_numeric(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 40 {
+        return false;
+    }
+    let digits = trimmed.trim_start_matches(['-', '+']);
+    if digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.") {
+        return false;
+    }
+    trimmed.parse::<f64>().is_ok_and(f64::is_finite) && trimmed.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
 }
 
 /// 字段类型缩成表头和记录徽标用的短码。
@@ -4274,13 +4322,50 @@ fn quote_tsv(value: &str, force: bool) -> String {
 }
 
 /// 列宽跟着列名保留，翻页或重新读取时不会回到默认宽度。
-fn merge_widths(previous: &[GridColumn], mut columns: Vec<GridColumn>) -> Vec<GridColumn> {
-    for column in &mut columns {
+/// 第一次出现的列按列名、类型与首屏数据估一个合适的宽度：短的数字列不占 140，
+/// 邮箱、时间戳这类列不一上来就被截断。用户拖过的宽度按列名保留，不被覆盖。
+fn merge_widths(previous: &[GridColumn], mut columns: Vec<GridColumn>, rows: &[GridRow]) -> Vec<GridColumn> {
+    for (index, column) in columns.iter_mut().enumerate() {
         if let Some(width) = previous.iter().find(|item| item.name == column.name).map(|item| item.width) {
             column.width = width;
+        } else {
+            column.width = estimate_width(column, rows.iter().map(|row| row.values.get(index).and_then(|value| value.as_deref())));
         }
     }
     columns
+}
+
+/// 初始列宽的上限：再宽的列也先让出屏幕，需要时双击表头边界自适应或拖宽。
+const COLUMN_AUTO_MAX_WIDTH: f32 = 320.0;
+/// 估宽时最多看的行数：首屏足够代表这一列，长结果不为估宽遍历全部行。
+const COLUMN_SAMPLE_ROWS: usize = 200;
+
+/// 一段文字在网格正文字号下的大致宽度：全角字符按一个字宽，其余按半个字宽。
+fn text_width_estimate(text: &str, half: f32) -> f32 {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .map(|ch| if ch.len_utf8() >= 3 { half * 1.8 } else { half })
+        .sum()
+}
+
+pub(crate) fn estimate_width<'a>(column: &GridColumn, values: impl Iterator<Item = Option<&'a str>>) -> f32 {
+    // 表头：列名 + 类型小字 + 主键图标 + 排序箭头的位置。
+    let mut header = text_width_estimate(&column.name, 7.8) + 20.0;
+    if !column.type_name.is_empty() {
+        header += text_width_estimate(&column.type_name.to_ascii_uppercase(), 6.4) + 6.0;
+    }
+    if column.primary {
+        header += 14.0;
+    }
+    let body = values
+        .take(COLUMN_SAMPLE_ROWS)
+        .map(|value| text_width_estimate(value.unwrap_or("NULL"), 7.8))
+        .fold(0.0_f32, f32::max)
+        + 20.0;
+    header.max(body).clamp(64.0, COLUMN_AUTO_MAX_WIDTH).round()
 }
 
 fn domain_column(column: &GridColumn) -> Column {
@@ -6795,4 +6880,52 @@ pub fn group_digits(value: i64) -> String {
         out.push(ch);
     }
     if value < 0 { format!("-{out}") } else { out }
+}
+
+#[cfg(test)]
+mod width_estimate_tests {
+    use super::*;
+
+    fn column(name: &str, type_name: &str, primary: bool) -> GridColumn {
+        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary, unique: false, auto: false, width: 140.0, editable: false }
+    }
+
+    /// 首屏估宽：短数字列收窄，邮箱/时间戳放得下，超长文本封顶，NULL 按字面宽度算。
+    #[test]
+    fn first_widths_follow_content_within_bounds() {
+        let flag = estimate_width(&column("vip", "INTEGER", false), [Some("0"), Some("1")].into_iter());
+        assert!(flag < 100.0, "短数字列不占默认宽度：{flag}");
+        let email = estimate_width(&column("email", "TEXT", false), [Some("user1200@example.com")].into_iter());
+        assert!(email >= 20.0 * 7.4, "邮箱整段放得下：{email}");
+        let huge = estimate_width(&column("note", "TEXT", false), [Some("x".repeat(500).as_str())].into_iter());
+        assert_eq!(huge, COLUMN_AUTO_MAX_WIDTH);
+        let empty = estimate_width(&column("c", "", false), std::iter::empty());
+        assert_eq!(empty, 64.0, "没有数据时不小于最小宽度");
+        let cjk = estimate_width(&column("city", "TEXT", false), [Some("上海市浦东新区张江高科")].into_iter());
+        let ascii = estimate_width(&column("city", "TEXT", false), [Some("abcdefghijk")].into_iter());
+        assert!(cjk > ascii, "全角字符按一个字宽：{cjk} vs {ascii}");
+    }
+
+    /// 用户调过的列宽按列名保留，不被估宽覆盖；新出现的列才估宽。
+    #[test]
+    fn merged_widths_keep_user_sizes() {
+        let previous = vec![GridColumn { width: 333.0, ..column("email", "TEXT", false) }];
+        let rows = vec![GridRow { id: "1".into(), values: vec![Some("a@b.c".into()), Some("1".into())], located: false, locator: Vec::new(), inserted: false }];
+        let merged = merge_widths(&previous, vec![column("email", "TEXT", false), column("id", "INTEGER", true)], &rows);
+        assert_eq!(merged[0].width, 333.0);
+        assert!(merged[1].width < 140.0);
+    }
+
+    #[test]
+    fn numeric_detection_is_conservative() {
+        assert!(numeric_type("numeric(10,2)"));
+        assert!(numeric_type("BIGINT"));
+        assert!(!numeric_type("boolean"));
+        assert!(!numeric_type("varchar(20)"));
+        assert!(looks_numeric("-12.5"));
+        assert!(looks_numeric("0.25"));
+        assert!(!looks_numeric("007"), "前导零的编号按文本处理");
+        assert!(!looks_numeric("12 apples"));
+        assert!(!looks_numeric("inf"));
+    }
 }
