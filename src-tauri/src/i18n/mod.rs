@@ -949,6 +949,7 @@ dict! {
     // 记录面板的就地暂存：值直接在字段行里改，不弹窗；批量动作只在选区不止一格时出现。
     "grid.record.editValue" => "点这一格暂存新值（Enter 暂存，Esc 取消）", "Click to stage a new value (Enter stages, Esc cancels)";
     "grid.record.editHint" => "输入新值，Enter 暂存，Esc 取消", "New value; Enter stages, Esc cancels";
+    "grid.record.preview" => "预览", "Preview";
     "grid.record.selection" => "选区 {count} 格", "{count} cells selected";
     "grid.record.selectionMany" => "选区：多格", "Many cells selected";
     "grid.record.copySelection" => "复制选区（多格含表头）", "Copy selection (headers included for multiple cells)";

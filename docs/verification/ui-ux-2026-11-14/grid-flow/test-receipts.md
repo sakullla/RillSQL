@@ -1,7 +1,7 @@
 # 测试回执（T7）
 
-运行环境：本机 macOS 共享工作区 `/Users/yanggeng/github/RillSQL`，基线为 `main` 上的 `cb24998`，
-本轮在其上加未提交改动。GPUI headless 测试 + Rust 单元测试；所有 cargo 命令都带 `--locked`，
+运行环境：本机 macOS 共享工作区 `/Users/yanggeng/github/RillSQL`，基线为 `main` 上的 `eec04ec`
+（T7 首轮提交）+ 复审补修（T7-A3）的未提交改动。首轮计数（124 / 1033）来自 `cb24998` + 首轮改动。GPUI headless 测试 + Rust 单元测试；所有 cargo 命令都带 `--locked`，
 `src-tauri/Cargo.toml` / `src-tauri/Cargo.lock` 未改动（`git status` 里没有这两个文件）。
 
 **证据归属**：下列运行都在「`cb24998` + 本轮未提交改动」的工作区上完成，不是某个提交上的干净复跑；
@@ -13,8 +13,8 @@
 | --- | --- | --- |
 | A | `cargo check --manifest-path src-tauri/Cargo.toml --lib --locked` | 退出码 0，0 error |
 | B | `cargo check --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 退出码 0，0 error |
-| C | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::grid` | ok：**124 passed / 0 failed / 2 ignored**（914 filtered） |
-| D | `cargo test --manifest-path src-tauri/Cargo.toml --locked` | ok：**1033 passed / 0 failed / 7 ignored**；`src/bin/rillsql-package` 1 passed；doc-tests 0 |
+| C | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::grid` | ok：**128 passed / 0 failed / 2 ignored**（914 filtered） |
+| D | `cargo test --manifest-path src-tauri/Cargo.toml --locked` | ok：**1037 passed / 0 failed / 7 ignored**；`main.rs` 0 passed；`src/bin/rillsql-package` 1 passed；doc-tests 0 |
 | E | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 退出码 0，0 error；crate 级 warning 32 条，全部是既有项（`CELL_MENU`/`COLUMN_MENU` 只在测试里用、`cell_menu` 参数过多、`SheetDelegate` 可见性、`question_mark` 等），本轮新增代码没有新 warning 类别 |
 
 ## 本轮新增/替换的用例
@@ -29,6 +29,10 @@
 | `pane_tests::double_clicking_a_column_divider_fits_that_column` | 分隔柄双击的等价入口 `TableState::fit_col` 量出宽度并写回会话（`> before + 100`），行号列返回 false |
 | `workbench_tests::record_panel_stages_a_field_in_place_and_offers_batch_actions` | 记录面板字段就地暂存：Enter 写进暂存、Esc 丢弃且保留已有暂存、多格选区出现 `#grid-record-batch` |
 | `workbench_tests::record_panel_explains_readonly_fields_instead_of_staging` | 只读结果点字段不进暂存：给会话只读原因并退化成查看完整值 |
+| `workbench_tests::record_panel_reads_the_original_before_staging_a_long_text_field` | 长文本预览格点字段先按定位读原值：读不到不开编辑只解释；读到后输入框是原值，Enter 暂存的 UPDATE 里是原值而不是空串 |
+| `workbench_tests::record_panel_never_opens_a_blank_editor_for_a_preview_cell` | 绕过入口直接摆出 `record_edit` 也不摆空输入框；Enter 不写空串 |
+| `workbench_tests::record_panel_switching_rows_discards_the_in_place_edit` | 就地暂存开着时换行/关面板都丢弃这次输入，不写错行，重开不带上次文字 |
+| `workbench_tests::record_panel_marks_preview_fields` | 预览字段有 `#grid-record-preview-{column}` 标记，普通值没有 |
 | `shortcut_tests::every_grid_state_key_exists_in_the_catalog` | 7 个三态/动作键 + 记录面板与复制新键都在 `i18n::catalog_keys()` 里，中英都不回退成键名 |
 | `workbench_tests::grid_flow_runs_at_three_widths_in_both_themes` | 1360/900/640 x 浅/深 x 紧凑/标准：加选 + 带表头复制 + 记录面板存在 + 内边距随密度 + 分隔柄自适应 |
 
@@ -45,6 +49,30 @@
 - `hidden_columns_are_not_drawn_but_stay_in_copies`、`frozen_columns_stay_visible_while_scrolling_right`：隐藏列与冻结列。
 - `set_value_on_selection_stages_one_batch_from_the_edit_bar`、`ctrl_v_pastes_tsv_only_from_the_grid_focus_and_respects_readonly`：批量原子拒绝。
 - `app::shell::tests::explicit_null_and_copy_go_through_the_shared_shell_grid`：外壳经 `perform` 走同一条 `copy-region`（单格给值）。
+
+
+## 复审补修（T7-A3）运行记录
+
+补修内容见审计文档 13b 节（预览信封门控、换行/关闭丢弃暂存、预览标记）。命令与结果：
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| F | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::grid` | ok：**128 passed / 0 failed / 2 ignored**（914 filtered） |
+| G | `cargo test --manifest-path src-tauri/Cargo.toml --locked` | ok：**1037 passed / 0 failed / 7 ignored**；`src/bin/rillsql-package` 1 passed；doc-tests 0 |
+| H | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 退出码 0，0 error；crate 级 warning 32 条，位置与首轮清单一致，没有新增类别 |
+
+反向核对（确认回归用例真的咬住这两个缺陷，不是只跑一次通过）：
+
+- 去掉 `grid-record-next` 里的 `discard_record_edit()`：`record_panel_switching_rows_discards_the_in_place_edit`
+  在「换行丢掉这次就地暂存」处失败（`left: Some(1)`）。恢复后通过。
+- 同时去掉 `record_field_press` 与 `begin_record_edit` 的原值判据：
+  `record_panel_reads_the_original_before_staging_a_long_text_field` 与
+  `record_panel_never_opens_a_blank_editor_for_a_preview_cell` 都在「不打开就地暂存」处失败。恢复后通过。
+
+未解释的一次性现象：补修期间有一次全量 `cargo test --locked` 以
+`panic in a destructor during cleanup`（tokio-rt-worker 线程）触发 SIGABRT 退出，日志里没有任何 `FAILED` 用例；
+随后两次全量运行（含本次 #G）都是 1037 passed / 0 failed。该现象没有定位到根因，按未解决事实记录，
+不计作通过证据，也不当作已排除。
 
 ## 未取得项 / 不计作通过
 

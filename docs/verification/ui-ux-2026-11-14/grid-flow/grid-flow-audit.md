@@ -197,6 +197,34 @@
   （只读不进暂存、给原因、退化查看）、`record_view_shows_the_focused_row_and_disables_the_ends`、
   `record_toggle_button_opens_and_closes_the_record_view`。
 
+## 13b. 复审补修（T7-A3）：预览信封与换行后的暂存状态
+
+第一节的修复只覆盖了记录面板"点开就编辑"，漏了两处状态真实性的边界。
+
+- 源码入口：`mod.rs::record_field_press`、`mod.rs::begin_record_edit`（对照 `mod.rs::begin_edit` 的原值门控）、
+  `mod.rs` 的 `grid-record-next` / `grid-record-prev` / `grid-record-close` / `grid-record-toggle` 分支、
+  `record.rs::render_record`。
+- 偏差（补修前）：
+  - 长文本/二进制格在记录面板里点开时没有 `begin_edit` 那道门控，`edit_text` 因为 `original()` 为空而给出空串，
+    字段打开就是空输入框；Enter 随后把 `Some("")` 暂存成一次 UPDATE，等于静默改写用户没见过的值。
+  - `RecordField.preview` 算出来了却没画，截断显示和完整值在面板上长得一样。
+  - 就地暂存开着时切上一行/下一行/关面板都不清 `record_edit` / `pending_record`：下一行显示上一行的文字，
+    Enter 还会把它写进错的那一行；`record_edit.is_some()` 期间网格按键也被一并吞掉。
+- 修复：
+  - `record_field_press` 复用 `begin_edit` 的判据（`needs_full` 且没有缓存原值时先 `begin_full_cells` +
+    `start_full_reads`，pending id 为 `record-edit`），读到原值后 `command("record-edit")` 回到同一条入口再进就地暂存；
+    `reads` 为空时用 `cell_block` 说明原因，不进入暂存。`begin_record_edit` 再做一次同样的判断兜底
+    （按下之后这一行被重读的情况），绝不摆出空输入框。
+  - 字段行右侧按 `field.preview` 画 `grid.record.preview`（预览）pill，悬停给 `grid.value.previewTag`。
+  - `discard_record_edit()` 统一丢掉 `record_edit` / `pending_record` / `record_edit_deferred`，
+    换行、关面板、换表（`show_query` / `open_table` / `clear_sheet`）都先走它；换行与关闭同时把焦点交回网格。
+- 验证材料：`record_panel_reads_the_original_before_staging_a_long_text_field`（原值没到手不开编辑、给原因；
+  原值回来后输入框是原值，Enter 暂存的是原值而不是空串——用生成的 UPDATE 反查）、
+  `record_panel_never_opens_a_blank_editor_for_a_preview_cell`（绕过入口直接摆出暂存状态也不会变成空输入框、
+  Enter 不写空串）、`record_panel_switching_rows_discards_the_in_place_edit`（换行丢弃、不写错行、关面板丢弃、
+  重开不带上次文字）、`record_panel_marks_preview_fields`（预览字段有标记、普通值没有）。
+  三个回归用例在去掉对应修复后会失败（已实测），不是只跑一次通过。
+
 ## 14. 保持不变的行为（回归对照）
 
 | 行为 | 用例 |

@@ -242,6 +242,18 @@ pub fn render_record(
                                     .into_any_element()
                             }
                         })
+                        // 这一格显示的只是预览片段：字段行直接标出来，别让截断显示被当成完整值。
+                        // 完整值仍从右边的按钮按定位读取。
+                        .when(field.preview, |this| {
+                            this.child(
+                                div()
+                                    .id(("grid-record-preview", column))
+                                    .debug_selector(move || format!("grid-record-preview-{column}"))
+                                    .flex_none()
+                                    .tooltip_text(t("grid.value.previewTag"))
+                                    .child(kit::pill(t("grid.record.preview"), p.accent_text, p.accent_soft)),
+                            )
+                        })
                         .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open)),
                 );
             }
