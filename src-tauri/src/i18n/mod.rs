@@ -1200,6 +1200,20 @@ dict! {
     "admin.empty.extrasHint" => "扩展与分区由引擎自己报告：先刷新一次，或确认目标库和 schema 选对了。", "The engine reports extensions and partitions itself: reload once, or check that the target database and schema are right.";
     "admin.preview.irreversible" => "管理操作确认后立即执行，数据库不提供撤销；要回退得另做一次反向操作。", "Admin actions run as soon as you confirm, the database offers no undo, and reverting takes another operation.";
     "admin.preview.danger" => "这是危险操作：确认后立即执行，且无法用一次撤销退回。", "This is a dangerous operation: it runs as soon as you confirm and cannot be undone in one step.";
+    // 连接分组：分组只是组织元数据，删除分组不删连接。
+    "ui.group.new" => "新建分组", "New group";
+    "ui.group.rename" => "重命名分组", "Rename group";
+    "ui.group.collapse" => "折叠分组", "Collapse group";
+    "ui.group.expand" => "展开分组", "Expand group";
+    "ui.group.delete" => "删除分组", "Delete group";
+    "ui.group.deleteHint" => "删除分组，连接保留并回到顶层", "Delete this group; its connections stay and return to the top level";
+    "ui.group.moveTo" => "移动到分组", "Move to group";
+    "ui.group.moveOut" => "移出分组（回到顶层）", "Remove from group (top level)";
+    "ui.group.alreadyHere" => "已经在这个分组里", "Already in this group";
+    "ui.group.none" => "还没有分组", "No groups yet";
+    "ui.group.noneHint" => "先用侧栏的分组按钮新建一个", "Create one with the group button in the sidebar first";
+    "ui.group.namePlaceholder" => "分组名称", "Group name";
+    "ui.group.members" => "个连接", "connections";
 }
 
 #[cfg(test)]
