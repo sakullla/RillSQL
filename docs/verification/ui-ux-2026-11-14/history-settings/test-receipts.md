@@ -57,3 +57,39 @@ ignored 的 7 条全部是既有需要外部 fixture/平台的用例（sqlite fi
 - **未做重启验证**：重启持久化只在 headless 里以"真实写盘 + `load_state()` 读回"证明（见 2.2 第 4 条），
   没有第二进程重启的原生证据。
 - 本任务未改动 `src-tauri/Cargo.toml` / `Cargo.lock`，也未新增 ignored 用例。
+
+## 5. A2 修复回执（2026-11-14）
+
+基线：HEAD `441ef6f`（T8-A1）+ 本次改动。两条问题都只在源码/headless 级验证，
+原生走查与截图仍然不可得（同第 4 节）。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::shell` | 通过：**195 passed / 0 failed / 1 ignored** |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views` | 通过：**296 passed / 0 failed / 2 ignored** |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 通过：**1053 passed / 0 failed / 7 ignored**（28.58s）；另有 `rillsql-package` 1 passed、`main` 与 doc-tests 各 0 |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 通过（exit 0）：32 条 warning，全部是既有代码；本次改动的行 0 warning |
+| `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | 通过（exit 0），依赖未变 |
+
+### 5.1 新增用例
+
+| 用例 | 覆盖 | 证据类型 |
+| --- | --- | --- |
+| `history_confirm_sheets_own_the_keyboard` | 删除确认开着时连按 ↓ / Enter / Delete：`selected_saved`、`delete_target`、`shell.page`、`pending_len` 全不变（不换选中、不载入换页、不排队删除）；取消后 ↓ 恢复；清空历史开着时 ↓ / Delete 同样不生效、不排队 `ClearHistory`/`DeleteRun` | headless 交互级（真实按键） |
+| `settings_save_completes_when_an_unrelated_command_lands_first` | 设置改动进入 `Saving` 后同一片段再跑一条无关命令（切换页面，走静默写盘并推进共享代次）：设置状态仍回到 `Saved`，`services.load_state()` 读到的就是当前设置 | headless + 真实文件写盘 |
+| `history_search_filter_preview_copy_delete_and_clear_are_reversible`（既有，追加断言） | 打开删除确认后把选中换成另一条：`delete_target()` 仍是打开确认时那条，`job_request(DeleteSaved)` 的 `saved_id` 也是它——异步作业不跟着选中漂移 | 源码级 |
+
+### 5.2 因果验证（先证失败，再证通过）
+
+| 修复 | 临时去掉改动后的结果 | 恢复后 |
+| --- | --- | --- |
+| 确认层让路（`overlay_key` 分支 + `history_key` 早退 + `mark-delete` 分流） | `history_confirm_sheets_own_the_keyboard` FAILED：`panicked at tests.rs:3787: assertion left == right failed: 方向键不改选中` | 通过 |
+| 设置写盘状态不再被代次卡住 | `settings_save_completes_when_an_unrelated_command_lands_first` FAILED：30s 超时未回到 `Saved`（`pump_until` 返回 false） | 通过 |
+
+### 5.3 本轮新增/改动的路径
+
+`src-tauri/src/app/shell/chrome.rs`（历史键位分支前提）、`src-tauri/src/app/shell/model.rs`（`history_key` 早退、删除目标钉住与清理）、
+`src-tauri/src/app/shell/view.rs`（`mark-delete` 分流、设置写盘结果判定）、`src-tauri/src/app/shell/jobs.rs`（`saved_id` 取钉住的目标）、
+`src-tauri/src/app/views/history/mod.rs`（`confirm_open`/`delete_target`）、`src-tauri/src/app/shell/tests.rs`（两条新用例 + 一条既有用例追加断言）、
+本目录 3 个文档。i18n 未新增文案键。
+

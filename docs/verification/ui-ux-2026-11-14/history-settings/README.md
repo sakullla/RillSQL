@@ -5,10 +5,12 @@
 - 覆盖需求：R1（逐屏审计）、R3（四态与交互一致）、R4（三态、双主题、密度、三档宽度）
 - 覆盖规范：S5.2（列表由容器持有焦点、当前行用选中表达）、S8.2（历史页）、S8.3（设置页分区导航）、
   S8.5（空态与错误态，"无行"与"无命中"文案必须不同）、S9（主题/密度/响应式）、S12（密度派生尺寸）
-- 基线：HEAD `0ff974d` + 本任务改动；Cargo 依赖未变（`git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` 通过）
-- 改动范围：`src-tauri/src/app/views/history/mod.rs`、`src-tauri/src/app/views/settings/mod.rs`、
-  `src-tauri/src/app/shell/chrome.rs`、`src-tauri/src/app/shell/model.rs`、`src-tauri/src/app/shell/view.rs`（仅新增写盘反馈方法、
-  `perform` 的两条路由分支）、`src-tauri/src/app/shell/tests.rs`、`src-tauri/src/i18n/mod.rs`（仅追加 14 个文案键）
+- 基线：A1 为 HEAD `0ff974d` + 任务改动；A2 修复（2026-11-14）为 HEAD `441ef6f` + 本次改动。
+  Cargo 依赖未变（`git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` 通过）
+- 改动范围（A1 + A2 合计）：`src-tauri/src/app/views/history/mod.rs`、`src-tauri/src/app/views/settings/mod.rs`、
+  `src-tauri/src/app/shell/chrome.rs`、`src-tauri/src/app/shell/model.rs`、`src-tauri/src/app/shell/view.rs`、
+  `src-tauri/src/app/shell/jobs.rs`（`saved_id` 改用钉住的删除目标，A2）、`src-tauri/src/app/shell/tests.rs`、
+  `src-tauri/src/i18n/mod.rs`（仅追加 14 个文案键，A2 未新增键）
 
 ## 文件
 
@@ -16,7 +18,7 @@
 | --- | --- |
 | `history-settings-audit.md` | 两页逐条审计：源码入口、本次之前的偏差、改动、验收对应与证据引用 |
 | `theme-density-and-widths.md` | 实际 headless 几何数值（行高、卡片高、导航宽）与三档宽度行为，双主题双密度取值来源 |
-| `test-receipts.md` | 实际运行的命令、结果、新增用例清单与未执行项 |
+| `test-receipts.md` | 实际运行的命令、结果、新增用例清单与未执行项；第 5 节是 A2 修复的回执与因果验证 |
 
 ## 证据类型（请勿混读）
 

@@ -3202,11 +3202,19 @@ async fn saved_query_rename_delete_cancel_and_deleted_connection_keep_sql() {
     assert_eq!(model.history.saved.len(), 2);
 
     let remove = model.history.saved.iter().find(|item| item.name == "第二个").expect("second").id.clone();
-    model.history.selected_saved = Some(remove);
+    model.history.selected_saved = Some(remove.clone());
     let _ = model.dispatch("saved-delete");
     assert!(model.history.confirm_delete);
     assert_eq!(model.pending_len(), 0);
     assert_eq!(model.history.saved.len(), 2);
+    // 确认层打开时钉住目标：中途换选中不改变真正要删的那一条，作业也只认钉住的 id。
+    let other = model.history.saved.iter().find(|item| item.id != remove).expect("other").id.clone();
+    model.history.selected_saved = Some(other);
+    assert_eq!(model.history.delete_target().as_deref(), Some(remove.as_str()), "确认目标是打开确认时那一条");
+    let token = model.begin_owner(&services.tasks, "history");
+    let pinned_request = job_request(&model, PendingJob::DeleteSaved, token);
+    assert_eq!(pinned_request.saved_id.as_deref(), Some(remove.as_str()), "删除作业不跟着选中漂移");
+    model.history.selected_saved = Some(remove.clone());
     let _ = model.dispatch("saved-delete-cancel");
     assert!(!model.history.confirm_delete);
     assert_eq!(model.history.saved.len(), 2);
@@ -3731,6 +3739,83 @@ fn history_keyboard_walks_rows_and_enter_only_loads(cx: &mut gpui_kit::TestAppCo
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 历史页的确认层（清空历史 / 删除保存查询）不接管键盘焦点，
+/// 所以这些键必须在这里让路：换选中、载入换页、越过确认直接删除都不允许。
+#[gpui_kit::test]
+fn history_confirm_sheets_own_the_keyboard(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-confirm-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let saved = |id: &str, name: &str, sql: &str| crate::query::SavedQuery {
+        id: id.into(),
+        name: name.into(),
+        sql: sql.into(),
+        connection_id: "live".into(),
+        connection_name: "conn-live".into(),
+        database_name: "app".into(),
+        engine: "postgres".into(),
+        updated_at: "2026-11-07T00:00:00Z".into(),
+    };
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::History;
+            view.model.history.apply_list(
+                vec![history_run("a", "select 1", "live", "ok"), history_run("b", "select 2", "live", "ok")],
+                vec![saved("s1", "第一条", "select 1"), saved("s2", "第二条", "select 2")],
+            );
+            view.model.history.section = HistorySection::Saved;
+            view.model.history.selected_saved = Some("s1".into());
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+        // 打开删除确认：确认的是 s1。
+        view.update(cx, |view, cx| view.perform("saved-delete", cx));
+        assert!(view.read(cx).model.history.confirm_delete, "Delete 先开确认层");
+        // 确认层里按方向键、回车、Delete：一律不生效。
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.press("delete", cx);
+        window.render_frame(cx);
+        {
+            let model = view.read(cx);
+            assert!(model.model.history.confirm_delete, "确认层不该被键位关掉或确认");
+            assert_eq!(model.model.history.selected_saved.as_deref(), Some("s1"), "方向键不改选中");
+            assert_eq!(model.model.history.delete_target().as_deref(), Some("s1"), "删除目标不漂移");
+            assert_eq!(model.model.shell.page, AppPage::History, "回车不能在确认层下面载入换页");
+            assert_eq!(model.model.pending_len(), 0, "确认前不排队任何删除");
+        }
+        // 取消后回到列表，确认层之外仍然是原来的键盘行为。
+        view.update(cx, |view, cx| view.perform("saved-delete-cancel", cx));
+        window.press("down", cx);
+        assert_eq!(view.read(cx).model.history.selected_saved.as_deref(), Some("s2"), "取消后方向键恢复");
+
+        // 清空历史开着时，Delete 不能直接把运行记录排进删除队列。
+        view.update(cx, |view, _| {
+            view.model.history.section = HistorySection::Runs;
+            view.model.history.selected_run = Some("a".into());
+        });
+        view.update(cx, |view, cx| view.perform("history-clear", cx));
+        assert!(view.read(cx).model.history.confirm_clear, "清空历史先开确认层");
+        window.press("down", cx);
+        window.press("delete", cx);
+        window.render_frame(cx);
+        {
+            let model = view.read(cx);
+            assert!(model.model.history.confirm_clear, "清空确认还在");
+            assert_eq!(model.model.history.selected_run.as_deref(), Some("a"), "方向键不改选中");
+            assert_eq!(model.model.pending_len(), 0, "确认前不排队清空或删除");
+            assert_eq!(model.model.shell.page, AppPage::History);
+        }
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 设置页：宽窗口左侧竖排分区导航、右侧表单，窄窗口折成顶部一行；
 /// 切换分区只换右侧表单，不改任何设置值。
 #[gpui_kit::test]
@@ -3899,6 +3984,38 @@ fn failed_settings_write_is_visible_then_retry_persists(cx: &mut gpui_kit::TestA
         assert!(window.try_find("status-settings-save").is_none(), "状态栏提示同时消失");
     })
     .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 设置写盘在飞时来了别的命令（它自己的快照也要落盘并推进同一个代次），
+/// 这次设置改动仍然要落到“已保存”，不能因为代次被别人推开就永久停在保存中。
+#[gpui_kit::test]
+fn settings_save_completes_when_an_unrelated_command_lands_first(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("settings", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    // 同一个同步片段里先改设置（进入保存中），紧接着跑一条无关命令：
+    // 它的静默写盘会和这次设置写盘抢同一个代次与写盘闸门，
+    // 而它自己不会给设置页任何反馈，所以只有这次设置写盘能结束“保存中”。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("font-up", cx);
+            view.perform("history", cx);
+        })
+    });
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.settings_save == crate::app::views::settings::SaveState::Saved),
+        "无关命令不能把设置写盘卡在保存中"
+    );
+    let stored = jobs::runtime().block_on(services.load_state()).expect("状态文件已写入");
+    let current_font = cx.update(|cx| view.read(cx).model.settings.editor_font);
+    assert_eq!(stored.shell.editor_font, current_font, "最终的设置改动仍然落到本机");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

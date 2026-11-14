@@ -53,6 +53,9 @@ pub struct HistoryPage {
     pub failure_detail: String,
     pub confirm_clear: bool,
     pub confirm_delete: bool,
+    /// 打开删除确认时钉住的条目：确认的是用户当时看到的那一条，
+    /// 之后列表选中变了也不会改删别的查询。
+    pub delete_target: Option<String>,
     /// 正在读取本机历史库；读到结果或失败前列表不算“无数据”。
     pub loading: bool,
     pub loads: u32,
@@ -80,6 +83,7 @@ impl Default for HistoryPage {
             failure_detail: String::new(),
             confirm_clear: false,
             confirm_delete: false,
+            delete_target: None,
             loading: false,
             loads: 0,
             executions: 0,
@@ -232,6 +236,18 @@ impl HistoryPage {
             self.selected_run.is_some()
         };
         selected.then_some("history-load")
+    }
+
+    /// 确认层（清空历史 / 删除保存查询）是否开着。
+    /// 这一层不接管键盘焦点，开着时历史页的列表键位必须让路。
+    pub fn confirm_open(&self) -> bool {
+        self.confirm_clear || self.confirm_delete
+    }
+
+    /// 保存查询的删除目标：确认层打开时钉住当时那一条，否则就是当前选中。
+    /// 异步作业只认这个 id，确认动作不会因为中途换了选中而删到别的查询。
+    pub fn delete_target(&self) -> Option<String> {
+        self.delete_target.clone().or_else(|| self.selected_saved.clone())
     }
 
     /// Delete 删除当前行：运行记录直接进入确认，保存的查询走它自己的确认层。

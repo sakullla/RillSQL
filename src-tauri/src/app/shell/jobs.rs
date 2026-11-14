@@ -91,7 +91,8 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
         save,
         rename,
         run_id: model.history.selected_run.clone(),
-        saved_id: model.history.selected_saved.clone(),
+        // 删除保存查询只认打开确认时钉住的目标，不跟着选中漂移。
+        saved_id: model.history.delete_target(),
         group: model.pending_group_op.clone(),
     }
 }

@@ -329,6 +329,11 @@ impl Workbench {
         // 历史页的 Delete 与条目右键菜单一致：删除当前选中的记录。
         // 表格的标记删除只在工作台的网格上有意义，不能在次级页里空转。
         if id == "mark-delete" && self.model.shell.page == AppPage::History {
+            // 确认层开着时 Delete 归确认层：不能在这里再开一层或直接执行删除。
+            if self.model.history.confirm_open() {
+                cx.notify();
+                return;
+            }
             if let Some(command) = self.model.history.delete_command() {
                 self.perform(command, cx);
             }
@@ -1804,11 +1809,14 @@ impl Workbench {
                 view.update(cx, |this, cx| {
                     match result {
                         Ok(Ok(())) => {
-                            // 只有仍是最新代次的写入才算数：更晚的改动已作废这次写盘，
-                            // 不能把更旧的快照记成“已落盘”，否则之后的重试会被去重跳过。
+                            // 写盘结果本身就是这次设置改动的答案：persist_revision 要么写了
+                            // 这份快照，要么已被更晚的写入接管（那份含同样的设置改动）。
+                            // 状态不能因为无关命令推进了代次就永久卡在“保存中”。
+                            this.model.settings_save = SaveState::Saved;
+                            // 代次只用来挡“更旧的快照冒充已落盘”：被接管的写入不更新
+                            // last_state，否则之后真正需要的重试会被内容去重跳过。
                             if this.revision.load(Ordering::SeqCst) == generation {
                                 this.last_state = blob;
-                                this.model.settings_save = SaveState::Saved;
                             }
                         }
                         Ok(Err(detail)) => this.model.settings_save = SaveState::Failed { detail },

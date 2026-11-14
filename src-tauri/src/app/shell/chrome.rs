@@ -357,9 +357,13 @@ impl Workbench {
         // 历史页的方向键属于列表：上下/Home/End 在筛选后的可见行里选，
         // 回车只载入编辑器（不执行），Delete 删除当前条目（与条目右键同一条命令）。
         // 有键位绑定时 Delete 作为动作到 perform，没有时在这里直接落到同一条命令。
+        // 清空历史 / 删除保存查询的确认层开着时，这些键归确认层：
+        // 确认层不接管键盘焦点，键会落到列表上，那样“确认”的就会是另一个条目。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
+            && !self.model.history.confirm_clear
+            && !self.model.history.confirm_delete
             && self.model.shell.page == AppPage::History
             && self.model.shell.focus != FocusTarget::Sidebar
         {

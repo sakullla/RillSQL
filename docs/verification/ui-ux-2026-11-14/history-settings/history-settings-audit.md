@@ -27,6 +27,7 @@
 | 2 | 回车没有键盘入口 | 回车载入编辑器，**不执行**：断言 `loads + 1` 且 `executions` 不变，草稿等于该条 SQL | R5「载入不执行」保持不变 | 同上 |
 | 3 | Delete 在历史页会命中全局 `mark-delete` 动作，等于把表格的"标记删除"累计到无关页面 | Delete 在历史页转成"删除当前条目"：有键位绑定时由 `perform("mark-delete")` 在视图层分流，没有绑定时由 `overlay_key` 直接落到同一条命令；两种入口都不再累计 `shell.marked_delete` | R3 键盘一致；outcome 1 | `history_keyboard_walks_rows_and_enter_only_loads`（保存的查询先开确认层，两个入口都不动网格指标） |
 | 4 | 键盘能力不可发现 | 列表末尾一行 `history-keyboard-hint`：`↑↓` / `Home/End` / `Enter` / `Delete` 键帽 + 现有 `kit::kbd` | R3 | headless 渲染 |
+| 5 | （A2 修复）清空历史 / 删除保存查询的确认层只盖住鼠标，不接管键盘：层开着时 ↑↓ 仍在改选中、Delete 仍会排队删除或当场确认、Enter 仍会载入并换页，于是"确认"的可能变成另一个条目 | `HistoryPage::confirm_open()` 进入三处让路判断：`overlay_key` 的历史键位分支（与 Esc 守卫同一组前提）、`history_key` 早退、视图层 `mark-delete` 分流；另把删除目标在开确认时钉住（`delete_target`），异步作业只认这个 id | S5.2 / R3；"确认的就是看到的那一条" | `history_confirm_sheets_own_the_keyboard`（确认层开着时连按 ↓/Enter/Delete：选中、`delete_target`、`shell.page`、`pending_len` 全不变；取消后键盘恢复；清空历史开着时 Delete 不排队） |
 
 保留项（回归，未改动）：载入只恢复草稿（`plan_from_run/plan_from_saved` 的 `execute: false` 与 `needs_target` 语义）、
 窄于 820 的内容区上下堆叠（`history_stacks_preview`）、条目右键菜单、`<200` 行截断、重命名目标钉住。
@@ -50,6 +51,7 @@
 | 2 | 失败只可能出现在设置页，用户离开设置页就彻底看不到 | 设置页表单末尾给出 `kit::error_state_with_action` + `settings-retry-save`；状态栏常驻 `status-settings-save`（危险色 + 图标 + 文案，点击回设置页）——即"全局可理解反馈" | ADR-10「持久化失败有全局可理解反馈」 | 同 `failed_settings_write...`（断言两个入口都在位，成功后同时消失） |
 | 3 | 写盘前乐观更新 `last_state`：失败后内容不变的重试会被去重跳过，永远写不进去 | 新路径只在**写成功后**才更新 `last_state`；失败保留旧值，重试必然真的再写一次 | 失败可恢复 | 同 `failed_settings_write...`（重试后状态文件里是该字号） |
 | 4 | 主题/密度的即时生效只在模型层被断言，没有渲染级回执 | 新增 headless 断言：同一窗口切浅/深色与紧凑/标准，历史行高 67.5→71.5、设置外观卡片 180→204，主题不改变几何 | S9 / R4 | `history_and_settings_geometry_holds_in_both_themes_densities_and_three_widths` |
+| 5 | （A2 修复）成功结果只在"自己仍是最新代次"时才记账：代次与静默写盘共用，设置保存期间任何无关命令（切页、打开抽屉等）推进代次后，这次设置写盘被接管，状态永久停在"保存中" | `persist_revision` 的结果就是设置的答案（写了这份快照，或已被更晚的写入接管），据此无条件回到 `Saved`；代次只用来挡"更旧的快照冒充已落盘"（不让被接管的写入更新 `last_state`，避免之后的重试被内容去重跳过） | R4「持久化失败有可靠反馈」的反面：成功也不许假装失败 | `settings_save_completes_when_an_unrelated_command_lands_first` |
 
 保留项（未改动）：合法的设置值归一（非法主题/密度/字号回落到默认）、`SettingsForm::to_settings` 的钳制、
 主题/密度/语言立即下发到 QueryPane（`sync_view_settings`）、脏值写盘前再次归一。
@@ -58,5 +60,7 @@
 
 | 页 | 关闭项 | 未关闭项 |
 | --- | --- | --- |
-| 历史 | 四态混用与读取态缺失、状态块裸按钮、失败无重试、键盘不可达、Delete 误命中网格命令、刷新无提示 | 原生窗口下的键盘走查与截图（环境不可得，见 README） |
-| 设置 | 单列长表单缺分区导航、写盘失败被丢弃、失败后无法重试、窄宽卡片挤压、失败反馈只可能出现在本页 | 原生窗口下重启验证与截图（环境不可得，见 README） |
+| 历史 | 四态混用与读取态缺失、状态块裸按钮、失败无重试、键盘不可达、Delete 误命中网格命令、刷新无提示、确认层不接管键盘（A2） | 原生窗口下的键盘走查与截图（环境不可得，见 README） |
+| 设置 | 单列长表单缺分区导航、写盘失败被丢弃、失败后无法重试、窄宽卡片挤压、失败反馈只可能出现在本页、无关命令把状态卡在"保存中"（A2） | 原生窗口下重启验证与截图（环境不可得，见 README） |
+
+> A2 修复的两个问题都在源码级回归里证明了因果：把对应守卫/判定临时去掉，新用例分别失败（选中被方向键改掉、`settings_save` 停在 `Saving`）；恢复后通过。`test-receipts.md` 第 5 节记录命令与计数。

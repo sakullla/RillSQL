@@ -578,12 +578,14 @@ impl WorkbenchModel {
                 self.history.section = HistorySection::Runs;
                 self.history.cancel_rename();
                 self.history.confirm_delete = false;
+                self.history.delete_target = None;
             }
             "saved-queries" => {
                 self.history.section = HistorySection::Saved;
                 self.history.filter_status.clear();
                 self.history.cancel_rename();
                 self.history.confirm_delete = false;
+                self.history.delete_target = None;
                 self.shell.page = AppPage::History;
             }
             "open-exchange" => {
@@ -1002,6 +1004,8 @@ impl WorkbenchModel {
                     self.notice_key = Some("ui.history.delete");
                     self.notice_detail.clear();
                 } else if !self.history.confirm_delete {
+                    // 确认层打开时把目标钉住：之后列表怎么变，删的都是用户看到的那一条。
+                    self.history.delete_target = self.history.selected_saved.clone();
                     self.history.confirm_delete = true;
                     self.notice_key = Some("history.page.deleteSavedConfirm");
                     self.notice_detail.clear();
@@ -1017,6 +1021,7 @@ impl WorkbenchModel {
             }
             "saved-delete-cancel" => {
                 self.history.confirm_delete = false;
+                self.history.delete_target = None;
                 self.notice_key = None;
                 self.notice_detail.clear();
             }
@@ -2246,6 +2251,10 @@ impl WorkbenchModel {
     /// 回车载入编辑器（不执行），Delete 走与右键相同的删除确认。
     pub fn history_key(&mut self, key: NavKey) -> Option<String> {
         if self.shell.page != AppPage::History {
+            return None;
+        }
+        // 确认层开着时列表键位一律让路：层里没有键盘焦点，放过来的键会改选中或直接执行。
+        if self.history.confirm_open() {
             return None;
         }
         match key {
