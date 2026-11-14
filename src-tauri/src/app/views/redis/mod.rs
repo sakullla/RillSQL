@@ -125,7 +125,7 @@ pub struct RedisPane {
     cursor: u64,
     done: bool,
     selected: String,
-    detail: Option<RedisKeyDetail>,
+    detail: Option<Arc<RedisKeyDetail>>,
     ttl_input: String,
     rename_to: String,
     command_input: String,
@@ -326,11 +326,11 @@ impl RedisPane {
         self.database = "0".into();
         self.keys = vec![RedisKeyInfo { name: name.into(), key_type: "string".into(), ttl_ms: Some(-1) }];
         self.selected = name.into();
-        self.detail = Some(RedisKeyDetail {
+        self.detail = Some(Arc::new(RedisKeyDetail {
             key_type: "string".into(),
             ttl_ms: Some(-1),
             value: RedisValue::String { text: "hello".into() },
-        });
+        }));
     }
 
     pub fn copied(&self) -> &str {
@@ -630,7 +630,7 @@ impl RedisPane {
                     Some(ms) if ms >= 0 => (ms / 1000).to_string(),
                     _ => String::new(),
                 };
-                self.detail = Some(detail);
+                self.detail = Some(Arc::new(detail));
                 self.reload_viewer = true;
                 self.error.clear();
             }
@@ -1176,7 +1176,7 @@ impl RedisPane {
 
     fn copy_hash(&mut self, index: &str, cx: &mut Context<Self>) {
         let Ok(index) = index.parse::<usize>() else { return };
-        let Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) = &self.detail else { return };
+        let Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) = self.detail.as_deref() else { return };
         let Some(entry) = entries.get(index) else { return };
         let text = entry.value.clone();
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
@@ -1192,7 +1192,7 @@ impl RedisPane {
 
     fn fill_hash(&mut self, index: &str) {
         let Ok(index) = index.parse::<usize>() else { return };
-        if let Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) = &self.detail {
+        if let Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) = self.detail.as_deref() {
             if let Some(entry) = entries.get(index) {
                 self.entry_field = entry.field.clone();
                 self.entry_value = entry.value.clone();
@@ -1202,7 +1202,7 @@ impl RedisPane {
 
     fn hash_field(&self, index: &str) -> Option<String> {
         let index = index.parse::<usize>().ok()?;
-        match &self.detail {
+        match self.detail.as_deref() {
             Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) => entries.get(index).map(|entry| entry.field.clone()),
             _ => None,
         }
@@ -1210,7 +1210,7 @@ impl RedisPane {
 
     fn list_item(&self, index: &str) -> Option<String> {
         let index = index.parse::<usize>().ok()?;
-        match &self.detail {
+        match self.detail.as_deref() {
             Some(RedisKeyDetail { value: RedisValue::List { items }, .. }) => items.get(index).cloned(),
             _ => None,
         }
@@ -1218,7 +1218,7 @@ impl RedisPane {
 
     fn set_member(&self, index: &str) -> Option<String> {
         let index = index.parse::<usize>().ok()?;
-        match &self.detail {
+        match self.detail.as_deref() {
             Some(RedisKeyDetail { value: RedisValue::Set { items }, .. }) => items.get(index).cloned(),
             _ => None,
         }
@@ -1226,7 +1226,7 @@ impl RedisPane {
 
     fn zset_member(&self, index: &str) -> Option<String> {
         let index = index.parse::<usize>().ok()?;
-        match &self.detail {
+        match self.detail.as_deref() {
             Some(RedisKeyDetail { value: RedisValue::ZSet { entries }, .. }) => entries.get(index).map(|entry| entry.member.clone()),
             _ => None,
         }
@@ -1234,7 +1234,7 @@ impl RedisPane {
 
     fn stream_message(&self, index: &str) -> Option<String> {
         let index = index.parse::<usize>().ok()?;
-        match &self.detail {
+        match self.detail.as_deref() {
             Some(RedisKeyDetail { value: RedisValue::Stream { messages }, .. }) => messages.get(index).map(|message| message.id.clone()),
             _ => None,
         }
@@ -1476,12 +1476,7 @@ fn describe_ttl(locale: Locale, ttl_ms: Option<i64>) -> String {
     }
 }
 
-/// 调试构建不复用栈槽。把一块界面放进独立栈帧，调用返回后槽位释放，
-/// 避免 Redis 页和外壳布局叠在 Windows 主线程默认 1 MB 栈上溢出。
-#[inline(never)]
-fn stack_frame<T>(build: impl FnOnce() -> T) -> T {
-    build()
-}
+use crate::ui::kit::stack_frame;
 
 impl Render for RedisPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1777,6 +1772,8 @@ impl Render for RedisPane {
                 )),
             );
         } else {
+            detail = stack_frame(|| {
+            let mut detail = detail;
             let (type_name, ttl_text) = self
                 .detail
                 .as_ref()
@@ -1834,6 +1831,8 @@ impl Render for RedisPane {
                                 .child(redis_button("redis-rename", Some(IconName::Pencil), &self.text("redis.tab.rename"), Kind::Secondary, &entity)),
                         ),
                 );
+            detail
+            });
         }
         if self.selected.is_empty() {
             // 操作按钮常驻，便于键盘与测试定位；没有选中键时它们只给出提示。
@@ -2115,13 +2114,13 @@ impl RedisPane {
     }
 
     fn value_body(&mut self, p: &Palette, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let snapshot = self.detail.as_ref().map(|detail| (detail.key_type.clone(), detail.value.clone()));
-        let Some((_, value)) = snapshot else {
+        // Keep a stable snapshot while inputs/viewers update; never clone the full value per frame.
+        let Some(detail) = self.detail.clone() else {
             return div().text_size(px(TypeScale::SM)).child(SharedString::from(self.text("redis.tab.pickKey"))).into_any_element();
         };
         let pad = kit::Metrics::of(cx).pad;
-        match value {
-            RedisValue::String { text } => {
+        match &detail.value {
+            RedisValue::String { text } => stack_frame(|| {
                 let viewer = self.ensure_string_viewer(&text, window, cx);
                 div()
                     .flex()
@@ -2131,8 +2130,8 @@ impl RedisPane {
                     .child(viewer)
                     .child(div().flex().justify_end().child(redis_button("redis-string-save", Some(IconName::Check), &self.text("redis.tab.execute"), Kind::Primary, entity)))
                     .into_any_element()
-            }
-            RedisValue::Hash { entries } => {
+            }),
+            RedisValue::Hash { entries } => stack_frame(|| {
                 let query = self.redis_input(Field::HashQuery, "redis-hash-filter", "redis.value.field", "", window, cx);
                 let field = self.redis_input(Field::EntryField, "redis-hash-field", "redis.value.field", "field", window, cx);
                 let entry_value = self.redis_input(Field::EntryValue, "redis-hash-value", "redis.value.value", "value", window, cx);
@@ -2164,8 +2163,8 @@ impl RedisPane {
                     );
                 }
                 body.into_any_element()
-            }
-            RedisValue::List { items } => {
+            }),
+            RedisValue::List { items } => stack_frame(|| {
                 let entry_value = self.redis_input(Field::EntryValue, "redis-list-value", "redis.value.value", "value", window, cx);
                 let mut body = div().flex().flex_col().gap(px(pad)).child(
                     div()
@@ -2188,8 +2187,8 @@ impl RedisPane {
                     );
                 }
                 body.into_any_element()
-            }
-            RedisValue::Set { items } => {
+            }),
+            RedisValue::Set { items } => stack_frame(|| {
                 let query = self.redis_input(Field::SetQuery, "redis-set-filter", "redis.value.member", "", window, cx);
                 let member = self.redis_input(Field::EntryMember, "redis-set-member", "redis.value.member", "member", window, cx);
                 let needle = self.set_query.trim().to_ascii_lowercase();
@@ -2215,8 +2214,8 @@ impl RedisPane {
                     );
                 }
                 body.into_any_element()
-            }
-            RedisValue::ZSet { entries } => {
+            }),
+            RedisValue::ZSet { entries } => stack_frame(|| {
                 let score = self.redis_input(Field::EntryScore, "redis-zset-score", "redis.value.score", "1", window, cx);
                 let member = self.redis_input(Field::EntryMember, "redis-zset-member", "redis.value.member", "member", window, cx);
                 let mut body = div().flex().flex_col().gap(px(pad)).child(
@@ -2239,8 +2238,8 @@ impl RedisPane {
                     );
                 }
                 body.into_any_element()
-            }
-            RedisValue::Stream { messages } => {
+            }),
+            RedisValue::Stream { messages } => stack_frame(|| {
                 let id = self.redis_input(Field::StreamId, "redis-stream-id", "redis.value.field", "*", window, cx);
                 let field = self.redis_input(Field::StreamField, "redis-stream-field", "redis.value.field", "field", window, cx);
                 let entry_value = self.redis_input(Field::StreamValue, "redis-stream-value", "redis.value.value", "value", window, cx);
@@ -2285,7 +2284,7 @@ impl RedisPane {
                     body = body.child(row);
                 }
                 body.into_any_element()
-            }
+            }),
             RedisValue::None {} => div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("redis.value.none"))).into_any_element(),
         }
     }
@@ -2501,11 +2500,11 @@ mod tests {
                 assert_eq!(pane.ttl_input(), "30");
                 pane.command("redis-cancel", cx);
                 assert_eq!(pane.ttl_input(), "30");
-                pane.detail = Some(RedisKeyDetail {
+                pane.detail = Some(Arc::new(RedisKeyDetail {
                     key_type: "zset".into(),
                     ttl_ms: Some(-1),
                     value: RedisValue::ZSet { entries: Vec::new() },
-                });
+                }));
                 pane.entry_score = "nope".into();
                 pane.entry_member = "张伟".into();
                 pane.command("redis-zadd", cx);

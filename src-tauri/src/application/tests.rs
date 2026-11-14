@@ -257,11 +257,8 @@ fn err_text(result: Result<impl Sized, String>) -> String {
     }
 }
 
-#[tokio::test]
-async fn typed_service_reaches_connections_catalog_query_files_and_state() {
-    let dir = temp_dir("facade");
-    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
-    let app = AppServices::new(Arc::clone(&service));
+#[inline(never)]
+async fn typed_service_connections(dir: &std::path::Path, service: Arc<Service>, app: &AppServices) {
     let hosted = AppServices::from_state(&ConnectionsState { service: Arc::clone(&service) });
     assert!(hosted.list_connections().await.expect("list").is_empty());
     let tag = app.save_tag(None, "预发😀".to_owned(), "local".to_owned()).await.expect("tag");
@@ -289,7 +286,10 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
     assert!(super::work::catalog_refresh(&service, &[], Some(0), None, true).await.expect("refresh").is_empty());
     assert!(err_text(super::work::catalog_page(&service, "missing", "main", "", 0, 50).await).contains("找不到这条连接"));
     assert!(err_text(super::work::catalog_definition(&service, "missing", "main", "", "customers", "table", "", "").await).contains("还没有打开"));
+}
 
+#[inline(never)]
+async fn typed_service_compare(dir: &std::path::Path, service: Arc<Service>) {
     let side = SideRequest { connection_id: "missing".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() };
     let tasks = super::TaskBoard::new();
     let token = tasks.begin("compare");
@@ -373,7 +373,10 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
         .await
     )
     .contains("还没有打开"));
+}
 
+#[inline(never)]
+async fn typed_service_queries(dir: &std::path::Path, service: Arc<Service>, app: &AppServices) {
     assert!(app.query.history().await.expect("history db").list().await.expect("history").is_empty());
     assert!(super::work::list_history(&app.query).await.expect("history").is_empty());
     let saved = super::work::save_saved(
@@ -436,6 +439,16 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(!text.contains("password"));
     assert!(!text.contains("passphrase"));
+}
+
+#[tokio::test]
+async fn typed_service_reaches_connections_catalog_query_files_and_state() {
+    let dir = temp_dir("facade");
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    let app = AppServices::new(Arc::clone(&service));
+    typed_service_connections(&dir, Arc::clone(&service), &app).await;
+    typed_service_compare(&dir, Arc::clone(&service)).await;
+    typed_service_queries(&dir, service, &app).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

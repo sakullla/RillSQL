@@ -2395,6 +2395,8 @@ fn count_of(request: &PageRequest) -> CountRequest {
     }
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for GridPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
@@ -3007,7 +3009,7 @@ impl GridPane {
         // 列：下拉列出全部列，换列不丢掉已经输入的值。
         let names = self.session.column_names();
         let column_entity = entity.clone();
-        let column_picker = Button::new(SharedString::from(format!("grid-filter-column-{index}")))
+        let column_picker = stack_frame(|| Button::new(SharedString::from(format!("grid-filter-column-{index}")))
             .ghost()
             .xsmall()
             .label(SharedString::from(draft.column.clone()))
@@ -3021,12 +3023,13 @@ impl GridPane {
                     }));
                 }
                 menu
-            });
+            })
+        );
         // 运算符：只列出这一列类型适用的运算符，当前项打勾。
         let ops = self.session.filter_ops_for(&draft.column);
         let current = draft.op.clone();
         let op_entity = entity.clone();
-        let op_picker = Button::new(SharedString::from(format!("grid-filter-op-{index}")))
+        let op_picker = stack_frame(|| Button::new(SharedString::from(format!("grid-filter-op-{index}")))
             .ghost()
             .xsmall()
             .label(SharedString::from(self.session.op_label(&draft.op)))
@@ -3040,7 +3043,8 @@ impl GridPane {
                     }));
                 }
                 menu
-            });
+            })
+        );
         let mut row = div()
             .id(SharedString::from(format!("grid-filter-chip-{index}")))
             .flex()

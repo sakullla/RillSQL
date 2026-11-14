@@ -752,13 +752,8 @@ fn legacy_structure_tabs_without_a_target_are_not_restored_as_empty_items() {
     assert_eq!(model.active_tab.as_deref(), Some("query-1"));
 }
 
-#[tokio::test]
-async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_run() {
-    let dir = std::env::temp_dir().join(format!("rillsql-shell-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let services = services_at(&dir);
-    let mut model = WorkbenchModel::new(Shell::default());
+#[inline(never)]
+async fn seven_engines_save(dir: &std::path::Path, services: &Arc<AppServices>, model: &mut WorkbenchModel) -> String {
     for engine in [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlserver, Engine::Sqlite, Engine::Redis, Engine::Mongodb] {
         let mut draft = if engine == Engine::Postgres { with_tls_ssh(engine) } else { sample_draft(engine) };
         if engine == Engine::Sqlite {
@@ -774,10 +769,10 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
         model.connections.editor = Some(draft);
         model.connections.secrets = Secrets::default();
         let _ = model.dispatch("conn-save");
-        let token = model.prepare_list_token(&services.tasks);
-        let request = request_of(&mut model, token);
-        let done = jobs::execute_job(&services, request).await;
-        apply_done(&mut model, &services, "connections", done);
+        let token = model.prepare_list_token(services.tasks);
+        let request = request_of(model, token);
+        let done = jobs::execute_job(services, request).await;
+        apply_done(model, services, "connections", done);
     }
     assert_eq!(model.connections.rows.len(), 7, "saved {:?}", model.connections.rows.iter().map(|row| row.saved.engine).collect::<Vec<_>>());
     let postgres_id = model.connections.rows.iter().find(|row| row.saved.engine == Engine::Postgres).unwrap().saved.id.clone();
@@ -804,40 +799,49 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     model.connections.selected = Some(sqlite_id.clone());
     model.connections.duplicate_selected();
     let _ = model.dispatch("conn-save");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), 8);
+    sqlite_id
+}
 
-    model.connections.selected = Some(sqlite_id.clone());
+#[inline(never)]
+async fn seven_engines_transfer(dir: &std::path::Path, services: &Arc<AppServices>, model: &mut WorkbenchModel, sqlite_id: &str) {
+    model.connections.selected = Some(sqlite_id.to_owned());
     let _ = model.dispatch("conn-connect");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
-    assert!(matches!(model.connections.status.get(&sqlite_id), Some(crate::app::views::connections::LinkStatus::Connected)), "{:?}", model.connections.message_detail);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
+    assert!(matches!(model.connections.status.get(sqlite_id), Some(crate::app::views::connections::LinkStatus::Connected)), "{:?}", model.connections.message_detail);
 
     let _ = model.dispatch("conn-disconnect");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
-    assert!(matches!(model.connections.status.get(&sqlite_id), Some(crate::app::views::connections::LinkStatus::Disconnected)));
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
+    assert!(matches!(model.connections.status.get(sqlite_id), Some(crate::app::views::connections::LinkStatus::Disconnected)));
     let _ = model.dispatch("conn-test");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert_eq!(model.connections.message_key, Some("connections.editor.test.ok"), "{}", model.connections.message_detail);
 
     let export = dir.join("connections.json");
     model.export_path = Some(export.display().to_string());
     let _ = model.dispatch("conn-export");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert!(export.is_file());
     let blob = std::fs::read_to_string(&export).unwrap();
     assert!(!blob.contains("sshPassphrase"));
     assert!(!blob.to_ascii_lowercase().contains("\"password\""));
+    seven_engines_delete(dir, services, model).await;
+    seven_engines_sealed(dir, services, model, &export).await;
+}
 
+#[inline(never)]
+async fn seven_engines_delete(dir: &std::path::Path, services: &Arc<AppServices>, model: &mut WorkbenchModel) {
     let before_delete = model.connections.rows.len();
     model.connections.selected = Some(model.connections.rows[0].saved.id.clone());
     let _ = model.dispatch("conn-delete");
@@ -851,9 +855,9 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     assert_eq!(services.list_connections().await.unwrap().len(), before_delete);
     let _ = model.dispatch("conn-delete");
     let _ = model.dispatch("conn-delete-confirm");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), before_delete - 1);
 
     let broken = dir.join("broken.json");
@@ -862,29 +866,32 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     model.import_path = Some(broken.display().to_string());
     model.bundle_passphrase.clear();
     let _ = model.dispatch("conn-import");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), kept);
     assert_eq!(services.list_connections().await.unwrap().len(), kept);
     let skip_file = dir.join("skip.json");
     std::fs::write(&skip_file, r#"{"format":"rillsql-connections","version":1,"connections":[{"name":"跳过我","engine":"oracle"}]}"#).unwrap();
     model.import_path = Some(skip_file.display().to_string());
     let _ = model.dispatch("conn-import");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), kept);
     assert!(!model.import_notes.is_empty(), "{:?}", model.import_notes);
     assert_eq!(model.notice_key, Some("connections.importReport.skippedTitle"));
+}
 
+#[inline(never)]
+async fn seven_engines_sealed(dir: &std::path::Path, services: &Arc<AppServices>, model: &mut WorkbenchModel, export: &std::path::Path) {
     model.bundle_passphrase = "correct-horse".into();
     let secret_export = dir.join("connections.rillsqlcx");
     model.export_path = Some(secret_export.display().to_string());
     let _ = model.dispatch("conn-export");
-    let token = model.prepare_list_token(&services.tasks);
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "connections", done);
+    let token = model.prepare_list_token(services.tasks);
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "connections", done);
     let sealed = std::fs::read(&secret_export).unwrap();
     assert!(sealed.starts_with(b"RILLSQLCX1"));
     assert!(!serde_json::to_string(&model.snapshot()).unwrap().contains("correct-horse"));
@@ -928,16 +935,19 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     let done = jobs::execute_job(&fresh, request_of(&mut imported, token)).await;
     apply_done(&mut imported, &fresh, "connections", done);
     assert!(imported.connections.rows.len() >= 7, "{}", imported.connections.rows.len());
+}
 
+#[inline(never)]
+async fn seven_engines_history(services: &Arc<AppServices>, model: &mut WorkbenchModel) {
     let _ = model.dispatch("new-query");
     model.tabs[0].draft = "select 1".into();
     model.history.save_name = "计数".into();
     model.history.section = HistorySection::Saved;
     let before = model.executions;
     let _ = model.dispatch("history-save-named");
-    let token = model.begin_owner(&services.tasks, "history");
-    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
-    apply_done(&mut model, &services, "history", done);
+    let token = model.begin_owner(services.tasks, "history");
+    let done = jobs::execute_job(services, request_of(model, token)).await;
+    apply_done(model, services, "history", done);
     assert_eq!(model.executions, before);
     assert_eq!(model.history.runs.len(), 0);
     assert_eq!(model.history.saved.len(), 1);
@@ -960,10 +970,10 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     model.settings.locale = "en".into();
     model.settings.editor_font = 18;
     model.settings.editor_theme = "warm".into();
-    model.settings.apply_shell(&mut model.shell);
+    model.settings.apply_shell(model.shell);
     let state = model.snapshot();
     assert!(!serde_json::to_string(&state).unwrap().contains("\"password\""));
-    super::model::persist_state(&services, &state).await.unwrap();
+    super::model::persist_state(services, &state).await.unwrap();
     let loaded = services.load_state().await.unwrap();
     let mut restored = WorkbenchModel::new(Shell::default());
     restored.apply_settings(&loaded.shell);
@@ -975,10 +985,10 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
     assert_eq!(restored.settings.editor_theme, "warm");
     assert!(restored.tabs.iter().all(|tab| !tab.uncommitted_cells));
 
-    let stale = model.connections.begin(&services.tasks);
-    let current = model.connections.begin(&services.tasks);
-    assert!(!model.connections.accept_list(&services.tasks, stale, Vec::new()));
-    assert!(model.connections.accept_list(&services.tasks, current, model.connections.rows.clone()));
+    let stale = model.connections.begin(services.tasks);
+    let current = model.connections.begin(services.tasks);
+    assert!(!model.connections.accept_list(services.tasks, stale, Vec::new()));
+    assert!(model.connections.accept_list(services.tasks, current, model.connections.rows.clone()));
 
     let _ = SaveRequest {
         name: "计数".into(),
@@ -989,6 +999,18 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
         engine: String::new(),
     };
     let _ = AppState::new(ShellSettings::default(), SessionState::default());
+}
+
+#[tokio::test]
+async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_run() {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let sqlite_id = seven_engines_save(&dir, &services, &mut model).await;
+    seven_engines_transfer(&dir, &services, &mut model, &sqlite_id).await;
+    seven_engines_history(&services, &mut model).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

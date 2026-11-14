@@ -779,6 +779,8 @@ fn row_has_children(items: &[String]) -> bool {
     !items.is_empty()
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for AdminPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 清单是一次异步读取：读取途中不再重复发起，读完（成功或离线）才允许下一次。
@@ -799,6 +801,8 @@ impl Render for AdminPane {
         let listed = ready && inventory.connected;
         let empty = move |icon: IconName, heading: &'static str, detail: &'static str| listed.then_some((icon, heading, detail));
         let mut cards = div().flex().flex_col().gap(px(12.));
+        cards = stack_frame(|| {
+        let mut cards = cards;
         if sections.maintenance {
             cards = cards.child(op_card("admin-vacuum", "vacuum", IconName::BrushCleaning, t("admin.action.vacuum"), Vec::new(), Vec::new(), None, &entity, locale, &p));
             let target = self.admin_field("reindex", &i18n::text(locale, "ui.conn.optional"), window, cx);
@@ -876,6 +880,10 @@ impl Render for AdminPane {
                 &p,
             ));
         }
+        cards
+        });
+        cards = stack_frame(|| {
+        let mut cards = cards;
         if sections.events {
             let name = self.admin_field("event", "event_name", window, cx);
             let mut toggles = div().flex().flex_wrap().gap(px(6.));
@@ -972,14 +980,10 @@ impl Render for AdminPane {
             // 没有数据库级操作也是一句"下一步"：换成能出现的引擎，而不是一块空白。
             cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.noneHint"), &p));
         }
-        let mut column = div()
-            .id("admin-pane")
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
+        cards
+        });
+        let header = stack_frame(|| {
+            div()
                     .flex_none()
                     .px(px(metrics.page_pad))
                     .pt(px(metrics.page_pad_y))
@@ -1020,8 +1024,10 @@ impl Render for AdminPane {
                                 cx.notify();
                             });
                         }))
-                    }),
-            );
+                    })
+                    .into_any_element()
+        });
+        let mut column = div().id("admin-pane").relative().size_full().flex().flex_col().child(header);
         let note = self.session.note.text(locale);
         // 首屏读取给骨架、刷新已读内容只给一行增量指示、读完而未连接给带"立即连接"的空态；
         // 三者都排在卡片之前，卡片本身（表单与预览入口）在任何状态下都保留，管理能力不因状态而消失。
@@ -1056,12 +1062,12 @@ impl Render for AdminPane {
             })))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
         if self.session.open {
+            let dialog = stack_frame(|| {
             let blocked = self.session.blocked();
             // 危险操作醒目化：计划里有 danger 级风险时，提示条与确认按钮都换成危险色；
             // 没有 danger 级风险的管理操作也给一句"确认后立即执行、数据库不提供撤销"。
             let dangerous = self.session.preview_dangerous();
-            column = column.child(
-                div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
+            div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
                     div()
                         .id("admin-preview-dialog")
                         .role(gpui_kit::Role::Dialog)
@@ -1134,8 +1140,10 @@ impl Render for AdminPane {
                                     admin_button("admin-confirm", "structure.action.confirm", true, entity, locale).into_any_element()
                                 }),
                         ),
-                ),
-            );
+                )
+                .into_any_element()
+            });
+            column = column.child(dialog);
         }
         column
     }
