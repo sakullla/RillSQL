@@ -764,10 +764,16 @@ impl LiveDriver {
 impl StatementDriver for LiveDriver {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport {
         let index = self.statement_index.fetch_add(1, Ordering::SeqCst);
-        // 读取上限改写只在这里做一次：驱动收到的就是要发出去的文本，报告里也用它。
-        let capped = cap_result_sql_detail(&self.engine, sql, limit);
-        let sent = capped.sql.as_str();
         let mut attached = self.session.lock().await;
+        // 没有可查询的会话时一条语句都不会发出去：报告里也就不能带改写后的文本，
+        // 否则界面会给一条从未执行的语句显示"实际执行的语句"和追加的 LIMIT。
+        let capped = if matches!(&*attached, Attached::Scripted) {
+            CappedSql::unchanged(sql)
+        } else {
+            // 读取上限改写只在这里做一次：驱动收到的就是要发出去的文本，报告里也用它。
+            cap_result_sql_detail(&self.engine, sql, limit)
+        };
+        let sent = capped.sql.as_str();
         let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
         let result: Result<StatementValue, Failure> = match &mut *attached {
             Attached::Scripted => Err(Failure::from("这个连接没有连着可查询的数据库".to_owned())),

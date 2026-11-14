@@ -93,7 +93,11 @@ pub struct MongoPane {
     confirm_prompt: String,
     note: String,
     error: String,
-    filter_error: String,
+    /// 数据区错误态的标题键：跟着失败来源走，读文档以外的失败不再套"读取文档失败"。
+    error_title: &'static str,
+    /// 文档读取本身失败：上一页的行还在也画错误态（带重试），
+    /// 不拿旧行或"集合为空"顶替一次读失败。
+    read_failed: bool,
     busy: bool,
     generation: u64,
     copied: String,
@@ -145,7 +149,8 @@ impl MongoPane {
             confirm_prompt: String::new(),
             note: String::new(),
             error: String::new(),
-            filter_error: String::new(),
+            error_title: "mongo.tab.loadFailed",
+            read_failed: false,
             busy: false,
             generation: 0,
             copied: String::new(),
@@ -237,8 +242,16 @@ impl MongoPane {
         &self.note
     }
 
-    pub fn filter_error(&self) -> &str {
-        &self.filter_error
+    /// 错误态的标题键，测试用它确认标题跟着失败来源走。
+    #[cfg(test)]
+    pub fn error_title(&self) -> &'static str {
+        self.error_title
+    }
+
+    /// 这次错误是否来自文档读取本身。
+    #[cfg(test)]
+    pub fn read_failed(&self) -> bool {
+        self.read_failed
     }
 
     pub fn copied(&self) -> &str {
@@ -338,7 +351,8 @@ impl MongoPane {
         self.confirm_prompt.clear();
         self.note.clear();
         self.error.clear();
-        self.filter_error.clear();
+        self.error_title = "mongo.tab.loadFailed";
+        self.read_failed = false;
         self.copied.clear();
         self.fields = Fields::default();
         self.nav_choice = None;
@@ -364,7 +378,9 @@ impl MongoPane {
         if self.busy && self.documents.is_empty() {
             return DocsState::Loading;
         }
-        if !self.error.is_empty() && self.documents.is_empty() {
+        // 读文档失败不再分"有没有旧行"：一次失败的读取既不能让上一页的行冒充当前结果，
+        // 也不能退化成"集合为空"。
+        if !self.error.is_empty() && (self.read_failed || self.documents.is_empty()) {
             return DocsState::Error;
         }
         if self.documents.is_empty() {
@@ -567,7 +583,7 @@ impl MongoPane {
                     self.load_collections(cx);
                 }
             }
-            Err(message) => self.show_error(message),
+            Err(message) => self.show_error_as("mongo.tab.listDatabasesFailed", message),
         }
     }
 
@@ -596,7 +612,7 @@ impl MongoPane {
                     self.load_page(AfterFind::Stay, cx);
                 }
             }
-            Err(message) => self.show_error(message),
+            Err(message) => self.show_error_as("mongo.tab.listCollectionsFailed", message),
         }
     }
 
@@ -640,12 +656,12 @@ impl MongoPane {
                 self.documents = page.documents;
                 self.total = page.total;
                 self.columns = columns_of(&self.documents);
-                self.filter_error.clear();
                 self.error.clear();
             }
             Err(message) => {
-                self.filter_error = message.clone();
-                self.show_error(message);
+                // 只留一处呈现：数据区的错误态（带重试）。同一句错误不再同时写进筛选条旁边的红条，
+                // 否则一次失败会出现两条说明和两个重试入口。
+                self.show_error_as("mongo.tab.loadFailed", message);
             }
         }
     }
@@ -690,7 +706,7 @@ impl MongoPane {
     fn ask_save(&mut self) {
         if let Some(message) = quick_validate(&self.editor_text, self.locale) {
             self.editor_error = message.clone();
-            self.show_error(message);
+            self.show_error_as("mongo.docs.saveFailed", message);
             return;
         }
         self.editor_error.clear();
@@ -714,7 +730,7 @@ impl MongoPane {
             EditorMode::Replace => {
                 let id_json = self.editor_id.clone();
                 if id_json.is_empty() {
-                    self.show_error(self.text("mongo.docs.notMatched"));
+                    self.show_error_as("mongo.docs.saveFailed", self.text("mongo.docs.notMatched"));
                     return;
                 }
                 self.confirm_prompt = if self.locale == Locale::En {
@@ -771,7 +787,7 @@ impl MongoPane {
             }
             Err(message) => {
                 self.editor_error = message.clone();
-                self.show_error(message);
+                self.show_error_as("mongo.docs.saveFailed", message);
             }
         }
     }
@@ -781,7 +797,7 @@ impl MongoPane {
             Ok(outcome) if outcome.matched == 0 => {
                 let message = self.text("mongo.docs.notMatched");
                 self.editor_error = message.clone();
-                self.show_error(message);
+                self.show_error_as("mongo.docs.saveFailed", message);
             }
             Ok(_) => {
                 self.note = self.text("mongo.docs.replacedNote");
@@ -792,7 +808,7 @@ impl MongoPane {
             }
             Err(message) => {
                 self.editor_error = message.clone();
-                self.show_error(message);
+                self.show_error_as("mongo.docs.saveFailed", message);
             }
         }
     }
@@ -834,7 +850,7 @@ impl MongoPane {
                 }
                 self.load_page(AfterFind::Stay, cx);
             }
-            Err(message) => self.show_error(message),
+            Err(message) => self.show_error_as("mongo.docs.deleteFailed", message),
         }
     }
 
@@ -848,7 +864,16 @@ impl MongoPane {
     }
 
     fn show_error(&mut self, message: String) {
+        self.show_error_as("mongo.tab.loadFailed", message);
+    }
+
+    /// 错误同时进状态条和数据区错误态；标题按失败来源给，
+    /// 否则一次写入或清单失败也会被标成"读取文档失败"。
+    fn show_error_as(&mut self, title: &'static str, message: String) {
         self.error = message;
+        self.error_title = title;
+        // 只有"读文档失败"才把数据区整块换成错误态；写入、删除、清单失败不动已有行。
+        self.read_failed = title == "mongo.tab.loadFailed";
         self.note.clear();
     }
 
@@ -892,6 +917,7 @@ impl MongoPane {
         self.generation = self.generation.wrapping_add(1);
         self.busy = true;
         self.error.clear();
+        self.read_failed = false;
         if clear_note {
             self.note.clear();
         }
@@ -902,7 +928,7 @@ impl MongoPane {
         let columns = self.columns.join(",");
         let names = self.documents.iter().take(8).map(|doc| doc.json.replace('\n', " ")).collect::<Vec<_>>().join(" || ");
         format!(
-            "{name} db={db} coll={coll} filter={filter} applied={applied} skip={skip} total={total} columns={columns} note={note} error={error} filter_error={filter_error} editor={editor} confirm={confirm} copied={copied} view={view} docs={names}",
+            "{name} db={db} coll={coll} filter={filter} applied={applied} skip={skip} total={total} columns={columns} note={note} error={error} error_title={error_title} editor={editor} confirm={confirm} copied={copied} view={view} docs={names}",
             name = self.connection_name,
             db = self.database,
             coll = self.collection,
@@ -912,7 +938,7 @@ impl MongoPane {
             total = self.total,
             note = self.note,
             error = self.error,
-            filter_error = self.filter_error,
+            error_title = self.error_title,
             editor = self.editor_text.replace('\n', " "),
             confirm = self.confirm_prompt,
             copied = self.copied.replace('\n', " "),
@@ -1358,29 +1384,7 @@ impl MongoPane {
             area = area.track_focus(&handle);
         }
         area = if matches!(state, DocsState::Rows) { area.overflow_y_scroll().overflow_x_scroll() } else { area.overflow_hidden() };
-        if !self.filter_error.is_empty() {
-            area = area.child(
-                div()
-                    .id("mongo-filter-error")
-                    .test_support()
-                    .flex_none()
-                    .mx(px(10.))
-                    .mt(px(10.))
-                    .px(px(12.))
-                    .py(px(8.))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.danger_soft)
-                    .text_color(p.danger)
-                    .text_size(px(TypeScale::SM))
-                    .child(kit::icon(IconName::CircleAlert, 14., p.danger))
-                    .child(div().flex_1().min_w(px(120.)).child(SharedString::from(self.filter_error.clone())))
-                    .child(mongo_button_for("mongo-filter-retry", "mongo-refresh", Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Secondary, entity)),
-            );
-        }
+        // 读失败只由下面的错误态呈现：这里不再另画一条同样的红条和第二个重试按钮。
         // 已有内容时的局部刷新：一行局部加载，不把整块换成首屏骨架。
         if self.busy && matches!(state, DocsState::Rows) {
             area = area.child(
@@ -1443,7 +1447,7 @@ impl MongoPane {
             .into_any_element(),
             DocsState::Loading => kit::skeleton_state(6, m, p).into_any_element(),
             DocsState::Error => kit::error_state_with_action(
-                self.text("mongo.tab.loadFailed"),
+                self.text(self.error_title),
                 self.error.clone(),
                 mongo_button_for("mongo-docs-retry", self.docs_retry_command(), Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Secondary, entity),
                 p,
@@ -2002,6 +2006,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 一次读失败只出现一次：数据区错误态的那个重试是唯一入口，筛选条旁不再另画一条同样的红条。
+    /// 标题跟着失败来源走，写入/删除失败不会被标成"读取文档失败"。
+    #[gpui_kit::test]
+    fn a_find_failure_is_reported_once_with_a_source_title(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestQueryExt as _;
+        let (dir, services) = pane_services("find-failed");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_documents("app", "orders", vec![doc("1", "c1", "active")]);
+                // 真实的读文档失败路径：读取回调带 Err 回来，而不是直接往面板里塞一句错误。
+                pane.finish_find(Err("过滤条件语法有误".into()), cx);
+            });
+        });
+        render(window, cx);
+        let (error, retry, retries, bars, detail) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window.try_find("error-state").is_some(),
+                    window.try_find("mongo-docs-retry").is_some(),
+                    window.find_all_by_label("重试").len(),
+                    window.try_find("mongo-filter-error").is_some(),
+                    window.try_find("error-state-detail").is_some(),
+                )
+            })
+            .unwrap();
+        assert!(error && retry, "读失败要画错误态并给出重试");
+        assert_eq!(retries, 1, "一次失败只能有一个重试入口");
+        assert!(!bars, "读失败不再另写一条筛选条红条");
+        // 错误原文只有错误态一处：面板里没有第二个字段再存它一遍。
+        assert!(detail, "错误原文放在错误态的说明位里");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.read_failed(), "读失败要记在读取来源上");
+            assert_eq!(pane.error_title(), "mongo.tab.loadFailed", "读失败标题仍是读文档");
+            assert_eq!(pane.status_line().matches("过滤条件语法有误").count(), 1, "{}", pane.status_line());
+        });
+        // 同一条错误通道，失败来源不是读取时标题跟着换：删除失败不能叫"读取文档失败"。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.finish_delete(Err("连接已断开".into()), cx));
+        });
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.error_title(), "mongo.docs.deleteFailed", "{}", pane.status_line());
+            assert!(!pane.read_failed(), "删除失败不是读文档失败");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[gpui_kit::test]
     fn filtered_collection_without_match_offers_clearing_the_filter(cx: &mut gpui_kit::TestAppContext) {
         let (dir, services) = pane_services("no-match");
@@ -2130,7 +2183,8 @@ mod tests {
             pane.total = 0;
             pane.busy = false;
             pane.error.clear();
-            pane.filter_error.clear();
+            pane.error_title = "mongo.tab.loadFailed";
+            pane.read_failed = false;
             pane.applied_filter.clear();
             pane.filter_input.clear();
             pane.view_open = false;

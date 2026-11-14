@@ -329,6 +329,17 @@ impl Workbench {
             cx.notify();
             return;
         }
+        // 清空历史 / 删除保存查询的确认层开着时，页面级键一律让路：确认层自己不管键盘焦点，
+        // 键会落到侧栏对象树或历史列表上，那样"确认"的就会是另一个对象。
+        // 这一条放在所有页面级分支之前，侧栏与列表两条路径共用同一个判断。
+        if self.model.menu.is_none()
+            && self.model.close_prompt.is_none()
+            && !self.model.shell.palette_open
+            && self.model.history.confirm_open()
+        {
+            // Esc 已在上面按确认层取消；其余键交给确认条自己的按钮。
+            return;
+        }
         // 侧栏有焦点时方向键属于对象树：上下移动、左右展开/折叠、回车打开。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
@@ -357,13 +368,10 @@ impl Workbench {
         // 历史页的方向键属于列表：上下/Home/End 在筛选后的可见行里选，
         // 回车只载入编辑器（不执行），Delete 删除当前条目（与条目右键同一条命令）。
         // 有键位绑定时 Delete 作为动作到 perform，没有时在这里直接落到同一条命令。
-        // 清空历史 / 删除保存查询的确认层开着时，这些键归确认层：
-        // 确认层不接管键盘焦点，键会落到列表上，那样“确认”的就会是另一个条目。
+        // 清空历史 / 删除保存查询的确认层开着时上面已经统一让路，这里不再重复判断。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
-            && !self.model.history.confirm_clear
-            && !self.model.history.confirm_delete
             && self.model.shell.page == AppPage::History
             && self.model.shell.focus != FocusTarget::Sidebar
         {

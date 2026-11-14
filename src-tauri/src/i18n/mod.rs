@@ -1202,6 +1202,10 @@ dict! {
     "mongo.tab.needConnectionHint" => "在启动台或侧栏打开连接后，这里会列出这个连接里的集合文档。", "Open a connection from the launcher or sidebar and its collection documents show up here.";
     "mongo.tab.needCollectionHint" => "从左侧导航或库与集合选择器里挑一个集合；清单还没读到时可以先重读一次。", "Pick a collection from the navigation or the database and collection picker, or reload the list first.";
     "mongo.tab.loadFailed" => "读取文档失败", "Could not read the documents";
+    "mongo.tab.listDatabasesFailed" => "读取库清单失败", "Could not list the databases";
+    "mongo.tab.listCollectionsFailed" => "读取集合清单失败", "Could not list the collections";
+    "mongo.docs.saveFailed" => "保存文档失败", "Could not save the document";
+    "mongo.docs.deleteFailed" => "删除文档失败", "Could not delete the document";
     "mongo.tab.emptyCollectionHint" => "这个集合里还没有文档。可以新增一篇，写入前会先给你完整预览和确认。", "This collection has no documents yet. Insert one; you review and confirm the write first.";
     "mongo.tab.emptyFilteredHint" => "没有文档匹配过滤条件 {filter}。调整或清除条件后重试，集合里的数据没有被改动。", "No documents match the filter {filter}. Adjust or clear it and try again; the collection was not changed.";
     "admin.probe.loading" => "正在读取清单…", "Reading inventory…";

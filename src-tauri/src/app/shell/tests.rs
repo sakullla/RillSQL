@@ -3816,6 +3816,104 @@ fn history_confirm_sheets_own_the_keyboard(cx: &mut gpui_kit::TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 历史确认层开着时，侧栏有焦点的方向键与回车同样让路：
+/// 确认层不接管键盘焦点，键落到对象树上就会去动另一个对象、甚至打开一张表。
+#[gpui_kit::test]
+fn history_confirm_sheet_also_yields_the_sidebar_keys(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-confirm-sidebar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let saved = |id: &str, name: &str, sql: &str| crate::query::SavedQuery {
+        id: id.into(),
+        name: name.into(),
+        sql: sql.into(),
+        connection_id: "live".into(),
+        connection_name: "conn-live".into(),
+        database_name: "app".into(),
+        engine: "postgres".into(),
+        updated_at: "2026-11-07T00:00:00Z".into(),
+    };
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            // 对象树里要有行可选：确认层下按方向键能不能动树，就看这两行。
+            view.model.connections.rows.push(record_for("notes", "笔记", Engine::Sqlite));
+            view.model.connections.rows.push(record_for("shop", "商城", Engine::Sqlite));
+            view.model.shell.page = AppPage::History;
+            view.model.shell.focus = crate::app::FocusTarget::Sidebar;
+            view.model.shell.sidebar_open = true;
+            view.model.history.apply_list(vec![history_run("a", "select 1", "live", "ok")], vec![saved("s1", "第一条", "select 1")]);
+            view.model.history.section = HistorySection::Saved;
+            view.model.history.selected_saved = Some("s1".into());
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+        // 打开删除确认：确认的是 s1，焦点却在侧栏。
+        view.update(cx, |view, cx| view.perform("saved-delete", cx));
+        assert!(view.read(cx).model.history.confirm_delete, "Delete 先开确认层");
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        {
+            let model = view.read(cx);
+            assert!(model.model.history.confirm_delete, "确认层不该被侧栏的键关掉或确认");
+            assert_eq!(model.model.explorer_current_row(), None, "确认层开着时方向键不能动对象树");
+            assert_eq!(model.model.shell.page, AppPage::History, "回车不能在确认层下面打开对象");
+            assert_eq!(model.model.history.delete_target().as_deref(), Some("s1"), "删除目标不漂移");
+        }
+        // 取消之后侧栏的键恢复：方向键照常动对象树。
+        view.update(cx, |view, cx| view.perform("saved-delete-cancel", cx));
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).model.explorer_current_row().is_some(),
+            "确认层关掉后侧栏的方向键恢复"
+        );
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 一次已经被更晚的写入接管的失败不算设置页的答案：
+/// 那份更新的快照已经写成功，旧的失败不能把它盖成"保存失败"。
+#[gpui_kit::test]
+fn a_superseded_settings_failure_does_not_overwrite_a_newer_result(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::settings::SaveState;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-superseded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("settings", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    // 先真的落一次盘，拿到一个当前代次。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("font-up", cx)));
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.settings_save == SaveState::Saved),
+        "第一次写入应当成功"
+    );
+    let newest = cx.update(|cx| view.read(cx).publish_generation());
+    assert!(newest > 0, "写盘推进了代次");
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.settings_save = SaveState::Saving;
+            // 旧的那次失败晚到：代次已经不是它，结果不算数。
+            view.apply_persist_settings(Ok(Err("磁盘写失败".into())), newest - 1, "{}".into());
+            assert_eq!(view.model.settings_save, SaveState::Saving, "被接管的失败不改设置页状态");
+            // 仍是最新一次写入的失败照旧显示出来。
+            view.apply_persist_settings(Ok(Err("磁盘写失败".into())), newest, "{}".into());
+            assert!(view.model.settings_save.failed(), "最新一次写入的失败要显示出来");
+        })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 设置页：宽窗口左侧竖排分区导航、右侧表单，窄窗口折成顶部一行；
 /// 切换分区只换右侧表单，不改任何设置值。
 #[gpui_kit::test]

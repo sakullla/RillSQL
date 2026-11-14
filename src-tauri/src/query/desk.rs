@@ -47,6 +47,7 @@ pub struct StatementView {
     /// 执行前对这条语句做的自动改写（读取上限）；用户手写 LIMIT 且不超过上限时为 None。
     pub rewrite: Option<AutoRewrite>,
     /// 自动插入/替换的位置在草稿里的字节偏移；草稿对不上时为 None，不伪造位置。
+    /// 它只是"改写发生在哪"的说明性元数据，不参与定位：失败语句的位置与标记仍由 error_mark 决定。
     pub rewrite_anchor: Option<usize>,
     pub status: String,
     pub message: String,
@@ -1959,6 +1960,7 @@ fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementVie
         }
         view.range = Some((start, end));
         // 自动插入/替换的位置只落到原草稿这一条语句里；越界时停在语句末尾，不外延。
+        // 这里只记录"改写发生在哪"给展示与测试用，定位与错误标记始终走下面的 error_mark。
         view.rewrite_anchor = view.rewrite.as_ref().map(|rewrite| start.saturating_add(rewrite.at).min(end));
         if view.status == "error" {
             let at = if exact { view.error_at } else { None };

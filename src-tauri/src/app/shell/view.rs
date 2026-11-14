@@ -1807,28 +1807,51 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    match result {
-                        Ok(Ok(())) => {
-                            // 写盘结果本身就是这次设置改动的答案：persist_revision 要么写了
-                            // 这份快照，要么已被更晚的写入接管（那份含同样的设置改动）。
-                            // 状态不能因为无关命令推进了代次就永久卡在“保存中”。
-                            this.model.settings_save = SaveState::Saved;
-                            // 代次只用来挡“更旧的快照冒充已落盘”：被接管的写入不更新
-                            // last_state，否则之后真正需要的重试会被内容去重跳过。
-                            if this.revision.load(Ordering::SeqCst) == generation {
-                                this.last_state = blob;
-                            }
-                        }
-                        Ok(Err(detail)) => this.model.settings_save = SaveState::Failed { detail },
-                        // 通道被丢弃说明这次写入已经作废：保持原状态，不假装成功。
-                        Err(_) => {}
-                    }
+                    this.apply_persist_settings(result, generation, blob);
                     cx.notify();
                 });
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// 一次设置写盘回到界面：只有仍是最新一次写入的结果才算设置页的答案。
+    /// 被更晚的写入接管时（那份快照含同样的设置改动，成功与否由它自己报），
+    /// 旧的失败不能盖掉新的结果——否则一次已经成功的写盘还会显示"保存失败"。
+    pub(super) fn apply_persist_settings(
+        &mut self,
+        result: Result<Result<(), String>, tokio::sync::oneshot::error::RecvError>,
+        generation: u64,
+        blob: String,
+    ) {
+        let newest = self.revision.load(Ordering::SeqCst) == generation;
+        match result {
+            Ok(Ok(())) => {
+                // 写盘结果本身就是这次设置改动的答案：persist_revision 要么写了
+                // 这份快照，要么已被更晚的写入接管（那份含同样的设置改动）。
+                // 状态不能因为无关命令推进了代次就永久卡在“保存中”。
+                self.model.settings_save = SaveState::Saved;
+                // 代次只用来挡“更旧的快照冒充已落盘”：被接管的写入不更新
+                // last_state，否则之后真正需要的重试会被内容去重跳过。
+                if newest {
+                    self.last_state = blob;
+                }
+            }
+            Ok(Err(detail)) => {
+                if newest {
+                    self.model.settings_save = SaveState::Failed { detail };
+                }
+            }
+            // 通道被丢弃说明这次写入已经作废：保持原状态，不假装成功。
+            Err(_) => {}
+        }
+    }
+
+    /// 当前写盘代次：设置页的用例要把"最新"和"被接管"两种结果分开验。
+    #[cfg(test)]
+    pub(super) fn publish_generation(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
     }
 
     fn prompt_dir(&self) -> std::path::PathBuf {

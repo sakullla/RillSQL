@@ -640,6 +640,8 @@ impl GridPane {
             "grid-search" => {
                 // 查找默认只筛已读取的行；服务器范围才把关键字下发并重读。
                 let text = self.search_text.clone();
+                // 本地查找同样换掉了可见行：目标行被筛掉后记录面板的暂存不能再占着网格的键。
+                self.record_row_changed();
                 self.session.set_search(&text);
                 if self.session.mode == GridMode::Table && self.session.find_scope() == FindScope::Server {
                     self.session.set_page_keep_identity(0, self.session.page_limit().max(1));
@@ -1718,6 +1720,8 @@ impl GridPane {
             }
             "column-clear-filters" => {
                 self.search_text.clear();
+                // 清掉条件会把行重新放回来：记录面板这次就地暂存属于旧的一批可见行。
+                self.record_row_changed();
                 self.session.clear_filters();
                 self.filter_input_reset();
                 None
@@ -7402,6 +7406,64 @@ mod workbench_tests {
         cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
         cx.run_until_parked();
         cx.update(|cx| assert!(!pane.read(cx).session.uncommitted(), "Enter 没有写进任何一行"));
+    }
+
+    /// 本地查找和"清除条件"同样换掉了可见行：目标行被筛掉后编辑器已经不在画面上，
+    /// 记录面板这次就地暂存必须作废，否则网格的键还被它吞着。两者都走同一个失效钩子。
+    #[gpui_kit::test]
+    fn record_panel_local_search_and_clear_filters_discard_the_in_place_edit(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-record-toggle", cx);
+                pane.record_field_press(1, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(("1".to_owned(), 1)), "字段就地进入暂存"));
+        // 只留"乙"那一行：暂存的目标行（id=1）被筛掉。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.search_text = "乙".into();
+                let _ = pane.command("grid-search", cx);
+            })
+        });
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.loaded_len(), 1, "本地查找只留匹配的行");
+            assert_eq!(pane.record_edit, None, "目标行被本地查找筛掉，暂存作废");
+            assert!(pane.record_edit_deferred.is_none());
+        });
+        // 网格的键重新归网格：Enter 又是写入口，而不是被一次已经不存在的暂存吞掉。
+        cx.update_window(window, |_, window, cx| {
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            pane.update(cx, |pane, _| pane.session.select(0, 1, false));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(pane.read(cx).editing(), "查找之后 Enter 仍能进编辑"));
+        cx.update_window(window, |_, window, cx| window.press("escape", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!pane.read(cx).editing(), "Esc 结束这次编辑"));
+        // 清除条件把行放回来：旧一批可见行上的暂存同样作废。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.record_field_press(1, cx);
+                assert_eq!(pane.record_edit, Some(("2".to_owned(), 1)), "现在暂存的是剩下那一行");
+                pane.column_command(1, "column-clear-filters", cx);
+            })
+        });
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.loaded_len(), 3, "清除条件把行放回来");
+            assert_eq!(pane.record_edit, None, "清除条件换回了旧的一批行，暂存作废");
+        });
+        let _ = window;
     }
 
     /// finish 自己的兜底：目标行还在，但这一格只是预览信封（原值从未读到）。

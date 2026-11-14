@@ -205,7 +205,10 @@ fn live_mongo_pages_filters_inserts_replaces_and_deletes(cx: &mut TestAppContext
     assert!(pump(cx, window, &view, |pane| !pane.running() && !pane.error().is_empty()), "非法过滤没有失败");
     cx.update(|app| {
         let pane = view.read(app);
-        assert!(pane.error().contains("语法") || pane.filter_error().contains("语法"), "{}", pane.status_line());
+        // 一次读失败只有一处呈现：数据区错误态里那句错误，标题仍是"读取文档失败"。
+        assert!(pane.error().contains("语法"), "{}", pane.status_line());
+        assert!(pane.read_failed(), "非法过滤要走读文档的失败路径：{}", pane.status_line());
+        assert_eq!(pane.error_title(), "mongo.tab.loadFailed", "{}", pane.status_line());
         assert!(pane.note().is_empty(), "{}", pane.note());
         assert_eq!(pane.filter_input(), "{");
         assert_eq!(pane.applied_filter(), r#"{"status":"active"}"#);

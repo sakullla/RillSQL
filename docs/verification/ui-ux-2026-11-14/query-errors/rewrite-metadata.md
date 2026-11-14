@@ -12,7 +12,7 @@
 | `query::exec::CappedSql` | `sql` / `rewrite` | 实际会发出去的文本与它的改写来源 |
 | `query::exec::StatementReport` | `sql` / `sent_sql` / `rewrite` | 语句级报告：原文、实际语句、改写来源 |
 | `query::commands::StatementDto` | `sentSql` / `rewrite` | 传给界面的安全字段；没有改写时 `sentSql` 为 null，不重复一份与原文相同的文本 |
-| `query::desk::StatementView` | `sent_sql` / `rewrite` / `rewrite_anchor` | 界面状态：实际语句、改写来源、改写位置在草稿里的字节偏移 |
+| `query::desk::StatementView` | `sent_sql` / `rewrite` / `rewrite_anchor` | 界面状态：实际语句、改写来源、改写位置在草稿里的字节偏移（后者仅作说明，不参与定位） |
 | `query::desk::LogEntry` | `sent_sql` / `rewrite` | 消息页每条记录同样带改写说明，不需要回查结果 |
 
 ## 改写点只剩一处
@@ -38,8 +38,8 @@
 ## 定位映射不变量
 
 1. **错误位置永远相对草稿原文**。PostgreSQL 的字符位置先在发出的文本里算出，再用 `map_rewritten_char` 映射回原文；MySQL/SQL Server 的行号不受改写影响，因为改写只在同一行内插入或替换数字，从不增加行数。`desk::place_statements` 与 `error_mark` 的既有换算因此不需要改动。
-2. **改写位置映射回原语句边界**：`rewrite_anchor = 语句起点 + rewrite.at`（越界时停在语句末尾）。`rewritten_error_maps_back_to_the_draft_statement_boundary` 断言该偏移正好落在草稿里这条语句末尾分号之前。
-3. **不伪造精确位置**：驱动没有偏移（SQLite）时 `error_mark = ErrorMark::Statement`，定位与错误标记都用整条语句的范围；`rewrite_anchor` 只是“改写发生在哪”，不当作错误位置。
+2. **`rewrite_anchor` 只是改写位置元数据，不是定位机制**：`rewrite_anchor = 语句起点 + rewrite.at`（越界时停在语句末尾），用途是说明"改写发生在原草稿的哪个字节"。它没有生产消费方——定位与错误标记一律由 `error_mark` 决定，界面不会拿这个偏移去跳转或高亮。`rewritten_error_maps_back_to_the_draft_statement_boundary` 断言它落在草稿里这条语句末尾分号之前，测的是这段换算本身。
+3. **不伪造精确位置**：驱动没有偏移（SQLite）时 `error_mark = ErrorMark::Statement`，定位与错误标记都用整条语句的范围；`rewrite_anchor` 既不参与定位，也不当作错误位置。
 4. **草稿不被替换**：编辑器里始终是用户自己写的语句，改写文本只出现在结果面板与消息页的只读展示里。
 
 ## 过期结果

@@ -1924,6 +1924,22 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
     assert_eq!(results[1].rewrite_anchor, Some(start + "SELECT * FROM logs WHERE".len()));
 }
 
+/// 没有可查询的会话时一条语句都没发出去：报告里的"实际语句"必须是原输入，
+/// 不能带上一处从未执行的改写（否则界面会给没发出去的语句显示追加的 LIMIT）。
+#[tokio::test]
+async fn scripted_session_reports_no_rewrite_because_nothing_was_sent() {
+    use crate::connections::{CancelTransport, CatalogSession};
+
+    let driver = exec::LiveDriver::attach(CatalogSession::Scripted, "sqlite", "main", CancelTransport::None, None)
+        .await
+        .expect("脚本会话不需要真实连接");
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = driver.run("SELECT * FROM logs", 2, &flag).await;
+    assert!(report.outcome.is_err(), "没有可查询的会话必须如实报错");
+    assert_eq!(report.sent.sql, "SELECT * FROM logs", "没发出去的语句原样带回");
+    assert_eq!(report.sent.rewrite, None, "没发出去的语句不带改写信息");
+}
+
 /// 过期的执行不能把它的改写信息写到更新的结果上。
 #[test]
 fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
