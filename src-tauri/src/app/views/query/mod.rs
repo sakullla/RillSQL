@@ -95,6 +95,8 @@ pub struct QueryPane {
     pending_text: Option<String>,
     opens: Vec<OpenRequest>,
     targets: Vec<TargetRequest>,
+    /// 工具条「运行」也是外壳的入口：按需连接与重放只有一份，面板不自己判断。
+    owner: Option<gpui_kit::WeakEntity<crate::app::shell::Workbench>>,
     variable_values: HashMap<String, String>,
     /// 每个查询标签自己的右侧面板状态（开关、大纲/对象）。
     side: HashMap<String, SideState>,
@@ -400,6 +402,7 @@ impl QueryPane {
             pending_text: None,
             opens: Vec::new(),
             targets: Vec::new(),
+            owner: None,
             variable_values: HashMap::new(),
             side: HashMap::new(),
             row_count: None,
@@ -743,7 +746,44 @@ impl QueryPane {
         );
     }
 
+    /// 工具条的「运行」与「更多」里的运行项外壳只认一份：交回 Workbench 走按需连接。
+    pub(crate) fn attach_owner(&mut self, owner: gpui_kit::WeakEntity<crate::app::shell::Workbench>) {
+        self.owner = Some(owner);
+    }
+
+    /// 面板自己的运行入口：先收起编辑器文本，再把命令交回外壳。
+    /// 面板正在更新时不能同步回头更新外壳（会重入），defer 到这一轮结束。
+    fn delegate_run(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        // 非活动查询由 command_impl 给统一说明，不在这里排队建连。
+        if !self.context_active {
+            return false;
+        }
+        let Some(owner) = self.owner.clone() else { return false };
+        self.capture(cx);
+        let id = id.to_owned();
+        cx.defer(move |cx| {
+            if let Some(owner) = owner.upgrade() {
+                owner.update(cx, |view, cx| view.perform(&id, cx));
+            }
+        });
+        true
+    }
+
+    /// 工具条、更多菜单与编辑器快捷键都从这里进；运行类命令交回外壳统一按需连接。
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
+        if runs_query(id) && self.delegate_run(id, cx) {
+            cx.notify();
+            return;
+        }
+        self.command_impl(id, cx);
+    }
+
+    /// 外壳转发进来的命令（perform → forward_query）：按需连接已经过一次，不再回头。
+    pub fn forwarded_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.command_impl(id, cx);
+    }
+
+    fn command_impl(&mut self, id: &str, cx: &mut Context<Self>) {
         // 表/结构等非查询工作项激活时，补全、格式化、执行、计划、变量、取消和语句选择
         // 都不能落在隐藏的查询标签上。
         if requires_active_query(id) && !self.context_active {
@@ -2928,6 +2968,12 @@ impl QueryPane {
 
 /// 非查询工作项激活时的统一说明。
 pub const NOT_ACTIVE_QUERY: &str = "当前工作项不是查询标签；切回查询标签后再执行、格式化或取消。";
+
+/// 会真正发出执行请求的命令：工具条「运行」、更多菜单的当前语句/整条脚本、大纲里的单条执行。
+/// 这些命令在面板和外壳之间只有一份按需连接判断。
+pub fn runs_query(id: &str) -> bool {
+    matches!(id, "execute-query" | "run-selection" | "run-current" | "run-script") || id.starts_with("outline-run:")
+}
 
 /// 补全、格式化、执行范围、计划、变量、取消和多语句结果都只作用于当前查询工作项。
 /// 外壳和查询页共用这份清单，避免只挡住其中一层。

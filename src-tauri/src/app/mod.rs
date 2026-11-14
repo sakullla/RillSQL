@@ -268,7 +268,15 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
         ($action:ty, $id:expr) => {{
             cx.on_action(move |_: &$action, cx: &mut App| {
                 if let Some(root) = cx.global::<WorkbenchActionTarget>().0.upgrade() {
-                    root.update(cx, |view, cx| view.perform($id, cx));
+                    root.update(cx, |view, cx| {
+                        // 连接模态打开时，快捷键不能在背景里换页、开标签或执行查询；
+                        // 模态自己需要的 Esc/Tab/回车不走全局动作。
+                        if view.model.action_blocked_by_modal($id) {
+                            cx.notify();
+                            return;
+                        }
+                        view.perform($id, cx);
+                    });
                 }
             });
         }};
