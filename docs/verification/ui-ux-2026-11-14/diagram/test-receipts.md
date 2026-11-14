@@ -2,6 +2,22 @@
 
 日期：2026-11-14。命令都在仓库根目录执行（`/Users/yanggeng/github/RillSQL`）。本任务改动只有 `src-tauri/src/app/views/diagram/mod.rs` 与本目录文档；三条 `diagram.*` 文案随 `3c21298` 进入 `main`，不重复认领 `src-tauri/src/i18n/mod.rs`；Cargo 依赖未改。
 
+## 0. 验证绑定与归属（2026-11-14 追加，修复 T10-A3 阻断项）
+
+**事实**：提交 `ec644f2`（`fix: 文档「返回」缺口改为事实，卡片菜单点别处收起，图页 11 用例全绿`）除本任务的 `src-tauri/src/app/views/diagram/mod.rs` 与 `docs/verification/ui-ux-2026-11-14/diagram/` 三份文档外，还带进了 `src-tauri/src/app/shell/view.rs` 两处 hunk，属于 T3 的范围（`pane.forwarded_command(id, cx)` 与查询工具条的 `self.query.update(cx, |pane, _| pane.attach_owner(owner))`）。这两处调用的 `QueryPane::forwarded_command` / `attach_owner` 直到 `da15f59` 才落地，所以 **`ec644f2` 单独检出不能编译**，其提交说明也没有描述这处 hunk。
+
+**结论**：本任务的验证一律绑定到 `da15f59`（`fix: 补齐查询页运行转发与模态快捷键守卫`，完整且可编译），不绑定 `ec644f2`。文档里此前的「11 passed」数字本身成立，但当时的工作区基线不是 `ec644f2` 单独可编译的状态，这一点在此记明。
+
+**本轮实跑**（在 `da15f59` 上）：
+
+```
+cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagram
+```
+
+结果：**11 passed; 0 failed; 0 ignored**（969 filtered out；用例内 0.54 s，EXIT=0），测得的 HEAD 即 `da15f59d0a2a65ea0bde981b746245ec49fa47e6`。执行前 `git status --porcelain` 为空，即该数字来自干净工作区，不含邻接任务未提交的改动。
+
+本任务不认领 `src-tauri/src/app/shell/**` 的任何改动（归 T3）；上文第 5 节全量数字里出现的 `app::shell::*` 用例同样只作邻接环境记录。
+
 ## 1. 关系图自身的用例
 
 命令：
