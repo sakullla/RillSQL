@@ -4284,6 +4284,50 @@ fn sqlite_notes_workbench_sized(
     (window, view, dir)
 }
 
+/// 两个 SQLite 连接：`notes` 已打开，`audit` 只保存没打开（同一份库文件），
+/// 用来测「运行 → 按需连接 → 重放执行」的完整真实路径。
+fn two_sqlite_connections(
+    cx: &mut gpui_kit::TestAppContext,
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>, std::path::PathBuf) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-two-conn-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("items.sqlite");
+    let config_dir = dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            // 只保存，不打开：给按需连接留出一条真的能连上的连接。
+            let mut draft = crate::connections::model::ConnectionDraft::blank(Engine::Sqlite);
+            draft.id = Some("audit".to_owned());
+            draft.name = "审计".to_owned();
+            draft.file_path = database.display().to_string();
+            services
+                .connections
+                .save(draft, crate::connections::model::SecretInput::default())
+                .await
+                .unwrap();
+            let _ = tx.send(services);
+        });
+    });
+    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let (window, view) = open_workbench_sized(cx, services, true, 1360., 800.);
+    (window, view, dir)
+}
+
 /// 启动后的外壳要同时读到连接列表和目录对象，资源管理器才会真的画出行。
 fn wait_for_shell_ready(
     cx: &mut gpui_kit::TestAppContext,
@@ -7444,6 +7488,121 @@ fn every_run_command_shares_the_same_gate() {
         let queued = model.connect_intents.iter().find(|queued| queued.replay.as_deref() == Some(command));
         assert!(queued.is_some(), "{command} 应排队等待重放");
     }
+}
+
+/// 查询页自己的「运行」（工具条按钮与「更多」里的运行项）不能绕过按需连接这道门：
+/// 未连接时只排一次打开连接，连上后这次执行被重放一次。
+#[gpui_kit::test]
+fn the_query_panes_own_run_button_gates_on_demand_connect(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = two_sqlite_connections(cx);
+    wait_for_shell_ready(cx, window, &view);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            // 「审计」这条连接只保存没打开：闸门应先建连，再把这次执行续上。
+            view.model.open_bound_query(
+                "select label from item".into(),
+                Some("audit".into()),
+                Some("审计".into()),
+                Some("main".into()),
+                Some("sqlite".into()),
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let runs_before = cx.update(|cx| view.read(cx).query_runs(cx));
+
+    // 工具条「运行」按下的就是查询页自己的命令入口，这里直接驱动它（不是 perform）。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.query.update(cx, |pane, cx| pane.command("execute-query", cx)));
+    });
+    cx.update(|cx| {
+        let runs = view.read(cx).query_runs(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.model.connections.status.get("audit"), Some(&LinkStatus::Connecting), "未连接时先建连");
+            // 走的是外壳的门：连接状态、提示与排队都只有 Workbench::perform 会写。
+            assert_eq!(view.model.notice_key, Some("ui.conn.connecting"), "面板把运行交回了外壳的按需连接");
+            let queued: Vec<&str> = view.model.connect_intents.iter().filter_map(|intent| intent.replay.as_deref()).collect();
+            assert_eq!(queued, vec!["execute-query"], "这次执行排队等待重放，且只排队一次");
+            assert_eq!(runs, runs_before, "没连上之前不执行");
+        });
+    });
+
+    // 真的把这条连接打开：连上后这次执行被重放，且只重放一次。
+    assert!(
+        pump_until(cx, window, &view, |view, cx| {
+            view.model.connections.status.get("audit") == Some(&LinkStatus::Connected) && view.query_runs(cx) == runs_before + 1
+        }),
+        "连上后这次执行要被重放一次"
+    );
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.connect_intents.is_empty(), "重放完不留排队");
+        assert_eq!(view.read(cx).query_runs(cx), runs_before + 1, "只重放一次，没有重复执行");
+    });
+
+    // 等这次执行收尾，工具条回到「运行」按钮。
+    assert!(pump_until(cx, window, &view, |view, cx| !view.query.read(cx).busy()));
+    // 工具条那颗「运行」按钮接的也是这条入口：已连接时直接执行，不再排连接。
+    cx.update_window(window, |_, window, cx| window.click("query-act-execute-query", cx)).unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.query_runs(cx) == runs_before + 2),
+        "工具条的运行按钮走同一条执行路径"
+    );
+    // 「更多」菜单里的「执行当前语句」走同一个入口。
+    assert!(pump_until(cx, window, &view, |view, cx| !view.query.read(cx).busy()));
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.query.update(cx, |pane, cx| pane.command("run-current", cx)));
+    });
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.query_runs(cx) == runs_before + 3),
+        "更多菜单的当前语句走同一条执行路径"
+    );
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.connect_intents.is_empty(), "已连接时不再排连接");
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 连接模态打开时，全局快捷键不能在背景里换页或开新标签；关闭后同一动作恢复。
+#[gpui_kit::test]
+fn the_connection_modal_blocks_global_shortcuts(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let tabs_before = cx.update(|cx| view.read(cx).model.tabs.len());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-connection", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(cx.update(|cx| view.read(cx).model.conn_modal.open), "模态开着");
+    // Cmd+T / Cmd+Enter 这类全局动作不能在模态背后开标签或执行。
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(Box::new(crate::app::NewQuery), cx);
+        window.dispatch_action(Box::new(crate::app::ExecuteQuery), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.conn_modal.open, "快捷键不能关掉模态");
+        assert_eq!(model.tabs.len(), tabs_before, "模态开着时不响应全局动作");
+        assert!(!model.commands.iter().any(|id| id == "new-query" || id == "execute-query"), "动作没有进入工作区");
+    });
+    // 关掉模态后同一批动作恢复。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("conn-cancel", cx));
+        window.render_frame(cx);
+        window.dispatch_action(Box::new(crate::app::NewQuery), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(!view.read(cx).model.conn_modal.open);
+        assert!(view.read(cx).model.tabs.len() > tabs_before, "关闭模态后快捷键照常");
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// 保存并连接要带着刚输入的密码去连接：关闭模态会清空表单机密，不能把空密码交给 OpenConnection。

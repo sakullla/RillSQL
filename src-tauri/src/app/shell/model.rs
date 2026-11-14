@@ -1200,6 +1200,12 @@ impl WorkbenchModel {
         self.conn_modal.open
     }
 
+    /// 连接模态打开时，全局快捷键不能在背景里改工作区：只放行关闭窗口。
+    /// 模态自己的 Esc/Tab/回车由外壳的按键处理与 focus trap 负责，不经过这里。
+    pub fn action_blocked_by_modal(&self, id: &str) -> bool {
+        self.conn_modal.open && id != "quit-window"
+    }
+
     /// 打开新建连接模态。启动台、命令搜索、对象树空态和快捷键都到这一处，
     /// 因此"新建连接"只有一份草稿与一个编辑面。
     pub fn open_connection_modal(&mut self, engine: Option<Engine>, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) {
@@ -1299,7 +1305,7 @@ impl WorkbenchModel {
         }
         // 执行查询：活动查询项绑定的连接还没打开时，先连上再重放这次执行，
         // 而不是让查询页回答“这条连接还没有打开”（run-current/选区同一条路）。
-        if matches!(id, "execute-query" | "run-current" | "run-selection" | "run-script") {
+        if crate::app::views::query::runs_query(id) {
             let tab = self.active_tab().filter(|tab| tab.kind.is_query())?;
             let connection = tab.connection_id.clone()?;
             if !self.connections.rows.iter().any(|row| row.saved.id == connection) {
