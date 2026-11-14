@@ -30,8 +30,12 @@ use crate::i18n::{self, Locale};
 
 use session::{
     cell_of, columns_from_schema, rows_from_page, schema_from_dto, BatchReject, CellPhase, Continuation, CopyBlock, CopyFormat, CopyScope, FindScope,
-    ForeignKeyInfo, FullRead, Gate, GridAction, Reference,
+    ForeignKeyInfo, FullRead, Gate, GridAction, Reference, SheetEmptiness,
 };
+
+// Tab / Shift+Tab 在网格里是「下一格 / 上一格」，不是焦点遍历：绑定在网格自己的 key context 上，
+// 才比外壳的 Tab（焦点遍历）更靠近焦点、先拿到这个键；表格自己有同名绑定，优先级更高。
+gpui_kit::actions!(rillsql_grid, [GridNextCell, GridPrevCell]);
 
 /// 外键跳转要打开的引用表工作项：目标身份和定位查询一起交给外壳，由它真正打开并定位。
 /// 网格只算出目标，不自己开工作项，也不把这段 SQL 当作"已经跳过去"。
@@ -224,6 +228,12 @@ impl GridPane {
         let edit_input = cx.new(|cx| InputState::new(window, cx));
         table.update(cx, |state, _| state.delegate_mut().edit_input = Some(edit_input.clone()));
         let grid_focus = cx.focus_handle().tab_stop(true);
+        // 只在网格自己的 key context 里把 Tab 解释成「下一格」；走到首格/末格时再交还外壳。
+        // 同一条绑定重复注册不会改变行为，多个网格共存也只有一种解释。
+        cx.bind_keys([
+            gpui_kit::KeyBinding::new("tab", GridNextCell, Some("Grid")),
+            gpui_kit::KeyBinding::new("shift-tab", GridPrevCell, Some("Grid")),
+        ]);
         // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
         let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -482,6 +492,13 @@ impl GridPane {
         let mut navigation: Option<GridNavigation> = None;
         let copied = match id {
             "grid-count" => { self.count_rows(cx); None }
+            // 读取失败后按当前条件重读同一窗口；查询结果不重新执行语句，只把原因继续留在屏幕上。
+            "grid-retry" => {
+                if self.session.mode == GridMode::Table && !self.fetching {
+                    self.fetch_current(true, cx);
+                }
+                None
+            }
             "edit-cell" => {
                 self.select_first_if_needed();
                 self.request_edit(false);
@@ -1926,8 +1943,11 @@ impl GridPane {
             let key = self.session.readonly_reason();
             if key.is_empty() { i18n::text(locale, "grid.status.readonly") } else { i18n::text(locale, key) }
         };
+        // 格子内边距只由当前密度决定；换密度时同步刷新，列宽测量读的也是这一份。
+        let cell_pad = cell_padding(kit::Metrics::of(cx));
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
+            state.delegate_mut().cell_pad = cell_pad;
             state.delegate_mut().selected = selected;
             state.delegate_mut().writable = writable;
             state.delegate_mut().dirty = dirty;
@@ -1957,6 +1977,29 @@ impl GridPane {
                 _ => {}
             }
         });
+    }
+}
+
+/// 网格行高与表头高：都取当前密度的行高（规范 S7.2 紧凑 26 / 标准 32 / 宽松 40）。
+/// 正文行、表头行和骨架占位行共用这一份值，换密度时三处一起变。
+fn row_height(m: kit::Metrics) -> Pixels {
+    px(m.row_h)
+}
+
+/// 单元格左右内边距：按密度取分栏内边距的一半（紧凑 5 / 标准 6 / 宽松 8），
+/// 上下由行高与垂直居中决定，不再叠一层裸间距。列宽测量与自适应也读它。
+fn cell_padding(m: kit::Metrics) -> gpui_kit::Edges<Pixels> {
+    let horizontal = px(m.pane_pad() / 2.);
+    gpui_kit::Edges { top: px(0.), bottom: px(0.), left: horizontal, right: horizontal }
+}
+
+/// 单元格的悬停提示：长文本截断后仍能看到整段值；大值/二进制指向查看面板；
+/// NULL 与空字符串不给提示（它们本身已经有自己的画法）。
+fn cell_tooltip(locale: Locale, kind: session::CellKind, text: &str) -> Option<SharedString> {
+    match kind {
+        session::CellKind::Text if !text.is_empty() => Some(SharedString::from(text.to_owned())),
+        session::CellKind::Large | session::CellKind::Binary => Some(SharedString::from(i18n::text(locale, "grid.value.openFullHint"))),
+        _ => None,
     }
 }
 
@@ -2071,8 +2114,23 @@ impl Render for GridPane {
             self.press = None;
         }
         self.focus_inside = focus_inside;
+        // 键盘焦点环：焦点在网格里、且最近一次输入来自键盘才画（与 kit 的 focus-visible 同一条判据），
+        // 鼠标点击选格不画环，方向键/Tab/翻页之后画。环画在当前焦点格上，不是整个表格外面一圈。
+        let ring = if focus_inside && window.last_input_was_keyboard() { self.session.focus_cell() } else { None };
+        if self.table.read(cx).delegate().focus_ring != ring {
+            self.table.update(cx, |state, cx| {
+                state.delegate_mut().focus_ring = ring;
+                cx.notify();
+            });
+        }
         let start = self.table.read(cx).delegate().visible_start;
         if self.table.read(cx).delegate().visible_seen {
+            // 先把屏幕上真实放得下的行数交给会话：翻页步长、可见窗口和滚动钳制都用这一份，
+            // 不再让会话里那份默认行数和实际窗口对不上。
+            let visible_len = self.table.read(cx).delegate().visible_len;
+            if visible_len > 0 && visible_len != self.session.viewport_rows() {
+                self.session.set_viewport(visible_len);
+            }
             // 滚动换行后指针下的格子已经不是拖选起点的邻居：结束拖拽，保留已选矩形。
             if start != self.visible_start {
                 self.visible_start = start;
@@ -2100,7 +2158,15 @@ impl Render for GridPane {
             .flex_col()
             .size_full()
             .bg(p.surface)
+            .key_context("Grid")
             .track_focus(&self.grid_focus)
+            // Tab / Shift+Tab：网格里逐格移动选择；走到边界就把这个键还给外壳的焦点遍历。
+            .on_action(cx.listener(|this, _: &GridNextCell, window, cx| {
+                this.step_cell(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GridPrevCell, window, cx| {
+                this.step_cell(false, window, cx);
+            }))
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let key = match key {
@@ -2143,7 +2209,8 @@ impl Render for GridPane {
                     return;
                 }
                 let table_focused = this.table.read(cx).focus_handle(cx).is_focused(window);
-                if matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+                // 方向键、Home/End 和 PageUp/PageDown 都走同一条会话移动路径；滚动跟在焦点后面。
+                if matches!(key, "up" | "down" | "left" | "right" | "home" | "end" | "pageup" | "pagedown") {
                     // 表格自身已移动过一次时不要再移动；Shift 没有绑定，由这里扩展选区。
                     if table_focused && !event.keystroke.modifiers.shift {
                         return;
@@ -2164,6 +2231,7 @@ impl Render for GridPane {
                 }
             }))
             .child(tools)
+            .children(self.render_read_error(&p, m, &entity))
             .children(filters_strip)
             .child(div().id("grid-range").hidden().child(range))
             .child(div().id("grid-banner").hidden().child(banner));
@@ -2283,7 +2351,12 @@ impl GridPane {
         let table_mode = self.session.mode == GridMode::Table;
         let range = SharedString::from(self.session.range_text());
         // 无匹配、表为空、加载中、还有更多、已到末尾各自有说法，不用同一个空列表。
-        let state_text = SharedString::from(self.session.state_text(loading));
+        // 读取失败已经由工具条下方的错误条说一次，状态栏不再重复同一段原因。
+        let state_text = if self.session.read_failure().is_some() {
+            SharedString::default()
+        } else {
+            SharedString::from(self.session.state_text(loading))
+        };
         // 查询结果、没有目标表、连接已关闭或失联时，整表筛选的开关不该看起来可以用。
         // 这里同时把失去连接的整表筛选退回已读取行，原因随后一起画出来。
         let scope_block = self.sync_find_scope();
@@ -2410,7 +2483,8 @@ impl GridPane {
                     .child(t("grid.status.readonly")),
             );
         }
-        if !self.notice.is_empty() {
+        // 读取失败的原因已经由工具条下方的错误条说一次；状态区不再重复同一段话。
+        if !self.notice.is_empty() && self.session.read_failure().is_none() {
             status = status.child(
                 div().px(px(6.)).min_w(px(0.)).max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
             );
@@ -2673,9 +2747,15 @@ impl GridPane {
     fn render_grid_body(&self, loading: bool, p: &Palette, m: kit::Metrics, entity: &Entity<GridPane>, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
-        if !self.session.column_names().is_empty() {
+        // 有已读取的行才画表格；空表格不保留表头骨架，交给下面的三态（需求 R4）。
+        if !self.session.column_names().is_empty() && self.session.loaded_len() > 0 {
             let table = self.table.clone();
-            let data_table = DataTable::new(&table).with_size(gpui_kit::component::Size::Size(px(m.row_h))).header_row_height(px(m.row_h)).stripe(true).accessibility_label("shared-grid");
+            // 行高、表头高与格子内边距只由当前密度决定，网格不再自带一套尺寸常量。
+            let data_table = DataTable::new(&table)
+                .with_size(gpui_kit::component::Size::Size(row_height(m)))
+                .header_row_height(row_height(m))
+                .stripe(true)
+                .accessibility_label("shared-grid");
             let content = if self.record_open {
                 let width = self.side_width.clamp(RECORD_SIDE_MIN, RECORD_SIDE_MAX);
                 let dragging = self.record_dragging;
@@ -2720,12 +2800,19 @@ impl GridPane {
             } else {
                 div().flex_1().min_h(px(0.)).child(data_table)
             };
+            // 横向滚动只发生在网格正文里：容器收窄到可用宽度并裁掉溢出，
+            // 列再宽也只是表格自己的横向滚动条，不会把查询页/表数据页撑宽。
             return div()
+                .id("grid-body")
+                .debug_selector(|| "grid-body".to_owned())
+                .test_support()
                 .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h(px(0.))
+                .min_w(px(0.))
+                .overflow_hidden()
                 .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| {
                     // 点中格子时把键盘交给网格本身，之后的方向键、Enter 和 F2 才有效。
                     window.focus(&this.grid_focus, cx);
@@ -2740,30 +2827,181 @@ impl GridPane {
                 .into_any_element();
         }
         if loading {
-            // 首屏、换表与替换读取还没回来：不画"没有数据"的空表插图，加载优先于空。
+            // 首屏、换表与替换读取还没回来：按当前密度排骨架行（规范 S8.5 的加载优先于空），
+            // 行数取自可视行数，密度一换骨架行高也跟着换，不再用整块转圈盖住内容区。
+            let rows = self.session.viewport_rows().clamp(4, 10);
             return div()
                 .id("grid-loading")
                 .debug_selector(|| "grid-loading".to_owned())
                 .flex_1()
+                .min_h(px(0.))
+                .min_w(px(0.))
                 .flex()
-                .items_center()
-                .justify_center()
-                .child(kit::loading_state(t("grid.state.loading"), p))
+                .flex_col()
+                .child(kit::skeleton_state(rows, &m, p))
                 .into_any_element();
         }
-        // 查询结果没有行是"结果集为空"，不是"表里没有行"。
-        let heading = match self.session.mode {
-            GridMode::Query => t("ui.grid.emptyResult"),
-            GridMode::Table => t("ui.grid.empty"),
+        // 一次都没读到、也没有可保留的结果：用统一错误态替换内容区，并给出能立刻做的纠正动作。
+        // 已经读到行时的失败不走这里：正文保留上次结果，只在工具栏下方挂一条错误条。
+        if self.session.read_failure().is_some() {
+            let message = SharedString::from(self.session.read_failure().unwrap_or_default().to_owned());
+            let retry = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-retry", cx);
+                    });
+                }
+            };
+            let body = if self.session.mode == GridMode::Table {
+                kit::error_state_with_action(
+                    t("grid.state.readErrorTitle"),
+                    message,
+                    kit::secondary_button("grid-retry", Some(IconName::RotateCcw), t("grid.action.retry"), retry).into_any_element(),
+                    p,
+                )
+                .into_any_element()
+            } else {
+                kit::error_state(t("grid.state.readErrorTitle"), message, p).into_any_element()
+            };
+            return div()
+                .id("grid-error")
+                .debug_selector(|| "grid-error".to_owned())
+                .test_support()
+                .flex_1()
+                .min_h(px(0.))
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(body)
+                .into_any_element();
+        }
+        // 空网格按语义分三类：无命中（调条件）、表里没有行（插入）、查询没有返回行（改语句）。
+        // 三类文案不同、下一步不同，都不保留表头骨架。
+        let emptiness = self.session.emptiness();
+        let body = match emptiness {
+            SheetEmptiness::NoMatch => {
+                let clear = {
+                    let entity = entity.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                        entity.update(cx, |pane, cx| {
+                            let _ = pane.command("grid-filter-clear", cx);
+                        });
+                    }
+                };
+                kit::no_match_state_with_action(
+                    IconName::Search,
+                    t("grid.state.noMatch"),
+                    t("grid.state.noMatchDetail"),
+                    kit::tool_button("grid-condition-clear", Some(IconName::ListRestart), t("grid.state.clearConditions"), clear).into_any_element(),
+                    p,
+                )
+                .into_any_element()
+            }
+            SheetEmptiness::TableEmpty | SheetEmptiness::Rows => {
+                let detail = t("grid.state.tableEmptyDetail");
+                if self.session.writable() {
+                    let insert = {
+                        let entity = entity.clone();
+                        move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                            entity.update(cx, |pane, cx| {
+                                let _ = pane.command("grid-insert", cx);
+                            });
+                        }
+                    };
+                    kit::empty_state_with_action(
+                        IconName::Table,
+                        t("ui.grid.empty"),
+                        detail,
+                        kit::tool_button("grid-empty-insert", Some(IconName::Plus), t("grid.action.insert"), insert).into_any_element(),
+                        p,
+                    )
+                    .into_any_element()
+                } else {
+                    kit::empty_state(IconName::Table, t("ui.grid.empty"), detail, p).into_any_element()
+                }
+            }
+            SheetEmptiness::ResultEmpty => {
+                kit::empty_state(IconName::Table, t("ui.grid.emptyResult"), t("grid.state.resultEmptyDetail"), p).into_any_element()
+            }
         };
         div()
             .debug_selector(|| "grid-empty".to_owned())
             .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .child(body)
+            .into_any_element()
+    }
+
+    /// 网格自己的 Tab / Shift+Tab：逐格移动选择并让滚动跟过去；
+    /// 走到首格或末格时不再拦截，把 Tab 交还给外壳的焦点遍历，键盘用户不会被关在网格里。
+    fn step_cell(&mut self, forward: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.session.move_tab(forward) {
+            cx.propagate();
+            return;
+        }
+        self.sync_table(cx);
+        if let Some((row, _)) = self.session.focus_cell() {
+            self.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
+        }
+        cx.notify();
+    }
+
+    /// 读取失败但上次结果还在时的一条错误条：原因只说一次、只出现在一处，并带一个重试动作。
+    /// 失败不清空旧页，所以这条挂在工具条下面，不替换正文；一次都没读到时用整块错误态。
+    #[inline(never)]
+    fn render_read_error(&self, p: &Palette, m: kit::Metrics, entity: &Entity<GridPane>) -> Option<gpui_kit::AnyElement> {
+        if self.session.column_names().is_empty() {
+            return None;
+        }
+        let message = self.session.read_failure()?.to_owned();
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let retry = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |pane, cx| {
+                    let _ = pane.command("grid-retry", cx);
+                });
+            }
+        };
+        let mut strip = div()
+            .id("grid-read-error")
+            .debug_selector(|| "grid-read-error".to_owned())
+            .test_support()
+            .flex_none()
+            .min_h(px(m.strip_h()))
+            .px(px(m.pane_pad()))
+            .py(px(3.))
             .flex()
             .items_center()
-            .justify_center()
-            .child(kit::empty_state(IconName::Table, heading, SharedString::from(""), p))
-            .into_any_element()
+            .gap(px(8.))
+            // 底色与描边取错误色，和 kit 的错误态同一个语义，只是压成一条不占内容区的横条。
+            .bg(p.danger_soft)
+            .border_b_1()
+            .border_color(p.danger)
+            .child(kit::icon(IconName::CircleAlert, 14., p.danger))
+            .child(div().flex_none().text_size(px(TypeScale::SM)).text_color(p.danger).child(t("grid.state.readErrorTitle")))
+            .child(
+                div()
+                    .id("grid-read-error-detail")
+                    .debug_selector(|| "grid-read-error-detail".to_owned())
+                    .test_support()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .tooltip_text(SharedString::from(message.clone()))
+                    .child(SharedString::from(message)),
+            );
+        if self.session.mode == GridMode::Table {
+            strip = strip.child(kit::tool_button("grid-retry", Some(IconName::RotateCcw), t("grid.action.retry"), retry));
+        }
+        Some(strip.into_any_element())
     }
 
     /// 单元格编辑栏；选区设值时说清会写到几格。
@@ -3072,6 +3310,12 @@ struct SheetDelegate {
     /// 正在原位编辑的格子（已读取行下标、逻辑列）；输入框直接画在这一格里。
     editing: Option<(usize, usize)>,
     edit_input: Option<Entity<InputState>>,
+    /// 单元格左右内边距：按当前密度发布，正文格与表头格共用同一个值。
+    cell_pad: gpui_kit::Edges<Pixels>,
+    /// 键盘焦点所在的格子（已读取行下标、逻辑列）：只有键盘刚动过、焦点还在网格里时才画焦点环。
+    focus_ring: Option<(usize, usize)>,
+    /// 最近一帧屏幕上真实放得下的行数；会话据此更新翻页步长和可见窗口。
+    visible_len: usize,
 }
 
 impl SheetDelegate {
@@ -3100,6 +3344,21 @@ impl SheetDelegate {
         Some((grid.cell_label(row_ix, column), dirty_mark(grid.cell_dirty_state(row_ix, column))))
     }
 
+    /// 这一格的语义（NULL / 空字符串 / 大值预览）：与 `cell_label` 同一套判据，只是不拼显示文本。
+    /// 界面据此决定是否弱化斜体、给什么悬停提示，不再拿显示文本和 "NULL" 字面量比较。
+    fn cell_kind_at(&self, row_ix: usize, col_ix: usize, cx: &App) -> session::CellKind {
+        let Some(column) = self.logical(col_ix) else {
+            return session::CellKind::Unset;
+        };
+        let Some(owner) = self.owner.as_ref().and_then(|owner| owner.upgrade()) else {
+            return session::CellKind::Unset;
+        };
+        let owner = owner.read(cx);
+        if row_ix >= owner.session.loaded_len() {
+            return session::CellKind::Unset;
+        }
+        owner.session.cell_kind_at(row_ix, column)
+    }
 }
 
 /// 一个格子是否落在会话选择的矩形里。列 0 是行号列，它只表示"整行被选中"：
@@ -3522,7 +3781,12 @@ impl TableDelegate for SheetDelegate {
     fn column(&self, col_ix: usize, _: &App) -> Column {
         let (name, width, fixed) = self.columns.get(col_ix).cloned().unwrap_or_else(|| (" ".to_owned(), 120.0, false));
         // 行号列不能拉宽；冻结的数据列仍然能拉。宽度上限和会话里记宽度的上限一致。
-        let mut column = Column::new(format!("c{col_ix}"), name).width(px(width)).resizable(col_ix != 0).max_width(px(640.));
+        // 列宽来自会话记下的宽度；内边距来自当前密度，表格不再用自己的默认 8/4 一组常量。
+        let mut column = Column::new(format!("c{col_ix}"), name)
+            .width(px(width))
+            .paddings(self.cell_pad)
+            .resizable(col_ix != 0)
+            .max_width(px(640.));
         // 第 0 列是行号列，不是数据列：整列选择在数据列之外没有意义。声明成不可选，
         // 表头点击就不会把表格切进列模式，也不会给 # 列和它的格子刷激活底色。
         if col_ix == 0 {
@@ -3536,7 +3800,11 @@ impl TableDelegate for SheetDelegate {
 
     fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let (text, mark) = self.cell_at(row_ix, col_ix, cx).unwrap_or_default();
-        let null = text == "NULL" || text == i18n::text(Locale::ZhCn, "grid.value.null") || text == i18n::text(Locale::En, "grid.value.null");
+        // 语义跟着值从会话回来：不再拿显示文本和 "NULL" 字面量比较，
+        // 真正存着 "NULL" 的字符串是普通文本，NULL 与空字符串各自可辨认。
+        let kind = self.cell_kind_at(row_ix, col_ix, cx);
+        let null = kind == session::CellKind::Null;
+        let tooltip = cell_tooltip(self.locale, kind, &text);
         let p = Palette::of(cx);
         // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
         // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
@@ -3592,6 +3860,12 @@ impl TableDelegate for SheetDelegate {
             .when(null, |this| this.text_color(p.text_faint).italic())
             .when(mark == 3, |this| this.line_through())
             .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
+            .when_some(tooltip, |this, tip| this.tooltip_text(tip))
+            // 键盘焦点环：只有键盘刚动过、焦点还在网格里时才画（和 kit 的 focus-visible 同一条判据），
+            // 宽度取设计 token 的 2px，颜色取强调色，深浅两套主题都够清楚。
+            .when(self.focus_ring == Some((row_ix, column)) && logical.is_some(), |this| {
+                this.border_2().border_color(p.accent)
+            })
             // 选中时保留选择色；未选中的暂存格用新增/修改/删除底色。
             .when(!selected, |this| this.when_some(tone_bg, |this, color| this.bg(color)))
             .when(selected, |this| this.bg(p.selection))
@@ -3760,6 +4034,9 @@ impl TableDelegate for SheetDelegate {
 
     fn visible_rows_changed(&mut self, visible_range: std::ops::Range<usize>, _: &mut Window, _: &mut Context<TableState<Self>>) {
         self.visible_start = visible_range.start;
+        // 屏幕上真实放得下多少行：翻页步长和会话的可见窗口都用它，
+        // 否则会话里那份默认行数会和实际可见窗口对不上。
+        self.visible_len = visible_range.len();
         self.visible_seen = true;
     }
 }
@@ -6041,6 +6318,23 @@ mod workbench_tests {
         })
     }
 
+    /// 指定窗口宽度的网格窗口：1360/900/640 三档证据共用同一条布局路径。
+    fn open_sized(cx: &mut TestAppContext, width: f32) -> (AnyWindowHandle, Entity<GridPane>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-width-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(width), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
     /// people(id 主键, name, note)：两行，含一个 NULL 和一个带逗号与引号的文本。
     fn plant(pane: &Entity<GridPane>, cx: &mut App) {
         pane.update(cx, |pane, cx| {
@@ -6413,5 +6707,292 @@ mod workbench_tests {
             pane.cancel_preview(cx);
         }));
         assert_eq!(cx.update(|cx| pane.read(cx).notice.clone()), i18n::text(Locale::ZhCn, "grid.write.cloned"));
+    }
+
+    /// 空网格的三类语义各用统一三态：无命中给“清除条件”，表里没有行给“插入行”，
+    /// 查询没有返回行不给写入口；空态替换内容区，不保留表头骨架。
+    #[gpui_kit::test]
+    fn empty_grids_use_the_kit_states_and_their_own_next_step(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        // 表里没有行：无数据空态 + 添加入口。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(target(), vec![("id", "integer"), ("name", "text")], Vec::<Vec<Option<&str>>>::new(), "id", cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("empty-state").is_some(), "表里没有行用无数据空态");
+            assert!(window.try_find("no-match-state").is_none());
+            assert!(window.try_find("grid-body").is_none(), "空态替换内容区，不保留表头骨架");
+            assert_eq!(window.find("grid-empty-insert").label(), Some("插入行"), "空态给添加入口");
+        })
+        .unwrap();
+        // 条件没命中：无命中空态 + 清除条件，和“表里没有行”不是同一段文案。
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.set_search("不存在"));
+            window.render_frame(cx);
+            assert!(window.try_find("no-match-state").is_some(), "条件没命中用无命中空态");
+            assert!(window.try_find("empty-state").is_none());
+            assert_eq!(window.find("grid-condition-clear").label(), Some("清除条件"));
+        })
+        .unwrap();
+        // 查询没有返回行：同样替换内容区，但查询结果不是可写来源，不给插入入口。
+        cx.update_window(window, |_, window, cx| {
+            // 查询结果自带一套空态：上一张表的查找条件不跟着带过去。
+            let sheet = QuerySheet { sql: "select 1".to_owned(), columns: vec!["x".to_owned()], rows: Vec::new(), truncated: false, full_count: Some(0) };
+            pane.update(cx, |pane, cx| {
+                pane.session.set_search("");
+                pane.show_query(target(), sheet, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("empty-state").is_some(), "查询没有返回行也要有空态");
+            assert!(window.try_find("no-match-state").is_none());
+            assert!(window.try_find("grid-empty-insert").is_none(), "查询结果不给插入入口");
+        })
+        .unwrap();
+    }
+
+    /// 一次都没读到时的失败：整块错误态替换内容区，并给一个重试动作。
+    #[gpui_kit::test]
+    fn a_first_read_failure_uses_the_kit_error_state_with_retry(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, _| {
+                pane.session.keep_after_failure("连接已断开");
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("error-state").is_some(), "一次都没读到用整块错误态");
+            assert!(window.try_find("empty-state").is_none(), "失败不是空态");
+            assert_eq!(window.find("grid-retry").label(), Some("重试"));
+        })
+        .unwrap();
+        // 读取成功才收掉失败态：清掉原因后错误态消失，回到空态。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.session.clear_read_failure()));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("error-state").is_none(), "重试成功后错误态收掉");
+            assert!(window.try_find("grid-retry").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 读取失败但上次结果还在：正文保留，只有一条错误条，带重试；原因不在状态区重复。
+    #[gpui_kit::test]
+    fn a_failed_read_keeps_the_sheet_and_shows_one_error_entry(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let before = cx.update(|cx| {
+            let pane = pane.read(cx);
+            (pane.cell(0, 0), pane.cell(0, 1))
+        });
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.apply_page_result(0, true, true, Err("连接已断开".to_owned()), cx);
+                // 失败只改会话和表格，绘制前要让面板自己也重画一次。
+                cx.notify();
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let pane = pane.read(cx);
+            assert!(pane.session.loaded_len() > 0, "失败不丢弃上次结果");
+            assert_eq!(pane.cell(0, 0), before.0, "第 0 行的值原样保留");
+            assert_eq!(pane.cell(0, 1), before.1, "第 1 列的值原样保留");
+            assert_eq!(window.find_all("grid-read-error").len(), 1, "错误条只出现一次");
+            assert!(window.try_find("grid-read-error-detail").is_some(), "错误条写出失败原因");
+            assert_eq!(window.find("grid-retry").label(), Some("重试"));
+            assert!(window.try_find("error-state").is_none(), "有旧结果时不用整块错误态");
+            assert!(window.try_find("grid-body").is_some(), "旧结果继续画在内容区");
+            assert!(window.try_find("notice").is_none());
+        })
+        .unwrap();
+        // 重试成功后错误条收掉：读取成功会清掉失败原因。
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| pane.session.clear_read_failure());
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find_all("grid-read-error").is_empty(), "成功读取后错误条收掉");
+            assert!(window.try_find("grid-retry").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 键盘翻页与 Tab：选择与滚动一起走，并且键盘操作才画焦点环。
+    #[gpui_kit::test]
+    fn page_and_tab_keys_move_the_selection_and_paint_the_focus_ring(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let rows = (0..40).map(|_| vec![Some("1"), Some("值")]).collect::<Vec<_>>();
+                pane.plant_writable(target(), vec![("id", "integer"), ("name", "text")], rows, "id", cx);
+                pane.session.select(0, 0, false);
+            });
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 翻页步长就是屏幕上真实放得下的行数：表格量完可见范围后，下一帧把行数发布给会话。
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        let step = cx.update(|cx| pane.read(cx).session.viewport_rows());
+        assert!(step > 1 && step < 40, "可见行数应在 1..40 之间：{step}");
+        cx.simulate_keystrokes(window, "pagedown");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let pane = pane.read(cx);
+            let (start, end) = pane.session.visible_bounds();
+            let focus = pane.session.focus_cell().expect("有焦点");
+            assert_eq!(focus, (step, 0), "PageDown 走一屏");
+            assert!(focus.0 >= start && focus.0 < end, "选中的格子始终在可见窗口里：{start}..{end}");
+            assert_eq!(pane.table.read(cx).delegate().focus_ring, Some((step, 0)), "键盘移动后画焦点环");
+            assert!(window.last_input_was_keyboard(), "键盘刚动过才画环");
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window, "tab");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let view = pane.read(cx);
+            let grid_focused = view.focus_handle().is_focused(window);
+            let table_focused = view.table.read(cx).focus_handle(cx).is_focused(window);
+            assert_eq!(view.session.focus_cell(), Some((step, 1)), "Tab 走下一格（网格焦点 {grid_focused}，表格焦点 {table_focused}）");
+            assert_eq!(view.table.read(cx).delegate().focus_ring, Some((step, 1)), "焦点环跟到新格子");
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window, "pageup");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).session.focus_cell(), Some((0, 1)), "PageUp 回到第一屏");
+        })
+        .unwrap();
+        // 末格处 Tab 不再拦：选择不动，焦点可以离开网格。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.session.select(39, 1, false)));
+        cx.simulate_keystrokes(window, "tab");
+        cx.update(|cx| assert_eq!(pane.read(cx).session.focus_cell(), Some((39, 1)), "末格处选择不再移动"));
+    }
+
+    /// 行高、表头高与格子内边距只从密度 token 来；选中底色从色板来，两套主题各一份。
+    /// 三档宽度（1360/900/640）下即使列宽总和远大于窗口，网格正文也不会撑出窗口。
+    #[gpui_kit::test]
+    fn grid_geometry_comes_from_tokens_and_stays_inside_three_widths(cx: &mut TestAppContext) {
+        // token：紧凑 26 / 标准 32 / 宽松 40（规范 S7.2 / S9），内边距是分栏内边距的一半。
+        for (metrics, expected) in [(kit::Metrics::compact(), 26.), (kit::Metrics::standard(), 32.), (kit::Metrics::relaxed(), 40.)] {
+            assert_eq!(row_height(metrics), px(expected), "行高跟密度走");
+            let pad = cell_padding(metrics);
+            assert_eq!((pad.top, pad.bottom), (px(0.), px(0.)), "上下由行高与居中决定");
+            assert_eq!(pad.left, pad.right, "左右内边距对称");
+            assert_eq!(pad.left, px(metrics.pane_pad() / 2.), "内边距按密度算，不是裸数字");
+        }
+        assert_ne!(kit::Palette::light().selection, kit::Palette::dark().selection, "两套主题的选中底色不同");
+        assert_ne!(kit::Palette::light().chrome, kit::Palette::dark().chrome, "表头底色也随主题变");
+        // 三档宽度：六列各 260px 远超窗口，正文仍然等于窗口宽度（横向滚动留在正文里）。
+        for width in [640., 900., 1360.] {
+            let (window, pane) = open_sized(cx, width);
+            let mut visual = VisualTestContext::from_window(window, cx);
+            visual.update(|window, cx| {
+                pane.update(cx, |pane, cx| {
+                    let columns = (0..6).map(|index| (format!("c{index}"), "text")).collect::<Vec<_>>();
+                    let named = columns.iter().map(|(name, kind)| (name.as_str(), *kind)).collect::<Vec<_>>();
+                    let rows = (0..8).map(|_| vec![Some("值"), Some("值"), Some("值"), Some("值"), Some("值"), Some("值")]).collect::<Vec<_>>();
+                    pane.plant_writable(target(), named, rows, "c0", cx);
+                    for column in 0..6 {
+                        pane.session.set_column_width(column, 260.);
+                    }
+                });
+                window.render_frame(cx);
+            });
+            let body = visual.debug_bounds("grid-body").expect("网格正文");
+            assert!(
+                body.size.width <= px(width) + px(1.),
+                "{width} 宽：正文 {} 不能超过窗口",
+                body.size.width
+            );
+        }
+    }
+
+    /// 换密度立刻反映到网格：格子内边距跟着 Metrics 发布，选中底色跟着当前色板。
+    #[gpui_kit::test]
+    fn density_and_theme_reach_the_rendered_grid(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        for (metrics, expected) in [(kit::Metrics::compact(), 5.), (kit::Metrics::standard(), 6.), (kit::Metrics::relaxed(), 8.)] {
+            cx.update(|cx| {
+                metrics.publish(cx);
+            });
+            cx.update_window(window, |_, window, cx| {
+                plant(&pane, cx);
+                window.render_frame(cx);
+                let view = pane.read(cx);
+                let cell_pad = view.table.read(cx).delegate().cell_pad;
+                assert_eq!(cell_pad.left, px(expected), "格子内边距随密度发布");
+                assert_eq!(cell_pad, cell_padding(metrics), "和 token 算出的一致");
+            })
+            .unwrap();
+        }
+        // 主题：暗色下网格用的是同一份色板，选中色来自 Palette 而不是写死的颜色。
+        cx.update(|cx| kit::apply_theme(true, cx));
+        cx.update(|cx| {
+            let p = Palette::of(cx);
+            assert_eq!(p.selection, kit::Palette::dark().selection, "暗色主题的选中底色");
+            assert_eq!(p.chrome, kit::Palette::dark().chrome, "暗色主题的表头底色");
+        });
+        cx.update(|cx| kit::apply_theme(false, cx));
+        cx.update(|cx| assert_eq!(Palette::of(cx).selection, kit::Palette::light().selection, "浅色主题的选中底色"));
+    }
+
+    /// 长文本按列宽截断，但完整值仍在：悬停拿到整段原文，大值/二进制指向查看面板。
+    /// NULL、空字符串和真的存着 "NULL" 的文本各画各的；暂存修改的格子带自己的标记。
+    #[gpui_kit::test]
+    fn long_values_truncate_with_the_value_reachable_and_null_differs_from_empty(cx: &mut TestAppContext) {
+        let long = "长".repeat(200);
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("name", "text")],
+                    vec![
+                        vec![Some("1"), None],
+                        vec![Some("2"), Some("")],
+                        vec![Some("3"), Some("NULL")],
+                        vec![Some("4"), Some("")],
+                    ],
+                    "id",
+                    cx,
+                );
+                // 第四行放一段长文本（用暂存写入，避免再走一次读取）。
+                let _ = pane.session.stage_text(3, 1, Some(long.clone()));
+            });
+            window.render_frame(cx);
+            let view = pane.read(cx);
+            let table = view.table.read(cx);
+            let delegate = table.delegate();
+            // 表格第 0 列是行号列，数据列从 1 起：第 1 列数据 = 表格列 2。
+            assert_eq!(delegate.cell_kind_at(0, 2, cx), session::CellKind::Null, "第 0 行是 NULL");
+            assert_eq!(delegate.cell_kind_at(1, 2, cx), session::CellKind::Empty, "第 1 行是空字符串");
+            assert_eq!(delegate.cell_kind_at(2, 2, cx), session::CellKind::Text, "第 2 行是文本 NULL");
+            assert_eq!(delegate.cell_label(2, 2, cx).as_deref(), Some("NULL"), "文本 NULL 原样显示");
+            assert_ne!(delegate.cell_label(0, 2, cx), delegate.cell_label(1, 2, cx), "NULL 与空字符串显示不同");
+            assert_eq!(delegate.cell_at(0, 2, cx).map(|(_, mark)| mark), Some(0), "没有暂存的格子不带标记");
+            assert_eq!(delegate.cell_at(3, 2, cx).map(|(_, mark)| mark), Some(2), "暂存修改的格子带自己的标记");
+            // 长文本整段仍在会话里：悬停提示给整段，格子本身只是视觉截断。
+            let shown = delegate.cell_label(3, 2, cx).expect("长文本");
+            assert_eq!(shown.len(), long.len());
+            assert_eq!(
+                cell_tooltip(Locale::ZhCn, session::CellKind::Text, &shown).as_deref(),
+                Some(long.as_str()),
+                "悬停提示拿得到完整值"
+            );
+            assert_eq!(
+                cell_tooltip(Locale::ZhCn, session::CellKind::Large, "大值 2048").as_deref(),
+                Some(i18n::text(Locale::ZhCn, "grid.value.openFullHint").as_str()),
+                "大值指向查看面板"
+            );
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Null, "NULL").is_none(), "NULL 不再额外提示");
+        })
+        .unwrap();
     }
 }

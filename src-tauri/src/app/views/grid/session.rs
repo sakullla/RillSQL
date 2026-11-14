@@ -1439,6 +1439,8 @@ impl SharedGrid {
         let visible = self.visible_columns();
         let position = visible.iter().position(|item| *item >= column).unwrap_or(visible.len().saturating_sub(1));
         let at = |index: usize| visible.get(index).copied().unwrap_or(column);
+        // 翻页按当前可视行数整页走；可视行数由外面按窗口高度发布，边界处停在首/末行。
+        let page = self.viewport.max(1);
         let next = match key {
             "up" => (row.saturating_sub(1), column),
             "down" => ((row + 1).min(self.rows.len() - 1), column),
@@ -1446,14 +1448,66 @@ impl SharedGrid {
             "right" => (row, at((position + 1).min(visible.len().saturating_sub(1)))),
             "home" => (row, at(0)),
             "end" => (row, at(visible.len().saturating_sub(1))),
+            "pagedown" => ((row + page).min(self.rows.len() - 1), column),
+            "pageup" => (row.saturating_sub(page), column),
             _ => (row, column),
         };
         self.select(next.0, next.1, extend);
-        if next.0 < self.scroll {
-            self.scroll = next.0;
-        } else if next.0 >= self.scroll + self.viewport {
-            self.scroll = next.0 + 1 - self.viewport;
+        self.follow_focus();
+    }
+
+    /// Tab / Shift+Tab：在可见列之间逐格移动，走到行首/行尾就换到上一行或下一行，
+    /// 首格和末格处不动。隐藏列不接住 Tab，和方向键的可见列范围一致。
+    /// 返回是否真的移动了：停在边界时调用方不再拦 Tab，键盘用户可以从网格两端用 Tab 离开。
+    pub fn move_tab(&mut self, forward: bool) -> bool {
+        if self.rows.is_empty() || self.columns.is_empty() {
+            return false;
         }
+        if !self.selected {
+            self.select(0, 0, false);
+            return true;
+        }
+        let (row, column) = self.focus;
+        let visible = self.visible_columns();
+        let Some(position) = visible.iter().position(|item| *item == column) else {
+            self.select(row, visible[0], false);
+            return true;
+        };
+        let next = if forward {
+            match visible.get(position + 1) {
+                Some(column) => Some((row, *column)),
+                None if row + 1 < self.rows.len() => Some((row + 1, visible[0])),
+                None => None,
+            }
+        } else if position > 0 {
+            Some((row, visible[position - 1]))
+        } else if row > 0 {
+            Some((row - 1, visible[visible.len() - 1]))
+        } else {
+            None
+        };
+        let Some((row, column)) = next else {
+            return false;
+        };
+        self.select(row, column, false);
+        self.follow_focus();
+        true
+    }
+
+    /// 可视行数：翻页步长和“屏幕上的行”都用它，由网格按窗口高度发布。
+    pub fn viewport_rows(&self) -> usize {
+        self.viewport.max(1)
+    }
+
+    /// 键盘移动后让滚动跟着焦点行走：焦点在窗口上方就顶到顶，在下方就滚到底。横向不动。
+    fn follow_focus(&mut self) {
+        let row = self.focus.0;
+        if row < self.scroll {
+            self.scroll = row;
+        } else if row >= self.scroll + self.viewport {
+            self.scroll = row + 1 - self.viewport;
+        }
+        self.clamp_scroll();
     }
 
     /// TSV 复制：数据库 NULL 写成不带引号的 NULL，字符串 "NULL" 写成带引号的 "NULL"，
@@ -1976,6 +2030,20 @@ impl SharedGrid {
             };
         }
         self.show_cell(row, column, false).label
+    }
+
+    /// 这一格要按哪种语义画：NULL、空字符串、普通文本、大值预览各自不同。
+    /// 与 `cell_label` 同一套判据（先看被拦下的暂存值，再看原值/预览信封），
+    /// 界面不再拿显示文本和 "NULL" 字面量比较 —— 真正存着 "NULL" 的字符串不能被画成空值。
+    pub fn cell_kind_at(&self, row: usize, column: usize) -> CellKind {
+        if let Some(overlay) = self.overlay_at(row, column).filter(|item| item.kind == "update" && item.gate != Gate::Writable) {
+            return match &overlay.value {
+                Some(text) if text.is_empty() => CellKind::Empty,
+                Some(_) => CellKind::Text,
+                None => CellKind::Null,
+            };
+        }
+        self.show_cell(row, column, false).kind
     }
 
     /// 当前格子的原始值，供编辑栏判断“NULL 未改动”和抽取文本。
@@ -5919,6 +5987,66 @@ mod tests {
         assert_eq!(grid.viewer_state().cloned(), viewer);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 键盘移动：PageDown/PageUp 按可视行数走，Tab/Shift+Tab 逐格走，越界时 Tab 报告“没动”，
+    /// 让调用方放行焦点离开网格；滚动始终跟在焦点后面。
+    #[test]
+    fn paging_and_tab_move_the_focus_and_keep_the_scroll_following_it() {
+        let mut grid = SharedGrid::new();
+        let columns = vec![text_column("id"), text_column("name"), text_column("note")];
+        let rows = (0..30).map(|index| row(&index.to_string(), vec![Some("1"), Some("name"), Some("note")], true)).collect::<Vec<_>>();
+        grid.load_local(columns, rows, Some(30), None);
+        grid.set_viewport(5);
+        grid.select(0, 0, false);
+        assert_eq!(grid.viewport_rows(), 5);
+        grid.move_key("pagedown", false);
+        assert_eq!(grid.focus_cell(), Some((5, 0)), "PageDown 走一屏");
+        assert_eq!(grid.visible_bounds().0, 1, "滚动跟着焦点走到窗口最下一行");
+        grid.move_key("pagedown", false);
+        assert_eq!(grid.focus_cell(), Some((10, 0)));
+        assert_eq!(grid.visible_bounds().0, 6);
+        grid.move_key("pageup", false);
+        assert_eq!(grid.focus_cell(), Some((5, 0)), "PageUp 回退一屏");
+        assert_eq!(grid.visible_bounds().0, 5, "向上翻页时焦点落在窗口第一行");
+        grid.move_key("pageup", false);
+        assert_eq!(grid.focus_cell(), Some((0, 0)));
+        assert_eq!(grid.visible_bounds().0, 0, "焦点到顶时滚动也到顶");
+        // Tab 在可见列之间逐格走，行尾换行；隐藏列不接住 Tab。
+        assert!(grid.hide_column(2), "第三列可隐藏");
+        assert!(grid.move_tab(true));
+        assert_eq!(grid.focus_cell(), Some((0, 1)));
+        assert!(grid.move_tab(true));
+        assert_eq!(grid.focus_cell(), Some((1, 0)), "隐藏列被跳过，行尾换到下一行首格");
+        assert!(grid.move_tab(false));
+        assert_eq!(grid.focus_cell(), Some((0, 1)), "Shift+Tab 回到上一行末个可见列");
+        grid.select(29, 1, false);
+        assert!(!grid.move_tab(true), "末格处 Tab 不再拦，焦点可以离开网格");
+        assert_eq!(grid.focus_cell(), Some((29, 1)));
+        grid.select(0, 0, false);
+        assert!(!grid.move_tab(false), "首格处 Shift+Tab 同样放行");
+    }
+
+    /// NULL、空字符串和真的存着 "NULL" 的文本是三种语义：界面按语义画，不按显示文本猜。
+    #[test]
+    fn cell_kind_separates_null_empty_and_the_text_null() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), None], true),
+                row("2", vec![Some("2"), Some("")], true),
+                row("3", vec![Some("3"), Some("NULL")], true),
+            ],
+            Some(3),
+            None,
+        );
+        assert_eq!(grid.cell_kind_at(0, 1), CellKind::Null);
+        assert_eq!(grid.cell_kind_at(1, 1), CellKind::Empty);
+        assert_eq!(grid.cell_kind_at(2, 1), CellKind::Text, "存着 NULL 的字符串是普通文本");
+        assert_eq!(grid.cell_label(2, 1), "NULL", "文本 NULL 原样显示");
+        assert_ne!(grid.cell_label(1, 1), grid.cell_label(0, 1), "空字符串与 NULL 的显示不同");
+    }
+
 }
 
 /// 多格式复制、列显示和批量写入（R2/R3/R4）。
