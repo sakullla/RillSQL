@@ -78,6 +78,9 @@ pub struct Workbench {
     close_hooked: bool,
     booted: bool,
     health_task: Option<gpui_kit::Task<()>>,
+    /// 最近一次设置写盘的回执监听：持有句柄让它随视图一起在界面线程上释放，
+    /// 否则脱离的本地任务会在测试拆卸时被别的线程丢弃并 panic。
+    settings_task: Option<gpui_kit::Task<()>>,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -224,6 +227,7 @@ impl Workbench {
             close_hooked: false,
             booted: false,
             health_task: None,
+            settings_task: None,
             boot,
             sized: false,
             last_state: String::new(),
@@ -1802,7 +1806,7 @@ impl Workbench {
             let result = jobs::persist_revision(&services, &state, &revision, generation, &gate).await;
             let _ = tx.send(result);
         });
-        cx.spawn(async move |_, cx| {
+        self.settings_task = Some(cx.spawn(async move |_, cx| {
             let result = rx.await;
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
@@ -1811,8 +1815,7 @@ impl Workbench {
                     cx.notify();
                 });
             });
-        })
-        .detach();
+        }));
         cx.notify();
     }
 
