@@ -8646,6 +8646,9 @@ fn dragging_a_connection_onto_a_group_row_queues_the_same_assign_command(cx: &mu
     std::fs::create_dir_all(&dir).unwrap();
     let services = services_at(&dir);
     let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1360., 800.);
+    // 工作台启动会在 tokio 侧登记连接状态；拖放触发后也可能排入分组任务。
+    // 允许测试执行器停放并在拖放后排空，避免后台线程与前台断言交错被判为非确定。
+    cx.executor().allow_parking();
     cx.update(|cx| {
         view.update(cx, |view, cx| {
             view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
@@ -8654,12 +8657,14 @@ fn dragging_a_connection_onto_a_group_row_queues_the_same_assign_command(cx: &mu
             cx.notify();
         });
     });
+    cx.run_until_parked();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window.drag_to("side-pg", "side-group-g1", cx);
         window.render_frame(cx);
     })
     .unwrap();
+    cx.run_until_parked();
     view.read_with(cx, |view, _| {
         assert_eq!(
             view.model.pending_group_op,
