@@ -148,6 +148,10 @@ dict! {
     "shell.paletteGroup.connection" => "连接", "Connections";
     "shell.paletteGroup.table" => "表 / 视图", "Tables & views";
     "shell.paletteGroup.command" => "命令", "Commands";
+    "shell.paletteGroup.tables" => "表", "Tables";
+    "shell.paletteGroup.views" => "视图", "Views";
+    "shell.paletteGroup.databases" => "数据库", "Databases";
+    "shell.paletteGroup.savedQueries" => "保存的查询", "Saved queries";
     "shell.palette.hintMove" => "选择", "Navigate";
     "shell.palette.hintRun" => "执行", "Run";
     "shell.palette.hintClose" => "关闭", "Close";
@@ -817,6 +821,9 @@ dict! {
     "ui.palette.empty" => "没有匹配项", "No matches";
     "ui.palette.noObjects" => "先连接并读取对象", "Connect and load objects first";
     "ui.palette.error" => "读取对象失败，刷新对象树后重试", "Could not load objects; refresh the object tree and retry";
+    "ui.palette.noMatch" => "没有匹配项，换个更短的关键词试试", "No matches — try a shorter keyword";
+    "ui.palette.databaseMissing" => "对象树里还没有这个库，先展开连接把它读出来", "This database is not loaded yet — expand the connection to read it";
+    "ui.palette.connectionMissing" => "这条连接已经不在了，刷新连接列表后重试", "That connection is gone — refresh the connection list and retry";
     "ui.help.global" => "全局", "Global";
     "ui.help.editor" => "编辑器", "Editor";
     "ui.help.table" => "表格", "Table";
