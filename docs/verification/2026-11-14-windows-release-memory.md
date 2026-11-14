@@ -46,8 +46,10 @@ node --test .github/scripts/release.test.mjs
 受限栈对照：同一关系图测试，设置 `RUST_MIN_STACK=786432`（768 KiB），旧版发生 stack overflow（Windows 退出码 `0xc00000fd`），修改版通过。512 KiB 下两版均溢出；这里没有声称支持任意小的线程栈。Windows CI 新增以下回归检查：
 
 ```powershell
-$env:RUST_MIN_STACK = '786432'
-cargo +1.100.0 test --locked --manifest-path src-tauri/Cargo.toml --lib app::views::diagram::tests::diagram_four_states_and_keyboard_hold_at_1360 -- --exact --nocapture
+$env:RUSTUP_TOOLCHAIN = '1.100.0'
+pwsh -File .github/scripts/test-render-stack.ps1
 ```
+
+脚本先用 Cargo 定位已编译的测试二进制，再仅给测试进程设置栈预算，避免让 rustc 编译线程也继承受限栈。
 
 CI 同时开启测试原始输出与回溯，避免原生异常终止时丢失捕获中的诊断信息。远端三平台结果以 [PR #5](https://github.com/sakullla/RillSQL/pull/5) 的最新 CI 为准；未修改发布 tag 或安装包。
