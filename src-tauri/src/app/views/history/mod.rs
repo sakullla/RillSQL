@@ -103,10 +103,15 @@ pub fn status_matches(status: &str, filter: &str) -> bool {
 
 impl HistoryPage {
     pub fn filtered_runs(&self) -> Vec<&HistoryEntry> {
+        self.iter_filtered_runs().collect()
+    }
+
+    /// Renderers can stop at their row limit without collecting the entire history.
+    pub fn iter_filtered_runs(&self) -> impl Iterator<Item = &HistoryEntry> {
         let needle = self.filter_text.trim().to_ascii_lowercase();
         self.runs
             .iter()
-            .filter(|entry| {
+            .filter(move |entry| {
                 if !self.filter_connection.is_empty() && entry.connection_id != self.filter_connection {
                     return false;
                 }
@@ -120,14 +125,17 @@ impl HistoryPage {
                     .to_ascii_lowercase()
                     .contains(&needle)
             })
-            .collect()
     }
 
     pub fn filtered_saved(&self) -> Vec<&SavedQuery> {
+        self.iter_filtered_saved().collect()
+    }
+
+    pub fn iter_filtered_saved(&self) -> impl Iterator<Item = &SavedQuery> {
         let needle = self.filter_text.trim().to_ascii_lowercase();
         self.saved
             .iter()
-            .filter(|item| {
+            .filter(move |item| {
                 if !self.filter_connection.is_empty() && item.connection_id != self.filter_connection {
                     return false;
                 }
@@ -136,7 +144,6 @@ impl HistoryPage {
                     || item.sql.to_ascii_lowercase().contains(&needle)
                     || item.connection_name.to_ascii_lowercase().contains(&needle)
             })
-            .collect()
     }
 
     pub fn has_filters(&self) -> bool {
@@ -155,8 +162,8 @@ impl HistoryPage {
     /// 读取中优先于空态，失败优先于无命中，避免把“还没读到”和“读失败”画成空列表。
     pub fn phase_for(&self, section: HistorySection) -> ListPhase {
         let (total, matched) = match section {
-            HistorySection::Runs => (self.runs.len(), self.filtered_runs().len()),
-            HistorySection::Saved => (self.saved.len(), self.filtered_saved().len()),
+            HistorySection::Runs => (self.runs.len(), self.iter_filtered_runs().next().is_some()),
+            HistorySection::Saved => (self.saved.len(), self.iter_filtered_saved().next().is_some()),
         };
         if self.failure_key.is_some() {
             ListPhase::Failed
@@ -164,7 +171,7 @@ impl HistoryPage {
             ListPhase::Loading
         } else if total == 0 {
             ListPhase::Empty
-        } else if matched == 0 {
+        } else if !matched {
             ListPhase::NoMatch
         } else {
             ListPhase::Rows
@@ -499,6 +506,25 @@ mod tests {
         assert!(!plan.needs_target);
         assert_eq!(plan.connection_id.as_deref(), Some("live"));
         assert_eq!(plan.notice_key, None);
+    }
+
+    #[test]
+    fn limited_history_rows_keep_filter_order_and_borrow_the_original_sql() {
+        let mut page = HistoryPage {
+            runs: (0..500).map(|index| run(&index.to_string(), "SELECT '长 SQL'", "live", if index % 2 == 0 { "ok" } else { "error" })).collect(),
+            ..Default::default()
+        };
+        page.filter_status = "failed".into();
+        let visible: Vec<_> = page.iter_filtered_runs().take(200).collect();
+        assert_eq!(visible.len(), 200);
+        assert_eq!(visible.first().unwrap().id, "1");
+        assert_eq!(visible.last().unwrap().id, "399");
+        assert!(std::ptr::eq(visible[0], &page.runs[1]), "row limits must not copy SQL payloads");
+        page.filter_text = "SQL' conn-live".into();
+        assert_eq!(page.iter_filtered_runs().count(), 250, "search can still span SQL and connection name");
+        page.filter_text = "missing".into();
+        assert_eq!(page.runs_phase(), ListPhase::NoMatch);
+        assert!(page.iter_filtered_runs().next().is_none());
     }
 
     #[test]

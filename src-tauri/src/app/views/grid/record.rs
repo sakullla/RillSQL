@@ -123,6 +123,8 @@ fn pane_command(entity: &Entity<GridPane>, id: &'static str) -> impl Fn(&gpui_ki
     }
 }
 
+use crate::ui::kit::stack_frame;
+
 /// 右侧面板：标题行（行号、上一行、下一行、关闭）和"列名—值"列表。长值点开完整值查看器。
 /// 尺寸跟随外壳密度：标题栏取 `bar_h`，字段行最小高度取 `row_h`，列名栏与面板宽度随行高等比伸缩。
 pub fn render_record(
@@ -160,6 +162,7 @@ pub fn render_record(
     match view {
         Some(view) => {
             for field in view.fields {
+                body = body.child(stack_frame(|| {
                 let column = field.column;
                 let open = {
                     let entity = entity.clone();
@@ -169,8 +172,7 @@ pub fn render_record(
                 };
                 let name = if field.hidden { format!("{} {}", field.name, i18n::text(locale, "grid.record.hidden")) } else { field.name.clone() };
                 let abbr = type_abbr(&field.type_name);
-                body = body.child(
-                    div()
+                div()
                         .id(("grid-record-field", column))
                         .debug_selector(move || format!("grid-record-field-{column}"))
                         .flex_none()
@@ -254,8 +256,8 @@ pub fn render_record(
                                     .child(kit::pill(t("grid.record.preview"), p.accent_text, p.accent_soft)),
                             )
                         })
-                        .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open)),
-                );
+                        .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open))
+                }));
             }
         }
         None => {

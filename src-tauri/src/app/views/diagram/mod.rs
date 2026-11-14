@@ -48,7 +48,7 @@ pub struct DiagramPane {
     database: String,
     schema: String,
     label: String,
-    diagram: Option<Diagram>,
+    diagram: Option<Arc<Diagram>>,
     error: String,
     loading: bool,
     hovered: Option<String>,
@@ -312,7 +312,7 @@ impl DiagramPane {
         match outcome {
             TaskOutcome::Current { value: Ok(diagram), .. } => {
                 self.error.clear();
-                self.diagram = Some(diagram);
+                self.diagram = Some(Arc::new(diagram));
             }
             TaskOutcome::Current { value: Err(message), .. } => {
                 self.diagram = None;
@@ -474,7 +474,7 @@ impl DiagramPane {
                 let mark = hover_mark(self.hovered.as_deref(), &table.name, diagram);
                 lines.push(format!("column {index} {mark} {}", table.name));
                 for column in &table.columns {
-                    let fk = if foreign.contains(&format!("{}.{}", table.name, column.name)) { "fk" } else { "column" };
+                    let fk = if foreign.contains(&(table.name.as_str(), column.name.as_str())) { "fk" } else { "column" };
                     lines.push(format!("{fk} {}.{}", table.name, column.name));
                     if column.primary {
                         lines.push(format!("pk {}.{}", table.name, column.name));
@@ -554,30 +554,30 @@ pub fn spec_from_object(spec: &str) -> Option<String> {
     ))
 }
 
-fn layout_columns(tables: &[DiagramTable], edges: &[DiagramEdge]) -> Vec<Vec<DiagramTable>> {
+fn layout_columns<'a>(tables: &'a [DiagramTable], edges: &[DiagramEdge]) -> Vec<Vec<&'a DiagramTable>> {
     let known: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
-    let mut columns: Vec<Vec<DiagramTable>> = Vec::new();
+    let mut columns: Vec<Vec<&DiagramTable>> = Vec::new();
     for table in tables {
         let level = depth(&table.name, &known, edges, &mut Vec::new());
         while columns.len() <= level {
             columns.push(Vec::new());
         }
-        columns[level].push(table.clone());
+        columns[level].push(table);
     }
     columns
 }
 
-fn depth(name: &str, known: &[&str], edges: &[DiagramEdge], path: &mut Vec<String>) -> usize {
-    if path.iter().any(|item| item == name) {
+fn depth<'a>(name: &'a str, known: &[&str], edges: &'a [DiagramEdge], path: &mut Vec<&'a str>) -> usize {
+    if path.contains(&name) {
         return 0;
     }
-    path.push(name.to_owned());
+    path.push(name);
     let mut deepest = 0usize;
     for edge in edges {
         if edge.from_table != name || edge.from_table == edge.to_table || !known.contains(&edge.to_table.as_str()) {
             continue;
         }
-        if path.iter().any(|item| item == &edge.to_table) {
+        if path.contains(&edge.to_table.as_str()) {
             continue;
         }
         deepest = deepest.max(1 + depth(&edge.to_table, known, edges, path));
@@ -586,8 +586,8 @@ fn depth(name: &str, known: &[&str], edges: &[DiagramEdge], path: &mut Vec<Strin
     deepest
 }
 
-fn foreign_columns(diagram: &Diagram) -> Vec<String> {
-    diagram.edges.iter().flat_map(|edge| edge.from_columns.iter().map(|column| format!("{}.{}", edge.from_table, column))).collect()
+fn foreign_columns(diagram: &Diagram) -> std::collections::HashSet<(&str, &str)> {
+    diagram.edges.iter().flat_map(|edge| edge.from_columns.iter().map(|column| (edge.from_table.as_str(), column.as_str()))).collect()
 }
 
 fn hover_mark(hovered: Option<&str>, name: &str, diagram: &Diagram) -> &'static str {
@@ -611,6 +611,33 @@ fn edge_hot(hovered: Option<&str>, edge: &DiagramEdge) -> bool {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_borrows_tables_and_foreign_columns_keep_qualified_names_distinct() {
+        let diagram = Diagram {
+            database: "main".into(),
+            schema: String::new(),
+            tables: vec![
+                DiagramTable { name: "a.b".into(), columns: Vec::new(), outside: Vec::new() },
+                DiagramTable { name: "parent".into(), columns: Vec::new(), outside: Vec::new() },
+            ],
+            edges: vec![DiagramEdge {
+                name: "fk".into(),
+                from_table: "a.b".into(),
+                from_columns: vec!["c".into()],
+                to_table: "parent".into(),
+                to_columns: vec!["id".into()],
+            }],
+            omitted: Vec::new(),
+            notice: None,
+        };
+        let columns = layout_columns(&diagram.tables, &diagram.edges);
+        assert!(std::ptr::eq(columns[0][0], &diagram.tables[1]));
+        assert!(std::ptr::eq(columns[1][0], &diagram.tables[0]));
+        let foreign = foreign_columns(&diagram);
+        assert!(foreign.contains(&("a.b", "c")));
+        assert!(!foreign.contains(&("a", "b.c")), "dots inside identifiers cannot alias another column");
+    }
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext as _, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 
@@ -640,7 +667,7 @@ mod tests {
         let mut pane = DiagramPane::new(services);
         pane.connection_id = "notes".into();
         pane.database = "main".into();
-        pane.diagram = Some(Diagram {
+        pane.diagram = Some(Arc::new(Diagram {
             database: "main".into(),
             schema: String::new(),
             tables: vec![DiagramTable {
@@ -654,7 +681,7 @@ mod tests {
             edges: Vec::new(),
             omitted: Vec::new(),
             notice: None,
-        });
+        }));
         let text = pane.lines().join("\n");
         assert!(text.contains("pk orders.id"), "{text}");
         assert!(text.contains("type orders.id INTEGER"), "{text}");
@@ -844,7 +871,7 @@ mod tests {
         pane.connection_id = "notes".into();
         pane.database = "shop".into();
         pane.label = "笔记 / shop".into();
-        pane.diagram = Some(sample_diagram());
+        pane.diagram = Some(Arc::new(sample_diagram()));
         (pane, dir)
     }
 
@@ -910,7 +937,7 @@ mod tests {
         empty.tables.clear();
         empty.edges.clear();
         empty.notice = Some("这个库只有视图。".into());
-        pane.diagram = Some(empty);
+        pane.diagram = Some(Arc::new(empty));
         assert_eq!(pane.state(), PaneState::Empty);
         let text = pane.lines().join("\n");
         assert!(text.contains("这个库只有视图。"), "空图要说明为什么空：{text}");
@@ -979,7 +1006,7 @@ mod tests {
                     pane.connection_id = "notes".into();
                     pane.database = "shop".into();
                     pane.label = "笔记 / shop".into();
-                    pane.diagram = Some(sample_diagram());
+                    pane.diagram = Some(Arc::new(sample_diagram()));
                 }
                 "empty" => {
                     pane.connection_id = "notes".into();
@@ -988,7 +1015,7 @@ mod tests {
                     let mut diagram = sample_diagram();
                     diagram.tables.clear();
                     diagram.edges.clear();
-                    pane.diagram = Some(diagram);
+                    pane.diagram = Some(Arc::new(diagram));
                 }
                 "error" => {
                     pane.diagram = None;
@@ -1285,6 +1312,8 @@ impl DiagramPane {
     }
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for DiagramPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -1301,6 +1330,11 @@ impl Render for DiagramPane {
         let zoom = self.zoom;
         let mono = cx.theme().mono_font_family.clone();
         let title = SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() });
+        let viewport_w = window.viewport_size().width.as_f32();
+        let pad_metrics = metrics.for_viewport(viewport_w);
+        let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
+        let layout_pad = pad_metrics.page_pad;
+        let tools = stack_frame(|| {
         let zoom_out = {
             let entity = entity.clone();
             kit::icon_button("diagram-zoom-out", IconName::Minus, t("diagram.zoom.out"), move |_, _, cx| {
@@ -1338,16 +1372,16 @@ impl Render for DiagramPane {
 
         // 只读说明放进标题的悬停提示，不常驻占一行。页头高度和左右边距走统一令牌。
         // 窄窗口把搜索框与缩放/返回换到第二行：页头不撑宽，页面本身不出现横向滚动。
-        let viewport_w = window.viewport_size().width.as_f32();
-        let pad_metrics = metrics.for_viewport(viewport_w);
-        let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
-        let layout_pad = pad_metrics.page_pad;
         let search_box = if narrow {
             div().flex_1().min_w(px(0.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
         } else {
             div().w(px(180.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
         };
+        (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back)
+        });
         let header = if narrow {
+            stack_frame(|| {
+            let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back) = tools;
             div()
                 .id("diagram-header")
                 .flex_none()
@@ -1373,7 +1407,11 @@ impl Render for DiagramPane {
                         .child(zoom_fit)
                         .child(back),
                 )
+            .into_any_element()
+            })
         } else {
+            stack_frame(|| {
+            let (search_box, zoom_out, zoom_reset, zoom_in, zoom_fit, back) = tools;
             div().id("diagram-header").flex_none().flex().flex_col().child(
                 div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
                     kit::page_header(title, &[], &pad_metrics, &p)
@@ -1385,6 +1423,8 @@ impl Render for DiagramPane {
                         .child(back),
                 ),
             )
+            .into_any_element()
+            })
         };
 
         let pane_state = self.state();
@@ -1517,6 +1557,7 @@ impl Render for DiagramPane {
                 let head_h = HEAD_H * zoom;
                 let row_h = ROW_H * zoom;
                 let board_entity = entity.clone();
+                let mut canvas_box = stack_frame(|| {
                 let mut canvas_box = div()
                     .id("diagram-board")
                     .test_support()
@@ -1550,7 +1591,10 @@ impl Render for DiagramPane {
                         move |event: &MouseDownEvent, _, cx| {
                             board_entity.update(cx, |pane, _| pane.begin_drag(event.position.x.as_f32(), event.position.y.as_f32()));
                         }
-                    })
+                    });
+                canvas_box = stack_frame(|| {
+                let canvas_box = canvas_box;
+                canvas_box
                     .on_mouse_move({
                         let board_entity = board_entity.clone();
                         move |event: &MouseMoveEvent, _, cx| {
@@ -1579,8 +1623,10 @@ impl Render for DiagramPane {
                                 cx.notify();
                             });
                         }
-                    });
-                // 连线
+                    })
+                });
+                // 连线单独一帧，避免和画板事件叠在同一个未优化栈帧里。
+                let wires_layer = stack_frame(|| {
                 let mut wires: Vec<(gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Point<gpui_kit::Pixels>, bool)> = Vec::new();
                 for edge in &diagram.edges {
                     let (Some(from), Some(to)) = (places.get(&edge.from_table), places.get(&edge.to_table)) else { continue };
@@ -1593,8 +1639,7 @@ impl Render for DiagramPane {
                 }
                 let dim = hovered.is_some();
                 let (wire, hot_wire, dim_wire) = (p.line_strong, p.accent, p.line);
-                canvas_box = canvas_box.child(
-                    canvas(
+                canvas(
                         move |_, _, _| (),
                         move |bounds, _, window, _| {
                             for (start, end, hot) in &wires {
@@ -1621,11 +1666,16 @@ impl Render for DiagramPane {
                         },
                     )
                     .absolute()
-                    .inset_0(),
-                );
+                    .inset_0()
+                    .into_any_element()
+                });
+                canvas_box = canvas_box.child(wires_layer);
+                canvas_box
+                });
                 for column in &columns {
                     for table in column {
                         let Some((x, y, _)) = places.get(&table.name).copied() else { continue };
+                        let card = stack_frame(|| {
                         let name = table.name.clone();
                         let mark = hover_mark(hovered.as_deref(), &name, diagram);
                         let label = SharedString::from(format!("{mark} {}", table.name));
@@ -1642,7 +1692,7 @@ impl Render for DiagramPane {
                         }
                         let mut rows = div().flex().flex_col().py(px(5. * zoom));
                         for column in &table.columns {
-                            let fk = foreign.contains(&format!("{}.{}", table.name, column.name));
+                            let fk = foreign.contains(&(table.name.as_str(), column.name.as_str()));
                             let icon = if column.primary {
                                 IconName::Key
                             } else if fk {
@@ -1789,13 +1839,16 @@ impl Render for DiagramPane {
                                         }
                                     }
                                 });
+                        kit::interactive(card, &p, false).opacity(opacity).into_any_element()
+                        });
                         // hover / active / focus-visible / disabled 四态走底座，不再自己拼底色。
                         // 悬停时其余卡片要按既有 dim 变淡，所以不透明度放在底座之后设置。
-                        canvas_box = canvas_box.child(kit::interactive(card, &p, false).opacity(opacity));
+                        canvas_box = canvas_box.child(card);
                     }
                 }
                 body = body.child(canvas_box);
                 if let Some(name) = menu_table.clone() {
+                    let bar = stack_frame(|| {
                     let open_data = {
                         let entity = entity.clone();
                         let table = name.clone();
@@ -1857,6 +1910,8 @@ impl Render for DiagramPane {
                                 .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("common.close"))),
                         );
                     }
+                    bar
+                    });
                     body = body.child(bar);
                 }
             }
@@ -1865,6 +1920,7 @@ impl Render for DiagramPane {
             body = body.child(div().size_full().flex().flex_col().items_start().justify_center().px(px(layout_pad)).child(need_target_state));
         }
 
+        let footer = stack_frame(|| {
         let mut footer = div().flex_none().flex().flex_col();
         if let Some(diagram) = diagram.as_ref() {
             if !diagram.omitted.is_empty() || diagram.notice.is_some() {
@@ -1883,7 +1939,10 @@ impl Render for DiagramPane {
                 footer = footer.child(div().id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table))).hidden().aria_label(label));
             }
         }
+        footer.into_any_element()
+        });
 
+        stack_frame(|| {
         div()
             .id("diagram-pane")
             .size_full()
@@ -1917,5 +1976,6 @@ impl Render for DiagramPane {
             .child(body)
             .child(footer)
             .child(div().id("diagram-summary").hidden().child(summary))
+        })
     }
 }

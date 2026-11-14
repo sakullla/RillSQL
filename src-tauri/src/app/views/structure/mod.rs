@@ -1713,6 +1713,7 @@ impl StructurePane {
                 let create = self.session.mode == StructureMode::Create;
                 let engine = self.session.target.engine.clone();
                 for (index, column) in columns.iter().enumerate() {
+                    form = form.child(stack_frame(|| {
                     let name = self.draft_input(10_000 + index as u32, &column.name, "name", window, cx);
                     let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
                     let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "DEFAULT", window, cx);
@@ -1807,7 +1808,8 @@ impl StructurePane {
                             cx.notify();
                         });
                     }));
-                    form = form.child(row);
+                    row.into_any_element()
+                    }));
                 }
                 let name = self.field("column_name", "structure.field.column", "new_column", window, cx);
                 let kind = self.field("column_type", "structure.field.type", "TEXT", window, cx);
@@ -1974,126 +1976,125 @@ impl StructurePane {
                 let table_entity = entity.clone();
                 let column_entity = entity.clone();
                 let ref_entity = entity.clone();
+                let local_button = stack_frame(|| {
+                    Button::new("structure-fk-local")
+                        .ghost()
+                        .small()
+                        .label(t("structure.field.column"))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for choice in local.clone() {
+                                let column_entity = column_entity.clone();
+                                let choice = choice.clone();
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                    let choice = choice.clone();
+                                    column_entity.update(cx, |pane, cx| {
+                                        pane.choose_fk("fk_column", choice);
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                });
+                let tables_button = stack_frame(|| {
+                    Button::new("structure-fk-tables")
+                        .ghost()
+                        .small()
+                        .label(t("ui.structure.refTable"))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for choice in tables.clone() {
+                                let table_entity = table_entity.clone();
+                                let choice = choice.clone();
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                    let choice = choice.clone();
+                                    table_entity.update(cx, |pane, cx| {
+                                        pane.choose_fk("fk_ref_table", choice);
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                });
+                let columns_button = stack_frame(|| {
+                    Button::new("structure-fk-ref-cols")
+                        .ghost()
+                        .small()
+                        .label(t("ui.structure.refColumn"))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for choice in columns.clone() {
+                                let ref_entity = ref_entity.clone();
+                                let choice = choice.clone();
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                    let choice = choice.clone();
+                                    ref_entity.update(cx, |pane, cx| {
+                                        pane.choose_fk("fk_ref_column", choice);
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                });
                 form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(table)).child(div().flex_1().child(target))).child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(8.))
-                        .child(
-                            Button::new("structure-fk-local")
-                                .ghost()
-                                .small()
-                                .label(t("structure.field.column"))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in local.clone() {
-                                        let column_entity = column_entity.clone();
-                                        let choice = choice.clone();
-                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                            let choice = choice.clone();
-                                            column_entity.update(cx, |pane, cx| {
-                                                pane.choose_fk("fk_column", choice);
-                                                cx.notify();
-                                            });
-                                        }));
-                                    }
-                                    menu
-                                }),
-                        )
-                        .child(
-                            Button::new("structure-fk-tables")
-                                .ghost()
-                                .small()
-                                .label(t("ui.structure.refTable"))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in tables.clone() {
-                                        let table_entity = table_entity.clone();
-                                        let choice = choice.clone();
-                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                            let choice = choice.clone();
-                                            table_entity.update(cx, |pane, cx| {
-                                                pane.choose_fk("fk_ref_table", choice);
-                                                cx.notify();
-                                            });
-                                        }));
-                                    }
-                                    menu
-                                }),
-                        )
-                        .child(
-                            Button::new("structure-fk-ref-cols")
-                                .ghost()
-                                .small()
-                                .label(t("ui.structure.refColumn"))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in columns.clone() {
-                                        let ref_entity = ref_entity.clone();
-                                        let choice = choice.clone();
-                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                            let choice = choice.clone();
-                                            ref_entity.update(cx, |pane, cx| {
-                                                pane.choose_fk("fk_ref_column", choice);
-                                                cx.notify();
-                                            });
-                                        }));
-                                    }
-                                    menu
-                                }),
-                        ),
+                    div().flex().flex_wrap().gap(px(8.)).child(local_button).child(tables_button).child(columns_button),
                 );
                 let actions = fk_action_choices(&self.session.target.engine);
                 let delete_now = self.session.fk_on_delete.clone();
                 let update_now = self.session.fk_on_update.clone();
                 let delete_entity = entity.clone();
                 let update_entity = entity.clone();
-                form = form.child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(
-                            Button::new("structure-fk-on-delete")
-                                .ghost()
-                                .small()
-                                .label(SharedString::from(format!("{} {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in actions {
-                                        let delete_entity = delete_entity.clone();
-                                        let choice = (*choice).to_owned();
-                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                            let choice = choice.clone();
-                                            delete_entity.update(cx, |pane, cx| {
-                                                pane.session.fk_on_delete = choice;
-                                                pane.session.intent = EditIntent::Apply;
-                                                pane.session.cancel();
-                                                cx.notify();
-                                            });
-                                        }));
-                                    }
-                                    menu
-                                }),
-                        )
-                        .child(
-                            Button::new("structure-fk-on-update")
-                                .ghost()
-                                .small()
-                                .label(SharedString::from(format!("{} {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in actions {
-                                        let update_entity = update_entity.clone();
-                                        let choice = (*choice).to_owned();
-                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                            let choice = choice.clone();
-                                            update_entity.update(cx, |pane, cx| {
-                                                pane.session.fk_on_update = choice;
-                                                pane.session.intent = EditIntent::Apply;
-                                                pane.session.cancel();
-                                                cx.notify();
-                                            });
-                                        }));
-                                    }
-                                    menu
-                                }),
-                        ),
-                );
+                let delete_button = stack_frame(|| {
+                    Button::new("structure-fk-on-delete")
+                        .ghost()
+                        .small()
+                        .label(SharedString::from(format!("{} {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for choice in actions {
+                                let delete_entity = delete_entity.clone();
+                                let choice = (*choice).to_owned();
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                    let choice = choice.clone();
+                                    delete_entity.update(cx, |pane, cx| {
+                                        pane.session.fk_on_delete = choice;
+                                        pane.session.intent = EditIntent::Apply;
+                                        pane.session.cancel();
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                });
+                let update_button = stack_frame(|| {
+                    let actions = fk_action_choices(&self.session.target.engine);
+                    Button::new("structure-fk-on-update")
+                        .ghost()
+                        .small()
+                        .label(SharedString::from(format!("{} {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for choice in actions {
+                                let update_entity = update_entity.clone();
+                                let choice = (*choice).to_owned();
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                    let choice = choice.clone();
+                                    update_entity.update(cx, |pane, cx| {
+                                        pane.session.fk_on_update = choice;
+                                        pane.session.intent = EditIntent::Apply;
+                                        pane.session.cancel();
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                });
+                form = form.child(div().flex().gap(px(8.)).child(delete_button).child(update_button));
                 form
             }),
             Section::View => stack_frame(|| {
@@ -2177,11 +2178,7 @@ impl StructurePane {
     }
 }
 
-/// 调试构建不复用栈槽。把一块界面放进独立栈帧，调用返回后槽位释放。
-#[inline(never)]
-fn stack_frame<T>(build: impl FnOnce() -> T) -> T {
-    build()
-}
+use crate::ui::kit::stack_frame;
 
 impl Render for StructurePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

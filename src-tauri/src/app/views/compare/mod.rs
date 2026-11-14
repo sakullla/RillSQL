@@ -144,8 +144,8 @@ pub struct ComparePane {
     baseline: SidePick,
     target: SidePick,
     schemas: BTreeMap<String, SchemaState>,
-    structure: Option<StructureReport>,
-    data: Option<DataReport>,
+    structure: Option<Arc<StructureReport>>,
+    data: Option<Arc<DataReport>>,
     structure_status: Status,
     data_status: Status,
     selected: BTreeMap<String, bool>,
@@ -716,12 +716,12 @@ impl ComparePane {
         self.selected.clear();
         self.chosen_key.clear();
         let Some(request) = self.structure_request() else {
-            self.structure = Some(empty_structure(Some(self.text("compare.gates.chooseBoth"))));
+            self.structure = Some(Arc::new(empty_structure(Some(self.text("compare.gates.chooseBoth")))));
             self.structure_status = Status::Refused;
             return;
         };
         if let Some(message) = self.refuse_local() {
-            self.structure = Some(empty_structure(Some(message)));
+            self.structure = Some(Arc::new(empty_structure(Some(message))));
             self.structure_status = Status::Refused;
             return;
         }
@@ -738,17 +738,17 @@ impl ComparePane {
         self.clear_error();
         self.data = None;
         let Some(request) = self.data_request() else {
-            self.data = Some(empty_data(Some(self.text("compare.gates.chooseBoth"))));
+            self.data = Some(Arc::new(empty_data(Some(self.text("compare.gates.chooseBoth")))));
             self.data_status = Status::Refused;
             return;
         };
         if let Some(message) = self.refuse_local() {
-            self.data = Some(empty_data(Some(message)));
+            self.data = Some(Arc::new(empty_data(Some(message))));
             self.data_status = Status::Refused;
             return;
         }
         if request.tables.is_empty() {
-            self.data = Some(empty_data(Some(self.text("compare.gates.noTablesPicked"))));
+            self.data = Some(Arc::new(empty_data(Some(self.text("compare.gates.noTablesPicked")))));
             self.data_status = Status::Refused;
             return;
         }
@@ -1012,7 +1012,7 @@ impl ComparePane {
     fn install_structure(&mut self, report: StructureReport) {
         if report.refused.is_some() {
             self.structure_status = Status::Refused;
-            self.structure = Some(report);
+            self.structure = Some(Arc::new(report));
             return;
         }
         self.selected.clear();
@@ -1020,7 +1020,7 @@ impl ComparePane {
             self.selected.insert(table.name.clone(), table.on_both);
         }
         self.structure_status = if report.incomplete { Status::Incomplete } else { Status::Ready };
-        self.structure = Some(report);
+        self.structure = Some(Arc::new(report));
     }
 
     fn install_data(&mut self, report: DataReport) {
@@ -1031,7 +1031,7 @@ impl ComparePane {
         } else {
             self.data_status = Status::Ready;
         }
-        self.data = Some(report);
+        self.data = Some(Arc::new(report));
     }
 
     fn ask_place(&mut self, kind: RunKind) {
@@ -1356,6 +1356,8 @@ fn empty_data(refused: Option<String>) -> DataReport {
     DataReport { refused, script: String::new(), incomplete: false, notes: Vec::new(), diffs: Vec::new() }
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for ComparePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -1371,7 +1373,7 @@ impl Render for ComparePane {
         self.schema_reload = false;
         let swap = kit::icon_button("compare-swap", IconName::ArrowRightLeft, t(self, "compare.action.swap"), compare_act("compare-swap", &entity));
         // 窄窗口里两侧竖排：并排会把每侧压到只剩图标；竖排后卡片各占整行，交换按钮居中（R6 900/640）。
-        let sides = if stacked {
+        let sides = stack_frame(|| if stacked {
             div()
                 .flex()
                 .flex_col()
@@ -1387,8 +1389,9 @@ impl Render for ComparePane {
                 .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
                 .child(div().flex_none().pt(px(m.header_h() / 2.)).child(swap))
                 .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card))
-        };
+        });
 
+        let actions = stack_frame(|| {
         let mut actions = div()
             .flex()
             .flex_wrap()
@@ -1403,8 +1406,12 @@ impl Render for ComparePane {
         } else {
             actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
+        actions
+        });
 
         let mut body = div().flex().flex_col().gap(px(m.section_gap())).child(sides).child(actions);
+        body = stack_frame(|| {
+        let mut body = body;
         // 正在比较且还没有报告：给骨架占位与一条局部加载，不让详情区空着。
         if self.running && self.structure.is_none() && self.data.is_none() {
             body = body.child(
@@ -1479,8 +1486,11 @@ impl Render for ComparePane {
                 &p,
             ));
         }
+        body
+        });
 
         if let Some(report) = self.structure.clone() {
+            let card = stack_frame(|| {
             let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad()));
             let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
             card = card.child(
@@ -1516,6 +1526,8 @@ impl Render for ComparePane {
                     diffs = diffs.child(diff_row("~", format!("{} {} · {}", item.kind, item.name, item.detail), p.warn, &p));
                 }
                 card = card.child(diffs);
+                card = stack_frame(|| {
+                let mut card = card;
                 for note in &report.notes {
                     card = card.child(kit::muted(SharedString::from(note.clone()), &p));
                 }
@@ -1563,11 +1575,16 @@ impl Render for ComparePane {
                     );
                     card = card.child(self.script_view("compare-structure-script", &report.script, window, cx, &p));
                 }
+                card
+                });
             }
+            card.into_any_element()
+            });
             body = body.child(card);
         }
 
         if let Some(report) = self.data.clone() {
+            let card = stack_frame(|| {
             let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
             let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
                 div()
@@ -1601,6 +1618,8 @@ impl Render for ComparePane {
                     card = card.child(self.script_view("compare-data-script", &report.script, window, cx, &p));
                 }
             }
+            card.into_any_element()
+            });
             body = body.child(card);
         } else {
             body = body.child(div().hidden().child(kit::tool_button("compare-place:data", None, t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity))));
@@ -1617,7 +1636,7 @@ impl Render for ComparePane {
                 .child(SharedString::from(self.context_note.clone()))
         });
 
-        div()
+        stack_frame(|| div()
             .id("compare-pane")
             .size_full()
             .flex()
@@ -1649,6 +1668,7 @@ impl Render for ComparePane {
                             .child(body),
                     ),
             )
+        )
     }
 }
 
@@ -1986,7 +2006,7 @@ mod tests {
         pane.target = SidePick { connection_id: "maria".into(), database: "app".into(), schema: String::new() };
         let message = pane.refuse_local().expect("引擎不同");
         assert!(message.contains("不生成脚本"), "{message}");
-        pane.structure = Some(empty_structure(Some(message)));
+        pane.structure = Some(Arc::new(empty_structure(Some(message))));
         assert!(pane.structure.as_ref().is_some_and(|report| report.script.is_empty() && report.refused.is_some()));
         assert!(!pane.structure_ready());
 
@@ -2040,7 +2060,7 @@ mod tests {
         pane.target = SidePick { connection_id: "base".into(), database: "main".into(), schema: String::new() };
         let mut report = empty_structure(None);
         report.script = "CREATE TABLE copied (id INTEGER PRIMARY KEY);".into();
-        pane.structure = Some(report);
+        pane.structure = Some(Arc::new(report));
         pane.structure_status = Status::Ready;
         pane.ask_place(RunKind::Structure);
         assert!(pane.pending_place.is_some(), "写脚本必须先确认");
@@ -2067,7 +2087,7 @@ mod tests {
         let mut report = empty_structure(None);
         report.tables.push(crate::compare::TableChoice { name: "orders".into(), on_both: true, needs_key_choice: false, keys: Vec::new() });
         report.tables.push(crate::compare::TableChoice { name: "hidden".into(), on_both: true, needs_key_choice: false, keys: Vec::new() });
-        pane.structure = Some(report);
+        pane.structure = Some(Arc::new(report));
         pane.structure_status = Status::Ready;
         pane.selected.insert("orders".into(), false);
         pane.selected.insert("hidden".into(), false);
@@ -2265,7 +2285,7 @@ mod tests {
         pane.update(cx, |pane, cx| pane.pick(true, "c", cx));
         assert_eq!(pane.update(cx, |pane, _| pane.sides()), ("c".to_owned(), "a".to_owned()));
         pane.update(cx, |pane, _| {
-            pane.structure = Some(empty_structure(None));
+            pane.structure = Some(Arc::new(empty_structure(None)));
             pane.structure_status = Status::Ready;
             pane.selected.insert("orders".into(), true);
             pane.chosen_key.insert("orders".into(), "id".into());
@@ -2503,7 +2523,7 @@ mod workbench {
                         pane.target = SidePick { connection_id: "right".into(), database: "app".into(), schema: String::new() };
                         pane.schemas.insert(schema_key("left", "app"), SchemaState::Ready(vec!["public".into(), "analytics".into()]));
                         pane.schemas.insert(schema_key("right", "app"), SchemaState::Manual("读取 schema 失败：权限不足".into()));
-                        pane.structure = Some(StructureReport {
+                        pane.structure = Some(Arc::new(StructureReport {
                             refused: None,
                             script: String::new(),
                             incomplete: true,
@@ -2520,7 +2540,7 @@ mod workbench {
                                     crate::compare::KeyChoice { name: "uk_email".into(), columns: vec!["email".into()], primary: false },
                                 ],
                             }],
-                        });
+                        }));
                         pane.structure_status = Status::Incomplete;
                         pane.selected.insert("orders".into(), true);
                         pane

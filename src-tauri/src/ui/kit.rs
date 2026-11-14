@@ -18,6 +18,14 @@ use gpui_kit::{
     div, hsla, px, rgb,
 };
 
+/// 将较大的元素构建分支放到独立栈帧，降低未优化构建的栈峰值。
+/// 闭包在当前线程立即执行，不分配堆内存；发布构建允许编译器内联。
+#[cfg_attr(debug_assertions, inline(never))]
+#[cfg_attr(not(debug_assertions), inline)]
+pub(crate) fn stack_frame<T>(build: impl FnOnce() -> T) -> T {
+    build()
+}
+
 /// 一套色板。字段名按用途取，不按色相取。
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {

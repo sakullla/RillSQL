@@ -1022,6 +1022,8 @@ fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
     Some((id, name, database, collection))
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for MongoPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_w = f32::from(window.viewport_size().width);
@@ -1043,7 +1045,12 @@ impl Render for MongoPane {
             Some(|this: &mut Self, _, cx| this.command("mongo-filter", cx)),
         );
 
+        let nav_w = m.header_h() * 4. + m.pane_pad();
+        // 窄窗口里左栏是覆盖内容区的抽屉：展开时不挤压文档表，页面本身也不会被撑出横向滚动。
+        let overlay_nav = !collapsed && self.viewport_w < kit::NARROW_PAGE_WIDTH;
+        let panel_w = if overlay_nav { nav_w.min((self.viewport_w - 32.).max(160.)) } else { nav_w };
         // ---- 左栏：库与集合
+        let nav_column = stack_frame(|| {
         let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
         nav = nav.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.databases")), &p)));
         for (index, database) in self.databases.iter().take(60).enumerate() {
@@ -1080,11 +1087,7 @@ impl Render for MongoPane {
                 &entity,
             ));
         }
-        let nav_w = m.header_h() * 4. + m.pane_pad();
-        // 窄窗口里左栏是覆盖内容区的抽屉：展开时不挤压文档表，页面本身也不会被撑出横向滚动。
-        let overlay_nav = !collapsed && self.viewport_w < kit::NARROW_PAGE_WIDTH;
-        let panel_w = if overlay_nav { nav_w.min((self.viewport_w - 32.).max(160.)) } else { nav_w };
-        let nav_column = div()
+        div()
             .id("mongo-nav")
             .test_support()
             .flex_none()
@@ -1110,7 +1113,8 @@ impl Render for MongoPane {
                     .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
                     .child(mongo_icon("mongo-refresh-db", IconName::RefreshCw, &self.text("mongo.tab.databases"), &entity)),
             )
-            .child(nav);
+            .child(nav)
+        });
 
         // ---- 工具条
         let page_text = if self.total >= 0 {
@@ -1118,7 +1122,7 @@ impl Render for MongoPane {
         } else {
             format!("{}–{}", self.skip + 1, self.skip + self.documents.len() as u64)
         };
-        let toolbar = div()
+        let toolbar = stack_frame(|| div()
             .flex_none()
             .px(px(10.))
             .py(px(8.))
@@ -1174,7 +1178,8 @@ impl Render for MongoPane {
             .child(mongo_icon("mongo-prev", IconName::ChevronLeft, &self.text("mongo.tab.prevPage"), &entity))
             .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(page_text)))
             .child(mongo_icon("mongo-next", IconName::ChevronRight, &self.text("mongo.tab.nextPage"), &entity))
-            .child(mongo_button("mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, &entity));
+            .child(mongo_button("mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, &entity))
+        );
 
         // ---- 文档数据区：状态分派在这里，页面本身不参与横向滚动。
         let state = self.docs_state();
@@ -1183,6 +1188,8 @@ impl Render for MongoPane {
         let documents = self.docs_body(state, docs_focused, &mono, &p, &m, &entity, cx);
 
         let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar);
+        right = stack_frame(|| {
+        let mut right = right;
         if self.crumb_db || self.crumb_coll {
             let mut menu = div().id("mongo-crumb-menu").flex().flex_col().max_h(px(m.header_h() * 6.)).overflow_y_scroll().p(px(m.pad)).border_b_1().border_color(p.line).bg(p.chrome);
             if self.crumb_db {
@@ -1217,10 +1224,13 @@ impl Render for MongoPane {
             }
             right = right.child(menu);
         }
+        right
+        });
         right = right.child(documents);
 
         // ---- 抽屉：查看 / 编辑
         if self.view_open || self.editor_open {
+            let drawer = stack_frame(|| {
             let editable = self.editor_open;
             let source = if editable { self.editor_text.clone() } else { self.view_json.clone() };
             let viewer = self.ensure_document_viewer(&source, editable, window, cx);
@@ -1258,12 +1268,14 @@ impl Render for MongoPane {
                     .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
                     .child(div().flex().justify_end().child(mongo_button("mongo-save", Some(IconName::Check), &caption, Kind::Primary, &entity)));
             }
+            drawer
+            });
             right = right.child(drawer);
         }
         if self.confirm_open() {
             let delete = self.confirm_is_delete();
-            right = right.child(
-                div()
+            let bar = stack_frame(|| {
+            div()
                     .flex_none()
                     .mx(px(10.))
                     .mb(px(8.))
@@ -1284,10 +1296,13 @@ impl Render for MongoPane {
                         &self.confirm_action_text(),
                         if delete { Kind::Danger } else { Kind::Primary },
                         &entity,
-                    )),
-            );
+                    ))
+            });
+            right = right.child(bar);
         }
         // 状态条：错误优先，其次是操作回执，读取中显示进度文案；读取进度在数据区还有局部/骨架两档。
+        right = stack_frame(|| {
+        let mut right = right;
         let status = if !self.error.is_empty() {
             self.error.clone()
         } else if !self.note.is_empty() {
@@ -1316,6 +1331,8 @@ impl Render for MongoPane {
                 .when(self.busy, |this| this.child(Spinner::new().xsmall().color(p.accent)))
                 .child(SharedString::from(status)),
         );
+        right
+        });
 
         // 页面根只负责分栏：不滚横向、不撑宽，滚动全部交给左栏或文档数据区自己。
         let mut root = div().id("mongo-pane").test_support().relative().size_full().flex().min_w(px(0.)).overflow_hidden();

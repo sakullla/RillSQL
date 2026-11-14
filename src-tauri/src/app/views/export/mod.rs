@@ -1163,6 +1163,8 @@ impl ExchangePane {
     }
 }
 
+use crate::ui::kit::stack_frame;
+
 impl Render for ExchangePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some((id, control)) = &self.loaded_control {
@@ -1211,6 +1213,7 @@ impl Render for ExchangePane {
             panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.notice.clone())));
         }
 
+        let (kinds, source_body) = stack_frame(|| {
         // 来源选择：当前表数据或当前查询结果，两种来源的列、行与能力互不混用。
         let mut kinds = Vec::new();
         for (kind, id, label) in [
@@ -1296,6 +1299,10 @@ impl Render for ExchangePane {
                 }
             }
         }
+        (kinds, source_body)
+        });
+        panel = stack_frame(|| {
+        let mut panel = panel;
         let mut formats = Vec::new();
         for (format, label) in [("csv", "CSV"), ("xlsx", "Excel"), ("json", "JSON"), ("insert", "SQL"), ("markdown", "Markdown")] {
             let entity = entity.clone();
@@ -1349,9 +1356,13 @@ impl Render for ExchangePane {
                 })
                 .into_any_element(),
         ));
+        panel
+        });
 
         // 导出：不可用的能力说明原因与下一步，而不是留一个点了没反应的入口。
         let loaded_ready = state == SourceState::Ready;
+        panel = stack_frame(|| {
+        let mut panel = panel;
         let mut export = div().id("exchange-export-card").test_support().flex().flex_col().gap(px(6.)).min_w(px(0.)).max_w_full();
         if loaded_ready {
             export = export.child(action_row(
@@ -1427,9 +1438,13 @@ impl Render for ExchangePane {
                 .child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
         }
         panel = panel.child(section(t("ui.exchange.export"), export.into_any_element()));
+        panel
+        });
 
         // 导入：写入目标必须来自当前表来源。查询结果不能写回，所以这里给的是
         // 一条空态（原因 + 下一步），主操作直接把来源切到当前表数据。
+        panel = stack_frame(|| {
+        let mut panel = panel;
         let mut import = kit::card(&p)
             .id("exchange-import-card")
             .test_support()
@@ -1526,8 +1541,12 @@ impl Render for ExchangePane {
         }
         }
         panel = panel.child(section(t("ui.exchange.import"), import.into_any_element()));
+        panel
+        });
 
         // 任务：没有任务时给空态（说明 + 下一步），不再是一行灰字。
+        panel = stack_frame(|| {
+        let mut panel = panel;
         let mut tasks = kit::card(&p).id("exchange-tasks").test_support().flex().flex_col().min_w(px(0.)).max_w_full();
         if self.log.tasks.is_empty() {
             let empty = if loaded_ready {
@@ -1546,6 +1565,7 @@ impl Render for ExchangePane {
         }
         let count = self.log.tasks.len();
         for (index, task) in self.log.tasks.iter().enumerate() {
+            let row = stack_frame(|| {
             let (fg, bg) = match task.phase {
                 Phase::Running => (p.accent_text, p.accent_soft),
                 Phase::Done => (p.ok, p.ok_soft),
@@ -1553,8 +1573,7 @@ impl Render for ExchangePane {
                 Phase::Partial | Phase::Blocked => (p.warn, p.warn_soft),
                 Phase::Cancelled => (p.text_muted, p.hover),
             };
-            tasks = tasks.child(
-                div()
+            div()
                     .px(px(14.))
                     .py(px(10.))
                     .flex()
@@ -1572,8 +1591,10 @@ impl Render for ExchangePane {
                             .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(if task.detail.is_empty() { task.path.clone().unwrap_or_default() } else { task.detail.clone() }))),
                     )
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} {}", task.done_rows, i18n::text(locale, "ui.grid.rows")))))
-                    .child(kit::pill(t(task.label_key()), fg, bg)),
-            );
+                    .child(kit::pill(t(task.label_key()), fg, bg))
+                    .into_any_element()
+            });
+            tasks = tasks.child(row);
         }
         panel = panel.child(section(
             t("export.task.title"),
@@ -1601,6 +1622,8 @@ impl Render for ExchangePane {
                 )
                 .into_any_element(),
         ));
+        panel
+        });
         panel
     }
 }

@@ -30,6 +30,8 @@ use super::conn_modal;
 use super::model::{ConnFilterMenu, DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
+use crate::ui::kit::stack_frame;
+
 /// 活动栏宽度来自布局模块，绘制与几何只保留一份。
 const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
 /// 活动栏激活指示条（3px 宽的竖线）两端的圆角。线条不是控件，不取 `Radius` token；见扫描测试例外清单。
@@ -210,7 +212,7 @@ impl Workbench {
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.model.shell.sidebar_open = false;
-                                    this.persist_if_needed();
+                                    this.persist_if_needed(cx);
                                     cx.notify();
                                 });
                             });
@@ -1400,7 +1402,7 @@ impl Workbench {
             .child(
                 kit::icon_button(SharedString::from(format!("tab-close-{id}")), IconName::X, self.t("common.close"), cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.model.request_close_tab(&close_id);
-                    this.persist_if_needed();
+                    this.persist_if_needed(cx);
                     cx.notify();
                 }))
                 .xsmall(),
@@ -1409,13 +1411,13 @@ impl Workbench {
                 // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
                 if this.model.tab_menu_for(&menu_id) {
                     this.menu_at = event.position;
-                    this.persist_if_needed();
+                    this.persist_if_needed(cx);
                 }
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.model.request_close_tab(&middle_id);
-                this.persist_if_needed();
+                this.persist_if_needed(cx);
                 cx.notify();
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1423,7 +1425,7 @@ impl Workbench {
                 if this.model.tool == WorkTool::Query {
                     this.query.update(cx, |pane, _| pane.request_focus());
                 }
-                this.persist_if_needed();
+                this.persist_if_needed(cx);
                 cx.notify();
             }));
             list = list.child(chip);
@@ -2102,6 +2104,7 @@ impl Workbench {
             &p,
             cx,
         );
+        let general = stack_frame(|| {
         let mut general = div().flex().flex_col().gap(px(14.));
         general = general.child(
             div()
@@ -2183,10 +2186,15 @@ impl Workbench {
                 general = general.child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p));
             }
         }
+        general.into_any_element()
+        });
 
-        // 安全：TLS 与 SSH。
-        let mut security = div().flex().flex_col().gap(px(14.));
-        if !file_based {
+        // 安全：TLS 与 SSH 分帧，两段表单的临时值不能留在同一个未优化栈帧里。
+        let tls = if file_based {
+            None
+        } else {
+            Some(stack_frame(|| {
+            let mut security = div().flex().flex_col().gap(px(14.));
             let mut tls_items = segment_track(&p);
             for (mode, key) in [(TlsMode::Off, "connections.page.tlsOff"), (TlsMode::Require, "ui.conn.tlsRequire"), (TlsMode::Verify, "ui.conn.tlsVerify")] {
                 tls_items = tls_items.child(self.modal_segment_item(
@@ -2257,6 +2265,14 @@ impl Workbench {
                         ))),
                 );
             }
+            security.into_any_element()
+            }))
+        };
+        let ssh = if file_based {
+            None
+        } else {
+            Some(stack_frame(|| {
+            let mut security = div().flex().flex_col().gap(px(14.));
             let ssh_on = draft.ssh_on;
             let ssh_handle = self.modal_control(cx, conn_modal::SSH_TOGGLE, conn_modal::ModalAction::Command("conn-ssh-toggle"));
             security = security.child(
@@ -2348,8 +2364,19 @@ impl Workbench {
                 }
                 security = security.child(ssh);
             }
+            security.into_any_element()
+            }))
+        };
+        let mut security = div().flex().flex_col().gap(px(14.));
+        if let Some(tls) = tls {
+            security = security.child(tls);
+        }
+        if let Some(ssh) = ssh {
+            security = security.child(ssh);
         }
 
+        // 页头、说明、页脚和面板分帧：调试构建不复用栈槽，叠在一起会让单次栈探测过大。
+        let notes = stack_frame(|| {
         // 测试/打开结果与无处归属的问题：集中在主体末尾，每条只说一次。
         let mut notes = div().flex().flex_col().gap(px(6.));
         for issue in self.model.connections.issues.iter().filter(|issue| !field_issue_placed(&issue.field)) {
@@ -2369,14 +2396,16 @@ impl Workbench {
                 banner(IconName::CircleAlert, SharedString::from(text), p.danger, p.danger_soft)
             });
         }
+        notes.into_any_element()
+        });
 
+        let header = stack_frame(|| {
         let title = if existing {
             SharedString::from(draft.name.clone())
         } else {
             self.t("connections.editor.newTitle")
         };
         let subtitle = SharedString::from(kit::engine_label(engine.as_str()));
-        let running = self.model.connections.test_running();
         let close = self.modal_icon_button(
             conn_modal::CLOSE,
             IconName::X,
@@ -2406,26 +2435,12 @@ impl Workbench {
             )
             .child(div().flex_1())
             .child(close);
+        header.into_any_element()
+        });
 
-        let body = div()
-            .id("conn-modal-scroll")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .px(px(pad))
-                    .py(px(12.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.))
-                    .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
-                    .child(form_section(self.t("ui.conn.general"), general, &p))
-                    .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
-                    .child(notes),
-            );
-
+        let footer = stack_frame(|| {
         // 固定页脚：保存、保存并连接、测试和取消始终在同一位置，不必先滚到底。
+        let running = self.model.connections.test_running();
         let intro = div()
             .flex()
             .items_center()
@@ -2493,6 +2508,28 @@ impl Workbench {
             .child(test)
             .child(save)
             .child(save_connect);
+        footer.into_any_element()
+        });
+
+        let shell = stack_frame(|| {
+        let body = div()
+            .id("conn-modal-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .px(px(pad))
+                    .py(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
+                    .child(form_section(self.t("ui.conn.general"), general, &p))
+                    .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
+                    .child(notes),
+            );
+
 
         let trap = self.modal_focus.clone();
         let content = div()
@@ -2526,12 +2563,6 @@ impl Workbench {
             .shadow_lg()
             .child(content);
 
-        if focus_first {
-            // 打开就把键盘交给首个字段：不用先点一下才能输入。
-            let handle = first_field.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-        }
-
         backdrop("conn-modal-backdrop", 0.32, cx)
             .flex()
             .items_start()
@@ -2541,6 +2572,14 @@ impl Workbench {
             .pb(px(20.))
             .child(panel)
             .into_any_element()
+        });
+
+        if focus_first {
+            // 打开就把键盘交给首个字段：不用先点一下才能输入。
+            let handle = first_field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        shell
     }
 
     /// 登记一个模态控件：拿到稳定焦点句柄、把 id 记进这一帧的渲染清单、记下它的动作。
@@ -3114,6 +3153,7 @@ impl Workbench {
         let p = Palette::of(cx);
         let m = self.metrics();
         let section = self.model.history.section;
+        let (search, save_name, rename_input, tabs, status_seg) = stack_frame(|| {
         let search = self.input_for(DraftField::HistorySearch, &self.model.text("ui.history.search"), false, window, cx);
         let save_name = self.input_for(DraftField::SaveName, &self.model.text("ui.history.saveAs"), false, window, cx);
         let rename_input = self.input_for(DraftField::RenameName, &self.model.text("history.page.rename"), false, window, cx);
@@ -3160,6 +3200,8 @@ impl Workbench {
             &p,
             self.metrics().control_h,
         );
+        (search, save_name, rename_input, tabs, status_seg)
+        });
         let filter_connection = self.model.history.filter_connection.clone();
         let connection_label = if filter_connection.is_empty() {
             self.t("history.page.filterConnection")
@@ -3200,8 +3242,10 @@ impl Workbench {
             );
         }
         if section == HistorySection::Runs {
-            let runs: Vec<_> = self.model.history.filtered_runs().into_iter().take(200).cloned().collect();
-            if runs.is_empty() {
+            list = stack_frame(|| {
+            let mut list = list;
+            let mut runs = self.model.history.iter_filtered_runs().take(200).peekable();
+            if runs.peek().is_none() {
                 // 读取中先给骨架，读到才判断“无数据”还是“无命中”。
                 list = list.child(match phase {
                     ListPhase::Loading => kit::skeleton_state(5, &m, &p).into_any_element(),
@@ -3237,7 +3281,7 @@ impl Workbench {
                 let menu = id.clone();
                 let load = id.clone();
                 let delete = id.clone();
-                list = list.child(
+                let row = stack_frame(|| {
                     kit::row_states(div().id(SharedString::from(format!("run-{id}"))), &p)
                         .test_support()
                         .group("run-row")
@@ -3317,12 +3361,18 @@ impl Workbench {
                                 this.perform("history-load", cx);
                             }
                             cx.notify();
-                        })),
-                );
+                        }))
+                        .into_any_element()
+                });
+                list = list.child(row);
             }
+            list
+            });
         } else {
-            let saved: Vec<_> = self.model.history.filtered_saved().into_iter().take(200).cloned().collect();
-            if saved.is_empty() {
+            list = stack_frame(|| {
+            let mut list = list;
+            let mut saved = self.model.history.iter_filtered_saved().take(200).peekable();
+            if saved.peek().is_none() {
                 list = list.child(match phase {
                     ListPhase::Loading => kit::skeleton_state(4, &m, &p).into_any_element(),
                     ListPhase::Empty => kit::empty_state_with_action(
@@ -3354,7 +3404,7 @@ impl Workbench {
                 let load = id.clone();
                 let rename = id.clone();
                 let delete = id.clone();
-                list = list.child(
+                let row = stack_frame(|| {
                     kit::row_states(div().id(SharedString::from(format!("saved-{id}"))), &p)
                         .test_support()
                         .group("saved-row")
@@ -3433,9 +3483,13 @@ impl Workbench {
                                 this.perform("history-load", cx);
                             }
                             cx.notify();
-                        })),
-                );
+                        }))
+                        .into_any_element()
+                });
+                list = list.child(row);
             }
+            list
+            });
         }
 
         // 键盘可用性写在列表末尾：方向键选行、回车载入、Delete 删除，与右键菜单同一批命令。
@@ -3465,6 +3519,7 @@ impl Workbench {
             self.model.history.selected_run.is_some()
         };
         let preview_open = self.model.history.preview_open;
+        let page = stack_frame(|| {
         let toolbar = div()
             .flex()
             .flex_wrap()
@@ -3548,6 +3603,8 @@ impl Workbench {
             .child(rename_bar)
             .child(body)
             .into_any_element()
+        });
+        page
     }
 
     #[inline(never)]
@@ -3720,57 +3777,6 @@ impl Workbench {
                 .collect::<Vec<_>>();
             kit::segmented_sized(built, &Palette::of(cx), m.control_h)
         };
-        let theme_seg = seg(
-            self,
-            &[
-                ("theme-light", "shell.theme.light", theme == ThemePreference::Light),
-                ("theme-dark", "shell.theme.dark", theme == ThemePreference::Dark),
-                ("theme-system", "shell.theme.system", theme == ThemePreference::System),
-            ],
-            cx,
-        );
-        let density_seg = seg(
-            self,
-            &[
-                ("density-compact", "shell.settings.densityCompact", s.density == "compact"),
-                ("density-standard", "shell.settings.densityStandard", s.density == "standard"),
-                ("density-relaxed", "shell.settings.densityRelaxed", s.density == "relaxed"),
-            ],
-            cx,
-        );
-        let locale_seg = seg(
-            self,
-            &[("locale-zh", "common.localeZh", self.model.shell.locale == crate::app::Locale::ZhCn), ("locale-en", "common.localeEn", self.model.shell.locale == crate::app::Locale::En)],
-            cx,
-        );
-        let timeout_seg = seg(
-            self,
-            &[
-                ("timeout-0", "ui.settings.timeoutOff", s.query_timeout_sec == 0),
-                ("timeout-15", "ui.settings.timeout15", s.query_timeout_sec == 15),
-                ("timeout-60", "ui.settings.timeout60", s.query_timeout_sec == 60),
-            ],
-            cx,
-        );
-        let null_seg = seg(
-            self,
-            &[("null-NULL", "ui.settings.nullWord", s.null_copy == "NULL"), ("null-empty", "ui.settings.nullEmpty", s.null_copy == "empty"), ("null-N", "ui.settings.nullN", s.null_copy == "N")],
-            cx,
-        );
-        let font = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .child(kit::icon_button("font-down", IconName::Minus, self.t("ui.settings.smaller"), act("font-down", cx)).outline())
-            .child(div().w(px(44.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(format!("{} px", s.editor_font))))
-            .child(kit::icon_button("font-up", IconName::Plus, self.t("ui.settings.larger"), act("font-up", cx)).outline());
-        let editor_theme = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(div().font_weight(FontWeight::MEDIUM).child(self.t(crate::app::views::settings::editor_theme_key(&s.editor_theme))))
-            .child(kit::icon_button("editor-theme-prev", IconName::ChevronLeft, self.t("ui.settings.change"), act("editor-theme-prev", cx)).outline())
-            .child(kit::icon_button("editor-theme-next", IconName::ChevronRight, self.t("ui.settings.change"), act("editor-theme-next", cx)).outline());
         let stepper = |this: &Self, id: &'static str, value: String, cx: &mut Context<Self>| {
             div()
                 .flex()
@@ -3780,16 +3786,6 @@ impl Workbench {
                 .child(div().min_w(px(56.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(value)))
                 .child(kit::icon_button(SharedString::from(format!("{id}-up")), IconName::Plus, this.t("ui.settings.increase"), act(format!("{id}-up"), cx)).outline())
         };
-        let page_size = stepper(self, "page-size", s.page_size.to_string(), cx);
-        let preview = stepper(self, "preview", format!("{} KB", s.preview_kb), cx);
-        let object_page = stepper(self, "object-page", s.object_page.to_string(), cx);
-        let updates = kit::interactive_states(div().id("toggle-updates"), &p, false)
-            .role(gpui_kit::Role::Switch)
-            .aria_label(self.t("shell.update.autoCheck"))
-            .aria_selected(s.auto_check_updates)
-            .child(switch_visual(s.auto_check_updates, &p))
-            .on_click(act("toggle-updates", cx));
-
         // 一组设置的卡片：标题 + 逐行“名称/说明 + 控件”。行内换行，
         // 窄窗口里控件掉到下一行而不是把名称挤没。
         let group = |id: &'static str, title: SharedString, rows: Vec<(SharedString, Option<SharedString>, AnyElement)>, p: &Palette| {
@@ -3833,7 +3829,45 @@ impl Workbench {
         // 只构建当前分区的表单：另一个分区的控件不进元素树，Tab 也不会走到看不见的控件上。
         let section = self.model.settings_section;
         let section_body = match section {
-            SettingsSection::Appearance => div()
+            SettingsSection::Appearance => stack_frame(|| {
+                let theme_seg = seg(
+                    self,
+                    &[
+                        ("theme-light", "shell.theme.light", theme == ThemePreference::Light),
+                        ("theme-dark", "shell.theme.dark", theme == ThemePreference::Dark),
+                        ("theme-system", "shell.theme.system", theme == ThemePreference::System),
+                    ],
+                    cx,
+                );
+                let density_seg = seg(
+                    self,
+                    &[
+                        ("density-compact", "shell.settings.densityCompact", s.density == "compact"),
+                        ("density-standard", "shell.settings.densityStandard", s.density == "standard"),
+                        ("density-relaxed", "shell.settings.densityRelaxed", s.density == "relaxed"),
+                    ],
+                    cx,
+                );
+                let locale_seg = seg(
+                    self,
+                    &[("locale-zh", "common.localeZh", self.model.shell.locale == crate::app::Locale::ZhCn), ("locale-en", "common.localeEn", self.model.shell.locale == crate::app::Locale::En)],
+                    cx,
+                );
+                let font = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(kit::icon_button("font-down", IconName::Minus, self.t("ui.settings.smaller"), act("font-down", cx)).outline())
+                    .child(div().w(px(44.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(format!("{} px", s.editor_font))))
+                    .child(kit::icon_button("font-up", IconName::Plus, self.t("ui.settings.larger"), act("font-up", cx)).outline());
+                let editor_theme = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(self.t(crate::app::views::settings::editor_theme_key(&s.editor_theme))))
+                    .child(kit::icon_button("editor-theme-prev", IconName::ChevronLeft, self.t("ui.settings.change"), act("editor-theme-prev", cx)).outline())
+                    .child(kit::icon_button("editor-theme-next", IconName::ChevronRight, self.t("ui.settings.change"), act("editor-theme-next", cx)).outline());
+                div()
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
@@ -3855,8 +3889,27 @@ impl Workbench {
                         (self.t("shell.settings.editorTheme"), Some(self.t("shell.settings.editorThemeAuto")), editor_theme.into_any_element()),
                     ],
                     &p,
-                )),
-            SettingsSection::Data => div()
+                )).into_any_element()
+            }),
+            SettingsSection::Data => stack_frame(|| {
+                let timeout_seg = seg(
+                    self,
+                    &[
+                        ("timeout-0", "ui.settings.timeoutOff", s.query_timeout_sec == 0),
+                        ("timeout-15", "ui.settings.timeout15", s.query_timeout_sec == 15),
+                        ("timeout-60", "ui.settings.timeout60", s.query_timeout_sec == 60),
+                    ],
+                    cx,
+                );
+                let null_seg = seg(
+                    self,
+                    &[("null-NULL", "ui.settings.nullWord", s.null_copy == "NULL"), ("null-empty", "ui.settings.nullEmpty", s.null_copy == "empty"), ("null-N", "ui.settings.nullN", s.null_copy == "N")],
+                    cx,
+                );
+                let page_size = stepper(self, "page-size", s.page_size.to_string(), cx);
+                let preview = stepper(self, "preview", format!("{} KB", s.preview_kb), cx);
+                let object_page = stepper(self, "object-page", s.object_page.to_string(), cx);
+                div()
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
@@ -3871,8 +3924,16 @@ impl Workbench {
                         (self.t("shell.settings.timeout"), None, timeout_seg),
                     ],
                     &p,
-                )),
-            SettingsSection::Local => div()
+                )).into_any_element()
+            }),
+            SettingsSection::Local => stack_frame(|| {
+                let updates = kit::interactive_states(div().id("toggle-updates"), &p, false)
+                    .role(gpui_kit::Role::Switch)
+                    .aria_label(self.t("shell.update.autoCheck"))
+                    .aria_selected(s.auto_check_updates)
+                    .child(switch_visual(s.auto_check_updates, &p))
+                    .on_click(act("toggle-updates", cx));
+                div()
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
@@ -3894,7 +3955,8 @@ impl Workbench {
                         .text_size(px(TypeScale::XS))
                         .text_color(p.text_faint)
                         .child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION")))),
-                ),
+                ).into_any_element()
+            }),
         };
         let form = div()
             .id("settings-form")
@@ -4064,6 +4126,8 @@ impl Workbench {
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if help {
+            panel = stack_frame(|| {
+            let mut panel = panel;
             let mut list = div().id("help-list").flex().flex_col().overflow_y_scroll().p(px(8.));
             let mut group = "";
             for shortcut in crate::app::model::SHORTCUTS {
@@ -4100,7 +4164,11 @@ impl Workbench {
                         }))),
                 )
                 .child(list);
+            panel
+            });
         } else {
+            panel = stack_frame(|| {
+            let mut panel = panel;
             let input = self.input_for(DraftField::PaletteQuery, &self.model.text("ui.palette.placeholder"), false, window, cx);
             if !self.palette_focused {
                 self.palette_focused = true;
@@ -4168,7 +4236,7 @@ impl Workbench {
                             .child(heading),
                     );
                 }
-                list = list.child(
+                let row = stack_frame(|| {
                     kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
                         .test_support()
                         .role(gpui_kit::Role::MenuItem)
@@ -4237,8 +4305,10 @@ impl Workbench {
                             if !this.model.shell.palette_open && !this.model.shell.help_open {
                                 this.restore_focus(window, cx);
                             }
-                        })),
-                );
+                        }))
+                        .into_any_element()
+                });
+                list = list.child(row);
             }
             let hint = |keys: &'static str, label: SharedString| {
                 div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, &p)).child(label)
@@ -4270,6 +4340,8 @@ impl Workbench {
                 )
                 .child(list.flex_1().min_h(px(0.)))
                 .child(footer);
+            panel
+            });
         }
         backdrop("palette-backdrop", 0.18, cx)
             .flex()
@@ -4641,31 +4713,34 @@ impl Workbench {
         } else {
             prompt.env_label.clone()
         };
-        let facts = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .text_size(px(TypeScale::SM))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.target")))
-                    .child(div().id("danger-target").min_w(px(0.)).truncate().child(SharedString::from(name.clone()))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.env")))
-                    .child(
-                        div()
-                            .id("danger-env")
-                            .text_color(if prompt.prod { p.danger } else { p.text })
-                            .when(prompt.prod, |this| this.font_weight(FontWeight::SEMIBOLD))
-                            .child(SharedString::from(env)),
-                    ),
-            );
+        let facts = stack_frame(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .text_size(px(TypeScale::SM))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.target")))
+                        .child(div().id("danger-target").min_w(px(0.)).truncate().child(SharedString::from(name.clone()))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.env")))
+                        .child(
+                            div()
+                                .id("danger-env")
+                                .text_color(if prompt.prod { p.danger } else { p.text })
+                                .when(prompt.prod, |this| this.font_weight(FontWeight::SEMIBOLD))
+                                .child(SharedString::from(env)),
+                        ),
+                )
+                .into_any_element()
+        });
         let mut content = div().flex().flex_col().gap(px(10.)).child(facts);
         if prompt.kind == super::danger::DangerKind::Rename {
             let input = self.input_for(DraftField::DangerNewName, &self.model.text("catalog.danger.newName"), false, window, cx);
@@ -4694,52 +4769,57 @@ impl Workbench {
         // 计划文字与错误由执行层按中文生成；英文界面按句型表逐条换成英文（数据库原文不动）。
         let locale = if self.model.shell.locale == crate::app::Locale::En { i18n::Locale::En } else { i18n::Locale::ZhCn };
         if let Some(plan) = prompt.plan.as_ref() {
-            if !plan.sql.is_empty() {
-                let mono = cx.theme().mono_font_family.clone();
-                content = content.child(kit::eyebrow(self.t("catalog.danger.sql"), &p)).child(
-                    div()
-                        .id("danger-sql")
-                        .px(px(10.))
-                        .py(px(8.))
-                        .rounded(px(Radius::PANEL))
-                        .bg(p.surface)
-                        .border_1()
-                        .border_color(p.line)
-                        .font_family(mono)
-                        .text_size(px(TypeScale::SM))
-                        .child(SharedString::from(plan.sql.join("\n"))),
-                );
-            }
-            let mut risks = div().id("danger-risks").flex().flex_col().gap(px(4.));
-            for (index, (level, text)) in plan.risks.iter().enumerate() {
-                let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                let text = crate::ddl::english::localize(text, locale);
-                risks = risks.child(
-                    div()
-                        .id(SharedString::from(format!("danger-risk-{index}")))
-                        .test_support()
-                        .aria_label(SharedString::from(text.clone()))
-                        .px(px(10.))
-                        .py(px(6.))
-                        .rounded(px(Radius::PANEL))
-                        .bg(bg)
-                        .text_color(fg)
-                        .text_size(px(TypeScale::SM))
-                        .child(SharedString::from(text)),
-                );
-            }
-            content = content.child(risks);
-            if !plan.blocked.is_empty() {
-                let blocked: Vec<String> = plan.blocked.iter().map(|text| crate::ddl::english::localize(text, locale)).collect();
-                let blocked = blocked.join(" ");
-                content = content.child(
-                    div()
-                        .id("danger-blocked")
-                        .test_support()
-                        .aria_label(SharedString::from(blocked.clone()))
-                        .child(banner(IconName::Ban, SharedString::from(blocked), p.danger, p.danger_soft)),
-                );
-            }
+            let plan_body = stack_frame(|| {
+                let mut column = div().flex().flex_col().gap(px(10.));
+                if !plan.sql.is_empty() {
+                    let mono = cx.theme().mono_font_family.clone();
+                    column = column.child(kit::eyebrow(self.t("catalog.danger.sql"), &p)).child(
+                        div()
+                            .id("danger-sql")
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(Radius::PANEL))
+                            .bg(p.surface)
+                            .border_1()
+                            .border_color(p.line)
+                            .font_family(mono)
+                            .text_size(px(TypeScale::SM))
+                            .child(SharedString::from(plan.sql.join("\n"))),
+                    );
+                }
+                let mut risks = div().id("danger-risks").flex().flex_col().gap(px(4.));
+                for (index, (level, text)) in plan.risks.iter().enumerate() {
+                    let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
+                    let text = crate::ddl::english::localize(text, locale);
+                    risks = risks.child(
+                        div()
+                            .id(SharedString::from(format!("danger-risk-{index}")))
+                            .test_support()
+                            .aria_label(SharedString::from(text.clone()))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(Radius::PANEL))
+                            .bg(bg)
+                            .text_color(fg)
+                            .text_size(px(TypeScale::SM))
+                            .child(SharedString::from(text)),
+                    );
+                }
+                column = column.child(risks);
+                if !plan.blocked.is_empty() {
+                    let blocked: Vec<String> = plan.blocked.iter().map(|text| crate::ddl::english::localize(text, locale)).collect();
+                    let blocked = blocked.join(" ");
+                    column = column.child(
+                        div()
+                            .id("danger-blocked")
+                            .test_support()
+                            .aria_label(SharedString::from(blocked.clone()))
+                            .child(banner(IconName::Ban, SharedString::from(blocked), p.danger, p.danger_soft)),
+                    );
+                }
+                column.into_any_element()
+            });
+            content = content.child(plan_body);
         }
         if let Some(error) = prompt.error.as_ref() {
             let error = prompt.error_text(locale).unwrap_or_else(|| error.clone());
@@ -4771,19 +4851,21 @@ impl Workbench {
         }
         let ready = prompt.execute_ready();
         let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };
-        let dialog = dialog_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
-            .test_support()
-            .max_w(px(560.))
-            .child(div().id("danger-body").max_h(px(420.)).overflow_y_scroll().child(content))
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.))
-                    .child(kit::secondary_button("cmd-danger-cancel", None, self.t("common.cancel"), act("danger-cancel", cx)))
-                    .child(kit::danger_button("cmd-danger-execute", Some(IconName::TriangleAlert), label, act("danger-execute", cx)).disabled(!ready)),
-            );
-        backdrop("danger-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+        stack_frame(|| {
+            let dialog = dialog_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
+                .test_support()
+                .max_w(px(560.))
+                .child(div().id("danger-body").max_h(px(420.)).overflow_y_scroll().child(content))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(kit::secondary_button("cmd-danger-cancel", None, self.t("common.cancel"), act("danger-cancel", cx)))
+                        .child(kit::danger_button("cmd-danger-execute", Some(IconName::TriangleAlert), label, act("danger-execute", cx)).disabled(!ready)),
+                );
+            backdrop("danger-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+        })
     }
 
     fn exchange_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
