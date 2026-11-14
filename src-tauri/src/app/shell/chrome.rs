@@ -15,7 +15,8 @@ use gpui_kit::{
 };
 
 use crate::app::views::connections::{engines, LinkStatus};
-use crate::app::views::history::HistorySection;
+use crate::app::views::history::{HistorySection, ListPhase};
+use crate::app::views::settings::{SaveState, SettingsSection};
 use crate::app::{AppPage, FocusTarget, ThemePreference};
 use crate::catalog::hierarchy::{NavKind, NavRow};
 use crate::catalog::model::ObjectKind;
@@ -347,6 +348,38 @@ impl Workbench {
                     _ => None,
                 };
                 if let Some(command) = command {
+                    self.perform(&command, cx);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        // 历史页的方向键属于列表：上下/Home/End 在筛选后的可见行里选，
+        // 回车只载入编辑器（不执行），Delete 删除当前条目（与条目右键同一条命令）。
+        // 有键位绑定时 Delete 作为动作到 perform，没有时在这里直接落到同一条命令。
+        if self.model.menu.is_none()
+            && self.model.close_prompt.is_none()
+            && !self.model.shell.palette_open
+            && self.model.shell.page == AppPage::History
+            && self.model.shell.focus != FocusTarget::Sidebar
+        {
+            if key == "delete" {
+                if let Some(command) = self.model.history.delete_command() {
+                    self.perform(command, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+            let nav = match key {
+                "up" => Some(super::menus::NavKey::ArrowUp),
+                "down" => Some(super::menus::NavKey::ArrowDown),
+                "home" => Some(super::menus::NavKey::Home),
+                "end" => Some(super::menus::NavKey::End),
+                "enter" => Some(super::menus::NavKey::Enter),
+                _ => None,
+            };
+            if let Some(nav) = nav {
+                if let Some(command) = self.model.history_key(nav) {
                     self.perform(&command, cx);
                 }
                 cx.notify();
@@ -1486,6 +1519,24 @@ impl Workbench {
                         .child(Spinner::new().xsmall().color(p.accent))
                         .child(self.t("query.status.running"))
                         .on_click(act("status-jobs", cx)),
+                )
+            })
+            // 设置写盘失败是全局事实：不只在设置页可见，状态栏常驻入口把它带回设置页。
+            .when(self.model.settings_save.failed(), |this| {
+                this.child(
+                    kit::interactive_states(div().id("status-settings-save"), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(self.t("ui.settings.saveFailed"))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .rounded(px(Radius::CONTROL))
+                        .px(px(6.))
+                        .text_color(p.danger)
+                        .child(kit::icon(IconName::CircleAlert, 12., p.danger))
+                        .child(self.t("ui.settings.saveFailed"))
+                        .on_click(act("settings", cx)),
                 )
             })
             .child(
@@ -3103,47 +3154,47 @@ impl Workbench {
             .overflow_y_scroll()
             .px(px(m.page_pad))
             .pb(px(m.page_pad_y));
+        let phase = self.model.history.phase_for(section);
+        // 读取失败与空态不是一回事：失败给原因和“重新读取”，旧行仍留在下面可读。
         if let Some(key) = self.model.history.failure_key {
             let detail = self.model.history.failure_detail.clone();
+            let detail = if detail.trim().is_empty() { self.t("history.page.retryLoad") } else { SharedString::from(detail) };
             list = list.child(
-                div()
-                    .id("history-failure")
-                    .role(gpui_kit::Role::Status)
-                    .px(px(12.))
-                    .py(px(10.))
-                    .rounded(px(Radius::PANEL))
-                    .border_1()
-                    .border_color(p.danger)
-                    .bg(p.danger_soft)
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(kit::icon(IconName::CircleAlert, 14., p.danger))
-                            .child(div().font_weight(FontWeight::MEDIUM).text_color(p.danger).child(self.t(key))),
-                    )
-                    .when(!detail.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(detail)))),
+                div().id("history-failure").test_support().child(kit::error_state_with_action(
+                    self.t(key),
+                    detail,
+                    kit::secondary_button("history-retry", Some(IconName::RefreshCw), self.t("history.page.retryLoad"), act("history-refresh", cx)),
+                    &p,
+                )),
             );
         }
         if section == HistorySection::Runs {
             let runs: Vec<_> = self.model.history.filtered_runs().into_iter().take(200).cloned().collect();
             if runs.is_empty() {
-                if self.model.history.runs.is_empty() {
-                    // 第一次为空：直接给出能产生历史记录的动作。
-                    list = list.child(
-                        kit::empty_state(IconName::Clock, self.t("ui.history.empty"), self.t("history.page.loadOnlySql"), &p)
-                            .child(kit::primary_button("history-empty-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx))),
-                    );
-                } else {
-                    list = list.child(
-                        kit::empty_state(IconName::Search, self.t("history.page.noMatch"), self.t("history.filter.reset"), &p)
-                            .child(kit::secondary_button("history-empty-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))),
-                    );
-                }
+                // 读取中先给骨架，读到才判断“无数据”还是“无命中”。
+                list = list.child(match phase {
+                    ListPhase::Loading => kit::skeleton_state(5, &m, &p).into_any_element(),
+                    ListPhase::Empty => kit::empty_state_with_action(
+                        IconName::Clock,
+                        self.t("ui.history.empty"),
+                        self.t("history.page.loadOnlySql"),
+                        kit::primary_button("history-empty-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx)),
+                        &p,
+                    )
+                    .into_any_element(),
+                    ListPhase::NoMatch => kit::no_match_state_with_action(
+                        IconName::Search,
+                        self.t("history.page.noMatch"),
+                        self.t("history.filter.reset"),
+                        kit::secondary_button("history-empty-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx)),
+                        &p,
+                    )
+                    .into_any_element(),
+                    ListPhase::Failed | ListPhase::Rows => div().into_any_element(),
+                });
+            } else if self.model.history.loading {
+                // 刷新时旧行继续显示，只在列表顶部说明还在读，不整块换成骨架。
+                list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loading"), &m, &p)));
             }
             for entry in runs {
                 let id = entry.id.clone();
@@ -3157,6 +3208,7 @@ impl Workbench {
                 let delete = id.clone();
                 list = list.child(
                     kit::row_states(div().id(SharedString::from(format!("run-{id}"))), &p)
+                        .test_support()
                         .group("run-row")
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(entry.sql.clone()))
@@ -3240,17 +3292,28 @@ impl Workbench {
         } else {
             let saved: Vec<_> = self.model.history.filtered_saved().into_iter().take(200).cloned().collect();
             if saved.is_empty() {
-                if self.model.history.saved.is_empty() {
-                    list = list.child(
-                        kit::empty_state(IconName::Bookmark, self.t("ui.history.emptySaved"), self.t("history.savedPanel.openNote"), &p)
-                            .child(kit::primary_button("history-empty-saved-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx))),
-                    );
-                } else {
-                    list = list.child(
-                        kit::empty_state(IconName::Search, self.t("history.page.noMatchSaved"), self.t("history.filter.reset"), &p)
-                            .child(kit::secondary_button("history-empty-saved-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))),
-                    );
-                }
+                list = list.child(match phase {
+                    ListPhase::Loading => kit::skeleton_state(4, &m, &p).into_any_element(),
+                    ListPhase::Empty => kit::empty_state_with_action(
+                        IconName::Bookmark,
+                        self.t("ui.history.emptySaved"),
+                        self.t("history.savedPanel.openNote"),
+                        kit::primary_button("history-empty-saved-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx)),
+                        &p,
+                    )
+                    .into_any_element(),
+                    ListPhase::NoMatch => kit::no_match_state_with_action(
+                        IconName::Search,
+                        self.t("history.page.noMatchSaved"),
+                        self.t("history.filter.reset"),
+                        kit::secondary_button("history-empty-saved-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx)),
+                        &p,
+                    )
+                    .into_any_element(),
+                    ListPhase::Failed | ListPhase::Rows => div().into_any_element(),
+                });
+            } else if self.model.history.loading {
+                list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loadingSaved"), &m, &p)));
             }
             for item in saved {
                 let id = item.id.clone();
@@ -3262,6 +3325,7 @@ impl Workbench {
                 let delete = id.clone();
                 list = list.child(
                     kit::row_states(div().id(SharedString::from(format!("saved-{id}"))), &p)
+                        .test_support()
                         .group("saved-row")
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(item.name.clone()))
@@ -3343,6 +3407,26 @@ impl Workbench {
             }
         }
 
+        // 键盘可用性写在列表末尾：方向键选行、回车载入、Delete 删除，与右键菜单同一批命令。
+        if phase == ListPhase::Rows {
+            list = list.child(
+                div()
+                    .id("history-keyboard-hint")
+                    .test_support()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .pt(px(4.))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(self.t("history.page.keyboardHint"))
+                    .child(kit::kbd("↑↓", &p))
+                    .child(kit::kbd("Home/End", &p))
+                    .child(kit::kbd("Enter", &p))
+                    .child(kit::kbd("Delete", &p)),
+            );
+        }
         let can_save = self.model.active_tab().is_some_and(|tab| tab.kind.is_query());
         let selected_any = if section == HistorySection::Saved {
             self.model.history.selected_saved.is_some()
@@ -3668,7 +3752,9 @@ impl Workbench {
             .child(switch_visual(s.auto_check_updates, &p))
             .on_click(act("toggle-updates", cx));
 
-        let group = |title: SharedString, rows: Vec<(SharedString, Option<SharedString>, AnyElement)>, p: &Palette| {
+        // 一组设置的卡片：标题 + 逐行“名称/说明 + 控件”。行内换行，
+        // 窄窗口里控件掉到下一行而不是把名称挤没。
+        let group = |id: &'static str, title: SharedString, rows: Vec<(SharedString, Option<SharedString>, AnyElement)>, p: &Palette| {
             let mut card = kit::card(p).flex().flex_col();
             let count = rows.len();
             for (index, (label, hint, control)) in rows.into_iter().enumerate() {
@@ -3684,7 +3770,7 @@ impl Workbench {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(180.))
+                                .min_w(px(160.))
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
@@ -3694,8 +3780,171 @@ impl Workbench {
                         .child(control),
                 );
             }
-            div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(title, p)).child(card)
+            div()
+                .id(SharedString::from(id))
+                .test_support()
+                .role(gpui_kit::Role::Group)
+                .aria_label(title.clone())
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(kit::eyebrow(title, p))
+                .child(card)
         };
+
+        // 只构建当前分区的表单：另一个分区的控件不进元素树，Tab 也不会走到看不见的控件上。
+        let section = self.model.settings_section;
+        let section_body = match section {
+            SettingsSection::Appearance => div()
+                .flex()
+                .flex_col()
+                .gap(px(m.section_gap()))
+                .child(group(
+                    "settings-group-appearance",
+                    self.t("ui.settings.appearance"),
+                    vec![
+                        (self.t("shell.settings.theme"), None, theme_seg),
+                        (self.t("shell.settings.density"), None, density_seg),
+                        (self.t("shell.settings.language"), None, locale_seg),
+                    ],
+                    &p,
+                ))
+                .child(group(
+                    "settings-group-editor",
+                    self.t("ui.settings.editor"),
+                    vec![
+                        (self.t("shell.settings.editorFont"), None, font.into_any_element()),
+                        (self.t("shell.settings.editorTheme"), Some(self.t("shell.settings.editorThemeAuto")), editor_theme.into_any_element()),
+                    ],
+                    &p,
+                )),
+            SettingsSection::Data => div()
+                .flex()
+                .flex_col()
+                .gap(px(m.section_gap()))
+                .child(group(
+                    "settings-group-data",
+                    self.t("ui.settings.data"),
+                    vec![
+                        (self.t("shell.settings.rowsPerPage"), None, page_size.into_any_element()),
+                        (self.t("shell.settings.previewLimit"), None, preview.into_any_element()),
+                        (self.t("shell.settings.objectPage"), None, object_page.into_any_element()),
+                        (self.t("shell.settings.nullCopy"), None, null_seg),
+                        (self.t("shell.settings.timeout"), None, timeout_seg),
+                    ],
+                    &p,
+                )),
+            SettingsSection::Local => div()
+                .flex()
+                .flex_col()
+                .gap(px(m.section_gap()))
+                .child(group(
+                    "settings-group-local",
+                    self.t("ui.settings.general"),
+                    vec![(self.t("shell.update.autoCheck"), None, updates.into_any_element())],
+                    &p,
+                ))
+                .child(
+                    div()
+                        .id("settings-local-hint")
+                        .text_size(px(TypeScale::SM))
+                        .text_color(p.text_muted)
+                        .child(self.t("ui.settings.localHint")),
+                )
+                .child(
+                    div()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION")))),
+                ),
+        };
+        let form = div()
+            .id("settings-form")
+            .test_support()
+            .role(gpui_kit::Role::Group)
+            .aria_label(self.t("shell.settings.title"))
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .max_w(px(760.))
+                    .min_w(px(0.))
+                    .px(px(m.page_pad))
+                    .py(px(m.page_pad_y))
+                    .flex()
+                    .flex_col()
+                    .gap(px(m.section_gap()))
+                    .child(kit::title(self.t(section.label_key()), TypeScale::MD, &p))
+                    .child(section_body)
+                    // 写盘反馈贴着表单末尾：改动立即生效，保存结果就地可读。
+                    .child(self.settings_save_row(&p, &m, cx)),
+            );
+
+        // 分区导航：宽窗口在左侧竖排，窄窗口折成顶部一行，右侧表单始终可滚动到底。
+        let nav_items: Vec<_> = SettingsSection::ALL
+            .iter()
+            .map(|item| (SharedString::from(item.command()), self.t(item.label_key()), *item == section, kit::click(act(item.command(), cx))))
+            .collect();
+        let side_by_side = settings_side_by_side(self.model.layout().content_width as f32);
+        let nav: AnyElement = if side_by_side {
+            let mut column = div()
+                .id("settings-nav")
+                .test_support()
+                .role(gpui_kit::Role::Navigation)
+                .aria_label(self.t("ui.settings.nav"))
+                .flex_none()
+                .w(px(180.))
+                .py(px(m.page_pad_y))
+                .px(px(m.page_pad))
+                .border_r_1()
+                .border_color(p.line)
+                .flex()
+                .flex_col()
+                .gap(px(2.));
+            for (id, label, selected, click) in nav_items {
+                column = column.child(
+                    kit::interactive_states(div().id(id), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label.clone())
+                        .aria_selected(selected)
+                        .h(px(m.row_h + 6.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::CONTROL))
+                        .text_size(px(TypeScale::SM))
+                        .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent).font_weight(FontWeight::MEDIUM))
+                        .when(!selected, |this| this.text_color(p.text_muted))
+                        .child(label)
+                        .on_click(click),
+                );
+            }
+            column.into_any_element()
+        } else {
+            div()
+                .id("settings-nav")
+                .test_support()
+                .role(gpui_kit::Role::Navigation)
+                .aria_label(self.t("ui.settings.nav"))
+                .flex_none()
+                .px(px(m.page_pad))
+                .pt(px(m.page_pad_y))
+                .child(kit::segmented_sized(nav_items, &p, m.control_h))
+                .into_any_element()
+        };
+
+        let body = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .when(side_by_side, |this| this.flex_row())
+            .when(!side_by_side, |this| this.flex_col())
+            .child(nav)
+            .child(form);
 
         div()
             .id("settings-page")
@@ -3703,50 +3952,51 @@ impl Workbench {
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("shell.settings.title"))
             .size_full()
-            .overflow_y_scroll()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
             .child(
                 div()
-                    .max_w(px(760.))
-                    .min_w(px(0.))
-                    .mx_auto()
                     .px(px(m.page_pad))
-                    .py(px(m.page_pad_y))
-                    .flex()
-                    .flex_col()
-                    .gap(px(m.page_pad - 4.))
-                    .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p))
-                    .child(group(
-                        self.t("ui.settings.appearance"),
-                        vec![
-                            (self.t("shell.settings.theme"), None, theme_seg),
-                            (self.t("shell.settings.density"), None, density_seg),
-                            (self.t("shell.settings.language"), None, locale_seg),
-                        ],
-                        &p,
-                    ))
-                    .child(group(
-                        self.t("ui.settings.editor"),
-                        vec![
-                            (self.t("shell.settings.editorFont"), None, font.into_any_element()),
-                            (self.t("shell.settings.editorTheme"), Some(self.t("shell.settings.editorThemeAuto")), editor_theme.into_any_element()),
-                        ],
-                        &p,
-                    ))
-                    .child(group(
-                        self.t("ui.settings.data"),
-                        vec![
-                            (self.t("shell.settings.rowsPerPage"), None, page_size.into_any_element()),
-                            (self.t("shell.settings.previewLimit"), None, preview.into_any_element()),
-                            (self.t("shell.settings.objectPage"), None, object_page.into_any_element()),
-                            (self.t("shell.settings.nullCopy"), None, null_seg),
-                            (self.t("shell.settings.timeout"), None, timeout_seg),
-                        ],
-                        &p,
-                    ))
-                    .child(group(self.t("ui.settings.general"), vec![(self.t("shell.update.autoCheck"), None, updates.into_any_element())], &p))
-                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION"))))),
+                    .pt(px(m.page_pad_y))
+                    .pb(px(10.))
+                    .flex_none()
+                    .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p)),
             )
+            .child(body)
             .into_any_element()
+    }
+
+    /// 设置写盘的可见结果：失败给原因与就地重试，不把错误吞在后台任务里。
+    fn settings_save_row(&self, p: &Palette, m: &kit::Metrics, cx: &mut Context<Self>) -> AnyElement {
+        match self.model.settings_save.clone() {
+            SaveState::Idle => div().into_any_element(),
+            SaveState::Saving => div()
+                .id("settings-save-state")
+                .test_support()
+                .child(kit::inline_loading(self.t("ui.settings.saving"), m, p))
+                .into_any_element(),
+            SaveState::Saved => div()
+                .id("settings-save-state")
+                .test_support()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(kit::icon(IconName::Check, 14., p.ok))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.t("ui.settings.saved")))
+                .into_any_element(),
+            SaveState::Failed { detail } => {
+                let hint = self.t("ui.settings.saveFailedHint");
+                let detail = if detail.trim().is_empty() { hint } else { SharedString::from(format!("{hint} {detail}")) };
+                kit::error_state_with_action(
+                    self.t("ui.settings.saveFailed"),
+                    detail,
+                    kit::secondary_button("settings-retry-save", Some(IconName::RefreshCw), self.t("ui.settings.retrySave"), act("settings-retry-save", cx)),
+                    p,
+                )
+                .into_any_element()
+            }
+        }
     }
 
     // ------------------------------------------------------------ 浮层
@@ -4928,6 +5178,12 @@ fn menu_block_height(items: &[super::menus::MenuItem], row_h: f32) -> f32 {
 /// 历史预览在窄内容区改为上下堆叠，避免挤压列表卡片。
 pub(super) fn history_stacks_preview(content_width: f32) -> bool {
     content_width < 820.
+}
+
+/// 设置页的分区导航在宽内容区放左侧，窄内容区折成顶部一行；
+/// 180 的导航加上表单与两侧页边距在 820 以下会把控件挤到换行以外。
+pub(super) fn settings_side_by_side(content_width: f32) -> bool {
+    content_width >= 820.
 }
 
 fn palette_icon(id: &str) -> IconName {

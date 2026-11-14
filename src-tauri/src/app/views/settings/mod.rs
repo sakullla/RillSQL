@@ -11,6 +11,97 @@ pub const PAGE_SIZE_RANGE: (i64, i64) = (1, 10_000);
 pub const PREVIEW_RANGE: (i64, i64) = (1, 64);
 pub const OBJECT_PAGE_RANGE: (i64, i64) = (1, 10_000);
 
+/// 会改动本机设置、因而需要写盘反馈的命令：主题、密度、语言、编辑器字号与配色、
+/// 读取上限、NULL 文本、查询超时与更新开关。分区导航与设置页本身不在此列。
+pub fn is_settings_command(id: &str) -> bool {
+    matches!(id, "font-up" | "font-down" | "editor-theme-next" | "editor-theme-prev" | "toggle-updates")
+        || id.starts_with("theme-")
+        || id.starts_with("density-")
+        || id.starts_with("locale-")
+        || id.starts_with("page-size-")
+        || id.starts_with("preview-")
+        || id.starts_with("object-page-")
+        || id.starts_with("null-")
+        || id.starts_with("timeout-")
+}
+
+/// 设置页的左侧分区导航：设计 S8.3 的三块，右侧只显示当前分区的表单。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    /// 外观与编辑器：主题、密度、语言、编辑器字号与配色。
+    Appearance,
+    /// 数据读取：每页行数、预览上限、对象分页、NULL 文本与查询超时。
+    Data,
+    /// 本地数据：更新检查与本机状态说明。
+    Local,
+}
+
+impl SettingsSection {
+    pub const ALL: [SettingsSection; 3] = [SettingsSection::Appearance, SettingsSection::Data, SettingsSection::Local];
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "ui.settings.navAppearance",
+            SettingsSection::Data => "ui.settings.navData",
+            SettingsSection::Local => "ui.settings.navLocal",
+        }
+    }
+
+    /// 分区按钮的命令 id：导航、键盘与命令面板共用同一个入口。
+    pub fn command(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "settings-section-appearance",
+            SettingsSection::Data => "settings-section-data",
+            SettingsSection::Local => "settings-section-local",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "settings-section-appearance" => Some(SettingsSection::Appearance),
+            "settings-section-data" => Some(SettingsSection::Data),
+            "settings-section-local" => Some(SettingsSection::Local),
+            _ => None,
+        }
+    }
+}
+
+/// 设置写盘结果。改动立即生效，但只有写成功才在重启后仍然成立，
+/// 因此失败必须让用户看得见并能就地重试，而不是静默丢掉错误。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SaveState {
+    /// 本次会话还没改过设置。
+    #[default]
+    Idle,
+    Saving,
+    Saved,
+    Failed {
+        detail: String,
+    },
+}
+
+impl SaveState {
+    pub fn label_key(&self) -> Option<&'static str> {
+        match self {
+            SaveState::Idle => None,
+            SaveState::Saving => Some("ui.settings.saving"),
+            SaveState::Saved => Some("ui.settings.saved"),
+            SaveState::Failed { .. } => Some("ui.settings.saveFailed"),
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            SaveState::Failed { detail } => detail.as_str(),
+            _ => "",
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        matches!(self, SaveState::Failed { .. })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsForm {
     pub theme: String,
@@ -408,5 +499,63 @@ mod tests {
         assert_ne!(auto, editor_theme_colors("contrast", true));
         assert_eq!(editor_theme_colors("NEON", false), auto, "未知档位归一为 auto");
         assert_ne!(editor_theme_colors("warm", false), editor_theme_colors("warm", true));
+    }
+
+    #[test]
+    fn sections_have_stable_commands_and_labels() {
+        assert_eq!(SettingsSection::ALL.len(), 3, "设计 S8.3 是三块分区");
+        for section in SettingsSection::ALL {
+            assert_eq!(SettingsSection::parse(section.command()), Some(section));
+            assert_ne!(section.label_key(), section.command());
+        }
+        assert_eq!(SettingsSection::parse("settings-section-bogus"), None);
+        assert_ne!(SettingsSection::Appearance.label_key(), SettingsSection::Data.label_key());
+        assert_ne!(SettingsSection::Data.label_key(), SettingsSection::Local.label_key());
+    }
+
+    #[test]
+    fn save_state_only_reports_copy_where_the_user_needs_it() {
+        assert_eq!(SaveState::default(), SaveState::Idle);
+        assert_eq!(SaveState::Idle.label_key(), None, "没改过设置时不打扰");
+        assert!(!SaveState::Idle.failed());
+        assert_eq!(SaveState::Saving.label_key(), Some("ui.settings.saving"));
+        assert_eq!(SaveState::Saved.label_key(), Some("ui.settings.saved"));
+        let failed = SaveState::Failed { detail: "磁盘只读".into() };
+        assert!(failed.failed());
+        assert_eq!(failed.label_key(), Some("ui.settings.saveFailed"));
+        assert_eq!(failed.detail(), "磁盘只读");
+        assert_eq!(SaveState::Saved.detail(), "", "只有失败才带底层原因");
+    }
+
+    #[test]
+    fn only_commands_that_change_settings_use_the_feedback_path() {
+        for id in [
+            "theme-light",
+            "theme-dark",
+            "density-compact",
+            "locale-en",
+            "font-up",
+            "editor-theme-next",
+            "page-size-down",
+            "preview-up",
+            "object-page-down",
+            "null-N",
+            "timeout-15",
+            "toggle-updates",
+        ] {
+            assert!(is_settings_command(id), "{id}");
+        }
+        // 分区导航、页面本身和历史预览按钮都不是设置写入，不能被当成保存失败反馈的来源。
+        for id in [
+            "settings",
+            "settings-section-data",
+            "settings-retry-save",
+            "history-preview-open",
+            "history-preview-copy",
+            "history-preview-load",
+            "new-query",
+        ] {
+            assert!(!is_settings_command(id), "{id}");
+        }
     }
 }

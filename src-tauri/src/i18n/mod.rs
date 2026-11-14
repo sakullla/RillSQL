@@ -1238,6 +1238,21 @@ dict! {
     "ui.group.noneHint" => "先用侧栏的分组按钮新建一个", "Create one with the group button in the sidebar first";
     "ui.group.namePlaceholder" => "分组名称", "Group name";
     "ui.group.members" => "个连接", "connections";
+    // 设置页的分区导航、写盘反馈与历史页的读取态。
+    "ui.settings.nav" => "设置分区", "Settings sections";
+    "ui.settings.navAppearance" => "外观与编辑器", "Appearance & editor";
+    "ui.settings.navData" => "数据读取", "Data reading";
+    "ui.settings.navLocal" => "本地数据", "Local data";
+    "ui.settings.saving" => "正在保存设置…", "Saving settings…";
+    "ui.settings.saved" => "设置已保存", "Settings saved";
+    "ui.settings.saveFailed" => "设置没有保存", "Settings were not saved";
+    "ui.settings.saveFailedHint" => "改动已生效，但重启后会退回上次保存的值。", "The change applies now but reverts on restart.";
+    "ui.settings.retrySave" => "重试保存", "Retry saving";
+    "ui.settings.localHint" => "设置与历史只存在这台机器上。", "Settings and history stay on this machine.";
+    "history.page.loading" => "正在读取历史…", "Reading history…";
+    "history.page.loadingSaved" => "正在读取保存的查询…", "Reading saved queries…";
+    "history.page.retryLoad" => "重新读取", "Reload";
+    "history.page.keyboardHint" => "键盘", "Keys";
 }
 
 #[cfg(test)]

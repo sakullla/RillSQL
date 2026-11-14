@@ -9,9 +9,11 @@ pub enum HistorySection {
     Saved,
 }
 
-/// 列表在界面上的四种可区分状态：空、筛选无命中、失败、正常。
+/// 列表在界面上的五种可区分状态：读取中、空、筛选无命中、失败、正常。
+/// 两个分区（运行记录 / 保存的查询）共用这一套判断，页面不再各自解释“空”。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListPhase {
+    Loading,
     Empty,
     NoMatch,
     Failed,
@@ -51,6 +53,8 @@ pub struct HistoryPage {
     pub failure_detail: String,
     pub confirm_clear: bool,
     pub confirm_delete: bool,
+    /// 正在读取本机历史库；读到结果或失败前列表不算“无数据”。
+    pub loading: bool,
     pub loads: u32,
     pub executions: u32,
 }
@@ -76,6 +80,7 @@ impl Default for HistoryPage {
             failure_detail: String::new(),
             confirm_clear: false,
             confirm_delete: false,
+            loading: false,
             loads: 0,
             executions: 0,
         }
@@ -135,26 +140,105 @@ impl HistoryPage {
     }
 
     pub fn runs_phase(&self) -> ListPhase {
-        if self.runs.is_empty() {
-            ListPhase::Empty
-        } else if self.failure_key.is_some() {
+        self.phase_for(HistorySection::Runs)
+    }
+
+    pub fn saved_phase(&self) -> ListPhase {
+        self.phase_for(HistorySection::Saved)
+    }
+
+    /// 两个分区共用同一条判断顺序：读取中 → 失败 → 无数据 → 筛选无命中 → 有行。
+    /// 读取中优先于空态，失败优先于无命中，避免把“还没读到”和“读失败”画成空列表。
+    pub fn phase_for(&self, section: HistorySection) -> ListPhase {
+        let (total, matched) = match section {
+            HistorySection::Runs => (self.runs.len(), self.filtered_runs().len()),
+            HistorySection::Saved => (self.saved.len(), self.filtered_saved().len()),
+        };
+        if self.failure_key.is_some() {
             ListPhase::Failed
-        } else if self.filtered_runs().is_empty() {
+        } else if total == 0 && self.loading {
+            ListPhase::Loading
+        } else if total == 0 {
+            ListPhase::Empty
+        } else if matched == 0 {
             ListPhase::NoMatch
         } else {
             ListPhase::Rows
         }
     }
 
-    pub fn saved_phase(&self) -> ListPhase {
-        if self.saved.is_empty() {
-            ListPhase::Empty
-        } else if self.failure_key.is_some() {
-            ListPhase::Failed
-        } else if self.filtered_saved().is_empty() {
-            ListPhase::NoMatch
+    /// 标记一次读取开始；失败与成功都会结束这次读取。
+    pub fn begin_load(&mut self) {
+        self.loading = true;
+    }
+
+    /// 当前分区筛选后可见的行 id，键盘导航和渲染共用同一份顺序。
+    pub fn visible_ids(&self) -> Vec<String> {
+        if self.section == HistorySection::Saved {
+            self.filtered_saved().into_iter().map(|item| item.id.clone()).collect()
         } else {
-            ListPhase::Rows
+            self.filtered_runs().into_iter().map(|entry| entry.id.clone()).collect()
+        }
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        let selected = if self.section == HistorySection::Saved { self.selected_saved.as_deref() } else { self.selected_run.as_deref() }?;
+        self.visible_ids().iter().position(|id| id == selected)
+    }
+
+    fn select(&mut self, id: Option<String>) {
+        match self.section {
+            HistorySection::Runs => self.selected_run = id,
+            HistorySection::Saved => self.selected_saved = id,
+        }
+        // 键盘换行与鼠标点选一致：选中就把预览打开到这一条。
+        self.preview_open = true;
+    }
+
+    /// 方向键在筛选后的可见行里移动一格；没有选中时从首行开始。返回是否换了行。
+    pub fn move_selection(&mut self, step: isize) -> bool {
+        let ids = self.visible_ids();
+        if ids.is_empty() {
+            self.select(None);
+            return false;
+        }
+        let next = match self.selected_index() {
+            Some(index) => (index as isize + step).clamp(0, ids.len() as isize - 1) as usize,
+            None if step < 0 => ids.len() - 1,
+            None => 0,
+        };
+        let changed = self.selected_index() != Some(next);
+        self.select(Some(ids[next].clone()));
+        changed
+    }
+
+    /// Home / End 跳到筛选后的第一行或最后一行。
+    pub fn select_edge(&mut self, first: bool) -> bool {
+        let ids = self.visible_ids();
+        let Some(id) = (if first { ids.first() } else { ids.last() }).cloned() else {
+            self.select(None);
+            return false;
+        };
+        let changed = self.selected_index() != Some(if first { 0 } else { ids.len() - 1 });
+        self.select(Some(id));
+        changed
+    }
+
+    /// 回车载入当前行：只恢复草稿，不执行 SQL。没有选中行时返回 None。
+    pub fn enter_command(&self) -> Option<&'static str> {
+        let selected = if self.section == HistorySection::Saved {
+            self.selected_saved.is_some()
+        } else {
+            self.selected_run.is_some()
+        };
+        selected.then_some("history-load")
+    }
+
+    /// Delete 删除当前行：运行记录直接进入确认，保存的查询走它自己的确认层。
+    pub fn delete_command(&self) -> Option<&'static str> {
+        match self.section {
+            HistorySection::Runs => self.selected_run.as_ref().map(|_| "history-delete"),
+            HistorySection::Saved => self.selected_saved.as_ref().map(|_| "saved-delete"),
         }
     }
 
@@ -255,6 +339,7 @@ impl HistoryPage {
     }
 
     pub fn mark_failure(&mut self, detail: String) {
+        self.loading = false;
         self.failure_key = Some("history.page.failed");
         self.failure_detail = detail;
     }
@@ -265,6 +350,7 @@ impl HistoryPage {
     }
 
     pub fn apply_list(&mut self, runs: Vec<HistoryEntry>, saved: Vec<SavedQuery>) {
+        self.loading = false;
         self.runs = runs;
         self.saved = saved;
         // 选区回退必须落在当前筛选后仍可见的第一条，不能预览到列表里不存在的记录。
@@ -481,5 +567,88 @@ mod tests {
         assert_eq!(page.selected_saved, None);
         assert!(page.failure_key.is_none());
         assert_eq!(page.runs_phase(), ListPhase::Rows);
+        assert!(!page.loading, "读到结果后读取标记必须复位");
+    }
+
+    #[test]
+    fn loading_failure_empty_and_no_match_stay_distinct_for_both_sections() {
+        let mut page = HistoryPage::default();
+        assert_eq!(page.runs_phase(), ListPhase::Empty, "没有开始读取的默认页仍是空态");
+        page.begin_load();
+        assert!(page.loading);
+        assert_eq!(page.runs_phase(), ListPhase::Loading, "还没读到不得当成无数据");
+        assert_eq!(page.saved_phase(), ListPhase::Loading, "两个分区共用同一判断");
+        page.mark_failure("历史库只读".into());
+        assert!(!page.loading, "失败结束这次读取");
+        assert_eq!(page.runs_phase(), ListPhase::Failed);
+        assert_eq!(page.saved_phase(), ListPhase::Failed);
+        page.clear_failure();
+        page.begin_load();
+        page.apply_list(vec![run("a", "select 1", "live", "ok")], vec![saved_item("s1", "计数", "live")]);
+        assert_eq!(page.runs_phase(), ListPhase::Rows);
+        assert_eq!(page.saved_phase(), ListPhase::Rows);
+        page.filter_text = "missing".into();
+        assert_eq!(page.runs_phase(), ListPhase::NoMatch);
+        assert_eq!(page.saved_phase(), ListPhase::NoMatch);
+        // 刷新期间已有行时不换成骨架：继续显示旧行，避免闪空。
+        page.begin_load();
+        assert_eq!(page.runs_phase(), ListPhase::NoMatch);
+        page.apply_list(Vec::new(), Vec::new());
+        page.reset_filters();
+        assert_eq!(page.runs_phase(), ListPhase::Empty);
+    }
+
+    #[test]
+    fn keyboard_selection_walks_filtered_rows_and_maps_to_the_same_commands() {
+        let mut page = HistoryPage {
+            runs: vec![
+                run("a", "select 1", "live", "ok"),
+                run("b", "select 2", "live", "error"),
+                run("c", "delete from t", "other", "ok"),
+            ],
+            ..HistoryPage::default()
+        };
+        assert_eq!(page.enter_command(), None, "没有选中行时回车载不了任何东西");
+        assert!(page.move_selection(1));
+        assert_eq!(page.selected_run.as_deref(), Some("a"));
+        assert!(page.preview_open, "键盘换行与点选一样打开预览");
+        assert!(page.move_selection(1));
+        assert_eq!(page.selected_run.as_deref(), Some("b"));
+        assert!(page.move_selection(1));
+        assert_eq!(page.selected_run.as_deref(), Some("c"));
+        assert!(!page.move_selection(1), "到末行后不再假装移动");
+        assert_eq!(page.selected_run.as_deref(), Some("c"));
+        assert!(page.select_edge(true));
+        assert_eq!(page.selected_run.as_deref(), Some("a"));
+        assert!(page.select_edge(false));
+        assert_eq!(page.selected_run.as_deref(), Some("c"));
+        assert_eq!(page.enter_command(), Some("history-load"));
+        assert_eq!(page.delete_command(), Some("history-delete"));
+
+        // 筛选后只在可见行里走：被筛掉的记录不能成为键盘目标。
+        page.filter_status = "ok".into();
+        assert_eq!(page.visible_ids(), vec!["a".to_owned(), "c".to_owned()]);
+        assert!(page.move_selection(-1));
+        assert_eq!(page.selected_run.as_deref(), Some("a"));
+        assert_eq!(page.delete_command(), Some("history-delete"));
+
+        page.reset_filters();
+        page.section = HistorySection::Saved;
+        assert!(!page.move_selection(1), "保存分区里没有行时不能凭空选中");
+        assert_eq!(page.selected_saved, None);
+        page.saved = vec![saved_item("s1", "计数", "live"), saved_item("s2", "排行榜", "other")];
+        assert!(page.move_selection(1));
+        assert_eq!(page.selected_saved.as_deref(), Some("s1"));
+        assert!(page.move_selection(1));
+        assert_eq!(page.selected_saved.as_deref(), Some("s2"));
+        assert_eq!(page.enter_command(), Some("history-load"));
+        assert_eq!(page.delete_command(), Some("saved-delete"));
+        page.filter_text = "排行".into();
+        assert_eq!(page.visible_ids(), vec!["s2".to_owned()]);
+        assert!(!page.select_edge(true), "只有一个命中时 Home 不换行");
+        assert_eq!(page.selected_saved.as_deref(), Some("s2"));
+        page.filter_text = "没有".into();
+        assert!(!page.move_selection(1));
+        assert_eq!(page.selected_saved, None, "无命中时键盘不保留已不可见的选中");
     }
 }

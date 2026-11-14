@@ -3511,7 +3511,11 @@ fn history_and_settings_pages_render_and_apply_their_controls(cx: &mut gpui_kit:
         window.click("cmd-saved-delete-cancel", cx);
         window.render_frame(cx);
         assert!(!view.read(cx).model.history.confirm_delete);
-        view.update(cx, |view, cx| view.perform("settings", cx));
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            // 设置页默认落在“外观与编辑器”，读取上限在“数据读取”分区里。
+            view.perform("settings-section-data", cx);
+        });
         window.render_frame(cx);
         let before = view.read(cx).model.settings.object_page;
         window.click("object-page-up", cx);
@@ -3538,6 +3542,364 @@ fn auto_update_check_is_skipped_when_the_setting_is_off() {
     assert_eq!(model.update_checks, 1);
     assert!(model.dispatch("check-updates").is_some());
     assert_eq!(model.update_checks, 2);
+}
+
+/// 历史页的四种非正常状态必须彼此可区分：读取中给骨架，失败给原因与重试，
+/// 无数据与无命中用不同的标题和不同的主操作；主操作沿用 kit 的 38px 缩进。
+/// 两页的分栏阈值都按内容宽度判断，而不是窗口宽度：同一个 900 宽窗口，
+/// 侧栏收起时内容 848（并排），侧栏停靠时内容 618（堆叠）。这样侧栏开合的
+/// 结果与"页面还剩多少可写宽度"一致，不会按窗口宽度给出错误的并排。
+#[gpui_kit::test]
+fn settings_and_history_breakpoints_follow_content_width(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-breakpoints-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (width, content, side_by_side, stacks) in [
+        (1360f32, 1074, true, false),
+        (900f32, 848, true, false),
+        (760f32, 708, false, true),
+        (640f32, 588, false, true),
+    ] {
+        let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 800.);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let model = &view.read(cx).model;
+            assert_eq!(model.viewport_width, width as i32, "{width}");
+            assert_eq!(model.layout().content_width, content, "{width}: 内容宽度");
+            assert_eq!(super::chrome::settings_side_by_side(content as f32), side_by_side, "{width}: 设置分栏");
+            assert_eq!(super::chrome::history_stacks_preview(content as f32), stacks, "{width}: 历史堆叠");
+        })
+        .unwrap();
+        if width == 900. {
+            cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = true));
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let model = &view.read(cx).model;
+                assert!(model.layout().content_width < 820, "侧栏停靠后内容宽度变小：{}", model.layout().content_width);
+                assert!(!super::chrome::settings_side_by_side(model.layout().content_width as f32), "同一窗口改按内容宽度堆叠");
+                assert!(super::chrome::history_stacks_preview(model.layout().content_width as f32));
+            })
+            .unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn history_states_are_distinct_and_keep_the_state_action_inset(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-phases-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::History;
+            view.model.history.begin_load();
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("skeleton-state").is_some(), "读取中给首屏骨架");
+        assert!(window.try_find("history-empty-query").is_none(), "读取中不能同时是无数据");
+        assert!(window.try_find("history-retry").is_none(), "读取中不是失败");
+    })
+    .unwrap();
+
+    cx.update(|cx| view.update(cx, |view, _| view.model.history.mark_failure("历史库只读".into())));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let error = window.try_find("history-failure").expect("失败块");
+        assert!(error.visible());
+        let retry = window.try_find("history-retry").expect("失败要能重试");
+        assert!(retry.visible());
+        assert!(window.try_find("skeleton-state").is_none(), "失败不再显示骨架");
+    })
+    .unwrap();
+
+    cx.update(|cx| view.update(cx, |view, _| view.model.history.apply_list(Vec::new(), Vec::new())));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let block = window.try_find("empty-state").expect("无数据空态");
+        assert!(block.visible());
+        let detail = window.try_find("empty-state-detail").expect("空态说明");
+        let action = window.try_find("history-empty-query").expect("空态主操作");
+        let inset = f32::from(action.bounds().origin.x) - f32::from(detail.bounds().origin.x);
+        assert!(
+            (inset - crate::ui::kit::STATE_ACTION_INSET).abs() < 0.5,
+            "主操作与说明左对齐，缩进 {}px，实际 {inset}",
+            crate::ui::kit::STATE_ACTION_INSET
+        );
+        assert!(f32::from(detail.bounds().size.width) <= crate::ui::kit::STATE_DETAIL_MAX_W + 0.5, "说明按面板宽换行");
+        assert!(window.try_find("history-empty-reset").is_none(), "无数据不是无命中");
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.history.apply_list(
+                vec![history_run("a", "select 1", "live", "ok"), history_run("b", "select 2", "live", "error")],
+                Vec::new(),
+            );
+            view.model.history.filter_text = "missing".into();
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("no-match-state").is_some(), "筛选无命中用无命中语义");
+        assert!(window.try_find("history-empty-reset").is_some(), "无命中的主操作是清除筛选");
+        assert!(window.try_find("empty-state").is_none(), "无命中不能画成无数据");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 历史页键盘：方向键只在筛选后的可见行里走，回车载入编辑器但绝不执行，Delete 走删除确认。
+#[gpui_kit::test]
+fn history_keyboard_walks_rows_and_enter_only_loads(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::History;
+            view.model.history.apply_list(
+                vec![
+                    history_run("a", "select 1", "live", "ok"),
+                    history_run("b", "select 2", "live", "error"),
+                    history_run("c", "select 3", "live", "ok"),
+                ],
+                Vec::new(),
+            );
+            view.model.history.selected_run = Some("a".into());
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+        window.press("down", cx);
+        assert_eq!(view.read(cx).model.history.selected_run.as_deref(), Some("b"), "下移一行");
+        window.press("end", cx);
+        assert_eq!(view.read(cx).model.history.selected_run.as_deref(), Some("c"), "End 到末行");
+        window.press("home", cx);
+        assert_eq!(view.read(cx).model.history.selected_run.as_deref(), Some("a"), "Home 回首行");
+        // Delete 与行上的删除按钮同一条命令：保存的查询先开确认层，不直接删；
+        // 表格的标记删除只属于网格，不能在历史页里累计。
+        view.update(cx, |view, _| {
+            view.model.history.section = HistorySection::Saved;
+            view.model.history.saved = vec![crate::query::SavedQuery {
+                id: "s1".into(),
+                name: "计数".into(),
+                sql: "select 1".into(),
+                connection_id: "live".into(),
+                connection_name: "conn-live".into(),
+                database_name: "app".into(),
+                engine: "postgres".into(),
+                updated_at: "2026-11-07T00:00:00Z".into(),
+            }];
+            view.model.history.selected_saved = Some("s1".into());
+        });
+        let marked = view.read(cx).model.shell.marked_delete;
+        window.render_frame(cx);
+        window.press("delete", cx);
+        assert!(view.read(cx).model.history.confirm_delete, "Delete 先开确认层");
+        assert_eq!(view.read(cx).model.shell.marked_delete, marked, "历史页的 Delete 不再冒充网格标记删除");
+        view.update(cx, |view, cx| view.perform("saved-delete-cancel", cx));
+        // 装了键位绑定时 Delete 以动作进来，落到同一条删除命令。
+        view.update(cx, |view, cx| view.perform("mark-delete", cx));
+        assert!(view.read(cx).model.history.confirm_delete, "动作入口同样落到删除确认");
+        assert_eq!(view.read(cx).model.shell.marked_delete, marked, "动作入口也不累计网格指标");
+        view.update(cx, |view, cx| view.perform("saved-delete-cancel", cx));
+        view.update(cx, |view, _| {
+            view.model.history.section = HistorySection::Runs;
+            view.model.history.saved.clear();
+            view.model.history.selected_saved = None;
+            view.model.history.selected_run = Some("a".into());
+        });
+
+        let executions = view.read(cx).model.executions;
+        let loads = view.read(cx).model.loads;
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.loads, loads + 1, "回车只载入");
+        assert_eq!(view.read(cx).model.executions, executions, "载入不得执行 SQL");
+        assert_eq!(view.read(cx).model.active_tab().map(|tab| tab.draft.as_str()), Some("select 1"));
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 设置页：宽窗口左侧竖排分区导航、右侧表单，窄窗口折成顶部一行；
+/// 切换分区只换右侧表单，不改任何设置值。
+#[gpui_kit::test]
+fn settings_sections_switch_and_nav_stacks_when_narrow(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-nav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 800.);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("settings", cx)));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let nav = window.try_find("settings-nav").expect("分区导航");
+        let form = window.try_find("settings-form").expect("分区表单");
+        assert!((f32::from(nav.bounds().size.width) - 180.).abs() < 0.5, "宽窗口导航固定 180");
+        assert!(f32::from(form.bounds().origin.x) >= f32::from(nav.bounds().right()) - 0.5, "表单在导航右侧");
+        assert!(window.try_find("theme-dark").is_some(), "默认分区是外观与编辑器");
+        assert!(window.try_find("object-page-up").is_none(), "别的分区不渲染控件");
+        window.click("settings-section-data", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("object-page-up").is_some(), "数据读取分区给出读取上限");
+        assert!(window.try_find("theme-dark").is_none(), "一次只显示一个分区");
+        window.click("settings-section-local", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("settings-group-local").is_some());
+        assert!(super::chrome::settings_side_by_side(1360.), "1360 并排");
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(view.read(cx).model.settings_section, crate::app::views::settings::SettingsSection::Local));
+
+    let narrow_dir = std::env::temp_dir().join(format!("rillsql-settings-nav-narrow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&narrow_dir);
+    std::fs::create_dir_all(&narrow_dir).unwrap();
+    let (narrow_window, narrow_view) = open_workbench_sized(cx, services_at(&narrow_dir), false, 640., 700.);
+    cx.update(|cx| narrow_view.update(cx, |view, cx| view.perform("settings", cx)));
+    cx.update_window(narrow_window, |_, window, cx| {
+        window.render_frame(cx);
+        let nav = window.try_find("settings-nav").expect("分区导航");
+        let form = window.try_find("settings-form").expect("分区表单");
+        assert!(!super::chrome::settings_side_by_side(640.), "640 不走并排");
+        assert!(f32::from(nav.bounds().right()) <= 640.5, "导航不出窗口");
+        assert!(f32::from(form.bounds().right()) <= 640.5, "表单不出窗口");
+        assert!(f32::from(nav.bounds().origin.y) + f32::from(nav.bounds().size.height) <= f32::from(form.bounds().origin.y) + 0.5, "窄窗口导航在表单上方");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&narrow_dir);
+}
+
+/// 两页在浅/深色 × 紧凑/标准 × 1360/900/640 下的可测几何：行高随密度变化、
+/// 页面不出窗口、设置导航在窄宽折到表单上方。
+#[gpui_kit::test]
+fn history_and_settings_geometry_holds_in_both_themes_densities_and_three_widths(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-geometry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for width in [1360f32, 900., 640.] {
+        let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 800.);
+        let mut history_rows = Vec::new();
+        let mut appearance_cards = Vec::new();
+        for density in [Density::Compact, Density::Standard] {
+            for theme in [ThemePreference::Light, ThemePreference::Dark] {
+                cx.update(|cx| {
+                    view.update(cx, |view, _| {
+                        view.model.shell.density = density;
+                        view.model.shell.theme = theme;
+                        view.model.shell.page = AppPage::History;
+                        view.model.history.section = HistorySection::Runs;
+                        view.model.history.apply_list(
+                            vec![history_run("a", "select 1", "live", "ok"), history_run("b", "select 2", "live", "error")],
+                            Vec::new(),
+                        );
+                        view.model.history.selected_run = Some("a".into());
+                        view.model.history.preview_open = false;
+                    })
+                });
+                cx.update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let row = window.find("run-a").bounds();
+                    assert!(
+                        f32::from(row.origin.x) >= -0.5 && f32::from(row.right()) <= width + 0.5,
+                        "{width} {density:?} {theme:?}: 历史行不出窗口"
+                    );
+                    history_rows.push(f32::from(row.size.height));
+                })
+                .unwrap();
+            }
+            // 设置页：同一窗口切到设置，量分区导航与外观卡片。
+            cx.update(|cx| view.update(cx, |view, cx| view.perform("settings", cx)));
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let nav = window.find("settings-nav").bounds();
+                let form = window.find("settings-form").bounds();
+                let card = window.find("settings-group-appearance").bounds();
+                assert!(f32::from(nav.right()) <= width + 0.5, "{width}: 导航不出窗口");
+                assert!(f32::from(form.right()) <= width + 0.5, "{width}: 表单不出窗口");
+                assert!(f32::from(card.right()) <= width + 0.5, "{width}: 设置卡片不出窗口");
+                if width >= 900. {
+                    assert!((f32::from(nav.size.width) - 180.).abs() < 0.5, "{width}: 宽窗口导航固定 180，实际 {}", f32::from(nav.size.width));
+                    assert!(f32::from(nav.origin.x) < f32::from(form.origin.x), "{width}: 导航在表单左侧");
+                } else {
+                    assert!(f32::from(nav.size.height) < 60., "{width}: 窄窗口导航折成一行，高 {}", f32::from(nav.size.height));
+                    assert!(f32::from(nav.origin.y) < f32::from(form.origin.y), "{width}: 窄窗口导航在表单上方");
+                }
+                appearance_cards.push(f32::from(card.size.height));
+            })
+            .unwrap();
+        }
+        assert_eq!(history_rows.len(), 4);
+        // 密度只改内边距与控件高：历史行 67.5 → 71.5（row_pad_y 5→7，上下各 +2）。
+        assert!((history_rows[0] - 67.5).abs() < 0.5, "{width}: 紧凑历史行 67.5，实际 {:?}", history_rows);
+        assert!((history_rows[2] - 71.5).abs() < 0.5, "{width}: 标准历史行 71.5，实际 {:?}", history_rows);
+        assert!((history_rows[2] - history_rows[0] - 4.).abs() < 0.5, "{width}: 两种密度行高只差上下内边距");
+        assert!(history_rows[0] == history_rows[1] && history_rows[2] == history_rows[3], "{width}: 主题不改变行高");
+        // 三行设置卡片：每行 +2 下内边距、控件 26→30 = 24。
+        assert!((appearance_cards[0] - 180.).abs() < 0.5, "{width}: 紧凑外观卡片 180，实际 {:?}", appearance_cards);
+        assert!((appearance_cards[1] - 204.).abs() < 0.5, "{width}: 标准外观卡片 204，实际 {:?}", appearance_cards);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 设置写盘失败必须在设置页与状态栏同时可见，修好路径后重试能真正写到本机。
+#[gpui_kit::test]
+fn failed_settings_write_is_visible_then_retry_persists(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("settings", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    // 用目录占住状态文件路径：读回与写入都会失败，和磁盘只读同类。
+    let state_path = services.state.path().to_path_buf();
+    let _ = std::fs::remove_file(&state_path);
+    std::fs::create_dir_all(&state_path).unwrap();
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("font-up", cx)));
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.settings_save.failed()),
+        "写盘失败要回到模型，而不是被后台任务吞掉"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings-retry-save").is_some(), "设置页给就地重试");
+        assert!(window.try_find("status-settings-save").is_some(), "状态栏有全局反馈");
+        assert!(view.read(cx).model.settings.editor_font > 10, "写盘失败不影响改动立即生效");
+    })
+    .unwrap();
+
+    std::fs::remove_dir_all(&state_path).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-retry-save", cx);
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.settings_save == crate::app::views::settings::SaveState::Saved),
+        "重试后应确认已保存"
+    );
+    let stored = jobs::runtime().block_on(services.load_state()).expect("状态文件已写入");
+    let current_font = cx.update(|cx| view.read(cx).model.settings.editor_font);
+    assert_eq!(stored.shell.editor_font, current_font, "写的是当前设置");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("settings-retry-save").is_none(), "成功后不再显示重试");
+        assert!(window.try_find("status-settings-save").is_none(), "状态栏提示同时消失");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[gpui_kit::test]

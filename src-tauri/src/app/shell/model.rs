@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::app::views::connections::{blank_draft, ConnectionPage, Secrets};
 use crate::app::views::history::{HistoryPage, HistorySection, LoadPlan};
-use crate::app::views::settings::SettingsForm;
+use crate::app::views::settings::{SaveState, SettingsForm, SettingsSection};
 use crate::app::views::welcome::WelcomePage;
 use crate::app::model::ObjectTarget;
 use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, Shell, ThemePreference, COMMANDS};
@@ -260,6 +260,10 @@ pub struct ClosePrompt {
 pub struct WorkbenchModel {
     pub shell: Shell,
     pub settings: SettingsForm,
+    /// 设置页左侧分区导航当前高亮的分区。
+    pub settings_section: SettingsSection,
+    /// 设置写盘结果：设置页与状态栏都从这里读，失败不静默。
+    pub settings_save: SaveState,
     pub tabs: Vec<WorkItem>,
     pub active_tab: Option<String>,
     pub connections: ConnectionPage,
@@ -401,6 +405,8 @@ impl WorkbenchModel {
         Self {
             shell,
             settings,
+            settings_section: SettingsSection::Appearance,
+            settings_save: SaveState::Idle,
             tabs: Vec::new(),
             active_tab: None,
             connections: ConnectionPage::default(),
@@ -1041,6 +1047,12 @@ impl WorkbenchModel {
                 self.settings.density = id.trim_start_matches("density-").to_owned();
                 self.settings.apply_shell(&mut self.shell);
             }
+            // 分区导航只切换右侧表单，不改任何设置值，也不触发写盘。
+            _ if SettingsSection::parse(id).is_some() => {
+                if let Some(section) = SettingsSection::parse(id) {
+                    self.settings_section = section;
+                }
+            }
             "editor-theme-next" => {
                 self.settings.cycle_editor_theme();
             }
@@ -1245,6 +1257,10 @@ impl WorkbenchModel {
     }
 
     fn enqueue(&mut self, job: PendingJob) {
+        // 读历史是本机库的一次异步读取：排队即进入读取态，读到结果或失败才离开。
+        if matches!(&job, PendingJob::RefreshHistory) {
+            self.history.begin_load();
+        }
         self.running_jobs = self.running_jobs.saturating_add(1);
         self.pending.push_back(job);
     }
@@ -2226,6 +2242,34 @@ impl WorkbenchModel {
     }
 
     /// 键盘在树上移动与展开；返回需要外壳继续执行的命令。
+    /// 历史页键盘：方向键与 Home/End 在筛选后的可见行里移动选中，
+    /// 回车载入编辑器（不执行），Delete 走与右键相同的删除确认。
+    pub fn history_key(&mut self, key: NavKey) -> Option<String> {
+        if self.shell.page != AppPage::History {
+            return None;
+        }
+        match key {
+            NavKey::ArrowDown => {
+                self.history.move_selection(1);
+                None
+            }
+            NavKey::ArrowUp => {
+                self.history.move_selection(-1);
+                None
+            }
+            NavKey::Home => {
+                self.history.select_edge(true);
+                None
+            }
+            NavKey::End => {
+                self.history.select_edge(false);
+                None
+            }
+            NavKey::Enter => self.history.enter_command().map(str::to_owned),
+            NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => None,
+        }
+    }
+
     pub fn nav_key(&mut self, key: NavKey) -> Option<String> {
         // 分组标题、连接行与树行是同一条可见序列：上下、Home/End 与回车先走资源管理器。
         match key {
@@ -4260,6 +4304,10 @@ impl WorkbenchModel {
             node("density-compact", "Button", "shell.settings.densityCompact", if self.settings.density == "compact" { "selected" } else { "enabled" }, "set-density"),
             node("density-standard", "Button", "shell.settings.densityStandard", if self.settings.density == "standard" { "selected" } else { "enabled" }, "set-density"),
             node("density-relaxed", "Button", "shell.settings.densityRelaxed", if self.settings.density == "relaxed" { "selected" } else { "enabled" }, "set-density"),
+            node("settings-nav", "Navigation", "ui.settings.nav", "current", "navigate"),
+            node("settings-nav-appearance", "Button", "ui.settings.navAppearance", if self.settings_section == SettingsSection::Appearance { "selected" } else { "enabled" }, SettingsSection::Appearance.command()),
+            node("settings-nav-data", "Button", "ui.settings.navData", if self.settings_section == SettingsSection::Data { "selected" } else { "enabled" }, SettingsSection::Data.command()),
+            node("settings-nav-local", "Button", "ui.settings.navLocal", if self.settings_section == SettingsSection::Local { "selected" } else { "enabled" }, SettingsSection::Local.command()),
             node("editor", "MultilineTextInput", "query.editor.area", "editable", "edit"),
             node("grid", "Grid", "shell.shortcuts.groupGrid", if self.grid_writable { "editable" } else { "readonly" }, "grid"),
         ];
@@ -4367,6 +4415,10 @@ impl WorkbenchModel {
                 "history.status.failed",
                 "history.filter.all",
                 "history.filter.reset",
+                "history.page.loading",
+                "history.page.loadingSaved",
+                "history.page.retryLoad",
+                "history.page.keyboardHint",
             ],
             AppPage::Compare => vec![
                 "compare.dialog.title",
@@ -4390,6 +4442,16 @@ impl WorkbenchModel {
                 "shell.settings.nullCopy",
                 "shell.settings.timeout",
                 "shell.update.autoCheck",
+                "ui.settings.nav",
+                "ui.settings.navAppearance",
+                "ui.settings.navData",
+                "ui.settings.navLocal",
+                "ui.settings.saving",
+                "ui.settings.saved",
+                "ui.settings.saveFailed",
+                "ui.settings.saveFailedHint",
+                "ui.settings.retrySave",
+                "ui.settings.localHint",
             ],
             _ if self.show_welcome() => vec!["shell.welcome.resumeTitle", "shell.welcome.recent", "shell.welcome.saved", "common.newConnection", "common.openSqlite"],
             _ => vec!["shell.statusbar.noTarget", "query.editor.area"],

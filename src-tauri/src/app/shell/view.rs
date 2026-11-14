@@ -17,6 +17,7 @@ use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::mongo::MongoPane;
 use crate::app::views::query::{requires_active_query, QueryPane, SyncEffect, TabSnap};
 use crate::app::views::redis::RedisPane;
+use crate::app::views::settings::SaveState;
 use crate::app::views::structure::StructurePane;
 use crate::app::model::ObjectTarget;
 use crate::app::views::diagram::DiagramOpen;
@@ -320,6 +321,19 @@ impl Workbench {
             cx.notify();
             return;
         }
+        // 设置页的“重试保存”：不重新派发任何设置命令，只再写一次当前快照。
+        if id == "settings-retry-save" {
+            self.persist_settings(cx);
+            return;
+        }
+        // 历史页的 Delete 与条目右键菜单一致：删除当前选中的记录。
+        // 表格的标记删除只在工作台的网格上有意义，不能在次级页里空转。
+        if id == "mark-delete" && self.model.shell.page == AppPage::History {
+            if let Some(command) = self.model.history.delete_command() {
+                self.perform(command, cx);
+            }
+            return;
+        }
         if id == "open-sqlite" {
             let Some(effect) = self.model.dispatch(id) else {
                 return;
@@ -477,7 +491,12 @@ impl Workbench {
         } else {
             self.apply_effect(effect, cx);
         }
-        self.persist_if_needed();
+        // 设置类命令走带反馈的写盘；其余命令沿用静默写盘。
+        if crate::app::views::settings::is_settings_command(id) {
+            self.persist_settings(cx);
+        } else {
+            self.persist_if_needed();
+        }
         cx.notify();
     }
 
@@ -1753,6 +1772,55 @@ impl Workbench {
         jobs::runtime().spawn(async move {
             let _ = jobs::persist_revision(&services, &state, &revision, generation, &gate).await;
         });
+    }
+
+    /// 设置改动的写盘路径：与 persist_if_needed 同一条去重、代次与闸门，
+    /// 区别是把结果写回模型——设置页和状态栏都要能把“没保存成功”说清楚。
+    /// last_state 只在写成功后才更新，失败后的重试不会因为内容相同被跳过。
+    pub(super) fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        let state = self.model.snapshot();
+        let blob = serde_json::to_string(&state).unwrap_or_default();
+        if blob == self.last_state {
+            self.model.settings_save = SaveState::Saved;
+            cx.notify();
+            return;
+        }
+        self.model.settings_save = SaveState::Saving;
+        let generation = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let revision = Arc::clone(&self.revision);
+        let gate = Arc::clone(&self.persist_gate);
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        // 写盘走后台 tokio 运行时（存储层用 spawn_blocking），结果再回到界面线程。
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let result = jobs::persist_revision(&services, &state, &revision, generation, &gate).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok(())) => {
+                            // 只有仍是最新代次的写入才算数：更晚的改动已作废这次写盘，
+                            // 不能把更旧的快照记成“已落盘”，否则之后的重试会被去重跳过。
+                            if this.revision.load(Ordering::SeqCst) == generation {
+                                this.last_state = blob;
+                                this.model.settings_save = SaveState::Saved;
+                            }
+                        }
+                        Ok(Err(detail)) => this.model.settings_save = SaveState::Failed { detail },
+                        // 通道被丢弃说明这次写入已经作废：保持原状态，不假装成功。
+                        Err(_) => {}
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn prompt_dir(&self) -> std::path::PathBuf {
