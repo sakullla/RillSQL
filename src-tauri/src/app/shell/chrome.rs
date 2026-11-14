@@ -3821,15 +3821,17 @@ impl Workbench {
             let entries = self.model.palette_entries();
             let mut list = div().id("palette-list").flex().flex_col().overflow_y_scroll().p(px(6.)).max_h(px(380.));
             if entries.is_empty() {
-                let error = self.model.catalog_error.clone();
+                let error = self.model.palette_error().to_owned();
+                let empty_key = self.model.palette_empty_key();
                 let mut empty = div()
                     .p(px(16.))
                     .flex()
                     .flex_col()
                     .gap(px(6.))
                     .text_color(p.text_faint)
-                    .child(self.t(self.model.palette_empty_key()));
-                if self.model.shell.palette_tables_only && !error.is_empty() {
+                    .child(self.t(empty_key));
+                // 目录读取失败与“没有命中”是两回事：只有失败才带原因和重试。
+                if empty_key == "ui.palette.error" && !error.is_empty() {
                     empty = empty
                         .child(div().id("palette-error").text_size(px(TypeScale::XS)).truncate().tooltip_text(SharedString::from(error.clone())).child(SharedString::from(error)))
                         .child(kit::tool_button(
@@ -3858,16 +3860,15 @@ impl Workbench {
             for (index, entry) in entries.into_iter().take(40).enumerate() {
                 let selected = index == self.model.palette_index;
                 let id = entry.id.clone();
-                let chord = crate::app::COMMANDS.iter().find(|command| command.id == entry.id).and_then(|command| command.chord);
+                // 快捷键来自菜单同源（COMMANDS → SHORTCUTS），类型标注来自条目种类。
+                let chord = entry.shortcut;
+                let type_label = self.t(super::model::palette_kind_key(entry.group));
+                let detail = entry.detail.clone();
                 let icon = palette_icon(&entry.id);
-                // 分组标题只在组变化时出现一次，行内不再重复组名和附加说明。
+                // 分组标题只在组变化时出现一次；类型标注仍在行内，滚动到中段也认得出。
                 if entry.group != last_group {
                     last_group = entry.group;
-                    let heading = match entry.group {
-                        "connection" => self.t("shell.paletteGroup.connection"),
-                        "table" => self.t("shell.paletteGroup.table"),
-                        _ => self.t("shell.paletteGroup.command"),
-                    };
+                    let heading = self.t(super::model::palette_kind_key(entry.group));
                     list = list.child(
                         div()
                             .px(px(10.))
@@ -3905,7 +3906,41 @@ impl Workbench {
                                 .bg(if selected { p.raised } else { p.hover })
                                 .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_muted })),
                         )
-                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
+                                // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
+                                .when(!detail.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!("pal-detail-{index}")))
+                                            .test_support()
+                                            .flex_none()
+                                            .max_w(px(190.))
+                                            .truncate()
+                                            .text_size(px(TypeScale::XS))
+                                            .text_color(if selected { p.accent_text } else { p.text_faint })
+                                            .child(SharedString::from(detail)),
+                                    )
+                                })
+                                // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询 / 命令。
+                                // 也是无障碍名称的一部分：读屏能听到这一行是什么类型。
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("pal-kind-{index}")))
+                                        .test_support()
+                                        .flex_none()
+                                        .text_size(px(TypeScale::XS))
+                                        .text_color(if selected { p.accent_text } else { p.text_faint })
+                                        .aria_label(type_label.clone())
+                                        .child(type_label),
+                                ),
+                        )
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
                         .when(selected && chord.is_none(), |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.accent_text)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -4896,8 +4931,14 @@ pub(super) fn history_stacks_preview(content_width: f32) -> bool {
 }
 
 fn palette_icon(id: &str) -> IconName {
-    if id.starts_with("connection:") {
+    if id.starts_with("connection:") || id.starts_with("palette-connection:") {
         return IconName::Database;
+    }
+    if id.starts_with("palette-database:") {
+        return IconName::FolderOpen;
+    }
+    if id.starts_with("palette-saved:") {
+        return IconName::SquareTerminal;
     }
     if id.starts_with("open-table:") {
         return IconName::Table;

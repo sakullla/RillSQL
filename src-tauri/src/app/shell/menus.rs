@@ -108,6 +108,14 @@ fn chord_for(id: &'static str) -> Option<&'static str> {
     crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == id).map(|shortcut| shortcut.chord)
 }
 
+/// 快速打开的行内快捷键：与菜单同源（COMMANDS → SHORTCUTS），不另编一份。
+pub(super) fn command_chord(id: &str) -> Option<&'static str> {
+    match crate::app::COMMANDS.iter().find(|command| command.id == id) {
+        Some(command) => command.chord,
+        None => crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == id).map(|shortcut| shortcut.chord),
+    }
+}
+
 fn item(id: &'static str, label_key: &'static str) -> MenuItem {
     leaf(id, label_key, false, true, None)
 }

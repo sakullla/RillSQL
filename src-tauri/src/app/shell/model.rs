@@ -591,6 +591,10 @@ impl WorkbenchModel {
                 self.palette_query.clear();
                 self.palette_index = 0;
                 self.menu = None;
+                // 保存的查询要先有清单才能被搜索；这里只重读本机历史库，不连业务库、不执行 SQL。
+                if !self.pending.iter().any(|job| matches!(job, PendingJob::RefreshHistory)) {
+                    self.enqueue(PendingJob::RefreshHistory);
+                }
             }
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
@@ -619,6 +623,25 @@ impl WorkbenchModel {
             return true;
         }
         if (id == "nav-refresh" || id.starts_with("nav-")) && self.nav_command(id) {
+            return true;
+        }
+        // 快速打开的两类定位目标：连接、库都只展开并聚焦对象树，不切管理页。
+        if let Some(rest) = id.strip_prefix("palette-connection:") {
+            if !self.palette_focus_connection(rest) {
+                // 连接在面板打开后被删掉：说明原因，不假装已经定位。
+                self.notice_key = Some("ui.palette.connectionMissing");
+                self.notice_detail = rest.to_owned();
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("palette-database:") {
+            if let Some((connection, database)) = rest.split_once('|') {
+                self.palette_focus_database(connection, database);
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("palette-saved:") {
+            self.palette_load_saved(rest);
             return true;
         }
         if let Some(spec) = id.strip_prefix("open-table:") {
@@ -1360,6 +1383,26 @@ impl WorkbenchModel {
             }
             return None;
         }
+        // 快速打开选中连接/库：先建连，再把这次定位命令重放一次。
+        if let Some(rest) = id.strip_prefix("palette-connection:") {
+            if self.connections.rows.iter().any(|row| row.saved.id == rest) {
+                return Some(ConnectIntent::new(rest, ConnectAction::Run, None).with_replay(id));
+            }
+            return None;
+        }
+        if let Some(rest) = id.strip_prefix("palette-database:") {
+            let connection = rest.split_once('|').map(|(connection, _)| connection).unwrap_or(rest);
+            if self.connections.rows.iter().any(|row| row.saved.id == connection) {
+                return Some(ConnectIntent::new(connection, ConnectAction::Run, None).with_replay(id));
+            }
+            return None;
+        }
+        // 快速打开选中表/视图：目录是这次会话读到的，但那条连接可能刚断开或还没打开。
+        // 先按需建连，连上后按排队时记下的对象打开数据，不重新读当前焦点。
+        if let Some(spec) = id.strip_prefix("open-table:") {
+            let target = ObjectTarget::parse(spec)?;
+            return Some(ConnectIntent::new(target.connection_id, ConnectAction::OpenData, Some(spec.to_owned())));
+        }
         // 执行查询：活动查询项绑定的连接还没打开时，先连上再重放这次执行，
         // 而不是让查询页回答“这条连接还没有打开”（run-current/选区同一条路）。
         if crate::app::views::query::runs_query(id) {
@@ -1721,22 +1764,128 @@ impl WorkbenchModel {
             entries.push(PaletteEntry {
                 id: command.id.to_owned(),
                 group: "command",
-                label_key: command.label_key,
+                label_key: palette_kind_key("command"),
                 label: self.text(command.label_key),
                 detail: self.command_detail(command.id),
+                shortcut: super::menus::command_chord(command.id),
             });
         }
         for row in &self.connections.rows {
             entries.push(PaletteEntry {
-                id: format!("connection:{}", row.saved.id),
+                id: format!("palette-connection:{}", row.saved.id),
                 group: "connection",
-                label_key: "shell.paletteGroup.connection",
+                label_key: palette_kind_key("connection"),
                 label: row.saved.name.clone(),
-                detail: String::new(),
+                detail: connection_detail(row),
+                shortcut: None,
             });
         }
+        entries.extend(self.database_entries());
         entries.extend(self.catalog_entries());
+        entries.extend(self.saved_entries());
         filter_palette(&entries, &self.palette_query, self.shell.palette_tables_only)
+    }
+
+    /// 快速打开里的已加载库：只有读到过的库才出现，不凭空列出未读取的目录。
+    pub fn database_entries(&self) -> Vec<PaletteEntry> {
+        let mut entries = Vec::new();
+        for connection in &self.nav_source {
+            if !relational_engine(connection.engine.as_str()) {
+                continue;
+            }
+            if !self.palette_connection_usable(&connection.id) {
+                continue;
+            }
+            for database in &connection.databases {
+                if database.name.trim().is_empty() {
+                    continue;
+                }
+                entries.push(PaletteEntry {
+                    id: format!("palette-database:{}|{}", connection.id, database.name),
+                    group: "database",
+                    label_key: palette_kind_key("database"),
+                    label: database.name.clone(),
+                    detail: connection.name.clone(),
+                    shortcut: None,
+                });
+            }
+        }
+        entries
+    }
+
+    /// 快速打开里的保存查询：只列已经载入的清单（本机历史库），
+    /// 选中后只写草稿，绝不执行。
+    pub fn saved_entries(&self) -> Vec<PaletteEntry> {
+        self.history
+            .saved
+            .iter()
+            .filter(|item| !item.name.trim().is_empty())
+            .map(|item| PaletteEntry {
+                id: format!("palette-saved:{}", item.id),
+                group: "saved",
+                label_key: palette_kind_key("saved"),
+                label: item.name.clone(),
+                detail: saved_detail(item),
+                shortcut: None,
+            })
+            .collect()
+    }
+
+    /// 这条连接的已知对象还能不能出现在快速打开里：断开、删除或连接失败后
+    /// 旧索引不再冒充“当前可打开”；状态未知时保留。
+    fn palette_connection_usable(&self, connection_id: &str) -> bool {
+        let known = self.connections.rows.iter().any(|row| row.saved.id == connection_id);
+        match self.connections.status.get(connection_id).copied() {
+            Some(LinkStatus::Connected) => known,
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// 快速打开选中连接：展开并聚焦对象树，而不是跳到连接管理页。
+    /// 返回 false 表示连接已经不在清单里，调用方不再假装定位成功。
+    fn palette_focus_connection(&mut self, connection_id: &str) -> bool {
+        if !self.connections.rows.iter().any(|row| row.saved.id == connection_id) {
+            return false;
+        }
+        self.shell.sidebar_open = true;
+        self.shell.page = AppPage::Workspace;
+        self.shell.focus = FocusTarget::Sidebar;
+        self.expand_nav_connection(connection_id);
+        let row = ExplorerRow::Connection(connection_id.to_owned());
+        self.reveal_row = Some(row.item_id());
+        self.set_explorer_current(row);
+        true
+    }
+
+    /// 快速打开选中库：展开连接和这个库，把键盘当前行落在库节点上。
+    /// 树里还没有这个库节点时说明原因，不伪造“已经定位”。
+    fn palette_focus_database(&mut self, connection_id: &str, database: &str) -> bool {
+        if !self.palette_focus_connection(connection_id) {
+            return false;
+        }
+        let node_id = crate::catalog::hierarchy::database_node_id(connection_id, database);
+        if self.nav.node(&node_id).is_none() {
+            self.notice_key = Some("ui.palette.databaseMissing");
+            self.notice_detail = database.to_owned();
+            return false;
+        }
+        self.nav.expand_reserved(&node_id);
+        // 库还没读 schema 时按库读取；读过的库不再重复请求。
+        self.request_lazy_read(&node_id);
+        self.reveal_row = Some(format!("nav:{node_id}"));
+        self.set_explorer_current(ExplorerRow::Node(node_id));
+        true
+    }
+
+    /// 快速打开选中保存的查询：走与历史页同一条载入路径，只写草稿、不执行。
+    fn palette_load_saved(&mut self, saved_id: &str) -> bool {
+        let Some(item) = self.history.saved.iter().find(|item| item.id == saved_id).cloned() else {
+            return false;
+        };
+        let plan = crate::app::views::history::plan_from_saved(&item, &self.known_ids());
+        self.apply_load(plan);
+        true
     }
 
     /// 命令面板里“对比”“导入导出”要带上当前对象或结果；没有上下文时这一行说明缺什么。
@@ -3221,18 +3370,7 @@ impl WorkbenchModel {
             .iter()
             // 断开、删除或连接失败的旧对象不再冒充“当前可打开”；
             // 状态未知时保留（离线读取与测试），状态为已连接时仍要求连接记录存在。
-            .filter(|object| {
-                let known = self
-                    .connections
-                    .rows
-                    .iter()
-                    .any(|row| row.saved.id == object.connection_id);
-                match self.connections.status.get(&object.connection_id).copied() {
-                    Some(LinkStatus::Connected) => known,
-                    Some(_) => false,
-                    None => true,
-                }
-            })
+            .filter(|object| self.palette_connection_usable(&object.connection_id))
             .filter(|object| is_table_object(object))
             .map(|object| {
                 let environment = self
@@ -3242,12 +3380,15 @@ impl WorkbenchModel {
                     .find(|row| row.saved.id == object.connection_id)
                     .map(|row| row.saved.env.clone())
                     .unwrap_or_default();
+                // 表与视图分开标注：两类的下一步不同，行内类型不能都写“表”。
+                let group = if object.kind.eq_ignore_ascii_case("view") { "view" } else { "table" };
                 PaletteEntry {
                     id: format!("open-table:{}", object_spec(object, &environment)),
-                    group: "table",
-                    label_key: "shell.paletteGroup.table",
+                    group,
+                    label_key: palette_kind_key(group),
                     label: object.name.clone(),
                     detail: object_detail(object),
+                    shortcut: None,
                 }
             })
             .collect()
@@ -3291,9 +3432,18 @@ impl WorkbenchModel {
         Some("ui.explorer.noMatch")
     }
 
+    /// 目录读取失败的原因；快速打开的“目录失败”与“无命中”靠它分开。
+    pub fn palette_error(&self) -> &str {
+        if self.nav_error.is_empty() {
+            &self.catalog_error
+        } else {
+            &self.nav_error
+        }
+    }
+
     /// 快速打开的空态文案；只在筛选结果为空时调用。
     pub fn palette_empty_key(&self) -> &'static str {
-        if !self.catalog_error.is_empty() {
+        if !self.palette_error().is_empty() {
             return "ui.palette.error";
         }
         if self.shell.palette_tables_only {
@@ -3302,7 +3452,12 @@ impl WorkbenchModel {
             }
             return "ui.explorer.noMatch";
         }
-        "ui.palette.empty"
+        if self.palette_query.trim().is_empty() {
+            "ui.palette.empty"
+        } else {
+            // 有搜索词却没命中：提示调整搜索，不和目录读取失败混用一条文案。
+            "ui.palette.noMatch"
+        }
     }
 
     pub fn facts(&self) -> CloseFacts {
@@ -4406,12 +4561,35 @@ fn field_slot_ref(draft: &crate::connections::model::ConnectionDraft, field: Dra
 #[derive(Clone, Debug)]
 pub struct PaletteEntry {
     pub id: String,
+    /// 条目类型：command / connection / database / table / view / saved。
+    /// 类型既是分组标题也是每行的类型标注，表与视图不再共用一种。
     pub group: &'static str,
     pub label_key: &'static str,
     /// 搜索与显示都用它；对象条目是对象名，命令和连接是各自的文案。
     pub label: String,
-    /// 补充说明，例如对象的“库.模式 · 连接”；没有时为空。
+    /// 上下文，例如对象的“库.模式 · 连接”、连接的“PostgreSQL · 库”；没有时为空。
     pub detail: String,
+    /// 命令的快捷键，与菜单/快捷键表同源；其它类型没有。
+    pub shortcut: Option<&'static str>,
+}
+
+/// 条目类型的文案键：分组标题与行内类型标注读同一份。
+pub fn palette_kind_key(group: &str) -> &'static str {
+    match group {
+        "connection" => "shell.paletteGroup.connection",
+        "database" => "shell.paletteGroup.databases",
+        "table" => "shell.paletteGroup.tables",
+        "view" => "shell.paletteGroup.views",
+        "saved" => "shell.paletteGroup.savedQueries",
+        _ => "shell.paletteGroup.command",
+    }
+}
+
+/// 结果分组顺序：命令最常用，其次是能定位的对象与查询。
+const PALETTE_GROUPS: [&str; 6] = ["command", "connection", "database", "table", "view", "saved"];
+
+fn palette_group_rank(group: &str) -> usize {
+    PALETTE_GROUPS.iter().position(|item| *item == group).unwrap_or(PALETTE_GROUPS.len())
 }
 
 /// 对象树一行的菜单范围：对象按能否开数据页分，列/索引只给自己的动作，
@@ -4471,6 +4649,26 @@ pub fn group_objects(objects: &[&TreeObject]) -> Vec<ObjectGroup> {
     groups
 }
 
+/// 连接条目的上下文：“引擎 · 库”；没有库就只写引擎。
+pub fn connection_detail(row: &crate::connections::ConnectionRecord) -> String {
+    let engine = crate::ui::kit::engine_label(row.saved.engine.as_str());
+    match row.saved.database.as_deref().map(str::trim).filter(|database| !database.is_empty()) {
+        Some(database) => format!("{engine} · {database}"),
+        None => engine.to_owned(),
+    }
+}
+
+/// 保存查询的上下文：“连接 · 库”；缺哪段就少哪段。
+pub fn saved_detail(item: &crate::query::SavedQuery) -> String {
+    let connection = item.connection_name.trim();
+    let database = item.database_name.trim();
+    match (connection.is_empty(), database.is_empty()) {
+        (true, _) => String::new(),
+        (false, true) => connection.to_owned(),
+        (false, false) => format!("{connection} · {database}"),
+    }
+}
+
 /// 对象条目的补充说明：“库.模式 · 连接”；缺哪段就少哪段。
 pub fn object_detail(object: &TreeObject) -> String {
     let mut scope = object.database.clone();
@@ -4495,8 +4693,13 @@ pub fn next_epoch() -> u64 {
 fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> Vec<PaletteEntry> {
     let trimmed = query.trim().to_lowercase();
     if tables_only {
-        let tables: Vec<_> = entries.iter().filter(|entry| entry.group == "table").cloned().collect();
-        return if trimmed.is_empty() { tables } else { rank(&tables, &trimmed) };
+        // 快速打开只收窄到能“打开数据”的对象；连接、库和保存的查询留给命令搜索。
+        let objects: Vec<_> = entries
+            .iter()
+            .filter(|entry| matches!(entry.group, "table" | "view"))
+            .cloned()
+            .collect();
+        return if trimmed.is_empty() { objects } else { rank(&objects, &trimmed) };
     }
     if let Some(rest) = trimmed.strip_prefix('>') {
         let commands: Vec<_> = entries.iter().filter(|entry| entry.group == "command").cloned().collect();
@@ -4504,8 +4707,8 @@ fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> V
         return if rest.is_empty() { commands } else { rank(&commands, rest) };
     }
     if trimmed.is_empty() {
-        let mut ordered: Vec<_> = entries.iter().filter(|entry| entry.group == "command").cloned().collect();
-        ordered.extend(entries.iter().filter(|entry| entry.group != "command").cloned());
+        let mut ordered = entries.to_vec();
+        ordered.sort_by_key(|entry| palette_group_rank(entry.group));
         return ordered;
     }
     rank(entries, &trimmed)
@@ -4516,26 +4719,35 @@ fn rank(entries: &[PaletteEntry], query: &str) -> Vec<PaletteEntry> {
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            let score = match_score(&entry.label, query);
+            let score = palette_score(entry, query);
             (score > 0).then_some((score, index, entry.clone()))
         })
         .collect();
-    let groups: Vec<&str> = entries.iter().map(|entry| entry.group).collect();
-    let mut ordered = Vec::new();
-    let mut seen = Vec::new();
-    for group in groups {
-        if seen.contains(&group) {
-            continue;
+    let mut groups: Vec<&str> = Vec::new();
+    for entry in entries {
+        if !groups.contains(&entry.group) {
+            groups.push(entry.group);
         }
-        seen.push(group);
+    }
+    groups.sort_by_key(|group| palette_group_rank(group));
+    let mut ordered = Vec::new();
+    for group in groups {
         let mut group_items: Vec<_> = scored.iter().filter(|(_, _, entry)| entry.group == group).collect();
         group_items.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         for item in group_items {
             ordered.push(item.2.clone());
         }
     }
-    let _ = scored.len();
     ordered
+}
+
+/// 名字命中优先，其次是上下文（库.模式 · 连接）命中；两类都不命中就不出现。
+fn palette_score(entry: &PaletteEntry, query: &str) -> u8 {
+    let label = match_score(&entry.label, query);
+    if label > 0 {
+        return label * 2;
+    }
+    match_score(&entry.detail, query)
 }
 
 fn match_score(text: &str, query: &str) -> u8 {

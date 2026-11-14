@@ -2792,7 +2792,9 @@ fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
     let entries = model.palette_entries();
     let labels: Vec<&str> = entries.iter().map(|entry| entry.label.as_str()).collect();
     assert_eq!(labels, vec!["orders", "order_view"], "快速打开只列真实表 / 视图");
-    assert!(entries.iter().all(|entry| entry.group == "table"), "命令和连接不应混入快速打开");
+    assert!(entries.iter().all(|entry| matches!(entry.group, "table" | "view")), "命令和连接不应混入快速打开");
+    assert_eq!(entries[0].group, "table", "表标注为表");
+    assert_eq!(entries[1].group, "view", "视图有自己的类型，不再共用“表”");
     // 断开连接后旧索引不再冒充可打开对象；已删除连接即使状态还停在 Connected 也不能列出。
     model
         .connections
@@ -2825,7 +2827,8 @@ fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
     let all = model.palette_entries();
     assert!(all.iter().any(|entry| entry.group == "command"));
     assert!(all.iter().any(|entry| entry.group == "table" && entry.label == "orders"));
-    assert_eq!(all.iter().filter(|entry| entry.group == "table").count(), 2);
+    assert_eq!(all.iter().filter(|entry| entry.group == "table").count(), 1, "表只算表");
+    assert_eq!(all.iter().filter(|entry| entry.group == "view").count(), 1, "视图单独算一类");
 }
 
 #[test]
@@ -3022,8 +3025,9 @@ fn quick_open_lists_the_loaded_tree_and_opens_without_running_sql(cx: &mut gpui_
             let item = entries.iter().find(|entry| entry.label == "item").expect("快速打开没有 item");
             assert_eq!(item.group, "table");
             let report = entries.iter().find(|entry| entry.label == "item_view").expect("快速打开没有视图");
-            assert_eq!(report.group, "table");
-            assert!(entries.iter().all(|entry| entry.group == "table"), "快速打开只含表 / 视图");
+            assert_eq!(report.group, "view", "视图按自己的类型标注");
+            assert!(entries.iter().all(|entry| matches!(entry.group, "table" | "view")), "快速打开只含表 / 视图");
+            assert!(view.model.text("shell.paletteGroup.views") != view.model.text("shell.paletteGroup.tables"), "表与视图标注文案不同");
             let id = item.id.clone();
             let spec = id.strip_prefix("open-table:").expect("open-table 目标").to_owned();
             view.perform(&id, cx);
@@ -8298,4 +8302,433 @@ fn object_browser_geometry_holds_at_1360_900_and_640(cx: &mut gpui_kit::TestAppC
         .unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+// ---------------------------------------------------------------- 快速打开（T5）
+
+fn saved_query_row(id: &str, name: &str, sql: &str) -> crate::query::SavedQuery {
+    crate::query::SavedQuery {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        sql: sql.to_owned(),
+        connection_id: "pg".to_owned(),
+        connection_name: "销售库".to_owned(),
+        database_name: "shop".to_owned(),
+        engine: "postgres".to_owned(),
+        updated_at: "2026-11-14T08:00:00Z".to_owned(),
+    }
+}
+
+/// 一份加载过目录、且记了一条保存查询的模型：快速打开的全部来源都能出条目。
+fn palette_model() -> WorkbenchModel {
+    use crate::catalog::model::ObjectRow;
+    let mut model = seeded_model(vec![record_for("pg", "销售库", Engine::Postgres)]);
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![nav_database("shop", vec![ObjectRow::table("orders", Some(2)), ObjectRow::view("recent")])],
+    );
+    model.apply_navigation(&[pg], false);
+    model.set_catalog(
+        &[
+            tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table"),
+            tree_object("pg", "销售库", "postgres", "shop", "public", "recent", "view"),
+        ],
+        "",
+    );
+    model.history.saved = vec![saved_query_row("q1", "每日订单", "select 1;")];
+    model
+}
+
+fn palette_groups(model: &WorkbenchModel) -> Vec<&'static str> {
+    model.palette_entries().iter().map(|entry| entry.group).collect()
+}
+
+#[test]
+fn palette_searches_connections_databases_tables_views_saved_queries_and_commands() {
+    let entries = palette_model().palette_entries();
+    let groups: Vec<&str> = entries.iter().map(|entry| entry.group).collect();
+    for group in ["command", "connection", "database", "table", "view", "saved"] {
+        assert!(groups.contains(&group), "快速打开缺类型 {group}");
+    }
+
+    // 每一类都能用名字搜到，并且带上下文和类型。
+    for (query, group, label) in [
+        ("order", "table", "orders"),
+        ("rec", "view", "recent"),
+        ("每日", "saved", "每日订单"),
+        ("shop", "database", "shop"),
+        ("销售", "connection", "销售库"),
+    ] {
+        let mut model = palette_model();
+        model.palette_query = query.into();
+        let found = model
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry.group == group && entry.label == label)
+            .unwrap_or_else(|| panic!("搜“{query}”没命中 {group}/{label}"));
+        assert!(!found.detail.is_empty(), "{group}/{label} 要带上下文");
+        assert_eq!(found.label_key, super::model::palette_kind_key(group));
+    }
+
+    // 上下文也参与模糊匹配（例如按库名找表），名字命中仍然排在前面。
+    let mut model = palette_model();
+    model.palette_query = "public".into();
+    let labels: Vec<(String, &str)> = model.palette_entries().iter().map(|entry| (entry.label.clone(), entry.group)).collect();
+    assert!(labels.iter().any(|(label, group)| label == "orders" && *group == "table"), "{labels:?}");
+    assert!(labels.iter().any(|(label, group)| label == "recent" && *group == "view"), "{labels:?}");
+
+    // 每行都带上下文与类型；六种类型的标注文案彼此不同。
+    let entries = palette_model().palette_entries();
+    let connection = entries.iter().find(|entry| entry.group == "connection").unwrap();
+    assert_eq!(connection.detail, "PostgreSQL · app");
+    let database = entries.iter().find(|entry| entry.group == "database").unwrap();
+    assert_eq!(database.detail, "销售库");
+    let table = entries.iter().find(|entry| entry.group == "table").unwrap();
+    assert_eq!(table.detail, "shop.public · 销售库");
+    let view = entries.iter().find(|entry| entry.group == "view").unwrap();
+    assert_eq!(view.detail, "shop.public · 销售库");
+    let saved = entries.iter().find(|entry| entry.group == "saved").unwrap();
+    assert_eq!(saved.detail, "销售库 · shop");
+    let mut texts: Vec<String> = ["command", "connection", "database", "table", "view", "saved"]
+        .iter()
+        .map(|group| model.text(super::model::palette_kind_key(group)))
+        .collect();
+    texts.sort();
+    texts.dedup();
+    assert_eq!(texts.len(), 6, "六种类型的标注文案不能重合");
+}
+
+#[test]
+fn palette_command_shortcuts_match_the_shortcut_help_and_menu_source() {
+    let entries = WorkbenchModel::new(Shell::default()).palette_entries();
+    let mut with_chord = 0;
+    for command in crate::app::COMMANDS {
+        let entry = entries.iter().find(|entry| entry.id == command.id).expect("命令面板缺命令");
+        let source = command
+            .chord
+            .or_else(|| crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == command.id).map(|shortcut| shortcut.chord));
+        assert_eq!(entry.shortcut, source, "{} 的快捷键要和菜单/快捷键表同源", command.id);
+        with_chord += usize::from(entry.shortcut.is_some());
+    }
+    assert!(with_chord >= 5, "已登记快捷键的命令都要标出来：{with_chord}");
+    // 非命令条目没有快捷键，不会借一条别人的键。
+    assert!(entries.iter().filter(|entry| entry.group != "command").all(|entry| entry.shortcut.is_none()));
+    // “>” 只留命令，快捷键照旧显示；搜索词按当前界面语言匹配。
+    let mut model = WorkbenchModel::new(Shell::default());
+    let new_query_label = model.text("shell.command.newQuery");
+    model.palette_query = format!("> {new_query_label}");
+    let commands = model.palette_entries();
+    assert!(!commands.is_empty() && commands.iter().all(|entry| entry.group == "command"));
+    assert_eq!(commands[0].id, "new-query", "名字命中排在最前");
+    assert_eq!(commands[0].shortcut, Some("Mod+T"));
+    // 英文界面同样按名字命中：">" 后面的空格不参与匹配。
+    model.shell.locale = Locale::En;
+    model.palette_query = "> new".into();
+    let commands = model.palette_entries();
+    assert!(commands.iter().any(|entry| entry.id == "new-query" && entry.shortcut == Some("Mod+T")), "{commands:?}");
+}
+
+#[test]
+fn palette_opens_data_loads_saved_and_focuses_the_tree() {
+    // 表：直接打开数据页，不执行 SQL。
+    let mut model = palette_model();
+    let table_id = model
+        .palette_entries()
+        .iter()
+        .find(|entry| entry.group == "table")
+        .expect("表行")
+        .id
+        .clone();
+    assert!(table_id.starts_with("open-table:"), "{table_id}");
+    assert!(model.dispatch(&table_id).is_some());
+    let tab = model.active_tab().expect("打开的表工作项");
+    assert_eq!(tab.kind, WorkItemKind::Table);
+    assert!(tab.spec.as_deref().is_some_and(|spec| spec.contains("orders")));
+    assert_eq!(model.executions, 0, "快速打开表不执行 SQL");
+
+    // 保存查询：载入编辑器，不执行。
+    let mut model = palette_model();
+    let tabs_before = model.tabs.len();
+    assert!(model.dispatch("palette-saved:q1").is_some());
+    let tab = model.active_tab().expect("载入的查询草稿");
+    assert!(tab.kind.is_query());
+    assert_eq!(tab.draft, "select 1;");
+    assert_eq!(tab.connection_id.as_deref(), Some("pg"), "载入时带上原来那条连接");
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+    assert!(tab.last_executed_sql.is_none(), "载入不是执行");
+    assert_eq!(model.executions, 0);
+    assert_eq!(model.history.executions, 0);
+    assert_eq!(model.loads, 1);
+    assert_eq!(model.tabs.len(), tabs_before + 1, "只开一条草稿");
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Editor);
+
+    // 库：展开并聚焦对象树，不跳管理页。
+    let mut model = palette_model();
+    assert!(model.dispatch("palette-database:pg|shop").is_some());
+    let database_node = crate::catalog::hierarchy::database_node_id("pg", "shop");
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Sidebar);
+    assert!(model.shell.sidebar_open);
+    assert_eq!(model.nav.focus(), Some(database_node.as_str()));
+    assert!(model.nav.is_expanded(&crate::catalog::hierarchy::connection_node_id("pg")));
+    assert_eq!(model.reveal_row, Some(format!("nav:{database_node}")));
+    assert_eq!(model.explorer_current_row(), Some(super::explorer::ExplorerRow::Node(database_node)));
+
+    // 连接：展开并落在连接行上。
+    let mut model = palette_model();
+    assert!(model.dispatch("palette-connection:pg").is_some());
+    assert_eq!(model.connections.selected.as_deref(), Some("pg"));
+    assert_eq!(model.explorer_current_row(), Some(super::explorer::ExplorerRow::Connection("pg".into())));
+    assert_eq!(model.reveal_row.as_deref(), Some("conn:pg"));
+    assert_eq!(model.shell.page, AppPage::Workspace, "连接只在树里定位");
+
+    // 树里没有这个库：说明原因，不假装定位成功。
+    let mut model = palette_model();
+    assert!(model.dispatch("palette-database:pg|nope").is_some());
+    assert_eq!(model.notice_key, Some("ui.palette.databaseMissing"));
+    assert_eq!(model.notice_detail, "nope");
+
+    // 连接在面板打开后被删掉：同样给出原因，不静默失败。
+    let mut model = palette_model();
+    model.connections.rows.clear();
+    assert!(model.dispatch("palette-connection:pg").is_some());
+    assert_eq!(model.notice_key, Some("ui.palette.connectionMissing"));
+    assert_eq!(model.notice_detail, "pg");
+}
+
+#[test]
+fn palette_keyboard_walks_every_type_and_enter_runs_the_selected_row() {
+    let mut model = palette_model();
+    assert!(model.dispatch("command-palette").is_some());
+    let entries = model.palette_entries();
+    assert!(entries.len() > 3);
+    assert_eq!(model.palette_index, 0);
+
+    assert_eq!(model.key(NavKey::ArrowDown), None);
+    assert_eq!(model.palette_index, 1);
+    assert_eq!(model.key(NavKey::End), None);
+    assert_eq!(model.palette_index, entries.len() - 1);
+    assert_eq!(model.key(NavKey::Home), None);
+    assert_eq!(model.palette_index, 0);
+    // 上下键在混合结果里循环，不会跳过连接/库/对象。
+    assert_eq!(model.key(NavKey::ArrowUp), None);
+    assert_eq!(model.palette_index, entries.len() - 1);
+
+    // 光标落到保存查询那一行，回车只载入不执行。
+    let index = entries.iter().position(|entry| entry.group == "saved").expect("保存查询行");
+    model.palette_index = index;
+    let command = model.key(NavKey::Enter);
+    assert_eq!(command.as_deref(), Some(entries[index].id.as_str()));
+    assert!(!model.shell.palette_open, "回车后面板关闭");
+    assert_eq!(model.active_tab().map(|tab| tab.draft.as_str()), Some("select 1;"));
+    assert_eq!(model.executions, 0, "键盘选中保存查询也不执行");
+}
+
+#[test]
+fn palette_targets_connect_first_when_the_connection_is_not_open() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    let orders = tree_object("pg", "Atlas", "postgres", "shop", "public", "orders", "table");
+    assert!(model.set_catalog(std::slice::from_ref(&orders), ""));
+    let spec = crate::app::views::query::object_spec(&orders, "");
+
+    // 已知但还没打开：先建连，动作排队，不直接打开。
+    assert!(model.gate_on_demand(&format!("open-table:{spec}")), "未连接时先建连");
+    assert_eq!(model.pending_len(), 1, "只排一次打开连接");
+    assert_eq!(model.connections.status.get("pg"), Some(&LinkStatus::Connecting));
+    let queued = model
+        .connect_intents
+        .iter()
+        .find(|intent| intent.spec.as_deref() == Some(spec.as_str()))
+        .expect("排队打开这个被选中的对象");
+    assert_eq!(queued.action, super::conn_modal::ConnectAction::OpenData);
+    assert!(model.tabs.is_empty(), "没连上之前不打开数据页");
+
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let ready = model.take_ready_intents();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].command(), Some("tree-open-data"));
+    assert_eq!(ready[0].spec.as_deref(), Some(spec.as_str()), "重放排队时记下的对象");
+    assert!(model.take_ready_intents().is_empty(), "只重放一次");
+    assert!(!model.gate_on_demand(&format!("open-table:{spec}")), "已连接照常打开");
+
+    // 连接与库：同样先建连再重放定位命令；保存查询不需要连接。
+    model.connections.status.insert("pg".into(), LinkStatus::Disconnected);
+    assert!(model.gate_on_demand("palette-connection:pg"));
+    assert!(model.gate_on_demand("palette-database:pg|shop"));
+    let replays: Vec<&str> = model.connect_intents.iter().filter_map(|intent| intent.replay.as_deref()).collect();
+    assert!(replays.contains(&"palette-connection:pg"), "{replays:?}");
+    assert!(replays.contains(&"palette-database:pg|shop"), "{replays:?}");
+    assert_eq!(model.pending_len(), 1, "在途连接复用在途操作");
+    assert!(!model.gate_on_demand("palette-saved:q1"), "载入保存查询不建连");
+    assert_eq!(model.pending_len(), 1);
+}
+
+#[test]
+fn palette_never_invents_unloaded_objects_and_separates_no_match_from_failure() {
+    // 连接可以搜到；从没读过的对象不会凭空出现。
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    assert!(model.palette_entries().iter().any(|entry| entry.group == "connection" && entry.label == "Atlas"));
+    assert!(model.palette_entries().iter().all(|entry| entry.group != "table" && entry.group != "database"));
+    model.palette_query = "orders".into();
+    assert!(model.palette_entries().is_empty(), "未加载的对象不能被伪造");
+    assert_eq!(model.palette_empty_key(), "ui.palette.noMatch");
+    assert_ne!(model.text("ui.palette.noMatch"), model.text("ui.palette.error"), "无命中与目录失败是两条文案");
+
+    // 目录失败：同一处提示换成失败原因，并给出原因明细。
+    assert!(model.set_catalog(&[], "连接超时"));
+    assert_eq!(model.palette_empty_key(), "ui.palette.error");
+    assert_eq!(model.palette_error(), "连接超时");
+
+    // 清空搜索词后又能找到连接：无命中只是这一次搜索没有结果。
+    assert!(model.set_catalog(&[], ""));
+    model.palette_query.clear();
+    assert!(model.palette_entries().iter().any(|entry| entry.group == "connection"));
+    assert_eq!(model.palette_empty_key(), "ui.palette.empty");
+}
+
+#[test]
+fn palette_drops_stale_rows_when_the_connection_goes_away_and_restores_them_after_reconnect() {
+    let mut model = palette_model();
+    assert!(palette_groups(&model).contains(&"table"));
+    assert!(palette_groups(&model).contains(&"database"));
+
+    // 断开：旧的目录快照不再冒充“当前可打开”，但连接本身还能搜到。
+    model.connections.status.insert("pg".into(), LinkStatus::Disconnected);
+    let after = palette_groups(&model);
+    assert!(!after.contains(&"table") && !after.contains(&"view") && !after.contains(&"database"), "{after:?}");
+    assert!(after.contains(&"connection"), "断开后仍能定位连接本身");
+    assert!(after.contains(&"saved"), "保存的查询不依赖连接状态");
+
+    // 重连：同一份已读索引回来。
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    assert!(palette_groups(&model).contains(&"table"));
+
+    // 连接记录被删除：即使状态还停在已连接也不列旧对象。
+    model.connections.rows.clear();
+    let gone = palette_groups(&model);
+    assert!(!gone.contains(&"table") && !gone.contains(&"database") && !gone.contains(&"connection"), "{gone:?}");
+
+    // 目录刷新失败：旧对象与库一起清空，失败原因留在空态里。
+    let mut model = palette_model();
+    assert!(model.set_catalog(&[], "读取对象失败"));
+    model.nav_failed("读取对象失败");
+    assert!(!palette_groups(&model).contains(&"table"));
+    assert_eq!(model.palette_empty_key(), "ui.palette.error");
+    assert_eq!(model.palette_error(), "读取对象失败");
+}
+
+/// 快速打开渲染出来的每一行都带上下文与类型；640 窄窗下面板仍完整落在视口里。
+#[gpui_kit::test]
+fn quick_open_renders_context_and_type_for_every_result_kind(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-palette-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 对象索引走真实读取（SQLite 表 + 视图），保存的查询进真历史库：
+    // 快速打开渲染的每一类都来自它平时读的那份数据。
+    let database = dir.join("items.sqlite");
+    let config_dir = dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT)").execute(&pool).await.unwrap();
+            sqlx::query("CREATE VIEW item_view AS SELECT id, label FROM item").execute(&pool).await.unwrap();
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            crate::app::views::history::save_named(
+                &services,
+                &SaveRequest {
+                    name: "每日订单".into(),
+                    sql: "select 1;".into(),
+                    connection_id: "notes".into(),
+                    connection_name: "笔记".into(),
+                    database_name: String::new(),
+                    engine: "sqlite".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _ = tx.send(services);
+        });
+    });
+    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let (window, view) = open_workbench_sized(cx, services, false, 640., 800.);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("refresh-tree", cx));
+    })
+    .unwrap();
+    assert!(wait_for_tree(cx, window, &view), "对象索引没有同步");
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.perform("command-palette", cx));
+    });
+    // 打开面板时补读历史库：等保存的查询落进清单，再取它渲染出来的行。
+    let started = std::time::Instant::now();
+    let mut ready = false;
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        ready = cx.update(|cx| view.read(cx).model.palette_entries().iter().any(|entry| entry.group == "saved"));
+        if ready {
+            break;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    assert!(ready, "保存的查询没有进入快速打开");
+
+    let entries = cx.update(|cx| view.read(cx).model.palette_entries());
+    let index_of = |group: &str| {
+        entries
+            .iter()
+            .position(|entry| entry.group == group)
+            .unwrap_or_else(|| {
+                let seen: Vec<String> = entries.iter().map(|entry| format!("{}:{}", entry.group, entry.label)).collect();
+                panic!("快速打开没有 {group} 行；实际 {seen:?}")
+            })
+    };
+    let (table, view_row, saved) = (index_of("table"), index_of("view"), index_of("saved"));
+    let texts = cx.update(|cx| {
+        let model = &view.read(cx).model;
+        (
+            model.text("shell.paletteGroup.tables"),
+            model.text("shell.paletteGroup.views"),
+            model.text("shell.paletteGroup.savedQueries"),
+        )
+    });
+    let (kind_table, kind_view, kind_saved, detail, palette, width) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let kind = |index: usize| {
+                window
+                    .try_find(format!("pal-kind-{index}"))
+                    .and_then(|element| element.label().map(str::to_owned))
+            };
+            let detail = |index: usize| {
+                window
+                    .try_find(format!("pal-detail-{index}"))
+                    .map(|element| (f32::from(element.bounds().size.width), f32::from(element.bounds().size.height)))
+            };
+            let palette = window.find("palette").bounds();
+            let width = f32::from(window.find("workbench").bounds().size.width);
+            (kind(table), kind(view_row), kind(saved), detail(table), palette, width)
+        })
+        .unwrap();
+    assert_eq!(kind_table.as_deref(), Some(texts.0.as_str()), "表行要标出“表”");
+    assert_eq!(kind_view.as_deref(), Some(texts.1.as_str()), "视图行要标出“视图”");
+    assert_eq!(kind_saved.as_deref(), Some(texts.2.as_str()), "保存查询行要标出“保存的查询”");
+    let (detail_w, detail_h) = detail.expect("表行要画出上下文");
+    assert!(detail_w > 0. && detail_h > 0., "上下文要真的占位：{detail_w}x{detail_h}");
+    assert!(f32::from(palette.origin.x) >= 0.);
+    assert!(f32::from(palette.origin.x + palette.size.width) <= width + 0.5, "640 窄窗下面板不越界");
+    assert!(f32::from(palette.size.width) <= 620.);
+    let _ = std::fs::remove_dir_all(&dir);
 }
