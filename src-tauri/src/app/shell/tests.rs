@@ -116,6 +116,9 @@ fn english_copy_has_no_chinese_and_query_titles_follow_locale() {
 fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestAppContext) {
     use gpui_kit::component::ActiveTheme as _;
 
+    // 页面切换会在真实 Tokio 线程读取连接/历史，设置也异步写盘。
+    // 允许这些线程唤醒测试调度器，并在结束前等待回执，不能只验证绘制后就拆掉调度器。
+    cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-scale-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -233,6 +236,14 @@ fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestA
         assert!(f32::from(palette.size.width) <= 620.);
     })
     .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.model.running_jobs == 0
+                && view.model.pending_len() == 0
+                && view.model.settings_save == crate::app::views::settings::SaveState::Saved
+        }),
+        "连接/历史读取与设置写盘必须在测试调度器退出前回到界面线程"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

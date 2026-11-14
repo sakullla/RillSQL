@@ -4,7 +4,11 @@
 
 main 提交 `ca3b3d9` 的 [CI 43592652443](https://github.com/sakullla/RillSQL/actions/runs/43592652443) 在 Windows Rust 测试阶段以 `0xc0000409` 退出，阻塞发布前置检查；同次 macOS、Linux、发布元数据检查成功。
 
-本机默认栈下没有复现该异常退出，不能仅凭退出码认定根因。已确认的问题是未优化 GPUI 元素构建存在过大的栈帧；缩小线程栈后能稳定复现关系图栈溢出，并验证修改后通过。
+开启原始输出后，[CI 43609591800](https://github.com/sakullla/RillSQL/actions/runs/43609591800) 确认直接原因：`density_theme_and_language_reach_the_rendered_chrome` 切换页面会启动真实 Tokio 读取与设置写盘，却没有允许后台唤醒，也没有等待读取回执就结束测试。Tokio 随后唤醒已经结束的 GPUI 测试调度器，触发非确定性检查及 `local task dropped by a thread that didn't spawn it` 二次 panic，Windows 以 `0xc0000409` 中止；Linux 同次在该测试报告非确定性失败。
+
+修复在该集成测试中允许真实线程唤醒，使用既有 30 秒有界条件等待，确认连接/历史任务已完成、待发队列为空且设置写盘成功后再清理目录。未放宽纯模型测试的确定性要求。
+
+另外，未优化 GPUI 元素构建确有过大的栈帧；缩小线程栈后能复现关系图栈溢出，并验证优化后通过。该性能问题与上述 CI 退出原因分别验证。
 
 修复在已有栈帧拆分基础上覆盖连接弹窗、历史、设置、关系图、对比、交换、Redis、MongoDB、结构和记录视图。共享 `kit::stack_frame` 仅在调试构建禁止内联；发布构建允许内联。两个大型异步集成测试拆成阶段，保留原有断言。
 
