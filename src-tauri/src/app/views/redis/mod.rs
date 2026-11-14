@@ -2121,7 +2121,7 @@ impl RedisPane {
         let pad = kit::Metrics::of(cx).pad;
         match &detail.value {
             RedisValue::String { text } => stack_frame(|| {
-                let viewer = self.ensure_string_viewer(&text, window, cx);
+                let viewer = self.ensure_string_viewer(text, window, cx);
                 div()
                     .flex()
                     .flex_col()

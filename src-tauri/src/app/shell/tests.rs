@@ -769,7 +769,7 @@ async fn seven_engines_save(dir: &std::path::Path, services: &Arc<AppServices>, 
         model.connections.editor = Some(draft);
         model.connections.secrets = Secrets::default();
         let _ = model.dispatch("conn-save");
-        let token = model.prepare_list_token(services.tasks);
+        let token = model.prepare_list_token(&services.tasks);
         let request = request_of(model, token);
         let done = jobs::execute_job(services, request).await;
         apply_done(model, services, "connections", done);
@@ -799,7 +799,7 @@ async fn seven_engines_save(dir: &std::path::Path, services: &Arc<AppServices>, 
     model.connections.selected = Some(sqlite_id.clone());
     model.connections.duplicate_selected();
     let _ = model.dispatch("conn-save");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), 8);
@@ -810,18 +810,18 @@ async fn seven_engines_save(dir: &std::path::Path, services: &Arc<AppServices>, 
 async fn seven_engines_transfer(dir: &std::path::Path, services: &Arc<AppServices>, model: &mut WorkbenchModel, sqlite_id: &str) {
     model.connections.selected = Some(sqlite_id.to_owned());
     let _ = model.dispatch("conn-connect");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert!(matches!(model.connections.status.get(sqlite_id), Some(crate::app::views::connections::LinkStatus::Connected)), "{:?}", model.connections.message_detail);
 
     let _ = model.dispatch("conn-disconnect");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert!(matches!(model.connections.status.get(sqlite_id), Some(crate::app::views::connections::LinkStatus::Disconnected)));
     let _ = model.dispatch("conn-test");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert_eq!(model.connections.message_key, Some("connections.editor.test.ok"), "{}", model.connections.message_detail);
@@ -829,7 +829,7 @@ async fn seven_engines_transfer(dir: &std::path::Path, services: &Arc<AppService
     let export = dir.join("connections.json");
     model.export_path = Some(export.display().to_string());
     let _ = model.dispatch("conn-export");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert!(export.is_file());
@@ -855,7 +855,7 @@ async fn seven_engines_delete(dir: &std::path::Path, services: &Arc<AppServices>
     assert_eq!(services.list_connections().await.unwrap().len(), before_delete);
     let _ = model.dispatch("conn-delete");
     let _ = model.dispatch("conn-delete-confirm");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), before_delete - 1);
@@ -866,7 +866,7 @@ async fn seven_engines_delete(dir: &std::path::Path, services: &Arc<AppServices>
     model.import_path = Some(broken.display().to_string());
     model.bundle_passphrase.clear();
     let _ = model.dispatch("conn-import");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), kept);
@@ -875,7 +875,7 @@ async fn seven_engines_delete(dir: &std::path::Path, services: &Arc<AppServices>
     std::fs::write(&skip_file, r#"{"format":"rillsql-connections","version":1,"connections":[{"name":"跳过我","engine":"oracle"}]}"#).unwrap();
     model.import_path = Some(skip_file.display().to_string());
     let _ = model.dispatch("conn-import");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     assert_eq!(model.connections.rows.len(), kept);
@@ -889,7 +889,7 @@ async fn seven_engines_sealed(dir: &std::path::Path, services: &Arc<AppServices>
     let secret_export = dir.join("connections.rillsqlcx");
     model.export_path = Some(secret_export.display().to_string());
     let _ = model.dispatch("conn-export");
-    let token = model.prepare_list_token(services.tasks);
+    let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "connections", done);
     let sealed = std::fs::read(&secret_export).unwrap();
@@ -945,7 +945,7 @@ async fn seven_engines_history(services: &Arc<AppServices>, model: &mut Workbenc
     model.history.section = HistorySection::Saved;
     let before = model.executions;
     let _ = model.dispatch("history-save-named");
-    let token = model.begin_owner(services.tasks, "history");
+    let token = model.begin_owner(&services.tasks, "history");
     let done = jobs::execute_job(services, request_of(model, token)).await;
     apply_done(model, services, "history", done);
     assert_eq!(model.executions, before);
@@ -970,7 +970,7 @@ async fn seven_engines_history(services: &Arc<AppServices>, model: &mut Workbenc
     model.settings.locale = "en".into();
     model.settings.editor_font = 18;
     model.settings.editor_theme = "warm".into();
-    model.settings.apply_shell(model.shell);
+    model.settings.apply_shell(&mut model.shell);
     let state = model.snapshot();
     assert!(!serde_json::to_string(&state).unwrap().contains("\"password\""));
     super::model::persist_state(services, &state).await.unwrap();
@@ -985,10 +985,10 @@ async fn seven_engines_history(services: &Arc<AppServices>, model: &mut Workbenc
     assert_eq!(restored.settings.editor_theme, "warm");
     assert!(restored.tabs.iter().all(|tab| !tab.uncommitted_cells));
 
-    let stale = model.connections.begin(services.tasks);
-    let current = model.connections.begin(services.tasks);
-    assert!(!model.connections.accept_list(services.tasks, stale, Vec::new()));
-    assert!(model.connections.accept_list(services.tasks, current, model.connections.rows.clone()));
+    let stale = model.connections.begin(&services.tasks);
+    let current = model.connections.begin(&services.tasks);
+    assert!(!model.connections.accept_list(&services.tasks, stale, Vec::new()));
+    assert!(model.connections.accept_list(&services.tasks, current, model.connections.rows.clone()));
 
     let _ = SaveRequest {
         name: "计数".into(),

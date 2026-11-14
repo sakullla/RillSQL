@@ -77,6 +77,12 @@ jobs:
         env:
           RUST_BACKTRACE: 1
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --nocapture
+      - name: Check Windows render stack budget
+        if: runner.os == 'Windows'
+        env:
+          RUST_MIN_STACK: 786432
+          RUST_BACKTRACE: 1
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib app::views::diagram::tests::diagram_four_states_and_keyboard_hold_at_1360 -- --exact --nocapture
       - name: Clippy
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets
 
