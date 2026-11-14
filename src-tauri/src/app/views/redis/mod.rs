@@ -1476,6 +1476,13 @@ fn describe_ttl(locale: Locale, ttl_ms: Option<i64>) -> String {
     }
 }
 
+/// 调试构建不复用栈槽。把一块界面放进独立栈帧，调用返回后槽位释放，
+/// 避免 Redis 页和外壳布局叠在 Windows 主线程默认 1 MB 栈上溢出。
+#[inline(never)]
+fn stack_frame<T>(build: impl FnOnce() -> T) -> T {
+    build()
+}
+
 impl Render for RedisPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -1500,6 +1507,7 @@ impl Render for RedisPane {
         let visible = indexes.len() + folders.len();
         let state = list_state(self.busy, scan_failed, self.keys.len(), visible, pattern_active, self.done);
 
+        let list = stack_frame(|| {
         // ---- 左侧：键列表。浏览只渲染 SCAN 结果，不发 KEYS。
         // 加载 / 读取失败 / 无命中 / 无数据都走底座三态，各带一个当场能做的下一步；
         // 有行时只在列表顶部给一行增量读取指示，不用整块转圈盖住已读到的键。
@@ -1630,6 +1638,9 @@ impl Render for RedisPane {
                     }),
             );
         }
+        list.into_any_element()
+        });
+        let left = stack_frame(|| {
         let side_w = m.header_h() * 6. + m.pane_pad();
         let left = div()
             .h_full()
@@ -1704,11 +1715,19 @@ impl Render for RedisPane {
                     .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity))
                     .into_any_element()
             });
+        left.into_any_element()
+        });
 
         // ---- 右侧：键详情。读到了内容才渲染结构化视图，读取中给骨架、失败给错误块。
         let detail_error = self.error_source == ErrorSource::Detail && !self.error.is_empty();
-        let value_panel = if self.detail.is_some() {
-            Some(self.value_body(&p, &entity, window, cx))
+        let loaded_value = if self.detail.is_some() {
+            Some(stack_frame(|| self.value_body(&p, &entity, window, cx)))
+        } else {
+            None
+        };
+        let detail = stack_frame(|| {
+        let value_panel = if let Some(value) = loaded_value {
+            Some(value)
         } else if detail_error {
             let owner = entity.clone();
             let retry = kit::secondary_button(
@@ -1829,8 +1848,11 @@ impl Render for RedisPane {
                     .child(kit::text_input("redis-rename-field", &rename, self.text("redis.tab.rename"))),
             );
         }
+        detail.into_any_element()
+        });
 
         // ---- 底部：命令行与状态
+        let console = stack_frame(|| {
         let mut console = div()
             .flex_none()
             .p(px(m.pane_pad()))
@@ -1912,7 +1934,10 @@ impl Render for RedisPane {
                 .text_color(p.text_muted)
                 .child(SharedString::from(self.note.clone())),
         );
+        console.into_any_element()
+        });
 
+        stack_frame(|| {
         let mut root = div()
             .id("redis-pane")
             .test_support()
@@ -1976,7 +2001,8 @@ impl Render for RedisPane {
                 .child(left)
                 .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(detail).child(console));
         }
-        root
+        root.into_any_element()
+        })
     }
 }
 

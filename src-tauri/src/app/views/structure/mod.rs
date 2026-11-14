@@ -1699,13 +1699,12 @@ impl StructurePane {
         let section = self.session.section;
         let entity = cx.entity();
         let metrics = kit::Metrics::of(cx);
-        let mut form = div().flex().flex_col().gap(px(metrics.section_gap()));
+        let form = div().flex().flex_col().gap(px(metrics.section_gap()));
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
-        match section {
-            Section::Columns if readonly_view => {
-                form = form.child(kit::muted(t("structure.section.viewDef"), &p));
-            }
-            Section::Columns => {
+        let form = match section {
+            Section::Columns if readonly_view => form.child(kit::muted(t("structure.section.viewDef"), &p)),
+            Section::Columns => stack_frame(|| {
+                let mut form = form;
                 if self.session.mode == StructureMode::Create {
                     let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
                     form = form.child(kit::form_row(t("structure.action.createTable"), name, &p));
@@ -1834,8 +1833,10 @@ impl StructurePane {
                                 });
                             })),
                     );
-            }
-            Section::Indexes => {
+                form
+            }),
+            Section::Indexes => stack_frame(|| {
+                let mut form = form;
                 let indexes = self.snapshot.as_ref().map(|snapshot| snapshot.indexes.clone()).unwrap_or_default();
                 for (index, index_row) in indexes.iter().enumerate() {
                     let protected = index_row.protected;
@@ -1915,8 +1916,10 @@ impl StructurePane {
                     }),
                     unique,
                 ));
-            }
-            Section::ForeignKeys => {
+                form
+            }),
+            Section::ForeignKeys => stack_frame(|| {
+                let mut form = form;
                 self.ensure_references(cx);
                 let keys = self.snapshot.as_ref().map(|snapshot| snapshot.foreign_keys.clone()).unwrap_or_default();
                 for (index, key) in keys.iter().enumerate() {
@@ -2091,8 +2094,10 @@ impl StructurePane {
                                 }),
                         ),
                 );
-            }
-            Section::View => {
+                form
+            }),
+            Section::View => stack_frame(|| {
+                let mut form = form;
                 self.ensure_view_editor(window, cx);
                 if let Some(editor) = self.view_editor.clone() {
                     kit::sync_editor(&editor, &mut self.view_editor_sync, &self.session.view_sql, window, cx);
@@ -2102,8 +2107,10 @@ impl StructurePane {
                         ),
                     );
                 }
-            }
-            Section::Ddl => {
+                form
+            }),
+            Section::Ddl => stack_frame(|| {
+                let mut form = form;
                 let (sql, missing) = self.snapshot.as_ref().map(definition_text).unwrap_or_else(|| (String::new(), Vec::new()));
                 let viewer = self.ddl_viewer(&sql, window, cx);
                 let copy_sql = sql.clone();
@@ -2119,8 +2126,10 @@ impl StructurePane {
                     }
                     form = form.child(notes);
                 }
-            }
-            Section::Danger => {
+                form
+            }),
+            Section::Danger => stack_frame(|| {
+                let mut form = form;
                 let view = self.session.object_kind == "view";
                 form = form.child(
                     div()
@@ -2161,15 +2170,42 @@ impl StructurePane {
                     let typed = self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx);
                     form = form.child(kit::form_row(t("structure.danger.typeName"), typed, &p));
                 }
-            }
-        }
+                form
+            }),
+        };
         form.into_any_element()
     }
+}
+
+/// 调试构建不复用栈槽。把一块界面放进独立栈帧，调用返回后槽位释放。
+#[inline(never)]
+fn stack_frame<T>(build: impl FnOnce() -> T) -> T {
+    build()
 }
 
 impl Render for StructurePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_snapshot(cx);
+        // 表单、确认层、页面主体各用一帧。未优化构建不复用栈槽，叠在 Windows 主线程 1 MB 栈上会溢出。
+        let form = if self.form_visible() { Some(self.section_form(window, cx)) } else { None };
+        let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
+        let section = self.session.section;
+        let entity = cx.entity();
+        let preview = self.render_preview_dialog(&entity, &p, metrics, section, window, cx);
+        self.render_page(form, preview, cx)
+    }
+}
+
+impl StructurePane {
+    /// 结构页主体。与确认层分属两个 `inline(never)` 帧，调用返回后槽位释放。
+    #[inline(never)]
+    fn render_page(
+        &mut self,
+        form: Option<AnyElement>,
+        preview: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
         let locale = self.session.locale;
@@ -2201,7 +2237,6 @@ impl Render for StructurePane {
                 }),
             ));
         }
-        let form = if self.form_visible() { Some(self.section_form(window, cx)) } else { None };
         let summary = self.summary_text();
         let title = if self.session.mode == StructureMode::Create {
             t("structure.action.createTable")
@@ -2278,7 +2313,29 @@ impl Render for StructurePane {
         if let Some(actions) = self.preview_footer(&entity, &p, locale, metrics) {
             column = column.child(actions);
         }
-        if self.session.preview_open() {
+        if let Some(preview) = preview {
+            column = column.child(preview);
+        }
+        column
+    }
+}
+
+impl StructurePane {
+    #[inline(never)]
+    fn render_preview_dialog(
+        &mut self,
+        entity: &Entity<Self>,
+        p: &Palette,
+        metrics: kit::Metrics,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.session.preview_open() {
+            return None;
+        }
+        let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
             // 危险操作确认层（S12.5）：标题行带对象名与危险图标，只有正文滚动，
             // 页脚动作固定可见，640/900/1360 三档都能点到取消与确认。
             let dangerous = self.session.preview_dangerous();
@@ -2319,7 +2376,7 @@ impl Render for StructurePane {
                     })
                 }
             };
-            column = column.child(
+        let dialog = 
                 div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
                     div()
                         .id("structure-preview-dialog")
@@ -2434,10 +2491,9 @@ impl Render for StructurePane {
                                     kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).into_any_element()
                                 }),
                         ),
-                ),
-            );
-        }
-        column
+                )
+            .into_any_element();
+        Some(dialog)
     }
 }
 
