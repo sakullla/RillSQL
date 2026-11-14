@@ -6,7 +6,9 @@
 - 覆盖规范：S5.2（Listbox 行与选中底）、S6.3（对象树与右键）、S8.5（无数据/无命中/错误语义）、S9 / S12.2（密度 token）、S12.4（三态）
 - 改动范围：
   - `src-tauri/src/connections/{groups.rs,store.rs,service.rs,mod.rs}`：分组模型、迁移、Store 命令、Service 入口
-  - `src-tauri/src/catalog/hierarchy.rs`：`visible_under` 在筛选时只走已加载节点并保留祖先
+  - `src-tauri/src/catalog/hierarchy.rs`：`visible_under` 在筛选时只走已加载节点并保留祖先；库节点 `unloaded` 与 `needs_database/begin_database/set_database`（按库懒加载）
+  - `src-tauri/src/catalog/{read.rs,detail.rs}`：非当前库不再是错误节点；`read_database_outline`、SQL Server 三段名限定（含列/索引/主键查询）
+  - `src-tauri/src/app/shell/{nav.rs,model.rs,view.rs}`：`NavRequest::Database`、按节点种类分派 `Load`、`nav_read_session`（PostgreSQL 临时会话）
   - `src-tauri/src/app/shell/{explorer.rs,model.rs,jobs.rs,menus.rs,chrome.rs,view.rs}`：扁平可见行、视口窗口、分组命令、拖拽/右键归组、分组输入面板与删除确认
   - `src-tauri/src/i18n/mod.rs`：只追加 `ui.group.*` 文案键
   - `src-tauri/src/app/shell/tests.rs`、`src-tauri/src/connections/{tests.rs,groups.rs}`：新增用例
@@ -18,6 +20,7 @@
 | `group-restart.md` | 分组创建/重命名/折叠/删除、删除后连接回顶层、迁移与重启恢复的断言与数据路径 |
 | `virtualization-and-scale.md` | 视口窗口算法、每行高度与元素数量、数百节点与三档宽度的实测几何 |
 | `interactions.md` | 长名称、展开箭头、状态、空库/无命中/错误、键盘导航、对象右键与拖拽 |
+| `database-lazy-loading.md` | 非当前库的按库懒加载（评审修复 A2）：数据路径、SQL Server 三段名、用例与仍未解决的相邻边界 |
 | `test-receipts.md` | 本轮实际运行的命令、结果与用例清单 |
 
 ## 证据类型（请勿混读）

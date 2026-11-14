@@ -56,3 +56,19 @@
 ## 4. ignored 用例
 
 7 个 ignored 全部是既有的远端 fixture 用例（MySQL/PostgreSQL/Redis/Mongo 等），本任务没有新增 ignored；它们**不计作通过**。
+
+## 5. 评审修复 A2（非当前库按库懒加载）复跑
+
+同一工作区、同一 HEAD（`2086aac`）+ 本轮改动，串行执行，没有并发第二个 cargo。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib catalog::` | **60 passed / 0 failed / 1 ignored**（954 filtered）。新增 4 个：`a_non_current_database_loads_layer_by_layer_with_a_loading_state`、`a_failed_database_read_keeps_the_reason_on_that_database_only`、`sqlserver_sql_is_scoped_with_three_part_names`、`a_database_scope_read_needs_a_database_on_a_layered_engine` |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::shell` | **179 passed / 0 failed / 1 ignored**（835 filtered）。新增 1 个：`a_database_outside_the_current_session_reads_on_expand_and_keeps_its_own_error` |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 通过。lib **1008 passed / 0 failed / 7 ignored**（26.11s）；`rillsql-package` 1 passed |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | exit 0；32 条 warning，与修复前同数，全部既有代码；本轮的 `catalog/{read,detail,hierarchy}.rs`、`app/shell/{nav,model,view,tests}.rs` 0 条 |
+| `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | exit 0：依赖未变 |
+
+- 改过的既有用例：`catalog::tests::refresh_keeps_the_loaded_window_and_a_failed_list_is_not_empty` —— 非当前库从“带错误”改为“`error: None` + 空 schemas”，断言随实现修正。
+- ignored 仍是既有的 7 个远端 fixture 用例，本轮没有新增 ignored，**不计作通过**。
+- 详细路径与仍未解决的相邻边界见 `database-lazy-loading.md`。

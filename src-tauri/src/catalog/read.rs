@@ -305,7 +305,7 @@ pub async fn read_object_kind_page(
             },
             Err(message) => empty_page(message),
         },
-        CatalogSession::Sqlserver(client) => match read_sqlserver_kind_slice(client, schema, kind, offset, limit).await {
+        CatalogSession::Sqlserver(client) => match read_sqlserver_kind_slice(client, database, schema, kind, offset, limit).await {
             Ok((total, objects)) => ObjectPageBody {
                 objects,
                 total,
@@ -358,10 +358,34 @@ pub async fn read_definition(
         CatalogSession::Scripted => Err(definition_failure("这个连接没有连着可查询的数据库")),
         CatalogSession::Sqlite { pool, .. } => read_sqlite_definition(pool, database, name, kind).await,
         CatalogSession::Mysql(pool) => read_mysql_definition(pool, engine, database, name, kind).await,
-        CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
-        CatalogSession::Sqlserver(client) => read_sqlserver_definition(client, schema, name, kind).await,
+        // pg_catalog 只覆盖会话自己的库：读别的库的定义会安静地读到同名的另一个对象，
+        // 宁可报出原因，也不返回错误的 DDL。
+        CatalogSession::Postgres(client) => {
+            let current = current_database(client).await?;
+            if database != current {
+                return Err(definition_failure(other_database_message(&current, database)));
+            }
+            read_postgres_definition(client, schema, name, kind, signature, relation).await
+        }
+        CatalogSession::Sqlserver(client) => {
+            let current = sqlserver_current_database(client).await?;
+            if database != current {
+                return Err(definition_failure(other_database_message(&current, database)));
+            }
+            read_sqlserver_definition(client, schema, name, kind).await
+        }
         CatalogSession::Redis(_) => Err(definition_failure("Redis 没有对象定义")),
         CatalogSession::Mongo(_) => Err(definition_failure("MongoDB 集合没有 SQL 定义；文档在集合浏览器查看")),
+    }
+}
+
+/// 会话当前库以外的库：只有一个库名，没有错误也不是“读不到”——它的模式与对象
+/// 等到用户展开这个库时按库另读（PostgreSQL 另开临时会话，SQL Server 用三段名）。
+pub(crate) fn unloaded_database(name: &str) -> DatabaseNode {
+    DatabaseNode {
+        name: name.to_owned(),
+        schemas: Vec::new(),
+        error: None,
     }
 }
 
@@ -383,11 +407,7 @@ pub(crate) fn assemble_postgres(names: &[String], current: &str, schemas: Result
                     },
                 }
             } else {
-                DatabaseNode {
-                    name: name.clone(),
-                    schemas: Vec::new(),
-                    error: Some(other_database_message(current, name)),
-                }
+                unloaded_database(name)
             }
         })
         .collect()
@@ -1220,14 +1240,62 @@ fn assemble_sqlserver(names: &[String], current: &str, schemas: Result<Vec<Schem
                     },
                 }
             } else {
-                DatabaseNode {
-                    name: name.clone(),
-                    schemas: Vec::new(),
-                    error: Some(other_database_message(current, name)),
-                }
+                unloaded_database(name)
             }
         })
         .collect()
+}
+
+/// SQL Server 的三段名限定：目录视图与“只在当前库生效”的函数都换成目标库内的写法。
+/// 在同一个会话上读别的库，不发 USE、不改当前库、也不另开连接。
+pub(crate) fn sqlserver_qualified(sql: &str, database: &str) -> String {
+    let database = database.trim();
+    if database.is_empty() {
+        return sql.to_owned();
+    }
+    let name = format!("[{}]", database.replace(']', "]]"));
+    sql.replace("sys.", &format!("{name}.sys."))
+        .replace("information_schema.", &format!("{name}.information_schema."))
+        // OBJECT_NAME 只认当前库；三段名读取时按目标库查父对象名。
+        .replace("OBJECT_NAME(t.parent_id)", &format!("(SELECT name FROM {name}.sys.objects WHERE object_id = t.parent_id)"))
+}
+
+/// 单个库的 schema 清单（不含对象）：库节点展开时按库读一次。
+/// PostgreSQL 的会话必须已经连到目标库（调用方另开临时会话，见 Service::open_ephemeral_postgres）；
+/// SQL Server 在原会话上用三段名读。对象仍按层的分组展开时读取。
+pub async fn read_database_outline(engine: Engine, session: &CatalogSession, database: &str) -> Result<Vec<SchemaNode>, String> {
+    if database.trim().is_empty() {
+        return Err(read_failure("需要数据库名"));
+    }
+    match (engine, session) {
+        (Engine::Postgres, CatalogSession::Postgres(client)) => {
+            let current = current_database(client).await?;
+            if current != database {
+                return Err(read_failure(format!("临时读取会话连到了 {current}，不是 {database}")));
+            }
+            let sql = metadata_sql(Engine::Postgres)
+                .schemas
+                .ok_or_else(|| read_failure("PostgreSQL 缺少 schema 查询"))?;
+            let rows = client.query(sql, &[]).await.map_err(read_failure)?;
+            let mut schemas = Vec::new();
+            for row in &rows {
+                schemas.push(SchemaNode::empty(pg_string(row, 0)?));
+            }
+            Ok(schemas)
+        }
+        (Engine::Sqlserver, CatalogSession::Sqlserver(client)) => {
+            let sql = metadata_sql(Engine::Sqlserver)
+                .schemas
+                .ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
+            let rows = tds_query_rows(client, &sqlserver_qualified(sql, database), &[]).await?;
+            let mut schemas = Vec::new();
+            for row in &rows {
+                schemas.push(SchemaNode::empty(tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?));
+            }
+            Ok(schemas)
+        }
+        _ => Err(read_failure("这个引擎的库层级已经随连接一次读出，不需要按库再读")),
+    }
 }
 
 async fn sqlserver_database_names(client: &TdsHandle) -> Result<(Vec<String>, String), String> {
@@ -1256,7 +1324,7 @@ async fn read_sqlserver(client: &TdsHandle, page: usize, windows: &[ObjectWindow
             for row in &rows {
                 let name = tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?;
                 let limit = requested_limit(&current, &name, windows, page);
-                schemas.push(read_sqlserver_schema(client, &name, 0, limit).await);
+                schemas.push(read_sqlserver_schema(client, &current, &name, 0, limit).await);
             }
             Ok(schemas)
         }
@@ -1284,14 +1352,8 @@ async fn read_sqlserver_outline(client: &TdsHandle) -> Result<Vec<DatabaseNode>,
 }
 
 async fn read_sqlserver_page(client: &TdsHandle, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
-    let current = match sqlserver_current_database(client).await {
-        Ok(name) => name,
-        Err(message) => return empty_page(message),
-    };
-    if database != current {
-        return empty_page(other_database_message(&current, database));
-    }
-    let schema_node = read_sqlserver_schema(client, schema, offset, limit).await;
+    // 别的库同样在这条会话上读：三段名限定目录视图，不发 USE，也不改动当前库。
+    let schema_node = read_sqlserver_schema(client, database, schema, offset, limit).await;
     ObjectPageBody {
         objects: schema_node.objects,
         total: schema_node.total,
@@ -1300,11 +1362,11 @@ async fn read_sqlserver_page(client: &TdsHandle, database: &str, schema: &str, o
     }
 }
 
-async fn read_sqlserver_schema(client: &TdsHandle, schema: &str, offset: usize, limit: usize) -> SchemaNode {
+async fn read_sqlserver_schema(client: &TdsHandle, database: &str, schema: &str, offset: usize, limit: usize) -> SchemaNode {
     let window = offset.saturating_add(limit);
     let mut parts = Vec::new();
     for kind in listed_kinds(Engine::Sqlserver) {
-        parts.push((*kind, read_sqlserver_kind(client, schema, *kind, window).await));
+        parts.push((*kind, read_sqlserver_kind(client, database, schema, *kind, window).await));
     }
     let (objects, total, reports) = finish_kinds(parts, offset, limit);
     SchemaNode {
@@ -1316,17 +1378,17 @@ async fn read_sqlserver_schema(client: &TdsHandle, schema: &str, offset: usize, 
     }
 }
 
-async fn read_sqlserver_kind(client: &TdsHandle, schema: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
-    read_sqlserver_kind_slice(client, schema, kind, 0, window).await
+async fn read_sqlserver_kind(client: &TdsHandle, database: &str, schema: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    read_sqlserver_kind_slice(client, database, schema, kind, 0, window).await
 }
 
-async fn read_sqlserver_kind_slice(client: &TdsHandle, schema: &str, kind: ObjectKind, offset: usize, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+async fn read_sqlserver_kind_slice(client: &TdsHandle, database: &str, schema: &str, kind: ObjectKind, offset: usize, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
     let sql = kind_sql(Engine::Sqlserver, kind);
-    let count_rows = tds_query_rows(client, sql.count, &[&schema]).await?;
+    let count_rows = tds_query_rows(client, &sqlserver_qualified(sql.count, database), &[&schema]).await?;
     let total = tds_i64(count_rows.first().ok_or_else(|| read_failure("没有对象数量"))?, 0).unwrap_or(0) as usize;
     let window_i = i64::try_from(window).unwrap_or(i64::MAX);
     let offset_i = i64::try_from(offset).unwrap_or(i64::MAX);
-    let page_sql = sql.list.replace("OFFSET 0 ROWS", "OFFSET @P3 ROWS");
+    let page_sql = sqlserver_qualified(&sql.list.replace("OFFSET 0 ROWS", "OFFSET @P3 ROWS"), database);
     let rows = tds_query_rows(client, &page_sql, &[&schema, &window_i, &offset_i]).await?;
     let mut objects = Vec::new();
     for row in &rows {
@@ -1437,5 +1499,36 @@ mod latency_fixture_tests {
         assert_eq!(recovered.objects[0].name, "table_000200");
         drop(session);
         pool.disconnect().await.unwrap();
+    }
+}
+#[cfg(test)]
+mod database_scope_tests {
+    use super::*;
+
+    /// 按库读 SQL Server 时，目录视图与只在当前库生效的函数都要换成三段名；
+    /// 空库名（当前库路径）保持原样。
+    #[test]
+    fn sqlserver_sql_is_scoped_with_three_part_names() {
+        let schemas = metadata_sql(Engine::Sqlserver).schemas.unwrap();
+        let scoped = sqlserver_qualified(schemas, "audit");
+        assert!(scoped.contains("[audit].sys.schemas"), "{scoped}");
+        assert!(!scoped.contains("FROM sys.schemas"), "{scoped}");
+
+        let trigger = kind_sql(Engine::Sqlserver, ObjectKind::Trigger).list;
+        let scoped = sqlserver_qualified(trigger, "au]dit");
+        assert!(scoped.contains("[au]]dit].sys.triggers"), "方括号要按 SQL 规则转义：{scoped}");
+        assert!(!scoped.contains("OBJECT_NAME(t.parent_id)"), "父对象名要按目标库查：{scoped}");
+        assert!(scoped.contains("(SELECT name FROM [au]]dit].sys.objects WHERE object_id = t.parent_id)"), "{scoped}");
+
+        assert_eq!(sqlserver_qualified(trigger, "  "), trigger, "当前库不加限定");
+    }
+
+    /// 按库读取必须有库名；不分库的引擎不需要这条路径。
+    #[tokio::test]
+    async fn a_database_scope_read_needs_a_database_on_a_layered_engine() {
+        let missing = read_database_outline(Engine::Postgres, &CatalogSession::Scripted, "  ").await.unwrap_err();
+        assert!(missing.contains("数据库名"), "{missing}");
+        let flat = read_database_outline(Engine::Sqlite, &CatalogSession::Scripted, "main").await.unwrap_err();
+        assert!(flat.contains("不需要按库再读"), "{flat}");
     }
 }

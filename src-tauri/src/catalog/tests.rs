@@ -353,8 +353,9 @@ fn refresh_keeps_the_loaded_window_and_a_failed_list_is_not_empty() {
         "app",
         Ok(vec![schema("public", vec![row("orders")])]),
     );
+    // 当前会话以外的库：只有库名，不是错误状态；展开时按库再读。
     let other = nodes.iter().find(|item| item.name == "other").unwrap();
-    assert!(other.error.as_deref().unwrap().contains("没有另开连接"));
+    assert!(other.error.is_none(), "别的库不是读取失败");
     assert!(other.schemas.is_empty());
     let current = nodes.iter().find(|item| item.name == "app").unwrap();
     assert!(current.error.is_none());

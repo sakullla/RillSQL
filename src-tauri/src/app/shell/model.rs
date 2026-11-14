@@ -1894,6 +1894,22 @@ impl WorkbenchModel {
         }
     }
 
+    /// 库节点按库读取自己的 schema 清单：别的库不随整条连接一次读出。
+    pub fn request_database(&mut self, node_id: &str) {
+        if self.nav.needs_database(node_id) && self.nav.begin_database(node_id) {
+            self.nav_requests.push_back(NavRequest::Database(node_id.to_owned()));
+        }
+    }
+
+    /// 展开一个容器节点后要发的按需读取：库读自己的 schema，分组读自己的对象。
+    pub fn request_lazy_read(&mut self, node_id: &str) {
+        if self.nav.node(node_id).map(|node| node.kind) == Some(NavKind::Database) {
+            self.request_database(node_id);
+        } else {
+            self.request_lazy_group(node_id);
+        }
+    }
+
     pub fn request_nav_details(&mut self, node_id: &str) {
         if self.nav.begin_details(node_id) {
             self.nav_requests.push_back(NavRequest::Details(node_id.to_owned()));
@@ -2022,6 +2038,16 @@ impl WorkbenchModel {
     /// 搜索命中行（完整路径）与普通树行分开渲染。
     pub fn nav_searching(&self) -> bool {
         !self.object_filter.trim().is_empty()
+    }
+
+    /// 会话连着的库（连接默认库）。读别的库要按库另读，不能借用这条会话。
+    pub fn nav_connection_database(&self, connection_id: &str) -> Option<String> {
+        self.connections
+            .rows
+            .iter()
+            .find(|row| row.saved.id == connection_id)
+            .and_then(|row| row.saved.database.clone())
+            .filter(|database| !database.is_empty())
     }
 
     fn nav_environment(&self, connection_id: &str) -> String {
@@ -2468,7 +2494,8 @@ impl WorkbenchModel {
         match action {
             NavAction::None | NavAction::FocusParent => None,
             NavAction::Load(id) => {
-                self.request_lazy_group(&id);
+                // 按节点种类分派：库读自己的 schema 清单，其余容器读自己的对象分组。
+                self.request_lazy_read(&id);
                 // 对象节点按需读列/索引。
                 if self.nav.node(&id).map(|node| node.kind) == Some(NavKind::Object) {
                     self.request_nav_details(&id);
@@ -2591,6 +2618,12 @@ impl WorkbenchModel {
             let has_kind = node.object_kind.is_some();
             match kind {
                 NavKind::Connection => self.request_nav_refresh(Some(connection_id)),
+                // 库读失败后重试：只重读这个库的 schema 清单，连接行和别的库不动。
+                NavKind::Database => {
+                    if self.nav.begin_database(rest) {
+                        self.nav_requests.push_back(NavRequest::Database(rest.to_owned()));
+                    }
+                }
                 NavKind::Object => self.request_nav_details(rest),
                 // 种类分组只在失败的那一类上重试；加载态也只留在这个分组。
                 NavKind::Group if has_kind => {
@@ -2623,7 +2656,7 @@ impl WorkbenchModel {
         if let Some(rest) = id.strip_prefix("nav-toggle:") {
             if self.nav.toggle(rest) && self.nav.is_expanded(rest) {
                 if self.nav.needs_details(rest) { self.request_nav_details(rest); }
-                self.request_lazy_group(rest);
+                self.request_lazy_read(rest);
             }
             self.nav.set_focus(rest);
             self.sync_object_spec_from_focus();

@@ -200,6 +200,8 @@ pub enum NavRequest {
     Refresh { connection: Option<String> },
     /// 按需读取一个对象的列与索引。
     Details(String),
+    /// 按库读取一个库的 schema 清单（会话当前库以外的库展开时）。
+    Database(String),
     /// 继续读取一个库/模式范围的对象。
     More(String),
     /// 只重读一个对象种类分组（局部失败后的重试，或“刷新此节点”）。

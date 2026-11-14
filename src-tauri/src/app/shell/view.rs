@@ -115,6 +115,28 @@ impl Drop for Workbench {
     }
 }
 
+/// 读一个节点所属库的会话。PostgreSQL 的会话只连着自己的库：读别的库时另开一个连到
+/// 那个库的临时会话（和比较页同一条路，读完随返回值一起断开），当前库仍用原会话。
+/// SQL Server 的读取在 catalog::read 里用三段名限定，同一个会话就够，不发 USE。
+async fn nav_read_session(
+    services: &AppServices,
+    engine: Engine,
+    connection_id: &str,
+    database: &str,
+    current: Option<&str>,
+) -> Result<(crate::connections::CatalogSession, Option<crate::connections::EphemeralRead>), String> {
+    if engine == Engine::Postgres && !database.is_empty() && current != Some(database) {
+        let read = services.connections.open_ephemeral_postgres(connection_id, database).await?;
+        let session = read.catalog();
+        return Ok((session, Some(read)));
+    }
+    let session = services
+        .connections
+        .catalog_session(connection_id)
+        .ok_or_else(|| "这条连接还没有打开".to_owned())?;
+    Ok((session, None))
+}
+
 impl Workbench {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = Arc::new(AppServices::from_state(&crate::connections::commands::ConnectionsState::new()));
@@ -987,6 +1009,7 @@ impl Workbench {
         while let Some(request) = self.model.take_nav_request() {
             match request {
                 super::nav::NavRequest::Refresh { connection } => self.spawn_nav_refresh(connection, cx),
+                super::nav::NavRequest::Database(id) => self.spawn_nav_database(id, cx),
                 super::nav::NavRequest::Details(id) => self.spawn_nav_details(id, cx),
                 super::nav::NavRequest::More(id) => self.spawn_nav_more(id, cx),
                 super::nav::NavRequest::Group(id) => self.spawn_nav_group(id, cx),
@@ -1005,15 +1028,19 @@ impl Workbench {
         let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
-                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned()), Vec::new()));
-                return;
+            let body = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page)).await
+                        .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
+                    drop(held);
+                    body
+                }
+                Err(message) => crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(message), kind_reports: Vec::new() },
             };
-            let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page)).await
-                .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
             // 按种类的失败一并带回：失败的种类不能当成“整类都被删了”。
             let _ = tx.send((body.objects, body.total, body.error, body.kind_reports));
         }, abort));
@@ -1229,7 +1256,7 @@ impl Workbench {
                                 this.model.nav_loading = pending;
                                 let expanded: Vec<_> = this.model.nav_rows().into_iter()
                                     .filter(|row| row.expanded).map(|row| row.id).collect();
-                                for id in expanded { this.model.request_lazy_group(&id); }
+                                for id in expanded { this.model.request_lazy_read(&id); }
                                 this.sync_navigation_index(cx);
                             }
                             NavigationEvent::Finished(_ids) => {
@@ -1273,6 +1300,47 @@ impl Workbench {
         self.query.update(cx, |pane, cx| pane.adopt_navigation(&self.model.nav_source, objects, cx));
     }
 
+    /// 库节点展开：读这个库的 schema 清单。加载态已由模型标在这个库上。
+    fn spawn_nav_database(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        let (abort, cancelled) = self.track_nav_read(&node);
+        let revision = self.nav_revision.get(&node.connection_id).copied();
+        let connection_id = node.connection_id.clone();
+        let gate = Arc::clone(&self.nav_gate);
+        let services = Arc::clone(&self.services);
+        let current = self.model.nav_connection_database(&node.connection_id);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
+            let result = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let schemas = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_database_outline(node.engine, &session, &node.database)).await;
+                    drop(held);
+                    schemas.unwrap_or_else(Err)
+                }
+                Err(message) => Err(message),
+            };
+            let _ = tx.send(result);
+        }, abort));
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    this.nav_reads.remove(&node_id);
+                    match result {
+                        Ok(schemas) => { this.model.nav.set_database(&node_id, schemas); }
+                        Err(_) => { this.model.nav.set_database(&node_id, Err("读取库失败".to_owned())); }
+                    }
+                    this.sync_navigation_index(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn spawn_nav_details(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
         let (abort, cancelled) = self.track_nav_read(&node);
@@ -1280,15 +1348,19 @@ impl Workbench {
         let connection_id = node.connection_id.clone();
         let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
+        let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
-                let _ = tx.send((Err("这条连接还没有打开".to_owned()), Err("这条连接还没有打开".to_owned())));
-                return;
+            let result = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let pair = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_details(&session, node.engine, &node.database, &node.schema, &node.name)).await
+                        .unwrap_or_else(|error| (Err(error.clone()), Err(error)));
+                    drop(held);
+                    pair
+                }
+                Err(message) => (Err(message.clone()), Err(message)),
             };
-            let result = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_details(&session, node.engine, &node.database, &node.schema, &node.name)).await
-                .unwrap_or_else(|error| (Err(error.clone()), Err(error)));
             let _ = tx.send(result);
         }, abort));
         cx.spawn(async move |_, cx| {
@@ -1330,15 +1402,19 @@ impl Workbench {
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
         let offset = node.loaded;
+        let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
-                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned())));
-                return;
+            let body = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, offset, page)).await
+                        .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
+                    drop(held);
+                    body
+                }
+                Err(message) => crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(message), kind_reports: Vec::new() },
             };
-            let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, offset, page)).await
-                .unwrap_or_else(|error| crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some(error), kind_reports: Vec::new() });
             let _ = tx.send((body.objects, body.total, body.error));
         }, abort));
         cx.spawn(async move |_, cx| {
@@ -1381,15 +1457,18 @@ impl Workbench {
         let services = Arc::clone(&self.services);
         let gate = Arc::clone(&self.nav_gate);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let result = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, async {
-                match services.connections.catalog_session(&node.connection_id) {
-                    Some(session) => crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, offset, page).await,
-                    None => crate::catalog::read::ObjectPageBody { objects: Vec::new(), total: 0, error: Some("这条连接还没有打开".to_owned()), kind_reports: Vec::new() },
+            let result = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, offset, page)).await;
+                    drop(held);
+                    body
                 }
-            }).await;
+                Err(message) => Err(message),
+            };
             let _ = tx.send(result);
         }, abort));
         cx.spawn(async move |_, cx| {

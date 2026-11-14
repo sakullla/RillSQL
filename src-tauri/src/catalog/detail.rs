@@ -439,8 +439,18 @@ pub async fn read_table_comment(session: &CatalogSession, engine: Engine, databa
     Ok(comments_from_rows(&rows).into_iter().next().map(|(_, comment)| comment))
 }
 
-/// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；
-/// 两者都不碰同级的其它节点。
+/// SQL Server 的列/索引/主键查询里既有目录视图也有只在当前库生效的函数：
+/// 读非当前库时按目标库三段名限定，同一条会话、不发 USE。
+fn scoped_sql(engine: Engine, database: &str, sql: &str) -> String {
+    if engine == Engine::Sqlserver {
+        crate::catalog::read::sqlserver_qualified(sql, database)
+    } else {
+        sql.to_owned()
+    }
+}
+
+/// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；两者都不碰同级的其它节点。
+/// database 是节点自己的库：SQL Server 用它限定三段名；PostgreSQL 非当前库要用连到该库的会话。
 pub async fn read_object_details(
     session: &CatalogSession,
     engine: Engine,
@@ -450,10 +460,11 @@ pub async fn read_object_details(
 ) -> (Result<Vec<ColumnInfo>, String>, Result<Vec<IndexInfo>, String>) {
     let columns = match columns_sql(engine, database, schema, table) {
         None => Err("这个引擎没有列清单".to_owned()),
-        Some(sql) => match rows_for(session, &sql).await {
+        Some(sql) => match rows_for(session, &scoped_sql(engine, database, &sql)).await {
             Ok(rows) => {
                 let mut items = columns_from_rows(engine, &rows);
                 if let Some(pk_sql) = primary_key_sql(engine, database, schema, table) {
+                    let pk_sql = scoped_sql(engine, database, &pk_sql);
                     // 主键读不到不算列失败：列已经读到了，只是没有主键标记。
                     if let Ok(pk_rows) = rows_for(session, &pk_sql).await {
                         apply_primary_key(&mut items, &pk_rows);
@@ -466,7 +477,7 @@ pub async fn read_object_details(
     };
     let indexes = match indexes_sql(engine, database, schema, table) {
         None => Err("这个引擎没有索引清单".to_owned()),
-        Some(sql) => match rows_for(session, &sql).await {
+        Some(sql) => match rows_for(session, &scoped_sql(engine, database, &sql)).await {
             Ok(rows) => {
                 let mut items = indexes_from_rows(engine, &rows);
                 if engine == Engine::Sqlite {

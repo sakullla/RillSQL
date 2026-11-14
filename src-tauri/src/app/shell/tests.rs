@@ -6005,6 +6005,65 @@ fn a_connection_refresh_ignores_errors_on_databases_the_tree_does_not_show() {
     }
 }
 
+/// 会话当前库以外的库：展开这一行按库读一次，先有加载态，成功后按层出现模式、分组与对象；
+/// 失败只在这个库上留原因，重试从同一个库再读；当前库的树不受影响。
+#[test]
+fn a_database_outside_the_current_session_reads_on_expand_and_keeps_its_own_error() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow, SchemaNode};
+
+    let mut pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![nav_database("shop", vec![ObjectRow::table("orders", Some(2))])],
+    );
+    pg.outline_only = true;
+    let mut audit = nav_database("audit", Vec::new());
+    audit.schemas.clear();
+    pg.databases.push(audit);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let connection = connection_node_id("pg");
+    let shop = database_node_id("pg", "shop");
+    let audit = database_node_id("pg", "audit");
+    expand_all(&mut model, &[connection.clone(), shop.clone()]);
+    assert!(model.take_nav_request().is_none(), "当前库随连接一次读出，展开不再发读取");
+    assert!(model.nav.node(&audit).is_some(), "别的库在树上是可展开的库行");
+
+    // 展开别的库：排队一次按库读取，行上先出现加载态。
+    expand_all(&mut model, std::slice::from_ref(&audit));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Database(audit.clone())));
+    let row = model.nav_rows().into_iter().find(|row| row.id == audit).unwrap();
+    assert!(row.loading, "库行渲染加载指示");
+    assert!(row.error.is_none());
+
+    // 失败：原因只在这个库上；重试从同一个库再读，连接行与当前库不动。
+    model.nav.set_database(&audit, Err("读取库表失败：permission denied".to_owned()));
+    let node = model.nav.node(&audit).unwrap();
+    assert_eq!(node.error.as_deref(), Some("读取库表失败：permission denied"));
+    assert!(!node.loading);
+    assert!(model.nav.node(&connection).unwrap().error.is_none());
+    assert!(model.nav.node(&shop).unwrap().error.is_none());
+    let _ = model.dispatch(&format!("nav-retry:{audit}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Database(audit.clone())));
+    assert!(model.nav.node(&audit).unwrap().loading);
+    assert!(model.nav.node(&audit).unwrap().error.is_none(), "重试先清掉上一次的原因");
+
+    // 成功：出现模式与未读的对象种类分组，对象仍按分组按需读。
+    model.nav.set_database(&audit, Ok(vec![SchemaNode::empty("public")]));
+    assert!(model.nav.node(&audit).unwrap().error.is_none());
+    let schema = schema_node_id("pg", "audit", "public");
+    assert!(model.nav_rows().iter().any(|row| row.id == schema), "按库读回的 schema 出现在树下");
+    let tables = group_node_id("pg", "audit", "public", ObjectKind::Table);
+    expand_all(&mut model, &[schema, tables.clone()]);
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Group(tables.clone())));
+    let login = ObjectRow::table("login", Some(1));
+    model.nav.set_kind_page(&tables, std::slice::from_ref(&login), 1, None);
+    assert!(model.nav.node(&nav_id("pg", "audit", "public", &login)).is_some());
+}
+
 /// 危险操作：生产（按 tone，自建标签也算）要输对名字；第一次点执行只待确认；取消不发语句；
 /// 失败保留树并显示原因；迟到的旧结果被丢弃。
 #[test]

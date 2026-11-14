@@ -491,6 +491,8 @@ impl NavTree {
             node.name = database.name.clone();
             node.error = database.error.clone();
             node.expandable = database.error.is_none();
+            // 会话当前库以外的库只带回来一个库名：模式与对象等展开这一行时按库读一次。
+            node.unloaded = node.expandable && connection.engine.shows_schemas() && database.schemas.is_empty();
             self.attach(root_id, node);
             if database.error.is_some() {
                 continue;
@@ -777,6 +779,63 @@ impl NavTree {
         node.loading = true;
         node.error = None;
         true
+    }
+
+    /// 库节点是否需要按库读一次 schema 清单（会话当前库以外的库）。
+    pub fn needs_database(&self, id: &str) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            node.kind == NavKind::Database && node.unloaded && !node.loading && node.error.is_none()
+        })
+    }
+
+    /// 库节点开始按库读取：加载态只落在这个库上。
+    pub fn begin_database(&mut self, id: &str) -> bool {
+        let Some(node) = self.nodes.get_mut(id) else { return false };
+        if node.kind != NavKind::Database || node.loading {
+            return false;
+        }
+        node.loading = true;
+        node.error = None;
+        true
+    }
+
+    /// 按库读到的 schema 清单：成功补上这个库的 schema 子节点（它们仍按层读对象），
+    /// 失败只在这个库节点上留原因，别的库和连接行都不动。
+    pub fn set_database(&mut self, database_id: &str, schemas: Result<Vec<SchemaNode>, String>) -> bool {
+        let Some(node) = self.nodes.get(database_id).cloned() else { return false };
+        if node.kind != NavKind::Database {
+            return false;
+        }
+        let items = match schemas {
+            Ok(items) => items,
+            Err(message) => {
+                if let Some(node) = self.nodes.get_mut(database_id) {
+                    node.loading = false;
+                    node.error = Some(message);
+                }
+                return false;
+            }
+        };
+        let mut connection = NavConnection::new(
+            node.connection_id.clone(),
+            node.connection_name.clone(),
+            node.engine,
+            ConnStatus::Connected,
+        );
+        // 按库读取只给「库 → 模式 → 种类分组」这一层：对象仍按分组分页按需读。
+        connection.outline_only = node.engine.shows_schemas();
+        let previous = BTreeMap::new();
+        for schema in &items {
+            self.push_schema(&connection, database_id, &node.database, schema, &previous);
+        }
+        if let Some(node) = self.nodes.get_mut(database_id) {
+            node.loading = false;
+            node.error = None;
+            node.unloaded = false;
+            node.total = items.len();
+            node.loaded = node.children.len();
+        }
+        !items.is_empty()
     }
 
     /// 列/索引读取结果。失败时只在这个对象节点上留原因，兄弟节点不动。
@@ -1655,6 +1714,83 @@ mod tests {
         tree.visible().into_iter().map(|row| (row.kind, row.label)).collect()
     }
 
+    /// 会话当前库以外的库只带回来一个库名（没有错误、没有模式）：展开这一行时按库读，
+    /// 先显示加载态，再按层出现模式/分组/对象。
+    #[test]
+    fn a_non_current_database_loads_layer_by_layer_with_a_loading_state() {
+        let mut pg = connection(
+            Engine::Postgres,
+            vec![
+                database("shop", vec![schema("public", vec![table("orders")])]),
+                database("audit", Vec::new()),
+            ],
+        );
+        pg.outline_only = true;
+        let mut tree = NavTree::new();
+        tree.apply(&[pg]);
+        let conn_id = connection_node_id("conn-postgres");
+        tree.expand(&conn_id);
+        let current = database_node_id("conn-postgres", "shop");
+        let other = database_node_id("conn-postgres", "audit");
+        let other_node = tree.node(&other).unwrap();
+        assert!(other_node.error.is_none(), "别的库不是错误状态");
+        assert!(other_node.expandable, "别的库可以展开");
+        assert!(other_node.unloaded, "别的库标成还没读");
+        assert!(!tree.needs_database(&current), "当前库随连接一次读出，不需要再读");
+        assert!(tree.needs_database(&other));
+
+        // 展开：先显示加载态。
+        tree.expand(&other);
+        assert!(tree.begin_database(&other));
+        assert!(tree.node(&other).unwrap().loading);
+        assert!(!tree.needs_database(&other), "在途读取不重复发请求");
+        assert!(!tree.begin_database(&other));
+        let row = tree.visible().into_iter().find(|row| row.id == other).unwrap();
+        assert!(row.loading, "库行渲染加载指示");
+
+        // 读回 schema：出现模式与（未读的）对象种类分组。
+        tree.set_database(&other, Ok(vec![SchemaNode::empty("public")]));
+        let node = tree.node(&other).unwrap();
+        assert!(!node.loading && node.error.is_none() && !node.unloaded);
+        let schema_id = schema_node_id("conn-postgres", "audit", "public");
+        assert!(tree.node(&schema_id).is_some(), "按库读回的 schema 出现在树下");
+        let group = group_node_id("conn-postgres", "audit", "public", ObjectKind::Table);
+        assert!(tree.needs_group(&group), "对象仍按种类分页按需读");
+        tree.begin_group(&group);
+        tree.set_kind_page(&group, &[table("login")], 1, None);
+        let login = object_node_id("conn-postgres", "audit", "public", &table("login"));
+        assert!(tree.node(&login).is_some(), "按种类读回的对象挂在这个分组下");
+        tree.expand(&schema_id);
+        tree.expand(&group);
+        assert!(tree.visible().iter().any(|row| row.id == login));
+        // 当前库的树没被这次按库读取改动。
+        assert!(tree.node(&schema_node_id("conn-postgres", "shop", "public")).is_some(), "当前库的模式不受影响");
+    }
+
+    /// 按库读取失败只在这个库上留原因；重试从同一个库再读，成功后清掉原因。
+    #[test]
+    fn a_failed_database_read_keeps_the_reason_on_that_database_only() {
+        let mut pg = connection(Engine::Postgres, vec![database("audit", Vec::new())]);
+        pg.outline_only = true;
+        let mut tree = NavTree::new();
+        tree.apply(&[pg]);
+        tree.expand(&connection_node_id("conn-postgres"));
+        let other = database_node_id("conn-postgres", "audit");
+        tree.begin_database(&other);
+        tree.set_database(&other, Err("读取库表失败：permission denied".to_owned()));
+        let node = tree.node(&other).unwrap();
+        assert!(!node.loading);
+        assert_eq!(node.error.as_deref(), Some("读取库表失败：permission denied"));
+        assert!(node.unloaded, "失败后仍可按库重试");
+        assert!(!tree.needs_database(&other), "带原因的库走重试入口而不是自动重读");
+        assert!(tree.node(&connection_node_id("conn-postgres")).unwrap().error.is_none());
+
+        assert!(tree.begin_database(&other));
+        assert!(tree.node(&other).unwrap().error.is_none());
+        tree.set_database(&other, Ok(vec![SchemaNode::empty("public")]));
+        assert!(tree.node(&other).unwrap().error.is_none());
+        assert!(!tree.node(&other).unwrap().unloaded);
+    }
     #[test]
     fn progressive_connections_preserve_other_inflight_and_loaded_groups() {
         let mut first = NavConnection::new("first", "First", Engine::Mysql, ConnStatus::Connected);
