@@ -354,6 +354,30 @@ pub struct FilterDraft {
     pub dirty: bool,
 }
 
+/// 一个矩形选区（行起、列起、行止、列止），始终归一化成 起 <= 止。
+pub type Rect = (usize, usize, usize, usize);
+
+fn rect_of(a: (usize, usize), b: (usize, usize)) -> Rect {
+    (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+}
+
+fn rect_has(rect: Rect, row: usize, column: usize) -> bool {
+    row >= rect.0 && row <= rect.2 && column >= rect.1 && column <= rect.3
+}
+
+fn overlaps(left: Rect, right: Rect) -> bool {
+    left.0 <= right.2 && right.0 <= left.2 && left.1 <= right.3 && right.1 <= left.3
+}
+
+/// 正在用 Ctrl/Cmd 拖出来的区域：按下时就知道这一拖是加还是减，松开才落定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionDrag {
+    anchor: (usize, usize),
+    subtract: bool,
+    /// 减选时要跟着指针改写的 minus 下标；加选时为 None，主矩形本身就是那一块。
+    slot: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableProof {
     pub schema: Option<String>,
@@ -394,6 +418,13 @@ pub struct SharedGrid {
     anchor_id: String,
     focus_id: String,
     selected: bool,
+    /// 选区的全部矩形：普通单击/拖选只有一块，Ctrl/Cmd 加选会往后面追加区域。
+    /// 这块表是选择的唯一来源，高亮、复制、统计和批量动作都从它算起。
+    regions: Vec<Rect>,
+    /// 被 Ctrl/Cmd 从选择里减掉的矩形；加色区域减去这里才是真正的选区。
+    minus: Vec<Rect>,
+    /// 正在用 Ctrl/Cmd 拖选的区域：按下时已经决定这一拖是加还是减，松开时才落定。
+    region_drag: Option<RegionDrag>,
     /// 完整值查看同样记住行 id + 列名，滚动、重排或改变列顺序后仍指向原来那一格。
     viewer: Option<ViewerState>,
     /// 按 (行 id, 列名) 缓存的完整原值：查看、复制、编辑、导出和 WHERE 共用同一次读取。
@@ -469,6 +500,9 @@ impl SharedGrid {
             anchor_id: String::new(),
             focus_id: String::new(),
             selected: false,
+            regions: Vec::new(),
+            minus: Vec::new(),
+            region_drag: None,
             viewer: None,
             full: HashMap::new(),
             keys: Vec::new(),
@@ -1329,6 +1363,9 @@ impl SharedGrid {
         self.selected = false;
         self.anchor_id.clear();
         self.focus_id.clear();
+        self.regions.clear();
+        self.minus.clear();
+        self.region_drag = None;
     }
 
     pub fn column_width(&self, index: usize) -> f32 {
@@ -1352,10 +1389,20 @@ impl SharedGrid {
         }
         let row = row.min(self.rows.len() - 1);
         let column = column.min(self.columns.len() - 1);
-        if !extend || !self.selected {
+        if !extend || !self.selected || self.regions.is_empty() {
             self.anchor = (row, column);
             self.anchor_id = self.rows[row].id.clone();
+            self.regions.clear();
+            self.regions.push((row, column, row, column));
+            self.minus.clear();
+        } else {
+            // Shift 扩展改的是最后一块区域；Ctrl/Cmd 加进来其它区域保持不动。
+            let rect = rect_of(self.anchor, (row, column));
+            let last = self.regions.len() - 1;
+            self.regions[last] = rect;
+            self.minus.clear();
         }
+        self.region_drag = None;
         self.focus = (row, column);
         self.focus_id = self.rows[row].id.clone();
         self.selected = true;
@@ -1370,6 +1417,10 @@ impl SharedGrid {
         self.anchor_id = self.rows[0].id.clone();
         self.focus = (self.rows.len() - 1, self.columns.len() - 1);
         self.focus_id = self.rows[self.rows.len() - 1].id.clone();
+        self.regions.clear();
+        self.regions.push((0, 0, self.rows.len() - 1, self.columns.len() - 1));
+        self.minus.clear();
+        self.region_drag = None;
         self.selected = true;
     }
 
@@ -1390,20 +1441,25 @@ impl SharedGrid {
         self.rows.iter().position(|row| row.id == row_id)
     }
 
-    /// 选择的矩形边界（行起、列起、行止、列止）。鼠标、Shift、Ctrl/Cmd、拖选和
-    /// 键盘扩展都写同一组 anchor/focus，因此高亮、复制和统计看到的是同一个矩形。
+    /// 选区的整体边界（行起、列起、行止、列止）。非连续选择取全部区域的包围盒；
+    /// 逐格的判据是 selection_regions + selection_holes，这里是给"整行/整列"判断用的摘要。
     pub fn selection_bounds(&self) -> Option<(usize, usize, usize, usize)> {
         if !self.selected || self.rows.is_empty() || self.columns.is_empty() {
             return None;
         }
-        let (row_a, col_a) = self.anchor;
-        let (row_b, col_b) = self.focus;
-        Some((
-            row_a.min(row_b).min(self.rows.len() - 1),
-            col_a.min(col_b).min(self.columns.len() - 1),
-            row_a.max(row_b).min(self.rows.len() - 1),
-            col_a.max(col_b).min(self.columns.len() - 1),
-        ))
+        let mut bounds: Option<Rect> = None;
+        for rect in self.regions.iter().copied() {
+            bounds = Some(match bounds {
+                Some(current) => (
+                    current.0.min(rect.0).min(self.rows.len() - 1),
+                    current.1.min(rect.1).min(self.columns.len() - 1),
+                    current.2.max(rect.2).min(self.rows.len() - 1),
+                    current.3.max(rect.3).min(self.columns.len() - 1),
+                ),
+                None => (rect.0.min(self.rows.len() - 1), rect.1.min(self.columns.len() - 1), rect.2.min(self.rows.len() - 1), rect.3.min(self.columns.len() - 1)),
+            });
+        }
+        bounds
     }
 
     /// 选择锚点与焦点各自对应的稳定行 id；滚动、排序、筛选和翻页后仍是同两行。
@@ -1414,17 +1470,116 @@ impl SharedGrid {
         Some((self.anchor_id.as_str(), self.focus_id.as_str()))
     }
 
+    /// 选中的格子数：非连续选择把各区域并起来再减掉洞，不是包围盒的面积。
     pub fn selection_count(&self) -> usize {
-        match self.selection_bounds() {
-            Some((row_start, column_start, row_end, column_end)) => {
-                (row_end - row_start + 1) * (column_end - column_start + 1)
-            }
-            None => 0,
-        }
+        self.selection().len()
     }
 
     pub fn selection_within_loaded(&self) -> bool {
         self.selection().iter().all(|(row, column)| *row < self.rows.len() && *column < self.columns.len())
+    }
+
+    /// Ctrl/Cmd 单击：已选中的格子从选择里减掉，没选中的加成一块新区域。
+    /// 拖选时从按下这一格开始扩成矩形，松开才落定（见 toggle_drag）。
+    pub fn toggle_press(&mut self, row: usize, column: usize) {
+        if self.rows.is_empty() || self.columns.is_empty() {
+            self.clear_selection();
+            return;
+        }
+        let row = row.min(self.rows.len() - 1);
+        let column = column.min(self.columns.len() - 1);
+        let already = self.is_selected(row, column);
+        self.anchor = (row, column);
+        self.anchor_id = self.rows[row].id.clone();
+        self.focus = (row, column);
+        self.focus_id = self.rows[row].id.clone();
+        self.selected = true;
+        if already {
+            // 减选：这一格先挖掉，拖动时把洞扩成矩形。
+            self.minus.push((row, column, row, column));
+            let slot = self.minus.len() - 1;
+            self.region_drag = Some(RegionDrag { anchor: (row, column), subtract: true, slot: Some(slot) });
+        } else {
+            self.regions.push((row, column, row, column));
+            let slot = self.regions.len() - 1;
+            self.region_drag = Some(RegionDrag { anchor: (row, column), subtract: false, slot: Some(slot) });
+        }
+    }
+
+    /// Ctrl/Cmd 拖过另一格：把按下时那一块区域换成从按下格到当前格的矩形；
+    /// 减选时改的是洞，原来的区域保持不动。
+    pub fn toggle_drag(&mut self, row: usize, column: usize) {
+        let Some(drag) = self.region_drag else {
+            return;
+        };
+        if self.rows.is_empty() || self.columns.is_empty() {
+            return;
+        }
+        let row = row.min(self.rows.len() - 1);
+        let column = column.min(self.columns.len() - 1);
+        let rect = rect_of(drag.anchor, (row, column));
+        if drag.subtract {
+            if let Some(slot) = drag.slot {
+                self.minus[slot] = rect;
+            }
+        } else if let Some(slot) = drag.slot {
+            self.regions[slot] = rect;
+        }
+        self.focus = (row, column);
+        self.focus_id = self.rows[row].id.clone();
+    }
+
+    /// 松开左键：这一段拖选结束了。整块被洞盖住的区域直接收掉，不留空区域。
+    pub fn finish_region(&mut self) {
+        self.region_drag = None;
+        let holes = self.minus.clone();
+        self.regions.retain(|rect| !holes.iter().any(|hole| hole == rect));
+        if self.regions.is_empty() {
+            self.minus.clear();
+            self.selected = false;
+            self.anchor_id.clear();
+            self.focus_id.clear();
+        } else {
+            let regions = self.regions.clone();
+            // 洞只在还和某块区域相交时才有意义。
+            self.minus.retain(|hole| regions.iter().any(|rect| overlaps(*rect, *hole)));
+        }
+    }
+
+    /// 这一格现在算不算选中：落在任何区域里、并且没有被减选的洞挖掉。
+    pub fn is_selected(&self, row: usize, column: usize) -> bool {
+        if !self.selected {
+            return false;
+        }
+        let hit = self.regions.iter().any(|rect| rect_has(*rect, row, column));
+        hit && !self.minus.iter().any(|hole| rect_has(*hole, row, column))
+    }
+
+    /// 选择的全部矩形（Ctrl/Cmd 加进来的区域也在内）。高亮按它逐格判断，
+    /// 和复制、统计、批量动作读的是同一份。
+    pub fn selection_regions(&self) -> Vec<Rect> {
+        if !self.selected {
+            return Vec::new();
+        }
+        self.regions.clone()
+    }
+
+    /// 减选的洞：这些矩形里的格子即使落在区域里也不算选中。
+    pub fn selection_holes(&self) -> Vec<Rect> {
+        if !self.selected {
+            return Vec::new();
+        }
+        self.minus.clone()
+    }
+
+    /// 选区是不是由多块区域拼起来的（Ctrl/Cmd 加选过）。
+    pub fn has_extra_regions(&self) -> bool {
+        self.selected && self.regions.len() > 1
+    }
+
+    /// 有没有真的选中格子。工具条每帧都问，所以只看区域表，不展开成格子。
+    pub fn has_selection(&self) -> bool {
+        self.selected && !self.regions.is_empty()
     }
 
     pub fn move_key(&mut self, key: &str, extend: bool) {
@@ -1510,14 +1665,39 @@ impl SharedGrid {
         self.clamp_scroll();
     }
 
-    /// TSV 复制：数据库 NULL 写成不带引号的 NULL，字符串 "NULL" 写成带引号的 "NULL"，
-    /// 空字符串保持空字段；制表符、换行和引号按 TSV 规则转义。
+    /// 选区按块拼成的 TSV 正文（不含表头）：数据库 NULL 写成不带引号的 NULL，
+    /// 字符串 "NULL" 写成带引号的 "NULL"，空字符串保持空字段；制表符、换行和引号按 TSV 规则转义。
+    /// 非连续选择里没选中的格子留空，行内从最小列排到最大列。
     pub fn tsv(&self) -> String {
         let points = self.selection();
         if self.missing_full(&points) {
             return String::new();
         }
         self.tsv_grid(&points)
+    }
+
+    /// 复制到剪贴板的文本：单格复制值本身，多格复制含表头的 TSV。
+    /// 多格式复制（grid-copy-as-*）仍然各写各的格式，长值和二进制的原值保护照旧。
+    pub fn copy_text(&self) -> String {
+        let Some((rows, column_start, column_end)) = self.selection_block() else {
+            return String::new();
+        };
+        let points = self.selection();
+        if self.missing_full(&points) {
+            return String::new();
+        }
+        if rows.len() == 1 && column_start == column_end {
+            return self.tsv_field(rows[0], column_start);
+        }
+        format!("{}\n{}", self.header_tsv(column_start, column_end), self.tsv_grid(&points))
+    }
+
+    /// 复制块的表头：列名按逻辑列顺序，和正文同一套 TSV 转义。
+    fn header_tsv(&self, column_start: usize, column_end: usize) -> String {
+        (column_start..=column_end.min(self.columns.len().saturating_sub(1)))
+            .filter_map(|column| self.columns.get(column).map(|item| quote_tsv(&item.name, false)))
+            .collect::<Vec<_>>()
+            .join("\t")
     }
 
     /// SQL 值复制：按目标引擎写成字面量，NULL 与 'NULL' 在文本上也可区分。
@@ -1534,16 +1714,28 @@ impl SharedGrid {
         if points.is_empty() {
             return String::new();
         }
-        let mut lines: Vec<Vec<String>> = Vec::new();
+        // 块按整段列范围对齐：非连续选择里没选中的格子留空字段，每行宽度一致。
+        let column_start = points.iter().map(|(_, column)| *column).min().unwrap_or(0);
+        let column_end = points.iter().map(|(_, column)| *column).max().unwrap_or(0);
+        let width = column_end.saturating_sub(column_start) + 1;
+        let finish = |line: Vec<Option<String>>| line.into_iter().map(|field| field.unwrap_or_default()).collect::<Vec<_>>().join("\t");
+        let mut lines: Vec<String> = Vec::new();
+        let mut line: Vec<Option<String>> = vec![None; width];
         let mut current = usize::MAX;
         for (row, column) in points.iter().copied() {
             if row != current {
-                lines.push(Vec::new());
+                if current != usize::MAX {
+                    lines.push(finish(line));
+                }
+                line = vec![None; width];
                 current = row;
             }
-            lines.last_mut().expect("line").push(self.tsv_field(row, column));
+            if let Some(slot) = line.get_mut(column.saturating_sub(column_start)) {
+                *slot = Some(self.tsv_field(row, column));
+            }
         }
-        lines.into_iter().map(|line| line.join("\t")).collect::<Vec<_>>().join("\n")
+        lines.push(finish(line));
+        lines.join("\n")
     }
 
     fn sql_grid(&self, points: &[(usize, usize)]) -> String {
@@ -2851,8 +3043,16 @@ impl SharedGrid {
         if !self.selected {
             self.anchor_id.clear();
             self.focus_id.clear();
+            self.regions.clear();
+            self.minus.clear();
+            self.region_drag = None;
             return;
         }
+        // 区域和洞按显示行号记：重排、筛选换行后行号已经不是同一批人，
+        // 无法按行身份还原，收拢成主矩形。主矩形按 id 重新定位。
+        self.regions.truncate(1);
+        self.minus.clear();
+        self.region_drag = None;
         let anchor = self.row_index(&self.anchor_id);
         let focus = self.row_index(&self.focus_id);
         match (anchor, focus) {
@@ -2872,6 +3072,7 @@ impl SharedGrid {
         let last_column = self.columns.len().saturating_sub(1);
         self.anchor.1 = self.anchor.1.min(last_column);
         self.focus.1 = self.focus.1.min(last_column);
+        self.regions = vec![rect_of(self.anchor, self.focus)];
     }
 
     fn clamp_scroll(&mut self) {
@@ -2883,24 +3084,42 @@ impl SharedGrid {
         self.scroll = self.scroll.min(max);
     }
 
+    /// 选择展开成显示行列：各区域并起来、去掉减选的洞，按行优先排序。
+    /// 复制、WHERE、批量动作和统计都读它，因此非连续选择在任何入口都是同一组格子。
     fn selection(&self) -> Vec<(usize, usize)> {
         if !self.selected || self.rows.is_empty() || self.columns.is_empty() {
             return Vec::new();
         }
-        let (row_a, col_a) = self.anchor;
-        let (row_b, col_b) = self.focus;
-        let mut points = Vec::new();
-        for row in row_a.min(row_b)..=row_a.max(row_b) {
-            if row >= self.rows.len() {
-                continue;
-            }
-            for column in col_a.min(col_b)..=col_a.max(col_b) {
-                if column < self.columns.len() {
-                    points.push((row, column));
+        let mut points: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (row_start, column_start, row_end, column_end) in self.regions.iter().copied() {
+            for row in row_start..=row_end.min(self.rows.len() - 1) {
+                for column in column_start..=column_end.min(self.columns.len() - 1) {
+                    if !self.minus.iter().any(|hole| rect_has(*hole, row, column)) {
+                        points.insert((row, column));
+                    }
                 }
             }
         }
-        points
+        points.into_iter().collect()
+    }
+
+    /// 选区的复制块：参与的行（升序）、最小列、最大列。表头、TSV 和导出都按这个块对齐，
+    /// 非连续选择里没选中的格子留空，块因此始终是矩形的。
+    pub fn selection_block(&self) -> Option<(Vec<usize>, usize, usize)> {
+        let points = self.selection();
+        let first = *points.first()?;
+        let mut rows: Vec<usize> = Vec::new();
+        let mut last = usize::MAX;
+        let (mut column_start, mut column_end) = (first.1, first.1);
+        for (row, column) in points.iter().copied() {
+            if row != last {
+                rows.push(row);
+                last = row;
+            }
+            column_start = column_start.min(column);
+            column_end = column_end.max(column);
+        }
+        Some((rows, column_start, column_end))
     }
 
     /// 行内当前值（含暂存修改），按显示位置读取；越界返回 None。
@@ -3185,6 +3404,12 @@ impl SharedGrid {
         if self.column_hidden(self.anchor.1) {
             self.anchor.1 = nearest(self.anchor.1);
         }
+        // 区域的列号也一起挪；挪不动的收拢成主矩形，免得高亮落在被藏起来的列上。
+        if !self.regions.is_empty() {
+            self.regions = vec![rect_of(self.anchor, self.focus)];
+            self.minus.clear();
+            self.region_drag = None;
+        }
     }
 }
 
@@ -3192,7 +3417,7 @@ impl SharedGrid {
 /// 和普通复制一样先要原值，预览信封绝不进剪贴板。
 impl SharedGrid {
     pub fn copy_as(&self, format: CopyFormat) -> Result<CopiedText, CopyBlock> {
-        let Some((row_start, column_start, row_end, column_end)) = self.selection_bounds() else {
+        let Some((block_rows, column_start, column_end)) = self.selection_block() else {
             return Err(CopyBlock::Empty);
         };
         let points = self.selection();
@@ -3204,8 +3429,16 @@ impl SharedGrid {
         }
         let columns: Vec<usize> = (column_start..=column_end).collect();
         let names: Vec<String> = columns.iter().map(|index| self.columns[*index].name.clone()).collect();
-        let rows: Vec<Vec<Option<String>>> =
-            (row_start..=row_end).map(|row| columns.iter().map(|column| self.original(row, *column).unwrap_or(None)).collect()).collect();
+        // 非连续选择按块导出：没选中的格子留空，列名仍然覆盖整个块。
+        let rows: Vec<Vec<Option<String>>> = block_rows
+            .iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|column| if self.is_selected(*row, *column) { self.original(*row, *column).unwrap_or(None) } else { None })
+                    .collect()
+            })
+            .collect();
         let table = crate::export::ParsedTable { columns: names.clone(), rows };
         let render = |name: &str, null_token: &str| -> String {
             crate::export::render(name, &table, ',', null_token, false, "", "").map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()

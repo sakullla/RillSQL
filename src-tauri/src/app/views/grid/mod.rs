@@ -82,6 +82,14 @@ impl GridNavigation {
     }
 }
 
+/// 左键按下时的意图。拖拽沿用按下时的意图：Shift 拉大主矩形，Ctrl/Cmd 长出新区域。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressMode {
+    Plain,
+    Extend,
+    Toggle,
+}
+
 pub struct GridPane {
     session: SharedGrid,
     services: Arc<AppServices>,
@@ -106,6 +114,11 @@ pub struct GridPane {
     loading_more: bool,
     /// 左键按下的格子；拖拽期间用它作为起点，松开、失焦、调整列宽或滚动时结束。
     press: Option<(usize, usize)>,
+    /// 按下时的意图：普通替换、Shift 扩展、Ctrl/Cmd 增减非连续区域。拖拽按它分派。
+    press_mode: PressMode,
+    /// 我们写回表格焦点时发出的 SelectCell 回声（显示列号含行号列）。
+    /// 事件是异步送达的，一次选择更新可能连发几条；只有认得出的回声才能被忽略。
+    echo_cells: Vec<(usize, usize)>,
     /// 上一次绘制的可见首行；滚动换行后不能继续把指针下的格子当成同一段拖选。
     visible_start: usize,
     /// 表格为行号列进入了行/列模式：事件回调里不能重入表格，下一帧绘制前把选择拉回会话。
@@ -139,6 +152,13 @@ pub struct GridPane {
     /// 记录面板宽度。默认 340，拖拽限制在 260..=640，双击复位。
     side_width: f32,
     record_dragging: bool,
+    /// 记录面板里正在就地暂存的列；非模态，值直接变成字段行里的输入框。
+    record_edit: Option<usize>,
+    /// 记录面板的文本输入：Enter 暂存，Esc 取消。
+    record_input: Entity<InputState>,
+    /// 记录面板的就地暂存要等下一次绘制才能拿到 Window。
+    pending_record: Option<(usize, usize)>,
+    _record_subscription: gpui_kit::Subscription,
     /// 单元格查看和记录面板共用的格式工作台。预览态不能提交。
     format_viewer: Option<Entity<FormatViewer>>,
     format_subscription: Option<gpui_kit::Subscription>,
@@ -227,6 +247,14 @@ impl GridPane {
         table.update(cx, |state, _| state.delegate_mut().owner = Some(owner));
         let edit_input = cx.new(|cx| InputState::new(window, cx));
         table.update(cx, |state, _| state.delegate_mut().edit_input = Some(edit_input.clone()));
+        // 记录面板复用同一套"Enter 提交、Esc 取消"：值是暂存到行上的字段，不经过弹窗。
+        let record_input = cx.new(|cx| InputState::new(window, cx));
+        let record_subscription = cx.subscribe(&record_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.suppress_enter = true;
+                this.finish_record_edit(cx);
+            }
+        });
         let grid_focus = cx.focus_handle().tab_stop(true);
         // 只在网格自己的 key context 里把 Tab 解释成「下一格」；走到首格/末格时再交还外壳。
         // 同一条绑定重复注册不会改变行为，多个网格共存也只有一种解释。
@@ -259,6 +287,8 @@ impl GridPane {
             refocus: false,
             loading_more: false,
             press: None,
+            press_mode: PressMode::Plain,
+            echo_cells: Vec::new(),
             visible_start: 0,
             table_resync: false,
             focus_inside: false,
@@ -279,6 +309,10 @@ impl GridPane {
             record_open: false,
             side_width: RECORD_SIDE_DEFAULT,
             record_dragging: false,
+            record_edit: None,
+            record_input,
+            pending_record: None,
+            _record_subscription: record_subscription,
             format_viewer: None,
             format_subscription: None,
             format_stamp: None,
@@ -546,7 +580,8 @@ impl GridPane {
                 if self.session.focus_cell().is_none() {
                     self.session.select_all_loaded();
                 }
-                Some(self.session.tsv())
+                // 单格复制值本身；多格复制含表头的 TSV，粘贴回表格时列名对得上。
+                Some(self.session.copy_text())
             }
             "copy-sql-value" => {
                 if self.session.focus_cell().is_none() {
@@ -848,6 +883,98 @@ impl GridPane {
             Ok(count) => i18n::fill(&i18n::text(self.locale, "grid.write.staged"), &[("count", &count.to_string())]),
             Err(reject) => reject.message(self.locale),
         };
+    }
+
+    /// 选区规模：一到几格给出准确数，大选区只报"多格"，不把整张表展开成格子。
+    /// 记录面板底部每帧都要问，所以先看包围盒面积。
+    fn selection_size(&self) -> usize {
+        const LIMIT: usize = 256;
+        match self.session.selection_bounds() {
+            Some((row_start, column_start, row_end, column_end)) => {
+                let area = (row_end - row_start + 1).saturating_mul(column_end - column_start + 1);
+                if area <= LIMIT {
+                    self.session.selection_count()
+                } else {
+                    usize::MAX
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// 记录面板标题旁的排序/筛选状态：当前结果是按哪一列排的、有多少条已应用的条件。
+    fn record_scope_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(sorted) = self.session.sort_text() {
+            parts.push(sorted);
+        }
+        let applied = self.session.filters().iter().filter(|draft| !draft.dirty).count();
+        if applied > 0 {
+            parts.push(i18n::fill(&i18n::text(self.locale, "grid.record.filtered"), &[("count", &applied.to_string())]));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// 记录面板里点一列的值：可写就地暂存，只读说明原因并打开完整值。
+    /// 两条路都先选中那一格，记录面板和网格高亮因此始终指同一行同一列。
+    pub(crate) fn record_field_press(&mut self, column: usize, cx: &mut Context<Self>) {
+        let Some(row) = record::record_row(&self.session) else {
+            return;
+        };
+        self.session.select(row, column, false);
+        let reason = self.session.write_reason(row, column);
+        if !reason.is_empty() {
+            self.notice = reason;
+            self.session.open_value(row, column);
+            self.pending_viewer = true;
+            self.record_edit = None;
+            self.refocus = true;
+            cx.notify();
+            return;
+        }
+        self.notice.clear();
+        self.record_edit = Some(column);
+        self.pending_record = Some((row, column));
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    /// 绘制阶段才能拿到 Window：把这一格的原值写进面板输入框并聚焦。
+    fn begin_record_edit(&mut self, row: usize, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.session.edit_text(row, column);
+        self.record_input.update(cx, |state, cx| state.set_value(text, window, cx));
+        let handle = self.record_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    /// Enter：这一列的值原样暂存到行上。只读、未定位和校验失败都给出同一套原因，
+    /// 已有的暂存保持不动（和网格原位编辑同一个门控）。
+    pub(crate) fn finish_record_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(column) = self.record_edit.take() else {
+            return;
+        };
+        let Some(row) = record::record_row(&self.session) else {
+            return;
+        };
+        let text = self.record_input.read(cx).value().to_string();
+        // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
+        let original = self.session.raw_value(row, column);
+        let value = match (&original, text.is_empty()) {
+            (Some(None), true) => None,
+            _ => Some(text),
+        };
+        let gate = self.session.stage_text(row, column, value);
+        self.notice = self.session.gate_text(gate);
+        self.refocus = true;
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    /// Esc：放弃这次输入。已经暂存的其它格子不受影响。
+    fn cancel_record_edit(&mut self, cx: &mut Context<Self>) {
+        self.record_edit = None;
+        self.refocus = true;
+        cx.notify();
     }
 
     /// 记录视图里点开某一列的完整值：焦点移到那一格，再走网格同一条查看路径。
@@ -1270,40 +1397,51 @@ impl GridPane {
         }
     }
 
-    /// 左键按下格子。普通按下把选择收拢到这一格；Ctrl/Cmd 或 Shift 按下时保留既有锚点，
-    /// 于是单击落在矩形另一角时得到“已有选择 + 该格”的矩形，而不是替换选择。
-    pub(crate) fn cell_press(&mut self, row: usize, column: usize, extend: bool, cx: &mut Context<Self>) {
+    /// 左键按下格子。普通按下把选择收拢到这一格；Shift 按下保留锚点扩成矩形；
+    /// Ctrl/Cmd 按下把这一格加进选区，或者把已经选中的这一格减掉（非连续选择）。
+    pub(crate) fn cell_press(&mut self, row: usize, column: usize, mode: PressMode, cx: &mut Context<Self>) {
         self.press = Some((row, column));
-        if extend && self.session.focus_cell() == Some((row, column)) {
+        self.press_mode = mode;
+        // Shift 落在焦点格上没有新信息；Ctrl/Cmd 落在同一格上要真的加/减，不能吞掉。
+        if mode == PressMode::Extend && self.session.focus_cell() == Some((row, column)) {
             return;
         }
-        self.session.select(row, column, extend);
+        match mode {
+            PressMode::Plain => self.session.select(row, column, false),
+            PressMode::Extend => self.session.select(row, column, true),
+            PressMode::Toggle => self.session.toggle_press(row, column),
+        }
         // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
         self.notice.clear();
         self.sync_table(cx);
         cx.notify();
     }
 
-    /// 按住左键拖过另一格：从按下时的选择锚点扩展到当前格。没有按下时不改变选择，
-    /// 松开后再移动指针也不会扩展。
+    /// 按住左键拖过另一格：普通/Shift 按下时把主矩形扩展到当前格；Ctrl/Cmd 按下时
+    /// 从按下格长出一块新区域（或者把已选区域挖掉一块）。没有按下时不改变选择。
     pub(crate) fn cell_drag(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
         if self.press.is_none() || self.session.focus_cell() == Some((row, column)) {
             return;
         }
-        self.session.select(row, column, true);
+        match self.press_mode {
+            PressMode::Toggle => self.session.toggle_drag(row, column),
+            _ => self.session.select(row, column, true),
+        }
         self.notice.clear();
         self.sync_table(cx);
         cx.notify();
     }
 
-    /// 松开左键：结束拖拽。下一个鼠标移动不会继续改选择，直到重新按下。
+    /// 松开左键：结束拖拽并把 Ctrl/Cmd 区域落定。下一个鼠标移动不会继续改选择。
     pub(crate) fn cell_release(&mut self) {
         self.press = None;
+        self.session.finish_region();
     }
 
     /// 结束拖拽但不改选择：指针在表外松开、窗口失焦、调整列宽或滚动都走这里。
     /// 返回刚才是否真的在拖选，界面据此只重绘真正变了的状态。
     pub(crate) fn cancel_drag(&mut self) -> bool {
+        self.session.finish_region();
         self.press.take().is_some()
     }
 
@@ -1556,7 +1694,13 @@ impl GridPane {
                     self.schedule_table_resync();
                     return;
                 };
-                // sync_table 会把会话焦点写回表格，表格随后又发回同一条事件；已经一致时不再改写选择。
+                // sync_table 会把会话焦点写回表格，表格随后又发回同一条事件：认得出的回声直接忽略，
+                // 否则一次选择更新连发的旧回声会把刚加进来的非连续区域冲掉。
+                if let Some(index) = self.echo_cells.iter().position(|item| *item == (*row, *col)) {
+                    self.echo_cells.remove(index);
+                    return;
+                }
+                // 已经一致时不再改写选择。
                 if self.session.focus_cell() != Some((*row, column)) {
                     self.session.select(*row, column, false);
                     // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
@@ -1920,8 +2064,9 @@ impl GridPane {
         // 表格自己的高亮也要跟着稳定身份走：重排后按会话焦点重新指到同一行。
         // 事件是异步送达的，靠 apply_table_event 的相等判断避免回声改写选择。
         let focus = self.table_focus();
-        // 高亮的唯一来源是会话矩形：拖选、Shift/Ctrl、键盘扩展和行头选择的每一格都由它画底色。
-        let selected = self.session.selection_bounds();
+        // 高亮的唯一来源是会话选区：拖选、Shift/Ctrl、键盘扩展和行头选择的每一格都由它画底色。
+        // 非连续选择是多块区域加减选的洞，格子逐格问自己算不算选中。
+        let selected = SelectionPaint { regions: self.session.selection_regions(), holes: self.session.selection_holes() };
         // 外键入口只在适用行出现；读取完整值的入口只在还有预览值时出现。
         let fk = self.session.has_reference();
         let unresolved = self.session.unresolved_previews();
@@ -1929,7 +2074,7 @@ impl GridPane {
         let visible = self.session.visible_columns();
         let frozen = self.session.frozen_count();
         let hidden = self.session.hidden_columns();
-        let has_selection = self.session.selection_count() > 0;
+        let has_selection = self.session.has_selection();
         let logical_count = names.len();
         let headers = (0..names.len()).filter_map(|column| self.session.column_header(column)).collect::<Vec<_>>();
         let (cell_dirty, row_dirty) = self
@@ -1945,6 +2090,8 @@ impl GridPane {
         };
         // 格子内边距只由当前密度决定；换密度时同步刷新，列宽测量读的也是这一份。
         let cell_pad = cell_padding(kit::Metrics::of(cx));
+        // 写回表格焦点的格子记下来：表格随后发回的 SelectCell 是回声，不是选择变更。
+        let mut echoed: Option<(usize, usize)> = None;
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
             state.delegate_mut().cell_pad = cell_pad;
@@ -1972,11 +2119,20 @@ impl GridPane {
             // 比较整份选择（行/列/单元格）而不只是 selected_cell：表格为行号列留下的列模式
             // 即使焦点没变也要复位，否则 # 整列会继续画激活底色。
             match focus {
-                Some((row, column)) if state.selection() != TableSelection::Cell(row, column) => state.set_selected_cell(row, column, cx),
+                Some((row, column)) if state.selection() != TableSelection::Cell(row, column) => {
+                    state.set_selected_cell(row, column, cx);
+                    echoed = Some((row, column));
+                }
                 None if state.selection() != TableSelection::None => state.clear_selection(cx),
                 _ => {}
             }
         });
+        self.echo_cells.extend(echoed);
+        // 回声表只用来认自己发出去的事件，留最近几条就够。
+        if self.echo_cells.len() > 8 {
+            let drop = self.echo_cells.len() - 8;
+            self.echo_cells.drain(..drop);
+        }
     }
 }
 
@@ -2062,6 +2218,10 @@ fn count_of(request: &PageRequest) -> CountRequest {
 impl Render for GridPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
+        // 记录面板的就地暂存和网格原位编辑一样，要等绘制阶段才拿得到 Window。
+        if let Some((row, column)) = self.pending_record.take() {
+            self.begin_record_edit(row, column, window, cx);
+        }
         if let Some(pending) = self.pending_edit.take() {
             self.begin_edit(pending, window, cx);
         } else if std::mem::take(&mut self.pending_batch) {
@@ -2074,7 +2234,7 @@ impl Render for GridPane {
         }
         // 行头/列头选择和表格回声只改会话，不一定走 sync_table；绘制前把矩形推给格子画法，
         // 否则高亮会落后复制和统计一步。只写字段、不 notify，本帧的表格紧接着就按新值画。
-        let selected = self.session.selection_bounds();
+        let selected = SelectionPaint { regions: self.session.selection_regions(), holes: self.session.selection_holes() };
         if self.table.read(cx).delegate().selected != selected {
             self.table.update(cx, |state, _| state.delegate_mut().selected = selected);
         }
@@ -2192,6 +2352,14 @@ impl Render for GridPane {
                     }
                     return;
                 }
+                // 记录面板的就地暂存：Esc 取消，其它键交给字段输入框自己处理。
+                if this.record_edit.is_some() {
+                    if key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_record_edit(cx);
+                    }
+                    return;
+                }
                 if key == "escape" {
                     if this.session.preview_open() {
                         this.cancel_preview(cx);
@@ -2221,8 +2389,14 @@ impl Render for GridPane {
                         this.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
                     }
                 } else if key == "enter" {
-                    // Enter 是显式查看；普通选择与方向键不会自动打开查看面板。
-                    let _ = this.command("grid-value-open", cx);
+                    // Enter 是写入口（和快捷键帮助里的 "Enter / F2" 一致）：可写格直接进编辑，
+                    // 只读格退化为查看完整值并说明原因。Ctrl/Cmd+Enter 才是显式的查看完整值。
+                    cx.stop_propagation();
+                    if event.keystroke.modifiers.secondary(cx) {
+                        let _ = this.command("grid-value-open", cx);
+                    } else {
+                        let _ = this.command("edit-cell", cx);
+                    }
                     cx.notify();
                 } else if let Some(id) = grid_shortcut(key, event.keystroke.modifiers.secondary(cx), event.keystroke.modifiers.shift) {
                     cx.stop_propagation();
@@ -2506,7 +2680,7 @@ impl GridPane {
             .flex()
             .items_center()
             .gap(px(4.))
-            .child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()))
+            .child(grid_icon("copy-region", IconName::Copy, t("grid.menu.copySelection"), entity.clone()))
             .child(grid_icon("grid-record-toggle", IconName::PanelRight, t("grid.record.open"), entity.clone()));
         if writable {
             actions = actions
@@ -2795,6 +2969,13 @@ impl GridPane {
                         cx.theme().mono_font_family.clone(),
                         entity,
                         width,
+                        record::RecordEdit {
+                            column: self.record_edit,
+                            input: Some(self.record_input.clone()),
+                            writable: self.session.writable(),
+                            selected: self.selection_size(),
+                            scope: self.record_scope_text(),
+                        },
                         self.format_viewer.clone(),
                     ))
             } else {
@@ -3280,9 +3461,9 @@ struct SheetDelegate {
     sort: Option<(usize, bool)>,
     has_more: bool,
     loading: bool,
-    /// 会话选择的矩形（行起、列起、行止、列止，数据列下标）。格子据此画高亮，
-    /// 和复制、统计读的是同一个矩形；行号列属于整行。
-    selected: Option<(usize, usize, usize, usize)>,
+    /// 会话选区的区域与减选的洞（行起、列起、行止、列止，数据列下标）。
+    /// 格子据此逐格画高亮，和复制、统计读的是同一份；行号列属于整行。
+    selected: SelectionPaint,
     visible_start: usize,
     visible_seen: bool,
     owner: Option<gpui_kit::WeakEntity<GridPane>>,
@@ -3366,22 +3547,39 @@ impl SheetDelegate {
 /// 单格选择或只覆盖部分列的矩形不会把行号格当成第一个数据列的颜色。
 /// `column` 是逻辑数据列；None 表示行号列。隐藏列不改变矩形的逻辑范围。
 fn cell_selected(
-    bounds: Option<(usize, usize, usize, usize)>,
+    paint: &SelectionPaint,
     row_ix: usize,
     column: Option<usize>,
     data_columns: usize,
 ) -> bool {
-    let Some((row_start, column_start, row_end, column_end)) = bounds else {
-        return false;
+    let covered = |row: usize, column: usize| {
+        paint.regions.iter().any(|(row_start, column_start, row_end, column_end)| {
+            row >= *row_start && row <= *row_end && column >= *column_start && column <= *column_end
+        })
     };
-    if row_ix < row_start || row_ix > row_end {
-        return false;
+    let holed = |row: usize, column: usize| {
+        paint.holes.iter().any(|(row_start, column_start, row_end, column_end)| {
+            row >= *row_start && row <= *row_end && column >= *column_start && column <= *column_end
+        })
+    };
+    match column {
+        None => {
+            // 整行才亮行号：某一区域从首列盖到末列，并且这一行没被减选的洞挖掉。
+            data_columns > 0
+                && paint.regions.iter().any(|(row_start, column_start, row_end, column_end)| {
+                    row_ix >= *row_start && row_ix <= *row_end && *column_start == 0 && column_end + 1 >= data_columns
+                })
+                && !(0..data_columns).all(|column| holed(row_ix, column))
+        }
+        Some(column) => covered(row_ix, column) && !holed(row_ix, column),
     }
-    let Some(column) = column else {
-        // 整行才亮行号：首列起、末列止，并且数据列非空。
-        return column_start == 0 && data_columns > 0 && column_end + 1 >= data_columns;
-    };
-    column >= column_start && column <= column_end
+}
+
+/// 画高亮用的选区快照：区域加减选的洞，和会话里的 selection_regions/selection_holes 同源。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SelectionPaint {
+    regions: Vec<(usize, usize, usize, usize)>,
+    holes: Vec<(usize, usize, usize, usize)>,
 }
 
 /// 表格获得焦点时的快捷键。与快捷键帮助里登记的组合一致。
@@ -3403,7 +3601,7 @@ fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str
 const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("grid-value-open", "grid.value.openFull", false, false),
     ("grid-record-toggle", "grid.record.open", false, false),
-    ("copy-region", "grid.value.copyValue", false, false),
+    ("copy-region", "grid.menu.copySelection", false, false),
     ("copy-sql-value", "shell.shortcuts.copySqlValue", false, false),
     ("grid-copy-row", "grid.menu.copyRow", false, false),
     ("grid-copy-column", "grid.menu.copyColumn", false, false),
@@ -3583,7 +3781,7 @@ pub(crate) fn cell_menu(
         menu.item(grid_item(locale, key, id, disabled, reason(needs_write, id), owner.clone()))
     };
     // 常用在上：复制 → 编辑 → 筛选/导航 → 子菜单；每组之间用分隔线。
-    let mut menu = item(menu, "grid.menu.copy", "copy-region", false);
+    let mut menu = item(menu, "grid.menu.copySelection", "copy-region", false);
     menu = menu.separator();
     menu = item(menu, "grid.menu.editCell", "edit-cell", true);
     menu = item(menu, "grid.value.null", "grid-set-null", true);
@@ -3814,7 +4012,7 @@ impl TableDelegate for SheetDelegate {
         let column = logical.unwrap_or(0);
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
         // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
-        let selected = cell_selected(self.selected, row_ix, logical, self.logical_count);
+        let selected = cell_selected(&self.selected, row_ix, logical, self.logical_count);
         let (tone_bg, tone_line) = match mark {
             1 => (Some(p.ok_soft), Some(p.ok)),
             2 => (Some(p.warn_soft), Some(p.warn)),
@@ -3875,10 +4073,16 @@ impl TableDelegate for SheetDelegate {
                 let release = owner.clone();
                 let release_out = owner.clone();
                 this.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
-                    // Ctrl/Cmd 单击加选；Shift 单击同样按扩展处理，与键盘 Shift 一致。
-                    let extend = event.modifiers.secondary(cx) || event.modifiers.shift;
+                    // Ctrl/Cmd 单击增减这一格；Shift 单击扩展主矩形，与键盘 Shift 一致。
+                    let mode = if event.modifiers.secondary(cx) {
+                        PressMode::Toggle
+                    } else if event.modifiers.shift {
+                        PressMode::Extend
+                    } else {
+                        PressMode::Plain
+                    };
                     if let Some(pane) = owner.upgrade() {
-                        pane.update(cx, |pane, cx| pane.cell_press(row_ix, column, extend, cx));
+                        pane.update(cx, |pane, cx| pane.cell_press(row_ix, column, mode, cx));
                     }
                 })
                 .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
@@ -4223,6 +4427,33 @@ mod shortcut_tests {
         assert_eq!(grid_shortcut("c", false, false), None);
     }
 
+    /// 网格状态、动作和提示用到的文案键必须在字典里真的有这一行：
+    /// 只断言 text() 会用键名回退，漏提交的键就看不出来。
+    #[test]
+    fn every_grid_state_key_exists_in_the_catalog() {
+        let keys = crate::i18n::catalog_keys();
+        for key in [
+            "grid.state.readErrorTitle",
+            "grid.state.clearConditions",
+            "grid.state.noMatchDetail",
+            "grid.state.tableEmptyDetail",
+            "grid.state.resultEmptyDetail",
+            "grid.action.retry",
+            "grid.value.openFullHint",
+            "grid.menu.copySelection",
+            "grid.record.editValue",
+            "grid.record.editHint",
+            "grid.record.selection",
+            "grid.record.selectionMany",
+            "grid.record.copySelection",
+            "grid.record.filtered",
+        ] {
+            assert!(keys.contains(&key), "{key} 必须在字典里");
+            for locale in [Locale::ZhCn, Locale::En] {
+                assert_ne!(i18n::text(locale, key), key, "{key}");
+            }
+        }
+    }
     #[test]
     fn every_menu_label_is_translated() {
         for (id, key, _, _) in CELL_MENU.iter().chain([("grid-undo", "grid.menu.undo", false, false)].iter()) {
@@ -4273,9 +4504,9 @@ mod pane_tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, Bounds, Modifiers, Pixels, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
 
-    /// 选区矩形里的格子数。
+    /// 选区里的格子数（非连续选择按并集算）。
     fn selected_cells(session: &SharedGrid) -> usize {
-        session.selection_bounds().map_or(0, |(row_start, column_start, row_end, column_end)| (row_end - row_start + 1) * (column_end - column_start + 1))
+        session.selection_count()
     }
 
     fn target() -> GridTarget {
@@ -4783,8 +5014,10 @@ mod pane_tests {
         });
     }
 
+    /// Ctrl/Cmd 单击是加减一格，不是把选区扩成矩形：多块区域各自独立，
+    /// 统计、复制和批量动作都按并集算。
     #[gpui_kit::test]
-    fn modifier_click_extends_the_existing_selection_into_a_rectangle(cx: &mut TestAppContext) {
+    fn modifier_click_adds_and_removes_single_cells(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
         cx.update_window(window, |_, window, cx| {
             plant(&pane, cx);
@@ -4792,21 +5025,162 @@ mod pane_tests {
         })
         .unwrap();
         // 第一次普通单击建立锚点；表格补发的同格 SelectCell 在真实事件循环里随后送达。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
         settle(cx);
-        // 两次 Ctrl/Cmd 单击分别向下、向右扩展，锚点始终留在 (0, 0)。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 0, true, cx)));
+        // 两次 Ctrl/Cmd 单击各加一格，中间没点到的格子不会被补进选区。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 0, PressMode::Toggle, cx)));
         settle(cx);
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Toggle, cx)));
         settle(cx);
         cx.update(|cx| {
             let pane = pane.read(cx);
-            assert_eq!(pane.session.focus_cell(), Some((1, 1)), "加选只移动焦点，不动锚点");
-            assert_eq!(pane.session.selection_count(), 4, "两次加选应形成 2x2 矩形");
-            assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙");
+            assert_eq!(pane.session.focus_cell(), Some((1, 1)), "加选把焦点移到刚点的格子");
+            assert!(pane.session.has_extra_regions(), "加选留下多块区域");
+            assert_eq!(pane.session.selection_count(), 3, "三格各自独立，没有把中间补成矩形");
+            assert_eq!(pane.session.tsv(), "1\t\n2\t乙", "块里没选中的格子留空，列仍然对齐");
+            assert_eq!(pane.session.copy_text(), "id\tname\n1\t\n2\t乙", "多格复制带表头");
+        });
+        // 再 Ctrl/Cmd 点一次同一格：从选择里减掉它。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Toggle, cx)));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 2, "再点一次减掉这一格");
+            assert_eq!(pane.session.tsv(), "1\n2");
+            assert!(!pane.session.selection_holes().is_empty(), "减选记在洞里");
         });
     }
 
+    /// Ctrl/Cmd 拖过一片格子就加一块矩形区域；再拖过已选区域把它挖掉，主矩形不动。
+    #[gpui_kit::test]
+    fn modifier_drag_adds_a_region_and_toggles_it_back_out(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 0, PressMode::Toggle, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, _| pane.cell_release()));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 3, "一格加一块 1x2 区域");
+            assert_eq!(pane.session.selection_regions().len(), 2);
+            assert_eq!(pane.session.tsv(), "1\t\n2\t乙");
+        });
+        // 从已选区域里 Ctrl/Cmd 起拖：整块被挖掉，只剩原来的那一格。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 0, PressMode::Toggle, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, _| pane.cell_release()));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 1, "拖过的区域被减掉");
+            assert_eq!(pane.session.tsv(), "1");
+            assert_eq!(pane.session.selection_regions().len(), 1, "被整块挖掉的区域在松开时收掉");
+            assert!(pane.session.selection_holes().is_empty(), "洞已经没有覆盖对象，一起收掉");
+        });
+    }
+
+    /// Ctrl+C：单格复制值本身，多格复制含表头的 TSV；多格式复制各自保持原样。
+    #[gpui_kit::test]
+    fn copy_region_copies_the_value_for_one_cell_and_headers_for_many(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let copied = |cx: &mut TestAppContext, id: &str| -> Option<String> {
+            let _ = cx.update(|cx| pane.update(cx, |pane, cx| pane.command(id, cx)));
+            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+        // 单格：值本身，没有表头。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.session.select(0, 1, false)));
+        assert_eq!(copied(cx, "copy-region").as_deref(), Some("甲"));
+        // 多格：列名一行 + 每行值。
+        cx.update(|cx| pane.update(cx, |pane, _| {
+            pane.session.select(0, 0, false);
+            pane.session.select(1, 1, true);
+        }));
+        assert_eq!(copied(cx, "copy-region").as_deref(), Some("id\tname\n1\t甲\n2\t乙"));
+        // 复制为 TSV 是同一份含表头文本；CSV 仍按 CSV 写。
+        assert_eq!(copied(cx, "grid-copy-as-tsv").as_deref(), Some("id\tname\n1\t甲\n2\t乙"));
+        assert_eq!(copied(cx, "grid-copy-as-csv").as_deref(), Some("\"id\",\"name\"\r\n\"1\",\"甲\"\r\n\"2\",\"乙\""));
+        // SQL 字面量复制不受影响。
+        assert_eq!(copied(cx, "copy-sql-value").as_deref(), Some("1, '甲'\n2, '乙'"));
+    }
+
+    /// Enter 是写入口（快捷键帮助里的 "Enter / F2"）：可写格进编辑，Esc 取消；
+    /// Ctrl/Cmd+Enter 才是显式的查看完整值。
+    #[gpui_kit::test]
+    fn enter_edits_the_cell_and_ctrl_enter_opens_the_full_value(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(pane.read(cx).editing(), "Enter 应进入编辑");
+            assert_eq!(pane.read(cx).edit_value(cx), "1", "编辑框带出原值");
+        });
+        cx.update_window(window, |_, window, cx| window.press("escape", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| assert!(!pane.read(cx).editing(), "Esc 取消编辑"));
+        // Ctrl/Cmd+Enter 打开完整值查看，不再进编辑。
+        cx.update_window(window, |_, window, cx| window.press("secondary-enter", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(pane.read(cx).session.viewer().is_some(), "Ctrl/Cmd+Enter 查看完整值");
+            assert!(!pane.read(cx).editing());
+        });
+    }
+
+    /// 双击列分隔柄走表格自己的 fit_col：量完发 ColumnWidthsChanged，会话按逻辑列记下新宽度。
+    #[gpui_kit::test]
+    fn double_clicking_a_column_divider_fits_that_column(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let long = "很长的一段备注文本，需要把列拉宽才能完整显示".repeat(2);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("note", "text")],
+                    vec![vec![Some("1"), Some(long.as_str())]],
+                    "id",
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let before = cx.update(|cx| pane.read(cx).session.column_width(1));
+        let table = cx.update(|cx| pane.read(cx).table.clone());
+        // 表格的分隔柄双击直接调 fit_col；和真实双击同一条入口。
+        let fitted = cx.update_window(window, |_, window, cx| table.update(cx, |state, cx| state.fit_col(2, window, cx)));
+        assert!(fitted.unwrap(), "双击分隔柄应量出一份宽度");
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        let after = cx.update(|cx| pane.read(cx).session.column_width(1));
+        assert!(after > before + 100.0, "自适应后列宽应跟着变：{before} -> {after}");
+        // 行号列没有可量的内容，双击它不做任何事。
+        let rownum = cx.update_window(window, |_, window, cx| table.update(cx, |state, cx| state.fit_col(0, window, cx)));
+        assert!(!rownum.unwrap(), "行号列不参与自适应");
+    }
     #[gpui_kit::test]
     fn dragging_across_cells_selects_the_rectangle_and_release_ends_it(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -4816,7 +5190,7 @@ mod pane_tests {
         })
         .unwrap();
         // 按下第一格，拖到右下角；每一步之间让表格补发的 SelectCell 回声送达。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
         settle(cx);
         cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
         settle(cx);
@@ -4851,7 +5225,10 @@ mod pane_tests {
         visual.simulate_mouse_down(second.center(), MouseButton::Left, secondary);
         visual.simulate_mouse_up(second.center(), MouseButton::Left, secondary);
         visual.update(|_, cx| {
-            assert_eq!(pane.read(cx).session.selection_count(), 4, "Ctrl/Cmd 单击应扩展为矩形");
+            let session = &pane.read(cx).session;
+            assert_eq!(session.selection_count(), 2, "Ctrl/Cmd 单击只加这一格，不把中间补成矩形");
+            assert!(session.has_extra_regions());
+            assert_eq!(session.tsv(), "1\t\n\t乙");
         });
 
         // 普通单击替换矩形，再按住从第一格拖到第二格。
@@ -4877,12 +5254,12 @@ mod pane_tests {
             window.render_frame(cx);
         })
         .unwrap();
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
         settle(cx);
         cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
         settle(cx);
         // 普通单击另一格替换整个矩形，而不是继续扩展。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Plain, cx)));
         settle(cx);
         cx.update(|cx| {
             let pane = pane.read(cx);
@@ -5505,7 +5882,7 @@ mod pane_tests {
         });
     }
 
-    /// 鼠标（普通按下 + Ctrl/Cmd 点）和键盘（Shift 扩展）必须落到同一个 anchor/focus 矩形。
+    /// 鼠标（普通按下 + Shift 点）和键盘（Shift 扩展）必须落到同一个矩形。
     #[gpui_kit::test]
     fn mouse_and_keyboard_produce_the_same_rectangle_and_copies(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -5516,11 +5893,11 @@ mod pane_tests {
         .unwrap();
         // 两次鼠标动作之间让表格补发的 SelectCell 回声送达，和真实点击顺序一致。
         cx.update(|cx| {
-            pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx));
+            pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx));
         });
         settle(cx);
         cx.update(|cx| {
-            pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx));
+            pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Extend, cx));
         });
         settle(cx);
         let mouse = cx.update(|cx| {
@@ -5558,7 +5935,7 @@ mod pane_tests {
         // 取消拖拽：已选矩形保留，但下一次移动不再扩展。
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
-                pane.cell_press(0, 0, false, cx);
+                pane.cell_press(0, 0, PressMode::Plain, cx);
                 assert!(pane.dragging());
                 assert!(pane.cancel_drag());
                 pane.cell_drag(1, 1, cx);
@@ -5574,7 +5951,7 @@ mod pane_tests {
         // 调整列宽结束拖拽：拖到的新格子不会被接进旧矩形。
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
-                pane.cell_press(0, 0, false, cx);
+                pane.cell_press(0, 0, PressMode::Plain, cx);
                 pane.apply_table_event(&TableEvent::ColumnWidthsChanged(vec![px(56.), px(80.), px(140.)]));
                 pane.cell_drag(1, 1, cx);
             });
@@ -5590,7 +5967,7 @@ mod pane_tests {
         cx.update_window(window, |_, window, cx| {
             pane.update(cx, |pane, cx| {
                 pane.session.select(0, 0, false);
-                pane.cell_press(0, 0, false, cx);
+                pane.cell_press(0, 0, PressMode::Plain, cx);
             });
             pane.update(cx, |pane, cx| {
                 pane.table.update(cx, |state, _| {
@@ -5620,7 +5997,7 @@ mod pane_tests {
         .unwrap();
         settle(cx);
         cx.update(|cx| {
-            pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx));
+            pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx));
         });
         cx.update(|cx| assert!(pane.read(cx).dragging()));
         cx.update_window(window, |_, window, cx| {
@@ -5685,7 +6062,7 @@ mod pane_tests {
                 assert_eq!(pane.session.selection_bounds(), Some((1, 0, 1, 1)));
                 pane.apply_table_event(&TableEvent::SelectCell(0, 1));
                 assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 0)));
-                pane.cell_press(0, 0, false, cx);
+                pane.cell_press(0, 0, PressMode::Plain, cx);
                 pane.cell_drag(1, 1, cx);
                 assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 1)), "拖选和行头用同一个矩形模型");
             });
@@ -5760,7 +6137,7 @@ mod pane_tests {
         .unwrap();
 
         // 鼠标拖选 2x2：矩形里的四格都要亮，行号列随整行走。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
         settle(cx);
         cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
         settle(cx);
@@ -5783,9 +6160,9 @@ mod pane_tests {
         assert!(visual.debug_bounds("grid-stats").is_none(), "选择时不显示自动统计");
 
         // Ctrl/Cmd 单击换角：同一个矩形，同样每格都亮。
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, PressMode::Plain, cx)));
         settle(cx);
-        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx)));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Extend, cx)));
         settle(cx);
         assert_paint_matches_selection(cx, window, &pane);
 
@@ -6561,6 +6938,92 @@ mod workbench_tests {
         assert!(visual.debug_bounds("grid-record").is_none());
     }
 
+    /// 记录面板的非模态整行暂存：点字段就地改，Enter 暂存、Esc 取消。
+    /// 只读格给原因并打开完整值；选区多于一格时面板底部出现批量动作。
+    #[gpui_kit::test]
+    fn record_panel_stages_a_field_in_place_and_offers_batch_actions(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-record-toggle", cx);
+                pane.record_field_press(1, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(1), "字段就地进入暂存"));
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("新值", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).cell(0, 1), "新值", "Enter 把值暂存到行上");
+            assert!(pane.read(cx).session.uncommitted());
+            assert_eq!(pane.read(cx).record_edit, None, "Enter 结束这次暂存");
+        });
+        // Esc 取消这次输入：已暂存的值保持不动。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.record_field_press(1, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("丢弃", cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).record_edit, None, "Esc 结束暂存");
+            assert_eq!(pane.read(cx).cell(0, 1), "新值", "Esc 不写值");
+            assert!(pane.read(cx).session.uncommitted(), "已有暂存保留");
+        });
+        // 多格选区：面板底部出现这一选区适用的批量动作。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, _| {
+                pane.session.select(0, 0, false);
+                pane.session.select(1, 1, true);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let batch = visual.debug_bounds("grid-record-batch");
+        assert!(batch.is_some(), "多格选区出现批量动作条");
+    }
+
+    /// 只读结果的记录面板不假装能写：点字段给出原因，并走同一条完整值查看路径。
+    #[gpui_kit::test]
+    fn record_panel_explains_readonly_fields_instead_of_staging(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let sheet = QuerySheet {
+                    sql: "select * from customers join people".to_owned(),
+                    columns: vec!["name".to_owned()],
+                    rows: vec![vec![Some("乙".to_owned())]],
+                    truncated: false,
+                    full_count: Some(1),
+                };
+                pane.show_query(target(), sheet, cx);
+                let _ = pane.command("grid-record-toggle", cx);
+                pane.record_field_press(0, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).record_edit, None, "只读格不进入暂存");
+            assert!(!pane.read(cx).session.writable(), "查询结果不可写");
+            assert!(!pane.read(cx).session.readonly_reason().is_empty(), "只读原因来自会话");
+            assert!(pane.read(cx).session.viewer().is_some(), "只读时退化为查看完整值");
+        });
+    }
     /// 工具条上的记录视图按钮点一下就打开，再点一下关上（走真实点击，不是直接调命令）。
     #[gpui_kit::test]
     fn record_toggle_button_opens_and_closes_the_record_view(cx: &mut TestAppContext) {
@@ -6943,6 +7406,51 @@ mod workbench_tests {
         cx.update(|cx| assert_eq!(Palette::of(cx).selection, kit::Palette::light().selection, "浅色主题的选中底色"));
     }
 
+    /// 表格操作在三档宽度 × 两套主题 × 两档密度下都走得通：单击、Ctrl/Cmd 加选、
+    /// 复制含表头、记录面板就地暂存、双击分隔柄自适应。这是 headless 布局级证据，
+    /// 不是原生像素截图（本任务没有原生窗口与截屏通道的授权）。
+    #[gpui_kit::test]
+    fn grid_flow_runs_at_three_widths_in_both_themes(cx: &mut TestAppContext) {
+        for width in [1360., 900., 640.] {
+            for dark in [false, true] {
+                for metrics in [kit::Metrics::compact(), kit::Metrics::standard()] {
+                    let (window, pane) = open_sized(cx, width);
+                    let mut visual = VisualTestContext::from_window(window, cx);
+                    cx.update(|cx| {
+                        metrics.publish(cx);
+                        kit::apply_theme(dark, cx);
+                    });
+                    visual.update(|window, cx| {
+                        plant(&pane, cx);
+                        pane.update(cx, |pane, cx| {
+                            pane.cell_press(0, 0, PressMode::Plain, cx);
+                            pane.cell_press(1, 2, PressMode::Toggle, cx);
+                            let _ = pane.command("grid-record-toggle", cx);
+                        });
+                        window.render_frame(cx);
+                    });
+                    visual.update(|window, cx| {
+                        let view = pane.read(cx);
+                        assert_eq!(view.session.selection_count(), 2, "{width}/{dark}/{metrics:?}");
+                        assert!(view.session.has_extra_regions(), "{width}/{dark}/{metrics:?}");
+                        assert!(view.session.copy_text().starts_with("id\t"), "多格复制带表头：{width}/{dark}");
+                        assert!(!view.session.tsv().is_empty());
+                        // 单元格内边距跟着当前密度走，主题只换颜色不动几何。
+                        assert_eq!(view.table.read(cx).delegate().cell_pad, cell_padding(metrics));
+                        window.render_frame(cx);
+                    });
+                    assert!(visual.debug_bounds("grid-body").is_some(), "{width} 宽时正文在");
+                    assert!(visual.debug_bounds("grid-record").is_some(), "{width} 宽时记录面板在");
+                    assert!(visual.debug_bounds("grid-record-value-1").is_some(), "记录字段在");
+                    // 双击列分隔柄的自适应在三档宽度里都能量出宽度并写回会话。
+                    let table = cx.update(|cx| pane.read(cx).table.clone());
+                    let fitted = cx.update_window(window, |_, window, cx| table.update(cx, |state, cx| state.fit_col(2, window, cx)));
+                    assert!(fitted.unwrap(), "{width} 宽时双击分隔柄应量出一份宽度");
+                    cx.run_until_parked();
+                }
+            }
+        }
+    }
     /// 长文本按列宽截断，但完整值仍在：悬停拿到整段原文，大值/二进制指向查看面板。
     /// NULL、空字符串和真的存着 "NULL" 的文本各画各的；暂存修改的格子带自己的标记。
     #[gpui_kit::test]

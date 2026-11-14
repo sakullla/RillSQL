@@ -208,7 +208,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         MenuPlace::Grid => {
             let write = target == MenuTarget::WritableGrid;
             vec![
-                item("copy-region", "grid.value.copyValue"),
+                item("copy-region", "grid.menu.copySelection"),
                 item("grid-copy-row", "grid.menu.copyRow"),
                 item("grid-copy-column", "grid.menu.copyColumn"),
                 item("grid-filter-value", "grid.menu.filterByValue"),

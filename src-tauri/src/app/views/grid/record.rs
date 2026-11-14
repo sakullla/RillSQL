@@ -4,14 +4,30 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::input::InputState;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window};
 
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
 use crate::ui::FormatViewer;
 
 use super::session::{type_abbr, CellKind, SharedGrid};
 use super::GridPane;
+
+/// 记录面板的就地暂存状态。非模态：值直接在字段行里改，Enter 暂存、Esc 取消。
+pub struct RecordEdit {
+    /// 正在编辑的逻辑列。
+    pub column: Option<usize>,
+    /// 面板里的文本输入；Enter 由订阅提交，Esc 由网格按键处理。
+    pub input: Option<Entity<InputState>>,
+    /// 目标格可写；不可写时点值只说明原因并打开完整值。
+    pub writable: bool,
+    /// 选区格子数：大于一格时在面板底部给出适用的批量动作。
+    pub selected: usize,
+    /// 排序/筛选状态的说明；没有条件时为空。
+    pub scope: Option<String>,
+}
 
 /// 记录视图里的一格：逻辑列、列名、类型和显示文本（含暂存修改）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +133,7 @@ pub fn render_record(
     mono: SharedString,
     entity: &Entity<GridPane>,
     width: f32,
+    edit: RecordEdit,
     viewer: Option<Entity<FormatViewer>>,
 ) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
@@ -134,6 +151,8 @@ pub fn render_record(
         .border_b_1()
         .border_color(p.line)
         .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(title))
+        // 排序/筛选状态写在标题旁边：记录视图逐行看数据时也清楚当前结果是被什么条件筛过的。
+        .when_some(edit.scope.clone(), |this, scope| this.child(kit::pill(scope, p.accent_text, p.accent_soft)))
         .child(kit::icon_button("grid-record-prev", IconName::ChevronUp, t("grid.record.prev"), pane_command(entity, "grid-record-prev")).disabled(!can_prev))
         .child(kit::icon_button("grid-record-next", IconName::ChevronDown, t("grid.record.next"), pane_command(entity, "grid-record-next")).disabled(!can_next))
         .child(kit::icon_button("grid-record-close", IconName::X, t("grid.record.close"), pane_command(entity, "grid-record-close")));
@@ -192,16 +211,37 @@ pub fn render_record(
                                 )
                                 .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(field.type_name.clone()))),
                         )
-                        .child(
-                            div()
+                        .child(match (edit.column == Some(column), edit.input.as_ref()) {
+                            // 就地暂存：值直接变成文本输入，Enter 暂存、Esc 取消，没有弹窗。
+                            (true, Some(input)) => div()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .font_family(mono.clone())
-                                .text_size(px(TypeScale::SM))
-                                .when(field.null, |this| this.italic().text_color(p.text_faint))
-                                .when(!field.null, |this| this.text_color(p.text))
-                                .child(SharedString::from(field.label.clone())),
-                        )
+                                .child(kit::text_input("grid-record-input", input, t("grid.record.editHint")).small())
+                                .into_any_element(),
+                            _ => {
+                                // 可写时点值就开始暂存；只读时同一处给出原因并打开完整值。
+                                let press = {
+                                    let entity = entity.clone();
+                                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                                        entity.update(cx, |pane, cx| pane.record_field_press(column, cx));
+                                    }
+                                };
+                                div()
+                                    .id(("grid-record-value", column))
+                                    .debug_selector(move || format!("grid-record-value-{column}"))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .font_family(mono.clone())
+                                    .text_size(px(TypeScale::SM))
+                                    .cursor_pointer()
+                                    .tooltip_text(if edit.writable { t("grid.record.editValue") } else { t("grid.status.readonly") })
+                                    .when(field.null, |this| this.italic().text_color(p.text_faint))
+                                    .when(!field.null, |this| this.text_color(p.text))
+                                    .child(SharedString::from(field.label.clone()))
+                                    .on_click(press)
+                                    .into_any_element()
+                            }
+                        })
                         .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open)),
                 );
             }
@@ -225,6 +265,32 @@ pub fn render_record(
         .bg(p.chrome)
         .child(header)
         .child(body);
+    // 选区不止一格时，面板底部给出这些格子适用的批量动作；单格时不占地方。
+    if edit.selected > 1 {
+        // 大选区只报"多格"：面板不必为了显示数字把整张表展开成格子。
+        let count = if edit.selected == usize::MAX {
+            t("grid.record.selectionMany")
+        } else {
+            SharedString::from(i18n::fill(&i18n::text(locale, "grid.record.selection"), &[("count", &edit.selected.to_string())]))
+        };
+        panel = panel.child(
+            div()
+                .id("grid-record-batch")
+                .debug_selector(|| "grid-record-batch".to_owned())
+                .flex_none()
+                .px(px(8.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .border_t_1()
+                .border_color(p.line)
+                .child(kit::pill(count, p.accent_text, p.accent_soft))
+                .child(kit::tool_button("grid-selection-set", Some(IconName::Pencil), t("grid.write.setValue"), pane_command(entity, "grid-selection-set")))
+                .child(kit::tool_button("grid-selection-null", Some(IconName::X), t("grid.write.setNull"), pane_command(entity, "grid-selection-null")))
+                .child(kit::icon_button("grid-record-copy", IconName::Copy, t("grid.record.copySelection"), pane_command(entity, "copy-region"))),
+        );
+    }
     if let Some(viewer) = viewer {
         panel = panel.child(div().flex_1().min_h(px(180.)).min_w(px(0.)).border_t_1().border_color(p.line).child(viewer));
     }

@@ -365,6 +365,14 @@ dict! {
     "grid.state.complete" => "已读到末尾", "All rows loaded";
     "grid.state.noContinuation" => "这个结果不能由网格继续读取，不会重新执行语句", "The grid cannot continue this result and will not re-run the statement";
     "grid.state.readFailed" => "上一次读取失败，保留了上次有效的结果。", "The last read failed; the previous result was kept.";
+    // 网格三态：错误态标题与纠正动作、三类空态的说明，文案各不相同（需求 R4 / 规范 S8.5）。
+    "grid.state.readErrorTitle" => "读取失败", "Read failed";
+    "grid.state.noMatchDetail" => "调整查找或筛选条件后再试，清除条件可以回到已读取的全部行。", "Adjust the search or filters, or clear them to see every loaded row.";
+    "grid.state.tableEmptyDetail" => "这张表还没有行。插入一行并刷新后就能看到数据。", "This table has no rows yet. Insert one and refresh to see data.";
+    "grid.state.resultEmptyDetail" => "语句执行成功，但没有返回任何行。", "The statement ran successfully but returned no rows.";
+    "grid.state.clearConditions" => "清除条件", "Clear conditions";
+    "grid.action.retry" => "重试", "Retry";
+    "grid.value.openFullHint" => "按 Ctrl/⌘+Enter 查看完整值", "Press Ctrl/Cmd+Enter for the full value";
     "grid.state.schemaUnknown" => "表格结构无法识别，保留了上次有效的结果。", "The table structure could not be read; the previous result was kept.";
     "grid.value.copyValue" => "复制值", "Copy value";
     "grid.value.openFull" => "查看完整值", "View full value";
@@ -938,6 +946,14 @@ dict! {
     "grid.record.openValue" => "查看完整值", "Open full value";
     "grid.record.empty" => "没有可显示的行", "No row to show";
     "grid.record.hidden" => "（已隐藏）", "(hidden)";
+    // 记录面板的就地暂存：值直接在字段行里改，不弹窗；批量动作只在选区不止一格时出现。
+    "grid.record.editValue" => "点这一格暂存新值（Enter 暂存，Esc 取消）", "Click to stage a new value (Enter stages, Esc cancels)";
+    "grid.record.editHint" => "输入新值，Enter 暂存，Esc 取消", "New value; Enter stages, Esc cancels";
+    "grid.record.selection" => "选区 {count} 格", "{count} cells selected";
+    "grid.record.selectionMany" => "选区：多格", "Many cells selected";
+    "grid.record.copySelection" => "复制选区（多格含表头）", "Copy selection (headers included for multiple cells)";
+    "grid.record.filtered" => "筛选 {count} 条", "{count} filters";
+    "grid.menu.copySelection" => "复制选区（单格为值，多格含表头）", "Copy selection (value for one cell, with headers for many)";
     "grid.write.clone" => "复制为新行", "Clone as new row";
     "grid.write.paste" => "粘贴", "Paste";
     "grid.write.setValue" => "选区设值…", "Set value on selection…";
