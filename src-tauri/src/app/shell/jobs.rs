@@ -9,11 +9,12 @@ use crate::app::views::connections::{self, Secrets};
 use crate::app::views::history::{self, HistoryPage};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskOutcome};
+use crate::connections::groups::ConnectionGroup;
 use crate::connections::model::ConnectionDraft;
 use crate::query::{HistoryEntry, RenameRequest, SaveRequest, SavedQuery};
 use crate::state::AppState;
 
-use super::model::{PendingJob, WorkbenchModel};
+use super::model::{GroupOp, PendingJob, WorkbenchModel};
 
 #[derive(Clone, Debug)]
 pub struct JobRequest {
@@ -31,6 +32,8 @@ pub struct JobRequest {
     pub rename: Option<RenameRequest>,
     pub run_id: Option<String>,
     pub saved_id: Option<String>,
+    /// 这一次要落库的分组命令；其它任务为空。
+    pub group: Option<GroupOp>,
 }
 
 pub enum JobDone {
@@ -44,6 +47,8 @@ pub enum JobDone {
     Notice(TaskToken, Result<String, String>),
     Imported(TaskToken, Result<(connections::ConnectionSnapshot, usize, Vec<String>), String>),
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
+    /// 分组与成员关系的快照：(分组, 连接 id → 分组 id)。
+    Groups(TaskToken, Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String>),
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -87,6 +92,7 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
         rename,
         run_id: model.history.selected_run.clone(),
         saved_id: model.history.selected_saved.clone(),
+        group: model.pending_group_op.clone(),
     }
 }
 
@@ -198,6 +204,27 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                     Err(err) => JobDone::Notice(token, Err(err)),
                 },
                 Err(err) => JobDone::Notice(token, Err(err)),
+            }
+        }
+        PendingJob::RefreshGroups => JobDone::Groups(token, services.connections.groups().await),
+        PendingJob::GroupOp => {
+            let Some(op) = request.group else {
+                return JobDone::Notice(token, Err("ui.group.new".into()));
+            };
+            let result: Result<(), String> = match op {
+                GroupOp::Save { id, name } => {
+                    services.connections.save_group(id, name).await.map(|_| ()).map_err(|err| err.message())
+                }
+                GroupOp::Delete { id } => services.connections.delete_group(&id).await,
+                GroupOp::Assign { connection, group } => {
+                    services.connections.assign_group(&connection, group.as_deref()).await
+                }
+                GroupOp::Collapsed { id, collapsed } => services.connections.set_group_collapsed(&id, collapsed).await,
+            };
+            match result {
+                Ok(()) => JobDone::Groups(token, services.connections.groups().await),
+                // 失败只报告原因：本地分组与连接列表保持原样，绝不丢连接。
+                Err(detail) => JobDone::Groups(token, Err(detail)),
             }
         }
         PendingJob::RefreshHistory => JobDone::History(token, load_history(services).await),
@@ -367,6 +394,19 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.history.rename_open = false;
                 model.history.rename_text.clear();
                 model.history.message_key = Some("history.page.loadOnlySql");
+            }
+        }
+        JobDone::Groups(token, Ok((groups, members))) => {
+            if accepted(services, owner, token) {
+                // 落库成功后唯一一次改写内存分组：失败时这里根本不会走到，界面保持原样。
+                model.apply_groups(groups, members);
+                model.notice_key = None;
+            }
+        }
+        JobDone::Groups(token, Err(detail)) => {
+            if accepted(services, owner, token) {
+                model.notice_key = Some(static_notice(&detail));
+                model.notice_detail = detail;
             }
         }
         JobDone::History(token, Err(detail)) => {

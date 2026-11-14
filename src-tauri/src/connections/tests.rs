@@ -13,6 +13,133 @@ use super::CatalogSession;
 use super::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestStatus};
 use super::store::persisted_bytes;
 
+
+/// 分组测试用的服务：本地配置库 + 内存机密。
+fn group_service(path: &Path) -> Service {
+    Service::new(path.to_path_buf(), Arc::new(MemoryStore::default()))
+}
+
+#[tokio::test]
+async fn groups_persist_across_restart_and_leave_other_connections_ungrouped() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let db_one = dir.join("one.sqlite");
+    let db_two = dir.join("two.sqlite");
+    sqlite_fixture(&db_one).await;
+    sqlite_fixture(&db_two).await;
+    let service = group_service(&path);
+    let mut first = ConnectionDraft::blank(Engine::Sqlite);
+    first.file_path = db_one.display().to_string();
+    let one = service.save(first, SecretInput::default()).await.unwrap().connection.id;
+    let mut second = ConnectionDraft::blank(Engine::Sqlite);
+    second.file_path = db_two.display().to_string();
+    let two = service.save(second, SecretInput::default()).await.unwrap().connection.id;
+
+    let group = service.save_group(None, "  夜间巡检 ".into()).await.unwrap();
+    assert_eq!(group.name, "夜间巡检", "分组名两侧空白去掉");
+    assert!(!group.collapsed);
+    service.assign_group(&one, Some(&group.id)).await.unwrap();
+    service.set_group_collapsed(&group.id, true).await.unwrap();
+    // 重新打开配置库：分组、成员关系与折叠状态都还在。
+    let reopened = group_service(&path);
+    let (groups, members) = reopened.groups().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "夜间巡检");
+    assert!(groups[0].collapsed, "折叠状态持久化");
+    assert_eq!(members.get(&one).map(String::as_str), Some(group.id.as_str()));
+    assert_eq!(members.get(&two), None, "没归组的连接保持未分组");
+    assert_eq!(reopened.list().await.unwrap().len(), 2, "分组不改变连接数量");
+    let as_record = reopened.list().await.unwrap();
+    let saved = as_record.iter().find(|row| row.saved.id == one).unwrap();
+    assert_eq!(saved.saved.name, "one.sqlite", "连接定义与分组分开存放");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn deleting_a_group_returns_connections_to_the_top_level_without_losing_them() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let db = dir.join("app.sqlite");
+    sqlite_fixture(&db).await;
+    let service = group_service(&path);
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.file_path = db.display().to_string();
+    let id = service.save(draft, SecretInput::default()).await.unwrap().connection.id;
+    let group = service.save_group(None, "开发".into()).await.unwrap();
+    service.assign_group(&id, Some(&group.id)).await.unwrap();
+
+    service.delete_group(&group.id).await.unwrap();
+    let (groups, members) = service.groups().await.unwrap();
+    assert!(groups.is_empty());
+    assert!(members.is_empty(), "成员关系随分组一起删掉");
+    let rows = service.list().await.unwrap();
+    assert_eq!(rows.len(), 1, "删分组绝不删连接");
+    assert!(rows.iter().any(|row| row.saved.id == id));
+    assert!(service.delete_group(&group.id).await.is_err(), "重复删除报找不到分组");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn group_names_are_validated_and_missing_targets_are_rejected() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let db = dir.join("app.sqlite");
+    sqlite_fixture(&db).await;
+    let service = group_service(&path);
+    assert!(service.save_group(None, "   ".into()).await.is_err(), "空名拒绝");
+    assert!(service.save_group(None, "组".repeat(25)).await.is_err(), "超长拒绝");
+    let created = service.save_group(None, "临时".into()).await.unwrap();
+    let renamed = service.save_group(Some(created.id.clone()), "正式".into()).await.unwrap();
+    assert_eq!(renamed.name, "正式");
+    assert_eq!(renamed.id.len(), 36, "重命名不换 id");
+    assert!(service.save_group(Some("missing".into()), "x".into()).await.is_err());
+    assert!(service.delete_group("missing").await.is_err());
+    assert!(service.set_group_collapsed("missing", true).await.is_err());
+
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.file_path = db.display().to_string();
+    let id = service.save(draft, SecretInput::default()).await.unwrap().connection.id;
+    assert!(service.assign_group(&id, Some("missing")).await.is_err(), "指向不存在的分组不落库");
+    assert!(service.assign_group("missing-connection", None).await.is_err());
+    assert!(service.groups().await.unwrap().1.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn unknown_group_ids_read_as_ungrouped_and_deleted_connections_drop_membership() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let db = dir.join("app.sqlite");
+    sqlite_fixture(&db).await;
+    let service = group_service(&path);
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.file_path = db.display().to_string();
+    let id = service.save(draft, SecretInput::default()).await.unwrap().connection.id;
+    let group = service.save_group(None, "校验".into()).await.unwrap();
+    service.assign_group(&id, Some(&group.id)).await.unwrap();
+    // 外部改库或半途失败留下的悬空成员关系：分组行没了，成员关系还在。
+    {
+        let store = super::store::Store::open(&path).await.unwrap();
+        store.delete_group(&group.id).await.unwrap();
+        store.testing_insert_membership(&id, &group.id).await.unwrap();
+        assert_eq!(store.memberships().await.unwrap().len(), 1);
+    }
+    // 下次打开配置库时迁移把悬空引用清掉：连接按未分组读，连接本身一条不少。
+    let suspended = group_service(&path);
+    let (groups, members) = suspended.groups().await.unwrap();
+    assert!(groups.is_empty(), "悬空分组不会凭空出现");
+    assert_eq!(members.get(&id), None, "悬空引用按未分组读");
+    assert_eq!(suspended.list().await.unwrap().len(), 1, "清理悬空引用不丢连接");
+
+    let kept = suspended.save_group(None, "留下的组".into()).await.unwrap();
+    suspended.assign_group(&id, Some(&kept.id)).await.unwrap();
+    let outcome = suspended.delete(&id).await.unwrap();
+    assert_eq!(outcome.connection.id, id);
+    assert!(suspended.groups().await.unwrap().1.is_empty(), "删连接时成员关系一起清掉");
+    assert_eq!(suspended.groups().await.unwrap().0.len(), 1, "分组本身保留");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn temp_workspace() -> PathBuf {
     let path = std::env::temp_dir().join(format!("rillsql-conn-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();

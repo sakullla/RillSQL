@@ -4,6 +4,7 @@ mod chrome;
 mod close;
 mod conn_modal;
 mod danger;
+pub(crate) mod explorer;
 mod jobs;
 mod layout;
 mod menus;

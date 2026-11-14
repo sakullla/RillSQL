@@ -247,6 +247,8 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
             MenuPlace::Editor => MenuTarget::QueryTab,
             MenuPlace::ConnectionRow => MenuTarget::Connection,
             MenuPlace::HistoryEntry => MenuTarget::Run,
+            // 分组菜单由模型用 with_items 现算，不在这份通用表里。
+            MenuPlace::ExplorerGroup => MenuTarget::Connection,
         };
         let items = menu_items(place, target);
         assert!(!items.is_empty(), "{place:?}");
@@ -7632,4 +7634,609 @@ async fn save_and_connect_carries_the_typed_password_into_open() {
     assert_eq!(request.secrets.password, "typed-only-here", "打开连接要用刚输入的密码");
     assert_eq!(request.selected.as_deref(), Some("pg"), "重试仍指向同一条连接");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ 连接分组与虚拟化对象浏览器（T4）
+
+fn group(id: &str, name: &str, position: i64, collapsed: bool) -> crate::connections::groups::ConnectionGroup {
+    crate::connections::groups::ConnectionGroup { id: id.into(), name: name.into(), position, collapsed }
+}
+
+fn grouped_model(rows: Vec<ConnectionRecord>, groups: Vec<crate::connections::groups::ConnectionGroup>, members: &[(&str, &str)]) -> WorkbenchModel {
+    let mut model = seeded_model(rows);
+    let members = members.iter().map(|(connection, group)| ((*connection).to_owned(), (*group).to_owned())).collect();
+    model.apply_groups(groups, members);
+    model
+}
+
+fn item_kinds(model: &WorkbenchModel) -> Vec<String> {
+    model.explorer_rows().iter().map(|item| item.id()).collect()
+}
+
+#[test]
+fn explorer_flat_rows_group_connections_and_keep_empty_groups_visible() {
+    let rows = vec![
+        record_for("c1", "Atlas", Engine::Postgres),
+        record_for("c2", "Borealis", Engine::Postgres),
+        record_for("c3", "Cygnus", Engine::Postgres),
+    ];
+    let groups = vec![group("g1", "空组", 0, false), group("g2", "生产", 1, false)];
+    let model = grouped_model(rows, groups, &[("c1", "g2")]);
+    let ids = item_kinds(&model);
+    assert_eq!(
+        ids,
+        vec![
+            "group:g1".to_owned(),
+            "group:g2".to_owned(),
+            "conn:c1".to_owned(),
+            "conn:c2".to_owned(),
+            "conn:c3".to_owned(),
+        ],
+        "分组在顶层连接之前，空组照样出现，成员连接在组标题下"
+    );
+
+    // 折叠只收起成员，标题与数量还在。
+    let mut model = model;
+    let _ = model.dispatch("group-toggle:g2");
+    let ids = item_kinds(&model);
+    assert_eq!(ids, vec!["group:g1".to_owned(), "group:g2".to_owned(), "conn:c2".to_owned(), "conn:c3".to_owned()]);
+}
+
+#[test]
+fn explorer_ids_are_stable_and_dense_under_hundreds_of_connections() {
+    let rows: Vec<ConnectionRecord> = (0..300)
+        .map(|index| record_for(&format!("c{index:03}"), &format!("连接 {index:03}"), Engine::Postgres))
+        .collect();
+    let model = grouped_model(rows, vec![group("g1", "生产", 0, false)], &[("c000", "g1")]);
+    let items = model.explorer_rows();
+    assert_eq!(items.len(), 301, "一行分组 + 300 条连接（没有会话就没有树行）");
+    let ids: std::collections::BTreeSet<String> = items.iter().map(|item| item.id()).collect();
+    assert_eq!(ids.len(), items.len(), "同一序列里 id 不重复");
+    assert_eq!(items[1].id(), "conn:c000");
+    assert_eq!(items.last().unwrap().id(), "conn:c299");
+
+    // 元素数量不随总节点线性增长：视口 480px 只创建视口内（含 overscan）的行。
+    let heights = model.explorer_heights(&items);
+    let window = super::explorer::window_rows(&heights, 0., 480., super::explorer::OVERSCAN_ROWS);
+    let created = window.range.len();
+    assert!(created < 40, "300 条连接时只创建 {created} 个元素");
+    let small: Vec<ConnectionRecord> = (0..20)
+        .map(|index| record_for(&format!("s{index:03}"), &format!("小 {index:03}"), Engine::Postgres))
+        .collect();
+    let small_model = grouped_model(small, Vec::new(), &[]);
+    let small_items = small_model.explorer_rows();
+    let small_heights = small_model.explorer_heights(&small_items);
+    let small_window = super::explorer::window_rows(&small_heights, 0., 480., super::explorer::OVERSCAN_ROWS);
+    assert!(
+        created <= small_window.range.len() + 4,
+        "视图元素数量与连接总数无关（300 条 {created}，20 条 {}）",
+        small_window.range.len()
+    );
+}
+
+#[test]
+fn group_commands_share_one_pending_job_and_reject_empty_or_missing_targets() {
+    let mut model = grouped_model(
+        vec![record_for("c1", "Atlas", Engine::Postgres)],
+        vec![group("g1", "生产", 0, false)],
+        &[],
+    );
+
+    // 新建：本地校验名称，通过后才排队一条落库命令。
+    let _ = model.dispatch("group-new");
+    assert!(model.group_prompt.is_some());
+    model.set_field(DraftField::GroupName, "  ".into());
+    let _ = model.dispatch("group-save");
+    assert!(model.group_prompt.as_ref().unwrap().error.is_some(), "空名当场拒绝");
+    assert!(model.pending_group_op.is_none());
+    model.set_field(DraftField::GroupName, "  夜间巡检 ".into());
+    let _ = model.dispatch("group-save");
+    assert_eq!(model.pending_group_op, Some(super::model::GroupOp::Save { id: None, name: "夜间巡检".into() }));
+    assert_eq!(model.take_pending(), Some(PendingJob::GroupOp));
+    model.pending_group_op = None;
+
+    // 重命名：输入面板预填原名，确认后带上分组 id 走同一条保存命令。
+    let _ = model.dispatch("group-rename:g1");
+    assert_eq!(model.group_prompt.as_ref().unwrap().text, "生产");
+    model.set_field(DraftField::GroupName, "生产库".into());
+    let _ = model.dispatch("group-save");
+    assert_eq!(
+        model.pending_group_op,
+        Some(super::model::GroupOp::Save { id: Some("g1".into()), name: "生产库".into() })
+    );
+    model.pending_group_op = None;
+    model.pending.clear();
+
+    // 折叠：本地立即生效，同一条命令负责持久化。
+    let _ = model.dispatch("group-toggle:g1");
+    assert!(model.groups[0].collapsed);
+    assert_eq!(model.pending_group_op, Some(super::model::GroupOp::Collapsed { id: "g1".into(), collapsed: true }));
+    assert_eq!(model.take_pending(), Some(PendingJob::GroupOp));
+    model.pending_group_op = None;
+    let _ = model.dispatch("group-toggle:g1");
+    model.pending_group_op = None;
+    model.pending.clear();
+
+    // 归组与移回顶层：同一个命令，目标为空就是顶层。
+    let _ = model.dispatch("group-assign:c1\u{1}g1");
+    assert_eq!(
+        model.pending_group_op,
+        Some(super::model::GroupOp::Assign { connection: "c1".into(), group: Some("g1".into()) })
+    );
+    model.pending_group_op = None;
+    let _ = model.dispatch("group-assign:c1\u{1}");
+    assert_eq!(
+        model.pending_group_op,
+        Some(super::model::GroupOp::Assign { connection: "c1".into(), group: None })
+    );
+    model.pending_group_op = None;
+    // 指向不存在的分组或连接：不产生命令，也就不可能把连接弄丢。
+    let _ = model.dispatch("group-assign:c1\u{1}ghost");
+    assert!(model.pending_group_op.is_none());
+    let _ = model.dispatch("group-assign:nobody\u{1}g1");
+    assert!(model.pending_group_op.is_none());
+
+    // 删除先进确认层：说明影响，第二次确认才落库。
+    let _ = model.dispatch("group-delete:g1");
+    assert_eq!(model.group_delete.as_deref(), Some("g1"));
+    let _ = model.dispatch("group-delete-cancel");
+    assert!(model.group_delete.is_none());
+    assert!(model.pending_group_op.is_none());
+    let _ = model.dispatch("group-delete:g1");
+    let _ = model.dispatch("group-delete-confirm");
+    assert_eq!(model.pending_group_op, Some(super::model::GroupOp::Delete { id: "g1".into() }));
+}
+
+#[test]
+fn unknown_group_ids_read_as_ungrouped_and_group_metadata_stays_out_of_connections() {
+    let rows = vec![record_for("c1", "Atlas", Engine::Postgres), record_for("c2", "Borealis", Engine::Mysql)];
+    let model = grouped_model(rows, vec![group("g1", "生产", 0, false)], &[("c1", "g1"), ("c2", "ghost")]);
+    assert_eq!(model.group_of("c1"), Some("g1"));
+    assert_eq!(model.group_of("c2"), None, "指向已删除分组按未分组读");
+    let ids = item_kinds(&model);
+    assert!(ids.contains(&"conn:c2".to_owned()), "未分组连接留在顶层");
+    let layout = model.group_layout();
+    assert_eq!(layout.ungrouped, vec!["c2".to_owned()]);
+    // 连接定义本身没有分组字段：序列化里也不会出现分组 id。
+    let blob = serde_json::to_string(&model.connections.rows[0].saved).unwrap();
+    assert!(!blob.contains("g1"), "{blob}");
+}
+
+#[test]
+fn explorer_keyboard_walks_groups_connections_and_tree_rows() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "Atlas", vec![nav_database("shop", vec![orders])]);
+    let mut model = grouped_model(vec![record_for("pg", "Atlas", Engine::Postgres)], vec![group("g1", "生产", 0, false)], &[("pg", "g1")]);
+    model.connections.status.insert("pg".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[pg], false);
+    let connection_id = crate::catalog::hierarchy::connection_node_id("pg");
+    let _ = model.dispatch(&format!("nav-toggle:{connection_id}"));
+
+    model.set_explorer_current(super::explorer::ExplorerRow::Group("g1".into()));
+    // 回车折叠分组：本地状态与后台命令同时到位。
+    let _ = model.nav_key(NavKey::Enter);
+    assert!(model.groups[0].collapsed);
+    assert_eq!(model.pending_group_op, Some(super::model::GroupOp::Collapsed { id: "g1".into(), collapsed: true }));
+    model.pending_group_op = None;
+    model.pending.clear();
+    // 右方向键展开回来，下方向键落到组内连接行。
+    let _ = model.nav_step(true);
+    assert!(!model.groups[0].collapsed);
+    model.pending_group_op = None;
+    model.pending.clear();
+    let _ = model.nav_key(NavKey::ArrowDown);
+    assert_eq!(model.explorer_current_row(), Some(super::explorer::ExplorerRow::Connection("pg".into())));
+    assert_eq!(model.connections.selected.as_deref(), Some("pg"));
+    // 再往下就是这条连接的树行。
+    let _ = model.nav_key(NavKey::ArrowDown);
+    assert!(matches!(model.explorer_current_row(), Some(super::explorer::ExplorerRow::Node(_))));
+    assert_eq!(model.executions, 0, "键盘导航不执行任何 SQL");
+}
+
+#[test]
+fn searching_reads_only_loaded_nodes_and_clearing_restores_the_tree() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let mut pg = nav_connection(Engine::Postgres, "pg", "Atlas", vec![nav_database("shop", vec![orders]), nav_database("cold", Vec::new())]);
+    // “cold”库还没展开过：范围总量为 0 表示从没读过，筛选不能去猜它的对象。
+    pg.databases[1].schemas = Vec::new();
+    let mut model = grouped_model(
+        vec![record_for("pg", "Atlas", Engine::Postgres), record_for("other", "Borealis", Engine::Postgres)],
+        vec![group("g1", "生产", 0, false), group("g2", "冷库组", 1, false)],
+        &[("pg", "g1"), ("other", "g2")],
+    );
+    model.connections.status.insert("pg".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[pg], false);
+    let connection_id = crate::catalog::hierarchy::connection_node_id("pg");
+    let _ = model.dispatch(&format!("nav-toggle:{connection_id}"));
+    let expanded = model.explorer_rows().len();
+
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let rows = model.explorer_rows();
+    let ids: Vec<String> = rows.iter().map(|item| item.id()).collect();
+    assert!(ids.contains(&"conn:pg".to_owned()));
+    let nav_labels: Vec<String> = rows
+        .iter()
+        .filter_map(|item| item.nav_row().map(|row| row.label.clone()))
+        .collect();
+    assert!(nav_labels.contains(&"shop".to_owned()), "命中对象的库作为祖先保留");
+    assert!(nav_labels.contains(&"orders".to_owned()));
+    assert!(!nav_labels.contains(&"cold".to_owned()), "没读过的库不参与筛选");
+    assert!(ids.contains(&"group:g1".to_owned()), "有命中的分组标题保留");
+    assert!(!ids.contains(&"group:g2".to_owned()), "没有命中的分组不出现");
+    assert!(!ids.contains(&"conn:other".to_owned()));
+
+    model.set_field(DraftField::ObjectFilter, String::new());
+    assert_eq!(model.explorer_rows().len(), expanded, "清除筛选恢复原样");
+}
+
+#[test]
+fn filtering_to_nothing_shows_one_clear_no_match_row() {
+    let model_rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+    let mut model = grouped_model(model_rows, vec![group("g1", "生产", 0, false)], &[("pg", "g1")]);
+    model.set_field(DraftField::ObjectFilter, "zzz".into());
+    let ids = item_kinds(&model);
+    assert_eq!(ids, vec!["explorer-no-match".to_owned()], "无命中时只剩一条提示行");
+    assert_eq!(model.nav_empty_key("pg"), Some("ui.explorer.noMatch"));
+}
+
+#[gpui_kit::test]
+fn hundreds_of_connections_render_only_the_visible_explorer_rows(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-many-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1360., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let rows: Vec<ConnectionRecord> = (0..300)
+                .map(|index| record_for(&format!("c{index:03}"), &format!("连接 {index:03}"), Engine::Postgres))
+                .collect();
+            view.model.connections.rows = rows;
+            view.model.apply_groups(vec![group("g1", "生产", 0, false)], [("c000".to_owned(), "g1".to_owned())].into_iter().collect());
+            view.model.shell.sidebar_open = true;
+            cx.notify();
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("side-c000").is_some(), "视口内的连接行要画出来");
+        assert!(window.try_find("side-group-g1").is_some(), "分组标题可见");
+        let mut created = 0;
+        for index in 0..300 {
+            if window.try_find(format!("side-c{index:03}")).is_some() {
+                created += 1;
+            }
+        }
+        assert!(created > 0 && created < 60, "300 条连接只创建 {created} 个行元素");
+        println!(
+            "HUNDREDS top rows {created} viewport {} max_offset {}",
+            f32::from(view.read(cx).explorer_scroll.bounds().size.height),
+            f32::from(view.read(cx).explorer_scroll.max_offset().y)
+        );
+        // 行高就是密度 token：连接行 row_h、分组标题 tree_row_h，没有被 flex 压扁。
+        assert_eq!(f32::from(window.try_find("side-c000").unwrap().bounds().size.height), 26.);
+        assert_eq!(f32::from(window.try_find("side-group-g1").unwrap().bounds().size.height), 23.);
+        assert!(window.try_find("side-c299").is_none(), "视口外的连接行不创建元素");
+        // 滚到底：窗口跟着滚动重算，远处的行才被创建，顶部的行被回收。
+        window.scroll(
+            "explorer-list",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::Point::new(gpui_kit::px(0.), gpui_kit::px(-9000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        // 再滚一次并重绘一帧：滚动到边界后视图才把最后几行算进窗口。
+        window.scroll(
+            "explorer-list",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::Point::new(gpui_kit::px(0.), gpui_kit::px(-9000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        for _ in 0..2 {
+            window.render_frame(cx);
+        }
+        let mut created = 0;
+        for index in 0..300 {
+            if window.try_find(format!("side-c{index:03}")).is_some() {
+                created += 1;
+            }
+        }
+        assert!(created < 60, "滚到底后仍只创建 {created} 个行元素");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 分组标题右键与拖拽归组：两条鼠标路径都发同一条命令，落库只在后台一处。
+#[gpui_kit::test]
+fn group_row_menu_and_connection_drag_share_the_same_move_command(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-drag-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1360., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+            view.model.apply_groups(
+                vec![group("g1", "生产库", 0, false)],
+                [("pg".to_owned(), "g1".to_owned())].into_iter().collect(),
+            );
+            view.model.shell.sidebar_open = true;
+            cx.notify();
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 分组标题右键：菜单属于被点的分组，命令带上稳定 id。
+        window.right_click("side-group-g1", cx);
+        assert!(window.try_find("group-chevron-g1").is_some(), "分组标题保留展开箭头");
+        view.update(cx, |view, _| {
+            let menu = view.model.menu.as_ref().expect("分组菜单");
+            let commands: Vec<String> = super::menus::flatten_items(&menu.items).iter().map(|item| item.command()).collect();
+            assert!(commands.contains(&"group-rename:g1".to_owned()), "{commands:?}");
+            assert!(commands.contains(&"group-delete:g1".to_owned()), "{commands:?}");
+            assert_eq!(view.model.group_menu.as_deref(), Some("g1"));
+        });
+        view.update(cx, |view, cx| {
+            view.model.menu = None;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        // 连接右键菜单里有“移动到分组”，子项带目标分组 id；已经在组内时另有移出项。
+        window.right_click("side-pg", cx);
+        view.update(cx, |view, _| {
+            let menu = view.model.menu.as_ref().expect("连接菜单");
+            let branch = menu.items.iter().find(|item| item.id == "submenu-move-group").expect("移动到分组子菜单");
+            let commands: Vec<String> = branch.children.iter().map(|item| item.command()).collect();
+            assert!(commands.contains(&"group-assign:pg\u{1}g1".to_owned()), "{commands:?}");
+            assert!(commands.iter().any(|command| command == "group-assign:pg\u{1}"), "已在组内要有移出项：{commands:?}");
+        });
+        view.update(cx, |view, cx| {
+            view.model.menu = None;
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 拖拽归组走真实鼠标路径：从连接行拖到分组标题放手，落同一条 assign 命令。
+#[gpui_kit::test]
+fn dragging_a_connection_onto_a_group_row_queues_the_same_assign_command(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-dnd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1360., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+            view.model.apply_groups(vec![group("g1", "生产库", 0, false)], Default::default());
+            view.model.shell.sidebar_open = true;
+            cx.notify();
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.drag_to("side-pg", "side-group-g1", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.model.pending_group_op,
+            Some(super::model::GroupOp::Assign { connection: "pg".into(), group: Some("g1".into()) }),
+            "拖拽与右键菜单落同一条命令"
+        );
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 资源管理器行：长名称可读、状态写成文字、展开箭头在位，右键仍绑定这一行。
+#[gpui_kit::test]
+fn explorer_rows_keep_long_names_status_chevrons_and_object_actions(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = two_sqlite_connections(cx);
+    wait_for_shell_ready(cx, window, &view);
+    let long_name = "客户订单归档与结算连接的完整名称".repeat(3);
+    let status_text = cx.update(|cx| view.read(cx).model.text("connections.status.connected"));
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            if let Some(row) = view.model.connections.rows.iter_mut().find(|row| row.saved.id == "notes") {
+                row.saved.name = long_name.clone();
+            }
+            cx.notify();
+        });
+    });
+    let object_id = wait_for_nav_object(cx, window, &view, "item");
+    assert!(!object_id.is_empty(), "目录树读到表节点");
+    {
+        let connection = crate::catalog::hierarchy::connection_node_id("notes");
+        let now = cx.update(|cx| view.read(cx).model.nav.is_expanded(&connection));
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| view.perform(&format!("nav-toggle:{connection}"), cx));
+        })
+        .unwrap();
+        let after = cx.update(|cx| view.read(cx).model.nav.is_expanded(&connection));
+        assert!(after, "nav-toggle 应展开连接（之前 {now}）");
+    }
+    // 展开对象种类分组，让对象行进入资源管理器。
+    let groups: Vec<String> = cx.update(|cx| {
+        view.read(cx)
+            .model
+            .nav
+            .visible()
+            .into_iter()
+            .filter(|row| row.kind == crate::catalog::hierarchy::NavKind::Group)
+            .map(|row| row.id)
+            .collect()
+    });
+    for group in groups {
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| view.perform(&format!("nav-toggle:{group}"), cx));
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let row = window.try_find("side-notes").expect("连接行");
+        let label = row.label().expect("无障碍名称").to_owned();
+        assert!(label.contains(&long_name), "完整名称仍要可读：{label}");
+        let description = row.description().expect("状态说明").to_owned();
+        assert!(description.contains(&status_text), "状态不只靠圆点颜色：{description}");
+        assert!(f32::from(row.bounds().size.width) <= f32::from(window.find("sidebar").bounds().size.width));
+        assert!(window.try_find("nav-chevron-notes").is_some(), "连接行保留展开箭头");
+        let object_row = gpui_kit::SharedString::from(format!("nav-{object_id}"));
+        assert!(window.try_find(object_row.clone()).expect("对象行").visible());
+        window.right_click(object_row, cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert_eq!(view.model.nav_menu_node.as_deref(), Some(object_id.as_str()), "菜单只属于被点的这一行");
+            let menu = view.model.menu.as_ref().expect("对象菜单");
+            let commands: Vec<String> = super::menus::flatten_items(&menu.items).iter().map(|item| item.command()).collect();
+            assert!(commands.contains(&"tree-open-data".to_owned()), "{commands:?}");
+            assert!(commands.contains(&"open-structure".to_owned()), "{commands:?}");
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+#[test]
+fn empty_databases_and_connection_errors_have_their_own_explorer_rows() {
+    use crate::catalog::model::ObjectRow;
+    use crate::catalog::NavConnection;
+    // 已连接但一条对象都没有：说明行用“没有对象”，不是错误、也不是无命中。
+    let empty = NavConnection::new("idle", "空库连接", Engine::Postgres, crate::catalog::model::ConnStatus::Connected);
+    let mut model = grouped_model(vec![record_for("idle", "空库连接", Engine::Postgres)], Vec::new(), &[]);
+    model.connections.status.insert("idle".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[empty], false);
+    let connection = crate::catalog::hierarchy::connection_node_id("idle");
+    let _ = model.dispatch(&format!("nav-toggle:{connection}"));
+    let notes: Vec<&'static str> = model
+        .explorer_rows()
+        .iter()
+        .filter_map(|item| match item {
+            super::explorer::ExplorerItem::Note { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes, vec!["ui.explorer.noObjects"]);
+
+    // 连接读取失败：原因只写在这一条连接下面，带重试；同连接的对象行照旧保留。
+    let mut broken = NavConnection::new("pg", "Atlas", Engine::Postgres, crate::catalog::model::ConnStatus::Lost);
+    broken.error = Some("连接已断开".to_owned());
+    broken.databases = vec![nav_database("shop", vec![ObjectRow::table("orders", Some(1))])];
+    let mut model = grouped_model(vec![record_for("pg", "Atlas", Engine::Postgres)], Vec::new(), &[]);
+    model.apply_navigation(&[broken], false);
+    let errors: Vec<String> = model
+        .explorer_rows()
+        .iter()
+        .filter_map(|item| match item {
+            super::explorer::ExplorerItem::ConnectionError { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, vec!["连接已断开".to_owned()]);
+    // 目录整体失败：只留一条提示行，不在每条连接下重复。
+    model.nav_error = "目录读取失败".to_owned();
+    let first = model.explorer_rows().first().map(|item| item.id());
+    assert_eq!(first.as_deref(), Some("catalog-error"));
+}
+/// 重启恢复：分组与折叠经配置库落盘，下次启动由 RefreshGroups 读回来。
+#[tokio::test]
+async fn groups_and_collapse_state_survive_a_restart_through_the_job_path() {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-group-restart-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let database = dir.join("work.sqlite");
+    let mut draft = crate::connections::model::ConnectionDraft::blank(Engine::Sqlite);
+    draft.id = Some("work".to_owned());
+    draft.name = "工作库".to_owned();
+    draft.file_path = database.display().to_string();
+    services.connections.save(draft, crate::connections::model::SecretInput::default()).await.unwrap();
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.open_group_prompt(None);
+    model.set_field(DraftField::GroupName, "夜间巡检".into());
+    assert!(model.confirm_group_prompt());
+    let token = model.begin_owner(&services.tasks, "groups");
+    let request = request_of(&mut model, token);
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "groups", done);
+    assert_eq!(model.groups.len(), 1, "新建分组落库后回到模型");
+    let group_id = model.groups[0].id.clone();
+
+    model.connections.rows = services.connections.list().await.unwrap();
+    assert!(model.assign_connection_group("work", Some(&group_id)));
+    let token = model.begin_owner(&services.tasks, "groups");
+    let request = request_of(&mut model, token);
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "groups", done);
+    assert_eq!(model.group_of("work"), Some(group_id.as_str()));
+    assert!(model.toggle_group(&group_id));
+    let token = model.begin_owner(&services.tasks, "groups");
+    let request = request_of(&mut model, token);
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "groups", done);
+    assert!(model.groups[0].collapsed);
+
+    // “重启”：新的服务与模型，只靠启动那次 RefreshGroups 恢复。
+    let restarted = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.connections.rows = restarted.connections.list().await.unwrap();
+    let _ = model.dispatch("group-refresh");
+    let token = model.begin_owner(&restarted.tasks, "groups");
+    let request = request_of(&mut model, token);
+    let done = jobs::execute_job(&restarted, request).await;
+    apply_done(&mut model, &restarted, "groups", done);
+    assert_eq!(model.groups.len(), 1, "重启后分组还在");
+    assert_eq!(model.groups[0].name, "夜间巡检");
+    assert!(model.groups[0].collapsed, "折叠状态一起恢复");
+    assert_eq!(model.group_of("work"), Some(group_id.as_str()), "成员关系一起恢复");
+    let ids: Vec<String> = model.explorer_rows().iter().map(|item| item.id()).collect();
+    assert_eq!(ids, vec![format!("group:{group_id}")], "折叠的分组只留标题，成员连接不展开");
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 三档宽度：对象浏览器的宽度、行高与元素数量都按密度与布局走，不横向溢出。
+#[gpui_kit::test]
+fn object_browser_geometry_holds_at_1360_900_and_640(cx: &mut gpui_kit::TestAppContext) {
+    for (width, overlay) in [(1360., false), (900., false), (640., true)] {
+        let dir = std::env::temp_dir().join(format!("rillsql-shell-geom-{}-{width}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = services_at(&dir);
+        let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, width, 800.);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.model.connections.rows = (0..12)
+                    .map(|index| record_for(&format!("c{index:02}"), &format!("客户订单归档连接 {index:02}"), Engine::Postgres))
+                    .collect();
+                view.model.shell.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let sidebar = window.try_find("sidebar").expect("资源管理器");
+            let sidebar_w = f32::from(sidebar.bounds().size.width);
+            let expected = view.read(cx).model.sidebar_width;
+            assert!((sidebar_w - expected).abs() < 1., "{width}: 侧栏宽 {sidebar_w}");
+            assert!(f32::from(sidebar.bounds().origin.x) <= 64. + 1., "{width}: 侧栏贴着活动栏");
+            let row = window.try_find("side-c00").expect("连接行");
+            assert!(f32::from(row.bounds().size.width) <= sidebar_w, "{width}: 行不横向溢出");
+            assert_eq!(f32::from(row.bounds().size.height), 26., "{width}: 紧凑行高");
+            let list = window.try_find("explorer-list").expect("列表");
+            assert!(f32::from(list.bounds().size.width) <= sidebar_w, "{width}: 列表不横向溢出");
+            let mut created = 0;
+            for index in 0..12 {
+                if window.try_find(format!("side-c{index:02}")).is_some() {
+                    created += 1;
+                }
+            }
+            let overlay_now = view.read(cx).model.painted().sidebar_overlay;
+            assert_eq!(overlay_now, overlay, "{width}: 是否覆盖式侧栏");
+            println!(
+                "WIDTH {width} sidebar {sidebar_w} list {} overlay {overlay} rows {created} row_h 26",
+                f32::from(list.bounds().size.width)
+            );
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

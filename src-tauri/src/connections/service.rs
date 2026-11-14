@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use futures::{stream, StreamExt};
 
 use crate::connections::drivers::{self, TunnelFault, TdsClient};
+use crate::connections::groups::{validate_group_name, ConnectionGroup};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
 use crate::connections::model::{
     password_account, ssh_password_account, validate_tag_label, ConnectionDraft, Engine, EnvTag, FieldError, SavedConnection, Secret, SecretInput,
@@ -531,6 +532,71 @@ impl Service {
         }
         store.delete_tag(id).await.map_err(db_err)?;
         Ok(())
+    }
+
+    /// 分组与成员关系一次读出；资源管理器、启动台与分组命令都只认这一份快照。
+    pub async fn groups(&self) -> Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String> {
+        let store = self.store().await?;
+        let groups = store.list_groups().await.map_err(db_err)?;
+        let members = store.memberships().await.map_err(db_err)?;
+        Ok((groups, members.into_iter().collect()))
+    }
+
+    /// 新建或重命名分组。重名允许（靠稳定 id 区分），空名与超长名在这里拒绝。
+    pub async fn save_group(&self, id: Option<String>, name: String) -> Result<ConnectionGroup, ServiceError> {
+        let name = validate_group_name(&name).map_err(ServiceError::Message)?;
+        let store = self.store().await.map_err(ServiceError::Message)?;
+        let requested = id.unwrap_or_default();
+        let requested = requested.trim();
+        let group = if requested.is_empty() {
+            let position = store.next_group_position().await.map_err(|err| ServiceError::Message(db_err(err)))?;
+            ConnectionGroup::new(uuid::Uuid::new_v4().to_string(), name, position)
+        } else {
+            let existing = store
+                .group(requested)
+                .await
+                .map_err(|err| ServiceError::Message(db_err(err)))?
+                .ok_or_else(|| ServiceError::Message("找不到这个分组".to_owned()))?;
+            ConnectionGroup { name, ..existing }
+        };
+        store.upsert_group(&group).await.map_err(|err| ServiceError::Message(db_err(err)))?;
+        Ok(group)
+    }
+
+    /// 删分组：只删分组记录与成员关系，连接回到顶层；连接配置一行都不动。
+    pub async fn delete_group(&self, id: &str) -> Result<(), String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("找不到这个分组".to_owned());
+        }
+        let store = self.store().await?;
+        if store.group(id).await.map_err(db_err)?.is_none() {
+            return Err("找不到这个分组".to_owned());
+        }
+        store.delete_group(id).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    pub async fn set_group_collapsed(&self, id: &str, collapsed: bool) -> Result<(), String> {
+        let store = self.store().await?;
+        if store.group(id).await.map_err(db_err)?.is_none() {
+            return Err("找不到这个分组".to_owned());
+        }
+        store.set_group_collapsed(id, collapsed).await.map_err(db_err)
+    }
+
+    /// 拖拽与右键“移动到分组”走同一条命令；None 表示移回顶层。
+    pub async fn assign_group(&self, connection_id: &str, group: Option<&str>) -> Result<(), String> {
+        let store = self.store().await?;
+        if store.get(connection_id).await.map_err(db_err)?.is_none() {
+            return Err("找不到这个连接".to_owned());
+        }
+        if let Some(group) = group {
+            if store.group(group).await.map_err(db_err)?.is_none() {
+                return Err("找不到这个分组".to_owned());
+            }
+        }
+        store.assign_group(connection_id, group).await.map_err(db_err)
     }
 
     pub async fn save(&self, draft: ConnectionDraft, input: SecretInput) -> Result<SaveOutcome, ServiceError> {

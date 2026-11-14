@@ -5,6 +5,7 @@ pub(crate) mod drivers;
 pub(crate) mod error_codes;
 pub(crate) mod export;
 pub(crate) mod forward;
+pub(crate) mod groups;
 mod hostkey;
 pub(crate) mod model;
 pub(crate) mod route;

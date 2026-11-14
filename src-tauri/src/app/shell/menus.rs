@@ -13,6 +13,8 @@ pub enum MenuPlace {
     Editor,
     ConnectionRow,
     HistoryEntry,
+    /// 资源管理器里的用户分组标题：重命名、折叠、删除。
+    ExplorerGroup,
 }
 
 impl MenuPlace {
@@ -24,6 +26,7 @@ impl MenuPlace {
             Self::Editor => "query.editor.area",
             Self::ConnectionRow => "connections.page.moreActions",
             Self::HistoryEntry => "history.page.tabsLabel",
+            Self::ExplorerGroup => "catalog.tree.menuLabel",
         }
     }
 
@@ -53,8 +56,13 @@ pub enum MenuTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuItem {
+    /// 稳定的条目身份；分组名、连接名这类可变文本走 text，不进 id。
     pub id: &'static str,
     pub label_key: &'static str,
+    /// 动态文案（分组名）；为空时按 label_key 取译文。
+    pub text: Option<String>,
+    /// 动态命令（带上目标分组/连接的 id）；为空时命令就是 id。
+    pub action: Option<String>,
     pub danger: bool,
     pub enabled: bool,
     pub reason_key: Option<&'static str>,
@@ -64,8 +72,32 @@ pub struct MenuItem {
     pub children: Vec<MenuItem>,
 }
 
+impl MenuItem {
+    /// 这一项真正要执行的命令：动态目标优先，否则就是稳定 id。
+    pub fn command(&self) -> String {
+        self.action.clone().unwrap_or_else(|| self.id.to_owned())
+    }
+}
+
 fn leaf(id: &'static str, label_key: &'static str, danger: bool, enabled: bool, reason_key: Option<&'static str>) -> MenuItem {
-    MenuItem { id, label_key, danger, enabled, reason_key, icon: None, shortcut: chord_for(id), separator_before: false, children: Vec::new() }
+    MenuItem {
+        id,
+        label_key,
+        text: None,
+        action: None,
+        danger,
+        enabled,
+        reason_key,
+        icon: None,
+        shortcut: chord_for(id),
+        separator_before: false,
+        children: Vec::new(),
+    }
+}
+
+/// 目标写在命令里的条目（分组名、连接 id 由模型现算），id 只做稳定身份。
+fn dynamic(id: &'static str, label_key: &'static str, text: String, action: String) -> MenuItem {
+    MenuItem { text: Some(text), action: Some(action), ..leaf(id, label_key, false, true, None) }
 }
 
 /// 已有命令或快捷键表里的按键。没有登记的动作不编一个新的。
@@ -98,6 +130,8 @@ fn branch(id: &'static str, label_key: &'static str, icon: IconName, children: V
     MenuItem {
         id,
         label_key,
+        text: None,
+        action: None,
         danger: false,
         enabled,
         reason_key: None,
@@ -160,6 +194,8 @@ pub fn place_submenu(parent_x: f32, parent_y: f32, parent_w: f32, width: f32, he
 
 pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
     match place {
+        // 分组菜单的条目由模型按分组现算（名字与命令都带目标），这里没有通用项。
+        MenuPlace::ExplorerGroup => Vec::new(),
         MenuPlace::ObjectTree => object_tree_items(target, None),
         MenuPlace::Grid => {
             let write = target == MenuTarget::WritableGrid;
@@ -401,6 +437,63 @@ pub struct ObjectFacts {
 ///   MongoDB、Redis、例程/触发器/序列等、范围行与列行都没有这些项（R11）。
 pub fn tree_menu_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<MenuItem> {
     object_tree_items(target, facts)
+}
+
+
+/// 带动态命令、静态文案的条目：折叠/展开、重命名这类目标写在命令里的动作。
+fn targeted(id: &'static str, label_key: &'static str, action: String) -> MenuItem {
+    MenuItem { action: Some(action), ..leaf(id, label_key, false, true, None) }
+}
+
+/// 资源管理器分组标题的菜单：新建、折叠/展开、重命名、删除（连接保留）。
+pub fn group_menu_items(group_id: &str, collapsed: bool) -> Vec<MenuItem> {
+    let toggle_key = if collapsed { "ui.group.expand" } else { "ui.group.collapse" };
+    vec![
+        with_icon(item("group-new", "ui.group.new"), IconName::Plus),
+        with_icon(targeted("group-toggle", toggle_key, format!("group-toggle:{group_id}")), IconName::ChevronDown),
+        with_icon(targeted("group-rename", "ui.group.rename", format!("group-rename:{group_id}")), IconName::SquarePen),
+        MenuItem {
+            danger: true,
+            separator_before: true,
+            ..targeted("group-delete", "ui.group.delete", format!("group-delete:{group_id}"))
+        },
+    ]
+}
+
+/// 连接菜单里的“移动到分组”子菜单。拖拽与这条菜单落同一个 Store 命令。
+pub fn move_to_group_branch(
+    connection_id: &str,
+    groups: &[crate::connections::groups::ConnectionGroup],
+    current: Option<&str>,
+) -> MenuItem {
+    let mut children = Vec::new();
+    for group in groups {
+        let mut entry = dynamic(
+            "group-assign",
+            "ui.group.moveTo",
+            group.name.clone(),
+            format!("group-assign:{connection_id}\u{1}{}", group.id),
+        );
+        // 已经在这个分组里：标出来，不给重复动作。
+        if current == Some(group.id.as_str()) {
+            entry.enabled = false;
+            entry.reason_key = Some("ui.group.alreadyHere");
+        }
+        children.push(with_icon(entry, IconName::Folder));
+    }
+    if children.is_empty() {
+        children.push(disabled("group-assign", "ui.group.none", "ui.group.noneHint"));
+    }
+    if current.is_some() {
+        let out = MenuItem {
+            separator_before: true,
+            ..targeted("group-assign", "ui.group.moveOut", format!("group-assign:{connection_id}\u{1}"))
+        };
+        children.push(out);
+    }
+    let mut branch = branch("submenu-move-group", "ui.group.moveTo", IconName::Folder, children);
+    branch.separator_before = true;
+    branch
 }
 
 #[derive(Clone, Debug)]

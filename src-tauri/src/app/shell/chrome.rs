@@ -9,9 +9,9 @@ use gpui_kit::component::input::{Editor, EditorState, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, point, px,
 };
 
 use crate::app::views::connections::{engines, LinkStatus};
@@ -33,6 +33,15 @@ use super::view::Workbench;
 const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
 /// 活动栏激活指示条（3px 宽的竖线）两端的圆角。线条不是控件，不取 `Radius` token；见扫描测试例外清单。
 const RAIL_INDICATOR_RADIUS: f32 = 2.;
+
+/// 拖拽连接时的拖动图形：不画内容，避免挡住目标分组标题。
+struct ConnectionDragGhost;
+
+impl Render for ConnectionDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
+    }
+}
 
 /// 点击后执行一条外壳命令。
 fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
@@ -224,6 +233,9 @@ impl Workbench {
         if self.model.connections.confirm_delete {
             root = root.child(self.delete_layer(cx));
         }
+        if self.model.group_delete.is_some() {
+            root = root.child(self.group_delete_layer(cx));
+        }
         if self.model.history.confirm_clear {
             root = root.child(self.clear_history_layer(cx));
         }
@@ -265,6 +277,19 @@ impl Workbench {
         }
         if key == "escape" && self.model.conn_filter_menu.is_some() && self.model.menu.is_none() {
             self.model.conn_filter_menu = None;
+            self.restore_focus(window, cx);
+            cx.notify();
+            return;
+        }
+        // 分组输入面板与删除确认：Esc 只取消这一层，不改任何数据。
+        if key == "escape" && self.model.group_delete.is_some() && self.model.menu.is_none() {
+            self.perform("group-delete-cancel", cx);
+            self.restore_focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.model.group_prompt.is_some() && self.model.menu.is_none() && !self.model.conn_modal.open {
+            self.perform("group-prompt-cancel", cx);
             self.restore_focus(window, cx);
             cx.notify();
             return;
@@ -342,7 +367,7 @@ impl Workbench {
                 return;
             }
             if self.model.menu.is_some() {
-                let id = self.model.menu.as_ref().and_then(|menu| menu.current().map(|item| item.id.to_owned()));
+                let id = self.model.menu.as_ref().and_then(|menu| menu.current().map(|item| item.command()));
                 self.model.menu = None;
                 self.model.shell.focus = self.model.menu_return;
                 if let Some(id) = id {
@@ -516,10 +541,12 @@ impl Workbench {
         let m = self.metrics();
         let width = self.model.layout().sidebar_width as f32;
         let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
+        let group_prompt = self.group_prompt_panel(window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
-        let rows: Vec<_> = self.model.connections.rows.clone();
+        // 可见行先拍成扁平序列（分组标题 → 连接 → 树行），渲染只创建视口窗口里的行。
         let mut list = div()
             .id("explorer-list")
+            .test_support()
             .track_focus(&self.nav_focus)
             .track_scroll(&self.explorer_scroll)
             .flex()
@@ -529,11 +556,7 @@ impl Workbench {
             .overflow_y_scroll()
             .px(px(6.))
             .pb(px(8.));
-        // 列表是平铺的：每个 child 一行。数着下标，跳转定义要滚到的那一行才能定位。
-        let mut children = 0usize;
-        let mut reveal_at: Option<usize> = None;
-        if rows.is_empty() {
-            children += 1;
+        if self.model.connections.rows.is_empty() {
             list = list.child(kit::empty_state_with_action(
                 IconName::Database,
                 self.t("ui.explorer.empty"),
@@ -560,103 +583,33 @@ impl Workbench {
                     )),
                 &p,
             ));
-        }
-        // 读取失败只留一条带原因的提示和重试入口，不在每个连接下重复。
-        let catalog_error = if self.model.nav_error.is_empty() { &self.model.catalog_error } else { &self.model.nav_error };
-        if !catalog_error.is_empty() {
-            let error = self.model.text(catalog_error);
-            let full_error = format!("{}: {}", self.model.text("ui.explorer.error"), error);
-            children += 1;
-            list = list.child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .mb(px(4.))
-                    .rounded(px(Radius::PANEL))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .id("explorer-error")
-                            .test_support()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .tooltip_text(SharedString::from(full_error.clone()))
-                            .text_size(px(TypeScale::SM))
-                            .text_color(p.danger)
-                            .child(SharedString::from(full_error)),
-                    )
-                    .child(kit::tool_button(
-                        "explorer-tree-retry",
-                        Some(IconName::RefreshCw),
-                        self.t("common.retry"),
-                        act("refresh-tree", cx),
-                    )),
-            );
-        }
-        let searching = self.model.nav_searching();
-        let mut search_hits = 0usize;
-        {
-            for row in rows {
-                let id = row.saved.id.clone();
-                let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
-                // 展开状态只有一份：树上的连接节点。鼠标、键盘和渲染都读它。
-                let nav_rows = self.model.nav_rows_for(&id);
-                // 筛选时保留树结构：没有命中的连接整条隐藏，有命中的连接自动展开。
-                if searching && nav_rows.is_empty() {
-                    continue;
-                }
-                search_hits += nav_rows.iter().filter(|row| row.highlight.is_some()).count();
-                let expanded = (searching || self.model.nav_connection_expanded(&id)) && status == LinkStatus::Connected;
-                let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
-                children += 1;
-                list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
-                if !expanded {
-                    continue;
-                }
-                // 连接级读取失败就把原因和重试放在这条连接下面，不吞掉。
-                if let Some(error) = self.model.nav.node(&crate::catalog::hierarchy::connection_node_id(&id)).and_then(|node| node.error.clone()) {
-                    children += 1;
-                    list = list.child(self.connection_error_row(&id, &error, &p, cx));
-                }
-                if nav_rows.is_empty() {
-                    if let Some(key) = self.model.nav_empty_key(&id) {
-                        if key != "ui.explorer.error" {
-                            children += 1;
-                            list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t(key)));
-                        }
-                    }
-                    continue;
-                }
-                for nav_row in nav_rows {
-                    if self.model.reveal_node.as_deref() == Some(nav_row.id.as_str()) {
-                        reveal_at = Some(children);
-                    }
-                    children += 1;
-                    list = list.child(self.nav_row(&nav_row, false, &p, cx));
+        } else {
+            let items = self.model.explorer_rows();
+            let heights = self.model.explorer_heights(&items);
+            let viewport = f32::from(self.explorer_scroll.bounds().size.height);
+            // 跳转定义与键盘定位：把目标行滚进视口一次，滚过就清掉。
+            let reveal = self
+                .model
+                .reveal_row
+                .take()
+                .or_else(|| self.model.reveal_node.take().map(|id| format!("nav:{id}")));
+            if let Some(reveal) = reveal {
+                if let Some(index) = items.iter().position(|item| item.id() == reveal) {
+                    let offset = super::explorer::scroll_offset_for(&heights, index, viewport);
+                    self.explorer_scroll.set_offset(point(px(0.), px(-offset)));
                 }
             }
-            if searching && search_hits == 0 {
-                list = list.child(
-                    div()
-                        .id("explorer-search-empty")
-                        .px(px(16.))
-                        .py(px(12.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .text_size(px(TypeScale::SM))
-                        .text_color(p.text_faint)
-                        .child(self.t("ui.explorer.noMatch")),
-                );
+            let scroll_top = -f32::from(self.explorer_scroll.offset().y);
+            let window = super::explorer::window_rows(&heights, scroll_top, viewport, super::explorer::OVERSCAN_ROWS);
+            if window.pad_top > 0. {
+                list = list.child(div().id("explorer-pad-top").flex_none().h(px(window.pad_top)));
             }
-        }
-        // 跳转定义选中的行：滚进可见区（下一次布局生效），只滚一次。
-        if let Some(index) = reveal_at {
-            self.explorer_scroll.scroll_to_item(index);
-            self.model.reveal_node = None;
+            for item in &items[window.range.clone()] {
+                list = list.child(self.explorer_row(item, &p, cx));
+            }
+            if window.pad_bottom > 0. {
+                list = list.child(div().id("explorer-pad-bottom").flex_none().h(px(window.pad_bottom)));
+            }
         }
         let dragging = self.model.sidebar_dragging;
         div()
@@ -708,10 +661,13 @@ impl Workbench {
                                     .flex()
                                     .gap(px(2.))
                                     .child(kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx)).xsmall())
+                                    // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
+                                    .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
                                     .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("new-connection", cx)).xsmall()),
                             ),
                     )
                     .child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                    .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
             )
             .child({
@@ -726,6 +682,211 @@ impl Workbench {
                 })
             })
             .into_any_element()
+    }
+
+    /// 扁平序列里的一行。每行都用稳定 id 绑定动作：图形不随滚动错位，命令也不按下标走。
+    fn explorer_row(&self, item: &super::explorer::ExplorerItem, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        use super::explorer::ExplorerItem;
+        match item {
+            ExplorerItem::Group { id, collapsed, members } => self.group_row(id, *collapsed, *members, p, cx),
+            ExplorerItem::Connection { id } => {
+                let status = self.model.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected);
+                let expanded = self.model.nav_connection_expanded(id) && status == LinkStatus::Connected;
+                let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
+                match self.model.connections.rows.iter().find(|row| row.saved.id == *id) {
+                    Some(row) => self.connection_row(row, status, expanded, selected, p, cx),
+                    // 列表刚变、这一帧找不到记录：画一个占位行，不做越界索引。
+                    None => div().id(SharedString::from(format!("side-missing-{id}"))).h(px(self.metrics().row_h)).into_any_element(),
+                }
+            }
+            ExplorerItem::ConnectionError { connection_id, error } => self.connection_error_row(connection_id, error, p, cx),
+            ExplorerItem::Note { connection_id, key } => {
+                let m = self.metrics();
+                div()
+                    .id(SharedString::from(format!("nav-note-{connection_id}")))
+                    .test_support()
+                    .flex_none()
+                    .h(px(m.tree_row_h))
+                    .pl(px(42.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .child(self.t(key))
+                    .into_any_element()
+            }
+            ExplorerItem::Nav(row) => self.nav_row(row, false, p, cx),
+            ExplorerItem::CatalogError { message } => {
+                let m = self.metrics();
+                let error = self.model.text(message);
+                let full_error = format!("{}: {}", self.model.text("ui.explorer.error"), error);
+                div()
+                    .id("explorer-error")
+                    .test_support()
+                    .flex_none()
+                    .h(px(m.row_h))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .bg(p.danger_soft)
+                    .child(
+                        div()
+                            .id("explorer-error-text")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .tooltip_text(SharedString::from(full_error.clone()))
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.danger)
+                            .child(SharedString::from(full_error)),
+                    )
+                    .child(kit::tool_button(
+                        "explorer-tree-retry",
+                        Some(IconName::RefreshCw),
+                        self.t("common.retry"),
+                        act("refresh-tree", cx),
+                    ))
+                    .into_any_element()
+            }
+            ExplorerItem::NoMatch => {
+                let m = self.metrics();
+                div()
+                    .id("explorer-search-empty")
+                    .test_support()
+                    .flex_none()
+                    .h(px(m.tree_row_h))
+                    .px(px(16.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .child(self.t("ui.explorer.noMatch"))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// 分组标题：折叠箭头、名称、成员数量。拖拽到这里才归组，右键只属于这一个分组。
+    fn group_row(&self, id: &str, collapsed: bool, members: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics();
+        let name = self.model.group(id).map(|group| group.name.clone()).unwrap_or_default();
+        let focused = matches!(&self.model.explorer_current, Some(super::explorer::ExplorerRow::Group(current)) if current == id);
+        let chevron = if collapsed { IconName::ChevronRight } else { IconName::ChevronDown };
+        let toggle_id = id.to_owned();
+        let click_id = id.to_owned();
+        let menu_id = id.to_owned();
+        let drop_id = id.to_owned();
+        let drop_soft = p.accent_soft;
+        let entity = cx.entity().downgrade();
+        kit::row_states(div().id(SharedString::from(format!("side-group-{id}"))), p)
+            .test_support()
+            .role(gpui_kit::Role::TreeItem)
+            .aria_label(SharedString::from(name.clone()))
+            .aria_selected(focused)
+            .aria_expanded(!collapsed)
+            .aria_description(SharedString::from(format!("{} · {members}", self.t("ui.group.members"))))
+            .flex_none()
+            .h(px(m.tree_row_h))
+            .px(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(Radius::CONTROL))
+            .when(focused, |this| this.bg(p.selection))
+            .when(!focused, |this| this.hover(|style| style.bg(p.hover)))
+            // 拖拽悬停：拖连接经过这一行时整行高亮，放手才真的移动。
+            .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft))
+            .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
+                let connection = drag.connection.clone();
+                let group = drop_id.clone();
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        this.model.shell.focus = FocusTarget::Sidebar;
+                        this.model.assign_connection_group(&connection, Some(&group));
+                        cx.notify();
+                    });
+                }
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!("group-chevron-{id}")))
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t(if collapsed { "catalog.tree.expand" } else { "catalog.tree.collapse" }))
+                    .tooltip_text(self.t(if collapsed { "catalog.tree.expand" } else { "catalog.tree.collapse" }))
+                    .flex_none()
+                    .w(px(12.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(kit::icon(chevron, 12., p.text_faint))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.perform(&format!("group-toggle:{toggle_id}"), cx);
+                        cx.notify();
+                    })),
+            )
+            .child(kit::icon(IconName::Folder, 13., p.text_muted))
+            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(name.clone())))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .rounded(px(Radius::TAG))
+                    .bg(p.hover)
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(members.to_string())),
+            )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.menu_at = event.position;
+                this.model.shell.focus = FocusTarget::Sidebar;
+                this.model.set_explorer_current(super::explorer::ExplorerRow::Group(menu_id.clone()));
+                this.model.open_group_menu(&menu_id);
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.model.shell.focus = FocusTarget::Sidebar;
+                window.focus(&this.nav_focus, cx);
+                this.model.set_explorer_current(super::explorer::ExplorerRow::Group(click_id.clone()));
+                this.perform(&format!("group-toggle:{click_id}"), cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// 分组名输入面板：新建与重命名共用，Esc 取消（由外壳统一处理）。
+    fn group_prompt_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let prompt = self.model.group_prompt.clone()?;
+        let p = Palette::of(cx);
+        let title = if prompt.id.is_some() { "ui.group.rename" } else { "ui.group.new" };
+        let input = self.input_for(DraftField::GroupName, &self.model.text("ui.group.namePlaceholder"), false, window, cx);
+        Some(
+            div()
+                .id("group-prompt")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(10.))
+                .pb(px(8.))
+                .child(kit::eyebrow(self.t(title), &p))
+                .child(input.cleanable(true))
+                .when_some(prompt.error.clone(), |this, error| {
+                    this.child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(error)))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(kit::secondary_button("group-prompt-cancel", None, self.t("common.cancel"), act("group-prompt-cancel", cx)))
+                        .child(kit::primary_button("group-prompt-save", None, self.t("common.save"), act("group-save", cx))),
+                )
+                .into_any_element(),
+        )
     }
 
     fn connection_row(&self, row: &crate::connections::ConnectionRecord, status: LinkStatus, expanded: bool, selected: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -757,6 +918,7 @@ impl Workbench {
             // 状态不只靠圆点颜色：无障碍描述和提示都写出同一句状态文案。
             .aria_description(SharedString::from(format!("{} · {}", full_name, self.t(state_key))))
             .tooltip_text(full_name)
+            .flex_none()
             .h(px(m.row_h))
             .px(px(6.))
             .flex()
@@ -809,9 +971,16 @@ impl Workbench {
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.menu_at = event.position;
                 this.model.connections.selected = Some(menu_id.clone());
+                this.model.set_explorer_current(super::explorer::ExplorerRow::Connection(menu_id.clone()));
                 this.perform("menu-connection", cx);
             }))
+            // 拖拽归组：拖到分组标题上放手，落库路径与右键“移动到分组”完全相同。
+            .on_drag(
+                super::explorer::ConnectionDrag { connection: id.clone() },
+                |_, _, _, cx| cx.new(|_| ConnectionDragGhost),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                this.model.set_explorer_current(super::explorer::ExplorerRow::Connection(click_id.clone()));
                 this.click_connection(&click_id, event.click_count() >= 2, cx);
             }))
             .into_any_element()
@@ -825,6 +994,7 @@ impl Workbench {
         div()
             .id(SharedString::from(format!("nav-conn-error-{id}")))
             .test_support()
+            .flex_none()
             .pl(px(42.))
             .pr(px(4.))
             .py(px(3.))
@@ -940,6 +1110,7 @@ impl Workbench {
             .aria_selected(row.focused)
             .aria_expanded(row.expanded)
             .tooltip_text(tooltip)
+            .flex_none()
             .h(px(m.tree_row_h))
             .pl(px(indent))
             .pr(px(4.))
@@ -3866,9 +4037,12 @@ impl Workbench {
             if item.separator_before || (index > 0 && item.danger && !items[index - 1].danger) {
                 list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line));
             }
-            let id = item.id.to_owned();
+            let id = item.command();
             let has_children = !item.children.is_empty();
-            let label = self.t(item.label_key);
+            let label = match &item.text {
+                Some(text) if !text.is_empty() => SharedString::from(text.clone()),
+                _ => self.t(item.label_key),
+            };
             let shortcut = item.shortcut.map(SharedString::from);
             let enabled = item.enabled;
             let selected = index == selected_index;
@@ -3971,6 +4145,28 @@ impl Workbench {
                 .child(kit::danger_button("cmd-conn-delete-confirm", Some(IconName::Trash), self.t("connections.deleteDialog.confirm"), act("conn-delete-confirm", cx))),
         );
         backdrop("delete-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+    }
+
+    /// 删除分组确认：只删分组记录与成员关系，连接回到顶层，配置与机密都不动。
+    fn group_delete_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let name = self
+            .model
+            .group_delete
+            .as_deref()
+            .and_then(|id| self.model.group(id))
+            .map(|group| group.name.clone())
+            .unwrap_or_default();
+        let body = super::explorer::full_label(&self.t("ui.group.deleteHint"), &name);
+        let dialog = dialog_card("delete-group", IconName::Trash, p.danger, self.t("ui.group.delete"), SharedString::from(body), &p).child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(8.))
+                .child(kit::secondary_button("cmd-group-delete-cancel", None, self.t("common.cancel"), act("group-delete-cancel", cx)))
+                .child(kit::danger_button("cmd-group-delete-confirm", Some(IconName::Trash), self.t("ui.group.delete"), act("group-delete-confirm", cx))),
+        );
+        backdrop("group-delete-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn clear_history_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {

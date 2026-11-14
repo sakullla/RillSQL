@@ -11,6 +11,7 @@ use crate::app::model::ObjectTarget;
 use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, Shell, ThemePreference, COMMANDS};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
+use crate::connections::groups::{layout_groups, validate_group_name, ConnectionGroup, GroupLayout};
 use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind};
 use crate::app::views::connections::LinkStatus;
 use crate::app::views::query::object_spec;
@@ -25,6 +26,7 @@ use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, 
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
 use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl};
+use super::explorer::{focus_rows, ExplorerItem, ExplorerRow};
 use super::layout::{
     clamp_history_preview, clamp_sidebar, layout_with_sidebar, painted_frame_with_sidebar, unbreakable_px, ChromeLayout, PaintedFrame, HISTORY_PREVIEW_DEFAULT,
     SIDEBAR_DEFAULT,
@@ -184,6 +186,8 @@ pub enum DraftField {
     DangerConfirm,
     /// 危险操作确认层：重命名的新名字。
     DangerNewName,
+    /// 分组名输入面板：新建分组与重命名共用。
+    GroupName,
 }
 
 /// 对象树“查看 / 复制 DDL”的读取状态。`copy_only` 时不显示查看器，读到就写剪贴板。
@@ -218,6 +222,31 @@ pub enum PendingJob {
     DeleteRun,
     DeleteSaved,
     RenameSaved,
+    /// 只重读分组与成员关系（启动恢复、导入之后）。
+    RefreshGroups,
+    /// 一次分组命令：新建/重命名、删除、归组、折叠。
+    GroupOp,
+}
+
+/// 一次分组变更。拖拽、右键和键盘都排同一条命令，落库只走一条路径。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupOp {
+    /// id 为空表示新建；名称已在这里校验过。
+    Save { id: Option<String>, name: String },
+    Delete { id: String },
+    /// group 为空表示移回顶层。
+    Assign { connection: String, group: Option<String> },
+    Collapsed { id: String, collapsed: bool },
+}
+
+/// 分组名输入框：新建与重命名共用一个小面板，不另开模态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupPrompt {
+    /// 被重命名的分组；新建时为空。
+    pub id: Option<String>,
+    pub text: String,
+    /// 校验失败的提示（空名、超长名）。
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +279,8 @@ pub struct WorkbenchModel {
     pub notice_detail: String,
     /// 跳转定义选中的树节点：下一帧对象树把它滚进可见区，滚过就清掉。
     pub reveal_node: Option<String>,
+    /// 键盘移动到的资源管理器行（group:/conn:/nav: 前缀）：下一帧滚进视口一次。
+    pub reveal_row: Option<String>,
     pub copied: String,
     pub executions: u32,
     pub loads: u32,
@@ -326,6 +357,20 @@ pub struct WorkbenchModel {
     pub viewport_height: i32,
     /// 自定义环境标签。列表、欢迎页、状态栏和表单按 id 取名称与色调。
     pub env_tags: Vec<EnvTag>,
+    /// 用户自定义分组（名称、顺序、折叠），来自配置库而不是会话快照。
+    pub groups: Vec<ConnectionGroup>,
+    /// 连接 id → 分组 id；没有条目就是未分组，不写哨兵值。
+    pub group_members: std::collections::BTreeMap<String, String>,
+    /// 分组名输入面板：新建与重命名共用。
+    pub group_prompt: Option<GroupPrompt>,
+    /// 右键的那一个分组；菜单动作只认它。
+    pub group_menu: Option<String>,
+    /// 等确认删除的分组：只删分组记录，连接回顶层。
+    pub group_delete: Option<String>,
+    /// 键盘当前停在资源管理器哪一行（分组 / 连接 / 树节点），虚拟化后按稳定 id 走。
+    pub explorer_current: Option<ExplorerRow>,
+    /// 排队的一次分组命令，随任务交给后台。
+    pub pending_group_op: Option<GroupOp>,
     /// 对象树“新建表”：下一帧交给结构页 `begin_create`。
     pub pending_create: Option<String>,
     /// 从历史预览保存时钉住这一条，避免误存当前查询草稿。
@@ -373,6 +418,7 @@ impl WorkbenchModel {
             notice_key: None,
             notice_detail: String::new(),
             reveal_node: None,
+            reveal_row: None,
             copied: String::new(),
             executions: 0,
             loads: 0,
@@ -420,6 +466,13 @@ impl WorkbenchModel {
             history_dragging: false,
             viewport_height: 900,
             env_tags: Vec::new(),
+            groups: Vec::new(),
+            group_members: std::collections::BTreeMap::new(),
+            group_prompt: None,
+            group_menu: None,
+            group_delete: None,
+            explorer_current: None,
+            pending_group_op: None,
             pending_create: None,
             preview_save: None,
             conn_filter_menu: None,
@@ -561,6 +614,10 @@ impl WorkbenchModel {
     }
 
     fn local(&mut self, id: &str) -> bool {
+        // 分组命令与连接菜单里的“移动到分组”共用同一批 id。
+        if (id.starts_with("group-") || id.starts_with("conn-move-group")) && self.group_command(id) {
+            return true;
+        }
         if (id == "nav-refresh" || id.starts_with("nav-")) && self.nav_command(id) {
             return true;
         }
@@ -1443,6 +1500,32 @@ impl WorkbenchModel {
 
     pub fn open_connection_menu(&mut self) {
         self.open_menu(MenuPlace::ConnectionRow, MenuTarget::Connection);
+        self.append_move_to_group();
+    }
+
+    /// 分组标题右键：菜单只属于被点的这一个分组。
+    pub fn open_group_menu(&mut self, group_id: &str) -> bool {
+        let Some(group) = self.group(group_id).cloned() else { return false };
+        self.group_menu = Some(group.id.clone());
+        self.open_menu(MenuPlace::ExplorerGroup, MenuTarget::Connection);
+        self.menu = Some(OpenMenu::with_items(
+            MenuPlace::ExplorerGroup,
+            super::menus::group_menu_items(&group.id, group.collapsed),
+        ));
+        true
+    }
+
+    /// 连接菜单补一条“移动到分组”：目标写在命令里，条目 id 仍是稳定的 conn-move-group。
+    fn append_move_to_group(&mut self) {
+        let Some(connection) = self.connections.selected.clone() else { return };
+        if !self.connections.rows.iter().any(|row| row.saved.id == connection) {
+            return;
+        }
+        let current = self.group_of(&connection).map(str::to_owned);
+        let entry = super::menus::move_to_group_branch(&connection, &self.groups, current.as_deref());
+        if let Some(menu) = self.menu.as_mut() {
+            menu.items.push(entry);
+        }
     }
 
     pub fn open_history_menu(&mut self) {
@@ -1969,40 +2052,411 @@ impl WorkbenchModel {
 
     /// 键盘在树上移动与展开；返回需要外壳继续执行的命令。
     pub fn nav_key(&mut self, key: NavKey) -> Option<String> {
-        let rows = self.nav.visible();
+        // 分组标题、连接行与树行是同一条可见序列：上下、Home/End 与回车先走资源管理器。
+        match key {
+            NavKey::ArrowDown => return self.explorer_move(1),
+            NavKey::ArrowUp => return self.explorer_move(-1),
+            NavKey::Home => return self.explorer_edge(true),
+            NavKey::End => return self.explorer_edge(false),
+            NavKey::Enter => return self.explorer_enter(),
+            NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => {}
+        }
+        self.sync_object_spec_from_focus();
+        None
+    }
+    // ------------------------------------------------------------ 连接分组
+
+    /// 分组与成员关系落库后的唯一出口。成员表里指向已删除分组的条目按未分组读，
+    /// 不隐藏连接、也不报错：删除分组只删分组记录。
+    pub fn apply_groups(&mut self, groups: Vec<ConnectionGroup>, members: std::collections::BTreeMap<String, String>) {
+        let known: std::collections::BTreeSet<String> = groups.iter().map(|group| group.id.clone()).collect();
+        self.group_members = members.into_iter().filter(|(_, group)| known.contains(group)).collect();
+        self.groups = groups;
+        if self.group_menu.as_deref().is_some_and(|id| self.group(id).is_none()) {
+            self.group_menu = None;
+        }
+        if self.group_delete.as_deref().is_some_and(|id| self.group(id).is_none()) {
+            self.group_delete = None;
+        }
+        if self
+            .group_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.id.as_deref())
+            .is_some_and(|id| self.group(id).is_none())
+        {
+            self.group_prompt = None;
+        }
+    }
+
+    pub fn group(&self, id: &str) -> Option<&ConnectionGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// 资源管理器要渲染的分组结构；成员顺序沿用配置库的名称排序。
+    pub fn group_layout(&self) -> GroupLayout {
+        let ids: Vec<String> = self.connections.rows.iter().map(|row| row.saved.id.clone()).collect();
+        layout_groups(&self.groups, &self.group_members, &ids)
+    }
+
+    pub fn group_of(&self, connection_id: &str) -> Option<&str> {
+        self.group_members.get(connection_id).map(String::as_str)
+    }
+
+    /// 打开分组名输入面板：id 为空是新建，否则是重命名（预填原名）。
+    pub fn open_group_prompt(&mut self, id: Option<String>) {
+        let text = id.as_deref().and_then(|id| self.group(id)).map(|group| group.name.clone()).unwrap_or_default();
+        self.group_menu = None;
+        self.group_prompt = Some(GroupPrompt { id, text, error: None });
+    }
+
+    /// 确认分组名：先本地校验（空名、超长名当场拒绝），再排进后台落库。
+    pub fn confirm_group_prompt(&mut self) -> bool {
+        let Some(prompt) = self.group_prompt.clone() else { return false };
+        match validate_group_name(&prompt.text) {
+            Ok(name) => {
+                self.pending_group_op = Some(GroupOp::Save { id: prompt.id.clone(), name });
+                self.group_prompt = None;
+                self.enqueue(PendingJob::GroupOp);
+                true
+            }
+            Err(message) => {
+                if let Some(prompt) = self.group_prompt.as_mut() {
+                    prompt.error = Some(message);
+                }
+                false
+            }
+        }
+    }
+
+    /// 折叠 / 展开一个分组：先改本地状态让界面立刻响应，再排进后台持久化。
+    pub fn toggle_group(&mut self, id: &str) -> bool {
+        let Some(group) = self.group(id).cloned() else { return false };
+        let collapsed = !group.collapsed;
+        if let Some(entry) = self.groups.iter_mut().find(|entry| entry.id == id) {
+            entry.collapsed = collapsed;
+        }
+        self.pending_group_op = Some(GroupOp::Collapsed { id: id.to_owned(), collapsed });
+        self.enqueue(PendingJob::GroupOp);
+        true
+    }
+
+    /// 归组（group 为空即移回顶层）。拖拽和右键都到这里，落库只有后台一条路径。
+    pub fn assign_connection_group(&mut self, connection_id: &str, group: Option<&str>) -> bool {
+        if !self.connections.rows.iter().any(|row| row.saved.id == connection_id) {
+            return false;
+        }
+        if let Some(group) = group {
+            if self.group(group).is_none() {
+                return false;
+            }
+        }
+        self.pending_group_op = Some(GroupOp::Assign { connection: connection_id.to_owned(), group: group.map(str::to_owned) });
+        self.enqueue(PendingJob::GroupOp);
+        true
+    }
+
+    /// 删除分组：连接回到顶层，连接配置与机密一个都不动。
+    pub fn take_pending_group_op(&mut self) -> Option<GroupOp> {
+        self.pending_group_op.take()
+    }
+
+    /// 分组相关的命令入口。菜单、键盘与拖拽都只发这些 id。
+    fn group_command(&mut self, id: &str) -> bool {
+        match id {
+            "group-new" => self.open_group_prompt(None),
+            "group-save" => {
+                let _ = self.confirm_group_prompt();
+            }
+            "group-prompt-cancel" => {
+                self.group_prompt = None;
+            }
+            "group-refresh" => self.enqueue(PendingJob::RefreshGroups),
+            "group-delete-confirm" => {
+                if let Some(group) = self.group_delete.take() {
+                    self.pending_group_op = Some(GroupOp::Delete { id: group });
+                    self.enqueue(PendingJob::GroupOp);
+                }
+            }
+            "group-delete-cancel" => self.group_delete = None,
+            _ => {
+                if let Some(rest) = id.strip_prefix("group-toggle:") {
+                    return self.toggle_group(rest);
+                }
+                if let Some(rest) = id.strip_prefix("group-rename:") {
+                    self.open_group_prompt(Some(rest.to_owned()));
+                } else if let Some(rest) = id.strip_prefix("group-delete:") {
+                    if self.group(rest).is_some() {
+                        // 先说明影响，再等第二次确认：连接不会跟着消失。
+                        self.group_menu = None;
+                        self.group_delete = Some(rest.to_owned());
+                    }
+                } else if let Some(rest) = id.strip_prefix("group-assign:") {
+                    let (connection, group) = rest.split_once('').unwrap_or((rest, ""));
+                    let group = if group.is_empty() { None } else { Some(group) };
+                    return self.assign_connection_group(connection, group);
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ------------------------------------------------------------ 资源管理器的扁平行
+
+    /// 资源管理器的一条可见行：分组标题 → 组内连接 → 未分组连接，
+    /// 每条展开的连接下面接它的树行。渲染只取这个序列的一个窗口。
+    pub fn explorer_rows(&self) -> Vec<ExplorerItem> {
+        if self.connections.rows.is_empty() {
+            // 配置列表还没到手（启动第一帧、单测直接喂目录）时，只画树上已有的行：
+            // 键盘与渲染读同一份序列，不会因为缺连接记录就整片空掉。
+            if self.nav.empty() {
+                return Vec::new();
+            }
+            return self.nav.visible().into_iter().map(ExplorerItem::Nav).collect();
+        }
+        let layout = self.group_layout();
+        let searching = self.nav_searching();
+        // 每条连接的成本只算一次：树行、命中与“被筛选隐藏”一起决定分组标题去留。
+        let chunks: Vec<(String, Vec<ExplorerItem>, bool, bool)> = self
+            .connections
+            .rows
+            .iter()
+            .map(|row| {
+                let id = row.saved.id.clone();
+                let (items, hits, hidden) = self.connection_rows(&id);
+                (id, items, hits, hidden)
+            })
+            .collect();
+        let chunk_of = |id: &str| chunks.iter().find(|(chunk_id, _, _, _)| chunk_id == id);
+        // 分组标题下只放“这一帧确实有行”的连接：被筛选隐藏的整条不出。
+        let mut items = Vec::new();
+        let error = if self.nav_error.is_empty() { &self.catalog_error } else { &self.nav_error };
+        if !error.is_empty() {
+            items.push(ExplorerItem::CatalogError { message: error.clone() });
+        }
+        for (group, members) in &layout.groups {
+            let visible: Vec<&(String, Vec<ExplorerItem>, bool, bool)> = members.iter().filter_map(|id| chunk_of(id)).collect();
+            let hits = visible.iter().filter(|(_, _, hits, _)| *hits).count();
+            // 筛选时组里没有命中就整组隐藏；不筛选时连空组也要留着。
+            if searching && hits == 0 {
+                continue;
+            }
+            let collapsed = group.collapsed && !searching;
+            items.push(ExplorerItem::Group { id: group.id.clone(), collapsed, members: members.len() });
+            if collapsed {
+                continue;
+            }
+            for (_, rows, _, hidden) in visible {
+                if *hidden {
+                    continue;
+                }
+                items.extend(rows.iter().cloned());
+            }
+        }
+        for id in &layout.ungrouped {
+            if let Some((_, rows, _, hidden)) = chunk_of(id) {
+                if !*hidden {
+                    items.extend(rows.iter().cloned());
+                }
+            }
+        }
+        if searching && !chunks.iter().any(|(_, _, hits, _)| *hits) {
+            items.push(ExplorerItem::NoMatch);
+        }
+        items
+    }
+
+    /// 一条连接在资源管理器里的行（连接行 + 可选错误行 + 树行）。
+    /// 返回（行, 是否有筛选命中, 是否被筛选整条隐藏）。
+    fn connection_rows(&self, id: &str) -> (Vec<ExplorerItem>, bool, bool) {
+        let searching = self.nav_searching();
+        let nav_rows = self.nav_rows_for(id);
+        let hits = nav_rows.iter().any(|row| row.highlight.is_some());
+        if searching && !hits {
+            return (Vec::new(), false, true);
+        }
+        let mut items = vec![ExplorerItem::Connection { id: id.to_owned() }];
+        if let Some(error) = self
+            .nav
+            .node(&crate::catalog::hierarchy::connection_node_id(id))
+            .and_then(|node| node.error.clone())
+        {
+            items.push(ExplorerItem::ConnectionError { connection_id: id.to_owned(), error });
+        }
+        let expanded = (searching || self.nav_connection_expanded(id))
+            && self.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected) == LinkStatus::Connected;
+        if !expanded {
+            return (items, hits, false);
+        }
+        if nav_rows.is_empty() {
+            if let Some(key) = self.nav_empty_key(id) {
+                if key != "ui.explorer.error" {
+                    items.push(ExplorerItem::Note { connection_id: id.to_owned(), key });
+                }
+            }
+            return (items, hits, false);
+        }
+        items.extend(nav_rows.into_iter().map(ExplorerItem::Nav));
+        (items, hits, false)
+    }
+
+    /// 每行的真实高度，和渲染阶段读同一份 Metrics。
+    pub fn explorer_heights(&self, items: &[ExplorerItem]) -> Vec<f32> {
+        let metrics = self.shell.density.metrics();
+        items.iter().map(|item| item.height(&metrics)).collect()
+    }
+
+    /// 键盘可停留的行，按渲染顺序。
+    pub fn explorer_focus_rows(&self) -> Vec<ExplorerRow> {
+        focus_rows(&self.explorer_rows())
+    }
+
+    /// 键盘当前行：显式记录优先，否则落在树焦点上（鼠标点树行的老路径）。
+    pub fn explorer_current_row(&self) -> Option<ExplorerRow> {
+        let rows = self.explorer_focus_rows();
+        if let Some(current) = self.explorer_current.clone() {
+            // 树焦点被别的入口挪走（跳转定义、鼠标点行）时，以树为准：
+            // 资源管理器的当前行不能和屏幕上的选中行说两套话。
+            let consistent = match &current {
+                ExplorerRow::Node(id) => self.nav.focus() == Some(id.as_str()),
+                _ => true,
+            };
+            if consistent && rows.contains(&current) {
+                return Some(current);
+            }
+        }
+        self.nav.focus().map(|id| ExplorerRow::Node(id.to_owned())).filter(|row| rows.contains(row))
+    }
+
+    /// 把键盘当前行写进三份状态：分组焦点、连接选择、树焦点各归其位。
+    pub fn set_explorer_current(&mut self, row: ExplorerRow) {
+        match &row {
+            // 分组行只记焦点：菜单与折叠状态各自独立。
+            ExplorerRow::Group(_) => {}
+            ExplorerRow::Connection(id) => {
+                self.connections.selected = Some(id.clone());
+            }
+            ExplorerRow::Node(id) => {
+                self.nav.set_focus(id);
+                self.sync_object_spec_from_focus();
+            }
+        }
+        self.explorer_current = Some(row);
+    }
+
+    /// 上下移动：分组标题、连接行与树行在同一条序列里走，不需要先猜层级。
+    pub fn explorer_move(&mut self, step: isize) -> Option<String> {
+        let rows = self.explorer_focus_rows();
         if rows.is_empty() {
             return None;
         }
-        let action = match key {
-            NavKey::ArrowDown => {
-                self.nav.move_focus(1);
-                None
-            }
-            NavKey::ArrowUp => {
-                self.nav.move_focus(-1);
-                None
-            }
-            NavKey::Home => {
-                self.nav.focus_first();
-                None
-            }
-            NavKey::End => {
-                self.nav.focus_last();
-                None
-            }
-            NavKey::Enter => {
-                let id = self.nav.focus()?.to_owned();
-                let action = self.nav.activate(&id);
-                Some(self.nav_activation_command(action).unwrap_or_else(|| format!("nav-focus:{id}")))
-            }
-            NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => None,
-        };
-        self.sync_object_spec_from_focus();
-        action
+        let current = self.explorer_current_row();
+        let index = current
+            .as_ref()
+            .and_then(|row| rows.iter().position(|item| item == row))
+            .map(|index| index as isize)
+            .unwrap_or(if step > 0 { -1 } else { rows.len() as isize });
+        let next = (index + step).clamp(0, rows.len() as isize - 1) as usize;
+        let row = rows[next].clone();
+        self.reveal_row = Some(row.item_id());
+        self.set_explorer_current(row);
+        None
     }
 
-    /// 右方向键展开/打开；左方向键折叠/回到父节点。
+    /// Home / End：跳到序列两端。
+    pub fn explorer_edge(&mut self, first: bool) -> Option<String> {
+        let rows = self.explorer_focus_rows();
+        let row = (if first { rows.first() } else { rows.last() }).cloned()?;
+        self.reveal_row = Some(row.item_id());
+        self.set_explorer_current(row);
+        None
+    }
+
+    /// 回车：分组折叠/展开，连接按需连接并展开，树节点照原规则打开。
+    pub fn explorer_enter(&mut self) -> Option<String> {
+        let Some(row) = self.explorer_current_row() else { return self.nav_key(NavKey::Enter) };
+        match row {
+            ExplorerRow::Group(id) => {
+                self.toggle_group(&id);
+                None
+            }
+            ExplorerRow::Connection(id) => {
+                if self.connections.row_status(&id) == LinkStatus::Connected {
+                    self.toggle_nav_connection(&id);
+                } else {
+                    self.expand_nav_connection(&id);
+                    self.queue_connect(ConnectIntent::new(id, ConnectAction::Expand, None));
+                }
+                None
+            }
+            ExplorerRow::Node(id) => {
+                let action = self.nav.activate(&id);
+                let command = self.nav_activation_command(action);
+                self.sync_object_spec_from_focus();
+                command.or_else(|| Some(format!("nav-focus:{id}")))
+            }
+        }
+    }
+
+    /// 左右键：分组折叠/展开，连接展开/收起，树节点沿用展开与回到父节点。
+    pub fn explorer_step(&mut self, forward: bool) -> Option<String> {
+        let Some(row) = self.explorer_current_row() else {
+            // 资源管理器还没有当前行（启动第一帧）：左右键直接落到树上。
+            return self.nav_step_direct(forward);
+        };
+        match row {
+            ExplorerRow::Group(id) => {
+                let collapsed = self.group(&id).map(|group| group.collapsed).unwrap_or(false);
+                // 右方向键展开折叠组，左方向键折叠展开组；没有可折叠的就退回上一行。
+                let toggles = if forward { collapsed } else { !collapsed };
+                if toggles {
+                    self.toggle_group(&id);
+                } else if !forward {
+                    self.explorer_move(-1);
+                }
+                None
+            }
+            ExplorerRow::Connection(id) => {
+                let expanded = self.nav_connection_expanded(&id);
+                if forward && !expanded {
+                    if self.connections.row_status(&id) == LinkStatus::Connected {
+                        self.toggle_nav_connection(&id);
+                    } else {
+                        self.expand_nav_connection(&id);
+                        self.queue_connect(ConnectIntent::new(id, ConnectAction::Expand, None));
+                    }
+                    None
+                } else if !forward && expanded {
+                    self.toggle_nav_connection(&id);
+                    None
+                } else if !forward {
+                    self.explorer_move(-1);
+                    None
+                } else {
+                    None
+                }
+            }
+            ExplorerRow::Node(id) => {
+                let action = if forward { self.nav.activate(&id) } else { self.nav.retreat(&id) };
+                let command = self.nav_activation_command(action);
+                self.sync_object_spec_from_focus();
+                command
+            }
+        }
+    }
+
+    /// 某一行的下标：跳转定义与键盘定位把行滚进视口时用它算偏移。
+    pub fn explorer_index(&self, items: &[ExplorerItem], target: &str) -> Option<usize> {
+        items.iter().position(|item| item.id() == target)
+    }
+
+    /// 左右键：先看资源管理器当前行（分组、连接），再落到树节点上。
     pub fn nav_step(&mut self, forward: bool) -> Option<String> {
+        self.explorer_step(forward)
+    }
+
+    fn nav_step_direct(&mut self, forward: bool) -> Option<String> {
         let id = self.nav.focus()?.to_owned();
         let action = if forward { self.nav.activate(&id) } else { self.nav.retreat(&id) };
         let command = self.nav_activation_command(action);
@@ -2177,6 +2631,7 @@ impl WorkbenchModel {
         }
         if let Some(rest) = id.strip_prefix("nav-focus:") {
             self.nav.set_focus(rest);
+            self.explorer_current = Some(ExplorerRow::Node(rest.to_owned()));
             self.sync_object_spec_from_focus();
             return true;
         }
@@ -3540,6 +3995,12 @@ impl WorkbenchModel {
             DraftField::SaveName => self.history.save_name = value,
             DraftField::RenameName => self.history.rename_text = value,
             DraftField::PaletteQuery => self.palette_query = value,
+            DraftField::GroupName => {
+                if let Some(prompt) = self.group_prompt.as_mut() {
+                    prompt.text = value;
+                    prompt.error = None;
+                }
+            }
             DraftField::DangerConfirm => {
                 if let Some(prompt) = self.danger.as_mut() {
                     prompt.set_typed(value);
@@ -3591,6 +4052,7 @@ impl WorkbenchModel {
             DraftField::SaveName => self.history.save_name.clone(),
             DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
+            DraftField::GroupName => self.group_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
             DraftField::DangerNewName => self.danger.as_ref().map(|prompt| prompt.new_name.clone()).unwrap_or_default(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
@@ -3617,7 +4079,7 @@ impl WorkbenchModel {
             nodes.push(node("context-menu", "Menu", menu.place.label_key(), "open", "menu"));
             for item in flatten_items(&menu.items) {
                 nodes.push(A11yNode {
-                    id: item.id.to_owned(),
+                    id: item.command(),
                     role: "MenuItem",
                     label_key: item.label_key,
                     state: if item.enabled { "enabled" } else { "disabled" },

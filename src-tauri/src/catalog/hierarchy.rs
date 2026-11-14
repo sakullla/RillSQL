@@ -1269,11 +1269,23 @@ impl NavTree {
     }
 
     /// 普通资源管理器只遍历本连接展开的子树，避免逐连接重建整棵树。
+    ///
+    /// 有筛选词时按同一份筛选规则只走进已加载节点：命中的对象连同它的库/模式/种类
+    /// 分组一起保留（祖先即“命中及祖先”），并且不受折叠状态限制——筛选期间这条连接
+    /// 临时展开，清空筛选后回到原来的展开现场。
     pub fn visible_under(&self, root_id: &str) -> Vec<NavRow> {
         let mut rows = Vec::new();
-        if self.expanded.contains(root_id) {
+        let needle = self.query.trim().to_lowercase();
+        let expanded = self.expanded.contains(root_id) || !needle.is_empty();
+        if expanded {
             if let Some(root) = self.nodes.get(root_id) {
-                for child in &root.children { self.walk(child, 0, &mut rows); }
+                for child in &root.children {
+                    if needle.is_empty() {
+                        self.walk(child, 0, &mut rows);
+                    } else {
+                        self.walk_filtered(child, 0, &needle, &mut rows);
+                    }
+                }
             }
         }
         rows

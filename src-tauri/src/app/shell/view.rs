@@ -1594,6 +1594,8 @@ impl Workbench {
                                 this.model.shell.sidebar_open = false;
                             }
                             let _ = this.model.dispatch("conn-refresh");
+                            // 分组与折叠状态跟着配置库走：重启后回到离开时的分组结构。
+                            let _ = this.model.dispatch("group-refresh");
                             let _ = this.model.dispatch("history-refresh");
                             let _ = this.model.dispatch("nav-refresh");
                             this.load_env_tags(cx);
@@ -1623,12 +1625,14 @@ impl Workbench {
             | PendingJob::ClearHistory
             | PendingJob::DeleteRun
             | PendingJob::DeleteSaved => "history",
+            // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
+            PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
             _ => "connections",
         };
-        let token = if owner == "history" {
-            self.model.begin_owner(&self.services.tasks, owner)
-        } else {
+        let token = if owner == "connections" {
             self.model.prepare_list_token(&self.services.tasks)
+        } else {
+            self.model.begin_owner(&self.services.tasks, owner)
         };
         let request = job_request(&self.model, job.clone(), token);
         if matches!(job, PendingJob::SaveNamed) {

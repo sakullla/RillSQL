@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+use crate::connections::groups::ConnectionGroup;
 use crate::connections::model::{
     CaMode, Engine, EnvTag, SavedConnection, SshAuthKind, SshSettings, TlsMode, TlsSettings,
 };
@@ -100,6 +101,34 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 last_used_at INTEGER NOT NULL
             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // 用户分组与成员关系各一张表：分组只是组织元数据，连接定义（含导出/导入形状）
+        // 一个字段都不改；没有分组时两张表是空的，存量连接天然是“未分组”。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS connection_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                collapsed INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS connection_group_members (
+                connection_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // 迁移只清理悬空引用，不删任何连接行：删过连接、导入过别的库之后仍能自洽。
+        sqlx::query(
+            "DELETE FROM connection_group_members
+             WHERE connection_id NOT IN (SELECT id FROM connections)
+                OR group_id NOT IN (SELECT id FROM connection_groups)",
         )
         .execute(&self.pool)
         .await?;
@@ -239,6 +268,11 @@ impl Store {
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM connection_usage WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        // 分组是组织元数据：连接删掉就一起清掉它的成员关系，分组本身留下。
+        sqlx::query("DELETE FROM connection_group_members WHERE connection_id = ?1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -384,6 +418,106 @@ impl Store {
         Ok(())
     }
 
+    pub async fn list_groups(&self) -> Result<Vec<ConnectionGroup>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id, name, position, collapsed FROM connection_groups ORDER BY position, name, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_group).collect()
+    }
+
+    pub async fn group(&self, id: &str) -> Result<Option<ConnectionGroup>, sqlx::Error> {
+        let row = sqlx::query("SELECT id, name, position, collapsed FROM connection_groups WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_group).transpose()
+    }
+
+    pub async fn next_group_position(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query("SELECT COALESCE(MAX(position), -1) + 1 FROM connection_groups")
+            .fetch_one(&self.pool)
+            .await?;
+        row.try_get(0)
+    }
+
+    pub async fn upsert_group(&self, group: &ConnectionGroup) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO connection_groups (id, name, position, collapsed) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, position = excluded.position, collapsed = excluded.collapsed",
+        )
+        .bind(&group.id)
+        .bind(&group.name)
+        .bind(group.position)
+        .bind(i64::from(u8::from(group.collapsed)))
+        .execute(&self.pool)
+        .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// 删分组只删分组和它的成员关系，连接行一个都不动：失败的删除也不会丢连接。
+    pub async fn delete_group(&self, id: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM connection_group_members WHERE group_id = ?1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM connection_groups WHERE id = ?1").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    pub async fn set_group_collapsed(&self, id: &str, collapsed: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE connection_groups SET collapsed = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(i64::from(u8::from(collapsed)))
+            .execute(&self.pool)
+            .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// 连接 id → 分组 id。没有行的连接就是未分组，不写哨兵值。
+    pub async fn memberships(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let rows = sqlx::query("SELECT connection_id, group_id FROM connection_group_members")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+            .collect()
+    }
+
+    pub async fn assign_group(&self, connection_id: &str, group: Option<&str>) -> Result<(), sqlx::Error> {
+        match group {
+            Some(group) => {
+                sqlx::query(
+                    "INSERT INTO connection_group_members (connection_id, group_id) VALUES (?1, ?2)
+                     ON CONFLICT(connection_id) DO UPDATE SET group_id = excluded.group_id",
+                )
+                .bind(connection_id)
+                .bind(group)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM connection_group_members WHERE connection_id = ?1")
+                    .bind(connection_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn testing_insert_membership(&self, connection_id: &str, group_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT OR REPLACE INTO connection_group_members (connection_id, group_id) VALUES (?1, ?2)")
+            .bind(connection_id)
+            .bind(group_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub async fn testing_set_env(&self, id: &str, env: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE connections SET env = ?1 WHERE id = ?2")
@@ -407,6 +541,15 @@ fn row_to_tag(row: &sqlx::sqlite::SqliteRow) -> Result<EnvTag, sqlx::Error> {
         label: row.try_get(1)?,
         tone: row.try_get(2)?,
         position: row.try_get(3)?,
+    })
+}
+
+fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> Result<ConnectionGroup, sqlx::Error> {
+    Ok(ConnectionGroup {
+        id: row.try_get(0)?,
+        name: row.try_get(1)?,
+        position: row.try_get(2)?,
+        collapsed: row.try_get::<i64, _>(3)? != 0,
     })
 }
 
