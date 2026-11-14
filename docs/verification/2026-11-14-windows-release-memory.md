@@ -47,7 +47,7 @@ node .github/scripts/release.mjs check
 node --test .github/scripts/release.test.mjs
 ```
 
-本地全量 Rust 测试：1065 项库测试通过，7 项既有测试忽略，另 1 项打包辅助测试通过。发布元数据与 12 项发布保护测试通过。Clippy 通过，仍有仓库既有告警。
+最终修复提交 `b539cfd` 的本地全量 Rust 测试：1066 项库测试通过，7 项既有测试忽略，另 1 项打包辅助测试通过。发布元数据与 12 项发布保护测试通过。[CI 43613082750](https://github.com/sakullla/RillSQL/actions/runs/43613082750) 的 Windows、macOS、Linux 测试和 Clippy 均通过，Windows 受限栈检查通过。Clippy 仍有仓库既有告警。计时测试的暂停夹具使用实际等待时长，避免繁忙机器的额外调度时间误算为执行耗时。
 
 受限栈对照：同一关系图测试，设置 `RUST_MIN_STACK=786432`（768 KiB），旧版发生 stack overflow（Windows 退出码 `0xc00000fd`），修改版通过。512 KiB 下两版均溢出；这里没有声称支持任意小的线程栈。Windows CI 新增以下回归检查：
 

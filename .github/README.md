@@ -8,6 +8,8 @@ A tag release waits for the latest `push` main CI run for its exact commit, and 
 
 Use the sequence in `AGENTS.md`: validate, push the release branch and main, wait for main CI, then push an annotated version tag. Rerun transient infrastructure failures on the same commit. For code fixes, increment the patch version; never move a pushed release tag. Published releases cannot be overwritten by this workflow.
 
+Release builds run the native binary with `--gpui-smoke` on each platform before packaging. Windows waits for the process exit code; macOS launches directly; Linux uses Xvfb and Mesa Vulkan drivers. Each check has a bounded timeout and blocks publication on failure. This verifies window creation and normal shutdown, not installer behavior or an end-to-end upgrade.
+
 Run the release guard tests locally with `node --test .github/scripts/release.test.mjs`. They cover manifest consistency, asset validation, and the main CI gate (including wrong commits, PR runs, failed newer runs and commits outside main).
 
 ## macOS signing and first launch

@@ -67,6 +67,9 @@ PACKAGES=(
   libxkbcommon-dev
   libxkbcommon-x11-dev
   libvulkan-dev
+  mesa-vulkan-drivers
+  xvfb
+  xauth
   patchelf
   xdg-utils
 )

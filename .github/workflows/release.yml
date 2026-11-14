@@ -146,6 +146,27 @@ jobs:
           fi
       - name: Build the GPUI binary
         run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin rillsql --target ${{ matrix.target }}
+      - name: Check native Windows startup
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $binary = Resolve-Path 'src-tauri/target/${{ matrix.target }}/release/rillsql.exe'
+          $process = Start-Process -FilePath $binary -ArgumentList '--gpui-smoke' -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(60000)) {
+            $process.Kill()
+            throw 'Native startup did not exit within 60 seconds'
+          }
+          if ($process.ExitCode -ne 0) { throw "Native startup failed: $($process.ExitCode)" }
+          Write-Output 'Native Windows startup passed'
+      - name: Check native macOS startup
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        run: src-tauri/target/${{ matrix.target }}/release/rillsql --gpui-smoke
+      - name: Check native Linux startup
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        run: timeout 60s xvfb-run -a env -u WAYLAND_DISPLAY src-tauri/target/${{ matrix.target }}/release/rillsql --gpui-smoke
       - name: Package with cargo-packager
         shell: bash
         env:
