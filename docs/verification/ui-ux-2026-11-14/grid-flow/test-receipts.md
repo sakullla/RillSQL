@@ -85,3 +85,34 @@
   本轮在 headless 里验证了 token 与 delegate 生效值（行高 40 / 内边距 8），没有在原生窗口里用设置页切到宽松再截图。
 - **原生双击分隔柄的像素级验证**：headless 里能拿到的是 `fit_col` 的等价入口与写回会话的列宽，
   真实鼠标双击命中分隔柄（2px 可抓取带）没有原生录屏证据。
+
+## 复审补修（T7-A4）运行记录
+
+补修内容见审计文档 13c 节（就地暂存绑行 id、失效收敛到一个钩子、finish 的原值兜底）。
+工作区为 `main` 上的 `caef6de` + 本轮未提交改动（`git status` 里没有 `Cargo.toml` / `Cargo.lock`）。
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| I | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::grid` | ok：**131 passed / 0 failed / 2 ignored**（914 filtered） |
+| J | `cargo test --manifest-path src-tauri/Cargo.toml --locked` | ok：**1040 passed / 0 failed / 7 ignored**；`src/bin/rillsql-package` 1 passed；doc-tests 0 |
+| K | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 退出码 0，0 error；crate 级 warning **32 条**，与 13b 的清单位置一致，本轮没有新增类别 |
+
+本轮新增用例：`record_panel_mouse_row_change_discards_the_in_place_edit`、
+`record_panel_sort_change_discards_the_in_place_edit`、
+`record_panel_enter_never_writes_a_blank_over_an_unread_preview_value`；
+既有记录面板用例的断言从"列号"改成"行 id + 列"（`Some(("1".to_owned(), 1))`）。
+
+反向核对（每次只去掉一处，跑 `--lib app::views::grid::workbench_tests::record_panel`）：
+
+- 去掉 `cell_press` 里的 `record_row_changed()`：`record_panel_mouse_row_change_discards_the_in_place_edit`
+  失败（8 passed / 1 failed）。恢复后通过。
+- 去掉 `finish_record_edit` 里的 `needs_full_of && full_text_of().is_none()` 判据：
+  `record_panel_enter_never_writes_a_blank_over_an_unread_preview_value` 失败（8 passed / 1 failed）。恢复后通过。
+- 去掉 `reload_after_condition_change` 顶部的 `record_row_changed()`：
+  `record_panel_sort_change_discards_the_in_place_edit` 失败（8 passed / 1 failed）。恢复后通过。
+
+本轮全量与分模块运行都没有复现 13b 记录的一次性 `panic in a destructor`
+（tokio-rt-worker）SIGABRT；该现象仍按未解决事实保留，不作已排除。
+
+未取得项与 13b 相同（原生像素截图、真实连库手点走查、宽松密度原生走查、原生双击分隔柄像素证据），
+按计划交 Delivery。

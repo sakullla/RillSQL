@@ -2252,6 +2252,21 @@ impl SharedGrid {
         }
     }
 
+    /// 按稳定行 id 取这一格的原值：长文本/二进制已读到完整值时才用它，预览信封绝不当原值。
+    /// 行不在了、列越界或原值还没读到时为空——调用方据此停手，不会拿空串顶替。
+    pub fn raw_value_of(&self, row_id: &str, column: usize) -> Option<Option<String>> {
+        let row = self.any_row(row_id)?;
+        if self.row_needs_full(row, column) {
+            return self.full_text_of(row_id, column);
+        }
+        self.value_in_row(row, column).map(|value| value.map(str::to_owned))
+    }
+
+    /// 按稳定行 id 取进入编辑时要摆进输入框的文本：原值没到手时为空，不留一个空框。
+    pub fn edit_text_of(&self, row_id: &str, column: usize) -> Option<String> {
+        self.raw_value_of(row_id, column).map(|value| value.unwrap_or_default())
+    }
+
     /// 当前格子是否真的可写；不可写时给出具体原因。只看结构，不看已存值。
     pub fn write_reason(&self, row: usize, column: usize) -> String {
         self.gate_text(self.structural_gate(Some(row), column))

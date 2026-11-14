@@ -152,14 +152,15 @@ pub struct GridPane {
     /// 记录面板宽度。默认 340，拖拽限制在 260..=640，双击复位。
     side_width: f32,
     record_dragging: bool,
-    /// 记录面板里正在就地暂存的列；非模态，值直接变成字段行里的输入框。
-    record_edit: Option<usize>,
+    /// 记录面板里正在就地暂存的格：稳定行 id + 逻辑列。行 id 才是唯一键——排序、筛选、翻页
+    /// 改变显示行号后仍指同一行；渲染和 Enter 都只认这一格，不再按当时的焦点行重新推导。
+    record_edit: Option<(String, usize)>,
     /// 记录面板的文本输入：Enter 暂存，Esc 取消。
     record_input: Entity<InputState>,
-    /// 记录面板的就地暂存要等下一次绘制才能拿到 Window。
-    pending_record: Option<(usize, usize)>,
-    /// 点到还是预览信封的记录字段：记下这一列，按定位读到原值后再回到同一条暂存入口。
-    record_edit_deferred: Option<usize>,
+    /// 记录面板的就地暂存要等下一次绘制才能拿到 Window（同样是行 id + 逻辑列）。
+    pending_record: Option<(String, usize)>,
+    /// 点到还是预览信封的记录字段：记下这一格，按定位读到原值后再回到同一条暂存入口。
+    record_edit_deferred: Option<(String, usize)>,
     _record_subscription: gpui_kit::Subscription,
     /// 单元格查看和记录面板共用的格式工作台。预览态不能提交。
     format_viewer: Option<Entity<FormatViewer>>,
@@ -348,6 +349,8 @@ impl GridPane {
         }
         // 正在编辑的格子按旧上限显示：结束编辑并回到网格，读完的原值缓存也已经作废。
         self.abandon_edit();
+        // 新的上限会把同样几行按另一套截断重读：记录面板这次暂存的文字属于旧显示。
+        self.record_row_changed();
         self.pending_full = None;
         if self.session.mode == GridMode::Table && !self.session.target.connection_id.is_empty() {
             // 表数据可以重读：从第一页重新读取，行列与预览都按新上限解释。
@@ -374,6 +377,8 @@ impl GridPane {
         }
         self.session.set_page(0, limit);
         self.pending_page = None;
+        // 页大小变了就是换一批行：记录面板的就地暂存不能跨过去。
+        self.record_row_changed();
         if self.session.mode == GridMode::Table && !self.session.target.connection_id.is_empty() {
             self.fetch_current(true, cx);
         }
@@ -396,7 +401,7 @@ impl GridPane {
         self.scheduled = 0;
         self.edit_target = None;
         self.pending_edit = None;
-        self.discard_record_edit();
+        self.record_row_changed();
         self.press = None;
         self.filter_input_reset();
         self.notice.clear();
@@ -494,8 +499,8 @@ impl GridPane {
         // 新的结果集意味着旧的编辑目标不再存在，先结束编辑。
         self.edit_target = None;
         self.pending_edit = None;
-        // 记录面板的列号属于上一份列结构：留在这里，下一份结果的同名列会继承上一张表的文字。
-        self.discard_record_edit();
+        // 记录面板这次暂存属于上一份结果：留在这里，下一份结果的同名列会继承上一张表的文字。
+        self.record_row_changed();
         self.press = None;
         self.pending_page = None;
         let QuerySheet { sql, columns, rows, truncated, full_count } = sheet;
@@ -511,7 +516,7 @@ impl GridPane {
         self.session.set_page(0, limit);
         self.edit_target = None;
         self.pending_edit = None;
-        self.discard_record_edit();
+        self.record_row_changed();
         self.press = None;
         self.pending_page = None;
         self.search_text.clear();
@@ -680,7 +685,9 @@ impl GridPane {
                     self.notice = i18n::text(self.locale, "grid.state.loading");
                 } else {
                     // 编辑目标所在的行要离开窗口了，先结束编辑，避免 Enter 落到不存在的位置。
+                    // 记录面板的就地暂存同样属于这一页的行，翻页后一律作废。
                     self.abandon_edit();
+                    self.record_row_changed();
                     let limit = self.session.page_limit().max(1);
                     let offset = if forward {
                         self.session.page_offset().saturating_add(limit)
@@ -819,7 +826,7 @@ impl GridPane {
                 self.record_open = !self.record_open;
                 // 关上面板就等于离开这次就地暂存：输入框跟着面板走，不能留到下次打开。
                 if !self.record_open {
-                    self.discard_record_edit();
+                    self.record_row_changed();
                     self.refocus = true;
                 }
                 None
@@ -827,14 +834,14 @@ impl GridPane {
             "grid-record-close" => {
                 self.record_open = false;
                 // 关上之前丢掉这次就地暂存：焦点和输入框都跟着面板一起走，留着会在下次打开时冒出来。
-                self.discard_record_edit();
+                self.record_row_changed();
                 self.refocus = true;
                 None
             }
             "grid-record-next" | "grid-record-prev" => {
                 // 换行前先丢掉这次就地暂存：否则下一行会显示上一行的文字，Enter 还会写进错的那一行。
                 // 已经把值暂存到行上的修改不受影响。
-                self.discard_record_edit();
+                self.record_row_changed();
                 let _ = record::record_step(&mut self.session, id == "grid-record-next");
                 self.refocus = true;
                 self.sync_table(cx);
@@ -843,8 +850,12 @@ impl GridPane {
             }
             // 预览信封记录字段的原值读回来了：回到同一条暂存入口，这次才是真的原值。
             "record-edit" => {
-                if let Some(column) = self.record_edit_deferred.take() {
-                    self.record_field_press(column, cx);
+                // 原值读回来了：只有焦点还停在点下去的那一行才继续；行已经换了，这次暂存作废
+                // （读到的原值仍留在缓存里，下次点同一格不用再读）。
+                if let Some((row_id, column)) = self.record_edit_deferred.take() {
+                    if self.session.focused_row_id() == Some(row_id.as_str()) {
+                        self.record_field_press(column, cx);
+                    }
                 }
                 None
             }
@@ -874,6 +885,8 @@ impl GridPane {
             }
             "grid-jump-staged" => {
                 if let Some((row, column)) = self.session.next_staged_cell() {
+                    // 跳到另一处已暂存的格子：记录面板这次输入先收掉。
+                    self.record_row_changed();
                     self.session.select(row, column, false);
                 }
                 None
@@ -946,7 +959,12 @@ impl GridPane {
     /// 两条路都先选中那一格，记录面板和网格高亮因此始终指同一行同一列。
     pub(crate) fn record_field_press(&mut self, column: usize, cx: &mut Context<Self>) {
         let Some(row) = record::record_row(&self.session) else {
-            self.record_edit_deferred = None;
+            self.record_row_changed();
+            return;
+        };
+        // 目标格在按下这一刻就定下来：行身份（稳定行 id）跟着这次暂存走完整个生命周期。
+        let Some(row_id) = self.session.row_id(row).map(str::to_owned) else {
+            self.record_row_changed();
             return;
         };
         self.session.select(row, column, false);
@@ -955,17 +973,17 @@ impl GridPane {
             self.notice = reason;
             self.session.open_value(row, column);
             self.pending_viewer = true;
-            self.discard_record_edit();
+            self.record_row_changed();
             self.refocus = true;
             cx.notify();
             return;
         }
         // 预览信封不是原值：和网格原位编辑（begin_edit）同一条门控，先按定位读一次再进暂存。
         // 否则长文本/二进制格会打开一个空输入框，Enter 接着把空串暂存成一次静默改写。
-        if self.session.needs_full(row, column) && self.session.full_text_at(row, column).is_none() {
+        if self.session.needs_full_of(&row_id, column) && self.session.full_text_of(&row_id, column).is_none() {
             let cell = (row, column);
             let reads = self.session.begin_full_cells(&[cell]);
-            self.discard_record_edit();
+            self.record_row_changed();
             if reads.is_empty() {
                 self.notice = self.session.cell_block(&[cell]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
                 self.refocus = true;
@@ -973,7 +991,7 @@ impl GridPane {
                 return;
             }
             let pending = PendingFull { id: "record-edit".to_owned(), token: self.session.sheet_serial() };
-            self.record_edit_deferred = Some(column);
+            self.record_edit_deferred = Some((row_id, column));
             self.pending_full = Some(pending.clone());
             self.start_full_reads(reads, Some(pending), cx);
             cx.notify();
@@ -981,54 +999,88 @@ impl GridPane {
         }
         self.notice.clear();
         self.record_edit_deferred = None;
-        self.record_edit = Some(column);
-        self.pending_record = Some((row, column));
+        self.record_edit = Some((row_id.clone(), column));
+        self.pending_record = Some((row_id, column));
         self.sync_table(cx);
         cx.notify();
     }
 
-    /// 丢掉记录面板里这次就地暂存：换行、关闭面板、重读都先走这里。
-    /// 暂存状态跨行没有意义——留着它，下一行会显示上一行的文字，Enter 还会写进错的那一行。
+    /// 丢掉记录面板里这次就地暂存：暂存以行 id 为键，行没了、换了或内容被重读，它就不再成立。
+    /// 只清状态，不动输入框（那要 Window），下一次绘制重新写。
     fn discard_record_edit(&mut self) {
         self.record_edit = None;
         self.pending_record = None;
         self.record_edit_deferred = None;
     }
 
+    /// 行内容、行身份或行集合要变了：记录面板这次就地暂存到此作废。
+    /// 所有会动行的入口（点选/行头选择/翻页/排序筛选重读/预览上限/换表/重读结果）都只调这一个钩子，
+    /// 而不是各自散着清字段。留着旧状态，新行会渲染上一行的文字，Enter 还会把那段文字写进新行。
+    fn record_row_changed(&mut self) {
+        self.discard_record_edit();
+    }
+
     /// 绘制阶段才能拿到 Window：把这一格的原值写进面板输入框并聚焦。
-    fn begin_record_edit(&mut self, row: usize, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_record_edit(&mut self, row_id: &str, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 目标行已经不在当前快照里（按下之后排序、筛选或翻页换过一批行）：这次暂存作废。
+        if self.session.row_index(row_id).is_none() {
+            self.record_row_changed();
+            return;
+        }
         // 值还是预览信封（按下之后刚好又重读过这一行）：不进暂存，说明原因，
         // 绝不把一个空输入框摆出来让 Enter 暂存成空串。正常路径已在 record_field_press 里先读过原值。
-        if self.session.needs_full(row, column) && self.session.full_text_at(row, column).is_none() {
-            self.discard_record_edit();
+        if self.session.needs_full_of(row_id, column) && self.session.full_text_of(row_id, column).is_none() {
+            self.record_row_changed();
+            let row = self.session.row_index(row_id).unwrap_or(0);
             self.notice = self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
             self.refocus = true;
             cx.notify();
             return;
         }
-        let text = self.session.edit_text(row, column);
+        let Some(text) = self.session.edit_text_of(row_id, column) else {
+            self.record_row_changed();
+            self.notice = i18n::text(self.locale, "grid.value.noOriginal");
+            self.refocus = true;
+            cx.notify();
+            return;
+        };
         self.record_input.update(cx, |state, cx| state.set_value(text, window, cx));
         let handle = self.record_input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
     }
 
-    /// Enter：这一列的值原样暂存到行上。只读、未定位和校验失败都给出同一套原因，
+    /// Enter：这一格的原样文本按行 id 暂存到按下时的那一行上。只读、未定位和校验失败都给出同一套原因，
     /// 已有的暂存保持不动（和网格原位编辑同一个门控）。
     pub(crate) fn finish_record_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(column) = self.record_edit.take() else {
+        let Some((row_id, column)) = self.record_edit.take() else {
             return;
         };
-        let Some(row) = record::record_row(&self.session) else {
+        // 兜底：目标行已经离开当前快照（或这次暂存跨过了行变化），一个字都不写。
+        let Some(row) = self.session.row_index(&row_id) else {
+            self.record_row_changed();
+            self.notice = self.session.gate_text(Gate::Unlocated);
+            self.refocus = true;
+            self.sync_table(cx);
+            cx.notify();
             return;
         };
+        // 和 begin_edit 同一条判据：值还是预览信封就绝不写，空串不能顶替用户没看过的原值。
+        if self.session.needs_full_of(&row_id, column) && self.session.full_text_of(&row_id, column).is_none() {
+            self.record_row_changed();
+            self.notice = self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+            self.refocus = true;
+            self.sync_table(cx);
+            cx.notify();
+            return;
+        }
         let text = self.record_input.read(cx).value().to_string();
         // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
-        let original = self.session.raw_value(row, column);
+        let original = self.session.raw_value_of(&row_id, column);
         let value = match (&original, text.is_empty()) {
             (Some(None), true) => None,
             _ => Some(text),
         };
-        let gate = self.session.stage_text(row, column, value);
+        let gate = self.session.stage_text_by_id(&row_id, column, value);
         self.notice = self.session.gate_text(gate);
         self.refocus = true;
         self.sync_table(cx);
@@ -1037,7 +1089,7 @@ impl GridPane {
 
     /// Esc：放弃这次输入。已经暂存的其它格子不受影响。
     fn cancel_record_edit(&mut self, cx: &mut Context<Self>) {
-        self.record_edit = None;
+        self.record_row_changed();
         self.refocus = true;
         cx.notify();
     }
@@ -1237,11 +1289,15 @@ impl GridPane {
     /// 条件、排序或查找范围改变后：表数据从第一页重读，查询结果只在本地重排。
     fn reload_after_condition_change(&mut self, cx: &mut Context<Self>) {
         self.sync_find_scope();
+        // 排序/筛选换了行序与行集合：记录面板的就地暂存不再属于任何一行，先作废。
+        self.record_row_changed();
         if self.session.mode == GridMode::Table && self.live_target() {
             let limit = self.session.page_limit().max(1);
             // 条件变了，旧偏移指向另一组行；选择仍按行 id 重新挂回。
             self.session.set_page_keep_identity(0, limit);
             self.abandon_edit();
+            // 排序/筛选换了行集合与行序：记录面板的就地暂存不再属于任何一行。
+            self.record_row_changed();
             self.fetch_current(true, cx);
         } else {
             self.sync_table(cx);
@@ -1467,6 +1523,8 @@ impl GridPane {
     pub(crate) fn cell_press(&mut self, row: usize, column: usize, mode: PressMode, cx: &mut Context<Self>) {
         self.press = Some((row, column));
         self.press_mode = mode;
+        // 鼠标点到别的格就是换了目标行/列：记录面板这次就地暂存不能跟着过去。
+        self.record_row_changed();
         // Shift 落在焦点格上没有新信息；Ctrl/Cmd 落在同一格上要真的加/减，不能吞掉。
         if mode == PressMode::Extend && self.session.focus_cell() == Some((row, column)) {
             return;
@@ -1767,6 +1825,8 @@ impl GridPane {
                 }
                 // 已经一致时不再改写选择。
                 if self.session.focus_cell() != Some((*row, column)) {
+                    // 表格自己改的选择同样是一次换行：记录面板的就地暂存到此作废。
+                    self.record_row_changed();
                     self.session.select(*row, column, false);
                     // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
                     self.notice.clear();
@@ -1779,6 +1839,7 @@ impl GridPane {
                     return;
                 };
                 // 双击与 F2 都进入同一条编辑路径；只读时退化为查看值并说明原因。
+                self.record_row_changed();
                 self.session.select(*row, column, false);
                 self.request_edit(true);
             }
@@ -1796,6 +1857,8 @@ impl GridPane {
                 // 高亮、TSV、SQL 值和统计读的是同一段行列。
                 let last = self.session.loaded_len().saturating_sub(1);
                 if self.session.selection_bounds() != Some((0, column, last, column)) {
+                    // 整列选择把焦点移到首行：记录面板的就地暂存跟着作废。
+                    self.record_row_changed();
                     self.session.select(0, column, false);
                     self.session.select(last, column, true);
                 }
@@ -1806,6 +1869,8 @@ impl GridPane {
                 let last = self.session.column_names().len().saturating_sub(1);
                 let bounds = self.session.selection_bounds();
                 if bounds != Some((*row, 0, *row, last)) {
+                    // 行头选中的是另一行：记录面板的就地暂存到此作废。
+                    self.record_row_changed();
                     self.session.select(*row, 0, false);
                     self.session.select(*row, last, true);
                 }
@@ -1997,6 +2062,8 @@ impl GridPane {
         self.schema_cache = Some((self.session.target.clone(), None, schema_dto.clone()));
         let rows = rows_from_page(&columns, &page);
         if replace {
+            // 整页替换：行内容与行集合都换了一套，记录面板的就地暂存不能跨过这次重读。
+            self.record_row_changed();
             self.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
             // 新的一页真的到了才换窗口；失败路径不动选择、滚动和偏移。
             if landed_page {
@@ -2284,8 +2351,8 @@ impl Render for GridPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
         // 记录面板的就地暂存和网格原位编辑一样，要等绘制阶段才拿得到 Window。
-        if let Some((row, column)) = self.pending_record.take() {
-            self.begin_record_edit(row, column, window, cx);
+        if let Some((row_id, column)) = self.pending_record.take() {
+            self.begin_record_edit(&row_id, column, window, cx);
         }
         if let Some(pending) = self.pending_edit.take() {
             self.begin_edit(pending, window, cx);
@@ -2999,6 +3066,13 @@ impl GridPane {
                 let width = self.side_width.clamp(RECORD_SIDE_MIN, RECORD_SIDE_MAX);
                 let dragging = self.record_dragging;
                 let reset = entity.clone();
+                // 只有面板正在显示的那一行才是这次暂存的目标：行换了就不再摆输入框，
+                // 免得把上一行留下的文字当成这一行的值来显示。
+                let editing_column = self
+                    .record_edit
+                    .as_ref()
+                    .filter(|(row_id, _)| record::record_row(&self.session).and_then(|row| self.session.row_id(row)) == Some(row_id.as_str()))
+                    .map(|(_, column)| *column);
                 // 纵向记录视图靠右，和网格共用同一个焦点行。左缘拖拽调宽，双击回到 340。
                 div()
                     .flex_1()
@@ -3035,7 +3109,7 @@ impl GridPane {
                         entity,
                         width,
                         record::RecordEdit {
-                            column: self.record_edit,
+                            column: editing_column,
                             input: Some(self.record_input.clone()),
                             writable: self.session.writable(),
                             selected: self.selection_size(),
@@ -7018,7 +7092,7 @@ mod workbench_tests {
             window.render_frame(cx);
         })
         .unwrap();
-        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(1), "字段就地进入暂存"));
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(("1".to_owned(), 1)), "字段就地进入暂存"));
         cx.update_window(window, |_, window, cx| {
             window.press("secondary-a", cx);
             window.input("新值", cx);
@@ -7129,7 +7203,7 @@ mod workbench_tests {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.record_edit, None, "原值没到手前不打开就地暂存");
-            assert_eq!(pane.record_edit_deferred, Some(1), "记下这一列，读完原值再回来");
+            assert_eq!(pane.record_edit_deferred, Some(("1".to_owned(), 1)), "记下这一格（行 id + 列），读完原值再回来");
             assert!(!pane.notice.is_empty(), "读不到原值要说明原因，不能静默无反应");
             assert!(!pane.session.uncommitted(), "没有暂存任何东西");
             assert!(!pane.cell(0, 1).contains('\u{1}'), "预览值原样保留，界面上不出现信封");
@@ -7146,7 +7220,7 @@ mod workbench_tests {
         cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
         cx.update(|cx| {
             let pane = pane.read(cx);
-            assert_eq!(pane.record_edit, Some(1));
+            assert_eq!(pane.record_edit, Some(("1".to_owned(), 1)));
             assert_eq!(pane.record_input.read(cx).value().to_string(), full, "输入框里是原值");
         });
         cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
@@ -7171,8 +7245,8 @@ mod workbench_tests {
             pane.update(cx, |pane, cx| {
                 let _ = pane.command("grid-record-toggle", cx);
                 // 绕过 record_field_press 直接摆出暂存状态，模拟按下之后这一行又被重读过。
-                pane.record_edit = Some(1);
-                pane.pending_record = Some((0, 1));
+                pane.record_edit = Some(("1".to_owned(), 1));
+                pane.pending_record = Some(("1".to_owned(), 1));
             });
             window.render_frame(cx);
         })
@@ -7203,7 +7277,7 @@ mod workbench_tests {
             window.render_frame(cx);
         })
         .unwrap();
-        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(1), "字段就地进入暂存"));
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(("1".to_owned(), 1)), "字段就地进入暂存"));
         // 输入一半就切到下一行。
         cx.update_window(window, |_, window, cx| {
             window.press("secondary-a", cx);
@@ -7254,6 +7328,110 @@ mod workbench_tests {
         }));
         cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
         cx.update(|cx| assert_eq!(pane.read(cx).record_edit, None, "重新打开也不是上次那次输入"));
+    }
+
+    /// 暂存开着时用鼠标点另一行：这次输入整体作废，Enter 不会把上一行的文字写进新行。
+    /// 目标格在按下那一刻就绑定了行 id，点选/行头/翻页/排序筛选/预览上限都走同一个作废钩子。
+    #[gpui_kit::test]
+    fn record_panel_mouse_row_change_discards_the_in_place_edit(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-record-toggle", cx);
+                pane.record_field_press(1, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(("1".to_owned(), 1)), "第 1 行的第 1 列进入暂存"));
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("上一行的字", cx);
+        })
+        .unwrap();
+        // 鼠标点第 2 行同一列：行身份变了，这次暂存必须作废。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, PressMode::Plain, cx)));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.record_edit, None, "点另一行丢掉这次就地暂存");
+            assert!(pane.pending_record.is_none());
+            assert_eq!(pane.session.focused_row_id(), Some("2"));
+            assert!(!pane.session.uncommitted(), "半截的输入没有进暂存");
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        // 记录面板现在画第 2 行，不再摆上一行的输入框；Enter 也不会写进这一行。
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.cell(1, 1), "乙", "新的一行原样");
+            assert!(!pane.session.uncommitted(), "Enter 没有把上一行的文字写进新的一行");
+        });
+    }
+
+    /// 排序/筛选换了行集合：暂存同样作废，不会按旧文字落到新的一批行上。
+    #[gpui_kit::test]
+    fn record_panel_sort_change_discards_the_in_place_edit(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-record-toggle", cx);
+                pane.record_field_press(1, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).record_edit, Some(("1".to_owned(), 1))));
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("半截", cx);
+        })
+        .unwrap();
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            let _ = pane.command("grid-sort", cx);
+        }));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.session.sort_text().is_some(), "排序已经生效");
+            assert_eq!(pane.record_edit, None, "排序改变行序后丢掉这次就地暂存");
+            assert!(!pane.session.uncommitted(), "半截的输入没有进暂存");
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!pane.read(cx).session.uncommitted(), "Enter 没有写进任何一行"));
+    }
+
+    /// finish 自己的兜底：目标行还在，但这一格只是预览信封（原值从未读到）。
+    /// 这时输入框是空的，Enter 也绝不能用空串顶替用户没看过的长文本/二进制值。
+    #[gpui_kit::test]
+    fn record_panel_enter_never_writes_a_blank_over_an_unread_preview_value(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant_long_record(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-record-toggle", cx);
+                // 直接摆出暂存状态（绕开 record_field_press 的原值门控）：输入框因此是空的。
+                pane.record_edit = Some(("1".to_owned(), 1));
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.record_input.read(cx).value().to_string(), "", "输入框没有任何文字");
+            assert!(pane.session.needs_full_of("1", 1), "这一格仍是预览信封");
+            assert!(pane.session.full_text_of("1", 1).is_none(), "原值没有读到");
+        });
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.finish_record_edit(cx)));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.session.uncommitted(), "没有暂存空串");
+            assert_eq!(pane.record_edit, None, "这次暂存结束");
+            assert!(!pane.notice.is_empty(), "要说明原值还没读到");
+        });
     }
 
     /// 记录面板里只是预览片段的字段要标出来：用户不会把截断显示当成完整值。

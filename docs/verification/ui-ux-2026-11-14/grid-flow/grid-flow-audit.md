@@ -225,6 +225,36 @@
   重开不带上次文字）、`record_panel_marks_preview_fields`（预览字段有标记、普通值没有）。
   三个回归用例在去掉对应修复后会失败（已实测），不是只跑一次通过。
 
+## 13c. 复审补修（T7-A4）：就地暂存改成按行身份绑定，失效收敛到一个钩子
+
+13b 的补修只把作废挂在了换行/关闭/换表五处，根因没动：`record_edit` 仍是一个列号，
+`finish_record_edit` 在 Enter 那一刻用当时的焦点行重新推导目标行（`stage_text(row, ...)`）。
+凡是改变当前行、又没走 next/prev/close 的路径（鼠标点格、表格选择事件、行头选择、翻页、
+排序/筛选后重读、`set_preview_kb` 重读）都会留下一个活着的暂存：新行渲染成上一行的文字，
+Enter 就把它——或清空后的空串——写进用户没看过的那一格。
+
+- 源码入口：`mod.rs` 的 `record_edit` / `pending_record` / `record_edit_deferred` 字段类型、
+  `record_field_press`、`begin_record_edit`、`finish_record_edit`、`cancel_record_edit`、
+  `discard_record_edit` / `record_row_changed`，以及渲染处 `record::RecordEdit { column }`；
+  `session.rs` 新增 `raw_value_of` / `edit_text_of`（按稳定行 id 取原值）。
+- 修复（对齐网格原位编辑的 `PendingEdit`：row_id + `stage_text_by_id`）：
+  1. 目标格在按下那一刻就绑定身份：三个字段都改成 `(行 id, 逻辑列)`，行 id 是唯一键。
+  2. `finish_record_edit` 只走 `stage_text_by_id(row_id, column, ...)`，不再按焦点行重新推导；
+     目标行已经离开当前快照时直接收掉并说明原因，一个字都不写。
+  3. 失效收敛到一个钩子 `record_row_changed()`：鼠标点格、表格 `SelectCell`/`RightClickedCell`、
+     `SelectColumn`、`SelectRow`/`DoubleClickedRow`、双击进编辑、翻页、页大小变化、
+     排序/筛选重读（`reload_after_condition_change` 顶部）、整页替换重读、`set_preview_kb`、
+     换表（`show_query`/`open_table`/`clear_sheet`）、记录面板换行/关闭/关闭开关、跳到已暂存格，
+     全部调它，不再各处分头清字段。
+  4. `finish_record_edit` 复用 `begin_edit` 的 `needs_full && full_text_of().is_none()` 判据兜底：
+     值还是预览信封时绝不写，空串不能顶替用户没看过的长文本/二进制原值。
+  5. 渲染也按身份判：只有记录面板正在显示的那一行等于暂存目标行时才摆输入框，
+     行换了就先不显示，不会把上一行的文字画成这一行的值。
+- 验证材料：`record_panel_mouse_row_change_discards_the_in_place_edit`（点另一行后 Enter 不写进新行）、
+  `record_panel_sort_change_discards_the_in_place_edit`（排序改变行集合后作废，Enter 不写任何行）、
+  `record_panel_enter_never_writes_a_blank_over_an_unread_preview_value`（原值未读到的预览格，
+  空输入框按 Enter 也不写空串）。三个用例都做过反向核对：去掉对应的钩子或判据后各自失败，恢复后通过。
+
 ## 14. 保持不变的行为（回归对照）
 
 | 行为 | 用例 |
