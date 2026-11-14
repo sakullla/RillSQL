@@ -1262,6 +1262,9 @@ fn open_workbench_sized(
     width: f32,
     height: f32,
 ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>) {
+    // 使用真实 AppServices/Tokio/SQLite 的集成夹具允许真实 I/O 唤醒。
+    // 纯模型测试不使用此夹具，仍保留确定性调度检查。
+    cx.executor().allow_parking();
     cx.update(gpui_kit::init);
     let (window, view) = cx.update(|cx| {
         let bounds = gpui_kit::Bounds {
@@ -1283,6 +1286,22 @@ fn open_workbench_sized(
         (window, view)
     });
     (window, view)
+}
+
+#[gpui_kit::test]
+fn closing_workbench_cancels_pending_job_receivers_on_the_ui_thread(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-job-drop-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cx.update(|cx| view.update(cx, |view, cx| view.receive_job("history", rx, cx)));
+    cx.run_until_parked();
+    assert!(!tx.is_closed(), "作业仍在等待后台回执");
+    cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
+    cx.update(|_| drop(view));
+    cx.run_until_parked();
+    assert!(tx.is_closed(), "关闭工作台必须在界面线程取消接收任务，后台发送者不能继续持有其唤醒器");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[gpui_kit::test]
@@ -3936,6 +3955,8 @@ fn a_superseded_settings_failure_does_not_overwrite_a_newer_result(cx: &mut gpui
     cx.update(|cx| {
         view.update(cx, |view, _| {
             view.model.settings_save = SaveState::Saving;
+            view.apply_persist_settings(Ok(Ok(())), newest - 1, "{}".into());
+            assert_eq!(view.model.settings_save, SaveState::Saving, "旧代次被跳过并不代表最新快照已经落盘");
             // 旧的那次失败晚到：代次已经不是它，结果不算数。
             view.apply_persist_settings(Ok(Err("磁盘写失败".into())), newest - 1, "{}".into());
             assert_eq!(view.model.settings_save, SaveState::Saving, "被接管的失败不改设置页状态");

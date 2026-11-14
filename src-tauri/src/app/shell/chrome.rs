@@ -212,7 +212,7 @@ impl Workbench {
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.model.shell.sidebar_open = false;
-                                    this.persist_if_needed();
+                                    this.persist_if_needed(cx);
                                     cx.notify();
                                 });
                             });
@@ -1402,7 +1402,7 @@ impl Workbench {
             .child(
                 kit::icon_button(SharedString::from(format!("tab-close-{id}")), IconName::X, self.t("common.close"), cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.model.request_close_tab(&close_id);
-                    this.persist_if_needed();
+                    this.persist_if_needed(cx);
                     cx.notify();
                 }))
                 .xsmall(),
@@ -1411,13 +1411,13 @@ impl Workbench {
                 // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
                 if this.model.tab_menu_for(&menu_id) {
                     this.menu_at = event.position;
-                    this.persist_if_needed();
+                    this.persist_if_needed(cx);
                 }
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.model.request_close_tab(&middle_id);
-                this.persist_if_needed();
+                this.persist_if_needed(cx);
                 cx.notify();
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1425,7 +1425,7 @@ impl Workbench {
                 if this.model.tool == WorkTool::Query {
                     this.query.update(cx, |pane, _| pane.request_focus());
                 }
-                this.persist_if_needed();
+                this.persist_if_needed(cx);
                 cx.notify();
             }));
             list = list.child(chip);

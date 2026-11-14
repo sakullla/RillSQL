@@ -81,6 +81,8 @@ pub struct Workbench {
     /// 最近一次设置写盘的回执监听：持有句柄让它随视图一起在界面线程上释放，
     /// 否则脱离的本地任务会在测试拆卸时被别的线程丢弃并 panic。
     settings_task: Option<gpui_kit::Task<()>>,
+    /// 接收后台作业的本地任务随工作台释放；下次派发时回收已完成句柄。
+    job_tasks: Vec<gpui_kit::Task<()>>,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -241,6 +243,7 @@ impl Workbench {
             booted: false,
             health_task: None,
             settings_task: None,
+            job_tasks: Vec::new(),
             boot,
             sized: false,
             last_state: String::new(),
@@ -276,7 +279,7 @@ impl Workbench {
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
         if self.model.gate_on_demand(id) {
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -301,7 +304,7 @@ impl Workbench {
         if requires_active_query(id) && !self.active_query_context() {
             self.model.notice_key = Some("query.errors.needTarget");
             self.model.notice_detail = crate::app::views::query::NOT_ACTIVE_QUERY.to_owned();
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -334,7 +337,7 @@ impl Workbench {
             let _ = self.model.dispatch(id);
             self.adopt_shell(Effect::None, cx);
             self.forward_query("save-sql-file", cx);
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -366,7 +369,7 @@ impl Workbench {
             } else {
                 self.apply_effect(effect, cx);
             }
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -400,7 +403,7 @@ impl Workbench {
                 }
             });
             self.refresh_exchange(cx);
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -424,7 +427,7 @@ impl Workbench {
                     if target.as_ref().is_some_and(|target| !target.is_relational()) {
                         self.model.notice_key = Some("catalog.tree.relationalOnly");
                         self.model.notice_detail = target.as_ref().map(|target| target.name.clone()).unwrap_or_default();
-                        self.persist_if_needed();
+                        self.persist_if_needed(cx);
                         cx.notify();
                         return;
                     }
@@ -444,7 +447,7 @@ impl Workbench {
                 pane.command(id, cx);
             });
             self.refresh_compare(cx);
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -466,7 +469,7 @@ impl Workbench {
                 self.diagram.update(cx, |pane, _| pane.set_locale(locale));
                 self.ensure_diagram(cx);
             }
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -480,7 +483,7 @@ impl Workbench {
             if let Some(text) = self.route_shared_grid(id, cx) {
                 self.model.copied = text;
             }
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
             cx.notify();
             return;
         }
@@ -499,7 +502,7 @@ impl Workbench {
             }
             if query_command(id) {
                 self.forward_query(id, cx);
-                self.persist_if_needed();
+                self.persist_if_needed(cx);
                 cx.notify();
             }
             return;
@@ -521,7 +524,7 @@ impl Workbench {
         if crate::app::views::settings::is_settings_command(id) {
             self.persist_settings(cx);
         } else {
-            self.persist_if_needed();
+            self.persist_if_needed(cx);
         }
         cx.notify();
     }
@@ -566,7 +569,7 @@ impl Workbench {
     pub(super) fn go_to_definition(&mut self, link: crate::ui::ObjectLink, cx: &mut Context<Self>) {
         let fallback = self.query.read(cx).definition_spec(&link);
         let _ = self.model.go_to_definition(&link.connection_id, &link.database, &link.schema, &link.name, &link.kind, fallback);
-        self.persist_if_needed();
+        self.persist_if_needed(cx);
         cx.notify();
     }
 
@@ -1733,7 +1736,7 @@ impl Workbench {
                             let _ = this.model.dispatch("history-refresh");
                             let _ = this.model.dispatch("nav-refresh");
                             this.load_env_tags(cx);
-                            this.persist_if_needed();
+                            this.persist_if_needed(cx);
                             cx.notify();
                         })
                         ;
@@ -1774,8 +1777,13 @@ impl Workbench {
         }
         let services = Arc::clone(&self.services);
         let rx = jobs::spawn_job(services, request);
+        self.receive_job(owner, rx, cx);
+    }
+
+    pub(super) fn receive_job(&mut self, owner: &'static str, rx: tokio::sync::oneshot::Receiver<jobs::JobDone>, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
+        self.job_tasks.retain(|task| !task.is_ready());
+        self.job_tasks.push(cx.spawn(async move |_, cx| {
             let done = rx.await;
             cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
@@ -1784,20 +1792,25 @@ impl Workbench {
                             apply_done(&mut this.model, &this.services, owner, done);
                         }
                         this.model.finish_job();
-                        this.persist_if_needed();
+                        this.persist_if_needed(cx);
                         cx.notify();
                     })
                     ;
                 }
             });
-        })
-        .detach();
+        }));
     }
 
-    pub(super) fn persist_if_needed(&mut self) {
+    pub(super) fn persist_if_needed(&mut self, cx: &mut Context<Self>) {
         let state = self.model.snapshot();
         let blob = serde_json::to_string(&state).unwrap_or_default();
         if blob == self.last_state {
+            return;
+        }
+        // 无关命令的新快照包含尚未保存的设置。接管写盘时也必须接管回执，
+        // 不能让旧代次被跳过的 Ok(()) 提前把界面标为“已保存”。
+        if self.model.settings_save == SaveState::Saving {
+            self.persist_settings(cx);
             return;
         }
         self.last_state = blob;
@@ -1812,15 +1825,11 @@ impl Workbench {
 
     /// 设置改动的写盘路径：与 persist_if_needed 同一条去重、代次与闸门，
     /// 区别是把结果写回模型——设置页和状态栏都要能把“没保存成功”说清楚。
-    /// last_state 只在写成功后才更新，失败后的重试不会因为内容相同被跳过。
+    /// last_state 仅用于合并已排队的快照；显式设置保存/重试必须取得真正的写盘回执。
     pub(super) fn persist_settings(&mut self, cx: &mut Context<Self>) {
         let state = self.model.snapshot();
         let blob = serde_json::to_string(&state).unwrap_or_default();
-        if blob == self.last_state {
-            self.model.settings_save = SaveState::Saved;
-            cx.notify();
-            return;
-        }
+        self.last_state = blob.clone();
         self.model.settings_save = SaveState::Saving;
         let generation = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let revision = Arc::clone(&self.revision);
@@ -1856,22 +1865,17 @@ impl Workbench {
         blob: String,
     ) {
         let newest = self.revision.load(Ordering::SeqCst) == generation;
+        if !newest {
+            return;
+        }
         match result {
             Ok(Ok(())) => {
-                // 写盘结果本身就是这次设置改动的答案：persist_revision 要么写了
-                // 这份快照，要么已被更晚的写入接管（那份含同样的设置改动）。
-                // 状态不能因为无关命令推进了代次就永久卡在“保存中”。
+                // 当前代次拿到 Ok 才说明写盘完成；被接管的请求由新回执负责。
                 self.model.settings_save = SaveState::Saved;
-                // 代次只用来挡“更旧的快照冒充已落盘”：被接管的写入不更新
-                // last_state，否则之后真正需要的重试会被内容去重跳过。
-                if newest {
-                    self.last_state = blob;
-                }
+                self.last_state = blob;
             }
             Ok(Err(detail)) => {
-                if newest {
-                    self.model.settings_save = SaveState::Failed { detail };
-                }
+                self.model.settings_save = SaveState::Failed { detail };
             }
             // 通道被丢弃说明这次写入已经作废：保持原状态，不假装成功。
             Err(_) => {}
@@ -1973,7 +1977,7 @@ impl Workbench {
                 self.model.notice_detail = error.to_string();
             }
         }
-        self.persist_if_needed();
+        self.persist_if_needed(cx);
         cx.notify();
     }
 
@@ -2003,7 +2007,7 @@ impl Workbench {
                 self.model.notice_detail = error.to_string();
             }
         }
-        self.persist_if_needed();
+        self.persist_if_needed(cx);
         cx.notify();
     }
 
@@ -2034,7 +2038,7 @@ impl Workbench {
                 self.model.notice_detail = error.to_string();
             }
         }
-        self.persist_if_needed();
+        self.persist_if_needed(cx);
         cx.notify();
     }
 

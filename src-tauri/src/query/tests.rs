@@ -1416,8 +1416,10 @@ struct Pausing {
 #[async_trait::async_trait]
 impl StatementDriver for Pausing {
     async fn run(&self, sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> exec::DriverReport {
+        let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(60)).await;
-        *self.paused.lock().expect("paused") += Duration::from_millis(60);
+        // 调度繁忙时 sleep 会晚于期限返回，暂停时长必须包含实际等待。
+        *self.paused.lock().expect("paused") += started.elapsed();
         exec::DriverReport::unchanged(sql, Ok(ok_count()))
     }
 
