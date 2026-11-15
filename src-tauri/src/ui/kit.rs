@@ -176,6 +176,8 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     theme.mono_font_size = px(TypeScale::MD);
     // 组件库按钮、输入框用 radius（控件 4px），对话框、通知等浮层用 radius_lg（面板 6px）。
     theme.radius = px(Radius::CONTROL);
+    // 桌面工具的滚动条常驻：表格、树、长列表一眼看得出还能往哪儿滚，不必先滚一下才出现。
+    theme.scrollbar_mode = gpui_kit::component::scroll::ScrollbarMode::Always;
     theme.radius_lg = px(Radius::PANEL);
     let c = &mut theme.colors;
     c.background = p.surface;

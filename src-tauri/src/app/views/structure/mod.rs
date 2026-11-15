@@ -552,6 +552,10 @@ pub struct StructurePane {
     view_editor: Option<gpui_kit::Entity<EditorState>>,
     view_editor_sync: String,
     view_sub: Option<Subscription>,
+    /// 索引/外键页的“新建”表单是否展开：默认收起，列表是主角。
+    composer_open: bool,
+    /// 读取失败是因为连接没打开时，“重试”先请外壳打开连接；连上后自动重读。
+    connect_request: Option<String>,
 }
 
 impl StructurePane {
@@ -560,6 +564,8 @@ impl StructurePane {
             session: StructureSession::new(GridTarget::default()),
             services,
             fields: Fields::default(),
+            connect_request: None,
+            composer_open: false,
             draft_fields: Fields::default(),
             snapshot: None,
             loaded_for: String::new(),
@@ -1386,10 +1392,28 @@ impl StructurePane {
 
     /// 读取失败后的重试：清掉失败原因与已读标记，下一帧重新读取（不清用户草稿）。
     pub fn retry_load(&mut self, cx: &mut Context<Self>) {
+        let connection = self.session.target.connection_id.clone();
+        if !connection.is_empty() && self.services.connections.catalog_session(&connection).is_none() {
+            // 连接没打开时重读只会再失败一次：先请外壳连接，连上后由 retry_after_connect 重读。
+            self.connect_request = Some(connection);
+            cx.notify();
+            return;
+        }
         self.load_error.clear();
         self.loaded_for.clear();
         self.loading = false;
         cx.notify();
+    }
+
+    pub fn take_connect_request(&mut self) -> Option<String> {
+        self.connect_request.take()
+    }
+
+    /// 连接刚打开：此前因连接未打开而读取失败的结构页自动重读。
+    pub fn retry_after_connect(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        if self.session.target.connection_id == connection_id && !self.load_error.is_empty() {
+            self.retry_load(cx);
+        }
     }
 
     /// 读取中或读取失败时不显示新增表单与主操作：先让用户看到加载/失败态与重试。
@@ -1401,21 +1425,11 @@ impl StructurePane {
     fn preview_action_visible(&self) -> bool {
         let section = self.session.section;
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
-        self.form_visible() && !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view)
+        // 索引/外键页只有展开“新建”表单时才有东西可预览；平时列表是主角，不常驻一个预览按钮。
+        let composing = !matches!(section, Section::Indexes | Section::ForeignKeys) || self.composer_open;
+        self.form_visible() && composing && !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view)
     }
 
-    /// 表名 + 字段/索引数量的摘要行（S8.4）。
-    fn summary_text(&self) -> String {
-        if self.session.mode == StructureMode::Create {
-            return String::new();
-        }
-        let Some(snapshot) = &self.snapshot else {
-            return String::new();
-        };
-        let columns = snapshot.columns.len().to_string();
-        let indexes = snapshot.indexes.len().to_string();
-        i18n::fill(&i18n::text(self.session.locale, "structure.summary"), &[("columns", &columns), ("indexes", &indexes)])
-    }
 
     fn apply_row_action(&mut self, action: RowAction, cx: &mut Context<Self>) {
         match action {
@@ -1433,6 +1447,7 @@ impl StructurePane {
         }
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
+        let pending = if section == Section::Columns { self.pending_changes() } else { 0 };
         let owner = entity.clone();
         let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
             owner.update(cx, |pane, cx| pane.preview_current(cx));
@@ -1454,17 +1469,61 @@ impl StructurePane {
                 .py(px(8.))
                 .border_t_1()
                 .border_color(p.line)
-                .bg(p.surface)
-                .child(div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p)))
+                .bg(if pending > 0 { p.warn_soft } else { p.surface })
+                .child(if pending > 0 {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(kit::icon(IconName::CircleDot, 13., p.warn))
+                        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(i18n::fill(&i18n::text(locale, "structure.changes.pending"), &[("count", &pending.to_string())]))))
+                        .child(kit::muted(t("structure.action.hint"), p))
+                } else {
+                    div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p))
+                })
+                .when(pending > 0, |this| {
+                    let owner = entity.clone();
+                    this.child(kit::tool_button("structure-reset-draft", Some(IconName::Undo2), t("structure.changes.discard"), move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.reset_draft();
+                            cx.notify();
+                        });
+                    }))
+                })
                 .child(button)
                 .into_any_element(),
         )
     }
 }
 
-fn selected_button(button: gpui_kit::component::button::Button, selected: bool) -> gpui_kit::component::button::Button {
-    if selected { button.primary() } else { button }
+/// 一行字段相对快照的状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnChange {
+    Clean,
+    Added,
+    Modified,
+    Dropped,
 }
+
+/// 小号勾选框（16px）：表格行里的布尔开关，比整块“可空”按钮更像一张表。
+fn check_box(id: SharedString, on: bool, enabled: bool, label: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
+    kit::interactive_states(div().id(id), p, !enabled)
+        .role(gpui_kit::Role::CheckBox)
+        .aria_label(label.clone())
+        .aria_selected(on)
+        .tooltip_text(label)
+        .size(px(16.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::TAG))
+        .border_1()
+        .when(on, |this| this.bg(p.accent).border_color(p.accent).child(kit::icon(IconName::Check, 12., p.on_accent)))
+        .when(!on, |this| this.border_color(p.line_strong).bg(p.surface))
+}
+
 
 fn replace_text(slot: &mut String, value: String) -> bool {
     if *slot == value {
@@ -1526,6 +1585,7 @@ struct RowSpec {
 }
 
 /// 右键菜单项。动作只改草稿或发起预览，不直接执行 SQL。
+#[derive(Clone)]
 struct MenuEntry {
     id: String,
     label: String,
@@ -1560,9 +1620,16 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
     for column in columns {
         head = head.child(table_cell(*column, div().truncate().child(SharedString::from(i18n::text(locale, column.key)))));
     }
+    // 行尾的可见删除：索引/外键行把菜单里的删除项直接摆出来（受保护的保持禁用并说明原因）。
+    let quick_of = |entries: &[MenuEntry]| entries.iter().find(|entry| matches!(entry.action, RowAction::DropIndex(_) | RowAction::DropForeignKey(_))).cloned();
+    let has_quick = rows.iter().any(|row| quick_of(&row.menu).is_some());
+    if has_quick {
+        head = head.child(div().w(px(28.)).flex_none());
+    }
     let mut body = div().flex().flex_col();
     for row in rows {
         let owner = entity.clone();
+        let quick = quick_of(&row.menu);
         let entries = row.menu;
         // 每行一个稳定的元素 id：右键菜单的状态按元素 id 保存，共用同一处代码位置会让所有行共享一个菜单。
         let mut cells = div()
@@ -1586,7 +1653,24 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
             .border_color(p.line_soft)
             .when(row.dim, |this| this.opacity(0.5))
             .hover(|style| style.bg(p.hover))
-            .child(cells);
+            .child(cells)
+            .when_some(quick, |this, entry| {
+                let owner = entity.clone();
+                let action = entry.action.clone();
+                let button = kit::icon_button(SharedString::from(format!("structure-quick-{}", entry.id)), IconName::Trash, SharedString::from(entry.label.clone()), move |_, _, cx| {
+                    owner.update(cx, |pane, cx| {
+                        pane.apply_row_action(action.clone(), cx);
+                        cx.notify();
+                    });
+                })
+                .xsmall()
+                .disabled(entry.disabled);
+                let button = match entry.reason.clone() {
+                    Some(reason) if entry.disabled => button.tooltip(SharedString::from(reason)),
+                    _ => button,
+                };
+                this.child(div().w(px(28.)).flex_none().flex().justify_center().child(button))
+            });
         body = body.child(line);
     }
     div().flex().flex_col().child(head).child(body).into_any_element()
@@ -1680,16 +1764,241 @@ impl StructurePane {
         self.preview(cx);
     }
 
-    fn preview_danger(&mut self, kind: DangerKind, cx: &mut Context<Self>) {
-        self.session.danger = kind;
-        self.session.intent = EditIntent::Apply;
-        self.session.section = Section::Danger;
-        self.preview(cx);
-    }
 
     fn draft_input(&mut self, key: u32, value: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = self.draft_fields.bind(key, value, FieldSpec { placeholder, masked: false }, window, cx, on_draft);
         kit::text_input(SharedString::from(format!("structure-draft-{key}")), &state, placeholder.to_owned()).small().into_any_element()
+    }
+
+    /// 一行字段与快照比，处于什么状态：新增 / 已修改 / 待删除 / 未改。
+    fn column_change(&self, column: &ColumnDraft) -> ColumnChange {
+        if column.dropped {
+            return ColumnChange::Dropped;
+        }
+        let Some(original) = column.original.as_deref() else {
+            return ColumnChange::Added;
+        };
+        let Some(before) = self.snapshot.as_ref().and_then(|snapshot| snapshot.columns.iter().find(|item| item.name == original)) else {
+            return ColumnChange::Clean;
+        };
+        let changed = before.name != column.name
+            || !before.type_name.eq_ignore_ascii_case(&column.type_name)
+            || before.nullable != column.nullable
+            || before.default_sql.clone().unwrap_or_default() != column.default_sql;
+        if changed { ColumnChange::Modified } else { ColumnChange::Clean }
+    }
+
+    /// 未应用的结构修改数（字段的增、改、删）。
+    pub fn pending_changes(&self) -> usize {
+        if self.session.mode == StructureMode::Create {
+            return 0;
+        }
+        self.session.kept_columns.iter().filter(|column| self.column_change(column) != ColumnChange::Clean).count()
+    }
+
+    /// 字段页：一张可直接编辑的结构表（设计表）。每行就是一列：名称、类型、可空、默认值；
+    /// 新建表时多出主键、自增与上下移动。改过的行左侧有色条（新增绿、修改黄、删除红并划线），
+    /// 最后一行“添加字段”。所有修改只改草稿，经“预览 SQL”确认后才执行。
+    #[inline(never)]
+    fn column_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let entity = cx.entity();
+        let metrics = kit::Metrics::of(cx);
+        let create = self.session.mode == StructureMode::Create;
+        let readonly_view = self.session.object_kind == "view" && !create;
+        if readonly_view {
+            return kit::muted(t("structure.section.viewDef"), &p);
+        }
+        let engine = self.session.target.engine.clone();
+        let row_h = metrics.row_h;
+        let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
+        if create {
+            let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
+            editor = editor.child(kit::form_row(t("structure.action.createTable"), div().max_w(px(360.)).child(name), &p));
+        }
+        // 表头：与行同一套列宽。
+        let head = div()
+            .id("structure-table-head")
+            .test_support()
+            .flex()
+            .flex_none()
+            .h(px(row_h))
+            .items_center()
+            .gap(px(6.))
+            .pl(px(12.))
+            .pr(px(8.))
+            .bg(p.chrome)
+            .border_b_1()
+            .border_color(p.line)
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint)
+            .child(div().flex_1().min_w(px(140.)).child(t("structure.field.column")))
+            .child(div().w(px(170.)).flex_none().child(t("structure.field.type")))
+            .child(div().w(px(52.)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
+            .child(div().w(px(150.)).flex_none().child(t("ui.structure.default")))
+            .when(create, |this| {
+                this.child(div().w(px(44.)).flex_none().flex().justify_center().child(t("structure.field.primary")))
+                    .child(div().w(px(44.)).flex_none().flex().justify_center().child(t("structure.field.auto")))
+                    .child(div().w(px(52.)).flex_none())
+            })
+            .child(div().w(px(28.)).flex_none());
+        let mut rows = div().flex().flex_col();
+        let columns = self.session.kept_columns.clone();
+        for (index, column) in columns.iter().enumerate() {
+            let change = self.column_change(column);
+            rows = rows.child(stack_frame(|| self.column_row(index, column, change, create, &engine, row_h, &p, &entity, window, cx)));
+        }
+        let add_entity = entity.clone();
+        let add = div()
+            .id("structure-add-column-row")
+            .flex()
+            .items_center()
+            .h(px(row_h + 4.))
+            .px(px(6.))
+            .child(kit::tool_button("structure-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
+                add_entity.update(cx, |pane, cx| {
+                    pane.add_column();
+                    cx.notify();
+                });
+            }));
+        editor
+            .child(kit::card(&p).overflow_hidden().flex().flex_col().child(head).child(rows).child(add))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn column_row(
+        &mut self,
+        index: usize,
+        column: &ColumnDraft,
+        change: ColumnChange,
+        create: bool,
+        engine: &str,
+        row_h: f32,
+        p: &Palette,
+        entity: &Entity<StructurePane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let name = self.draft_input(10_000 + index as u32, &column.name, "name", window, cx);
+        let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
+        let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "NULL", window, cx);
+        let types = type_choices(engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+        let type_entity = entity.clone();
+        let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::ChevronDown)
+            .tooltip(t("structure.field.pickType"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for choice in types.clone() {
+                    let entity = type_entity.clone();
+                    let choice = choice.clone();
+                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                        let choice = choice.clone();
+                        entity.update(cx, |pane, cx| {
+                            pane.write_draft(20_000 + index as u32, choice);
+                            cx.notify();
+                        });
+                    }));
+                }
+                menu
+            });
+        let toggle = |id: String, on: bool, which: &'static str, label: SharedString, enabled: bool| {
+            let owner = entity.clone();
+            check_box(SharedString::from(id), on, enabled, label, p).on_click(move |_, _, cx| {
+                owner.update(cx, |pane, cx| {
+                    pane.toggle_column(index, which);
+                    cx.notify();
+                });
+            })
+        };
+        let bar = match change {
+            ColumnChange::Added => Some(p.ok),
+            ColumnChange::Modified => Some(p.warn),
+            ColumnChange::Dropped => Some(p.danger),
+            ColumnChange::Clean => None,
+        };
+        let dropped = change == ColumnChange::Dropped;
+        let drop_entity = entity.clone();
+        let drop = kit::icon_button(
+            SharedString::from(format!("structure-drop-col-{index}")),
+            if dropped { IconName::Undo2 } else { IconName::Trash },
+            if dropped { t("structure.field.undoDelete") } else { t("structure.field.delete") },
+            move |_, _, cx| {
+                drop_entity.update(cx, |pane, cx| {
+                    pane.toggle_column(index, "drop");
+                    cx.notify();
+                });
+            },
+        )
+        .xsmall();
+        let mut row = div()
+            .id(SharedString::from(format!("structure-row-columns-{index}")))
+            .test_support()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .relative()
+            .h(px(row_h))
+            .pl(px(12.))
+            .pr(px(8.))
+            .border_b_1()
+            .border_color(p.line_soft)
+            .hover(|style| style.bg(p.hover))
+            // 改动色条单独画在左侧，不染行的分隔线。
+            .when_some(bar, |this, color| this.child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(color)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(140.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn)))
+                    .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name)),
+            )
+            .child(div().w(px(170.)).flex_none().flex().items_center().gap(px(2.)).when(dropped, |this| this.opacity(0.5)).child(div().flex_1().min_w(px(0.)).child(kind)).child(type_menu))
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(toggle(format!("structure-null-{index}"), column.nullable, "null", t("ui.structure.nullable"), !dropped && !column.primary)),
+            )
+            .child(div().w(px(150.)).flex_none().when(dropped, |this| this.opacity(0.5)).child(default_value));
+        if create {
+            let up_entity = entity.clone();
+            let down_entity = entity.clone();
+            row = row
+                .child(div().w(px(44.)).flex_none().flex().justify_center().child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)))
+                .child(div().w(px(44.)).flex_none().flex().justify_center().child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)))
+                .child(
+                    div()
+                        .w(px(52.))
+                        .flex_none()
+                        .flex()
+                        .child(kit::icon_button(SharedString::from(format!("structure-up-{index}")), IconName::ChevronUp, t("structure.field.moveUp"), move |_, _, cx| {
+                            up_entity.update(cx, |pane, cx| {
+                                pane.move_column(index, -1);
+                                cx.notify();
+                            });
+                        }).xsmall())
+                        .child(kit::icon_button(SharedString::from(format!("structure-down-{index}")), IconName::ChevronDown, t("structure.field.moveDown"), move |_, _, cx| {
+                            down_entity.update(cx, |pane, cx| {
+                                pane.move_column(index, 1);
+                                cx.notify();
+                            });
+                        }).xsmall()),
+                );
+        }
+        row.child(div().w(px(28.)).flex_none().flex().justify_center().child(drop)).into_any_element()
     }
 
     fn section_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1703,243 +2012,124 @@ impl StructurePane {
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
         let form = match section {
             Section::Columns if readonly_view => form.child(kit::muted(t("structure.section.viewDef"), &p)),
-            Section::Columns => stack_frame(|| {
-                let mut form = form;
-                if self.session.mode == StructureMode::Create {
-                    let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
-                    form = form.child(kit::form_row(t("structure.action.createTable"), name, &p));
-                }
-                let columns = self.session.kept_columns.clone();
-                let create = self.session.mode == StructureMode::Create;
-                let engine = self.session.target.engine.clone();
-                for (index, column) in columns.iter().enumerate() {
-                    form = form.child(stack_frame(|| {
-                    let name = self.draft_input(10_000 + index as u32, &column.name, "name", window, cx);
-                    let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
-                    let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "DEFAULT", window, cx);
-                    let entity = entity.clone();
-                    let types = type_choices(&engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
-                    let type_menu = {
-                        let entity = entity.clone();
-                        Button::new(SharedString::from(format!("structure-types-{index}")))
-                            .ghost()
-                            .small()
-                            .label(t("structure.field.type"))
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for choice in types.clone() {
-                                    let entity = entity.clone();
-                                    let choice = choice.clone();
-                                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                        let choice = choice.clone();
-                                        entity.update(cx, |pane, cx| {
-                                            pane.write_draft(20_000 + index as u32, choice);
-                                            cx.notify();
-                                        });
-                                    }));
-                                }
-                                menu
-                            })
-                            .into_any_element()
-                    };
-                    let null_entity = entity.clone();
-                    let null_on = column.nullable;
-                    let null_button = selected_button(
-                        kit::secondary_button(SharedString::from(format!("structure-null-{index}")), None, t("ui.structure.nullable"), move |_, _, cx| {
-                            null_entity.update(cx, |pane, cx| {
-                                pane.toggle_column(index, "null");
-                                cx.notify();
-                            });
-                        }),
-                        null_on,
-                    );
-                    let mut row = div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .when(column.dropped, |row| row.opacity(0.45))
-                        .child(div().flex_1().min_w(px(120.)).child(name))
-                        .child(div().w(px(140.)).child(kind))
-                        .child(type_menu)
-                        .child(div().w(px(140.)).child(default_value))
-                        .child(null_button);
-                    if create {
-                        let primary_entity = entity.clone();
-                        let primary_on = column.primary;
-                        row = row.child(selected_button(
-                            kit::secondary_button(SharedString::from(format!("structure-pk-{index}")), Some(IconName::Key), t("structure.field.primary"), move |_, _, cx| {
-                                primary_entity.update(cx, |pane, cx| {
-                                    pane.toggle_column(index, "primary");
-                                    cx.notify();
-                                });
-                            }),
-                            primary_on,
-                        ));
-                        let auto_entity = entity.clone();
-                        let auto_on = column.auto;
-                        row = row.child(selected_button(
-                            kit::secondary_button(SharedString::from(format!("structure-auto-{index}")), None, t("structure.field.auto"), move |_, _, cx| {
-                                auto_entity.update(cx, |pane, cx| {
-                                    pane.toggle_column(index, "auto");
-                                    cx.notify();
-                                });
-                            }),
-                            auto_on,
-                        ));
-                        let up_entity = entity.clone();
-                        row = row.child(kit::icon_button(SharedString::from(format!("structure-up-{index}")), IconName::ChevronUp, t("structure.field.moveUp"), move |_, _, cx| {
-                            up_entity.update(cx, |pane, cx| {
-                                pane.move_column(index, -1);
-                                cx.notify();
-                            });
-                        }));
-                        let down_entity = entity.clone();
-                        row = row.child(kit::icon_button(SharedString::from(format!("structure-down-{index}")), IconName::ChevronDown, t("structure.field.moveDown"), move |_, _, cx| {
-                            down_entity.update(cx, |pane, cx| {
-                                pane.move_column(index, 1);
-                                cx.notify();
-                            });
-                        }));
-                    }
-                    let drop_entity = entity.clone();
-                    row = row.child(kit::icon_button(SharedString::from(format!("structure-drop-col-{index}")), IconName::Trash, t("structure.field.delete"), move |_, _, cx| {
-                        drop_entity.update(cx, |pane, cx| {
-                            pane.toggle_column(index, "drop");
-                            cx.notify();
-                        });
-                    }));
-                    row.into_any_element()
-                    }));
-                }
-                let name = self.field("column_name", "structure.field.column", "new_column", window, cx);
-                let kind = self.field("column_type", "structure.field.type", "TEXT", window, cx);
-                let add_entity = entity.clone();
-                let reset_entity = entity.clone();
-                form = form
-                    .child(div().flex().gap(px(8.)).child(div().flex_1().child(name)).child(div().w(px(160.)).child(kind)))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.))
-                            .child(kit::secondary_button("structure-add-column", Some(IconName::Plus), t("ui.structure.add"), move |_, _, cx| {
-                                add_entity.update(cx, |pane, cx| {
-                                    pane.add_column();
-                                    cx.notify();
-                                });
-                            }))
-                            .child(kit::secondary_button("structure-reset-draft", None, t("structure.field.reset"), move |_, _, cx| {
-                                reset_entity.update(cx, |pane, cx| {
-                                    pane.reset_draft();
-                                    cx.notify();
-                                });
-                            })),
-                    );
-                form
-            }),
+            Section::Columns => form.child(self.column_editor(window, cx)),
             Section::Indexes => stack_frame(|| {
+                // 新建索引：名称与“唯一”在一行；已选列按顺序排成标签（点标签切升/降序，× 移除），
+                // “添加列”下拉只列还没选的列。已有索引在上面的列表里，这里不再重复列一遍。
                 let mut form = form;
-                let indexes = self.snapshot.as_ref().map(|snapshot| snapshot.indexes.clone()).unwrap_or_default();
-                for (index, index_row) in indexes.iter().enumerate() {
-                    let protected = index_row.protected;
-                    let reason = localize(&index_row.reason, locale);
-                    let name = index_row.name.clone();
-                    let drop_entity = entity.clone();
-                    let button = kit::secondary_button(SharedString::from(format!("structure-drop-index-{index}")), Some(IconName::Trash), t("structure.index.delete"), move |_, _, cx| {
-                        let name = name.clone();
-                        drop_entity.update(cx, |pane, cx| pane.preview_drop_index(name, cx));
-                    })
-                    .disabled(protected);
-                    let button = if protected && !reason.is_empty() { button.tooltip(SharedString::from(reason)).into_any_element() } else { button.into_any_element() };
-                    form = form.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().flex_1().truncate().child(SharedString::from(index_row.name.clone())))
-                            .child(button),
-                    );
-                }
                 let names = self.snapshot.as_ref().map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>()).unwrap_or_else(|| {
                     self.session.kept_columns.iter().filter(|column| !column.dropped).map(|column| column.name.clone()).collect()
                 });
                 let selected = self.session.index_columns.clone();
-                for name in &names {
-                    let picked = selected.iter().find(|column| column.name == *name);
-                    let on = picked.is_some();
-                    let descending = picked.is_some_and(|column| column.descending);
-                    let pick_entity = entity.clone();
-                    let column_name = name.clone();
-                    let order_entity = entity.clone();
-                    let order_name = name.clone();
-                    form = form.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(selected_button(
-                                kit::secondary_button(SharedString::from(format!("structure-index-col-{name}")), None, SharedString::from(name.clone()), move |_, _, cx| {
-                                    let column_name = column_name.clone();
-                                    pick_entity.update(cx, |pane, cx| {
-                                        pane.toggle_index_column(&column_name);
+                let unique = self.session.index_unique;
+                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
+                let unique_entity = entity.clone();
+                form = form.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap(px(16.))
+                        .child(div().flex_1().min_w(px(200.)).max_w(px(360.)).child(name))
+                        .child(
+                            div()
+                                .id("structure-index-unique")
+                                .h(px(metrics.control_h))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .cursor_pointer()
+                                .child(check_box(SharedString::from("structure-index-unique-box"), unique, true, t("structure.index.unique"), &p))
+                                .child(div().text_size(px(TypeScale::SM)).child(t("structure.index.unique")))
+                                .on_click(move |_, _, cx| {
+                                    unique_entity.update(cx, |pane, cx| {
+                                        pane.session.index_unique = !pane.session.index_unique;
+                                        pane.session.intent = EditIntent::Apply;
+                                        pane.session.cancel();
                                         cx.notify();
                                     });
                                 }),
-                                on,
-                            ))
+                        ),
+                );
+                let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
+                if selected.is_empty() {
+                    chips = chips.child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("structure.index.pickHint")));
+                }
+                for column in &selected {
+                    let order_entity = entity.clone();
+                    let remove_entity = entity.clone();
+                    let order_name = column.name.clone();
+                    let remove_name = column.name.clone();
+                    chips = chips.child(
+                        div()
+                            .id(SharedString::from(format!("structure-index-chip-{}", column.name)))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .h(px(24.))
+                            .pl(px(8.))
+                            .pr(px(2.))
+                            .rounded(px(Radius::CONTROL))
+                            .bg(p.accent_soft)
+                            .text_color(p.accent_text)
+                            .text_size(px(TypeScale::SM))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .child(SharedString::from(column.name.clone()))
                             .child(
-                                kit::secondary_button(
-                                    SharedString::from(format!("structure-index-order-{name}")),
-                                    None,
-                                    if descending { t("structure.index.desc") } else { t("structure.index.asc") },
-                                    move |_, _, cx| {
-                                        let order_name = order_name.clone();
+                                div()
+                                    .id(SharedString::from(format!("structure-index-order-{}", column.name)))
+                                    .px(px(4.))
+                                    .rounded(px(Radius::TAG))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(p.surface))
+                                    .tooltip_text(t("structure.index.toggleOrder"))
+                                    .child(if column.descending { t("structure.index.desc") } else { t("structure.index.asc") })
+                                    .on_click(move |_, _, cx| {
+                                        let name = order_name.clone();
                                         order_entity.update(cx, |pane, cx| {
-                                            pane.toggle_index_order(&order_name);
+                                            pane.toggle_index_order(&name);
                                             cx.notify();
                                         });
-                                    },
-                                )
-                                .disabled(!on),
-                            ),
+                                    }),
+                            )
+                            .child(kit::icon_button(SharedString::from(format!("structure-index-remove-{}", column.name)), IconName::X, t("structure.index.removeColumn"), move |_, _, cx| {
+                                let name = remove_name.clone();
+                                remove_entity.update(cx, |pane, cx| {
+                                    pane.toggle_index_column(&name);
+                                    cx.notify();
+                                });
+                            }).xsmall()),
                     );
                 }
-                let unique_entity = entity.clone();
-                let unique = self.session.index_unique;
-                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
-                form = form.child(name).child(selected_button(
-                    kit::secondary_button("structure-index-unique", None, t("structure.index.unique"), move |_, _, cx| {
-                        unique_entity.update(cx, |pane, cx| {
-                            pane.session.index_unique = !pane.session.index_unique;
-                            pane.session.intent = EditIntent::Apply;
-                            pane.session.cancel();
-                            cx.notify();
-                        });
-                    }),
-                    unique,
-                ));
-                form
+                let remaining: Vec<String> = names.into_iter().filter(|name| !selected.iter().any(|column| &column.name == name)).collect();
+                let add_entity = entity.clone();
+                chips = chips.child(
+                    Button::new("structure-index-add-column")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .label(t("structure.index.addColumn"))
+                        .disabled(remaining.is_empty())
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for name in remaining.clone() {
+                                let entity = add_entity.clone();
+                                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
+                                    let name = name.clone();
+                                    entity.update(cx, |pane, cx| {
+                                        pane.toggle_index_column(&name);
+                                        cx.notify();
+                                    });
+                                }));
+                            }
+                            menu
+                        }),
+                );
+                form.child(kit::form_row(t("structure.section.columns"), chips, &p))
             }),
             Section::ForeignKeys => stack_frame(|| {
                 let mut form = form;
                 self.ensure_references(cx);
-                let keys = self.snapshot.as_ref().map(|snapshot| snapshot.foreign_keys.clone()).unwrap_or_default();
-                for (index, key) in keys.iter().enumerate() {
-                    let name = if key.name.is_empty() { format!("fk_{index}") } else { key.name.clone() };
-                    let drop_entity = entity.clone();
-                    let drop_name = name.clone();
-                    form = form.child(
-                        div().flex().items_center().gap(px(8.)).child(div().flex_1().truncate().child(SharedString::from(name))).child(kit::secondary_button(
-                            SharedString::from(format!("structure-drop-fk-{index}")),
-                            Some(IconName::Trash),
-                            t("structure.fk.delete"),
-                            move |_, _, cx| {
-                                let drop_name = drop_name.clone();
-                                drop_entity.update(cx, |pane, cx| pane.preview_drop_fk(drop_name, cx));
-                            },
-                        )),
-                    );
-                }
+                // 已有外键在上面的列表里（行尾可删除），这里只放新建表单。
                 let name = self.field("fk_name", "structure.section.foreign", "fk_name", window, cx);
                 let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
                 let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
@@ -2130,46 +2320,44 @@ impl StructurePane {
                 form
             }),
             Section::Danger => stack_frame(|| {
+                // 只摆用户从“更多”里选的那一项：标题与后果说明随操作变化，重命名才要新名字，
+                // 生产环境再要求输入表名；执行仍经底部“预览 SQL”和确认层。
                 let mut form = form;
                 let view = self.session.object_kind == "view";
+                let (title_key, detail_key) = match (self.session.danger, view) {
+                    (_, true) => ("catalog.tree.dropView", "ui.structure.dropDetail"),
+                    (DangerKind::Rename, false) => ("catalog.tree.renameTable", "structure.danger.renameDetail"),
+                    (DangerKind::Truncate, false) => ("catalog.tree.truncateTable", "structure.danger.truncateDetail"),
+                    (DangerKind::Drop, false) => ("catalog.tree.dropTable", "ui.structure.dropDetail"),
+                };
+                let rename = self.session.danger == DangerKind::Rename && !view;
+                let tone = if rename { p.warn } else { p.danger };
+                let tone_soft = if rename { p.warn_soft } else { p.danger_soft };
                 form = form.child(
                     div()
                         .flex()
                         .gap(px(10.))
                         .p(px(metrics.card_pad()))
                         .rounded(px(Radius::PANEL))
-                        .bg(p.danger_soft)
-                        .text_color(p.danger)
-                        .child(kit::icon(IconName::TriangleAlert, 16., p.danger))
+                        .bg(tone_soft)
+                        .text_color(tone)
+                        .child(kit::icon(IconName::TriangleAlert, 16., tone))
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(if view { t("structure.section.view") } else { t("ui.structure.dropTitle") }))
-                                .child(div().text_size(px(TypeScale::SM)).child(t("ui.structure.dropDetail"))),
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(format!("{} {}", i18n::text(locale, title_key), self.session.target.table))))
+                                .child(div().text_size(px(TypeScale::SM)).child(t(detail_key))),
                         ),
                 );
-                if !view {
-                    let rename = self.field("rename_to", "catalog.danger.newName", "new_name", window, cx);
-                    let rename_entity = entity.clone();
-                    let truncate_entity = entity.clone();
-                    form = form.child(rename).child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(8.))
-                            .child(kit::secondary_button("structure-rename", None, t("catalog.tree.renameTable"), move |_, _, cx| {
-                                rename_entity.update(cx, |pane, cx| pane.preview_danger(DangerKind::Rename, cx));
-                            }))
-                            .child(kit::danger_button("structure-truncate", None, t("catalog.tree.truncateTable"), move |_, _, cx| {
-                                truncate_entity.update(cx, |pane, cx| pane.preview_danger(DangerKind::Truncate, cx));
-                            })),
-                    );
+                if rename {
+                    let input = self.field("rename_to", "catalog.danger.newName", "new_name", window, cx);
+                    form = form.child(div().max_w(px(360.)).child(input));
                 }
                 if self.session.production() && !self.session.preview_open() {
                     let typed = self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx);
-                    form = form.child(kit::form_row(t("structure.danger.typeName"), typed, &p));
+                    form = form.child(kit::form_row(t("structure.danger.typeName"), div().max_w(px(360.)).child(typed), &p));
                 }
                 form
             }),
@@ -2209,8 +2397,14 @@ impl StructurePane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
         let entity = cx.entity();
-        let mut items = Vec::new();
+        // 页签：左对齐、带数量的下划线页签（字段 7 · 索引 1 · 外键 0 · DDL）。危险操作不当页签，
+        // 收进右上角“更多”，进入后才在页签末尾显示一个红色的当前页签。
+        let counts = self.snapshot.as_ref().map(|snapshot| (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len()));
+        let mut tabs = div().id("structure-tabs").role(gpui_kit::Role::TabList).flex().items_end().gap(px(4.));
         for value in self.session.visible_sections() {
+            if value == Section::Danger && section != Section::Danger {
+                continue;
+            }
             let key = match value {
                 Section::Columns => "structure.section.columns",
                 Section::Indexes => "structure.section.indexes",
@@ -2219,22 +2413,57 @@ impl StructurePane {
                 Section::Ddl => "structure.section.ddl",
                 Section::Danger => "structure.section.danger",
             };
-            let entity = entity.clone();
-            items.push((
-                SharedString::from(key),
-                t(key),
-                section == value,
-                kit::click(move |_, _, cx| {
-                    entity.update(cx, |pane, cx| {
-                        pane.session.section = value;
-                        pane.session.intent = EditIntent::Apply;
-                        pane.session.cancel();
-                        cx.notify();
-                    });
-                }),
-            ));
+            let count = match (value, counts) {
+                (Section::Columns, Some((columns, _, _))) => Some(columns),
+                (Section::Indexes, Some((_, indexes, _))) => Some(indexes),
+                (Section::ForeignKeys, Some((_, _, keys))) => Some(keys),
+                _ => None,
+            };
+            let selected = section == value;
+            let danger = value == Section::Danger;
+            let owner = entity.clone();
+            tabs = tabs.child(
+                kit::interactive_states(div().id(SharedString::from(key)), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Tab)
+                    .aria_label(t(key))
+                    .aria_selected(selected)
+                    .h(px(metrics.tabs_h))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .border_b_2()
+                    .text_size(px(TypeScale::SM))
+                    .when(selected, |this| {
+                        this.border_color(if danger { p.danger } else { p.accent })
+                            .text_color(if danger { p.danger } else { p.text })
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                    .when(!selected, |this| this.border_color(gpui_kit::hsla(0., 0., 0., 0.)).text_color(p.text_muted).hover(|style| style.text_color(p.text)))
+                    .child(t(key))
+                    .when_some(count, |this, count| {
+                        this.child(
+                            div()
+                                .px(px(5.))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.hover)
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child(SharedString::from(count.to_string())),
+                        )
+                    })
+                    .on_click(move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.session.section = value;
+                            pane.session.intent = EditIntent::Apply;
+                            pane.session.cancel();
+                            pane.composer_open = false;
+                            cx.notify();
+                        });
+                    }),
+            );
         }
-        let summary = self.summary_text();
         let title = if self.session.mode == StructureMode::Create {
             t("structure.action.createTable")
         } else if self.session.target.table.is_empty() {
@@ -2242,6 +2471,37 @@ impl StructurePane {
         } else {
             SharedString::from(self.session.target.table.clone())
         };
+        // “更多”：表级的重命名、清空、删除。只给已存在的表/视图，都先进入危险操作页、经预览确认。
+        let more = (self.session.mode != StructureMode::Create && self.session.visible_sections().contains(&Section::Danger)).then(|| {
+            let owner = entity.clone();
+            let view = self.session.object_kind == "view";
+            Button::new("structure-more")
+                .ghost()
+                .small()
+                .icon(IconName::Ellipsis)
+                .label(t("structure.action.more"))
+                .dropdown_menu(move |mut menu, _, _| {
+                    let entries: Vec<(&str, DangerKind)> = if view {
+                        vec![("catalog.tree.dropView", DangerKind::Drop)]
+                    } else {
+                        vec![("catalog.tree.renameTable", DangerKind::Rename), ("catalog.tree.truncateTable", DangerKind::Truncate), ("catalog.tree.dropTable", DangerKind::Drop)]
+                    };
+                    for (key, kind) in entries {
+                        let owner = owner.clone();
+                        let item = PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                            owner.update(cx, |pane, cx| {
+                                pane.session.section = Section::Danger;
+                                pane.session.danger = kind;
+                                pane.session.intent = EditIntent::Apply;
+                                pane.session.cancel();
+                                cx.notify();
+                            });
+                        });
+                        menu = menu.item(item);
+                    }
+                    menu
+                })
+        });
         let mut column = div()
             .id("structure-pane")
             .test_support()
@@ -2254,54 +2514,73 @@ impl StructurePane {
                     .flex_none()
                     .px(px(metrics.page_pad))
                     .pt(px(metrics.page_pad_y))
-                    .pb(px(metrics.pane_pad()))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(14.))
-                    .border_b_1()
-                    .border_color(p.line)
-                    .child(kit::engine_badge(&self.session.target.engine, 30.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.))
-                            .flex()
-                            .flex_col()
-                            .child(kit::title(title, TypeScale::LG, &p))
-                            .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner())))
-                            .when(!summary.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .id("structure-summary")
-                                        .test_support()
-                                        .text_size(px(TypeScale::XS))
-                                        .text_color(p.text_faint)
-                                        .truncate()
-                                        .child(SharedString::from(summary)),
-                                )
-                            }),
-                    )
-                    .child(kit::segmented_sized(items, &p, metrics.control_h)),
-            );
-        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).flex().flex_col().gap(px(metrics.section_gap()));
-        body = body.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(kit::eyebrow(t("ui.structure.existing"), &p))
-                .child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx))),
-        );
-        if let Some(form) = form {
-            body = body.child(
-                div()
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p))
-                    .child(kit::card(&p).p(px(metrics.card_pad())).child(form)),
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(kit::engine_badge(&self.session.target.engine, 28.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(160.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(kit::title(title, TypeScale::LG, &p))
+                                    .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
+                            )
+                            .children(more),
+                    )
+                    .child(tabs),
             );
+        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).flex().flex_col().gap(px(metrics.section_gap()));
+        let editing_columns = section == Section::Columns && self.form_visible() && !(self.session.object_kind == "view" && self.session.mode != StructureMode::Create);
+        let composer_section = matches!(section, Section::Indexes | Section::ForeignKeys);
+        if editing_columns {
+            // 字段页：编辑表就是主体，不再先列一遍“当前结构”再列一遍“新增”。
+            if let Some(form) = form {
+                body = body.child(form);
+            }
+        } else {
+            if composer_section && self.form_visible() {
+                let owner = entity.clone();
+                let label = if section == Section::Indexes { t("structure.index.new") } else { t("structure.fk.new") };
+                body = body.child(
+                    div().flex().items_center().child(div().flex_1()).child(
+                        kit::secondary_button("structure-composer-toggle", Some(if self.composer_open { IconName::X } else { IconName::Plus }), if self.composer_open { t("common.cancel") } else { label }, move |_, _, cx| {
+                            owner.update(cx, |pane, cx| {
+                                pane.composer_open = !pane.composer_open;
+                                pane.session.cancel();
+                                cx.notify();
+                            });
+                        }),
+                    ),
+                );
+            }
+            body = body.child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx)));
+            if let Some(form) = form.filter(|_| !composer_section || self.composer_open) {
+                let heading = match section {
+                    Section::Indexes => t("structure.index.new"),
+                    Section::ForeignKeys => t("structure.fk.new"),
+                    Section::Danger => t("structure.section.danger"),
+                    _ => t("structure.section.definition"),
+                };
+                body = body.child(
+                    div()
+                        .id("structure-composer")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(kit::eyebrow(heading, &p))
+                        .child(kit::card(&p).p(px(metrics.card_pad())).child(form)),
+                );
+            }
         }
         if !self.session.note.is_empty() {
             body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note())));

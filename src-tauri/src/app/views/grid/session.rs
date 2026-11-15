@@ -2924,6 +2924,20 @@ impl SharedGrid {
         }
     }
 
+    /// 排除焦点格的值：NULL 排除为“非空”，其余为“不等于”。同样按原值，不用截断的预览。
+    pub fn filter_focused_value_excluded(&mut self) {
+        let Some((row, column)) = self.focus_cell() else {
+            return;
+        };
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return;
+        };
+        match self.original(row, column).unwrap_or(None) {
+            None => self.set_filter(&name, "notnull", ""),
+            Some(text) => self.set_filter(&name, "ne", &text),
+        }
+    }
+
     fn sheet_line(&self, row: usize) -> Vec<String> {
         let mut line = vec![self.row_number(row)];
         line.extend((0..self.columns.len()).map(|column| self.cell_label(row, column)));
@@ -4226,9 +4240,10 @@ pub fn classify_with_limit(
                 body: String::new(),
                 preview: true,
             },
-            crate::grid::PreviewValue::Text { bytes, preview } => ShownCell {
+            // 大字段显示开头一段（单行）加省略号：看得出是什么内容；大小写在悬停提示里。
+            crate::grid::PreviewValue::Text { bytes: _, preview } => ShownCell {
                 kind: CellKind::Large,
-                label: format!("{} {bytes}", i18n::text(locale, "grid.value.largeLabel")),
+                label: large_label(&preview),
                 body: if opened { preview } else { String::new() },
                 preview: true,
             },
@@ -4245,12 +4260,18 @@ pub fn classify_with_limit(
     if text.len() > preview_bytes.max(1) && !opened {
         return ShownCell {
             kind: CellKind::Large,
-            label: format!("{} {}", i18n::text(locale, "grid.value.largeLabel"), text.len()),
+            label: large_label(&text),
             body: String::new(),
             preview: false,
         };
     }
     ShownCell { kind: CellKind::Text, label: text.clone(), body: text, preview: false }
+}
+
+/// 大字段在格子里的样子：前 120 个字符压成一行，末尾加省略号。
+fn large_label(text: &str) -> String {
+    let flat: String = text.chars().take(120).map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+    format!("{}…", flat.trim_end())
 }
 
 fn editable_names(schema: &TableSchema, columns: &[String], proof: &TableProof) -> Vec<String> {
@@ -4784,7 +4805,8 @@ mod tests {
             );
         };
         load(&mut grid, &envelope);
-        let large = format!("{} 2048", i18n::text(Locale::ZhCn, "grid.value.largeLabel"));
+        // 大字段显示开头一段加省略号（不再只写“大值 2048”）。
+        let large = format!("{}…", "a".repeat(64));
         assert_eq!(grid.sheet_preview_bytes(), 1024, "快照记住读出时的上限");
         assert_eq!(grid.cell_label(0, 1), large, "默认 1 KB 上限下显示大字段");
         assert!(grid.needs_full(0, 1), "信封不是原值");

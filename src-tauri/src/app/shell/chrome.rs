@@ -929,14 +929,34 @@ impl Workbench {
 
     /// 分组名输入面板：新建与重命名共用，Esc 取消（由外壳统一处理）。
     fn group_prompt_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let prompt = self.model.group_prompt.clone()?;
+        let Some(prompt) = self.model.group_prompt.clone() else {
+            self.group_prompt_focused = false;
+            return None;
+        };
         let p = Palette::of(cx);
         let title = if prompt.id.is_some() { "ui.group.rename" } else { "ui.group.new" };
-        let input = self.input_for(DraftField::GroupName, &self.model.text("ui.group.namePlaceholder"), false, window, cx);
+        let (input, state) = self.field_input(DraftField::GroupName, &self.model.text("ui.group.namePlaceholder"), false, window, cx);
+        // 面板一出现就把键盘交给名称输入框：点“新建分组”后直接打字，回车保存，Esc 取消。
+        if !self.group_prompt_focused {
+            self.group_prompt_focused = true;
+            let handle = state.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
         Some(
             div()
                 .id("group-prompt")
                 .test_support()
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
+                    "enter" => {
+                        cx.stop_propagation();
+                        this.perform("group-save", cx);
+                    }
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.perform("group-prompt-cancel", cx);
+                    }
+                    _ => {}
+                }))
                 .flex()
                 .flex_col()
                 .gap(px(6.))
@@ -1373,11 +1393,12 @@ impl Workbench {
         let p = Palette::of(cx);
         let m = self.metrics();
         // 标签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
+        // 新建按钮紧跟最后一个标签（浏览器式），标签多到放不下时列表自己横向滚动。
         let mut list = div()
             .id("tab-list")
             .flex()
             .items_end()
-            .flex_1()
+            .flex_shrink(1.)
             .min_w(px(0.))
             .overflow_x_scroll();
         let work_page = matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure);
@@ -1449,9 +1470,10 @@ impl Workbench {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .px(px(6.))
+                    .px(px(4.))
                     .child(kit::icon_button("tab-new", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).xsmall()),
             )
+            .child(div().flex_1())
             .into_any_element()
     }
 
@@ -1512,7 +1534,21 @@ impl Workbench {
                 }))
                 .into_any_element(),
         };
-        let notice = match self.model.notice_key {
+        // 提示有时效：换了一句就重新计时；超过 NOTICE_TTL 不再显示，状态栏回到“就绪”。
+        let seen = (self.model.notice_key, self.model.notice_detail.clone());
+        if seen != self.notice_seen {
+            self.notice_seen = seen;
+            self.notice_since = std::time::Instant::now();
+            if self.model.notice_key.is_some() && !cfg!(test) {
+                self.notice_timer = Some(cx.spawn(async move |view, cx| {
+                    cx.background_executor().timer(NOTICE_TTL + std::time::Duration::from_millis(50)).await;
+                    let _ = view.update(cx, |_, cx| cx.notify());
+                }));
+            }
+        }
+        let expired = !cfg!(test) && self.notice_since.elapsed() > NOTICE_TTL;
+        let notice_key = if expired { None } else { self.model.notice_key };
+        let notice = match notice_key {
             // 复制 DDL 失败的原因保留原文，显示时按当前语言给出。
             Some("catalog.ddl.failed") if !self.model.notice_detail.is_empty() => {
                 let detail = crate::catalog::definition::error_text(&self.model.notice_detail, self.model.locale());
@@ -1523,8 +1559,6 @@ impl Workbench {
             None => self.model.text("ui.status.ready"),
         };
         let running = self.model.running_jobs > 0 || self.model.exchange_running || self.model.compare_running || self.model.tabs.iter().any(|tab| tab.running);
-        let locale_next = if self.model.shell.locale == crate::app::Locale::En { "locale-zh" } else { "locale-en" };
-        let locale_label = if self.model.shell.locale == crate::app::Locale::En { "EN" } else { "中" };
         div()
             .id("status")
             .test_support()
@@ -1608,15 +1642,7 @@ impl Workbench {
                         .on_click(act("settings", cx)),
                 )
             })
-            .child(
-                kit::interactive_states(div().id("status-locale"), &p, false)
-                    .test_support()
-                    .px(px(6.))
-                    .rounded(px(Radius::CONTROL))
-                    .hover(|style| style.bg(p.hover).text_color(p.text))
-                    .child(locale_label)
-                    .on_click(act(locale_next, cx)),
-            )
+
             .into_any_element()
     }
 
@@ -1697,7 +1723,7 @@ impl Workbench {
                     ),
             )
             .child(self.launcher_header(window, cx))
-            .child(self.launcher_body(cx))
+            .child(self.launcher_body(window, cx))
             // 没有执行记录时不留一张只写着“没有记录”的卡片。
             .when(!recent_runs.is_empty(), |this| this.child(
                 kit::card(&p)
@@ -1733,7 +1759,7 @@ impl Workbench {
             .flex_col()
             .overflow_hidden()
             .child(self.launcher_header(window, cx))
-            .child(self.launcher_body(cx))
+            .child(self.launcher_body(window, cx))
             .child(
                 div()
                     .flex_none()
@@ -1784,6 +1810,16 @@ impl Workbench {
                         cx,
                     ))
                     .child(self.launcher_action(
+                        "launcher-group-new",
+                        IconName::FolderPlus,
+                        self.t("ui.group.new"),
+                        None,
+                        "group-new",
+                        false,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.launcher_action(
                         "launcher-sqlite",
                         IconName::FolderOpen,
                         self.t("common.openSqlite"),
@@ -1830,7 +1866,7 @@ impl Workbench {
     }
 
     /// 启动台主体：最近连接（按持久化用量排序）与全部连接。滚动只发生在这一块。
-    fn launcher_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn launcher_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
         let all: Vec<crate::connections::ConnectionRecord> = self.model.connections.launcher_all().into_iter().cloned().collect();
@@ -1903,7 +1939,18 @@ impl Workbench {
                 body = body.child(self.launcher_row(row, &p, cx, "recent"));
             }
         }
-        body = body.child(section_label(self.t("connections.launcher.all"), &p));
+        // 分组名输入（新建/重命名）就地出现在列表上方。
+        // 欢迎页旁边有资源管理器，分组名输入在侧栏里出现；连接页没有侧栏，就地显示。
+        if self.model.shell.page == AppPage::Connections {
+            if let Some(prompt) = self.group_prompt_panel(window, cx) {
+                body = body.child(div().mb(px(6.)).child(prompt));
+            }
+        }
+        let layout = self.model.group_layout();
+        let grouped = !layout.groups.is_empty();
+        if !grouped {
+            body = body.child(section_label(self.t("connections.launcher.all"), &p));
+        }
         if all.is_empty() {
             // 有连接但筛选无命中：与"一条都没有"分开呈现，并给出清除筛选。
             return body
@@ -1916,10 +1963,91 @@ impl Workbench {
                 ))
                 .into_any_element();
         }
-        for row in &all {
-            body = body.child(self.launcher_row(row, &p, cx, "all"));
+        if !grouped {
+            for row in &all {
+                body = body.child(self.launcher_row(row, &p, cx, "all"));
+            }
+            return body.into_any_element();
+        }
+        // 有分组时按分组排：分组标题（可折叠、右键改名/删除）→ 组内连接；最后是未分组。
+        // 筛选时只留有命中的分组并临时展开；不筛选时空分组也显示，告诉用户怎么把连接放进来。
+        let shown = |id: &str| all.iter().find(|row| row.saved.id == id).cloned();
+        for (group, members) in &layout.groups {
+            let rows: Vec<crate::connections::ConnectionRecord> = members.iter().filter_map(|id| shown(id)).collect();
+            if filtering && rows.is_empty() {
+                continue;
+            }
+            let expanded = filtering || !group.collapsed;
+            body = body.child(self.launcher_group_row(&group.id, &group.name, rows.len(), expanded, &p, cx));
+            if !expanded {
+                continue;
+            }
+            if rows.is_empty() {
+                body = body.child(
+                    div()
+                        .pl(px(30.))
+                        .py(px(4.))
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(self.t("connections.group.emptyHint")),
+                );
+            }
+            for row in &rows {
+                body = body.child(div().pl(px(14.)).child(self.launcher_row(row, &p, cx, "all")));
+            }
+        }
+        let ungrouped: Vec<crate::connections::ConnectionRecord> = layout.ungrouped.iter().filter_map(|id| shown(id)).collect();
+        if !ungrouped.is_empty() {
+            body = body.child(section_label(self.t("connections.group.ungrouped"), &p));
+            for row in &ungrouped {
+                body = body.child(self.launcher_row(row, &p, cx, "all"));
+            }
         }
         body.into_any_element()
+    }
+
+    /// 启动台里的分组标题：折叠箭头、文件夹、组名、数量；单击折叠/展开，右键改名或删除。
+    fn launcher_group_row(&self, id: &str, name: &str, members: usize, expanded: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics();
+        let menu_id = id.to_owned();
+        let click_id = id.to_owned();
+        kit::row_states(div().id(SharedString::from(format!("launcher-group-{id}"))), p)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(SharedString::from(name.to_owned()))
+            .aria_expanded(expanded)
+            .mt(px(6.))
+            .h(px(m.row_h))
+            .px(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(Radius::CONTROL))
+            .hover(|style| style.bg(p.hover))
+            .child(kit::icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
+            .child(kit::icon(if expanded { IconName::FolderOpen } else { IconName::Folder }, 14., p.text_muted))
+            .child(div().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::SM)).child(SharedString::from(name.to_owned())))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .rounded(px(Radius::TAG))
+                    .bg(p.hover)
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(members.to_string())),
+            )
+            .child(div().flex_1())
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.menu_at = event.position;
+                this.model.open_group_menu(&menu_id);
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.perform(&format!("group-toggle:{click_id}"), cx);
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// 启动台的一行：徽标 / 名称 + 环境 / 地址与库 / 状态文字 / 操作组。
@@ -1955,7 +2083,8 @@ impl Workbench {
             .aria_label(SharedString::from(label))
             .aria_selected(selected)
             .aria_description(SharedString::from(aware.clone()))
-            .tooltip_text(SharedString::from(aware))
+            // 右键菜单打开时不挂悬停提示，免得盖住菜单第一项。
+            .when(self.model.menu.is_none(), |this| this.tooltip_text(SharedString::from(aware)))
             .h(px(m.row_h))
             .px(px(8.))
             .flex()
@@ -5228,6 +5357,9 @@ fn nav_tint(kind: NavKind, p: &Palette) -> gpui_kit::Hsla {
         _ => p.text_faint,
     }
 }
+
+/// 状态栏提示的显示时长。
+const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(8);
 
 fn brand_mark(size: f32, p: &Palette) -> AnyElement {
     div()

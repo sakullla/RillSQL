@@ -613,7 +613,8 @@ pub fn explain_sql(engine: &str, statement: &str) -> Result<String, String> {
     } else if engine == "mariadb" {
         Ok(format!("EXPLAIN FORMAT=JSON {body}"))
     } else {
-        Ok(format!("EXPLAIN {body}"))
+        // PostgreSQL：JSON 格式带结构化的代价、行数与条件，计划视图据此画树。
+        Ok(format!("EXPLAIN (FORMAT JSON) {body}"))
     }
 }
 

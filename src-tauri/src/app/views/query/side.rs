@@ -3,6 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -250,6 +251,7 @@ fn object_column(
     mono: &SharedString,
     p: &Palette,
     engine: &str,
+    table: &str,
     entity: &Entity<QueryPane>,
 ) -> AnyElement {
     let focused = focused_name.is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
@@ -260,6 +262,10 @@ fn object_column(
     };
     let quoted = assist::quote_ident(engine, &column.name);
     let insert = entity.clone();
+    let menu_entity = entity.clone();
+    let menu_name = column.name.clone();
+    let menu_quoted = quoted.clone();
+    let menu_table = table.to_owned();
     div()
         .id(SharedString::from(format!("query-side-column-{index}")))
         .test_support()
@@ -281,6 +287,27 @@ fn object_column(
         .on_click(move |_, window, cx| {
             let sql = quoted.clone();
             insert.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+        })
+        // 右键：写查询时最常用的几件事——插入、复制字段名/限定名、插入一个筛选条件。
+        .context_menu(move |menu, _, _| {
+            let (insert, copy, qualified, condition) = (menu_entity.clone(), menu_name.clone(), format!("{menu_table}.{menu_name}"), format!("{menu_quoted} = "));
+            let insert_where = menu_entity.clone();
+            let quoted = menu_quoted.clone();
+            menu.item(PopupMenuItem::new(i18n::text(locale, "query.side.menuInsert")).icon(IconName::SquarePen).on_click(move |_, window, cx| {
+                let sql = quoted.clone();
+                insert.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+            }))
+            .item(PopupMenuItem::new(i18n::text(locale, "query.side.menuWhere")).icon(IconName::Funnel).on_click(move |_, window, cx| {
+                let sql = condition.clone();
+                insert_where.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+            }))
+            .separator()
+            .item(PopupMenuItem::new(i18n::text(locale, "query.side.menuCopyName")).icon(IconName::Copy).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+            }))
+            .item(PopupMenuItem::new(i18n::text(locale, "query.side.menuCopyQualified")).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(qualified.clone()));
+            }))
         })
         .child(
             div()
@@ -351,9 +378,26 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                         .rounded(px(Radius::CONTROL))
                         .cursor_pointer()
                         .hover(|style| style.bg(p.hover))
-                        .on_click(move |_, window, cx| {
-                            let sql = object_sql.clone();
-                            insert_object.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+                        .on_click({
+                            let object_sql = object_sql.clone();
+                            let insert_object = insert_object.clone();
+                            move |_, window, cx| {
+                                let sql = object_sql.clone();
+                                insert_object.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+                            }
+                        })
+                        .context_menu({
+                            let name = qualified.clone();
+                            move |menu, _, _| {
+                                let (insert, sql, copy) = (insert_object.clone(), object_sql.clone(), name.clone());
+                                menu.item(PopupMenuItem::new(i18n::text(locale, "query.side.menuInsert")).icon(IconName::SquarePen).on_click(move |_, window, cx| {
+                                    let sql = sql.clone();
+                                    insert.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+                                }))
+                                .item(PopupMenuItem::new(i18n::text(locale, "query.side.menuCopyObject")).icon(IconName::Copy).on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(copy.clone()));
+                                }))
+                            }
                         })
                         .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::MD)).text_color(p.text).child(SharedString::from(qualified)))
                         .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(kind))),
@@ -366,7 +410,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
         body = body.child(div().px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(i18n::text(locale, "query.side.noColumns"))));
     }
     for (index, column) in info.columns.iter().enumerate() {
-        body = body.child(object_column(index, column, info.column.as_deref(), locale, metrics, mono, p, engine, entity));
+        body = body.child(object_column(index, column, info.column.as_deref(), locale, metrics, mono, p, engine, &info.name, entity));
     }
     body.into_any_element()
 }

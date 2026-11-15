@@ -86,6 +86,12 @@ pub struct Workbench {
     /// 应用内更新的后台任务（检查、下载、安装）与启动后的延迟检查：持有句柄，随视图在界面线程上释放。
     update_task: Option<gpui_kit::Task<()>>,
     update_timer: Option<gpui_kit::Task<()>>,
+    /// 状态栏提示的时效：同一句提示显示一段时间后自动退场，不让“已连接”“清空历史？”一直挂着。
+    pub(super) notice_seen: (Option<&'static str>, String),
+    pub(super) notice_since: std::time::Instant,
+    pub(super) notice_timer: Option<gpui_kit::Task<()>>,
+    /// 分组名输入面板出现后是否已经把焦点交给它（只交一次，不抢用户后来的点击）。
+    pub(super) group_prompt_focused: bool,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -249,6 +255,10 @@ impl Workbench {
             job_tasks: Vec::new(),
             update_task: None,
             update_timer: None,
+            notice_seen: (None, String::new()),
+            notice_since: std::time::Instant::now(),
+            notice_timer: None,
+            group_prompt_focused: false,
             boot,
             sized: false,
             last_state: String::new(),
@@ -281,6 +291,11 @@ impl Workbench {
     }
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id == "menu-grid" {
+            // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
+            let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
+            self.model.grid_menu = if table { self.table.read(cx).menu_facts() } else { self.query.read(cx).grid_menu_facts(cx) };
+        }
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
         if self.model.gate_on_demand(id) {
@@ -1797,6 +1812,7 @@ impl Workbench {
                 self.table.update(cx, |pane, cx| {
                     pane.retry_after_connect(&id, cx);
                 });
+                self.structure.update(cx, |pane, cx| pane.retry_after_connect(&id, cx));
             }
             let browse = self.pending_browser.take_if(|id| connected.contains(id));
             self.connected_seen = connected;
@@ -2484,6 +2500,9 @@ impl Workbench {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
         }
         // 表数据页的“重试”在连接没打开时同样走按需连接；连上后 refresh_tree_on_connect 触发重读。
+        if let Some(id) = self.structure.update(cx, |pane, _| pane.take_connect_request()) {
+            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+        }
         if let Some(id) = self.table.update(cx, |pane, _| pane.take_connect_request()) {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
         }
@@ -2628,7 +2647,8 @@ fn parse_target(spec: &str) -> Option<GridTarget> {
 }
 
 fn grid_surface_command(id: &str) -> bool {
-    matches!(
+    // 网格自己的命令统一以 grid- 开头（含右键菜单里的 grid-column:*）：全部交给活动网格。
+    id.starts_with("grid-") || matches!(
         id,
         "edit-cell"
             | "cancel-edit"

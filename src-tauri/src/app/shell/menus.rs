@@ -205,29 +205,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         // 分组菜单的条目由模型按分组现算（名字与命令都带目标），这里没有通用项。
         MenuPlace::ExplorerGroup => Vec::new(),
         MenuPlace::ObjectTree => object_tree_items(target, None),
-        MenuPlace::Grid => {
-            let write = target == MenuTarget::WritableGrid;
-            vec![
-                item("copy-region", "grid.menu.copySelection"),
-                item("grid-copy-row", "grid.menu.copyRow"),
-                item("grid-copy-column", "grid.menu.copyColumn"),
-                item("grid-filter-value", "grid.menu.filterByValue"),
-                item("tree-select-sql", "catalog.tree.copyToQuery"),
-                item("open-exchange", "shell.command.openExchange"),
-                // 网格里的对比以正在显示的表格为目标，不复用对象树选择（compare-object）。
-                item("compare-grid", "shell.command.compare"),
-                if write {
-                    item("edit-cell", "shell.shortcuts.editCell")
-                } else {
-                    disabled("edit-cell", "shell.shortcuts.editCell", "grid.errors.viewReadonly")
-                },
-                if write {
-                    danger("mark-delete", "grid.menu.markDelete")
-                } else {
-                    disabled("mark-delete", "grid.menu.markDelete", "grid.errors.viewReadonly")
-                },
-            ]
-        }
+        MenuPlace::Grid => grid_items(&GridMenuFacts { table: true, writable: target == MenuTarget::WritableGrid, ..GridMenuFacts::default() }),
         MenuPlace::TabBar => vec![
             item("close-tab", "common.close"),
             item("tab-close-others", "shell.tabs.closeOthers"),
@@ -245,14 +223,15 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             item("command-palette", "shell.shortcuts.commandPalette"),
             item("editor-clear", "query.editor.menu.clear"),
         ],
+        // 连接页的行菜单：连接与新建查询在上，配置居中，“移动到分组”由模型插在删除之前，删除最后。
         MenuPlace::ConnectionRow => vec![
-            item("conn-connect", "connections.page.connect"),
-            item("conn-edit", "connections.page.menuEdit"),
-            item("conn-test", "connections.editor.test.button"),
-            item("conn-duplicate", "common.copy"),
+            with_icon(item("conn-connect", "connections.page.connect"), IconName::Plug),
             // 新建查询到此连接：先按需连接再打开编辑器，和对象树里的同名入口走同一条续接。
-            item("conn-new-query", "shell.command.newQuery"),
-            danger("conn-delete", "connections.page.menuDelete"),
+            with_icon(item("conn-new-query", "shell.command.newQuery"), IconName::SquareTerminal),
+            sep(with_icon(item("conn-edit", "connections.page.menuEdit"), IconName::Pencil)),
+            with_icon(item("conn-duplicate", "common.copy"), IconName::Copy),
+            with_icon(item("conn-test", "connections.editor.test.button"), IconName::Zap),
+            sep(with_icon(danger("conn-delete", "connections.page.menuDelete"), IconName::Trash)),
         ],
         MenuPlace::HistoryEntry => {
             if target == MenuTarget::Saved {
@@ -273,6 +252,91 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             }
         }
     }
+}
+
+pub use crate::app::views::grid::GridMenuFacts;
+
+fn sep(mut entry: MenuItem) -> MenuItem {
+    entry.separator_before = true;
+    entry
+}
+
+fn keyed(mut entry: MenuItem, chord: &'static str) -> MenuItem {
+    entry.shortcut = Some(chord);
+    entry
+}
+
+/// 只读网格里的写入项：留在原位但禁用，并说明为什么不能改。
+fn writable_only(entry: MenuItem, writable: bool) -> MenuItem {
+    if writable {
+        entry
+    } else {
+        MenuItem { enabled: false, reason_key: Some("grid.errors.viewReadonly"), ..entry }
+    }
+}
+
+/// 网格（表数据与查询结果共用）的右键菜单。按使用频率分组：
+/// 复制 → 查看/编辑这一格 → 按这一格筛选/排序 → 行操作 → 生成 SQL。
+/// 查询结果没有行写入与翻页，相关组整组不出现，而不是一排灰色项。
+pub fn grid_items(facts: &GridMenuFacts) -> Vec<MenuItem> {
+    let writable = facts.writable;
+    let mut copy_as = vec![
+        item("grid-copy-row", "grid.menu.copyRow"),
+        item("grid-copy-column", "grid.menu.copyColumn"),
+        sep(item("grid-copy-as-tsv", "grid.copyAs.tsv")),
+        item("grid-copy-as-csv", "grid.copyAs.csv"),
+        item("grid-copy-as-json", "grid.copyAs.json"),
+        item("grid-copy-as-markdown", "grid.copyAs.markdown"),
+        sep(item("copy-sql-value", "grid.copyAs.sqlLiteral")),
+    ];
+    if facts.table {
+        copy_as.push(item("grid-copy-as-insert", "grid.copyAs.insert"));
+        copy_as.push(item("grid-copy-where", "grid.sql.whereCell"));
+    }
+    let mut items = vec![
+        keyed(with_icon(item("copy-region", "grid.menu.copy"), IconName::Copy), "Mod+C"),
+        branch("submenu-copy-as", "grid.menu.copyAs", IconName::ClipboardList, copy_as),
+        sep(keyed(with_icon(item("grid-value-open", "grid.value.openFull"), IconName::Eye), "Mod+Enter")),
+    ];
+    if facts.table {
+        items.push(keyed(with_icon(writable_only(item("edit-cell", "grid.menu.editCell"), writable), IconName::SquarePen), "Enter"));
+        items.push(with_icon(writable_only(item("grid-set-null", "grid.menu.setNull"), writable), IconName::Eraser));
+    }
+    if facts.cell_dirty {
+        items.push(with_icon(item("grid-undo-cell", "grid.write.undoCell"), IconName::Undo2));
+    }
+    items.push(sep(with_icon(item("grid-filter-value", "grid.menu.filterByValue"), IconName::Funnel)));
+    items.push(with_icon(item("grid-filter-exclude", "grid.menu.filterExclude"), IconName::Ban));
+    items.push(with_icon(item("grid-column:column-sort-asc", "grid.menu.sortAsc"), IconName::ArrowUpNarrowWide));
+    items.push(with_icon(item("grid-column:column-sort-desc", "grid.menu.sortDesc"), IconName::ArrowDownWideNarrow));
+    if facts.conditions {
+        items.push(with_icon(item("grid-clear-conditions", "grid.menu.clearConditions"), IconName::FunnelX));
+    }
+    if facts.foreign_key {
+        items.push(with_icon(item("grid-fk-jump", "grid.fk.jump"), IconName::Link));
+    }
+    if facts.table {
+        items.push(sep(with_icon(writable_only(item("grid-insert", "grid.action.insert"), writable), IconName::Plus)));
+        items.push(with_icon(writable_only(item("grid-clone-row", "grid.write.clone"), writable), IconName::CopyPlus));
+        if facts.row_dirty {
+            items.push(with_icon(item("grid-undo-row", "grid.write.undoRow"), IconName::RotateCcw));
+        }
+        let mut delete = keyed(with_icon(writable_only(item("mark-delete", "grid.menu.markDelete"), writable), IconName::Trash), "Delete");
+        delete.danger = writable;
+        items.push(delete);
+        items.push(sep(branch(
+            "submenu-grid-sql",
+            "grid.menu.generateSql",
+            IconName::Braces,
+            vec![
+                item("grid-sql-select", "grid.sql.select"),
+                item("grid-sql-update", "grid.sql.update"),
+                item("grid-copy-row-where", "grid.sql.whereRow"),
+            ],
+        )));
+        items.push(with_icon(item("grid-refresh", "grid.menu.refresh"), IconName::RefreshCw));
+    }
+    items
 }
 
 fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<MenuItem> {
@@ -316,115 +380,83 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
         ];
     }
     if target == MenuTarget::Connection {
+        // 连接节点：连接与查询在上，配置居中，删除在最下。
         return vec![
-            item("conn-connect", "connections.page.connect"),
-            item("conn-disconnect", "connections.page.menuDisconnect"),
-            item("conn-edit", "connections.page.menuEdit"),
-            item("conn-test", "connections.editor.test.button"),
-            item("conn-duplicate", "common.copy"),
+            with_icon(item("conn-connect", "connections.page.connect"), IconName::Plug),
+            with_icon(item("conn-disconnect", "connections.page.menuDisconnect"), IconName::Unplug),
+            sep(with_icon(item("conn-new-query", "shell.command.newQuery"), IconName::SquareTerminal)),
+            with_icon(item("tree-refresh-node", "catalog.tree.refreshNode"), IconName::RefreshCw),
             with_icon(item("open-admin", "ui.tool.admin"), IconName::Database),
-            danger("conn-delete", "connections.page.menuDelete"),
+            sep(with_icon(item("conn-edit", "connections.page.menuEdit"), IconName::Pencil)),
+            with_icon(item("conn-duplicate", "common.copy"), IconName::Copy),
+            with_icon(item("conn-test", "connections.editor.test.button"), IconName::Zap),
+            sep(with_icon(danger("conn-delete", "connections.page.menuDelete"), IconName::Trash)),
         ];
     }
-    let data = if target == MenuTarget::NonDataObject {
-        disabled("tree-open-data", "catalog.tree.openData", "catalog.tree.noData")
-    } else {
-        with_icon(item("tree-open-data", "catalog.tree.openData"), IconName::Table)
-    };
-    let structure = if target == MenuTarget::NonDataObject {
-        disabled("open-structure", "catalog.tree.viewStructure", "catalog.tree.noStructure")
-    } else {
-        with_icon(item("open-structure", "catalog.tree.viewStructure"), IconName::Table)
-    };
-    // 高频项最多七个：打开数据、打开结构、新建查询、查看/复制 DDL、刷新。
-    let mut items = vec![
-        data,
-        structure,
-        with_icon(item("tree-new-query", "catalog.tree.newQueryHere"), IconName::SquareTerminal),
-    ];
+    // 表/视图（以及例程等无数据对象）的菜单：常用在上、危险在下，不放低频项。
+    // 打开 → 复制名称 → 生成 SQL（含建表语句）→ 工具 → 危险操作。
+    // “刷新此节点”交给资源管理器的刷新按钮与连接/分组菜单；“插入到编辑器”由“复制名称”与模板覆盖。
+    let data_object = target != MenuTarget::NonDataObject;
     let relational = facts.is_some_and(|facts| facts.engine.is_relational());
     let table = facts.is_some_and(|facts| facts.kind == ObjectKind::Table);
     let view = facts.is_some_and(|facts| facts.kind == ObjectKind::View);
-    if let Some(facts) = facts.filter(|facts| facts.engine.is_relational() && matches!(target, MenuTarget::Object | MenuTarget::NonDataObject)) {
-        if ddl_available(facts.engine, facts.kind) {
-            items.push(with_icon(item("tree-view-ddl", "catalog.tree.viewDdl"), IconName::Eye));
-            items.push(with_icon(item("tree-copy-ddl", "catalog.tree.copyDdl"), IconName::Copy));
+    let mut items = vec![
+        if data_object {
+            with_icon(item("tree-open-data", "catalog.tree.openData"), IconName::Table)
         } else {
-            items.push(disabled("tree-view-ddl", "catalog.tree.viewDdl", "catalog.tree.noDefinition"));
-            items.push(disabled("tree-copy-ddl", "catalog.tree.copyDdl", "catalog.tree.noDefinition"));
-        }
-    }
-    items.push(with_icon(item("tree-refresh-node", "catalog.tree.refreshNode"), IconName::RefreshCw));
-    let diagram = if target == MenuTarget::NonDataObject || !relational {
-        disabled("open-diagram", "catalog.tree.diagram", "catalog.tree.noStructure")
-    } else {
-        with_icon(item("open-diagram", "catalog.tree.diagram"), IconName::ChartNetwork)
-    };
-    let compare = if relational {
-        item("compare-object", "shell.command.compare")
-    } else {
-        disabled("compare-object", "shell.command.compare", "catalog.tree.relationalOnly")
-    };
-    let exchange = if relational {
-        item("exchange-object", "shell.command.openExchange")
-    } else {
-        disabled("exchange-object", "shell.command.openExchange", "catalog.tree.relationalOnly")
-    };
-    let mut tools = vec![diagram, compare, exchange];
-    if relational {
-        tools.push(with_icon(item("open-admin", "ui.tool.admin"), IconName::Database));
-    }
+            disabled("tree-open-data", "catalog.tree.openData", "catalog.tree.noData")
+        },
+        if data_object {
+            with_icon(item("open-structure", "catalog.tree.viewStructure"), IconName::TableProperties)
+        } else {
+            disabled("open-structure", "catalog.tree.viewStructure", "catalog.tree.noStructure")
+        },
+        with_icon(item("tree-new-query", "catalog.tree.newQueryHere"), IconName::SquareTerminal),
+        sep(with_icon(item("tree-copy-name", "catalog.tree.copyFullName"), IconName::Copy)),
+    ];
+
+    let mut sql = Vec::new();
     if relational && target == MenuTarget::Object && (table || view) {
-        let mut templates = vec![
+        sql.extend([
+            item("tree-select-sql", "catalog.tree.templateSelect"),
             item("tree-template-insert", "catalog.tree.templateInsert"),
             item("tree-template-update", "catalog.tree.templateUpdate"),
             item("tree-template-delete", "catalog.tree.templateDelete"),
-            item("tree-select-sql", "catalog.tree.templateSelect"),
-        ];
-        if let Some(first) = templates.first_mut() {
-            first.separator_before = false;
-        }
-        let mut sql = branch("submenu-sql", "catalog.menu.sqlTemplates", IconName::Braces, templates);
-        sql.separator_before = true;
-        items.push(sql);
-        items.push(branch(
-            "submenu-insert",
-            "catalog.menu.insertEditor",
-            IconName::SquarePen,
-            vec![
-                item("tree-insert-object", "catalog.menu.insertQualified"),
-                item("tree-insert-select", "catalog.tree.insertSelect"),
-                item("tree-copy-name", "catalog.tree.copyFullName"),
-            ],
-        ));
-    } else if matches!(target, MenuTarget::Object | MenuTarget::NonDataObject) {
-        items.push(branch(
-            "submenu-insert",
-            "catalog.menu.insertEditor",
-            IconName::SquarePen,
-            vec![
-                item("tree-insert-object", "catalog.tree.insertObject"),
-                item("tree-insert-select", "catalog.tree.insertSelect"),
-                item("tree-copy-name", "catalog.tree.copyFullName"),
-            ],
-        ));
+        ]);
     }
-    items.push(branch("submenu-tools", "catalog.menu.tools", IconName::FolderOpen, tools));
-    if relational && target == MenuTarget::Object && (table || view) {
-        let mut danger_items = Vec::new();
-        if table {
-            danger_items.extend([
-                danger("tree-rename-table", "catalog.tree.renameTable"),
-                danger("tree-truncate-table", "catalog.tree.truncateTable"),
-                danger("tree-drop-object", "catalog.tree.dropTable"),
-            ]);
-        } else {
-            danger_items.push(danger("tree-drop-object", "catalog.tree.dropView"));
+    if let Some(facts) = facts.filter(|facts| facts.engine.is_relational()) {
+        if ddl_available(facts.engine, facts.kind) {
+            let first = sql.is_empty();
+            let mut view_ddl = item("tree-view-ddl", "catalog.tree.viewDdl");
+            view_ddl.separator_before = !first;
+            sql.push(view_ddl);
+            sql.push(item("tree-copy-ddl", "catalog.tree.copyDdl"));
         }
-        let mut danger_menu = branch("submenu-danger", "catalog.menu.danger", IconName::TriangleAlert, danger_items);
-        danger_menu.danger = true;
-        danger_menu.separator_before = true;
-        items.push(danger_menu);
+    }
+    if !sql.is_empty() {
+        items.push(branch("submenu-sql", "catalog.menu.generateSql", IconName::Braces, sql));
+    }
+    // 名称/限定名插入编辑器：放在生成 SQL 之外的一个入口，供写查询时使用。
+    items.push(with_icon(item("tree-insert-object", "catalog.menu.insertName"), IconName::SquarePen));
+
+    // 工具：只给关系型对象，不排一行灰色项。
+    if relational {
+        items.push(sep(with_icon(item("exchange-object", "shell.command.openExchange"), IconName::ArrowDownUp)));
+        if data_object {
+            items.push(with_icon(item("open-diagram", "catalog.tree.diagram"), IconName::ChartNetwork));
+        }
+        items.push(with_icon(item("compare-object", "shell.command.compare"), IconName::GitCompare));
+    }
+
+    // 危险操作平铺在最下面：红色、带省略号表示还要确认，不藏进二级菜单。
+    if relational && target == MenuTarget::Object && table {
+        items.push(sep(with_icon(item("tree-rename-table", "catalog.tree.renameTable"), IconName::Pencil)));
+        let mut truncate = with_icon(danger("tree-truncate-table", "catalog.tree.truncateTable"), IconName::Eraser);
+        truncate.danger = true;
+        items.push(truncate);
+        items.push(with_icon(danger("tree-drop-object", "catalog.tree.dropTable"), IconName::Trash));
+    } else if relational && target == MenuTarget::Object && view {
+        items.push(sep(with_icon(danger("tree-drop-object", "catalog.tree.dropView"), IconName::Trash)));
     }
     items
 }
@@ -696,12 +728,15 @@ mod tests {
     #[test]
     fn danger_items_only_on_relational_tables_and_views() {
         for engine in [Engine::Sqlite, Engine::Mysql, Engine::Mariadb, Engine::Postgres, Engine::Sqlserver] {
-            // 表：删除/清空/重命名都在，并且都是危险项。
+            // 表：清空/删除是危险项（红色、一级、在最下面）；重命名在旁边但不标红。
             let table = tree_menu_items(MenuTarget::Object, facts(engine, ObjectKind::Table));
-            for id in DANGER {
-                let item = flatten_items(&table).into_iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{engine:?} {id}"));
+            for id in ["tree-truncate-table", "tree-drop-object"] {
+                let item = table.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{engine:?} {id}"));
                 assert!(item.danger && item.enabled, "{engine:?} {id}");
             }
+            let rename = table.iter().find(|item| item.id == "tree-rename-table").expect("rename");
+            assert!(rename.enabled && !rename.danger);
+            assert_eq!(table.last().map(|item| item.id), Some("tree-drop-object"), "删除表在最下面");
             assert!(TEMPLATES.iter().all(|id| ids(&table).contains(id)), "{engine:?}");
             // 视图：只有删除，清空与重命名只给表。
             let view = tree_menu_items(MenuTarget::Object, facts(engine, ObjectKind::View));
@@ -740,45 +775,65 @@ mod tests {
     #[test]
     fn ddl_items_follow_definition_availability_and_scope_rows_refresh() {
         let table = tree_menu_items(MenuTarget::Object, facts(Engine::Postgres, ObjectKind::Table));
-        assert!(table.iter().any(|item| item.id == "tree-view-ddl" && item.enabled));
-        assert!(table.iter().any(|item| item.id == "tree-copy-ddl" && item.enabled));
-        // 扩展读不到定义：两项禁用并说明原因。
-        let extension = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Extension));
+        // 查看/复制 DDL 归在“生成 SQL”里，与模板同组。
         for id in ["tree-view-ddl", "tree-copy-ddl"] {
-            let item = extension.iter().find(|item| item.id == id).expect(id);
-            assert!(!item.enabled);
-            assert_eq!(item.reason_key, Some("catalog.tree.noDefinition"));
+            assert!(flatten_items(&table).iter().any(|item| item.id == id && item.enabled), "{id}");
         }
+        // 扩展读不到定义：不出现 DDL 项（不摆一排灰色项）。
+        let extension = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Extension));
+        assert!(!ids(&extension).contains(&"tree-view-ddl") && !ids(&extension).contains(&"tree-copy-ddl"));
         // 例程有定义：DDL 可用，但仍没有危险项。
         let routine = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Function));
-        assert!(routine.iter().any(|item| item.id == "tree-view-ddl" && item.enabled));
+        assert!(flatten_items(&routine).iter().any(|item| item.id == "tree-view-ddl" && item.enabled));
         // SQLite 序列之类没有定义来源。
         let sqlite = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Sqlite, ObjectKind::Sequence));
-        assert!(sqlite.iter().any(|item| item.id == "tree-view-ddl" && !item.enabled));
+        assert!(!ids(&sqlite).contains(&"tree-view-ddl"));
         // MongoDB 集合没有 DDL 项。
         let mongo = tree_menu_items(MenuTarget::DocumentObject, facts(Engine::Mongodb, ObjectKind::Table));
         assert!(!ids(&mongo).contains(&"tree-view-ddl"));
-        // 范围行：自己的动作，加上关系型的新建表和管理页。
+        // 范围行：自己的动作，加上关系型的新建表和管理页；刷新留在范围行上。
         assert_eq!(
             top_ids(&tree_menu_items(MenuTarget::Scope, None)),
             vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "open-admin"]
         );
         let redis_scope = tree_menu_items(MenuTarget::Scope, facts(Engine::Redis, ObjectKind::Table));
         assert!(!ids(&redis_scope).contains(&"open-admin"));
-        // 表的一级高频项不超过 7，模板和危险操作在子菜单里。
+        // 表菜单：打开数据/结构/新建查询在最前，一级没有低频的刷新与管理页。
         let top = top_ids(&table);
-        let leaves: Vec<_> = table.iter().filter(|item| item.children.is_empty()).map(|item| item.id).collect();
-        assert!(leaves.len() <= 7, "{leaves:?}");
-        assert!(leaves.contains(&"tree-open-data"));
-        assert!(leaves.contains(&"open-structure"));
-        assert!(leaves.contains(&"tree-new-query"));
-        assert!(leaves.contains(&"tree-view-ddl"));
-        assert!(leaves.contains(&"tree-copy-ddl"));
-        assert!(leaves.contains(&"tree-refresh-node"));
-        assert!(top.contains(&"submenu-sql") && top.contains(&"submenu-danger"));
+        assert_eq!(&top[..3], &["tree-open-data", "open-structure", "tree-new-query"]);
+        assert!(top.contains(&"submenu-sql") && top.contains(&"tree-copy-name"));
+        assert!(!ids(&table).contains(&"tree-refresh-node") && !ids(&table).contains(&"open-admin"));
         assert!(ids(&table).contains(&"tree-select-sql"));
-        assert!(ids(&table).contains(&"open-admin"));
         assert!(ids(&table).contains(&"open-diagram"));
+        assert!(ids(&table).contains(&"exchange-object"));
+    }
+
+    /// 网格菜单按现场事实生成：查询结果没有写入与行操作；只读表的写入项禁用并说明原因；
+    /// 撤销、清除条件、外键跳转只在真有其事时出现。
+    #[test]
+    fn grid_menu_follows_the_cell_it_was_opened_on() {
+        let query = grid_items(&GridMenuFacts::default());
+        let query_ids = ids(&query);
+        assert!(query_ids.contains(&"copy-region") && query_ids.contains(&"grid-filter-value"));
+        for id in ["edit-cell", "grid-insert", "mark-delete", "grid-sql-update", "grid-refresh", "grid-undo-cell", "grid-clear-conditions", "grid-fk-jump"] {
+            assert!(!query_ids.contains(&id), "查询结果不该有 {id}");
+        }
+
+        let readonly = grid_items(&GridMenuFacts { table: true, ..GridMenuFacts::default() });
+        for id in ["edit-cell", "grid-set-null", "grid-insert", "grid-clone-row", "mark-delete"] {
+            let item = readonly.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{id}"));
+            assert!(!item.enabled && item.reason_key == Some("grid.errors.viewReadonly"), "{id}");
+        }
+        assert!(!readonly.iter().find(|item| item.id == "mark-delete").unwrap().danger, "禁用的删除不标红");
+
+        let busy = grid_items(&GridMenuFacts { table: true, writable: true, cell_dirty: true, row_dirty: true, foreign_key: true, conditions: true });
+        let busy_ids = ids(&busy);
+        for id in ["grid-undo-cell", "grid-undo-row", "grid-clear-conditions", "grid-fk-jump"] {
+            assert!(busy_ids.contains(&id), "{id}");
+        }
+        let delete = busy.iter().find(|item| item.id == "mark-delete").unwrap();
+        assert!(delete.enabled && delete.danger && delete.shortcut == Some("Delete"));
+        assert_eq!(busy.first().map(|item| (item.id, item.shortcut)), Some(("copy-region", Some("Mod+C"))));
     }
 
     #[test]
@@ -797,9 +852,9 @@ mod tests {
         menu.index = sql;
         assert!(menu.open_submenu());
         assert_eq!(menu.submenu.map(|pair| pair.0), Some(sql));
-        assert_eq!(menu.current().map(|item| item.id), Some("tree-template-insert"));
+        assert_eq!(menu.current().map(|item| item.id), Some("tree-select-sql"));
         menu.move_by(1);
-        assert_eq!(menu.current().map(|item| item.id), Some("tree-template-update"));
+        assert_eq!(menu.current().map(|item| item.id), Some("tree-template-insert"));
         assert!(menu.close_submenu());
         assert!(menu.submenu.is_none());
         menu.hover(sql);

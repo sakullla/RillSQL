@@ -11,6 +11,7 @@ pub(crate) mod functions;
 mod history;
 pub(crate) mod meta;
 mod saved;
+pub mod plan;
 mod split;
 
 pub use commands::{

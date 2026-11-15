@@ -303,6 +303,8 @@ pub struct WorkbenchModel {
     pub bundle_passphrase: String,
     pub import_notes: Vec<String>,
     pub grid_writable: bool,
+    /// 打开网格菜单那一刻从活动网格读到的现场事实。
+    pub grid_menu: super::menus::GridMenuFacts,
     /// 网格暂存不进 app-state.json，但窗口关闭仍要看见它。
     pub grid_dirty: bool,
     pub startup_warning: Option<String>,
@@ -446,6 +448,7 @@ impl WorkbenchModel {
             bundle_passphrase: String::new(),
             import_notes: Vec::new(),
             grid_writable: false,
+            grid_menu: super::menus::GridMenuFacts::default(),
             grid_dirty: false,
             startup_warning: None,
             tool: WorkTool::Query,
@@ -1609,7 +1612,11 @@ impl WorkbenchModel {
         let current = self.group_of(&connection).map(str::to_owned);
         let entry = super::menus::move_to_group_branch(&connection, &self.groups, current.as_deref());
         if let Some(menu) = self.menu.as_mut() {
-            menu.items.push(entry);
+            // 放在删除之前：删除始终是菜单最后一项。
+            match menu.items.iter().position(|item| item.id == "conn-delete") {
+                Some(index) => menu.items.insert(index, entry),
+                None => menu.items.push(entry),
+            }
         }
     }
 
@@ -1638,6 +1645,12 @@ impl WorkbenchModel {
     pub fn open_grid_menu(&mut self) {
         let target = if self.grid_writable { MenuTarget::WritableGrid } else { MenuTarget::ReadonlyGrid };
         self.open_menu(MenuPlace::Grid, target);
+        // 条目按现场事实现算：只读、未提交修改、外键、筛选/排序各自决定出现哪些动作。
+        let mut facts = self.grid_menu.clone();
+        facts.writable = facts.writable && self.grid_writable;
+        if let Some(menu) = self.menu.as_mut() {
+            *menu = super::menus::OpenMenu::with_items(MenuPlace::Grid, super::menus::grid_items(&facts));
+        }
     }
 
     pub fn open_tree_menu(&mut self, object: bool) {
@@ -1992,7 +2005,27 @@ impl WorkbenchModel {
             self.nav.focus_first();
             self.sync_object_spec_from_focus();
         }
+        self.fill_single_database_targets();
         changed
+    }
+
+    /// 查询标签只选了连接、没选库（恢复的旧会话、或建标签时还没读到库列表）：
+    /// 这条连接只有一个库（SQLite 的 main、只配一个库的服务器）就直接补上，不让用户再选一次。
+    fn fill_single_database_targets(&mut self) {
+        let missing: Vec<(usize, String)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.kind.is_query() && tab.database.as_deref().is_none_or(str::is_empty))
+            .filter_map(|(index, tab)| tab.connection_id.clone().filter(|id| !id.is_empty()).map(|id| (index, id)))
+            .collect();
+        for (index, connection_id) in missing {
+            if let Some(database) = self.only_database(&connection_id) {
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.database = Some(database);
+                }
+            }
+        }
     }
 
     /// 整目录读取失败：保留上一份树，只把原因放在顶部提示条。

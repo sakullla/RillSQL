@@ -2,6 +2,7 @@
 //! 方言规则在 query::assist / query::desk；这里只提交任务和显示。
 
 mod log;
+mod plan_view;
 mod side;
 
 use std::collections::{HashMap, HashSet};
@@ -139,6 +140,9 @@ pub struct QueryPane {
     marks_seen: HashMap<String, u64>,
     /// 正在重命名的固定结果页签。
     pin_rename: Option<PinRename>,
+    /// 执行计划视图：看计划树还是引擎原始结果；树上选中的节点（前序下标）。
+    plan_raw: bool,
+    plan_selected: usize,
     /// 统计绑定结果代次和来源；同一 SQL 再执行或切换目标后不复用旧计数。
     row_count: Option<(CountIdentity, RowCount)>,
 }
@@ -436,6 +440,8 @@ impl QueryPane {
             definition_sink: None,
             marks_seen: HashMap::new(),
             pin_rename: None,
+            plan_raw: false,
+            plan_selected: 0,
         }
     }
 
@@ -784,6 +790,17 @@ impl QueryPane {
     }
 
     fn command_impl(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 执行计划视图：切换计划树 / 原始结果、选中计划节点。只改视图状态。
+        if let Some(view) = id.strip_prefix("plan-view:") {
+            self.plan_raw = view == "raw";
+            cx.notify();
+            return;
+        }
+        if let Some(index) = id.strip_prefix("plan-select:").and_then(|index| index.parse::<usize>().ok()) {
+            self.plan_selected = index;
+            cx.notify();
+            return;
+        }
         // 表/结构等非查询工作项激活时，补全、格式化、执行、计划、变量、取消和语句选择
         // 都不能落在隐藏的查询标签上。
         if requires_active_query(id) && !self.context_active {
@@ -1599,7 +1616,12 @@ impl QueryPane {
 
     fn explain(&mut self, cx: &mut Context<Self>) {
         match self.desk.explain_active() {
-            Ok(sql) => self.start(RunScope::Script, Some(sql), cx),
+            Ok(sql) => {
+                // 新的计划从树视图、第一个节点开始看。
+                self.plan_raw = false;
+                self.plan_selected = 0;
+                self.start(RunScope::Script, Some(sql), cx)
+            }
             Err(reason) => {
                 self.desk.set_active_note(&reason);
                 cx.notify();
@@ -2648,13 +2670,17 @@ impl QueryPane {
                     .flex_none()
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
-                    .h(px(metrics.control_h))
+                    .h(px(metrics.control_h - 2.))
                     .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .rounded(px(Radius::CONTROL))
                     .text_size(px(TypeScale::SM))
-                    .text_color(p.accent)
+                    .text_color(p.accent_text)
                     .bg(p.accent_soft)
-                    .child(SharedString::from(format!("{} +{}", i18n::text(locale, "query.results.loadMore"), limit.saturating_sub(loaded))))
+                    .child(kit::icon(IconName::ChevronsDown, 13., p.accent_text))
+                    .child(SharedString::from(i18n::fill(&i18n::text(locale, "query.results.loadNext"), &[("count", &limit.saturating_sub(loaded).to_string())])))
                     .on_click(move |_, _, cx| {
                         more.update(cx, |pane, cx| pane.load_more(cx));
                     })
@@ -2731,6 +2757,19 @@ impl QueryPane {
         };
         if result.columns.is_empty() {
             return statement_outcome(result, &self.desk.active_note(), locale, mono, p, metrics, entity);
+        }
+        // 结果是执行计划：画成计划视图（摘要、问题与建议、计划树、节点详情）；“原始结果”仍是网格。
+        let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
+        let sent = result.sent_sql.clone().unwrap_or_else(|| result.sql.clone());
+        if let Some(plan) = crate::query::plan::parse(&engine, &sent, &result.columns, &result.rows) {
+            let view = plan_view::PlanView { plan: &plan, selected: self.plan_selected, raw: self.plan_raw, locale, metrics, mono: mono.clone(), narrow: self.narrow };
+            let header = view.header(p, entity);
+            let body = if self.plan_raw {
+                div().id("query-grid").test_support().flex_1().min_h(px(0.)).child(self.grid.clone()).into_any_element()
+            } else {
+                view.body(p, entity)
+            };
+            return div().flex_1().min_h(px(0.)).flex().flex_col().child(header).child(body).into_any_element();
         }
         let grid_entity = entity.clone();
         div()
@@ -2961,6 +3000,11 @@ impl QueryPane {
     }
 
     /// 结果表格上的右键：外壳据此打开表格菜单而不是编辑器菜单。
+    /// 结果网格的右键现场事实。
+    pub fn grid_menu_facts(&self, cx: &App) -> crate::app::views::grid::GridMenuFacts {
+        self.grid.read(cx).menu_facts()
+    }
+
     /// 结果网格的单元格右键出口（与表数据页同一个外壳菜单）。
     pub fn set_grid_menu_sink(&mut self, sink: crate::app::views::grid::MenuSink, cx: &mut Context<Self>) {
         self.grid.update(cx, |grid, _| grid.set_menu_sink(sink));

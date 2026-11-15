@@ -4591,9 +4591,10 @@ fn grid_menu_compare_carries_the_displayed_table_not_the_tree_row(cx: &mut gpui_
         let view = view.read(cx);
         let menu = view.model.menu.as_ref().expect("网格菜单");
         let ids: Vec<&str> = menu.items.iter().map(|item| item.id).collect();
-        assert!(ids.contains(&"compare-grid"), "{ids:?}");
+        // 网格菜单只放按格子发生的动作；对比库从对象树与命令面板进入，仍以显示中的表为目标。
         assert_eq!(menu.place, MenuPlace::Grid);
         assert!(!ids.contains(&"compare-object"), "网格菜单不能再复用对象树的范围动作：{ids:?}");
+        assert!(ids.contains(&"copy-region") && ids.contains(&"grid-filter-value"), "{ids:?}");
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| view.perform("compare-grid", cx));
@@ -5373,7 +5374,7 @@ fn non_object_rows_never_borrow_another_object() {
 
     // 对象行仍然拿到完整的对象菜单。
     assert!(model.open_nav_menu(&orders_id));
-    assert!(crate::app::shell::menus::flatten_items(&model.menu.as_ref().unwrap().items).iter().any(|item| item.id == "tree-insert-select"));
+    assert!(crate::app::shell::menus::flatten_items(&model.menu.as_ref().unwrap().items).iter().any(|item| item.id == "tree-select-sql"));
     let _ = model.dispatch("tree-copy-name");
     assert_eq!(model.copied, "public.orders");
 }
@@ -5718,7 +5719,7 @@ fn display_matrix_keeps_primary_controls_visible_and_unoverlapped(cx: &mut gpui_
                 assert!(bottom <= height + 0.5, "{width}: {label} 下方越界 {bottom}");
             };
 
-            for id in ["toolbar", "activity", "workbench-content", "status", "top-new-query", "status-locale"] {
+            for id in ["toolbar", "activity", "workbench-content", "status", "top-new-query"] {
                 inside(id, rect(id));
             }
             let toolbar = rect("toolbar");
@@ -6864,16 +6865,14 @@ fn definition_requests_only_for_readable_objects() {
     assert!(model.take_clipboard().is_none());
     assert_eq!(model.notice_key, Some("catalog.ddl.failed"));
 
-    // 扩展读不到定义：菜单项禁用，直接派发也不开查看器。
+    // 扩展读不到定义：菜单里不出现 DDL 项，直接派发也不开查看器。
     let extension = ObjectRow::fresh("pgcrypto", ObjectKind::Extension);
     let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![extension.clone()])]);
     let mut ext = WorkbenchModel::new(Shell::default());
     ext.apply_navigation(&[pg], false);
     let id = nav_id("pg", "shop", "public", &extension);
     assert!(ext.open_nav_menu(&id));
-    let item = ext.menu.as_ref().unwrap().items.iter().find(|item| item.id == "tree-view-ddl").cloned().expect("DDL 项");
-    assert!(!item.enabled);
-    assert_eq!(item.reason_key, Some("catalog.tree.noDefinition"));
+    assert!(!crate::app::shell::menus::flatten_items(&ext.menu.as_ref().unwrap().items).iter().any(|item| item.id == "tree-view-ddl"), "没有可读定义就不给 DDL 项");
     let _ = ext.dispatch(&format!("nav-view-ddl:{id}"));
     assert!(ext.ddl_view.is_none());
     assert!(ext.take_nav_request().is_none());
@@ -7458,7 +7457,7 @@ fn submenu_escape_returns_to_the_parent_and_widths_stay_in_range() {
     model.menu.as_mut().unwrap().index = sql;
     assert!(model.key(NavKey::ArrowRight).is_none());
     assert!(model.menu.as_ref().unwrap().submenu.is_some());
-    assert_eq!(model.menu.as_ref().unwrap().current().map(|item| item.id), Some("tree-template-insert"));
+    assert_eq!(model.menu.as_ref().unwrap().current().map(|item| item.id), Some("tree-select-sql"));
     model.menu.as_mut().unwrap().hover(0);
     assert!(model.menu.as_ref().unwrap().submenu.is_none(), "悬停没有子菜单的项要收起子菜单");
     model.menu.as_mut().unwrap().index = sql;
@@ -9464,4 +9463,17 @@ fn palette_check_updates_opens_the_card_and_checks() {
     assert_eq!(model.settings_section, crate::app::views::settings::SettingsSection::Local);
     assert_eq!(model.update.stage, super::update::UpdateStage::Checking { manual: true });
     assert_eq!(model.update_job, Some(super::update::UpdateJob::Check));
+}
+
+/// 恢复出来的查询标签只有连接、没有库：目录读到这条连接只有一个库时自动补上，执行不再被“请选择库”挡住。
+#[test]
+fn restored_query_tab_gets_the_only_database() {
+    let (mut model, _) = pg_orders_model();
+    assert!(model.dispatch("new-query").is_some());
+    let id = model.active_tab.clone().unwrap();
+    model.set_query_target(&id, Some("pg".into()), Some("销售库".into()), None, Some("postgres".into()));
+    let orders = crate::catalog::model::ObjectRow::table("orders", Some(2));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders])]);
+    model.apply_navigation(&[pg], false);
+    assert_eq!(model.tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.database.clone()).as_deref(), Some("shop"));
 }
