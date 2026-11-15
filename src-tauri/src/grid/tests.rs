@@ -486,6 +486,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         filters: Vec::new(),
         sort: None,
         search: None,
+        filter_expression: None,
         limit,
         truncated,
         statement: statement.to_owned(),
@@ -775,6 +776,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
             filters: Vec::new(),
             sort: None,
             search: None,
+            filter_expression: None,
             limit: 0,
             truncated: false,
             statement: String::new(),
@@ -962,6 +964,7 @@ async fn markdown_export_writes_header_rule_escapes_pipes_and_marks_partial() {
         mode,
         database: "main".to_owned(),
         search: None,
+        filter_expression: None,
         schema: String::new(),
         table: "customers".to_owned(),
         engine_hint: "sqlite".to_owned(),
@@ -1052,6 +1055,7 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
         mode,
         database: "main".to_owned(),
         search: None,
+        filter_expression: None,
         schema: String::new(),
         table: "items".to_owned(),
         engine_hint: "sqlite".to_owned(),
@@ -1325,4 +1329,124 @@ fn benchmark_result_location() {
     assert_eq!(result.len(), 10_000);
     assert!(result.iter().all(|row| row.located && row.locator.len() == 1));
     eprintln!("locator-benchmark rows=10000 columns=8 elapsed_us={} non_key_payload_bytes=17920000", elapsed.as_micros());
+}
+/// 直接 SQL 条件在真实读取上与结构化条件同口径：分页、计数和全表导出都吃同一份 WHERE。
+#[tokio::test]
+async fn direct_expression_drives_page_count_and_full_export() {
+    use super::live::{self, ExportMode, ExportSpec};
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-expr-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)").execute(&setup).await.unwrap();
+    for (id, name, note) in [(1, "a;b", None), (2, "b", Some("x")), (3, "c", None), (4, "d", Some("")), (5, "e", Some("y"))] {
+        sqlx::query("INSERT INTO items (id, name, note) VALUES (?1, ?2, ?3)").bind(id).bind(name).bind(note).execute(&setup).await.unwrap();
+    }
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let session = service.catalog_session("notes").expect("已打开会话");
+    let read = |filters: &[Filter], expression: Option<&str>| {
+        let filters = filters.to_vec();
+        let expression = expression.map(str::to_owned);
+        let session = session.clone();
+        async move {
+            live::query_page_search_preview(&session, "main", "", "items", "sqlite", &filters, None, None, expression.as_deref(), 0, 100, 1024).await
+        }
+    };
+
+    // 结构化条件与等价表达式读到同一批行。
+    let structured = read(&[filt("id", FilterOp::Gt, Some("2"))], None).await.unwrap();
+    let expression = read(&[], Some("id > 2")).await.unwrap();
+    let ids = |page: &live::LivePage| {
+        page.rows
+            .iter()
+            .filter_map(|row| match row.cells.get("id") {
+                Some(Cell::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&structured), vec!["3".to_owned(), "4".to_owned(), "5".to_owned()]);
+    assert_eq!(ids(&expression), ids(&structured));
+    assert!(expression.sql.contains("WHERE (\nid > 2\n)"), "{}", expression.sql);
+
+    // 字符串里的分号、注释、IN、NULL 与函数都按用户写的表达式执行。
+    let tricky = read(&[], Some("name = 'a;b' OR note IS NULL -- 注释\n")).await.unwrap();
+    assert_eq!(ids(&tricky), vec!["1".to_owned(), "3".to_owned()]);
+    let listed = read(&[], Some("id IN (1, 5) AND note IS NULL")).await.unwrap();
+    assert_eq!(ids(&listed), vec!["1".to_owned()]);
+    let called = read(&[], Some("upper(name) = 'B'")).await.unwrap();
+    assert_eq!(ids(&called), vec!["2".to_owned()]);
+    // 括号内的只读子查询保留。
+    let nested = read(&[], Some("id > (SELECT min(id) FROM items)")).await.unwrap();
+    assert_eq!(ids(&nested), vec!["2".to_owned(), "3".to_owned(), "4".to_owned(), "5".to_owned()]);
+
+    // 排序与分页也吃同一份条件：条件不变，只换窗口。
+    let sort = super::store::Sort { column: "id".to_owned(), descending: true };
+    let first = live::query_page_search_preview(&session, "main", "", "items", "sqlite", &[], Some(&sort), None, Some("id > 2"), 0, 1, 1024)
+        .await
+        .unwrap();
+    assert_eq!(ids(&first), vec!["5".to_owned()]);
+    assert!(first.truncated && first.sql.contains("ORDER BY") && first.sql.contains("LIMIT 1"), "{}", first.sql);
+    let second = live::query_page_search_preview(&session, "main", "", "items", "sqlite", &[], Some(&sort), None, Some("id > 2"), 1, 1, 1024)
+        .await
+        .unwrap();
+    assert_eq!(ids(&second), vec!["4".to_owned()], "第二页还是同一份条件");
+
+    // 计数与分页同一份条件。
+    let counted = live::count_rows_search(&session, "main", "", "items", "sqlite", &[], None, Some("id > 2")).await.unwrap();
+    assert_eq!(counted, 3);
+    let structured_count = live::count_rows_search(&session, "main", "", "items", "sqlite", &[filt("id", FilterOp::Gt, Some("2"))], None, None).await.unwrap();
+    assert_eq!(counted, structured_count);
+
+    // 全表导出带着同一份条件，写出的就是界面上那一组行。
+    let path = dir.join("items-full.csv");
+    let spec = ExportSpec {
+        id: "expr-full".to_owned(),
+        mode: ExportMode::TableFull,
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "items".to_owned(),
+        engine_hint: "sqlite".to_owned(),
+        filters: Vec::new(),
+        sort: None,
+        search: None,
+        filter_expression: Some("id > 2".to_owned()),
+        limit: 0,
+        truncated: false,
+        statement: String::new(),
+        acknowledged: true,
+        path: path.display().to_string(),
+        delimiter: ",".to_owned(),
+        null_token: "NULL".to_owned(),
+        bom: false,
+        header: true,
+        format: "csv".to_owned(),
+        fail_after_rows: None,
+        cancel_after_rows: None,
+    };
+    let outcome = live::run_export(&session, &spec).await;
+    assert!(outcome.success, "{}", outcome.message);
+    assert_eq!(outcome.written_rows, 3, "{}", outcome.message);
+    let written = fs::read_to_string(&path).unwrap();
+    let lines = written.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4, "表头 + 三行：{written}");
+    assert!(lines[1].starts_with("\"3\"") && lines[3].starts_with("\"5\""), "被条件排除的行不能导出：{written}");
+
+    // 闸门在读取边界上同样生效：多语句和写入不会被送到数据库。
+    let refused = read(&[], Some("id = 1; DROP TABLE items")).await.err().unwrap_or_default();
+    assert!(refused.contains("分号"), "{refused}");
+    let write = read(&[], Some("id = 1 OR DELETE FROM items")).await.err().unwrap_or_default();
+    assert!(write.contains("DELETE"), "{write}");
+    let leftover = live::count_rows_search(&session, "main", "", "items", "sqlite", &[], None, None).await.unwrap();
+    assert_eq!(leftover, 5, "被拒绝的表达式没有执行任何写入");
+    let _ = std::fs::remove_dir_all(&dir);
 }

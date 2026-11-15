@@ -75,6 +75,24 @@ pub enum BlockedAction {
     Migrate,
 }
 
+/// 来源当前已应用的筛选条件：结构化条件、整表关键字和直接 SQL 表达式。
+/// 全表导出必须带同一份条件，否则导出的是整张表而不是界面上那一组行。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExchangeCondition {
+    pub filters: Vec<crate::grid::commands::FilterArg>,
+    pub search: Option<String>,
+    pub expression: Option<String>,
+}
+
+impl ExchangeCondition {
+    /// 有没有会缩小行集合的条件；空关键字、空表达式都不算。
+    pub fn narrowing(&self) -> bool {
+        !self.filters.is_empty()
+            || self.search.as_deref().is_some_and(|text| !text.trim().is_empty())
+            || self.expression.as_deref().is_some_and(|text| !text.trim().is_empty())
+    }
+}
+
 /// 面板当前展示的来源快照。列、已读取行、目标与全量能力全部随它切换，
 /// 不再从 shell 的 table_spec 兜底，避免查询页拿到上一张表的目标。
 #[derive(Debug, Default)]
@@ -93,6 +111,8 @@ pub struct ExchangeSource {
     /// 这些行读出来时的大字段预览上限。导出前的信封检查按它比较；
     /// None 表示这份行没经过预览截断（例如查询结果），协议形状的普通文本仍是原值。
     pub preview_bytes: Option<usize>,
+    /// 当前已应用的条件（R13）；全表导出用同一份，分页/计数/导出口径一致。
+    pub condition: ExchangeCondition,
 }
 
 impl ExchangeSource {
@@ -697,13 +717,21 @@ impl ExchangePane {
             self.fail_open("full", "export", i18n::text(self.locale, "ui.exchange.fullNoTable"));
             return;
         };
-        let request = ExportRequest {
+        let request = self.full_request(table, path);
+        self.launch_full(request, cx);
+    }
+
+    /// 全表导出的请求：带着界面上已应用的同一份条件。SQL 表达式、关键字和结构化条件
+    /// 都不另算，否则导出的行会比界面上多。
+    fn full_request(&self, table: TableRef, path: std::path::PathBuf) -> ExportRequest {
+        ExportRequest {
             id: format!("full-{}", uuid::Uuid::new_v4()),
             mode: "table-full".to_owned(),
             table,
-            filters: Vec::new(),
+            filters: self.source.condition.filters.clone(),
             sort: None,
-            search: None,
+            search: self.source.condition.search.clone(),
+            filter_expression: self.source.condition.expression.clone(),
             limit: 0,
             truncated: false,
             statement: String::new(),
@@ -714,8 +742,7 @@ impl ExchangePane {
             bom: false,
             header: true,
             format: self.format_name.clone(),
-        };
-        self.launch_full(request, cx);
+        }
     }
 
     fn launch_full(&mut self, request: ExportRequest, cx: &mut Context<Self>) {
@@ -1797,6 +1824,7 @@ mod tests {
             label: table.to_owned(),
             context: "笔记 / main".to_owned(),
             preview_bytes: Some(crate::grid::DEFAULT_PREVIEW_BYTES),
+            condition: Default::default(),
         }
     }
 
@@ -1819,6 +1847,29 @@ mod tests {
         assert_eq!(pane.mapping(), &fresh);
     }
 
+    /// 全表导出必须带界面已应用的那份条件：否则导出的是整张表，而不是用户看到的那组行。
+    #[test]
+    fn full_export_carries_the_applied_filter_condition() {
+        let mut pane = exchange_pane();
+        let mut source = table_source("customers", &["id", "name"]);
+        source.condition = ExchangeCondition {
+            filters: Vec::new(),
+            search: Some("甲".to_owned()),
+            expression: Some("id > 2".to_owned()),
+        };
+        assert!(source.condition.narrowing());
+        pane.bind_source(source);
+        let request = pane.full_request(pane.source().table.clone().expect("目标表"), std::path::PathBuf::from("/tmp/full.csv"));
+        assert_eq!(request.mode, "table-full");
+        assert_eq!(request.search.as_deref(), Some("甲"));
+        assert_eq!(request.filter_expression.as_deref(), Some("id > 2"), "SQL 条件跟着全表导出走");
+        assert!(request.filters.is_empty());
+        // 没有条件时不带任何筛选：全表就是全表。
+        pane.bind_source(table_source("customers", &["id", "name"]));
+        let plain = pane.full_request(pane.source().table.clone().expect("目标表"), std::path::PathBuf::from("/tmp/plain.csv"));
+        assert!(plain.search.is_none() && plain.filter_expression.is_none() && plain.filters.is_empty());
+    }
+
     fn query_source(running: bool) -> ExchangeSource {
         ExchangeSource {
             kind: ExchangeSourceKind::Query,
@@ -1831,6 +1882,7 @@ mod tests {
             label: "查询结果".to_owned(),
             context: "笔记 / main".to_owned(),
             preview_bytes: None,
+            condition: Default::default(),
         }
     }
 
@@ -2085,6 +2137,7 @@ mod unified_state_tests {
             label: "orders".to_owned(),
             context: "笔记 / main".to_owned(),
             preview_bytes: None,
+            condition: Default::default(),
         }
     }
 
@@ -2100,6 +2153,7 @@ mod unified_state_tests {
             label: "结果".to_owned(),
             context: "笔记 / main".to_owned(),
             preview_bytes: None,
+            condition: Default::default(),
         }
     }
 

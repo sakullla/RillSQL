@@ -2397,6 +2397,8 @@ impl Workbench {
                     context: pane.exchange_context(),
                     // 查询结果是完整值，没有经过预览截断：协议形状的普通文本照原值导出。
                     preview_bytes: None,
+                    // 查询结果没有可重读的表：网格不会借 SQL 筛选重跑语句，导出口径就是这些已读取行。
+                    condition: Default::default(),
                 }
             }
             ExchangeSourceKind::Table => {
@@ -2426,6 +2428,7 @@ impl Workbench {
                         label: String::new(),
                         context: String::new(),
                         preview_bytes: None,
+                        condition: Default::default(),
                     };
                 }
                 let rows = if include_rows { self.table.read(cx).exchange_sheet().2 } else { Vec::new() };
@@ -2452,6 +2455,8 @@ impl Workbench {
                     label,
                     context,
                     preview_bytes: Some(preview_bytes),
+                    // 全表导出带的就是这一份已应用条件，导出与分页、计数同口径。
+                    condition: self.table.read(cx).exchange_condition(),
                 }
             }
         }

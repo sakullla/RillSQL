@@ -241,15 +241,133 @@ fn searchable_family(type_name: &str) -> bool {
 
 /// compile_where 的搜索叠加形态：筛选条件与整表关键字 AND 组合，分页与计数共用。
 pub fn compile_where_with_search(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> Result<String, String> {
+    compile_where_with_condition(schema, filters, search, None)
+}
+
+/// 已应用条件的统一拼装：可视化条件、整表关键字与直接 SQL 表达式都进同一个 WHERE。
+/// 直接表达式整体加括号后再 AND，保证它自己的 OR 不会串到别的条件上。
+pub fn compile_where_with_condition(
+    schema: &TableSchema,
+    filters: &[Filter],
+    search: Option<&str>,
+    expression: Option<&str>,
+) -> Result<String, String> {
     let mut where_sql = compile_where(schema, filters)?;
     if let Some(clause) = search.and_then(|keyword| search_clause(schema.engine, &schema.columns, keyword)) {
-        if where_sql.is_empty() {
-            where_sql = clause;
-        } else {
-            where_sql = format!("{where_sql} AND {clause}");
+        where_sql = and_part(where_sql, clause);
+    }
+    if let Some(raw) = expression {
+        match gate_filter_expression(engine_key(schema.engine), raw) {
+            // 表达式独占一行再包括号：用户末尾的行注释不会把括号和后面的子句吃掉。
+            Ok(Some(text)) => where_sql = and_part(where_sql, format!("(\n{text}\n)")),
+            Ok(None) => {}
+            Err(refusal) => return Err(refusal.message(crate::i18n::Locale::ZhCn)),
         }
     }
     Ok(where_sql)
+}
+
+fn and_part(left: String, right: String) -> String {
+    if left.is_empty() {
+        right
+    } else {
+        format!("{left} AND {right}")
+    }
+}
+
+/// 引擎名：和连接、查询词法用的字符串保持一致。
+pub fn engine_key(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "postgres",
+        Engine::Mysql => "mysql",
+        Engine::Mariadb => "mariadb",
+        Engine::Sqlite => "sqlite",
+        Engine::Sqlserver => "sqlserver",
+        Engine::Redis => "redis",
+        Engine::Mongodb => "mongodb",
+    }
+}
+
+/// 直接 SQL 表达式被拒绝的原因：键给界面翻成当前语言，token 是触发它的那个词。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExprRefusal {
+    pub key: &'static str,
+    pub token: String,
+}
+
+impl ExprRefusal {
+    fn new(key: &'static str, token: impl Into<String>) -> Self {
+        Self { key, token: token.into() }
+    }
+
+    pub fn message(&self, locale: crate::i18n::Locale) -> String {
+        crate::i18n::fill(&crate::i18n::text(locale, self.key), &[("token", &self.token)])
+    }
+}
+
+/// 写、DDL、事务和客户端控制语句：它们不能出现在 WHERE 表达式里，任何括号层都不行。
+const EXPR_FORBIDDEN: [&str; 34] = [
+    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "GRANT", "REVOKE",
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET", "RESET", "DECLARE", "PREPARE", "EXECUTE", "EXEC", "CALL", "DO", "VACUUM",
+    "ANALYZE", "PRAGMA", "ATTACH", "DETACH", "LOCK", "USE",
+];
+
+/// 筛选表达式闸门：空表达式表示无条件；其余必须是一段可放进 WHERE 的布尔表达式。
+/// 这是命令边界上的词法检查：拒绝未闭合文本、客户端指令、多语句、分号分隔、
+/// 字符串与引用标识符之外的写/DDL/事务关键字，以及顶层 SELECT（括号内的只读子查询保留）。
+/// 它不做沙箱化，数据库仍是语法与语义的最终校验者。
+pub fn gate_filter_expression(engine: &str, raw: &str) -> Result<Option<String>, ExprRefusal> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // 末尾补一个换行：表达式最后一行是行注释时它仍然完整，不该被当成没闭合。
+    let (tokens, open) = crate::query::complete::tokens(&format!("{trimmed}\n"));
+    if open {
+        return Err(ExprRefusal::new("grid.filter.sqlUnclosed", ""));
+    }
+    // 行首的 \d、\i 这类客户端指令不是条件，原样报给界面。
+    if trimmed.starts_with('\u{5c}') {
+        return Err(ExprRefusal::new("grid.filter.sqlRefused", trimmed.lines().next().unwrap_or_default().trim().to_owned()));
+    }
+    let mut depth = 0usize;
+    for token in &tokens {
+        // 引用标识符里的词不是关键字，按原文放行。
+        if token.word && !token.quoted {
+            let upper = token.text.to_ascii_uppercase();
+            if EXPR_FORBIDDEN.contains(&upper.as_str()) {
+                return Err(ExprRefusal::new("grid.filter.sqlWrite", upper));
+            }
+            if upper == "SELECT" && depth == 0 {
+                return Err(ExprRefusal::new("grid.filter.sqlSelect", upper));
+            }
+            continue;
+        }
+        match token.text.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                if depth == 0 {
+                    return Err(ExprRefusal::new("grid.filter.sqlUnbalanced", ")"));
+                }
+                depth -= 1;
+            }
+            ";" => return Err(ExprRefusal::new("grid.filter.sqlSemicolon", ";")),
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(ExprRefusal::new("grid.filter.sqlUnbalanced", "("));
+    }
+    // 客户端指令（\d、自定义结束符）与未闭合格块由 query 的语句扫描拒绝。
+    let report = crate::query::split_sql(engine, trimmed);
+    if let Some(reason) = report.refusal {
+        return Err(ExprRefusal::new("grid.filter.sqlRefused", reason));
+    }
+    let statements = report.pieces.iter().filter(|piece| !piece.text.trim().is_empty()).count();
+    if statements > 1 {
+        return Err(ExprRefusal::new("grid.filter.sqlMulti", ""));
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 pub fn browse_sql(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {

@@ -1,4 +1,6 @@
-use super::sql::{browse_sql, browse_sql_with_search, compile_where, compile_where_with_search, quote_ident, search_clause};
+use super::sql::{
+    browse_sql, browse_sql_with_search, compile_where, compile_where_with_condition, compile_where_with_search, gate_filter_expression, quote_ident, search_clause,
+};
 use super::store::{customers_fixture, matches, query_page, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 fn col(name: &str, type_name: &str) -> Column {
@@ -314,4 +316,93 @@ fn later_pages_keep_conditions_and_shift_only_the_window() {
     let searched = query_page(&store, &filters, Some(&sort), 0, 50).unwrap();
     assert_eq!(searched.matched, 40);
     assert!(!searched.truncated);
+}
+/// 表达式闸门：空表达式就是无条件；合法表达式原样（去空白）通过。
+#[test]
+fn direct_expression_gate_accepts_plain_and_structured_expressions() {
+    let gate = |text: &str| gate_filter_expression("postgres", text);
+    assert_eq!(gate("   ").unwrap(), None);
+    assert_eq!(gate("").unwrap(), None);
+    assert_eq!(gate(" id > 10 ").unwrap().as_deref(), Some("id > 10"));
+    // AND / OR / 括号 / IN / NULL / 函数都能通过；括号内的只读子查询保留。
+    for text in [
+        "id > 10 AND name LIKE 'a%'",
+        "id = 1 OR id = 2",
+        "(id > 1 OR id < 5) AND note IS NULL",
+        "name IN ('a', 'b')",
+        "note IS NOT NULL AND note <> ''",
+        "lower(name) = 'x'",
+        "id > (SELECT min(id) FROM customers)",
+        "name = 'a;b'",
+        "created_at > now() - interval '1 day'",
+        "-- 只读注释\nid > 1",
+    ] {
+        assert!(gate(text).is_ok(), "{text}");
+    }
+    // 字符串里的分号、关键字和 SELECT 都不是语句，不能被误判。
+    assert_eq!(gate("name = 'DROP TABLE x; SELECT 1'").unwrap().as_deref(), Some("name = 'DROP TABLE x; SELECT 1'"));
+    assert!(gate("\"select\" = 1").is_ok(), "引用标识符里的词不是关键字");
+    assert!(gate("\u{60}update\u{60} = 1").is_ok());
+}
+
+/// 表达式闸门：未闭合、多语句、分号、写入/DDL/事务关键字和顶层 SELECT 在发送前拒绝。
+#[test]
+fn direct_expression_gate_refuses_statements_and_unclosed_text() {
+    let refusal = |text: &str| gate_filter_expression("postgres", text).unwrap_err();
+    assert_eq!(refusal("name = 'oops").key, "grid.filter.sqlUnclosed");
+    assert_eq!(refusal("id > 1 /* 没关上").key, "grid.filter.sqlUnclosed");
+    assert_eq!(refusal("id > (1").key, "grid.filter.sqlUnbalanced");
+    assert_eq!(refusal("id > 1)").key, "grid.filter.sqlUnbalanced");
+    assert_eq!(refusal("id > 1;").key, "grid.filter.sqlSemicolon");
+    assert_eq!(refusal("id = 1; DELETE FROM customers").key, "grid.filter.sqlSemicolon");
+    assert_eq!(refusal("SELECT * FROM customers").key, "grid.filter.sqlSelect");
+    assert_eq!(refusal("insert into customers values (1)").key, "grid.filter.sqlWrite");
+    assert_eq!(refusal("id = 1 AND (SELECT 1 FROM t WHERE DELETE)").key, "grid.filter.sqlWrite");
+    assert_eq!(refusal("id = 1 UNION DROP TABLE customers").key, "grid.filter.sqlWrite");
+    assert_eq!(refusal("BEGIN").key, "grid.filter.sqlWrite");
+    assert_eq!(refusal("id > 1 COMMIT").key, "grid.filter.sqlWrite");
+    // \d 这类客户端指令不是条件。
+    assert_eq!(refusal("\\d customers").key, "grid.filter.sqlRefused");
+    // 用 GO 或结束符分开的两段同样是多条语句，一律拒绝。
+    assert_eq!(gate_filter_expression("sqlserver", "id > 1\nGO\nid > 2").unwrap_err().key, "grid.filter.sqlMulti");
+    assert_eq!(gate_filter_expression("postgres", "id > 1;\nid > 2").unwrap_err().key, "grid.filter.sqlSemicolon");
+}
+
+/// 结构化条件与它生成的 SQL 等价：同一批行，同一份 WHERE。
+#[test]
+fn structured_conditions_and_their_sql_stay_equivalent() {
+    let schema = schema_of(Engine::Postgres);
+    let filters = [
+        Filter { column: "id".to_owned(), op: FilterOp::Gt, value: Some("10".to_owned()), second: None, values: Vec::new() },
+        Filter { column: "name".to_owned(), op: FilterOp::Null, value: None, second: None, values: Vec::new() },
+    ];
+    let generated = compile_where(&schema, &filters).unwrap();
+    assert_eq!(generated, "\"id\" > 10 AND \"name\" IS NULL");
+    // 直接表达式整体加括号后再拼，自己的 OR 不会串到关键字条件上。
+    let combined = compile_where_with_condition(&schema, &[], Some("小河"), Some(&generated)).unwrap();
+    assert_eq!(
+        combined,
+        format!("{} AND (\n{generated}\n)", search_clause(Engine::Postgres, &schema.columns, "小河").unwrap())
+    );
+    // 结构化条件与关键字组合的既有形态不变。
+    assert_eq!(
+        compile_where_with_condition(&schema, &filters, Some("小河"), None).unwrap(),
+        compile_where_with_search(&schema, &filters, Some("小河")).unwrap()
+    );
+    // 空表达式等于没有条件；被拒绝的表达式不会拼进语句。
+    assert_eq!(compile_where_with_condition(&schema, &filters, None, Some("   ")).unwrap(), generated);
+    assert!(compile_where_with_condition(&schema, &[], None, Some("id = 1; DROP TABLE customers")).is_err());
+}
+
+/// 直接表达式与结构化条件读到同一批行：计数与分页用的都是同一份 WHERE。
+#[test]
+fn direct_expression_page_matches_the_structured_page() {
+    let store = customers_fixture(40);
+    let filters = [cmp("id", FilterOp::Gt, "20")];
+    let structured = query_page(&store, &filters, None, 0, 100).unwrap();
+    let expression = compile_where(&store.schema, &filters).unwrap();
+    let via_sql = compile_where_with_condition(&store.schema, &[], None, Some(&expression)).unwrap();
+    assert!(via_sql.starts_with("(\n") && via_sql.trim_end().ends_with(')'), "{via_sql}");
+    assert_eq!(structured.matched, 20);
+    assert!(compile_where_with_condition(&store.schema, &[], Some("备注"), Some("id > 20")).unwrap().contains(" AND "));
 }

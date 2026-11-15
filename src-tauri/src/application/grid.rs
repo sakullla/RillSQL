@@ -36,6 +36,7 @@ pub async fn describe(service: &Service, request: &TableRef) -> Result<SchemaDto
 pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, String> {
     let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
+    let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
     let session = session_of(service, &request.table.connection_id)?;
     let page = query_page_search_preview(
@@ -47,6 +48,7 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
         &filters,
         sort.as_ref(),
         request.search.as_deref(),
+        expression.as_deref(),
         request.offset,
         request.limit,
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
@@ -58,11 +60,22 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
 pub async fn page_described(service: &Service, request: &PageRequest, schema: &crate::grid::TableSchema) -> Result<PageDto, String> {
     let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
+    let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
     let session = session_of(service, &request.table.connection_id)?;
-    let page = crate::grid::query_page_with_schema(&session, schema, &filters, sort.as_ref(), request.search.as_deref(), request.offset, request.limit,
+    let page = crate::grid::query_page_with_schema(&session, schema, &filters, sort.as_ref(), request.search.as_deref(), expression.as_deref(), request.offset, request.limit,
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1)).await?;
     Ok(page_dto(page))
+}
+
+/// 直接 SQL 筛选表达式在命令边界上再走一次闸门：界面已经校验过，这里不信任调用方。
+/// 空表达式就是没有条件；被拒绝时返回原因，调用方不能发出这条读取。
+fn expression_of(engine: &str, expression: Option<&str>) -> Result<Option<String>, String> {
+    match expression {
+        None => Ok(None),
+        Some(raw) => crate::grid::gate_filter_expression(engine, raw)
+            .map_err(|refusal| refusal.message(crate::i18n::Locale::ZhCn)),
+    }
 }
 
 fn page_dto(page: crate::grid::LivePage) -> PageDto {
@@ -86,6 +99,7 @@ fn page_dto(page: crate::grid::LivePage) -> PageDto {
 pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto, String> {
     let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
+    let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let session = session_of(service, &request.table.connection_id)?;
     let matched = count_rows_search(
         &session,
@@ -95,6 +109,7 @@ pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto
         &request.table.engine,
         &filters,
         request.search.as_deref(),
+        expression.as_deref(),
     )
     .await?;
     Ok(CountDto { matched })
@@ -103,6 +118,7 @@ pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto
 pub async fn export(service: &Service, request: &ExportRequest) -> Result<ExportDto, String> {
     let mode = export_mode(&request.mode)?;
     let filters = filters_of(&request.filters)?;
+    let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
     let session = session_of(service, &request.table.connection_id)?;
     let spec = ExportSpec {
@@ -115,6 +131,7 @@ pub async fn export(service: &Service, request: &ExportRequest) -> Result<Export
         filters,
         sort,
         search: request.search.clone(),
+        filter_expression: expression,
         limit: request.limit,
         truncated: request.truncated,
         statement: request.statement.clone(),

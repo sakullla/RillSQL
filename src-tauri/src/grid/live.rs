@@ -85,6 +85,8 @@ pub struct ExportSpec {
     pub sort: Option<Sort>,
     /// 整表关键字（R3）。table 模式的全量导出与网格读到同一组行，口径一致。
     pub search: Option<String>,
+    /// 已应用的直接 SQL 筛选表达式（R13）；与结构化条件互斥，和关键词一起进同一个 WHERE。
+    pub filter_expression: Option<String>,
     pub limit: u64,
     pub truncated: bool,
     pub statement: String,
@@ -180,10 +182,11 @@ pub async fn query_page_search(
     offset: u64,
     limit: u64,
 ) -> Result<LivePage, String> {
-    query_page_search_preview(session, database, schema_name, table, engine_hint, filters, sort, search, offset, limit, 1024).await
+    query_page_search_preview(session, database, schema_name, table, engine_hint, filters, sort, search, None, offset, limit, 1024).await
 }
 
 /// 与 query_page_search 相同，但大字段预览的上限来自设置 preview_kb。
+/// expression 是已应用的直接 SQL 条件（R13），与结构化条件、关键词处在同一份 WHERE 里。
 #[allow(clippy::too_many_arguments)]
 pub async fn query_page_search_preview(
     session: &CatalogSession,
@@ -194,18 +197,19 @@ pub async fn query_page_search_preview(
     filters: &[Filter],
     sort: Option<&Sort>,
     search: Option<&str>,
+    expression: Option<&str>,
     offset: u64,
     limit: u64,
     preview_bytes: usize,
 ) -> Result<LivePage, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
-    query_page_with_schema(session, &schema, filters, sort, search, offset, limit, preview_bytes).await
+    query_page_with_schema(session, &schema, filters, sort, search, expression, offset, limit, preview_bytes).await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn query_page_with_schema(
     session: &CatalogSession, schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>,
-    search: Option<&str>, offset: u64, limit: u64, preview_bytes: usize,
+    search: Option<&str>, expression: Option<&str>, offset: u64, limit: u64, preview_bytes: usize,
 ) -> Result<LivePage, String> {
     let limit = limit.min(MAX_PAGE);
     if let Some(sort) = sort {
@@ -213,11 +217,11 @@ pub async fn query_page_with_schema(
             return Err(format!("未知排序列 {}", sort.column));
         }
     }
-    let display = page_sql(schema, filters, search, sort, limit, offset, preview_bytes)?;
+    let display = page_sql(schema, filters, search, expression, sort, limit, offset, preview_bytes)?;
     if limit == 0 {
         return Ok(LivePage { rows: Vec::new(), truncated: false, sql: display });
     }
-    let executed = page_sql(schema, filters, search, sort, limit.saturating_add(1), offset, preview_bytes)?;
+    let executed = page_sql(schema, filters, search, expression, sort, limit.saturating_add(1), offset, preview_bytes)?;
     let width = schema.columns.len();
     let mut fetched = fetch_cells(session, &executed, width).await?;
     let truncated = fetched.len() as u64 > limit;
@@ -241,10 +245,12 @@ pub async fn count_rows(
     engine_hint: &str,
     filters: &[Filter],
 ) -> Result<i64, String> {
-    count_rows_search(session, database, schema_name, table, engine_hint, filters, None).await
+    count_rows_search(session, database, schema_name, table, engine_hint, filters, None, None).await
 }
 
 /// count_rows 的整表关键字形态（R3）：统计行数与分页读到同一组行。
+/// expression 与分页使用同一份已应用条件（R13）。
+#[allow(clippy::too_many_arguments)]
 pub async fn count_rows_search(
     session: &CatalogSession,
     database: &str,
@@ -253,9 +259,10 @@ pub async fn count_rows_search(
     engine_hint: &str,
     filters: &[Filter],
     search: Option<&str>,
+    expression: Option<&str>,
 ) -> Result<i64, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
-    let sql = count_sql(&schema, filters, search)?;
+    let sql = count_sql(&schema, filters, search, expression)?;
     fetch_count(session, &sql).await
 }
 
@@ -489,9 +496,9 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             };
             let partial = spec.mode == ExportMode::TableLoaded && spec.truncated;
             let sql = match if spec.mode == ExportMode::TableFull {
-                page_sql_unlimited(&schema, &spec.filters, spec.search.as_deref(), spec.sort.as_ref())
+                page_sql_unlimited(&schema, &spec.filters, spec.search.as_deref(), spec.filter_expression.as_deref(), spec.sort.as_ref())
             } else {
-                page_sql_full(&schema, &spec.filters, spec.search.as_deref(), spec.sort.as_ref(), spec.limit)
+                page_sql_full(&schema, &spec.filters, spec.search.as_deref(), spec.filter_expression.as_deref(), spec.sort.as_ref(), spec.limit)
             } {
                 Ok(sql) => sql,
                 Err(message) => return failed_message(message),
@@ -1104,14 +1111,16 @@ fn residual(written: u64, path: &Path, message: &str) -> ExportOutcome {
     }
 }
 
-fn page_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64, offset: u64, preview_bytes: usize) -> Result<String, String> {
-    let (body, ordered) = page_body(schema, filters, search, sort, false, preview_bytes)?;
+#[allow(clippy::too_many_arguments)]
+fn page_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>, sort: Option<&Sort>, limit: u64, offset: u64, preview_bytes: usize) -> Result<String, String> {
+    let (body, ordered) = page_body(schema, filters, search, expression, sort, false, preview_bytes)?;
     let tail = sql::page_tail(schema.engine, limit, offset, ordered);
     Ok(format!("{body}{tail}"))
 }
 
-fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64) -> Result<String, String> {
-    let (body, ordered) = page_body(schema, filters, search, sort, true, 1024)?;
+#[allow(clippy::too_many_arguments)]
+fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>, sort: Option<&Sort>, limit: u64) -> Result<String, String> {
+    let (body, ordered) = page_body(schema, filters, search, expression, sort, true, 1024)?;
     let tail = if schema.engine == Engine::Sqlserver {
         sql::page_tail(schema.engine, limit, 0, ordered)
     } else {
@@ -1120,21 +1129,22 @@ fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>,
     Ok(format!("{body}{tail}"))
 }
 
-fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>) -> Result<String, String> {
-    page_body(schema, filters, search, sort, true, 1024).map(|(sql, _)| sql)
+fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>, sort: Option<&Sort>) -> Result<String, String> {
+    page_body(schema, filters, search, expression, sort, true, 1024).map(|(sql, _)| sql)
 }
 
-fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, full: bool, preview_bytes: usize) -> Result<(String, bool), String> {
+#[allow(clippy::too_many_arguments)]
+fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>, sort: Option<&Sort>, full: bool, preview_bytes: usize) -> Result<(String, bool), String> {
     let list = sql::select_list_preview(schema, full || sql::reads_full_values(schema, filters), preview_bytes);
-    let where_sql = sql::compile_where_with_search(schema, filters, search)?;
+    let where_sql = sql::compile_where_with_condition(schema, filters, search, expression)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     let order = order_clause(schema, sort);
     let ordered = order.starts_with(" ORDER BY");
     Ok((format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order), ordered))
 }
 
-fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> Result<String, String> {
-    let where_sql = sql::compile_where_with_search(schema, filters, search)?;
+fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>) -> Result<String, String> {
+    let where_sql = sql::compile_where_with_condition(schema, filters, search, expression)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     let count = match schema.engine {
         Engine::Postgres => "COUNT(*)::bigint",

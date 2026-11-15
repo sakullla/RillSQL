@@ -151,11 +151,11 @@ fn filter_arg(op: &str) -> FilterArg {
 }
 
 fn page_request(op: &str) -> PageRequest {
-    PageRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None }
+    PageRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None, filter_expression: None }
 }
 
 fn count_request(op: &str) -> CountRequest {
-    CountRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], search: None }
+    CountRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], search: None, filter_expression: None }
 }
 
 fn export_request(mode: &str, op: &str) -> ExportRequest {
@@ -166,6 +166,7 @@ fn export_request(mode: &str, op: &str) -> ExportRequest {
         filters: vec![filter_arg(op)],
         sort: None,
         search: None,
+        filter_expression: None,
         limit: 10,
         truncated: false,
         statement: String::new(),

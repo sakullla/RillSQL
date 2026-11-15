@@ -158,6 +158,9 @@ pub struct GridPane {
     /// 筛选条每一行的取值输入（值、上界/集合）；结构变化时整体重建。
     filter_inputs: Vec<FilterRowInputs>,
     filter_subscriptions: Vec<gpui_kit::Subscription>,
+    /// 直接 SQL 条件输入框与它的订阅：与结构化条件的输入框分开保存，切换形态不丢文本。
+    sql_input: Option<Entity<InputState>>,
+    sql_subscription: Option<gpui_kit::Subscription>,
     search: Option<Entity<InputState>>,
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
     clear_search: bool,
@@ -327,6 +330,8 @@ impl GridPane {
             connect_request: None,
             filter_inputs: Vec::new(),
             filter_subscriptions: Vec::new(),
+            sql_input: None,
+            sql_subscription: None,
             search: None,
             clear_search: false,
             pending_full: None,
@@ -533,6 +538,16 @@ impl GridPane {
     }
 
     pub fn exchange_metadata(&self) -> (Option<TableRef>, Vec<String>, bool) { self.session.exchange_metadata() }
+
+    /// 交换/导出看到的那份已应用条件：分页、计数、全表导出共用，不再各算一套。
+    pub fn exchange_condition(&self) -> crate::app::views::export::ExchangeCondition {
+        let filters = self.session.filter_args().unwrap_or_default();
+        crate::app::views::export::ExchangeCondition {
+            filters,
+            search: self.session.server_search(),
+            expression: self.session.applied_expression(),
+        }
+    }
 
     pub fn exchange_stamp(&self) -> (GridTarget, (u64, usize, u64, bool), bool) {
         (self.session.target.clone(), self.session.exchange_stamp(), self.fetching)
@@ -1456,8 +1471,10 @@ impl GridPane {
     }
 
     /// 应用筛选条里的全部条件；非法输入只提示原因，不发查询也不清旧结果。
+    /// 表目标在线时条件要等这次读取成功才成为已应用来源，线上失败就回滚。
     pub fn apply_filters(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        match self.session.apply_filters() {
+        let awaits_read = self.live_target();
+        match self.session.apply_filters(awaits_read) {
             Ok(()) => {
                 self.notice.clear();
                 self.reload_after_condition_change(cx);
@@ -1625,6 +1642,54 @@ impl GridPane {
         }
         self.filter_inputs = inputs;
         self.filter_subscriptions = subscriptions;
+    }
+
+    /// 直接 SQL 条件的输入框：按需创建一次，之后每帧把会话里的文本（模式切换生成、
+    /// 清除条件）同步回来；输入变化只改草稿，回车才应用。
+    fn ensure_sql_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.sql_input.clone() {
+            let current = state.read(cx).value().to_string();
+            let wanted = self.session.filter_sql().to_owned();
+            if current != wanted {
+                state.update(cx, |state, cx| state.set_value(wanted, window, cx));
+            }
+            return;
+        }
+        let placeholder = SharedString::from(i18n::text(self.locale, "grid.filter.sqlPlaceholder"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        state.update(cx, |state, cx| state.set_value(self.session.filter_sql().to_owned(), window, cx));
+        let subscription = cx.subscribe(&state, |this, state, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                let text = state.read(cx).value().to_string();
+                if this.session.set_filter_sql(&text) {
+                    cx.notify();
+                }
+            }
+            // 只有显式应用才发查询；非法表达式停在这里。
+            InputEvent::PressEnter { .. } => {
+                let _ = this.apply_filters(cx);
+            }
+            _ => {}
+        });
+        self.sql_input = Some(state);
+        self.sql_subscription = Some(subscription);
+    }
+
+    /// 切换条件写法：只换编辑形态，不读取、不丢另一种写法的草稿；被拒绝时说明原因。
+    pub fn pick_filter_mode(&mut self, mode: session::FilterMode, cx: &mut Context<Self>) -> bool {
+        match self.session.switch_filter_mode(mode) {
+            Ok(()) => {
+                self.notice.clear();
+                cx.notify();
+                true
+            }
+            Err(reason) => {
+                self.notice = reason;
+                self.sync_table(cx);
+                cx.notify();
+                false
+            }
+        }
     }
 
     fn select_first_if_needed(&mut self) {
@@ -2182,6 +2247,8 @@ impl GridPane {
             // 整页替换：行内容与行集合都换了一套，记录面板的就地暂存不能跨过这次重读。
             self.record_row_changed();
             self.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
+            // 读取成功才把这次的条件换成已应用来源：失败时 pending 已在失败路径丢掉。
+            self.session.commit_applied_filter();
             // 新的一页真的到了才换窗口；失败路径不动选择、滚动和偏移。
             if landed_page {
                 self.session.reset_page_view();
@@ -2204,6 +2271,8 @@ impl GridPane {
         self.fetching = false;
         self.pending_page = None;
         self.notice = message.clone();
+        // 这次读取失败：草稿、上一次已应用条件和旧结果都留着，条件不算应用成功。
+        self.session.discard_pending_filter();
         if stale {
             // 换了表又读失败：旧快照丢掉，但这次失败的原因要留下，
             // 否则空网格会被画成“表里没有行”，把读取失败说成了空表。
@@ -2462,10 +2531,37 @@ fn count_of(request: &PageRequest) -> CountRequest {
             })
             .collect(),
         search: request.search.clone(),
+        filter_expression: request.filter_expression.clone(),
     }
 }
 
 use crate::ui::kit::stack_frame;
+
+/// 条件行里的列名：太长就截断成可辨认的前缀，完整名字走悬停提示。
+fn shorten_column(name: &str) -> String {
+    const LIMIT: usize = 24;
+    if name.chars().count() <= LIMIT {
+        return name.to_owned();
+    }
+    let head = name.chars().take(LIMIT - 1).collect::<String>();
+    format!("{head}…")
+}
+
+/// 筛选区里的说明行：非法原因或模式说明。整行占满并换行，长错误不会被裁成半句。
+fn filter_note(id: &'static str, text: String, color: gpui_kit::Hsla) -> gpui_kit::AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(4.))
+        .text_size(px(TypeScale::SM))
+        .text_color(color)
+        .child(div().flex_none().mt(px(1.)).child(kit::icon(IconName::Info, 12., color)))
+        .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
+        .into_any_element()
+}
 
 impl Render for GridPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3006,38 +3102,39 @@ impl GridPane {
         )
     }
 
-    /// 筛选条：每条条件可辨认、可换条件、可改值、可单删；非法原因和全清也在这里。
+    /// 筛选区：形态切换、条件行、添加/删除、应用与清除在同一处。
+    /// 三段宽度下动作都可达：动作靠右，条件与说明各自换行，长列名与长错误都不裁掉关键信息。
     #[inline(never)]
     fn render_filters(&mut self, p: &Palette, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        // 没有列就没有可筛选的东西；有列时这条常驻，SQL 形态也才有入口。
+        if self.session.column_names().is_empty() {
+            return None;
+        }
+        let mode = self.session.filter_mode();
         let unapplied = self.session.unapplied_filters();
         let drafts = self.session.filters().to_vec();
         let filter_error = self.session.filter_error().map(str::to_owned);
-        if drafts.is_empty() && filter_error.is_none() {
-            return None;
-        }
+        let hint = self.session.filter_hint().map(str::to_owned);
         self.ensure_filter_inputs(window, cx);
-        let mut strip = div()
-            .id("grid-filters")
-            .flex_none()
-            .px(px(10.))
-            .py(px(3.))
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .border_b_1()
-            .border_color(p.line)
-            .bg(p.chrome)
-            .child(div().id("grid-filter-title").tooltip_text(t("grid.filter.title")).child(kit::icon(IconName::Funnel, 13., p.text_muted)));
-        for (index, draft) in drafts.iter().enumerate() {
-            // 条件之间是“且”：写出来，避免误以为是“或”。
-            if index > 0 {
-                strip = strip.child(div().text_size(px(TypeScale::XS)).font_weight(gpui_kit::FontWeight::MEDIUM).text_color(p.text_faint).child(t("grid.filter.and")));
-            }
-            strip = strip.child(self.render_filter_row(index, draft, p, entity));
-        }
+        self.ensure_sql_input(window, cx);
+        let pick_mode = |target: session::FilterMode| {
+            let entity = entity.clone();
+            kit::click(move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |pane, cx| {
+                    pane.pick_filter_mode(target, cx);
+                });
+            })
+        };
+        let modes = kit::segmented_sized(
+            vec![
+                (SharedString::from("grid-filter-mode-visual"), t("grid.filter.modeVisual"), mode == session::FilterMode::Visual, pick_mode(session::FilterMode::Visual)),
+                (SharedString::from("grid-filter-mode-sql"), t("grid.filter.modeSql"), mode == session::FilterMode::Sql, pick_mode(session::FilterMode::Sql)),
+            ],
+            p,
+            22.,
+        );
         let apply = {
             let entity = entity.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
@@ -3062,17 +3159,120 @@ impl GridPane {
                 });
             }
         };
-        strip = strip
-            .child(kit::icon_button("grid-filter-add-strip", IconName::Plus, t("grid.filter.add"), add))
-            // 有未应用的条件时"应用"变成主按钮：这里才是让条件真正生效的一步。
+        let mut header = div()
+            .id("grid-filter-header")
+            .debug_selector(|| "grid-filter-header".to_owned())
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .id("grid-filter-title")
+                    .flex()
+                    .items_center()
+                    .tooltip_text(t("grid.filter.modeHint"))
+                    .child(kit::icon(IconName::Funnel, 13., p.text_muted)),
+            )
+            .child(modes);
+        if unapplied {
+            // 条件改了还没应用：与条件行里的圆点同一个意思，这里靠动作一侧也能看见。
+            header = header.child(
+                div()
+                    .id("grid-filter-unapplied-badge")
+                    .debug_selector(|| "grid-filter-unapplied-badge".to_owned())
+                    .mx(px(2.))
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(p.accent)
+                    .tooltip_text(t(if mode == session::FilterMode::Sql { "grid.filter.sqlUnapplied" } else { "grid.filter.unapplied" })),
+            );
+        }
+        header = header
+            .child(div().flex_1().min_w(px(0.)))
+            .children((mode == session::FilterMode::Visual).then(|| kit::icon_button("grid-filter-add-strip", IconName::Plus, t("grid.filter.add"), add).into_any_element()))
+            // 有未应用的条件时"应用"是主按钮：这里才是让条件真正生效的一步。
             .child(if unapplied {
                 kit::primary_button("grid-filter-apply", Some(IconName::Check), t("grid.filter.apply"), apply.clone()).into_any_element()
             } else {
                 kit::icon_button("grid-filter-apply", IconName::Check, t("grid.filter.apply"), apply).into_any_element()
             })
             .child(kit::icon_button("grid-filter-clear", IconName::X, t("grid.filter.clearAll"), clear));
+        let mut strip = div()
+            .id("grid-filters")
+            .debug_selector(|| "grid-filters".to_owned())
+            .flex_none()
+            .px(px(10.))
+            .py(px(3.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(p.line)
+            .bg(p.chrome)
+            .child(header);
+        if mode == session::FilterMode::Visual {
+            let mut rows = div()
+                .id("grid-filter-rows")
+                .debug_selector(|| "grid-filter-rows".to_owned())
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.));
+            for (index, draft) in drafts.iter().enumerate() {
+                // 条件之间是“且”：写出来，避免误以为是“或”。
+                if index > 0 {
+                    rows = rows.child(
+                        div()
+                            .text_size(px(TypeScale::XS))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(p.text_faint)
+                            .child(t("grid.filter.and")),
+                    );
+                }
+                rows = rows.child(self.render_filter_row(index, draft, p, entity));
+            }
+            if drafts.is_empty() {
+                rows = rows.child(
+                    div()
+                        .id("grid-filter-empty")
+                        .text_size(px(TypeScale::SM))
+                        .text_color(p.text_faint)
+                        .child(t("grid.filter.emptyVisual")),
+                );
+            }
+            strip = strip.child(rows);
+        } else {
+            let mut row = div()
+                .id("grid-filter-sql-row")
+                .debug_selector(|| "grid-filter-sql-row".to_owned())
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(6.));
+            if let Some(state) = self.sql_input.clone() {
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(120.))
+                        .child(kit::text_input("grid-filter-sql-input", &state, t("grid.filter.sqlPlaceholder")).appearance(false).xsmall()),
+                );
+            }
+            row = row.child(
+                div()
+                    .id("grid-filter-sql-hint")
+                    .flex_none()
+                    .tooltip_text(t("grid.filter.sqlHint"))
+                    .child(kit::icon(IconName::Info, 13., p.text_muted)),
+            );
+            strip = strip.child(row);
+        }
         if let Some(error) = filter_error {
-            strip = strip.child(div().max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(error)));
+            strip = strip.child(filter_note("grid-filter-error", error, p.danger));
+        } else if let Some(hint) = hint {
+            strip = strip.child(filter_note("grid-filter-hint", hint, p.text_muted));
         }
         Some(strip.into_any_element())
     }
@@ -3087,13 +3287,15 @@ impl GridPane {
                 entity.update(cx, |pane, cx| pane.remove_filter(index, cx));
             }
         };
-        // 列：下拉列出全部列，换列不丢掉已经输入的值。
+        // 列：下拉列出全部列，换列不丢掉已经输入的值。长列名在条件行里缩短，
+        // 完整名字留在悬停提示里，窄窗口下也不会把整个条件行撑破。
         let names = self.session.column_names();
         let column_entity = entity.clone();
+        let column_label = shorten_column(&draft.column);
         let column_picker = stack_frame(|| Button::new(SharedString::from(format!("grid-filter-column-{index}")))
             .ghost()
             .xsmall()
-            .label(SharedString::from(draft.column.clone()))
+            .label(SharedString::from(column_label))
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, _| {
                 for name in names.clone() {
@@ -3139,7 +3341,8 @@ impl GridPane {
             // 正在编辑、尚未应用的条件用强调边框标出来，避免把旧结果当成新条件的结果。
             .border_color(if draft.dirty { p.accent } else { p.line })
             .bg(p.raised)
-            .child(column_picker)
+            .max_w(px(420.))
+            .child(div().id(SharedString::from(format!("grid-filter-column-slot-{index}"))).max_w(px(180.)).min_w(px(0.)).flex_none().tooltip_text(draft.column.clone()).child(column_picker))
             .child(op_picker);
         if draft.dirty {
             row = row.child(
@@ -8153,5 +8356,257 @@ mod workbench_tests {
             assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Null, "NULL").is_none(), "NULL 不再额外提示");
         })
         .unwrap();
+    }
+}
+
+
+/// 筛选区（R4/R5/R12）的界面证据：三档宽度、双主题、密度与中英文下，
+/// 条件行、错误说明和动作都还在画面内；SQL 形态在真实读取上把条件交给数据库。
+#[cfg(test)]
+mod filter_ui_tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AnyWindowHandle, Bounds, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
+
+    const LONG_COLUMN: &str = "customer_note_with_a_very_long_column_name_超长列名";
+
+    fn target_of(table: &str) -> GridTarget {
+        GridTarget {
+            connection_id: "notes".to_owned(),
+            connection_name: "笔记".to_owned(),
+            database: "main".to_owned(),
+            schema: String::new(),
+            table: table.to_owned(),
+            engine: "sqlite".to_owned(),
+            environment: "dev".to_owned(),
+        }
+    }
+
+    fn open_at(cx: &mut TestAppContext, width: f32) -> (AnyWindowHandle, Entity<GridPane>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-filter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(width), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
+    fn sqlite_services(name: &str, statements: &[String]) -> (std::path::PathBuf, Arc<AppServices>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-filter-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("notes.sqlite");
+        let config = dir.clone();
+        let statements = statements.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime_for_views().spawn(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            for sql in statements {
+                sqlx::query(sqlx::AssertSqlSafe(sql.clone())).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite 夹具");
+        (dir, services)
+    }
+
+    fn open_with(cx: &mut TestAppContext, services: Arc<AppServices>) -> (AnyWindowHandle, Entity<GridPane>) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
+    fn wait_for_fetch(cx: &mut TestAppContext, window: AnyWindowHandle, pane: &Entity<GridPane>) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            let done = cx.update(|cx| !pane.read(cx).fetching && pane.read(cx).pending_page.is_none());
+            if done {
+                return true;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(20) {
+                return false;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn plant_long(pane: &Entity<GridPane>, cx: &mut App) {
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target_of("customers"),
+                vec![("id", "integer"), (LONG_COLUMN, "text")],
+                vec![
+                    vec![Some("1"), Some("甲")],
+                    vec![Some("2"), Some("乙")],
+                    vec![Some("3"), Some("丙")],
+                ],
+                "id",
+                cx,
+            );
+        });
+    }
+
+    /// 三档宽度 × 双主题 × 两档密度 × 中英文：长列名的条件行与很长的错误说明都不越界。
+    #[gpui_kit::test]
+    fn filter_strip_keeps_rows_errors_and_actions_inside_three_widths(cx: &mut TestAppContext) {
+        let long_error = i18n::text(Locale::ZhCn, "grid.filter.sqlQueryOnly").repeat(2);
+        for width in [1360., 900., 640.] {
+            for dark in [false, true] {
+                for metrics in [kit::Metrics::compact(), kit::Metrics::standard()] {
+                    for locale in [Locale::ZhCn, Locale::En] {
+                        let (window, pane) = open_at(cx, width);
+                        let mut visual = VisualTestContext::from_window(window, cx);
+                        visual.update(|window, cx| {
+                            metrics.publish(cx);
+                            kit::apply_theme(dark, cx);
+                            plant_long(&pane, cx);
+                            pane.update(cx, |pane, cx| {
+                                pane.set_locale(locale);
+                                // 一条长列名条件 + 一条未填值的条件：错误说明与条件行同时出现。
+                                pane.session.add_filter(LONG_COLUMN);
+                                pane.session.add_filter("id");
+                                pane.apply_filters(cx).expect_err("缺值必须被拒绝");
+                                let _ = long_error.len();
+                            });
+                            window.render_frame(cx);
+                        });
+                        let strip = visual.debug_bounds("grid-filters").expect("筛选区常驻");
+                        assert!(f32::from(strip.size.width) <= width + 1., "{width}/{dark}/{locale:?} 筛选区不能越界");
+                        let header = visual.debug_bounds("grid-filter-header").expect("动作行");
+                        assert!(f32::from(header.size.width) <= width + 1., "{width}/{dark}/{locale:?} 动作行不能越界");
+                        assert!(visual.debug_bounds("grid-filter-rows").is_some(), "{width}/{dark}/{locale:?} 条件行");
+                        assert!(visual.debug_bounds("grid-filter-error").is_some(), "{width}/{dark}/{locale:?} 错误说明");
+                        // 动作入口都在：添加、应用、清除。
+                        let _ = visual.debug_bounds("grid-filters");
+                        window_has(&pane, cx);
+                        // SQL 形态换成输入行，条件行让位但不丢草稿。这里只量布局，
+                        // 目标按在线处理（外壳每帧本来就把真实连接状态同步进来）。
+                        visual.update(|_, cx| {
+                            pane.update(cx, |pane, cx| {
+                                pane.session.set_target_live(true);
+                                assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx), "在线表可以切到 SQL 条件");
+                            });
+                        });
+                        visual.update(|window, cx| window.render_frame(cx));
+                        assert!(visual.debug_bounds("grid-filter-sql-row").is_some(), "{width}/{dark}/{locale:?} SQL 输入行");
+                        assert!(visual.debug_bounds("grid-filter-rows").is_none(), "SQL 形态不画可视化条件行");
+                    }
+                }
+            }
+        }
+    }
+
+    fn window_has(pane: &Entity<GridPane>, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.filters().len(), 2);
+            assert!(pane.session.filter_error().is_some());
+        });
+    }
+
+    /// 真实读取：SQL 条件落到数据库，分页、计数和导出拿到的是同一份已应用条件。
+    #[gpui_kit::test]
+    fn sql_condition_reaches_the_database_and_every_reader(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services(
+            "sql-mode",
+            &[
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".to_owned(),
+                "INSERT INTO items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')".to_owned(),
+            ],
+        );
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("items"), 100, cx));
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert_eq!(pane.loaded_len(), 4);
+                assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx));
+                pane.session.set_filter_sql("id > 2");
+                pane.apply_filters(cx).expect("表达式合法");
+                assert!(pane.session.has_pending_filter(), "读取还没回来，条件先挂起");
+            });
+        });
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.loaded_len(), 2, "{}", pane.notice);
+            assert_eq!(pane.cell(0, 0), "3");
+            assert_eq!(pane.session.applied_source(), session::FilterSource::Sql);
+            assert!(!pane.session.unapplied_filters());
+            // 分页、计数、导出共用同一份已应用条件。
+            let request = pane.session.page_request().expect("条件合法");
+            assert!(request.filters.is_empty(), "结构化条件不再参与");
+            assert_eq!(request.filter_expression.as_deref(), Some("id > 2"));
+            let counted = count_of(&request);
+            assert_eq!(counted.filter_expression.as_deref(), Some("id > 2"));
+            let condition = pane.exchange_condition();
+            assert!(condition.filters.is_empty());
+            assert_eq!(condition.expression.as_deref(), Some("id > 2"));
+            assert!(condition.narrowing());
+        });
+        // 被拒绝的表达式：保留草稿和上次条件，行不动，错误显示出来。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.set_filter_sql("id = 1; DROP TABLE items");
+                let error = pane.apply_filters(cx).unwrap_err();
+                assert!(error.contains("分号"), "{error}");
+                assert_eq!(pane.loaded_len(), 2, "旧结果还在");
+                assert_eq!(pane.session.filter_sql(), "id = 1; DROP TABLE items", "草稿还在");
+                assert_eq!(pane.session.applied_expression().as_deref(), Some("id > 2"), "上次条件还在");
+                assert_eq!(pane.notice, error);
+                assert_eq!(pane.session.filter_mode(), session::FilterMode::Sql);
+            });
+        });
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update(|cx| assert_eq!(pane.read(cx).loaded_len(), 2, "失败的表达式没有重读成空表"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 查询结果没有可重读的表：SQL 条件入口说明原因，本地筛选照旧可用。
+    #[gpui_kit::test]
+    fn query_results_explain_why_sql_filtering_is_unavailable(cx: &mut TestAppContext) {
+        let (window, pane) = open_at(cx, 1100.);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.update(|window, cx| {
+            plant_long(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.mode = GridMode::Query);
+            window.render_frame(cx);
+        });
+        visual.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(!pane.pick_filter_mode(session::FilterMode::Sql, cx), "查询结果不能切到 SQL 筛选");
+                assert_eq!(pane.session.filter_mode(), session::FilterMode::Visual);
+                assert_eq!(pane.notice, i18n::text(pane.locale, "grid.filter.sqlQueryOnly"));
+                // 本地筛选仍然有效。
+                pane.session.set_filter_full("id", "gt", "1", "", "");
+                assert_eq!(pane.loaded_len(), 2);
+            });
+        });
     }
 }

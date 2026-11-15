@@ -82,6 +82,7 @@ fn export_request(id: &str, mode: &str, path: &Path, format: &str, limit: u64, t
         filters: Vec::new(),
         sort: None,
         search: None,
+        filter_expression: None,
         limit,
         truncated,
         statement: statement.to_owned(),
@@ -476,6 +477,7 @@ fn exchange_source_capabilities_follow_the_selected_source() {
         label: "items".to_owned(),
         context: "items / main".to_owned(),
         preview_bytes: Some(crate::grid::DEFAULT_PREVIEW_BYTES),
+        condition: Default::default(),
     };
     assert!(table.full_available(), "表数据可以重新读取全量");
     assert!(table.has_columns());
@@ -491,6 +493,7 @@ fn exchange_source_capabilities_follow_the_selected_source() {
         label: "查询结果".to_owned(),
         context: "items / main".to_owned(),
         preview_bytes: None,
+        condition: Default::default(),
     };
     assert!(!query.full_available(), "查询结果只有已读取的行，不能声称全量能力");
     assert!(query.has_columns(), "已读取的列仍可导出");

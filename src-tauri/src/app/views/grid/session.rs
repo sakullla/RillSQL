@@ -340,6 +340,59 @@ pub enum Continuation {
 /// 后端已经支持、并且可以出现在筛选条里的条件。
 pub const FILTER_OPS: [&str; 11] = ["eq", "ne", "contains", "starts", "gt", "lt", "between", "in", "null", "notnull", "empty"];
 
+/// 表达式字符串回到后端枚举；未知条件按相等处理（compile_draft 已经挡住未知值）。
+fn op_of(op: &str) -> crate::grid::FilterOp {
+    match op {
+        "ne" => crate::grid::FilterOp::Ne,
+        "contains" => crate::grid::FilterOp::Contains,
+        "starts" => crate::grid::FilterOp::Starts,
+        "gt" => crate::grid::FilterOp::Gt,
+        "lt" => crate::grid::FilterOp::Lt,
+        "between" => crate::grid::FilterOp::Between,
+        "in" => crate::grid::FilterOp::In,
+        "null" => crate::grid::FilterOp::Null,
+        "notnull" => crate::grid::FilterOp::NotNull,
+        "empty" => crate::grid::FilterOp::Empty,
+        _ => crate::grid::FilterOp::Eq,
+    }
+}
+
+/// 筛选的两种编辑形态。切换形态本身不读取、不应用，也不丢另一边的草稿。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterMode {
+    /// 列 + 操作符 + 值的结构化条件。
+    #[default]
+    Visual,
+    /// 直接写 WHERE 表达式；只有本界面生成的、未改过的 SQL 才能回到可视化。
+    Sql,
+}
+
+impl FilterMode {
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::Visual => "grid.filter.modeVisual",
+            Self::Sql => "grid.filter.modeSql",
+        }
+    }
+}
+
+/// 当前真正驱动读取的那一份来源：同一时刻只有一种，分页、计数和导出都读它。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterSource {
+    #[default]
+    Visual,
+    Sql,
+}
+
+/// 已经通过校验、等着这次读取落地的条件。只有读取成功才替换已应用来源，
+/// 数据库拒绝或校验失败时整个丢掉，草稿、上次来源和旧结果都还在。
+#[derive(Clone, Debug)]
+struct PendingCondition {
+    mode: FilterMode,
+    drafts: Vec<FilterDraft>,
+    expression: String,
+}
+
 /// 一条筛选条件草稿。文本保留用户的原文，只有"应用"时才编译成请求参数。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterDraft {
@@ -398,8 +451,21 @@ pub struct SharedGrid {
     /// 目标表所在连接是否仍然可用（已打开且未失联）；会话自己拿不到服务，由 GridPane 同步。
     target_live: bool,
     filters: Vec<FilterDraft>,
+    /// 当前正在编辑的筛选形态；切换它本身不读取。
+    filter_mode: FilterMode,
+    /// 直接 SQL 条件的草稿文本；与可视化草稿分开保存，互不覆盖。
+    filter_sql: String,
+    /// 上一次从可视化条件生成出来的表达式：只有草稿仍等于它时才允许回到可视化。
+    generated_sql: String,
+    /// 当前驱动读取的来源与它的表达式。
+    applied: FilterSource,
+    applied_sql: String,
+    /// 已校验、等这次读取落地的条件；成功才提交，失败就丢掉。
+    pending_filter: Option<PendingCondition>,
     /// 最近一次应用筛选时的非法输入原因；不解成请求，也不改已有结果。
     filter_error: Option<String>,
+    /// 模式切换或反向映射失败时的说明（不是错误，条件本身没变）。
+    filter_hint: Option<String>,
     /// 最近一次替换/追加读取失败的原因；旧行列仍保留，界面据此提示重试。
     read_failure: Option<String>,
     /// 换了目标表但还没读到新数据：这时读取失败才丢弃旧表快照。
@@ -484,7 +550,14 @@ impl SharedGrid {
             find_scope: FindScope::Loaded,
             target_live: true,
             filters: Vec::new(),
+            filter_mode: FilterMode::Visual,
+            filter_sql: String::new(),
+            generated_sql: String::new(),
+            applied: FilterSource::Visual,
+            applied_sql: String::new(),
+            pending_filter: None,
             filter_error: None,
+            filter_hint: None,
             read_failure: None,
             target_changed: false,
             sort: None,
@@ -634,6 +707,9 @@ impl SharedGrid {
         self.read_failure = None;
         self.target_changed = false;
         self.find_scope = FindScope::Loaded;
+        // 新的结果集不是上一份结果的行：条件草稿和已应用来源一起清空，
+        // 否则旧表达式会被当成这份结果的筛选条件。
+        self.reset_filter_state();
         self.close_preview();
         self.recompute();
         self.token
@@ -779,8 +855,7 @@ impl SharedGrid {
             self.failures.clear();
             self.search.clear();
             self.find_scope = FindScope::Loaded;
-            self.filters.clear();
-            self.filter_error = None;
+            self.reset_filter_state();
             self.read_failure = None;
             self.sort = None;
             self.selected = false;
@@ -957,6 +1032,143 @@ impl SharedGrid {
         self.filter_error.as_deref()
     }
 
+    /// 模式切换被降级时的说明；它不改变任何条件，只是解释"为什么没切过去"。
+    pub fn filter_hint(&self) -> Option<&str> {
+        self.filter_hint.as_deref()
+    }
+
+    pub fn filter_mode(&self) -> FilterMode {
+        self.filter_mode
+    }
+
+    /// 直接 SQL 条件的草稿文本。
+    pub fn filter_sql(&self) -> &str {
+        &self.filter_sql
+    }
+
+    /// 当前驱动读取的来源；导出与计数按它取条件。
+    pub fn applied_source(&self) -> FilterSource {
+        self.applied
+    }
+
+    /// 已应用的直接表达式；来源是可视化时为空。
+    pub fn applied_expression(&self) -> Option<String> {
+        match self.applied {
+            FilterSource::Visual => None,
+            FilterSource::Sql => {
+                let text = self.applied_sql.trim();
+                (!text.is_empty()).then(|| text.to_owned())
+            }
+        }
+    }
+
+    /// 已应用的表达式原文（可能是空串）：界面用它显示 SQL 草稿的已应用版本。
+    pub fn applied_sql(&self) -> &str {
+        &self.applied_sql
+    }
+
+    /// 直连 SQL 筛选在哪些情形下不可用：查询结果没有可重读的表，网格不会重跑原语句。
+    pub fn sql_block(&self) -> Option<&'static str> {
+        if self.mode == GridMode::Query {
+            return Some("grid.filter.sqlQueryOnly");
+        }
+        if self.target.connection_id.is_empty() || self.target.table.is_empty() {
+            return Some("grid.filter.sqlNoTable");
+        }
+        if !self.target_live {
+            return Some("grid.filter.sqlOffline");
+        }
+        None
+    }
+
+    fn engine_name(&self) -> String {
+        match &self.schema {
+            Some(schema) => crate::grid::engine_key(schema.engine).to_owned(),
+            None => self.target.engine.clone(),
+        }
+    }
+
+    /// 走闸门后的表达式：空白表示无条件，被拒绝时给出可直接显示的当前语言原因。
+    pub fn gated_sql(&self) -> Result<Option<String>, String> {
+        crate::grid::gate_filter_expression(&self.engine_name(), &self.filter_sql)
+            .map_err(|refusal| refusal.message(self.locale))
+    }
+
+    /// 只有本界面生成且没被改过的 SQL（或空表达式）才允许回到可视化。
+    pub fn sql_mappable(&self) -> bool {
+        let draft = self.filter_sql.trim();
+        draft.is_empty() || draft == self.generated_sql.trim()
+    }
+
+    /// 逐字更新 SQL 草稿：只改文本，不读取、不应用。
+    pub fn set_filter_sql(&mut self, text: &str) -> bool {
+        if self.filter_sql == text {
+            return false;
+        }
+        self.filter_sql = text.to_owned();
+        self.filter_error = None;
+        true
+    }
+
+    /// 切换筛选形态：可视化 → SQL 用现有 compile_where 生成可审阅表达式；
+    /// SQL → 可视化只接受未改过的生成结果，否则保留 SQL 并说明原因。
+    pub fn switch_filter_mode(&mut self, mode: FilterMode) -> Result<(), String> {
+        if self.filter_mode == mode {
+            return Ok(());
+        }
+        match mode {
+            FilterMode::Sql => {
+                if let Some(reason) = self.sql_block() {
+                    let text = i18n::text(self.locale, reason);
+                    self.filter_hint = Some(text.clone());
+                    return Err(text);
+                }
+                let generated = self.generate_sql()?;
+                // 已经有用户手写的表达式时保留它：切换形态不丢内容。
+                let draft = self.filter_sql.trim();
+                if draft.is_empty() || draft == self.generated_sql.trim() {
+                    self.filter_sql = generated.clone();
+                }
+                self.generated_sql = generated;
+                self.filter_mode = FilterMode::Sql;
+                self.filter_hint = None;
+                self.filter_error = None;
+                Ok(())
+            }
+            FilterMode::Visual => {
+                if !self.sql_mappable() {
+                    let text = i18n::text(self.locale, "grid.filter.sqlUnmapped");
+                    self.filter_hint = Some(text.clone());
+                    return Err(text);
+                }
+                // 生成结果与已应用表达式一致时，来源等价地回到可视化条件。
+                if self.applied == FilterSource::Sql && self.applied_sql.trim() == self.filter_sql.trim() {
+                    self.applied = FilterSource::Visual;
+                }
+                self.filter_mode = FilterMode::Visual;
+                self.filter_hint = None;
+                self.filter_error = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// 当前已应用的可视化条件编译成 SQL 表达式；没有条件时是空串。
+    fn generate_sql(&self) -> Result<String, String> {
+        let filters = self.filter_args()?;
+        let Some(schema) = self.schema.as_ref() else {
+            return Err(i18n::text(self.locale, "grid.filter.sqlNoSchema"));
+        };
+        let compiled = filters.into_iter().map(|arg| crate::grid::Filter {
+            column: arg.column,
+            op: op_of(&arg.op),
+            value: arg.value,
+            second: arg.second,
+            values: arg.values,
+        }).collect::<Vec<_>>();
+        crate::grid::compile_where(schema, &compiled)
+    }
+
     /// 这一列适用的条件：数字/日期给范围，文本给包含，二进制只留相等与 NULL。
     pub fn filter_ops_for(&self, column: &str) -> Vec<&'static str> {
         let family = self.columns.iter().find(|item| item.name == column).map(|item| value_family(&item.type_name)).unwrap_or(ValueFamily::Unknown);
@@ -995,6 +1207,8 @@ impl SharedGrid {
             values: values.to_owned(),
             dirty: false,
         };
+        // 结构化条件被使用时，编辑形态回到可视化一侧。
+        self.filter_mode = FilterMode::Visual;
         match self.draft_index(column) {
             Some(index) => self.filters[index] = draft,
             None => self.filters.push(draft),
@@ -1005,6 +1219,7 @@ impl SharedGrid {
 
     /// 为一列新增一条待编辑条件；这一列已有条件就改成编辑已有的那条。
     pub fn add_filter(&mut self, column: &str) -> usize {
+        self.filter_mode = FilterMode::Visual;
         if let Some(index) = self.draft_index(column) {
             self.filters[index].dirty = true;
             return index;
@@ -1015,6 +1230,7 @@ impl SharedGrid {
     }
 
     pub fn set_filter_column(&mut self, index: usize, column: &str) -> bool {
+        self.filter_mode = FilterMode::Visual;
         let ops = self.filter_ops_for(column);
         let Some(draft) = self.filters.get_mut(index) else {
             return false;
@@ -1030,6 +1246,7 @@ impl SharedGrid {
     }
 
     pub fn set_filter_op(&mut self, index: usize, op: &str) -> bool {
+        self.filter_mode = FilterMode::Visual;
         let Some(column) = self.filters.get(index).map(|item| item.column.clone()) else {
             return false;
         };
@@ -1064,6 +1281,7 @@ impl SharedGrid {
     }
 
     pub fn update_filter(&mut self, index: usize, op: &str, value: &str, second: &str, values: &str) -> bool {
+        self.filter_mode = FilterMode::Visual;
         let Some(draft) = self.filters.get_mut(index) else {
             return false;
         };
@@ -1077,6 +1295,7 @@ impl SharedGrid {
 
     /// 编辑输入框的逐字更新：只改草稿文本，不应用、不发查询。
     pub fn update_filter_value(&mut self, index: usize, slot: usize, value: &str) -> bool {
+        self.filter_mode = FilterMode::Visual;
         let Some(draft) = self.filters.get_mut(index) else {
             return false;
         };
@@ -1091,6 +1310,7 @@ impl SharedGrid {
 
     /// 界面上的取值输入：按当前条件决定这是值、上界还是集合。
     pub fn update_filter_text(&mut self, index: usize, first: bool, text: &str) -> bool {
+        self.filter_mode = FilterMode::Visual;
         let Some(draft) = self.filters.get_mut(index) else {
             return false;
         };
@@ -1111,18 +1331,31 @@ impl SharedGrid {
         if index >= self.filters.len() {
             return false;
         }
+        self.filter_mode = FilterMode::Visual;
         self.filters.remove(index);
         self.filter_error = None;
         self.recompute();
         true
     }
 
-    /// 全清：条件和查找一起清掉。
+    /// 全清：可视化条件、直接表达式和查找一起清掉，来源显式回到无条件。
     pub fn clear_filters(&mut self) {
-        self.filters.clear();
-        self.filter_error = None;
+        self.reset_filter_state();
         self.search.clear();
         self.recompute();
+    }
+
+    /// 只清条件状态，不动行、也不重算：换结果集时用。
+    fn reset_filter_state(&mut self) {
+        self.filters.clear();
+        self.filter_sql.clear();
+        self.generated_sql.clear();
+        self.filter_mode = FilterMode::Visual;
+        self.applied = FilterSource::Visual;
+        self.applied_sql.clear();
+        self.pending_filter = None;
+        self.filter_error = None;
+        self.filter_hint = None;
     }
 
     fn compile_draft(&self, draft: &FilterDraft) -> Result<crate::grid::commands::FilterArg, String> {
@@ -1171,18 +1404,72 @@ impl SharedGrid {
         Ok(())
     }
 
-    /// 应用全部条件。非法输入只记录原因：不发查询，已有结果和条件输入都保留。
-    pub fn apply_filters(&mut self) -> Result<(), String> {
-        if let Err(error) = self.validate_filters() {
+    /// 校验当前形态的全部条件；SQL 形态走表达式闸门。
+    pub fn validate_conditions(&self) -> Result<(), String> {
+        match self.filter_mode {
+            FilterMode::Visual => self.validate_filters(),
+            FilterMode::Sql => self.gated_sql().map(|_| ()),
+        }
+    }
+
+    /// 应用当前形态的全部条件。非法输入只记录原因：不发查询，已有结果、草稿和
+    /// 上一次已应用来源都保留。
+    ///
+    /// 还要重新读取时（表目标在线）只登记 pending，等这次读取成功才提交；
+    /// 没有可重读的表时立即提交，本地筛选照旧生效。
+    pub fn apply_filters(&mut self, awaits_read: bool) -> Result<(), String> {
+        if let Err(error) = self.validate_conditions() {
             self.filter_error = Some(error.clone());
             return Err(error);
         }
-        for draft in &mut self.filters {
-            draft.dirty = false;
+        // 直接表达式只有数据库能算：没有可重读的表时宁可拒绝，也不假装筛过。
+        if self.filter_mode == FilterMode::Sql && !awaits_read {
+            let text = i18n::text(self.locale, "grid.filter.sqlOffline");
+            self.filter_error = Some(text.clone());
+            return Err(text);
         }
         self.filter_error = None;
+        self.filter_hint = None;
+        self.pending_filter = Some(PendingCondition {
+            mode: self.filter_mode,
+            drafts: self.filters.clone(),
+            expression: self.filter_sql.trim().to_owned(),
+        });
+        if !awaits_read {
+            self.commit_applied_filter();
+        }
         self.recompute();
         Ok(())
+    }
+
+    /// 这次读取成功了：把 pending 换成已应用来源并清掉 dirty。
+    pub fn commit_applied_filter(&mut self) {
+        let Some(pending) = self.pending_filter.take() else {
+            return;
+        };
+        match pending.mode {
+            FilterMode::Visual => {
+                for draft in &mut self.filters {
+                    draft.dirty = false;
+                }
+                self.applied = FilterSource::Visual;
+            }
+            FilterMode::Sql => {
+                self.applied = FilterSource::Sql;
+                self.applied_sql = pending.expression;
+            }
+        }
+        self.filter_error = None;
+    }
+
+    /// 这次读取失败了：丢掉 pending，草稿、上一次已应用来源和旧结果都不动。
+    pub fn discard_pending_filter(&mut self) {
+        self.pending_filter = None;
+    }
+
+    /// 有没有等这次读取落地的条件。
+    pub fn has_pending_filter(&self) -> bool {
+        self.pending_filter.is_some()
     }
 
     pub fn sort_state(&self) -> Option<(&str, bool)> {
@@ -1191,7 +1478,13 @@ impl SharedGrid {
 
     /// 还有正在编辑、尚未应用的筛选条件：界面据此标出"未应用"，避免把旧结果当成新条件的结果。
     pub fn unapplied_filters(&self) -> bool {
-        self.filters.iter().any(|draft| draft.dirty)
+        if self.pending_filter.is_some() {
+            return true;
+        }
+        match self.filter_mode {
+            FilterMode::Visual => self.filters.iter().any(|draft| draft.dirty),
+            FilterMode::Sql => self.applied != FilterSource::Sql || self.applied_sql != self.filter_sql.trim(),
+        }
     }
 
     /// 排序列在数据列里的下标；表头用它标出方向，和焦点无关。
@@ -1244,7 +1537,11 @@ impl SharedGrid {
         if !self.rows.is_empty() {
             return SheetEmptiness::Rows;
         }
-        let narrowing = !self.search.trim().is_empty() || self.filters.iter().any(|draft| !draft.dirty);
+        let narrowing = !self.search.trim().is_empty()
+            || match self.applied {
+                FilterSource::Sql => !self.applied_sql.trim().is_empty(),
+                FilterSource::Visual => self.filters.iter().any(|draft| !draft.dirty),
+            };
         if narrowing {
             return SheetEmptiness::NoMatch;
         }
@@ -1293,10 +1590,35 @@ impl SharedGrid {
         }
     }
 
+    /// 这次读取要用的条件：pending 优先（它就是这次要落地的条件），否则用已应用来源。
+    /// 可视化条件与直接表达式不会同时出现：同一时刻只有一个来源。
+    fn request_condition(&self) -> Result<(Vec<crate::grid::commands::FilterArg>, Option<String>), String> {
+        if let Some(pending) = &self.pending_filter {
+            return match pending.mode {
+                FilterMode::Visual => {
+                    let args = pending.drafts.iter().map(|draft| self.compile_draft(draft)).collect::<Result<Vec<_>, String>>()?;
+                    Ok((args, None))
+                }
+                FilterMode::Sql => {
+                    let text = pending.expression.trim().to_owned();
+                    Ok((Vec::new(), (!text.is_empty()).then_some(text)))
+                }
+            };
+        }
+        match self.applied {
+            FilterSource::Visual => Ok((self.filter_args()?, None)),
+            FilterSource::Sql => {
+                let text = self.applied_sql.trim().to_owned();
+                Ok((Vec::new(), (!text.is_empty()).then_some(text)))
+            }
+        }
+    }
+
     /// 读取请求。条件非法时返回原因：调用方不能发出这条查询，也不能清掉旧结果。
     pub fn page_request(&self) -> Result<PageRequest, String> {
-        let filters = self.filter_args()?;
+        let (filters, filter_expression) = self.request_condition()?;
         Ok(PageRequest {
+            filter_expression,
             table: self.table_ref(),
             filters,
             sort: self.sort.as_ref().map(|(column, descending)| SortArg {
@@ -2681,8 +3003,7 @@ impl SharedGrid {
         self.schema = None;
         self.full_count = None;
         self.truncated = false;
-        self.filters.clear();
-        self.filter_error = None;
+        self.reset_filter_state();
         self.search.clear();
         self.find_scope = FindScope::Loaded;
         self.sort = None;
@@ -3021,7 +3342,9 @@ impl SharedGrid {
     fn recompute(&mut self) {
         self.prune_display();
         let mut rows = self.source.clone();
-        let applied = self.filters.iter().filter(|draft| !draft.dirty).count();
+        // 直接 SQL 条件已经由服务器筛过，这里不再套用可视化条件（它们不是当前来源）。
+        let visual = self.applied == FilterSource::Visual;
+        let applied = if visual { self.filters.iter().filter(|draft| !draft.dirty).count() } else { 0 };
         let filtering = !self.search.is_empty() || applied > 0 || self.sort.is_some();
         // 已读取范围的查找在本地筛；服务器范围的行已经是服务器筛过的，不再重复筛。
         if self.find_scope == FindScope::Loaded && !self.search.is_empty() {
@@ -3033,12 +3356,15 @@ impl SharedGrid {
         }
         // 还在编辑、没有应用的草稿不改变可见行；非法条件也不改变可见行，
         // 否则一个漏填的上界会让整张表突然变空。
-        let drafts: Vec<FilterDraft> = self
-            .filters
-            .iter()
-            .filter(|draft| !draft.dirty && self.compile_draft(draft).is_ok())
-            .cloned()
-            .collect();
+        let drafts: Vec<FilterDraft> = if visual {
+            self.filters
+                .iter()
+                .filter(|draft| !draft.dirty && self.compile_draft(draft).is_ok())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !drafts.is_empty() {
             let indices: Vec<Option<usize>> = drafts.iter().map(|draft| self.columns.iter().position(|item| item.name == draft.column)).collect();
             rows.retain(|row| {
@@ -5401,12 +5727,12 @@ mod tests {
         assert!(grid.update_filter_text(index, true, "甲"));
         assert_eq!(grid.loaded_len(), 4, "未应用的草稿不改变可见行");
         assert!(grid.page_request().unwrap().filters.is_empty());
-        assert!(grid.apply_filters().is_ok());
+        assert!(grid.apply_filters(false).is_ok());
         assert_eq!(grid.loaded_len(), 1);
         // 应用失败时条件与结果都保留，可以改好再应用。
         assert!(grid.update_filter_text(index, true, ""));
         let reason = i18n::text(Locale::ZhCn, "grid.filter.needValue");
-        assert_eq!(grid.apply_filters().unwrap_err(), reason);
+        assert_eq!(grid.apply_filters(false).unwrap_err(), reason);
         assert_eq!(grid.filter_error(), Some(reason.as_str()));
         assert_eq!(grid.loaded_len(), 1);
         // 单删与全清。
@@ -5544,7 +5870,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 24, preview_bytes: 1024, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 24, preview_bytes: 1024, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -5616,7 +5942,7 @@ mod tests {
         let loose_schema = schema_from_dto(&crate::application::grid::describe(&service, &loose_ref).await.unwrap()).unwrap();
         let loose_page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table: loose_ref, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
+            &crate::grid::commands::PageRequest { table: loose_ref, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -5656,6 +5982,7 @@ mod tests {
                 limit: 10,
                 preview_bytes: 1024,
                 search: None,
+                filter_expression: None,
             },
         )
         .await
@@ -5725,7 +6052,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -5794,7 +6121,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -5854,6 +6181,7 @@ mod tests {
                 limit: 10,
                 preview_bytes: 1024,
                 search: None,
+                filter_expression: None,
             },
         )
         .await
@@ -6013,7 +6341,7 @@ mod tests {
         let schema = schema_from_dto(&dto).unwrap();
         let page = crate::application::grid::page(
             service,
-            &crate::grid::commands::PageRequest { table: request, filters: Vec::new(), sort: None, offset: 0, limit: 20, preview_bytes, search: None },
+            &crate::grid::commands::PageRequest { table: request, filters: Vec::new(), sort: None, offset: 0, limit: 20, preview_bytes, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -6774,7 +7102,7 @@ mod batch_tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
+            &PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None, filter_expression: None },
         )
         .await
         .unwrap();
@@ -6949,5 +7277,170 @@ mod width_estimate_tests {
         assert!(!looks_numeric("007"), "前导零的编号按文本处理");
         assert!(!looks_numeric("12 apples"));
         assert!(!looks_numeric("inf"));
+    }
+}
+
+
+/// 筛选来源模型（R13）：可视化草稿、SQL 草稿、各自 dirty 与唯一已应用来源。
+#[cfg(test)]
+mod filter_model_tests {
+    use super::*;
+
+    fn row_of(id: &str, values: Vec<Option<&str>>) -> GridRow {
+        GridRow {
+            id: id.to_owned(),
+            values: values.into_iter().map(|value| value.map(str::to_owned)).collect(),
+            located: true,
+            locator: vec![("id".to_owned(), Some(id.to_owned()))],
+            inserted: false,
+        }
+    }
+
+    fn customers() -> SharedGrid {
+        let schema = schema_from_parts(
+            "postgres",
+            "public",
+            "customers",
+            "table",
+            vec![column_of("id", "integer", true), column_of("name", "text", false)],
+            vec!["id".to_owned()],
+        )
+        .unwrap();
+        let mut grid = SharedGrid::new();
+        let columns = columns_from_schema(&schema, true);
+        let rows = vec![
+            row_of("1", vec![Some("1"), Some("甲")]),
+            row_of("2", vec![Some("2"), Some("乙")]),
+            row_of("3", vec![Some("3"), Some("丙")]),
+        ];
+        grid.load_local(columns, rows, Some(3), Some(schema));
+        grid.target = GridTarget {
+            connection_id: "conn".into(),
+            connection_name: "本地".into(),
+            database: "db".into(),
+            schema: "public".into(),
+            table: "customers".into(),
+            engine: "postgres".into(),
+            environment: "dev".into(),
+        };
+        grid.set_target_live(true);
+        grid
+    }
+
+    #[test]
+    fn switching_modes_generates_sql_and_keeps_both_drafts() {
+        let mut grid = customers();
+        grid.set_filter_full("id", "gt", "1", "", "");
+        assert_eq!(grid.filters().len(), 1);
+        assert_eq!(grid.applied_source(), FilterSource::Visual);
+        // 切到 SQL：用 compile_where 生成可审阅表达式，切换本身不读取也不改来源。
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        assert_eq!(grid.filter_mode(), FilterMode::Sql);
+        assert_eq!(grid.filter_sql(), "\"id\" > 1");
+        assert_eq!(grid.applied_source(), FilterSource::Visual, "切换不应用");
+        assert_eq!(grid.filters().len(), 1, "可视化草稿还在");
+        // 未改过的生成结果可以回可视化。
+        assert!(grid.switch_filter_mode(FilterMode::Visual).is_ok());
+        assert_eq!(grid.filter_mode(), FilterMode::Visual);
+        assert_eq!(grid.filter_sql(), "\"id\" > 1", "SQL 草稿不被清空");
+        // 手写 SQL 无法反向映射：保留文本并说明原因。
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("id > 1 AND name IS NOT NULL");
+        let refused = grid.switch_filter_mode(FilterMode::Visual).unwrap_err();
+        assert_eq!(refused, i18n::text(Locale::ZhCn, "grid.filter.sqlUnmapped"));
+        assert_eq!(grid.filter_mode(), FilterMode::Sql, "仍是 SQL 形态");
+        assert_eq!(grid.filter_sql(), "id > 1 AND name IS NOT NULL");
+        assert_eq!(grid.filter_hint().map(str::to_owned), Some(refused));
+        // 清空表达式之后可以回到可视化。
+        grid.set_filter_sql("");
+        assert!(grid.switch_filter_mode(FilterMode::Visual).is_ok());
+    }
+
+    #[test]
+    fn pending_sql_replaces_the_source_only_after_a_successful_read() {
+        let mut grid = customers();
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("id > 1");
+        assert!(grid.apply_filters(true).is_ok());
+        // 还没落地：请求用 pending，来源仍是可视化。
+        assert!(grid.has_pending_filter());
+        assert!(grid.unapplied_filters());
+        let request = grid.page_request().unwrap();
+        assert!(request.filters.is_empty(), "同一时刻只有一种来源");
+        assert_eq!(request.filter_expression.as_deref(), Some("id > 1"));
+        assert_eq!(grid.applied_source(), FilterSource::Visual);
+        // 读取成功才替换来源并清 dirty。
+        grid.commit_applied_filter();
+        assert_eq!(grid.applied_source(), FilterSource::Sql);
+        assert_eq!(grid.applied_expression().as_deref(), Some("id > 1"));
+        assert!(!grid.unapplied_filters());
+        assert!(!grid.has_pending_filter());
+        // 读取失败：丢掉 pending，草稿和来源都保留，可以再试。
+        grid.set_filter_sql("id > 2");
+        assert!(grid.apply_filters(true).is_ok());
+        grid.discard_pending_filter();
+        assert_eq!(grid.applied_source(), FilterSource::Sql);
+        assert_eq!(grid.applied_expression().as_deref(), Some("id > 1"), "上次条件还在");
+        assert_eq!(grid.filter_sql(), "id > 2", "草稿还在");
+        assert!(grid.unapplied_filters(), "改动仍是未应用");
+    }
+
+    #[test]
+    fn refused_or_unavailable_sql_keeps_the_input_and_the_old_source() {
+        let mut grid = customers();
+        grid.set_filter_full("id", "gt", "1", "", "");
+        assert_eq!(grid.loaded_len(), 2);
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("id = 1; DROP TABLE customers");
+        let refused = grid.apply_filters(true).unwrap_err();
+        assert!(refused.contains("分号"), "{refused}");
+        assert_eq!(grid.filter_error(), Some(refused.as_str()));
+        assert_eq!(grid.filter_sql(), "id = 1; DROP TABLE customers", "草稿不被清掉");
+        assert_eq!(grid.applied_source(), FilterSource::Visual);
+        assert_eq!(grid.loaded_len(), 2, "旧结果还在");
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 1, "上一次应用的可视化条件仍是来源");
+        assert!(request.filter_expression.is_none());
+
+        // 没有可重读的表时直接拒绝，不假装筛过。
+        let mut offline = customers();
+        offline.set_target_live(false);
+        assert!(offline.switch_filter_mode(FilterMode::Sql).is_err());
+        assert_eq!(offline.filter_mode(), FilterMode::Visual);
+        offline.set_target_live(true);
+        assert!(offline.switch_filter_mode(FilterMode::Sql).is_ok());
+        offline.set_target_live(false);
+        offline.set_filter_sql("id > 1");
+        assert_eq!(offline.apply_filters(false).unwrap_err(), i18n::text(Locale::ZhCn, "grid.filter.sqlOffline"));
+    }
+
+    #[test]
+    fn query_results_refuse_server_side_sql_filtering_with_a_reason() {
+        let mut grid = customers();
+        grid.mode = GridMode::Query;
+        assert_eq!(grid.sql_block(), Some("grid.filter.sqlQueryOnly"));
+        let reason = grid.switch_filter_mode(FilterMode::Sql).unwrap_err();
+        assert_eq!(reason, i18n::text(Locale::ZhCn, "grid.filter.sqlQueryOnly"));
+        assert_eq!(grid.filter_mode(), FilterMode::Visual);
+        // 已读取行的本地筛选照旧：结构化条件仍然能在本页生效。
+        grid.set_filter_full("name", "eq", "乙", "", "");
+        assert_eq!(grid.loaded_len(), 1);
+        assert_eq!(grid.applied_source(), FilterSource::Visual);
+    }
+
+    #[test]
+    fn applied_expression_decides_emptiness_and_local_filtering() {
+        let mut grid = customers();
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("id > 9");
+        assert!(grid.apply_filters(true).is_ok());
+        grid.commit_applied_filter();
+        // 服务器已经按表达式筛过：本地不再套用可视化条件，行集合不动。
+        assert_eq!(grid.loaded_len(), 3);
+        grid.clear_filters();
+        assert_eq!(grid.applied_source(), FilterSource::Visual);
+        assert!(grid.applied_expression().is_none());
+        assert_eq!(grid.filter_sql(), "");
+        assert_eq!(grid.loaded_len(), 3);
     }
 }

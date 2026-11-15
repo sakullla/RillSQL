@@ -55,6 +55,9 @@ pub struct PageRequest {
     /// 整表关键字搜索（R3），与筛选 AND 组合；空表示没有搜索。
     #[serde(default)]
     pub search: Option<String>,
+    /// 已应用的直接 SQL 筛选表达式（R13）；与结构化条件互斥，整段加括号后 AND 进 WHERE。
+    #[serde(default)]
+    pub filter_expression: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -66,6 +69,9 @@ pub struct CountRequest {
     /// 与 grid_page 相同的关键字，保证计数与分页读到同一组行。
     #[serde(default)]
     pub search: Option<String>,
+    /// 与 grid_page 相同的直接表达式，保证统计总数与分页读到同一组行。
+    #[serde(default)]
+    pub filter_expression: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -110,6 +116,9 @@ pub struct ExportRequest {
     /// 整表关键字（R3）。全表远程导出携带当前网格关键字，与界面读到同一组行。
     #[serde(default)]
     pub search: Option<String>,
+    /// 当前已应用的直接 SQL 筛选表达式（R13），与界面读到同一组行。
+    #[serde(default)]
+    pub filter_expression: Option<String>,
     pub limit: u64,
     pub truncated: bool,
     pub statement: String,
