@@ -264,6 +264,12 @@ pub struct WorkbenchModel {
     pub settings_section: SettingsSection,
     /// 设置写盘结果：设置页与状态栏都从这里读，失败不静默。
     pub settings_save: SaveState,
+    /// 应用内更新：检查、下载、安装与待重启。
+    pub update: super::update::UpdateState,
+    /// 这份安装能否原地更新；启动时判定一次。
+    pub update_route: crate::release::check::InstallRoute,
+    /// 待视图执行的更新任务（检查或下载安装）；视图取走后在后台线程执行。
+    pub update_job: Option<super::update::UpdateJob>,
     pub tabs: Vec<WorkItem>,
     pub active_tab: Option<String>,
     pub connections: ConnectionPage,
@@ -407,6 +413,9 @@ impl WorkbenchModel {
             settings,
             settings_section: SettingsSection::Appearance,
             settings_save: SaveState::Idle,
+            update: super::update::UpdateState::default(),
+            update_route: super::update::startup_route(),
+            update_job: None,
             tabs: Vec::new(),
             active_tab: None,
             connections: ConnectionPage::default(),
@@ -569,6 +578,11 @@ impl WorkbenchModel {
     fn after_shell(&mut self, id: &str, page_before: AppPage) {
         match id {
             "new-query" => self.open_blank_query(),
+            // 命令面板的“检查更新”：外壳已切到设置页；这里落到更新卡片所在分区并立即检查。
+            "check-updates-show" => {
+                self.settings_section = crate::app::views::settings::SettingsSection::Local;
+                self.begin_manual_update_check();
+            }
             "new-connection" => {
                 // 命令搜索、菜单和快捷键都到这里：打开同一个全局模态，不导航到另一个编辑页。
                 self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Connections, None, "new-connection");
@@ -874,7 +888,13 @@ impl WorkbenchModel {
             "menu-connection" => self.open_connection_menu(),
             "menu-history" => self.open_history_menu(),
             "update-install" => {
-                let _ = self.request_update_install();
+                let _ = self.request_update_download();
+            }
+            // 状态栏的新版本提示：打开设置里的更新卡片。
+            "update-show" => {
+                self.shell.page = AppPage::Settings;
+                self.shell.focus = FocusTarget::Settings;
+                self.settings_section = crate::app::views::settings::SettingsSection::Local;
             }
             "null-next" => self.settings.cycle_null(),
             "null-prev" => self.settings.cycle_null_step(-1),
@@ -1075,8 +1095,9 @@ impl WorkbenchModel {
             "font-down" => self.settings.step_editor_font(-1),
             "editor-theme-prev" => self.settings.cycle_editor_theme_step(-1),
             "toggle-updates" => self.settings.toggle_updates(),
+            // 手动检查不受“启动时自动检查”开关影响：用户点了就查。
             "check-updates" => {
-                self.begin_update_check();
+                self.begin_manual_update_check();
             }
             "close-stay" => self.choose_stay(),
             "close-leave" => self.choose_leave(),
@@ -3570,11 +3591,33 @@ impl WorkbenchModel {
     /// 更新检查的唯一入口。关闭自动检查时直接返回 false，不发起网络检查；
     /// 开启时只在这里记账，真正的检查任务由调用方在返回 true 后启动。
     pub fn begin_update_check(&mut self) -> bool {
-        if !self.settings.auto_check_updates {
+        if !self.settings.auto_check_updates || !self.update.begin_check(false) {
             return false;
         }
         self.update_checks = self.update_checks.saturating_add(1);
+        self.update_job = Some(super::update::UpdateJob::Check);
         true
+    }
+
+    /// 用户点“检查更新”：不看自动检查开关；正在检查、下载或待重启时不重复发起。
+    pub fn begin_manual_update_check(&mut self) -> bool {
+        if !self.update.begin_check(true) {
+            return false;
+        }
+        self.update_checks = self.update_checks.saturating_add(1);
+        self.update_job = Some(super::update::UpdateJob::Check);
+        true
+    }
+
+    /// 下载并安装：先过“没有运行中的任务、没有未提交修改”的门禁，再排下载任务。
+    /// 被挡住时原因同时写在更新卡片与状态栏上，当前版本不动。
+    pub fn request_update_download(&mut self) -> Result<(), &'static str> {
+        self.request_update_install()?;
+        if !self.update.can_install(&self.update_route) || !self.update.begin_download() {
+            return Err("update.unavailable");
+        }
+        self.update_job = Some(super::update::UpdateJob::Download);
+        Ok(())
     }
 
     pub fn request_update_install(&mut self) -> Result<(), &'static str> {
@@ -3582,6 +3625,9 @@ impl WorkbenchModel {
             None => Ok(()),
             Some(key) => {
                 self.notice_key = Some(key);
+                if self.update.offer.is_some() {
+                    self.update.fail(self.text(key));
+                }
                 Err(key)
             }
         }

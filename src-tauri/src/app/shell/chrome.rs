@@ -1559,6 +1559,37 @@ impl Workbench {
                         .on_click(act("status-jobs", cx)),
                 )
             })
+            // 有新版本、正在下载或待重启：状态栏给一个常驻入口，点开设置里的更新卡片。
+            .when(self.model.update.announces(), |this| {
+                use super::update::UpdateStage;
+                let version = self.model.update.offer.as_ref().map(|offer| format!("v{}", offer.version)).unwrap_or_default();
+                let label = match self.model.update.stage {
+                    UpdateStage::Ready => self.model.text("update.chipReady"),
+                    UpdateStage::Downloading { .. } | UpdateStage::Installing => match self.model.update.percent() {
+                        Some(percent) => format!("{} {percent}%", self.model.text("update.chipDownloading")),
+                        None => self.model.text("update.chipDownloading"),
+                    },
+                    _ => i18n::fill(&self.model.text("update.chipAvailable"), &[("version", &version)]),
+                };
+                this.child(
+                    kit::interactive_states(div().id("status-update"), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(SharedString::from(label.clone()))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .rounded(px(Radius::CONTROL))
+                        .px(px(6.))
+                        .bg(p.accent_soft)
+                        .text_color(p.accent_text)
+                        .font_weight(FontWeight::MEDIUM)
+                        .hover(|style| style.bg(p.active))
+                        .child(kit::icon(IconName::Download, 12., p.accent_text))
+                        .child(SharedString::from(label))
+                        .on_click(act("update-show", cx)),
+                )
+            })
             // 设置写盘失败是全局事实：不只在设置页可见，状态栏常驻入口把它带回设置页。
             .when(self.model.settings_save.failed(), |this| {
                 this.child(
@@ -3937,12 +3968,7 @@ impl Workbench {
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
-                .child(group(
-                    "settings-group-local",
-                    self.t("ui.settings.general"),
-                    vec![(self.t("shell.update.autoCheck"), None, updates.into_any_element())],
-                    &p,
-                ))
+                .child(self.update_card(updates.into_any_element(), &p, &m, cx))
                 .child(
                     div()
                         .id("settings-local-hint")
@@ -3950,12 +3976,7 @@ impl Workbench {
                         .text_color(p.text_muted)
                         .child(self.t("ui.settings.localHint")),
                 )
-                .child(
-                    div()
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.text_faint)
-                        .child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION")))),
-                ).into_any_element()
+                .into_any_element()
             }),
         };
         let form = div()
@@ -4064,6 +4085,211 @@ impl Workbench {
                     .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p)),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    /// 软件更新卡片：当前版本、检查状态、主操作；有新版本时给下载进度与更新说明；
+    /// 最后一行是“启动时自动检查”的开关。状态文字与按钮只按 `UpdateState` 画，不另记一份。
+    fn update_card(&self, auto_switch: AnyElement, p: &Palette, m: &kit::Metrics, cx: &mut Context<Self>) -> AnyElement {
+        use super::update::UpdateStage;
+        let update = &self.model.update;
+        let route = &self.model.update_route;
+        let offer = update.offer.as_ref();
+        let version = offer.map(|offer| format!("v{}", offer.version)).unwrap_or_default();
+        let fill = |key: &str, pairs: &[(&str, &str)]| SharedString::from(i18n::fill(&self.model.text(key), pairs));
+        let installable = offer.is_some_and(|offer| offer.installable(route));
+        let (status, tone): (SharedString, gpui_kit::Hsla) = match &update.stage {
+            UpdateStage::Idle => (self.t("update.idle"), p.text_muted),
+            UpdateStage::Checking { .. } => (self.t("update.checking"), p.text_muted),
+            UpdateStage::Latest { checked_at } => {
+                let checked = fill("update.checkedAt", &[("time", checked_at)]);
+                (SharedString::from(format!("{} · {checked}", self.model.text("update.latest"))), p.ok)
+            }
+            UpdateStage::Available => (fill("update.available", &[("version", &version)]), p.accent_text),
+            UpdateStage::Downloading { .. } => (fill("update.downloading", &[("version", &version)]), p.accent_text),
+            UpdateStage::Installing => (self.t("update.installing"), p.accent_text),
+            UpdateStage::Ready => (fill("update.ready", &[("version", &version)]), p.ok),
+            UpdateStage::Failed { message } => (fill("update.failed", &[("reason", message)]), p.danger),
+        };
+        // 辅助说明：只能手动下载时说明原因；Windows 安装会关闭应用，提前说清楚。
+        let hint: Option<SharedString> = match &update.stage {
+            UpdateStage::Available | UpdateStage::Failed { .. } if offer.is_some() && !installable => Some(self.t("update.manualOnly")),
+            UpdateStage::Available if installable && cfg!(target_os = "windows") => Some(self.t("update.windowsHint")),
+            _ => None,
+        };
+        let check = |label: SharedString, loading: bool, cx: &mut Context<Self>| {
+            kit::secondary_button("update-check", Some(IconName::RefreshCw), label, act("check-updates", cx)).loading(loading).disabled(loading).into_any_element()
+        };
+        let open_page = |primary: bool, cx: &mut Context<Self>| {
+            let label = self.t("update.openPage");
+            if primary {
+                kit::primary_button("update-open-page", Some(IconName::ExternalLink), label, act("update-open-page", cx)).into_any_element()
+            } else {
+                kit::tool_button("update-open-page", Some(IconName::ExternalLink), label, act("update-open-page", cx)).into_any_element()
+            }
+        };
+        let mut actions = div().flex().flex_none().flex_wrap().items_center().gap(px(6.));
+        actions = match &update.stage {
+            UpdateStage::Checking { .. } => actions.child(check(self.t("update.checking"), true, cx)),
+            UpdateStage::Available | UpdateStage::Failed { .. } if installable => {
+                let key = if matches!(update.stage, UpdateStage::Failed { .. }) { "update.retryInstall" } else { "update.install" };
+                actions
+                    .child(kit::primary_button("update-install", Some(IconName::Download), self.t(key), act("update-install", cx)))
+                    .child(open_page(false, cx))
+            }
+            UpdateStage::Available | UpdateStage::Failed { .. } if offer.is_some() => actions.child(open_page(true, cx)).child(check(self.t("update.check"), false, cx)),
+            UpdateStage::Downloading { .. } | UpdateStage::Installing => actions,
+            UpdateStage::Ready => actions.child(kit::primary_button("update-restart", Some(IconName::RefreshCw), self.t("update.restart"), act("update-restart", cx))),
+            _ => actions.child(check(self.t("update.check"), false, cx)),
+        };
+
+        let header = div()
+            .px(px(16.))
+            .py(px(m.row_pad_y + 8.))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(12.))
+            .child(brand_mark(36., p))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(200.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("RillSQL"))
+                            .child(kit::pill(SharedString::from(format!("v{}", crate::release::PRODUCT_VERSION)), p.text_muted, p.hover)),
+                    )
+                    .child(
+                        div()
+                            .id("update-status")
+                            .test_support()
+                            .role(if matches!(update.stage, UpdateStage::Failed { .. }) { gpui_kit::Role::Alert } else { gpui_kit::Role::Status })
+                            .text_size(px(TypeScale::SM))
+                            .text_color(tone)
+                            .child(status),
+                    )
+                    .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(hint))),
+            )
+            .child(actions);
+
+        let progress = match update.stage {
+            UpdateStage::Downloading { done, total } => {
+                let percent = update.percent();
+                let label = match total {
+                    Some(total) => format!("{} / {}", super::update::megabytes(done), super::update::megabytes(total)),
+                    None => super::update::megabytes(done),
+                };
+                Some(
+                    div()
+                        .id("update-progress")
+                        .test_support()
+                        .role(gpui_kit::Role::ProgressIndicator)
+                        .px(px(16.))
+                        .pb(px(12.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(6.))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.hover)
+                                .overflow_hidden()
+                                // 总长未知时画一段固定宽度，表示仍在进行。
+                                .child(div().h_full().rounded(px(Radius::TAG)).bg(p.accent).w(gpui_kit::relative(percent.map(|value| value as f32 / 100.).unwrap_or(0.3)))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child(SharedString::from(match percent {
+                                    Some(percent) => format!("{label}  {percent}%"),
+                                    None => label,
+                                })),
+                        ),
+                )
+            }
+            _ => None,
+        };
+
+        // 更新说明：有新版本、下载中或待重启时显示；纯文本行，标题加粗，长说明在框内滚动。
+        let show_notes = matches!(update.stage, UpdateStage::Available | UpdateStage::Downloading { .. } | UpdateStage::Installing | UpdateStage::Ready | UpdateStage::Failed { .. });
+        let notes = offer.filter(|offer| show_notes && !offer.notes.is_empty()).map(|offer| {
+            let mut body = div().id("update-notes-body").flex().flex_col().gap(px(2.)).max_h(px(220.)).overflow_y_scroll();
+            for (heading, line) in super::update::notes_lines(&offer.notes) {
+                body = body.child(if line.is_empty() {
+                    div().h(px(6.))
+                } else if heading {
+                    div().pt(px(4.)).text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(line))
+                } else {
+                    div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(line))
+                });
+            }
+            let date = offer.pub_date.as_deref().and_then(|date| date.get(..10)).unwrap_or_default().to_owned();
+            div()
+                .id("update-notes")
+                .test_support()
+                .mx(px(16.))
+                .mb(px(14.))
+                .p(px(12.))
+                .rounded(px(Radius::PANEL))
+                .bg(p.sunken)
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(kit::icon(IconName::Sparkles, 13., p.accent_text))
+                        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).child(fill("update.notes", &[("version", &version)])))
+                        .child(div().flex_1())
+                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(date))),
+                )
+                .child(body)
+        });
+
+        let auto = div()
+            .px(px(16.))
+            .py(px(m.row_pad_y + 5.))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(16.))
+            .border_t_1()
+            .border_color(p.line_soft)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(self.t("shell.update.autoCheck")))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("shell.update.autoCheckHint"))),
+            )
+            .child(auto_switch);
+
+        div()
+            .id("settings-group-update")
+            .test_support()
+            .role(gpui_kit::Role::Group)
+            .aria_label(self.t("update.title"))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(kit::eyebrow(self.t("update.title"), p))
+            .child(kit::card(p).flex().flex_col().child(header).children(progress).children(notes).child(auto))
             .into_any_element()
     }
 
@@ -5342,6 +5568,7 @@ fn palette_icon(id: &str) -> IconName {
         "theme-dark" => IconName::Moon,
         "theme-system" => IconName::Monitor,
         "help" => IconName::Keyboard,
+        "check-updates-show" => IconName::Download,
         _ => IconName::ChevronRight,
     }
 }

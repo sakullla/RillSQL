@@ -261,6 +261,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "theme-dark", label_key: "shell.command.themeDark", icon: "moon", chord: None },
     CommandSpec { id: "theme-system", label_key: "shell.command.themeSystem", icon: "monitor", chord: None },
     CommandSpec { id: "help", label_key: "shell.command.help", icon: "keyboard", chord: Some("?") },
+    CommandSpec { id: "check-updates-show", label_key: "shell.command.checkUpdates", icon: "download", chord: None },
 ];
 
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -301,7 +302,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
 
 const ICONS: &[&str] = &[
     "code", "play", "table", "plus", "file", "history", "database", "sliders", "sidebar", "sun",
-    "moon", "monitor", "keyboard", "arrow-down-up",
+    "moon", "monitor", "keyboard", "arrow-down-up", "download",
 ];
 
 pub struct ControlSpec {
@@ -492,7 +493,7 @@ impl Shell {
                 self.page = AppPage::History;
                 Effect::None
             }
-            "settings" | "open-settings" => {
+            "settings" | "open-settings" | "check-updates-show" => {
                 self.page = AppPage::Settings;
                 self.focus = FocusTarget::Settings;
                 Effect::None
@@ -633,6 +634,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.command.themeDark" => "切换到深色主题",
         "shell.command.themeSystem" => "主题跟随系统",
         "shell.command.help" => "键盘快捷键",
+        "shell.command.checkUpdates" => "检查更新",
         "shell.command.quit" => "退出",
         "shell.menu.file" => "文件",
         "shell.menu.edit" => "编辑",
@@ -708,6 +710,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.command.themeDark" => "Switch to dark theme",
         "shell.command.themeSystem" => "Theme follows system",
         "shell.command.help" => "Keyboard shortcuts",
+        "shell.command.checkUpdates" => "Check for updates",
         "shell.command.quit" => "Quit",
         "shell.menu.file" => "File",
         "shell.menu.edit" => "Edit",
@@ -840,6 +843,7 @@ mod tests {
                 "theme-dark",
                 "theme-system",
                 "help",
+                "check-updates-show",
             ]
         );
         for command in COMMANDS {

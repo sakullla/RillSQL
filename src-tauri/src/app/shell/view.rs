@@ -83,6 +83,9 @@ pub struct Workbench {
     settings_task: Option<gpui_kit::Task<()>>,
     /// 接收后台作业的本地任务随工作台释放；下次派发时回收已完成句柄。
     job_tasks: Vec<gpui_kit::Task<()>>,
+    /// 应用内更新的后台任务（检查、下载、安装）与启动后的延迟检查：持有句柄，随视图在界面线程上释放。
+    update_task: Option<gpui_kit::Task<()>>,
+    update_timer: Option<gpui_kit::Task<()>>,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -244,6 +247,8 @@ impl Workbench {
             health_task: None,
             settings_task: None,
             job_tasks: Vec::new(),
+            update_task: None,
+            update_timer: None,
             boot,
             sized: false,
             last_state: String::new(),
@@ -305,6 +310,16 @@ impl Workbench {
             self.model.notice_key = Some("query.errors.needTarget");
             self.model.notice_detail = crate::app::views::query::NOT_ACTIVE_QUERY.to_owned();
             self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        if id == "update-open-page" {
+            let url = self.model.update.offer.as_ref().map(|offer| offer.page_url.clone()).unwrap_or_else(|| crate::release::check::RELEASES_PAGE.to_owned());
+            cx.open_url(&url);
+            return;
+        }
+        if id == "update-restart" {
+            self.restart_for_update(cx);
             cx.notify();
             return;
         }
@@ -1579,6 +1594,191 @@ impl Workbench {
         self.model.fail_pending_intents();
     }
 
+    /// 启动后延迟检查一次更新：不和启动时的连接、目录读取抢网络；开关关闭时不检查。
+    fn schedule_auto_update(&mut self, cx: &mut Context<Self>) {
+        if self.model.update.auto_scheduled {
+            return;
+        }
+        self.model.update.auto_scheduled = true;
+        if cfg!(test) {
+            // 测试不等真实时间：直接走同一个入口（开关、记账与排任务），由 pump_update 跳过网络。
+            self.model.begin_update_check();
+            return;
+        }
+        let view = cx.entity().downgrade();
+        self.update_timer = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(AUTO_UPDATE_DELAY).await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    if this.model.begin_update_check() {
+                        cx.notify();
+                    }
+                });
+            });
+        }));
+    }
+
+    /// 取走模型排的更新任务并在后台线程执行。测试里不发真实网络请求，状态由测试直接驱动。
+    fn pump_update(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.model.update_job.take() else { return };
+        if cfg!(test) {
+            return;
+        }
+        match job {
+            super::update::UpdateJob::Check => self.spawn_update_check(cx),
+            super::update::UpdateJob::Download => self.spawn_update_download(cx),
+        }
+    }
+
+    fn spawn_update_check(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // 阻塞的 HTTP 读取放在独立线程：不占 tokio 运行时，也不卡界面。
+        let spawned = std::thread::Builder::new().name("rillsql-update-check".into()).spawn(move || {
+            let _ = tx.send(crate::release::check::check_now(crate::release::PRODUCT_VERSION));
+        });
+        if let Err(err) = spawned {
+            self.model.update.finish_check(Err(err.to_string()), String::new());
+            return;
+        }
+        let view = cx.entity().downgrade();
+        self.update_task = Some(cx.spawn(async move |_, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("update check stopped".to_owned()));
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    let result = result.map_err(|raw| this.update_error_text(raw));
+                    this.model.update.finish_check(result, chrono::Local::now().format("%H:%M").to_string());
+                    cx.notify();
+                });
+            });
+        }));
+    }
+
+    fn spawn_update_download(&mut self, cx: &mut Context<Self>) {
+        let platform = self.model.update.offer.as_ref().and_then(|offer| offer.platform.clone());
+        let route = self.model.update_route.clone();
+        let (Some(platform), crate::release::check::InstallRoute::InPlace(extract)) = (platform, route) else {
+            self.model.update.fail(self.model.text("update.unavailable"));
+            return;
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpdateMessage>();
+        let spawned = std::thread::Builder::new().name("rillsql-update-download".into()).spawn(move || {
+            let reported = std::sync::atomic::AtomicU64::new(0);
+            let progress = tx.clone();
+            let result = crate::release::check::download_verified(&platform, &extract, |done, total| {
+                // 进度按 256 KB 一档回报，不为每个读取块唤醒一次界面。
+                let last = reported.load(Ordering::Relaxed);
+                if done.saturating_sub(last) >= 256 * 1024 || total == Some(done) {
+                    reported.store(done, Ordering::Relaxed);
+                    let _ = progress.send(UpdateMessage::Progress(done, total));
+                }
+            });
+            let _ = tx.send(UpdateMessage::Downloaded(Box::new(result)));
+        });
+        if let Err(err) = spawned {
+            self.model.update.fail(err.to_string());
+            return;
+        }
+        let view = cx.entity().downgrade();
+        self.update_task = Some(cx.spawn(async move |_, cx| {
+            while let Some(message) = rx.recv().await {
+                let finished = matches!(message, UpdateMessage::Downloaded(_));
+                cx.update(|cx| {
+                    let Some(view) = view.upgrade() else { return };
+                    view.update(cx, |this, cx| {
+                        match message {
+                            UpdateMessage::Progress(done, total) => this.model.update.progress(done, total),
+                            UpdateMessage::Downloaded(result) => this.install_downloaded(*result, cx),
+                        }
+                        cx.notify();
+                    });
+                });
+                if finished {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// 下载并验签完成：安装前再过一次门禁（下载期间可能开始了新任务或新编辑），
+    /// 再把当前会话写盘——Windows 安装器启动后本进程会立即退出。
+    fn install_downloaded(&mut self, result: Result<crate::release::check::VerifiedPackage, String>, cx: &mut Context<Self>) {
+        let package = match result {
+            Ok(package) => package,
+            Err(message) => {
+                let text = self.update_error_text(message);
+                self.model.update.fail(text);
+                return;
+            }
+        };
+        if self.model.request_update_install().is_err() {
+            return;
+        }
+        self.model.update.stage = super::update::UpdateStage::Installing;
+        let state = self.model.snapshot();
+        self.last_state = serde_json::to_string(&state).unwrap_or_default();
+        let generation = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let revision = Arc::clone(&self.revision);
+        let gate = Arc::clone(&self.persist_gate);
+        let services = Arc::clone(&self.services);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            if let Err(err) = jobs::persist_revision(&services, &state, &revision, generation, &gate).await {
+                let _ = tx.send(Err(err));
+                return;
+            }
+            let installed = tokio::task::spawn_blocking(move || crate::release::launch_verified_install(&package.update, package.bytes))
+                .await
+                .unwrap_or_else(|err| Err(err.to_string()));
+            let _ = tx.send(installed);
+        });
+        let view = cx.entity().downgrade();
+        self.update_task = Some(cx.spawn(async move |_, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("install stopped".to_owned()));
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => this.model.update.stage = super::update::UpdateStage::Ready,
+                        Err(message) => {
+                            let text = this.update_error_text(message);
+                            this.model.update.fail(text);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        }));
+    }
+
+    /// 原始错误换成当前语言的一句话；归不了类的保留原文，排查时还看得到细节。
+    fn update_error_text(&self, raw: String) -> String {
+        match super::update::error_key(&raw) {
+            Some(key) => self.model.text(key),
+            None => raw,
+        }
+    }
+
+    /// 新版本已替换到位（macOS / AppImage）：按正常关闭流程退出，再打开新版本。
+    /// 有未保存内容时走关闭守卫，不强行退出。
+    fn restart_for_update(&mut self, cx: &mut Context<Self>) {
+        if self.model.update.stage != super::update::UpdateStage::Ready {
+            return;
+        }
+        let Some(mut command) = crate::release::check::relaunch_command(&self.model.update_route) else {
+            return;
+        };
+        if !self.model.allow_system_close() {
+            return;
+        }
+        self.persist_if_needed(cx);
+        match command.spawn() {
+            Ok(_) => cx.quit(),
+            Err(err) => self.model.update.fail(err.to_string()),
+        }
+    }
+
     fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
         let connected: std::collections::BTreeSet<String> = self
             .model
@@ -1721,7 +1921,7 @@ impl Workbench {
                             // 保存的主题（含深色）要在启动时就写进组件库主题，否则重启后仍是浅色色板。
                             this.apply_effect(Effect::ApplyTheme, cx);
                             // 启动时的自动更新检查只走这个开关；关闭时不发起检查。
-                            this.model.begin_update_check();
+                            this.schedule_auto_update(cx);
                             this.model.restore_session(&startup.state.session);
                             if let Some(key) = startup.warning_key {
                                 this.model.notice_key = Some(key);
@@ -2330,6 +2530,7 @@ impl Render for Workbench {
         self.pump_jobs(cx);
         self.pump_nav(cx);
         self.pump_danger(cx);
+        self.pump_update(cx);
         self.flush_clipboard(cx);
         // 结构页删除表成功后，对象树也要跟着变。
         if let Some(target) = self.structure.update(cx, |pane, _| pane.take_dropped()) {
@@ -2389,6 +2590,15 @@ impl Render for Workbench {
         self.note_admin_link(cx);
         self.render_root(window, cx)
     }
+}
+
+/// 启动后多久做第一次自动更新检查。
+const AUTO_UPDATE_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 下载线程发回界面的消息。
+enum UpdateMessage {
+    Progress(u64, Option<u64>),
+    Downloaded(Box<Result<crate::release::check::VerifiedPackage, String>>),
 }
 
 /// 网格里的实际表是否就是这条规格指向的对象。MySQL 的对象没有 schema，

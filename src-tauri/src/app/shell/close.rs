@@ -45,15 +45,15 @@ pub fn message_key(scope: CloseScope, kind: CloseKind) -> Option<&'static str> {
     }
 }
 
-/// 更新安装不能绕过关闭守卫。允许关闭才允许安装。
+/// 更新安装的门禁：沿用关闭守卫的判定，但只挡会丢失的工作（运行中的任务、未提交修改）。
 pub fn update_block_key(facts: CloseFacts) -> Option<&'static str> {
+    // 未执行的查询草稿随会话写盘、重启后恢复：安装前会再写一次会话，所以草稿不挡更新。
+    // 挡住更新的只有会丢的东西——运行中的任务与未提交的表格/结构修改。
     match evaluate(facts) {
         CloseKind::Allow => None,
         CloseKind::BlockedRunning => Some("shell.update.busy"),
-        CloseKind::Confirm { uncommitted: true, draft: false } => Some("shell.update.pending"),
-        CloseKind::Confirm { uncommitted: false, draft: true } => Some("shell.closeGuard.windowDraft"),
-        CloseKind::Confirm { uncommitted: true, draft: true } => Some("shell.closeGuard.windowBoth"),
-        CloseKind::Confirm { .. } => Some("shell.update.pending"),
+        CloseKind::Confirm { uncommitted: true, .. } => Some("shell.update.pending"),
+        CloseKind::Confirm { .. } => None,
     }
 }
 
@@ -83,7 +83,8 @@ mod tests {
         assert_eq!(message_key(CloseScope::Tab, CloseKind::Confirm { uncommitted: false, draft: true }), Some("shell.closeGuard.tabDraft"));
         assert_eq!(update_block_key(CloseFacts { running: true, uncommitted: false, draft: false }), Some("shell.update.busy"));
         assert_eq!(update_block_key(CloseFacts { running: false, uncommitted: true, draft: false }), Some("shell.update.pending"));
-        assert_eq!(update_block_key(CloseFacts { running: false, uncommitted: false, draft: true }), Some("shell.closeGuard.windowDraft"));
+        assert_eq!(update_block_key(CloseFacts { running: false, uncommitted: false, draft: true }), None, "草稿随会话保存，不挡更新");
+        assert_eq!(update_block_key(CloseFacts { running: false, uncommitted: true, draft: true }), Some("shell.update.pending"));
         assert_eq!(update_block_key(CloseFacts { running: false, uncommitted: false, draft: false }), None);
         assert!(!draft_pending("query", "select 1", Some("select 1")));
         assert!(draft_pending("query", "select 1", None));

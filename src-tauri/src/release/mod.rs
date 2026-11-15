@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 
 use crate::app::shell::{update_block_key, CloseFacts};
 
+pub mod check;
+
 pub const PACKAGER_VERSION: &str = "0.11.8";
 pub const PACKAGER_UPDATER_VERSION: &str = "0.2.3";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,7 +44,7 @@ pub struct ReleaseAsset {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlatformUpdate {
     pub target: String,
     pub version: String,
@@ -54,12 +56,19 @@ pub struct PlatformUpdate {
 #[derive(Debug)]
 struct Manifest {
     version: String,
+    notes: String,
+    pub_date: Option<String>,
     platforms: BTreeMap<String, RawPlatform>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawManifest {
     version: String,
+    /// 发布说明与发布时间：应用内更新卡片展示用；旧清单缺失时按空处理。
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    pub_date: Option<String>,
     platforms: BTreeMap<String, RawPlatform>,
 }
 
@@ -327,7 +336,7 @@ fn parse_manifest(manifest_json: &str) -> Result<Manifest, String> {
     if version.is_empty() {
         return Err("latest.json is missing a version".to_owned());
     }
-    Ok(Manifest { version, platforms: raw.platforms })
+    Ok(Manifest { version, notes: raw.notes.unwrap_or_default(), pub_date: raw.pub_date, platforms: raw.platforms })
 }
 
 fn infer_format(target: &str, url: &str, explicit: Option<&str>) -> Result<&'static str, String> {
@@ -549,9 +558,9 @@ mod tests {
         model.tabs[0].draft = "select 1".into();
         model.tabs[0].last_executed_sql = None;
         model.tabs[0].kind = WorkItemKind::Query;
-        let error = apply_verified_update(&mut app, model.facts(), &keys.public_b64, &manifest, "windows-x86_64", bytes, |_| Ok(())).unwrap_err();
-        assert!(matches!(error, UpdateError::Blocked(_)), "{error}");
-        assert_eq!(app.version, PRODUCT_VERSION);
+        // 未执行草稿随会话保存并在重启后恢复：它不挡更新（关窗口时仍会单独确认）。
+        let result = apply_verified_update(&mut app, model.facts(), &keys.public_b64, &manifest, "windows-x86_64", bytes, |_| Ok(()));
+        assert!(!matches!(result, Err(UpdateError::Blocked(_))), "{result:?}");
     }
 
     #[test]

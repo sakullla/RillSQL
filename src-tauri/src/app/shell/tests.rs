@@ -272,7 +272,8 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
     model.tabs[0].draft = "select 1".into();
     assert!(!model.allow_system_close());
     assert!(model.close_prompt.is_some());
-    assert!(model.request_update_install().is_err());
+    // 关窗口要为未执行草稿确认，但更新不丢草稿（安装前写一次会话、重启后恢复），不挡更新。
+    assert!(model.request_update_install().is_ok());
     assert!(!model.release_close);
     model.close_prompt = None;
     model.tabs[0].draft.clear();
@@ -3595,13 +3596,65 @@ fn auto_update_check_is_skipped_when_the_setting_is_off() {
     model.settings.auto_check_updates = false;
     assert!(!model.begin_update_check(), "关闭时不发起检查");
     assert_eq!(model.update_checks, 0);
+    assert_eq!(model.update_job, None);
+    // 手动检查是用户明确要查：不受“启动时自动检查”开关影响。
     assert!(model.dispatch("check-updates").is_some());
-    assert_eq!(model.update_checks, 0, "命令入口也必须读取开关");
+    assert_eq!(model.update_checks, 1, "手动检查照常发起");
+    assert_eq!(model.update.stage, super::update::UpdateStage::Checking { manual: true });
+    assert_eq!(model.update_job, Some(super::update::UpdateJob::Check));
+    // 检查进行中不重复排任务。
+    model.update_job = None;
+    assert!(model.dispatch("check-updates").is_some());
+    assert_eq!(model.update_checks, 1);
+    assert_eq!(model.update_job, None);
+    model.update.finish_check(Ok(None), "10:00".into());
     model.settings.auto_check_updates = true;
     assert!(model.begin_update_check());
-    assert_eq!(model.update_checks, 1);
-    assert!(model.dispatch("check-updates").is_some());
     assert_eq!(model.update_checks, 2);
+    assert_eq!(model.update.stage, super::update::UpdateStage::Checking { manual: false });
+}
+
+/// 发现新版本后：状态栏入口打开更新卡片；没有原地安装路线时不排下载，只能去发布页；
+/// 有运行中的任务时安装被门禁挡住，原因留在卡片上，当前版本不动。
+#[test]
+fn update_offer_routes_to_the_card_and_respects_the_install_gate() {
+    use crate::release::check::{InstallRoute, UpdateOffer};
+    use crate::release::PlatformUpdate;
+    let mut model = WorkbenchModel::new(Shell::default());
+    let offer = UpdateOffer {
+        version: "9.0.0".into(),
+        notes: String::new(),
+        pub_date: None,
+        platform: Some(PlatformUpdate { target: "linux-x86_64".into(), version: "9.0.0".into(), url: "https://example.test/a.AppImage".into(), signature: "c2ln".into(), format: "appimage" }),
+        page_url: "https://github.com/sakullla/RillSQL/releases/tag/v9.0.0".into(),
+    };
+    assert!(model.begin_manual_update_check());
+    // 视图取走检查任务、在后台读完清单后落结果。
+    assert_eq!(model.update_job.take(), Some(super::update::UpdateJob::Check));
+    model.update.finish_check(Ok(Some(offer)), "10:00".into());
+    assert!(model.update.announces());
+
+    assert!(model.dispatch("update-show").is_some());
+    assert_eq!(model.shell.page, AppPage::Settings);
+    assert_eq!(model.settings_section, crate::app::views::settings::SettingsSection::Local);
+
+    // 开发构建与 deb 安装：只能去发布页，不排下载。
+    model.update_route = InstallRoute::Manual;
+    assert!(model.request_update_download().is_err());
+    assert_eq!(model.update_job, None);
+
+    model.update_route = InstallRoute::InPlace(std::path::PathBuf::from("/opt/RillSQL.AppImage"));
+    let _ = model.dispatch("new-query");
+    model.tabs[0].running = true;
+    assert_eq!(model.request_update_download().unwrap_err(), "shell.update.busy");
+    assert!(matches!(model.update.stage, super::update::UpdateStage::Failed { .. }), "挡住的原因写在更新卡片上");
+    assert_eq!(model.update_job, None);
+
+    model.tabs[0].running = false;
+    model.tabs[0].draft.clear();
+    assert!(model.dispatch("update-install").is_some());
+    assert_eq!(model.update_job, Some(super::update::UpdateJob::Download));
+    assert_eq!(model.update.stage, super::update::UpdateStage::Downloading { done: 0, total: None });
 }
 
 /// 历史页的四种非正常状态必须彼此可区分：读取中给骨架，失败给原因与重试，
@@ -3991,7 +4044,7 @@ fn settings_sections_switch_and_nav_stacks_when_narrow(cx: &mut gpui_kit::TestAp
         assert!(window.try_find("theme-dark").is_none(), "一次只显示一个分区");
         window.click("settings-section-local", cx);
         window.render_frame(cx);
-        assert!(window.try_find("settings-group-local").is_some());
+        assert!(window.try_find("settings-group-update").is_some());
         assert!(super::chrome::settings_side_by_side(1360.), "1360 并排");
     })
     .unwrap();
@@ -4202,14 +4255,15 @@ fn public_settings_reach_the_query_pane_without_a_restart(cx: &mut gpui_kit::Tes
         assert_eq!(query.run_limit(), 150, "查询读取行数跟随 page_size");
     });
 
-    // 关掉自动检查后，启动路径和命令入口都不再发起检查。
+    // 关掉自动检查后，启动路径不再发起检查；手动“检查更新”照常检查（测试里不发真实请求）。
     cx.update(|cx| {
         view.update(cx, |view, cx| {
             view.model.settings.auto_check_updates = false;
+            assert!(!view.model.begin_update_check());
             view.perform("check-updates", cx);
         });
     });
-    cx.update(|cx| assert_eq!(view.read(cx).model.update_checks, 0));
+    cx.update(|cx| assert_eq!(view.read(cx).model.update_checks, 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -9397,4 +9451,17 @@ fn blank_query_inherits_the_obvious_target() {
     model.connections.status.insert("b".into(), LinkStatus::Connected);
     assert!(model.dispatch("new-query").is_some());
     assert_eq!(model.active_tab().unwrap().connection_id, None);
+}
+
+/// 命令面板的“检查更新”：打开设置里的更新卡片并立即发起手动检查（不看自动检查开关）。
+#[test]
+fn palette_check_updates_opens_the_card_and_checks() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.settings.auto_check_updates = false;
+    assert!(crate::app::COMMANDS.iter().any(|command| command.id == "check-updates-show"), "命令面板里能搜到检查更新");
+    assert!(model.dispatch("check-updates-show").is_some());
+    assert_eq!(model.shell.page, AppPage::Settings);
+    assert_eq!(model.settings_section, crate::app::views::settings::SettingsSection::Local);
+    assert_eq!(model.update.stage, super::update::UpdateStage::Checking { manual: true });
+    assert_eq!(model.update_job, Some(super::update::UpdateJob::Check));
 }
