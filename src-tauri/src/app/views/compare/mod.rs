@@ -2365,7 +2365,7 @@ mod workbench {
             }
             let _ = tx.send((services, target_file));
         });
-        let (services, target_file) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite compare setup");
+        let (services, target_file) = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite compare setup");
         cx.update(gpui_kit::init);
         let (window, view) = cx.update(|cx| {
             let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(800.)) };

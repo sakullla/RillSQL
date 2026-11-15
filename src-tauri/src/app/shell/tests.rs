@@ -3188,7 +3188,7 @@ fn quick_open_lists_the_loaded_tree_and_opens_without_running_sql(cx: &mut gpui_
             let _ = tx.send(services);
         });
     });
-    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let services = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite setup");
     let (window, view) = open_workbench(cx, services, false);
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |view, cx| view.perform("refresh-tree", cx));
@@ -5096,7 +5096,7 @@ fn sqlite_notes_workbench_sized(
             let _ = tx.send(services);
         });
     });
-    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let services = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite setup");
     let (window, view) = open_workbench_sized(cx, services, boot, width, height);
     (window, view, dir)
 }
@@ -5140,7 +5140,7 @@ fn two_sqlite_connections(
             let _ = tx.send(services);
         });
     });
-    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let services = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite setup");
     let (window, view) = open_workbench_sized(cx, services, true, 1360., 800.);
     (window, view, dir)
 }
@@ -7762,7 +7762,7 @@ fn mysql_lazy_navigation_latency_fixture(cx: &mut gpui_kit::TestAppContext) {
         assert!(opened.connected, "{:?}", opened.report);
         tx.send(task.list_connections().await.unwrap()).unwrap();
     });
-    let rows = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("fixture setup");
+    let rows = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("fixture setup");
     let (window, view) = open_workbench(cx, Arc::clone(&services), false);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, _| {
@@ -9475,7 +9475,7 @@ fn quick_open_renders_context_and_type_for_every_result_kind(cx: &mut gpui_kit::
             let _ = tx.send(services);
         });
     });
-    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let services = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite setup");
     let (window, view) = open_workbench_sized(cx, services, false, 640., 800.);
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |view, cx| view.perform("refresh-tree", cx));

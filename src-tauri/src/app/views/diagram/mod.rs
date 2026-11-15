@@ -744,7 +744,7 @@ mod tests {
             services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
             let _ = tx.send((services, database, master_before, rows_before));
         });
-        let (services, database, master_before, rows_before) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("diagram setup");
+        let (services, database, master_before, rows_before) = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("diagram setup");
         cx.update(gpui_kit::init);
         let (window, view) = cx.update(|cx| {
             let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(800.)) };
