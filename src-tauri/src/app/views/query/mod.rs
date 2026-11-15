@@ -4,6 +4,7 @@
 mod log;
 mod plan_view;
 mod side;
+mod target;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -143,6 +144,10 @@ pub struct QueryPane {
     /// 执行计划视图：看计划树还是引擎原始结果；树上选中的节点（前序下标）。
     plan_raw: bool,
     plan_selected: usize,
+    /// 目标选择器：候选连接（含未打开的）与弹层状态；选未打开的连接时请外壳先连接。
+    target_choices: Vec<target::TargetChoice>,
+    target_picker: target::TargetPicker,
+    connect_request: Option<String>,
     /// 统计绑定结果代次和来源；同一 SQL 再执行或切换目标后不复用旧计数。
     row_count: Option<(CountIdentity, RowCount)>,
 }
@@ -442,6 +447,9 @@ impl QueryPane {
             pin_rename: None,
             plan_raw: false,
             plan_selected: 0,
+            target_choices: Vec::new(),
+            target_picker: target::TargetPicker::default(),
+            connect_request: None,
         }
     }
 
@@ -1673,8 +1681,10 @@ impl QueryPane {
         let mut databases = Vec::new();
         let links = connections.iter().filter(|connection| connection.status == crate::catalog::model::ConnStatus::Connected).map(|connection| {
             let mut names: Vec<String> = connection.databases.iter().map(|database| database.name.clone()).collect();
+            // 连接配置里的默认库排在最前：换到这条连接时先落在它上面，而不是列表里随便一个库。
             if let Some(name) = connection.default_database.as_ref().filter(|name| !name.is_empty()) {
-                if !names.contains(name) { names.push(name.clone()); }
+                names.retain(|item| item != name);
+                names.insert(0, name.clone());
             }
             for name in &names { if !databases.contains(name) { databases.push(name.clone()); } }
             desk::OpenLink { id: connection.id.clone(), name: connection.name.clone(), engine: connection.engine.as_str().to_owned(), databases: names, environment: String::new() }
@@ -1683,7 +1693,97 @@ impl QueryPane {
         self.desk.set_links(links);
         self.desk.set_tree_error("");
         self.metadata_context = None;
+        // 选择器的候选：全部已保存的连接，已打开的带上它的库。
+        self.target_choices = connections
+            .iter()
+            .map(|connection| {
+                let connected = connection.status == crate::catalog::model::ConnStatus::Connected;
+                let databases = if connected { self.desk.links().iter().find(|link| link.id == connection.id).map(|link| link.databases.clone()).unwrap_or_default() } else { Vec::new() };
+                target::TargetChoice { id: connection.id.clone(), name: connection.name.clone(), engine: connection.engine.as_str().to_owned(), connected, databases }
+            })
+            .collect();
+        // 在选择器里点了“连接”的那条连上了：直接绑到它的默认库，弹层留着可以再换库。
+        if let Some(pending) = self.target_picker.pending.clone() {
+            if self.target_choices.iter().any(|choice| choice.id == pending && choice.connected) {
+                self.target_picker.pending = None;
+                self.target_picker.focus = Some(pending.clone());
+                self.queue_connection(&pending);
+            }
+        }
         cx.notify();
+    }
+
+    pub fn toggle_target_picker(&mut self, at: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut Context<Self>) {
+        if self.target_picker.anchor.is_some() {
+            self.close_target_picker(cx);
+            return;
+        }
+        self.target_picker.anchor = Some(at);
+        self.target_picker.focus = self.desk.target().map(|target| target.connection_id).filter(|id| !id.is_empty());
+        cx.notify();
+    }
+
+    pub fn close_target_picker(&mut self, cx: &mut Context<Self>) {
+        self.target_picker.anchor = None;
+        self.target_picker.search = None;
+        cx.notify();
+    }
+
+    pub fn focus_target_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.target_picker.focus = Some(id.to_owned());
+        cx.notify();
+    }
+
+    /// 选择器里连接一条未打开的连接：请外壳按需连接，连上后由 adopt_navigation 绑定。
+    pub fn connect_target(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.connect_request = Some(id.to_owned());
+        self.target_picker.pending = Some(id.to_owned());
+        cx.notify();
+    }
+
+    pub fn take_connect_request(&mut self) -> Option<String> {
+        self.connect_request.take()
+    }
+
+    /// 选定“连接 + 库”：换连接时先绑连接，再落到所选的库；完成后关闭弹层。
+    pub fn pick_target(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
+        let current = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+        if current != connection {
+            self.queue_connection(connection);
+        }
+        self.queue_database(database);
+        self.close_target_picker(cx);
+    }
+
+    /// 回车：选中左栏当前连接下、搜索命中的第一个库。
+    pub fn pick_first_target(&mut self, cx: &mut Context<Self>) {
+        let filter = self.target_filter(cx);
+        let focus = self.target_picker.focus.clone().or_else(|| self.desk.target().map(|target| target.connection_id));
+        let pick = self
+            .target_choices
+            .iter()
+            .filter(|choice| choice.connected && (focus.as_deref() == Some(choice.id.as_str()) || focus.is_none()))
+            .find_map(|choice| choice.databases.iter().find(|database| filter.is_empty() || database.to_lowercase().contains(&filter) || choice.name.to_lowercase().contains(&filter)).map(|database| (choice.id.clone(), database.clone())));
+        if let Some((connection, database)) = pick {
+            self.pick_target(&connection, &database, cx);
+        }
+    }
+
+    fn target_filter(&self, cx: &App) -> String {
+        self.target_picker.search.as_ref().map(|state| state.read(cx).value().to_string().trim().to_lowercase()).unwrap_or_default()
+    }
+
+    /// 弹层打开时创建搜索框并把焦点交给它。
+    fn ensure_target_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.target_picker.anchor.is_none() || self.target_picker.search.is_some() {
+            return;
+        }
+        let locale = self.locale;
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(i18n::text(locale, "ui.query.targetSearch")));
+        cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+        let handle = gpui_kit::Focusable::focus_handle(state.read(cx), cx);
+        window.focus(&handle, cx);
+        self.target_picker.search = Some(state);
     }
 
     pub fn invalidate_metadata(&mut self) {
@@ -2148,6 +2248,7 @@ impl Render for QueryPane {
         self.refresh_folds(cx);
         self.sync_grid(cx);
         self.take_focus(window, cx);
+        self.ensure_target_search(window, cx);
         self.narrow = f32::from(window.viewport_size().width) < side::NARROW_WIDTH;
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
@@ -2157,7 +2258,7 @@ impl Render for QueryPane {
 
         // 各区域在各自不内联的函数里搭建：未优化构建不复用栈槽，整页写在一个函数里时单帧近 800 KB，
         // 叠上外壳与布局递归会撑爆 Windows 主线程默认 1 MB 栈（调试版启动即崩）。
-        let toolbar = self.render_toolbar(running, &p, metrics, &entity);
+        let toolbar = self.render_toolbar(running, &p, metrics, &entity, cx);
         let editor_row = self.render_editor_row(&p, metrics, &mono, &entity, cx);
         let results_panel = self.render_results(running, &p, metrics, &mono, &entity, window, cx);
 
@@ -2199,7 +2300,7 @@ fn result_tab(id: SharedString, label: SharedString, selected: bool, p: &Palette
 impl QueryPane {
     /// 工具条：执行/停止、格式化、计划、更多、连接与数据库选择、右侧面板开关。
     #[inline(never)]
-    fn render_toolbar(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    fn render_toolbar(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>, cx: &App) -> AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let run: AnyElement = if running {
@@ -2210,7 +2311,7 @@ impl QueryPane {
                 .into_any_element()
         };
         let more = self.render_more_menu(entity);
-        let pickers = self.render_target_pickers(p, entity);
+        let pickers = self.render_target_pickers(p, entity, cx);
         div()
             .id("query-toolbar")
             .flex_none()
@@ -2274,70 +2375,19 @@ impl QueryPane {
 
     /// 工具条右侧：引擎徽标（有目标时）、连接选择、分隔箭头、数据库选择。
     #[inline(never)]
-    fn render_target_pickers(&self, p: &Palette, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
-        let locale = self.locale;
-        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+    fn render_target_pickers(&self, p: &Palette, entity: &Entity<QueryPane>, cx: &App) -> Vec<AnyElement> {
+        // 一个“实例 › 库”按钮，点开是双栏弹层（连接 | 库）；弹层是 deferred 浮层，挂在哪儿都画在最上面。
+        let metrics = self.density.metrics();
         let target = self.desk.target();
-        let databases = self.desk.databases().to_vec();
-        let connection_label = target
+        let (connection_id, connection_name, database, engine) = target
             .as_ref()
-            .map(|target| if target.connection_name.is_empty() { target.connection_id.clone() } else { target.connection_name.clone() })
-            .unwrap_or_else(|| i18n::text(locale, "ui.query.chooseConnection"));
-        let engine = target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
-        let conn_entity = entity.clone();
-        let conn_links = self.desk.links().to_vec();
-        let mut conn_button = Button::new("query-connection")
-            .outline()
-            .small()
-            .label(SharedString::from(connection_label))
-            .dropdown_caret(true)
-            .accessibility_label(t("ui.query.chooseConnection"));
-        if target.is_some() {
-            conn_button = conn_button.icon(IconName::Database);
+            .map(|target| (target.connection_id.clone(), target.connection_name.clone(), target.database.clone(), target.engine.clone()))
+            .unwrap_or_default();
+        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, &connection_id, &connection_name, &database, &engine, self.locale, metrics, p, entity)];
+        let filter = self.target_filter(cx);
+        if let Some(popover) = target::popover(&self.target_picker, &self.target_choices, (&connection_id, &database), &filter, self.locale, metrics, p, entity) {
+            items.push(popover);
         }
-        let connection_picker = conn_button.dropdown_menu(move |mut menu, _, _| {
-            if conn_links.is_empty() {
-                menu = menu.item(PopupMenuItem::new(i18n::text(locale, "ui.query.noConnection")).disabled(true));
-            }
-            for link in &conn_links {
-                let id = link.id.clone();
-                let entity = conn_entity.clone();
-                let name = if link.name.is_empty() { link.id.clone() } else { link.name.clone() };
-                menu = menu.item(PopupMenuItem::new(format!("{name}  ·  {}", kit::engine_label(&link.engine))).on_click(move |_, _, cx| {
-                    let id = id.clone();
-                    entity.update(cx, |pane, cx| pane.command(&format!("bind-connection:{id}"), cx));
-                }));
-            }
-            menu
-        });
-        let database_label = target.as_ref().map(|target| target.database.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| i18n::text(locale, "ui.query.chooseDatabase"));
-        let db_entity = entity.clone();
-        let no_databases = databases.is_empty();
-        let database_picker = Button::new("query-database")
-            .outline()
-            .small()
-            .label(SharedString::from(database_label))
-            .dropdown_caret(true)
-            .disabled(no_databases)
-            .accessibility_label(t("query.database.label"))
-            .dropdown_menu(move |mut menu, _, _| {
-                for database in &databases {
-                    let name = database.clone();
-                    let entity = db_entity.clone();
-                    menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
-                        let name = name.clone();
-                        entity.update(cx, |pane, cx| pane.command(&format!("database:{name}"), cx));
-                    }));
-                }
-                menu
-            });
-        let mut items = Vec::with_capacity(4);
-        if !engine.is_empty() {
-            items.push(kit::engine_badge(&engine, 18.).into_any_element());
-        }
-        items.push(connection_picker.into_any_element());
-        items.push(kit::icon(IconName::ChevronRight, 13., p.text_faint).into_any_element());
-        items.push(database_picker.into_any_element());
         items
     }
 

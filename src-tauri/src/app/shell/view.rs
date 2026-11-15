@@ -92,6 +92,7 @@ pub struct Workbench {
     pub(super) notice_timer: Option<gpui_kit::Task<()>>,
     /// 分组名输入面板出现后是否已经把焦点交给它（只交一次，不抢用户后来的点击）。
     pub(super) group_prompt_focused: bool,
+    pub(super) tag_label_focused: bool,
     boot: bool,
     sized: bool,
     last_state: String,
@@ -259,6 +260,7 @@ impl Workbench {
             notice_since: std::time::Instant::now(),
             notice_timer: None,
             group_prompt_focused: false,
+            tag_label_focused: false,
             boot,
             sized: false,
             last_state: String::new(),
@@ -1634,6 +1636,39 @@ impl Workbench {
         }));
     }
 
+    /// 标签管理的读写：保存或删除后重读标签列表，结果交回模型。
+    fn pump_tag_job(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.model.tag_job.take() else { return };
+        let deleted = match &job {
+            super::model::TagJob::Delete(id) => Some(id.clone()),
+            super::model::TagJob::Save { .. } => None,
+        };
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let outcome = match job {
+                super::model::TagJob::Save { id, label, tone } => services.connections.save_tag(id, label, tone).await.map(|_| ()).map_err(|err| err.message()),
+                super::model::TagJob::Delete(id) => services.connections.delete_tag(&id).await,
+            };
+            let result = match outcome {
+                Ok(()) => services.connections.list_tags().await,
+                Err(message) => Err(message),
+            };
+            let _ = tx.send(result);
+        });
+        self.job_tasks.push(cx.spawn(async move |_, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("tag job stopped".to_owned()));
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    this.model.finish_tag_job(deleted, result);
+                    cx.notify();
+                });
+            });
+        }));
+    }
+
     /// 取走模型排的更新任务并在后台线程执行。测试里不发真实网络请求，状态由测试直接驱动。
     fn pump_update(&mut self, cx: &mut Context<Self>) {
         let Some(job) = self.model.update_job.take() else { return };
@@ -2500,6 +2535,10 @@ impl Workbench {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
         }
         // 表数据页的“重试”在连接没打开时同样走按需连接；连上后 refresh_tree_on_connect 触发重读。
+        // 查询页目标选择器里点了“连接”：同一条按需连接入口。
+        if let Some(id) = self.query.update(cx, |pane, _| pane.take_connect_request()) {
+            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+        }
         if let Some(id) = self.structure.update(cx, |pane, _| pane.take_connect_request()) {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
         }
@@ -2550,6 +2589,7 @@ impl Render for Workbench {
         self.pump_nav(cx);
         self.pump_danger(cx);
         self.pump_update(cx);
+        self.pump_tag_job(cx);
         self.flush_clipboard(cx);
         // 结构页删除表成功后，对象树也要跟着变。
         if let Some(target) = self.structure.update(cx, |pane, _| pane.take_dropped()) {

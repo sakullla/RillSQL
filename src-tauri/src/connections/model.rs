@@ -111,6 +111,7 @@ pub fn parse_tone(value: &str) -> Option<&'static str> {
         "test" => Some("test"),
         "prod" => Some("prod"),
         "local" => Some("local"),
+        "info" => Some("info"),
         _ => None,
     }
 }

@@ -9477,3 +9477,55 @@ fn restored_query_tab_gets_the_only_database() {
     model.apply_navigation(&[pg], false);
     assert_eq!(model.tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.database.clone()).as_deref(), Some("shop"));
 }
+
+/// 双击触发器、函数这类没有数据页的对象：打开它的定义查看器，而不是什么都不发生。
+#[test]
+fn double_clicking_a_trigger_or_routine_opens_its_definition() {
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let trigger = ObjectRow::fresh("touch_updated", ObjectKind::Trigger);
+    let function = ObjectRow::fresh("total_of", ObjectKind::Function);
+    let table = ObjectRow::table("orders", Some(2));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![table.clone(), trigger.clone(), function.clone()])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    for row in [&trigger, &function] {
+        let id = nav_id("pg", "shop", "public", row);
+        assert_eq!(model.nav_toggle_command(&id), Some(format!("nav-view-ddl:{id}")), "{}", row.name);
+    }
+    let orders = nav_id("pg", "shop", "public", &table);
+    assert_eq!(model.nav_toggle_command(&orders), Some(format!("nav-open-data:{orders}")), "表仍然打开数据");
+}
+
+/// 标签管理：新建要求名称、保存交给后台；删除先确认，删除后用到它的连接变成无标签、筛选复位。
+#[test]
+fn tag_manager_validates_saves_and_untags_connections_on_delete() {
+    use super::model::TagJob;
+    use crate::connections::model::EnvTag;
+    let mut model = WorkbenchModel::new(Shell::default());
+    let mut row = record_for("pg", "Atlas", Engine::Postgres);
+    row.saved.env = "staging".into();
+    model.connections.rows = vec![row];
+    model.env_tags = vec![EnvTag { id: "staging".into(), label: "预发".into(), tone: "info".into(), position: 4 }];
+    assert!(model.dispatch("tags-manage").is_some());
+    model.dispatch("tag-new");
+    model.dispatch("tag-save");
+    assert!(model.tag_manager.as_ref().unwrap().error.is_some(), "空名称要拦下");
+    assert!(model.tag_job.is_none());
+    model.set_field(DraftField::TagLabel, "灰度".into());
+    model.dispatch("tag-tone:info");
+    model.dispatch("tag-save");
+    assert_eq!(model.tag_job.take(), Some(TagJob::Save { id: None, label: "灰度".into(), tone: "info".into() }));
+
+    assert_eq!(model.tag_usage("staging"), 1);
+    model.connections.filter_env = "staging".into();
+    model.dispatch("tag-delete:staging");
+    assert!(model.tag_job.is_none(), "删除先确认");
+    model.dispatch("tag-delete-confirm:staging");
+    assert_eq!(model.tag_job.take(), Some(TagJob::Delete("staging".into())));
+    model.finish_tag_job(Some("staging".into()), Ok(Vec::new()));
+    assert_eq!(model.connections.rows[0].saved.env, "none");
+    assert!(model.connections.filter_env.is_empty());
+    assert!(model.tag_manager.is_some(), "对话框留着继续管理");
+    model.dismiss();
+    assert!(model.tag_manager.is_none());
+}

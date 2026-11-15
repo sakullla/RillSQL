@@ -3,6 +3,7 @@
 mod chrome;
 mod close;
 mod conn_modal;
+mod conn_page;
 mod danger;
 pub(crate) mod explorer;
 mod jobs;

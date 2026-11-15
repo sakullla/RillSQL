@@ -584,6 +584,7 @@ pub fn env_colors(env: &str, p: &Palette) -> (Hsla, Hsla) {
         "prod" | "production" => (p.danger, p.danger_soft),
         "test" | "staging" => (p.warn, p.warn_soft),
         "dev" | "development" => (p.ok, p.ok_soft),
+        "info" => (p.info, p.info.opacity(0.14)),
         _ => (p.text_muted, p.hover),
     }
 }

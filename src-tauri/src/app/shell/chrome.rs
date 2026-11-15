@@ -47,7 +47,7 @@ impl Render for ConnectionDragGhost {
 }
 
 /// 点击后执行一条外壳命令。
-fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
+pub(super) fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
     let id: String = id.into();
     let entity = cx.entity().downgrade();
     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -62,24 +62,24 @@ fn field_changed(this: &mut Workbench, field: DraftField, value: String, _cx: &m
 }
 
 impl Workbench {
-    fn t(&self, key: &str) -> SharedString {
+    pub(super) fn t(&self, key: &str) -> SharedString {
         SharedString::from(self.model.text(key))
     }
 
     /// 连接的环境标签文字。存过的标签用它的名称，不用原始 id。
-    fn env_text(&self, env: &str) -> SharedString {
+    pub(super) fn env_text(&self, env: &str) -> SharedString {
         SharedString::from(env_label(|key| self.model.text(key), env, &self.model.env_tags))
     }
 
     /// 连接的环境标签小块；没有标签（空或 none）时不画。颜色跟标签色调走。
-    fn env_pill(&self, env: &str, p: &Palette) -> Option<AnyElement> {
+    pub(super) fn env_pill(&self, env: &str, p: &Palette) -> Option<AnyElement> {
         let tone = env_tone(env, &self.model.env_tags).to_owned();
         let label = self.env_text(env);
         env_shown(env).then(|| kit::env_tag(&tone, label, p))
     }
 
     /// 当前密度的尺寸指标；绘制只读这一处。
-    fn metrics(&self) -> kit::Metrics {
+    pub(super) fn metrics(&self) -> kit::Metrics {
         self.model.shell.density.metrics()
     }
 
@@ -248,6 +248,9 @@ impl Workbench {
         // 连接模态盖在最上层：backdrop 吞掉下面控件的点击，Esc 与 Tab 也归它。
         if self.model.conn_modal.open {
             root = root.child(self.connection_modal_layer(window, cx));
+        }
+        if let Some(layer) = self.tag_manager_layer(window, cx) {
+            root = root.child(layer);
         }
         if self.model.close_prompt.is_some() {
             root = root.child(self.close_layer(cx));
@@ -928,7 +931,7 @@ impl Workbench {
     }
 
     /// 分组名输入面板：新建与重命名共用，Esc 取消（由外壳统一处理）。
-    fn group_prompt_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn group_prompt_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(prompt) = self.model.group_prompt.clone() else {
             self.group_prompt_focused = false;
             return None;
@@ -1184,9 +1187,11 @@ impl Workbench {
             SharedString::from(format!("{} / {}", row.path, row.name))
         };
         let is_group = matches!(row.kind, NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup);
+        // 已读完、确实一个对象都没有的种类分组：不画展开箭头，名称与数量弱化，看起来不像“展开了却丢了内容”。
+        let empty_group = row.kind == NavKind::Group && !row.unloaded && !row.loading && row.error.is_none() && row.total == 0 && row.loaded == 0 && !row.has_more;
         let body = match row.highlight {
             Some((start, end)) if end > start && end <= label.len() => highlight_label(&label, start, end, p),
-            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(label.clone()).into_any_element(),
+            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(empty_group, |this| this.text_color(p.text_faint)).child(label.clone()).into_any_element(),
         };
         let click_id = id.clone();
         let menu_id = id.clone();
@@ -1223,7 +1228,7 @@ impl Workbench {
                     .cursor_pointer()
                     .flex_none()
                     .w(px(12.))
-                    .when(row.expandable, |this| {
+                    .when(row.expandable && !empty_group, |this| {
                         this.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             this.model.shell.focus = FocusTarget::Sidebar;
@@ -1255,9 +1260,9 @@ impl Workbench {
                         .flex_none()
                         .px(px(5.))
                         .rounded(px(Radius::TAG))
-                        .bg(p.hover)
+                        .when(!empty_group, |this| this.bg(p.hover))
                         .text_size(px(TypeScale::XS))
-                        .text_color(p.text_muted)
+                        .text_color(if empty_group { p.text_faint } else { p.text_muted })
                         .child(SharedString::from(row.total.to_string())),
                 )
             })
@@ -1723,7 +1728,7 @@ impl Workbench {
                     ),
             )
             .child(self.launcher_header(window, cx))
-            .child(self.launcher_body(window, cx))
+            .child(self.launcher_body(false, window, cx))
             // 没有执行记录时不留一张只写着“没有记录”的卡片。
             .when(!recent_runs.is_empty(), |this| this.child(
                 kit::card(&p)
@@ -1746,268 +1751,8 @@ impl Workbench {
 
     /// 连接页与欢迎区共用的启动台：最近连接、全部连接、紧凑行与全部入口。
     /// 新建/编辑不再在页面里开第二块编辑区，而是打开同一个全局模态。
-    fn connections_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = Palette::of(cx);
-        let m = self.metrics();
-        div()
-            .id("connections-page")
-            .role(gpui_kit::Role::Group)
-            .aria_label(self.t("connections.page.title"))
-            .test_support()
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(self.launcher_header(window, cx))
-            .child(self.launcher_body(window, cx))
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(m.page_pad))
-                    .py(px(8.))
-                    .border_t_1()
-                    .border_color(p.line)
-                    .text_size(px(TypeScale::XS))
-                    .text_color(p.text_faint)
-                    .child(self.t("connections.page.note")),
-            )
-            .into_any_element()
-    }
-
-    /// 启动台头部：标题、主入口、搜索与筛选。三个入口都只有一条命令。
-    fn launcher_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = Palette::of(cx);
-        let m = self.metrics();
-        let filter = self.input_for(DraftField::Filter, &self.model.text("ui.conn.search"), false, window, cx);
-        let shown = self.model.connections.filtered().len();
-        let total = self.model.connections.rows.len();
-        div()
-            .flex_none()
-            .px(px(m.page_pad))
-            .pt(px(m.page_pad_y))
-            .pb(px(10.))
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .border_b_1()
-            .border_color(p.line)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
-                    .child(kit::muted(SharedString::from(format!("{shown} / {total}")), &p))
-                    .child(div().flex_1())
-                    .child(self.launcher_action(
-                        "conn-new",
-                        IconName::Plus,
-                        self.t("common.newConnection"),
-                        Some(&self.conn_launcher_focus.clone()),
-                        "conn-new-launcher",
-                        true,
-                        &p,
-                        cx,
-                    ))
-                    .child(self.launcher_action(
-                        "launcher-group-new",
-                        IconName::FolderPlus,
-                        self.t("ui.group.new"),
-                        None,
-                        "group-new",
-                        false,
-                        &p,
-                        cx,
-                    ))
-                    .child(self.launcher_action(
-                        "launcher-sqlite",
-                        IconName::FolderOpen,
-                        self.t("common.openSqlite"),
-                        None,
-                        "open-sqlite",
-                        false,
-                        &p,
-                        cx,
-                    ))
-                    .child(self.launcher_action(
-                        "launcher-import",
-                        IconName::Download,
-                        self.t("ui.conn.import"),
-                        None,
-                        "conn-import",
-                        false,
-                        &p,
-                        cx,
-                    ))
-                    .child(self.launcher_action(
-                        "launcher-export",
-                        IconName::Upload,
-                        self.t("ui.conn.export"),
-                        None,
-                        "conn-export",
-                        false,
-                        &p,
-                        cx,
-                    )),
-            )
-            // 一条连接都没有时，搜索与筛选没有可作用的对象，不占一行。
-            .when(total > 0, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().flex_1().min_w(px(160.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
-                        .child(self.connection_filters(&p, cx)),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// 启动台主体：最近连接（按持久化用量排序）与全部连接。滚动只发生在这一块。
-    fn launcher_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = Palette::of(cx);
-        let m = self.metrics();
-        let all: Vec<crate::connections::ConnectionRecord> = self.model.connections.launcher_all().into_iter().cloned().collect();
-        let recent: Vec<crate::connections::ConnectionRecord> =
-            self.model.connections.launcher_recent(6).into_iter().cloned().collect();
-        let filtering = !self.model.connections.filter_text.trim().is_empty()
-            || self.model.connections.filter_engine.is_some()
-            || !self.model.connections.filter_env.is_empty();
-        let mut body = div()
-            .id("launcher-scroll")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .px(px(m.page_pad))
-            .py(px(10.))
-            .gap(px(2.));
-        if self.model.connections.rows.is_empty() {
-            // 一条连接都没有：空态给下一步，而不是只留一句"没有连接"。
-            // 头部已经给出新建连接与打开 SQLite 两个入口；空态只说明，不在同一屏再放一个同名主按钮。
-            body = body.child(kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p));
-            return body.into_any_element();
-        }
-        // 连接失败的待办动作：原因与重试入口留在启动台上，不把用户想打开的对象丢掉。
-        if let Some(retry) = self.model.connect_retry.clone() {
-            // 用连接名而不是 id：失败说明要能指回用户那一行。
-            let name = self
-                .model
-                .connections
-                .rows
-                .iter()
-                .find(|row| row.saved.id == retry.connection_id)
-                .map(|row| row.saved.name.clone())
-                .unwrap_or_else(|| retry.connection_id.clone());
-            body = body.child(
-                div()
-                    .id("launcher-connect-retry")
-                    .test_support()
-                    .mb(px(6.))
-                    .px(px(8.))
-                    .py(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.danger_soft)
-                    .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_size(px(TypeScale::SM))
-                            .text_color(p.danger)
-                            .child(SharedString::from(format!("{} · {name}", self.model.text("connections.status.error")))),
-                    )
-                    .child(kit::tool_button(
-                        "launcher-connect-retry-action",
-                        Some(IconName::RefreshCw),
-                        self.t("common.retry"),
-                        act("conn-retry", cx),
-                    )),
-            );
-        }
-        // 最近一栏只在它是全部连接的子集时才有意义；连接不多时同一行列两遍只是噪音。
-        if !recent.is_empty() && !filtering && all.len() > recent.len() {
-            body = body.child(section_label(self.t("connections.launcher.recent"), &p));
-            for row in &recent {
-                body = body.child(self.launcher_row(row, &p, cx, "recent"));
-            }
-        }
-        // 分组名输入（新建/重命名）就地出现在列表上方。
-        // 欢迎页旁边有资源管理器，分组名输入在侧栏里出现；连接页没有侧栏，就地显示。
-        if self.model.shell.page == AppPage::Connections {
-            if let Some(prompt) = self.group_prompt_panel(window, cx) {
-                body = body.child(div().mb(px(6.)).child(prompt));
-            }
-        }
-        let layout = self.model.group_layout();
-        let grouped = !layout.groups.is_empty();
-        if !grouped {
-            body = body.child(section_label(self.t("connections.launcher.all"), &p));
-        }
-        if all.is_empty() {
-            // 有连接但筛选无命中：与"一条都没有"分开呈现，并给出清除筛选。
-            return body
-                .child(kit::no_match_state_with_action(
-                    IconName::Search,
-                    self.t("ui.explorer.noMatch"),
-                    self.t("ui.conn.search"),
-                    kit::secondary_button("launcher-clear-filter", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)),
-                    &p,
-                ))
-                .into_any_element();
-        }
-        if !grouped {
-            for row in &all {
-                body = body.child(self.launcher_row(row, &p, cx, "all"));
-            }
-            return body.into_any_element();
-        }
-        // 有分组时按分组排：分组标题（可折叠、右键改名/删除）→ 组内连接；最后是未分组。
-        // 筛选时只留有命中的分组并临时展开；不筛选时空分组也显示，告诉用户怎么把连接放进来。
-        let shown = |id: &str| all.iter().find(|row| row.saved.id == id).cloned();
-        for (group, members) in &layout.groups {
-            let rows: Vec<crate::connections::ConnectionRecord> = members.iter().filter_map(|id| shown(id)).collect();
-            if filtering && rows.is_empty() {
-                continue;
-            }
-            let expanded = filtering || !group.collapsed;
-            body = body.child(self.launcher_group_row(&group.id, &group.name, rows.len(), expanded, &p, cx));
-            if !expanded {
-                continue;
-            }
-            if rows.is_empty() {
-                body = body.child(
-                    div()
-                        .pl(px(30.))
-                        .py(px(4.))
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.text_faint)
-                        .child(self.t("connections.group.emptyHint")),
-                );
-            }
-            for row in &rows {
-                body = body.child(div().pl(px(14.)).child(self.launcher_row(row, &p, cx, "all")));
-            }
-        }
-        let ungrouped: Vec<crate::connections::ConnectionRecord> = layout.ungrouped.iter().filter_map(|id| shown(id)).collect();
-        if !ungrouped.is_empty() {
-            body = body.child(section_label(self.t("connections.group.ungrouped"), &p));
-            for row in &ungrouped {
-                body = body.child(self.launcher_row(row, &p, cx, "all"));
-            }
-        }
-        body.into_any_element()
-    }
-
     /// 启动台里的分组标题：折叠箭头、文件夹、组名、数量；单击折叠/展开，右键改名或删除。
-    fn launcher_group_row(&self, id: &str, name: &str, members: usize, expanded: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn launcher_group_row(&self, id: &str, name: &str, members: usize, expanded: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let m = self.metrics();
         let menu_id = id.to_owned();
         let click_id = id.to_owned();
@@ -2050,122 +1795,9 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 启动台的一行：徽标 / 名称 + 环境 / 地址与库 / 状态文字 / 操作组。
-    /// 双击走按需连接续接进入工作区；编辑与测试同样作用于这一行。
-    fn launcher_row(
-        &mut self,
-        row: &crate::connections::ConnectionRecord,
-        p: &Palette,
-        cx: &mut Context<Self>,
-        prefix: &'static str,
-    ) -> AnyElement {
-        let m = self.metrics();
-        let id = row.saved.id.clone();
-        let status = self.model.connections.row_status(&id);
-        let (dot, state_key) = status_parts(status, p);
-        let detail = connection_detail(row);
-        let shown_detail = match row.saved.file_path.as_deref() {
-            Some(path) if !path.is_empty() => short_path(path),
-            _ => detail.clone(),
-        };
-        let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
-        let label = format!("{} {} {}", row.saved.name, row.saved.engine.as_str(), self.model.text(state_key));
-        let aware = format!("{detail} · {}", self.model.text(state_key));
-        // 全部连接沿用 conn-row-<id> 这个稳定锚点；最近一栏单独加前缀，避免同一行注册两次。
-        let row_id = if prefix == "all" { format!("conn-row-{id}") } else { format!("launcher-{prefix}-{id}") };
-        let select_id = id.clone();
-        let menu_id = id.clone();
-        let edit_id = id.clone();
-        let test_id = id.clone();
-        kit::row_states(div().id(SharedString::from(row_id)), p)
-            .test_support()
-            .role(gpui_kit::Role::ListItem)
-            .aria_label(SharedString::from(label))
-            .aria_selected(selected)
-            .aria_description(SharedString::from(aware.clone()))
-            // 右键菜单打开时不挂悬停提示，免得盖住菜单第一项。
-            .when(self.model.menu.is_none(), |this| this.tooltip_text(SharedString::from(aware)))
-            .h(px(m.row_h))
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .rounded(px(Radius::CONTROL))
-            .when(selected, |this| this.bg(p.active))
-            .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-            .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .flex_1()
-                    .truncate()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(SharedString::from(row.saved.name.clone())),
-            )
-            .children(self.env_pill(&row.saved.env, p))
-            .child(
-                div()
-                    .flex_none()
-                    .max_w(px(280.))
-                    .truncate()
-                    .text_size(px(TypeScale::XS))
-                    .text_color(p.text_faint)
-                    .child(SharedString::from(shown_detail)),
-            )
-            // 状态不只靠圆点：文字与 tooltip 说同一句话。
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .child(kit::status_dot(dot))
-                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.model.text(state_key))),
-            )
-            .child(
-                kit::icon_button(
-                    SharedString::from(format!("launcher-edit-{id}")),
-                    IconName::Pencil,
-                    self.model.text("connections.page.menuEdit"),
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.model.connections.selected = Some(edit_id.clone());
-                        this.perform("conn-edit", cx);
-                    }),
-                )
-                .xsmall(),
-            )
-            .child(
-                kit::icon_button(
-                    SharedString::from(format!("launcher-test-{id}")),
-                    IconName::Zap,
-                    self.model.text("connections.editor.test.button"),
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.model.connections.selected = Some(test_id.clone());
-                        this.perform("conn-test", cx);
-                    }),
-                )
-                .xsmall(),
-            )
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                this.menu_at = event.position;
-                this.model.connections.selected = Some(menu_id.clone());
-                this.perform("menu-connection", cx);
-            }))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.model.connections.selected = Some(select_id.clone());
-                if event.click_count() >= 2 {
-                    let command = format!("connection:{}", select_id);
-                    this.perform(&command, cx);
-                } else {
-                    cx.notify();
-                }
-            }))
-            .into_any_element()
-    }
-
     /// 启动台的入口按钮。带焦点句柄的那些在模态关闭后接回焦点。
     #[allow(clippy::too_many_arguments)]
-    fn launcher_action(
+    pub(super) fn launcher_action(
         &mut self,
         id: &'static str,
         icon: IconName,
@@ -3091,7 +2723,7 @@ impl Workbench {
 
     /// 一个筛选按钮：展开时用强调底，点击同时记住锚点位置供浮层定位。
     #[allow(clippy::too_many_arguments)]
-    fn filter_button(
+    pub(super) fn filter_button(
         &mut self,
         id: &'static str,
         icon: IconName,
@@ -5477,7 +5109,7 @@ fn list_row(id: SharedString, p: &Palette, pad_y: f32) -> gpui_kit::Stateful<gpu
 }
 
 /// 启动台里的小节标题：11px、粗体、弱色，与 S4.1 的分区标签一致。
-fn section_label(text: SharedString, p: &Palette) -> AnyElement {
+pub(super) fn section_label(text: SharedString, p: &Palette) -> AnyElement {
     div()
         .pt(px(8.))
         .pb(px(2.))
@@ -5489,7 +5121,7 @@ fn section_label(text: SharedString, p: &Palette) -> AnyElement {
 }
 
 /// 连接状态的颜色与文案键。颜色不是唯一载体：调用处同时渲染文字。
-fn status_parts(status: LinkStatus, p: &Palette) -> (gpui_kit::Hsla, &'static str) {
+pub(super) fn status_parts(status: LinkStatus, p: &Palette) -> (gpui_kit::Hsla, &'static str) {
     match status {
         LinkStatus::Connected => (p.ok, "connections.status.connected"),
         LinkStatus::Connecting => (p.warn, "ui.conn.connecting"),
@@ -5632,7 +5264,7 @@ fn segment_track(p: &Palette) -> gpui_kit::Div {
     div().flex().flex_wrap().flex_none().self_start().max_w_full().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover)
 }
 
-fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit::Stateful<gpui_kit::Div> {
+pub(super) fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit::Stateful<gpui_kit::Div> {
     let entity = cx.entity();
     div()
         .id(id)
@@ -5732,7 +5364,7 @@ fn url_example(engine: Engine) -> &'static str {
 }
 
 /// 列表里显示的文件路径：长路径只留最后两段（目录/文件名），完整路径放在提示里。
-fn short_path(path: &str) -> String {
+pub(super) fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.split(['/', '\\']).filter(|part| !part.is_empty()).collect();
     if parts.len() <= 2 || path.chars().count() <= 40 {
         return path.to_owned();
@@ -5740,7 +5372,7 @@ fn short_path(path: &str) -> String {
     format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
 }
 
-fn connection_detail(row: &crate::connections::ConnectionRecord) -> String {
+pub(super) fn connection_detail(row: &crate::connections::ConnectionRecord) -> String {
     let saved = &row.saved;
     if let Some(path) = saved.file_path.as_deref().filter(|path| !path.is_empty()) {
         return path.to_owned();
@@ -5788,6 +5420,12 @@ pub(super) fn env_shown(env: &str) -> bool {
 }
 
 /// 存过名称的标签用 `EnvTag.label`。没有记录时，内置环境走字典；字典也没有才显示 id。
+/// 连接的环境 id 归一：空串与 none 都算“无标签”。
+pub(super) fn env_key(env: &str) -> &str {
+    let env = env.trim();
+    if env.is_empty() { "none" } else { env }
+}
+
 pub(super) fn env_label(text: impl Fn(&str) -> String, env: &str, tags: &[EnvTag]) -> String {
     if let Some(tag) = tags.iter().find(|tag| tag.id == env) {
         let label = tag.label.trim();

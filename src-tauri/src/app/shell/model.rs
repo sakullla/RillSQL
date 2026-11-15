@@ -188,6 +188,32 @@ pub enum DraftField {
     DangerNewName,
     /// 分组名输入面板：新建分组与重命名共用。
     GroupName,
+    /// 标签管理：新建或编辑中的标签名。
+    TagLabel,
+}
+
+/// 标签管理对话框：列出全部标签；editing 是正在新建（id 为空）或编辑的那一个。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TagManager {
+    pub editing: Option<TagDraft>,
+    /// 等第二次确认的删除。
+    pub confirm_delete: Option<String>,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TagDraft {
+    pub id: Option<String>,
+    pub label: String,
+    pub tone: String,
+}
+
+/// 视图要做的标签读写（后台执行，完成后重读标签）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagJob {
+    Save { id: Option<String>, label: String, tone: String },
+    Delete(String),
 }
 
 /// 对象树“查看 / 复制 DDL”的读取状态。`copy_only` 时不显示查看器，读到就写剪贴板。
@@ -375,6 +401,9 @@ pub struct WorkbenchModel {
     pub group_members: std::collections::BTreeMap<String, String>,
     /// 分组名输入面板：新建与重命名共用。
     pub group_prompt: Option<GroupPrompt>,
+    /// 标签管理对话框；None 表示没打开。
+    pub tag_manager: Option<TagManager>,
+    pub tag_job: Option<TagJob>,
     /// 右键的那一个分组；菜单动作只认它。
     pub group_menu: Option<String>,
     /// 等确认删除的分组：只删分组记录，连接回顶层。
@@ -487,6 +516,8 @@ impl WorkbenchModel {
             groups: Vec::new(),
             group_members: std::collections::BTreeMap::new(),
             group_prompt: None,
+            tag_manager: None,
+            tag_job: None,
             group_menu: None,
             group_delete: None,
             explorer_current: None,
@@ -644,6 +675,9 @@ impl WorkbenchModel {
 
     fn local(&mut self, id: &str) -> bool {
         // 分组命令与连接菜单里的“移动到分组”共用同一批 id。
+        if id.starts_with("tags-") || id.starts_with("tag-") {
+            return self.tag_command(id);
+        }
         if (id.starts_with("group-") || id.starts_with("conn-move-group")) && self.group_command(id) {
             return true;
         }
@@ -1667,6 +1701,13 @@ impl WorkbenchModel {
             self.shell.focus = self.menu_return;
             return Effect::None;
         }
+        // 标签管理：Esc/点外面先收起编辑，再关对话框。
+        if let Some(manager) = self.tag_manager.as_mut() {
+            if manager.editing.take().is_none() {
+                self.tag_manager = None;
+            }
+            return Effect::None;
+        }
         if self.close_prompt.is_some() {
             self.choose_stay();
             return Effect::None;
@@ -2442,6 +2483,103 @@ impl WorkbenchModel {
         self.pending_group_op.take()
     }
 
+    /// 标签管理的命令：打开/关闭、新建/编辑/选色调/保存、删除（两步确认）。
+    /// 读写在视图里后台执行（tag_job），结果回来后重读标签列表。
+    fn tag_command(&mut self, id: &str) -> bool {
+        match id {
+            "tags-manage" => self.tag_manager = Some(TagManager::default()),
+            "tags-close" => self.tag_manager = None,
+            "tag-new" => {
+                if let Some(manager) = self.tag_manager.as_mut() {
+                    manager.editing = Some(TagDraft { id: None, label: String::new(), tone: "dev".into() });
+                    manager.confirm_delete = None;
+                    manager.error = None;
+                }
+            }
+            "tag-cancel" => {
+                if let Some(manager) = self.tag_manager.as_mut() {
+                    manager.editing = None;
+                    manager.error = None;
+                }
+            }
+            "tag-save" => {
+                let Some(manager) = self.tag_manager.as_mut() else { return true };
+                let Some(draft) = manager.editing.clone() else { return true };
+                match crate::connections::model::validate_tag_label(&draft.label) {
+                    Ok(label) => {
+                        manager.busy = true;
+                        manager.error = None;
+                        self.tag_job = Some(TagJob::Save { id: draft.id, label, tone: draft.tone });
+                    }
+                    Err(message) => manager.error = Some(message),
+                }
+            }
+            "tag-delete-cancel" => {
+                if let Some(manager) = self.tag_manager.as_mut() {
+                    manager.confirm_delete = None;
+                }
+            }
+            _ => {
+                let Some(manager) = self.tag_manager.as_mut() else { return false };
+                if let Some(rest) = id.strip_prefix("tag-edit:") {
+                    if let Some(tag) = self.env_tags.iter().find(|tag| tag.id == rest) {
+                        manager.editing = Some(TagDraft { id: Some(tag.id.clone()), label: tag.label.clone(), tone: tag.tone.clone() });
+                        manager.confirm_delete = None;
+                        manager.error = None;
+                    }
+                } else if let Some(tone) = id.strip_prefix("tag-tone:") {
+                    if let Some(draft) = manager.editing.as_mut() {
+                        draft.tone = tone.to_owned();
+                    }
+                } else if let Some(rest) = id.strip_prefix("tag-delete:") {
+                    manager.confirm_delete = Some(rest.to_owned());
+                } else if let Some(rest) = id.strip_prefix("tag-delete-confirm:") {
+                    manager.confirm_delete = None;
+                    manager.busy = true;
+                    self.tag_job = Some(TagJob::Delete(rest.to_owned()));
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// 标签读写的结果回到模型：成功关闭编辑、换上新列表；失败把原因留在对话框里。
+    pub fn finish_tag_job(&mut self, deleted: Option<String>, result: Result<Vec<EnvTag>, String>) {
+        // 删掉的标签在库里已改成无标签；内存里的连接同步改掉，不必整表重读。
+        if let (Some(id), Ok(_)) = (deleted.as_deref(), result.as_ref()) {
+            for row in &mut self.connections.rows {
+                if row.saved.env == id {
+                    row.saved.env = crate::connections::model::ENV_NONE.to_owned();
+                }
+            }
+            if self.connections.filter_env == id {
+                self.connections.filter_env.clear();
+            }
+        }
+        let Some(manager) = self.tag_manager.as_mut() else {
+            if let Ok(tags) = result {
+                self.env_tags = tags;
+            }
+            return;
+        };
+        manager.busy = false;
+        match result {
+            Ok(tags) => {
+                manager.editing = None;
+                manager.error = None;
+                self.env_tags = tags;
+            }
+            Err(message) => manager.error = Some(message),
+        }
+    }
+
+    /// 某个标签被多少条连接使用：删除前告诉用户影响。
+    pub fn tag_usage(&self, id: &str) -> usize {
+        self.connections.rows.iter().filter(|row| row.saved.env == id).count()
+    }
+
     /// 分组相关的命令入口。菜单、键盘与拖拽都只发这些 id。
     fn group_command(&mut self, id: &str) -> bool {
         match id {
@@ -2759,6 +2897,10 @@ impl WorkbenchModel {
                 None
             }
             NavAction::OpenData(id) => Some(format!("nav-open-data:{id}")),
+            // 触发器、例程、序列等没有表结构页：双击/回车改为查看它的定义（DDL），读不到定义时给出原因。
+            NavAction::OpenStructure(id) if self.nav.node(&id).and_then(|node| node.object()).is_some_and(|object| !object.opens_data()) => {
+                Some(format!("nav-view-ddl:{id}"))
+            }
             NavAction::OpenStructure(id) => Some(format!("nav-open-structure:{id}")),
             NavAction::OpenKeyspace { connection_id, keyspace } => {
                 Some(format!("nav-open-keyspace:{connection_id}\u{1}{keyspace}"))
@@ -4374,6 +4516,14 @@ impl WorkbenchModel {
                     prompt.error = None;
                 }
             }
+            DraftField::TagLabel => {
+                if let Some(manager) = self.tag_manager.as_mut() {
+                    if let Some(draft) = manager.editing.as_mut() {
+                        draft.label = value;
+                    }
+                    manager.error = None;
+                }
+            }
             DraftField::DangerConfirm => {
                 if let Some(prompt) = self.danger.as_mut() {
                     prompt.set_typed(value);
@@ -4426,6 +4576,7 @@ impl WorkbenchModel {
             DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
             DraftField::GroupName => self.group_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
+            DraftField::TagLabel => self.tag_manager.as_ref().and_then(|manager| manager.editing.as_ref()).map(|draft| draft.label.clone()).unwrap_or_default(),
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
             DraftField::DangerNewName => self.danger.as_ref().map(|prompt| prompt.new_name.clone()).unwrap_or_default(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
