@@ -163,7 +163,16 @@ impl Workbench {
                     IconName::Database,
                     self.t("ui.explorer.empty"),
                     self.t("ui.explorer.emptyHint"),
-                    kit::secondary_button("launcher-empty-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)),
+                    // 第一次打开时三条起步路径都给文字按钮：新建、打开本机 SQLite、导入已有的连接清单。
+                    // 页头那排只有图标，第一次用的人认不出“导入”。
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(kit::primary_button("launcher-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("conn-new-launcher", cx)))
+                        .child(kit::secondary_button("launcher-empty-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)))
+                        .child(kit::secondary_button("launcher-empty-import", Some(IconName::Download), self.t("ui.conn.importList"), act("conn-import", cx))),
                     &p,
                 ))
                 .into_any_element();

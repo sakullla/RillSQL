@@ -7,7 +7,7 @@ pub use session::group_digits;
 use std::ops::DerefMut;
 use std::sync::{Arc, OnceLock};
 
-pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
+pub use session::{display_banner, operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -127,6 +127,8 @@ pub struct GridPane {
     /// 编辑栏要等下一次绘制才能拿到 Window，先把请求记下来。
     pending_edit: Option<PendingEdit>,
     notice: String,
+    /// 筛选区是否由用户展开。没有条件、没有说明也没展开时整条收起，不占网格的行高。
+    filters_open: bool,
     grid_focus: FocusHandle,
     /// 编辑栏关闭后把键盘焦点还回网格，Esc 之后方向键和 F2 仍然可用。
     refocus: bool,
@@ -332,6 +334,7 @@ impl GridPane {
             filter_subscriptions: Vec::new(),
             sql_input: None,
             sql_subscription: None,
+            filters_open: false,
             search: None,
             clear_search: false,
             pending_full: None,
@@ -796,6 +799,8 @@ impl GridPane {
                 None
             }
             "grid-filter-new" => {
+                // 工具栏“筛选”：收起时展开并给一条以当前列开头的条件；展开时继续加一条。
+                self.filters_open = true;
                 self.new_filter(cx);
                 None
             }
@@ -1546,7 +1551,25 @@ impl GridPane {
         }
     }
 
+    /// 筛选区是否要画：用户展开过，或者有条件、已应用的表达式、错误与说明需要看见。
+    pub fn filters_shown(&self) -> bool {
+        self.filters_open
+            || !self.session.filters().is_empty()
+            || !self.session.filter_sql().trim().is_empty()
+            || !self.session.applied_sql().trim().is_empty()
+            || self.session.filter_error().is_some()
+            || self.session.filter_hint().is_some()
+    }
+
+    /// 展开筛选区但不新增条件（右键菜单、命令面板与测试用）。
+    pub fn open_filters(&mut self, cx: &mut Context<Self>) {
+        self.filters_open = true;
+        cx.notify();
+    }
+
     pub fn clear_filter_panel(&mut self, cx: &mut Context<Self>) {
+        // 清除全部同时收起筛选区：回到没有条件时的干净网格。
+        self.filters_open = false;
         self.session.clear_filters();
         self.search_text.clear();
         self.clear_search = true;
@@ -1685,6 +1708,7 @@ impl GridPane {
     pub fn pick_filter_mode(&mut self, mode: session::FilterMode, cx: &mut Context<Self>) -> bool {
         match self.session.switch_filter_mode(mode) {
             Ok(()) => {
+                self.filters_open = true;
                 self.notice.clear();
                 cx.notify();
                 true
@@ -2917,7 +2941,7 @@ impl GridPane {
             t("grid.action.filter")
         };
         let filter_button = kit::tool_button("grid-filter-add", Some(IconName::ListFilter), filter_label, pane_click(entity, "grid-filter-new"));
-        left = left.child(if filters > 0 { filter_button.selected(true) } else { filter_button });
+        left = left.child(if filters > 0 || self.filters_shown() { filter_button.selected(true) } else { filter_button });
         // 当前排序是一枚可清除的标签：看得出按哪列哪个方向排，点 × 回到原始顺序。
         if let Some(sorted) = self.session.sort_text() {
             left = left.child(
@@ -3020,7 +3044,9 @@ impl GridPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let writable = self.session.writable();
         let mut actions = div().id("grid-tools-actions").flex_none().ml_auto().flex().items_center().gap(px(2.));
-        if table_mode {
+        // 连接没打开、一行都没读到时，翻页、统计、新增和刷新都无从谈起：正文里已有“连接并读取”，这里不再摆一排点了也没用的按钮。
+        let offline_empty = !self.session.target.connection_id.is_empty() && !self.live_target() && self.session.source_len() == 0;
+        if table_mode && !offline_empty {
             // 范围写成“起–止 / 总数 行”；总数未知时点击统计（大表可能较慢，所以按需）。
             let range = SharedString::from(self.session.range_text());
             let counted = self.session.full_count().is_some();
@@ -3116,8 +3142,9 @@ impl GridPane {
     fn render_filters(&mut self, p: &Palette, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
-        // 没有列就没有可筛选的东西；有列时这条常驻，SQL 形态也才有入口。
-        if self.session.column_names().is_empty() {
+        // 没有列就没有可筛选的东西；没有条件、没有说明也没被展开时收起，
+        // 入口是工具栏的“筛选”。
+        if self.session.column_names().is_empty() || !self.filters_shown() {
             return None;
         }
         let mode = self.session.filter_mode();
@@ -3521,7 +3548,19 @@ impl GridPane {
                     });
                 }
             };
-            let body = if self.session.mode == GridMode::Table {
+            // 连接还没打开（恢复会话时标签先于连接出现）不是读取出错：给中性的说明和“连接并读取”主按钮，
+            // 不用红色错误态吓人；连上后外壳会自动重读。
+            let offline = self.session.mode == GridMode::Table && !self.session.target.connection_id.is_empty() && !self.live_target();
+            let body = if offline {
+                kit::empty_state_with_action(
+                    IconName::Plug,
+                    t("grid.state.offlineTitle"),
+                    t("grid.state.offlineHint"),
+                    kit::primary_button("grid-retry", Some(IconName::Plug), t("grid.action.connectRead"), retry).into_any_element(),
+                    p,
+                )
+                .into_any_element()
+            } else if self.session.mode == GridMode::Table {
                 kit::error_state_with_action(
                     t("grid.state.readErrorTitle"),
                     message,
@@ -3852,7 +3891,7 @@ impl GridPane {
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
                         .child(kit::title(t("grid.preview.title"), TypeScale::LG, p))
-                        .child(kit::muted(SharedString::from(self.session.banner()), p))
+                        .child(kit::muted(SharedString::from(self.session.display_banner()), p))
                         .child(
                             div()
                                 .id("grid-preview-sql")
@@ -4489,6 +4528,9 @@ impl TableDelegate for SheetDelegate {
         // 真正存着 "NULL" 的字符串是普通文本，NULL 与空字符串各自可辨认。
         let kind = self.cell_kind_at(row_ix, col_ix, cx);
         let null = kind == session::CellKind::Null;
+        // 空字符串显示的是占位标签，不是数据：和 NULL 一样用弱色斜体，
+        // 免得和真的存着这几个字的文本混在一起。
+        let placeholder = null || kind == session::CellKind::Empty;
         let tooltip = cell_tooltip(self.locale, kind, &text);
         // 行号与数字列右对齐、行号用弱色：数据列的位数可比，行号不和数据抢视线。
         let row_number = self.logical(col_ix).is_none();
@@ -4545,9 +4587,9 @@ impl TableDelegate for SheetDelegate {
             .debug_selector(move || format!("grid-cell-{row_ix}-{col_ix}"))
             .size_full()
             .truncate()
-            .when(numeric && !null, |this| this.text_right())
+            .when(numeric && !placeholder, |this| this.text_right())
             .when(row_number, |this| this.text_color(p.text_faint))
-            .when(null, |this| this.text_color(p.text_faint).italic())
+            .when(placeholder, |this| this.text_color(p.text_faint).italic())
             .when(mark == 3, |this| this.line_through())
             .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
             .when_some(tooltip, |this, tip| this.tooltip_text(tip))
@@ -8777,6 +8819,39 @@ mod filter_ui_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 没有条件时筛选区收起，不占网格行高；工具栏“筛选”展开并带一条条件，清除全部再收起。
+    #[gpui_kit::test]
+    fn filter_strip_stays_collapsed_until_asked_and_collapses_after_clear(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = items_fixture("filter-collapsed");
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("items"), 100, cx));
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.update(|window, cx| window.render_frame(cx));
+        assert!(visual.debug_bounds("grid-filters").is_none(), "没有条件时筛选区收起");
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-filter-new", cx);
+            });
+            window.render_frame(cx);
+        });
+        assert!(visual.debug_bounds("grid-filters").is_some(), "点“筛选”后展开");
+        assert_eq!(pane.read_with(&visual, |pane, _| pane.session.filters().len()), 1, "展开时带一条条件");
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-filter-clear", cx);
+            });
+            window.render_frame(cx);
+        });
+        assert!(visual.debug_bounds("grid-filters").is_none(), "清除全部后收起");
+        drop(visual);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 一条条件都没有时筛选区给的是可读说明，不是键名；中英文都不露 grid.filter. 前缀。
     #[gpui_kit::test]
     fn empty_visual_filter_strip_shows_a_readable_note_in_both_locales(cx: &mut TestAppContext) {
@@ -8791,8 +8866,9 @@ mod filter_ui_tests {
         let mut visual = VisualTestContext::from_window(window, cx);
         for locale in [Locale::ZhCn, Locale::En] {
             visual.update(|window, cx| {
-                pane.update(cx, |pane, _| {
+                pane.update(cx, |pane, cx| {
                     pane.set_locale(locale);
+                    pane.open_filters(cx);
                 });
                 window.render_frame(cx);
             });

@@ -2844,6 +2844,10 @@ impl SharedGrid {
         operation_banner(&self.target)
     }
 
+    pub fn display_banner(&self) -> String {
+        display_banner(&self.target, self.locale)
+    }
+
     pub fn focus_cell(&self) -> Option<(usize, usize)> {
         if self.selected { Some(self.focus) } else { None }
     }
@@ -4389,6 +4393,26 @@ pub fn operation_banner(target: &GridTarget) -> String {
         format!("{}.{}.{}", target.database, target.schema, target.table)
     };
     format!("{} · {} · {} · {}", target.connection_name, target.environment, object, target.engine)
+}
+
+/// 给人看的来源说明：环境与引擎换成当前语言的显示名（“本地”“SQLite”），
+/// 不把 local、sqlite 这类内部 id 直接摆在标题下。`operation_banner` 保留原样给日志与确认层比对。
+pub fn display_banner(target: &GridTarget, locale: Locale) -> String {
+    let object = if target.schema.is_empty() {
+        format!("{}.{}", target.database, target.table)
+    } else {
+        format!("{}.{}.{}", target.database, target.schema, target.table)
+    };
+    let env_key = format!("ui.conn.env.{}", target.environment);
+    let env = i18n::text(locale, &env_key);
+    let env = if env == env_key { target.environment.clone() } else { env };
+    let engine = crate::ui::kit::engine_label(&target.engine);
+    let engine = if engine == "Database" { target.engine.as_str() } else { engine };
+    [target.connection_name.as_str(), env.as_str(), object.as_str(), engine]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// 单表 SELECT 的结构证明。拒绝时返回具体原因键：联接、聚合、多语句、括号（子查询/派生表）

@@ -414,6 +414,9 @@ dict! {
     "grid.state.readFailed" => "上一次读取失败，保留了上次有效的结果。", "The last read failed; the previous result was kept.";
     // 网格三态：错误态标题与纠正动作、三类空态的说明，文案各不相同（需求 R4 / 规范 S8.5）。
     "grid.state.readErrorTitle" => "读取失败", "Read failed";
+    "grid.state.offlineTitle" => "连接未打开", "Not connected";
+    "grid.state.offlineHint" => "这张表所在的连接还没有打开，连上后自动读取。", "This table's connection isn't open yet. It loads as soon as the connection opens.";
+    "grid.action.connectRead" => "连接并读取", "Connect and load";
     "grid.state.noMatchDetail" => "调整查找或筛选条件后再试，清除条件可以回到已读取的全部行。", "Adjust the search or filters, or clear them to see every loaded row.";
     "grid.state.tableEmptyDetail" => "这张表还没有行。插入一行并刷新后就能看到数据。", "This table has no rows yet. Insert one and refresh to see data.";
     "grid.state.resultEmptyDetail" => "语句执行成功，但没有返回任何行。", "The statement ran successfully but returned no rows.";
@@ -887,6 +890,7 @@ dict! {
     "ui.conn.search" => "搜索连接", "Search connections";
     "ui.conn.new" => "新建", "New";
     "ui.conn.import" => "导入", "Import";
+    "ui.conn.importList" => "导入连接", "Import connections";
     "ui.conn.export" => "导出", "Export";
     "ui.conn.emptyTitle" => "选择或新建一个连接", "Pick or create a connection";
     "ui.conn.pickEngine" => "数据库类型", "Database type";

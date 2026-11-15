@@ -2488,7 +2488,7 @@ impl QueryPane {
         if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
             results_panel = results_panel.child(row);
         }
-        results_panel.child(self.render_results_body(p, metrics, mono, entity)).into_any_element()
+        results_panel.child(self.render_results_body(running, p, metrics, mono, entity)).into_any_element()
     }
 
     /// 页签头：页签条里是固定结果与当前结果的各条语句，之后是消息页签、固定按钮与状态。
@@ -2503,10 +2503,14 @@ impl QueryPane {
             .flex()
             .items_center()
             .gap(px(2.))
+            // 右端的耗时、行数和运行态不贴着窗口边缘。
+            .pr(px(6.))
             .bg(p.chrome)
             .border_b_1()
             .border_color(p.line)
-            .child(div().flex_1().min_w(px(0.)).h_full().child(tabs))
+            // 页签条按内容取宽、空间不够时再收缩并横向滚动：消息页签紧跟在结果页签之后，
+            // 不会被一段弹性留白推到页签头中间。
+            .child(div().flex_initial().min_w(px(0.)).h_full().child(tabs))
             .children(self.render_head_actions(p, metrics, entity))
             .children(self.render_head_status(running, p, metrics, entity))
             .into_any_element()
@@ -2642,7 +2646,7 @@ impl QueryPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let mut items: Vec<AnyElement> = vec![div().flex_1().into_any_element()];
         let active_result = self.desk.shown_result();
-        let summary = active_result.map(|result| {
+        let summary = active_result.filter(|result| !(statement_failed(result) && result.columns.is_empty())).map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
                 format!("{affected} ✓")
             } else {
@@ -2685,7 +2689,10 @@ impl QueryPane {
             );
         }
         if let Some(failure) = self.failure_view() {
-            items.extend(failure_status(failure, locale, p, metrics, entity));
+            // 正在看的就是这条失败语句时，下面的语句面板里已经有“定位到出错位置”：头部只留短状态，不重复按钮。
+            let panel_has_jump = self.desk.result_view() != ResultView::Messages
+                && self.desk.shown_result().is_some_and(|shown| statement_failed(shown) && shown.columns.is_empty());
+            items.extend(failure_status(failure, !panel_has_jump, locale, p, metrics, entity));
         }
         let note = self.desk.active_note();
         if !note.is_empty() {
@@ -2850,7 +2857,7 @@ impl QueryPane {
 
     /// 结果区主体：消息页、空结果、无列语句的状态，或结果表格。
     #[inline(never)]
-    fn render_results_body(&mut self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
+    fn render_results_body(&mut self, running: bool, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         if self.desk.result_view() == ResultView::Messages {
@@ -2863,6 +2870,18 @@ impl QueryPane {
             return panel.render(p, entity);
         }
         let Some(result) = self.desk.shown_result() else {
+            // 第一次执行、还没有任何结果：正文是加载态，不再显示“运行查询后结果会显示在这里”。
+            if running {
+                return div()
+                    .id("query-results-running")
+                    .test_support()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(kit::loading_state(t("query.status.running"), p))
+                    .into_any_element();
+            }
             return div()
                 .flex_1()
                 .flex()
@@ -3002,11 +3021,11 @@ fn pinned_tab(
 /// 结果头里的失败状态。这里只留一句短状态：完整错误在下面的语句面板或消息页里显示一次，
 /// 头部再堆一遍同一段长错误就是重复。完整原文留在悬停提示里，需要时悬停即可读到。
 #[inline(never)]
-fn failure_status(result: &desk::StatementView, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
+fn failure_status(result: &desk::StatementView, with_jump: bool, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
     let detail = failure_summary(locale, result);
     let label = i18n::text(locale, "query.log.error");
     let jump = entity.clone();
-    vec![
+    let mut items = vec![
         div()
             .id("query-error-summary")
             .test_support()
@@ -3021,8 +3040,11 @@ fn failure_status(result: &desk::StatementView, locale: Locale, p: &Palette, met
             .tooltip_text(SharedString::from(detail))
             .child(SharedString::from(label))
             .into_any_element(),
-        error_jump_button("query-error-jump", locale, p, metrics, &jump),
-    ]
+    ];
+    if with_jump {
+        items.push(error_jump_button("query-error-jump", locale, p, metrics, &jump));
+    }
+    items
 }
 
 fn statement_failed(view: &desk::StatementView) -> bool {
@@ -3094,7 +3116,8 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
                 .child(icon)
                 .child(SharedString::from(message)),
         )
-        .when(failed, |this| this.child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity)))
+        // 按钮按内容取宽，不被纵向排布拉成一整条红色横幅。
+        .when(failed, |this| this.child(div().flex().child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity))))
         // 失败且被自动改写时，说明改写并给出真正执行过的语句；手写 LIMIT 没有这一段。
         .when_some(if failed { rewrite_block(result, locale, mono, p) } else { None }, |this, block| this.child(block))
         .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
@@ -4242,7 +4265,9 @@ mod tests {
             assert!(!summary.label().unwrap_or_default().contains("no such table"), "{:?}", summary.label());
             let panel = window.find("query-error-message");
             assert!(panel.label().unwrap_or_default().contains("no such table: missing"), "{:?}", panel.label());
-            window.click("query-error-jump", cx);
+            // 定位按钮只在语句面板里出现一次，头部不再重复一个。
+            assert!(window.try_find("query-error-jump").is_none(), "头部不重复定位按钮");
+            window.click("query-error-jump-panel", cx);
             window.render_frame(cx);
             let editor = pane.read(cx).editors.get("q").cloned().unwrap();
             assert_eq!(editor.read(cx).selected_text(cx), "select missing;");

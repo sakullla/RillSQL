@@ -272,6 +272,10 @@ impl AdminSession {
         operation_banner(&self.target)
     }
 
+    pub fn display_banner(&self) -> String {
+        crate::app::views::grid::display_banner(&self.target, self.locale)
+    }
+
     pub fn request(&self) -> Result<Request, String> {
         crate::application::ddl::request(self.target.database.clone(), self.target.schema.clone(), &self.target.engine, self.action())
     }
@@ -1001,7 +1005,7 @@ impl Render for AdminPane {
                             .flex()
                             .flex_col()
                             .child(kit::title(t("ui.tool.admin"), TypeScale::LG, &p))
-                            .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
+                            .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.display_banner()))),
                     )
                     // 同一个位置：读取中换成一行转圈，读完换回来源说明。探测有可见加载态，表头也不会因插入而抖动。
                     .when(probing, |header| {
@@ -1085,7 +1089,7 @@ impl Render for AdminPane {
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
                         .child(kit::title(t("structure.preview.title"), TypeScale::LG, &p))
-                        .child(kit::muted(SharedString::from(self.session.banner()), &p))
+                        .child(kit::muted(SharedString::from(self.session.display_banner()), &p))
                         .child(
                             div()
                                 .id("admin-preview-sql")

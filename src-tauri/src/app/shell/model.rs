@@ -627,6 +627,7 @@ impl WorkbenchModel {
                 self.history.cancel_rename();
                 self.history.confirm_delete = false;
                 self.history.delete_target = None;
+                self.refresh_history_on_entry();
             }
             "saved-queries" => {
                 self.history.section = HistorySection::Saved;
@@ -635,6 +636,7 @@ impl WorkbenchModel {
                 self.history.confirm_delete = false;
                 self.history.delete_target = None;
                 self.shell.page = AppPage::History;
+                self.refresh_history_on_entry();
             }
             "open-exchange" => {
                 self.exchange_open = !self.exchange_open;
@@ -800,6 +802,7 @@ impl WorkbenchModel {
             }
             "activity-history" => {
                 let _ = self.shell.dispatch("history");
+                self.refresh_history_on_entry();
             }
             "activity-settings" => {
                 let _ = self.shell.dispatch("settings");
@@ -1139,6 +1142,7 @@ impl WorkbenchModel {
             "close-leave" => self.choose_leave(),
             "welcome-history" => {
                 let _ = self.shell.dispatch("history");
+                self.refresh_history_on_entry();
             }
             _ => return false,
         }
@@ -1302,6 +1306,14 @@ impl WorkbenchModel {
         if let Some(spec) = crate::app::views::diagram::spec_from_object(&target.spec()) {
             self.diagram_spec = Some(spec);
             self.shell.page = AppPage::Diagram;
+        }
+    }
+
+    /// 进入历史页时重读一次本机历史库：刚执行完的语句要能马上看到，不必再点“刷新”。
+    /// 只读本机库，不连业务库；已经在排队时不重复排。
+    fn refresh_history_on_entry(&mut self) {
+        if !self.pending.iter().any(|job| matches!(job, PendingJob::RefreshHistory)) {
+            self.enqueue(PendingJob::RefreshHistory);
         }
     }
 
@@ -4192,7 +4204,12 @@ impl WorkbenchModel {
             self.shell.focus = FocusTarget::Editor;
             return;
         }
-        if let Some(id) = self.active_tab().and_then(|tab| tab.connection_id.clone()) {
+        let tree = || self.nav.focus_node().map(|node| node.connection_id.clone()).filter(|id| !id.is_empty());
+        let id = match self.active_tab() {
+            Some(tab) => tab.connection_id.clone(),
+            None => tree(),
+        };
+        if let Some(id) = id {
             self.connections.selected = Some(id);
         }
         self.shell.page = AppPage::Connections;

@@ -175,6 +175,8 @@ fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestA
     // 紧凑宽度下每个主要页面的首要操作都要真正可见、可点。
     for (command, action) in [("connections", "conn-new"), ("history", "history-empty-query")] {
         cx.update(|cx| view.update(cx, |view, cx| view.perform(command, cx)));
+        // 进历史页会重读本机历史：这里直接落一份空清单，量的是读完后的空态按钮。
+        cx.update(|cx| view.update(cx, |view, _| view.model.history.apply_list(Vec::new(), Vec::new())));
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             let width = f32::from(window.find("workbench").bounds().size.width);
@@ -9858,3 +9860,20 @@ fn crowded_work_item_tabs_scroll_the_current_one_into_view(cx: &mut gpui_kit::Te
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// 每个进历史页的入口都重读一次本机历史：刚执行的语句不必手动点“刷新”就能看到；
+/// 已经在排队时不重复排。
+#[test]
+fn entering_history_from_any_entry_rereads_local_history_once() {
+    for entry in ["activity-history", "welcome-history", "history", "saved-queries"] {
+        let mut model = WorkbenchModel::new(Shell::default());
+        let _ = model.drain_pending();
+        let _ = model.dispatch(entry);
+        assert_eq!(model.shell.page, AppPage::History, "{entry} 进历史页");
+        assert_eq!(model.drain_pending(), vec![PendingJob::RefreshHistory], "{entry} 重读一次历史");
+        let _ = model.dispatch("activity-workspace");
+        let _ = model.dispatch(entry);
+        let _ = model.dispatch(entry);
+        assert_eq!(model.drain_pending(), vec![PendingJob::RefreshHistory], "{entry} 排队中不重复");
+    }
+}

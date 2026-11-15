@@ -1524,23 +1524,37 @@ impl Workbench {
         let m = self.metrics();
         // 目标名可能很长；只压缩这一段，状态提示与语言开关保持在位。
         let target_max = (self.model.viewport_width as f32 * 0.42).max(120.);
-        let target: AnyElement = match self.model.active_tab() {
-            Some(tab) if tab.connection_id.is_some() => {
-                let engine = tab.engine.clone().unwrap_or_default();
+        // 目标：活动工作项自己的连接；没有工作项时（欢迎页、历史、设置）落到对象树里选中的连接，
+        // 免得树上明明选着一条已连接的库，状态栏却说“未选择连接”。
+        let tab_target = self.model.active_tab().filter(|tab| tab.connection_id.is_some()).map(|tab| {
+            (
+                tab.connection_id.clone().unwrap_or_default(),
+                tab.engine.clone().unwrap_or_default(),
+                tab.connection_name.clone().unwrap_or_default(),
+                tab.database.clone().unwrap_or_default(),
+            )
+        });
+        let tree_target = || {
+            self.model.nav.focus_node().filter(|node| !node.connection_id.is_empty()).map(|node| {
+                (node.connection_id.clone(), node.engine.as_str().to_owned(), node.connection_name.clone(), node.database.clone())
+            })
+        };
+        let status_target = if self.model.active_tab().is_some() { tab_target } else { tab_target.or_else(tree_target) };
+        let target: AnyElement = match status_target {
+            Some((connection_id, engine, name, database)) => {
                 let env = self
                     .model
                     .connections
                     .rows
                     .iter()
-                    .find(|row| Some(&row.saved.id) == tab.connection_id.as_ref())
+                    .find(|row| row.saved.id == connection_id)
                     .map(|row| row.saved.env.clone())
                     .unwrap_or_default();
-                let name = tab.connection_name.clone().unwrap_or_default();
-                let database = tab.database.clone().unwrap_or_default();
+                let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
                 kit::interactive_states(div().id("status-target"), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
-                    .aria_label(self.t("ui.status.noTarget"))
+                    .aria_label(label.clone())
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1549,7 +1563,7 @@ impl Workbench {
                     .rounded(px(Radius::CONTROL))
                     .px(px(4.))
                     .child(kit::engine_badge(&engine, 14.))
-                    .child(div().min_w(px(0.)).truncate().child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") })))
+                    .child(div().min_w(px(0.)).truncate().child(label))
                     .children(self.env_pill(&env, &p))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.perform("status-target", cx);
@@ -1750,11 +1764,14 @@ impl Workbench {
                     .child(kit::title("RillSQL", TypeScale::LG, &p))
                     .child(div().flex_1())
                     .child(
-                        div()
-                            .id("welcome-history")
+                        // 可点的文字链接：和其它可点元素一样有悬停、按下与键盘焦点环。
+                        kit::interactive_states(div().id("welcome-history"), &p, false)
                             .flex()
                             .items_center()
                             .gap(px(6.))
+                            .px(px(6.))
+                            .py(px(3.))
+                            .rounded(px(Radius::CONTROL))
                             .text_size(px(TypeScale::XS))
                             .text_color(p.text_muted)
                             .child(kit::icon(IconName::Clock, 13., p.text_faint))

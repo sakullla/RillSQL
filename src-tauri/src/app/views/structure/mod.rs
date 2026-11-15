@@ -365,6 +365,10 @@ impl StructureSession {
         operation_banner(&self.target)
     }
 
+    pub fn display_banner(&self) -> String {
+        crate::app::views::grid::display_banner(&self.target, self.locale)
+    }
+
     pub fn request(&self) -> Result<Request, String> {
         crate::application::ddl::request(self.target.database.clone(), self.target.schema.clone(), &self.target.engine, self.action())
     }
@@ -2634,7 +2638,7 @@ impl StructurePane {
                                     .flex()
                                     .flex_col()
                                     .child(kit::title(title, TypeScale::LG, &p))
-                                    .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
+                                    .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.display_banner()))),
                             )
                             .children(more),
                     )
@@ -2721,7 +2725,7 @@ impl StructurePane {
             let confirm_blocked = self.session.confirm_blocked();
             let object = SharedString::from(self.session.object_label());
             let sql = self.session.preview_sql().join("\n");
-            let banner = SharedString::from(self.session.banner());
+            let banner = SharedString::from(self.session.display_banner());
             let target = SharedString::from(self.session.preview_target());
             let rule = self.session.preview_rule();
             let note_text = self.session.note();
