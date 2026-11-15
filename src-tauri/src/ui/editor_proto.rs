@@ -1918,7 +1918,11 @@ select 1;";
         .unwrap();
         cx.update_window(window, |_, window, cx| {
             assert_eq!(editor.read(cx).value(cx), sql, "一次撤销回到切换前");
+            // 重做键随平台不同：macOS 是 Cmd+Shift+Z，Windows/Linux 的编辑器是 Ctrl+Y。
+            #[cfg(target_os = "macos")]
             window.press("secondary-shift-z", cx);
+            #[cfg(not(target_os = "macos"))]
+            window.press("secondary-y", cx);
         })
         .unwrap();
         cx.update_window(window, |_, window, cx| {
