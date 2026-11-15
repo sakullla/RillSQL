@@ -2391,7 +2391,7 @@ fn type_colors(kind: &str, p: &Palette) -> (gpui_kit::Hsla, gpui_kit::Hsla) {
     }
 }
 
-fn row_button(id: String, icon: IconName, label: String, entity: &Entity<RedisPane>) -> gpui_kit::component::button::Button {
+fn row_button(id: String, icon: IconName, label: String, entity: &Entity<RedisPane>) -> kit::IconButton {
     let entity = entity.clone();
     let command = id.clone();
     kit::icon_button(SharedString::from(id), icon, SharedString::from(label), move |_, _, cx| {
@@ -2412,7 +2412,7 @@ fn redis_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kin
     }
 }
 
-fn redis_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<RedisPane>) -> gpui_kit::component::button::Button {
+fn redis_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<RedisPane>) -> kit::IconButton {
     let entity = entity.clone();
     kit::icon_button(id, icon, SharedString::from(label.to_owned()), move |_, _, cx| entity.update(cx, |pane, cx| pane.command(id, cx)))
 }

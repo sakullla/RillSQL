@@ -639,7 +639,7 @@ mod tests {
         assert!(!foreign.contains(&("a", "b.c")), "dots inside identifiers cannot alias another column");
     }
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext as _, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 
     #[test]
     fn failure_text_names_the_target_and_retry_stays_available() {

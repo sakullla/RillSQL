@@ -3913,7 +3913,7 @@ fn pane_click(entity: &Entity<GridPane>, id: &'static str) -> impl Fn(&gpui_kit:
     }
 }
 
-fn grid_icon(id: &'static str, icon: IconName, label: SharedString, entity: Entity<GridPane>) -> gpui_kit::component::button::Button {
+fn grid_icon(id: &'static str, icon: IconName, label: SharedString, entity: Entity<GridPane>) -> kit::IconButton {
     kit::icon_button(id, icon, label, move |_, _, cx| {
         entity.update(cx, |pane, cx| {
             let _ = pane.command(id, cx);

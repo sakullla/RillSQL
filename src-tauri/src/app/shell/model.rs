@@ -912,11 +912,10 @@ impl WorkbenchModel {
                 self.connections.clear_list_filters();
                 self.conn_filter_menu = None;
             }
-            "conn-tls-cycle" => self.connections.cycle_tls(),
             "conn-ssh-toggle" => self.connections.toggle_ssh(),
+            // 安全选项的两种内部切换入口：键盘/测试按控件 id 走，界面上是同一组分段控件。
             "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
             "conn-ca-mode" => self.connections.cycle_ca_mode(),
-            "conn-env-cycle" => self.connections.cycle_env(),
             "menu-object" => self.open_tree_menu(false),
             "menu-object-item" => self.open_tree_menu(true),
             "menu-grid" => self.open_grid_menu(),
@@ -1138,21 +1137,8 @@ impl WorkbenchModel {
             }
             "close-stay" => self.choose_stay(),
             "close-leave" => self.choose_leave(),
-            "welcome-connections" => {
-                let _ = self.shell.dispatch("connections");
-            }
-            "welcome-sqlite" => {
-                let _ = self.shell.dispatch("open-sqlite");
-            }
-            "welcome-compare" => {
-                let _ = self.shell.dispatch("compare");
-            }
             "welcome-history" => {
                 let _ = self.shell.dispatch("history");
-            }
-            "welcome-saved" => {
-                let _ = self.shell.dispatch("saved-queries");
-                self.history.section = HistorySection::Saved;
             }
             _ => return false,
         }

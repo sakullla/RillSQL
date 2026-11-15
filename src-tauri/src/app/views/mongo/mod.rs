@@ -1768,12 +1768,12 @@ fn mongo_button_for(
     }
 }
 
-fn mongo_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+fn mongo_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<MongoPane>) -> kit::IconButton {
     let entity = entity.clone();
     kit::icon_button(id, icon, SharedString::from(label.to_owned()), move |_, _, cx| entity.update(cx, |pane, cx| pane.command(id, cx)))
 }
 
-fn doc_icon(id: String, icon: IconName, label: String, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+fn doc_icon(id: String, icon: IconName, label: String, entity: &Entity<MongoPane>) -> kit::IconButton {
     let entity = entity.clone();
     let command = id.clone();
     kit::icon_button(SharedString::from(id), icon, SharedString::from(label), move |_, _, cx| {

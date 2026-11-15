@@ -220,48 +220,11 @@ impl ConnectionPage {
         self.filter_env.clear();
     }
 
-    /// 环境筛选在“全部”、内置环境和自定义标签之间循环。
-    pub fn cycle_env_filter(&mut self, tags: &[crate::connections::model::EnvTag]) {
-        let mut options = vec![String::new(), "dev".into(), "test".into(), "prod".into(), "local".into()];
-        for tag in tags {
-            if !options.iter().any(|id| id == &tag.id) {
-                options.push(tag.id.clone());
-            }
-        }
-        let index = options.iter().position(|id| id == &self.filter_env).unwrap_or(0);
-        self.filter_env = options[(index + 1) % options.len()].clone();
-    }
-
-    pub fn cycle_engine_filter(&mut self) {
-        let engines = engines();
-        self.filter_engine = match self.filter_engine {
-            None => Some(engines[0]),
-            Some(current) => {
-                let index = engines.iter().position(|engine| *engine == current).unwrap_or(0);
-                if index + 1 >= engines.len() { None } else { Some(engines[index + 1]) }
-            }
-        };
-    }
-
     pub fn select_engine(&mut self, engine: Engine) {
         self.start_new(engine);
     }
 
-    pub fn cycle_tls(&mut self) {
-        let Some(draft) = self.editor.as_mut() else { return };
-        draft.tls_mode = match draft.tls_mode {
-            TlsMode::Off => TlsMode::Require,
-            TlsMode::Require => TlsMode::Verify,
-            TlsMode::Verify => TlsMode::Off,
-        };
-    }
-
-    pub fn toggle_ssh(&mut self) {
-        if let Some(draft) = self.editor.as_mut() {
-            draft.ssh_on = !draft.ssh_on;
-        }
-    }
-
+    /// SSH 认证方式在原位来回切；界面上的两个分段控件也落到这里。
     pub fn cycle_ssh_auth(&mut self) {
         let Some(draft) = self.editor.as_mut() else { return };
         draft.ssh_auth = match draft.ssh_auth {
@@ -278,15 +241,10 @@ impl ConnectionPage {
         };
     }
 
-    pub fn cycle_env(&mut self) {
-        let Some(draft) = self.editor.as_mut() else { return };
-        draft.env = match draft.env.as_str() {
-            "dev" => "test",
-            "test" => "prod",
-            "prod" => "local",
-            _ => "dev",
+    pub fn toggle_ssh(&mut self) {
+        if let Some(draft) = self.editor.as_mut() {
+            draft.ssh_on = !draft.ssh_on;
         }
-        .to_owned();
     }
 
     /// 清掉某个字段的错误。用户开始改这个字段，就不该继续显示上一次的结论。

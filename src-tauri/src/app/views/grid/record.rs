@@ -2,7 +2,6 @@
 //! 记录视图始终跟着网格的焦点行走：重新读取后焦点按行 id 挂回，那一行不在了就回到第一行。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Sizable as _;

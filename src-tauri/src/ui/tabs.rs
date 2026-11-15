@@ -145,7 +145,7 @@ pub fn close_action(
     p: &Palette,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement + gpui_kit::StatefulInteractiveElement {
-    kit::icon_action(id, IconName::X, label, HitArea::INLINE, if active { p.text_muted } else { p.text_faint }, p, false, on_click)
+    kit::icon_action(id, IconName::X, label, HitArea::INLINE, if active { p.text_muted } else { p.text_faint }, p, false, false, on_click)
 }
 
 /// 页签是否已经完整落在列表视口内。用上一帧记下的列表区域、页签位置和滚动偏移判断，
@@ -349,6 +349,7 @@ mod tab_tests {
                 HitArea::CONTROL,
                 p.text_muted,
                 &p,
+                false,
                 false,
                 cx.listener(|this: &mut Self, _, _, cx| {
                     this.clicks += 100;

@@ -114,6 +114,53 @@ struct ColumnSpec {
     min_w: f32,
 }
 
+/// 可直接编辑的字段表那一张的列宽。表头与行共用同一份：宽窗口用设计稿的固定档，
+/// 内容宽度放不下整行时按同一比例收窄，最后一列的"标记删除"不会被卡片裁掉（R6 / R7）。
+/// 之前这里两边各写一遍像素值，640 宽下多出来的主键/自增/上下移动把删除键挤到屏幕外。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FieldWidths {
+    name_min: f32,
+    kind: f32,
+    nullable: f32,
+    default: f32,
+    primary: f32,
+    auto: f32,
+    moves: f32,
+    drop: f32,
+}
+
+impl FieldWidths {
+    /// 行内间距与左右内边距：表头与行共用，不再各写一遍 6 / 12 / 8。
+    const GAP: f32 = 6.;
+    const PAD_LEFT: f32 = 12.;
+    const PAD_RIGHT: f32 = 8.;
+
+    fn wide() -> Self {
+        Self { name_min: 140., kind: 170., nullable: 52., default: 150., primary: 44., auto: 44., moves: 52., drop: 28. }
+    }
+
+    fn compact() -> Self {
+        Self { name_min: 100., kind: 120., nullable: 44., default: 100., primary: 38., auto: 38., moves: 44., drop: 24. }
+    }
+
+    /// 整行在给定内容宽度里至少要多宽：固定列 + 名称最小宽 + 列间距 + 左右内边距。
+    fn min_total(&self, create: bool) -> f32 {
+        let mut total = self.name_min + self.kind + self.nullable + self.default + self.drop;
+        let mut columns = 4;
+        if create {
+            total += self.primary + self.auto + self.moves;
+            columns += 3;
+        }
+        total + Self::GAP * columns as f32 + Self::PAD_LEFT + Self::PAD_RIGHT
+    }
+
+    /// 宽档放得下就用宽档，否则整行换紧凑档；两档都放不下时仍用紧凑档（不再往回缩到点不中）。
+    fn of(content_w: f32, create: bool) -> Self {
+        let wide = Self::wide();
+        if wide.min_total(create) <= content_w { wide } else { Self::compact() }
+    }
+}
+
 const FIELDS_TABLE: [ColumnSpec; 4] = [
     ColumnSpec { key: "structure.field.column", weight: 2., min_w: 96. },
     ColumnSpec { key: "structure.field.type", weight: 1.4, min_w: 76. },
@@ -1813,6 +1860,9 @@ impl StructurePane {
         }
         let engine = self.session.target.engine.clone();
         let row_h = metrics.row_h;
+        // 内容宽度扣掉页面左右内边距后，才是这一行真正能用的宽度。
+        let viewport_w = f32::from(window.viewport_size().width);
+        let widths = FieldWidths::of(viewport_w - 2. * metrics.page_pad_for(viewport_w), create);
         let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
         if create {
             let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
@@ -1826,29 +1876,29 @@ impl StructurePane {
             .flex_none()
             .h(px(row_h))
             .items_center()
-            .gap(px(6.))
-            .pl(px(12.))
-            .pr(px(8.))
+            .gap(px(FieldWidths::GAP))
+            .pl(px(FieldWidths::PAD_LEFT))
+            .pr(px(FieldWidths::PAD_RIGHT))
             .bg(p.chrome)
             .border_b_1()
             .border_color(p.line)
             .text_size(px(TypeScale::XS))
             .text_color(p.text_faint)
-            .child(div().flex_1().min_w(px(140.)).child(t("structure.field.column")))
-            .child(div().w(px(170.)).flex_none().child(t("structure.field.type")))
-            .child(div().w(px(52.)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
-            .child(div().w(px(150.)).flex_none().child(t("ui.structure.default")))
+            .child(div().flex_1().min_w(px(widths.name_min)).child(t("structure.field.column")))
+            .child(div().w(px(widths.kind)).flex_none().child(t("structure.field.type")))
+            .child(div().w(px(widths.nullable)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
+            .child(div().w(px(widths.default)).flex_none().child(t("ui.structure.default")))
             .when(create, |this| {
-                this.child(div().w(px(44.)).flex_none().flex().justify_center().child(t("structure.field.primary")))
-                    .child(div().w(px(44.)).flex_none().flex().justify_center().child(t("structure.field.auto")))
-                    .child(div().w(px(52.)).flex_none())
+                this.child(div().w(px(widths.primary)).flex_none().flex().justify_center().child(t("structure.field.primary")))
+                    .child(div().w(px(widths.auto)).flex_none().flex().justify_center().child(t("structure.field.auto")))
+                    .child(div().w(px(widths.moves)).flex_none())
             })
-            .child(div().w(px(28.)).flex_none());
+            .child(div().w(px(widths.drop)).flex_none());
         let mut rows = div().flex().flex_col();
         let columns = self.session.kept_columns.clone();
         for (index, column) in columns.iter().enumerate() {
             let change = self.column_change(column);
-            rows = rows.child(stack_frame(|| self.column_row(index, column, change, create, &engine, row_h, &p, &entity, window, cx)));
+            rows = rows.child(stack_frame(|| self.column_row(index, column, change, create, &engine, row_h, widths, &p, &entity, window, cx)));
         }
         let add_entity = entity.clone();
         let add = div()
@@ -1878,6 +1928,7 @@ impl StructurePane {
         create: bool,
         engine: &str,
         row_h: f32,
+        widths: FieldWidths,
         p: &Palette,
         entity: &Entity<StructurePane>,
         window: &mut Window,
@@ -1943,11 +1994,11 @@ impl StructurePane {
             .test_support()
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(FieldWidths::GAP))
             .relative()
             .h(px(row_h))
-            .pl(px(12.))
-            .pr(px(8.))
+            .pl(px(FieldWidths::PAD_LEFT))
+            .pr(px(FieldWidths::PAD_RIGHT))
             .border_b_1()
             .border_color(p.line_soft)
             .hover(|style| style.bg(p.hover))
@@ -1956,32 +2007,32 @@ impl StructurePane {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(140.))
+                    .min_w(px(widths.name_min))
                     .flex()
                     .items_center()
                     .gap(px(4.))
                     .when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn)))
                     .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name)),
             )
-            .child(div().w(px(170.)).flex_none().flex().items_center().gap(px(2.)).when(dropped, |this| this.opacity(0.5)).child(div().flex_1().min_w(px(0.)).child(kind)).child(type_menu))
+            .child(div().w(px(widths.kind)).flex_none().flex().items_center().gap(px(2.)).when(dropped, |this| this.opacity(0.5)).child(div().flex_1().min_w(px(0.)).child(kind)).child(type_menu))
             .child(
                 div()
-                    .w(px(52.))
+                    .w(px(widths.nullable))
                     .flex_none()
                     .flex()
                     .justify_center()
                     .child(toggle(format!("structure-null-{index}"), column.nullable, "null", t("ui.structure.nullable"), !dropped && !column.primary)),
             )
-            .child(div().w(px(150.)).flex_none().when(dropped, |this| this.opacity(0.5)).child(default_value));
+            .child(div().w(px(widths.default)).flex_none().when(dropped, |this| this.opacity(0.5)).child(default_value));
         if create {
             let up_entity = entity.clone();
             let down_entity = entity.clone();
             row = row
-                .child(div().w(px(44.)).flex_none().flex().justify_center().child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)))
-                .child(div().w(px(44.)).flex_none().flex().justify_center().child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)))
+                .child(div().w(px(widths.primary)).flex_none().flex().justify_center().child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)))
+                .child(div().w(px(widths.auto)).flex_none().flex().justify_center().child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)))
                 .child(
                     div()
-                        .w(px(52.))
+                        .w(px(widths.moves))
                         .flex_none()
                         .flex()
                         .child(kit::icon_button(SharedString::from(format!("structure-up-{index}")), IconName::ChevronUp, t("structure.field.moveUp"), move |_, _, cx| {
@@ -1998,7 +2049,7 @@ impl StructurePane {
                         }).xsmall()),
                 );
         }
-        row.child(div().w(px(28.)).flex_none().flex().justify_center().child(drop)).into_any_element()
+        row.child(div().w(px(widths.drop)).flex_none().flex().justify_center().child(drop)).into_any_element()
     }
 
     fn section_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3439,6 +3490,77 @@ mod tests {
                 assert!((f32::from(row.size.height) - expected).abs() < 0.5, "{theme}: 行高 {} 应为 {expected}", f32::from(row.size.height));
                 assert!((f32::from(head.size.height) - expected).abs() < 0.5, "{theme}: 表头高应为 {expected}");
                 assert!(action, "{theme}: 主操作在两种密度两种主题下都在位");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 行尾的纯图标动作（上移、下移、标记删除）全部走 `kit::icon_button`：三档宽度与两种主题下
+    /// 都是同一个行内命中档、角色与无障碍名称就位，点击真的改草稿。
+    /// 页面不再各自拼一套被压小的图标按钮（R2 / R12）。
+    #[gpui_kit::test]
+    fn row_icon_actions_share_one_inline_hit_area_and_still_edit_the_draft(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("row-icons");
+        for dark in [false, true] {
+            for width in [1360., 900., 640.] {
+                cx.update(|cx| {
+                    gpui_kit::init(cx);
+                    kit::apply_theme(dark, cx);
+                });
+                let (window, pane) = cx
+                    .update(|cx| {
+                        let bounds = gpui_kit::Bounds {
+                            origin: gpui_kit::Point::default(),
+                            size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)),
+                        };
+                        let (window, pane) = gpui_kit::open_window(
+                            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                            cx,
+                            |_window, cx| {
+                                cx.new(|_| {
+                                    let mut pane = pane_with_snapshot(services.clone(), 3);
+                                    pane.session.mode = StructureMode::Create;
+                                    pane.session.table_name = "notes".into();
+                                    pane
+                                })
+                            },
+                        )
+                        .expect("structure pane");
+                        (window, pane)
+                    });
+                let note = format!("{width} dark={dark}");
+                let (up, down, drop, role) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        let up = window.find("structure-up-1");
+                        let down = window.find("structure-down-1");
+                        let drop = window.find("structure-drop-col-1");
+                        let role = up.role();
+                        (up.bounds(), down.bounds(), drop.bounds(), role)
+                    })
+                    .unwrap();
+                for (name, bounds) in [("上移", up), ("下移", down), ("标记删除", drop)] {
+                    assert!((f32::from(bounds.size.width) - kit::HitArea::INLINE).abs() < 0.5, "{note}: {name} 命中宽度");
+                    assert!((f32::from(bounds.size.height) - kit::HitArea::INLINE).abs() < 0.5, "{note}: {name} 命中高度");
+                }
+                assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: 行尾动作的角色");
+                // 整行的最后一列（标记删除）必须落在行自己的框里：窄窗口曾经把它挤到卡片外面，
+                // 只剩不可达的像素（R6 / R7）。
+                let row = cx.update_window(window, |_, window, _| window.find("structure-row-columns-0").bounds()).unwrap();
+                let row_right = f32::from(row.origin.x + row.size.width);
+                assert!(
+                    f32::from(drop.origin.x + drop.size.width) <= row_right + 0.5,
+                    "{note}: 标记删除被挤出整行（{row_right} 之后）"
+                );
+                let before: Vec<String> = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+                cx.update_window(window, |_, window, cx| window.click("structure-down-0", cx)).unwrap();
+                let after: Vec<String> = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+                assert_eq!(after[0], before[1], "{note}: 下移真的换到草稿顺序里");
+                assert_eq!(after[1], before[0]);
+                cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
+                assert!(cx.update(|cx| pane.read(cx).session.kept_columns[1].dropped), "{note}: 标记删除落在草稿上");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

@@ -14,7 +14,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontFeatures, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
+    IntoElement, ParentElement as _, Render, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window,
     div, hsla, px, rgb,
 };
 
@@ -420,7 +421,7 @@ pub fn control_text(text: impl Into<SharedString>, size: f32, weight: FontWeight
 ///
 /// 四态统一走 `interactive`（而非只挂按下态的 `interactive_states`）：悬停有背景反馈，
 /// 禁用时 hover/active/focus 一起消失、不成为 Tab 停靠点、也不挂点击。
-/// 其余页面自绘的 `icon_button` 是 T4 的收敛目标，这里不再派生新的同义实现。
+/// 全应用只有这一处拼纯图标动作的几何与状态：页签关闭、页签条新建、工具条和行尾图标都走这里。
 #[allow(clippy::too_many_arguments)]
 pub fn icon_action(
     id: impl Into<ElementId>,
@@ -430,11 +431,18 @@ pub fn icon_action(
     color: Hsla,
     p: &Palette,
     disabled: bool,
+    selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement + gpui_kit::StatefulInteractiveElement {
+) -> impl IntoElement + gpui_kit::StatefulInteractiveElement + gpui_kit::Styled {
     let label = label.into();
-    interactive(div().id(id), p, disabled)
-        .test_support()
+    // 选中的纯图标动作自己持有强调浅底，用不带 hover 的那条交互路径：
+    // 悬停换底会把选中底盖掉，让"当前项"看起来变成普通项。
+    let base = if selected {
+        interactive_states(div().id(id), p, disabled).bg(p.accent_soft)
+    } else {
+        interactive(div().id(id), p, disabled)
+    };
+    base.test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
         .tooltip_text(label)
@@ -1079,16 +1087,117 @@ pub fn vline(p: &Palette) -> AnyElement {
 
 type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
+/// 纯图标按钮的色调。只换前景色与可选的一圈边界线，
+/// 命中范围、图标档与四态仍由 `icon_action` 统一，页面不再各配一套。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconTone {
+    /// 幽灵样式：次级文字色，日常工具条与行尾动作。
+    Muted,
+    /// 主操作：强调色，整条工具条上只有一个。
+    Accent,
+    /// 描边：幽灵样式外加一圈控件边界线，用于成对的步进/翻页。
+    Outline,
+}
+
+/// 纯图标按钮：`icon_button` 的返回值。
+///
+/// 渲染时走 `icon_action`，因此命中范围只有 `HitArea` 三档、图标随命中档取尺寸、
+/// 四态只有一个实现。`xsmall/small/outline/primary/disabled/tooltip` 保留既有写法，
+/// 但不再是 `Button` 的第二套尺寸档与状态规则。带文字的按钮继续用
+/// `tool_button`/`primary_button`/`secondary_button`/`danger_button`。
+#[derive(IntoElement)]
+pub struct IconButton {
+    id: ElementId,
+    name: IconName,
+    label: SharedString,
+    /// 悬停提示可以比无障碍名称更具体（例如禁用原因），默认与 `label` 相同。
+    tooltip: Option<SharedString>,
+    hit: f32,
+    tone: IconTone,
+    disabled: bool,
+    selected: bool,
+    on_click: Click,
+}
+
+impl IconButton {
+    /// 行内尺寸：页签关闭、列表行尾动作。
+    pub fn xsmall(mut self) -> Self {
+        self.hit = HitArea::INLINE;
+        self
+    }
+
+    /// 工具条尺寸，也是默认档。
+    pub fn small(mut self) -> Self {
+        self.hit = HitArea::CONTROL;
+        self
+    }
+
+    /// 主操作色调。
+    pub fn primary(mut self) -> Self {
+        self.tone = IconTone::Accent;
+        self
+    }
+
+    /// 描边样式。
+    pub fn outline(mut self) -> Self {
+        self.tone = IconTone::Outline;
+        self
+    }
+
+    /// 当前项：强调浅底 + 强调色图标，替代表达开关是否打开。
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    /// 禁用：不可点、不悬停、不成为 Tab 停靠点；调用方同时给出原因。
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// 悬停提示换成更具体的一句话；无障碍名称仍是 `label`。
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+}
+
+impl RenderOnce for IconButton {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = Palette::of(cx);
+        let color = match (self.tone, self.selected) {
+            (IconTone::Accent, _) => p.accent,
+            (_, true) => p.accent_text,
+            (IconTone::Muted | IconTone::Outline, false) => p.text_muted,
+        };
+        // 悬停提示与无障碍名称是两件事：提示可以更具体（例如禁用原因），
+        // 名称仍必须是控件做的事，读屏与测试按它找控件。
+        let tip = self.tooltip.clone().unwrap_or_else(|| self.label.clone());
+        let mut button = icon_action(self.id, self.name, tip, self.hit, color, &p, self.disabled, self.selected, self.on_click);
+        if self.tooltip.is_some() {
+            button = button.aria_label(self.label.clone());
+        }
+        if self.tone == IconTone::Outline {
+            button = button.border_1().border_color(p.line_strong);
+        }
+        button
+    }
+}
+
 /// 图标按钮：幽灵样式、带提示。`label` 同时作为无障碍名称，测试按它找控件。
-pub fn icon_button(id: impl Into<ElementId>, name: IconName, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Button {
-    let label = label.into();
-    Button::new(id)
-        .ghost()
-        .small()
-        .icon(name)
-        .tooltip(label.clone())
-        .accessibility_label(label)
-        .on_click(on_click)
+pub fn icon_button(id: impl Into<ElementId>, name: IconName, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> IconButton {
+    IconButton {
+        id: id.into(),
+        name,
+        label: label.into(),
+        tooltip: None,
+        hit: HitArea::CONTROL,
+        tone: IconTone::Muted,
+        disabled: false,
+        selected: false,
+        on_click: Box::new(on_click),
+    }
 }
 
 /// 工具条按钮：幽灵样式、图标 + 文字。
@@ -2199,6 +2308,7 @@ mod control_tests {
                     p.text_muted,
                     &p,
                     false,
+                    false,
                     cx.listener(|this: &mut Self, _, _, cx| {
                         this.clicks += 1;
                         cx.notify();
@@ -2212,6 +2322,7 @@ mod control_tests {
                     p.text_faint,
                     &p,
                     true,
+                    false,
                     cx.listener(|this: &mut Self, _, _, cx| {
                         this.clicks += 10;
                         cx.notify();
@@ -2310,6 +2421,135 @@ mod control_tests {
                 .unwrap();
             assert!(first.is_some(), "{note}: 可用动作是 Tab 停靠点");
             assert_eq!(first, second, "{note}: 禁用动作不在停靠序列里（焦点只在唯一可用动作上循环）");
+        }
+    }
+
+    /// 各页面用的纯图标按钮探针：默认档、行内档、禁用、选中、描边各一个。
+    struct IconProbe {
+        clicks: usize,
+    }
+
+    impl Render for IconProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_start()
+                .p(px(40.))
+                .child(icon_button("ib-control", IconName::Plus, "新建查询", cx.listener(|this: &mut Self, _, _, cx| {
+                    this.clicks += 1;
+                    cx.notify();
+                })))
+                .child(icon_button("ib-inline", IconName::X, "关闭", cx.listener(|this: &mut Self, _, _, cx| {
+                    this.clicks += 10;
+                    cx.notify();
+                })).xsmall())
+                .child(
+                    icon_button("ib-off", IconName::Trash, "删除", cx.listener(|this: &mut Self, _, _, cx| {
+                        this.clicks += 100;
+                        cx.notify();
+                    }))
+                    .xsmall()
+                    .disabled(true)
+                    .tooltip("当前对象只读"),
+                )
+                .child(icon_button("ib-selected", IconName::PanelRight, "记录面板", cx.listener(|this: &mut Self, _, _, cx| {
+                    this.clicks += 1000;
+                    cx.notify();
+                })).selected(true))
+                .child(icon_button("ib-outline", IconName::ArrowRightLeft, "对比", cx.listener(|this: &mut Self, _, _, cx| {
+                    this.clicks += 10_000;
+                    cx.notify();
+                })).outline())
+        }
+    }
+
+    fn open_icons(cx: &mut TestAppContext, width: f32, dark: bool) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<IconProbe>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(dark, cx);
+        });
+        let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(width), px(400.)) };
+        cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, cx| cx.new(|_| IconProbe { clicks: 0 }),
+            )
+            .expect("icon button window")
+        })
+    }
+
+    /// 各页面用的 `icon_button` 只有一个实现：命中范围仍是 `HitArea` 三档、图标随之取档、
+    /// 角色与无障碍名称就位，`disabled` 真的不可点且不在 Tab 序列里。
+    /// 页面把同一批控件从 `Button` 换成这里之后，几何与四态不再分叉。
+    #[gpui_kit::test]
+    fn icon_button_keeps_icon_action_hit_area_role_and_states(cx: &mut TestAppContext) {
+        for width in [1360., 900., 640.] {
+            for dark in [false, true] {
+                let (window, view) = open_icons(cx, width, dark);
+                let note = format!("{width} dark={dark}");
+                let (control, inline, disabled, selected, outline, role, label) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        let control = window.find("ib-control");
+                        let inline = window.find("ib-inline");
+                        let disabled = window.find("ib-off");
+                        let selected = window.find("ib-selected");
+                        let outline = window.find("ib-outline");
+                        let role = control.role();
+                        let label = control.label().map(str::to_owned);
+                        (control.bounds(), inline.bounds(), disabled.bounds(), selected.bounds(), outline.bounds(), role, label)
+                    })
+                    .unwrap();
+                assert!((f32::from(control.size.width) - HitArea::CONTROL).abs() < 0.5, "{note}: 默认档命中宽度");
+                assert!((f32::from(control.size.height) - HitArea::CONTROL).abs() < 0.5, "{note}: 默认档命中高度");
+                assert!((f32::from(inline.size.width) - HitArea::INLINE).abs() < 0.5, "{note}: xsmall 只换命中档");
+                assert!((f32::from(disabled.size.height) - HitArea::INLINE).abs() < 0.5, "{note}: 禁用的几何不变");
+                assert!((f32::from(selected.size.width) - HitArea::CONTROL).abs() < 0.5, "{note}: 选中项尺寸不变");
+                assert!((f32::from(outline.size.width) - HitArea::CONTROL).abs() < 0.5, "{note}: 描边画在命中范围里");
+                assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: 图标按钮的角色");
+                assert_eq!(label.as_deref(), Some("新建查询"), "{note}: 无障碍名称");
+                cx.update_window(window, |_, window, cx| window.click("ib-control", cx)).unwrap();
+                cx.update_window(window, |_, window, cx| window.click("ib-off", cx)).unwrap();
+                assert_eq!(cx.update(|cx| view.read(cx).clicks), 1, "{note}: 可用项可点、禁用项不响应");
+                let (first, second) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.focus_next(cx);
+                        let first = window.focused(cx);
+                        window.focus_next(cx);
+                        let second = window.focused(cx);
+                        (first, second)
+                    })
+                    .unwrap();
+                assert!(first.is_some(), "{note}: 可用图标按钮是 Tab 停靠点");
+                assert_ne!(first, second, "{note}: 禁用项不进停靠序列，焦点继续往后走");
+            }
+        }
+    }
+
+    /// 选中的图标按钮自己持有强调浅底：悬停时不会被普通悬停底盖掉，替代表达“当前项”与“开关已开”。
+    #[gpui_kit::test]
+    fn selected_icon_button_keeps_its_accent_soft_background_on_hover(cx: &mut TestAppContext) {
+        for dark in [false, true] {
+            let (window, _view) = open_icons(cx, 900., dark);
+            let note = format!("dark={dark}");
+            let p = cx.update(|cx| Palette::of(cx));
+            let (idle, hovered, after) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let idle = paints_background(window, p.accent_soft);
+                    window.hover("ib-selected", cx);
+                    let hovered = paints_background(window, p.accent_soft);
+                    window.hover("ib-control", cx);
+                    let after = paints_background(window, p.accent_soft);
+                    (idle, hovered, after)
+                })
+                .unwrap();
+            assert!(idle, "{note}: 选中项有强调浅底");
+            assert!(hovered, "{note}: 悬停不盖掉选中底");
+            assert!(after, "{note}: 指针移开后选中底仍在");
         }
     }
 }

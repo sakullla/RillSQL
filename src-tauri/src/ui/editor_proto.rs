@@ -1888,7 +1888,7 @@ select 1;";
             window.press("secondary-z", cx);
         })
         .unwrap();
-        cx.update_window(window, |_, window, cx| {
+        cx.update_window(window, |_, _window, cx| {
             let value = editor.read(cx).value(cx);
             assert!(!value.contains("/*x*/"), "插入走编辑器撤销栈：{value}");
             assert!(value.starts_with("select"), "{value}");

@@ -1,7 +1,6 @@
 //! 外壳的画法：顶栏、活动栏、资源管理器、标签条、状态栏、页面与浮层。
 //! 状态与命令都在 `WorkbenchModel`；这里只把它画出来，并把点击交回 `perform`。
 
-use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
@@ -1490,6 +1489,7 @@ impl Workbench {
             kit::HitArea::CONTROL,
             p.text_muted,
             &p,
+            false,
             false,
             act("new-query", cx),
         )
