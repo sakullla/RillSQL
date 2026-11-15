@@ -1412,25 +1412,23 @@ impl Workbench {
                 let key = Some((active, self.model.tabs.len()));
                 if self.tab_scroll_seen != key {
                     self.tab_scroll_seen = key;
-                    self.tab_scroll_pending = index;
+                    self.tab_scroll_pending = index.map(tabs::Reveal::new);
                 }
             } else {
                 self.tab_scroll_seen = None;
                 self.tab_scroll_pending = None;
             }
         }
-        let reveal = match self.tab_scroll_pending {
-            Some(index) if tabs::tab_visible(&self.tab_scroll, index) => {
-                self.tab_scroll_pending = None;
-                None
-            }
-            Some(index) => {
-                // 这一帧才开始滚，页签位置要等画完才量得出来：再要一帧确认它真的进来了。
-                cx.notify();
-                Some(index)
-            }
-            None => None,
-        };
+        // 确认走共享的 reveal 协议：可见就结束，确认不了（零宽视口、列表还没挂载）
+        // 最多再请求 `REVEAL_MAX_FRAMES` 帧就放弃，不会每帧都要一帧重绘。
+        let visible = self
+            .tab_scroll_pending
+            .is_some_and(|reveal| tabs::tab_visible(&self.tab_scroll, reveal.index));
+        let reveal = tabs::reveal_step(&mut self.tab_scroll_pending, visible);
+        if reveal.is_some() {
+            // 这一帧才开始滚，页签位置要等画完才量得出来：再要一帧确认它真的进来了。
+            cx.notify();
+        }
         // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
         let dirty_text = self.t("ui.grid.pending");
         for tab in self.model.tabs.clone() {

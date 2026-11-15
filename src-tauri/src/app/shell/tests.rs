@@ -9714,6 +9714,9 @@ fn crowded_work_item_tabs_scroll_the_current_one_into_view(cx: &mut gpui_kit::Te
     assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "尾部新建动作仍在视口内");
     let offset = cx.update(|cx| f32::from(view.read(cx).tab_scroll.offset().x));
     assert!(offset < -0.5, "页签条确实横向滚动了（offset {offset}）");
+    // 两帧确认之后滚动请求必须自己结束，否则每帧都会再要一帧重绘。
+    let pending = cx.update(|cx| view.read(cx).tab_scroll_pending);
+    assert!(pending.is_none(), "确认进入视口后清掉 tab_scroll_pending");
     // Ctrl+Tab 绕一圈回到最后一个：切换后的当前项同样要在可视区里。
     for _ in 0..10 {
         cx.update(|cx| view.update(cx, |view, cx| view.perform("next-tab", cx)));

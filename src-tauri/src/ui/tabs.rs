@@ -167,12 +167,50 @@ pub fn tab_visible(scroll: &gpui_kit::ScrollHandle, index: usize) -> bool {
         && f32::from(right - (viewport.origin.x + viewport.size.width)) <= 0.5
 }
 
+/// 一次“把当前页签滚进视口”的请求。`frames` 是已经为它请求过的帧数，
+/// 用于给同一个请求设上限；当前页签或页签数量一变就重新从 0 开始。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reveal {
+    pub index: usize,
+    pub frames: u8,
+}
+
+impl Reveal {
+    pub fn new(index: usize) -> Self {
+        Self { index, frames: 0 }
+    }
+}
+
+/// 同一个请求最多再请求几帧。首帧只是发起滚动，第二帧才量得出页签是否真的进来了；
+/// 超过这个帧数仍在视口外，就说明几何确认不了（零宽视口、列表还没挂载、被别的布局压成
+/// 零高），此时必须放弃确认并清掉请求，否则每帧都会再要一次重绘。
+pub const REVEAL_MAX_FRAMES: u8 = 2;
+
+/// 推进一帧的滚动确认：
+/// - 已经完整可见 → 结束请求，之后不再动滚动位置（用户手动横向滚开不会被拉回）；
+/// - 还在视口外且没超过 `REVEAL_MAX_FRAMES` → 再请求一帧，返回要滚的下标；
+/// - 已经请求够帧数 → 放弃确认并清掉请求，宁可停在当前位置也不再每帧重绘。
+pub fn reveal_step(pending: &mut Option<Reveal>, visible: bool) -> Option<usize> {
+    let reveal = (*pending)?;
+    if visible {
+        *pending = None;
+        return None;
+    }
+    if reveal.frames >= REVEAL_MAX_FRAMES {
+        *pending = None;
+        return None;
+    }
+    *pending = Some(Reveal { frames: reveal.frames + 1, ..reveal });
+    Some(reveal.index)
+}
+
 /// 页签条：页签列表自己横向滚动，尾部动作（新建）固定在右侧。
 /// 列表 `flex_shrink` + `min_w(0)`，窄窗口里滚动而不是被裁切；尾部动作 `flex_none`，始终留在视口内。
 ///
 /// `scroll` 是调用方持有的滚动句柄（跨帧保存偏移，不能每帧新建），`reveal` 是本帧要把哪个
 /// 页签（下标）完整滚进列表视口：当前项由 Ctrl+Tab/新建切过去之后，列表自己滚到它，
-/// 不必用户手动横向拖动。调用方用 `tab_visible` 确认它真的进来了才停止给 `Some`，
+/// 不必用户手动横向拖动。调用方每帧用 `tab_visible` + `reveal_step` 确认它真的进来了
+/// 才停止给 `Some`（超过 `REVEAL_MAX_FRAMES` 帧仍确认不了就放弃），
 /// 确认之后不再动滚动位置，用户手动横向滚开不会被每帧拉回。
 #[allow(clippy::too_many_arguments)]
 pub fn tab_strip(
@@ -243,20 +281,35 @@ mod tab_tests {
         active: usize,
         /// 跨帧持有的滚动句柄，和 Workbench 一样由界面自己保存。
         scroll: gpui_kit::ScrollHandle,
-        /// 上一次已经滚动到的（当前项，页签数量），避免每帧重滚把用户的手动横向滚动拉回。
-        revealed: Option<(usize, usize)>,
+        /// 上一次已经请求过的（当前项，页签数量），与 Workbench 的 `tab_scroll_seen` 同义。
+        seen: Option<(usize, usize)>,
+        /// 还没确认进入视口的请求，与 Workbench 的 `tab_scroll_pending` 同义。
+        pending: Option<Reveal>,
+        /// 已经为滚动请求过多少帧：几何不可测时必须停下来，不能每帧都要一帧重绘。
+        requests: usize,
+        /// 页签条外面套一层零宽容器，模拟列表视口量不出宽度（零宽、未挂载）。
+        starved: bool,
+        /// 页签、关闭动作、尾部新建各自的焦点句柄：用来确认焦点顺序落在哪个元素上。
+        focus: [gpui_kit::FocusHandle; 3],
     }
 
     impl Render for Probe {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let p = Palette::of(cx);
             let layout = self.layout;
-            let reveal = if self.revealed == Some((self.active, self.count)) {
-                None
-            } else {
-                self.revealed = Some((self.active, self.count));
-                Some(self.active)
-            };
+            // 与 Workbench 的页签条完全同一套协议：当前项/数量变了就挂请求，
+            // 每帧用上一帧几何确认它是否已经进来，确认后就不再动滚动位置。
+            let key = Some((self.active, self.count));
+            if self.seen != key {
+                self.seen = key;
+                self.pending = Some(Reveal::new(self.active));
+            }
+            let visible = self.pending.is_some_and(|reveal| tab_visible(&self.scroll, reveal.index));
+            let reveal = reveal_step(&mut self.pending, visible);
+            if reveal.is_some() {
+                self.requests += 1;
+            }
+            let focus = self.focus.clone();
             let items: Vec<AnyElement> = (0..self.count)
                 .map(|index| {
                     let active = index == self.active;
@@ -264,22 +317,29 @@ mod tab_tests {
                         .active(active)
                         .running(index == 2)
                         .dirty(index == 1, Some(SharedString::from("有未提交的修改")));
-                    tab(spec, &p)
-                        .child(close_action(
-                            format!("tab-close-{index}"),
-                            "关闭",
-                            active,
-                            &p,
-                            cx.listener(|this: &mut Self, _, _, cx| {
-                                this.closes += 1;
-                                cx.notify();
-                            }),
-                        ))
+                    let close = close_action(
+                        format!("tab-close-{index}"),
+                        "关闭",
+                        active,
+                        &p,
+                        cx.listener(|this: &mut Self, _, _, cx| {
+                            this.closes += 1;
+                            cx.notify();
+                        }),
+                    );
+                    // 第一个页签与它的关闭动作挂上测试持有的焦点句柄：
+                    // 焦点顺序断言因此能指名到具体元素，而不只是“三个互不相同的句柄”。
+                    let close = if index == 0 { close.track_focus(&focus[1]) } else { close };
+                    let mut chip = tab(spec, &p)
+                        .child(close)
                         .on_click(cx.listener(|this: &mut Self, _, _, cx| {
                             this.clicks += 1;
                             cx.notify();
-                        }))
-                        .into_any_element()
+                        }));
+                    if index == 0 {
+                        chip = chip.track_focus(&focus[0]);
+                    }
+                    chip.into_any_element()
                 })
                 .collect();
             let new_tab = kit::icon_action(
@@ -295,24 +355,26 @@ mod tab_tests {
                     cx.notify();
                 }),
             )
+            .track_focus(&self.focus[2])
             .into_any_element();
-            div()
-                .id("tab-probe")
-                .test_support()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(tab_strip(
-                    "tabs",
-                    "打开的标签",
-                    "tab-list",
-                    items,
-                    vec![new_tab],
-                    &self.scroll,
-                    reveal,
-                    &layout,
-                    &p,
-                ))
+            let strip = tab_strip(
+                "tabs",
+                "打开的标签",
+                "tab-list",
+                items,
+                vec![new_tab],
+                &self.scroll,
+                reveal,
+                &layout,
+                &p,
+            );
+            let root = div().id("tab-probe").test_support().size_full().flex().flex_col();
+            // starved：外面套一层零宽容器，列表视口量不出宽度，页签几何永远确认不了。
+            if self.starved {
+                root.child(div().w(px(0.)).overflow_hidden().child(strip))
+            } else {
+                root.child(strip)
+            }
         }
     }
 
@@ -322,6 +384,17 @@ mod tab_tests {
         layout: Metrics,
         dark: bool,
         count: usize,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Probe>) {
+        open_with(cx, width, layout, dark, count, false)
+    }
+
+    fn open_with(
+        cx: &mut TestAppContext,
+        width: f32,
+        layout: Metrics,
+        dark: bool,
+        count: usize,
+        starved: bool,
     ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Probe>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -333,6 +406,13 @@ mod tab_tests {
                 WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
                 cx,
                 |_, cx| {
+                    // 显式跟踪的句柄由自己声明 tab 停靠属性：gpui 只对自动创建的句柄套用
+                    // 元素的 tab_index/tab_stop，句柄默认不是停靠点。
+                    let focus = [
+                        cx.focus_handle().tab_stop(true),
+                        cx.focus_handle().tab_stop(true),
+                        cx.focus_handle().tab_stop(true),
+                    ];
                     cx.new(|_| Probe {
                         layout,
                         count,
@@ -340,7 +420,11 @@ mod tab_tests {
                         closes: 0,
                         active: 0,
                         scroll: gpui_kit::ScrollHandle::new(),
-                        revealed: None,
+                        seen: None,
+                        pending: None,
+                        requests: 0,
+                        starved,
+                        focus,
                     })
                 },
             )
@@ -527,6 +611,59 @@ mod tab_tests {
             "新建后的当前页签完整落在列表视口内"
         );
         assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "新建后尾部动作仍可达");
+        // 两帧确认之后请求必须自己结束：否则每一帧都要一帧重绘。
+        let (pending, requests) = cx.update(|cx| (view.read(cx).pending, view.read(cx).requests));
+        assert!(pending.is_none(), "确认进入视口后清掉滚动请求");
+        assert!(requests <= 4, "只在需要时请求滚动（实际 {requests} 帧）");
+    }
+
+    /// 请求必须自己停下来：几何永远确认不了（零宽视口、列表还没挂载）时，
+    /// 不能每帧都再要一帧重绘。
+    #[test]
+    fn reveal_requests_stop_even_when_the_geometry_never_confirms() {
+        let mut pending = Some(Reveal::new(3));
+        let mut frames = 0;
+        while reveal_step(&mut pending, false).is_some() {
+            frames += 1;
+            assert!(frames <= usize::from(REVEAL_MAX_FRAMES) + 1, "确认不了时请求必须有限");
+        }
+        assert_eq!(frames, usize::from(REVEAL_MAX_FRAMES), "只请求到上限就放弃");
+        assert!(pending.is_none(), "放弃之后清掉请求，不再每帧重绘");
+        // 已经可见：立刻结束，不再动滚动位置。
+        let mut pending = Some(Reveal { index: 1, frames: 0 });
+        assert_eq!(reveal_step(&mut pending, true), None);
+        assert!(pending.is_none());
+        // 一帧之后才确认可见：只请求一次，第二帧结束。
+        let mut pending = Some(Reveal::new(2));
+        assert_eq!(reveal_step(&mut pending, false), Some(2));
+        assert_eq!(reveal_step(&mut pending, true), None);
+        assert!(pending.is_none());
+        assert_eq!(reveal_step(&mut pending, false), None, "没有请求时不自己发起");
+    }
+
+    /// 列表视口量不出宽度时，页签条最多请求几帧就停下：`tab_visible` 一直 false
+    /// 也不会变成持续重绘的循环。
+    #[gpui_kit::test]
+    fn a_zero_width_strip_stops_asking_for_frames(cx: &mut TestAppContext) {
+        let layout = Metrics::compact();
+        let (window, view) = open_with(cx, 640., layout, false, 3, true);
+        let mut tips = Vec::new();
+        let list_width = cx
+            .update_window(window, |_, window, cx| {
+                for _ in 0..6 {
+                    window.render_frame(cx);
+                    tips.push(view.read(cx).requests);
+                }
+                f32::from(window.find("tab-list").bounds().size.width)
+            })
+            .unwrap();
+        assert!(list_width <= 0.5, "零宽容器里的列表量不出宽度（实际 {list_width}），落在不可测分支");
+        assert_eq!(tips[4], tips[5], "请求已经停下，不会每帧再要一帧");
+        assert!(tips[5] <= usize::from(REVEAL_MAX_FRAMES), "请求次数有上限（实际 {}）", tips[5]);
+        let pending = cx.update(|cx| view.read(cx).pending);
+        assert!(pending.is_none(), "放弃确认后清掉请求");
+        let offset = cx.update(|cx| f32::from(view.read(cx).scroll.offset().x));
+        assert_eq!(offset, 0., "没有可见几何时不乱滚");
     }
 
     /// 键盘 Tab 依次走到页签、它的关闭动作和尾部新建：三个停靠点互不相同，
@@ -534,23 +671,37 @@ mod tab_tests {
     #[gpui_kit::test]
     fn keyboard_focus_visits_tab_close_and_new_in_order(cx: &mut TestAppContext) {
         let layout = Metrics::standard();
-        let (window, _view) = open(cx, 900., layout, false, 1);
-        let handles = cx
+        let (window, view) = open(cx, 900., layout, false, 1);
+        let focus = cx.update(|cx| view.read(cx).focus.clone());
+        // 每一步记下焦点句柄，以及三个具名元素各自是否报告持有焦点。
+        let steps = cx
             .update_window(window, |_, window, cx| {
                 window.render_frame(cx);
-                let mut handles = Vec::new();
+                let mut steps = Vec::new();
                 for _ in 0..4 {
                     window.focus_next(cx);
                     window.render_frame(cx);
-                    handles.push(window.focused(cx).expect("页签条里的控件应当都是 Tab 停靠点"));
+                    let handle = window.focused(cx).expect("页签条里的控件应当都是 Tab 停靠点");
+                    let facts = ["tab-0", "tab-close-0", "tab-new"].map(|id| window.find(id).focused());
+                    steps.push((handle, facts));
                 }
-                handles
+                steps
             })
             .unwrap();
-        assert_ne!(handles[0], handles[1], "页签与关闭动作是两个停靠点");
-        assert_ne!(handles[1], handles[2], "关闭动作与尾部新建是两个停靠点");
-        assert_ne!(handles[0], handles[2], "页签与尾部新建是两个停靠点");
-        assert_eq!(handles[0], handles[3], "三个停靠点走完回到第一个，焦点不会跑出页签条");
+        // 逐个指名：第一个停靠点就是页签本体，第二个是它的关闭动作，第三个是尾部新建。
+        assert_eq!(steps[0].0, focus[0], "第一个停靠点是 tab-0");
+        assert_eq!(steps[1].0, focus[1], "第二个停靠点是 tab-close-0");
+        assert_eq!(steps[2].0, focus[2], "第三个停靠点是 tab-new");
+        assert_eq!(steps[3].0, focus[0], "走完一圈回到 tab-0，焦点不会跑出页签条");
+        // 元素自身也报告持有焦点；关闭动作是页签的子元素，所以页签的作用域同时包含它。
+        assert_eq!(steps[0].1[0], Some(true), "tab-0 持有焦点");
+        assert_eq!(steps[0].1[1], Some(false), "焦点不在关闭动作上");
+        assert_eq!(steps[1].1[1], Some(true), "tab-close-0 持有焦点");
+        assert_eq!(steps[1].1[2], Some(false), "焦点不在尾部新建上");
+        assert_eq!(steps[2].1[2], Some(true), "tab-new 持有焦点");
+        assert_eq!(steps[1].1[0], Some(true), "关闭动作在页签作用域内");
+        // 焦点环是 2px inset 阴影，headless 读不到像素；可读的焦点事实就是句柄与持有关系。
+        assert_eq!(steps[2].1[0], Some(false), "焦点不在页签作用域内");
         let (strip, chip, title, close, new_tab) = cx
             .update_window(window, |_, window, cx| {
                 window.render_frame(cx);

@@ -115,6 +115,15 @@ pub struct Workbench {
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
     /// 对象树列表的滚动；跳转定义后把选中行滚进可见区。
     pub(super) explorer_scroll: gpui_kit::ScrollHandle,
+    /// 工作项页签条的横向滚动。跨帧保存偏移，不能每帧新建句柄；
+    /// Ctrl+Tab、新建或关闭之后要把当前页签滚进可视区。
+    pub(super) tab_scroll: gpui_kit::ScrollHandle,
+    /// 上一次已经请求过滚动的（当前页签 id，页签数量）。两者都没变就不再新增请求。
+    pub(super) tab_scroll_seen: Option<(String, usize)>,
+    /// 还没确认进入视口的当前页签：几何要等下一帧才量得出来，所以请求会挂着，
+    /// 直到它在列表视口里（或超过帧数上限——零宽视口确认不了，必须自己停下，
+    /// 否则每帧都要一帧重绘）。确认之后不再动滚动位置，用户手动横向滚开不会被拉回。
+    pub(super) tab_scroll_pending: Option<crate::ui::tabs::Reveal>,
     /// 切到次级页面后，下一帧把键盘焦点交回工作区根。
     pub(super) restore_pending: bool,
     pub(super) seen_page: AppPage,
@@ -280,6 +289,9 @@ impl Workbench {
             nav_gate: metadata_gate,
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
+            tab_scroll: gpui_kit::ScrollHandle::new(),
+            tab_scroll_seen: None,
+            tab_scroll_pending: None,
             restore_pending: false,
             seen_page: AppPage::Workspace,
             admin_link: None,
