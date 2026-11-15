@@ -1067,6 +1067,19 @@ impl SharedGrid {
         &self.applied_sql
     }
 
+    /// 唯一已应用条件：只有一份来源，结构化条件与直接表达式不会同时出现。
+    /// 分页请求、计数和全表导出都取这一份，不能各自再算一套；这里不含 pending，
+    /// 因为读取还没回来时屏幕上的行仍是上一次已应用条件的结果。
+    pub fn applied_condition(&self) -> Result<(Vec<crate::grid::commands::FilterArg>, Option<String>), String> {
+        match self.applied {
+            FilterSource::Visual => Ok((self.filter_args()?, None)),
+            FilterSource::Sql => {
+                let text = self.applied_sql.trim().to_owned();
+                Ok((Vec::new(), (!text.is_empty()).then_some(text)))
+            }
+        }
+    }
+
     /// 直连 SQL 筛选在哪些情形下不可用：查询结果没有可重读的表，网格不会重跑原语句。
     pub fn sql_block(&self) -> Option<&'static str> {
         if self.mode == GridMode::Query {
@@ -1416,15 +1429,17 @@ impl SharedGrid {
     /// 上一次已应用来源都保留。
     ///
     /// 还要重新读取时（表目标在线）只登记 pending，等这次读取成功才提交；
-    /// 没有可重读的表时立即提交，本地筛选照旧生效。
+    /// 不会发起读取时（查询结果、表目标离线）立即提交，本地筛选照旧生效：
+    /// 查询结果没有可重读的表，条件不能挂在一次永远不会发生的读取上。
     pub fn apply_filters(&mut self, awaits_read: bool) -> Result<(), String> {
         if let Err(error) = self.validate_conditions() {
             self.filter_error = Some(error.clone());
             return Err(error);
         }
-        // 直接表达式只有数据库能算：没有可重读的表时宁可拒绝，也不假装筛过。
+        // 直接表达式只有数据库能算：这次不会重读时宁可拒绝，也不假装筛过。
+        // 原因按现场取：查询结果没有可重读的表，不能把它说成"连接已关闭"。
         if self.filter_mode == FilterMode::Sql && !awaits_read {
-            let text = i18n::text(self.locale, "grid.filter.sqlOffline");
+            let text = i18n::text(self.locale, self.sql_block().unwrap_or("grid.filter.sqlOffline"));
             self.filter_error = Some(text.clone());
             return Err(text);
         }
@@ -1605,13 +1620,8 @@ impl SharedGrid {
                 }
             };
         }
-        match self.applied {
-            FilterSource::Visual => Ok((self.filter_args()?, None)),
-            FilterSource::Sql => {
-                let text = self.applied_sql.trim().to_owned();
-                Ok((Vec::new(), (!text.is_empty()).then_some(text)))
-            }
-        }
+        // 没有 pending 时就是已应用来源：与导出、计数取的是同一个函数。
+        self.applied_condition()
     }
 
     /// 读取请求。条件非法时返回原因：调用方不能发出这条查询，也不能清掉旧结果。
@@ -7383,6 +7393,30 @@ mod filter_model_tests {
         assert_eq!(grid.applied_expression().as_deref(), Some("id > 1"), "上次条件还在");
         assert_eq!(grid.filter_sql(), "id > 2", "草稿还在");
         assert!(grid.unapplied_filters(), "改动仍是未应用");
+    }
+
+    #[test]
+    fn applied_condition_has_exactly_one_source() {
+        let mut grid = customers();
+        grid.set_filter_full("id", "gt", "1", "", "");
+        let (filters, expression) = grid.applied_condition().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(expression.is_none());
+        // 切到 SQL 只换编辑形态：来源仍是可视化条件集。
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("\"name\" = '甲'");
+        assert!(grid.apply_filters(true).is_ok());
+        // pending 期间屏幕上的行仍是上一次已应用条件的结果，导出也取这一份。
+        let (filters, expression) = grid.applied_condition().unwrap();
+        assert_eq!(filters.len(), 1, "pending 不改变已应用来源");
+        assert!(expression.is_none());
+        grid.commit_applied_filter();
+        let (filters, expression) = grid.applied_condition().unwrap();
+        assert!(filters.is_empty(), "SQL 来源不再带可视化条件");
+        assert_eq!(expression.as_deref(), Some("\"name\" = '甲'"));
+        // 与分页请求逐项一致：两者不能各算一套。
+        let request = grid.page_request().unwrap();
+        assert_eq!((filters, expression), (request.filters, request.filter_expression));
     }
 
     #[test]

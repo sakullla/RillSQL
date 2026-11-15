@@ -539,13 +539,18 @@ impl GridPane {
 
     pub fn exchange_metadata(&self) -> (Option<TableRef>, Vec<String>, bool) { self.session.exchange_metadata() }
 
-    /// 交换/导出看到的那份已应用条件：分页、计数、全表导出共用，不再各算一套。
+    /// 交换/导出看到的那份已应用条件：与分页请求、计数取同一个函数，不再各算一套。
+    /// 查询结果没有服务器条件（网格只在已读取行上本地筛选），全表导出也不可用，
+    /// 因此不能把本地草稿当成要下发给服务器的筛选条件。
     pub fn exchange_condition(&self) -> crate::app::views::export::ExchangeCondition {
-        let filters = self.session.filter_args().unwrap_or_default();
+        if self.session.mode != GridMode::Table {
+            return crate::app::views::export::ExchangeCondition::default();
+        }
+        let (filters, expression) = self.session.applied_condition().unwrap_or_default();
         crate::app::views::export::ExchangeCondition {
             filters,
             search: self.session.server_search(),
-            expression: self.session.applied_expression(),
+            expression,
         }
     }
 
@@ -1471,9 +1476,10 @@ impl GridPane {
     }
 
     /// 应用筛选条里的全部条件；非法输入只提示原因，不发查询也不清旧结果。
-    /// 表目标在线时条件要等这次读取成功才成为已应用来源，线上失败就回滚。
+    /// 只有表目标在线、而且这次应用真的会发起重读时，条件才挂在读取成功上；
+    /// 查询结果没有可重读的表，等一次不会发生的读取只会让条件永远停在"未应用"。
     pub fn apply_filters(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        let awaits_read = self.live_target();
+        let awaits_read = self.session.mode == GridMode::Table && self.live_target();
         match self.session.apply_filters(awaits_read) {
             Ok(()) => {
                 self.notice.clear();
@@ -2246,9 +2252,11 @@ impl GridPane {
         if replace {
             // 整页替换：行内容与行集合都换了一套，记录面板的就地暂存不能跨过这次重读。
             self.record_row_changed();
-            self.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
             // 读取成功才把这次的条件换成已应用来源：失败时 pending 已在失败路径丢掉。
+            // 必须先提交再替换行：替换会重算本地可见行，来源还是上一份可视化条件时，
+            // 服务器刚算好的这一页会被本地条件再筛一遍（SQL 来源只剩上一组条件的行）。
             self.session.commit_applied_filter();
+            self.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
             // 新的一页真的到了才换窗口；失败路径不动选择、滚动和偏移。
             if landed_page {
                 self.session.reset_page_view();
@@ -3235,9 +3243,11 @@ impl GridPane {
                 rows = rows.child(self.render_filter_row(index, draft, p, entity));
             }
             if drafts.is_empty() {
+                // 一条条件都没有时，这里是一句可读说明，不是键名。
                 rows = rows.child(
                     div()
                         .id("grid-filter-empty")
+                        .debug_selector(|| "grid-filter-empty".to_owned())
                         .text_size(px(TypeScale::SM))
                         .text_color(p.text_faint)
                         .child(t("grid.filter.emptyVisual")),
@@ -3251,13 +3261,15 @@ impl GridPane {
                 .w_full()
                 .flex()
                 .items_center()
-                .gap(px(6.));
+                .gap(px(6.))
+                .tooltip_text(t("grid.filter.sqlTitle"));
             if let Some(state) = self.sql_input.clone() {
                 row = row.child(
                     div()
                         .flex_1()
                         .min_w(px(120.))
-                        .child(kit::text_input("grid-filter-sql-input", &state, t("grid.filter.sqlPlaceholder")).appearance(false).xsmall()),
+                        // 输入框的可读名字用"直接写 WHERE 表达式"；示例长句留在占位符里。
+                        .child(kit::text_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle")).appearance(false).xsmall()),
                 );
             }
             row = row.child(
@@ -8608,5 +8620,190 @@ mod filter_ui_tests {
                 assert_eq!(pane.loaded_len(), 2);
             });
         });
+    }
+
+    fn query_items_sheet() -> QuerySheet {
+        QuerySheet {
+            sql: "SELECT id, name FROM items".to_owned(),
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            rows: vec![
+                vec![Some("1".to_owned()), Some("a".to_owned())],
+                vec![Some("2".to_owned()), Some("b".to_owned())],
+                vec![Some("3".to_owned()), Some("c".to_owned())],
+                vec![Some("4".to_owned()), Some("d".to_owned())],
+            ],
+            truncated: false,
+            full_count: Some(4),
+        }
+    }
+
+    fn items_fixture(name: &str) -> (std::path::PathBuf, Arc<AppServices>) {
+        sqlite_services(
+            name,
+            &[
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".to_owned(),
+                "INSERT INTO items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')".to_owned(),
+            ],
+        )
+    }
+
+    /// 真实查询结果 + 仍然在线的连接：可视化条件必须当场作用在已读取行上。
+    /// 查询结果没有可重读的表，把条件挂在一次永远不会发生的读取上，
+    /// 行不变、dirty 和"未应用"提示还会一直留着。
+    #[gpui_kit::test]
+    fn query_result_filters_apply_locally_even_while_the_connection_is_live(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = items_fixture("query-local-filter");
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("items"), 100, cx));
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        // 语句结果进网格：连接还在，但这份结果没有可重读的表。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.show_query(target_of("items"), query_items_sheet(), cx));
+        });
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert_eq!(pane.loaded_len(), 4);
+                assert!(pane.live_target(), "连接还在，这正是原先误挂 pending 的条件");
+                let index = pane.session.add_filter("name");
+                pane.session.set_filter_op(index, "ne");
+                pane.session.update_filter_text(index, true, "b");
+                pane.apply_filters(cx).expect("查询结果的可视化条件必须直接生效");
+                assert!(!pane.session.has_pending_filter(), "查询结果没有可重读的读取，不能挂起条件");
+                assert_eq!(pane.loaded_len(), 3, "行集合当场变化");
+                assert_eq!(pane.cell(0, 1), "a");
+                assert_eq!(pane.cell(2, 1), "d");
+                assert!(pane.session.filters().iter().all(|draft| !draft.dirty), "dirty 要清掉");
+                assert!(!pane.session.unapplied_filters(), "应用过就不能再算未应用");
+                assert_eq!(pane.session.applied_source(), session::FilterSource::Visual);
+                assert!(pane.notice.is_empty(), "{}", pane.notice);
+            });
+        });
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.update(|window, cx| window.render_frame(cx));
+        assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_none(), "未应用提示必须消失");
+        assert!(visual.debug_bounds("grid-filter-rows").is_some(), "条件行还在");
+        // 失败的草稿：行集合和上一次已应用条件都不动，只说明原因。
+        visual.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.add_filter("id");
+                let error = pane.apply_filters(cx).expect_err("缺值必须被拒绝");
+                assert_eq!(pane.loaded_len(), 3, "失败的草稿没有改变行集合");
+                let request = pane.session.page_request().expect("上一次条件仍合法");
+                assert_eq!(request.filters.len(), 1);
+                assert_eq!(request.filters[0].column, "name");
+                assert!(pane.session.unapplied_filters(), "缺值的草稿仍是未应用");
+                assert_eq!(pane.notice, error);
+            });
+        });
+        visual.update(|window, cx| window.render_frame(cx));
+        assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_some(), "失败的草稿要标出未应用");
+        drop(visual);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 可视化 → SQL 切换后只有一份已应用来源：网格、计数和全表导出逐项一致，
+    /// 老的可视化草稿留在界面里但不再下发。
+    #[gpui_kit::test]
+    fn switched_sql_condition_is_the_only_source_for_rows_count_and_full_export(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services(
+            "sql-single-source",
+            &[
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT NOT NULL)".to_owned(),
+                "INSERT INTO orders (id, status) VALUES (1, 'paid'), (2, 'pending'), (3, 'paid')".to_owned(),
+            ],
+        );
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("orders"), 100, cx));
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        // 1) 可视化条件 id > 1：真实重读，来源是可视化条件集。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                let index = pane.session.add_filter("id");
+                pane.session.set_filter_op(index, "gt");
+                pane.session.update_filter_text(index, true, "1");
+                pane.apply_filters(cx).expect("条件合法");
+                assert!(pane.session.has_pending_filter(), "在线表要等这次重读落地");
+            });
+        });
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.loaded_len(), 2, "{}", pane.notice);
+            let request = pane.session.page_request().expect("条件合法");
+            assert_eq!(request.filters.len(), 1);
+            assert!(request.filter_expression.is_none());
+            let condition = pane.exchange_condition();
+            assert_eq!(condition.filters, request.filters, "可视化来源：导出与分页同源");
+            assert!(condition.expression.is_none());
+        });
+        // 2) 切到 SQL 并改成 status = 'paid'：切换不丢可视化草稿，但它不再是来源。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx), "在线表可以切到 SQL 条件");
+                pane.session.set_filter_sql("\"status\" = 'paid'");
+                pane.apply_filters(cx).expect("表达式合法");
+                assert!(pane.session.has_pending_filter(), "表达式也要等这次重读落地");
+            });
+        });
+        assert!(wait_for_fetch(cx, window, &pane));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.loaded_len(), 2, "{}", pane.notice);
+            assert_eq!(pane.cell(0, 0), "1");
+            assert_eq!(pane.cell(1, 0), "3");
+            assert_eq!(pane.session.applied_source(), session::FilterSource::Sql);
+            assert!(!pane.session.filters().is_empty(), "可视化草稿仍留在界面里");
+            let request = pane.session.page_request().expect("条件合法");
+            assert!(request.filters.is_empty(), "旧的可视化条件不再下发：{:?}", request.filters);
+            assert_eq!(request.filter_expression.as_deref(), Some("\"status\" = 'paid'"));
+            let counted = count_of(&request);
+            assert!(counted.filters.is_empty(), "计数与分页同源");
+            assert_eq!(counted.filter_expression, request.filter_expression);
+            let condition = pane.exchange_condition();
+            assert!(condition.filters.is_empty(), "全表导出不能带上旧的可视化草稿：{:?}", condition.filters);
+            assert_eq!(condition.expression, request.filter_expression, "导出的条件与网格一致");
+            assert_eq!(condition.search, request.search);
+            assert!(condition.narrowing(), "导出仍然是筛过的这一组行");
+            assert!(!condition.expression.as_deref().unwrap_or_default().contains("\"id\""), "旧目标条件不再出现");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 一条条件都没有时筛选区给的是可读说明，不是键名；中英文都不露 grid.filter. 前缀。
+    #[gpui_kit::test]
+    fn empty_visual_filter_strip_shows_a_readable_note_in_both_locales(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = items_fixture("filter-empty-note");
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("items"), 100, cx));
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane));
+        let mut visual = VisualTestContext::from_window(window, cx);
+        for locale in [Locale::ZhCn, Locale::En] {
+            visual.update(|window, cx| {
+                pane.update(cx, |pane, _| {
+                    pane.set_locale(locale);
+                });
+                window.render_frame(cx);
+            });
+            assert!(visual.debug_bounds("grid-filter-empty").is_some(), "{locale:?} 空态要画出来");
+            for key in ["grid.filter.emptyVisual", "grid.filter.sqlTitle"] {
+                let text = i18n::text(locale, key);
+                assert_ne!(text, key.to_owned(), "{locale:?} {key} 必须在字典里");
+                assert!(!text.contains("grid.filter."), "{locale:?} {key} 不能露出键名前缀：{text}");
+            }
+        }
+        drop(visual);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

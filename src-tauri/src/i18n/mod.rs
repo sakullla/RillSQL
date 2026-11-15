@@ -373,6 +373,7 @@ dict! {
     "grid.filter.modeVisual" => "可视化条件", "Visual";
     "grid.filter.modeSql" => "SQL 条件", "SQL";
     "grid.filter.modeHint" => "切换条件写法不会重新读取，也不会丢掉另一种写法的草稿", "Switching the filter style re-reads nothing and keeps the other draft";
+    "grid.filter.emptyVisual" => "还没有条件：点“添加条件”选一列和值，或切到 SQL 条件。", "No conditions yet: add one, or switch to SQL.";
     "grid.filter.sqlTitle" => "直接写 WHERE 表达式", "Write a WHERE expression";
     "grid.filter.sqlPlaceholder" => "例如 amount > 100 AND status IN ('paid')；留空表示无条件", "For example amount > 100 AND status IN ('paid'); leave empty for no condition";
     "grid.filter.sqlHint" => "这里只写条件表达式，不替代完整查询编辑器；读语句和写入都会被拒绝", "Only an expression here, not a full query editor; statements and writes are refused";
