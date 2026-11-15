@@ -16,6 +16,9 @@ pub struct SplitReport {
     pub refusal_from: Option<usize>,
 }
 
+/// 中文输入法的全角分号。
+const FULLWIDTH_SEMICOLON: &str = "\u{ff1b}";
+
 pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
     let hash = hash_comments(engine);
     let mut notices = Vec::new();
@@ -453,6 +456,14 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             i = close_at;
             break;
         }
+        // 中文输入法下常打出全角分号“；”：在字符串、注释与标识符之外按语句结束符处理，
+        // 不让它跟着语句发给数据库（也不让自动追加的 LIMIT 接在它后面）。
+        if !catch_pending && paren == 0 && begin_depth == 0 && delimiter == ";" && sql[i..].starts_with(FULLWIDTH_SEMICOLON) {
+            closed = true;
+            close_at = i + FULLWIDTH_SEMICOLON.len();
+            i = close_at;
+            break;
+        }
         i += utf8_len(bytes[i]);
     }
     if quote.is_some() {
@@ -497,7 +508,9 @@ fn make_piece(sql: &str, start: usize, end: usize, delimiter: &str, closed: bool
     };
     let raw = &sql[start..body_end.max(start)];
     let lead = leading_noise(raw, hash);
-    let body = raw[lead..].trim_end();
+    let trimmed = raw[lead..].trim_end();
+    // 全角分号只是结束符，不属于语句本身。
+    let body = trimmed.strip_suffix(FULLWIDTH_SEMICOLON).map(str::trim_end).unwrap_or(trimmed);
     // 只剩分号（块自闭合后残留的结束符）不算一条语句。
     if !meaningful(&body.replace(';', " "), hash) {
         return None;
@@ -641,7 +654,10 @@ fn is_go_line(sql: &str, word_start: usize) -> bool {
         return false;
     }
     let line_end = eol_at(sql, word_start);
+    // GO 后面允许：重复次数（GO 5）、行尾注释（GO -- 第二批）与一个多写的分号（GO;）。
     let rest = sql[word_start + 2..line_end].trim();
+    let rest = rest.split_once("--").map(|(code, _)| code).unwrap_or(rest).trim();
+    let rest = rest.strip_suffix(';').unwrap_or(rest).trim();
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 

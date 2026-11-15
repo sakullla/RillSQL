@@ -2115,3 +2115,52 @@ async fn sqlite_query_results_keep_real_values() {
     assert_eq!(rows.rows[1][2], Some("42".to_owned()), "TEXT 列里的数字按实际值读出");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 回归：中文输入法的全角分号“；”在字符串与注释之外按语句结束符处理；
+/// 语句文本里不带它，自动追加的 LIMIT 也不会接在它后面（否则数据库报 near "；" 语法错误）。
+#[test]
+fn fullwidth_semicolon_ends_a_statement_outside_strings() {
+    let sql = "SELECT * FROM thread_items WHERE turn_id='01a1；89'；\nSELECT 1;";
+    let report = split::split_sql("sqlite", sql);
+    assert!(report.refusal.is_none(), "{report:?}");
+    let texts: Vec<&str> = report.pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(texts, vec!["SELECT * FROM thread_items WHERE turn_id='01a1；89'", "SELECT 1;"], "字符串里的全角分号原样保留");
+    // 片段区间仍指向编辑器里的原文，定位出错位置不偏移。
+    let first = &report.pieces[0];
+    assert_eq!(&sql[first.start..first.end], first.text);
+
+    let capped = exec::cap_result_sql("sqlite", &report.pieces[0].text, 100);
+    assert_eq!(capped, "SELECT * FROM thread_items WHERE turn_id='01a1；89' LIMIT 101");
+
+    // 只有一个全角分号的“空语句”不算一条语句；注释里的全角分号不切分。
+    assert!(split::split_sql("sqlite", "；").pieces.is_empty());
+    let commented = split::split_sql("postgres", "SELECT 1 -- 说明；\n+ 1；");
+    assert_eq!(commented.pieces.len(), 1, "{commented:?}");
+    assert_eq!(commented.pieces[0].text, "SELECT 1 -- 说明；\n+ 1");
+}
+
+/// 分隔符因引擎而异：SQL Server 的 GO（大小写、次数、行尾注释、多写的分号）是批次分隔，
+/// 不进语句文本，读取上限用 TOP；MySQL 的 DELIMITER 自定义结束符下，过程体里的分号（含全角）不切分。
+#[test]
+fn delimiters_follow_each_engine() {
+    let tsql = "SELECT * FROM orders\ngo\nSELECT name FROM customers\nGO 2\nSELECT 1 -- 第三批\nGO -- 结束\nSELECT 2；\nGO;\n";
+    let report = split::split_sql("sqlserver", tsql);
+    assert!(report.refusal.is_none(), "{report:?}");
+    let texts: Vec<&str> = report.pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(texts, vec!["SELECT * FROM orders", "SELECT name FROM customers", "SELECT 1 -- 第三批", "SELECT 2"]);
+    assert!(texts.iter().all(|text| !text.to_ascii_uppercase().contains("\nGO")), "GO 不进语句");
+    assert_eq!(exec::cap_result_sql("sqlserver", texts[0], 100), "SELECT TOP (101) * FROM orders", "SQL Server 用 TOP 而不是 LIMIT");
+    // 单独一行的 GO 才是分隔：列名或字符串里的 go 不切分。
+    let inline = split::split_sql("sqlserver", "SELECT go FROM t WHERE note = 'go'\nGO");
+    assert_eq!(inline.pieces.len(), 1);
+    assert_eq!(inline.pieces[0].text, "SELECT go FROM t WHERE note = 'go'");
+
+    let mysql = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2； END$$\nDELIMITER ;\nSELECT 3；SELECT 4;";
+    let report = split::split_sql("mysql", mysql);
+    assert!(report.refusal.is_none(), "{report:?}");
+    let texts: Vec<&str> = report.pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert!(texts[0].starts_with("CREATE PROCEDURE") && texts[0].contains("SELECT 2；"), "自定义结束符下过程体整体保留：{texts:?}");
+    assert_eq!(texts[1], "SELECT 3");
+    assert_eq!(texts[2], "SELECT 4;");
+}
