@@ -17,7 +17,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Disableable as _, Sizable as _};
+use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
@@ -2370,14 +2370,10 @@ impl QueryPane {
             .child(div().flex_1())
             .children(pickers)
             .child(kit::vline(p))
+            // 右侧面板开关：命中范围、图标与四态走共享的纯图标动作；面板打开时是选中态。
             .child(
-                Button::new("query-side-toggle")
-                    .ghost()
-                    .small()
-                    .icon(IconName::PanelRight)
-                    .tooltip(t("query.side.toggle"))
-                    .accessibility_label(t("query.side.toggle"))
-                    .on_click(pane_act("toggle-side", entity)),
+                kit::icon_button("query-side-toggle", IconName::PanelRight, t("query.side.toggle"), pane_act("toggle-side", entity))
+                    .selected(self.side_open()),
             )
             .into_any_element()
     }
@@ -2629,15 +2625,13 @@ impl QueryPane {
             .on_click(move |_, _, cx| log_entity.update(cx, |pane, cx| pane.command("query-view:messages", cx)))
             .into_any_element();
         let pin_entity = entity.clone();
-        let pin = Button::new("query-act-pin")
-            .ghost()
-            .xsmall()
-            .icon(IconName::Bookmark)
-            .disabled(!self.desk.can_pin())
-            .tooltip(t("query.results.pin"))
-            .accessibility_label(t("query.results.pin"))
-            .on_click(move |_, _, cx| pin_entity.update(cx, |pane, cx| pane.command("pin-result", cx)))
-            .into_any_element();
+        // 固定当前结果：行内命中档，没有可固定的结果时禁用（不挂点击、不进 Tab 序列）。
+        let pin = kit::icon_button("query-act-pin", IconName::Bookmark, t("query.results.pin"), move |_, _, cx| {
+            pin_entity.update(cx, |pane, cx| pane.command("pin-result", cx));
+        })
+        .xsmall()
+        .disabled(!self.desk.can_pin())
+        .into_any_element();
         [log_tab, pin]
     }
 
@@ -4545,6 +4539,13 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(pane.read(cx).cell(0, 0, cx), "a");
             assert!(window.try_find("query-pinned-1").is_none());
+            // 固定结果走共享的纯图标动作：行内命中档、按钮角色与无障碍名称就位（Tab 可达由
+            // ui::kit::control_tests::icon_button_keeps_icon_action_hit_area_role_and_states 守住）。
+            let pin = window.find("query-act-pin");
+            assert_eq!(pin.role(), Some(gpui_kit::Role::Button), "固定结果是纯图标按钮");
+            assert_eq!(pin.label(), Some(i18n::text(Locale::ZhCn, "query.results.pin").as_str()), "固定按钮的无障碍名称");
+            assert!((f32::from(pin.bounds().size.width) - kit::HitArea::INLINE).abs() < 0.5, "固定按钮是行内命中档");
+            assert!(pin.visible(), "有结果时固定按钮可见");
             window.click("query-act-pin", cx);
             window.render_frame(cx);
             assert!(window.find("query-pinned-1").visible(), "固定后多出一个固定页签");
@@ -4776,9 +4777,16 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(window.try_find("query-outline").is_some(), "b 还是默认的大纲页");
+            // 收起按钮和工具条开关也是共享的纯图标动作：角色、无障碍名称、命中档一致。
+            let close = window.find("query-side-close");
+            assert_eq!(close.role(), Some(gpui_kit::Role::Button), "收起是纯图标按钮");
+            assert_eq!(close.label(), Some(i18n::text(Locale::ZhCn, "query.side.close").as_str()), "收起按钮的无障碍名称");
+            assert!((f32::from(close.bounds().size.width) - kit::HitArea::INLINE).abs() < 0.5, "收起是行内命中档");
+            assert_eq!(window.find("query-side-toggle").selected(), Some(true), "面板打开时工具条开关是选中态");
             window.click("query-side-close", cx);
             window.render_frame(cx);
             assert!(window.try_find("query-side-panel").is_none(), "收起后不再画右侧面板");
+            assert_ne!(window.find("query-side-toggle").selected(), Some(true), "面板收起后开关不再是选中态");
             pane.update(cx, |pane, cx| {
                 let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);
             });
@@ -4790,9 +4798,14 @@ mod tests {
             });
             window.render_frame(cx);
             assert!(window.try_find("query-side-panel").is_none(), "b 保持收起");
+            let toggle = window.find("query-side-toggle");
+            assert_eq!(toggle.role(), Some(gpui_kit::Role::Button), "右侧面板开关是纯图标按钮");
+            assert_eq!(toggle.label(), Some(i18n::text(Locale::ZhCn, "query.side.toggle").as_str()), "开关的无障碍名称");
+            assert!((f32::from(toggle.bounds().size.width) - kit::HitArea::CONTROL).abs() < 0.5, "开关是工具条命中档");
             window.click("query-side-toggle", cx);
             window.render_frame(cx);
             assert!(window.try_find("query-side-panel").is_some(), "工具条按钮重新打开");
+            assert_eq!(window.find("query-side-toggle").selected(), Some(true), "重开后开关回到选中态");
         })
         .unwrap();
     }

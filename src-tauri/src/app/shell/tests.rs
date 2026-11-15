@@ -1514,6 +1514,129 @@ fn grid_edits_block_close_and_structure_admin_bind_the_target(cx: &mut gpui_kit:
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 结构页字段表按内容区真实宽度排版：完整工作台里 900 / 640、开着侧栏、双主题、
+/// 紧凑/标准密度、中英文下，行尾每个动作都在行框内、可见、可点。
+/// 面板曾经拿窗口视口宽当内容宽，900 默认侧栏和 640 下右侧动作被 overflow_hidden 裁掉。
+#[gpui_kit::test]
+fn structure_row_actions_stay_inside_the_real_content_column(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::structure::StructureMode;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-structure-width-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    // 目标不带连接 id：结构页不会发起 describe，快照由测试直接装进面板。
+    let target = crate::app::views::grid::GridTarget {
+        connection_id: String::new(),
+        connection_name: String::new(),
+        database: "app".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        engine: "postgres".into(),
+        environment: "dev".into(),
+    };
+    for width in [900., 640.] {
+        let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, width, 800.);
+        for (theme, dark) in [("theme-light", "浅色"), ("theme-dark", "深色")] {
+            for density in ["density-compact", "density-standard"] {
+                for (locale, language) in [("locale-zh", "中文"), ("locale-en", "英文")] {
+                    let note = format!("{width} {dark} {density} {language}");
+                    cx.update(|cx| {
+                        view.update(cx, |view, cx| {
+                            view.perform(theme, cx);
+                            view.perform(density, cx);
+                            view.perform(locale, cx);
+                            // 侧栏开着才是被裁掉的场景：内容列少掉活动栏与停靠侧栏。
+                            view.model.shell.sidebar_open = true;
+                            view.model.shell.page = AppPage::Structure;
+                            view.model.tool = WorkTool::Structure;
+                            view.structure.update(cx, |pane, cx| {
+                                pane.bind(target.clone());
+                                pane.install_snapshot_for_test(4);
+                                pane.session.mode = StructureMode::Create;
+                                pane.session.table_name = "notes".into();
+                                cx.notify();
+                            });
+                            cx.notify();
+                        });
+                    });
+                    for mode in [StructureMode::Create, StructureMode::Existing] {
+                        let mode_note = if mode == StructureMode::Create { "新建" } else { "已有表" };
+                        let note = format!("{note} {mode_note}");
+                        cx.update(|cx| {
+                            view.update(cx, |view, cx| {
+                                view.structure.update(cx, |pane, cx| {
+                                    pane.session.mode = mode;
+                                    cx.notify();
+                                });
+                            });
+                        });
+                        let layout_width = cx.update(|cx| view.read(cx).model.layout().content_width as f32);
+                        let (content_width, viewport, workbench_w, body, row, actions) = cx
+                            .update_window(window, |_, window, cx| {
+                                window.render_frame(cx);
+                                let content_width = view.read(cx).structure.read(cx).content_width();
+                                let body = window.find("structure-body").bounds();
+                                let row = window.find("structure-row-columns-0").bounds();
+                                // 新建表才有多出的上移/下移；已有表每行只有标记删除。
+                                let ids: &[&str] = if mode == StructureMode::Create {
+                                    &["structure-up-1", "structure-down-1", "structure-drop-col-1"]
+                                } else {
+                                    &["structure-drop-col-1"]
+                                };
+                                let actions: Vec<_> = ids
+                                    .iter()
+                                    .map(|id| {
+                                        let element = window.find(*id);
+                                        (*id, element.bounds(), element.visible(), element.role())
+                                    })
+                                    .collect();
+                                let workbench_w = f32::from(window.find("workbench").bounds().size.width);
+                                (content_width, f32::from(window.viewport_size().width), workbench_w, body, row, actions)
+                            })
+                            .unwrap();
+                        assert!((content_width - layout_width).abs() < 0.5, "{note}: 面板内容宽 {content_width} 应来自布局 {layout_width}");
+                        assert!(content_width < viewport - 1., "{note}: 内容宽不能是窗口视口宽 {viewport}");
+                        let row_right = f32::from(row.origin.x + row.size.width);
+                        let body_right = f32::from(body.origin.x + body.size.width);
+                        assert!(row_right <= body_right + 0.5, "{note}: 整行越出滚动内容（{row_right} > {body_right}）");
+                        for (id, bounds, visible, role) in actions {
+                            assert!(visible, "{note}: {id} 应可见");
+                            assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: {id} 的角色");
+                            let left = f32::from(bounds.origin.x);
+                            let right = f32::from(bounds.origin.x + bounds.size.width);
+                            assert!(left >= f32::from(row.origin.x) - 0.5, "{note}: {id} 越出整行左侧");
+                            assert!(right <= row_right + 0.5, "{note}: {id} 被挤出整行（{right} > {row_right}）");
+                            assert!(right <= workbench_w + 0.5, "{note}: {id} 越出工作台");
+                        }
+                        // 动作不只是画得下，也要真的改草稿。
+                        // 640 的侧栏是覆盖式，遮罩会吞掉内容点击（侧栏浮在内容之上的既有行为）；
+                        // 收起后内容列宽度不变（覆盖与收起都是 588），在这里验证动作可点。
+                        if width < 700. {
+                            cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = false));
+                            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+                        }
+                        let before: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+                        cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
+                        assert!(cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 标记删除可点");
+                        cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
+                        assert!(!cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 再点一次取消标记");
+                        if mode == StructureMode::Create {
+                            cx.update_window(window, |_, window, cx| window.click("structure-down-0", cx)).unwrap();
+                            let after: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+                            assert_eq!(after[0], before[1], "{note}: 下移可点且换到草稿顺序里");
+                            assert_eq!(after[1], before[0]);
+                        }
+                        if width < 700. {
+                            cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = true));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 管理页空态（和表头）的「立即连接」不是死路：外壳取走请求，走树/连接行同一条按需连接入口，
 /// 连上后由 note_connection 让管理页自己重读清单。请求只消费一次，不重复排队。
 #[gpui_kit::test]

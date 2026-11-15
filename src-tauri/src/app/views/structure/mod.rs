@@ -139,8 +139,12 @@ impl FieldWidths {
         Self { name_min: 140., kind: 170., nullable: 52., default: 150., primary: 44., auto: 44., moves: 52., drop: 28. }
     }
 
+    /// 紧凑档要放进最窄的真实内容列：640 宽窗口开着侧栏时内容列只余 588
+    /// （640 - 52 活动栏），扣掉结构页左右内边距（标准 20 / 宽松 26）和卡片边线，
+    /// 可用约 534–548。列间距与行内边距占 62，固定列预算按 472 收，
+    /// 行尾动作才不会被 overflow_hidden 裁掉。
     fn compact() -> Self {
-        Self { name_min: 100., kind: 120., nullable: 44., default: 100., primary: 38., auto: 38., moves: 44., drop: 24. }
+        Self { name_min: 96., kind: 108., nullable: 40., default: 84., primary: 36., auto: 36., moves: 40., drop: 24. }
     }
 
     /// 整行在给定内容宽度里至少要多宽：固定列 + 名称最小宽 + 列间距 + 左右内边距。
@@ -155,6 +159,8 @@ impl FieldWidths {
     }
 
     /// 宽档放得下就用宽档，否则整行换紧凑档；两档都放不下时仍用紧凑档（不再往回缩到点不中）。
+    /// `content_w` 是字段表真实可用的内容宽（外壳内容区宽减去 structure-body 左右内边距），
+    /// 不是窗口视口宽。
     fn of(content_w: f32, create: bool) -> Self {
         let wide = Self::wide();
         if wide.min_total(create) <= content_w { wide } else { Self::compact() }
@@ -603,6 +609,9 @@ pub struct StructurePane {
     composer_open: bool,
     /// 读取失败是因为连接没打开时，“重试”先请外壳打开连接；连上后自动重读。
     connect_request: Option<String>,
+    /// 外壳同步来的真实可用内容宽（已扣活动栏与停靠侧栏）。
+    /// 字段表按它决定列宽，不能拿窗口视口宽冒充：900 的视口开着侧栏时只剩 614。
+    content_width: f32,
 }
 
 impl StructurePane {
@@ -631,7 +640,48 @@ impl StructurePane {
             view_editor: None,
             view_editor_sync: String::new(),
             view_sub: None,
+            content_width: 0.,
         }
+    }
+
+    /// 外壳每帧下发内容区真实宽度；变了返回 true，调用方据此重绘。
+    /// 布局还没跑过（独立渲染面板的测试）时是 0，字段表退回紧凑档，而不是拿视口宽冒充。
+    pub fn set_content_width(&mut self, width: f32) -> bool {
+        if (self.content_width - width).abs() < 0.5 {
+            return false;
+        }
+        self.content_width = width;
+        true
+    }
+
+    /// 字段表此刻依据的内容宽；测试用来核对它确实来自布局而不是视口。
+    #[cfg(test)]
+    pub(crate) fn content_width(&self) -> f32 {
+        self.content_width
+    }
+
+    /// 测试夹具：跳过 describe 直接装一份快照（目标没有连接 id，渲染时不会发起读取）。
+    #[cfg(test)]
+    pub(crate) fn install_snapshot_for_test(&mut self, columns: usize) {
+        let mut snapshot = crate::ddl::Snapshot::bare(crate::ddl::DdlEngine::Postgres, "app", "public", "orders");
+        snapshot.kind = "table".into();
+        for index in 0..columns {
+            snapshot.columns.push(crate::ddl::Column {
+                name: format!("col_{index}"),
+                type_name: if index == 0 { "bigint" } else { "integer" }.into(),
+                nullable: index != 0,
+                default_sql: None,
+                primary: index == 0,
+                auto: false,
+                generated: false,
+                default_constraint: None,
+            });
+        }
+        self.session.object_kind = snapshot.kind.clone();
+        self.session.kept_columns = column_drafts(&snapshot);
+        self.session.index_columns.clear();
+        self.drafts_ready = true;
+        self.snapshot = Some(snapshot);
     }
 
     /// 外壳取走“刚建好的表”。
@@ -1860,9 +1910,10 @@ impl StructurePane {
         }
         let engine = self.session.target.engine.clone();
         let row_h = metrics.row_h;
-        // 内容宽度扣掉页面左右内边距后，才是这一行真正能用的宽度。
-        let viewport_w = f32::from(window.viewport_size().width);
-        let widths = FieldWidths::of(viewport_w - 2. * metrics.page_pad_for(viewport_w), create);
+        // 内容宽由外壳布局同步（活动栏、停靠侧栏和根内边距已经扣掉），
+        // 再扣掉 structure-body 真正应用的左右内边距，才是这一行能用的宽度。
+        let content_w = (self.content_width - 2. * metrics.page_pad).max(0.);
+        let widths = FieldWidths::of(content_w, create);
         let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
         if create {
             let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
@@ -3495,75 +3546,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 行尾的纯图标动作（上移、下移、标记删除）全部走 `kit::icon_button`：三档宽度与两种主题下
-    /// 都是同一个行内命中档、角色与无障碍名称就位，点击真的改草稿。
-    /// 页面不再各自拼一套被压小的图标按钮（R2 / R12）。
-    #[gpui_kit::test]
-    fn row_icon_actions_share_one_inline_hit_area_and_still_edit_the_draft(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("row-icons");
-        for dark in [false, true] {
-            for width in [1360., 900., 640.] {
-                cx.update(|cx| {
-                    gpui_kit::init(cx);
-                    kit::apply_theme(dark, cx);
-                });
-                let (window, pane) = cx
-                    .update(|cx| {
-                        let bounds = gpui_kit::Bounds {
-                            origin: gpui_kit::Point::default(),
-                            size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)),
-                        };
-                        let (window, pane) = gpui_kit::open_window(
-                            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                            cx,
-                            |_window, cx| {
-                                cx.new(|_| {
-                                    let mut pane = pane_with_snapshot(services.clone(), 3);
-                                    pane.session.mode = StructureMode::Create;
-                                    pane.session.table_name = "notes".into();
-                                    pane
-                                })
-                            },
-                        )
-                        .expect("structure pane");
-                        (window, pane)
-                    });
-                let note = format!("{width} dark={dark}");
-                let (up, down, drop, role) = cx
-                    .update_window(window, |_, window, cx| {
-                        window.render_frame(cx);
-                        let up = window.find("structure-up-1");
-                        let down = window.find("structure-down-1");
-                        let drop = window.find("structure-drop-col-1");
-                        let role = up.role();
-                        (up.bounds(), down.bounds(), drop.bounds(), role)
-                    })
-                    .unwrap();
-                for (name, bounds) in [("上移", up), ("下移", down), ("标记删除", drop)] {
-                    assert!((f32::from(bounds.size.width) - kit::HitArea::INLINE).abs() < 0.5, "{note}: {name} 命中宽度");
-                    assert!((f32::from(bounds.size.height) - kit::HitArea::INLINE).abs() < 0.5, "{note}: {name} 命中高度");
-                }
-                assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: 行尾动作的角色");
-                // 整行的最后一列（标记删除）必须落在行自己的框里：窄窗口曾经把它挤到卡片外面，
-                // 只剩不可达的像素（R6 / R7）。
-                let row = cx.update_window(window, |_, window, _| window.find("structure-row-columns-0").bounds()).unwrap();
-                let row_right = f32::from(row.origin.x + row.size.width);
-                assert!(
-                    f32::from(drop.origin.x + drop.size.width) <= row_right + 0.5,
-                    "{note}: 标记删除被挤出整行（{row_right} 之后）"
-                );
-                let before: Vec<String> = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
-                cx.update_window(window, |_, window, cx| window.click("structure-down-0", cx)).unwrap();
-                let after: Vec<String> = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
-                assert_eq!(after[0], before[1], "{note}: 下移真的换到草稿顺序里");
-                assert_eq!(after[1], before[0]);
-                cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
-                assert!(cx.update(|cx| pane.read(cx).session.kept_columns[1].dropped), "{note}: 标记删除落在草稿上");
+    /// 字段表的紧凑档要放进最窄的真实内容列：640 宽窗口开着侧栏时内容列 588，
+    /// 扣掉结构页左右内边距和卡片边线只剩 534（原先拿 640 视口宽去算，行尾动作被裁掉）。
+    /// 完整工作台里 900 / 640 的可见与可点由外壳用例
+    /// structure_row_actions_stay_inside_the_real_content_column 覆盖。
+    #[test]
+    fn compact_field_widths_fit_the_narrowest_content_column() {
+        let rail = crate::app::shell::layout::RAIL_WIDTH as f32;
+        for metrics in [kit::Metrics::compact(), kit::Metrics::standard(), kit::Metrics::relaxed()] {
+            // 640 - 活动栏 - 左右页边距 - 卡片左右边线。
+            let content_w = 640. - rail - 2. * metrics.page_pad - 2.;
+            let widths = FieldWidths::compact();
+            for create in [false, true] {
+                let needed = widths.min_total(create);
+                assert!(needed <= content_w, "{metrics:?} create={create}: 紧凑行需要 {needed}，640 开侧栏只有 {content_w}");
             }
+            // 宽档放不下时必须整体换紧凑档，不能停在宽档把右边挤出去。
+            assert_eq!(FieldWidths::of(content_w, true).min_total(true), widths.min_total(true), "{metrics:?}: 窄内容列应取紧凑档");
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        // 反向：宽档确实更宽，档位不是摆设。
+        assert!(FieldWidths::wide().min_total(false) > FieldWidths::compact().min_total(false));
     }
 
     /// 空索引列表整块换成空态：既没有表头，也没有"表头 + 破折号"的占位行。

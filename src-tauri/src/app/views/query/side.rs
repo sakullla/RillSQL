@@ -2,9 +2,7 @@
 //! 宽窗口里它在编辑器旁边；窄窗口默认收起，打开时盖在编辑器上，不改变编辑器和结果区的布局。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, ClickEvent, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
@@ -97,17 +95,11 @@ impl SidePanel<'_> {
                 self.metrics.control_h,
             ))
             .child(div().flex_1())
-            .child(
-                Button::new("query-side-close")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::X)
-                    .tooltip(t("query.side.close"))
-                    .accessibility_label(t("query.side.close"))
-                    .on_click(move |_, _, cx| {
-                        close_entity.update(cx, |pane, cx| pane.command("toggle-side", cx));
-                    }),
-            );
+            // 收起：和页签关闭同一个纯图标动作，命中范围与四态不再由页面另拼。
+            .child(kit::icon_button("query-side-close", IconName::X, t("query.side.close"), move |_, _, cx| {
+                close_entity.update(cx, |pane, cx| pane.command("toggle-side", cx));
+            })
+            .xsmall());
         let body = match self.body {
             SideBody::Outline(items) => outline(items, locale, self.metrics, &self.mono, p, entity),
             SideBody::Object(info) => object(info, locale, self.metrics, &self.mono, p, self.engine, entity),

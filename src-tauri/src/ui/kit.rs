@@ -445,6 +445,8 @@ pub fn icon_action(
     base.test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
+        // 选中态是开关/当前项的语义：读屏与测试按 aria-selected 判断，而不是靠底色。
+        .when(selected, |this| this.aria_selected(true))
         .tooltip_text(label)
         .flex_none()
         .size(px(hit))
