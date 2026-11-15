@@ -1,4 +1,7 @@
 //! 按引擎切分用户 SQL。只用于决定发送范围，不判断语句是否安全。
+//! 行注释切换也放在这里：同样是按行切文本的纯变换，不依赖编辑器状态。
+
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
@@ -802,5 +805,266 @@ fn utf8_len(first: u8) -> usize {
         3
     } else {
         4
+    }
+}
+
+/// 一次行注释切换带来的编辑：整段受影响的行只替换一次，撤销栈里只有一条。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentEdit {
+    /// 受影响的连续行（字节范围），不含最后一行的换行符；换行本身留在原处。
+    pub range: Range<usize>,
+    /// 这段范围要换成的新文本。
+    pub text: String,
+    /// 替换之后应当恢复的选区（新文档的字节坐标）。
+    pub selection: Range<usize>,
+    /// 这次是加上一层注释（true）还是去掉一层（false）。
+    pub commented: bool,
+}
+
+/// SQL 通用行注释标记：标记本身加一个空格。
+const COMMENT: &str = "-- ";
+/// 判断“已经注释”时只看标记，不要求后面有空格。
+const MARK: &str = "--";
+
+fn line_start(sql: &str, at: usize) -> usize {
+    sql[..at].rfind('\n').map(|pos| pos + 1).unwrap_or(0)
+}
+
+fn line_end(sql: &str, from: usize) -> usize {
+    let from = floor_boundary(sql, from);
+    sql[from..].find('\n').map(|at| from + at).unwrap_or(sql.len())
+}
+
+fn floor_boundary(text: &str, mut at: usize) -> usize {
+    at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn ceil_boundary(text: &str, mut at: usize) -> usize {
+    at = at.min(text.len());
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// 拆出一行的前导空白与正文；CRLF 的行尾回车不算正文。
+fn body_of(line: &str) -> (&str, &str) {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let (indent, body) = line.split_at(indent);
+    (indent, body.trim_end_matches('\r'))
+}
+
+/// 去掉一层注释：标记及其后的一个可选空格。调用方保证这一行确实是注释。
+fn uncomment(body: &str) -> &str {
+    let rest = &body[MARK.len()..];
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// 切换一段 SQL 的行注释，返回一次范围替换所需的数据。
+///
+/// - 没有选区时作用于光标所在行；有选区时作用到选区触及的全部行
+///   （选区恰好结束在行首时不算下一行）。
+/// - 只识别前导空白之后的注释标记；空行（含只有空白的行）保持原样。
+/// - 所有非空行都已注释时去掉一层注释，否则给所有非空行加一层注释；
+///   混合选区因此第一次统一注释、第二次统一取消。
+/// - 保留缩进、CRLF 与 UTF-8；整段文本为空、或没有任何可改动的非空行时不动作。
+pub fn toggle_line_comment(sql: &str, selection: Range<usize>) -> Option<CommentEdit> {
+    if sql.is_empty() {
+        return None;
+    }
+    let len = sql.len();
+    let mut start = floor_boundary(sql, selection.start);
+    let mut end = ceil_boundary(sql, selection.end);
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    start = start.min(len);
+    end = end.min(len);
+    let region_start = line_start(sql, start);
+    // 选区末字符所在的行：末字符是换行时它属于上一行，不会把下一行算进来。
+    // 末字符可能落在多字节字符中间，按字符边界往回取。
+    let last = if end > start { floor_boundary(sql, end - 1) } else { start };
+    let region_end = line_end(sql, last.max(region_start));
+    let region = &sql[region_start..region_end];
+
+    let mut any_body = false;
+    let mut all_commented = true;
+    for line in region.split('\n') {
+        let (_, body) = body_of(line);
+        if body.is_empty() {
+            continue;
+        }
+        any_body = true;
+        if !body.starts_with(MARK) {
+            all_commented = false;
+        }
+    }
+    if !any_body {
+        return None;
+    }
+    let commented = !all_commented;
+
+    let mut first_delta: isize = 0;
+    let mut rebuilt = String::with_capacity(region.len() + 8);
+    for (index, line) in region.split('\n').enumerate() {
+        if index > 0 {
+            rebuilt.push('\n');
+        }
+        let (indent, body) = body_of(line);
+        let cr = &line[indent.len() + body.len()..];
+        let rewritten = if body.is_empty() {
+            line.to_owned()
+        } else if commented {
+            format!("{indent}{COMMENT}{body}{cr}")
+        } else {
+            format!("{indent}{}{cr}", uncomment(body))
+        };
+        // 光标在第一行时按这一行的长度变化平移，仍停在同一个字符上。
+        if index == 0 {
+            first_delta = rewritten.len() as isize - line.len() as isize;
+        }
+        rebuilt.push_str(&rewritten);
+    }
+
+    let selection = if end > start {
+        region_start..region_start + rebuilt.len()
+    } else {
+        let at = (start as isize + first_delta).clamp(region_start as isize, (region_start + rebuilt.len()) as isize) as usize;
+        at..at
+    };
+    Some(CommentEdit { range: region_start..region_end, text: rebuilt, selection, commented })
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::*;
+
+    /// 把一次编辑作用回文本，得到切换后的完整 SQL。
+    fn apply(sql: &str, selection: Range<usize>) -> (String, Range<usize>, bool) {
+        let edit = toggle_line_comment(sql, selection).expect("应当发生的行注释切换");
+        let mut next = String::with_capacity(sql.len() + edit.text.len());
+        next.push_str(&sql[..edit.range.start]);
+        next.push_str(&edit.text);
+        next.push_str(&sql[edit.range.end..]);
+        (next, edit.selection, edit.commented)
+    }
+
+    #[test]
+    fn a_caret_without_a_selection_comments_and_restores_its_own_line() {
+        let sql = "SELECT 1;";
+        let (commented, selection, added) = apply(sql, 0..0);
+        assert_eq!(commented, "-- SELECT 1;");
+        assert!(added, "第一次是加注释");
+        assert_eq!(selection, 3..3, "光标跟着原字符移动，不落在标记中间");
+        let (restored, _, added) = apply(&commented, selection);
+        assert_eq!(restored, sql, "第二次切换回到原 SQL");
+        assert!(!added, "第二次是去掉注释");
+        // 光标在行尾时同样只动这一行。
+        let (commented, selection, _) = apply(sql, sql.len()..sql.len());
+        assert_eq!(commented, "-- SELECT 1;");
+        assert_eq!(selection, sql.len() + 3..sql.len() + 3);
+    }
+
+    #[test]
+    fn a_multi_line_selection_comments_every_non_empty_line_and_leaves_blank_lines_alone() {
+        let sql = "SELECT 1;\n\nSELECT 2;";
+        let (commented, selection, added) = apply(sql, 0..sql.len());
+        assert_eq!(commented, "-- SELECT 1;\n\n-- SELECT 2;");
+        assert!(added);
+        assert_eq!(selection, 0..commented.len(), "多行切换后整段仍在选区里");
+        let (restored, _, added) = apply(&commented, 0..commented.len());
+        assert_eq!(restored, sql, "只去掉这一层标记，空行与文本不变");
+        assert!(!added);
+    }
+
+    #[test]
+    fn a_selection_ending_at_a_line_start_does_not_touch_the_next_line() {
+        let sql = "SELECT 1;\nSELECT 2;";
+        // 选区包含第一行行尾的换行符：仍然只算第一行。
+        let (commented, _, _) = apply(sql, 0.."SELECT 1;\n".len());
+        assert_eq!(commented, "-- SELECT 1;\nSELECT 2;");
+        // 从第二行行首开始：只算这一行。
+        let (commented, _, _) = apply(sql, 10..sql.len());
+        assert_eq!(commented, "SELECT 1;\n-- SELECT 2;");
+    }
+
+    #[test]
+    fn indentation_is_preserved_on_both_directions() {
+        let sql = "    SELECT 1;\n  SELECT 2;";
+        let (commented, _, _) = apply(sql, 0..sql.len());
+        assert_eq!(commented, "    -- SELECT 1;\n  -- SELECT 2;");
+        let (restored, _, _) = apply(&commented, 0..commented.len());
+        assert_eq!(restored, sql);
+        // 只去掉一个可选空格：标记后有两个空格时留一个。
+        let spaced = "  --  SELECT 1;";
+        let (stripped, _, _) = apply(spaced, 0..spaced.len());
+        assert_eq!(stripped, "   SELECT 1;");
+    }
+
+    #[test]
+    fn a_mixed_selection_comments_everything_first_and_uncomments_on_the_second_pass() {
+        let sql = "SELECT 1;\n-- SELECT 2;\n  --SELECT 3;";
+        let (commented, _, added) = apply(sql, 0..sql.len());
+        assert!(added, "混合选区第一次统一注释");
+        assert_eq!(commented, "-- SELECT 1;\n-- -- SELECT 2;\n  -- --SELECT 3;");
+        let (restored, _, added) = apply(&commented, 0..commented.len());
+        assert!(!added, "第二次统一取消一层");
+        assert_eq!(restored, sql);
+    }
+
+    #[test]
+    fn comments_without_a_space_and_with_extra_spaces_still_count() {
+        let sql = "--SELECT 1;";
+        let (stripped, _, added) = apply(sql, 0..0);
+        assert!(!added);
+        assert_eq!(stripped, "SELECT 1;");
+        let sql = "---- SELECT 1;";
+        let (stripped, _, _) = apply(sql, 0..sql.len());
+        assert_eq!(stripped, "-- SELECT 1;", "只去掉一层");
+    }
+
+    #[test]
+    fn utf8_and_crlf_text_keeps_its_bytes_and_line_endings() {
+        let sql = "SELECT '中文' AS 名称;\r\nSELECT 2;";
+        let (commented, selection, _) = apply(sql, 0..sql.len());
+        assert_eq!(commented, "-- SELECT '中文' AS 名称;\r\n-- SELECT 2;");
+        assert!(commented.contains("\r\n"), "CRLF 不被改成 LF");
+        assert_eq!(selection, 0..commented.len());
+        let (restored, _, _) = apply(&commented, 0..commented.len());
+        assert_eq!(restored, sql, "还原后 UTF-8 与 CRLF 都和原文一致");
+        // 光标落在中文里：切换不切在字符中间。
+        let at = sql.find('名').expect("中文位置");
+        let (commented, selection, _) = apply(sql, at..at);
+        assert_eq!(commented, "-- SELECT '中文' AS 名称;\r\nSELECT 2;");
+        assert!(commented.is_char_boundary(selection.start), "光标仍在字符边界上");
+        assert_eq!(selection.start, at + 3);
+        // 选区边界落在多字节字符中间时，按最近的字符边界处理。
+        let (commented, _, _) = apply(sql, at + 1..at + 2);
+        assert_eq!(commented, "-- SELECT '中文' AS 名称;\r\nSELECT 2;");
+    }
+
+    #[test]
+    fn blank_only_and_empty_documents_do_not_move() {
+        assert_eq!(toggle_line_comment("", 0..0), None);
+        assert_eq!(toggle_line_comment("\n\n", 0..2), None);
+        assert_eq!(toggle_line_comment("   \n \t", 0..7), None);
+        // 空行夹在选区里不算“已全部注释”，加注释时也保持原样。
+        let sql = "SELECT 1;\n\n\nSELECT 2;";
+        let (commented, _, _) = apply(sql, 0..sql.len());
+        assert_eq!(commented, "-- SELECT 1;\n\n\n-- SELECT 2;");
+    }
+
+    #[test]
+    fn the_replaced_range_covers_exactly_the_touched_lines() {
+        let sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        let edit = toggle_line_comment(sql, 12..12).expect("第二行内的光标");
+        assert_eq!(edit.range, 10..19, "只覆盖光标所在行，不含换行");
+        assert_eq!(edit.text, "-- SELECT 2;");
+        let edit = toggle_line_comment(sql, 0..sql.len()).expect("全选");
+        assert_eq!(edit.range, 0..sql.len(), "整段连续行一次替换，没有行尾换行时覆盖到末字符");
     }
 }

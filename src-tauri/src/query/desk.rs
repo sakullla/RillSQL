@@ -17,6 +17,7 @@ use super::assist::{
 use super::complete;
 use super::commands::{self, RunDto, StartRequest};
 use super::exec::{AutoRewrite, ErrorAt, LiveDriver, StatementDriver};
+use super::title;
 
 /// 词频表上限；超出时按次数与名称稳定截断。
 const FREQUENCY_LIMIT: usize = 200;
@@ -787,6 +788,33 @@ impl Desk {
         let trimmed = title.trim();
         pin.custom_title = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
         true
+    }
+
+    /// 当前结果的自动标题，与结果一一对应；引擎取产生这批结果的目标。
+    /// 标题只来自执行时的语句快照，之后的草稿编辑不会改写它。
+    pub fn result_titles(&self) -> Vec<Option<String>> {
+        let Some(tab) = self.active_tab() else {
+            return Vec::new();
+        };
+        let engine = tab
+            .results_target
+            .as_ref()
+            .or(tab.target.as_ref())
+            .map(|target| target.engine.clone())
+            .unwrap_or_default();
+        let statements: Vec<&str> = tab.results.iter().map(|result| result.sql.as_str()).collect();
+        title::titles(&engine, &statements)
+    }
+
+    /// 一个固定结果的默认标题：来自它固定时的那份快照 SQL，不跟之后的编辑走。
+    pub fn pin_auto_title(&self, pin: &PinnedResult) -> Option<String> {
+        let engine = pin
+            .target
+            .as_ref()
+            .or_else(|| self.active_tab().and_then(|tab| tab.target.as_ref()))
+            .map(|target| target.engine.clone())
+            .unwrap_or_default();
+        title::title(&engine, &pin.view.sql, pin.statement + 1)
     }
 
     /// 结果表格要显示的那一条：看固定结果时是它的快照，否则是当前结果里选中的语句。

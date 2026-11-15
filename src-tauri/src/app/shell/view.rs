@@ -2731,6 +2731,7 @@ fn query_command(id: &str) -> bool {
             | "run-current"
             | "run-script"
             | "request-cancel"
+            | "toggle-comment"
             | "format"
             | "autocomplete"
             | "explain"

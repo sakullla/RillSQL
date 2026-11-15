@@ -702,6 +702,49 @@ impl SqlEditor {
         });
     }
 
+    /// 一次性替换一个字节范围，并把选区恢复成 replace 之后的样子。
+    /// 整个替换只进撤销栈一次：一次 Ctrl/Cmd+Z 就回到替换前。
+    pub fn replace_bytes(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        selection: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let applied = self.state.update(cx, |state, cx| {
+            // replace_text_in_range 收的是 UTF-16 偏移，先按当前文本换算。
+            let value = state.value();
+            let start = utf16_offset(&value, range.start);
+            let end = utf16_offset(&value, range.end);
+            state.replace_text_in_range(Some(start..end), text, window, cx);
+            state.set_selected_range(selection, cx);
+            state.focus(window, cx);
+            true
+        });
+        if applied {
+            self.clear_errors(cx);
+        }
+        applied
+    }
+
+    /// Ctrl/⌘+/：切换当前行或选区触及行的行注释。
+    /// 整段连续行只替换一次（一次撤销即可还原），不执行查询；输入法组合输入期间不动作。
+    pub fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let composing = self
+            .state
+            .update(cx, |state, cx| state.marked_text_range(window, cx).is_some());
+        if composing {
+            return false;
+        }
+        let value = self.value(cx);
+        let selection = self.selected_range(cx);
+        let Some(edit) = crate::query::toggle_line_comment(&value, selection) else {
+            return false;
+        };
+        self.replace_bytes(edit.range, &edit.text, edit.selection, window, cx)
+    }
+
     /// 在当前光标或选区插入文本。`None` 表示用当前选区（字节偏移），
     /// 由 `EditorState::replace_text_in_range` 记入撤销栈；随后聚焦，Ctrl+Z 才能落到这次插入。
     pub fn insert_at_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1137,6 +1180,15 @@ impl DefinitionProvider for SqlDefinition {
             .collect();
         Task::ready(Ok(links))
     }
+}
+
+/// 字节偏移换成 UTF-16 偏移（编辑器输入接口用的单位）；落在字符中间时按字符边界往回取。
+fn utf16_offset(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    text[..at].encode_utf16().count()
 }
 
 fn word_before(text: &Rope, offset: usize) -> String {
@@ -1840,6 +1892,51 @@ select 1;";
             let value = editor.read(cx).value(cx);
             assert!(!value.contains("/*x*/"), "插入走编辑器撤销栈：{value}");
             assert!(value.starts_with("select"), "{value}");
+        })
+        .unwrap();
+    }
+
+    /// Ctrl/⌘+/：整段连续行一次替换，一次撤销就回到切换前；IME 组合输入期间不动作。
+    #[gpui_kit::test]
+    fn toggling_line_comments_replaces_the_region_once_and_skips_ime(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let sql = "SELECT 1;\n\n  SELECT 2;";
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+                editor.select_range(0..sql.len(), cx);
+            });
+            window.render_frame(cx);
+            assert!(editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)));
+            let commented = editor.read(cx).value(cx);
+            assert_eq!(commented, "-- SELECT 1;\n\n  -- SELECT 2;", "空行不变，缩进保留");
+            assert_eq!(editor.read(cx).selected_text(cx), commented, "整段仍在选区里");
+            // 一次撤销还原整个区域，不是逐行撤销。
+            window.press("secondary-z", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(editor.read(cx).value(cx), sql, "一次撤销回到切换前");
+            window.press("secondary-shift-z", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            let commented = editor.read(cx).value(cx);
+            assert_eq!(commented, "-- SELECT 1;\n\n  -- SELECT 2;", "一次重做恢复整段注释");
+            // 再次切换是去掉这一层：先选整段，范围与第一次相同。
+            editor.update(cx, |editor, cx| {
+                editor.select_range(0..commented.len(), cx);
+                assert!(editor.toggle_comment(window, cx));
+            });
+            assert_eq!(editor.read(cx).value(cx), sql);
+            // 输入法组合输入期间不响应命令。
+            editor.update(cx, |editor, cx| {
+                editor.state.update(cx, |state, cx| {
+                    state.replace_and_mark_text_in_range(None, "zhong", Some(0..0), window, cx);
+                });
+            });
+            assert!(!editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)), "组合输入期间不动作");
         })
         .unwrap();
     }

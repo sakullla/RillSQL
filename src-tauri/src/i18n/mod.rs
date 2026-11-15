@@ -577,6 +577,7 @@ dict! {
     "query.outline.jump" => "跳到这条语句", "Go to this statement";
     "query.status.noObjects" => "没有对象", "No objects";
     "query.results.statement" => "结果", "Result";
+    "query.results.tabs" => "结果页签", "Result tabs";
     "query.results.loadMore" => "加载更多", "Load more";
     "query.results.loadNext" => "再读取 {count} 行", "Load {count} more rows";
     "query.results.allLoaded" => "已全部读取", "All rows loaded";

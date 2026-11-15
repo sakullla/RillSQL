@@ -25,6 +25,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, Metrics, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::tabs::{self, Reveal, TabSpec};
 
 use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
 use crate::app::model::ObjectTarget;
@@ -150,6 +151,14 @@ pub struct QueryPane {
     connect_request: Option<String>,
     /// 统计绑定结果代次和来源；同一 SQL 再执行或切换目标后不复用旧计数。
     row_count: Option<(CountIdentity, RowCount)>,
+    /// 等待应用的行注释切换（Ctrl/⌘+/）：命令层没有窗口，交给下一帧的 apply_pending 执行。
+    pending_comment: bool,
+    /// 结果页签条的滚动句柄：跨帧保存，不能每帧新建。
+    result_scroll: gpui_kit::ScrollHandle,
+    /// 上一次已经滚过的（当前页签下标，页签数量）。
+    result_scroll_seen: Option<(Option<usize>, usize)>,
+    /// 还没确认进入视口的滚动请求。
+    result_scroll_pending: Option<tabs::Reveal>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -450,6 +459,10 @@ impl QueryPane {
             target_choices: Vec::new(),
             target_picker: target::TargetPicker::default(),
             connect_request: None,
+            pending_comment: false,
+            result_scroll: gpui_kit::ScrollHandle::new(),
+            result_scroll_seen: None,
+            result_scroll_pending: None,
         }
     }
 
@@ -806,6 +819,12 @@ impl QueryPane {
         }
         if let Some(index) = id.strip_prefix("plan-select:").and_then(|index| index.parse::<usize>().ok()) {
             self.plan_selected = index;
+            cx.notify();
+            return;
+        }
+        // 行注释：命令层没有窗口，先挂起，下一帧只对真正有焦点的 SQL 编辑器执行。
+        if id == "toggle-comment" {
+            self.pending_comment = true;
             cx.notify();
             return;
         }
@@ -2121,6 +2140,9 @@ impl QueryPane {
                 self.desk.refresh_outline();
             }
         }
+        if std::mem::take(&mut self.pending_comment) {
+            self.apply_comment(window, cx);
+        }
         if self.pending_completion {
             self.pending_completion = false;
             if let Some(id) = id.as_deref() {
@@ -2157,6 +2179,26 @@ impl QueryPane {
                 }
             }
         }
+    }
+
+    /// 行注释：只有活动 SQL 编辑器真的持有焦点时才改文本，网格和其它输入框不受影响。
+    /// 整段只替换一次（一次撤销即可还原），随后同步草稿与折叠，但不执行查询。
+    fn apply_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.desk.active_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(editor) = self.editors.get(&id).cloned() else {
+            return;
+        };
+        if !editor.read(cx).is_focused(window, cx) {
+            return;
+        }
+        if !editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)) {
+            return;
+        }
+        self.capture(cx);
+        self.desk.refresh_outline();
+        cx.notify();
     }
 
     /// 高亮会在消化文本改动的那一帧覆盖折叠候选，所以等到下一帧再安装。
@@ -2276,25 +2318,6 @@ impl Render for QueryPane {
                 ),
             )
     }
-}
-
-/// 结果区页签（固定结果、语句、消息）的共同外观。
-fn result_tab(id: SharedString, label: SharedString, selected: bool, p: &Palette, metrics: Metrics) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
-    kit::interactive(div().id(id), p, false)
-        .test_support()
-        .role(gpui_kit::Role::Tab)
-        .aria_label(label)
-        .aria_selected(selected)
-        .flex_none()
-        .h(px(metrics.control_h))
-        .px(px(10.))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .rounded(px(Radius::CONTROL))
-        .text_size(px(TypeScale::SM))
-        .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
-        .when(!selected, |this| this.text_color(p.text_muted))
 }
 
 impl QueryPane {
@@ -2455,92 +2478,119 @@ impl QueryPane {
         results_panel.child(self.render_results_body(p, metrics, mono, entity)).into_any_element()
     }
 
-    /// 页签头：页签从左到右是 固定结果… | 当前结果（语句 N） | 消息，之后是固定按钮与状态。
+    /// 页签头：页签条里是固定结果与当前结果的各条语句，之后是消息页签、固定按钮与状态。
+    /// 页签本身来自 ui::tabs：几何、状态、横向滚动和“当前项入视口”只在那里实现一次。
     #[inline(never)]
-    fn render_results_head(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    fn render_results_head(&mut self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        let tabs = self.render_result_tabs(p, metrics, entity);
         div()
             .id("query-results-head")
             .flex_none()
-            .h(px(metrics.bar_h()))
-            .px(px(8.))
+            .h(px(metrics.tabs_h))
             .flex()
             .items_center()
             .gap(px(2.))
             .bg(p.chrome)
             .border_b_1()
             .border_color(p.line)
-            .child(self.render_result_tabs(p, metrics, entity))
+            .child(div().flex_1().min_w(px(0.)).h_full().child(tabs))
             .children(self.render_head_actions(p, metrics, entity))
             .children(self.render_head_status(running, p, metrics, entity))
             .into_any_element()
     }
 
+    /// 结果页签条：固定结果在前，当前结果的各条语句在后，两者共用同一份页签外观。
+    /// 当前页签或数量变化时把它滚进视口；确认到达后不再动滚动位置。
     #[inline(never)]
-    fn render_result_tabs(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    fn render_result_tabs(&mut self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
-        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let result_view = self.desk.result_view();
-        let pinned = self.desk.pinned();
-        let results = self.desk.results();
-        let mut strip = div()
-            .id("query-result-tabs")
-            .role(gpui_kit::Role::TabList)
-            .flex_initial()
-            .min_w(px(0.))
-            .overflow_x_scroll()
-            .flex()
-            .items_center()
-            .gap(px(2.));
-        for pin in pinned {
+        let titles = self.desk.result_titles();
+        let single = self.desk.results().len() <= 1;
+        let mut items: Vec<AnyElement> = Vec::new();
+        let mut active: Option<usize> = None;
+        for pin in self.desk.pinned() {
+            let selected = result_view == ResultView::Pinned(pin.id);
+            if selected {
+                active = Some(items.len());
+            }
+            let label = pin_title(self.desk.pin_auto_title(pin), pin, locale);
             let renaming = self.pin_rename.as_ref().filter(|item| item.id == pin.id).map(|item| item.input.clone());
-            strip = strip.child(pinned_tab(pin, result_view == ResultView::Pinned(pin.id), renaming.as_ref(), locale, p, metrics, entity));
+            items.push(pinned_tab(pin, label, selected, renaming.as_ref(), locale, p, entity));
         }
-        // 固定结果与当前结果之间用一道竖线分开；没有固定结果时不加。
-        if !pinned.is_empty() {
-            strip = strip.child(kit::vline(p));
-        }
-        if results.len() > 1 {
+        if single {
+            let selected = result_view == ResultView::Current;
+            if selected {
+                active = Some(items.len());
+            }
+            let label = titles.first().and_then(|title| title.clone()).unwrap_or_else(|| i18n::text(locale, "ui.query.results"));
+            let entity = entity.clone();
+            items.push(
+                tabs::tab(TabSpec::new("query-results-tab", IconName::Table, label).active(selected), p)
+                    .on_click(move |_, _, cx| entity.update(cx, |pane, cx| pane.command("query-view:current", cx)))
+                    .into_any_element(),
+            );
+        } else {
             let current = self.desk.statement();
-            for (index, result) in results.iter().enumerate() {
+            for (index, result) in self.desk.results().iter().enumerate() {
                 let selected = result_view == ResultView::Current && index == current;
-                let failed = result.status == "error" || result.status == "failed";
+                if selected {
+                    active = Some(items.len());
+                }
                 let skipped = result.status == "skipped";
-                let id = format!("statement:{index}");
-                let entity = entity.clone();
-                let label = SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
-                let accessible = if skipped {
-                    SharedString::from(format!("{label} {}", i18n::text(locale, "query.log.skipped")))
+                let semantic = titles
+                    .get(index)
+                    .and_then(|title| title.clone())
+                    .unwrap_or_else(|| format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
+                // 跳过的语句没有结果可看：状态写进标题，不只靠颜色表达。
+                let label = if skipped { format!("{semantic} {}", i18n::text(locale, "query.log.skipped")) } else { semantic };
+                let dot = if statement_failed(result) {
+                    p.danger
+                } else if skipped {
+                    p.text_faint
+                } else if result.status == "cancelled" {
+                    p.warn
                 } else {
-                    label.clone()
+                    p.ok
                 };
-                let dot = if failed { p.danger } else if skipped { p.text_faint } else if result.status == "cancelled" { p.warn } else { p.ok };
-                strip = strip.child(
-                    result_tab(SharedString::from(format!("query-act-statement-{index}")), accessible, selected, p, metrics)
+                let entity = entity.clone();
+                let click = format!("statement:{index}");
+                items.push(
+                    tabs::tab(TabSpec::new(format!("query-act-statement-{index}"), IconName::Table, label).active(selected), p)
                         .child(kit::status_dot(dot))
-                        .child(label)
-                        .when(skipped, |this| {
-                            this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(i18n::text(locale, "query.log.skipped"))))
-                        })
                         .on_click(move |_, _, cx| {
-                            let id = id.clone();
+                            let id = click.clone();
                             entity.update(cx, |pane, cx| pane.command(&id, cx));
-                        }),
+                        })
+                        .into_any_element(),
                 );
             }
-        } else {
-            let entity = entity.clone();
-            strip = strip.child(
-                result_tab(SharedString::from("query-results-tab"), t("ui.query.results"), result_view == ResultView::Current, p, metrics)
-                    .child(t("ui.query.results"))
-                    .on_click(move |_, _, cx| entity.update(cx, |pane, cx| pane.command("query-view:current", cx))),
-            );
         }
-        strip.into_any_element()
+        // 当前页签或页签数量一变就重新请求一次滚动；确认到达后请求自己结束。
+        let key = (active, items.len());
+        if self.result_scroll_seen != Some(key) {
+            self.result_scroll_seen = Some(key);
+            self.result_scroll_pending = active.map(Reveal::new);
+        }
+        let visible = self
+            .result_scroll_pending
+            .is_some_and(|reveal| tabs::tab_visible(&self.result_scroll, reveal.index));
+        let reveal = tabs::reveal_step(&mut self.result_scroll_pending, visible);
+        tabs::tab_strip(
+            "query-result-tabs",
+            i18n::text(locale, "query.results.tabs"),
+            "query-result-tab-list",
+            items,
+            Vec::new(),
+            &self.result_scroll,
+            reveal,
+            &metrics,
+            p,
+        )
     }
-
     /// 消息页签（在页签条之外、紧随其后：页签再多也不会被挤出视口）与固定按钮。
     #[inline(never)]
-    fn render_head_actions(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> [AnyElement; 2] {
+    fn render_head_actions(&self, p: &Palette, _metrics: Metrics, entity: &Entity<QueryPane>) -> [AnyElement; 2] {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let log = self.desk.log();
@@ -2551,9 +2601,14 @@ impl QueryPane {
             format!("{} {}", i18n::text(locale, "query.log.tab"), log.len())
         };
         let log_entity = entity.clone();
-        let log_tab = result_tab(SharedString::from("query-log-tab"), SharedString::from(log_label.clone()), self.desk.result_view() == ResultView::Messages, p, metrics)
-            .when(log_failed, |this| this.child(kit::status_dot(p.danger)))
-            .child(SharedString::from(log_label))
+        let log_tab = tabs::tab(
+            TabSpec::new("query-log-tab", IconName::ClipboardList, log_label.clone())
+                .active(self.desk.result_view() == ResultView::Messages),
+            p,
+        );
+        // 有失败记录时用状态点表达，不只靠标题文本。
+        let log_tab = if log_failed { log_tab.child(kit::status_dot(p.danger)) } else { log_tab };
+        let log_tab = log_tab
             .on_click(move |_, _, cx| log_entity.update(cx, |pane, cx| pane.command("query-view:messages", cx)))
             .into_any_element();
         let pin_entity = entity.clone();
@@ -2835,41 +2890,73 @@ impl QueryPane {
     }
 }
 
-fn pin_title(pin: &desk::PinnedResult, locale: Locale) -> String {
+/// 固定页签的标题：手动命名优先；清空后回到这份快照的自动标题，
+/// 自动标题也识别不出来时退到既有的“固定 n · 结果 m”。
+fn pin_title(auto: Option<String>, pin: &desk::PinnedResult, locale: Locale) -> String {
     pin.custom_title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| {
-        i18n::fill(&i18n::text(locale, "query.results.pinned"), &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())])
+        auto.unwrap_or_else(|| {
+            i18n::fill(&i18n::text(locale, "query.results.pinned"), &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())])
+        })
     })
 }
 
 /// 一个固定结果的页签：书签图标、标题、关闭，以及双击或右键重命名。
+/// 外观与几何来自共享页签；右键菜单挂在外面一层不参与点击的容器上，
+/// 页签本身的点击、双击与关闭行为保持不变。
 #[inline(never)]
 fn pinned_tab(
     pin: &desk::PinnedResult,
+    label: String,
     selected: bool,
     renaming: Option<&Entity<InputState>>,
     locale: Locale,
     p: &Palette,
-    metrics: Metrics,
     entity: &Entity<QueryPane>,
 ) -> AnyElement {
-    let label = pin_title(pin, locale);
-    let failed = pin.view.status == "error" || pin.view.status == "failed";
+    let failed = statement_failed(&pin.view);
+    let skipped = pin.view.status == "skipped";
+    let cancelled = pin.view.status == "cancelled";
     let open = entity.clone();
     let close = entity.clone();
     let rename = entity.clone();
     let pin_id = pin.id;
     let open_id = format!("query-view:pinned:{pin_id}");
     let close_id = format!("unpin:{pin_id}");
-    let title = if let Some(input) = renaming {
-        div()
-            .w(px(148.))
-            .child(kit::text_input(SharedString::from(format!("query-pinned-rename-{pin_id}")), input, SharedString::from(i18n::text(locale, "query.results.rename"))).small())
-            .into_any_element()
+    // 跳过的固定结果没有内容可看：状态写进标题，不只靠颜色。
+    let label = if skipped { format!("{label} {}", i18n::text(locale, "query.log.skipped")) } else { label };
+    // 重命名时标题让位给输入框；输入框自带无障碍名称。
+    let title = if renaming.is_some() { SharedString::from("") } else { SharedString::from(label) };
+    let dot = if failed {
+        p.danger
+    } else if skipped {
+        p.text_faint
+    } else if cancelled {
+        p.warn
     } else {
-        div().min_w(px(0.)).truncate().child(SharedString::from(label.clone())).into_any_element()
+        p.ok
     };
-    result_tab(SharedString::from(format!("query-pinned-{pin_id}")), SharedString::from(label), selected, p, metrics)
-        .pr(px(4.))
+    let mut tab = tabs::tab(TabSpec::new(format!("query-pinned-{pin_id}"), IconName::Bookmark, title).active(selected), p);
+    if let Some(input) = renaming {
+        tab = tab.child(
+            div()
+                .w(px(148.))
+                .child(kit::text_input(SharedString::from(format!("query-pinned-rename-{pin_id}")), input, SharedString::from(i18n::text(locale, "query.results.rename"))).small()),
+        );
+    }
+    let close_tab = close.clone();
+    let tab = tab
+        .child(kit::status_dot(dot))
+        .child(tabs::close_action(
+            SharedString::from(format!("query-pinned-close-{pin_id}")),
+            i18n::text(locale, "query.results.unpin"),
+            selected,
+            p,
+            move |_, _, cx| {
+                cx.stop_propagation();
+                let id = close_id.clone();
+                close_tab.update(cx, |pane, cx| pane.command(&id, cx));
+            },
+        ))
         .on_click(move |event, window, cx| {
             if event.click_count() >= 2 {
                 open.update(cx, |pane, cx| pane.begin_pin_rename(pin_id, window, cx));
@@ -2877,7 +2964,12 @@ fn pinned_tab(
                 let id = open_id.clone();
                 open.update(cx, |pane, cx| pane.command(&id, cx));
             }
-        })
+        });
+    div()
+        .id(SharedString::from(format!("query-pinned-slot-{pin_id}")))
+        .flex_none()
+        .h_full()
+        .flex()
         .context_menu({
             let rename = rename.clone();
             let close = close.clone();
@@ -2892,27 +2984,7 @@ fn pinned_tab(
                 }))
             }
         })
-        .child(kit::icon(IconName::Bookmark, 12., if failed { p.danger } else { p.accent }))
-        .child(title)
-        .child(
-            div()
-                .id(SharedString::from(format!("query-pinned-close-{pin_id}")))
-                .test_support()
-                .role(gpui_kit::Role::Button)
-                .aria_label(SharedString::from(i18n::text(locale, "query.results.unpin")))
-                .size(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(Radius::CONTROL))
-                .hover(|style| style.bg(p.active))
-                .child(kit::icon(IconName::X, 12., p.text_faint))
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    let id = close_id.clone();
-                    close.update(cx, |pane, cx| pane.command(&id, cx));
-                }),
-        )
+        .child(tab)
         .into_any_element()
 }
 
@@ -4835,4 +4907,178 @@ mod tests {
             .unwrap();
         }
     }
-}
+
+    /// 外壳 + 查询页：键位绑定和工作台动作都按生产路径安装，用来验真实键击的路由。
+    fn open_shell(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<crate::app::shell::Workbench>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-comment-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
+            )
+            .expect("workbench")
+        });
+        cx.update(|cx| {
+            crate::app::bind_keys(cx);
+            crate::app::install_workbench_actions(cx, &view);
+        });
+        (window, view)
+    }
+
+    /// 外壳里用真实键击走一遍：Ctrl/⌘+/ 只改有焦点的 SQL 编辑器，草稿同步、不执行查询，
+    /// 焦点离开编辑器后同一条快捷键不再改写文本。
+    #[gpui_kit::test]
+    fn the_comment_shortcut_only_edits_the_focused_sql_editor(cx: &mut TestAppContext) {
+        let (window, view) = open_shell(cx);
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 1;".to_owned());
+            window.render_frame(cx);
+            assert!(view.read(cx).query_editor_focused(window, cx), "查询编辑器没有拿到焦点");
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;");
+            window.press("secondary-/", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), "-- SELECT 1;", "快捷键没有切换行注释");
+            assert_eq!(view.read(cx).query_draft(cx), "-- SELECT 1;", "草稿跟着编辑器同步");
+            assert_eq!(view.read(cx).query_runs(cx), 0, "注释不是执行");
+            assert!(!view.read(cx).query_executed(cx));
+            // 一次撤销回到切换前：整段只算一次编辑。
+            window.press("secondary-z", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;");
+            // 焦点离开编辑器后，同一条快捷键不改写查询草稿。
+            let mut moved = false;
+            for _ in 0..8 {
+                window.focus_next(cx);
+                window.render_frame(cx);
+                if !view.read(cx).query_editor_focused(window, cx) {
+                    moved = true;
+                    break;
+                }
+            }
+            assert!(moved, "Tab 焦点应当能离开编辑器");
+            window.press("secondary-/", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;", "非编辑器焦点下不该改写文本");
+        })
+        .unwrap();
+    }
+
+    /// 多结果页签用语句快照生成标题：切换页签看到的结果与标题一致，
+    /// 之后编辑草稿不会改写既有结果的标题。
+    #[gpui_kit::test]
+    fn result_tabs_carry_semantic_titles_that_survive_draft_edits(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "SELECT * FROM customers; SELECT * FROM orders;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![
+                    result("SELECT * FROM customers", "ok", &["id"], &["1"], None, ""),
+                    result("SELECT * FROM orders", "ok", &["id"], &["2"], None, ""),
+                ]);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.results().len(), 2, "两条语句的结果应当都在");
+            assert_eq!(window.find("query-act-statement-0").label(), Some("SELECT · customers"));
+            assert_eq!(window.find("query-act-statement-1").label(), Some("SELECT · orders"));
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "1");
+            window.click("query-act-statement-1", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.statement(), 1);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "2", "标题对应的就是这条语句的结果");
+            // 继续编辑草稿：既有结果的标题只认执行时的快照。
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            editor.update(cx, |editor, cx| editor.set_sql("SELECT * FROM audit_log", window, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("query-act-statement-0").label(), Some("SELECT · customers"));
+            assert_eq!(window.find("query-act-statement-1").label(), Some("SELECT · orders"));
+        })
+        .unwrap();
+    }
+
+    /// 固定结果用固定时那份快照的标题：手动重命名优先，清空回到自动标题，
+    /// 快照不随后续执行或编辑改变。
+    #[gpui_kit::test]
+    fn a_pinned_result_keeps_its_snapshot_title_and_takes_a_manual_one(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM customers")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("SELECT * FROM customers", "ok", &["id"], &["1"], None, "")]);
+            });
+            window.render_frame(cx);
+            window.click("query-act-pin", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-pinned-1").label(), Some("SELECT · customers"), "固定页签用快照标题");
+            // 再执行别的语句：固定页签保留固定时的标题。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM orders")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("SELECT * FROM orders", "ok", &["id"], &["2"], None, "")]);
+                assert!(pane.desk.rename_pin(1, "订单预览"));
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-pinned-1").label(), Some("订单预览"), "手动命名优先");
+            assert_eq!(window.find("query-results-tab").label(), Some("SELECT · orders"));
+            // 清空手动名称：回到这份快照的自动标题。
+            pane.update(cx, |pane, _| {
+                assert!(pane.desk.rename_pin(1, "   "));
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-pinned-1").label(), Some("SELECT · customers"), "清空后恢复快照标题");
+        })
+        .unwrap();
+    }
+
+    /// 页签多到放不下时，切到的当前页签自己滚进视口；关闭不改变其余页签的顺序。
+    #[gpui_kit::test]
+    fn the_active_result_tab_scrolls_into_view_and_closing_keeps_the_rest(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 640., 720.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM t")), Some("q"), Locale::ZhCn, window, cx);
+                // 每次执行后固定一条：页签多到 640 放不下。
+                for _ in 0..8 {
+                    pane.desk.plant_run(vec![result("SELECT * FROM t", "ok", &["id"], &["1"], None, "")]);
+                    pane.desk.pin_current();
+                }
+                assert_eq!(pane.desk.pinned().len(), 8);
+            });
+            window.render_frame(cx);
+            // 切到最左边的固定页签，再切回最后一个：列表每次都把当前项滚进视口。
+            pane.update(cx, |pane, cx| pane.command("query-view:pinned:1", cx));
+            window.render_frame(cx);
+            let list = window.find("query-result-tab-list").bounds();
+            let first = window.find("query-pinned-1").bounds();
+            assert!(
+                f32::from(first.origin.x) >= f32::from(list.origin.x) - 0.5
+                    && f32::from(first.origin.x + first.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5,
+                "第一个固定页签滚回视口内"
+            );
+            pane.update(cx, |pane, cx| pane.command("query-view:pinned:8", cx));
+            window.render_frame(cx);
+            let list = window.find("query-result-tab-list").bounds();
+            let last = window.find("query-pinned-8").bounds();
+            assert!(window.find("query-pinned-8").visible(), "最后一个固定页签要能看到");
+            assert!(
+                f32::from(last.origin.x) >= f32::from(list.origin.x) - 0.5
+                    && f32::from(last.origin.x + last.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5,
+                "当前页签完整落在列表视口内（tab {}..{} / list {}..{}）",
+                f32::from(last.origin.x),
+                f32::from(last.origin.x + last.size.width),
+                f32::from(list.origin.x),
+                f32::from(list.origin.x + list.size.width)
+            );
+            pane.update(cx, |pane, cx| pane.command("unpin:8", cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-pinned-8").is_none(), "关闭后页签消失");
+            assert!(window.find("query-pinned-7").visible(), "其余页签不受影响");
+        })
+        .unwrap();
+    }}
