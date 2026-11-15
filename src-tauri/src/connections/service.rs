@@ -114,19 +114,19 @@ impl HealthProbe for SelectOneProbe {
             // SQLite 是本地文件，没有“断线”可言，免探活（这里到不了，防御返回成功）。
             CatalogSession::Sqlite { .. } | CatalogSession::Scripted => Ok(()),
             CatalogSession::Mysql(pool) => {
-                let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
-                conn.ping().await.map_err(|err| err.to_string())
+                let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+                conn.ping().await.map_err(|err| crate::error_text::chain(&err))
             }
             CatalogSession::Postgres(client) => client
                 .simple_query("SELECT 1")
                 .await
                 .map(|_| ())
-                .map_err(|err| err.to_string()),
+                .map_err(|err| crate::error_text::chain(&err)),
             CatalogSession::Sqlserver(client) => {
                 let mut client = client.lock().await;
                 use futures::TryStreamExt;
-                let mut stream = client.simple_query("SELECT 1").await.map_err(|err| err.to_string())?;
-                while let Some(item) = stream.try_next().await.map_err(|err| err.to_string())? {
+                let mut stream = client.simple_query("SELECT 1").await.map_err(|err| crate::error_text::chain(&err))?;
+                while let Some(item) = stream.try_next().await.map_err(|err| crate::error_text::chain(&err))? {
                     if item.into_row().is_some() {
                         return Ok(());
                     }
@@ -135,7 +135,7 @@ impl HealthProbe for SelectOneProbe {
             }
             CatalogSession::Redis(conn) => {
                 let mut conn = conn.lock().await;
-                let pong: String = redis::cmd("PING").query_async(&mut *conn).await.map_err(|err| err.to_string())?;
+                let pong: String = redis::cmd("PING").query_async(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
                 if pong.eq_ignore_ascii_case("pong") {
                     Ok(())
                 } else {
@@ -147,7 +147,7 @@ impl HealthProbe for SelectOneProbe {
                     .database("admin")
                     .run_command(mongodb::bson::doc! { "ping": 1 })
                     .await
-                    .map_err(|err| err.to_string())?;
+                    .map_err(|err| crate::error_text::chain(&err))?;
                 if reply.get_f64("ok") == Ok(1.0) || reply.get_i32("ok") == Ok(1) {
                     Ok(())
                 } else {

@@ -208,7 +208,7 @@ fn pg_error_at(err: &tokio_postgres::Error, statement: &str) -> Option<ErrorAt> 
 }
 
 fn tds_failure(err: &tiberius::error::Error) -> Failure {
-    Failure { message: err.to_string(), at: tds_error_at(err) }
+    Failure { message: crate::error_text::chain(err), at: tds_error_at(err) }
 }
 
 /// sent 是实际发出的文本（可能加了行数上限），位置先在 sent 里换算，再映射回用户写的 statement。
@@ -217,7 +217,7 @@ fn pg_failure(err: &tokio_postgres::Error, sent: &str, statement: &str) -> Failu
         Some(ErrorAt::Char(offset)) => Some(ErrorAt::Char(map_rewritten_char(statement, sent, offset))),
         other => other,
     };
-    Failure { message: err.to_string(), at }
+    Failure { message: crate::error_text::chain(err), at }
 }
 
 /// 执行前的改写只在一处插入或替换文本（行数上限）。把改写后文本里的字符偏移映射回原文：
@@ -690,7 +690,7 @@ impl LiveDriver {
                 let mut conn = pool
                     .get_conn()
                     .await
-                    .map_err(|err| attach_failure(&transport, err.to_string()))?;
+                    .map_err(|err| attach_failure(&transport, crate::error_text::chain(&err)))?;
                 conn.reset_connection(false);
                 // 握手已经提供真实连接 id，无需再花一次网络往返查询。
                 transport.set_mysql_connection_id(u64::from(conn.id()));
@@ -807,13 +807,13 @@ impl StatementDriver for LiveDriver {
 }
 
 async fn align_mysql(conn: &mut mysql_async::Conn, engine: &str, database: &str) -> Result<(), String> {
-    let value: Option<String> = conn.query_first("SELECT DATABASE()").await.map_err(|err| err.to_string())?;
+    let value: Option<String> = conn.query_first("SELECT DATABASE()").await.map_err(|err| crate::error_text::chain(&err))?;
     let current = value.unwrap_or_default();
     match database_gate(engine, &current, database) {
         DatabaseGate::Refuse => Err(refuse_message(&current, database)),
         DatabaseGate::Switch => {
             let statement = format!("USE {}", quote_mysql(database));
-            conn.query_drop(statement).await.map_err(|err| err.to_string())?;
+            conn.query_drop(statement).await.map_err(|err| crate::error_text::chain(&err))?;
             Ok(())
         }
         DatabaseGate::Ready => Ok(()),
@@ -822,21 +822,21 @@ async fn align_mysql(conn: &mut mysql_async::Conn, engine: &str, database: &str)
 
 async fn run_mysql_statements(conn: &mut mysql_async::Conn, statements: &[String]) -> Result<(), String> {
     for statement in statements {
-        conn.query_drop(statement).await.map_err(|err| err.to_string())?;
+        conn.query_drop(statement).await.map_err(|err| crate::error_text::chain(&err))?;
     }
     Ok(())
 }
 
 async fn run_postgres_statements(client: &tokio_postgres::Client, statements: &[String]) -> Result<(), String> {
     for statement in statements {
-        client.simple_query(statement).await.map_err(|err| err.to_string())?;
+        client.simple_query(statement).await.map_err(|err| crate::error_text::chain(&err))?;
     }
     Ok(())
 }
 
 async fn postgres_current(client: &tokio_postgres::Client) -> Result<String, String> {
-    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| err.to_string())?;
-    row.try_get(0).map_err(|err| err.to_string())
+    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
+    row.try_get(0).map_err(|err| crate::error_text::chain(&err))
 }
 
 async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>) -> Result<String, String> {
@@ -1083,11 +1083,11 @@ async fn sqlite_run(
     sink: &dyn RowSink,
     index: usize,
 ) -> Result<StatementValue, String> {
-    let mut conn = pool.acquire().await.map_err(|err| err.to_string())?;
+    let mut conn = pool.acquire().await.map_err(|err| crate::error_text::chain(&err))?;
     let watched = Arc::clone(cancel);
     conn.lock_handle()
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|err| crate::error_text::chain(&err))?
         .set_progress_handler(64, move || !watched.load(Ordering::SeqCst));
     let outcome = sqlite_dispatch(&mut conn, sql, limit, cancel, sink, index).await;
     if let Ok(mut handle) = conn.lock_handle().await {
@@ -1122,7 +1122,7 @@ async fn sqlite_dispatch(
             let row = if let Some(row) = pending.take() {
                 row
             } else {
-                match stream.try_next().await.map_err(|err| err.to_string())? {
+                match stream.try_next().await.map_err(|err| crate::error_text::chain(&err))? {
                     Some(row) => row,
                     None => break,
                 }
@@ -1138,7 +1138,7 @@ async fn sqlite_dispatch(
             let width = columns.len();
             rows.push((0..width).map(|cell| sqlite_text(&row, cell)).collect());
             if rows.len() < limit && rows.len() % step == 0 {
-                let peek = stream.try_next().await.map_err(|err| err.to_string())?;
+                let peek = stream.try_next().await.map_err(|err| crate::error_text::chain(&err))?;
                 let partial = StatementValue {
                     columns: columns.clone(),
                     column_types: column_types.clone(),
@@ -1171,7 +1171,7 @@ async fn sqlite_dispatch(
         sink.publish(index, &value).await;
         return Ok(value);
     }
-    let done = sqlx::query(safe).execute(&mut *conn).await.map_err(|err| err.to_string())?;
+    let done = sqlx::query(safe).execute(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
     let value = StatementValue {
         columns: Vec::new(),
         column_types: Vec::new(),
@@ -1268,7 +1268,7 @@ async fn mysql_run(
         transport.set_mysql_connection_id(id);
     }
     // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-    let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| err.to_string())?;
+    let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
     let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
         .columns_ref()
         .iter()
@@ -1279,7 +1279,7 @@ async fn mysql_run(
     if columns.is_empty() {
         let affected = result.affected_rows();
         // OK 包没有行。收掉这个结果集，同一条连接才能执行下一条。
-        result.drop_result().await.map_err(|err| err.to_string())?;
+        result.drop_result().await.map_err(|err| crate::error_text::chain(&err))?;
         let value = StatementValue {
             columns,
             column_types,
@@ -1302,7 +1302,7 @@ async fn mysql_run(
         let row = if let Some(row) = pending.take() {
             row
         } else {
-            match result.next().await.map_err(|err| err.to_string())? {
+            match result.next().await.map_err(|err| crate::error_text::chain(&err))? {
                 Some(row) => row,
                 None => break,
             }
@@ -1316,7 +1316,7 @@ async fn mysql_run(
             .collect();
         rows.push(cells);
         if rows.len() < limit && rows.len() % step == 0 {
-            let peek = result.next().await.map_err(|err| err.to_string())?;
+            let peek = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
             let partial = StatementValue {
                 columns: columns.clone(),
                 column_types: column_types.clone(),
@@ -1337,7 +1337,7 @@ async fn mysql_run(
     }
     if truncated {
         // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
-        let _ = result.next().await.map_err(|err| err.to_string())?;
+        let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
     }
     let value = StatementValue {
         columns,

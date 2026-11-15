@@ -103,18 +103,41 @@ pub fn resolved_focus(
     shown.first().map(|choice| choice.id.clone())
 }
 
+/// 目标按钮上一帧的位置（窗口坐标）。没有点击坐标时（键盘、状态栏、执行被拦下）选择器贴着它弹出。
+pub type ButtonBounds = std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<Pixels>>>>;
+
+/// 选择器的锚点：按钮右下角向内一点，和鼠标点按钮时弹出的位置一致。
+pub fn anchor_for(bounds: Option<gpui_kit::Bounds<Pixels>>) -> Point<Pixels> {
+    match bounds {
+        Some(area) => gpui_kit::point(area.origin.x + area.size.width - px(4.), area.origin.y + area.size.height / 2.),
+        None => gpui_kit::point(px(0.), px(0.)),
+    }
+}
+
+/// 标签绑着的连接已经不在保存的连接里（被删除或导入覆盖）。连接清单还没读到时不下结论，
+/// 免得启动瞬间把每个标签都标成“已不存在”。
+pub fn target_missing(known: bool, choices: &[TargetChoice], connection_id: &str) -> bool {
+    known && !connection_id.is_empty() && !choices.iter().any(|choice| choice.id == connection_id)
+}
+
 /// 目标按钮：引擎徽标 + 连接名 › 库名 + 下拉箭头。没有目标时提示选择。
 #[allow(clippy::too_many_arguments)]
-pub fn button(open: bool, choices: &[TargetChoice], connection_id: &str, connection_name: &str, database: &str, engine: &str, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: &str, connection_name: &str, database: &str, engine: &str, bounds: &ButtonBounds, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let has_target = !connection_id.is_empty();
     let connected = choices.iter().any(|choice| choice.id == connection_id && choice.connected);
+    let missing = target_missing(known, choices, connection_id);
     let owner = entity.clone();
+    let tooltip = if missing {
+        Some(t("ui.query.targetMissing"))
+    } else {
+        (has_target && !open).then(|| SharedString::from(format!("{connection_name} › {database}")))
+    };
     kit::interactive_states(div().id("query-connection"), p, false)
         .test_support()
         .role(gpui_kit::Role::Button)
-        .aria_label(t("ui.query.chooseTarget"))
-        .tooltip_text_opt((has_target && !open).then(|| SharedString::from(format!("{connection_name} › {database}"))))
+        .aria_label(if missing { t("ui.query.targetMissing") } else { t("ui.query.chooseTarget") })
+        .tooltip_text_opt(tooltip.filter(|_| !open))
         .h(px(metrics.control_h))
         .max_w(px(380.))
         .px(px(8.))
@@ -123,14 +146,25 @@ pub fn button(open: bool, choices: &[TargetChoice], connection_id: &str, connect
         .gap(px(6.))
         .rounded(px(Radius::CONTROL))
         .border_1()
-        .border_color(if open { p.accent } else { p.line })
+        .border_color(if open { p.accent } else if missing { p.warn } else { p.line })
         .when(open, |this| this.bg(p.hover))
         .hover(|style| style.border_color(p.line_strong).bg(p.hover))
         .text_size(px(TypeScale::SM))
         .when(has_target, |this| {
             this.child(kit::engine_badge(engine, 16.))
-                .child(div().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(if connection_name.is_empty() { connection_id.to_owned() } else { connection_name.to_owned() })))
-                .child(kit::status_dot(if connected { p.ok } else { p.line_strong }))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .when(missing, |this| this.text_color(p.warn).line_through())
+                        .child(SharedString::from(if connection_name.is_empty() { connection_id.to_owned() } else { connection_name.to_owned() })),
+                )
+                .child(if missing {
+                    kit::icon(IconName::TriangleAlert, 12., p.warn).into_any_element()
+                } else {
+                    kit::status_dot(if connected { p.ok } else { p.line_strong }).into_any_element()
+                })
                 .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
                 .child(
                     div()
@@ -146,6 +180,12 @@ pub fn button(open: bool, choices: &[TargetChoice], connection_id: &str, connect
             this.child(kit::icon(IconName::Database, 14., p.text_muted)).child(div().text_color(p.text_muted).child(t("ui.query.chooseTarget")))
         })
         .child(kit::icon(IconName::ChevronDown, 12., p.text_faint))
+        // 记下按钮在窗口里的位置：状态栏点目标、或执行时发现目标已不存在，都从这里弹出同一个选择器。
+        .child({
+            let bounds = bounds.clone();
+            gpui_kit::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+        })
+        .relative()
         .on_click(move |event: &gpui_kit::ClickEvent, _, cx| {
             let at = event.position();
             owner.update(cx, |pane, cx| pane.toggle_target_picker(at, cx));
@@ -187,7 +227,11 @@ pub fn popover(
         .border_color(p.line)
         .py(px(4.));
     left = left.child(div().px(px(10.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("ui.query.targetConnections")));
-    if shown.is_empty() {
+    // 一条连接都没有和“筛选后没有匹配”是两回事：前者要给出新建连接的出口，而不是让人对着空列表找。
+    let no_connections = choices.is_empty();
+    if no_connections {
+        left = left.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoConnections")));
+    } else if shown.is_empty() {
         left = left.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoMatch")));
     }
     for choice in &shown {
@@ -230,6 +274,24 @@ pub fn popover(
         .overflow_y_scroll()
         .py(px(4.));
     match focused {
+        None if no_connections => {
+            let owner = entity.clone();
+            right = right.child(
+                div()
+                    .id("query-target-empty")
+                    .test_support()
+                    .p(px(14.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(8.))
+                    .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(t("ui.query.targetNoConnections")))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.query.targetNoConnectionsHint")))
+                    .child(kit::primary_button("query-target-new-connection", Some(IconName::Plus), t("shell.command.newConnection"), move |_, _, cx| {
+                        owner.update(cx, |pane, cx| pane.new_connection_from_target(cx));
+                    })),
+            );
+        }
         None => {}
         Some(choice) if !choice.connected => {
             let pending = picker.pending.as_deref() == Some(choice.id.as_str());
@@ -335,6 +397,18 @@ pub fn popover(
         .child(hint("Tab", t("ui.query.targetHintConn")))
         .child(hint("Enter", t("shell.palette.hintRun")))
         .child(hint("Esc", t("shell.palette.hintClose")));
+    // 高度贴合内容，最高 360：只有一两条连接时不留一大块空白。右栏按所有已打开连接里最长的库清单估算，
+    // 用 Tab 在连接间切换时面板不会跟着忽高忽低。
+    let left_rows = shown.len().max(1);
+    let right_rows = choices
+        .iter()
+        .filter(|choice| choice.connected)
+        .map(|choice| filtered_databases(choice, filter).len())
+        .max()
+        .unwrap_or(0)
+        .max(if no_connections || choices.iter().any(|choice| !choice.connected) { 4 } else { 1 });
+    let list_h = left_rows.max(right_rows) as f32 * row_h + 34.;
+    let panel_h = (list_h + 46. + 32.).clamp(220., 360.);
     let close = entity.clone();
     let keys = entity.clone();
     let panel = div()
@@ -342,7 +416,7 @@ pub fn popover(
         .test_support()
         .occlude()
         .w(px(panel_w))
-        .h(px(360.))
+        .h(px(panel_h))
         .flex()
         .flex_col()
         .bg(p.raised)
@@ -394,5 +468,24 @@ impl<E: gpui_kit::StatefulInteractiveElement + kit::Tip> TooltipOpt for E {
             Some(text) => self.tooltip_text(text),
             None => self,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(id: &str) -> TargetChoice {
+        TargetChoice { id: id.to_owned(), name: id.to_owned(), engine: "postgres".to_owned(), connected: false, databases: Vec::new() }
+    }
+
+    #[test]
+    fn a_target_is_missing_only_after_the_connection_list_is_known() {
+        let choices = vec![choice("pg")];
+        assert!(!target_missing(false, &[], "gone"), "清单还没读到时不下结论");
+        assert!(target_missing(true, &choices, "gone"), "绑定的连接已不在清单里");
+        assert!(target_missing(true, &[], "gone"), "删掉最后一条连接也算不存在");
+        assert!(!target_missing(true, &choices, "pg"));
+        assert!(!target_missing(true, &choices, ""), "没绑定目标不是“已不存在”");
     }
 }

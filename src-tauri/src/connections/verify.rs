@@ -58,10 +58,10 @@ fn server_config(fixture: CertFixture) -> Result<Arc<ServerConfig>, String> {
     let material = material(fixture);
     let config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .map_err(|err| err.to_string())?
+        .map_err(|err| crate::error_text::chain(&err))?
         .with_no_client_auth()
         .with_single_cert(material.chain, material.key)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     Ok(Arc::new(config))
 }
 
@@ -69,10 +69,10 @@ fn server_config(fixture: CertFixture) -> Result<Arc<ServerConfig>, String> {
 fn verifying_client() -> Result<Arc<ClientConfig>, String> {
     let material = material(CertFixture::DatabaseHost);
     let mut roots = RootCertStore::empty();
-    roots.add(material.ca).map_err(|err| err.to_string())?;
+    roots.add(material.ca).map_err(|err| crate::error_text::chain(&err))?;
     let config = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .map_err(|err| err.to_string())?
+        .map_err(|err| crate::error_text::chain(&err))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(config))
@@ -80,23 +80,23 @@ fn verifying_client() -> Result<Arc<ClientConfig>, String> {
 
 #[cfg(test)]
 pub fn handshake(server_name: &str, fixture: CertFixture) -> Result<(), String> {
-    let server_name = ServerName::try_from(server_name.to_owned()).map_err(|err| err.to_string())?;
-    let mut client = ClientConnection::new(verifying_client()?, server_name).map_err(|err| err.to_string())?;
-    let mut server = ServerConnection::new(server_config(fixture)?).map_err(|err| err.to_string())?;
+    let server_name = ServerName::try_from(server_name.to_owned()).map_err(|err| crate::error_text::chain(&err))?;
+    let mut client = ClientConnection::new(verifying_client()?, server_name).map_err(|err| crate::error_text::chain(&err))?;
+    let mut server = ServerConnection::new(server_config(fixture)?).map_err(|err| crate::error_text::chain(&err))?;
     for _ in 0..16 {
         let mut client_buf = Vec::new();
-        let client_wrote = client.write_tls(&mut client_buf).map_err(|err| err.to_string())?;
+        let client_wrote = client.write_tls(&mut client_buf).map_err(|err| crate::error_text::chain(&err))?;
         if client_wrote > 0 {
             let mut rest = client_buf.as_slice();
-            server.read_tls(&mut rest).map_err(|err| err.to_string())?;
-            server.process_new_packets().map_err(|err| err.to_string())?;
+            server.read_tls(&mut rest).map_err(|err| crate::error_text::chain(&err))?;
+            server.process_new_packets().map_err(|err| crate::error_text::chain(&err))?;
         }
         let mut server_buf = Vec::new();
-        let server_wrote = server.write_tls(&mut server_buf).map_err(|err| err.to_string())?;
+        let server_wrote = server.write_tls(&mut server_buf).map_err(|err| crate::error_text::chain(&err))?;
         if server_wrote > 0 {
             let mut rest = server_buf.as_slice();
-            client.read_tls(&mut rest).map_err(|err| err.to_string())?;
-            client.process_new_packets().map_err(|err| err.to_string())?;
+            client.read_tls(&mut rest).map_err(|err| crate::error_text::chain(&err))?;
+            client.process_new_packets().map_err(|err| crate::error_text::chain(&err))?;
         }
         if !client.is_handshaking() && !server.is_handshaking() {
             return Ok(());
@@ -158,7 +158,7 @@ impl EncryptWithoutVerify {
     pub fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Self, String> {
         let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(RootCertStore::empty()), provider)
             .build()
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| crate::error_text::chain(&err))?;
         Ok(Self { inner })
     }
 }

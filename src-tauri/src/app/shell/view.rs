@@ -733,6 +733,15 @@ impl Workbench {
         }
     }
 
+    /// 状态栏的目标在查询页上就是“换执行目标”：直接弹出查询页的目标选择器。
+    pub(super) fn open_query_target_picker(&mut self, cx: &mut Context<Self>) {
+        let on_query = self.model.shell.page == crate::app::AppPage::Workspace
+            && self.model.active_tab().is_some_and(|tab| tab.kind.is_query());
+        if on_query {
+            self.query.update(cx, |pane, cx| pane.open_target_picker(cx));
+        }
+    }
+
     fn forward_query(&mut self, id: &str, cx: &mut Context<Self>) {
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
@@ -777,6 +786,10 @@ impl Workbench {
     fn sync_view_settings(&mut self, cx: &mut Context<Self>) {
         let settings = self.model.settings.to_settings();
         self.query.update(cx, |pane, cx| pane.apply_public_settings(&settings, cx));
+        if self.model.connections.loaded {
+            let saved: Vec<&str> = self.model.connections.rows.iter().map(|row| row.saved.id.as_str()).collect();
+            self.query.update(cx, |pane, cx| pane.retain_saved_targets(&saved, cx));
+        }
         let page_size = u64::try_from(settings.page_size.max(1)).unwrap_or(1);
         let preview_kb = u64::try_from(settings.preview_kb.max(1)).unwrap_or(1);
         let null_copy = settings.null_copy.clone();
@@ -1956,6 +1969,17 @@ impl Workbench {
                             if view.model.connections.status.get(&status.id) != Some(&next) {
                                 view.model.connections.status.insert(status.id.clone(), next);
                                 changed = true;
+                                match next {
+                                    LinkStatus::Connected => {
+                                        view.model.connections.failures.remove(&status.id);
+                                    }
+                                    LinkStatus::Failed => {
+                                        if let Some(reason) = status.reason.clone().filter(|reason| !reason.trim().is_empty()) {
+                                            view.model.connections.failures.insert(status.id.clone(), reason);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 if next == LinkStatus::Failed && view.model.connections.selected.as_deref() == Some(status.id.as_str()) {
                                     view.model.notice_key = Some("connections.status.error");
                                     view.model.notice_detail = status.reason.unwrap_or_default();
@@ -2806,6 +2830,10 @@ fn query_command(id: &str) -> bool {
         || id.starts_with("unpin:")
         || id.starts_with("log:")
         || id.starts_with("side-mode:")
+        // 查询页把自己的运行类命令（含大纲里的单条执行）交回外壳统一按需连接；
+        // 外壳必须认得同一份清单再转发回去，否则这类命令会在外壳这一层被静默丢掉。
+        || crate::app::views::query::runs_query(id)
+        || id.starts_with("outline:")
 }
 
 pub(super) fn nav_key(key: &str) -> Option<NavKey> {

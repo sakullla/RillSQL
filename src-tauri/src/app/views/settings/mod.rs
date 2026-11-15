@@ -15,6 +15,7 @@ pub const OBJECT_PAGE_RANGE: (i64, i64) = (1, 10_000);
 /// 读取上限、NULL 文本、查询超时与更新开关。分区导航与设置页本身不在此列。
 pub fn is_settings_command(id: &str) -> bool {
     matches!(id, "font-up" | "font-down" | "editor-theme-next" | "editor-theme-prev" | "toggle-updates")
+        || id.starts_with("editor-theme-set-")
         || id.starts_with("theme-")
         || id.starts_with("density-")
         || id.starts_with("locale-")

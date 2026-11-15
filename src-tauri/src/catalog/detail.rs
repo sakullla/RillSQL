@@ -282,7 +282,8 @@ pub fn indexes_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<In
     indexes
 }
 
-fn failure(err: impl std::fmt::Display) -> String {
+fn failure(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取对象详情失败：{err}")
 }
 

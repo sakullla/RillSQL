@@ -59,6 +59,7 @@ dict! {
     "shell.command.toggleSidebar" => "显示 / 隐藏资源管理器", "Show / hide the explorer";
     "shell.command.themeLight" => "切换到浅色主题", "Switch to light theme";
     "shell.command.themeDark" => "切换到深色主题", "Switch to dark theme";
+    "shell.command.toggleTheme" => "切换浅色 / 深色主题", "Toggle light / dark theme";
     "shell.command.themeSystem" => "主题跟随系统", "Theme follows system";
     "shell.command.help" => "键盘快捷键", "Keyboard shortcuts";
     "shell.command.checkUpdates" => "检查更新", "Check for updates";
@@ -250,6 +251,8 @@ dict! {
     "connections.status.connected" => "已连接", "Connected";
     "connections.status.error" => "连接失败", "Connection failed";
     "connections.deleteDialog.title" => "删除这条连接配置？", "Delete this connection configuration?";
+    "connections.deleteDialog.titleNamed" => "删除连接配置“{name}”？", "Delete the connection “{name}”?";
+    "connections.deleteDialog.boundTabs" => "{count} 个打开的标签正在使用它，删除后需要重新选择执行目标。", "{count} open tab(s) use it and will need a new target.";
     "connections.validate.chooseFile" => "请选择数据库文件", "Choose a database file";
     "connections.validate.hostRequired" => "请填写主机", "Enter a host";
     "connections.validate.portRange" => "端口应为 1–65535", "Port must be 1–65535";
@@ -523,8 +526,8 @@ dict! {
     "conn.page.tag" => "标签", "Tag";
     "conn.page.none" => "无", "None";
     "conn.page.tlsOff" => "未加密", "Off";
-    "conn.page.tlsRequire" => "TLS（不校验证书）", "TLS (no verification)";
-    "conn.page.tlsVerify" => "TLS（校验证书）", "TLS (verified)";
+    "conn.page.tlsRequire" => "TLS（不核对证书）", "TLS (no verification)";
+    "conn.page.tlsVerify" => "TLS（核对证书）", "TLS (verified)";
     "conn.page.allTags" => "全部", "All";
     "conn.page.noTag" => "无标签", "Untagged";
     "conn.page.manageTags" => "管理标签", "Manage tags";
@@ -553,6 +556,10 @@ dict! {
     "ui.query.targetConnections" => "连接", "Connections";
     "ui.query.targetDatabases" => "{name} 的库", "Databases in {name}";
     "ui.query.targetNoMatch" => "没有匹配的连接", "No matching connections";
+    "ui.explorer.editConnection" => "编辑连接", "Edit connection";
+    "ui.query.targetNoConnections" => "还没有连接", "No connections yet";
+    "ui.query.targetNoConnectionsHint" => "先新建一个连接，再回来选择执行目标。", "Create a connection first, then pick it as the target.";
+    "ui.query.targetMissing" => "这条连接已不存在，请重新选择执行目标", "This connection no longer exists. Pick another target.";
     "ui.query.targetNoDatabase" => "没有可选的库", "No databases to choose";
     "ui.query.targetNotOpen" => "这条连接还没有打开。连接后列出它的库。", "This connection isn't open yet. Connect to list its databases.";
     "query.plan.title" => "执行计划", "Execution plan";
@@ -899,8 +906,10 @@ dict! {
     "ui.conn.url" => "连接串（可选）", "Connection string (optional)";
     "ui.conn.urlHint" => "粘贴后点“解析”，如", "Paste and parse, e.g.";
     "ui.conn.parse" => "解析", "Parse";
+    "ui.conn.urlApplied" => "已按连接串填好连接信息", "Connection details filled from the URL";
     "ui.conn.name" => "名称", "Name";
     "ui.conn.namePlaceholder" => "给连接起个名字", "Name this connection";
+    "ui.conn.nameDefault" => "留空则命名为 {name}", "Leave blank to use {name}";
     "ui.conn.env" => "环境", "Environment";
     "ui.conn.env.dev" => "开发", "Dev";
     "ui.conn.env.test" => "测试", "Test";
@@ -1250,6 +1259,8 @@ dict! {
     "grid.write.jumpStaged" => "定位到变更", "Jump to staged change";
     "grid.status.readonlyReason" => "只读：{reason}", "Read-only: {reason}";
     "query.errors.locate" => "定位到出错位置", "Jump to error";
+    "query.errors.copy" => "复制错误", "Copy error";
+    "query.errors.copied" => "已复制错误信息", "Error message copied";
     "query.outline.run" => "运行此语句", "Run this statement";
     "query.results.rename" => "重命名固定结果", "Rename pinned result";
     "query.side.primary" => "主键", "Primary key";

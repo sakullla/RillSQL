@@ -353,7 +353,7 @@ async fn fetch_page(session: &CatalogSession, schema: &TableSchema, offset: u64,
 }
 
 async fn fetch_sqlite(pool: &sqlx::SqlitePool, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())).fetch_all(pool).await.map_err(|err| err.to_string())?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())).fetch_all(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     rows.iter().map(|row| read_sqlite_row(row, width)).collect()
 }
 
@@ -379,12 +379,12 @@ fn read_sqlite_row(row: &sqlx::sqlite::SqliteRow, width: usize) -> Result<Vec<Ce
 }
 
 async fn fetch_postgres(client: &tokio_postgres::Client, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    let rows = client.query(sql, &[]).await.map_err(|err| err.to_string())?;
+    let rows = client.query(sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
     let mut matrix = Vec::new();
     for row in &rows {
         let mut cells = Vec::new();
         for index in 0..width {
-            let value = row.try_get::<_, Option<String>>(index).map_err(|err| err.to_string())?;
+            let value = row.try_get::<_, Option<String>>(index).map_err(|err| crate::error_text::chain(&err))?;
             cells.push(cell_text(value));
         }
         matrix.push(cells);
@@ -398,11 +398,11 @@ async fn fetch_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::conne
 }
 
 async fn fetch_mysql(pool: &mysql_async::Pool, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
-    let mut result = conn.query_iter(sql).await.map_err(|err| err.to_string())?;
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+    let mut result = conn.query_iter(sql).await.map_err(|err| crate::error_text::chain(&err))?;
     let width = result.columns_ref().len();
     let mut matrix = Vec::new();
-    while let Some(row) = result.next().await.map_err(|err| err.to_string())? {
+    while let Some(row) = result.next().await.map_err(|err| crate::error_text::chain(&err))? {
         let cells = (0..width).map(|index| mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL))).collect();
         matrix.push(cells);
     }
@@ -651,8 +651,8 @@ async fn postgres_current(session: &CatalogSession) -> Result<String, String> {
     let CatalogSession::Postgres(client) = session else {
         return Ok(String::new());
     };
-    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| err.to_string())?;
-    let name: Option<String> = row.try_get(0).map_err(|err| err.to_string())?;
+    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
+    let name: Option<String> = row.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
     Ok(name.unwrap_or_default())
 }
 
@@ -671,7 +671,7 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
             let CatalogSession::Postgres(client) = session else {
                 return Err("会话类型和目标引擎不一致".to_owned());
             };
-            let rows = client.query("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema]).await.map_err(|err| err.to_string())?;
+            let rows = client.query("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema]).await.map_err(|err| crate::error_text::chain(&err))?;
             if rows.is_empty() {
                 return Err(format!("schema {schema} 不存在"));
             }
@@ -681,11 +681,11 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
             let CatalogSession::Mysql(pool) = session else {
                 return Err("会话类型和目标引擎不一致".to_owned());
             };
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
             let row: Option<mysql_async::Row> = conn
                 .exec_first("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?", (database.to_owned(),))
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| crate::error_text::chain(&err))?;
             if row.is_none() {
                 return Err(format!("数据库 {database} 不存在"));
             }
@@ -772,7 +772,7 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
     let sql = crate::catalog::metadata_sql(CatalogEngine::Postgres)
         .schemas
         .ok_or_else(|| "PostgreSQL 缺少 schema 查询".to_owned())?;
-    let rows = client.query(sql, &[]).await.map_err(|err| err.to_string())?;
+    let rows = client.query(sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
     let mut names = Vec::new();
     for row in &rows {
         let name = schema_name(row)?;
@@ -790,7 +790,7 @@ fn schema_name(row: &tokio_postgres::Row) -> Result<String, String> {
     match row.try_get::<_, Option<String>>(0) {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Err("schema 名是空值".to_owned()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     }
 }
 

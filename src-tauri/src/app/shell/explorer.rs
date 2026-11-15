@@ -14,6 +14,8 @@ pub enum ExplorerItem {
     Connection { id: String },
     /// 连接级读取失败：原因只写在这一条连接下面。
     ConnectionError { connection_id: String, error: String },
+    /// 连接本身没有连上：写出最近一次失败的原因，并给出重试与编辑。
+    ConnectFailed { connection_id: String, reason: String },
     /// 连接下“没有对象 / 无命中 / 读取中”的说明行。
     Note { connection_id: String, key: &'static str },
     /// 目录树的一行（库、模式、种类分组、对象、列、索引）。
@@ -39,6 +41,7 @@ impl ExplorerItem {
             ExplorerItem::Group { id, .. } => format!("group:{id}"),
             ExplorerItem::Connection { id } => format!("conn:{id}"),
             ExplorerItem::ConnectionError { connection_id, .. } => format!("conn-error:{connection_id}"),
+            ExplorerItem::ConnectFailed { connection_id, .. } => format!("conn-failed:{connection_id}"),
             ExplorerItem::Note { connection_id, .. } => format!("note:{connection_id}"),
             ExplorerItem::Nav(row) => format!("nav:{}", row.id),
             ExplorerItem::CatalogError { .. } => "catalog-error".to_owned(),

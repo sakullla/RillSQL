@@ -81,6 +81,11 @@ pub struct ConnectionPage {
     pub test_running_generation: Option<u64>,
     /// 持久化的最近使用顺序（Store 的 connection_usage）。启动台的"最近连接"只认它。
     pub recent_ids: Vec<String>,
+    /// 连接清单至少成功读到过一次。之前不能断言“某条连接已不存在”。
+    pub loaded: bool,
+    /// 每条连接最近一次连接失败的原因。状态栏的提示会被下一条消息覆盖，
+    /// 这里按连接留住，资源管理器在失败的连接下面直接写出原因。连上后清掉。
+    pub failures: BTreeMap<String, String>,
 }
 
 
@@ -94,6 +99,7 @@ impl ConnectionPage {
         match tasks.accept(OWNER, token, rows) {
             TaskOutcome::Current { value, .. } => {
                 self.rows = value;
+                self.loaded = true;
                 true
             }
             TaskOutcome::Stale { .. } | TaskOutcome::Cancelled { .. } => false,
@@ -356,7 +362,8 @@ impl ConnectionPage {
                     TestStatus::Err => {
                         self.issues = Self::failure_issues(&report, self.editor.as_ref());
                         if let Some(id) = row_id {
-                            self.status.insert(id, LinkStatus::Failed);
+                            self.status.insert(id.clone(), LinkStatus::Failed);
+                            self.failures.insert(id, failure_reason(&report));
                         }
                     }
                 }
@@ -366,7 +373,8 @@ impl ConnectionPage {
                 self.message_key = Some("connections.status.error");
                 self.issues.clear();
                 if let Some(id) = row_id {
-                    self.status.insert(id, LinkStatus::Failed);
+                    self.status.insert(id.clone(), LinkStatus::Failed);
+                    self.failures.insert(id, self.message_detail.clone());
                 }
             }
         }
@@ -384,16 +392,19 @@ impl ConnectionPage {
             Ok(outcome) if outcome.connected => {
                 // 成功提示说连上了哪条连接；最后一个检查阶段的内部说明（如 foreign_keys ON）不放进状态栏。
                 let name = self.rows.iter().find(|row| row.saved.id == id).map(|row| row.saved.name.clone()).unwrap_or_default();
+                self.failures.remove(&id);
                 self.status.insert(id, LinkStatus::Connected);
                 self.message_key = Some("connections.status.connected");
                 self.message_detail = if name.is_empty() { String::new() } else { format!("· {name}") };
             }
             Ok(outcome) => {
+                self.failures.insert(id.clone(), failure_reason(&outcome.report));
                 self.status.insert(id, LinkStatus::Failed);
                 self.message_key = Some("connections.status.error");
                 self.message_detail = outcome.report.summary.or(outcome.report.hint).unwrap_or_default();
             }
             Err(detail) => {
+                self.failures.insert(id.clone(), detail.clone());
                 self.status.insert(id, LinkStatus::Failed);
                 self.message_key = Some("connections.status.error");
                 self.message_detail = detail;
@@ -401,6 +412,16 @@ impl ConnectionPage {
         }
         self.executed_sql = false;
         true
+    }
+}
+
+/// 资源管理器里留给一条连接的失败原因：首行是失败阶段的原文，有处理建议时另起一行附上。
+fn failure_reason(report: &TestReport) -> String {
+    let message = crate::connections::report_failure_text(report);
+    match report.hint.as_deref().map(str::trim).filter(|hint| !hint.is_empty() && *hint != message.trim()) {
+        Some(hint) => format!("{message}
+{hint}"),
+        None => message,
     }
 }
 
@@ -785,6 +806,20 @@ mod tests {
         assert!(!copy.save_password);
         assert!(copy.name.contains("copy"));
         assert!(!page.executed_sql);
+    }
+
+    #[test]
+    fn an_open_failure_is_remembered_per_connection_until_it_connects() {
+        let tasks = TaskBoard::new();
+        let mut page = ConnectionPage { rows: vec![record("pg", "Atlas", Engine::Postgres)], selected: Some("pg".into()), ..Default::default() };
+        assert!(!page.loaded, "清单还没被接受过");
+        let token = page.begin(&tasks);
+        assert!(page.note_open(&tasks, token, Err("connection refused".into())));
+        assert_eq!(page.status.get("pg"), Some(&LinkStatus::Failed));
+        assert_eq!(page.failures.get("pg").map(String::as_str), Some("connection refused"));
+        // 状态栏消息被别的提示覆盖了也没关系：原因按连接留着。
+        page.message_detail.clear();
+        assert_eq!(page.failures.get("pg").map(String::as_str), Some("connection refused"));
     }
 
     fn record(id: &str, name: &str, engine: Engine) -> ConnectionRecord {

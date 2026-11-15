@@ -266,7 +266,8 @@ impl DumpScope {
 
 // ---------------------------------------------------------------- 对象枚举与定义读取
 
-fn read_failure(err: impl std::fmt::Display) -> String {
+fn read_failure(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取失败：{err}")
 }
 
@@ -905,7 +906,7 @@ async fn write_table_data(
         for cells in &rows {
             let line = insert_line(engine, &schema_label, &table, &columns, &names, cells);
             if let Err(err) = writeln!(out, "{line}") {
-                return Err(DumpStop::Failed(err.to_string()));
+                return Err(DumpStop::Failed(crate::error_text::chain(&err)));
             }
             written += 1;
         }
@@ -1019,7 +1020,7 @@ async fn dump_body(session: &CatalogSession, request: &DumpRequest, flag: &Atomi
     };
     let mut out = BufWriter::new(file);
     if let Err(err) = write_header(&mut out, engine, &scope, request, &notes) {
-        return residual_outcome(&staging, err.to_string(), 0, 0);
+        return residual_outcome(&staging, crate::error_text::chain(&err), 0, 0);
     }
 
     let entries = plan_sections(engine, &scope, &objects, request.include_data, &request.tables);
@@ -1038,14 +1039,14 @@ async fn dump_body(session: &CatalogSession, request: &DumpRequest, flag: &Atomi
                     continue;
                 }
                 if let Err(err) = writeln!(out, "{text};\n") {
-                    return residual_outcome(&staging, err.to_string(), written_objects, written_rows);
+                    return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
                 }
                 written_objects += 1;
                 progress(DumpProgress::ddl(&request.id, object));
             }
             DumpEntry::Data { schema, table } => {
                 if let Err(err) = writeln!(out, "\n-- 表 {table} 的数据") {
-                    return residual_outcome(&staging, err.to_string(), written_objects, written_rows);
+                    return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
                 }
                 let mut table_rows = |rows: u64| progress(DumpProgress::data(&request.id, table, rows));
                 match write_table_data(&mut out, session, &scope.database, schema, table, engine_name(engine), flag, &mut table_rows).await {
@@ -1058,19 +1059,19 @@ async fn dump_body(session: &CatalogSession, request: &DumpRequest, flag: &Atomi
                     Err(DumpStop::Failed(message)) => return residual_outcome(&staging, message, written_objects, written_rows),
                 }
                 if let Err(err) = writeln!(out) {
-                    return residual_outcome(&staging, err.to_string(), written_objects, written_rows);
+                    return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
                 }
             }
         }
     }
     if let Err(err) = out.flush() {
-        return residual_outcome(&staging, err.to_string(), written_objects, written_rows);
+        return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
     }
     if target.exists() && fs::remove_file(target).is_err() {
         return residual_outcome(&staging, "无法替换目标文件".to_owned(), written_objects, written_rows);
     }
     if let Err(err) = fs::rename(&staging, target) {
-        return residual_outcome(&staging, err.to_string(), written_objects, written_rows);
+        return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
     }
     done_dto(target.display().to_string(), written_objects, written_rows, request.include_data)
 }

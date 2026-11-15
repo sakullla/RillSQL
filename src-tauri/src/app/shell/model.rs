@@ -956,8 +956,10 @@ impl WorkbenchModel {
                 }
             }
             "conn-apply-url" => {
+                // 解析失败落在连接串字段下面：错误和出错的输入框在一起，而不是跑到状态栏。
+                self.connections.clear_issue("url");
                 if let Err(key) = self.connections.apply_url(&self.url_buffer) {
-                    self.notice_key = Some(key);
+                    self.connections.issues.push(crate::app::views::connections::FieldIssue::new("url", key));
                 }
             }
             "conn-filter-engine" => {
@@ -1246,6 +1248,9 @@ impl WorkbenchModel {
             "font-up" => self.settings.step_editor_font(1),
             "font-down" => self.settings.step_editor_font(-1),
             "editor-theme-prev" => self.settings.cycle_editor_theme_step(-1),
+            _ if id.starts_with("editor-theme-set-") => {
+                self.settings.editor_theme = crate::app::views::settings::normalize_editor_theme(id.trim_start_matches("editor-theme-set-")).to_owned();
+            }
             "toggle-updates" => self.settings.toggle_updates(),
             // 手动检查不受“启动时自动检查”开关影响：用户点了就查。
             "check-updates" => {
@@ -1733,6 +1738,16 @@ impl WorkbenchModel {
 
     pub fn open_connection_menu(&mut self) {
         self.open_menu(MenuPlace::ConnectionRow, MenuTarget::Connection);
+        let connected = self
+            .connections
+            .selected
+            .as_deref()
+            .is_some_and(|id| self.connections.row_status(id) == LinkStatus::Connected);
+        if let Some(menu) = self.menu.as_mut() {
+            if let Some(slot) = menu.items.iter_mut().find(|item| item.id == "conn-connect") {
+                *slot = super::menus::connection_link_item(connected);
+            }
+        }
         self.append_move_to_group();
     }
 
@@ -2903,6 +2918,11 @@ impl WorkbenchModel {
             return (Vec::new(), false, true);
         }
         let mut items = vec![ExplorerItem::Connection { id: id.to_owned() }];
+        if self.connections.status.get(id) == Some(&LinkStatus::Failed) {
+            if let Some(reason) = self.connections.failures.get(id).filter(|reason| !reason.trim().is_empty()) {
+                items.push(ExplorerItem::ConnectFailed { connection_id: id.to_owned(), reason: reason.clone() });
+            }
+        }
         if let Some(error) = self
             .nav
             .node(&crate::catalog::hierarchy::connection_node_id(id))
@@ -3213,6 +3233,21 @@ impl WorkbenchModel {
     fn nav_command(&mut self, id: &str) -> bool {
         if id == "nav-refresh" {
             self.request_nav_refresh(None);
+            return true;
+        }
+        // 资源管理器里连接失败那一行的两个出口：再连一次，或打开这条连接的编辑表单改配置。
+        if let Some(connection) = id.strip_prefix("nav-connect-retry:") {
+            if self.connections.rows.iter().any(|row| row.saved.id == connection) {
+                self.connections.selected = Some(connection.to_owned());
+                self.queue_connect(super::conn_modal::ConnectIntent::new(connection.to_owned(), super::conn_modal::ConnectAction::Expand, None));
+            }
+            return true;
+        }
+        if let Some(connection) = id.strip_prefix("nav-connect-edit:") {
+            if self.connections.rows.iter().any(|row| row.saved.id == connection) {
+                self.connections.selected = Some(connection.to_owned());
+                self.conn_command("conn-edit");
+            }
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-retry:") {
@@ -4716,7 +4751,16 @@ impl WorkbenchModel {
             }
             DraftField::Passphrase => self.connections.secrets.ssh_passphrase = value,
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
-            DraftField::Url => self.url_buffer = value,
+            DraftField::Url => {
+                // 一次多出好几个字符基本就是粘贴：能完整解析就直接填好下面的字段，省掉再点“解析”。
+                // 逐字输入时不解析，半截地址不会把已经填好的字段冲掉。
+                let pasted = value.trim().len() > self.url_buffer.trim().len() + 1;
+                self.url_buffer = value;
+                self.connections.clear_issue("url");
+                if pasted && !self.url_buffer.trim().is_empty() && self.connections.apply_url(&self.url_buffer).is_ok() {
+                    self.notice_key = Some("ui.conn.urlApplied");
+                }
+            }
             DraftField::Filter => self.connections.filter_text = value,
             DraftField::ObjectFilter => {
                 // 资源管理器搜索与对象索引是同一份：显示完整路径并高亮，清除后恢复树。

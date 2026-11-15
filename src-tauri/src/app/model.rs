@@ -184,7 +184,12 @@ impl ObjectTarget {
             }
             scope.push_str(&self.schema);
         }
-        let mut path = if scope.is_empty() { self.name.clone() } else { format!("{scope}.{}", self.name) };
+        // 只有连接/库范围（没有具体对象）时不留一个悬空的点：显示 "shop · Atlas" 而不是 "shop. · Atlas"。
+        let mut path = match (scope.is_empty(), self.name.is_empty()) {
+            (true, _) => self.name.clone(),
+            (false, true) => scope,
+            (false, false) => format!("{scope}.{}", self.name),
+        };
         let owner = if self.connection_name.is_empty() { &self.connection_id } else { &self.connection_name };
         if !owner.is_empty() {
             path.push_str(" · ");
@@ -807,6 +812,14 @@ pub fn accept_versioned(current: u64, response: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scope_without_an_object_has_no_dangling_dot() {
+        let scope = ObjectTarget::new("pg", "Atlas", "shop", "", "", "postgres", "");
+        assert_eq!(scope.path(), "shop · Atlas");
+        let table = ObjectTarget::new("pg", "Atlas", "shop", "public", "orders", "postgres", "table");
+        assert_eq!(table.path(), "shop.public.orders · Atlas");
+    }
 
     #[test]
     fn locales_share_every_foundation_key_and_do_not_echo_the_key() {

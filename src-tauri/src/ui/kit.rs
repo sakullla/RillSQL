@@ -169,6 +169,46 @@ pub fn apply_theme(dark: bool, cx: &mut App) {
     let white = hex(0xffffff);
     let clear = hsla(0., 0., 0., 0.);
     Theme::update(cx, |theme| brand(theme, &p, white, clear));
+    paint_editor_surface(dark, cx);
+}
+
+/// 当前编辑器配色（auto / contrast / warm / cool / mono）。主题切换时据此重设编辑器底色，
+/// 行号栏和正文才是同一块底，而不是组件库默认的近黑色竖条。
+struct EditorSurface(&'static str);
+
+impl gpui_kit::Global for EditorSurface {}
+
+/// 设置页改了编辑器配色：记住它，并把行号栏底色换成同一档背景。值没变时什么也不做。
+pub fn set_editor_surface(editor_theme: &str, cx: &mut App) {
+    let name = crate::app::views::settings::normalize_editor_theme(editor_theme);
+    if cx.try_global::<EditorSurface>().is_some_and(|current| current.0 == name) {
+        return;
+    }
+    cx.set_global(EditorSurface(name));
+    paint_editor_surface(cx.theme().is_dark(), cx);
+}
+
+/// 组件库按高亮主题里的编辑器底色画行号栏（为了盖住横向滚动的文字，它必须不透明）。
+/// 编辑器正文用的是配色设置里的底色，两者不一致时行号栏会变成一条突兀的深色带。
+fn paint_editor_surface(dark: bool, cx: &mut App) {
+    let name = cx.try_global::<EditorSurface>().map(|current| current.0).unwrap_or("auto");
+    let (background, _) = crate::app::views::settings::editor_theme_colors(name, dark);
+    let background = hex(background);
+    if cx.theme().highlight_theme.style.editor_background == Some(background) {
+        return;
+    }
+    Theme::update(cx, |theme| {
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.editor_background = Some(background);
+        highlight.style.editor_gutter_background = Some(background);
+        theme.highlight_theme = Arc::new(highlight);
+    });
+}
+
+/// 行号栏当前的底色（测试用）：与编辑器正文的配色底色应当一致。
+#[cfg(test)]
+pub fn editor_gutter_background(cx: &App) -> Option<Hsla> {
+    cx.theme().highlight_theme.style.editor_gutter_background
 }
 
 fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
@@ -2354,6 +2394,21 @@ mod control_tests {
             )
             .expect("control window")
         })
+    }
+
+    /// 行号栏和编辑器正文是同一块底：跟随主题时取 auto 档底色，换配色、切明暗后跟着变。
+    #[gpui_kit::test]
+    fn the_editor_gutter_matches_the_editor_surface(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(true, cx);
+            let auto_dark = hex(crate::app::views::settings::editor_theme_colors("auto", true).0);
+            assert_eq!(editor_gutter_background(cx), Some(auto_dark), "深色下不是组件库默认的近黑竖条");
+            set_editor_surface("warm", cx);
+            assert_eq!(editor_gutter_background(cx), Some(hex(crate::app::views::settings::editor_theme_colors("warm", true).0)));
+            apply_theme(false, cx);
+            assert_eq!(editor_gutter_background(cx), Some(hex(crate::app::views::settings::editor_theme_colors("warm", false).0)), "切明暗后沿用当前配色");
+        });
     }
 
     /// 纯图标动作：命中范围是 HitArea 方形、无障碍名称与角色就位、点击真的触发；

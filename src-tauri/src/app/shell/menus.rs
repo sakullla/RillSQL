@@ -116,6 +116,16 @@ pub(super) fn command_chord(id: &str) -> Option<&'static str> {
     }
 }
 
+/// 连接行菜单的第一项跟着连接状态走：已连接时是“断开连接”，否则是“连接”。
+/// 已经连上的连接再给一个“连接”既没用，也让人以为它没连上。
+pub fn connection_link_item(connected: bool) -> MenuItem {
+    if connected {
+        with_icon(item("conn-disconnect", "connections.page.menuDisconnect"), IconName::Unplug)
+    } else {
+        with_icon(item("conn-connect", "connections.page.connect"), IconName::Plug)
+    }
+}
+
 fn item(id: &'static str, label_key: &'static str) -> MenuItem {
     leaf(id, label_key, false, true, None)
 }
@@ -356,7 +366,7 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
         let relational = facts.map(|facts| facts.engine.is_relational()).unwrap_or(true);
         if relational {
             items.push(with_icon(item("tree-create-table", "structure.action.createTable"), IconName::Plus));
-            items.push(with_icon(item("open-admin", "ui.tool.admin"), IconName::Database));
+            items.push(with_icon(item("open-admin", "ui.tool.admin"), IconName::Gauge));
         }
         return items;
     }
@@ -386,7 +396,7 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
             with_icon(item("conn-disconnect", "connections.page.menuDisconnect"), IconName::Unplug),
             sep(with_icon(item("conn-new-query", "shell.command.newQuery"), IconName::SquareTerminal)),
             with_icon(item("tree-refresh-node", "catalog.tree.refreshNode"), IconName::RefreshCw),
-            with_icon(item("open-admin", "ui.tool.admin"), IconName::Database),
+            with_icon(item("open-admin", "ui.tool.admin"), IconName::Gauge),
             sep(with_icon(item("conn-edit", "connections.page.menuEdit"), IconName::Pencil)),
             with_icon(item("conn-duplicate", "common.copy"), IconName::Copy),
             with_icon(item("conn-test", "connections.editor.test.button"), IconName::Zap),

@@ -100,6 +100,10 @@ pub struct QueryPane {
     targets: Vec<TargetRequest>,
     /// 工具条「运行」也是外壳的入口：按需连接与重放只有一份，面板不自己判断。
     owner: Option<gpui_kit::WeakEntity<crate::app::shell::Workbench>>,
+    /// 外壳已经送来过一次连接清单；之前不判断“绑定的连接已不存在”。
+    targets_known: bool,
+    /// 目标按钮上一帧的位置：没有点击坐标时选择器从这里弹出。
+    target_button: target::ButtonBounds,
     variable_values: HashMap<String, String>,
     /// 每个查询标签自己的右侧面板状态（开关、大纲/对象）。
     side: HashMap<String, SideState>,
@@ -443,6 +447,8 @@ impl QueryPane {
             opens: Vec::new(),
             targets: Vec::new(),
             owner: None,
+            targets_known: false,
+            target_button: Default::default(),
             variable_values: HashMap::new(),
             side: HashMap::new(),
             row_count: None,
@@ -565,6 +571,7 @@ impl QueryPane {
         self.desk.set_page_size(self.page_size);
         let font = self.editor_font;
         let theme = self.editor_theme.clone();
+        kit::set_editor_surface(&theme, cx);
         for editor in self.editors.values() {
             // 每帧都会下发一次；值没变时不要 notify，否则编辑器会持续重绘。
             let unchanged = {
@@ -915,6 +922,19 @@ impl QueryPane {
         if let Some(index) = id.strip_prefix("outline:") {
             if let Ok(index) = index.parse::<usize>() {
                 let _ = self.jump_to_statement(index, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if id == "copy-error" {
+            // 错误原文常要贴给同事或搜索：复制服务器给的完整消息，不带界面上的状态前缀。
+            let text = self.failure_view().map(|view| failure_summary(self.locale, view));
+            match text {
+                Some(text) => {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                    self.desk.set_active_note(&i18n::text(self.locale, "query.errors.copied"));
+                }
+                None => self.desk.set_active_note(&i18n::text(self.locale, "query.log.noPosition")),
             }
             cx.notify();
             return;
@@ -1423,6 +1443,9 @@ impl QueryPane {
     }
 
     fn start(&mut self, scope: RunScope, override_sql: Option<String>, cx: &mut Context<Self>) {
+        if self.refuse_missing_target(cx) {
+            return;
+        }
         // 重新执行：上一次的错误标记不再成立。
         if let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() {
             editor.update(cx, |editor, cx| editor.clear_errors(cx));
@@ -1745,6 +1768,7 @@ impl QueryPane {
         self.desk.set_tree_error("");
         self.metadata_context = None;
         // 选择器的候选：全部已保存的连接，已打开的带上它的库。
+        self.targets_known = true;
         self.target_choices = connections
             .iter()
             .map(|connection| {
@@ -1762,6 +1786,17 @@ impl QueryPane {
             }
         }
         cx.notify();
+    }
+
+    /// 外壳每帧送来当前保存的连接：删掉的连接立即从选择器里拿掉，绑着它的标签随即显示“已不存在”。
+    /// 目录导航只在读树时刷新，等它回来之前选择器会一直把已删除的连接当成可用的。
+    pub fn retain_saved_targets(&mut self, saved: &[&str], cx: &mut Context<Self>) {
+        let before = self.target_choices.len();
+        self.target_choices.retain(|choice| saved.contains(&choice.id.as_str()));
+        if self.target_choices.len() != before {
+            self.targets_known = true;
+            cx.notify();
+        }
     }
 
     pub fn toggle_target_picker(&mut self, at: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut Context<Self>) {
@@ -1782,6 +1817,27 @@ impl QueryPane {
         cx.notify();
     }
 
+    /// 没有点击坐标时打开选择器（状态栏的目标、执行时发现目标已不存在）。已经开着就不动。
+    pub fn open_target_picker(&mut self, cx: &mut Context<Self>) {
+        if self.target_picker.anchor.is_some() {
+            return;
+        }
+        let at = target::anchor_for(self.target_button.get());
+        self.toggle_target_picker(at, cx);
+    }
+
+    /// 当前标签绑着的连接已被删除：执行前拦下，说明原因并直接打开选择器，而不是报“连接没有打开”。
+    fn refuse_missing_target(&mut self, cx: &mut Context<Self>) -> bool {
+        let connection = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+        if !target::target_missing(self.targets_known, &self.target_choices, &connection) {
+            return false;
+        }
+        self.desk.set_active_note(&i18n::text(self.locale, "ui.query.targetMissing"));
+        self.open_target_picker(cx);
+        cx.notify();
+        true
+    }
+
     pub fn close_target_picker(&mut self, cx: &mut Context<Self>) {
         self.target_picker.anchor = None;
         self.target_picker.search = None;
@@ -1800,6 +1856,17 @@ impl QueryPane {
         self.connect_request = Some(id.to_owned());
         self.target_picker.pending = Some(id.to_owned());
         cx.notify();
+    }
+
+    /// 选择器里一条连接都没有时的出口：关掉弹层，请外壳打开“新建连接”。
+    pub fn new_connection_from_target(&mut self, cx: &mut Context<Self>) {
+        self.close_target_picker(cx);
+        let Some(owner) = self.owner.clone() else { return };
+        cx.defer(move |cx| {
+            if let Some(owner) = owner.upgrade() {
+                owner.update(cx, |view, cx| view.perform("new-connection", cx));
+            }
+        });
     }
 
     pub fn take_connect_request(&mut self) -> Option<String> {
@@ -2384,6 +2451,10 @@ impl QueryPane {
             return;
         };
         if self.desk.select_connection(id) {
+            // 换了目标，“绑定的连接已不存在”这句提示随之作废。
+            if self.desk.active_note() == i18n::text(self.locale, "ui.query.targetMissing") {
+                self.desk.set_active_note("");
+            }
             if let Some(target) = self.desk.target() {
                 self.targets.push(TargetRequest {
                     id: tab_id,
@@ -2518,7 +2589,7 @@ impl QueryPane {
             .as_ref()
             .map(|target| (target.connection_id.clone(), target.connection_name.clone(), target.database.clone(), target.engine.clone()))
             .unwrap_or_default();
-        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, &connection_id, &connection_name, &database, &engine, self.locale, metrics, p, entity)];
+        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, self.targets_known, &connection_id, &connection_name, &database, &engine, &self.target_button, self.locale, metrics, p, entity)];
         let filter = self.target_filter(cx);
         if let Some(popover) = target::popover(
             &self.target_picker,
@@ -3188,6 +3259,33 @@ fn error_jump_button(id: &'static str, locale: Locale, p: &Palette, metrics: Met
         .into_any_element()
 }
 
+/// 复制错误原文：次要动作，用中性描边按钮，不和“定位”抢红色。
+fn error_copy_button(locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    let entity = entity.clone();
+    let label = SharedString::from(i18n::text(locale, "query.errors.copy"));
+    kit::interactive(div().id("query-error-copy"), p, false)
+        .test_support()
+        .flex_none()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .h(px(metrics.control_h))
+        .px(px(8.))
+        .rounded(px(Radius::CONTROL))
+        .border_1()
+        .border_color(p.line_strong)
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .child(kit::icon(IconName::Copy, kit::IconSize::INLINE, p.text_muted))
+        .child(label)
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |pane, cx| pane.command("copy-error", cx));
+        })
+        .into_any_element()
+}
+
 /// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。
 #[inline(never)]
 fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, mono: &SharedString, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
@@ -3226,7 +3324,16 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
                 .child(SharedString::from(message)),
         )
         // 按钮按内容取宽，不被纵向排布拉成一整条红色横幅。
-        .when(failed, |this| this.child(div().flex().child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity))))
+        .when(failed, |this| {
+            this.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity))
+                    .child(error_copy_button(locale, p, metrics, entity)),
+            )
+        })
         // 失败且被自动改写时，说明改写并给出真正执行过的语句；手写 LIMIT 没有这一段。
         .when_some(if failed { rewrite_block(result, locale, mono, p) } else { None }, |this, block| this.child(block))
         .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
@@ -3311,6 +3418,7 @@ pub fn requires_active_query(id: &str) -> bool {
             | "pin-result"
             | "toggle-side"
             | "jump-error"
+            | "copy-error"
     ) || id.starts_with("statement:")
         || id.starts_with("outline:")
         || id.starts_with("query-view:")
@@ -4382,6 +4490,11 @@ mod tests {
             assert_eq!(editor.read(cx).selected_text(cx), "select missing;");
             let hover = editor.read(cx).hover_text(draft.find("missing").unwrap(), cx).expect("悬停错误原文");
             assert!(hover.contains("no such table: missing"), "{hover}");
+            // 错误原文可以一键复制，只复制服务器给的消息。
+            window.click("query-error-copy", cx);
+            let copied = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+            assert_eq!(copied, "no such table: missing");
+            assert_eq!(pane.read(cx).desk.active_note(), "已复制错误信息");
         })
         .unwrap();
     }
@@ -5458,6 +5571,79 @@ mod tests {
                     .any(|req| req.connection_id.as_deref() == Some("my") && req.database.as_deref() == Some("warehouse")),
                 "向外壳同步连接 my 与高亮库 warehouse"
             );
+        })
+        .unwrap();
+    }
+
+    /// 绑定的连接被删掉：外壳送来新的保存清单后，目标按钮立即显示“已不存在”，不再显示成已连接。
+    #[gpui_kit::test]
+    fn deleting_the_bound_connection_marks_the_target_missing(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.target_choices = vec![super::target::TargetChoice {
+                    id: "notes".into(),
+                    name: "笔记".into(),
+                    engine: "sqlite".into(),
+                    connected: true,
+                    databases: vec!["main".into()],
+                }];
+                pane.targets_known = true;
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-connection").label(), Some("选择连接与库"), "还在的连接照常显示");
+            pane.update(cx, |pane, cx| pane.retain_saved_targets(&[], cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("query-connection").label(), Some("这条连接已不存在，请重新选择执行目标"));
+            // 照样点运行：不发出执行，说明原因并直接打开目标选择器。
+            pane.update(cx, |pane, cx| pane.command("execute-query", cx));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.executions(), 0, "目标已不存在时不执行");
+            assert_eq!(pane.read(cx).desk.active_note(), "这条连接已不存在，请重新选择执行目标");
+            assert!(window.try_find("query-target-popover").is_some(), "直接打开选择器让人换目标");
+            // 换到一条还在的连接后，“已不存在”的提示随之消失。
+            pane.update(cx, |pane, cx| {
+                pane.target_choices = vec![super::target::TargetChoice {
+                    id: "other".into(),
+                    name: "另一条".into(),
+                    engine: "sqlite".into(),
+                    connected: true,
+                    databases: vec!["main".into()],
+                }];
+                pane.desk.set_links(vec![desk::OpenLink {
+                    id: "other".into(),
+                    name: "另一条".into(),
+                    engine: "sqlite".into(),
+                    databases: vec!["main".into()],
+                    environment: String::new(),
+                }]);
+                pane.pick_target("other", "main", cx);
+            });
+            assert_eq!(pane.read(cx).desk.active_note(), "");
+        })
+        .unwrap();
+    }
+
+    /// 一条连接都没有时，选择器说清楚“还没有连接”并给出新建入口，而不是“没有匹配的连接”。
+    /// 绑定的连接已经被删掉时，目标按钮用警示态说明，而不是看起来一切正常。
+    #[gpui_kit::test]
+    fn the_target_picker_offers_a_new_connection_when_there_are_none(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.adopt_navigation(&[], Vec::new(), cx);
+                pane.toggle_target_picker(gpui_kit::point(px(580.), px(36.)), cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-target-empty").is_some(), "空清单给出说明");
+            assert!(window.try_find("query-target-new-connection").is_some(), "并给出新建连接的入口");
+            let button = window.find("query-connection");
+            assert_eq!(button.label(), Some("这条连接已不存在，请重新选择执行目标"), "绑定的 notes 已不在清单里");
+            window.click("query-target-new-connection", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-target-popover").is_none(), "点新建后关闭弹层");
         })
         .unwrap();
     }

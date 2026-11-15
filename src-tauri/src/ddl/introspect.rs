@@ -128,19 +128,19 @@ pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &st
                 .bind(current)
                 .fetch_one(pool)
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| crate::error_text::chain(&err))?;
             Ok(count > 0)
         }
         CatalogSession::Mysql(pool) => {
             use mysql_async::prelude::Queryable;
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
             let count: Option<i64> = conn
                 .exec_first(
                     "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND BINARY TABLE_NAME <> BINARY ?",
                     (snapshot.database.as_str(), name, current),
                 )
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| crate::error_text::chain(&err))?;
             Ok(count.unwrap_or(0) > 0)
         }
         CatalogSession::Postgres(client) => {
@@ -150,7 +150,7 @@ pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &st
                     &[&snapshot.schema, &name, &current],
                 )
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| crate::error_text::chain(&err))?;
             let count: i64 = row.get(0);
             Ok(count > 0)
         }
@@ -199,7 +199,7 @@ async fn postgres_comments(client: &tokio_postgres::Client, schema: &str, table:
             &[&schema, &table],
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     let mut table_comment = None;
     let mut columns = BTreeMap::new();
     for row in &rows {
@@ -274,8 +274,8 @@ pub async fn session_snapshot(session: &CatalogSession, request: &Request) -> Re
     snapshot.object_exists = false;
     snapshot.table_sql.clear();
     snapshot.recorded_foreign_keys = *foreign_keys;
-    snapshot.sqlite_version = sqlx::query_scalar("SELECT sqlite_version()").fetch_one(pool).await.map_err(|err| err.to_string())?;
-    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    snapshot.sqlite_version = sqlx::query_scalar("SELECT sqlite_version()").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
+    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     snapshot.live_foreign_keys = Some(live != 0);
     Ok(snapshot)
 }
@@ -369,13 +369,13 @@ struct SqliteState {
 
 async fn sqlite_state(pool: &sqlx::SqlitePool) -> Result<SqliteState, String> {
     let mut pragmas = BTreeMap::new();
-    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     pragmas.insert("foreign_keys".to_owned(), if foreign_keys != 0 { "ON" } else { "OFF" }.to_owned());
-    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     pragmas.insert("journal_mode".to_owned(), journal_mode);
-    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     pragmas.insert("user_version".to_owned(), user_version.to_string());
-    let rows = sqlx::query("PRAGMA database_list").fetch_all(pool).await.map_err(|err| err.to_string())?;
+    let rows = sqlx::query("PRAGMA database_list").fetch_all(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     let attached = rows
         .iter()
         .map(|row| AttachedDatabase { name: sqlite_text(row, 1).unwrap_or_default(), path: sqlite_text(row, 2).unwrap_or_default() })
@@ -454,7 +454,7 @@ async fn mysql_event_enabled(pool: &mysql_async::Pool, database: &str, event: &s
     if database.is_empty() {
         return Err("需要数据库名，没有另开连接。".to_owned());
     }
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
     let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::exec_first(
         &mut conn,
         "SELECT STATUS FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? AND EVENT_NAME = ?",
@@ -501,21 +501,21 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
         .bind(table)
         .fetch_optional(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     let Some(kind) = kind else {
         return Err(format!("找不到表或视图 {table}"));
     };
     let mut snapshot = Snapshot::bare(Engine::Sqlite, "main", "", table);
     snapshot.kind = if kind.eq_ignore_ascii_case("view") { "view" } else { "table" }.to_owned();
     snapshot.recorded_foreign_keys = recorded;
-    snapshot.sqlite_version = sqlx::query_scalar("SELECT sqlite_version()").fetch_one(pool).await.map_err(|err| err.to_string())?;
-    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    snapshot.sqlite_version = sqlx::query_scalar("SELECT sqlite_version()").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
+    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
     snapshot.live_foreign_keys = Some(live != 0);
     let table_sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?1 AND type IN ('table', 'view')")
         .bind(table)
         .fetch_optional(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     snapshot.table_sql = table_sql.unwrap_or_default();
     let upper = snapshot.table_sql.to_ascii_uppercase();
     snapshot.has_check = upper.contains("CHECK(") || upper.contains("CHECK (");
@@ -527,7 +527,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
     let info = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_xinfo({quoted})")))
         .fetch_all(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &info {
         let name = sqlite_text(row, 1)?;
         let hidden = sqlite_i64(row, 6).unwrap_or(0);
@@ -570,7 +570,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
         sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA index_list({quoted})")))
             .fetch_all(pool)
             .await
-            .map_err(|err| err.to_string()),
+            .map_err(|err| crate::error_text::chain(&err)),
     );
     for index in &indexes {
         if snapshot.index_error.is_some() {
@@ -598,7 +598,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
             Err(err) => {
                 snapshot.indexes.clear();
                 if snapshot.index_error.is_none() {
-                    snapshot.index_error = Some(err.to_string());
+                    snapshot.index_error = Some(crate::error_text::chain(&err));
                 }
                 break;
             }
@@ -628,7 +628,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
             Err(err) => {
                 snapshot.indexes.clear();
                 if snapshot.index_error.is_none() {
-                    snapshot.index_error = Some(err.to_string());
+                    snapshot.index_error = Some(crate::error_text::chain(&err));
                 }
                 break;
             }
@@ -640,7 +640,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
         sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA foreign_key_list({quoted})")))
             .fetch_all(pool)
             .await
-            .map_err(|err| err.to_string()),
+            .map_err(|err| crate::error_text::chain(&err)),
     );
     if snapshot.foreign_key_error.is_none() {
         match group_sqlite_fks(table, &snapshot.table_sql, &fk_rows) {
@@ -660,14 +660,14 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
         .bind(table)
         .fetch_all(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &triggers {
         snapshot.triggers.push(DependentSql { name: sqlite_text(row, 0)?, sql: sqlite_text(row, 1).unwrap_or_default() });
     }
     let views = sqlx::query("SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'view'")
         .fetch_all(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &views {
         let name = sqlite_text(row, 0)?;
         let sql = sqlite_text(row, 1).unwrap_or_default();
@@ -687,7 +687,7 @@ async fn incoming_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<Vec<Inc
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
         .fetch_all(pool)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     let mut incoming = Vec::new();
     for name in names {
         if name == table {
@@ -696,7 +696,7 @@ async fn incoming_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<Vec<Inc
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA foreign_key_list({})", quote_ident(Engine::Sqlite, &name))))
             .fetch_all(pool)
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| crate::error_text::chain(&err))?;
         for key in group_sqlite_fks(&name, "", &rows)? {
             if key.ref_table == table {
                 incoming.push(IncomingForeignKey {
@@ -813,21 +813,21 @@ fn paren_list(text: &str) -> Option<Vec<String>> {
 
 async fn count_rows_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<i64, String> {
     let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(Engine::Sqlite, table));
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.map_err(|err| err.to_string())
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))
 }
 
 async fn count_nulls(session: &CatalogSession, snapshot: &Snapshot, column: &str) -> Result<i64, String> {
     let qualified = qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?;
     let sql = format!("SELECT COUNT(*) FROM {qualified} WHERE {} IS NULL", quote_ident(snapshot.engine, column));
     match session {
-        CatalogSession::Sqlite { pool, .. } => sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.map_err(|err| err.to_string()),
+        CatalogSession::Sqlite { pool, .. } => sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err)),
         CatalogSession::Postgres(client) => {
-            let row = client.query_one(&sql, &[]).await.map_err(|err| err.to_string())?;
-            row.try_get(0).map_err(|err| err.to_string())
+            let row = client.query_one(&sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
+            row.try_get(0).map_err(|err| crate::error_text::chain(&err))
         }
         CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
-            let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(&mut conn, sql).await.map_err(|err| err.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+            let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(&mut conn, sql).await.map_err(|err| crate::error_text::chain(&err))?;
             let row = row.ok_or_else(|| "没有读到 NULL 计数".to_owned())?;
             Ok(mysql_i64(&row, 0))
         }
@@ -850,14 +850,14 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
     if database.is_empty() {
         return Err("需要数据库名，没有另开连接。".to_owned());
     }
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
     let kind: Option<mysql_async::Row> = mysql_async::prelude::Queryable::exec_first(
         &mut conn,
         "SELECT TABLE_TYPE, ENGINE FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
         (database.to_owned(), table.to_owned()),
     )
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| crate::error_text::chain(&err))?;
     let Some(kind_row) = kind else {
         return Err(format!("找不到表或视图 {database}.{table}"));
     };
@@ -870,7 +870,7 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
         (database.to_owned(), table.to_owned()),
     )
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| crate::error_text::chain(&err))?;
     for row in &columns {
         let extra = mysql_string(row, 4).to_ascii_lowercase();
         let generated = !mysql_string(row, 5).is_empty() || extra.contains("generated");
@@ -896,7 +896,7 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             (database.to_owned(), table.to_owned()),
         )
         .await
-        .map_err(|err| err.to_string()),
+        .map_err(|err| crate::error_text::chain(&err)),
     );
     for row in &indexes {
         let name = mysql_string(row, 0);
@@ -928,7 +928,7 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             (database.to_owned(), table.to_owned()),
         )
         .await
-        .map_err(|err| err.to_string()),
+        .map_err(|err| crate::error_text::chain(&err)),
     );
     if snapshot.foreign_key_error.is_none() {
         push_mysql_fks(&mut snapshot.foreign_keys, &foreign_keys, false);
@@ -947,7 +947,7 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             (database.to_owned(), table.to_owned()),
         )
         .await
-        .map_err(|err| err.to_string()),
+        .map_err(|err| crate::error_text::chain(&err)),
     );
     let mut incoming_keys = Vec::new();
     for row in &incoming {
@@ -985,7 +985,7 @@ async fn mysql_view_definition(conn: &mut mysql_async::Conn, database: &str, tab
         quote_ident(Engine::Mysql, database),
         quote_ident(Engine::Mysql, table)
     );
-    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| err.to_string())?;
+    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| crate::error_text::chain(&err))?;
     let row = row.ok_or_else(|| "没有读到视图定义".to_owned())?;
     let text = mysql_string(&row, 1);
     if text.trim().is_empty() || text.trim().starts_with("--") {
@@ -1021,7 +1021,7 @@ fn push_mysql_fks(target: &mut Vec<ForeignKey>, rows: &[mysql_async::Row], _inco
 
 async fn count_nulls_mysql_count(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<i64, String> {
     let sql = format!("SELECT COUNT(*) FROM {}", qualified_table(Engine::Mysql, database, "", table)?);
-    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| err.to_string())?;
+    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| crate::error_text::chain(&err))?;
     Ok(mysql_i64(&row.ok_or_else(|| "没有读到行数".to_owned())?, 0))
 }
 
@@ -1363,8 +1363,8 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
     if schema.is_empty() {
         return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
     }
-    let current = client.query_one("SELECT current_database()", &[]).await.map_err(|err| err.to_string())?;
-    let current: Option<String> = current.try_get(0).map_err(|err| err.to_string())?;
+    let current = client.query_one("SELECT current_database()", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
+    let current: Option<String> = current.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
     if current.as_deref().unwrap_or("") != database {
         return Err(format!("当前连接打开的是 {}，没有另开连接修改 {database}", current.unwrap_or_default()));
     }
@@ -1374,7 +1374,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             &[&schema, &table],
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     let Some(kind_row) = kind_rows.first() else {
         return Err(format!("找不到表或视图 {schema}.{table}"));
     };
@@ -1389,7 +1389,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             &[&oid],
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &columns {
         let identity: String = row.get(4);
         let generated: String = row.get(5);
@@ -1413,7 +1413,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
                 &[&oid],
             )
             .await
-            .map_err(|err| err.to_string()),
+            .map_err(|err| crate::error_text::chain(&err)),
     );
     for row in &indexes {
         let name: String = row.get(0);
@@ -1449,7 +1449,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
                 &[&oid],
             )
             .await
-            .map_err(|err| err.to_string()),
+            .map_err(|err| crate::error_text::chain(&err)),
     );
     for row in &constraints {
         let contype: String = row.get(0);
@@ -1488,7 +1488,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
                 &[&oid],
             )
             .await
-            .map_err(|err| err.to_string()),
+            .map_err(|err| crate::error_text::chain(&err)),
     );
     for row in &incoming {
         let name: String = row.get(0);
@@ -1508,14 +1508,14 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
     let triggers = client
         .query("SELECT tgname, pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = $1 AND NOT tgisinternal", &[&oid])
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &triggers {
         snapshot.triggers.push(DependentSql { name: row.get(0), sql: row.get(1) });
     }
     let views = client
         .query("SELECT c.relname, pg_get_viewdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('v','m')", &[&schema])
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     for row in &views {
         let name: String = row.get(0);
         let sql: String = row.get(1);
@@ -1526,7 +1526,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
     let count = client
         .query_one(&format!("SELECT COUNT(*) FROM {}", qualified_table(Engine::Postgres, database, schema, table)?), &[])
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     snapshot.row_count = Some(count.get(0));
     snapshot.object_exists = true;
     if snapshot.kind == "view" {
@@ -1554,7 +1554,7 @@ async fn postgres_view_definition(
     let row = client
         .query_one("SELECT pg_get_viewdef($1::oid, true)", &[&oid])
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| crate::error_text::chain(&err))?;
     let body: String = row.get(0);
     if body.trim().is_empty() {
         return Err("没有读到视图定义".to_owned());

@@ -353,8 +353,8 @@ async fn count(session: &CatalogSession, sql: &str) -> Result<i64, String> {
 async fn scalar(session: &CatalogSession, sql: &str) -> Result<String, String> {
     match session {
         CatalogSession::Postgres(client) => {
-            let row = client.query_one(sql, &[]).await.map_err(|err| err.to_string())?;
-            row.try_get(0).map_err(|err| err.to_string())
+            let row = client.query_one(sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
+            row.try_get(0).map_err(|err| crate::error_text::chain(&err))
         }
         CatalogSession::Mysql(pool) => mysql_scalar(pool, sql).await,
         CatalogSession::Sqlserver(client) => {
@@ -371,11 +371,11 @@ async fn scalar(session: &CatalogSession, sql: &str) -> Result<String, String> {
 async fn exec(session: &CatalogSession, sql: &str) -> Result<(), String> {
     match session {
         CatalogSession::Postgres(client) => {
-            client.execute(sql, &[]).await.map(|_| ()).map_err(|err| err.to_string())
+            client.execute(sql, &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err))
         }
         CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
-            conn.query_drop(sql).await.map_err(|err| err.to_string())
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+            conn.query_drop(sql).await.map_err(|err| crate::error_text::chain(&err))
         }
         // CREATE SCHEMA 不能包进 sp_executesql。simple_query 单独成批。
         CatalogSession::Sqlserver(client) => crate::grid::sqlserver_rows(client, sql).await.map(|_| ()),
@@ -384,16 +384,16 @@ async fn exec(session: &CatalogSession, sql: &str) -> Result<(), String> {
 }
 
 async fn mysql_scalar(pool: &mysql_async::Pool, sql: &str) -> Result<String, String> {
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
-    let mut result = conn.query_iter(sql).await.map_err(|err| err.to_string())?;
-    let row = result.next().await.map_err(|err| err.to_string())?.ok_or_else(|| "没有计数".to_owned())?;
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+    let mut result = conn.query_iter(sql).await.map_err(|err| crate::error_text::chain(&err))?;
+    let row = result.next().await.map_err(|err| crate::error_text::chain(&err))?.ok_or_else(|| "没有计数".to_owned())?;
     let text = match row.as_ref(0) {
-        Some(mysql_async::Value::Bytes(bytes)) => String::from_utf8(bytes.clone()).map_err(|err| err.to_string())?,
+        Some(mysql_async::Value::Bytes(bytes)) => String::from_utf8(bytes.clone()).map_err(|err| crate::error_text::chain(&err))?,
         Some(mysql_async::Value::Int(number)) => number.to_string(),
         Some(mysql_async::Value::UInt(number)) => number.to_string(),
         Some(other) => other.as_sql(true),
         None => return Err("没有计数列".to_owned()),
     };
-    while result.next().await.map_err(|err| err.to_string())?.is_some() {}
+    while result.next().await.map_err(|err| crate::error_text::chain(&err))?.is_some() {}
     Ok(text)
 }

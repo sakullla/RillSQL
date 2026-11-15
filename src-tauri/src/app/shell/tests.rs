@@ -3523,6 +3523,12 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
     assert_eq!(model.settings.editor_theme, "mono");
     let _ = model.dispatch("editor-theme-next");
     assert_eq!(model.settings.editor_theme, "auto");
+    // 设置页直接摆出全部配色：点哪个就是哪个，未知值回落到跟随主题。
+    let _ = model.dispatch("editor-theme-set-warm");
+    assert_eq!(model.settings.editor_theme, "warm");
+    assert!(crate::app::views::settings::is_settings_command("editor-theme-set-warm"), "选配色要写盘");
+    let _ = model.dispatch("editor-theme-set-neon");
+    assert_eq!(model.settings.editor_theme, "auto");
 
     model.settings.set_page_size(1);
     let _ = model.dispatch("page-size-down");
@@ -8436,6 +8442,15 @@ fn the_query_panes_own_run_button_gates_on_demand_connect(cx: &mut gpui_kit::Tes
         let model = &view.read(cx).model;
         assert!(model.connect_intents.is_empty(), "已连接时不再排连接");
     });
+    // 大纲里每条语句旁的运行图标同样交回外壳；外壳要认得它并转发回来，不能静默丢掉。
+    assert!(pump_until(cx, window, &view, |view, cx| !view.query.read(cx).busy()));
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.query.update(cx, |pane, cx| pane.command("outline-run:1", cx)));
+    });
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.query_runs(cx) == runs_before + 4),
+        "大纲的运行图标走同一条执行路径"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -10197,4 +10212,77 @@ fn connections_page_keyboard_navigation_and_copy_address(cx: &mut gpui_kit::Test
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 粘贴一整段连接串就直接填好字段；逐字输入半截地址不解析；显式“解析”失败时错误落在字段下面。
+#[test]
+fn pasting_a_connection_url_fills_the_form_and_parse_errors_stay_on_the_field() {
+    let mut model = seeded_model(Vec::new());
+    let _ = model.dispatch("new-connection");
+    model.set_field(DraftField::Url, "postgres://app:s3cret@db.example.test:6543/shop".into());
+    let draft = model.connections.editor.clone().expect("草稿");
+    assert_eq!(draft.host, "db.example.test", "粘贴后不用再点解析");
+    assert_eq!(draft.port, "6543");
+    assert_eq!(draft.database, "shop");
+    assert_eq!(draft.username, "app");
+    assert_eq!(model.connections.secrets.password, "s3cret");
+
+    // 逐字输入：每次只多一个字符，不解析，已填好的字段不被半截地址冲掉。
+    model.set_field(DraftField::Url, String::new());
+    for (ix, _) in "mysql://".char_indices() {
+        model.set_field(DraftField::Url, "mysql://"[..=ix].to_owned());
+    }
+    assert_eq!(model.connections.editor.as_ref().unwrap().host, "db.example.test");
+
+    // 显式解析失败：问题挂在 url 字段上，不再只丢进状态栏。
+    model.set_field(DraftField::Url, "not a url".into());
+    let _ = model.dispatch("conn-apply-url");
+    assert!(model.connections.issues.iter().any(|issue| issue.field == "url"), "{:?}", model.connections.issues);
+    // 改动连接串后旧错误清掉。
+    model.set_field(DraftField::Url, "not a url!".into());
+    assert!(!model.connections.issues.iter().any(|issue| issue.field == "url"));
+}
+
+/// 连接失败的原因按连接留在资源管理器里：连接行下面写出原因，给出重试和编辑；连上后原因消失。
+#[test]
+fn a_failed_connection_shows_its_reason_with_retry_and_edit_in_the_explorer() {
+    use super::explorer::ExplorerItem;
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.connections.status.insert("pg".into(), LinkStatus::Failed);
+    model.connections.failures.insert("pg".into(), "password authentication failed for user \"app\"".into());
+    let rows = model.explorer_rows();
+    assert!(
+        rows.iter().any(|row| matches!(row, ExplorerItem::ConnectFailed { connection_id, reason } if connection_id == "pg" && reason.contains("password authentication failed"))),
+        "{rows:?}"
+    );
+
+    let _ = model.dispatch("nav-connect-retry:pg");
+    assert_eq!(model.connections.status.get("pg"), Some(&LinkStatus::Connecting), "重试就是再连一次");
+    assert!(model.connect_intents.iter().any(|intent| intent.connection_id == "pg"));
+
+    model.connections.status.insert("pg".into(), LinkStatus::Failed);
+    let _ = model.dispatch("nav-connect-edit:pg");
+    assert!(model.conn_modal.open, "编辑直接打开这条连接的表单");
+    assert_eq!(model.connections.editor.as_ref().and_then(|draft| draft.id.as_deref()), Some("pg"));
+
+    // 连上之后不再挂着旧原因。
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    assert!(!model.explorer_rows().iter().any(|row| matches!(row, ExplorerItem::ConnectFailed { .. })));
+}
+
+/// 连接行右键：已连接时第一项是“断开连接”，没连上时是“连接”，两者不同时出现。
+#[test]
+fn the_connection_menu_offers_disconnect_only_when_connected() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.connections.selected = Some("pg".into());
+    model.open_connection_menu();
+    let ids: Vec<&str> = model.menu.as_ref().unwrap().items.iter().map(|item| item.id).collect();
+    assert_eq!(ids.first(), Some(&"conn-connect"), "{ids:?}");
+    assert!(!ids.contains(&"conn-disconnect"));
+
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    model.open_connection_menu();
+    let ids: Vec<&str> = model.menu.as_ref().unwrap().items.iter().map(|item| item.id).collect();
+    assert_eq!(ids.first(), Some(&"conn-disconnect"), "{ids:?}");
+    assert!(!ids.contains(&"conn-connect"), "已连接时不再给“连接”");
 }

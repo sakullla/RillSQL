@@ -290,14 +290,14 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
             }
         }
         CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
             mysql_async::prelude::Queryable::query_drop(&mut conn, "BEGIN".to_owned())
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| crate::error_text::chain(&err))?;
             match mysql_async::prelude::Queryable::query_drop(&mut conn, statement.to_owned()).await {
                 Ok(()) => mysql_async::prelude::Queryable::query_drop(&mut conn, "COMMIT".to_owned())
                     .await
-                    .map_err(|err| err.to_string()),
+                    .map_err(|err| crate::error_text::chain(&err)),
                 Err(error) => {
                     let _ = mysql_async::prelude::Queryable::query_drop(&mut conn, "ROLLBACK".to_owned()).await;
                     Err(error.to_string())
@@ -306,9 +306,9 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
         }
         // Arc<Client> 不支持 transaction()，同一条连接上的显式 BEGIN/COMMIT 等价。
         CatalogSession::Postgres(client) => {
-            client.execute("BEGIN", &[]).await.map_err(|err| err.to_string())?;
+            client.execute("BEGIN", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
             match client.execute(statement, &[]).await {
-                Ok(_) => client.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| err.to_string()),
+                Ok(_) => client.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
                 Err(error) => {
                     let _ = client.execute("ROLLBACK", &[]).await;
                     Err(error.to_string())
@@ -318,9 +318,9 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
         // 同一条 TDS 连接上的显式事务；失败回滚后由调用方降级逐行重放。
         CatalogSession::Sqlserver(client) => {
             let mut locked = client.lock().await;
-            locked.execute("BEGIN TRANSACTION", &[]).await.map_err(|err| err.to_string())?;
+            locked.execute("BEGIN TRANSACTION", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
             match locked.execute(statement.to_owned(), &[]).await {
-                Ok(_) => locked.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| err.to_string()),
+                Ok(_) => locked.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
                 Err(error) => {
                     let _ = locked.execute("ROLLBACK", &[]).await;
                     Err(error.to_string())
@@ -338,15 +338,15 @@ async fn exec_one(target: &CatalogSession, statement: &str) -> Result<(), String
         CatalogSession::Mongo(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_MONGO_NOT_TARGET, "MongoDB 不是迁移目标；文档经集合浏览器写入。")),
         CatalogSession::Sqlite { pool, .. } => exec_sqlite(pool, statement).await,
         CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
             mysql_async::prelude::Queryable::query_drop(&mut conn, statement.to_owned())
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(|err| crate::error_text::chain(&err))
         }
-        CatalogSession::Postgres(client) => client.execute(statement, &[]).await.map(|_| ()).map_err(|err| err.to_string()),
+        CatalogSession::Postgres(client) => client.execute(statement, &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
         CatalogSession::Sqlserver(client) => {
             let mut locked = client.lock().await;
-            locked.execute(statement.to_owned(), &[]).await.map(|_| ()).map_err(|err| err.to_string())
+            locked.execute(statement.to_owned(), &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err))
         }
     }
 }
@@ -356,7 +356,7 @@ async fn exec_sqlite(pool: &sqlx::SqlitePool, statement: &str) -> Result<(), Str
         .execute(pool)
         .await
         .map(|_| ())
-        .map_err(|err| err.to_string())
+        .map_err(|err| crate::error_text::chain(&err))
 }
 
 /// 逐行连续失败后的探活：区分"这行数据有问题"和"连接已经断开"。

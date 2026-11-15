@@ -76,8 +76,8 @@ async fn prepare_snapshot(session: &CatalogSession, request: &Request) -> Result
                     snapshot.sqlite_version = sqlx::query_scalar("SELECT sqlite_version()")
                         .fetch_one(pool)
                         .await
-                        .map_err(|err| err.to_string())?;
-                    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| err.to_string())?;
+                        .map_err(|err| crate::error_text::chain(&err))?;
+                    let live: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| crate::error_text::chain(&err))?;
                     snapshot.live_foreign_keys = Some(live != 0);
                 }
                 Ok(snapshot)
@@ -118,11 +118,11 @@ async fn run_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connect
             Ok(_) => results.push(receipt(step, StepStatus::Ok, "")),
             Err(tiberius::error::Error::Server(err)) => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Failed, &err.to_string()));
+                results.push(receipt(step, StepStatus::Failed, &crate::error_text::chain(&err)));
             }
             Err(err) => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Unknown, &err.to_string()));
+                results.push(receipt(step, StepStatus::Unknown, &crate::error_text::chain(&err)));
             }
         }
     }
@@ -141,7 +141,7 @@ pub(crate) fn committed_foreign_keys(action: &Action, receipt: &Receipt) -> Opti
 }
 
 async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], restore: Option<bool>) -> Result<Vec<StepReceipt>, String> {
-    let mut conn = pool.acquire().await.map_err(|err| err.to_string())?;
+    let mut conn = pool.acquire().await.map_err(|err| crate::error_text::chain(&err))?;
     let mut results = Vec::new();
     let mut stop = false;
     let mut unknown = false;
@@ -163,20 +163,20 @@ async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], restore: Option<boo
                         Err(format!("foreign_key_check 发现 {} 处违规，不会把这次重建当成成功。", rows.len()))
                     }
                 })
-                .map_err(|err| err.to_string())
+                .map_err(|err| crate::error_text::chain(&err))
                 .and_then(|item| item),
             // PRAGMA 可能带回一行（journal_mode 就会），用 fetch_all 接住并当成结果反馈。
             StmtKind::Probe => sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
                 .fetch_all(&mut *conn)
                 .await
                 .map(|rows| Ok::<Option<String>, String>(probe_note(&rows)))
-                .map_err(|err| err.to_string())
+                .map_err(|err| crate::error_text::chain(&err))
                 .and_then(|item| item),
             _ => sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
                 .execute(&mut *conn)
                 .await
                 .map(|_| Ok::<Option<String>, String>(None))
-                .map_err(|err| err.to_string())
+                .map_err(|err| crate::error_text::chain(&err))
                 .and_then(|item| item),
         };
         match executed {
@@ -264,7 +264,7 @@ async fn restore_foreign_keys(conn: &mut sqlx::SqliteConnection, results: &mut V
 }
 
 async fn run_mysql(pool: &mysql_async::Pool, steps: &[Step]) -> Result<Vec<StepReceipt>, String> {
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
     let mut results = Vec::new();
     let mut stop = false;
     for step in steps {
@@ -276,11 +276,11 @@ async fn run_mysql(pool: &mysql_async::Pool, steps: &[Step]) -> Result<Vec<StepR
             Ok(()) => results.push(receipt(step, StepStatus::Ok, "")),
             Err(mysql_async::Error::Server(err)) => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Failed, &err.to_string()));
+                results.push(receipt(step, StepStatus::Failed, &crate::error_text::chain(&err)));
             }
             Err(err) => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Unknown, &err.to_string()));
+                results.push(receipt(step, StepStatus::Unknown, &crate::error_text::chain(&err)));
             }
         }
     }
@@ -299,11 +299,11 @@ async fn run_postgres(client: &tokio_postgres::Client, steps: &[Step]) -> Result
             Ok(()) => results.push(receipt(step, StepStatus::Ok, "")),
             Err(err) if err.as_db_error().is_some() => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Failed, &err.to_string()));
+                results.push(receipt(step, StepStatus::Failed, &crate::error_text::chain(&err)));
             }
             Err(err) => {
                 stop = true;
-                results.push(receipt(step, StepStatus::Unknown, &err.to_string()));
+                results.push(receipt(step, StepStatus::Unknown, &crate::error_text::chain(&err)));
             }
         }
     }

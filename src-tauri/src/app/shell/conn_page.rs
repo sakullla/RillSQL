@@ -209,7 +209,27 @@ impl Workbench {
                     .rounded(px(Radius::PANEL))
                     .bg(p.danger_soft)
                     .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(format!("{} · {name}", self.model.text("connections.status.error")))))
+                    .child({
+                        // 横幅写出这条连接最近一次失败的原因（首行），完整原因和处理建议在悬停提示里。
+                        let reason = self.model.connections.failures.get(&retry.connection_id).cloned().unwrap_or_default();
+                        let head = reason.lines().next().unwrap_or_default().to_owned();
+                        let label = if head.is_empty() {
+                            format!("{} · {name}", self.model.text("connections.status.error"))
+                        } else {
+                            format!("{} · {name}: {head}", self.model.text("connections.status.error"))
+                        };
+                        div()
+                            .id("launcher-connect-retry-text")
+                            .test_support()
+                            .aria_label(SharedString::from(label.clone()))
+                            .when(!reason.is_empty(), |this| this.tooltip_text(SharedString::from(reason.clone())))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.danger)
+                            .child(SharedString::from(label))
+                    })
                     .child(kit::tool_button("launcher-connect-retry-action", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx))),
             );
             child_count += 1;

@@ -47,11 +47,13 @@ fn requested_limit(database: &str, schema: &str, windows: &[ObjectWindow], page:
     read_limit(requested, page)
 }
 
-fn read_failure(err: impl std::fmt::Display) -> String {
+fn read_failure(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取库表失败：{err}")
 }
 
-fn definition_failure(err: impl std::fmt::Display) -> String {
+fn definition_failure(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取定义失败：{err}")
 }
 
@@ -1190,7 +1192,7 @@ async fn tds_query_rows(client: &TdsHandle, sql: &str, params: &[&dyn tiberius::
     let mut client = client.lock().await;
     let mut stream = client.query(sql, params).await.map_err(read_failure)?;
     let mut rows = Vec::new();
-    while let Some(item) = stream.try_next().await.map_err(|err| read_failure(err.to_string()))? {
+    while let Some(item) = stream.try_next().await.map_err(|err| read_failure(crate::error_text::chain(&err)))? {
         if let Some(row) = item.into_row() {
             rows.push(row);
         }

@@ -150,7 +150,8 @@ pub(crate) struct PartitionRaw {
     pub rows: Option<i64>,
 }
 
-fn extras_failure(what: &str, err: impl std::fmt::Display) -> String {
+fn extras_failure(what: &str, err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取{what}失败：{err}")
 }
 

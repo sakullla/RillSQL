@@ -40,19 +40,19 @@ pub async fn open_sqlite(path: &Path) -> Result<SqliteOpen, StageError> {
         .max_connections(1)
         .connect_with(options)
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_SQLITE_OPEN_FAILED, err.to_string(), "没有打开文件，后续阶段不会执行。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_SQLITE_OPEN_FAILED, crate::error_text::chain(&err), "没有打开文件，后续阶段不会执行。"))?;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name")
         .fetch_all(&pool)
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_SCHEMA_READ_FAILED, err.to_string(), "文件已打开，但没有读到 schema。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_SCHEMA_READ_FAILED, crate::error_text::chain(&err), "文件已打开，但没有读到 schema。"))?;
     let version: String = sqlx::query_scalar("SELECT sqlite_version()")
         .fetch_one(&pool)
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, err.to_string(), "文件已打开，但没有读到版本。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, crate::error_text::chain(&err), "文件已打开，但没有读到版本。"))?;
     let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
         .fetch_one(&pool)
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_FOREIGN_KEYS_READ_FAILED, err.to_string(), "没有读到 foreign_keys。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_FOREIGN_KEYS_READ_FAILED, crate::error_text::chain(&err), "没有读到 foreign_keys。"))?;
     Ok(SqliteOpen {
         pool,
         version,
@@ -99,15 +99,15 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     }
     let opts = mysql_async::Opts::from(builder);
     let pool = Pool::new(opts.clone());
-    let mut conn = pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
+    let mut conn = pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let version: Option<(String,)> = conn
         .query_first("SELECT VERSION()")
         .await
-        .map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
+        .map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let connection_id: Option<u64> = conn
         .query_first("SELECT CONNECTION_ID()")
         .await
-        .map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
+        .map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let version = version.map(|row| row.0).unwrap_or_else(|| "未知版本".to_owned());
     Ok(MysqlOpen {
         pool,
@@ -194,21 +194,21 @@ pub async fn open_sqlserver(config: &SavedConnection, route: &Route, password: &
     let kill_config = sqlserver_tds_config(config, route, password)?;
     let tcp = tokio::net::TcpStream::connect(kill_config.get_addr())
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, err.to_string(), "网络连接失败，没有改用加密连接重试。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
     tcp.set_nodelay(true)
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, err.to_string(), "网络连接失败，没有改用加密连接重试。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
     let mut client = tiberius::Client::connect(kill_config.clone(), tcp.compat())
         .await
         .map_err(|err| sqlserver_stage(route.tls_mode, &err))?;
     let mut stream = client
         .simple_query("SELECT @@SPID AS spid, @@VERSION AS version")
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, err.to_string(), "数据库认证已通过，但没有读到版本。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, crate::error_text::chain(&err), "数据库认证已通过，但没有读到版本。"))?;
     let mut spid = 0u32;
     let mut banner = String::new();
     {
         use futures::TryStreamExt;
-        while let Some(item) = stream.try_next().await.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, err.to_string(), "数据库认证已通过，但没有读到版本。"))? {
+        while let Some(item) = stream.try_next().await.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, crate::error_text::chain(&err), "数据库认证已通过，但没有读到版本。"))? {
             if let Some(row) = item.into_row() {
                 spid = row.try_get::<i32, _>("spid").ok().flatten().map(|v| v as u32).unwrap_or(0);
                 banner = row.try_get::<&str, _>("version").ok().flatten().unwrap_or_default().to_owned();
@@ -301,7 +301,7 @@ pub(crate) fn sqlserver_product_major(banner: &str) -> Option<u32> {
 
 /// 连接建立期的错误分类：TCP / 登录 / TLS 分开报，不自动降级。
 pub(crate) fn sqlserver_stage(mode: TlsMode, err: &tiberius::error::Error) -> StageError {
-    let text = err.to_string();
+    let text = crate::error_text::chain(err);
     let lowered = text.to_ascii_lowercase();
     if let tiberius::error::Error::Server(token) = err {
         if token.code() == 18456 || token.code() == 18452 || token.code() == 4060 {
@@ -444,7 +444,7 @@ fn redis_server_version(info: &str) -> String {
 
 /// Redis 连接错误分类：TCP / AUTH / TLS 分开报，不降级重试（与 sqlserver_stage 同纪律）。
 pub(crate) fn redis_stage(mode: TlsMode, err: &redis::RedisError) -> StageError {
-    let text = err.to_string();
+    let text = crate::error_text::chain(err);
     let lowered = text.to_ascii_lowercase();
     if matches!(err.kind(), redis::ErrorKind::AuthenticationFailed)
         || lowered.contains("noauth")
@@ -610,7 +610,7 @@ fn mongo_tls(config: &SavedConnection) -> Result<Option<mongodb::options::Tls>, 
 
 /// MongoDB 连接错误分类：TCP / 认证 / TLS 分开报，不降级重试（与 redis_stage 同纪律）。
 pub(crate) fn mongo_stage(mode: TlsMode, err: &mongodb::error::Error) -> StageError {
-    let text = err.to_string();
+    let text = crate::error_text::chain(err);
     let lowered = text.to_ascii_lowercase();
     let is_auth = matches!(&*err.kind, mongodb::error::ErrorKind::Authentication { .. })
         || matches!(&*err.kind, mongodb::error::ErrorKind::Command(command) if command.code == 18 || command.code == 13 || command.code == 33)
@@ -671,13 +671,13 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
     pg.connect_timeout(Duration::from_secs(15));
     let tls_for_cancel = if plan.use_tls { Some(postgres_tls(config, &plan)?) } else { None };
     let client = if let Some(tls) = tls_for_cancel.clone() {
-        let (client, connection) = pg.connect(tls).await.map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
+        let (client, connection) = pg.connect(tls).await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
         client
     } else {
-        let (client, connection) = pg.connect(NoTls).await.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, err.to_string(), "网络连接失败，没有改走加密连接重试。"))?;
+        let (client, connection) = pg.connect(NoTls).await.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改走加密连接重试。"))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -687,7 +687,7 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
     let messages = client
         .simple_query("SELECT version()")
         .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, err.to_string(), "数据库认证已通过，但没有读到版本。"))?;
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_VERSION_READ_FAILED, crate::error_text::chain(&err), "数据库认证已通过，但没有读到版本。"))?;
     let version = messages
         .iter()
         .find_map(|message| match message {
@@ -710,7 +710,7 @@ fn postgres_tls(config: &SavedConnection, plan: &PostgresTlsPlan) -> Result<Make
         let verifier = Arc::new(EncryptWithoutVerify::new(provider.clone()).map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err, "没有退回明文。"))?);
         let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有退回明文。"))?
+            .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有退回明文。"))?
             .dangerous()
             .with_custom_certificate_verifier(verifier);
         let client = finish_client_config(builder, tls)?;
@@ -722,8 +722,8 @@ fn postgres_tls(config: &SavedConnection, plan: &PostgresTlsPlan) -> Result<Make
         let mut roots = rustls::RootCertStore::empty();
         let mut added = 0;
         for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&bytes) {
-            let cert = cert.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))?;
-            roots.add(cert).map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))?;
+            let cert = cert.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))?;
+            roots.add(cert).map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))?;
             added += 1;
         }
         if added == 0 {
@@ -731,7 +731,7 @@ fn postgres_tls(config: &SavedConnection, plan: &PostgresTlsPlan) -> Result<Make
         }
         let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))?
+            .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))?
             .with_root_certificates(roots);
         return Ok(MakeRustlsConnect::new(finish_client_config(builder, tls)?));
     }
@@ -767,12 +767,12 @@ fn finish_client_config(
             let key_bytes = std::fs::read(key).map_err(|_| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, format!("读不到客户端私钥 {key}"), "没有改用不验证的连接。"))?;
             let chain = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_bytes)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))?;
+                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))?;
             let private = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes)
-                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))?;
+                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))?;
             builder
                 .with_client_auth_cert(chain, private)
-                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, err.to_string(), "没有改用不验证的连接。"))
+                .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_TLS_DOWNGRADE_REFUSED, crate::error_text::chain(&err), "没有改用不验证的连接。"))
         }
         (None, None) => Ok(builder.with_no_client_auth()),
         _ => Err(stages::fail_code(crate::connections::error_codes::CONN_TLS_CERT_MISSING, "客户端证书和私钥需要同时填写", "没有改用不验证的连接。")),
@@ -783,12 +783,27 @@ fn db_stage(mode: TlsMode, message: String) -> StageError {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("certificate") || lowered.contains("tls") || lowered.contains("ssl") || message.contains("证书") {
         let _ = route::on_tls_failure(mode);
+        // 证书不是受信任机构签发的（本地/内网库的自签名证书最常见）：直接说出两条出路，而不只是“已终止”。
+        if untrusted_certificate(&lowered) {
+            return stages::fail_code(
+                crate::connections::error_codes::CONN_TLS_TERMINATED,
+                message,
+                "服务器证书不是受信任机构签发的（自签名证书常见）。可在连接的“安全”里指定 CA 文件，或改为“加密”（不核对证书）。没有自动降级。",
+            );
+        }
         return stages::fail_code(crate::connections::error_codes::CONN_TLS_TERMINATED, message, "连接已终止。没有改用 localhost 身份校验，也没有降级为不验证证书或不加密后重试。");
     }
     if lowered.contains("password") || lowered.contains("access denied") || lowered.contains("authentication") || message.contains("认证") {
         return stages::fail_code(crate::connections::error_codes::CONN_AUTH_FAILED, message, "请检查数据库用户名和密码。");
     }
     stages::fail_code(crate::connections::error_codes::CONN_TLS_TERMINATED, message, "连接已终止，没有自动改用另一种加密方式重试。")
+}
+
+/// rustls / native-tls 对“证书链不可信”的几种写法。
+fn untrusted_certificate(lowered: &str) -> bool {
+    ["unknownissuer", "unknown issuer", "self signed", "self-signed", "unable to get local issuer", "certificate verify failed"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
 }
 
 pub fn version_note(engine: Engine, version: &str) -> String {
@@ -822,7 +837,7 @@ struct HandlerErr(String);
 
 impl From<russh::Error> for HandlerErr {
     fn from(err: russh::Error) -> Self {
-        Self(err.to_string())
+        Self(crate::error_text::chain(&err))
     }
 }
 
@@ -857,7 +872,7 @@ impl crate::connections::forward::DirectTcpOpener for HandleOpener {
             handle
                 .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
                 .await
-                .map_err(|err| crate::connections::forward::ForwardError::Channel(err.to_string()))?
+                .map_err(|err| crate::connections::forward::ForwardError::Channel(crate::error_text::chain(&err)))?
         };
         Ok(crate::connections::forward::Pipe::new(channel.into_stream()))
     }
@@ -945,7 +960,7 @@ pub async fn start_tunnel(
         }
         Err(err) => {
             return Err(TunnelFault::Authentication(stages::fail_code(crate::connections::error_codes::CONN_SSH_AUTH_FAILED,
-                err.to_string(),
+                crate::error_text::chain(&err),
                 "这是登录跳板机失败，还没有尝试连接数据库。",
             )));
         }
@@ -954,7 +969,7 @@ pub async fn start_tunnel(
         Ok(forwarder) => forwarder,
         Err(err) => {
             return Err(TunnelFault::Tunnel(stages::fail_code(crate::connections::error_codes::CONN_TUNNEL_FAILED,
-                err.to_string(),
+                crate::error_text::chain(&err),
                 "已登录 SSH 跳板机，但到数据库的通道没有打通，还没有连接数据库。",
             )))
         }
@@ -963,7 +978,7 @@ pub async fn start_tunnel(
         Ok(port) => port,
         Err(err) => {
             return Err(TunnelFault::Tunnel(stages::fail_code(crate::connections::error_codes::CONN_TUNNEL_FAILED,
-                err.to_string(),
+                crate::error_text::chain(&err),
                 "已登录 SSH 跳板机，但到数据库的通道没有打通，还没有连接数据库。",
             )))
         }
@@ -994,5 +1009,20 @@ fn decision_error(decision: crate::connections::hostkey::HostKeyDecision) -> Tun
         crate::connections::hostkey::HostKeyDecision::Trusted => {
             TunnelFault::Identity(stages::fail_code(crate::connections::error_codes::CONN_HOST_KEY_INCONSISTENT, "SSH 主机密钥状态不一致", "没有继续认证。"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_hint_tests {
+    use super::*;
+
+    #[test]
+    fn an_untrusted_certificate_says_how_to_get_through() {
+        let stage = db_stage(TlsMode::Verify, "Input/output error: invalid peer certificate: UnknownIssuer".into());
+        let StageError::Fail { hint, .. } = stage else { panic!("证书失败应当是失败阶段") };
+        assert!(hint.contains("CA 文件") && hint.contains("不核对证书"), "{hint}");
+        let other = db_stage(TlsMode::Verify, "TLS handshake eof".into());
+        let StageError::Fail { hint, .. } = other else { panic!() };
+        assert!(!hint.contains("CA 文件"), "其他 TLS 失败保持原说明：{hint}");
     }
 }

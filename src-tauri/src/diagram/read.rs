@@ -41,7 +41,8 @@ pub(crate) async fn read_diagram(engine: Engine, session: &CatalogSession, datab
     }
 }
 
-fn failure(err: impl std::fmt::Display) -> String {
+fn failure(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     format!("读取关系图失败：{err}")
 }
 
@@ -78,7 +79,7 @@ async fn postgres_table(client: &tokio_postgres::Client, schema: &str, name: Str
     let column_params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &name];
     let columns = match client.query(POSTGRES_COLUMNS, &column_params).await {
         Ok(rows) => postgres_columns(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     if columns.is_err() {
         return TableAttempt { name, columns, foreign_keys: Ok(Vec::new()) };
@@ -86,7 +87,7 @@ async fn postgres_table(client: &tokio_postgres::Client, schema: &str, name: Str
     let key_params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &name];
     let foreign_keys = match client.query(POSTGRES_FOREIGN_KEYS, &key_params).await {
         Ok(rows) => postgres_keys(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     TableAttempt { name, columns, foreign_keys }
 }
@@ -94,11 +95,11 @@ async fn postgres_table(client: &tokio_postgres::Client, schema: &str, name: Str
 fn postgres_columns(rows: &[tokio_postgres::Row]) -> Result<ReadColumns, String> {
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
-        let type_name: Option<String> = row.try_get(1).map_err(|err| err.to_string())?;
+        let type_name: Option<String> = row.try_get(1).map_err(|err| crate::error_text::chain(&err))?;
         columns.push(DiagramColumn {
-            name: row.try_get(0).map_err(|err| err.to_string())?,
+            name: row.try_get(0).map_err(|err| crate::error_text::chain(&err))?,
             type_name: type_name.unwrap_or_default(),
-            primary: row.try_get(2).map_err(|err| err.to_string())?,
+            primary: row.try_get(2).map_err(|err| crate::error_text::chain(&err))?,
         });
     }
     Ok(ReadColumns(columns))
@@ -108,12 +109,12 @@ fn postgres_keys(rows: &[tokio_postgres::Row]) -> Result<Vec<OutgoingKey>, Strin
     let mut parts = Vec::with_capacity(rows.len());
     for row in rows {
         parts.push(KeyPart {
-            name: row.try_get(0).map_err(|err| err.to_string())?,
-            column: row.try_get(1).map_err(|err| err.to_string())?,
-            ref_schema: row.try_get(2).map_err(|err| err.to_string())?,
-            ref_table: row.try_get(3).map_err(|err| err.to_string())?,
-            ref_column: row.try_get(4).map_err(|err| err.to_string())?,
-            ordinal: row.try_get(5).map_err(|err| err.to_string())?,
+            name: row.try_get(0).map_err(|err| crate::error_text::chain(&err))?,
+            column: row.try_get(1).map_err(|err| crate::error_text::chain(&err))?,
+            ref_schema: row.try_get(2).map_err(|err| crate::error_text::chain(&err))?,
+            ref_table: row.try_get(3).map_err(|err| crate::error_text::chain(&err))?,
+            ref_column: row.try_get(4).map_err(|err| crate::error_text::chain(&err))?,
+            ordinal: row.try_get(5).map_err(|err| crate::error_text::chain(&err))?,
         });
     }
     Ok(group_key_parts(parts))
@@ -151,21 +152,21 @@ async fn mysql_table(pool: &mysql_async::Pool, database: &str, name: String) -> 
         Err(err) => {
             return TableAttempt {
                 name,
-                columns: Err(err.to_string()),
+                columns: Err(crate::error_text::chain(&err)),
                 foreign_keys: Ok(Vec::new()),
             };
         }
     };
     let columns = match conn.exec(MYSQL_COLUMNS, (database.to_owned(), name.clone())).await {
         Ok(rows) => mysql_columns(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     if columns.is_err() {
         return TableAttempt { name, columns, foreign_keys: Ok(Vec::new()) };
     }
     let foreign_keys = match conn.exec(MYSQL_FOREIGN_KEYS, (database.to_owned(), name.clone())).await {
         Ok(rows) => mysql_keys(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     TableAttempt { name, columns, foreign_keys }
 }
@@ -201,7 +202,7 @@ fn mysql_keys(rows: &[mysql_async::Row]) -> Result<Vec<OutgoingKey>, String> {
 fn mysql_string(row: &mysql_async::Row, index: usize) -> Result<String, String> {
     let value = row.as_ref(index).ok_or_else(|| "元数据列缺失".to_owned())?;
     match value {
-        mysql_async::Value::Bytes(bytes) => String::from_utf8(bytes.clone()).map_err(|err| err.to_string()),
+        mysql_async::Value::Bytes(bytes) => String::from_utf8(bytes.clone()).map_err(|err| crate::error_text::chain(&err)),
         mysql_async::Value::NULL => Err("元数据列是空值".to_owned()),
         other => Ok(other.as_sql(true)),
     }
@@ -326,14 +327,14 @@ async fn read_sqlite(pool: &sqlx::SqlitePool) -> Result<Diagram, String> {
 async fn sqlite_table(pool: &sqlx::SqlitePool, name: String) -> TableAttempt {
     let columns = match sqlx::query(SQLITE_COLUMNS).bind(&name).fetch_all(pool).await {
         Ok(rows) => sqlite_columns(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     if columns.is_err() {
         return TableAttempt { name, columns, foreign_keys: Ok(Vec::new()) };
     }
     let foreign_keys = match sqlx::query(SQLITE_FOREIGN_KEYS).bind(&name).fetch_all(pool).await {
         Ok(rows) => sqlite_keys(&rows),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(crate::error_text::chain(&err)),
     };
     TableAttempt { name, columns, foreign_keys }
 }
@@ -341,8 +342,8 @@ async fn sqlite_table(pool: &sqlx::SqlitePool, name: String) -> TableAttempt {
 fn sqlite_columns(rows: &[sqlx::sqlite::SqliteRow]) -> Result<ReadColumns, String> {
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
-        let name: String = row.try_get(0).map_err(|err| err.to_string())?;
-        let type_name: String = row.try_get::<Option<String>, _>(1).map_err(|err| err.to_string())?.unwrap_or_default();
+        let name: String = row.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
+        let type_name: String = row.try_get::<Option<String>, _>(1).map_err(|err| crate::error_text::chain(&err))?.unwrap_or_default();
         let primary = sqlite_pk(&row)?;
         columns.push(DiagramColumn { name, type_name, primary });
     }
@@ -356,15 +357,15 @@ fn sqlite_pk(row: &sqlx::sqlite::SqliteRow) -> Result<bool, String> {
     if let Ok(value) = row.try_get::<i32, _>(2) {
         return Ok(value > 0);
     }
-    let text: Option<String> = row.try_get(2).map_err(|err| err.to_string())?;
+    let text: Option<String> = row.try_get(2).map_err(|err| crate::error_text::chain(&err))?;
     Ok(text.as_deref().is_some_and(|value| value != "0" && !value.is_empty()))
 }
 
 fn sqlite_keys(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<OutgoingKey>, String> {
     let mut parts = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.try_get(0).map_err(|err| err.to_string())?;
-        let seq: i64 = row.try_get(1).map_err(|err| err.to_string())?;
+        let id: i64 = row.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
+        let seq: i64 = row.try_get(1).map_err(|err| crate::error_text::chain(&err))?;
         let (ref_schema, ref_table) = split_sqlite_target(&sqlite_text(row, 3)?);
         parts.push(KeyPart {
             name: id.to_string(),
@@ -388,7 +389,7 @@ fn sqlite_text(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<String, St
         return Ok(value);
     }
     let optional: Result<Option<String>, _> = row.try_get(index);
-    optional.map(|value| value.unwrap_or_default()).map_err(|err| err.to_string())
+    optional.map(|value| value.unwrap_or_default()).map_err(|err| crate::error_text::chain(&err))
 }
 
 /// `main.customers` 仍在当前文件里。其他前缀是附加库，不在这张图的范围。

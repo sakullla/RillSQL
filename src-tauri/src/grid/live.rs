@@ -21,7 +21,8 @@ use super::store::{Applied, Cell, Column, CommitReport, Engine, Failed, Filter, 
 
 const MAX_PAGE: u64 = 10_000;
 
-fn db_err(err: impl std::fmt::Display) -> String {
+fn db_err(err: impl Into<crate::error_text::Reason>) -> String {
+    let err = err.into();
     err.to_string()
 }
 
@@ -548,11 +549,11 @@ async fn stream_statement(
                 None => {
                     let mut conn = match pool.acquire().await {
                         Ok(conn) => conn,
-                        Err(err) => return failed_message(err.to_string()),
+                        Err(err) => return failed_message(crate::error_text::chain(&err)),
                     };
                     let statement = match conn.prepare(audited(sql).into_sql_str()).await {
                         Ok(statement) => statement,
-                        Err(err) => return failed_message(err.to_string()),
+                        Err(err) => return failed_message(crate::error_text::chain(&err)),
                     };
                     statement.columns().iter().map(|column| column.name().to_owned()).collect()
                 }
@@ -587,18 +588,18 @@ async fn stream_statement(
                         }
                     }
                     Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&err.to_string()),
+                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
                 }
             }
         }
         CatalogSession::Mysql(pool) => {
             let mut conn = match pool.get_conn().await {
                 Ok(conn) => conn,
-                Err(err) => return failed_message(err.to_string()),
+                Err(err) => return failed_message(crate::error_text::chain(&err)),
             };
             let mut result = match mysql_async::prelude::Queryable::query_iter(&mut conn, sql).await {
                 Ok(result) => result,
-                Err(err) => return failed_message(err.to_string()),
+                Err(err) => return failed_message(crate::error_text::chain(&err)),
             };
             let names = known_names.unwrap_or_else(|| result.columns_ref().iter().map(|column| column.name_str().into_owned()).collect());
             let typed = plain_columns(&names, columns);
@@ -627,7 +628,7 @@ async fn stream_statement(
                         }
                     }
                     Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&err.to_string()),
+                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
                 }
             }
         }
@@ -637,14 +638,14 @@ async fn stream_statement(
                 None => {
                     let statement = match client.prepare(sql).await {
                         Ok(statement) => statement,
-                        Err(err) => return failed_message(err.to_string()),
+                        Err(err) => return failed_message(crate::error_text::chain(&err)),
                     };
                     statement.columns().iter().map(|column| column.name().to_owned()).collect()
                 }
             };
             let statement = match client.prepare(sql).await {
                 Ok(statement) => statement,
-                Err(err) => return failed_message(err.to_string()),
+                Err(err) => return failed_message(crate::error_text::chain(&err)),
             };
             let typed = plain_columns(&names, columns);
             let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
@@ -663,7 +664,7 @@ async fn stream_statement(
             let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
             let stream = match client.query_raw(&statement, params).await {
                 Ok(stream) => stream,
-                Err(err) => return csv.fail(&err.to_string()),
+                Err(err) => return csv.fail(&crate::error_text::chain(&err)),
             };
             futures::pin_mut!(stream);
             loop {
@@ -681,7 +682,7 @@ async fn stream_statement(
                         }
                     }
                     Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&err.to_string()),
+                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
                 }
             }
         }
@@ -689,7 +690,7 @@ async fn stream_statement(
             let mut locked = client.lock().await;
             let mut stream = match locked.simple_query(sql).await {
                 Ok(stream) => stream,
-                Err(err) => return failed_message(err.to_string()),
+                Err(err) => return failed_message(crate::error_text::chain(&err)),
             };
             let mut names = known_names;
             let mut rows: Vec<tiberius::Row> = Vec::new();
@@ -804,7 +805,7 @@ impl CsvFile {
         if self.format == "markdown" {
             let rule = format!("| {} |", vec!["---"; names.len()].join(" | "));
             if let Err(err) = self.write_line(&markdown_row(names.iter().map(|name| Some(name.as_str())), &self.null_token)).and_then(|()| self.write_line(&rule)) {
-                return Some(self.fail(&err.to_string()));
+                return Some(self.fail(&crate::error_text::chain(&err)));
             }
             return None;
         }
@@ -812,7 +813,7 @@ impl CsvFile {
             return None;
         }
         let fields = names.iter().map(|name| encode_field(Some(name), &self.null_token)).collect::<Vec<_>>();
-        self.write_line(&fields.join(&self.delimiter)).err().map(|err| self.fail(&err.to_string()))
+        self.write_line(&fields.join(&self.delimiter)).err().map(|err| self.fail(&crate::error_text::chain(&err)))
     }
 
     fn write_cells(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
@@ -838,7 +839,7 @@ impl CsvFile {
             })
             .collect::<Vec<_>>();
         if let Err(err) = self.write_line(&fields.join(&self.delimiter)) {
-            return Some(self.fail(&err.to_string()));
+            return Some(self.fail(&crate::error_text::chain(&err)));
         }
         self.written += 1;
         None
@@ -853,7 +854,7 @@ impl CsvFile {
             &self.null_token,
         );
         if let Err(err) = self.write_line(&row) {
-            return Some(self.fail(&err.to_string()));
+            return Some(self.fail(&crate::error_text::chain(&err)));
         }
         self.written += 1;
         None
@@ -863,7 +864,7 @@ impl CsvFile {
         let object = json_object(&self.names, cells);
         let text = if self.written == 0 { format!("[{object}") } else { format!(",{object}") };
         if let Err(err) = self.write_chunk(&text) {
-            return Some(self.fail(&err.to_string()));
+            return Some(self.fail(&crate::error_text::chain(&err)));
         }
         self.written += 1;
         None
@@ -873,7 +874,7 @@ impl CsvFile {
         let line = insert_line(self.engine, &self.schema_name, &self.table_name, &self.columns, &self.names, cells);
         let text = if self.written == 0 { line } else { format!("\r\n{line}") };
         if let Err(err) = self.write_chunk(&text) {
-            return Some(self.fail(&err.to_string()));
+            return Some(self.fail(&crate::error_text::chain(&err)));
         }
         self.written += 1;
         None
@@ -912,24 +913,24 @@ impl CsvFile {
         if self.format == "json" {
             let tail = if self.written == 0 { "[]" } else { "]" };
             if let Err(err) = self.write_chunk(tail) {
-                return residual(self.written, &self.partial_path, &err.to_string());
+                return residual(self.written, &self.partial_path, &crate::error_text::chain(&err));
             }
         }
         if self.format == "xlsx" {
             if let Err(err) = self.write_xlsx_package() {
-                return residual(self.written, &self.partial_path, &err.to_string());
+                return residual(self.written, &self.partial_path, &crate::error_text::chain(&err));
             }
         }
         let flush = self.file.as_mut().map(|file| file.flush()).transpose();
         self.file.take();
         if let Err(err) = flush {
-            return residual(self.written, &self.partial_path, &err.to_string());
+            return residual(self.written, &self.partial_path, &crate::error_text::chain(&err));
         }
         if self.final_path.exists() && fs::remove_file(&self.final_path).is_err() {
             return residual(self.written, &self.partial_path, "无法替换目标文件");
         }
         if let Err(err) = fs::rename(&self.partial_path, &self.final_path) {
-            return residual(self.written, &self.partial_path, &err.to_string());
+            return residual(self.written, &self.partial_path, &crate::error_text::chain(&err));
         }
         let path = self.final_path.display().to_string();
         let message = if self.marked_partial {
@@ -1685,7 +1686,7 @@ pub(crate) async fn sqlserver_rows(client: &TdsHandle, sql: &str) -> Result<(Vec
     {
         use futures::TryStreamExt;
         // QueryItem 不公开导出，经 as_metadata/into_row 取内容。
-        while let Some(item) = stream.try_next().await.map_err(|err| db_err(err.to_string()))? {
+        while let Some(item) = stream.try_next().await.map_err(|err| db_err(crate::error_text::chain(&err)))? {
             if let Some(meta) = item.as_metadata() {
                 if names.is_empty() {
                     names = meta.columns().iter().map(|column| column.name().to_owned()).collect();

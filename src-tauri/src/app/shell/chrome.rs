@@ -610,7 +610,9 @@ impl Workbench {
                     .child(kit::icon_button(
                         "top-theme",
                         if dark { IconName::Sun } else { IconName::Moon },
-                        self.t(if dark { "shell.command.themeLight" } else { "shell.command.themeDark" }),
+                        // 名称固定、不随当前主题变：悬停提示在点击后的那一帧之前就已生成，
+                        // “切换到浅色主题”这类随状态变的文案会在切换后还挂着旧说法。图标本身表明去向。
+                        self.t("shell.command.toggleTheme"),
                         act(theme_next, cx),
                     ))
                     .child(if narrow {
@@ -838,6 +840,7 @@ impl Workbench {
                 }
             }
             ExplorerItem::ConnectionError { connection_id, error } => self.connection_error_row(connection_id, error, p, cx),
+            ExplorerItem::ConnectFailed { connection_id, reason } => self.connect_failed_row(connection_id, reason, p, cx),
             ExplorerItem::Note { connection_id, key } => {
                 let m = self.metrics();
                 div()
@@ -967,7 +970,6 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t(if collapsed { "catalog.tree.expand" } else { "catalog.tree.collapse" }))
-                    .tooltip_text(self.t(if collapsed { "catalog.tree.expand" } else { "catalog.tree.collapse" }))
                     .flex_none()
                     .w(px(12.))
                     .flex()
@@ -1105,7 +1107,6 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t(if expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
-                    .tooltip_text(self.t(if expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -1133,13 +1134,18 @@ impl Workbench {
                 let icon = if row.saved.engine == Engine::Redis { IconName::Key } else { IconName::Braces };
                 this.child(kit::icon_button(SharedString::from(element_id), icon, SharedString::from(label), act(command, cx)).xsmall())
             })
-            .child(
+            .child({
+                // 失败时悬停圆点也能读到原因，不只是“连接失败”四个字。
+                let state_text = match self.model.connections.failures.get(&id).filter(|_| status == LinkStatus::Failed) {
+                    Some(reason) => SharedString::from(format!("{}: {reason}", self.t(state_key))),
+                    None => self.t(state_key),
+                };
                 div()
                     .id(SharedString::from(format!("side-state-{id}")))
-                    .aria_label(self.t(state_key))
-                    .tooltip_text(self.t(state_key))
-                    .child(kit::status_dot(dot)),
-            )
+                    .aria_label(state_text.clone())
+                    .tooltip_text(state_text)
+                    .child(kit::status_dot(dot))
+            })
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.menu_at = event.position;
                 this.model.connections.selected = Some(menu_id.clone());
@@ -1192,6 +1198,55 @@ impl Workbench {
                     IconName::RefreshCw,
                     self.t("common.retry"),
                     act(format!("nav-retry:{node_id}"), cx),
+                )
+                .xsmall(),
+            )
+            .into_any_element()
+    }
+
+    /// 连接没连上：原因直接写在这条连接下面（完整原文在悬停提示里），旁边是重试和编辑连接。
+    /// 不用再去状态栏里找一闪而过的提示，也不用猜是密码、地址还是证书的问题。
+    fn connect_failed_row(&self, id: &str, reason: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let full = SharedString::from(format!("{}: {reason}", self.t("connections.status.error")));
+        div()
+            .id(SharedString::from(format!("nav-conn-failed-{id}")))
+            .test_support()
+            .flex_none()
+            .pl(px(42.))
+            .pr(px(4.))
+            .py(px(3.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                div()
+                    .id(SharedString::from(format!("nav-conn-failed-text-{id}")))
+                    .test_support()
+                    .aria_label(full.clone())
+                    .tooltip_text(full.clone())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.danger)
+                    // 行内只写原因首行；处理建议在悬停提示里。
+                    .child(SharedString::from(reason.lines().next().unwrap_or(reason).to_owned())),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("nav-connect-retry-{id}")),
+                    IconName::RefreshCw,
+                    self.t("common.retry"),
+                    act(format!("nav-connect-retry:{id}"), cx),
+                )
+                .xsmall(),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("nav-connect-edit-{id}")),
+                    IconName::Pencil,
+                    self.t("ui.explorer.editConnection"),
+                    act(format!("nav-connect-edit:{id}"), cx),
                 )
                 .xsmall(),
             )
@@ -1301,7 +1356,6 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t(if row.expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
-                    .tooltip_text(self.t(if row.expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -1629,12 +1683,15 @@ impl Workbench {
                     .find(|row| row.saved.id == connection_id)
                     .map(|row| row.saved.env.clone())
                     .unwrap_or_default();
+                // 绑定的连接已被删除：照样显示原名，但用警示色说明它已不存在，而不是看起来一切就绪。
+                let missing = self.model.connections.loaded && !self.model.connections.rows.iter().any(|row| row.saved.id == connection_id);
                 let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
                 kit::interactive_states(div().id("status-target"), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
-                    .aria_label(label.clone())
-                    .tooltip_text(self.t("ui.status.switchTargetHint"))
+                    .aria_label(if missing { SharedString::from(format!("{label} · {}", self.t("ui.query.targetMissing"))) } else { label.clone() })
+                    .tooltip_text(if missing { self.t("ui.query.targetMissing") } else { self.t("ui.status.switchTargetHint") })
+                    .when(missing, |this| this.text_color(p.warn))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1645,10 +1702,12 @@ impl Workbench {
                     .hover(|style| style.bg(p.hover).text_color(p.text))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w(px(0.)).truncate().child(label))
+                    .when(missing, |this| this.child(kit::icon(IconName::TriangleAlert, 12., p.warn)))
                     .children(self.env_pill(&env, &p))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.perform("status-target", cx);
                     this.restore_focus(window, cx);
+                    this.open_query_target_picker(cx);
                 }))
                     .into_any_element()
             }
@@ -2812,6 +2871,11 @@ impl Workbench {
             DraftField::SshKey => "~/.ssh/id_ed25519".to_owned(),
             DraftField::CaFile => "ca.pem".to_owned(),
             DraftField::Password if existing => self.model.text("ui.conn.passwordKeep"),
+            // 名称留空时保存会用主机名（SQLite 用文件名）：占位里直接说出来，用户知道不填也行、会叫什么。
+            DraftField::Name => match self.model.connections.editor.as_ref().and_then(default_connection_name) {
+                Some(name) => i18n::fill(&self.model.text("ui.conn.nameDefault"), &[("name", &name)]),
+                None => self.model.text(key),
+            },
             // 示例跟着当前引擎走：选了 SQLite 不再提示一个 postgres 连接串。
             DraftField::Url => format!("{} {}", self.model.text(key), url_example(engine.unwrap_or(Engine::Postgres))),
             _ if key.is_empty() => String::new(),
@@ -3858,13 +3922,14 @@ impl Workbench {
                             .outline()
                             .disabled(s.editor_font >= FONT_RANGE.1),
                     );
-                let editor_theme = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(self.t(crate::app::views::settings::editor_theme_key(&s.editor_theme))))
-                    .child(kit::icon_button("editor-theme-prev", IconName::ChevronLeft, self.t("ui.settings.change"), act("editor-theme-prev", cx)).outline())
-                    .child(kit::icon_button("editor-theme-next", IconName::ChevronRight, self.t("ui.settings.change"), act("editor-theme-next", cx)).outline());
+                // 五种配色直接摆出来一次选中，不用左右箭头逐个翻、也看不到还有哪些可选。
+                let editor_theme_ids: Vec<String> = crate::app::views::settings::EDITOR_THEMES.iter().map(|name| format!("editor-theme-set-{name}")).collect();
+                let editor_theme_items: Vec<(&str, &str, bool)> = crate::app::views::settings::EDITOR_THEMES
+                    .iter()
+                    .zip(editor_theme_ids.iter())
+                    .map(|(name, id)| (id.as_str(), crate::app::views::settings::editor_theme_key(name), s.editor_theme == *name))
+                    .collect();
+                let editor_theme = seg(self, &editor_theme_items, cx);
                 div()
                 .flex()
                 .flex_col()
@@ -3884,7 +3949,7 @@ impl Workbench {
                     self.t("ui.settings.editor"),
                     vec![
                         (self.t("shell.settings.editorFont"), None, font.into_any_element()),
-                        (self.t("shell.settings.editorTheme"), Some(self.t("shell.settings.editorThemeAuto")), editor_theme.into_any_element()),
+                        (self.t("shell.settings.editorTheme"), None, editor_theme.into_any_element()),
                     ],
                     &p,
                 )).into_any_element()
@@ -4539,6 +4604,7 @@ impl Workbench {
                 // 快捷键来自菜单同源（COMMANDS → SHORTCUTS），类型标注来自条目种类。
                 let chord = entry.shortcut;
                 let type_label = self.t(super::model::palette_kind_key(entry.group));
+                let show_kind = entry.group != "command";
                 let detail = entry.detail.clone();
                 let icon = palette_icon(&entry.id);
                 // 分组标题只在组变化时出现一次；类型标注仍在行内，滚动到中段也认得出。
@@ -4608,9 +4674,10 @@ impl Workbench {
                                             .child(SharedString::from(detail)),
                                     )
                                 })
-                                // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询 / 命令。
+                                // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询。
                                 // 也是无障碍名称的一部分：读屏能听到这一行是什么类型。
-                                .child(
+                                // 命令占了面板的大半，每行都写一遍“命令”只是噪音；它们由分组标题和快捷键认出。
+                                .when(show_kind, |this| this.child(
                                     div()
                                         .id(SharedString::from(format!("pal-kind-{index}")))
                                         .test_support()
@@ -4619,7 +4686,7 @@ impl Workbench {
                                         .text_color(if selected { p.accent_text } else { p.text_faint })
                                         .aria_label(type_label.clone())
                                         .child(type_label),
-                                ),
+                                )),
                         )
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
                         .when(selected && chord.is_none(), |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.accent_text)))
@@ -4869,7 +4936,25 @@ impl Workbench {
 
     fn delete_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        let dialog = dialog_card("delete-connection", IconName::Trash, p.danger, self.t("connections.deleteDialog.title"), self.t("connections.deleteDialog.willKeepDb"), &p).child(
+        // 标题点名要删的是哪一条；正在用它的标签数一并说明，删除后这些标签要重新选执行目标。
+        let selected = self.model.connections.selected.clone().unwrap_or_default();
+        let name = self.model.connections.rows.iter().find(|row| row.saved.id == selected).map(|row| row.saved.name.clone());
+        let title = match name {
+            Some(name) => SharedString::from(i18n::fill(&self.model.text("connections.deleteDialog.titleNamed"), &[("name", &name)])),
+            None => self.t("connections.deleteDialog.title"),
+        };
+        let bound = self.model.tabs.iter().filter(|tab| tab.connection_id.as_deref() == Some(selected.as_str())).count();
+        let body = if bound > 0 {
+            SharedString::from(format!(
+                "{}
+{}",
+                self.model.text("connections.deleteDialog.willKeepDb"),
+                i18n::fill(&self.model.text("connections.deleteDialog.boundTabs"), &[("count", &bound.to_string())])
+            ))
+        } else {
+            self.t("connections.deleteDialog.willKeepDb")
+        };
+        let dialog = dialog_card("delete-connection", IconName::Trash, p.danger, title, body, &p).child(
             div()
                 .flex()
                 .justify_end()
@@ -5638,6 +5723,7 @@ fn palette_icon(id: &str) -> IconName {
         "execute-query" => IconName::Play,
         "open-structure" => IconName::Columns3,
         "compare" => IconName::GitCompare,
+        "open-admin" => IconName::Gauge,
         "open-exchange" => IconName::ArrowDownUp,
         "new-connection" => IconName::Plus,
         "open-sqlite" => IconName::FolderOpen,
@@ -5765,4 +5851,15 @@ pub(super) fn env_tone<'a>(env: &'a str, tags: &'a [EnvTag]) -> &'a str {
         }
     }
     env
+}
+
+/// 名称留空时保存所用的名字：与连接配置保存时的取名规则一致（文件库取文件名，其余取主机）。
+fn default_connection_name(draft: &crate::connections::model::ConnectionDraft) -> Option<String> {
+    let name = if draft.engine == Engine::Sqlite {
+        let path = draft.file_path.trim();
+        std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_owned()
+    } else {
+        draft.host.trim().to_owned()
+    };
+    (!name.is_empty()).then_some(name)
 }

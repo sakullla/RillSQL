@@ -4586,8 +4586,12 @@ impl TableDelegate for SheetDelegate {
             // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
             .debug_selector(move || format!("grid-cell-{row_ix}-{col_ix}"))
             .size_full()
-            .truncate()
-            .when(numeric && !placeholder, |this| this.text_right())
+            // 文字在行内垂直居中：标准/宽松密度下行更高，顶对齐时文字贴着上沿，
+            // 双击进入原位编辑（输入框居中）时还会往下跳一截。
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .when(numeric && !placeholder, |this| this.justify_end().text_right())
             .when(row_number, |this| this.text_color(p.text_faint))
             .when(placeholder, |this| this.text_color(p.text_faint).italic())
             .when(mark == 3, |this| this.line_through())
@@ -4601,7 +4605,7 @@ impl TableDelegate for SheetDelegate {
             // 选中时保留选择色；未选中的暂存格用新增/修改/删除底色。
             .when(!selected, |this| this.when_some(tone_bg, |this, color| this.bg(color)))
             .when(selected, |this| this.bg(p.selection))
-            .child(SharedString::from(text))
+            .child(div().min_w(px(0.)).truncate().child(SharedString::from(text)))
             .when_some(owner, move |this, owner| {
                 let drag = owner.clone();
                 let release = owner.clone();
