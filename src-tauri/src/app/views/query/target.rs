@@ -27,19 +27,80 @@ pub struct TargetChoice {
 }
 
 /// 选择器弹层的界面状态。
-#[derive(Default)]
 pub struct TargetPicker {
     /// 弹层的锚点（打开它的那次点击位置）；None 表示关闭。
     pub anchor: Option<Point<Pixels>>,
     /// 左栏当前选中的连接（右栏列它的库）。
     pub focus: Option<String>,
+    /// 右栏当前键盘高亮的库下标。
+    pub db_index: usize,
     pub search: Option<Entity<InputState>>,
     /// 等着连接成功后再绑定的连接。
     pub pending: Option<String>,
+    pub conn_scroll: gpui_kit::ScrollHandle,
+    pub db_scroll: gpui_kit::ScrollHandle,
 }
 
-fn matches(text: &str, filter: &str) -> bool {
+impl Default for TargetPicker {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            focus: None,
+            db_index: 0,
+            search: None,
+            pending: None,
+            conn_scroll: gpui_kit::ScrollHandle::new(),
+            db_scroll: gpui_kit::ScrollHandle::new(),
+        }
+    }
+}
+
+pub fn matches(text: &str, filter: &str) -> bool {
     filter.is_empty() || text.to_lowercase().contains(filter)
+}
+
+pub fn filtered_choices<'a>(choices: &'a [TargetChoice], filter: &str) -> Vec<&'a TargetChoice> {
+    choices
+        .iter()
+        .filter(|choice| {
+            matches(&choice.name, filter)
+                || matches(&choice.id, filter)
+                || choice.databases.iter().any(|database| matches(database, filter))
+        })
+        .collect()
+}
+
+pub fn filtered_databases<'a>(choice: &'a TargetChoice, filter: &str) -> Vec<&'a String> {
+    choice
+        .databases
+        .iter()
+        .filter(|database| matches(database, filter) || matches(&choice.name, filter) || matches(&choice.id, filter))
+        .collect()
+}
+
+pub fn resolved_focus(
+    picker: &TargetPicker,
+    choices: &[TargetChoice],
+    current_connection: &str,
+    filter: &str,
+) -> Option<String> {
+    let shown = filtered_choices(choices, filter);
+    if shown.is_empty() {
+        return picker
+            .focus
+            .clone()
+            .or_else(|| (!current_connection.is_empty()).then(|| current_connection.to_owned()))
+            .or_else(|| choices.first().map(|choice| choice.id.clone()));
+    }
+    if let Some(id) = picker.focus.as_deref() {
+        if shown.iter().any(|choice| choice.id == id) {
+            return Some(id.to_owned());
+        }
+    }
+    if !current_connection.is_empty() && shown.iter().any(|choice| choice.id == current_connection) {
+        return Some(current_connection.to_owned());
+    }
+    shown.first().map(|choice| choice.id.clone())
 }
 
 /// 目标按钮：引擎徽标 + 连接名 › 库名 + 下拉箭头。没有目标时提示选择。
@@ -99,6 +160,7 @@ pub fn popover(
     choices: &[TargetChoice],
     current: (&str, &str),
     filter: &str,
+    viewport_width: f32,
     locale: Locale,
     metrics: Metrics,
     p: &Palette,
@@ -107,16 +169,23 @@ pub fn popover(
     let anchor = picker.anchor?;
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let (current_connection, current_database) = current;
-    let focus = picker.focus.clone().or_else(|| (!current_connection.is_empty()).then(|| current_connection.to_owned())).or_else(|| choices.first().map(|choice| choice.id.clone()));
-    // 搜索命中：连接名命中或它的某个库命中都留下这条连接。
-    let shown: Vec<&TargetChoice> = choices
-        .iter()
-        .filter(|choice| matches(&choice.name, filter) || matches(&choice.id, filter) || choice.databases.iter().any(|database| matches(database, filter)))
-        .collect();
+    let shown = filtered_choices(choices, filter);
+    let focus = resolved_focus(picker, choices, current_connection, filter);
     let focused = focus.as_deref().and_then(|id| choices.iter().find(|choice| choice.id == id));
     let row_h = metrics.row_h + 2.;
+    let panel_w = (if viewport_width > 0. { viewport_width - 24. } else { 560. }).clamp(300., 560.);
+    let left_w = if panel_w < 460. { 156. } else { 220. };
 
-    let mut left = div().id("query-target-connections").w(px(230.)).flex_none().h_full().overflow_y_scroll().border_r_1().border_color(p.line).py(px(4.));
+    let mut left = div()
+        .id("query-target-connections")
+        .track_scroll(&picker.conn_scroll)
+        .w(px(left_w))
+        .flex_none()
+        .h_full()
+        .overflow_y_scroll()
+        .border_r_1()
+        .border_color(p.line)
+        .py(px(4.));
     left = left.child(div().px(px(10.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("ui.query.targetConnections")));
     if shown.is_empty() {
         left = left.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoMatch")));
@@ -128,6 +197,10 @@ pub fn popover(
         let id = choice.id.clone();
         left = left.child(
             kit::row_states(div().id(SharedString::from(format!("query-target-conn-{}", choice.id))), p)
+                .test_support()
+                .role(gpui_kit::Role::ListItem)
+                .aria_label(SharedString::from(choice.name.clone()))
+                .aria_selected(selected)
                 .mx(px(4.))
                 .h(px(row_h))
                 .px(px(6.))
@@ -148,7 +221,14 @@ pub fn popover(
         );
     }
 
-    let mut right = div().id("query-target-databases").flex_1().min_w(px(0.)).h_full().overflow_y_scroll().py(px(4.));
+    let mut right = div()
+        .id("query-target-databases")
+        .track_scroll(&picker.db_scroll)
+        .flex_1()
+        .min_w(px(0.))
+        .h_full()
+        .overflow_y_scroll()
+        .py(px(4.));
     match focused {
         None => {}
         Some(choice) if !choice.connected => {
@@ -176,7 +256,8 @@ pub fn popover(
             );
         }
         Some(choice) => {
-            let databases: Vec<&String> = choice.databases.iter().filter(|database| matches(database, filter) || matches(&choice.name, filter)).collect();
+            let databases = filtered_databases(choice, filter);
+            let active_db = picker.db_index.min(databases.len().saturating_sub(1));
             right = right.child(
                 div()
                     .px(px(10.))
@@ -188,12 +269,17 @@ pub fn popover(
             if databases.is_empty() {
                 right = right.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoDatabase")));
             }
-            for database in databases {
+            for (ix, database) in databases.into_iter().enumerate() {
                 let current = choice.id == current_connection && database == current_database;
+                let highlighted = ix == active_db;
                 let owner = entity.clone();
                 let (id, name) = (choice.id.clone(), database.clone());
                 right = right.child(
                     kit::row_states(div().id(SharedString::from(format!("query-target-db-{}-{database}", choice.id))), p)
+                        .test_support()
+                        .role(gpui_kit::Role::ListItem)
+                        .aria_label(SharedString::from(database.clone()))
+                        .aria_selected(highlighted)
                         .mx(px(4.))
                         .h(px(row_h))
                         .px(px(8.))
@@ -201,11 +287,23 @@ pub fn popover(
                         .items_center()
                         .gap(px(8.))
                         .rounded(px(Radius::CONTROL))
-                        .when(current, |this| this.bg(p.accent_soft))
+                        .when(current && !highlighted, |this| this.bg(p.accent_soft))
+                        .when(highlighted && !current, |this| this.bg(p.selection))
+                        .when(highlighted && current, |this| this.bg(p.accent_soft).border_1().border_color(p.accent))
                         .hover(|style| style.bg(p.hover))
-                        .child(kit::icon(IconName::Database, 13., if current { p.accent_text } else { p.text_muted }))
-                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(current, |this| this.text_color(p.accent_text).font_weight(FontWeight::MEDIUM)).child(SharedString::from(database.clone())))
+                        .child(kit::icon(IconName::Database, 13., if current || highlighted { p.accent_text } else { p.text_muted }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(TypeScale::SM))
+                                .when(current, |this| this.text_color(p.accent_text).font_weight(FontWeight::MEDIUM))
+                                .when(highlighted && !current, |this| this.font_weight(FontWeight::MEDIUM))
+                                .child(SharedString::from(database.clone())),
+                        )
                         .when(current, |this| this.child(kit::icon(IconName::Check, 13., p.accent_text)))
+                        .when(highlighted && !current, |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.text_muted)))
                         .on_click(move |_, _, cx| {
                             let (id, name) = (id.clone(), name.clone());
                             owner.update(cx, |pane, cx| pane.pick_target(&id, &name, cx));
@@ -218,12 +316,32 @@ pub fn popover(
     let search = picker.search.clone().map(|state| {
         kit::text_input("query-target-search", &state, t("ui.query.targetSearch")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)
     });
+    let hint = |keys: &'static str, label: SharedString| div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, p)).child(label);
+    let footer = div()
+        .id("query-target-footer")
+        .flex_none()
+        .px(px(10.))
+        .py(px(5.))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(10.))
+        .border_t_1()
+        .border_color(p.line)
+        .bg(p.chrome)
+        .text_size(px(TypeScale::XS))
+        .text_color(p.text_faint)
+        .child(hint("↑↓", t("ui.query.targetHintMove")))
+        .child(hint("Tab", t("ui.query.targetHintConn")))
+        .child(hint("Enter", t("shell.palette.hintRun")))
+        .child(hint("Esc", t("shell.palette.hintClose")));
     let close = entity.clone();
     let keys = entity.clone();
     let panel = div()
         .id("query-target-popover")
+        .test_support()
         .occlude()
-        .w(px(560.))
+        .w(px(panel_w))
         .h(px(360.))
         .flex()
         .flex_col()
@@ -240,15 +358,29 @@ pub fn popover(
                     cx.stop_propagation();
                     keys.update(cx, |pane, cx| pane.close_target_picker(cx));
                 }
+                "up" => {
+                    cx.stop_propagation();
+                    keys.update(cx, |pane, cx| pane.step_target_picker(-1, cx));
+                }
+                "down" => {
+                    cx.stop_propagation();
+                    keys.update(cx, |pane, cx| pane.step_target_picker(1, cx));
+                }
+                "tab" => {
+                    cx.stop_propagation();
+                    let backward = event.keystroke.modifiers.shift;
+                    keys.update(cx, |pane, cx| pane.cycle_target_connection(backward, cx));
+                }
                 "enter" => {
                     cx.stop_propagation();
-                    keys.update(cx, |pane, cx| pane.pick_first_target(cx));
+                    keys.update(cx, |pane, cx| pane.pick_highlighted_target(cx));
                 }
                 _ => {}
             }
         })
         .children(search.map(|input| div().flex_none().p(px(8.)).border_b_1().border_color(p.line).child(input)))
-        .child(div().flex_1().min_h(px(0.)).flex().child(left).child(right));
+        .child(div().flex_1().min_h(px(0.)).flex().child(left).child(right))
+        .child(footer);
     Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(div().pt(px(14.)).child(panel))).with_priority(2).into_any_element())
 }
 

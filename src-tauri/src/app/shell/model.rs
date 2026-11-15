@@ -192,6 +192,51 @@ pub enum DraftField {
     TagLabel,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaletteScope {
+    #[default]
+    All,
+    Objects,
+    Commands,
+    Connections,
+    Saved,
+}
+
+impl PaletteScope {
+    pub const ALL: [Self; 5] = [Self::All, Self::Objects, Self::Commands, Self::Connections, Self::Saved];
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::All => "ui.palette.scopeAll",
+            Self::Objects => "shell.paletteGroup.table",
+            Self::Commands => "shell.paletteGroup.command",
+            Self::Connections => "shell.paletteGroup.connection",
+            Self::Saved => "shell.paletteGroup.savedQueries",
+        }
+    }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::All => "palette-scope:all",
+            Self::Objects => "palette-scope:objects",
+            Self::Commands => "palette-scope:commands",
+            Self::Connections => "palette-scope:connections",
+            Self::Saved => "palette-scope:saved",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "palette-scope:all" => Some(Self::All),
+            "palette-scope:objects" => Some(Self::Objects),
+            "palette-scope:commands" => Some(Self::Commands),
+            "palette-scope:connections" => Some(Self::Connections),
+            "palette-scope:saved" => Some(Self::Saved),
+            _ => None,
+        }
+    }
+}
+
 /// 标签管理对话框：列出全部标签；editing 是正在新建（id 为空）或编辑的那一个。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TagManager {
@@ -427,6 +472,12 @@ pub struct WorkbenchModel {
     /// “保存并连接”刚存下的那次输入机密（连接 id + 机密）：紧接着的 OpenConnection
     /// 用它连接，而不是用被 close_connection_modal 清空后的空机密。连上或重新打开表单即清。
     pub pending_open_secrets: Option<(String, Secrets)>,
+    /// 命令面板的范围筛选（全部 / 表与视图 / 命令 / 连接 / 保存的查询）。
+    pub palette_scope: PaletteScope,
+    /// 键盘在历史页移动选中项后，下一帧把该条目滚入视口一次。
+    pub history_reveal: bool,
+    /// 键盘在连接页移动选中项后，下一帧把该行滚入视口一次。
+    pub launcher_reveal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,6 +580,9 @@ impl WorkbenchModel {
             connect_intents: Vec::new(),
             connect_retry: None,
             pending_open_secrets: None,
+            palette_scope: PaletteScope::All,
+            history_reveal: false,
+            launcher_reveal: false,
         }
     }
 
@@ -648,6 +702,7 @@ impl WorkbenchModel {
             "command-palette" | "quick-open" => {
                 self.palette_query.clear();
                 self.palette_index = 0;
+                self.palette_scope = PaletteScope::All;
                 self.menu = None;
                 // 保存的查询要先有清单才能被搜索；这里只重读本机历史库，不连业务库、不执行 SQL。
                 if !self.pending.iter().any(|job| matches!(job, PendingJob::RefreshHistory)) {
@@ -915,6 +970,45 @@ impl WorkbenchModel {
                 self.connections.clear_list_filters();
                 self.conn_filter_menu = None;
             }
+            "explorer-clear-filter" => {
+                self.object_filter.clear();
+            }
+            "palette-clear" => {
+                self.palette_query.clear();
+                self.palette_scope = PaletteScope::All;
+                self.shell.palette_tables_only = false;
+                self.palette_index = 0;
+            }
+            "conn-copy-address" => {
+                if let Some(row) = self
+                    .connections
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.connections.rows.iter().find(|row| &row.saved.id == id))
+                {
+                    let address = match row.saved.file_path.as_deref() {
+                        Some(path) if !path.is_empty() => path.to_owned(),
+                        _ => {
+                            let host = row.saved.host.clone().unwrap_or_default();
+                            match row.saved.port {
+                                Some(port) if !host.is_empty() => format!("{host}:{port}"),
+                                _ => host,
+                            }
+                        }
+                    };
+                    if !address.is_empty() {
+                        self.copied = address.clone();
+                        self.clipboard_out = Some(address);
+                        self.notice_key = Some("conn.page.copiedAddress");
+                        self.notice_detail.clear();
+                    }
+                }
+            }
+            _ if PaletteScope::parse(id).is_some() => {
+                if let Some(scope) = PaletteScope::parse(id) {
+                    self.set_palette_scope(scope);
+                }
+            }
             "conn-ssh-toggle" => self.connections.toggle_ssh(),
             // 安全选项的两种内部切换入口：键盘/测试按控件 id 走，界面上是同一组分段控件。
             "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
@@ -967,6 +1061,25 @@ impl WorkbenchModel {
             | "tree-truncate-table"
             | "tree-rename-table" => self.tree_action(id),
             "ddl-close" => self.ddl_view = None,
+            "ddl-retry" => {
+                if let Some(node_id) = self.ddl_view.as_ref().map(|view| view.node_id.clone()) {
+                    self.open_definition(&node_id, false);
+                }
+            }
+            "ddl-open-query" => {
+                if let Some(view) = self.ddl_view.clone() {
+                    if let Some(text) = view.text {
+                        self.ddl_view = None;
+                        self.open_bound_query(
+                            text,
+                            Some(view.object.connection_id),
+                            Some(view.object.connection_name),
+                            Some(view.object.database),
+                            Some(view.object.engine.as_str().to_owned()),
+                        );
+                    }
+                }
+            }
             "ddl-copy" => {
                 let text = self.ddl_view.as_ref().and_then(|view| view.text.clone());
                 match text {
@@ -1699,9 +1812,9 @@ impl WorkbenchModel {
             self.shell.focus = self.menu_return;
             return Effect::None;
         }
-        // 标签管理：Esc/点外面先收起编辑，再关对话框。
+        // 标签管理：Esc/点外面先收起编辑或删除确认，再关对话框。
         if let Some(manager) = self.tag_manager.as_mut() {
-            if manager.editing.take().is_none() {
+            if manager.editing.take().is_none() && manager.confirm_delete.take().is_none() {
                 self.tag_manager = None;
             }
             return Effect::None;
@@ -1718,6 +1831,7 @@ impl WorkbenchModel {
             self.ddl_view = None;
             return Effect::None;
         }
+        self.palette_scope = PaletteScope::All;
         self.shell.close_overlay();
         Effect::None
     }
@@ -1725,6 +1839,12 @@ impl WorkbenchModel {
     pub fn key(&mut self, key: NavKey) -> Option<String> {
         if self.menu.is_some() {
             return self.menu_key(key);
+        }
+        if self.tag_manager.is_some() {
+            if key == NavKey::Escape {
+                self.dismiss();
+            }
+            return None;
         }
         if self.close_prompt.is_some() {
             return match key {
@@ -1738,6 +1858,12 @@ impl WorkbenchModel {
                 }
                 _ => None,
             };
+        }
+        if self.shell.help_open {
+            if key == NavKey::Escape {
+                self.dismiss();
+            }
+            return None;
         }
         if self.shell.palette_open {
             return self.palette_key(key);
@@ -1852,6 +1978,30 @@ impl WorkbenchModel {
         }
     }
 
+    /// 当前生效的命令面板范围：`quick-open`（`palette_tables_only`）映射为“表与视图”，
+    /// 输入框带 `>` 前缀时映射为“命令”，其余走 `palette_scope`。
+    pub fn effective_palette_scope(&self) -> PaletteScope {
+        if self.shell.palette_tables_only {
+            PaletteScope::Objects
+        } else if self.palette_query.trim_start().starts_with('>') {
+            PaletteScope::Commands
+        } else {
+            self.palette_scope
+        }
+    }
+
+    pub fn set_palette_scope(&mut self, scope: PaletteScope) {
+        self.palette_scope = scope;
+        self.shell.palette_tables_only = scope == PaletteScope::Objects;
+        if scope != PaletteScope::Commands {
+            let trimmed = self.palette_query.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('>') {
+                self.palette_query = rest.trim_start().to_owned();
+            }
+        }
+        self.palette_index = 0;
+    }
+
     pub fn palette_entries(&self) -> Vec<PaletteEntry> {
         let mut entries = Vec::new();
         for command in COMMANDS {
@@ -1877,7 +2027,7 @@ impl WorkbenchModel {
         entries.extend(self.database_entries());
         entries.extend(self.catalog_entries());
         entries.extend(self.saved_entries());
-        filter_palette(&entries, &self.palette_query, self.shell.palette_tables_only)
+        filter_palette(&entries, &self.palette_query, self.effective_palette_scope())
     }
 
     /// 快速打开里的已加载库：只有读到过的库才出现，不凭空列出未读取的目录。
@@ -2353,21 +2503,79 @@ impl WorkbenchModel {
         match key {
             NavKey::ArrowDown => {
                 self.history.move_selection(1);
+                self.history_reveal = true;
                 None
             }
             NavKey::ArrowUp => {
                 self.history.move_selection(-1);
+                self.history_reveal = true;
                 None
             }
             NavKey::Home => {
                 self.history.select_edge(true);
+                self.history_reveal = true;
                 None
             }
             NavKey::End => {
                 self.history.select_edge(false);
+                self.history_reveal = true;
                 None
             }
             NavKey::Enter => self.history.enter_command().map(str::to_owned),
+            NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => None,
+        }
+    }
+
+    /// 连接页键盘：在筛选后的可见连接里上下/Home/End 选行，回车直接打开或连接。
+    pub fn connections_key(&mut self, key: NavKey) -> Option<String> {
+        if self.shell.page != AppPage::Connections || self.connections.confirm_delete || self.conn_modal.open || self.group_prompt.is_some() {
+            return None;
+        }
+        let ids: Vec<String> = self.connections.launcher_all().into_iter().map(|row| row.saved.id.clone()).collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let current = self
+            .connections
+            .selected
+            .as_ref()
+            .and_then(|id| ids.iter().position(|item| item == id));
+        match key {
+            NavKey::ArrowDown => {
+                let next = match current {
+                    Some(index) => (index + 1).min(ids.len() - 1),
+                    None => 0,
+                };
+                self.connections.selected = Some(ids[next].clone());
+                self.launcher_reveal = true;
+                None
+            }
+            NavKey::ArrowUp => {
+                let prev = match current {
+                    Some(index) => index.saturating_sub(1),
+                    None => 0,
+                };
+                self.connections.selected = Some(ids[prev].clone());
+                self.launcher_reveal = true;
+                None
+            }
+            NavKey::Home => {
+                self.connections.selected = Some(ids[0].clone());
+                self.launcher_reveal = true;
+                None
+            }
+            NavKey::End => {
+                if let Some(last) = ids.last() {
+                    self.connections.selected = Some(last.clone());
+                    self.launcher_reveal = true;
+                }
+                None
+            }
+            NavKey::Enter => {
+                let target = current.map(|index| ids[index].clone()).or_else(|| ids.first().cloned())?;
+                self.connections.selected = Some(target.clone());
+                Some(format!("connection:{target}"))
+            }
             NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => None,
         }
     }
@@ -3693,11 +3901,18 @@ impl WorkbenchModel {
         if !self.palette_error().is_empty() {
             return "ui.palette.error";
         }
-        if self.shell.palette_tables_only {
+        let scope = self.effective_palette_scope();
+        if scope == PaletteScope::Objects {
             if self.catalog_entries().is_empty() {
                 return "ui.palette.noObjects";
             }
             return "ui.explorer.noMatch";
+        }
+        if scope == PaletteScope::Saved && self.palette_query.trim().is_empty() && self.saved_entries().is_empty() {
+            return "ui.history.emptySaved";
+        }
+        if scope == PaletteScope::Connections && self.palette_query.trim().is_empty() && self.connections.rows.is_empty() {
+            return "ui.explorer.empty";
         }
         if self.palette_query.trim().is_empty() {
             "ui.palette.empty"
@@ -5047,28 +5262,33 @@ pub fn next_epoch() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> Vec<PaletteEntry> {
+fn filter_palette(entries: &[PaletteEntry], query: &str, scope: PaletteScope) -> Vec<PaletteEntry> {
     let trimmed = query.trim().to_lowercase();
-    if tables_only {
+    let query_body = trimmed.strip_prefix('>').map(str::trim).unwrap_or(trimmed.as_str());
+    let scoped: Vec<PaletteEntry> = match scope {
+        PaletteScope::All => entries.to_vec(),
         // 快速打开只收窄到能“打开数据”的对象；连接、库和保存的查询留给命令搜索。
-        let objects: Vec<_> = entries
+        PaletteScope::Objects => entries
             .iter()
             .filter(|entry| matches!(entry.group, "table" | "view"))
             .cloned()
-            .collect();
-        return if trimmed.is_empty() { objects } else { rank(&objects, &trimmed) };
-    }
-    if let Some(rest) = trimmed.strip_prefix('>') {
-        let commands: Vec<_> = entries.iter().filter(|entry| entry.group == "command").cloned().collect();
-        let rest = rest.trim();
-        return if rest.is_empty() { commands } else { rank(&commands, rest) };
-    }
-    if trimmed.is_empty() {
-        let mut ordered = entries.to_vec();
-        ordered.sort_by_key(|entry| palette_group_rank(entry.group));
+            .collect(),
+        PaletteScope::Commands => entries.iter().filter(|entry| entry.group == "command").cloned().collect(),
+        PaletteScope::Connections => entries
+            .iter()
+            .filter(|entry| matches!(entry.group, "connection" | "database"))
+            .cloned()
+            .collect(),
+        PaletteScope::Saved => entries.iter().filter(|entry| entry.group == "saved").cloned().collect(),
+    };
+    if query_body.is_empty() {
+        let mut ordered = scoped;
+        if scope == PaletteScope::All {
+            ordered.sort_by_key(|entry| palette_group_rank(entry.group));
+        }
         return ordered;
     }
-    rank(entries, &trimmed)
+    rank(&scoped, query_body)
 }
 
 fn rank(entries: &[PaletteEntry], query: &str) -> Vec<PaletteEntry> {

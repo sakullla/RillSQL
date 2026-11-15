@@ -125,9 +125,11 @@ impl Workbench {
             let on = current == id;
             let command = if on || id.is_empty() { "conn-filter-env:".to_owned() } else { format!("conn-filter-env:{id}") };
             let (fg, bg) = tone.as_deref().map(|tone| kit::env_colors(tone, p)).unwrap_or((p.text_muted, p.hover));
+            let aria = SharedString::from(format!("{label} {n}"));
             bar = bar.child(
                 kit::interactive_states(div().id(SharedString::from(format!("conn-tag-{}", if id.is_empty() { "all" } else { &id }))), p, false)
                     .role(gpui_kit::Role::Button)
+                    .aria_label(aria)
                     .aria_selected(on)
                     .h(px(24.))
                     .px(px(8.))
@@ -156,8 +158,22 @@ impl Workbench {
         let all: Vec<ConnectionRecord> = self.model.connections.launcher_all().into_iter().cloned().collect();
         let recent: Vec<ConnectionRecord> = self.model.connections.launcher_recent(5).into_iter().cloned().collect();
         let filtering = !self.model.connections.filter_text.trim().is_empty() || self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty();
-        let mut body = div().id("launcher-scroll").flex().flex_col().flex_1().min_w(px(0.)).h_full().overflow_y_scroll().px(px(m.page_pad - 6.)).py(px(8.)).gap(px(1.));
+        let mut body = div()
+            .id("launcher-scroll")
+            .track_scroll(&self.launcher_scroll)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(m.page_pad - 6.))
+            .py(px(8.))
+            .gap(px(1.));
+        let mut child_count = 0usize;
+        let mut selected_child: Option<usize> = None;
         if self.model.connections.rows.is_empty() {
+            self.model.launcher_reveal = false;
             return body
                 .child(kit::empty_state_with_action(
                     IconName::Database,
@@ -196,13 +212,16 @@ impl Workbench {
                     .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(format!("{} · {name}", self.model.text("connections.status.error")))))
                     .child(kit::tool_button("launcher-connect-retry-action", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx))),
             );
+            child_count += 1;
         }
         if self.model.shell.page == crate::app::AppPage::Connections {
             if let Some(prompt) = self.group_prompt_panel(window, cx) {
                 body = body.child(div().mb(px(6.)).child(prompt));
+                child_count += 1;
             }
         }
         if all.is_empty() {
+            self.model.launcher_reveal = false;
             return body
                 .child(kit::no_match_state_with_action(
                     IconName::Search,
@@ -215,8 +234,10 @@ impl Workbench {
         }
         if !recent.is_empty() && !filtering && all.len() > recent.len() + 2 {
             body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.launcher.recent"), &p)));
+            child_count += 1;
             for row in &recent {
                 body = body.child(self.launcher_row(row, wide, &p, cx, "recent"));
+                child_count += 1;
             }
         }
         let layout = self.model.group_layout();
@@ -224,9 +245,19 @@ impl Workbench {
         if layout.groups.is_empty() {
             if !recent.is_empty() && !filtering && all.len() > recent.len() + 2 {
                 body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.launcher.all"), &p)));
+                child_count += 1;
             }
             for row in &all {
+                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                    selected_child = Some(child_count);
+                }
                 body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
+                child_count += 1;
+            }
+            if std::mem::take(&mut self.model.launcher_reveal) {
+                if let Some(child_ix) = selected_child {
+                    self.launcher_scroll.scroll_to_item(child_ix);
+                }
             }
             return body.into_any_element();
         }
@@ -237,21 +268,37 @@ impl Workbench {
             }
             let expanded = filtering || !group.collapsed;
             body = body.child(self.launcher_group_row(&group.id, &group.name, rows.len(), expanded, &p, cx));
+            child_count += 1;
             if !expanded {
                 continue;
             }
             if rows.is_empty() {
                 body = body.child(div().pl(px(32.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("connections.group.emptyHint")));
+                child_count += 1;
             }
             for row in &rows {
+                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                    selected_child = Some(child_count);
+                }
                 body = body.child(div().pl(px(16.)).child(self.launcher_row(row, wide, &p, cx, "all")));
+                child_count += 1;
             }
         }
         let ungrouped: Vec<ConnectionRecord> = layout.ungrouped.iter().filter_map(|id| shown(id)).collect();
         if !ungrouped.is_empty() {
             body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.group.ungrouped"), &p)));
+            child_count += 1;
             for row in &ungrouped {
+                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                    selected_child = Some(child_count);
+                }
                 body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
+                child_count += 1;
+            }
+        }
+        if std::mem::take(&mut self.model.launcher_reveal) {
+            if let Some(child_ix) = selected_child {
+                self.launcher_scroll.scroll_to_item(child_ix);
             }
         }
         body.into_any_element()
@@ -409,13 +456,36 @@ impl Workbench {
         facts.push(("conn.page.group", group));
         let mut table = div().flex().flex_col().gap(px(8.));
         for (key, value) in facts {
+            let has_value = value != none;
+            let copyable = has_value && matches!(key, "conn.page.address" | "conn.page.file");
             table = table.child(
                 div()
                     .flex()
+                    .items_center()
                     .gap(px(10.))
                     .text_size(px(TypeScale::SM))
                     .child(div().flex_none().w(px(72.)).text_color(p.text_muted).child(self.t(key)))
-                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(if value == none { p.text_faint } else { p.text }).child(SharedString::from(value))),
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("conn-fact-{key}")))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(if has_value { p.text } else { p.text_faint })
+                            .when(has_value, |this| this.tooltip_text(SharedString::from(value.clone())))
+                            .child(SharedString::from(value)),
+                    )
+                    .when(copyable, |this| {
+                        this.child(
+                            kit::icon_button(
+                                "conn-detail-copy-addr",
+                                IconName::Copy,
+                                self.t("conn.page.copyAddress"),
+                                act("conn-copy-address", cx),
+                            )
+                            .xsmall(),
+                        )
+                    }),
             );
         }
         let tag = self.env_pill(&saved.env, p);
@@ -486,8 +556,8 @@ impl Workbench {
                 let (fg, _) = kit::env_colors(tone, &p);
                 let on = draft.tone == tone;
                 tones = tones.child(
-                    div()
-                        .id(SharedString::from(format!("tag-tone-{tone}")))
+                    kit::interactive_states(div().id(SharedString::from(format!("tag-tone-{tone}"))), &p, false)
+                        .test_support()
                         .role(gpui_kit::Role::Button)
                         .aria_label(self.t(&format!("tags.tone.{tone}")))
                         .aria_selected(on)
@@ -499,6 +569,7 @@ impl Workbench {
                         .justify_center()
                         .border_2()
                         .border_color(if on { fg } else { gpui_kit::transparent_black() })
+                        .hover(|style| style.bg(p.hover))
                         .child(div().size(px(14.)).rounded_full().bg(fg))
                         .on_click(act(format!("tag-tone:{tone}"), cx)),
                 );

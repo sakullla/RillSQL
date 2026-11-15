@@ -9877,3 +9877,324 @@ fn entering_history_from_any_entry_rereads_local_history_once() {
         assert_eq!(model.drain_pending(), vec![PendingJob::RefreshHistory], "{entry} 排队中不重复");
     }
 }
+
+#[gpui_kit::test]
+fn palette_scope_chips_and_clear_filter_and_scroll_offscreen_selection(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::SharedString;
+
+    // 1. 模型层：范围筛选芯片、> 前缀与一键清空过滤词。
+    let mut model = palette_model();
+    assert!(model.dispatch("command-palette").is_some());
+    assert_eq!(model.effective_palette_scope(), super::model::PaletteScope::All);
+
+    assert!(model.dispatch("palette-scope:objects").is_some());
+    assert_eq!(model.effective_palette_scope(), super::model::PaletteScope::Objects);
+    assert!(
+        model.palette_entries().iter().all(|e| matches!(e.group, "table" | "view")),
+        "表与视图范围只保留对象"
+    );
+
+    assert!(model.dispatch("palette-scope:connections").is_some());
+    assert!(
+        model.palette_entries().iter().all(|e| matches!(e.group, "connection" | "database")),
+        "连接范围只保留连接与库"
+    );
+
+    assert!(model.dispatch("palette-scope:saved").is_some());
+    assert!(model.palette_entries().iter().all(|e| e.group == "saved"), "保存查询范围只保留保存的查询");
+
+    assert!(model.dispatch("palette-scope:commands").is_some());
+    assert!(model.palette_entries().iter().all(|e| e.group == "command"), "命令范围只保留命令");
+
+    model.palette_query = "nonexistent-needle".into();
+    assert!(model.palette_entries().is_empty());
+    assert!(model.dispatch("palette-clear").is_some());
+    assert!(model.palette_query.is_empty());
+    assert_eq!(model.effective_palette_scope(), super::model::PaletteScope::All);
+    assert!(!model.palette_entries().is_empty(), "清空后恢复全部结果");
+
+    // 2. 渲染层：超过 40 条结果时，End / 上键循环选到末项仍能渲染并滚进可视区。
+    let dir = std::env::temp_dir().join(format!("rillsql-palette-scroll-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 640., 680.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+            view.model.connections.status.insert("pg".into(), crate::app::views::connections::LinkStatus::Connected);
+            let tables: Vec<_> = (0..45)
+                .map(|ix| tree_object("pg", "Atlas", "postgres", "shop", "public", &format!("tbl_{ix:02}"), "table"))
+                .collect();
+            let nav_conn = crate::catalog::NavConnection {
+                id: "pg".into(),
+                name: "Atlas".into(),
+                engine: Engine::Postgres,
+                status: crate::catalog::model::ConnStatus::Connected,
+                default_database: Some("shop".into()),
+                databases: Vec::new(),
+                outline_only: false,
+                error: None,
+            };
+            view.query.update(cx, |pane, cx| pane.adopt_navigation(&[nav_conn], tables.clone(), cx));
+            let _ = view.model.set_catalog(&tables, "");
+            view.perform("command-palette", cx);
+        });
+    });
+    let total = cx.update(|cx| view.read(cx).model.palette_entries().len());
+    assert!(total > 50, "总条目应超过旧的 40 条上限：{total}");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("end", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let last_id = SharedString::from(format!("pal-{}", total - 1));
+        let row = window.find(last_id);
+        assert_eq!(row.selected(), Some(true), "末项真实渲染且为选中态");
+        let list_b = window.find("palette-list").bounds();
+        let row_b = row.bounds();
+        assert!(
+            f32::from(row_b.origin.y + row_b.size.height) <= f32::from(list_b.origin.y + list_b.size.height) + 1.5,
+            "End 跳到末项后列表自动滚动到可视区（row_bottom={}, list_bottom={}）",
+            f32::from(row_b.origin.y + row_b.size.height),
+            f32::from(list_b.origin.y + list_b.size.height),
+        );
+    })
+    .unwrap();
+    let offset_y = cx.update(|cx| f32::from(view.read(cx).palette_scroll.offset().y));
+    assert!(offset_y < -1.0, "palette-list 实际发生了纵向滚动：{offset_y}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ddl_viewer_supports_retry_and_opening_in_query_editor_without_executing() {
+    let (mut model, node_id) = pg_orders_model();
+    let mut pg = pg_saved("pg", "dev");
+    pg.saved.database = Some("shop".into());
+    model.connections.rows.push(pg);
+    model.connections.status.insert("pg".into(), crate::app::views::connections::LinkStatus::Connected);
+
+    assert!(model.open_nav_menu(&node_id));
+    assert!(model.dispatch("tree-view-ddl").is_some());
+    let first_epoch = model.ddl_view.as_ref().expect("打开定义查看器").epoch;
+    while model.take_nav_request().is_some() {}
+
+    // 读取失败后可一键重试：重新进入 loading 并入队 NavRequest::Definition。
+    model.definition_loaded(first_epoch, Err("读取定义失败：连接闪断".into()));
+    assert!(model.ddl_view.as_ref().unwrap().error.is_some());
+    assert!(model.dispatch("ddl-retry").is_some());
+    let retried = model.ddl_view.as_ref().expect("仍在定义查看器");
+    assert!(retried.loading);
+    assert!(retried.epoch > first_epoch);
+    let second_epoch = retried.epoch;
+    assert_eq!(
+        model.take_nav_request(),
+        Some(super::nav::NavRequest::Definition(node_id.clone())),
+        "重试重新派发 NavRequest::Definition"
+    );
+
+    // 读取成功后点击“在查询中打开”：关闭查看器、带连接/库打开草稿，绝不自动执行。
+    let ddl = crate::catalog::definition::ObjectDdl {
+        text: "CREATE TABLE public.orders (id bigint PRIMARY KEY);".into(),
+        rebuilt: false,
+        missing: Vec::new(),
+    };
+    model.definition_loaded(second_epoch, Ok(ddl));
+    let before_exec = model.executions;
+    assert!(model.dispatch("ddl-open-query").is_some());
+    assert!(model.ddl_view.is_none(), "转入查询编辑器后关闭定义查看器");
+    let tab = model.active_tab().expect("新建查询工作项");
+    assert_eq!(tab.draft, "CREATE TABLE public.orders (id bigint PRIMARY KEY);");
+    assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+    assert_eq!(model.executions, before_exec, "打开 DDL 到编辑器绝不自动执行");
+}
+
+#[gpui_kit::test]
+fn modals_handle_escape_and_isolate_background_page_navigation(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-modal-keys-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.connections.rows = vec![
+                record_for("c1", "Alpha", Engine::Postgres),
+                record_for("c2", "Beta", Engine::Mysql),
+            ];
+            view.model.connections.selected = Some("c1".into());
+            view.model.shell.page = AppPage::Connections;
+        });
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+
+        // 1. 标签管理层：第一次 Esc 退出内联新建编辑，第二次 Esc 关闭标签管理模态；打开期间下键不动背后的连接选中项。
+        view.update(cx, |view, cx| {
+            view.perform("tags-manage", cx);
+            view.perform("tag-new", cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).model.tag_manager.as_ref().unwrap().editing.is_some());
+        window.press("down", cx);
+        assert_eq!(view.read(cx).model.connections.selected.as_deref(), Some("c1"), "模态期间下键不穿透到连接列表");
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.tag_manager.is_some(), "第一次 Esc 只收起内联编辑");
+        assert!(view.read(cx).model.tag_manager.as_ref().unwrap().editing.is_none());
+        window.focus(&focus, cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.tag_manager.is_none(), "第二次 Esc 关闭标签管理对话框");
+
+        // 2. 快捷键帮助弹层：Esc 直接关闭。
+        view.update(cx, |view, cx| view.perform("help", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).model.shell.help_open);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.shell.help_open, "Esc 关闭快捷键帮助");
+
+        // 3. 删除连接确认层打开时，背景连接列表不响应下键切换，Esc 取消删除确认。
+        view.update(cx, |view, cx| view.perform("conn-delete", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).model.connections.confirm_delete);
+        window.press("down", cx);
+        assert_eq!(view.read(cx).model.connections.selected.as_deref(), Some("c1"), "删除确认期间不改背后选中的连接");
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.connections.confirm_delete);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn settings_steppers_disable_at_min_and_max_bounds_and_sidebar_toggle_shows_selected(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::settings::{FONT_RANGE, OBJECT_PAGE_RANGE, PAGE_SIZE_RANGE, PREVIEW_RANGE};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-bounds-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let initially_open = view.read(cx).model.shell.sidebar_open;
+        if initially_open {
+            assert_eq!(window.find("top-sidebar").selected(), Some(true));
+        } else {
+            assert_ne!(window.find("top-sidebar").selected(), Some(true));
+        }
+        view.update(cx, |view, cx| view.perform("sidebar", cx));
+        window.render_frame(cx);
+        if !initially_open {
+            assert_eq!(window.find("top-sidebar").selected(), Some(true), "顶栏侧栏开关反映当前开合状态");
+        } else {
+            assert_ne!(window.find("top-sidebar").selected(), Some(true), "顶栏侧栏开关反映当前开合状态");
+        }
+
+        // 外观分区：字号下限与上限（禁用的步进按钮不可点、不触发越界写盘；反方向可用且正常步进）。
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            view.perform("settings-section-appearance", cx);
+            view.model.settings.editor_font = FONT_RANGE.0;
+            view.model.settings_save = crate::app::views::settings::SaveState::Idle;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("font-down", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.settings.editor_font, FONT_RANGE.0, "最小字号处减号已禁用，点击不响应");
+        assert_eq!(
+            view.read(cx).model.settings_save,
+            crate::app::views::settings::SaveState::Idle,
+            "禁用按钮不触发无意义的写盘"
+        );
+        window.click("font-up", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.settings.editor_font > FONT_RANGE.0, "加号仍可用");
+
+        view.update(cx, |view, cx| {
+            view.model.settings.editor_font = FONT_RANGE.1;
+            view.model.settings_save = crate::app::views::settings::SaveState::Idle;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("font-up", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.settings.editor_font, FONT_RANGE.1, "最大字号处加号已禁用，点击不响应");
+        assert_eq!(view.read(cx).model.settings_save, crate::app::views::settings::SaveState::Idle);
+
+        // 数据读取分区：分页、预览、对象分页上下限同样禁用对应方向点击。
+        view.update(cx, |view, cx| {
+            view.perform("settings-section-data", cx);
+            view.model.settings.page_size = PAGE_SIZE_RANGE.0;
+            view.model.settings.preview_kb = PREVIEW_RANGE.1;
+            view.model.settings.object_page = OBJECT_PAGE_RANGE.0;
+            view.model.settings_save = crate::app::views::settings::SaveState::Idle;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("page-size-down", cx);
+        window.click("preview-up", cx);
+        window.click("object-page-down", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).model.settings_save,
+            crate::app::views::settings::SaveState::Idle,
+            "边界禁用按钮点击均被拦截，不触发空保存"
+        );
+        window.click("page-size-up", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.settings.page_size > PAGE_SIZE_RANGE.0, "非边界方向正常步进");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn connections_page_keyboard_navigation_and_copy_address(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-conn-keys-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1024., 720.);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let mut r1 = record_for("c1", "Alpha", Engine::Postgres);
+            r1.saved.host = Some("db.alpha.internal".into());
+            r1.saved.port = Some(5432);
+            let r2 = record_for("c2", "Beta", Engine::Mysql);
+            let r3 = record_for("c3", "Gamma", Engine::Redis);
+            view.model.connections.rows = vec![r1, r2, r3];
+            view.model.connections.selected = Some("c1".into());
+            view.model.shell.page = AppPage::Connections;
+        });
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+
+        // 复制连接详情地址。
+        window.click("conn-detail-copy-addr", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.copied, "db.alpha.internal:5432");
+        assert_eq!(view.read(cx).model.notice_key, Some("conn.page.copiedAddress"));
+
+        // 方向键与 Home/End 在连接启动台列表里移动选中项。
+        window.press("down", cx);
+        assert_eq!(view.read(cx).model.connections.selected.as_deref(), Some("c2"));
+        window.press("end", cx);
+        assert_eq!(view.read(cx).model.connections.selected.as_deref(), Some("c3"));
+        window.press("home", cx);
+        assert_eq!(view.read(cx).model.connections.selected.as_deref(), Some("c1"));
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

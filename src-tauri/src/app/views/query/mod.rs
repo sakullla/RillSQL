@@ -107,6 +107,7 @@ pub struct QueryPane {
     density: Density,
     /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
     narrow: bool,
+    viewport_width: f32,
     /// 测试用：消息页/右侧面板最近一次绘制时用的底色 (surface, chrome)。
     #[cfg(test)]
     drawn_colors: Option<(gpui_kit::Hsla, gpui_kit::Hsla)>,
@@ -161,6 +162,7 @@ pub struct QueryPane {
     result_scroll_seen: Option<(Option<usize>, usize)>,
     /// 还没确认进入视口的滚动请求。
     result_scroll_pending: Option<tabs::Reveal>,
+    _target_tab_sub: gpui_kit::Subscription,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -407,6 +409,24 @@ impl QueryPane {
 
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
+        let weak = cx.entity().downgrade();
+        let target_tab_sub = cx.intercept_keystrokes(move |event, _, cx| {
+            if event.keystroke.key != "tab" {
+                return;
+            }
+            if event.keystroke.modifiers.control || event.keystroke.modifiers.alt || event.keystroke.modifiers.platform {
+                return;
+            }
+            let backward = event.keystroke.modifiers.shift;
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            if pane.read(cx).target_picker.anchor.is_none() {
+                return;
+            }
+            cx.stop_propagation();
+            pane.update(cx, |pane, cx| pane.cycle_target_connection(backward, cx));
+        });
         Self {
             desk: Desk::new(),
             metadata_seen: HashSet::new(),
@@ -428,6 +448,7 @@ impl QueryPane {
             row_count: None,
             density: Density::Compact,
             narrow: false,
+            viewport_width: 1200.,
             #[cfg(test)]
             drawn_colors: None,
             pending_completion: false,
@@ -465,6 +486,7 @@ impl QueryPane {
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
+            _target_tab_sub: target_tab_sub,
         }
     }
 
@@ -1748,18 +1770,28 @@ impl QueryPane {
             return;
         }
         self.target_picker.anchor = Some(at);
-        self.target_picker.focus = self.desk.target().map(|target| target.connection_id).filter(|id| !id.is_empty());
+        let current = self.desk.target();
+        let conn_id = current.as_ref().map(|target| target.connection_id.clone()).filter(|id| !id.is_empty());
+        let db_name = current.as_ref().map(|target| target.database.as_str()).unwrap_or("");
+        self.target_picker.focus = conn_id.clone();
+        self.target_picker.db_index = conn_id
+            .as_deref()
+            .and_then(|id| self.target_choices.iter().find(|choice| choice.id == id))
+            .and_then(|choice| choice.databases.iter().position(|db| db == db_name))
+            .unwrap_or(0);
         cx.notify();
     }
 
     pub fn close_target_picker(&mut self, cx: &mut Context<Self>) {
         self.target_picker.anchor = None;
         self.target_picker.search = None;
+        self.target_picker.db_index = 0;
         cx.notify();
     }
 
     pub fn focus_target_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         self.target_picker.focus = Some(id.to_owned());
+        self.target_picker.db_index = 0;
         cx.notify();
     }
 
@@ -1784,18 +1816,77 @@ impl QueryPane {
         self.close_target_picker(cx);
     }
 
-    /// 回车：选中左栏当前连接下、搜索命中的第一个库。
-    pub fn pick_first_target(&mut self, cx: &mut Context<Self>) {
+    /// 上下方向键：当前连接已打开且有库时在右栏库列表里循环移动；未打开连接时在左栏连接列表里移动。
+    pub fn step_target_picker(&mut self, delta: isize, cx: &mut Context<Self>) {
         let filter = self.target_filter(cx);
-        let focus = self.target_picker.focus.clone().or_else(|| self.desk.target().map(|target| target.connection_id));
-        let pick = self
-            .target_choices
-            .iter()
-            .filter(|choice| choice.connected && (focus.as_deref() == Some(choice.id.as_str()) || focus.is_none()))
-            .find_map(|choice| choice.databases.iter().find(|database| filter.is_empty() || database.to_lowercase().contains(&filter) || choice.name.to_lowercase().contains(&filter)).map(|database| (choice.id.clone(), database.clone())));
-        if let Some((connection, database)) = pick {
-            self.pick_target(&connection, &database, cx);
+        let current_conn = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+        let focus = target::resolved_focus(&self.target_picker, &self.target_choices, &current_conn, &filter);
+        if let Some(choice) = focus.as_deref().and_then(|id| self.target_choices.iter().find(|c| c.id == id)) {
+            if choice.connected {
+                let dbs = target::filtered_databases(choice, &filter);
+                if !dbs.is_empty() {
+                    let len = dbs.len();
+                    let cur = self.target_picker.db_index.min(len - 1);
+                    let next = if delta >= 0 { (cur + 1) % len } else if cur == 0 { len - 1 } else { cur - 1 };
+                    self.target_picker.focus = Some(choice.id.clone());
+                    self.target_picker.db_index = next;
+                    // 第 0 个子元素是库列表标题，库行从下标 1 开始。
+                    self.target_picker.db_scroll.scroll_to_item(if next == 0 { 0 } else { next + 1 });
+                    cx.notify();
+                    return;
+                }
+            }
         }
+        self.cycle_target_connection(delta < 0, cx);
+    }
+
+    /// Tab / Shift+Tab：在左栏筛选命中的连接之间切换焦点，并把右栏库高亮重置到首项。
+    pub fn cycle_target_connection(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let filter = self.target_filter(cx);
+        let shown = target::filtered_choices(&self.target_choices, &filter);
+        if shown.is_empty() {
+            return;
+        }
+        let current_conn = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+        let focus = target::resolved_focus(&self.target_picker, &self.target_choices, &current_conn, &filter);
+        let pos = focus
+            .as_deref()
+            .and_then(|id| shown.iter().position(|c| c.id == id))
+            .unwrap_or(0);
+        let len = shown.len();
+        let next = if backward {
+            if pos == 0 { len - 1 } else { pos - 1 }
+        } else {
+            (pos + 1) % len
+        };
+        let next_id = shown[next].id.clone();
+        self.target_picker.focus = Some(next_id);
+        self.target_picker.db_index = 0;
+        self.target_picker.conn_scroll.scroll_to_item(if next == 0 { 0 } else { next + 1 });
+        cx.notify();
+    }
+
+    /// 回车：选中右栏当前高亮的库；若所选连接尚未打开则触发按需连接。
+    pub fn pick_highlighted_target(&mut self, cx: &mut Context<Self>) {
+        let filter = self.target_filter(cx);
+        let current_conn = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+        let focus = target::resolved_focus(&self.target_picker, &self.target_choices, &current_conn, &filter);
+        let Some(choice) = focus.as_deref().and_then(|id| self.target_choices.iter().find(|c| c.id == id)).cloned() else {
+            return;
+        };
+        if !choice.connected {
+            self.connect_target(&choice.id, cx);
+            return;
+        }
+        let dbs: Vec<String> = target::filtered_databases(&choice, &filter).into_iter().cloned().collect();
+        if let Some(db) = dbs.get(self.target_picker.db_index.min(dbs.len().saturating_sub(1))) {
+            self.pick_target(&choice.id, db, cx);
+        }
+    }
+
+    /// 兼容入口：转调当前高亮目标选择。
+    pub fn pick_first_target(&mut self, cx: &mut Context<Self>) {
+        self.pick_highlighted_target(cx);
     }
 
     fn target_filter(&self, cx: &App) -> String {
@@ -1809,7 +1900,13 @@ impl QueryPane {
         }
         let locale = self.locale;
         let state = cx.new(|cx| InputState::new(window, cx).placeholder(i18n::text(locale, "ui.query.targetSearch")));
-        cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+        cx.subscribe(&state, |pane, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                pane.target_picker.db_index = 0;
+            }
+            cx.notify();
+        })
+        .detach();
         let handle = gpui_kit::Focusable::focus_handle(state.read(cx), cx);
         window.focus(&handle, cx);
         self.target_picker.search = Some(state);
@@ -2308,7 +2405,9 @@ impl Render for QueryPane {
         self.sync_grid(cx);
         self.take_focus(window, cx);
         self.ensure_target_search(window, cx);
-        self.narrow = f32::from(window.viewport_size().width) < side::NARROW_WIDTH;
+        let vw = f32::from(window.viewport_size().width);
+        self.viewport_width = vw;
+        self.narrow = vw < side::NARROW_WIDTH;
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
         let mono = cx.theme().mono_font_family.clone();
@@ -2421,7 +2520,17 @@ impl QueryPane {
             .unwrap_or_default();
         let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, &connection_id, &connection_name, &database, &engine, self.locale, metrics, p, entity)];
         let filter = self.target_filter(cx);
-        if let Some(popover) = target::popover(&self.target_picker, &self.target_choices, (&connection_id, &database), &filter, self.locale, metrics, p, entity) {
+        if let Some(popover) = target::popover(
+            &self.target_picker,
+            &self.target_choices,
+            (&connection_id, &database),
+            &filter,
+            self.viewport_width,
+            self.locale,
+            metrics,
+            p,
+            entity,
+        ) {
             items.push(popover);
         }
         items
@@ -5269,4 +5378,87 @@ mod tests {
             assert!(window.find("query-pinned-7").visible(), "其余页签不受影响");
         })
         .unwrap();
-    }}
+    }
+
+    /// 目标选择弹层：640 窄窗下宽度自适应不越界，↑/↓ 选库、Tab 切换连接、Enter 绑定高亮目标。
+    #[gpui_kit::test]
+    fn target_picker_supports_keyboard_navigation_and_clamps_to_narrow_640_viewport(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 640., 720.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.set_links(vec![
+                    desk::OpenLink {
+                        id: "pg".into(),
+                        name: "Atlas".into(),
+                        engine: "postgres".into(),
+                        databases: vec!["postgres".into(), "analytics".into(), "billing".into()],
+                        environment: String::new(),
+                    },
+                    desk::OpenLink {
+                        id: "my".into(),
+                        name: "Hermes".into(),
+                        engine: "mysql".into(),
+                        databases: vec!["shop".into(), "warehouse".into()],
+                        environment: String::new(),
+                    },
+                ]);
+                pane.target_choices = vec![
+                    super::target::TargetChoice {
+                        id: "pg".into(),
+                        name: "Atlas".into(),
+                        engine: "postgres".into(),
+                        connected: true,
+                        databases: vec!["postgres".into(), "analytics".into(), "billing".into()],
+                    },
+                    super::target::TargetChoice {
+                        id: "my".into(),
+                        name: "Hermes".into(),
+                        engine: "mysql".into(),
+                        connected: true,
+                        databases: vec!["shop".into(), "warehouse".into()],
+                    },
+                ];
+                pane.toggle_target_picker(gpui_kit::point(px(580.), px(36.)), cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let pop_bounds = window.find("query-target-popover").bounds();
+            assert!(
+                f32::from(pop_bounds.size.width) <= 620. && f32::from(pop_bounds.origin.x + pop_bounds.size.width) <= 640.5,
+                "640 窄窗下目标选择弹层不越界：{pop_bounds:?}"
+            );
+            assert_eq!(window.find("query-target-db-pg-postgres").selected(), Some(true));
+
+            // 下键切到第二个库 analytics。
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-target-db-pg-analytics").selected(), Some(true));
+
+            // Tab 切到下一条连接 Hermes，右栏重置到首库 shop；再按一次下键选中 warehouse 并回车绑定。
+            window.press("tab", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-target-conn-my").selected(), Some(true));
+            assert_eq!(window.find("query-target-db-my-shop").selected(), Some(true));
+
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-target-db-my-warehouse").selected(), Some(true));
+
+            window.press("enter", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-target-popover").is_none(), "回车选定后关闭弹层");
+            let chosen = pane.read(cx).desk.target().expect("已绑定新目标");
+            assert_eq!(chosen.connection_id, "my");
+            assert_eq!(chosen.database, "warehouse");
+            let pending_targets = pane.update(cx, |pane, _| std::mem::take(&mut pane.targets));
+            assert!(
+                pending_targets
+                    .iter()
+                    .any(|req| req.connection_id.as_deref() == Some("my") && req.database.as_deref() == Some("warehouse")),
+                "向外壳同步连接 my 与高亮库 warehouse"
+            );
+        })
+        .unwrap();
+    }
+}

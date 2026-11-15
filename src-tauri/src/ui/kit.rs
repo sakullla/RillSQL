@@ -1401,6 +1401,12 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
             state.update(cx, |state, cx| state.focus(window, cx));
         }
     }
+
+    pub fn is_focused(&self, key: K, window: &Window, cx: &App) -> bool {
+        self.inputs
+            .get(&key)
+            .is_some_and(|state| gpui_kit::Focusable::focus_handle(state.read(cx), cx).is_focused(window))
+    }
 }
 
 /// 文本框外观：小号、带 id。id 让测试与无障碍能点到它。

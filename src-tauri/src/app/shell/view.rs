@@ -115,6 +115,15 @@ pub struct Workbench {
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
     /// 对象树列表的滚动；跳转定义后把选中行滚进可见区。
     pub(super) explorer_scroll: gpui_kit::ScrollHandle,
+    /// 命令面板列表滚动：上下/Home/End 导航与循环越界时把选中行滚进可视区。
+    pub(super) palette_scroll: gpui_kit::ScrollHandle,
+    pub(super) palette_scroll_seen: Option<(usize, String, super::model::PaletteScope)>,
+    /// 历史/保存查询列表滚动：方向键移动时跟随选中卡片。
+    pub(super) history_scroll: gpui_kit::ScrollHandle,
+    /// 连接启动台“全部连接”列表滚动：方向键移动时跟随选中行。
+    pub(super) launcher_scroll: gpui_kit::ScrollHandle,
+    pub(super) danger_focused_epoch: Option<u64>,
+    pub(super) history_rename_focused: bool,
     /// 工作项页签条的横向滚动。跨帧保存偏移，不能每帧新建句柄；
     /// Ctrl+Tab、新建或关闭之后要把当前页签滚进可视区。
     pub(super) tab_scroll: gpui_kit::ScrollHandle,
@@ -212,6 +221,7 @@ impl Workbench {
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
         let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
+        let palette_owner = cx.entity().downgrade();
         let child_subscriptions = vec![
             cx.observe(&query, |_, _, cx| cx.notify()),
             cx.observe(&table, |_, _, cx| cx.notify()),
@@ -221,6 +231,30 @@ impl Workbench {
             cx.observe(&diagram, |_, _, cx| cx.notify()),
             cx.observe(&redis, |_, _, cx| cx.notify()),
             cx.observe(&mongo, |_, _, cx| cx.notify()),
+            // 命令面板打开且搜索框为空时，Input 的 Home/End 动作会先于 capture_key_down 抢走按键；
+            // 在拦截阶段转成首项/末项跳转，有输入文本时则保留原生光标跳转。
+            cx.intercept_keystrokes(move |event, _window, cx| {
+                let key = event.keystroke.key.as_str();
+                if !matches!(key, "home" | "end") || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(owner) = palette_owner.upgrade() else {
+                    return;
+                };
+                let should_handle = {
+                    let this = owner.read(cx);
+                    this.model.shell.palette_open && this.model.palette_query.is_empty()
+                };
+                if !should_handle {
+                    return;
+                }
+                cx.stop_propagation();
+                owner.update(cx, |this, cx| {
+                    let nav = if key == "home" { super::menus::NavKey::Home } else { super::menus::NavKey::End };
+                    let _ = this.model.key(nav);
+                    cx.notify();
+                });
+            }),
         ];
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
@@ -289,6 +323,12 @@ impl Workbench {
             nav_gate: metadata_gate,
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
+            palette_scroll: gpui_kit::ScrollHandle::new(),
+            palette_scroll_seen: None,
+            history_scroll: gpui_kit::ScrollHandle::new(),
+            launcher_scroll: gpui_kit::ScrollHandle::new(),
+            danger_focused_epoch: None,
+            history_rename_focused: false,
             tab_scroll: gpui_kit::ScrollHandle::new(),
             tab_scroll_seen: None,
             tab_scroll_pending: None,
@@ -551,9 +591,11 @@ impl Workbench {
             }
             return;
         };
-        // 新建查询后光标直接落在编辑器里：点完“新建查询”就能打字。
-        if matches!(effect, Effect::FocusEditor) || (id == "new-query" && self.model.tool == super::model::WorkTool::Query) {
-            if id == "new-query" {
+        // 新建查询或从定义查看器转入查询后光标直接落在编辑器里：点完就能编辑。
+        if matches!(effect, Effect::FocusEditor)
+            || (matches!(id, "new-query" | "ddl-open-query") && self.model.tool == super::model::WorkTool::Query)
+        {
+            if matches!(id, "new-query" | "ddl-open-query") {
                 self.model.shell.focus = crate::app::FocusTarget::Editor;
             }
             self.adopt_shell(Effect::None, cx);
@@ -564,6 +606,7 @@ impl Workbench {
         } else {
             self.apply_effect(effect, cx);
         }
+        self.flush_clipboard(cx);
         // 设置类命令走带反馈的写盘；其余命令沿用静默写盘。
         if crate::app::views::settings::is_settings_command(id) {
             self.persist_settings(cx);

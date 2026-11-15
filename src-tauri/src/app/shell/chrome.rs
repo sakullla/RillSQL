@@ -15,7 +15,9 @@ use gpui_kit::{
 
 use crate::app::views::connections::{engines, LinkStatus};
 use crate::app::views::history::{HistorySection, ListPhase};
-use crate::app::views::settings::{SaveState, SettingsSection};
+use crate::app::views::settings::{
+    SaveState, SettingsSection, FONT_RANGE, OBJECT_PAGE_RANGE, PAGE_SIZE_RANGE, PREVIEW_RANGE,
+};
 use crate::app::{AppPage, FocusTarget, ThemePreference};
 use crate::catalog::hierarchy::{NavKind, NavRow};
 use crate::catalog::model::ObjectKind;
@@ -27,7 +29,7 @@ use crate::ui::tabs;
 use gpui_kit::base::FocusTrapElement as _;
 
 use super::conn_modal;
-use super::model::{ConnFilterMenu, DraftField, WorkItemKind, WorkTool};
+use super::model::{ConnFilterMenu, DraftField, PaletteScope, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
 use crate::ui::kit::stack_frame;
@@ -137,6 +139,13 @@ impl Workbench {
         let help_open = self.model.shell.help_open;
         if !palette_open {
             self.palette_focused = false;
+            self.palette_scroll_seen = None;
+        }
+        if self.model.danger.is_none() {
+            self.danger_focused_epoch = None;
+        }
+        if page != AppPage::History || !self.model.history.rename_open {
+            self.history_rename_focused = false;
         }
         let sidebar_visible = self.model.shell.sidebar_open && matches!(page, AppPage::Workspace | AppPage::Structure | AppPage::Compare | AppPage::Diagram);
         let overlay_sidebar = sidebar_visible && frame.sidebar_overlay;
@@ -280,7 +289,10 @@ impl Workbench {
     fn overlay_key(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         // 浮层关闭后键盘要回到打开它的地方，而不是留在已经消失的弹层上。
-        let overlay_was_open = self.model.menu.is_some() || self.model.shell.palette_open;
+        let overlay_was_open = self.model.menu.is_some()
+            || self.model.shell.palette_open
+            || self.model.shell.help_open
+            || self.model.tag_manager.is_some();
         // 连接模态打开时，Esc 关闭、Tab 在模态里循环、回车等于当前页脚动作。
         if self.model.conn_modal.open && self.model.menu.is_none() && !self.model.shell.palette_open && self.model.danger.is_none() {
             if key == "escape" {
@@ -353,21 +365,29 @@ impl Workbench {
             cx.notify();
             return;
         }
-        // 清空历史 / 删除保存查询的确认层开着时，页面级键一律让路：确认层自己不管键盘焦点，
-        // 键会落到侧栏对象树或历史列表上，那样"确认"的就会是另一个对象。
-        // 这一条放在所有页面级分支之前，侧栏与列表两条路径共用同一个判断。
+        // 确认层/对话框开着时，页面级键一律让路：不能落到侧栏对象树、连接列表或历史列表上，
+        // 那样"确认"或"打开"的就会是背景里的另一个对象。Esc 交给下面的浮层收尾处理。
+        let modal_blocks_page = self.model.history.confirm_open()
+            || self.model.connections.confirm_delete
+            || self.model.group_delete.is_some()
+            || self.model.group_prompt.is_some()
+            || self.model.tag_manager.is_some()
+            || self.model.shell.help_open
+            || self.model.danger.is_some()
+            || self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only);
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
-            && self.model.history.confirm_open()
+            && modal_blocks_page
+            && key != "escape"
         {
-            // Esc 已在上面按确认层取消；其余键交给确认条自己的按钮。
             return;
         }
         // 侧栏有焦点时方向键属于对象树：上下移动、左右展开/折叠、回车打开。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
+            && !modal_blocks_page
             && self.model.shell.focus == FocusTarget::Sidebar
             && self.model.shell.sidebar_open
         {
@@ -389,17 +409,50 @@ impl Workbench {
                 return;
             }
         }
-        // 历史页的方向键属于列表：上下/Home/End 在筛选后的可见行里选，
-        // 回车只载入编辑器（不执行），Delete 删除当前条目（与条目右键同一条命令）。
-        // 有键位绑定时 Delete 作为动作到 perform，没有时在这里直接落到同一条命令。
-        // 清空历史 / 删除保存查询的确认层开着时上面已经统一让路，这里不再重复判断。
+        // 连接页的方向键属于连接启动台列表：上下/Home/End 在筛选后的可见连接里移动，回车打开/连接。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
+            && !modal_blocks_page
+            && self.model.shell.page == AppPage::Connections
+            && self.model.shell.focus != FocusTarget::Sidebar
+        {
+            let filter_focused = self.fields.is_focused(DraftField::Filter, window, cx);
+            let launcher_btn_focused = self.conn_launcher_focus.is_focused(window);
+            let nav = match key {
+                "up" => Some(super::menus::NavKey::ArrowUp),
+                "down" => Some(super::menus::NavKey::ArrowDown),
+                "home" if !filter_focused => Some(super::menus::NavKey::Home),
+                "end" if !filter_focused => Some(super::menus::NavKey::End),
+                "enter" if !launcher_btn_focused => Some(super::menus::NavKey::Enter),
+                _ => None,
+            };
+            if let Some(nav) = nav {
+                if let Some(command) = self.model.connections_key(nav) {
+                    self.perform(&command, cx);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        // 历史页的方向键属于列表：上下/Home/End 在筛选后的可见行里选，
+        // 回车只载入编辑器（不执行），Delete 删除当前条目（与条目右键同一条命令）。
+        // 有键位绑定时 Delete 作为动作到 perform，没有时在这里直接落到同一条命令。
+        if self.model.menu.is_none()
+            && self.model.close_prompt.is_none()
+            && !self.model.shell.palette_open
+            && !modal_blocks_page
             && self.model.shell.page == AppPage::History
             && self.model.shell.focus != FocusTarget::Sidebar
         {
-            if key == "delete" {
+            let rename_focused = self.fields.is_focused(DraftField::RenameName, window, cx);
+            let save_focused = self.fields.is_focused(DraftField::SaveName, window, cx);
+            let search_focused = self.fields.is_focused(DraftField::HistorySearch, window, cx);
+            let any_input = rename_focused || save_focused || search_focused;
+            if rename_focused || save_focused {
+                return;
+            }
+            if key == "delete" && !any_input {
                 if let Some(command) = self.model.history.delete_command() {
                     self.perform(command, cx);
                     cx.notify();
@@ -409,8 +462,8 @@ impl Workbench {
             let nav = match key {
                 "up" => Some(super::menus::NavKey::ArrowUp),
                 "down" => Some(super::menus::NavKey::ArrowDown),
-                "home" => Some(super::menus::NavKey::Home),
-                "end" => Some(super::menus::NavKey::End),
+                "home" if !any_input => Some(super::menus::NavKey::Home),
+                "end" if !any_input => Some(super::menus::NavKey::End),
                 "enter" => Some(super::menus::NavKey::Enter),
                 _ => None,
             };
@@ -423,7 +476,12 @@ impl Workbench {
             }
         }
         let Some(nav) = super::view::nav_key(key) else { return };
-        if self.model.menu.is_none() && self.model.close_prompt.is_none() && !self.model.shell.palette_open {
+        if self.model.menu.is_none()
+            && self.model.close_prompt.is_none()
+            && !self.model.shell.palette_open
+            && !self.model.shell.help_open
+            && self.model.tag_manager.is_none()
+        {
             return;
         }
         if matches!(nav, super::menus::NavKey::Enter) {
@@ -465,7 +523,12 @@ impl Workbench {
 
     /// 弹层关闭后把真实键盘焦点送回触发区域；模型里的 focus 只是可读状态。
     fn restore_if_closed(&mut self, was_open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if was_open && self.model.menu.is_none() && !self.model.shell.palette_open {
+        if was_open
+            && self.model.menu.is_none()
+            && !self.model.shell.palette_open
+            && !self.model.shell.help_open
+            && self.model.tag_manager.is_none()
+        {
             self.restore_focus(window, cx);
         }
     }
@@ -506,7 +569,9 @@ impl Workbench {
             .items_center()
             .gap(px(8.))
             .child(controls(
-                kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx)).into_any_element(),
+                kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx))
+                    .selected(self.model.shell.sidebar_open)
+                    .into_any_element(),
             ))
             .child(
                 div()
@@ -825,17 +890,31 @@ impl Workbench {
             }
             ExplorerItem::NoMatch => {
                 let m = self.metrics();
+                let has_object_filter = !self.model.object_filter.trim().is_empty();
                 div()
                     .id("explorer-search-empty")
                     .test_support()
                     .flex_none()
-                    .h(px(m.tree_row_h))
+                    .h(px(m.tree_row_h + 4.))
                     .px(px(16.))
                     .flex()
                     .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_faint)
-                    .child(self.t("ui.explorer.noMatch"))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(self.t("ui.explorer.noMatch")))
+                    .when(has_object_filter, |this| {
+                        this.child(
+                            kit::tool_button(
+                                "explorer-clear-filter",
+                                Some(IconName::X),
+                                self.t("connections.filter.clear"),
+                                act("explorer-clear-filter", cx),
+                            )
+                            .xsmall(),
+                        )
+                    })
                     .into_any_element()
             }
         }
@@ -1555,6 +1634,7 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(label.clone())
+                    .tooltip_text(self.t("ui.status.switchTargetHint"))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1562,6 +1642,7 @@ impl Workbench {
                     .max_w(px(target_max))
                     .rounded(px(Radius::CONTROL))
                     .px(px(4.))
+                    .hover(|style| style.bg(p.hover).text_color(p.text))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w(px(0.)).truncate().child(label))
                     .children(self.env_pill(&env, &p))
@@ -1575,11 +1656,13 @@ impl Workbench {
                 .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(self.t("ui.status.noTarget"))
+                .tooltip_text(self.t("ui.status.switchTargetHint"))
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .rounded(px(Radius::CONTROL))
                 .px(px(4.))
+                .hover(|style| style.bg(p.hover).text_color(p.text))
                 .child(kit::status_dot(p.line_strong))
                 .child(self.t("ui.status.noTarget"))
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -1637,11 +1720,13 @@ impl Workbench {
                         .test_support()
                         .role(gpui_kit::Role::Button)
                         .aria_label(self.t("query.status.running"))
+                        .tooltip_text(self.t("ui.status.jobsHint"))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .rounded(px(Radius::CONTROL))
                         .px(px(4.))
+                        .hover(|style| style.bg(p.hover).text_color(p.text))
                         .child(Spinner::new().xsmall().color(p.accent))
                         .child(self.t("query.status.running"))
                         .on_click(act("status-jobs", cx)),
@@ -1685,12 +1770,14 @@ impl Workbench {
                         .test_support()
                         .role(gpui_kit::Role::Button)
                         .aria_label(self.t("ui.settings.saveFailed"))
+                        .tooltip_text(self.t("ui.settings.saveFailedHint"))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .rounded(px(Radius::CONTROL))
                         .px(px(6.))
                         .text_color(p.danger)
+                        .hover(|style| style.bg(p.danger_soft))
                         .child(kit::icon(IconName::CircleAlert, 12., p.danger))
                         .child(self.t("ui.settings.saveFailed"))
                         .on_click(act("settings", cx)),
@@ -3062,6 +3149,7 @@ impl Workbench {
         let mono = cx.theme().mono_font_family.clone();
         let mut list = div()
             .id("history-list")
+            .track_scroll(&self.history_scroll)
             .flex()
             .flex_col()
             .gap(px(6.))
@@ -3071,6 +3159,8 @@ impl Workbench {
             .overflow_y_scroll()
             .px(px(m.page_pad))
             .pb(px(m.page_pad_y));
+        let mut child_count = 0usize;
+        let mut selected_child: Option<usize> = None;
         let phase = self.model.history.phase_for(section);
         // 读取失败与空态不是一回事：失败给原因和“重新读取”，旧行仍留在下面可读。
         if let Some(key) = self.model.history.failure_key {
@@ -3084,6 +3174,7 @@ impl Workbench {
                     &p,
                 )),
             );
+            child_count += 1;
         }
         if section == HistorySection::Runs {
             list = stack_frame(|| {
@@ -3111,13 +3202,18 @@ impl Workbench {
                     .into_any_element(),
                     ListPhase::Failed | ListPhase::Rows => div().into_any_element(),
                 });
+                child_count += 1;
             } else if self.model.history.loading {
                 // 刷新时旧行继续显示，只在列表顶部说明还在读，不整块换成骨架。
                 list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loading"), &m, &p)));
+                child_count += 1;
             }
             for entry in runs {
                 let id = entry.id.clone();
                 let selected = self.model.history.selected_run.as_deref() == Some(id.as_str());
+                if selected {
+                    selected_child = Some(child_count);
+                }
                 let ok = entry.status == "ok" || entry.status == "success" || entry.status == "done";
                 let elapsed = entry.elapsed_ms.map(|ms| if ms >= 1000 { format!("{:.1} s", ms as f64 / 1000.) } else { format!("{ms} ms") }).unwrap_or_default();
                 let when = entry.started_at.replace('T', " ").chars().take(19).collect::<String>();
@@ -3209,6 +3305,7 @@ impl Workbench {
                         .into_any_element()
                 });
                 list = list.child(row);
+                child_count += 1;
             }
             list
             });
@@ -3237,12 +3334,17 @@ impl Workbench {
                     .into_any_element(),
                     ListPhase::Failed | ListPhase::Rows => div().into_any_element(),
                 });
+                child_count += 1;
             } else if self.model.history.loading {
                 list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loadingSaved"), &m, &p)));
+                child_count += 1;
             }
             for item in saved {
                 let id = item.id.clone();
                 let selected = self.model.history.selected_saved.as_deref() == Some(id.as_str());
+                if selected {
+                    selected_child = Some(child_count);
+                }
                 let select = id.clone();
                 let copy = id.clone();
                 let load = id.clone();
@@ -3331,9 +3433,15 @@ impl Workbench {
                         .into_any_element()
                 });
                 list = list.child(row);
+                child_count += 1;
             }
             list
             });
+        }
+        if std::mem::take(&mut self.model.history_reveal) {
+            if let Some(child_ix) = selected_child {
+                self.history_scroll.scroll_to_item(child_ix);
+            }
         }
 
         // 键盘可用性写在列表末尾：方向键选行、回车载入、Delete 删除，与右键菜单同一批命令。
@@ -3381,20 +3489,50 @@ impl Workbench {
                     .child(kit::tool_button("history-refresh", Some(IconName::RefreshCw), self.t("redis.tab.refresh"), act("history-refresh", cx)))
             })
             .when(section == HistorySection::Saved && can_save, |this| {
-                this.child(div().w(px(220.)).child(save_name)).child(kit::primary_button("history-save-named", Some(IconName::Save), self.t("history.savedPanel.save"), act("history-save-named", cx)))
+                this.child(
+                    div()
+                        .w(px(220.))
+                        .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "enter" {
+                                cx.stop_propagation();
+                                this.perform("history-save-named", cx);
+                            }
+                        }))
+                        .child(save_name),
+                )
+                .child(kit::primary_button("history-save-named", Some(IconName::Save), self.t("history.savedPanel.save"), act("history-save-named", cx)))
             });
         let rename_bar = if section == HistorySection::Saved && self.model.history.rename_open {
+            if !self.history_rename_focused {
+                self.history_rename_focused = true;
+                self.fields.focus(DraftField::RenameName, window, cx);
+            }
             div()
+                .id("history-rename-bar")
+                .test_support()
                 .px(px(m.page_pad))
                 .pb(px(10.))
                 .flex()
                 .items_center()
                 .gap(px(8.))
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| match event.keystroke.key.as_str() {
+                    "enter" => {
+                        cx.stop_propagation();
+                        this.perform("history-rename-confirm", cx);
+                    }
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.perform("history-rename-cancel", cx);
+                        this.restore_focus(window, cx);
+                    }
+                    _ => {}
+                }))
                 .child(div().w(px(260.)).child(rename_input))
                 .child(kit::primary_button("history-rename-confirm", Some(IconName::Check), self.t("history.page.renameSave"), act("history-rename-confirm", cx)))
                 .child(kit::secondary_button("history-rename-cancel", Some(IconName::X), self.t("common.cancel"), act("history-rename-cancel", cx)))
                 .into_any_element()
         } else {
+            self.history_rename_focused = false;
             div().into_any_element()
         };
 
@@ -3621,14 +3759,22 @@ impl Workbench {
                 .collect::<Vec<_>>();
             kit::segmented_sized(built, &Palette::of(cx), m.control_h)
         };
-        let stepper = |this: &Self, id: &'static str, value: String, cx: &mut Context<Self>| {
+        let stepper = |this: &Self, id: &'static str, value: String, at_min: bool, at_max: bool, cx: &mut Context<Self>| {
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(kit::icon_button(SharedString::from(format!("{id}-down")), IconName::Minus, this.t("ui.settings.smaller"), act(format!("{id}-down"), cx)).outline())
+                .child(
+                    kit::icon_button(SharedString::from(format!("{id}-down")), IconName::Minus, this.t("ui.settings.smaller"), act(format!("{id}-down"), cx))
+                        .outline()
+                        .disabled(at_min),
+                )
                 .child(div().min_w(px(56.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(value)))
-                .child(kit::icon_button(SharedString::from(format!("{id}-up")), IconName::Plus, this.t("ui.settings.increase"), act(format!("{id}-up"), cx)).outline())
+                .child(
+                    kit::icon_button(SharedString::from(format!("{id}-up")), IconName::Plus, this.t("ui.settings.increase"), act(format!("{id}-up"), cx))
+                        .outline()
+                        .disabled(at_max),
+                )
         };
         // 一组设置的卡片：标题 + 逐行“名称/说明 + 控件”。行内换行，
         // 窄窗口里控件掉到下一行而不是把名称挤没。
@@ -3701,9 +3847,17 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(kit::icon_button("font-down", IconName::Minus, self.t("ui.settings.smaller"), act("font-down", cx)).outline())
+                    .child(
+                        kit::icon_button("font-down", IconName::Minus, self.t("ui.settings.smaller"), act("font-down", cx))
+                            .outline()
+                            .disabled(s.editor_font <= FONT_RANGE.0),
+                    )
                     .child(div().w(px(44.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(format!("{} px", s.editor_font))))
-                    .child(kit::icon_button("font-up", IconName::Plus, self.t("ui.settings.larger"), act("font-up", cx)).outline());
+                    .child(
+                        kit::icon_button("font-up", IconName::Plus, self.t("ui.settings.larger"), act("font-up", cx))
+                            .outline()
+                            .disabled(s.editor_font >= FONT_RANGE.1),
+                    );
                 let editor_theme = div()
                     .flex()
                     .items_center()
@@ -3750,9 +3904,30 @@ impl Workbench {
                     &[("null-NULL", "ui.settings.nullWord", s.null_copy == "NULL"), ("null-empty", "ui.settings.nullEmpty", s.null_copy == "empty"), ("null-N", "ui.settings.nullN", s.null_copy == "N")],
                     cx,
                 );
-                let page_size = stepper(self, "page-size", s.page_size.to_string(), cx);
-                let preview = stepper(self, "preview", format!("{} KB", s.preview_kb), cx);
-                let object_page = stepper(self, "object-page", s.object_page.to_string(), cx);
+                let page_size = stepper(
+                    self,
+                    "page-size",
+                    s.page_size.to_string(),
+                    s.page_size <= PAGE_SIZE_RANGE.0,
+                    s.page_size >= PAGE_SIZE_RANGE.1,
+                    cx,
+                );
+                let preview = stepper(
+                    self,
+                    "preview",
+                    format!("{} KB", s.preview_kb),
+                    s.preview_kb <= PREVIEW_RANGE.0,
+                    s.preview_kb >= PREVIEW_RANGE.1,
+                    cx,
+                );
+                let object_page = stepper(
+                    self,
+                    "object-page",
+                    s.object_page.to_string(),
+                    s.object_page <= OBJECT_PAGE_RANGE.0,
+                    s.object_page >= OBJECT_PAGE_RANGE.1,
+                    cx,
+                );
                 div()
                 .flex()
                 .flex_col()
@@ -3851,7 +4026,7 @@ impl Workbench {
                         .rounded(px(Radius::CONTROL))
                         .text_size(px(TypeScale::SM))
                         .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent).font_weight(FontWeight::MEDIUM))
-                        .when(!selected, |this| this.text_color(p.text_muted))
+                        .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
                         .child(label)
                         .on_click(click),
                 );
@@ -4144,6 +4319,7 @@ impl Workbench {
         let p = Palette::of(cx);
         let m = self.metrics();
         let help = self.model.shell.help_open && !self.model.shell.palette_open;
+        let max_panel_h = (self.model.viewport_height.max(480) as f32 - 104.).clamp(360., 560.);
         let mut panel = div()
             .id("palette")
             .test_support()
@@ -4154,7 +4330,7 @@ impl Workbench {
             .occlude()
             .w_full()
             .max_w(px(620.))
-            .max_h(px(480.))
+            .max_h(px(max_panel_h))
             .flex()
             .flex_col()
             .bg(p.raised)
@@ -4163,6 +4339,21 @@ impl Workbench {
             .rounded(px(Radius::PANEL))
             .shadow_lg()
             .overflow_hidden()
+            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                if this.model.shell.palette_open {
+                    let query_empty = this.model.palette_query.is_empty();
+                    let intercept = matches!(key, "up" | "down" | "enter" | "escape")
+                        || (query_empty && matches!(key, "home" | "end"));
+                    if intercept {
+                        cx.stop_propagation();
+                        this.overlay_key(event, window, cx);
+                    }
+                } else if this.model.shell.help_open && key == "escape" {
+                    cx.stop_propagation();
+                    this.overlay_key(event, window, cx);
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if help {
             panel = stack_frame(|| {
@@ -4213,34 +4404,66 @@ impl Workbench {
                 self.palette_focused = true;
                 self.fields.focus(DraftField::PaletteQuery, window, cx);
             }
+            let active_scope = self.model.effective_palette_scope();
+            let mut scopes = div()
+                .id("palette-scopes")
+                .test_support()
+                .pt(px(8.))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.));
+            for scope in PaletteScope::ALL {
+                let on = scope == active_scope;
+                let cmd = scope.command();
+                let label = self.t(scope.label_key());
+                scopes = scopes.child(
+                    kit::interactive_states(div().id(SharedString::from(cmd)), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label.clone())
+                        .aria_selected(on)
+                        .h(px(22.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .border_1()
+                        .text_size(px(TypeScale::XS))
+                        .when(on, |this| {
+                            this.border_color(p.accent)
+                                .bg(p.accent_soft)
+                                .text_color(p.accent_text)
+                                .font_weight(FontWeight::MEDIUM)
+                        })
+                        .when(!on, |this| {
+                            this.border_color(p.line)
+                                .text_color(p.text_muted)
+                                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
+                        })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.perform(cmd, cx);
+                            this.fields.focus(DraftField::PaletteQuery, window, cx);
+                        })),
+                );
+            }
             let entries = self.model.palette_entries();
-            let mut list = div().id("palette-list").flex().flex_col().overflow_y_scroll().p(px(6.)).max_h(px(380.));
+            let list_max_h = (max_panel_h - 124.).clamp(180., 420.);
+            let mut list = div()
+                .id("palette-list")
+                .test_support()
+                .track_scroll(&self.palette_scroll)
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .p(px(6.))
+                .max_h(px(list_max_h));
             if entries.is_empty() {
                 let error = self.model.palette_error().to_owned();
                 let empty_key = self.model.palette_empty_key();
-                let mut empty = div()
-                    .p(px(16.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .text_color(p.text_faint)
-                    .child(self.t(empty_key));
-                // 目录读取失败与“没有命中”是两回事：只有失败才带原因和重试。
-                if empty_key == "ui.palette.error" && !error.is_empty() {
-                    empty = empty
-                        .child(div().id("palette-error").text_size(px(TypeScale::XS)).truncate().tooltip_text(SharedString::from(error.clone())).child(SharedString::from(error)))
-                        .child(kit::tool_button(
-                            "palette-tree-retry",
-                            Some(IconName::RefreshCw),
-                            self.t("common.retry"),
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.model.shell.close_overlay();
-                                this.perform("refresh-tree", cx);
-                            }),
-                        ));
-                }
-                // 面板为空时给一个能立刻继续的动作，而不是只留解释。
-                empty = empty.child(kit::tool_button(
+                let filtered = !self.model.palette_query.trim().is_empty() || active_scope != PaletteScope::All;
+                let new_query_btn = kit::secondary_button(
                     "palette-new-query",
                     Some(IconName::SquareTerminal),
                     self.t("shell.command.newQuery"),
@@ -4248,11 +4471,69 @@ impl Workbench {
                         this.model.shell.close_overlay();
                         this.perform("new-query", cx);
                     }),
-                ));
+                )
+                .small();
+                let empty: AnyElement = if empty_key == "ui.palette.error" && !error.is_empty() {
+                    let actions = div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            kit::primary_button(
+                                "palette-tree-retry",
+                                Some(IconName::RefreshCw),
+                                self.t("common.retry"),
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.model.shell.close_overlay();
+                                    this.perform("refresh-tree", cx);
+                                }),
+                            )
+                            .small(),
+                        )
+                        .child(new_query_btn);
+                    div()
+                        .id("palette-error")
+                        .test_support()
+                        .aria_label(SharedString::from(error.clone()))
+                        .p(px(8.))
+                        .child(kit::error_state_with_action(self.t(empty_key), SharedString::from(error), actions, &p))
+                        .into_any_element()
+                } else if filtered || empty_key == "ui.palette.noMatch" || empty_key == "ui.explorer.noMatch" {
+                    let actions = div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            kit::secondary_button(
+                                "palette-clear",
+                                Some(IconName::X),
+                                self.t("ui.palette.clearSearch"),
+                                cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.perform("palette-clear", cx);
+                                    this.fields.focus(DraftField::PaletteQuery, window, cx);
+                                }),
+                            )
+                            .small(),
+                        )
+                        .child(new_query_btn);
+                    div()
+                        .p(px(8.))
+                        .child(kit::no_match_state_with_action(IconName::Search, self.t(empty_key), self.t("ui.palette.noMatchHint"), actions, &p))
+                        .into_any_element()
+                } else {
+                    div()
+                        .p(px(8.))
+                        .child(kit::empty_state_with_action(IconName::Compass, self.t(empty_key), self.t("ui.palette.emptyHint"), new_query_btn, &p))
+                        .into_any_element()
+                };
                 list = list.child(empty);
             }
             let mut last_group = "";
-            for (index, entry) in entries.into_iter().take(40).enumerate() {
+            let mut child_count = 0usize;
+            let mut selected_child: Option<usize> = None;
+            for (index, entry) in entries.into_iter().enumerate() {
                 let selected = index == self.model.palette_index;
                 let id = entry.id.clone();
                 // 快捷键来自菜单同源（COMMANDS → SHORTCUTS），类型标注来自条目种类。
@@ -4274,6 +4555,10 @@ impl Workbench {
                             .text_color(p.text_faint)
                             .child(heading),
                     );
+                    child_count += 1;
+                }
+                if selected {
+                    selected_child = Some(if index == 0 { 0 } else { child_count });
                 }
                 let row = stack_frame(|| {
                     kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
@@ -4348,6 +4633,14 @@ impl Workbench {
                         .into_any_element()
                 });
                 list = list.child(row);
+                child_count += 1;
+            }
+            let seen_key = (self.model.palette_index, self.model.palette_query.clone(), active_scope);
+            if self.palette_scroll_seen.as_ref() != Some(&seen_key) {
+                self.palette_scroll_seen = Some(seen_key);
+                if let Some(child_ix) = selected_child {
+                    self.palette_scroll.scroll_to_item(child_ix);
+                }
             }
             let hint = |keys: &'static str, label: SharedString| {
                 div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, &p)).child(label)
@@ -4375,7 +4668,13 @@ impl Workbench {
                         .py(px(10.))
                         .border_b_1()
                         .border_color(p.line)
-                        .child(input.appearance(false).prefix(kit::icon(IconName::Search, 15., p.text_faint))),
+                        .child(
+                            input
+                                .appearance(false)
+                                .prefix(kit::icon(IconName::Search, 15., p.text_faint))
+                                .cleanable(true),
+                        )
+                        .child(scopes),
                 )
                 .child(list.flex_1().min_h(px(0.)))
                 .child(footer);
@@ -4641,14 +4940,10 @@ impl Workbench {
         };
         let name = super::nav::qualified_name(&view.object);
         let title = SharedString::from(format!("{} · {name}", self.model.text("catalog.ddl.title")));
+        let viewer_h = (self.model.viewport_height.max(520) as f32 - 220.).clamp(220., 520.);
         let body: AnyElement = if view.loading {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .text_color(p.text_muted)
-                .child(Spinner::new().small().color(p.accent))
-                .child(self.t("catalog.ddl.loading"))
+            kit::loading_state(self.t("catalog.ddl.loading"), &p)
+                .py(px(28.))
                 .into_any_element()
         } else if let Some(text) = view.text.clone() {
             let editor = match &self.ddl_editor {
@@ -4662,7 +4957,7 @@ impl Workbench {
             div()
                 .id("ddl-viewer-text")
                 .test_support()
-                .h(px(320.))
+                .h(px(viewer_h))
                 .rounded(px(Radius::PANEL))
                 .border_1()
                 .border_color(p.line)
@@ -4674,11 +4969,17 @@ impl Workbench {
             // 模型里留原文，显示时去掉重复的“读取定义失败”前缀并按当前语言给出。
             let error = crate::catalog::definition::error_text(view.error.as_deref().unwrap_or_default(), self.model.locale());
             let text = format!("{} {error}", self.model.text("catalog.ddl.failed")).trim_end().to_owned();
+            let detail = if error.trim().is_empty() { text.clone() } else { error };
             div()
                 .id("ddl-viewer-error")
                 .test_support()
-                .aria_label(SharedString::from(text.clone()))
-                .child(banner(IconName::TriangleAlert, SharedString::from(text), p.danger, p.danger_soft))
+                .aria_label(SharedString::from(text))
+                .child(kit::error_state_with_action(
+                    self.t("catalog.ddl.failed"),
+                    SharedString::from(detail),
+                    kit::secondary_button("cmd-ddl-retry", Some(IconName::RefreshCw), self.t("common.retry"), act("ddl-retry", cx)),
+                    &p,
+                ))
                 .into_any_element()
         };
         let rebuilt = view.rebuilt.then(|| {
@@ -4728,11 +5029,18 @@ impl Workbench {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .justify_end()
                     .gap(px(8.))
                     .child(kit::secondary_button("cmd-ddl-close", None, self.t("common.close"), act("ddl-close", cx)))
                     .when(has_text, |this| {
-                        this.child(kit::primary_button("cmd-ddl-copy", Some(IconName::Copy), self.t("catalog.tree.copyDdl"), act("ddl-copy", cx)))
+                        this.child(kit::secondary_button(
+                            "cmd-ddl-open-query",
+                            Some(IconName::SquarePen),
+                            self.t("catalog.ddl.openInQuery"),
+                            act("ddl-open-query", cx),
+                        ))
+                        .child(kit::primary_button("cmd-ddl-copy", Some(IconName::Copy), self.t("catalog.tree.copyDdl"), act("ddl-copy", cx)))
                     }),
             );
         backdrop("ddl-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
@@ -4780,28 +5088,28 @@ impl Workbench {
                 )
                 .into_any_element()
         });
+        let m = self.metrics();
         let mut content = div().flex().flex_col().gap(px(10.)).child(facts);
         if prompt.kind == super::danger::DangerKind::Rename {
             let input = self.input_for(DraftField::DangerNewName, &self.model.text("catalog.danger.newName"), false, window, cx);
+            let running = prompt.running;
             content = content.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" && !running {
+                            cx.stop_propagation();
+                            this.perform("danger-preview", cx);
+                        }
+                    }))
                     .child(div().flex_1().min_w(px(0.)).child(input))
                     .child(kit::secondary_button("cmd-danger-preview", Some(IconName::Eye), self.t("catalog.danger.preview"), act("danger-preview", cx)).disabled(prompt.running)),
             );
         }
         if prompt.loading {
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_color(p.text_muted)
-                    .child(Spinner::new().small().color(p.accent))
-                    .child(self.t("catalog.danger.loading")),
-            );
+            content = content.child(kit::inline_loading(self.t("catalog.danger.loading"), &m, &p));
         } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
             content = content.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
         }
@@ -4877,16 +5185,16 @@ impl Workbench {
                 .child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(hint)))
                 .child(input);
         }
+        if self.danger_focused_epoch != Some(prompt.epoch) {
+            self.danger_focused_epoch = Some(prompt.epoch);
+            if prompt.kind == super::danger::DangerKind::Rename {
+                self.fields.focus(DraftField::DangerNewName, window, cx);
+            } else if prompt.prod {
+                self.fields.focus(DraftField::DangerConfirm, window, cx);
+            }
+        }
         if prompt.running {
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_color(p.text_muted)
-                    .child(Spinner::new().small().color(p.accent))
-                    .child(self.t("catalog.danger.running")),
-            );
+            content = content.child(kit::inline_loading(self.t("catalog.danger.running"), &m, &p));
         }
         let ready = prompt.execute_ready();
         let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };

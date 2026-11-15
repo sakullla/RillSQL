@@ -258,12 +258,12 @@ fn object_column(
     let menu_name = column.name.clone();
     let menu_quoted = quoted.clone();
     let menu_table = table.to_owned();
-    div()
-        .id(SharedString::from(format!("query-side-column-{index}")))
+    kit::row_states(div().id(SharedString::from(format!("query-side-column-{index}"))), p)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(SharedString::from(column_text(locale, column)))
         .aria_selected(focused)
+        .tooltip_text(SharedString::from(column_text(locale, column)))
         .flex_none()
         .min_h(px(metrics.row_h))
         .px(px(12.))
@@ -272,7 +272,6 @@ fn object_column(
         .flex_col()
         .justify_center()
         .text_size(px(TypeScale::SM))
-        .cursor_pointer()
         .rounded(px(Radius::CONTROL))
         .when(focused, |this| this.bg(p.accent_soft))
         .hover(|style| style.bg(p.hover))
@@ -359,16 +358,15 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                 .flex_col()
                 .gap(px(2.))
                 .child(
-                    div()
-                        .id("query-side-object-name")
+                    kit::interactive_states(div().id("query-side-object-name"), p, false)
                         .test_support()
                         .role(gpui_kit::Role::Button)
                         .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "catalog.menu.insertEditor"), qualified)))
+                        .tooltip_text(SharedString::from(format!("{} {}", i18n::text(locale, "catalog.menu.insertEditor"), qualified)))
                         .flex()
                         .items_center()
                         .gap(px(6.))
                         .rounded(px(Radius::CONTROL))
-                        .cursor_pointer()
                         .hover(|style| style.bg(p.hover))
                         .on_click({
                             let object_sql = object_sql.clone();

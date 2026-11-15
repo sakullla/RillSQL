@@ -1416,6 +1416,17 @@ dict! {
     "history.page.loadingSaved" => "正在读取保存的查询…", "Reading saved queries…";
     "history.page.retryLoad" => "重新读取", "Reload";
     "history.page.keyboardHint" => "键盘", "Keys";
+    "ui.palette.scopeAll" => "全部", "All";
+    "ui.palette.clearSearch" => "清除搜索", "Clear search";
+    "ui.palette.noMatchHint" => "清除搜索词或切换范围以查看全部条目。", "Clear the search or switch scope to see everything.";
+    "ui.palette.emptyHint" => "连接数据库并展开对象树后，表、视图与保存的查询都会出现在这里。", "Connect a database and expand the explorer to find tables, views, and saved queries here.";
+    "catalog.ddl.openInQuery" => "在查询编辑器中打开", "Open in query editor";
+    "ui.status.switchTargetHint" => "切换或定位当前连接目标", "Switch or locate the active connection target";
+    "ui.status.jobsHint" => "查看后台任务与导入导出进度", "View background tasks and exchange progress";
+    "conn.page.copyAddress" => "复制地址", "Copy address";
+    "conn.page.copiedAddress" => "已复制地址", "Address copied";
+    "ui.query.targetHintMove" => "选择库", "Navigate";
+    "ui.query.targetHintConn" => "切换连接", "Switch connection";
 }
 
 #[cfg(test)]
