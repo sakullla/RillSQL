@@ -127,7 +127,10 @@ pub struct PinnedResult {
     /// 产生这份结果的那次执行用的目标（连接/库/模式）。显示固定结果时按它绑定表格，
     /// 不跟着标签之后切换的库走；来源无法证明（外部写入的结果）时为 None，表格按未定位只读处理。
     pub target: Option<Target>,
-    /// 用户给这个固定页签起的名字；没有时用默认的“固定 n · 结果 m”。
+    /// 固定时这条语句在同一批结果里的自动标题（同批重名带语句序号）。
+    /// 它是执行时快照的一部分，之后的编辑或新执行都不会改写；自定义标题清空后回到它。
+    pub auto_title: Option<String>,
+    /// 用户给这个固定页签起的名字；没有时用上面那份自动标题，识别不出操作时才是“固定 n · 结果 m”。
     pub custom_title: Option<String>,
 }
 
@@ -757,7 +760,10 @@ impl Desk {
         tab.pin_seq = tab.pin_seq.saturating_add(1);
         let id = tab.pin_seq;
         let target = tab.results_target.clone();
-        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target, custom_title: None });
+        // 固定前页签上显示的就是这条语句在本批结果里的自动标题（同批重名带序号），
+        // 固定后必须逐字保持一致，不能拿单条语句重算。
+        let auto_title = Self::batch_titles(tab).into_iter().nth(statement).flatten();
+        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target, auto_title, custom_title: None });
         tab.result_view = ResultView::Pinned(id);
         self.view_gen = self.view_gen.saturating_add(1);
         Some(id)
@@ -790,12 +796,9 @@ impl Desk {
         true
     }
 
-    /// 当前结果的自动标题，与结果一一对应；引擎取产生这批结果的目标。
+    /// 一批结果的自动标题，与结果一一对应；引擎取产生这批结果的目标。
     /// 标题只来自执行时的语句快照，之后的草稿编辑不会改写它。
-    pub fn result_titles(&self) -> Vec<Option<String>> {
-        let Some(tab) = self.active_tab() else {
-            return Vec::new();
-        };
+    fn batch_titles(tab: &TabState) -> Vec<Option<String>> {
         let engine = tab
             .results_target
             .as_ref()
@@ -806,15 +809,18 @@ impl Desk {
         title::titles(&engine, &statements)
     }
 
-    /// 一个固定结果的默认标题：来自它固定时的那份快照 SQL，不跟之后的编辑走。
+    /// 当前结果的自动标题，与结果一一对应。
+    pub fn result_titles(&self) -> Vec<Option<String>> {
+        let Some(tab) = self.active_tab() else {
+            return Vec::new();
+        };
+        Self::batch_titles(tab)
+    }
+
+    /// 一个固定结果的默认标题：固定时存下的那份批内自动标题，
+    /// 既不跟之后的编辑走，也不会因为单条重算丢掉同批序号。
     pub fn pin_auto_title(&self, pin: &PinnedResult) -> Option<String> {
-        let engine = pin
-            .target
-            .as_ref()
-            .or_else(|| self.active_tab().and_then(|tab| tab.target.as_ref()))
-            .map(|target| target.engine.clone())
-            .unwrap_or_default();
-        title::title(&engine, &pin.view.sql, pin.statement + 1)
+        pin.auto_title.clone()
     }
 
     /// 结果表格要显示的那一条：看固定结果时是它的快照，否则是当前结果里选中的语句。
@@ -2854,6 +2860,80 @@ mod tests {
         assert!(desk.rename_pin(pin, "   "));
         assert!(desk.pinned()[0].custom_title.is_none(), "空白标题恢复默认");
         assert!(!desk.rename_pin(pin + 3, "没有这一页"));
+    }
+
+    fn ok_view(sql: &str, value: &str) -> StatementView {
+        StatementView {
+            sql: sql.to_owned(),
+            sent_sql: None,
+            rewrite: None,
+            rewrite_anchor: None,
+            status: "ok".to_owned(),
+            message: String::new(),
+            columns: vec!["id".to_owned()],
+            rows: vec![vec![Some(value.to_owned())]],
+            truncated: false,
+            affected: None,
+            elapsed_ms: Some(1),
+            error_at: None,
+            range: None,
+            error_mark: None,
+        }
+    }
+
+    #[test]
+    fn a_pinned_result_keeps_the_batch_ordinal_it_was_pinned_with() {
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        desk.new_query();
+        desk.plant_run(vec![
+            ok_view("SELECT * FROM t", "1"),
+            ok_view("SELECT * FROM t", "2"),
+        ]);
+        assert_eq!(
+            desk.result_titles(),
+            vec![Some("SELECT · t (1)".to_owned()), Some("SELECT · t (2)".to_owned())],
+            "同批重名靠序号区分"
+        );
+        desk.set_statement(1);
+        let id = desk.pin_current().expect("固定第二条");
+        let pin = &desk.pinned()[0];
+        assert_eq!(pin.statement, 1);
+        assert_eq!(
+            desk.pin_auto_title(pin),
+            Some("SELECT · t (2)".to_owned()),
+            "固定页签保留固定时那一页的标题，不丢同批序号"
+        );
+        assert_eq!(desk.pin_auto_title(pin), desk.result_titles()[1], "与固定前看到的当前页签逐字一致");
+        // 自定义标题优先；清空后回到这份批内标题，而不是重新按单条语句算成「SELECT · t」。
+        assert!(desk.rename_pin(id, "订单预览"));
+        let custom = desk.pinned()[0].custom_title.clone();
+        assert_eq!(custom.as_deref(), Some("订单预览"));
+        assert!(desk.rename_pin(id, "   "));
+        let pin = &desk.pinned()[0];
+        assert!(pin.custom_title.is_none());
+        assert_eq!(desk.pin_auto_title(pin), Some("SELECT · t (2)".to_owned()));
+    }
+
+    #[test]
+    fn a_pinned_title_survives_later_runs_and_single_statement_batches_are_not_numbered() {
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        desk.new_query();
+        desk.plant_run(vec![ok_view("SELECT * FROM customers", "1")]);
+        let id = desk.pin_current().expect("固定");
+        let single = desk.pinned()[0].auto_title.clone();
+        assert_eq!(single.as_deref(), Some("SELECT · customers"), "单条结果没有重名，不加序号");
+        // 之后又执行了一批同名的两条：固定页签的标题不变。
+        desk.plant_run(vec![ok_view("SELECT * FROM t", "1"), ok_view("SELECT * FROM t", "2")]);
+        let pin = &desk.pinned()[0];
+        assert_eq!(pin.id, id);
+        assert_eq!(desk.pin_auto_title(pin), Some("SELECT · customers".to_owned()));
+        assert_eq!(
+            desk.result_titles(),
+            vec![Some("SELECT · t (1)".to_owned()), Some("SELECT · t (2)".to_owned())],
+            "当前结果标题不跟着固定结果走"
+        );
     }
 
     #[test]

@@ -1074,6 +1074,12 @@ impl Workbench {
         self.query.read(cx).has_object(name)
     }
 
+    /// 测试用：查询面板里还挂着的行注释请求属于哪个标签。
+    #[cfg(test)]
+    pub fn query_pending_comment(&self, cx: &App) -> Option<String> {
+        self.query.read(cx).pending_comment_request().map(str::to_owned)
+    }
+
     #[cfg(test)]
     pub fn query_runs(&self, cx: &App) -> u32 {
         self.query.read(cx).run_count()

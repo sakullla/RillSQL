@@ -152,7 +152,9 @@ pub struct QueryPane {
     /// 统计绑定结果代次和来源；同一 SQL 再执行或切换目标后不复用旧计数。
     row_count: Option<(CountIdentity, RowCount)>,
     /// 等待应用的行注释切换（Ctrl/⌘+/）：命令层没有窗口，交给下一帧的 apply_pending 执行。
-    pending_comment: bool,
+    /// 存的是按下快捷键时活动查询标签的 id；那时不是查询工作项就不挂起，
+    /// 之后切了工作项或标签，请求按 id 对不上作废，不落在别的页面或别的标签上。
+    pending_comment: Option<String>,
     /// 结果页签条的滚动句柄：跨帧保存，不能每帧新建。
     result_scroll: gpui_kit::ScrollHandle,
     /// 上一次已经滚过的（当前页签下标，页签数量）。
@@ -459,7 +461,7 @@ impl QueryPane {
             target_choices: Vec::new(),
             target_picker: target::TargetPicker::default(),
             connect_request: None,
-            pending_comment: false,
+            pending_comment: None,
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
@@ -665,6 +667,12 @@ impl QueryPane {
         self.editors.get(id).is_some_and(|editor| editor.read(cx).is_focused(window, cx))
     }
 
+    /// 测试用：还挂着的行注释请求属于哪个查询标签；没有请求时为 None。
+    #[cfg(test)]
+    pub fn pending_comment_request(&self) -> Option<&str> {
+        self.pending_comment.as_deref()
+    }
+
     #[cfg(test)]
     pub fn polls(&self) -> u32 {
         self.polls.load(Ordering::Relaxed)
@@ -823,8 +831,10 @@ impl QueryPane {
             return;
         }
         // 行注释：命令层没有窗口，先挂起，下一帧只对真正有焦点的 SQL 编辑器执行。
+        // 只有当前活动工作项就是这次请求的查询标签时才挂起；表格/结构/设置等页面
+        // 按同一条快捷键什么都不排，回到查询时也不会执行这次残留的请求。
         if id == "toggle-comment" {
-            self.pending_comment = true;
+            self.pending_comment = if self.context_active { self.desk.active_id().map(str::to_owned) } else { None };
             cx.notify();
             return;
         }
@@ -2140,8 +2150,8 @@ impl QueryPane {
                 self.desk.refresh_outline();
             }
         }
-        if std::mem::take(&mut self.pending_comment) {
-            self.apply_comment(window, cx);
+        if let Some(request) = self.pending_comment.take() {
+            self.apply_comment(&request, window, cx);
         }
         if self.pending_completion {
             self.pending_completion = false;
@@ -2183,10 +2193,17 @@ impl QueryPane {
 
     /// 行注释：只有活动 SQL 编辑器真的持有焦点时才改文本，网格和其它输入框不受影响。
     /// 整段只替换一次（一次撤销即可还原），随后同步草稿与折叠，但不执行查询。
-    fn apply_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// request 是按下快捷键时那个查询标签的 id：期间切了工作项或标签就作废这次请求。
+    fn apply_comment(&mut self, request: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.context_active {
+            return;
+        }
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
+        if id != request {
+            return;
+        }
         let Some(editor) = self.editors.get(&id).cloned() else {
             return;
         };
@@ -4970,6 +4987,100 @@ mod tests {
         .unwrap();
     }
 
+    /// 行注释请求带上发起时的查询标签：那时不是查询工作项就不排，
+    /// 排了之后切了标签也要作废，不能落到别的页或别的标签上。
+    #[gpui_kit::test]
+    fn a_comment_request_is_scoped_to_the_query_it_was_issued_for(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let a = bound("a", "SELECT 1;");
+        let b = bound("b", "SELECT 2;");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&a), Some("table-1"), Locale::ZhCn, window, cx);
+                assert!(!pane.context_active, "表格工作项激活时查询上下文必须关闭");
+                pane.command("toggle-comment", cx);
+                assert_eq!(pane.pending_comment_request(), None, "非查询页面不排注释请求");
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editor_text(cx), "SELECT 1;", "隐藏的查询草稿不被改写");
+        })
+        .unwrap();
+
+        // 两个标签先都建立起编辑器，后面的切标签才在同一个窗口里发生。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.command("toggle-comment", cx);
+                assert_eq!(pane.pending_comment_request(), Some("a"), "活动查询才排请求");
+                // 下一帧之前切到另一个查询标签：这次请求不属于它，必须作废，
+                // 不能顺手注释新标签的草稿（它的编辑器也真的有焦点）。
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("b"), Locale::ZhCn, window, cx);
+            });
+            let editor_b = pane.read(cx).editors.get("b").cloned().expect("b 的编辑器");
+            editor_b.update(cx, |editor, cx| editor.focus(window, cx));
+            window.render_frame(cx);
+            assert!(editor_b.read(cx).is_focused(window, cx), "b 的编辑器确实有焦点");
+            assert_eq!(editor_b.read(cx).value(cx), "SELECT 2;", "请求不写到发起之后的标签上");
+            assert_eq!(pane.read(cx).pending_comment_request(), None, "请求已经消耗掉");
+        })
+        .unwrap();
+    }
+
+    /// R10：在表格工作项里按 Ctrl/⌘+/ 什么都不排；切回查询时草稿与编辑器文本原样。
+    #[gpui_kit::test]
+    fn the_comment_shortcut_leaves_nothing_behind_on_another_work_item(cx: &mut TestAppContext) {
+        // 打开表格工作项会真的排队连库任务：允许执行器停车，测试才确定。
+        cx.executor().allow_parking();
+        let (window, view) = open_shell(cx);
+        let query = cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                let query = view.model.active_tab.clone().expect("query item");
+                view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
+                view.model.tabs.iter_mut().find(|tab| tab.id == query).unwrap().draft = "SELECT 1;".to_owned();
+                query
+            })
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).query_editor_focused(window, cx), "查询编辑器没有拿到焦点");
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;");
+        })
+        .unwrap();
+        // 切到表格工作项：查询面板隐藏，同一条快捷键不给查询留任何请求。
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.perform("open-table:notes|笔记|main||customers|sqlite|dev", cx));
+            window.render_frame(cx);
+            assert_ne!(view.read(cx).model.active_tab.as_deref(), Some(query.as_str()), "表格工作项已经激活");
+            window.press("secondary-/", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_pending_comment(cx), None, "非查询页面不排注释请求");
+        })
+        .unwrap();
+        // 切回查询：没有残留的请求，草稿和编辑器文本都不变。
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, _| assert!(view.model.activate_item(&query), "切回查询工作项"));
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, _, cx| {
+            assert_eq!(view.read(cx).model.active_tab.as_deref(), Some(query.as_str()), "回到查询工作项");
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;", "非查询页面的快捷键不能在回到查询时补执行");
+            assert_eq!(view.read(cx).query_pending_comment(cx), None);
+        })
+        .unwrap();
+    }
+
     /// 多结果页签用语句快照生成标题：切换页签看到的结果与标题一致，
     /// 之后编辑草稿不会改写既有结果的标题。
     #[gpui_kit::test]
@@ -5032,6 +5143,45 @@ mod tests {
             });
             window.render_frame(cx);
             assert_eq!(window.find("query-pinned-1").label(), Some("SELECT · customers"), "清空后恢复快照标题");
+        })
+        .unwrap();
+    }
+
+    /// R11：同批两条同名语句各自带序号标题；固定第二条后，固定页签的标题与固定前那一页逐字一致，
+    /// 手动重命名优先，清空后仍回到这份批内标题。
+    #[gpui_kit::test]
+    fn a_pinned_tab_keeps_the_ordinal_title_of_the_page_it_was_pinned_from(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM t; SELECT * FROM t;")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![
+                    result("SELECT * FROM t", "ok", &["id"], &["1"], None, ""),
+                    result("SELECT * FROM t", "ok", &["id"], &["2"], None, ""),
+                ]);
+                pane.desk.set_statement(1);
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-act-statement-0").label(), Some("SELECT · t (1)"), "同批重名靠序号区分");
+            assert_eq!(window.find("query-act-statement-1").label(), Some("SELECT · t (2)"));
+            let current = window.find("query-act-statement-1").label().unwrap().to_owned();
+            window.click("query-act-pin", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("query-pinned-1").label(),
+                Some(current.as_str()),
+                "固定页签与固定前的那一页逐字一致"
+            );
+            pane.update(cx, |pane, _| assert!(pane.desk.rename_pin(1, "订单预览")));
+            window.render_frame(cx);
+            assert_eq!(window.find("query-pinned-1").label(), Some("订单预览"), "手动命名优先");
+            pane.update(cx, |pane, _| assert!(pane.desk.rename_pin(1, "  ")));
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("query-pinned-1").label(),
+                Some(current.as_str()),
+                "清空后回到批内自动标题，不是按单条语句重算的「SELECT · t」"
+            );
         })
         .unwrap();
     }
