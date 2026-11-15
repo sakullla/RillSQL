@@ -364,6 +364,84 @@ where
     element.cursor_pointer().active(move |s| s.bg(active))
 }
 
+// ---------------------------------------------------------------- 控件几何
+
+/// 图标尺寸三档，与 `TypeScale` 的字号搭配使用；业务页不再写 13/14/16 这类裸值。
+pub struct IconSize;
+
+impl IconSize {
+    /// 行内动作（页签关闭、行尾图标）：与 12px 正文同排。
+    pub const INLINE: f32 = 12.;
+    /// 控件内图标（页签类型图标、工具条按钮）：与 12–13px 文字同排。
+    pub const CONTROL: f32 = 14.;
+    /// 活动栏与空态的大图标。
+    pub const RAIL: f32 = 18.;
+}
+
+/// 纯图标动作的方形点击区域三档。点击区域与图标尺寸分开取值：
+/// 图标可以画小，命中范围不能跟着缩到点不中。
+pub struct HitArea;
+
+impl HitArea {
+    /// 页签关闭、行内尾部动作。
+    pub const INLINE: f32 = 20.;
+    /// 工具条与页签条尾部的紧凑动作（新建页签）。
+    pub const CONTROL: f32 = 26.;
+    /// 活动栏。
+    pub const RAIL: f32 = 38.;
+}
+
+/// 按点击区域取图标档，同一排的图标视觉大小一致。
+pub fn icon_size_for(hit: f32) -> f32 {
+    if hit >= HitArea::RAIL {
+        IconSize::RAIL
+    } else if hit >= HitArea::CONTROL {
+        IconSize::CONTROL
+    } else {
+        IconSize::INLINE
+    }
+}
+
+/// 控件内文字行高：字号 × 1.25 向上取整。
+/// 显式给行高后，文字行盒与同排图标、附属动作共用同一个垂直中心，不随字体默认行距漂浮。
+pub fn line_height(size: f32) -> f32 {
+    (size * 1.25).ceil()
+}
+
+/// 控件内的一段文字：字号、字重、颜色与行高一次设好。
+/// 调用方只给 `TypeScale` 档位（扫描测试守住），行高与基线由这里统一。
+pub fn control_text(text: impl Into<SharedString>, size: f32, weight: FontWeight, color: Hsla) -> gpui_kit::Div {
+    div().text_size(px(size)).line_height(px(line_height(size))).font_weight(weight).text_color(color).child(text.into())
+}
+
+/// 纯图标动作：固定点击区域、按区域取的图标、hover/pressed/focus/disabled 四态、
+/// tooltip 与无障碍名称。页签关闭、页签条新建和工具条图标都走这里，
+/// 不再由各页面拼 `Button` 的尺寸档，也不再各写一套命中范围。
+pub fn icon_action(
+    id: impl Into<ElementId>,
+    name: IconName,
+    label: impl Into<SharedString>,
+    hit: f32,
+    color: Hsla,
+    p: &Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement + gpui_kit::StatefulInteractiveElement {
+    let label = label.into();
+    interactive_states(div().id(id), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .tooltip_text(label)
+        .flex_none()
+        .size(px(hit))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::CONTROL))
+        .child(icon(name, icon_size_for(hit), color))
+        .on_click(on_click)
+}
+
 // ---------------------------------------------------------------- 尺寸指标
 
 /// 视口窄于这个宽度时，水平页边距收到紧凑档，避免把内容挤出屏幕。
@@ -1300,6 +1378,28 @@ mod palette_tests {
         }
     }
 
+    /// 关键图标、焦点环与状态标记在实际背景上至少 3:1（WCAG 非文本对比度，需求 R2）：
+    /// 页签图标、关闭动作、未保存标记与焦点环都不能靠低对比度凑出“安静”的观感。
+    #[test]
+    fn every_theme_keeps_icons_and_state_marks_above_three_to_one() {
+        for p in [Palette::light(), Palette::dark()] {
+            for (name, fg, bg) in [
+                ("idle icon on chrome", p.text_muted, p.chrome),
+                ("idle icon on surface", p.text_muted, p.surface),
+                ("active icon on surface", p.accent_text, p.surface),
+                ("active icon on chrome", p.accent_text, p.chrome),
+                ("quiet icon on hover", p.text_faint, p.hover),
+                ("quiet icon on surface", p.text_faint, p.surface),
+                ("dirty mark on chrome", p.text_muted, p.chrome),
+                ("focus ring on surface", p.accent, p.surface),
+                ("focus ring on chrome", p.accent, p.chrome),
+            ] {
+                let ratio = contrast(fg, bg);
+                assert!(ratio >= 3., "{name}: {ratio:.2} ({})", p.dark);
+            }
+        }
+    }
+
     /// 三档密度必须真的拉开行高，否则切换只是文案变化。
     /// 紧凑与标准按规范 S9（紧凑 26/23/26、标准 32/30/30，行/树/控件）；宽松不小于标准。
     #[test]
@@ -1523,7 +1623,7 @@ mod token_tests {
     const EXCEPTIONS: &[(&str, &str, &str)] = &[
         ("ui/kit.rs", "px((size * 0.42).max(8.))", "引擎徽标里的两字母缩写随徽标尺寸等比缩放，属于图形而非排版"),
         ("ui/kit.rs", "px((size / 4.).max(3.))", "引擎徽标方块的圆角随徽标尺寸等比缩放，属于图形"),
-        ("ui/kit.rs", "px(size)", "kit::title 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
+        ("ui/kit.rs", "px(size)", "kit::title 与 kit::control_text 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
         ("ui/editor_proto.rs", "px(self.font_size)", "SQL 编辑器字号来自用户设置（规范 S4.1：编辑器字号由设置控制）"),
         ("app/shell/chrome.rs", "px(size * 0.28)", "品牌标记的圆角随尺寸等比缩放，属于图形"),
         ("app/shell/chrome.rs", "px(RAIL_INDICATOR_RADIUS)", "活动栏激活指示条只有 3px 宽，是线条而非控件；只认这一个具名常量"),
@@ -2036,3 +2136,110 @@ mod metric_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{Bounds, Context, Point, Render, TestAppContext, Window, WindowBounds, WindowOptions};
+
+    /// 控件行高只由字号推出：五档字号各有确定行高，并随字号单调递增。
+    /// 显式行高让图标、文字和附属动作共用同一个垂直中心，不靠字体默认行距碰运气。
+    #[test]
+    fn control_line_height_derives_from_type_scale() {
+        let expected = [(TypeScale::XS, 14.), (TypeScale::SM, 15.), (TypeScale::MD, 17.), (TypeScale::LG, 19.), (TypeScale::XL, 23.)];
+        for (size, height) in expected {
+            assert_eq!(line_height(size), height, "{size}px 的行高");
+            assert!(line_height(size) > size, "{size}px 的行高包住文字");
+        }
+        for pair in expected.windows(2) {
+            assert!(line_height(pair[0].0) < line_height(pair[1].0), "行高随字号递增");
+        }
+        assert_eq!(line_height(12.), line_height(TypeScale::SM), "同字号同结果，不受调用点影响");
+    }
+
+    /// 点击区域三档决定图标档：行内 12、控件 14、活动栏 18；图标永远小于命中范围。
+    #[test]
+    fn hit_areas_map_to_icon_sizes() {
+        assert_eq!((HitArea::INLINE, HitArea::CONTROL, HitArea::RAIL), (20., 26., 38.));
+        assert_eq!((IconSize::INLINE, IconSize::CONTROL, IconSize::RAIL), (12., 14., 18.));
+        assert_eq!(icon_size_for(HitArea::INLINE), IconSize::INLINE);
+        assert_eq!(icon_size_for(HitArea::CONTROL), IconSize::CONTROL);
+        assert_eq!(icon_size_for(HitArea::RAIL), IconSize::RAIL);
+        for hit in [HitArea::INLINE, HitArea::CONTROL, HitArea::RAIL] {
+            assert!(icon_size_for(hit) < hit, "图标 {hit} 不得撑满命中范围");
+        }
+    }
+
+    struct Probe {
+        clicks: usize,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_start()
+                .child(icon_action(
+                    "probe-action",
+                    IconName::Plus,
+                    "新建查询",
+                    HitArea::CONTROL,
+                    p.text_muted,
+                    &p,
+                    cx.listener(|this: &mut Self, _, _, cx| {
+                        this.clicks += 1;
+                        cx.notify();
+                    }),
+                ))
+                .child(control_text("控件文字", TypeScale::SM, FontWeight::MEDIUM, p.text).id("probe-label").test_support())
+        }
+    }
+
+    fn open(cx: &mut TestAppContext, width: f32, dark: bool) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<Probe>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(dark, cx);
+        });
+        let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(width), px(400.)) };
+        cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, cx| cx.new(|_| Probe { clicks: 0 }),
+            )
+            .expect("control window")
+        })
+    }
+
+    /// 纯图标动作：命中范围是 HitArea 方形、无障碍名称与角色就位、点击真的触发；
+    /// 控件文字行高取 line_height，同排控件的基线因此一致。
+    #[gpui_kit::test]
+    fn icon_action_keeps_its_hit_area_and_control_text_keeps_its_line_box(cx: &mut TestAppContext) {
+        for width in [1360., 900., 640.] {
+            for dark in [false, true] {
+                let (window, view) = open(cx, width, dark);
+                let (action, role, label, text) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        let action = window.find("probe-action");
+                        let text = window.find("probe-label");
+                        (action.bounds(), action.role(), action.label().map(str::to_owned), text.bounds())
+                    })
+                    .unwrap();
+                let note = format!("{width} dark={dark}");
+                assert!((f32::from(action.size.width) - HitArea::CONTROL).abs() < 0.5, "{note}: 命中宽度");
+                assert!((f32::from(action.size.height) - HitArea::CONTROL).abs() < 0.5, "{note}: 命中高度");
+                assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: 图标动作的角色");
+                assert_eq!(label.as_deref(), Some("新建查询"), "{note}: 无障碍名称");
+                assert!((f32::from(text.size.height) - line_height(TypeScale::SM)).abs() < 0.5, "{note}: 文字行高");
+                cx.update_window(window, |_, window, cx| window.click("probe-action", cx)).unwrap();
+                assert_eq!(cx.update(|cx| view.read(cx).clicks), 1, "{note}: 图标动作可点");
+            }
+        }
+    }
+}
+

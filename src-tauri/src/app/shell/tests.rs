@@ -9529,3 +9529,150 @@ fn tag_manager_validates_saves_and_untags_connections_on_delete() {
     model.dismiss();
     assert!(model.tag_manager.is_none());
 }
+
+// ------------------------------------------------------------ 共享页签（T1）
+
+/// 工作项页签迁移到共享组件后，类型图标、标题、关闭与新建在 1360/900/640 × 双主题 ×
+/// 三档密度 × 中英文下共用同一条垂直中心，宽度不被裁切；关闭、右键、中键与键盘切换不回退。
+#[gpui_kit::test]
+fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::SharedString;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tabs-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let center = |bounds: gpui_kit::Bounds<gpui_kit::Pixels>| f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.;
+    for width in [1360., 900., 640.] {
+        let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, width, 900.);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.perform("new-query", cx);
+                view.perform("new-query", cx);
+                view.perform("new-query", cx);
+            });
+        });
+        for theme in ["theme-light", "theme-dark"] {
+            for density in ["density-compact", "density-standard", "density-relaxed"] {
+                for locale in ["locale-zh", "locale-en"] {
+                    cx.update(|cx| {
+                        view.update(cx, |view, cx| {
+                            view.perform(theme, cx);
+                            view.perform(density, cx);
+                            view.perform(locale, cx);
+                        });
+                    });
+                    let note = format!("{width} {theme} {density} {locale}");
+                    let tabs_h = cx.update(|cx| view.read(cx).metrics().tabs_h);
+                    let (ids, active, titles) = cx.update(|cx| {
+                        let model = &view.read(cx).model;
+                        (
+                            model.tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(),
+                            model.active_tab.clone(),
+                            model.tabs.iter().map(|tab| tab.title.clone()).collect::<Vec<_>>(),
+                        )
+                    });
+                    assert_eq!(ids.len(), 3, "{note}: 三个工作项");
+                    let (content, strip, chips, news) = cx
+                        .update_window(window, |_, window, cx| {
+                            window.render_frame(cx);
+                            let content = window.find("workbench-content").bounds();
+                            let strip = window.find("tabs").bounds();
+                            let chips = ids
+                                .iter()
+                                .map(|id| {
+                                    (
+                                        window.find(SharedString::from(format!("tab-{id}"))),
+                                        window.find(SharedString::from(format!("tab-{id}-icon"))).bounds(),
+                                        window.find(SharedString::from(format!("tab-{id}-title"))).bounds(),
+                                        window.find(SharedString::from(format!("tab-close-{id}"))).bounds(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            (content, strip, chips, window.find("tab-new").bounds())
+                        })
+                        .unwrap();
+                    assert!((f32::from(strip.size.height) - tabs_h).abs() < 0.5, "{note}: 页签条高度跟随密度");
+                    assert!(
+                        (f32::from(strip.size.width) - f32::from(content.size.width)).abs() <= 1.5,
+                        "{note}: 页签条占满工作区宽度（strip {} content {} x {}）",
+                        f32::from(strip.size.width),
+                        f32::from(content.origin.x),
+                        f32::from(content.size.width)
+                    );
+                    assert!(f32::from(strip.origin.x + strip.size.width) <= width + 0.5, "{note}: 页签条不越出视口");
+                    for (index, (chip, icon, title, close)) in chips.iter().enumerate() {
+                        let chip_bounds = chip.bounds();
+                        assert!((f32::from(chip_bounds.size.height) - f32::from(strip.size.height)).abs() < 1.5, "{note}: 页签撑满条高");
+                        assert!(f32::from(chip_bounds.size.width) <= crate::ui::tabs::TAB_MAX_W + 0.5, "{note}: 长标题不撑破页签");
+                        let middle = center(chip_bounds);
+                        for (name, bounds) in [("类型图标", *icon), ("标题", *title), ("关闭", *close)] {
+                            assert!((center(bounds) - middle).abs() < 0.5, "{note}: {name} 与页签同一垂直中心");
+                        }
+                        assert!(
+                            (f32::from(title.size.height) - crate::ui::kit::line_height(crate::ui::kit::TypeScale::SM)).abs() < 0.5,
+                            "{note}: 标题行高与组件一致"
+                        );
+                        assert!(
+                            f32::from(title.origin.x + title.size.width) <= f32::from(close.origin.x) + 0.5,
+                            "{note}: 关闭按钮不压标题"
+                        );
+                        assert_eq!(chip.label(), Some(titles[index].as_str()), "{note}: 截断后仍能取完整标题");
+                        let selected = chip.selected();
+                        assert_eq!(selected, Some(active.as_deref() == Some(ids[index].as_str())), "{note}: 只有当前工作项选中");
+                    }
+                    assert!((f32::from(news.size.width) - crate::ui::kit::HitArea::CONTROL).abs() < 0.5, "{note}: 新建命中宽度");
+                    assert!((center(news) - center(chips[0].0.bounds())).abs() < 0.5, "{note}: 新建与页签内容同一垂直中心");
+                    assert!(f32::from(news.origin.x + news.size.width) <= f32::from(strip.origin.x + strip.size.width) + 0.5, "{note}: 新建动作留在页签条内");
+                    assert!(f32::from(news.origin.x + news.size.width) <= width + 0.5, "{note}: 新建动作留在视口内");
+                }
+            }
+        }
+        // 交互边界：右键先激活再弹菜单、中键关闭、关闭按钮走同一份关闭确认、键盘循环切换。
+        let (first, second) = cx.update(|cx| {
+            let model = &view.read(cx).model;
+            (model.tabs[0].id.clone(), model.tabs[1].id.clone())
+        });
+        // 中键关闭：先做，避免右键菜单的浮层挡住页签。
+        cx.update_window(window, |_, window, cx| {
+            window.click_with_options(
+                SharedString::from(format!("tab-{second}")),
+                gpui_kit::test::ClickOptions::new().with_button(gpui_kit::MouseButton::Middle),
+                cx,
+            )
+        })
+        .unwrap();
+        let remaining = cx.update(|cx| view.read(cx).model.tabs.len());
+        assert_eq!(remaining, 2, "{width}: 中键关闭该工作项");
+        // 右键先激活该工作项再弹出页签菜单，菜单随后收起，后面的点击才落在页签上。
+        cx.update_window(window, |_, window, cx| window.right_click(SharedString::from(format!("tab-{first}")), cx)).unwrap();
+        let (active, place) = cx.update(|cx| {
+            let model = &view.read(cx).model;
+            (model.active_tab.clone(), model.menu.as_ref().map(|menu| menu.place))
+        });
+        assert_eq!(active.as_deref(), Some(first.as_str()), "{width}: 右键先激活该工作项");
+        assert_eq!(place, Some(MenuPlace::TabBar), "{width}: 右键弹出页签菜单");
+        cx.update(|cx| view.update(cx, |view, _| view.model.menu = None));
+        let close_id = cx.update(|cx| view.read(cx).model.tabs[0].id.clone());
+        cx.update_window(window, |_, window, cx| window.click(SharedString::from(format!("tab-close-{close_id}")), cx)).unwrap();
+        let closed = cx.update(|cx| view.read(cx).model.tabs.len());
+        assert_eq!(closed, 1, "{width}: 关闭按钮走既有关闭确认并关掉工作项");
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("new-query", cx)));
+        let before = cx.update(|cx| view.read(cx).model.active_tab.clone());
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("next-tab", cx)));
+        let after = cx.update(|cx| view.read(cx).model.active_tab.clone());
+        assert_ne!(before, after, "{width}: 键盘 Ctrl+Tab 切换工作项");
+        let active_id = cx.update(|cx| view.read(cx).model.active_tab.clone().unwrap_or_default());
+        let rendered = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let chip = window.find(SharedString::from(format!("tab-{active_id}")));
+                (chip.selected(), chip.label().map(str::to_owned))
+            })
+            .unwrap();
+        assert_eq!(rendered.0, Some(true), "{width}: 键盘切换后的当前页签表达选中");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

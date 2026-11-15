@@ -3,6 +3,7 @@ mod format_viewer;
 mod foundation;
 mod grid_proto;
 pub mod kit;
+pub mod tabs;
 
 pub use editor_proto::{ObjectHandler, ObjectLink, SqlEditor};
 #[allow(unused_imports)] // 后续任务的公开入口，本任务内尚无调用方。

@@ -23,6 +23,7 @@ use crate::catalog::model::ObjectKind;
 use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::tabs;
 
 use gpui_kit::base::FocusTrapElement as _;
 
@@ -1397,16 +1398,12 @@ impl Workbench {
     fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        // 标签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
+        // 页签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
         // 新建按钮紧跟最后一个标签（浏览器式），标签多到放不下时列表自己横向滚动。
-        let mut list = div()
-            .id("tab-list")
-            .flex()
-            .items_end()
-            .flex_shrink(1.)
-            .min_w(px(0.))
-            .overflow_x_scroll();
+        let mut items: Vec<AnyElement> = Vec::new();
         let work_page = matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure);
+        // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
+        let dirty_text = self.t("ui.grid.pending");
         for tab in self.model.tabs.clone() {
             // 只有工作页才把标签显示为选中；设置、对比、关系图页不伪装成某个工作项。
             let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
@@ -1416,23 +1413,25 @@ impl Workbench {
             let close_id = tab.id.clone();
             let menu_id = tab.id.clone();
             let middle_id = tab.id.clone();
-            let chip = tab_chip(
-                SharedString::from(format!("tab-{id}")),
-                item_icon(tab.kind),
-                title,
-                active,
-                dirty,
-                tab.running,
+            let close_label = self.t("common.close");
+            let chip = tabs::tab(
+                tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
+                    .active(active)
+                    .running(tab.running)
+                    .dirty(dirty, Some(dirty_text.clone())),
                 &p,
             )
-            .child(
-                kit::icon_button(SharedString::from(format!("tab-close-{id}")), IconName::X, self.t("common.close"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .child(tabs::close_action(
+                SharedString::from(format!("tab-close-{id}")),
+                close_label,
+                active,
+                &p,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.model.request_close_tab(&close_id);
                     this.persist_if_needed(cx);
                     cx.notify();
-                }))
-                .xsmall(),
-            )
+                }),
+            ))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
                 if this.model.tab_menu_for(&menu_id) {
@@ -1454,32 +1453,28 @@ impl Workbench {
                 this.persist_if_needed(cx);
                 cx.notify();
             }));
-            list = list.child(chip);
+            items.push(chip.into_any_element());
         }
-        div()
-            .id("tabs")
-            .test_support()
-            .role(gpui_kit::Role::TabList)
-            .aria_label(self.t("shell.tabs.tablist"))
-            .flex_none()
-            .h(px(m.tabs_h))
-            .flex()
-            .items_end()
-            .bg(p.chrome)
-            .border_b_1()
-            .border_color(p.line)
-            .child(list)
-            .child(
-                div()
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px(px(4.))
-                    .child(kit::icon_button("tab-new", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).xsmall()),
-            )
-            .child(div().flex_1())
-            .into_any_element()
+        // 新建入口与页签同一垂直中心、命中范围不小于控件档，不再用被压小的图标按钮。
+        let new_action = kit::icon_action(
+            "tab-new",
+            IconName::Plus,
+            self.t("shell.command.newQuery"),
+            kit::HitArea::CONTROL,
+            p.text_muted,
+            &p,
+            act("new-query", cx),
+        )
+        .into_any_element();
+        tabs::tab_strip(
+            "tabs",
+            self.t("shell.tabs.tablist"),
+            "tab-list",
+            items,
+            vec![new_action],
+            &m,
+            &p,
+        )
     }
 
     // ------------------------------------------------------------ 状态栏
@@ -5052,48 +5047,6 @@ fn item_icon(kind: WorkItemKind) -> IconName {
         WorkItemKind::Redis => IconName::Key,
         WorkItemKind::Mongo => IconName::Braces,
     }
-}
-
-fn tab_chip(
-    id: impl Into<SharedString>,
-    icon: IconName,
-    title: SharedString,
-    active: bool,
-    dirty: bool,
-    running: bool,
-    p: &Palette,
-) -> impl IntoElement + gpui_kit::ParentElement + gpui_kit::StatefulInteractiveElement {
-    let accent = p.accent;
-    let full_title = title.clone();
-    kit::interactive_states(div().id(gpui_kit::ElementId::Name(id.into())), p, false)
-        .test_support()
-        .role(gpui_kit::Role::Tab)
-        .aria_label(title.clone())
-        .tooltip_text(full_title)
-        .aria_selected(active)
-        .group("tab")
-        .relative()
-        .flex_none()
-        .h_full()
-        .max_w(px(220.))
-        .pl(px(12.))
-        .pr(px(4.))
-        .flex()
-        .items_center()
-        .gap(px(7.))
-        .border_r_1()
-        .border_color(p.line)
-        .when(active, |this| this.bg(p.surface).text_color(p.text))
-        .when(!active, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
-        .when(active, |this| this.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(accent)))
-        .child(if running {
-            Spinner::new().xsmall().color(p.accent).into_any_element()
-        } else {
-            kit::icon(icon, 13., if active { p.accent } else { p.text_faint }).into_any_element()
-        })
-        .child(div().truncate().text_size(px(TypeScale::SM)).child(title))
-        .when(dirty, |this| this.child(div().flex_none().size(px(6.)).rounded_full().bg(p.text_faint)))
-        .test_support()
 }
 
 fn list_row(id: SharedString, p: &Palette, pad_y: f32) -> gpui_kit::Stateful<gpui_kit::Div> {
