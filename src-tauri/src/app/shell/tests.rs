@@ -9676,3 +9676,59 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 640 宽、工作项多到页签条放不下时，新建和 Ctrl+Tab 之后的当前页签要自动进入
+/// tab-list 的可视区，尾部新建动作始终留在视口内（R12：当前项到达）。
+#[gpui_kit::test]
+fn crowded_work_item_tabs_scroll_the_current_one_into_view(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::SharedString;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tab-scroll-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 640., 900.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..9 {
+                view.perform("new-query", cx);
+            }
+        });
+    });
+    // 滚动的目标位置要画完一帧才量得出来，页签条会自己再要一帧确认；
+    // 这里跟着渲染两帧，等同于真实窗口里连续两帧。
+    let measure = |window: &mut gpui_kit::Window, cx: &mut gpui_kit::App, active: &str| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let list = window.find("tab-list").bounds();
+        let chip = window.find(SharedString::from(format!("tab-{active}"))).bounds();
+        let new_tab = window.find("tab-new").bounds();
+        let inside = f32::from(chip.origin.x) >= f32::from(list.origin.x) - 0.5
+            && f32::from(chip.origin.x + chip.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5;
+        (inside, new_tab)
+    };
+    // 新建后的当前项：9 个页签已经超出 640 宽，当前项必须已经在可视区里。
+    let active = cx.update(|cx| view.read(cx).model.active_tab.clone().expect("新建后的工作项"));
+    let (inside, new_tab) = cx.update_window(window, |_, window, cx| measure(window, cx, &active)).unwrap();
+    assert!(inside, "新建后的当前页签落在 tab-list 可视区内");
+    assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "尾部新建动作仍在视口内");
+    let offset = cx.update(|cx| f32::from(view.read(cx).tab_scroll.offset().x));
+    assert!(offset < -0.5, "页签条确实横向滚动了（offset {offset}）");
+    // Ctrl+Tab 绕一圈回到最后一个：切换后的当前项同样要在可视区里。
+    for _ in 0..10 {
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("next-tab", cx)));
+    }
+    let active = cx.update(|cx| view.read(cx).model.active_tab.clone().expect("切换后的工作项"));
+    let (inside, new_tab) = cx.update_window(window, |_, window, cx| measure(window, cx, &active)).unwrap();
+    assert!(inside, "Ctrl+Tab 之后的当前页签落在 tab-list 可视区内");
+    assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "切换后尾部新建动作仍在视口内");
+    // 回到第一个工作项：列表要能滚回左边，当前项同样可见。
+    for _ in 0..3 {
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("prev-tab", cx)));
+    }
+    let active = cx.update(|cx| view.read(cx).model.active_tab.clone().expect("回退后的工作项"));
+    let (inside, _) = cx.update_window(window, |_, window, cx| measure(window, cx, &active)).unwrap();
+    assert!(inside, "回到前面的工作项后当前页签同样可见");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

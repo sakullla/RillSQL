@@ -417,6 +417,11 @@ pub fn control_text(text: impl Into<SharedString>, size: f32, weight: FontWeight
 /// 纯图标动作：固定点击区域、按区域取的图标、hover/pressed/focus/disabled 四态、
 /// tooltip 与无障碍名称。页签关闭、页签条新建和工具条图标都走这里，
 /// 不再由各页面拼 `Button` 的尺寸档，也不再各写一套命中范围。
+///
+/// 四态统一走 `interactive`（而非只挂按下态的 `interactive_states`）：悬停有背景反馈，
+/// 禁用时 hover/active/focus 一起消失、不成为 Tab 停靠点、也不挂点击。
+/// 其余页面自绘的 `icon_button` 是 T4 的收敛目标，这里不再派生新的同义实现。
+#[allow(clippy::too_many_arguments)]
 pub fn icon_action(
     id: impl Into<ElementId>,
     name: IconName,
@@ -424,10 +429,11 @@ pub fn icon_action(
     hit: f32,
     color: Hsla,
     p: &Palette,
+    disabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement + gpui_kit::StatefulInteractiveElement {
     let label = label.into();
-    interactive_states(div().id(id), p, false)
+    interactive(div().id(id), p, disabled)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
@@ -439,7 +445,7 @@ pub fn icon_action(
         .justify_center()
         .rounded(px(Radius::CONTROL))
         .child(icon(name, icon_size_for(hit), color))
-        .on_click(on_click)
+        .when(!disabled, |this| this.on_click(on_click))
 }
 
 // ---------------------------------------------------------------- 尺寸指标
@@ -2183,6 +2189,8 @@ mod control_tests {
                 .flex()
                 .flex_col()
                 .items_start()
+                // 探针不贴左上角：测试窗口的指针初始停在 (0,0)，贴着角落的元素一开始就算被悬停。
+                .p(px(40.))
                 .child(icon_action(
                     "probe-action",
                     IconName::Plus,
@@ -2190,8 +2198,22 @@ mod control_tests {
                     HitArea::CONTROL,
                     p.text_muted,
                     &p,
+                    false,
                     cx.listener(|this: &mut Self, _, _, cx| {
                         this.clicks += 1;
+                        cx.notify();
+                    }),
+                ))
+                .child(icon_action(
+                    "probe-action-off",
+                    IconName::X,
+                    "关闭",
+                    HitArea::INLINE,
+                    p.text_faint,
+                    &p,
+                    true,
+                    cx.listener(|this: &mut Self, _, _, cx| {
+                        this.clicks += 10;
                         cx.notify();
                     }),
                 ))
@@ -2239,6 +2261,55 @@ mod control_tests {
                 cx.update_window(window, |_, window, cx| window.click("probe-action", cx)).unwrap();
                 assert_eq!(cx.update(|cx| view.read(cx).clicks), 1, "{note}: 图标动作可点");
             }
+        }
+    }
+
+    /// 本帧实际画出的实心背景里有没有这个颜色：断言的是渲染结果，不只是样式对象里的字段。
+    fn paints_background(window: &Window, color: Hsla) -> bool {
+        window.painted_quads().iter().filter_map(|quad| quad.background.as_solid()).any(|drawn| {
+            (drawn.h - color.h).abs() < 0.002
+                && (drawn.s - color.s).abs() < 0.002
+                && (drawn.l - color.l).abs() < 0.002
+                && (drawn.a - color.a).abs() < 0.002
+        })
+    }
+
+    /// 纯图标动作走同一条交互路径：可用时悬停换背景；禁用时不换背景、不响应点击，
+    /// 也不是 Tab 停靠点（禁用分支不给 tab_index，键盘焦点没地方落）。
+    #[gpui_kit::test]
+    fn icon_action_hovers_when_enabled_and_stays_inert_when_disabled(cx: &mut TestAppContext) {
+        for dark in [false, true] {
+            let (window, view) = open(cx, 900., dark);
+            let note = format!("dark={dark}");
+            let p = cx.update(|cx| Palette::of(cx));
+            let (idle, hovered, left) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let idle = paints_background(window, p.hover);
+                    window.hover("probe-action", cx);
+                    let hovered = paints_background(window, p.hover);
+                    // 指针移到禁用动作上：可用动作的 hover 背景必须撤掉，禁用的自己也不画。
+                    window.hover("probe-action-off", cx);
+                    let left = paints_background(window, p.hover);
+                    (idle, hovered, left)
+                })
+                .unwrap();
+            assert!(!idle, "{note}: 未悬停时没有 hover 背景");
+            assert!(hovered, "{note}: 悬停可用动作出现 hover 背景");
+            assert!(!left, "{note}: 移到禁用动作后不再有 hover 背景");
+            cx.update_window(window, |_, window, cx| window.click("probe-action-off", cx)).unwrap();
+            assert_eq!(cx.update(|cx| view.read(cx).clicks), 0, "{note}: 禁用动作不响应点击");
+            let (first, second) = cx
+                .update_window(window, |_, window, cx| {
+                    window.focus_next(cx);
+                    let first = window.focused(cx);
+                    window.focus_next(cx);
+                    let second = window.focused(cx);
+                    (first, second)
+                })
+                .unwrap();
+            assert!(first.is_some(), "{note}: 可用动作是 Tab 停靠点");
+            assert_eq!(first, second, "{note}: 禁用动作不在停靠序列里（焦点只在唯一可用动作上循环）");
         }
     }
 }

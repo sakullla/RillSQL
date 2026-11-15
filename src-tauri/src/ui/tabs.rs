@@ -137,7 +137,7 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
 }
 
 /// 页签关闭动作：固定 20px 命中范围、12px 图标，与标题同一垂直中心。
-/// 关闭确认仍由业务层处理，组件只负责把点击交回去。
+/// 关闭确认仍由业务层处理，组件只负责把点击交回去；页签本身不可关闭时不调用它。
 pub fn close_action(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -145,17 +145,44 @@ pub fn close_action(
     p: &Palette,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement + gpui_kit::StatefulInteractiveElement {
-    kit::icon_action(id, IconName::X, label, HitArea::INLINE, if active { p.text_muted } else { p.text_faint }, p, on_click)
+    kit::icon_action(id, IconName::X, label, HitArea::INLINE, if active { p.text_muted } else { p.text_faint }, p, false, on_click)
+}
+
+/// 页签是否已经完整落在列表视口内。用上一帧记下的列表区域、页签位置和滚动偏移判断，
+/// 位置还没量出来（首帧、刚新建）时按“还看不见”处理，让调用方再请求一次滚动。
+pub fn tab_visible(scroll: &gpui_kit::ScrollHandle, index: usize) -> bool {
+    let viewport = scroll.bounds();
+    if f32::from(viewport.size.width) <= 0.5 {
+        return false;
+    }
+    let Some(item) = scroll.bounds_for_item(index) else { return false };
+    let offset = scroll.offset();
+    let left = item.origin.x + offset.x;
+    if item.size.width > viewport.size.width {
+        // 页签比视口还宽：对齐左缘就是能看到的最大程度。
+        return f32::from(left - viewport.origin.x) <= 0.5;
+    }
+    let right = left + item.size.width;
+    f32::from(left - viewport.origin.x) >= -0.5
+        && f32::from(right - (viewport.origin.x + viewport.size.width)) <= 0.5
 }
 
 /// 页签条：页签列表自己横向滚动，尾部动作（新建）固定在右侧。
 /// 列表 `flex_shrink` + `min_w(0)`，窄窗口里滚动而不是被裁切；尾部动作 `flex_none`，始终留在视口内。
+///
+/// `scroll` 是调用方持有的滚动句柄（跨帧保存偏移，不能每帧新建），`reveal` 是本帧要把哪个
+/// 页签（下标）完整滚进列表视口：当前项由 Ctrl+Tab/新建切过去之后，列表自己滚到它，
+/// 不必用户手动横向拖动。调用方用 `tab_visible` 确认它真的进来了才停止给 `Some`，
+/// 确认之后不再动滚动位置，用户手动横向滚开不会被每帧拉回。
+#[allow(clippy::too_many_arguments)]
 pub fn tab_strip(
     id: impl Into<SharedString>,
     aria_label: impl Into<SharedString>,
     list_id: impl Into<SharedString>,
     tabs: Vec<AnyElement>,
     actions: Vec<AnyElement>,
+    scroll: &gpui_kit::ScrollHandle,
+    reveal: Option<usize>,
     layout: &Metrics,
     p: &Palette,
 ) -> AnyElement {
@@ -167,7 +194,12 @@ pub fn tab_strip(
         .test_support()
         .flex_shrink(1.)
         .min_w(px(0.))
-        .overflow_x_scroll();
+        .overflow_x_scroll()
+        .track_scroll(scroll);
+    if let Some(index) = reveal {
+        // 只滚到能看见为止（gpui 的 FirstVisible 策略），不把列表强行拉回最左。
+        scroll.scroll_to_item(index);
+    }
     for tab in tabs {
         list = list.child(tab);
     }
@@ -207,15 +239,27 @@ mod tab_tests {
         count: usize,
         clicks: usize,
         closes: usize,
+        /// 当前页签下标：改动它会触发一次“把当前项滚进视口”。
+        active: usize,
+        /// 跨帧持有的滚动句柄，和 Workbench 一样由界面自己保存。
+        scroll: gpui_kit::ScrollHandle,
+        /// 上一次已经滚动到的（当前项，页签数量），避免每帧重滚把用户的手动横向滚动拉回。
+        revealed: Option<(usize, usize)>,
     }
 
     impl Render for Probe {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let p = Palette::of(cx);
             let layout = self.layout;
+            let reveal = if self.revealed == Some((self.active, self.count)) {
+                None
+            } else {
+                self.revealed = Some((self.active, self.count));
+                Some(self.active)
+            };
             let items: Vec<AnyElement> = (0..self.count)
                 .map(|index| {
-                    let active = index == 0;
+                    let active = index == self.active;
                     let spec = TabSpec::new(format!("tab-{index}"), IconName::Code, LONG_TITLE)
                         .active(active)
                         .running(index == 2)
@@ -245,6 +289,7 @@ mod tab_tests {
                 HitArea::CONTROL,
                 p.text_muted,
                 &p,
+                false,
                 cx.listener(|this: &mut Self, _, _, cx| {
                     this.clicks += 100;
                     cx.notify();
@@ -257,7 +302,17 @@ mod tab_tests {
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(tab_strip("tabs", "打开的标签", "tab-list", items, vec![new_tab], &layout, &p))
+                .child(tab_strip(
+                    "tabs",
+                    "打开的标签",
+                    "tab-list",
+                    items,
+                    vec![new_tab],
+                    &self.scroll,
+                    reveal,
+                    &layout,
+                    &p,
+                ))
         }
     }
 
@@ -277,7 +332,17 @@ mod tab_tests {
             gpui_kit::open_window(
                 WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
                 cx,
-                |_, cx| cx.new(|_| Probe { layout, count, clicks: 0, closes: 0 }),
+                |_, cx| {
+                    cx.new(|_| Probe {
+                        layout,
+                        count,
+                        clicks: 0,
+                        closes: 0,
+                        active: 0,
+                        scroll: gpui_kit::ScrollHandle::new(),
+                        revealed: None,
+                    })
+                },
             )
             .expect("tabs window")
         })
@@ -404,5 +469,114 @@ mod tab_tests {
         let (clicks, closes) = cx.update(|cx| (view.read(cx).clicks, view.read(cx).closes));
         assert!(clicks >= 100, "新建动作照常分发点击（实际 {clicks}）");
         assert_eq!(closes, 1, "关闭动作把点击交回业务层");
+    }
+
+    /// 640 宽、页签多到放不下时，Ctrl+Tab 或新建切到的当前项要自己滚进列表视口：
+    /// 当前页签完整可见、尾部新建仍在视口内，列表确实横向滚动了。
+    #[gpui_kit::test]
+    fn the_current_tab_scrolls_into_the_visible_list_at_640(cx: &mut TestAppContext) {
+        let layout = Metrics::compact();
+        let (window, view) = open(cx, 640., layout, false, 12);
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        let initial = cx.update(|cx| f32::from(view.read(cx).scroll.offset().x));
+        assert_eq!(initial, 0., "首个页签本来就在视口里，列表不预先滚动");
+        // Ctrl+Tab 到最后一个页签：只有当前项变化才会触发滚动。
+        cx.update(|cx| {
+            view.update(cx, |probe, cx| {
+                probe.active = probe.count - 1;
+                cx.notify();
+            })
+        });
+        let (list, active, new_tab) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.find("tab-list").bounds(), window.find("tab-11").bounds(), window.find("tab-new").bounds())
+            })
+            .unwrap();
+        let offset = cx.update(|cx| f32::from(view.read(cx).scroll.offset().x));
+        assert!(offset < -0.5, "当前项在视口外时列表横向滚动（offset {offset}）");
+        assert!(
+            f32::from(active.origin.x) >= f32::from(list.origin.x) - 0.5
+                && f32::from(active.origin.x + active.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5,
+            "当前页签完整落在列表视口内（tab {}..{} / list {}..{}）",
+            f32::from(active.origin.x),
+            f32::from(active.origin.x + active.size.width),
+            f32::from(list.origin.x),
+            f32::from(list.origin.x + list.size.width)
+        );
+        assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "尾部新建仍在视口内");
+        // 新建页签（数量也变了）：新的当前项同样进入视口。
+        cx.update(|cx| {
+            view.update(cx, |probe, cx| {
+                probe.count += 1;
+                probe.active = probe.count - 1;
+                cx.notify();
+            })
+        });
+        let (list, active, new_tab) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.find("tab-list").bounds(), window.find("tab-12").bounds(), window.find("tab-new").bounds())
+            })
+            .unwrap();
+        let offset = cx.update(|cx| f32::from(view.read(cx).scroll.offset().x));
+        assert!(offset < -0.5, "新建页签后列表继续滚动（offset {offset}）");
+        assert!(
+            f32::from(active.origin.x) >= f32::from(list.origin.x) - 0.5
+                && f32::from(active.origin.x + active.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5,
+            "新建后的当前页签完整落在列表视口内"
+        );
+        assert!(f32::from(new_tab.origin.x + new_tab.size.width) <= 640.5, "新建后尾部动作仍可达");
+    }
+
+    /// 键盘 Tab 依次走到页签、它的关闭动作和尾部新建：三个停靠点互不相同，
+    /// 走完一圈回到第一个；三者几何上都留在页签条内，不被裁切也不互相遮挡。
+    #[gpui_kit::test]
+    fn keyboard_focus_visits_tab_close_and_new_in_order(cx: &mut TestAppContext) {
+        let layout = Metrics::standard();
+        let (window, _view) = open(cx, 900., layout, false, 1);
+        let handles = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let mut handles = Vec::new();
+                for _ in 0..4 {
+                    window.focus_next(cx);
+                    window.render_frame(cx);
+                    handles.push(window.focused(cx).expect("页签条里的控件应当都是 Tab 停靠点"));
+                }
+                handles
+            })
+            .unwrap();
+        assert_ne!(handles[0], handles[1], "页签与关闭动作是两个停靠点");
+        assert_ne!(handles[1], handles[2], "关闭动作与尾部新建是两个停靠点");
+        assert_ne!(handles[0], handles[2], "页签与尾部新建是两个停靠点");
+        assert_eq!(handles[0], handles[3], "三个停靠点走完回到第一个，焦点不会跑出页签条");
+        let (strip, chip, title, close, new_tab) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.find("tabs").bounds(),
+                    window.find("tab-0").bounds(),
+                    window.find("tab-0-title").bounds(),
+                    window.find("tab-close-0").bounds(),
+                    window.find("tab-new").bounds(),
+                )
+            })
+            .unwrap();
+        let inside = |bounds: Bounds<gpui_kit::Pixels>| {
+            f32::from(bounds.origin.x) >= f32::from(strip.origin.x) - 0.5
+                && f32::from(bounds.origin.x + bounds.size.width) <= f32::from(strip.origin.x + strip.size.width) + 0.5
+        };
+        for (name, bounds) in [("页签", chip), ("标题", title), ("关闭动作", close), ("新建动作", new_tab)] {
+            assert!(inside(bounds), "{name} 留在页签条内，不被裁切");
+        }
+        assert!(
+            f32::from(title.origin.x + title.size.width) <= f32::from(close.origin.x) + 0.5,
+            "关闭动作不压住页签标题"
+        );
+        assert!(
+            f32::from(close.origin.x + close.size.width) <= f32::from(new_tab.origin.x) + 0.5,
+            "新建动作不压住关闭动作"
+        );
     }
 }

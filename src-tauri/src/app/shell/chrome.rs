@@ -1398,10 +1398,39 @@ impl Workbench {
     fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        // 页签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
+        // 页签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达，
+        // 并且切过去之后列表自己把当前项滚进视口，不用手动横向拖。
         // 新建按钮紧跟最后一个标签（浏览器式），标签多到放不下时列表自己横向滚动。
         let mut items: Vec<AnyElement> = Vec::new();
         let work_page = matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure);
+        // 当前页签或页签数量一变就挂一个“把它滚进视口”的请求；请求一直挂到确认可见为止，
+        // 因为页签位置要下一帧才量得出来（首帧、刚新建时都还没有几何）。确认可见后就不再动，
+        // 用户手动横向滚开也不会被每帧拉回。
+        if work_page {
+            if let Some(active) = self.model.active_tab.clone() {
+                let index = self.model.tabs.iter().position(|tab| tab.id == active);
+                let key = Some((active, self.model.tabs.len()));
+                if self.tab_scroll_seen != key {
+                    self.tab_scroll_seen = key;
+                    self.tab_scroll_pending = index;
+                }
+            } else {
+                self.tab_scroll_seen = None;
+                self.tab_scroll_pending = None;
+            }
+        }
+        let reveal = match self.tab_scroll_pending {
+            Some(index) if tabs::tab_visible(&self.tab_scroll, index) => {
+                self.tab_scroll_pending = None;
+                None
+            }
+            Some(index) => {
+                // 这一帧才开始滚，页签位置要等画完才量得出来：再要一帧确认它真的进来了。
+                cx.notify();
+                Some(index)
+            }
+            None => None,
+        };
         // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
         let dirty_text = self.t("ui.grid.pending");
         for tab in self.model.tabs.clone() {
@@ -1463,6 +1492,7 @@ impl Workbench {
             kit::HitArea::CONTROL,
             p.text_muted,
             &p,
+            false,
             act("new-query", cx),
         )
         .into_any_element();
@@ -1472,6 +1502,8 @@ impl Workbench {
             "tab-list",
             items,
             vec![new_action],
+            &self.tab_scroll,
+            reveal,
             &m,
             &p,
         )
