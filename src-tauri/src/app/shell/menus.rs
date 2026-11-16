@@ -217,21 +217,21 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         MenuPlace::ObjectTree => object_tree_items(target, None),
         MenuPlace::Grid => grid_items(&GridMenuFacts { table: true, writable: target == MenuTarget::WritableGrid, ..GridMenuFacts::default() }),
         MenuPlace::TabBar => vec![
-            item("close-tab", "common.close"),
-            item("tab-close-others", "shell.tabs.closeOthers"),
-            item("tab-close-right", "shell.tabs.closeRight"),
-            item("tab-close-all", "shell.tabs.closeAll"),
-            item("history-copy", "query.editor.menu.copy"),
+            with_icon(item("close-tab", "common.close"), IconName::X),
+            with_icon(item("tab-close-others", "shell.tabs.closeOthers"), IconName::CircleX),
+            with_icon(item("tab-close-right", "shell.tabs.closeRight"), IconName::ArrowRight),
+            with_icon(item("tab-close-all", "shell.tabs.closeAll"), IconName::Trash),
+            sep(with_icon(item("history-copy", "query.editor.menu.copy"), IconName::Copy)),
         ],
         MenuPlace::Editor => vec![
-            item("execute-query", "query.editor.menu.run"),
-            item("run-current", "query.editor.menu.runCurrent"),
-            item("format", "query.editor.menu.format"),
-            item("explain", "query.editor.menu.plan"),
-            item("history-copy", "query.editor.menu.copy"),
-            item("open-exchange", "shell.command.openExchange"),
-            item("command-palette", "shell.shortcuts.commandPalette"),
-            item("editor-clear", "query.editor.menu.clear"),
+            with_icon(item("execute-query", "query.editor.menu.run"), IconName::Play),
+            with_icon(item("run-current", "query.editor.menu.runCurrent"), IconName::StepForward),
+            sep(with_icon(item("format", "query.editor.menu.format"), IconName::WandSparkles)),
+            with_icon(item("explain", "query.editor.menu.plan"), IconName::ChartNetwork),
+            sep(with_icon(item("history-copy", "query.editor.menu.copy"), IconName::Copy)),
+            with_icon(item("open-exchange", "shell.command.openExchange"), IconName::ArrowDownUp),
+            with_icon(item("command-palette", "shell.shortcuts.commandPalette"), IconName::Search),
+            sep(with_icon(danger("editor-clear", "query.editor.menu.clear"), IconName::Eraser)),
         ],
         // 连接页的行菜单：连接与新建查询在上，配置居中，“移动到分组”由模型插在删除之前，删除最后。
         MenuPlace::ConnectionRow => vec![
@@ -246,18 +246,18 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         MenuPlace::HistoryEntry => {
             if target == MenuTarget::Saved {
                 vec![
-                    item("history-load", "history.page.loadToEditor"),
-                    item("history-copy", "history.preview.copy"),
-                    item("history-rename", "history.page.rename"),
-                    danger("saved-delete", "ui.history.delete"),
+                    with_icon(item("history-load", "history.page.loadToEditor"), IconName::SquarePen),
+                    with_icon(item("history-copy", "history.preview.copy"), IconName::Copy),
+                    with_icon(item("history-rename", "history.page.rename"), IconName::Pencil),
+                    sep(with_icon(danger("saved-delete", "ui.history.delete"), IconName::Trash)),
                 ]
             } else {
                 vec![
-                    item("history-load", "history.page.loadToEditor"),
-                    item("history-copy", "history.preview.copy"),
-                    item("history-detail", "history.page.sqlPreview"),
-                    item("history-filter-connection", "history.page.filterConnection"),
-                    item("history-save-preview", "history.preview.saveQuery"),
+                    with_icon(item("history-load", "history.page.loadToEditor"), IconName::SquarePen),
+                    with_icon(item("history-copy", "history.preview.copy"), IconName::Copy),
+                    with_icon(item("history-detail", "history.page.sqlPreview"), IconName::Eye),
+                    sep(with_icon(item("history-filter-connection", "history.page.filterConnection"), IconName::Funnel)),
+                    with_icon(item("history-save-preview", "history.preview.saveQuery"), IconName::Bookmark),
                 ]
             }
         }

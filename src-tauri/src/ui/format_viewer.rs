@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use base64::Engine;
 use chrono::Datelike;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
-use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, Render,
@@ -552,7 +551,7 @@ fn text_button(
     label: SharedString,
     disabled: bool,
     action: impl Fn(&mut FormatViewer, &mut Context<FormatViewer>) + 'static,
-) -> gpui_kit::component::button::Button {
+) -> kit::ActionButton {
     let target = entity.clone();
     kit::tool_button(id, None, label, move |_, _, cx| {
         target.update(cx, |this, cx| action(this, cx));

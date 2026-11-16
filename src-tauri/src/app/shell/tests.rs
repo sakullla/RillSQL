@@ -10286,3 +10286,19 @@ fn the_connection_menu_offers_disconnect_only_when_connected() {
     assert_eq!(ids.first(), Some(&"conn-disconnect"), "{ids:?}");
     assert!(!ids.contains(&"conn-connect"), "已连接时不再给“连接”");
 }
+
+/// 表数据页与表结构页一键互切，欢迎工作台不再重复渲染左侧同款连接筛选器。
+#[test]
+fn table_and_structure_views_switch_directly_on_active_object() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let _ = model.dispatch("open-table:pg|Atlas|shop|public|table|orders|postgres|dev");
+    assert_eq!(model.active_tab().map(|tab| tab.kind), Some(WorkItemKind::Table));
+
+    let _ = model.dispatch("switch-to-structure");
+    assert_eq!(model.active_tab().map(|tab| tab.kind), Some(WorkItemKind::Structure));
+    assert!(model.active_tab().and_then(|tab| tab.spec.as_deref()).is_some_and(|spec| spec.contains("|orders|")));
+
+    let _ = model.dispatch("switch-to-data");
+    assert_eq!(model.active_tab().map(|tab| tab.kind), Some(WorkItemKind::Table));
+}

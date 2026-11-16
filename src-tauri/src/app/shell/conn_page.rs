@@ -2,7 +2,6 @@
 //! 窄窗口只留列表，操作跟在选中行上。标签由用户自己维护（新建、改名、换色、删除）。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AnyElement, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, SharedString,
@@ -124,29 +123,10 @@ impl Workbench {
         for (id, label, tone, n) in chips {
             let on = current == id;
             let command = if on || id.is_empty() { "conn-filter-env:".to_owned() } else { format!("conn-filter-env:{id}") };
-            let (fg, bg) = tone.as_deref().map(|tone| kit::env_colors(tone, p)).unwrap_or((p.text_muted, p.hover));
+            let dot = tone.as_deref().map(|tone| kit::env_colors(tone, p).0);
             let aria = SharedString::from(format!("{label} {n}"));
-            bar = bar.child(
-                kit::interactive_states(div().id(SharedString::from(format!("conn-tag-{}", if id.is_empty() { "all" } else { &id }))), p, false)
-                    .role(gpui_kit::Role::Button)
-                    .aria_label(aria)
-                    .aria_selected(on)
-                    .h(px(24.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .rounded_full()
-                    .border_1()
-                    .text_size(px(TypeScale::XS))
-                    .when(on, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
-                    .when(!on, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
-                    .when(tone.is_some(), |this| this.child(div().size(px(8.)).rounded_full().bg(fg)))
-                    .child(label)
-                    .child(div().text_color(if on { p.accent_text } else { p.text_faint }).when(n == 0, |this| this.opacity(0.6)).child(SharedString::from(n.to_string())))
-                    .when(tone.is_none() && !id.is_empty(), |this| this.bg(bg))
-                    .on_click(act(command, cx)),
-            );
+            let chip_id = SharedString::from(format!("conn-tag-{}", if id.is_empty() { "all" } else { &id }));
+            bar = bar.child(kit::filter_chip(chip_id, label, Some(aria), dot, Some(n), on, p, act(command, cx)));
         }
         bar.child(kit::tool_button("conn-tag-manage", Some(IconName::Settings2), self.t("conn.page.manageTags"), act("tags-manage", cx)).xsmall()).into_any_element()
     }
@@ -526,32 +506,47 @@ impl Workbench {
 
         panel = panel.child(
             div()
-                .p(px(16.))
+                .p(px(18.))
                 .flex()
                 .flex_col()
                 .gap(px(14.))
                 .child(
-                    div()
+                    kit::card(p)
+                        .p(px(14.))
                         .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(kit::engine_badge(saved.engine.as_str(), 32.))
+                        .flex_col()
+                        .gap(px(12.))
                         .child(
                             div()
-                                .flex_1()
-                                .min_w(px(0.))
                                 .flex()
-                                .flex_col()
-                                .gap(px(3.))
-                                .child(div().truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::LG)).child(SharedString::from(saved.name.clone())))
-                                .child(div().flex().items_center().gap(px(6.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(kit::status_dot(dot)).child(self.model.text(state_key))),
-                        ),
+                                .items_center()
+                                .gap(px(12.))
+                                .child(kit::engine_badge(saved.engine.as_str(), 36.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(div().truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::LG)).child(SharedString::from(saved.name.clone())))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .text_size(px(TypeScale::XS))
+                                                .text_color(p.text_muted)
+                                                .child(kit::status_dot(dot))
+                                                .child(self.model.text(state_key)),
+                                        ),
+                                ),
+                        )
+                        .child(actions)
+                        .child(div().pt(px(4.)).border_t_1().border_color(p.line_soft).child(tools)),
                 )
-                .child(actions)
-                .child(tools)
-                .child(div().h(px(1.)).bg(p.line))
-                .child(table)
-                .when(!connected, |this| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("conn.page.openHint")))),
+                .child(kit::card(p).p(px(14.)).child(table))
+                .when(!connected, |this| this.child(div().px(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("conn.page.openHint")))),
         );
         panel.into_any_element()
     }

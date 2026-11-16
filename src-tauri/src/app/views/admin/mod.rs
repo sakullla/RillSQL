@@ -1153,7 +1153,7 @@ impl Render for AdminPane {
     }
 }
 
-fn admin_button(id: &'static str, key: &'static str, primary: bool, entity: Entity<AdminPane>, locale: Locale) -> gpui_kit::component::button::Button {
+fn admin_button(id: &'static str, key: &'static str, primary: bool, entity: Entity<AdminPane>, locale: Locale) -> kit::ActionButton {
     let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
         entity.update(cx, |pane, cx| match id {
             "admin-preview" => pane.preview(cx),

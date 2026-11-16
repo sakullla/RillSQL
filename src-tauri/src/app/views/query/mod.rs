@@ -2533,6 +2533,12 @@ impl QueryPane {
             .border_b_1()
             .border_color(p.line)
             .child(run)
+            .when(!running && !self.narrow, |this| {
+                this.child(
+                    kit::secondary_button("query-act-run-current", Some(IconName::CornerDownLeft), t("query.editor.menu.runCurrent"), pane_act("run-current", entity))
+                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.editor.menu.runCurrent"), kit::shortcut("Ctrl+Shift+Enter")))),
+                )
+            })
             .child(kit::vline(p))
             .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity)))
             .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity)))
@@ -3236,54 +3242,21 @@ fn failure_summary(locale: Locale, result: &desk::StatementView) -> String {
     if message.trim().is_empty() { i18n::text(locale, "query.log.error") } else { message }
 }
 
-fn error_jump_button(id: &'static str, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+fn error_jump_button(id: &'static str, locale: Locale, _p: &Palette, _metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
     let entity = entity.clone();
-    let label = SharedString::from(i18n::text(locale, "query.errors.locate"));
-    kit::interactive(div().id(id), p, false)
-        .test_support()
-        .flex_none()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .h(px(metrics.control_h))
-        .px(px(8.))
-        .rounded(px(Radius::CONTROL))
-        .flex()
-        .items_center()
-        .text_size(px(TypeScale::SM))
-        .text_color(p.danger)
-        .bg(p.danger_soft)
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| pane.command("jump-error", cx));
-        })
-        .into_any_element()
+    kit::danger_soft_button(id, Some(IconName::Crosshair), i18n::text(locale, "query.errors.locate"), move |_, _, cx| {
+        entity.update(cx, |pane, cx| pane.command("jump-error", cx));
+    })
+    .into_any_element()
 }
 
 /// 复制错误原文：次要动作，用中性描边按钮，不和“定位”抢红色。
-fn error_copy_button(locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+fn error_copy_button(locale: Locale, _p: &Palette, _metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
     let entity = entity.clone();
-    let label = SharedString::from(i18n::text(locale, "query.errors.copy"));
-    kit::interactive(div().id("query-error-copy"), p, false)
-        .test_support()
-        .flex_none()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .h(px(metrics.control_h))
-        .px(px(8.))
-        .rounded(px(Radius::CONTROL))
-        .border_1()
-        .border_color(p.line_strong)
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .text_size(px(TypeScale::SM))
-        .text_color(p.text_muted)
-        .child(kit::icon(IconName::Copy, kit::IconSize::INLINE, p.text_muted))
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| pane.command("copy-error", cx));
-        })
-        .into_any_element()
+    kit::secondary_button("query-error-copy", Some(IconName::Copy), i18n::text(locale, "query.errors.copy"), move |_, _, cx| {
+        entity.update(cx, |pane, cx| pane.command("copy-error", cx));
+    })
+    .into_any_element()
 }
 
 /// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。

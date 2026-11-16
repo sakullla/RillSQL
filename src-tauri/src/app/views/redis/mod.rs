@@ -2400,7 +2400,7 @@ fn row_button(id: String, icon: IconName, label: String, entity: &Entity<RedisPa
     })
 }
 
-fn redis_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<RedisPane>) -> gpui_kit::component::button::Button {
+fn redis_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<RedisPane>) -> kit::ActionButton {
     let entity = entity.clone();
     let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(id, cx));
     let label = SharedString::from(label.to_owned());

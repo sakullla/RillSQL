@@ -13,7 +13,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div, px,
 };
 
-use super::kit::{self, HitArea, IconSize, Metrics, Palette, Tip as _, TypeScale};
+use super::kit::{self, HitArea, IconSize, Metrics, Palette, Radius, Tip as _, TypeScale};
 
 /// 页签最大宽度：长标题在这里截断，完整标题留在 tooltip 与无障碍名称上。
 pub const TAB_MAX_W: f32 = 220.;
@@ -117,11 +117,20 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
         .items_center()
         .gap(px(TAB_GAP))
         .border_r_1()
-        .border_color(p.line)
+        .border_color(if spec.active { p.line } else { p.line_soft })
         .when(spec.active, |this| this.bg(p.surface).text_color(p.text))
         .when(!spec.active, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
         .when(spec.active, |this| {
-            this.child(div().absolute().top_0().left_0().right_0().h(px(TAB_MARK_H)).bg(p.accent))
+            this.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(6.))
+                    .right(px(6.))
+                    .h(px(TAB_MARK_H))
+                    .rounded(px(Radius::TAG))
+                    .bg(p.accent),
+            )
         })
         .child(leading)
         .child(
@@ -132,7 +141,7 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
                 .truncate()
                 .test_support(),
         )
-        .when(spec.dirty, |this| this.child(kit::status_dot(p.text_muted)))
+        .when(spec.dirty, |this| this.child(kit::status_dot(p.warn)))
         .test_support()
 }
 

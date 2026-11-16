@@ -185,10 +185,16 @@ impl Workbench {
         // 外键跳转的出口：网格只算出目标和定位查询，真正打开工作项由外壳负责。
         // 这条接线就是"跳转"与"只复制 SQL"的区别，所以必须在这里接上，而不是留给网格自己。
         let nav_owner = cx.entity().downgrade();
+        let struct_owner = cx.entity().downgrade();
         table.update(cx, |pane, _| {
             pane.set_navigation_sink(Arc::new(move |navigation: crate::app::views::grid::GridNavigation, cx: &mut App| {
                 if let Some(owner) = nav_owner.upgrade() {
                     owner.update(cx, |view, cx| view.open_reference(navigation, cx));
+                }
+            }));
+            pane.set_structure_sink(Arc::new(move |cx: &mut App| {
+                if let Some(owner) = struct_owner.upgrade() {
+                    owner.update(cx, |view, cx| view.perform("switch-to-structure", cx));
                 }
             }));
         });
@@ -214,7 +220,16 @@ impl Workbench {
                 }
             }));
         });
-        let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
+        let data_owner = cx.entity().downgrade();
+        let structure = cx.new(|_| {
+            let mut pane = StructurePane::new(Arc::clone(&services));
+            pane.set_data_sink(Arc::new(move |cx: &mut App| {
+                if let Some(owner) = data_owner.upgrade() {
+                    owner.update(cx, |view, cx| view.perform("switch-to-data", cx));
+                }
+            }));
+            pane
+        });
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
         let compare = cx.new(|_| ComparePane::new(Arc::clone(&services)));

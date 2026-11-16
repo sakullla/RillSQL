@@ -760,6 +760,18 @@ impl WorkbenchModel {
             self.palette_load_saved(rest);
             return true;
         }
+        if id == "switch-to-structure" {
+            if let Some(spec) = self.active_tab().and_then(|tab| tab.spec.clone()).or_else(|| self.object_spec.clone()) {
+                self.open_item(WorkItemKind::Structure, spec);
+            }
+            return true;
+        }
+        if id == "switch-to-data" {
+            if let Some(spec) = self.active_tab().and_then(|tab| tab.spec.clone()).or_else(|| self.object_spec.clone()) {
+                self.open_item(WorkItemKind::Table, spec);
+            }
+            return true;
+        }
         if let Some(spec) = id.strip_prefix("open-table:") {
             self.open_item(WorkItemKind::Table, spec.to_owned());
             return true;
@@ -1594,6 +1606,12 @@ impl WorkbenchModel {
         }
         // 快速打开选中表/视图：目录是这次会话读到的，但那条连接可能刚断开或还没打开。
         // 先按需建连，连上后按排队时记下的对象打开数据，不重新读当前焦点。
+        if id == "switch-to-structure" || id == "switch-to-data" {
+            let spec = self.active_tab().and_then(|tab| tab.spec.clone()).or_else(|| self.object_spec.clone())?;
+            let target = ObjectTarget::parse(&spec)?;
+            let action = if id == "switch-to-structure" { ConnectAction::OpenStructure } else { ConnectAction::OpenData };
+            return Some(ConnectIntent::new(target.connection_id, action, Some(spec)));
+        }
         if let Some(spec) = id.strip_prefix("open-table:") {
             let target = ObjectTarget::parse(spec)?;
             return Some(ConnectIntent::new(target.connection_id, ConnectAction::OpenData, Some(spec.to_owned())));

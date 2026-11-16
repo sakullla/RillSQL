@@ -7,13 +7,12 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontFeatures, FontWeight, Hsla, InteractiveElement as _,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FocusHandle, FontFeatures, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
     Window,
     div, hsla, px, rgb,
@@ -81,74 +80,73 @@ impl Palette {
     pub fn light() -> Self {
         Self {
             surface: hex(0xffffff),
-            chrome: hex(0xf6f7f9),
-            rail: hex(0xeef0f4),
+            chrome: hex(0xf7f8fa),
+            rail: hex(0xf0f2f6),
             raised: hex(0xffffff),
-            // 比外壳再沉一档的冷灰，和白底、外壳、浮层都分开。
-            sunken: hex(0xe8edf5),
-            hover: hex(0xeceef3),
-            active: hex(0xe2e5ec),
-            line: hex(0xe4e7ec),
-            line_soft: hex(0xf0f2f5),
-            line_strong: hex(0xd0d5dd),
-            text: hex(0x16191f),
+            // 比外壳再沉一档的清冷凹陷底，和纯白表面、外壳、浮层都形成细腻层次。
+            sunken: hex(0xebf0f7),
+            hover: hex(0xeceff5),
+            active: hex(0xe1e6f0),
+            line: hex(0xe4e8f0),
+            line_soft: hex(0xf0f2f7),
+            line_strong: hex(0xcdd4e0),
+            text: hex(0x111827),
             // 次级文字必须比 faint 更强一档，避免 token 层级倒置。
-            text_muted: hex(0x4f5a68),
-            // 弱文用于 11–12px 的提示与分区标题；保持在白底和 chrome 底上都过 4.5:1。
-            // 选中/悬停底（active、accent_soft、hover）上也要过 4.5:1。
-            text_faint: hex(0x5b6573),
-            accent: hex(0x4f5bd5),
-            accent_hover: hex(0x4350c4),
-            accent_active: hex(0x3a45ad),
-            accent_soft: hex(0xeceefc),
-            accent_text: hex(0x3a45ad),
+            text_muted: hex(0x475467),
+            // 弱文用于 11–12px 的提示与分区标题；保持在白底、chrome 和选中/悬停底上都过 4.5:1。
+            text_faint: hex(0x535d6e),
+            accent: hex(0x4f46e5),
+            accent_hover: hex(0x4338ca),
+            accent_active: hex(0x3730a3),
+            accent_soft: hex(0xeef0ff),
+            accent_text: hex(0x3730a3),
             on_accent: hex(0xffffff),
-            selection: alpha(0x4f5bd5, 0.14),
-            zebra: hex(0xfafbfc),
+            selection: alpha(0x4f46e5, 0.13),
+            zebra: hex(0xfafbfd),
             // 状态色同时作为小号文字使用，压深到 soft 底也过 4.5:1。
-            ok: hex(0x0f7a4d),
-            warn: hex(0x8f5e14),
-            danger: hex(0xb42f2f),
-            info: hex(0x2568b0),
-            ok_soft: hex(0xe6f6ee),
-            warn_soft: hex(0xfdf3e1),
-            danger_soft: hex(0xfdecec),
+            ok: hex(0x087443),
+            warn: hex(0x935310),
+            danger: hex(0xbd2828),
+            info: hex(0x1d5fb8),
+            ok_soft: hex(0xe6f7ef),
+            warn_soft: hex(0xfef3e2),
+            danger_soft: hex(0xfeecec),
             dark: false,
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            surface: hex(0x17181c),
-            chrome: hex(0x1d1f24),
-            rail: hex(0x15161a),
-            raised: hex(0x24262c),
-            // 比工作区更深的底，避免和外壳、浮层挤在同一档明度上。
-            sunken: hex(0x101216),
-            hover: hex(0x2a2d34),
-            active: hex(0x33363e),
-            line: hex(0x2c2f36),
-            line_soft: hex(0x222429),
-            line_strong: hex(0x3b3f48),
-            text: hex(0xe9ebef),
-            text_muted: hex(0xa1a7b3),
+            surface: hex(0x14161c),
+            chrome: hex(0x191c24),
+            rail: hex(0x101217),
+            raised: hex(0x20242e),
+            // 比工作区更深的黑曜石底，避免和外壳、浮层挤在同一档明度上。
+            sunken: hex(0x0d0f14),
+            hover: hex(0x262b37),
+            active: hex(0x2f3543),
+            line: hex(0x262b36),
+            line_soft: hex(0x1d212a),
+            line_strong: hex(0x373e4d),
+            text: hex(0xeceef4),
+            text_muted: hex(0xa5aec0),
             // 深色主题的选中/悬停底同样按 4.5:1 校准。
-            text_faint: hex(0x98a0ac),
-            accent: hex(0x7c86f5),
-            accent_hover: hex(0x949cf8),
-            accent_active: hex(0x6670e6),
-            accent_soft: hex(0x262a45),
-            accent_text: hex(0xaab1ff),
+            text_faint: hex(0x9aa3b4),
+            accent: hex(0x7580ff),
+            accent_hover: hex(0x8c96ff),
+            accent_active: hex(0x5f6bf2),
+            accent_soft: hex(0x222744),
+            accent_text: hex(0xb0b8ff),
             on_accent: hex(0xffffff),
-            selection: alpha(0x7c86f5, 0.22),
-            zebra: hex(0x1a1b20),
-            ok: hex(0x3ccf8e),
-            warn: hex(0xf0b44c),
-            danger: hex(0xf06d6d),
-            info: hex(0x5eaaf5),
-            ok_soft: hex(0x16352a),
-            warn_soft: hex(0x3a2f17),
-            danger_soft: hex(0x3d1e20),
+            selection: alpha(0x7580ff, 0.22),
+            zebra: hex(0x171920),
+            ok: hex(0x34d399),
+            warn: hex(0xf5b841),
+            danger: hex(0xf87171),
+            info: hex(0x60a5fa),
+            ok_soft: hex(0x133227),
+            warn_soft: hex(0x382b14),
+            danger_soft: hex(0x3a1c20),
             dark: true,
         }
     }
@@ -244,7 +242,8 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     c.button_foreground = p.text;
     c.accent = p.hover;
     c.accent_foreground = p.text;
-    c.input = p.line_strong;
+    // 输入框与按钮、卡片共用同一条柔和边界线，聚焦时才提亮为强调色，避免未聚焦时黑框抢眼。
+    c.input = p.line;
     c.ring = p.accent;
     c.caret = p.accent;
     c.selection = p.selection;
@@ -308,16 +307,16 @@ impl TypeScale {
     pub const XL: f32 = 18.;
 }
 
-/// 圆角：规范 S4.2 的控件 4px、面板/浮层 6px、状态标签 3px。取消胶囊与大圆角卡片。
+/// 圆角：现代桌面工作台三档刻度 —— 标签 4px、控件 6px、面板/卡片/浮层 10px。
 pub struct Radius;
 
 impl Radius {
-    /// 状态/环境标签（`kit::pill`、`kit::env_tag`），规范 S4.2 / S5.2 `Tag`。
-    pub const TAG: f32 = 3.;
+    /// 状态/环境标签（`kit::pill`、`kit::env_tag`）。
+    pub const TAG: f32 = 4.;
     /// 按钮、列表行、标签、菜单项、分段项、输入类控件。
-    pub const CONTROL: f32 = 4.;
+    pub const CONTROL: f32 = 6.;
     /// 面板、卡片、提示条、浮层、对话框、代码块。
-    pub const PANEL: f32 = 6.;
+    pub const PANEL: f32 = 10.;
 }
 
 /// 焦点环宽度：规范 S5.3 的 2px。
@@ -670,14 +669,14 @@ impl gpui_kit::Global for DensityMetrics {}
 /// 引擎缩写与品牌色。只做识别，不做商标。
 pub fn engine_mark(engine: &str) -> (&'static str, u32) {
     match engine {
-        "postgres" | "postgresql" => ("PG", 0x336791),
-        "mysql" => ("MY", 0x00758f),
-        "mariadb" => ("MA", 0xa35a3d),
-        "sqlite" => ("SL", 0x0f80cc),
-        "sqlserver" | "mssql" => ("MS", 0xcc2927),
-        "redis" => ("RD", 0xd8392c),
-        "mongodb" | "mongo" => ("MG", 0x13aa52),
-        _ => ("DB", 0x6b7280),
+        "postgres" | "postgresql" => ("PG", 0x3b6ea5),
+        "mysql" => ("MY", 0x0284a8),
+        "mariadb" => ("MA", 0xb46346),
+        "sqlite" => ("SL", 0x1d82d6),
+        "sqlserver" | "mssql" => ("MS", 0xd63636),
+        "redis" => ("RD", 0xdc3d35),
+        "mongodb" | "mongo" => ("MG", 0x10a356),
+        _ => ("DB", 0x64748b),
     }
 }
 
@@ -694,18 +693,23 @@ pub fn engine_label(engine: &str) -> &'static str {
     }
 }
 
-/// 圆角方块里的两字母引擎徽标。
+/// 圆角方块里的两字母引擎徽标：柔和微透底 + 清晰品牌描边与色相，比纯色大红大绿块更精致现代。
 pub fn engine_badge(engine: &str, size: f32) -> AnyElement {
     let (abbr, color) = engine_mark(engine);
+    let solid = hex(color);
+    let soft = alpha(color, 0.16);
+    let border = alpha(color, 0.34);
     div()
         .flex_none()
         .size(px(size))
         .rounded(px((size / 4.).max(3.)))
-        .bg(rgb(color))
+        .bg(soft)
+        .border_1()
+        .border_color(border)
         .flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(0xffffff))
+        .text_color(solid)
         .text_size(px((size * 0.42).max(8.)))
         .font_weight(FontWeight::BOLD)
         .child(abbr)
@@ -1131,6 +1135,7 @@ type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// 纯图标按钮的色调。只换前景色与可选的一圈边界线，
 /// 命中范围、图标档与四态仍由 `icon_action` 统一，页面不再各配一套。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconTone {
     /// 幽灵样式：次级文字色，日常工具条与行尾动作。
@@ -1181,6 +1186,7 @@ impl IconButton {
     }
 
     /// 描边样式。
+    #[allow(dead_code)]
     pub fn outline(mut self) -> Self {
         self.tone = IconTone::Outline;
         self
@@ -1242,48 +1248,334 @@ pub fn icon_button(id: impl Into<ElementId>, name: IconName, label: impl Into<Sh
     }
 }
 
-/// 工具条按钮：幽灵样式、图标 + 文字。
-pub fn tool_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Button {
-    let label = label.into();
-    let mut button = Button::new(id).ghost().small().label(label.clone()).accessibility_label(label);
-    if let Some(name) = name {
-        button = button.icon(name);
+/// 文字动作按钮的统一变体。全应用所有带文字的操作按钮共用一套高度、圆角、字重、图标与四态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionVariant {
+    /// 主动作：强调实心底，白字。每个视图最多一个。
+    Primary,
+    /// 次要动作：清晰描边 + 表面底色。
+    Secondary,
+    /// 轻强调：强调浅底 + 强调文字（用于次主入口或已激活状态）。
+    Subtle,
+    /// 工具条/行内动作：默认透明，悬停浮现浅底。
+    Ghost,
+    /// 危险确认动作：危险实心底，白字。
+    Danger,
+    /// 温和危险动作：危险浅底 + 危险文字，不抢主操作视线。
+    DangerSoft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionSize {
+    /// 跟随当前密度 `Metrics.control_h`。
+    Control,
+    /// 紧凑行内档 `(Metrics.control_h - 4.).max(22.)`。
+    Inline,
+}
+
+/// 全应用统一的带文字动作按钮。
+#[derive(IntoElement)]
+pub struct ActionButton {
+    id: ElementId,
+    icon: Option<IconName>,
+    trailing_icon: Option<IconName>,
+    label: SharedString,
+    aria_label: Option<SharedString>,
+    tooltip: Option<SharedString>,
+    variant: ActionVariant,
+    size: ActionSize,
+    disabled: bool,
+    loading: bool,
+    selected: bool,
+    focus: Option<FocusHandle>,
+    on_click: Click,
+}
+
+impl ActionButton {
+    fn new(
+        id: impl Into<ElementId>,
+        icon: Option<IconName>,
+        label: impl Into<SharedString>,
+        variant: ActionVariant,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            icon,
+            trailing_icon: None,
+            label: label.into(),
+            aria_label: None,
+            tooltip: None,
+            variant,
+            size: ActionSize::Control,
+            disabled: false,
+            loading: false,
+            selected: false,
+            focus: None,
+            on_click: Box::new(on_click),
+        }
     }
-    button.on_click(on_click)
+
+    /// 跟随当前密度的标准控件高度。
+    pub fn small(mut self) -> Self {
+        self.size = ActionSize::Control;
+        self
+    }
+
+    /// 紧凑行内尺寸（列表行尾、辅助标签条）。
+    pub fn xsmall(mut self) -> Self {
+        self.size = ActionSize::Inline;
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
+    }
+
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.aria_label = Some(label.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn trailing_icon(mut self, icon: IconName) -> Self {
+        self.trailing_icon = Some(icon);
+        self
+    }
+
+    pub fn focus_handle(mut self, handle: &FocusHandle) -> Self {
+        self.focus = Some(handle.clone());
+        self
+    }
+}
+
+/// 为自定义按钮元素补齐无障碍节点上的 `disabled` 标记（GPUI 的 `Div` 没有 `aria_disabled` 方法）。
+struct A11yDisabled<E> {
+    inner: E,
+    disabled: bool,
+}
+
+impl<E: gpui::Element> IntoElement for A11yDisabled<E> {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl<E: gpui::InteractiveElement> gpui::InteractiveElement for A11yDisabled<E> {
+    fn interactivity(&mut self) -> &mut gpui::Interactivity {
+        self.inner.interactivity()
+    }
+}
+
+impl<E: gpui::Element> gpui::Element for A11yDisabled<E> {
+    type RequestLayoutState = E::RequestLayoutState;
+    type PrepaintState = E::PrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        self.inner.id()
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        self.inner.source_location()
+    }
+
+    fn request_layout(&mut self, id: Option<&gpui::GlobalElementId>, inspector: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        self.inner.request_layout(id, inspector, window, cx)
+    }
+
+    fn prepaint(&mut self, id: Option<&gpui::GlobalElementId>, inspector: Option<&gpui::InspectorElementId>, bounds: gpui::Bounds<gpui::Pixels>, layout: &mut Self::RequestLayoutState, window: &mut Window, cx: &mut App) -> Self::PrepaintState {
+        self.inner.prepaint(id, inspector, bounds, layout, window, cx)
+    }
+
+    fn paint(&mut self, id: Option<&gpui::GlobalElementId>, inspector: Option<&gpui::InspectorElementId>, bounds: gpui::Bounds<gpui::Pixels>, layout: &mut Self::RequestLayoutState, prepaint: &mut Self::PrepaintState, window: &mut Window, cx: &mut App) {
+        self.inner.paint(id, inspector, bounds, layout, prepaint, window, cx)
+    }
+
+    fn a11y_role(&self) -> Option<gpui::Role> {
+        self.inner.a11y_role()
+    }
+
+    fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
+        self.inner.write_a11y_info(node);
+        if self.disabled {
+            node.set_disabled();
+        }
+    }
+
+    fn a11y_synthetic_children(&mut self, prepaint: &mut Self::PrepaintState, builder: &mut gpui::A11ySubtreeBuilder) {
+        self.inner.a11y_synthetic_children(prepaint, builder);
+    }
+}
+
+impl RenderOnce for ActionButton {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = Palette::of(cx);
+        let m = Metrics::of(cx);
+        let inert = self.disabled || self.loading;
+        let (height, pad_x, icon_sz, gap) = match self.size {
+            ActionSize::Control => (m.control_h, 11., IconSize::CONTROL, 6.),
+            ActionSize::Inline => (18., 7., IconSize::INLINE, 4.),
+        };
+        let effective_variant = if self.selected && self.variant == ActionVariant::Ghost {
+            ActionVariant::Subtle
+        } else {
+            self.variant
+        };
+        let (fg, icon_fg) = match effective_variant {
+            ActionVariant::Primary => (p.on_accent, p.on_accent),
+            ActionVariant::Danger => (p.on_accent, p.on_accent),
+            ActionVariant::Subtle => (p.accent_text, p.accent_text),
+            ActionVariant::DangerSoft => (p.danger, p.danger),
+            ActionVariant::Secondary => (p.text, p.text_muted),
+            ActionVariant::Ghost => (p.text, p.text_muted),
+        };
+        let aria = self.aria_label.unwrap_or_else(|| self.label.clone());
+        let mut el = interactive_states(div().id(self.id), &p, inert)
+            .role(gpui_kit::Role::Button)
+            .aria_label(aria)
+            .when(self.selected, |this| this.aria_selected(true))
+            .flex_none()
+            .h(px(height))
+            .px(px(pad_x))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(gap))
+            .whitespace_nowrap()
+            .rounded(px(Radius::CONTROL));
+
+        if let Some(tip) = self.tooltip {
+            el = el.tooltip_text(tip);
+        }
+        if let Some(handle) = self.focus {
+            el = el.track_focus(&handle);
+        }
+
+        el = match effective_variant {
+            ActionVariant::Primary => el
+                .bg(p.accent)
+                .border_1()
+                .border_color(p.accent)
+                .when(!inert, |this| {
+                    this.hover(|s| s.bg(p.accent_hover).border_color(p.accent_hover))
+                        .active(|s| s.bg(p.accent_active).border_color(p.accent_active))
+                }),
+            ActionVariant::Secondary => el
+                .bg(if p.dark { p.raised } else { p.surface })
+                .border_1()
+                .border_color(p.line)
+                .when(!inert, |this| {
+                    this.hover(|s| s.bg(p.hover).border_color(p.line_strong))
+                        .active(|s| s.bg(p.active))
+                }),
+            ActionVariant::Subtle => el
+                .bg(p.accent_soft)
+                .border_1()
+                .border_color(p.accent.opacity(0.28))
+                .when(!inert, |this| {
+                    this.hover(|s| s.border_color(p.accent))
+                        .active(|s| s.bg(p.selection))
+                }),
+            ActionVariant::Ghost => el.when(!inert, |this| {
+                this.hover(|s| s.bg(p.hover)).active(|s| s.bg(p.active))
+            }),
+            ActionVariant::Danger => el
+                .bg(p.danger)
+                .border_1()
+                .border_color(p.danger)
+                .when(!inert, |this| {
+                    this.hover(|s| s.opacity(0.92)).active(|s| s.opacity(0.85))
+                }),
+            ActionVariant::DangerSoft => el
+                .bg(p.danger_soft)
+                .border_1()
+                .border_color(p.danger.opacity(0.28))
+                .when(!inert, |this| {
+                    this.hover(|s| s.border_color(p.danger))
+                        .active(|s| s.opacity(0.88))
+                }),
+        };
+
+        if self.loading {
+            el = el.child(gpui_kit::component::spinner::Spinner::new().xsmall().color(icon_fg));
+        } else if let Some(name) = self.icon {
+            el = el.child(icon(name, icon_sz, icon_fg));
+        }
+        el = el.child(control_text(
+            self.label,
+            TypeScale::SM,
+            if matches!(effective_variant, ActionVariant::Primary | ActionVariant::Danger | ActionVariant::Subtle) {
+                FontWeight::MEDIUM
+            } else {
+                FontWeight::NORMAL
+            },
+            fg,
+        ));
+        if let Some(trailing) = self.trailing_icon {
+            el = el.child(icon(trailing, IconSize::INLINE, p.text_faint));
+        }
+        let el = el.when(!inert, |this| this.on_click(self.on_click));
+        A11yDisabled { inner: el, disabled: inert }.test_support()
+    }
+}
+
+/// 工具条按钮：幽灵样式、图标 + 文字。
+pub fn tool_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::Ghost, on_click)
 }
 
 /// 主要动作按钮。
-pub fn primary_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Button {
-    let label = label.into();
-    let mut button = Button::new(id).primary().small().label(label.clone()).accessibility_label(label);
-    if let Some(name) = name {
-        button = button.icon(name);
-    }
-    button.on_click(on_click)
+pub fn primary_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::Primary, on_click)
 }
 
 /// 次要动作按钮（描边）。
-pub fn secondary_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Button {
-    let label = label.into();
-    let mut button = Button::new(id).outline().small().label(label.clone()).accessibility_label(label);
-    if let Some(name) = name {
-        button = button.icon(name);
-    }
-    button.on_click(on_click)
+pub fn secondary_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::Secondary, on_click)
 }
 
-pub fn danger_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Button {
-    let label = label.into();
-    let mut button = Button::new(id).danger().small().label(label.clone()).accessibility_label(label);
-    if let Some(name) = name {
-        button = button.icon(name);
-    }
-    button.on_click(on_click)
+/// 轻强调按钮（强调浅底 + 强调文字）。
+pub fn subtle_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::Subtle, on_click)
 }
 
-/// 分段选择：一组互斥选项，选中项高亮；高度由调用方按当前密度的控件高传入。
+/// 危险确认按钮（实心红底）。
+pub fn danger_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::Danger, on_click)
+}
+
+/// 温和危险按钮（浅红底 + 红字，用于非模态工具条删除入口）。
+#[allow(dead_code)]
+pub fn danger_soft_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
+    ActionButton::new(id, name, label, ActionVariant::DangerSoft, on_click)
+}
+
+/// 分段选择：一组互斥选项，凹陷轨道 + 浮起选中卡片；高度由调用方按当前密度的控件高传入。
 pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette, height: f32) -> AnyElement {
-    let mut row = div().flex().flex_none().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover);
+    let mut row = div()
+        .flex()
+        .flex_none()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(Radius::CONTROL))
+        .bg(p.sunken);
     for (id, label, selected, on_click) in items {
         row = row.child(
             interactive_states(div().id(ElementId::Name(id)), p, false)
@@ -1297,13 +1589,196 @@ pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p:
                 .items_center()
                 .rounded(px(Radius::CONTROL))
                 .text_size(px(TypeScale::SM))
-                .when(selected, |this| this.bg(p.surface).text_color(p.text).font_weight(FontWeight::MEDIUM).shadow_sm())
+                .when(selected, |this| {
+                    this.bg(if p.dark { p.raised } else { p.surface })
+                        .text_color(p.text)
+                        .font_weight(FontWeight::MEDIUM)
+                        .shadow_sm()
+                })
                 .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.text_color(p.text)))
                 .child(label)
                 .on_click(move |event, window, cx| on_click(event, window, cx)),
         );
     }
     div().flex().child(row).into_any_element()
+}
+
+/// 统一筛选胶囊/标签项：用于连接环境筛选、命令面板范围、Redis 类型筛选等。
+#[allow(clippy::too_many_arguments)]
+pub fn filter_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    aria: Option<SharedString>,
+    dot: Option<Hsla>,
+    count: Option<usize>,
+    selected: bool,
+    p: &Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let label = label.into();
+    let aria_label = aria.unwrap_or_else(|| label.clone());
+    interactive_states(div().id(id), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(aria_label)
+        .aria_selected(selected)
+        .h(px(24.))
+        .px(px(9.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .rounded(px(Radius::CONTROL))
+        .border_1()
+        .text_size(px(TypeScale::XS))
+        .when(selected, |this| {
+            this.border_color(p.accent)
+                .bg(p.accent_soft)
+                .text_color(p.accent_text)
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!selected, |this| {
+            this.border_color(p.line)
+                .bg(if p.dark { p.chrome } else { p.surface })
+                .text_color(p.text_muted)
+                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
+        })
+        .when_some(dot, |this, color| this.child(div().size(px(7.)).rounded_full().bg(color)))
+        .child(label)
+        .when_some(count, |this, n| {
+            this.child(
+                div()
+                    .font_features(tabular_figures())
+                    .text_color(if selected { p.accent_text } else { p.text_faint })
+                    .when(n == 0, |s| s.opacity(0.6))
+                    .child(SharedString::from(n.to_string())),
+            )
+        })
+        .on_click(on_click)
+        .into_any_element()
+}
+
+/// 统一提示横幅的语义色调。
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BannerTone {
+    Info,
+    Success,
+    Warn,
+    Danger,
+}
+
+impl BannerTone {
+    pub fn colors(self, p: &Palette) -> (Hsla, Hsla, Hsla) {
+        match self {
+            BannerTone::Info => (p.accent_text, p.accent_soft, p.accent.opacity(0.26)),
+            BannerTone::Success => (p.ok, p.ok_soft, p.ok.opacity(0.28)),
+            BannerTone::Warn => (p.warn, p.warn_soft, p.warn.opacity(0.30)),
+            BannerTone::Danger => (p.danger, p.danger_soft, p.danger.opacity(0.30)),
+        }
+    }
+}
+
+/// 统一提示条（柔和底色 + 细描边 + 图标 + 文案 + 可选右侧动作）。
+pub fn banner(tone: BannerTone, icon_name: IconName, text: impl Into<SharedString>, action: Option<AnyElement>, p: &Palette) -> gpui_kit::Div {
+    let (fg, bg, border) = tone.colors(p);
+    let mut row = div()
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(Radius::PANEL))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(TypeScale::SM))
+        .text_color(fg)
+        .child(div().flex_none().child(icon(icon_name, IconSize::CONTROL, fg)))
+        .child(div().flex_1().min_w(px(0.)).child(text.into()));
+    if let Some(action) = action {
+        row = row.child(div().flex_none().child(action));
+    }
+    row
+}
+
+/// 统一开关视觉（36×20 圆胶囊轨道 + 16px 纯白圆滑块）。
+pub fn switch_visual(on: bool, p: &Palette) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(36.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
+        .bg(if on { p.accent } else { p.line_strong })
+        .flex()
+        .items_center()
+        .when(on, |this| this.justify_end())
+        .child(div().size(px(16.)).rounded_full().bg(hex(0xffffff)).shadow_sm())
+        .into_any_element()
+}
+
+/// 统一一体式步进器：`[ - | 数值 | + ]` 合并在一个精致边框容器内。
+#[allow(clippy::too_many_arguments)]
+pub fn stepper(
+    dec_id: impl Into<ElementId>,
+    inc_id: impl Into<ElementId>,
+    dec_label: impl Into<SharedString>,
+    inc_label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    at_min: bool,
+    at_max: bool,
+    height: f32,
+    p: &Palette,
+    on_dec: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_inc: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let step_w = (height - 2.).max(24.);
+    let step_btn = |id: ElementId, name: IconName, label: SharedString, disabled: bool, on_click: Click| {
+        let label_tip = label.clone();
+        interactive(div().id(id), p, disabled)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(label)
+            .tooltip_text(label_tip)
+            .flex_none()
+            .w(px(step_w))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(name, IconSize::INLINE, if disabled { p.text_faint } else { p.text_muted }))
+            .when(!disabled, |this| this.on_click(on_click))
+    };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(height))
+        .rounded(px(Radius::CONTROL))
+        .border_1()
+        .border_color(p.line)
+        .bg(if p.dark { p.raised } else { p.surface })
+        .overflow_hidden()
+        .child(step_btn(dec_id.into(), IconName::Minus, dec_label.into(), at_min, Box::new(on_dec)))
+        .child(
+            div()
+                .min_w(px(62.))
+                .h_full()
+                .px(px(8.))
+                .border_l_1()
+                .border_r_1()
+                .border_color(p.line_soft)
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_features(tabular_figures())
+                .text_size(px(TypeScale::SM))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text)
+                .child(value.into()),
+        )
+        .child(step_btn(inc_id.into(), IconName::Plus, inc_label.into(), at_max, Box::new(on_inc)))
+        .into_any_element()
 }
 
 /// 给可交互元素加一句文字提示。
@@ -1449,9 +1924,14 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
     }
 }
 
-/// 文本框外观：小号、带 id。id 让测试与无障碍能点到它。
+/// 文本框外观：小号、带 id，与按钮共享紧凑控件尺寸。
 pub fn text_input(id: impl Into<ElementId>, state: &Entity<InputState>, label: impl Into<SharedString>) -> Input {
-    Input::new(state).id(id).aria_label(label)
+    Input::new(state).id(id).small().aria_label(label)
+}
+
+/// 无框搜索输入框：用于命令面板、目标选择器等头部内嵌搜索，不再叠第二圈边框与外发光。
+pub fn borderless_input(id: impl Into<ElementId>, state: &Entity<InputState>, label: impl Into<SharedString>) -> Input {
+    Input::new(state).id(id).small().appearance(false).bordered(false).focus_bordered(false).aria_label(label)
 }
 
 /// 表单行：上方小标签，下方控件。
@@ -1909,7 +2389,7 @@ mod token_tests {
     #[test]
     fn style_literals_follow_design_tokens() {
         assert_eq!([TypeScale::XS, TypeScale::SM, TypeScale::MD, TypeScale::LG, TypeScale::XL], [11., 12., 13., 15., 18.], "规范 S4.1 五档字号");
-        assert_eq!((Radius::TAG, Radius::CONTROL, Radius::PANEL), (3., 4., 6.), "规范 S4.2 标签 3 / 控件 4 / 面板 6");
+        assert_eq!((Radius::TAG, Radius::CONTROL, Radius::PANEL), (4., 6., 10.), "现代圆角三档：标签 4 / 控件 6 / 面板 10");
         let files = sources();
         assert!(files.len() > 20, "扫描到了 app/ 与 ui/ 的源码");
         let bad = violations(&files);

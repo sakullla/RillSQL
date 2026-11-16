@@ -3,7 +3,6 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputState;
-use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     anchored, deferred, div, px, Anchor, AnyElement, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, SharedString,
@@ -147,7 +146,7 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
         .rounded(px(Radius::CONTROL))
         .border_1()
         .border_color(if open { p.accent } else if missing { p.warn } else { p.line })
-        .when(open, |this| this.bg(p.hover))
+        .bg(if open { p.accent_soft } else if p.dark { p.raised } else { p.surface })
         .hover(|style| style.border_color(p.line_strong).bg(p.hover))
         .text_size(px(TypeScale::SM))
         .when(has_target, |this| {
@@ -376,7 +375,7 @@ pub fn popover(
     }
 
     let search = picker.search.clone().map(|state| {
-        kit::text_input("query-target-search", &state, t("ui.query.targetSearch")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)
+        kit::borderless_input("query-target-search", &state, t("ui.query.targetSearch")).prefix(kit::icon(IconName::Search, 14., p.text_faint)).cleanable(true)
     });
     let hint = |keys: &'static str, label: SharedString| div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, p)).child(label);
     let footer = div()

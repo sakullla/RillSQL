@@ -1438,6 +1438,18 @@ dict! {
     "conn.page.copiedAddress" => "已复制地址", "Address copied";
     "ui.query.targetHintMove" => "选择库", "Navigate";
     "ui.query.targetHintConn" => "切换连接", "Switch connection";
+    "ui.welcome.subtitle" => "轻量、现代的多引擎数据库工作台", "Modern, lightweight multi-engine database workbench";
+    "ui.welcome.quickStart" => "快速开始", "Quick start";
+    "ui.welcome.newConnDesc" => "连接 PostgreSQL、MySQL、SQL Server、Redis、MongoDB 等", "Connect PostgreSQL, MySQL, SQL Server, Redis, MongoDB, and more";
+    "ui.welcome.openSqliteDesc" => "直接打开本机 .sqlite / .db 文件浏览与编辑", "Open a local .sqlite / .db file to browse and edit";
+    "ui.welcome.newQueryDesc" => "新建空白 SQL 编辑器，按 Ctrl+Enter 立即执行", "Open a SQL editor and press Ctrl+Enter to run";
+    "ui.welcome.myConnections" => "我的连接", "My connections";
+    "ui.welcome.manageConnections" => "连接管理", "Manage";
+    "ui.welcome.enginesHint" => "原生支持 PostgreSQL · MySQL · MariaDB · SQLite · SQL Server · Redis · MongoDB", "Native support for PostgreSQL · MySQL · MariaDB · SQLite · SQL Server · Redis · MongoDB";
+    "ui.table.switchStructure" => "表结构", "Structure";
+    "ui.table.switchData" => "表数据", "Data";
+    "ui.conn.quickUrl" => "粘贴连接串快速填充", "Paste URL to auto-fill";
+    "ui.palette.hintSelect" => "上下选择", "Navigate";
 }
 
 #[cfg(test)]

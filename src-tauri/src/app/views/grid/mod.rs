@@ -14,7 +14,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableSelection, TableState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
     relative, DragMoveEvent,
@@ -71,6 +71,9 @@ pub struct GridMenuFacts {
 /// 单元格右键的出口：表格组件在格子上截住右键（stop_propagation），外层容器收不到；
 /// 格子自己把指针位置交给外壳，由外壳弹出网格菜单。
 pub type MenuSink = Arc<dyn Fn(gpui_kit::Point<gpui_kit::Pixels>, &mut App)>;
+
+/// 表数据页切换到表结构页的出口签名。
+pub type ActionSink = Arc<dyn Fn(&mut App)>;
 
 /// 查看阶段里的 Preview 不等于截断。完整原值保持可编辑；真预览在读完原值前锁定。
 fn truncation_for_open_cell(phase: CellPhase, truncated: bool, total_bytes: u64, can_load_full: bool, error: &str) -> TruncationState {
@@ -172,6 +175,7 @@ pub struct GridPane {
     /// 外键跳转的出口：由外壳（直接消费者）注入，网格只负责生成目标和定位查询。
     navigation: Option<NavigationSink>,
     menu_sink: Option<MenuSink>,
+    structure_sink: Option<ActionSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
     /// 右侧纵向记录视图是否打开；它始终显示网格的焦点行。
@@ -340,6 +344,7 @@ impl GridPane {
             pending_full: None,
             navigation: None,
             menu_sink: None,
+            structure_sink: None,
             pending_viewer: false,
             record_open: false,
             side_width: RECORD_SIDE_DEFAULT,
@@ -375,6 +380,11 @@ impl GridPane {
     /// 单元格右键菜单的出口由外壳注入。
     pub fn set_menu_sink(&mut self, sink: MenuSink) {
         self.menu_sink = Some(sink);
+    }
+
+    /// 切换到当前对象的表结构视图，由外壳注入。
+    pub fn set_structure_sink(&mut self, sink: ActionSink) {
+        self.structure_sink = Some(sink);
     }
 
     pub fn menu_sink(&self) -> Option<MenuSink> {
@@ -3081,6 +3091,14 @@ impl GridPane {
                 }
             }
             actions = actions.child(grid_icon("grid-refresh", IconName::RefreshCw, t("grid.menu.refresh"), entity.clone()));
+            if let Some(sink) = self.structure_sink.clone() {
+                actions = actions.child(kit::vline(p)).child(kit::tool_button(
+                    "grid-open-structure",
+                    Some(IconName::Columns3),
+                    t("ui.table.switchStructure"),
+                    move |_, _, cx| sink(cx),
+                ));
+            }
         }
         let record = grid_icon("grid-record-toggle", IconName::PanelRight, t("grid.record.open"), entity.clone());
         actions.child(if self.record_open { record.selected(true) } else { record }).into_any_element()

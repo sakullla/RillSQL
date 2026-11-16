@@ -616,6 +616,7 @@ pub struct StructurePane {
     /// 外壳同步来的真实可用内容宽（已扣活动栏与停靠侧栏）。
     /// 字段表按它决定列宽，不能拿窗口视口宽冒充：900 的视口开着侧栏时只剩 614。
     content_width: f32,
+    data_sink: Option<Arc<dyn Fn(&mut App)>>,
 }
 
 impl StructurePane {
@@ -645,7 +646,12 @@ impl StructurePane {
             view_editor_sync: String::new(),
             view_sub: None,
             content_width: 0.,
+            data_sink: None,
         }
+    }
+
+    pub fn set_data_sink(&mut self, sink: Arc<dyn Fn(&mut App)>) {
+        self.data_sink = Some(sink);
     }
 
     /// 外壳每帧下发内容区真实宽度；变了返回 true，调用方据此重绘。
@@ -2639,6 +2645,16 @@ impl StructurePane {
                                     .flex_col()
                                     .child(kit::title(title, TypeScale::LG, &p))
                                     .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.display_banner()))),
+                            )
+                            .when_some(
+                                self.data_sink
+                                    .clone()
+                                    .filter(|_| self.session.mode != StructureMode::Create && !self.session.target.table.is_empty()),
+                                |this, sink| {
+                                    this.child(kit::secondary_button("structure-open-data", Some(IconName::Table), t("ui.table.switchData"), move |_, _, cx| {
+                                        sink(cx);
+                                    }))
+                                },
                             )
                             .children(more),
                     )

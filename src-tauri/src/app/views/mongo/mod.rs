@@ -1137,9 +1137,29 @@ impl Render for MongoPane {
                 IconName::PanelLeft,
                 &self.text(if collapsed { "mongo.nav.expand" } else { "mongo.nav.collapse" }),
                 &entity,
-            ))
-            .child(mongo_button("mongo-view-table", None, &self.text("mongo.view.table"), Kind::Tool, &entity))
-            .child(mongo_button("mongo-view-tree", None, &self.text("mongo.view.tree"), Kind::Tool, &entity))
+            ).selected(!collapsed))
+            .child({
+                let e1 = entity.clone();
+                let e2 = entity.clone();
+                kit::segmented_sized(
+                    vec![
+                        (
+                            SharedString::from("mongo-view-table"),
+                            SharedString::from(self.text("mongo.view.table")),
+                            !self.doc_tree,
+                            kit::click(move |_, _, cx| e1.update(cx, |pane, cx| pane.command("mongo-view-table", cx))),
+                        ),
+                        (
+                            SharedString::from("mongo-view-tree"),
+                            SharedString::from(self.text("mongo.view.tree")),
+                            self.doc_tree,
+                            kit::click(move |_, _, cx| e2.update(cx, |pane, cx| pane.command("mongo-view-tree", cx))),
+                        ),
+                    ],
+                    &p,
+                    kit::Metrics::of(cx).control_h,
+                )
+            })
             .child(
                 // 面包屑自身允许换行与截断：长库名在 640 宽度下也不会把工具条撑出页面。
                 div()
@@ -1744,7 +1764,7 @@ fn nav_row(id: String, label: String, icon: IconName, text: String, count: Strin
         .into_any_element()
 }
 
-fn mongo_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+fn mongo_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<MongoPane>) -> kit::ActionButton {
     mongo_button_for(id, id, icon, label, kind, entity)
 }
 
@@ -1756,7 +1776,7 @@ fn mongo_button_for(
     label: &str,
     kind: Kind,
     entity: &Entity<MongoPane>,
-) -> gpui_kit::component::button::Button {
+) -> kit::ActionButton {
     let entity = entity.clone();
     let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(command, cx));
     let label = SharedString::from(label.to_owned());

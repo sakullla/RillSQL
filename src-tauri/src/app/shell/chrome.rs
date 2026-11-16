@@ -5,7 +5,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, TitleBar};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle, Focusable as _, FontWeight,
@@ -587,8 +587,8 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.palette.title"))
-                    .w(px(if narrow { 180. } else { 360. }))
-                    .h(px(m.control_h + 6.))
+                    .w(px(if narrow { 176. } else { 360. }))
+                    .h(px(m.control_h + 2.))
                     .px(px(10.))
                     .flex()
                     .items_center()
@@ -596,9 +596,9 @@ impl Workbench {
                     .rounded(px(Radius::CONTROL))
                     .border_1()
                     .border_color(p.line)
-                    .bg(p.surface)
-                    .hover(|style| style.border_color(p.line_strong))
-                    .child(kit::icon(IconName::Search, 14., p.text_faint))
+                    .bg(p.sunken)
+                    .hover(|style| style.bg(p.surface).border_color(p.line_strong))
+                    .child(kit::icon(IconName::Search, 13., p.text_faint))
                     .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.search.placeholder")))
                     .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
                     .on_click(act("command-palette", cx))
@@ -607,6 +607,12 @@ impl Workbench {
             .child(div().flex_1())
             .child(
                 controls(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)).into_any_element())
+                    .when(!narrow, |this| {
+                        this.child(
+                            kit::icon_button("top-exchange", IconName::ArrowDownUp, self.t("shell.command.openExchange"), act("open-exchange", cx))
+                                .selected(self.model.exchange_open),
+                        )
+                    })
                     .child(kit::icon_button(
                         "top-theme",
                         if dark { IconName::Sun } else { IconName::Moon },
@@ -618,7 +624,7 @@ impl Workbench {
                     .child(if narrow {
                         kit::icon_button("top-new-query", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).primary().into_any_element()
                     } else {
-                        kit::primary_button("top-new-query", Some(IconName::Plus), self.t("shell.command.newQuery"), act("new-query", cx)).into_any_element()
+                        kit::subtle_button("top-new-query", Some(IconName::Plus), self.t("shell.command.newQuery"), act("new-query", cx)).into_any_element()
                     }),
             );
         TitleBar::new()
@@ -1083,8 +1089,12 @@ impl Workbench {
         let click_id = id.clone();
         let menu_id = id.clone();
         let chevron_id = id.clone();
+        let query_id = id.clone();
+        let group = SharedString::from(format!("side-conn-group-{id}"));
+        let relational_conn = !matches!(row.saved.engine, Engine::Redis | Engine::Mongodb);
         kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
+            .group(group.clone())
             .role(gpui_kit::Role::TreeItem)
             .aria_label(name.clone())
             .aria_selected(selected)
@@ -1099,7 +1109,7 @@ impl Workbench {
             .items_center()
             .gap(px(6.))
             .rounded(px(Radius::CONTROL))
-            .when(selected, |this| this.bg(p.active))
+            .when(selected, |this| this.bg(p.selection))
             .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
             .child(
                 div()
@@ -1107,8 +1117,10 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t(if expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
+                    .w(px(15.))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .cursor_pointer()
                     .child(kit::icon(chevron, 13., p.text_faint))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1129,6 +1141,20 @@ impl Workbench {
             .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
             .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(name))
             .when(status == LinkStatus::Connecting, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
+            .when(relational_conn, |this| {
+                this.child(explorer_hover_icon(
+                    SharedString::from(format!("side-query-{id}")),
+                    group.clone(),
+                    IconName::SquareTerminal,
+                    self.t("shell.command.newQuery"),
+                    p,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.model.connections.selected = Some(query_id.clone());
+                        this.perform("conn-new-query", cx);
+                    }),
+                ))
+            })
             .when_some(browser_command(row), |this, (command, key, element_id)| {
                 let label = format!("{} {}", self.model.text(key), row.saved.name);
                 let icon = if row.saved.engine == Engine::Redis { IconName::Key } else { IconName::Braces };
@@ -1331,9 +1357,17 @@ impl Workbench {
         let menu_id = id.clone();
         let focus_id = id.clone();
         let toggle_id = id.clone();
+        let open_data_id = id.clone();
+        let open_struct_id = id.clone();
         let has_error = row.error.is_some();
+        let quick_table = row.kind == NavKind::Object
+            && matches!(row.object_kind, Some(ObjectKind::Table | ObjectKind::View))
+            && !row.stale
+            && !has_error;
+        let group = SharedString::from(format!("nav-row-group-{id}"));
         kit::row_states(div().id(SharedString::from(format!("nav-{id}"))), p)
             .test_support()
+            .group(group.clone())
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
             .aria_selected(row.focused)
@@ -1358,9 +1392,10 @@ impl Workbench {
                     .aria_label(self.t(if row.expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .cursor_pointer()
                     .flex_none()
-                    .w(px(12.))
+                    .w(px(14.))
                     .when(row.expandable && !empty_group, |this| {
                         this.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -1373,6 +1408,37 @@ impl Workbench {
             )
             .child(kit::icon(icon, 13., icon_tint))
             .child(body)
+            .when(quick_table, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(1.))
+                        .child(explorer_hover_icon(
+                            SharedString::from(format!("nav-quick-data-{id}")),
+                            group.clone(),
+                            IconName::Table,
+                            self.t("catalog.tree.openData"),
+                            p,
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.perform(&format!("nav-open-data:{open_data_id}"), cx);
+                            }),
+                        ))
+                        .child(explorer_hover_icon(
+                            SharedString::from(format!("nav-quick-struct-{id}")),
+                            group.clone(),
+                            IconName::Columns3,
+                            self.t("catalog.tree.viewStructure"),
+                            p,
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.perform(&format!("nav-open-structure:{open_struct_id}"), cx);
+                            }),
+                        )),
+                )
+            })
             .when(!detail_text.is_empty(), |this| {
                 this.child(
                     div()
@@ -1851,41 +1917,246 @@ impl Workbench {
     fn welcome_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        // 欢迎区与连接页是同一个启动台：同一份最近/全部连接、同一组入口、同一套行操作。
+        let content_w = self.model.layout().content_width as f32;
+        let compact_cards = content_w < 720.;
         let recent_runs: Vec<_> = self.model.welcome.recent(&self.model.history.runs).to_vec();
-        let mut history_rows = div().flex().flex_col().gap(px(2.));
-        for entry in recent_runs.iter() {
-            let id = entry.id.clone();
-            history_rows = history_rows.child(
-                list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
-                    .child(kit::icon(IconName::Clock, 14., p.text_faint))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(px(TypeScale::SM))
-                            .child(SharedString::from(one_line(&entry.sql))),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("welcome-run-client-{id}")))
-                            .flex_none()
-                            .max_w(px(160.))
-                            .truncate()
-                            .tooltip_text(SharedString::from(entry.connection_name.clone()))
-                            .text_size(px(TypeScale::XS))
-                            .text_color(p.text_faint)
-                            .child(SharedString::from(entry.connection_name.clone())),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.model.history.selected_run = Some(id.clone());
-                        this.model.history.section = HistorySection::Runs;
-                        this.perform("history-load", cx);
-                    })),
-            );
-        }
+        let quick_connections: Vec<_> = {
+            let recent = self.model.connections.launcher_recent(6);
+            if recent.is_empty() {
+                self.model.connections.rows.iter().take(6).cloned().collect()
+            } else {
+                recent.into_iter().cloned().collect()
+            }
+        };
+        let _ = window;
+
+        let quick_card = |id: &'static str, icon: IconName, heading: SharedString, desc: SharedString, chord: Option<&'static str>, command: &'static str, cx: &mut Context<Self>| {
+            kit::interactive_states(div().id(id), &p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(heading.clone())
+                .flex_1()
+                .min_w(px(190.))
+                .p(px(m.card_pad() + 2.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .rounded(px(Radius::PANEL))
+                .border_1()
+                .border_color(p.line)
+                .bg(if p.dark { p.raised } else { p.surface })
+                .hover(|style| style.border_color(p.accent).bg(p.hover))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .size(px(32.))
+                                .rounded(px(Radius::CONTROL))
+                                .bg(p.accent_soft)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(kit::icon(icon, 16., p.accent_text)),
+                        )
+                        .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(chord), &p))),
+                )
+                .child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
+                .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(desc))
+                .on_click(act(command, cx))
+                .into_any_element()
+        };
+
+        let cards_row = div()
+            .flex()
+            .when(compact_cards, |this| this.flex_col())
+            .when(!compact_cards, |this| this.flex_row().flex_wrap())
+            .gap(px(12.))
+            .child(quick_card(
+                "welcome-card-new-conn",
+                IconName::Plug,
+                self.t("common.newConnection"),
+                self.t("ui.welcome.newConnDesc"),
+                None,
+                "new-connection",
+                cx,
+            ))
+            .child(quick_card(
+                "welcome-card-sqlite",
+                IconName::FolderOpen,
+                self.t("common.openSqlite"),
+                self.t("ui.welcome.openSqliteDesc"),
+                None,
+                "open-sqlite",
+                cx,
+            ))
+            .child(quick_card(
+                "welcome-card-query",
+                IconName::SquareTerminal,
+                self.t("shell.command.newQuery"),
+                self.t("ui.welcome.newQueryDesc"),
+                Some("Ctrl+T"),
+                "new-query",
+                cx,
+            ));
+
+        let retry_banner = self.model.connect_retry.clone().map(|retry| {
+            let name = self
+                .model
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == retry.connection_id)
+                .map(|row| row.saved.name.clone())
+                .unwrap_or_else(|| retry.connection_id.clone());
+            let reason = self.model.connections.failures.get(&retry.connection_id).cloned().unwrap_or_default();
+            let head = reason.lines().next().unwrap_or_default().to_owned();
+            let label = if head.is_empty() {
+                format!("{} · {name}", self.model.text("connections.status.error"))
+            } else {
+                format!("{} · {name}: {head}", self.model.text("connections.status.error"))
+            };
+            kit::banner(
+                kit::BannerTone::Danger,
+                IconName::CircleAlert,
+                SharedString::from(label),
+                Some(kit::secondary_button("welcome-retry-connect", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx)).xsmall().into_any_element()),
+                &p,
+            )
+            .id("welcome-connect-retry")
+            .into_any_element()
+        });
+
+        let connections_section = (!quick_connections.is_empty()).then(|| {
+            let mut conn_rows = div().flex().flex_col().gap(px(2.));
+            for row in &quick_connections {
+                let id = row.saved.id.clone();
+                let open_id = id.clone();
+                let status = self.model.connections.row_status(&id);
+                let (dot, state_key) = status_parts(status, &p);
+                let detail = match row.saved.file_path.as_deref() {
+                    Some(path) if !path.is_empty() => short_path(path),
+                    _ => connection_detail(row),
+                };
+                conn_rows = conn_rows.child(
+                    list_row(SharedString::from(format!("welcome-conn-{id}")), &p, m.row_pad_y)
+                        .tooltip_text(SharedString::from(format!("{} · {}", row.saved.name, self.model.text(state_key))))
+                        .child(kit::engine_badge(row.saved.engine.as_str(), 22.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(div().truncate().text_size(px(TypeScale::MD)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(row.saved.name.clone())))
+                                        .children(self.env_pill(&row.saved.env, &p)),
+                                )
+                                .when(!detail.is_empty(), |this| {
+                                    this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail)))
+                                }),
+                        )
+                        .child(kit::status_dot(dot))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.model.connections.selected = Some(open_id.clone());
+                            if this.model.connections.row_status(&open_id) == LinkStatus::Connected {
+                                this.perform("conn-new-query", cx);
+                            } else {
+                                this.model.expand_nav_connection(&open_id);
+                                this.model.queue_connect(super::conn_modal::ConnectIntent::new(
+                                    open_id.clone(),
+                                    super::conn_modal::ConnectAction::NewQuery,
+                                    None,
+                                ));
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            kit::card(&p)
+                .flex_1()
+                .min_w(px(260.))
+                .p(px(m.card_pad()))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(kit::eyebrow(self.t("ui.welcome.myConnections"), &p))
+                        .child(
+                            kit::tool_button("welcome-manage-conns", Some(IconName::ArrowRight), self.t("ui.welcome.manageConnections"), act("connections", cx))
+                                .xsmall(),
+                        ),
+                )
+                .child(conn_rows)
+                .into_any_element()
+        });
+
+        let history_section = (!recent_runs.is_empty()).then(|| {
+            let mut history_rows = div().flex().flex_col().gap(px(2.));
+            for entry in recent_runs.iter() {
+                let id = entry.id.clone();
+                history_rows = history_rows.child(
+                    list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
+                        .child(kit::icon(IconName::Clock, 14., p.text_faint))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(TypeScale::SM))
+                                .child(SharedString::from(one_line(&entry.sql))),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("welcome-run-client-{id}")))
+                                .flex_none()
+                                .max_w(px(140.))
+                                .truncate()
+                                .tooltip_text(SharedString::from(entry.connection_name.clone()))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_faint)
+                                .child(SharedString::from(entry.connection_name.clone())),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.model.history.selected_run = Some(id.clone());
+                            this.model.history.section = HistorySection::Runs;
+                            this.perform("history-load", cx);
+                        })),
+                );
+            }
+            kit::card(&p)
+                .flex_1()
+                .min_w(px(260.))
+                .p(px(m.card_pad()))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(kit::eyebrow(self.t("shell.welcome.recent"), &p))
+                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(recent_runs.len().to_string()))),
+                )
+                .child(div().id("welcome-recent-runs").max_h(px(240.)).overflow_y_scroll().child(history_rows))
+                .into_any_element()
+        });
+
+        let has_panels = connections_section.is_some() || history_section.is_some();
 
         div()
             .id("welcome-page")
@@ -1893,54 +2164,86 @@ impl Workbench {
             .aria_label(self.t("shell.welcome.title"))
             .test_support()
             .size_full()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .overflow_hidden()
+            .items_center()
+            .px(px(m.page_pad))
+            .py(px(m.page_pad_y + 10.))
             .child(
                 div()
-                    .flex_none()
-                    .px(px(m.page_pad))
-                    .pt(px(m.page_pad_y))
-                    .pb(px(4.))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(brand_mark(36., &p))
-                    // 欢迎区主标题不超过 16px：它标识产品，不做宣传口号（S8.6）。
-                    .child(kit::title("RillSQL", TypeScale::LG, &p))
-                    .child(div().flex_1())
-                    .child(
-                        // 可点的文字链接：和其它可点元素一样有悬停、按下与键盘焦点环。
-                        kit::interactive_states(div().id("welcome-history"), &p, false)
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .px(px(6.))
-                            .py(px(3.))
-                            .rounded(px(Radius::CONTROL))
-                            .text_size(px(TypeScale::XS))
-                            .text_color(p.text_muted)
-                            .child(kit::icon(IconName::Clock, 13., p.text_faint))
-                            .child(self.t("ui.welcome.allHistory"))
-                            .on_click(act("history", cx)),
-                    ),
-            )
-            .child(self.launcher_header(window, cx))
-            .child(self.launcher_body(false, window, cx))
-            // 没有执行记录时不留一张只写着“没有记录”的卡片。
-            .when(!recent_runs.is_empty(), |this| this.child(
-                kit::card(&p)
-                    .flex_none()
-                    .mx(px(m.page_pad))
-                    .mb(px(10.))
-                    .p(px(8.))
-                    .max_h(px(168.))
+                    .w_full()
+                    .max_w(px(840.))
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .child(section_label(self.t("shell.welcome.recent"), &p))
-                    .child(div().id("welcome-recent-runs").flex_1().min_h(px(0.)).overflow_y_scroll().child(history_rows)),
-            ))
+                    .gap(px(m.section_gap() + 4.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(14.))
+                            .child(brand_mark(40., &p))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(160.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(kit::title("RillSQL", TypeScale::LG, &p))
+                                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("ui.welcome.subtitle"))),
+                            )
+                            .child(
+                                kit::interactive_states(div().id("welcome-history"), &p, false)
+                                    .test_support()
+                                    .role(gpui_kit::Role::Button)
+                                    .aria_label(self.t("ui.welcome.allHistory"))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .h(px(m.control_h))
+                                    .px(px(10.))
+                                    .rounded(px(Radius::CONTROL))
+                                    .border_1()
+                                    .border_color(p.line)
+                                    .bg(if p.dark { p.raised } else { p.surface })
+                                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+                                    .text_size(px(TypeScale::SM))
+                                    .text_color(p.text_muted)
+                                    .child(kit::icon(IconName::Clock, 13., p.text_faint))
+                                    .child(self.t("ui.welcome.allHistory"))
+                                    .on_click(act("history", cx)),
+                            ),
+                    )
+                    .children(retry_banner)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(kit::eyebrow(self.t("ui.welcome.quickStart"), &p))
+                            .child(cards_row),
+                    )
+                    .when(has_panels, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .when(compact_cards, |row| row.flex_col())
+                                .when(!compact_cards, |row| row.flex_row().flex_wrap().items_start())
+                                .gap(px(12.))
+                                .children(connections_section)
+                                .children(history_section),
+                        )
+                    })
+                    .child(
+                        div()
+                            .pt(px(4.))
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_faint)
+                            .child(self.t("ui.welcome.enginesHint")),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2003,31 +2306,18 @@ impl Workbench {
         handle: Option<&FocusHandle>,
         command: &'static str,
         primary: bool,
-        p: &Palette,
+        _p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let height = self.metrics().control_h;
-        let mut element = kit::interactive_states(div().id(id), p, false)
-            .test_support()
-            .role(gpui_kit::Role::Button)
-            .aria_label(label.clone())
-            .h(px(height))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .rounded(px(Radius::CONTROL))
-            .border_1()
-            .text_size(px(TypeScale::SM))
-            .when(primary, |this| this.bg(p.accent).text_color(p.on_accent).border_color(p.accent).hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover)).active(|style| style.bg(p.accent_active)))
-            .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
-            .child(kit::icon(icon, 14., if primary { p.on_accent } else { p.text_muted }))
-            .child(label)
-            .on_click(act(command, cx));
+        let mut button = if primary {
+            kit::primary_button(id, Some(icon), label, act(command, cx))
+        } else {
+            kit::secondary_button(id, Some(icon), label, act(command, cx))
+        };
         if let Some(handle) = handle {
-            element = element.track_focus(handle);
+            button = button.focus_handle(handle);
         }
-        element.into_any_element()
+        button.into_any_element()
     }
 
     // ------------------------------------------------------------ 连接模态
@@ -2097,12 +2387,13 @@ impl Workbench {
         let general = stack_frame(|| {
         let mut general = div().flex().flex_col().gap(px(14.));
         general = general.child(
-            div()
+            kit::sunken(&p)
+                .p(px(10.))
                 .flex()
                 .flex_wrap()
                 .items_end()
                 .gap(px(8.))
-                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.url"), "url", url_input, &p)))
+                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.quickUrl"), "url", url_input, &p)))
                 .child(apply_url),
         );
         let (name_hint, name_masked) = self.field_hint(DraftField::Name);
@@ -2888,43 +3179,7 @@ impl Workbench {
         (placeholder, masked)
     }
 
-    /// 引擎/环境筛选的两个按钮。点击记下位置，浮层在根层弹出并自动避开视口边缘。
-    fn connection_filters(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let engine = self
-            .model
-            .connections
-            .filter_engine
-            .map(|engine| kit::engine_label(engine.as_str()).to_owned())
-            .unwrap_or_else(|| self.model.text("connections.filter.engine"));
-        let env = if self.model.connections.filter_env.is_empty() {
-            self.t("connections.filter.env")
-        } else {
-            self.env_text(&self.model.connections.filter_env)
-        };
-        let active = self.model.connections.filter_engine.is_some()
-            || !self.model.connections.filter_env.is_empty()
-            || !self.model.connections.filter_text.trim().is_empty();
-        let engine_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Engine);
-        let env_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Env);
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .child(self.filter_button("conn-filter-engine", IconName::Database, SharedString::from(engine), engine_open, "conn-filter-engine", p, cx))
-            .child(self.filter_button("conn-filter-env", IconName::Funnel, env, env_open, "conn-filter-env", p, cx))
-            .when(active, |this| {
-                this.child(kit::tool_button(
-                    "conn-filter-clear",
-                    Some(IconName::X),
-                    self.t("connections.filter.clear"),
-                    act("conn-filter-clear", cx),
-                ))
-            })
-            .into_any_element()
-    }
-
-    /// 一个筛选按钮：展开时用强调底，点击同时记住锚点位置供浮层定位。
+    /// 一个筛选按钮：展开时用强调底，点击同时记住锚点位置供浮层定位（下拉箭头在右侧）。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn filter_button(
         &mut self,
@@ -2943,7 +3198,7 @@ impl Workbench {
             .aria_label(label.clone())
             .aria_expanded(open)
             .h(px(height))
-            .px(px(9.))
+            .px(px(10.))
             .flex()
             .items_center()
             .gap(px(6.))
@@ -2951,10 +3206,15 @@ impl Workbench {
             .border_1()
             .text_size(px(TypeScale::SM))
             .when(open, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
-            .when(!open, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
-            .child(kit::icon(IconName::ChevronDown, 12., p.text_faint))
-            .child(kit::icon(icon, 13., p.text_muted))
+            .when(!open, |this| {
+                this.border_color(p.line)
+                    .bg(if p.dark { p.raised } else { p.surface })
+                    .text_color(p.text)
+                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+            })
+            .child(kit::icon(icon, 13., if open { p.accent_text } else { p.text_muted }))
             .child(label)
+            .child(kit::icon(IconName::ChevronDown, 12., if open { p.accent_text } else { p.text_faint }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 // 浮层以按钮的左下角为锚点：位置来自这次真实点击，不靠猜元素坐标。
                 this.conn_filter_at = event.position();
@@ -3824,21 +4084,19 @@ impl Workbench {
             kit::segmented_sized(built, &Palette::of(cx), m.control_h)
         };
         let stepper = |this: &Self, id: &'static str, value: String, at_min: bool, at_max: bool, cx: &mut Context<Self>| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(
-                    kit::icon_button(SharedString::from(format!("{id}-down")), IconName::Minus, this.t("ui.settings.smaller"), act(format!("{id}-down"), cx))
-                        .outline()
-                        .disabled(at_min),
-                )
-                .child(div().min_w(px(56.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(value)))
-                .child(
-                    kit::icon_button(SharedString::from(format!("{id}-up")), IconName::Plus, this.t("ui.settings.increase"), act(format!("{id}-up"), cx))
-                        .outline()
-                        .disabled(at_max),
-                )
+            kit::stepper(
+                SharedString::from(format!("{id}-down")),
+                SharedString::from(format!("{id}-up")),
+                this.t("ui.settings.smaller"),
+                this.t("ui.settings.increase"),
+                SharedString::from(value),
+                at_min,
+                at_max,
+                m.control_h,
+                &Palette::of(cx),
+                act(format!("{id}-down"), cx),
+                act(format!("{id}-up"), cx),
+            )
         };
         // 一组设置的卡片：标题 + 逐行“名称/说明 + 控件”。行内换行，
         // 窄窗口里控件掉到下一行而不是把名称挤没。
@@ -3907,21 +4165,19 @@ impl Workbench {
                     &[("locale-zh", "common.localeZh", self.model.shell.locale == crate::app::Locale::ZhCn), ("locale-en", "common.localeEn", self.model.shell.locale == crate::app::Locale::En)],
                     cx,
                 );
-                let font = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        kit::icon_button("font-down", IconName::Minus, self.t("ui.settings.smaller"), act("font-down", cx))
-                            .outline()
-                            .disabled(s.editor_font <= FONT_RANGE.0),
-                    )
-                    .child(div().w(px(44.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(format!("{} px", s.editor_font))))
-                    .child(
-                        kit::icon_button("font-up", IconName::Plus, self.t("ui.settings.larger"), act("font-up", cx))
-                            .outline()
-                            .disabled(s.editor_font >= FONT_RANGE.1),
-                    );
+                let font = kit::stepper(
+                    "font-down",
+                    "font-up",
+                    self.t("ui.settings.smaller"),
+                    self.t("ui.settings.larger"),
+                    SharedString::from(format!("{} px", s.editor_font)),
+                    s.editor_font <= FONT_RANGE.0,
+                    s.editor_font >= FONT_RANGE.1,
+                    m.control_h,
+                    &p,
+                    act("font-down", cx),
+                    act("font-up", cx),
+                );
                 // 五种配色直接摆出来一次选中，不用左右箭头逐个翻、也看不到还有哪些可选。
                 let editor_theme_ids: Vec<String> = crate::app::views::settings::EDITOR_THEMES.iter().map(|name| format!("editor-theme-set-{name}")).collect();
                 let editor_theme_items: Vec<(&str, &str, bool)> = crate::app::views::settings::EDITOR_THEMES
@@ -4482,36 +4738,19 @@ impl Workbench {
                 let on = scope == active_scope;
                 let cmd = scope.command();
                 let label = self.t(scope.label_key());
-                scopes = scopes.child(
-                    kit::interactive_states(div().id(SharedString::from(cmd)), &p, false)
-                        .test_support()
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(label.clone())
-                        .aria_selected(on)
-                        .h(px(22.))
-                        .px(px(8.))
-                        .flex()
-                        .items_center()
-                        .rounded_full()
-                        .border_1()
-                        .text_size(px(TypeScale::XS))
-                        .when(on, |this| {
-                            this.border_color(p.accent)
-                                .bg(p.accent_soft)
-                                .text_color(p.accent_text)
-                                .font_weight(FontWeight::MEDIUM)
-                        })
-                        .when(!on, |this| {
-                            this.border_color(p.line)
-                                .text_color(p.text_muted)
-                                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
-                        })
-                        .child(label)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.perform(cmd, cx);
-                            this.fields.focus(DraftField::PaletteQuery, window, cx);
-                        })),
-                );
+                scopes = scopes.child(kit::filter_chip(
+                    SharedString::from(cmd),
+                    label,
+                    None,
+                    None,
+                    None,
+                    on,
+                    &p,
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.perform(cmd, cx);
+                        this.fields.focus(DraftField::PaletteQuery, window, cx);
+                    }),
+                ));
             }
             let entries = self.model.palette_entries();
             let list_max_h = (max_panel_h - 124.).clamp(180., 420.);
@@ -5107,7 +5346,8 @@ impl Workbench {
                     .items_center()
                     .gap(px(8.))
                     .child(kit::icon(IconName::Code, 16., p.accent))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, TypeScale::LG, &p))),
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, TypeScale::LG, &p)))
+                    .child(kit::icon_button("ddl-header-close", IconName::X, self.t("common.close"), act("ddl-close", cx))),
             )
             .when_some(rebuilt, |this, rebuilt| this.child(rebuilt))
             .child(body)
@@ -5349,6 +5589,36 @@ impl Workbench {
 }
 
 // ---------------------------------------------------------------- 小部件
+
+/// 对象树行尾的悬停快捷动作图标：平时透明、行悬停时浮现，不抢树自身的 Tab 停靠点。
+fn explorer_hover_icon(
+    id: SharedString,
+    group: SharedString,
+    icon: IconName,
+    label: SharedString,
+    p: &Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .tooltip_text(label)
+        .flex_none()
+        .size(px(18.))
+        .rounded(px(Radius::CONTROL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .opacity(0.)
+        .group_hover(group, |style| style.opacity(1.))
+        .hover(|style| style.bg(p.active))
+        .child(kit::icon(icon, 12., p.text_muted))
+        .on_click(on_click)
+        .into_any_element()
+}
 
 /// 搜索命中的一段：前缀与后缀保持普通文本，中间用当前主题的选中底色强调。
 fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) -> AnyElement {
@@ -5607,10 +5877,12 @@ fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::
         .px(px(12.))
         .py(px(8.))
         .flex()
-        .items_start()
+        .items_center()
         .gap(px(8.))
         .rounded(px(Radius::PANEL))
         .bg(bg)
+        .border_1()
+        .border_color(fg.opacity(0.26))
         .text_color(fg)
         .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
@@ -5619,17 +5891,7 @@ fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::
 }
 
 fn switch_visual(on: bool, p: &Palette) -> AnyElement {
-    div()
-        .flex_none()
-        .w(px(34.))
-        .h(px(20.))
-        .p(px(2.))
-        .rounded_full()
-        .bg(if on { p.accent } else { p.line_strong })
-        .flex()
-        .when(on, |this| this.justify_end())
-        .child(div().size(px(16.)).rounded_full().bg(gpui_kit::hsla(0., 0., 1., 1.)).shadow_sm())
-        .into_any_element()
+    kit::switch_visual(on, p)
 }
 
 fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: SharedString, body: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -5655,7 +5917,19 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
             div()
                 .flex()
                 .gap(px(12.))
-                .child(div().flex_none().size(px(34.)).rounded_full().bg(tone.opacity(0.14)).flex().items_center().justify_center().child(kit::icon(icon, 17., tone)))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(36.))
+                        .rounded(px(Radius::PANEL))
+                        .bg(tone.opacity(0.14))
+                        .border_1()
+                        .border_color(tone.opacity(0.24))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(kit::icon(icon, 17., tone)),
+                )
                 .child(div().flex().flex_col().gap(px(6.)).min_w(px(0.)).child(kit::title(title, TypeScale::LG, p)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body))),
         )
 }
@@ -5664,7 +5938,18 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
 /// 模态里分段选择的槽：浅底圆角，选中项浮起（与 kit::segmented_sized 同一外观）。
 /// 选项多时整槽换行，不被裁切。
 fn segment_track(p: &Palette) -> gpui_kit::Div {
-    div().flex().flex_wrap().flex_none().self_start().max_w_full().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover)
+    div()
+        .flex()
+        .flex_wrap()
+        .flex_none()
+        .self_start()
+        .max_w_full()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(Radius::CONTROL))
+        .bg(p.sunken)
+        .border_1()
+        .border_color(p.line_soft)
 }
 
 pub(super) fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit::Stateful<gpui_kit::Div> {
