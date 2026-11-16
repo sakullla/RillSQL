@@ -875,6 +875,12 @@ impl WorkbenchModel {
                     self.return_to_work();
                 }
             }
+            "back-workspace" => {
+                self.return_to_work();
+            }
+            "collapse-tree" => {
+                self.nav.collapse_all();
+            }
             "activity-connections" => {
                 let _ = self.shell.dispatch("connections");
             }
@@ -1916,9 +1922,7 @@ impl WorkbenchModel {
     }
 
     fn menu_key(&mut self, key: NavKey) -> Option<String> {
-        if self.menu.is_none() {
-            return None;
-        }
+        self.menu.as_ref()?;
         match key {
             NavKey::Escape | NavKey::ArrowLeft => {
                 let open = self.menu.as_ref().is_some_and(|menu| menu.submenu.is_some());

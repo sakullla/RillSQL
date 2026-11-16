@@ -636,8 +636,7 @@ impl OpenMenu {
     }
 
     pub fn close_submenu(&mut self) -> bool {
-        let open = self.submenu.take().is_some();
-        open
+        self.submenu.take().is_some()
     }
 
     /// 悬停父项：切到这一项；有子菜单就换开它，没有就收起。

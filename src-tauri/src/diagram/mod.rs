@@ -5,7 +5,9 @@ mod read;
 mod sql;
 
 pub use commands::diagram_read;
-pub use model::{Diagram, DiagramColumn, DiagramEdge, DiagramTable};
+#[cfg(test)]
+pub use model::DiagramColumn;
+pub use model::{Diagram, DiagramEdge, DiagramTable};
 pub(crate) use read::read_diagram;
 
 pub fn module_id() -> &'static str {

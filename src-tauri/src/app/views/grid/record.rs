@@ -126,6 +126,7 @@ use crate::ui::kit::stack_frame;
 
 /// 右侧面板：标题行（行号、上一行、下一行、关闭）和"列名—值"列表。长值点开完整值查看器。
 /// 尺寸跟随外壳密度：标题栏取 `bar_h`，字段行最小高度取 `row_h`，列名栏与面板宽度随行高等比伸缩。
+#[allow(clippy::too_many_arguments)]
 pub fn render_record(
     view: Option<RecordView>,
     locale: Locale,

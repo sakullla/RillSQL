@@ -86,6 +86,10 @@ impl Workbench {
                     .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
                     .child(div().px(px(6.)).rounded(px(Radius::TAG)).bg(p.hover).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(count)))
                     .child(div().flex_1())
+                    .when(!self.model.tabs.is_empty() && self.model.viewport_width >= 760, |this| {
+                        this.child(kit::tool_button("conn-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
+                            .child(kit::vline(&p))
+                    })
                     .children(secondary)
                     .child(kit::vline(&p))
                     .child(self.launcher_action("conn-new", IconName::Plus, self.t("common.newConnection"), Some(&focus), "conn-new-launcher", true, &p, cx)),

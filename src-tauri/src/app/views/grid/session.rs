@@ -10,6 +10,14 @@ use crate::grid::{delete_sql, insert_sql, locate_sheet, qualified_name, quote_id
 use crate::i18n::{self, Locale};
 use crate::query::split_sql;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SelectionStats {
+    pub cells: usize,
+    pub numeric_count: usize,
+    pub sum: f64,
+    pub avg: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellKind {
     Null,
@@ -1812,6 +1820,39 @@ impl SharedGrid {
     /// 选中的格子数：非连续选择把各区域并起来再减掉洞，不是包围盒的面积。
     pub fn selection_count(&self) -> usize {
         self.selection().len()
+    }
+
+    /// 多格选区的即时统计（选中格数；存在 2 个及以上数值格时给出求和与均值）。
+    /// 单格选择不出现统计胶囊；超大选区对数值统计设上限以免每帧扫描全表。
+    pub fn selection_stats(&self) -> Option<SelectionStats> {
+        let (r0, c0, r1, c1) = self.selection_bounds()?;
+        if r0 == r1 && c0 == c1 && self.regions.len() <= 1 {
+            return None;
+        }
+        let cells = self.selection();
+        let count = cells.len();
+        if count < 2 {
+            return None;
+        }
+        let mut numeric_count = 0usize;
+        let mut sum = 0.0f64;
+        if count <= 4_096 {
+            for (row, column) in cells {
+                if row < self.rows.len() && column < self.columns.len() {
+                    let shown = self.show_cell(row, column, false);
+                    if shown.kind == CellKind::Text {
+                        if let Ok(value) = shown.label.trim().parse::<f64>() {
+                            if value.is_finite() {
+                                numeric_count += 1;
+                                sum += value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let avg = if numeric_count > 0 { sum / numeric_count as f64 } else { 0.0 };
+        Some(SelectionStats { cells: count, numeric_count, sum, avg })
     }
 
     pub fn selection_within_loaded(&self) -> bool {

@@ -765,6 +765,18 @@ impl NavTree {
         self.expanded.remove(id)
     }
 
+    pub fn has_expanded(&self) -> bool {
+        !self.expanded.is_empty()
+    }
+
+    pub fn collapse_all(&mut self) -> bool {
+        if self.expanded.is_empty() {
+            return false;
+        }
+        self.expanded.clear();
+        true
+    }
+
     /// 对象节点是否需要按需读取列/索引。
     pub fn needs_details(&self, id: &str) -> bool {
         let Some(node) = self.nodes.get(id) else { return false };

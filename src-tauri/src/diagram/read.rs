@@ -344,7 +344,7 @@ fn sqlite_columns(rows: &[sqlx::sqlite::SqliteRow]) -> Result<ReadColumns, Strin
     for row in rows {
         let name: String = row.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
         let type_name: String = row.try_get::<Option<String>, _>(1).map_err(|err| crate::error_text::chain(&err))?.unwrap_or_default();
-        let primary = sqlite_pk(&row)?;
+        let primary = sqlite_pk(row)?;
         columns.push(DiagramColumn { name, type_name, primary });
     }
     Ok(ReadColumns(columns))

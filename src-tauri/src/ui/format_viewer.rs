@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use base64::Engine;
 use chrono::Datelike;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -236,28 +237,8 @@ impl FormatViewer {
         &self.draft
     }
 
-    pub fn detected_format(&self) -> DataFormat {
-        self.detected
-    }
-
-    pub fn manual_format(&self) -> Option<DataFormat> {
-        self.manual
-    }
-
     pub fn format(&self) -> DataFormat {
         effective_format(self.detected, self.manual)
-    }
-
-    pub fn truncation(&self) -> &TruncationState {
-        &self.truncation
-    }
-
-    pub fn mode(&self) -> EditMode {
-        self.mode
-    }
-
-    pub fn validation(&self) -> Option<&JsonDiagnostic> {
-        self.last_error.as_ref()
     }
 
     pub fn hint(&self) -> Option<ScalarHint> {
@@ -440,7 +421,14 @@ impl Render for FormatViewer {
 }
 
 fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, metrics: &kit::Metrics, locked: bool) -> AnyElement {
-    let mut formats = div().flex().flex_wrap().gap(px(4.));
+    let mut formats = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(Radius::CONTROL))
+        .bg(p.sunken);
     for format in DataFormat::ALL {
         let selected = viewer.format() == format;
         let target = entity.clone();
@@ -450,14 +438,23 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
                 .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(label.clone())
+                .aria_selected(selected)
                 .px(px(8.))
                 .h(px((metrics.control_h - 4.).max(22.)))
                 .flex()
                 .items_center()
                 .rounded(px(Radius::CONTROL))
                 .text_size(px(TypeScale::SM))
-                .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text).font_weight(gpui_kit::FontWeight::MEDIUM))
-                .when(!selected, |this| this.text_color(p.text_muted))
+                .when(selected, |this| {
+                    this.bg(if p.dark { p.raised } else { p.surface })
+                        .text_color(p.accent_text)
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .shadow_sm()
+                })
+                .when(!selected, |this| {
+                    this.text_color(p.text_muted)
+                        .hover(|style| style.bg(p.hover).text_color(p.text))
+                })
                 .child(label)
                 .on_click(move |_, window, cx| {
                     target.update(cx, |this, cx| this.set_manual_format(Some(format), window, cx));
@@ -466,25 +463,51 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
     }
     let mut actions = div().flex().flex_wrap().items_center().gap(px(4.));
     if viewer.format() == DataFormat::Json {
-        actions = actions.child(mode_chip(entity, viewer, p, false)).child(mode_chip(entity, viewer, p, true));
-        actions = actions.child(text_button(entity, "format-pretty", viewer.text("format.action.pretty"), locked, |this, cx| this.pretty(cx)));
-        actions = actions.child(text_button(entity, "format-minify", viewer.text("format.action.minify"), locked, |this, cx| this.minify(cx)));
-        actions = actions.child(text_button(entity, "format-expand", viewer.text("format.action.expandAll"), false, |this, cx| this.expand_all(cx)));
-        actions = actions.child(text_button(entity, "format-collapse", viewer.text("format.action.collapseAll"), false, |this, cx| this.collapse_all(cx)));
+        actions = actions.child(
+            div()
+                .flex()
+                .items_center()
+                .p(px(2.))
+                .gap(px(2.))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.sunken)
+                .child(mode_chip(entity, viewer, p, false))
+                .child(mode_chip(entity, viewer, p, true)),
+        );
+        actions = actions.child(text_button(entity, "format-pretty", Some(IconName::Sparkles), viewer.text("format.action.pretty"), locked, |this, cx| this.pretty(cx)));
+        actions = actions.child(text_button(entity, "format-minify", None, viewer.text("format.action.minify"), locked, |this, cx| this.minify(cx)));
+        if !viewer.code_view {
+            actions = actions.child(text_button(entity, "format-expand", None, viewer.text("format.action.expandAll"), false, |this, cx| this.expand_all(cx)));
+            actions = actions.child(text_button(entity, "format-collapse", None, viewer.text("format.action.collapseAll"), false, |this, cx| this.collapse_all(cx)));
+        }
     } else if viewer.format() != DataFormat::Hex {
-        actions = actions.child(text_button(entity, "format-reformat", viewer.text("format.action.pretty"), locked, |this, cx| this.reformat(cx)));
+        actions = actions.child(text_button(entity, "format-reformat", Some(IconName::Sparkles), viewer.text("format.action.pretty"), locked, |this, cx| this.reformat(cx)));
     }
     if viewer.format() != DataFormat::Hex && (viewer.format() != DataFormat::Json || viewer.code_view) {
         actions = actions.child(wrap_chip(entity, viewer, p));
     }
-    actions = actions.child(text_button(entity, "format-copy", viewer.text("format.action.copyAll"), false, |this, cx| {
+    actions = actions.child(text_button(entity, "format-copy", Some(IconName::Copy), viewer.text("format.action.copyAll"), false, |this, cx| {
         let text = if this.format() == DataFormat::Hex { hex_dump_source(&this.draft, this.bytes.as_deref()) } else { this.draft.clone() };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }));
     let apply_locked = apply_block(viewer.format(), viewer.mode, &viewer.truncation, &viewer.draft).is_some();
-    actions = actions.child(text_button(entity, "format-apply", viewer.text("format.action.apply"), apply_locked, |this, cx| {
-        let _ = this.commit(cx);
-    }));
+    let dirty_ready = !apply_locked && viewer.draft != viewer.source;
+    let apply_target = entity.clone();
+    let apply_btn = if dirty_ready {
+        kit::primary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), move |_, _, cx| {
+            apply_target.update(cx, |this, cx| {
+                let _ = this.commit(cx);
+            });
+        })
+    } else {
+        kit::secondary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), move |_, _, cx| {
+            apply_target.update(cx, |this, cx| {
+                let _ = this.commit(cx);
+            });
+        })
+        .disabled(apply_locked)
+    };
+    actions = actions.child(apply_btn);
     div()
         .flex_none()
         .px(px(metrics.pane_pad()))
@@ -492,9 +515,11 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
         .flex()
         .flex_wrap()
         .items_center()
+        .justify_between()
         .gap(px(8.))
         .border_b_1()
         .border_color(p.line)
+        .bg(p.chrome)
         .child(formats)
         .child(actions)
         .into_any_element()
@@ -510,14 +535,23 @@ fn mode_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, 
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
+        .aria_selected(selected)
         .px(px(8.))
         .h(px(22.))
         .flex()
         .items_center()
         .rounded(px(Radius::CONTROL))
         .text_size(px(TypeScale::SM))
-        .when(selected, |this| this.bg(p.surface).text_color(p.text))
-        .when(!selected, |this| this.text_color(p.text_muted))
+        .when(selected, |this| {
+            this.bg(if p.dark { p.raised } else { p.surface })
+                .text_color(p.text)
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .shadow_sm()
+        })
+        .when(!selected, |this| {
+            this.text_color(p.text_muted)
+                .hover(|style| style.text_color(p.text))
+        })
         .child(label)
         .on_click(move |_, _, cx| {
             target.update(cx, |this, cx| {
@@ -536,14 +570,26 @@ fn wrap_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette) 
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
+        .aria_selected(selected)
         .px(px(8.))
-        .h(px(22.))
+        .h(px(24.))
         .flex()
         .items_center()
         .rounded(px(Radius::CONTROL))
+        .border_1()
         .text_size(px(TypeScale::SM))
-        .when(selected, |this| this.bg(p.surface).text_color(p.text))
-        .when(!selected, |this| this.text_color(p.text_muted))
+        .when(selected, |this| {
+            this.border_color(p.accent.opacity(0.32))
+                .bg(p.accent_soft)
+                .text_color(p.accent_text)
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+        })
+        .when(!selected, |this| {
+            this.border_color(p.line)
+                .bg(if p.dark { p.raised } else { p.surface })
+                .text_color(p.text_muted)
+                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
+        })
         .child(label)
         .on_click(move |_, window, cx| {
             target.update(cx, |this, cx| {
@@ -557,12 +603,13 @@ fn wrap_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette) 
 fn text_button(
     entity: &Entity<FormatViewer>,
     id: impl Into<gpui_kit::ElementId>,
+    icon: Option<IconName>,
     label: SharedString,
     disabled: bool,
     action: impl Fn(&mut FormatViewer, &mut Context<FormatViewer>) + 'static,
 ) -> kit::ActionButton {
     let target = entity.clone();
-    kit::tool_button(id, None, label, move |_, _, cx| {
+    kit::tool_button(id, icon, label, move |_, _, cx| {
         target.update(cx, |this, cx| action(this, cx));
     })
     .disabled(disabled)
@@ -597,7 +644,7 @@ fn banner_line(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette
             .text_size(px(TypeScale::SM))
             .child(div().flex_1().min_w(px(0.)).child(SharedString::from(message)))
             .when(banner.load_full, |this| {
-                this.child(text_button(entity, "format-load-full", load, !can_load, |_, cx| {
+                this.child(text_button(entity, "format-load-full", Some(IconName::Download), load, !can_load, |_, cx| {
                     cx.emit(FormatViewerEvent::LoadFull);
                 }))
             })
@@ -624,7 +671,7 @@ fn hint_line(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette) 
             .text_size(px(TypeScale::SM))
             .text_color(p.text_muted)
             .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
-            .child(text_button(entity, "format-copy-hint", label, false, move |_, cx| {
+            .child(text_button(entity, "format-copy-hint", Some(IconName::Copy), label, false, move |_, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
             }))
             .into_any_element(),
@@ -764,14 +811,14 @@ fn tree_row(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, n
             let color = node.scalar_kind.map(|kind| scalar_color(kind, p)).unwrap_or(p.text);
             div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(color).child(SharedString::from(scalar))
         }))
-        .child(text_button(entity, value_id, value_label, false, move |this, cx| {
+        .child(text_button(entity, value_id, None, value_label, false, move |this, cx| {
             if let Ok(value) = parse_json(&this.draft) {
                 if let Some(text) = copy_node_value(&value, &value_path) {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
         }))
-        .child(text_button(entity, path_id, path_label, false, move |_, cx| {
+        .child(text_button(entity, path_id, None, path_label, false, move |_, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(copied_path.clone()));
         }))
         .into_any_element()
@@ -1443,7 +1490,7 @@ fn sql_needs_gap(out: &str, token: &str) -> bool {
 
 fn decode_hex_text(text: &str) -> Option<Vec<u8>> {
     let stripped: String = text.chars().filter(|ch| !ch.is_ascii_whitespace()).collect();
-    if stripped.is_empty() || stripped.len() % 2 != 0 || !stripped.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if stripped.is_empty() || !stripped.len().is_multiple_of(2) || !stripped.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return None;
     }
     let bytes = stripped.as_bytes();

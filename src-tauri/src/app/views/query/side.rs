@@ -19,6 +19,8 @@ use super::QueryPane;
 /// 视口窄于它时右侧面板默认收起，打开时作为浮层。
 pub const NARROW_WIDTH: f32 = 800.;
 pub const PANEL_WIDTH: f32 = 240.;
+pub const PANEL_MIN: f32 = 180.;
+pub const PANEL_MAX: f32 = 400.;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideMode {
@@ -51,6 +53,8 @@ pub struct SidePanel<'a> {
     pub locale: Locale,
     pub metrics: Metrics,
     pub overlay: bool,
+    pub width: f32,
+    pub active_statement: Option<usize>,
     pub mono: SharedString,
     /// 当前目标的引擎，用来给点选插入的标识符加引号。
     pub engine: &'a str,
@@ -101,16 +105,17 @@ impl SidePanel<'_> {
             })
             .xsmall());
         let body = match self.body {
-            SideBody::Outline(items) => outline(items, locale, self.metrics, &self.mono, p, entity),
+            SideBody::Outline(items) => outline(items, self.active_statement, locale, self.metrics, &self.mono, p, entity),
             SideBody::Object(info) => object(info, locale, self.metrics, &self.mono, p, self.engine, entity),
         };
+        let panel_w = if self.overlay { PANEL_WIDTH } else { self.width.clamp(PANEL_MIN, PANEL_MAX) };
         div()
             .id("query-side-panel")
             .test_support()
             .role(gpui_kit::Role::Complementary)
             .aria_label(t("query.side.toggle"))
             .flex_none()
-            .w(px(PANEL_WIDTH))
+            .w(px(panel_w))
             .h_full()
             .flex()
             .flex_col()
@@ -124,7 +129,7 @@ impl SidePanel<'_> {
     }
 }
 
-fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+fn outline(items: &[OutlineItem], active_statement: Option<usize>, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
     let mut list = div()
         .id("query-outline")
         .test_support()
@@ -148,12 +153,12 @@ fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &Share
         );
     }
     for item in items {
-        list = list.child(outline_row(item, locale, metrics, mono, p, entity));
+        list = list.child(outline_row(item, active_statement == Some(item.index), locale, metrics, mono, p, entity));
     }
     list.into_any_element()
 }
 
-fn outline_row(item: &OutlineItem, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+fn outline_row(item: &OutlineItem, current: bool, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
     let failed = item.status == "error" || item.status == "failed";
     let skipped = item.status == "skipped";
     let index = item.index;
@@ -163,6 +168,7 @@ fn outline_row(item: &OutlineItem, locale: Locale, metrics: Metrics, mono: &Shar
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.outline.jump"), index)))
+        .aria_selected(current)
         .on_click(move |event: &ClickEvent, _, cx| {
             let command = if event.click_count() >= 2 { format!("outline-run:{index}") } else { format!("outline:{index}") };
             jump.update(cx, |pane, cx| pane.command(&command, cx));
@@ -175,14 +181,22 @@ fn outline_row(item: &OutlineItem, locale: Locale, metrics: Metrics, mono: &Shar
         .items_center()
         .gap(px(6.))
         .text_size(px(TypeScale::SM))
-        .hover(|style| style.bg(p.hover))
-        .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{index}"))))
+        .when(current, |this| this.bg(p.accent_soft))
+        .when(!current, |this| this.hover(|style| style.bg(p.hover)))
+        .child(
+            div()
+                .flex_none()
+                .text_color(if current { p.accent_text } else { p.text_faint })
+                .when(current, |this| this.font_weight(gpui_kit::FontWeight::SEMIBOLD))
+                .child(SharedString::from(format!("{index}"))),
+        )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
                 .font_family(mono.clone())
+                .when(current && !failed && !skipped, |this| this.text_color(p.accent_text).font_weight(gpui_kit::FontWeight::MEDIUM))
                 .when(failed, |this| this.text_color(p.danger))
                 .when(skipped, |this| this.text_color(p.text_faint))
                 .child(SharedString::from(item.preview.clone())),

@@ -123,6 +123,7 @@ impl PaintedFrame {
     }
 }
 
+#[cfg(test)]
 pub fn painted_frame(viewport: i32, sidebar_open: bool, pad: i32) -> PaintedFrame {
     painted_frame_with_sidebar(viewport, sidebar_open, pad, SIDEBAR_DEFAULT as i32)
 }

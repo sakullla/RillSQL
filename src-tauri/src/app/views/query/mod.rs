@@ -20,7 +20,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
+    AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
@@ -109,6 +109,8 @@ pub struct QueryPane {
     variable_values: HashMap<String, String>,
     /// 每个查询标签自己的右侧面板状态（开关、大纲/对象）。
     side: HashMap<String, SideState>,
+    side_width: f32,
+    side_dragging: bool,
     /// 外壳密度；消息页和右侧面板的行高与控件高度跟它走。
     density: Density,
     /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
@@ -454,6 +456,8 @@ impl QueryPane {
             target_button: Default::default(),
             variable_values: HashMap::new(),
             side: HashMap::new(),
+            side_width: side::PANEL_WIDTH,
+            side_dragging: false,
             row_count: None,
             density: Density::Compact,
             narrow: false,
@@ -2643,21 +2647,27 @@ impl QueryPane {
             .tooltip(t("ui.query.more"))
             .accessibility_label(t("ui.query.more"))
             .dropdown_menu(move |menu, _, _| {
-                let item = |id: &'static str, key: &str| {
+                let item = |id: &'static str, icon_name: IconName, key: &'static str, chord: Option<&'static str>| {
                     let entity = more_entity.clone();
-                    PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                    let label = SharedString::from(i18n::text(locale, key));
+                    let hint = chord.map(|c| SharedString::from(kit::shortcut(c)));
+                    PopupMenuItem::element(move |_, cx| {
+                        let p = Palette::of(cx);
+                        kit::popup_menu_row(Some(icon_name), label.clone(), hint.clone(), false, &p)
+                    })
+                    .on_click(move |_, _, cx| {
                         entity.update(cx, |pane, cx| pane.command(id, cx));
                     })
                 };
-                menu.item(item("run-current", "query.editor.menu.runCurrent"))
-                    .item(item("run-script", "query.run.runScript"))
+                menu.item(item("run-current", IconName::CornerDownLeft, "query.editor.menu.runCurrent", Some("Ctrl+Shift+Enter")))
+                    .item(item("run-script", IconName::Play, "query.run.runScript", None))
                     .separator()
-                    .item(item("autocomplete", "shell.shortcuts.autocomplete"))
-                    .item(item("expand-star", "query.complete.expandStar"))
-                    .item(item("toggle-outline", "query.outline.heading"))
+                    .item(item("autocomplete", IconName::Sparkles, "shell.shortcuts.autocomplete", Some("Ctrl+Space")))
+                    .item(item("expand-star", IconName::Columns3, "query.complete.expandStar", None))
+                    .item(item("toggle-outline", IconName::ListOrdered, "query.outline.heading", None))
                     .separator()
-                    .item(item("open-sql-file", "query.fileIo.open"))
-                    .item(item("save-sql-file", "query.fileIo.save"))
+                    .item(item("open-sql-file", IconName::FolderOpen, "query.fileIo.open", Some("Ctrl+O")))
+                    .item(item("save-sql-file", IconName::Download, "query.fileIo.save", None))
             })
             .into_any_element()
     }
@@ -2698,10 +2708,31 @@ impl QueryPane {
         let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
         let side_state = self.side_state();
         let side_open = side_state.is_open(self.narrow);
-        let mut editor_row = div().id("query-editor-row").relative().flex().size_full().min_h(px(0.));
+        let mut editor_row = div()
+            .id("query-editor-row")
+            .relative()
+            .flex()
+            .size_full()
+            .min_h(px(0.))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
+                if event.drag(cx).key.as_ref() != "query-side-resize" {
+                    return;
+                }
+                let width = f32::from(event.bounds.right() - event.event.position.x);
+                let max_w = (f32::from(event.bounds.size.width) - 220.).clamp(side::PANEL_MIN, side::PANEL_MAX);
+                this.side_width = width.clamp(side::PANEL_MIN, max_w);
+                this.side_dragging = true;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.side_dragging {
+                    this.side_dragging = false;
+                    cx.notify();
+                }
+            }));
         let mut cursor_text: Option<(String, usize)> = None;
         if let Some(editor) = editor {
-            if side_open && side_state.mode == SideMode::Object {
+            if side_open {
                 let state = editor.read(cx);
                 let text = state.value(cx);
                 let cursor = state.selected_range(cx).end.min(text.len());
@@ -2720,6 +2751,15 @@ impl QueryPane {
             );
         }
         if side_open && self.desk.active_id().is_some() {
+            if !self.narrow {
+                let reset = entity.clone();
+                editor_row = editor_row.child(kit::resize_handle("query-side-resize", t("query.side.toggle"), self.side_dragging, p, move |_, _, cx| {
+                    reset.update(cx, |pane, cx| {
+                        pane.side_width = side::PANEL_WIDTH;
+                        cx.notify();
+                    });
+                }));
+            }
             editor_row = editor_row.child(self.render_side(side_state, cursor_text, p, metrics, mono, entity));
             #[cfg(test)]
             {
@@ -2732,13 +2772,30 @@ impl QueryPane {
     #[inline(never)]
     fn render_side(&self, side_state: SideState, cursor_text: Option<(String, usize)>, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
         let outline = self.desk.outline();
+        let active_statement = cursor_text.as_ref().and_then(|(_, cursor)| {
+            outline
+                .iter()
+                .find(|item| *cursor >= item.start && *cursor <= item.end)
+                .or_else(|| outline.iter().rev().find(|item| *cursor >= item.start))
+                .map(|item| item.index)
+        });
         let info = cursor_text.and_then(|(text, cursor)| self.desk.object_info_at(&text, cursor));
         let body = match side_state.mode {
             SideMode::Outline => side::SideBody::Outline(&outline),
             SideMode::Object => side::SideBody::Object(info.as_ref()),
         };
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
-        let panel = side::SidePanel { mode: side_state.mode, body, locale: self.locale, metrics, overlay: self.narrow, mono: mono.clone(), engine: &engine };
+        let panel = side::SidePanel {
+            mode: side_state.mode,
+            body,
+            locale: self.locale,
+            metrics,
+            overlay: self.narrow,
+            width: self.side_width,
+            active_statement,
+            mono: mono.clone(),
+            engine: &engine,
+        };
         panel.render(p, entity)
     }
 
@@ -3095,6 +3152,7 @@ impl QueryPane {
         }
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let cancel_entity = entity.clone();
         let mut row = div()
             .id("query-variables")
             .flex_none()
@@ -3106,6 +3164,12 @@ impl QueryPane {
             .bg(p.accent_soft)
             .border_b_1()
             .border_color(p.line)
+            .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    cancel_entity.update(cx, |pane, cx| pane.command("cancel-variables", cx));
+                }
+            })
             .child(div().flex().items_center().gap(px(6.)).h(px(metrics.bar_h() - 4.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
         for field in &variables {
             let value = self.variable_values.get(&field.key).cloned().unwrap_or_default();

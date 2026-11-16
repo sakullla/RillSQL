@@ -623,8 +623,10 @@ pub struct StructurePane {
     /// 外壳同步来的真实可用内容宽（已扣活动栏与停靠侧栏）。
     /// 字段表按它决定列宽，不能拿窗口视口宽冒充：900 的视口开着侧栏时只剩 614。
     content_width: f32,
-    data_sink: Option<Arc<dyn Fn(&mut App)>>,
+    data_sink: Option<DataSink>,
 }
+
+type DataSink = Arc<dyn Fn(&mut App)>;
 
 impl StructurePane {
     pub fn new(services: Arc<AppServices>) -> Self {
@@ -2098,6 +2100,8 @@ impl StructurePane {
         if create {
             let up_entity = entity.clone();
             let down_entity = entity.clone();
+            let is_first = index == 0;
+            let is_last = index + 1 >= self.session.kept_columns.len();
             row = row
                 .child(div().w(px(widths.primary)).flex_none().flex().justify_center().child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)))
                 .child(div().w(px(widths.auto)).flex_none().flex().justify_center().child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)))
@@ -2111,13 +2115,13 @@ impl StructurePane {
                                 pane.move_column(index, -1);
                                 cx.notify();
                             });
-                        }).xsmall())
+                        }).xsmall().disabled(is_first))
                         .child(kit::icon_button(SharedString::from(format!("structure-down-{index}")), IconName::ChevronDown, t("structure.field.moveDown"), move |_, _, cx| {
                             down_entity.update(cx, |pane, cx| {
                                 pane.move_column(index, 1);
                                 cx.notify();
                             });
-                        }).xsmall()),
+                        }).xsmall().disabled(is_last)),
                 );
         }
         row.child(div().w(px(widths.drop)).flex_none().flex().justify_center().child(drop)).into_any_element()
@@ -2256,35 +2260,13 @@ impl StructurePane {
                 let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
                 let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
                 let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
-                form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)));
-                if shows_ref_schema(&self.session.target.engine) {
-                    let schema = self.field("fk_ref_schema", "structure.fk.refSchema", "public", window, cx);
-                    let schemas = self.fk_schemas.clone();
-                    let schema_entity = entity.clone();
-                    form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(schema)).child(
-                        Button::new("structure-fk-schemas")
-                            .ghost()
-                            .small()
-                            .label(t("structure.fk.refSchema"))
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for choice in schemas.clone() {
-                                    let schema_entity = schema_entity.clone();
-                                    let choice = choice.clone();
-                                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                        let choice = choice.clone();
-                                        schema_entity.update(cx, |pane, cx| {
-                                            pane.choose_fk("fk_ref_schema", choice);
-                                            cx.notify();
-                                        });
-                                    }));
-                                }
-                                menu
-                            }),
-                    ));
-                }
                 let tables = self.fk_tables.clone();
                 let columns = self.fk_columns.clone();
-                let local = self.snapshot.as_ref().map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect()).unwrap_or_else(Vec::new);
+                let local: Vec<String> = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect())
+                    .unwrap_or_default();
                 let table_entity = entity.clone();
                 let column_entity = entity.clone();
                 let ref_entity = entity.clone();
@@ -2292,7 +2274,9 @@ impl StructurePane {
                     Button::new("structure-fk-local")
                         .ghost()
                         .small()
-                        .label(t("structure.field.column"))
+                        .icon(IconName::ChevronDown)
+                        .tooltip(t("structure.field.column"))
+                        .accessibility_label(t("structure.field.column"))
                         .dropdown_menu(move |mut menu, _, _| {
                             for choice in local.clone() {
                                 let column_entity = column_entity.clone();
@@ -2313,7 +2297,9 @@ impl StructurePane {
                     Button::new("structure-fk-tables")
                         .ghost()
                         .small()
-                        .label(t("ui.structure.refTable"))
+                        .icon(IconName::ChevronDown)
+                        .tooltip(t("ui.structure.refTable"))
+                        .accessibility_label(t("ui.structure.refTable"))
                         .dropdown_menu(move |mut menu, _, _| {
                             for choice in tables.clone() {
                                 let table_entity = table_entity.clone();
@@ -2334,7 +2320,9 @@ impl StructurePane {
                     Button::new("structure-fk-ref-cols")
                         .ghost()
                         .small()
-                        .label(t("ui.structure.refColumn"))
+                        .icon(IconName::ChevronDown)
+                        .tooltip(t("ui.structure.refColumn"))
+                        .accessibility_label(t("ui.structure.refColumn"))
                         .dropdown_menu(move |mut menu, _, _| {
                             for choice in columns.clone() {
                                 let ref_entity = ref_entity.clone();
@@ -2351,8 +2339,84 @@ impl StructurePane {
                         })
                         .into_any_element()
                 });
-                form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(table)).child(div().flex_1().child(target))).child(
-                    div().flex().flex_wrap().gap(px(8.)).child(local_button).child(tables_button).child(columns_button),
+                form = form.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(160.)).child(name))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.))
+                                .flex()
+                                .items_end()
+                                .gap(px(4.))
+                                .child(div().flex_1().min_w(px(0.)).child(column))
+                                .child(local_button),
+                        ),
+                );
+                if shows_ref_schema(&self.session.target.engine) {
+                    let schema = self.field("fk_ref_schema", "structure.fk.refSchema", "public", window, cx);
+                    let schemas = self.fk_schemas.clone();
+                    let schema_entity = entity.clone();
+                    form = form.child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w(px(0.)).child(schema))
+                            .child(
+                                Button::new("structure-fk-schemas")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::ChevronDown)
+                                    .tooltip(t("structure.fk.refSchema"))
+                                    .accessibility_label(t("structure.fk.refSchema"))
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        for choice in schemas.clone() {
+                                            let schema_entity = schema_entity.clone();
+                                            let choice = choice.clone();
+                                            menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                                let choice = choice.clone();
+                                                schema_entity.update(cx, |pane, cx| {
+                                                    pane.choose_fk("fk_ref_schema", choice);
+                                                    cx.notify();
+                                                });
+                                            }));
+                                        }
+                                        menu
+                                    }),
+                            ),
+                    );
+                }
+                form = form.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.))
+                                .flex()
+                                .items_end()
+                                .gap(px(4.))
+                                .child(div().flex_1().min_w(px(0.)).child(table))
+                                .child(tables_button),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.))
+                                .flex()
+                                .items_end()
+                                .gap(px(4.))
+                                .child(div().flex_1().min_w(px(0.)).child(target))
+                                .child(columns_button),
+                        ),
                 );
                 let actions = fk_action_choices(&self.session.target.engine);
                 let delete_now = self.session.fk_on_delete.clone();
@@ -2448,9 +2512,22 @@ impl StructurePane {
                         if copied { t("ui.copied") } else { t("common.copy") },
                         move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy_sql.clone()));
+                            let reset = owner.downgrade();
                             owner.update(cx, |pane, cx| {
                                 pane.ddl_copied = true;
                                 cx.notify();
+                                cx.spawn(async move |_, cx| {
+                                    cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                                    cx.update(|cx| {
+                                        if let Some(pane) = reset.upgrade() {
+                                            pane.update(cx, |pane, cx| {
+                                                pane.ddl_copied = false;
+                                                cx.notify();
+                                            });
+                                        }
+                                    });
+                                })
+                                .detach();
                             });
                         },
                     ));
@@ -2843,7 +2920,7 @@ impl StructurePane {
                 Some(kit::form_row(
                     t("structure.danger.typeName"),
                     self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
-                    &p,
+                    p,
                 ))
             } else {
                 None
@@ -2892,7 +2969,7 @@ impl StructurePane {
                                 .border_b_1()
                                 .border_color(p.line_soft)
                                 .when(dangerous, |this| this.child(kit::icon(IconName::TriangleAlert, 16., p.danger)))
-                                .child(kit::title(preview_title, TypeScale::LG, &p))
+                                .child(kit::title(preview_title, TypeScale::LG, p))
                                 .child(div().flex_1().min_w(px(0.)))
                                 .child(
                                     div()
@@ -2917,7 +2994,7 @@ impl StructurePane {
                                 .flex()
                                 .flex_col()
                                 .gap(px(10.))
-                                .child(kit::muted(banner, &p))
+                                .child(kit::muted(banner, p))
                                 .child(
                                     div()
                                         .id("structure-preview-sql")
@@ -2932,7 +3009,7 @@ impl StructurePane {
                                         .text_size(px(TypeScale::SM))
                                         .child(SharedString::from(sql)),
                                 )
-                                .child(kit::muted(target, &p))
+                                .child(kit::muted(target, p))
                                 .when(!risks.is_empty(), |this| {
                                     let mut list = div().flex().flex_col().gap(px(4.));
                                     for (level, text) in risks {
@@ -2941,7 +3018,7 @@ impl StructurePane {
                                     }
                                     this.child(list)
                                 })
-                                .when(!rule.is_empty(), |this| this.child(kit::muted(SharedString::from(rule), &p)))
+                                .when(!rule.is_empty(), |this| this.child(kit::muted(SharedString::from(rule), p)))
                                 .when(!blocked_text.is_empty(), |this| {
                                     this.child(
                                         div()
@@ -2954,7 +3031,7 @@ impl StructurePane {
                                             .child(SharedString::from(blocked_text.clone())),
                                     )
                                 })
-                                .when(!note_text.is_empty(), |this| this.child(kit::muted(SharedString::from(note_text), &p)))
+                                .when(!note_text.is_empty(), |this| this.child(kit::muted(SharedString::from(note_text), p)))
                                 .when_some(danger_field, |this, field| this.child(field))
                                 .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
                         )

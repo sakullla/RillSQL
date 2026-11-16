@@ -302,6 +302,12 @@ impl Workbench {
             }
             // Tab/Shift+Tab 由面板上的 GPUI focus trap 处理（Root 的 Tab 动作在容器内成环），
             // 这里不再自绘序列——那会被 Root 的绑定抢先吃掉。
+            // URL 快速填充框里按回车直接解析连接串，不必再伸手点“解析”。
+            if key == "enter" && self.fields.is_focused(DraftField::Url, window, cx) {
+                self.perform("conn-apply-url", cx);
+                cx.notify();
+                return;
+            }
             // 回车落在已登记的控件上就激活它；落在输入框上时交还给输入框。
             if key == "enter" && self.modal_activate_focused(window, cx) {
                 cx.notify();
@@ -610,7 +616,7 @@ impl Workbench {
                     .when(!narrow, |this| {
                         this.child(
                             kit::icon_button("top-exchange", IconName::ArrowDownUp, self.t("shell.command.openExchange"), act("open-exchange", cx))
-                                .selected(self.model.exchange_open),
+                                .selected(self.model.exchange_open || self.model.exchange_running),
                         )
                     })
                     .child(kit::icon_button(
@@ -803,6 +809,11 @@ impl Workbench {
                                 div()
                                     .flex()
                                     .gap(px(2.))
+                                    .child(
+                                        kit::icon_button("explorer-collapse", IconName::ChevronsUp, self.t("ui.explorer.collapseAll"), act("collapse-tree", cx))
+                                            .xsmall()
+                                            .disabled(!self.model.nav.has_expanded()),
+                                    )
                                     .child(kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx)).xsmall())
                                     // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
                                     .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
@@ -1365,6 +1376,16 @@ impl Workbench {
             && !row.stale
             && !has_error;
         let group = SharedString::from(format!("nav-row-group-{id}"));
+        let guides = (0..depth).map(|level| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(13. + level as f32 * 12.))
+                .w(px(1.))
+                .bg(p.line_soft)
+                .into_any_element()
+        });
         kit::row_states(div().id(SharedString::from(format!("nav-{id}"))), p)
             .test_support()
             .group(group.clone())
@@ -1374,6 +1395,7 @@ impl Workbench {
             .aria_expanded(row.expanded)
             // 右键菜单打开时不再挂悬停提示：提示浮层会盖住菜单的第一项。
             .when(self.model.menu.is_none(), |this| this.tooltip_text(tooltip))
+            .relative()
             .flex_none()
             .h(px(m.tree_row_h))
             .pl(px(indent))
@@ -1384,6 +1406,7 @@ impl Workbench {
             .rounded(px(Radius::CONTROL))
             .when(row.focused, |this| this.bg(p.selection))
             .when(!row.focused, |this| this.hover(|style| style.bg(p.hover)))
+            .children(guides)
             .child(
                 div()
                     .id(SharedString::from(format!("nav-chevron-{id}")))
@@ -1652,6 +1675,35 @@ impl Workbench {
             let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
             let dirty = tab.uncommitted_cells;
             let title = SharedString::from(tab.title.clone());
+            let (is_prod, context_hint) = tab
+                .connection_id
+                .as_deref()
+                .map(|conn_id| {
+                    let row = self.model.connections.rows.iter().find(|r| r.saved.id == conn_id);
+                    let env = row.map(|r| r.saved.env.as_str()).unwrap_or("");
+                    let prod = super::danger::env_is_prod(env, Some(&self.model.env_tags));
+                    let conn_name = tab
+                        .connection_name
+                        .clone()
+                        .or_else(|| row.map(|r| r.saved.name.clone()))
+                        .unwrap_or_default();
+                    let db = tab.database.clone().unwrap_or_default();
+                    let mut ctx = if db.is_empty() {
+                        conn_name
+                    } else if conn_name.is_empty() {
+                        db
+                    } else {
+                        format!("{conn_name} / {db}")
+                    };
+                    if env_shown(env) {
+                        let env_txt = self.env_text(env);
+                        if !ctx.is_empty() {
+                            ctx = format!("{ctx} [{env_txt}]");
+                        }
+                    }
+                    (prod, (!ctx.is_empty()).then(|| SharedString::from(ctx)))
+                })
+                .unwrap_or((false, None));
             let id = tab.id.clone();
             let close_id = tab.id.clone();
             let menu_id = tab.id.clone();
@@ -1661,6 +1713,8 @@ impl Workbench {
                 tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
                     .active(active)
                     .running(tab.running)
+                    .prod(is_prod)
+                    .context(context_hint)
                     .dirty(dirty, Some(dirty_text.clone())),
                 &p,
             )
@@ -1711,7 +1765,7 @@ impl Workbench {
             act("new-query", cx),
         )
         .into_any_element();
-        tabs::tab_strip(
+        tabs::tab_strip_with_double_click(
             "tabs",
             self.t("shell.tabs.tablist"),
             "tab-list",
@@ -1721,6 +1775,7 @@ impl Workbench {
             reveal,
             &m,
             &p,
+            Some(kit::click(act("new-query", cx))),
         )
     }
 
@@ -1916,6 +1971,40 @@ impl Workbench {
                         .on_click(act("settings", cx)),
                 )
             })
+            .when(self.model.tabs.len() > 1 && self.model.viewport_width >= 760, |this| {
+                let total = self.model.tabs.len();
+                let current = self
+                    .model
+                    .active_tab
+                    .as_deref()
+                    .and_then(|id| self.model.tabs.iter().position(|tab| tab.id == id))
+                    .map(|idx| idx + 1)
+                    .unwrap_or(1);
+                this.child(
+                    div()
+                        .id("status-tab-count")
+                        .flex_none()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(format!("{current} / {total}"))),
+                )
+            })
+            .child(
+                kit::interactive_states(div().id("status-help"), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t("shell.help.title"))
+                    .tooltip_text(self.t("ui.status.shortcutsHint"))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.))
+                    .rounded(px(Radius::CONTROL))
+                    .hover(|style| style.bg(p.hover).text_color(p.text))
+                    .child(kit::icon(IconName::Keyboard, 12., p.text_faint))
+                    .on_click(act("help", cx)),
+            )
 
             .into_any_element()
     }
@@ -2705,7 +2794,14 @@ impl Workbench {
 
         let header = stack_frame(|| {
         let title = if existing {
-            SharedString::from(draft.name.clone())
+            let trimmed = draft.name.trim();
+            if trimmed.is_empty() {
+                default_connection_name(&draft)
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| self.t("connections.editor.newTitle"))
+            } else {
+                SharedString::from(draft.name.clone())
+            }
         } else {
             self.t("connections.editor.newTitle")
         };
@@ -3016,8 +3112,17 @@ impl Workbench {
             .gap(px(6.))
             .rounded(px(Radius::CONTROL))
             .border_1()
-            .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
-            .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
+            .when(selected, |this| {
+                this.border_color(p.accent)
+                    .bg(p.accent_soft)
+                    .text_color(p.accent_text)
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .when(!selected, |this| {
+                this.border_color(p.line)
+                    .bg(if p.dark { p.raised } else { p.surface })
+                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+            })
             .child(kit::engine_badge(name, 16.))
             .child(div().text_size(px(TypeScale::SM)).child(kit::engine_label(name)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -3054,8 +3159,13 @@ impl Workbench {
             .items_center()
             .rounded(px(Radius::CONTROL))
             .text_size(px(TypeScale::SM))
-            .when(selected, |this| this.bg(p.surface).text_color(p.text).font_weight(FontWeight::MEDIUM).shadow_sm())
-            .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.text_color(p.text)))
+            .when(selected, |this| {
+                this.bg(if p.dark { p.raised } else { p.surface })
+                    .text_color(p.text)
+                    .font_weight(FontWeight::MEDIUM)
+                    .shadow_sm()
+            })
+            .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.activate_modal_control(&click_id, cx);
@@ -3092,8 +3202,21 @@ impl Workbench {
             .rounded(px(Radius::CONTROL))
             .border_1()
             .text_size(px(TypeScale::SM))
-            .when(primary, |this| this.bg(p.accent).text_color(p.on_accent).border_color(p.accent).hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover)).active(|style| style.bg(p.accent_active)))
-            .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)));
+            .when(primary, |this| {
+                this.bg(p.accent)
+                    .text_color(p.on_accent)
+                    .font_weight(FontWeight::MEDIUM)
+                    .border_color(p.accent)
+                    .hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover))
+                    .active(|style| style.bg(p.accent_active))
+            })
+            .when(!primary, |this| {
+                this.bg(if p.dark { p.raised } else { p.surface })
+                    .border_color(p.line)
+                    .text_color(p.text)
+                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+                    .active(|style| style.bg(p.active))
+            });
         if let Some(icon) = icon {
             button = button.child(kit::icon(icon, 13., if primary { p.on_accent } else { p.text_muted }));
         }
@@ -3956,12 +4079,24 @@ impl Workbench {
             .child(
                 div()
                     .px(px(m.page_pad))
-                    .pt(px(20.))
-                    .pb(px(14.))
+                    .pt(px(m.page_pad_y))
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(p.line)
                     .flex()
                     .flex_col()
-                    .gap(px(14.))
-                    .child(kit::title(self.t("history.page.titleRuns"), TypeScale::LG, &p))
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(kit::title(self.t("history.page.titleRuns"), TypeScale::LG, &p))
+                            .when(!self.model.tabs.is_empty(), |this| {
+                                this.child(kit::tool_button("history-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
+                            }),
+                    )
                     .child(toolbar),
             )
             .child(rename_bar)
@@ -4447,9 +4582,18 @@ impl Workbench {
                 div()
                     .px(px(m.page_pad))
                     .pt(px(m.page_pad_y))
-                    .pb(px(10.))
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(p.line)
                     .flex_none()
-                    .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p)),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p))
+                    .when(!self.model.tabs.is_empty(), |this| {
+                        this.child(kit::tool_button("settings-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
+                    }),
             )
             .child(body)
             .into_any_element()
@@ -5098,6 +5242,7 @@ impl Workbench {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn context_menu_box(
         &mut self,
         element_id: &'static str,

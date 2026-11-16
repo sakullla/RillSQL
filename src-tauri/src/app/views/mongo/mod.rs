@@ -116,6 +116,7 @@ pub struct MongoPane {
     cell_focus: Option<FocusHandle>,
     /// 键盘光标所在单元格（行、列下标），鼠标点格子也会同步到这里。
     focused_cell: Option<(usize, usize)>,
+    drawer_tall: bool,
 }
 
 impl MongoPane {
@@ -166,6 +167,7 @@ impl MongoPane {
             viewport_w: 1200.,
             cell_focus: None,
             focused_cell: None,
+            drawer_tall: false,
         }
     }
 
@@ -1256,9 +1258,26 @@ impl Render for MongoPane {
             let viewer = self.ensure_document_viewer(&source, editable, window, cx);
             let caption = if self.editor_mode == EditorMode::Insert { self.text("mongo.tab.saveInsert") } else { self.text("mongo.tab.saveReplace") };
             let close_entity = entity.clone();
+            let tall_entity = entity.clone();
+            let tall = self.drawer_tall;
+            let drawer_h = if tall { m.header_h() * 9. } else { m.header_h() * 6. };
+            let close_btn: AnyElement = if editable {
+                kit::icon_button("mongo-editor-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
+                    close_entity.update(cx, |pane, cx| {
+                        pane.editor_open = false;
+                        cx.notify();
+                    })
+                })
+                .into_any_element()
+            } else {
+                kit::icon_button("mongo-view-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
+                    close_entity.update(cx, |pane, cx| pane.command("mongo-view-close", cx))
+                })
+                .into_any_element()
+            };
             let mut drawer = div()
                 .flex_none()
-                .h(px(m.header_h() * 6.))
+                .h(px(drawer_h))
                 .flex()
                 .flex_col()
                 .gap(px(m.pad))
@@ -1272,15 +1291,27 @@ impl Render for MongoPane {
                         .items_center()
                         .justify_between()
                         .child(kit::eyebrow(SharedString::from(self.text(if editable { "mongo.tab.editorLabel" } else { "mongo.tab.viewLabel" })), &p))
-                        .child(mongo_button("mongo-view-close", Some(IconName::X), &self.text("mongo.tab.close"), Kind::Tool, &entity))
-                        .when(editable, |this| {
-                            this.child(kit::icon_button("mongo-editor-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
-                                close_entity.update(cx, |pane, cx| {
-                                    pane.editor_open = false;
-                                    cx.notify();
-                                })
-                            }))
-                        }),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(
+                                    kit::icon_button(
+                                        "mongo-drawer-size",
+                                        if tall { IconName::Minimize2 } else { IconName::Maximize2 },
+                                        SharedString::from(self.text(if editable { "mongo.tab.editorLabel" } else { "mongo.tab.viewLabel" })),
+                                        move |_, _, cx| {
+                                            tall_entity.update(cx, |pane, cx| {
+                                                pane.drawer_tall = !pane.drawer_tall;
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .selected(tall),
+                                )
+                                .child(close_btn),
+                        ),
                 )
                 .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_hidden().child(viewer));
             if editable {

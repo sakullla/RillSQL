@@ -116,6 +116,7 @@ fn check_directory(directory: &Path, require_complete: bool) -> Result<(), Strin
     Ok(())
 }
 
+#[cfg(any(feature = "packager", test))]
 fn resolve_out_dir(base: &Path, out: &Path) -> Result<PathBuf, String> {
     let absolute = if out.is_absolute() { out.to_path_buf() } else { base.join(out) };
     fs::create_dir_all(&absolute).map_err(|err| format!("create {}: {err}", absolute.display()))?;
@@ -123,6 +124,7 @@ fn resolve_out_dir(base: &Path, out: &Path) -> Result<PathBuf, String> {
     Ok(strip_verbatim_prefix(&canonical))
 }
 
+#[cfg(any(feature = "packager", test))]
 fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.as_os_str().to_string_lossy();
     match text.strip_prefix(r"\\?\") {

@@ -10320,3 +10320,77 @@ fn opening_a_connected_connection_returns_to_the_workspace_and_reveals_it() {
     assert_eq!(model.shell.page, AppPage::Connections);
     assert_eq!(model.connections.selected.as_deref(), Some("c2"));
 }
+
+#[gpui_kit::test]
+fn tab_strip_double_click_url_enter_collapse_all_and_back_navigation_work_cleanly(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-ux-flows-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1200., 800.);
+
+    // 1) 新建首个查询后，双击标签栏右侧空白区新建第二个查询标签。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.tabs.len(), 1);
+        window.double_click("tabs-empty", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.tabs.len(), 2, "双击标签条空白区应新建查询标签");
+    })
+    .unwrap();
+
+    // 2) 进入历史页与设置页时，页头提供“返回工作台”按钮，点击后回到原工作项且不翻转侧栏。
+    let sidebar_before = cx.update(|cx| view.read(cx).model.shell.sidebar_open);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("settings", cx));
+        window.render_frame(cx);
+        assert!(window.find("settings-back").visible());
+        window.click("settings-back", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Workspace);
+        assert_eq!(view.read(cx).model.shell.sidebar_open, sidebar_before, "返回工作台不误切换侧栏开关");
+    })
+    .unwrap();
+
+    // 3) 状态栏快捷键按钮一键打开快捷键面板。
+    cx.update_window(window, |_, window, cx| {
+        window.click("status-help", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.shell.help_open, "状态栏键盘图标应打开快捷键帮助");
+        view.update(cx, |view, cx| view.perform("help", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 4) 连接模态 URL 输入框按 Enter 直接解析填充主机、端口、用户与库，不关闭模态。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-connection", cx);
+            view.model.set_field(super::model::DraftField::Url, "postgres://alice@db.internal:5433/analytics".into());
+        });
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        let model = &view.read(cx).model;
+        assert!(model.conn_modal.open, "URL 回车解析不应关闭模态");
+        let draft = model.connections.editor.as_ref().expect("草稿仍在");
+        assert_eq!(draft.host, "db.internal");
+        assert_eq!(draft.port, "5433");
+        assert_eq!(draft.username, "alice");
+        assert_eq!(draft.database, "analytics");
+        view.update(cx, |view, cx| view.perform("conn-cancel", cx));
+    })
+    .unwrap();
+
+    // 5) 资源管理器“全部折叠”一键收起已展开节点。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.expand_nav_connection("c1");
+            assert!(view.model.nav.has_expanded());
+            view.perform("collapse-tree", cx);
+            assert!(!view.model.nav.has_expanded(), "collapse-tree 应清空全部展开节点");
+        });
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

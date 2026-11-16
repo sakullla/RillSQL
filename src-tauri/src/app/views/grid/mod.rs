@@ -3116,6 +3116,33 @@ impl GridPane {
                 div().min_w(px(0.)).max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
             );
         }
+        if let Some(stats) = self.session.selection_stats() {
+            let cells_txt = i18n::fill(&i18n::text(locale, "grid.selection.summary"), &[("count", &stats.cells.to_string())]);
+            let summary_txt = if stats.numeric_count >= 2 {
+                let nums = i18n::fill(
+                    &i18n::text(locale, "grid.selection.stats"),
+                    &[("sum", &format_stat_num(stats.sum)), ("avg", &format_stat_num(stats.avg))],
+                );
+                format!("{cells_txt} · {nums}")
+            } else {
+                cells_txt
+            };
+            status = status.child(
+                div()
+                    .id("grid-selection-stats")
+                    .test_support()
+                    .flex_none()
+                    .px(px(6.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::TAG))
+                    .bg(p.accent_soft)
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.accent_text)
+                    .child(SharedString::from(summary_txt)),
+            );
+        }
         // 可编辑是默认状态，不挂标签；只读时给一个带锁的小标签，原因放在悬停提示里。
         if !self.session.writable() {
             let reason = self.session.readonly_reason().to_owned();
@@ -3154,8 +3181,23 @@ impl GridPane {
             // 范围写成“起–止 / 总数 行”；总数未知时点击统计（大表可能较慢，所以按需）。
             let range = SharedString::from(self.session.range_text());
             let counted = self.session.full_count().is_some();
+            let busy = self.fetching || self.loading_more;
+            let can_prev = self.session.can_page(false) && !busy;
+            let can_next = self.session.can_page(true) && !busy;
+            let mut prev_btn = grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone())
+                .xsmall()
+                .disabled(!can_prev);
+            if !self.session.can_page(false) {
+                prev_btn = prev_btn.tooltip(t("grid.state.firstPage"));
+            }
+            let mut next_btn = grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone())
+                .xsmall()
+                .disabled(!can_next);
+            if !self.session.can_page(true) {
+                next_btn = next_btn.tooltip(t("grid.state.noMorePages"));
+            }
             actions = actions
-                .child(grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone()).xsmall())
+                .child(prev_btn)
                 .child(
                     div()
                         .id("grid-range-label")
@@ -3176,7 +3218,7 @@ impl GridPane {
                         .when(!counted, |this| this.child(div().ml(px(4.)).text_color(p.accent_text).child(t("grid.count.action"))))
                         .on_click(pane_click(entity, "grid-count")),
                 )
-                .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()).xsmall())
+                .child(next_btn)
                 .child(div().w(px(6.)));
             if writable {
                 actions = actions.child(kit::tool_button("grid-insert", Some(IconName::Plus), t("grid.action.insertShort"), pane_click(entity, "grid-insert")));
@@ -4309,7 +4351,17 @@ fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str
     }
 }
 
+fn format_stat_num(value: f64) -> String {
+    if (value - value.round()).abs() < 1e-9 && value.abs() < 1e15 {
+        format!("{}", value.round() as i64)
+    } else {
+        let s = format!("{value:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    }
+}
+
 /// 单元格右键菜单：(命令, 文案, 需要可写, 危险)。
+#[cfg(test)]
 const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("grid-value-open", "grid.value.openFull", false, false),
     ("grid-record-toggle", "grid.record.open", false, false),
@@ -4349,6 +4401,7 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
 ];
 
 /// 表头右键菜单。
+#[cfg(test)]
 const COLUMN_MENU: &[(&str, &str)] = &[
     ("column-sort-asc", "grid.menu.sortAsc"),
     ("column-sort-desc", "grid.menu.sortDesc"),
@@ -4419,6 +4472,7 @@ struct ColumnMenuState {
 }
 
 /// 表头菜单条目是否禁用：只剩一列可见时不能再藏；没有冻结时不能取消；没有隐藏列时不用"显示全部"。
+#[cfg(test)]
 fn column_item_disabled(id: &str, state: &ColumnMenuState) -> bool {
     match id {
         "column-hide" => !state.can_hide,
@@ -4475,7 +4529,8 @@ fn write_reason_for(needs_write: bool, state: CellMenuState, write_reason: &str,
 }
 
 #[inline(never)]
-pub(crate) fn cell_menu(
+#[allow(clippy::too_many_arguments)]
+fn cell_menu(
     menu: PopupMenu,
     owner: Option<gpui_kit::WeakEntity<GridPane>>,
     locale: Locale,
@@ -9076,6 +9131,47 @@ mod filter_ui_tests {
             }
         }
         drop(visual);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui_kit::test]
+    fn multi_cell_selection_computes_live_sum_and_average_and_single_cell_hides_it(cx: &mut TestAppContext) {
+        let (dir, services) = items_fixture("selection-stats");
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target_of("items"),
+                    vec![("id", "integer"), ("amount", "integer"), ("label", "text")],
+                    vec![
+                        vec![Some("1"), Some("10"), Some("a")],
+                        vec![Some("2"), Some("20"), Some("b")],
+                        vec![Some("3"), Some("30"), Some("c")],
+                    ],
+                    "id",
+                    cx,
+                );
+                pane.session.select(0, 1, false);
+                pane.sync_table(cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("grid-selection-stats").is_none(), "单格选择不显示统计胶囊");
+            assert_eq!(window.find("grid-page-prev").disabled(), Some(true), "第一页禁用上一页");
+            assert_eq!(window.find("grid-page-next").disabled(), Some(true), "没有更多页时禁用下一页");
+
+            pane.update(cx, |pane, cx| {
+                pane.session.select(2, 1, true);
+                pane.sync_table(cx);
+            });
+            window.render_frame(cx);
+            let stats = pane.read(cx).session.selection_stats().expect("三格数值选区");
+            assert_eq!(stats.cells, 3);
+            assert_eq!(stats.numeric_count, 3);
+            assert!((stats.sum - 60.0).abs() < 1e-6);
+            assert!((stats.avg - 20.0).abs() < 1e-6);
+            assert!(window.try_find("grid-selection-stats").is_some(), "多格选区显示即时统计胶囊");
+        })
+        .unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

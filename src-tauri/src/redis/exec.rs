@@ -137,6 +137,7 @@ pub fn invocation_word(word: &str, args: &[String]) -> String {
 }
 
 /// 执行前置检查：Blocked 无条件拒绝；Dangerous 必须带确认标记。
+#[cfg(test)]
 pub fn guard_command(word: &str, confirmed: bool) -> Result<(), String> {
     guard_invocation(word, &[], confirmed)
 }

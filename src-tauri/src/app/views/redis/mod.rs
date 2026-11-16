@@ -20,6 +20,7 @@ use crate::i18n::{self, Locale};
 use crate::redis::exec::{self, CommandRisk, RespReply};
 use crate::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ScanPage};
 
+#[allow(dead_code, clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
     Pattern,
@@ -90,6 +91,7 @@ enum ListState {
 /// 2) 但"这一轮读完没有"要压过模式判定——SCAN 用服务端 MATCH 分批返回，空页是正常现象
 ///    （见 `redis::keys::scan_keys`），游标还开着就说"这一轮已读完 / 没有符合条件的键"，
 ///    等于把未完成的扫描当结论，还会把用户的模式连同页脚的"再读取一批"一起废掉。
+///
 /// 所以 `total == 0` 里先看 `!done`，读完才允许下"无命中"或"无数据"的结论。
 fn list_state(busy: bool, scan_failed: bool, total: usize, visible: usize, pattern_active: bool, done: bool) -> ListState {
     if busy && total == 0 {
@@ -1672,9 +1674,31 @@ impl Render for RedisPane {
                         div()
                             .flex()
                             .flex_wrap()
+                            .items_center()
+                            .justify_between()
                             .gap(px(4.))
-                            .child(redis_button("redis-view-flat", None, &self.text("redis.view.flat"), Kind::Tool, &entity))
-                            .child(redis_button("redis-view-tree", None, &self.text("redis.view.tree"), Kind::Tool, &entity))
+                            .child({
+                                let flat_entity = entity.clone();
+                                let tree_entity = entity.clone();
+                                kit::segmented_sized(
+                                    vec![
+                                        (
+                                            SharedString::from("redis-view-flat"),
+                                            SharedString::from(self.text("redis.view.flat")),
+                                            !self.tree_view,
+                                            kit::click(move |_, _, cx| flat_entity.update(cx, |pane, cx| pane.command("redis-view-flat", cx))),
+                                        ),
+                                        (
+                                            SharedString::from("redis-view-tree"),
+                                            SharedString::from(self.text("redis.view.tree")),
+                                            self.tree_view,
+                                            kit::click(move |_, _, cx| tree_entity.update(cx, |pane, cx| pane.command("redis-view-tree", cx))),
+                                        ),
+                                    ],
+                                    &p,
+                                    m.control_h - 4.,
+                                )
+                            })
                             .child(redis_button("redis-new-key", Some(IconName::Plus), &self.text("redis.action.newKey"), Kind::Primary, &entity)),
                     )
                     .child(type_bar)
@@ -1707,7 +1731,7 @@ impl Render for RedisPane {
                     .border_t_1()
                     .border_color(p.line)
                     .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(if self.done { self.text("redis.tab.scanDone") } else { format!("{} keys", self.keys.len()) })))
-                    .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity))
+                    .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity).disabled(self.done || self.busy))
                     .into_any_element()
             });
         left.into_any_element()

@@ -38,13 +38,17 @@ pub struct TabSpec {
     pub active: bool,
     pub running: bool,
     pub dirty: bool,
+    /// 是否关联生产环境连接：顶部标记条改用危险色，防止跨环境误操作。
+    pub prod: bool,
+    /// 连接/库上下文说明（例如 `Atlas / orders · PROD`）：进入 tooltip，不占页签宽度。
+    pub context: Option<SharedString>,
     /// 状态短标签（已翻译，例如“未保存”）：进入 tooltip，状态不只靠颜色表达。
     pub status: Option<SharedString>,
 }
 
 impl TabSpec {
     pub fn new(id: impl Into<SharedString>, icon: IconName, title: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), icon, title: title.into(), active: false, running: false, dirty: false, status: None }
+        Self { id: id.into(), icon, title: title.into(), active: false, running: false, dirty: false, prod: false, context: None, status: None }
     }
 
     pub fn active(mut self, active: bool) -> Self {
@@ -57,6 +61,17 @@ impl TabSpec {
         self
     }
 
+    /// 生产环境警示与连接上下文提示。
+    pub fn prod(mut self, prod: bool) -> Self {
+        self.prod = prod;
+        self
+    }
+
+    pub fn context(mut self, context: Option<SharedString>) -> Self {
+        self.context = context;
+        self
+    }
+
     /// 未保存修改：画标记，并把状态写进 tooltip。
     pub fn dirty(mut self, dirty: bool, status: Option<SharedString>) -> Self {
         self.dirty = dirty;
@@ -64,12 +79,18 @@ impl TabSpec {
         self
     }
 
-    /// 完整标题：截断后仍可获取，状态一并带上。
+    /// 完整标题：截断后仍可获取，连接上下文与未保存状态一并带上。
     fn hint(&self) -> SharedString {
-        match (self.dirty, self.status.as_ref()) {
-            (true, Some(status)) if !status.is_empty() => SharedString::from(format!("{} · {}", self.title, status)),
-            _ => self.title.clone(),
+        let mut parts = vec![self.title.to_string()];
+        if let Some(ctx) = self.context.as_ref().filter(|ctx| !ctx.is_empty()) {
+            parts.push(ctx.to_string());
         }
+        if self.dirty {
+            if let Some(status) = self.status.as_ref().filter(|s| !s.is_empty()) {
+                parts.push(status.to_string());
+            }
+        }
+        SharedString::from(parts.join(" · "))
     }
 }
 
@@ -79,7 +100,13 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
     let title = spec.title.clone();
     let hint = spec.hint();
     let tone = if spec.active { p.text } else { p.text_muted };
-    let icon_tone = if spec.active { p.accent_text } else { p.text_muted };
+    let icon_tone = if spec.prod && spec.active {
+        p.danger
+    } else if spec.active {
+        p.accent_text
+    } else {
+        p.text_muted
+    };
     let weight = if spec.active { FontWeight::MEDIUM } else { FontWeight::NORMAL };
     // 图标与转圈占同一个方形槽位，页签在运行/空闲之间切换时标题不左右跳。
     let slot = |child: AnyElement| {
@@ -120,7 +147,12 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
         .border_color(if spec.active { p.line } else { p.line_soft })
         .when(spec.active, |this| this.bg(p.surface).text_color(p.text))
         .when(!spec.active, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
-        .when(spec.active, |this| {
+        .when(spec.active || spec.prod, |this| {
+            let mark_color = if spec.prod {
+                if spec.active { p.danger } else { p.danger.opacity(0.45) }
+            } else {
+                p.accent
+            };
             this.child(
                 div()
                     .absolute()
@@ -129,7 +161,7 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
                     .right(px(6.))
                     .h(px(TAB_MARK_H))
                     .rounded(px(Radius::TAG))
-                    .bg(p.accent),
+                    .bg(mark_color),
             )
         })
         .child(leading)
@@ -233,6 +265,23 @@ pub fn tab_strip(
     layout: &Metrics,
     p: &Palette,
 ) -> AnyElement {
+    tab_strip_with_double_click(id, aria_label, list_id, tabs, actions, scroll, reveal, layout, p, None)
+}
+
+/// 页签条（支持双击右侧空白区域新建查询）。
+#[allow(clippy::too_many_arguments)]
+pub fn tab_strip_with_double_click(
+    id: impl Into<SharedString>,
+    aria_label: impl Into<SharedString>,
+    list_id: impl Into<SharedString>,
+    tabs: Vec<AnyElement>,
+    actions: Vec<AnyElement>,
+    scroll: &gpui_kit::ScrollHandle,
+    reveal: Option<usize>,
+    layout: &Metrics,
+    p: &Palette,
+    on_empty_double_click: Option<kit::Click>,
+) -> AnyElement {
     let mut list = div()
         .id(ElementId::Name(list_id.into()))
         .flex()
@@ -254,8 +303,23 @@ pub fn tab_strip(
     for action in actions {
         trailing = trailing.child(action);
     }
+    let strip_id: SharedString = id.into();
+    let filler: AnyElement = match on_empty_double_click {
+        Some(on_double) => div()
+            .id(ElementId::Name(SharedString::from(format!("{strip_id}-empty"))))
+            .test_support()
+            .flex_1()
+            .h_full()
+            .on_click(move |event, window, cx| {
+                if event.click_count() >= 2 {
+                    on_double(event, window, cx);
+                }
+            })
+            .into_any_element(),
+        None => div().flex_1().h_full().into_any_element(),
+    };
     div()
-        .id(ElementId::Name(id.into()))
+        .id(ElementId::Name(strip_id))
         .test_support()
         .role(gpui_kit::Role::TabList)
         .aria_label(aria_label.into())
@@ -270,7 +334,7 @@ pub fn tab_strip(
         .border_color(p.line)
         .child(list)
         .child(trailing)
-        .child(div().flex_1())
+        .child(filler)
         .into_any_element()
 }
 #[cfg(test)]

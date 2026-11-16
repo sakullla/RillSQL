@@ -462,7 +462,7 @@ pub fn control_text(text: impl Into<SharedString>, size: f32, weight: FontWeight
 /// 禁用时 hover/active/focus 一起消失、不成为 Tab 停靠点、也不挂点击。
 /// 全应用只有这一处拼纯图标动作的几何与状态：页签关闭、页签条新建、工具条和行尾图标都走这里。
 #[allow(clippy::too_many_arguments)]
-pub fn icon_action(
+fn icon_action_base(
     id: impl Into<ElementId>,
     name: IconName,
     label: impl Into<SharedString>,
@@ -472,7 +472,7 @@ pub fn icon_action(
     disabled: bool,
     selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement + gpui_kit::StatefulInteractiveElement + gpui_kit::Styled {
+) -> gpui::Stateful<gpui::Div> {
     let label = label.into();
     // 选中的纯图标动作自己持有强调浅底，用不带 hover 的那条交互路径：
     // 悬停换底会把选中底盖掉，让"当前项"看起来变成普通项。
@@ -481,8 +481,7 @@ pub fn icon_action(
     } else {
         interactive(div().id(id), p, disabled)
     };
-    base.test_support()
-        .role(gpui_kit::Role::Button)
+    base.role(gpui_kit::Role::Button)
         .aria_label(label.clone())
         // 选中态是开关/当前项的语义：读屏与测试按 aria-selected 判断，而不是靠底色。
         .when(selected, |this| this.aria_selected(true))
@@ -495,6 +494,21 @@ pub fn icon_action(
         .rounded(px(Radius::CONTROL))
         .child(icon(name, icon_size_for(hit), color))
         .when(!disabled, |this| this.on_click(on_click))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn icon_action(
+    id: impl Into<ElementId>,
+    name: IconName,
+    label: impl Into<SharedString>,
+    hit: f32,
+    color: Hsla,
+    p: &Palette,
+    disabled: bool,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement + gpui_kit::StatefulInteractiveElement + gpui_kit::Styled {
+    icon_action_base(id, name, label, hit, color, p, disabled, selected, on_click).test_support()
 }
 
 // ---------------------------------------------------------------- 尺寸指标
@@ -1131,7 +1145,7 @@ pub fn vline(p: &Palette) -> AnyElement {
 
 // ---------------------------------------------------------------- 按钮
 
-type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+pub type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// 纯图标按钮的色调。只换前景色与可选的一圈边界线，
 /// 命中范围、图标档与四态仍由 `icon_action` 统一，页面不再各配一套。
@@ -1222,14 +1236,14 @@ impl RenderOnce for IconButton {
         // 悬停提示与无障碍名称是两件事：提示可以更具体（例如禁用原因），
         // 名称仍必须是控件做的事，读屏与测试按它找控件。
         let tip = self.tooltip.clone().unwrap_or_else(|| self.label.clone());
-        let mut button = icon_action(self.id, self.name, tip, self.hit, color, &p, self.disabled, self.selected, self.on_click);
+        let mut button = icon_action_base(self.id, self.name, tip, self.hit, color, &p, self.disabled, self.selected, self.on_click);
         if self.tooltip.is_some() {
             button = button.aria_label(self.label.clone());
         }
         if self.tone == IconTone::Outline {
             button = button.border_1().border_color(p.line_strong);
         }
-        button
+        A11yDisabled { inner: button, disabled: self.disabled }.test_support()
     }
 }
 
@@ -1562,9 +1576,34 @@ pub fn danger_button(id: impl Into<ElementId>, name: Option<IconName>, label: im
 }
 
 /// 温和危险按钮（浅红底 + 红字，用于非模态工具条删除入口）。
-#[allow(dead_code)]
 pub fn danger_soft_button(id: impl Into<ElementId>, name: Option<IconName>, label: impl Into<SharedString>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> ActionButton {
     ActionButton::new(id, name, label, ActionVariant::DangerSoft, on_click)
+}
+
+/// 弹出菜单条目的统一排版：左侧图标 + 正文 + 右侧快捷键提示。
+pub fn popup_menu_row(icon_name: Option<IconName>, label: impl Into<SharedString>, shortcut_hint: Option<SharedString>, danger: bool, p: &Palette) -> gpui_kit::Div {
+    let fg = if danger { p.danger } else { p.text };
+    let icon_fg = if danger { p.danger } else { p.text_muted };
+    div()
+        .w_full()
+        .min_w(px(176.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(TypeScale::SM))
+        .text_color(fg)
+        .when_some(icon_name, |this, name| this.child(icon(name, IconSize::CONTROL, icon_fg)))
+        .child(div().flex_1().min_w(px(0.)).truncate().child(label.into()))
+        .when_some(shortcut_hint, |this, hint| {
+            this.child(
+                div()
+                    .flex_none()
+                    .pl(px(12.))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(hint),
+            )
+        })
 }
 
 /// 分段选择：一组互斥选项，凹陷轨道 + 浮起选中卡片；高度由调用方按当前密度的控件高传入。

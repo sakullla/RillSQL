@@ -1475,6 +1475,11 @@ dict! {
     "ui.copy.value" => "点击复制", "Click to copy";
     "ui.copied" => "已复制", "Copied";
     "ui.structure.ddlLines" => "{count} 行", "{count} lines";
+    "ui.explorer.collapseAll" => "全部折叠", "Collapse all";
+    "ui.page.backWorkspace" => "返回工作台", "Back to workbench";
+    "ui.status.shortcutsHint" => "查看键盘快捷键", "Keyboard shortcuts";
+    "grid.selection.summary" => "已选 {count} 格", "{count} selected";
+    "grid.selection.stats" => "求和 {sum} · 均值 {avg}", "Sum {sum} · Avg {avg}";
 }
 
 #[cfg(test)]
