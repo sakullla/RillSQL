@@ -643,12 +643,26 @@ async fn read_mysql_outline(pool: &mysql_async::Pool, engine: Engine) -> Result<
     Ok(databases)
 }
 
+/// 展开一个库：各类对象分别借一条元数据连接并发读取。远端高延迟时，
+/// 六类对象 × (计数 + 列表) 串行要走十几次往返；并发后只等最慢的那一类。
 async fn read_mysql_page(pool: &mysql_async::Pool, engine: Engine, database: &str, offset: usize, limit: usize) -> ObjectPageBody {
-    let mut conn = match pool.get_conn().await {
-        Ok(conn) => conn,
-        Err(err) => return empty_page(read_failure(err)),
+    let window = offset.saturating_add(limit);
+    let reads = listed_kinds(engine).iter().map(|kind| async move {
+        let result = match pool.get_conn().await {
+            Ok(mut conn) => read_mysql_kind(&mut conn, engine, database, *kind, window).await,
+            Err(err) => Err(read_failure(err)),
+        };
+        (*kind, result)
+    });
+    let parts = futures::future::join_all(reads).await;
+    let (objects, total, reports) = finish_kinds(parts, offset, limit);
+    let schema = SchemaNode {
+        name: String::new(),
+        objects,
+        total,
+        error: None,
+        kind_reports: reports,
     };
-    let schema = read_mysql_objects(&mut conn, engine, database, offset, limit).await;
     ObjectPageBody {
         objects: schema.objects,
         total: schema.total,

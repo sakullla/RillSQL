@@ -62,11 +62,25 @@ pub async fn open_sqlite(path: &Path) -> Result<SqliteOpen, StageError> {
 }
 
 pub struct MysqlOpen {
+    /// 查询执行专用：固定一条连接，USE、会话变量与事务在多次执行之间保持。
     pub pool: Pool,
+    /// 目录、结构、表浏览与补全元数据专用的小池子：慢的元数据读取不会卡住查询，
+    /// 查询中的长语句也不会卡住资源管理器。
+    pub meta_pool: Pool,
     pub version: String,
     /// 只在取消时另开一条连接。执行仍使用上面的池。
     pub kill_opts: mysql_async::Opts,
     pub connection_id: u64,
+}
+
+/// 元数据池的连接上限。目录读取本身已按连接限流到 2 个，这里再给结构页、表浏览和补全留余量。
+pub const MYSQL_META_CONNECTIONS: usize = 4;
+
+fn mysql_pool_opts(max: usize) -> mysql_async::PoolOpts {
+    mysql_async::PoolOpts::new()
+        .with_constraints(mysql_async::PoolConstraints::new(0, max.max(1)).expect("mysql pool"))
+        .with_reset_connection(false)
+        .with_inactive_connection_ttl(Duration::from_secs(28_800))
 }
 
 pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str) -> Result<MysqlOpen, StageError> {
@@ -87,18 +101,15 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     if let Some(database) = &config.database {
         builder = builder.db_name(Some(database.clone()));
     }
-    // 目录、表浏览和查询共用池里这一条连接。空闲时留着它，归还时不发 COM_RESET_CONNECTION。
-    builder = builder.pool_opts(
-        mysql_async::PoolOpts::new()
-            .with_constraints(mysql_async::PoolConstraints::new(0, 1).expect("mysql pool"))
-            .with_reset_connection(false)
-            .with_inactive_connection_ttl(Duration::from_secs(28_800)),
-    );
+    // 查询执行独占池里这一条连接。空闲时留着它，归还时不发 COM_RESET_CONNECTION。
+    builder = builder.pool_opts(mysql_pool_opts(1));
     if plan.ssl_opts_present {
         builder = builder.ssl_opts(Some(mysql_ssl(&plan, config.tls.as_ref())?));
     }
+    let meta_opts = mysql_async::Opts::from(builder.clone().pool_opts(mysql_pool_opts(MYSQL_META_CONNECTIONS)));
     let opts = mysql_async::Opts::from(builder);
     let pool = Pool::new(opts.clone());
+    let meta_pool = Pool::new(meta_opts);
     let mut conn = pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let version: Option<(String,)> = conn
         .query_first("SELECT VERSION()")
@@ -111,6 +122,7 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     let version = version.map(|row| row.0).unwrap_or_else(|| "未知版本".to_owned());
     Ok(MysqlOpen {
         pool,
+        meta_pool,
         version: version_note(config.engine, &version),
         kill_opts: opts,
         connection_id: connection_id.unwrap_or(0),

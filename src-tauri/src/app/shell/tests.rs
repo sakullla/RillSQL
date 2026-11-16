@@ -4381,7 +4381,7 @@ fn public_settings_reach_the_query_pane_without_a_restart(cx: &mut gpui_kit::Tes
         assert_eq!(query.editor_theme(), "contrast");
         assert_eq!(query.page_size(), 150);
         assert_eq!(query.preview_kb(), 2);
-        assert_eq!(query.object_page(), 150);
+        assert_eq!(query.object_page(), 550);
         assert_eq!(query.null_copy(), "N", "QueryPane 保留原始设置，由网格转换显示文本");
         assert_eq!(query.run_limit(), 150, "查询读取行数跟随 page_size");
     });
@@ -10301,4 +10301,22 @@ fn table_and_structure_views_switch_directly_on_active_object() {
 
     let _ = model.dispatch("switch-to-data");
     assert_eq!(model.active_tab().map(|tab| tab.kind), Some(WorkItemKind::Table));
+}
+
+#[test]
+fn opening_a_connected_connection_returns_to_the_workspace_and_reveals_it() {
+    let mut model = seeded_model(vec![record_for("c1", "Alpha", Engine::Mysql), record_for("c2", "Beta", Engine::Postgres)]);
+    model.shell.page = AppPage::Connections;
+    model.connections.status.insert("c1".into(), LinkStatus::Connected);
+    let _ = model.dispatch("connection:c1");
+    assert_eq!(model.shell.page, AppPage::Workspace, "已连接时“打开”要回到工作台，不能停在连接管理页");
+    assert!(model.shell.sidebar_open);
+    assert_eq!(model.connections.selected.as_deref(), Some("c1"));
+    assert!(model.nav_connection_expanded("c1"), "资源管理器里这条连接要展开");
+
+    // 没连上的连接：仍停在连接管理页（连接动作由按需连接接管）。
+    model.shell.page = AppPage::Connections;
+    let _ = model.dispatch("connection:c2");
+    assert_eq!(model.shell.page, AppPage::Connections);
+    assert_eq!(model.connections.selected.as_deref(), Some("c2"));
 }

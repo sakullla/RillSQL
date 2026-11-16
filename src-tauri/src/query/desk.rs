@@ -257,6 +257,8 @@ pub struct Desk {
     active: Option<String>,
     seq: u64,
     objects: Vec<TreeObject>,
+    /// 补全专用的完整对象清单（按连接+库整库读取，不受资源管理器分页影响）。
+    known_objects: HashMap<(String, String), Vec<TreeObject>>,
     /// 按连接/库/模式/表记住的列及其元数据；同一个表名在不同模式里不互相覆盖。
     columns: HashMap<String, Vec<ColumnMeta>>,
     /// 按连接/库/模式/表记住的对象注释；读不到注释的对象不在表里。
@@ -285,6 +287,7 @@ impl Desk {
             active: None,
             seq: 0,
             objects: Vec::new(),
+            known_objects: HashMap::new(),
             columns: HashMap::new(),
             comments: HashMap::new(),
             foreign_keys: Vec::new(),
@@ -1372,6 +1375,23 @@ impl Desk {
         self.foreign_keys = keys;
     }
 
+    /// 记下某个库的完整对象清单。资源管理器只按页读对象，补全不能只认得已经展开的那一页。
+    pub fn remember_objects(&mut self, connection_id: &str, database: &str, objects: Vec<TreeObject>) {
+        self.known_objects.insert((connection_id.to_owned(), database.to_owned()), objects);
+    }
+
+    pub fn knows_objects(&self, connection_id: &str, database: &str) -> bool {
+        self.known_objects.contains_key(&(connection_id.to_owned(), database.to_owned()))
+    }
+
+    /// 连接断开或刷新目录后，整库清单需要重读。
+    pub fn forget_objects(&mut self, connection_id: Option<&str>) {
+        match connection_id {
+            Some(id) => self.known_objects.retain(|(connection, _), _| connection != id),
+            None => self.known_objects.clear(),
+        }
+    }
+
     pub fn set_objects(&mut self, objects: Vec<TreeObject>, databases: Vec<String>) {
         self.databases = databases;
         self.objects = objects;
@@ -1446,6 +1466,11 @@ impl Desk {
     pub fn completion_scope(&self) -> Option<assist::CompletionScope> {
         let tab = self.active_tab()?;
         let engine = tab.target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
+        let known = tab
+            .target
+            .as_ref()
+            .and_then(|target| self.known_objects.get(&(target.connection_id.clone(), target.database.clone())));
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         let objects: Vec<CatalogObject> = self
             .objects
             .iter()
@@ -1454,6 +1479,8 @@ impl Desk {
                     .as_ref()
                     .is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database)
             })
+            .chain(known.into_iter().flatten())
+            .filter(|object| seen.insert((object.schema.clone(), object.name.clone())))
             .map(|object| CatalogObject {
                 name: object.name.clone(),
                 schema: object.schema.clone(),
@@ -3033,6 +3060,39 @@ mod tests {
         assert_eq!(weight("id"), Some(1));
         assert_eq!(weight("item"), Some(2));
         assert_eq!(weight("select"), None, "关键字不计入词频");
+    }
+
+    #[test]
+    fn completion_knows_tables_beyond_the_explorer_page() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("my", "业务库", "mysql", "shop");
+        desk.set_provider(true);
+        let object = |name: &str| TreeObject {
+            connection_id: "my".to_owned(),
+            connection_name: "业务库".to_owned(),
+            engine: "mysql".to_owned(),
+            database: "shop".to_owned(),
+            schema: String::new(),
+            name: name.to_owned(),
+            kind: "table".to_owned(),
+        };
+        // 资源管理器只翻到了第一页（a 开头的表）。
+        desk.set_objects(vec![object("alarm_dept")], vec!["shop".to_owned()]);
+        let sql = "select * from ta";
+        let before = desk.completion_for(sql, sql.len(), Locale::ZhCn);
+        assert!(!before.iter().any(|entry| entry.label == "task_list_info"));
+        assert!(!desk.knows_objects("my", "shop"));
+        desk.remember_objects("my", "shop", vec![object("alarm_dept"), object("task_list_info"), object("task_list_track_code")]);
+        assert!(desk.knows_objects("my", "shop"));
+        let after = desk.completion_for(sql, sql.len(), Locale::ZhCn);
+        assert!(after.iter().any(|entry| entry.label == "task_list_info"), "{after:?}");
+        assert!(after.iter().any(|entry| entry.label == "task_list_track_code"));
+        // 同一张表在树上和整库清单里都有时只出一次。
+        let scope = desk.completion_scope().expect("有目标");
+        assert_eq!(scope.objects.iter().filter(|object| object.name == "alarm_dept").count(), 1);
+        desk.forget_objects(Some("my"));
+        assert!(!desk.knows_objects("my", "shop"));
     }
 
     #[test]

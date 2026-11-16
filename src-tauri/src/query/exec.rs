@@ -1264,9 +1264,8 @@ async fn mysql_run(
     sink: &dyn RowSink,
     index: usize,
 ) -> Result<StatementValue, String> {
-    if let Ok(Some(id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()").await {
-        transport.set_mysql_connection_id(id);
-    }
+    // 握手包里的线程 id 就是 CONNECTION_ID()；不再为每条语句多走一次网络往返。
+    transport.set_mysql_connection_id(u64::from(conn.id()));
     // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
     let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
     let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result

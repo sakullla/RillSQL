@@ -219,6 +219,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("没有读到 NULL 计数", "The NULL count could not be read"),
     ("没有读到行数", "The row count could not be read"),
     ("没有读到视图定义", "The view definition could not be read"),
+    ("没有读到建表语句", "The CREATE TABLE statement could not be read"),
     ("不是整数 {}", "Not an integer: {0}"),
     ("元数据是空的", "The metadata is empty"),
     ("读不到第 {} 列", "Column {0} could not be read"),

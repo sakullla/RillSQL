@@ -1450,6 +1450,31 @@ dict! {
     "ui.table.switchData" => "表数据", "Data";
     "ui.conn.quickUrl" => "粘贴连接串快速填充", "Paste URL to auto-fill";
     "ui.palette.hintSelect" => "上下选择", "Navigate";
+    "ui.conn.block.quick" => "快速填充", "Quick fill";
+    "ui.conn.block.quickHint" => "粘贴连接串，一次填好地址、端口、用户和库", "Paste a connection URL to fill host, port, user and database at once";
+    "ui.conn.block.identity" => "名称与环境", "Name & environment";
+    "ui.conn.block.identityHint" => "显示在资源管理器和标签上；生产环境的危险操作需要二次确认", "Shown in the explorer and tabs; production asks twice before risky changes";
+    "ui.conn.block.server" => "服务器", "Server";
+    "ui.conn.block.serverHint" => "数据库服务的地址与端口", "Address and port of the database server";
+    "ui.conn.block.fileHint" => "本机上的 .sqlite / .db 文件", "A local .sqlite / .db file";
+    "ui.conn.block.auth" => "身份验证", "Authentication";
+    "ui.conn.block.authHint" => "密码保存在系统钥匙串；默认库可留空", "Passwords live in the system keychain; the default database is optional";
+    "ui.conn.block.securityHint" => "TLS 加密与 SSH 跳板机", "TLS encryption and SSH bastion";
+    "grid.numeric.unrecognized" => "这不像一个数字，已按原样暂存，保存时由数据库校验", "This does not look like a number; it is staged as typed and the database will validate it on save";
+    "grid.temporal.format" => "格式 {format}，也可输入 2023/7/4 9:05、20230704", "Format {format}; 2023/7/4 9:05 or 20230704 also work";
+    "grid.temporal.willSave" => "将保存为 {value}", "Will save as {value}";
+    "grid.temporal.unrecognized" => "无法识别为日期时间，将原样提交（格式 {format}）", "Not a recognized date/time; it will be sent as typed (format {format})";
+    "grid.temporal.now" => "现在", "Now";
+    "grid.temporal.today" => "今天", "Today";
+    "grid.temporal.prevDay" => "前一天", "Previous day";
+    "grid.temporal.nextDay" => "后一天", "Next day";
+    "grid.temporal.calendar" => "日历", "Calendar";
+    "ui.nav.moreCount" => "还有 {count}", "{count} more";
+    "ui.copy.name" => "点击复制名称", "Click to copy the name";
+    "ui.copy.path" => "点击复制完整名 {name}", "Click to copy the full name {name}";
+    "ui.copy.value" => "点击复制", "Click to copy";
+    "ui.copied" => "已复制", "Copied";
+    "ui.structure.ddlLines" => "{count} 行", "{count} lines";
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-pub const DEFAULT_OBJECT_PAGE: usize = 100;
+pub const DEFAULT_OBJECT_PAGE: usize = 500;
 
 pub use crate::connections::model::Engine;
 

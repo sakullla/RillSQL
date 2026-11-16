@@ -151,7 +151,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     }
     let notices = report.notices;
     let parts = report.pieces;
-    let session = service.catalog_session(&request.connection_id).ok_or_else(|| {
+    let session = service.query_session(&request.connection_id).ok_or_else(|| {
         // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
         if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
             "连接已断开，自动重连成功后才能执行。没有把这次语句排队重发。".to_owned()

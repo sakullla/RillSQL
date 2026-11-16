@@ -3097,3 +3097,61 @@ mod control_tests {
     }
 }
 
+
+/// 关键信息（表名、完整路径、连接地址等）点一下就复制。悬停时出现复制图标，
+/// 复制后图标变成对勾约 1.5 秒；状态挂在元素上，调用方不用自己记。
+pub fn copyable(
+    id: impl Into<ElementId>,
+    value: impl Into<SharedString>,
+    content: impl IntoElement,
+    tooltip: impl Into<SharedString>,
+    p: &Palette,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    use gpui_kit::prelude::FluentBuilder as _;
+    let id: ElementId = id.into();
+    let group = SharedString::from(format!("copyable-{id}"));
+    let state = window.use_keyed_state(id.clone(), cx, |_, _| false);
+    let copied = *state.read(cx);
+    let value: SharedString = value.into();
+    let tooltip: SharedString = tooltip.into();
+    let icon_color = if copied { p.ok } else { p.text_faint };
+    div()
+        .id(id)
+        .group(group.clone())
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .px(px(4.))
+        .mx(px(-4.))
+        .rounded(px(Radius::CONTROL))
+        .cursor_pointer()
+        .hover(|style| style.bg(p.hover))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(div().min_w(px(0.)).truncate().child(content))
+        .child(
+            div()
+                .flex_none()
+                .when(!copied, |this| this.invisible().group_hover(group, |style| style.visible()))
+                .child(icon(if copied { IconName::Check } else { IconName::Copy }, 12., icon_color)),
+        )
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(value.to_string()));
+            state.update(cx, |copied, cx| {
+                *copied = true;
+                cx.notify();
+            });
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                state.update(cx, |copied, cx| {
+                    *copied = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        })
+        .into_any_element()
+}

@@ -87,6 +87,8 @@ pub struct QueryPane {
     desk: Desk,
     metadata_seen: HashSet<String>,
     metadata_reads: HashMap<String, futures::future::AbortHandle>,
+    /// 补全用的整库对象清单正在读取的（连接, 库）；读完或失败后移除，失败的过一会儿再试。
+    object_reads: HashMap<(String, String), std::time::Instant>,
     metadata_context: Option<(String, u64, Option<Target>)>,
     metadata_epoch: u64,
     metadata_gate: Arc<crate::catalog::nav_read::MetadataGate>,
@@ -435,6 +437,7 @@ impl QueryPane {
             desk: Desk::new(),
             metadata_seen: HashSet::new(),
             metadata_reads: HashMap::new(),
+            object_reads: HashMap::new(),
             metadata_context: None,
             metadata_epoch: 0,
             metadata_gate: Arc::clone(&services.metadata_gate),
@@ -477,7 +480,7 @@ impl QueryPane {
             editor_theme: "auto".to_owned(),
             page_size: 100,
             preview_kb: 1,
-            object_page: 100,
+            object_page: 500,
             null_copy: "NULL".to_owned(),
             captured: None,
             definition_sink: None,
@@ -1763,6 +1766,9 @@ impl QueryPane {
             for name in &names { if !databases.contains(name) { databases.push(name.clone()); } }
             desk::OpenLink { id: connection.id.clone(), name: connection.name.clone(), engine: connection.engine.as_str().to_owned(), databases: names, environment: String::new() }
         }).collect();
+        for connection in connections.iter().filter(|connection| connection.status != crate::catalog::model::ConnStatus::Connected) {
+            self.desk.forget_objects(Some(&connection.id));
+        }
         self.desk.set_objects(objects, databases);
         self.desk.set_links(links);
         self.desk.set_tree_error("");
@@ -1984,6 +1990,76 @@ impl QueryPane {
         self.metadata_epoch = self.metadata_epoch.wrapping_add(1);
         self.metadata_seen.clear();
         self.metadata_context = None;
+    }
+
+    /// 当前目标库的完整对象清单：补全要认得库里所有的表，而不只是资源管理器已经翻到的那一页。
+    /// 只读名字（与目录同一条元数据通道、同一套限流），读完记进 desk。
+    fn ensure_known_objects(&mut self, cx: &mut Context<Self>) {
+        const FULL_LIST: usize = 5_000;
+        let Some(target) = self.desk.target() else { return };
+        if target.database.is_empty() || self.desk.knows_objects(&target.connection_id, &target.database) {
+            return;
+        }
+        let key = (target.connection_id.clone(), target.database.clone());
+        if self.object_reads.get(&key).is_some_and(|since| since.elapsed() < std::time::Duration::from_secs(30)) {
+            return;
+        }
+        if !matches!(self.services.connections.session_condition(&target.connection_id), Some(crate::connections::SessionCondition::Connected)) {
+            return;
+        }
+        let Ok(engine) = crate::catalog::Engine::parse(&target.engine) else { return };
+        if !engine.is_relational() {
+            return;
+        }
+        let schema = match engine {
+            crate::catalog::Engine::Postgres if target.schema.is_empty() => "public".to_owned(),
+            crate::catalog::Engine::Sqlserver if target.schema.is_empty() => "dbo".to_owned(),
+            _ => target.schema.clone(),
+        };
+        self.object_reads.insert(key.clone(), std::time::Instant::now());
+        let services = Arc::clone(&self.services);
+        let gate = Arc::clone(&self.metadata_gate);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let read_target = target.clone();
+        runtime().spawn(async move {
+            let result = crate::catalog::nav_read::limited_metadata(gate, &read_target.connection_id, async {
+                let session = services.connections.catalog_session(&read_target.connection_id).ok_or_else(|| "连接没有打开".to_owned())?;
+                let page = crate::catalog::read_object_page(&session, engine, &read_target.database, &schema, 0, FULL_LIST).await;
+                match page.error {
+                    Some(error) if page.objects.is_empty() => Err(error),
+                    _ => Ok((schema, page.objects)),
+                }
+            })
+            .await
+            .and_then(|value| value);
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            let _ = cx.update(|cx| {
+                this.update(cx, |pane, cx| {
+                    // 失败保留时间戳：30 秒内不反复重试，之后切回这个库会再读一次。
+                    if let Ok((schema, rows)) = result {
+                        pane.object_reads.remove(&key);
+                        let objects = rows
+                            .into_iter()
+                            .map(|row| TreeObject {
+                                connection_id: target.connection_id.clone(),
+                                connection_name: target.connection_name.clone(),
+                                engine: target.engine.clone(),
+                                database: target.database.clone(),
+                                schema: schema.clone(),
+                                name: row.name,
+                                kind: crate::catalog::model::kind_name(row.kind).to_owned(),
+                            })
+                            .collect();
+                        pane.desk.remember_objects(&target.connection_id, &target.database, objects);
+                    }
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
     }
 
     fn request_statement_metadata(&mut self, cx: &mut Context<Self>) {
@@ -2290,6 +2366,7 @@ impl QueryPane {
 
     fn apply_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.request_statement_metadata(cx);
+        self.ensure_known_objects(cx);
         let id = self.desk.active_id().map(str::to_owned);
         if let Some(editor) = id.as_deref().and_then(|id| self.editors.get(id)) {
             let scope = self.desk.completion_scope();

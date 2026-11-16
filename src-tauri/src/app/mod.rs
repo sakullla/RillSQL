@@ -267,7 +267,14 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     macro_rules! bind {
         ($action:ty, $id:expr) => {{
             cx.on_action(move |_: &$action, cx: &mut App| {
-                if let Some(root) = cx.global::<WorkbenchActionTarget>().0.upgrade() {
+                let root = match cx.global::<WorkbenchActionTarget>().0.upgrade() {
+                    Some(root) => Some(root),
+                    // 窗口已经关掉、应用还在程序坞里：程序坞菜单里的“新建查询 / 新建连接”等
+                    // 先把工作台窗口开回来再执行，而不是点了没反应。
+                    None if DOCK_COMMANDS.contains(&$id) => Some(open_workbench_window(cx)),
+                    None => None,
+                };
+                if let Some(root) = root {
                     root.update(cx, |view, cx| {
                         // 连接模态打开时，快捷键不能在背景里换页、开标签或执行查询；
                         // 模态自己需要的 Esc/Tab/回车不走全局动作。
@@ -336,7 +343,24 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     });
 }
 
+/// 程序坞菜单里的命令：应用没有窗口时也能直接用它们把工作台带回来。
+const DOCK_COMMANDS: [&str; 5] = ["new-query", "new-connection", "connections", "open-sqlite", "history"];
+
+/// macOS 程序坞图标的右键菜单：常用入口一步直达。
+fn install_dock_menu(cx: &mut App, shell: &Shell) {
+    let label = |key: &'static str| shell.text(key).to_string();
+    cx.set_dock_menu(vec![
+        MenuItem::action(label("shell.command.newQuery"), NewQuery),
+        MenuItem::action(label("shell.command.newConnection"), NewConnection),
+        MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
+        MenuItem::separator(),
+        MenuItem::action(label("shell.command.connections"), ShowConnections),
+        MenuItem::action(label("shell.command.history"), ShowHistory),
+    ]);
+}
+
 pub fn install_menus(cx: &mut App, shell: &Shell) {
+    install_dock_menu(cx, shell);
     let label = |key: &'static str| shell.text(key).to_string();
     cx.set_menus([
         Menu::new(label("shell.menu.file")).items([

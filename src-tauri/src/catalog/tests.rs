@@ -346,7 +346,7 @@ async fn sqlite_file_pages_objects_reports_foreign_keys_and_does_not_pretend_a_m
 fn refresh_keeps_the_loaded_window_and_a_failed_list_is_not_empty() {
     assert_eq!(read_limit(120, 100), 120);
     assert_eq!(read_limit(0, 100), 100);
-    assert_eq!(read_limit(0, 0), 100);
+    assert_eq!(read_limit(0, 0), crate::catalog::model::DEFAULT_OBJECT_PAGE);
 
     let nodes = assemble_postgres(
         &["app".to_owned(), "other".to_owned()],

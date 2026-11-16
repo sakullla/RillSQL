@@ -2,6 +2,7 @@
 
 mod record;
 mod session;
+mod temporal;
 pub use session::group_digits;
 
 use std::ops::DerefMut;
@@ -125,6 +126,9 @@ pub struct GridPane {
     edit_input: Entity<InputState>,
     /// 正在编辑的格子用稳定行 id 记住，排序或翻页后仍写回同一行。
     edit_target: Option<EditTarget>,
+    /// 日期 / 时间格编辑时的日历；第一次用到时创建，选中某天只替换日期部分。
+    calendar: Option<Entity<gpui_kit::component::calendar::CalendarState>>,
+    _calendar_subscription: Option<gpui_kit::Subscription>,
     /// 编辑框处理完 Enter 后，同一次按键还会冒泡到网格；这里消费掉那一次回声。
     suppress_enter: bool,
     /// 编辑栏要等下一次绘制才能拿到 Window，先把请求记下来。
@@ -314,6 +318,8 @@ impl GridPane {
             search_text: String::new(),
             edit_input,
             edit_target: None,
+            calendar: None,
+            _calendar_subscription: None,
             suppress_enter: false,
             pending_edit: None,
             notice: String::new(),
@@ -1875,6 +1881,32 @@ impl GridPane {
             cx.notify();
             return;
         }
+        // 日期 / 时间列：宽松输入（2023/7/4 9:05、20230704、带 T 的 ISO）规整成数据库写法。
+        // 认不出来的文本不拦着——交给数据库判断——但先说一声。
+        let mut format_note = None;
+        let text = match self.edit_temporal_kind(target.column) {
+            Some(kind) if !text.trim().is_empty() => match temporal::normalize(kind, &text) {
+                Ok(Some(normalized)) => normalized,
+                Ok(None) => text,
+                Err(()) => {
+                    format_note = Some(i18n::fill(&i18n::text(self.locale, "grid.temporal.unrecognized"), &[("format", kind.format_hint())]));
+                    text
+                }
+            },
+            _ => {
+                // 数字列：两端空白去掉；明显不是数字的输入照样提交，但先提醒一句。
+                let numeric = self.session.column_type(target.column).is_some_and(session::numeric_type);
+                if numeric && !text.trim().is_empty() {
+                    let trimmed = text.trim().to_owned();
+                    if trimmed.replace(',', "").parse::<f64>().is_err() {
+                        format_note = Some(i18n::text(self.locale, "grid.numeric.unrecognized"));
+                    }
+                    trimmed
+                } else {
+                    text
+                }
+            }
+        };
         // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
         let value = match (&target.original, text.is_empty()) {
             (Some(None), true) => None,
@@ -1882,10 +1914,67 @@ impl GridPane {
         };
         let gate = self.session.stage_text_by_id(&target.row_id, target.column, value);
         self.notice = self.session.gate_text(gate);
+        if let Some(note) = format_note.filter(|_| self.notice.is_empty()) {
+            self.notice = note;
+        }
         self.pending_edit = None;
         self.refocus = true;
         self.sync_table(cx);
         cx.notify();
+    }
+
+    /// 正在单格编辑的列是不是日期 / 时间列。
+    fn edit_temporal_kind(&self, column: usize) -> Option<temporal::TemporalKind> {
+        self.session.column_type(column).and_then(temporal::TemporalKind::of)
+    }
+
+    /// 单格编辑中的日期 / 时间列（选区设值不出辅助条）。
+    fn temporal_edit(&self) -> Option<temporal::TemporalKind> {
+        let target = self.edit_target.as_ref().filter(|target| target.cells.is_empty())?;
+        self.edit_temporal_kind(target.column)
+    }
+
+    /// 辅助条上的快捷操作：改写输入框内容并把焦点还给输入框，Enter 仍是唯一的提交方式。
+    fn set_edit_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_input.update(cx, |state, cx| state.set_value(text, window, cx));
+        let handle = self.edit_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn temporal_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(kind) = self.temporal_edit() else { return };
+        let current = self.edit_input.read(cx).value().to_string();
+        let now = chrono::Local::now().naive_local();
+        let next = match action {
+            "now" => Some(temporal::now_text(kind, &current, now)),
+            "today" => Some(temporal::with_date(kind, &current, now.date())),
+            "prev" => temporal::shift_days(kind, &current, -1),
+            "next" => temporal::shift_days(kind, &current, 1),
+            "normalize" => temporal::normalize(kind, &current).ok().flatten(),
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.set_edit_text(next, window, cx);
+        }
+    }
+
+    fn ensure_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<gpui_kit::component::calendar::CalendarState> {
+        if let Some(calendar) = self.calendar.clone() {
+            return calendar;
+        }
+        let calendar = cx.new(|cx| gpui_kit::component::calendar::CalendarState::new(window, cx));
+        let subscription = cx.subscribe_in(&calendar, window, |this, _, event: &gpui_kit::component::calendar::CalendarEvent, window, cx| {
+            let gpui_kit::component::calendar::CalendarEvent::Selected(gpui_kit::component::calendar::Date::Single(Some(day))) = event else {
+                return;
+            };
+            let Some(kind) = this.temporal_edit() else { return };
+            let current = this.edit_input.read(cx).value().to_string();
+            this.set_edit_text(temporal::with_date(kind, &current, *day), window, cx);
+        });
+        self.calendar = Some(calendar.clone());
+        self._calendar_subscription = Some(subscription);
+        calendar
     }
 
     fn cancel_edit(&mut self) {
@@ -2438,6 +2527,7 @@ impl GridPane {
         let has_selection = self.session.has_selection();
         let logical_count = names.len();
         let headers = (0..names.len()).filter_map(|column| self.session.column_header(column)).collect::<Vec<_>>();
+        let temporal_columns = (0..names.len()).map(|column| self.session.column_type(column).and_then(temporal::TemporalKind::of)).collect::<Vec<_>>();
         let (cell_dirty, row_dirty) = self
             .session
             .focus_cell()
@@ -2467,6 +2557,7 @@ impl GridPane {
             state.delegate_mut().hidden = hidden;
             state.delegate_mut().has_selection = has_selection;
             state.delegate_mut().headers = headers;
+            state.delegate_mut().temporal = temporal_columns;
             state.delegate_mut().cell_dirty = cell_dirty;
             state.delegate_mut().row_dirty = row_dirty;
             state.delegate_mut().write_reason = write_reason;
@@ -2803,6 +2894,9 @@ impl Render for GridPane {
         column = column.child(self.render_grid_body(loading, &p, m, &entity, cx));
         if let Some(bar) = self.render_edit_bar(&p, &entity) {
             column = column.child(bar);
+        }
+        if let Some(assist) = self.render_temporal_assist(&p, &entity, window, cx) {
+            column = column.child(assist);
         }
         column = column.children(self.render_value_viewer(&p, &entity, cx));
         if let Some(preview) = self.render_preview(&p, &entity, cx) {
@@ -3729,6 +3823,78 @@ impl GridPane {
         Some(strip.into_any_element())
     }
 
+    /// 日期 / 时间格的编辑辅助条：格式提示、实时校验、现在 / 今天 / 前后一天 / 日历 / NULL。
+    /// 只改输入框里的文本，提交仍然是 Enter，取消仍然是 Esc。
+    #[inline(never)]
+    fn render_temporal_assist(&mut self, p: &Palette, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let kind = self.temporal_edit()?;
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let current = self.edit_input.read(cx).value().to_string();
+        let parsed = temporal::normalize(kind, &current);
+        let (status_icon, status_color, status_text) = match &parsed {
+            Ok(None) => (IconName::Info, p.text_faint, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.format"), &[("format", kind.format_hint())]))),
+            Ok(Some(normalized)) if normalized == current.trim() => (IconName::CircleCheck, p.ok, SharedString::from(
+                temporal::describe(kind, normalized, locale, chrono::Local::now().naive_local()).unwrap_or_else(|| normalized.clone()),
+            )),
+            Ok(Some(normalized)) => (IconName::CornerDownLeft, p.accent_text, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.willSave"), &[("value", normalized)]))),
+            Err(()) => (IconName::TriangleAlert, p.warn, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.unrecognized"), &[("format", kind.format_hint())]))),
+        };
+        let action = |id: &'static str, label: SharedString| {
+            let owner = entity.clone();
+            kit::tool_button(SharedString::from(format!("grid-temporal-{id}")), None, label, move |_, window, cx| {
+                owner.update(cx, |pane, cx| pane.temporal_action(id, window, cx));
+            })
+            .xsmall()
+        };
+        let calendar = (kind != temporal::TemporalKind::Time).then(|| {
+            let state = self.ensure_calendar(window, cx);
+            if let Some(day) = temporal::date_of(kind, &current) {
+                state.update(cx, |calendar, cx| calendar.set_date(day, window, cx));
+            }
+            gpui_kit::component::popover::Popover::new("grid-temporal-calendar")
+                .anchor(gpui_kit::Anchor::BottomLeft)
+                .trigger(Button::new("grid-temporal-calendar-button").ghost().xsmall().icon(IconName::Calendar).label(t("grid.temporal.calendar")))
+                .content(move |_, _, _| gpui_kit::component::calendar::Calendar::new(&state).small())
+        });
+        let set_null = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |pane, cx| {
+                    let _ = pane.command("grid-set-null", cx);
+                });
+            }
+        };
+        Some(
+            div()
+                .id("grid-temporal-assist")
+                .test_support()
+                .flex_none()
+                .px(px(12.))
+                .py(px(6.))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .bg(p.raised)
+                .border_t_1()
+                .border_color(p.line)
+                .child(kit::icon(status_icon, 14., status_color))
+                .child(div().flex_1().min_w(px(160.)).truncate().text_size(px(TypeScale::SM)).text_color(status_color).child(status_text))
+                .child(action("now", t("grid.temporal.now")))
+                .when(kind != temporal::TemporalKind::Time, |this| {
+                    this.child(action("today", t("grid.temporal.today")))
+                        .child(action("prev", t("grid.temporal.prevDay")))
+                        .child(action("next", t("grid.temporal.nextDay")))
+                })
+                .children(calendar)
+                .child(kit::tool_button("grid-temporal-null", None, t("grid.value.null"), set_null).xsmall())
+                .child(kit::kbd("Enter", p))
+                .child(kit::kbd("Esc", p))
+                .into_any_element(),
+        )
+    }
+
     /// 单元格编辑栏；选区设值时说清会写到几格。
     #[inline(never)]
     fn render_edit_bar(&self, p: &Palette, entity: &Entity<GridPane>) -> Option<gpui_kit::AnyElement> {
@@ -4028,6 +4194,8 @@ struct SheetDelegate {
     has_selection: bool,
     /// 与可见数据列对齐的表头：类型缩写、主键、外键。
     headers: Vec<session::ColumnHeader>,
+    /// 每个逻辑列是不是日期 / 时间列；悬停说明据此给出星期和相对时间。
+    temporal: Vec<Option<temporal::TemporalKind>>,
     cell_dirty: bool,
     row_dirty: bool,
     /// 只读时写操作禁用的原因，悬停时显示。
@@ -4549,7 +4717,13 @@ impl TableDelegate for SheetDelegate {
         // 空字符串显示的是占位标签，不是数据：和 NULL 一样用弱色斜体，
         // 免得和真的存着这几个字的文本混在一起。
         let placeholder = null || kind == session::CellKind::Empty;
-        let tooltip = cell_tooltip(self.locale, kind, &text);
+        let temporal_kind = self.logical(col_ix).and_then(|logical| self.temporal.get(logical).copied().flatten());
+        let tooltip = match temporal_kind {
+            Some(temporal_kind) if kind == session::CellKind::Text => temporal::describe(temporal_kind, &text, self.locale, chrono::Local::now().naive_local())
+                .map(SharedString::from)
+                .or_else(|| cell_tooltip(self.locale, kind, &text)),
+            _ => cell_tooltip(self.locale, kind, &text),
+        };
         // 行号与数字列右对齐、行号用弱色：数据列的位数可比，行号不和数据抢视线。
         let row_number = self.logical(col_ix).is_none();
         let numeric = row_number || self.logical(col_ix).and_then(|logical| self.headers.get(logical)).is_some_and(|header| header.numeric);

@@ -82,10 +82,15 @@ fn definition_text(snapshot: &Snapshot) -> (String, Vec<String>) {
     if snapshot.kind != "table" {
         return (snapshot.table_sql.clone(), Vec::new());
     }
-    if !snapshot.table_sql.trim().is_empty() {
+    // 没有服务器原文时读取只留下“-- 库.表”一行占位；它不是定义，改用重建定义。
+    if !is_placeholder_definition(&snapshot.table_sql) {
         return (snapshot.table_sql.clone(), Vec::new());
     }
     crate::ddl::rebuilt_definition(snapshot)
+}
+
+fn is_placeholder_definition(sql: &str) -> bool {
+    sql.lines().map(str::trim).filter(|line| !line.is_empty()).all(|line| line.starts_with("--"))
 }
 
 /// 字段、索引、外键三张列表共用一份几何（S8.4：复用结果网格的表头、行高与列宽规范）。
@@ -606,6 +611,8 @@ pub struct StructurePane {
     fk_key: String,
     ddl_view: Option<gpui_kit::Entity<FormatViewer>>,
     ddl_text: String,
+    /// DDL 已复制到剪贴板：按钮短暂显示“已复制”，换表或改定义后复位。
+    ddl_copied: bool,
     view_editor: Option<gpui_kit::Entity<EditorState>>,
     view_editor_sync: String,
     view_sub: Option<Subscription>,
@@ -642,6 +649,7 @@ impl StructurePane {
             fk_key: String::new(),
             ddl_view: None,
             ddl_text: String::new(),
+            ddl_copied: false,
             view_editor: None,
             view_editor_sync: String::new(),
             view_sub: None,
@@ -1243,6 +1251,7 @@ impl StructurePane {
         if let Some(view) = self.ddl_view.clone() {
             if self.ddl_text != text {
                 self.ddl_text = text.to_owned();
+                self.ddl_copied = false;
                 let locale = self.session.locale;
                 let text = text.to_owned();
                 view.update(cx, |viewer, cx| {
@@ -1266,6 +1275,7 @@ impl StructurePane {
         let view = cx.new(|cx| {
             let mut viewer = FormatViewer::new(spec, window, cx);
             viewer.set_manual_format(Some(DataFormat::Sql), window, cx);
+            viewer.set_code_only(true, cx);
             viewer
         });
         self.ddl_view = Some(view.clone());
@@ -2417,11 +2427,36 @@ impl StructurePane {
                 let (sql, missing) = self.snapshot.as_ref().map(definition_text).unwrap_or_else(|| (String::new(), Vec::new()));
                 let viewer = self.ddl_viewer(&sql, window, cx);
                 let copy_sql = sql.clone();
+                let lines = sql.lines().count().max(1) as f32;
+                // 编辑器高度跟着定义行数走，最多铺满窗口可用高度；短定义不留大片空白。
+                let available = (f32::from(window.viewport_size().height) - 300.).max(240.);
+                let height = (lines * 20. + 24.).clamp(160., available);
+                let copied = self.ddl_copied;
+                let owner = cx.entity();
+                let toolbar = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!(
+                        "{} · {}",
+                        i18n::text(locale, "structure.section.ddl"),
+                        i18n::text(locale, "ui.structure.ddlLines").replace("{count}", &(lines as usize).to_string())
+                    ))))
+                    .child(kit::secondary_button(
+                        "structure-copy-ddl",
+                        Some(if copied { IconName::Check } else { IconName::Copy }),
+                        if copied { t("ui.copied") } else { t("common.copy") },
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_sql.clone()));
+                            owner.update(cx, |pane, cx| {
+                                pane.ddl_copied = true;
+                                cx.notify();
+                            });
+                        },
+                    ));
                 form = form
-                    .child(div().h(px(280.)).child(viewer))
-                    .child(kit::secondary_button("structure-copy-ddl", Some(IconName::Copy), t("common.copy"), move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_sql.clone()));
-                    }));
+                    .child(toolbar)
+                    .child(div().h(px(height)).rounded(px(Radius::CONTROL)).border_1().border_color(p.line).overflow_hidden().child(viewer));
                 if !missing.is_empty() {
                     let mut notes = div().flex().flex_col().gap(px(4.));
                     for item in missing {
@@ -2490,7 +2525,7 @@ impl Render for StructurePane {
         let section = self.session.section;
         let entity = cx.entity();
         let preview = self.render_preview_dialog(&entity, &p, metrics, section, window, cx);
-        self.render_page(form, preview, cx)
+        self.render_page(form, preview, window, cx)
     }
 }
 
@@ -2501,6 +2536,7 @@ impl StructurePane {
         &mut self,
         form: Option<AnyElement>,
         preview: Option<AnyElement>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -2614,6 +2650,48 @@ impl StructurePane {
                     menu
                 })
         });
+        // 表名与完整路径都能点一下复制：写 SQL、贴工单时最常要的就是这两样。
+        let existing = self.session.mode != StructureMode::Create && !self.session.target.table.is_empty();
+        let qualified = {
+            let target = &self.session.target;
+            [target.database.as_str(), target.schema.as_str(), target.table.as_str()].iter().filter(|part| !part.is_empty()).copied().collect::<Vec<_>>().join(".")
+        };
+        let banner_text = SharedString::from(self.session.display_banner());
+        let title_row: AnyElement = if existing {
+            div()
+                .flex()
+                .child(kit::copyable(
+                    "structure-copy-name",
+                    self.session.target.table.clone(),
+                    kit::title(title.clone(), TypeScale::LG, &p),
+                    i18n::text(locale, "ui.copy.name"),
+                    &p,
+                    window,
+                    cx,
+                ))
+                .into_any_element()
+        } else {
+            kit::title(title.clone(), TypeScale::LG, &p)
+        };
+        let banner_row: AnyElement = if existing {
+            div()
+                .id("structure-banner")
+                .flex()
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .child(kit::copyable(
+                    "structure-copy-path",
+                    qualified.clone(),
+                    banner_text.clone(),
+                    i18n::fill(&i18n::text(locale, "ui.copy.path"), &[("name", &qualified)]),
+                    &p,
+                    window,
+                    cx,
+                ))
+                .into_any_element()
+        } else {
+            div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(banner_text).into_any_element()
+        };
         let mut column = div()
             .id("structure-pane")
             .test_support()
@@ -2643,8 +2721,8 @@ impl StructurePane {
                                     .min_w(px(160.))
                                     .flex()
                                     .flex_col()
-                                    .child(kit::title(title, TypeScale::LG, &p))
-                                    .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.display_banner()))),
+                                    .child(title_row)
+                                    .child(banner_row),
                             )
                             .when_some(
                                 self.data_sink
@@ -2684,7 +2762,16 @@ impl StructurePane {
                     ),
                 );
             }
-            body = body.child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx)));
+            // DDL 页签：定义本身就是主体，不再先摆一张只读预览卡再摆一遍编辑器。
+            let ddl_direct = section == Section::Ddl && form.is_some() && self.has_definition();
+            let mut form = form;
+            if ddl_direct {
+                if let Some(form) = form.take() {
+                    body = body.child(div().id("structure-composer").test_support().child(form));
+                }
+            } else {
+                body = body.child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx)));
+            }
             if let Some(form) = form.filter(|_| !composer_section || self.composer_open) {
                 let heading = match section {
                     Section::Indexes => t("structure.index.new"),
@@ -2911,6 +2998,22 @@ mod tests {
             generated: false,
             default_constraint: None,
         }
+    }
+
+    #[test]
+    fn ddl_tab_never_shows_the_placeholder_comment_as_the_definition() {
+        let mut mysql = Snapshot::bare(DdlEngine::Mysql, "shop", "", "task_list_track_code");
+        mysql.columns = vec![column("id", "bigint(20) unsigned", true), column("track_code", "varchar(128)", false)];
+        // 读不到 SHOW CREATE TABLE 时只剩一行占位：DDL 页签要退回重建定义，而不是只显示这行注释。
+        mysql.table_sql = "-- shop.task_list_track_code".to_owned();
+        let (text, _) = definition_text(&mysql);
+        assert!(text.contains("CREATE TABLE"), "{text}");
+        assert!(text.contains("track_code"), "{text}");
+        // 读到了服务器原文就原样显示。
+        mysql.table_sql = "CREATE TABLE `task_list_track_code` (\n  `id` bigint unsigned NOT NULL\n);".to_owned();
+        assert_eq!(definition_text(&mysql).0, mysql.table_sql);
+        assert!(is_placeholder_definition("-- a.b\n\n-- c"));
+        assert!(!is_placeholder_definition("-- note\nCREATE TABLE t (id int)"));
     }
 
     fn target(engine: &str, table: &str) -> GridTarget {

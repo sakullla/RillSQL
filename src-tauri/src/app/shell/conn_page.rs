@@ -31,7 +31,7 @@ impl Workbench {
         if self.model.connections.selected.as_ref().is_none_or(|id| !self.model.connections.rows.iter().any(|row| &row.saved.id == id)) {
             self.model.connections.selected = self.model.connections.launcher_all().first().map(|row| row.saved.id.clone());
         }
-        let detail = if wide && !self.model.connections.rows.is_empty() { Some(self.connection_detail_panel(&p, cx)) } else { None };
+        let detail = if wide && !self.model.connections.rows.is_empty() { Some(self.connection_detail_panel(&p, window, cx)) } else { None };
         div()
             .id("connections-page")
             .role(gpui_kit::Role::Group)
@@ -351,25 +351,33 @@ impl Workbench {
             .aria_selected(selected)
             .aria_description(SharedString::from(aware.clone()))
             .when(self.model.menu.is_none(), |this| this.tooltip_text(SharedString::from(aware)))
-            .h(px(m.row_h + 6.))
-            .px(px(8.))
+            // 两行：名称与环境在上，地址在下。名字长、地址长时各自截断，互不挤占。
+            .h(px(m.row_h * 2. + 4.))
+            .px(px(10.))
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(10.))
             .rounded(px(Radius::CONTROL))
             .when(selected, |this| this.bg(p.selection))
             .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-            .child(kit::engine_badge(row.saved.engine.as_str(), 20.))
+            .child(kit::engine_badge(row.saved.engine.as_str(), 28.))
             .child(
                 div()
                     .min_w(px(0.))
                     .flex_1()
                     .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(div().min_w(px(0.)).flex_shrink(1.).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
-                    .children(self.env_pill(&row.saved.env, p))
-                    .child(div().min_w(px(0.)).flex_1().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(shown_detail))),
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().min_w(px(0.)).flex_shrink(1.).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
+                            .children(self.env_pill(&row.saved.env, p)),
+                    )
+                    .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(shown_detail))),
             )
             .child(
                 div()
@@ -398,7 +406,7 @@ impl Workbench {
     }
 
     /// 详情栏：所选连接的身份、状态、常用操作与配置摘要。
-    fn connection_detail_panel(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn connection_detail_panel(&mut self, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div().id("conn-detail").test_support().flex_none().w(px(DETAIL_W)).h_full().border_l_1().border_color(p.line).bg(p.chrome).overflow_y_scroll();
         let Some(row) = self.model.connections.selected.as_ref().and_then(|id| self.model.connections.rows.iter().find(|row| &row.saved.id == id)).cloned() else {
             return panel.child(div().p(px(20.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("conn.page.pickHint"))).into_any_element();
@@ -457,7 +465,37 @@ impl Workbench {
         let mut table = div().flex().flex_col().gap(px(8.));
         for (key, value) in facts {
             let has_value = value != none;
-            let copyable = has_value && matches!(key, "conn.page.address" | "conn.page.file");
+            // 地址、文件、库名、用户名、SSH 都是会被贴到别处的值：点一下就复制。
+            let copyable = has_value && matches!(key, "conn.page.database" | "conn.page.user" | "conn.page.ssh");
+            // 地址 / 文件保留显式的复制按钮：复制后状态栏会提示，连接管理页的快捷操作也走它。
+            let address = has_value && matches!(key, "conn.page.address" | "conn.page.file");
+            let value_cell: AnyElement = if copyable {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .text_color(p.text)
+                    .child(kit::copyable(
+                        SharedString::from(format!("conn-fact-{key}")),
+                        value.clone(),
+                        SharedString::from(value.clone()),
+                        crate::i18n::fill(&self.model.text("ui.copy.path"), &[("name", &value)]),
+                        p,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element()
+            } else {
+                div()
+                    .id(SharedString::from(format!("conn-fact-{key}")))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(if has_value { p.text } else { p.text_faint })
+                    .when(has_value, |this| this.tooltip_text(SharedString::from(value.clone())))
+                    .child(SharedString::from(value))
+                    .into_any_element()
+            };
             table = table.child(
                 div()
                     .flex()
@@ -465,17 +503,8 @@ impl Workbench {
                     .gap(px(10.))
                     .text_size(px(TypeScale::SM))
                     .child(div().flex_none().w(px(72.)).text_color(p.text_muted).child(self.t(key)))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("conn-fact-{key}")))
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(if has_value { p.text } else { p.text_faint })
-                            .when(has_value, |this| this.tooltip_text(SharedString::from(value.clone())))
-                            .child(SharedString::from(value)),
-                    )
-                    .when(copyable, |this| {
+                    .child(value_cell)
+                    .when(address, |this| {
                         this.child(
                             kit::icon_button(
                                 "conn-detail-copy-addr",
@@ -529,7 +558,15 @@ impl Workbench {
                                         .flex()
                                         .flex_col()
                                         .gap(px(4.))
-                                        .child(div().truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::LG)).child(SharedString::from(saved.name.clone())))
+                                        .child(div().flex().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::LG)).child(kit::copyable(
+                                            "conn-detail-name",
+                                            saved.name.clone(),
+                                            SharedString::from(saved.name.clone()),
+                                            self.model.text("ui.copy.name"),
+                                            p,
+                                            window,
+                                            cx,
+                                        )))
                                         .child(
                                             div()
                                                 .flex()

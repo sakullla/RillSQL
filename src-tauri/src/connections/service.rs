@@ -168,7 +168,8 @@ struct PendingHostKey {
 
 enum SessionKind {
     Sqlite(sqlx::SqlitePool),
-    Mysql(mysql_async::Pool),
+    /// exec 只给 SQL 执行（单连接，会话状态跨执行保留）；meta 给目录、结构、表浏览与补全。
+    Mysql { exec: mysql_async::Pool, meta: mysql_async::Pool },
     Postgres(Arc<tokio_postgres::Client>),
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
     Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
@@ -1071,8 +1072,8 @@ impl Service {
             if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
             let kind = if let Some(pool) = attempt.sqlite_pool.take() {
                 SessionKind::Sqlite(pool)
-            } else if let Some(pool) = attempt.mysql_pool.take() {
-                SessionKind::Mysql(pool)
+            } else if let Some((exec, meta)) = attempt.mysql_pool.take() {
+                SessionKind::Mysql { exec, meta }
             } else if let Some(client) = attempt.postgres.take() {
                 SessionKind::Postgres(Arc::new(client))
             } else if let Some(client) = attempt.sqlserver.take() {
@@ -1172,12 +1173,29 @@ impl Service {
                 pool: pool.clone(),
                 foreign_keys: session.foreign_keys,
             },
-            SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
+            SessionKind::Mysql { meta, .. } => CatalogSession::Mysql(meta.clone()),
             SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
             SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
             SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
             SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
             SessionKind::Scripted => CatalogSession::Scripted,
+        })
+    }
+
+    /// SQL 执行用的会话句柄。MySQL / MariaDB 走独立的执行连接，
+    /// 其余引擎与 catalog_session 相同。
+    pub fn query_session(&self, id: &str) -> Option<CatalogSession> {
+        let exec = {
+            let sessions = self.sessions.lock().expect("sessions");
+            match &sessions.get(id)?.kind {
+                SessionKind::Mysql { exec, .. } => Some(exec.clone()),
+                _ => None,
+            }
+        };
+        let session = self.catalog_session(id)?;
+        Some(match exec {
+            Some(pool) => CatalogSession::Mysql(pool),
+            None => session,
         })
     }
 
@@ -1475,7 +1493,7 @@ fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
             pool: pool.clone(),
             foreign_keys: None,
         },
-        SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
+        SessionKind::Mysql { meta, .. } => CatalogSession::Mysql(meta.clone()),
         SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
         SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
         SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
@@ -1642,7 +1660,8 @@ struct Attempt {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     remote: Remote,
     sqlite_pool: Option<sqlx::SqlitePool>,
-    mysql_pool: Option<mysql_async::Pool>,
+    /// (执行池, 元数据池)。
+    mysql_pool: Option<(mysql_async::Pool, mysql_async::Pool)>,
     postgres: Option<tokio_postgres::Client>,
     sqlserver: Option<TdsClient>,
     redis: Option<redis::aio::MultiplexedConnection>,
@@ -1802,7 +1821,7 @@ impl Attempt {
                     via_ssh,
                     health: Arc::new(SessionHealth::default()),
                 };
-                self.mysql_pool = Some(opened.pool);
+                self.mysql_pool = Some((opened.pool, opened.meta_pool));
                 opened.version
             }),
             Engine::Postgres => drivers::open_postgres(&self.config, &route, &password).await.map(|opened| {

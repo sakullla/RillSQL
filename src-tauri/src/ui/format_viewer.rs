@@ -157,6 +157,8 @@ pub struct FormatViewer {
     mode: EditMode,
     locale: Locale,
     code_view: bool,
+    /// 只读代码视图（结构页 DDL）：不显示格式切换条，只留编辑器本身。
+    code_only: bool,
     wrap: bool,
     collapsed: BTreeSet<String>,
     filter: String,
@@ -211,6 +213,7 @@ impl FormatViewer {
             mode: spec.mode,
             locale: spec.locale,
             code_view: detected != DataFormat::Json,
+            code_only: false,
             wrap: true,
             collapsed: BTreeSet::new(),
             filter: String::new(),
@@ -274,6 +277,12 @@ impl FormatViewer {
         let language = editor_language(self.format()).to_owned();
         self.editor.update(cx, |state, cx| state.set_highlighter(language, cx));
         self.refresh_validation();
+        cx.notify();
+    }
+
+    /// 隐藏格式切换与操作条，只保留代码编辑器；调用方自己提供复制等操作。
+    pub fn set_code_only(&mut self, code_only: bool, cx: &mut Context<Self>) {
+        self.code_only = code_only;
         cx.notify();
     }
 
@@ -423,7 +432,7 @@ impl Render for FormatViewer {
             .flex()
             .flex_col()
             .bg(p.surface)
-            .child(toolbar(self, &entity, &p, &metrics, locked))
+            .when(!self.code_only, |this| this.child(toolbar(self, &entity, &p, &metrics, locked)))
             .children(banner)
             .children(hint)
             .child(body)

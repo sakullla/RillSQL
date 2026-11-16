@@ -790,6 +790,17 @@ impl WorkbenchModel {
         }
         if let Some(connection_id) = id.strip_prefix("connection:") {
             self.connections.selected = Some(connection_id.to_owned());
+            if self.connections.row_status(connection_id) == LinkStatus::Connected {
+                // 已连接时“打开”就是回到工作台：资源管理器展开并定位到这条连接，
+                // 而不是停在连接管理页原地不动。
+                let node = crate::catalog::hierarchy::connection_node_id(connection_id);
+                self.nav.expand_reserved(&node);
+                self.nav.set_focus(&node);
+                self.return_to_work();
+                self.shell.page = AppPage::Workspace;
+                self.shell.sidebar_open = true;
+                return true;
+            }
             self.shell.page = AppPage::Connections;
             return true;
         }

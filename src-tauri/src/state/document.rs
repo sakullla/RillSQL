@@ -64,7 +64,7 @@ impl Default for ShellSettings {
             locale: "zh-CN".to_owned(),
             page_size: 100,
             preview_kb: 1,
-            object_page: 100,
+            object_page: 500,
             null_copy: "NULL".to_owned(),
             query_timeout_sec: 0,
             auto_check_updates: true,

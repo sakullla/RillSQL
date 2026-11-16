@@ -974,9 +974,28 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             }
         }
     } else {
-        snapshot.table_sql = format!("-- {}.{table}", database);
+        // 表的 DDL 用服务器自己的 SHOW CREATE TABLE 原文；读不到时退回占位，DDL 页签改用重建定义。
+        snapshot.table_sql = match mysql_table_definition(&mut conn, database, table).await {
+            Ok(sql) => sql,
+            Err(_) => format!("-- {}.{table}", database),
+        };
     }
     Ok(snapshot)
+}
+
+async fn mysql_table_definition(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<String, String> {
+    let sql = format!(
+        "SHOW CREATE TABLE {}.{}",
+        quote_ident(Engine::Mysql, database),
+        quote_ident(Engine::Mysql, table)
+    );
+    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| crate::error_text::chain(&err))?;
+    let row = row.ok_or_else(|| "没有读到建表语句".to_owned())?;
+    let text = mysql_string(&row, 1);
+    if !text.trim_start().to_ascii_uppercase().starts_with("CREATE") {
+        return Err("没有读到建表语句".to_owned());
+    }
+    Ok(format!("{};", text.trim_end().trim_end_matches(';')))
 }
 
 async fn mysql_view_definition(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<String, String> {
@@ -1019,10 +1038,23 @@ fn push_mysql_fks(target: &mut Vec<ForeignKey>, rows: &[mysql_async::Row], _inco
     }
 }
 
+/// 结构页只需要“约多少行”和“有没有行”：大表上的 COUNT(*) 会扫全表，
+/// 占着连接几十秒甚至几分钟。这里用统计信息估算行数，再用 LIMIT 1 确认是否为空。
 async fn count_nulls_mysql_count(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<i64, String> {
-    let sql = format!("SELECT COUNT(*) FROM {}", qualified_table(Engine::Mysql, database, "", table)?);
-    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| crate::error_text::chain(&err))?;
-    Ok(mysql_i64(&row.ok_or_else(|| "没有读到行数".to_owned())?, 0))
+    let qualified = qualified_table(Engine::Mysql, database, "", table)?;
+    let probe = format!("SELECT 1 FROM {qualified} LIMIT 1");
+    let any: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, probe).await.map_err(|err| crate::error_text::chain(&err))?;
+    if any.is_none() {
+        return Ok(0);
+    }
+    let estimate: Option<mysql_async::Row> = mysql_async::prelude::Queryable::exec_first(
+        conn,
+        "SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+        (database.to_owned(), table.to_owned()),
+    )
+    .await
+    .map_err(|err| crate::error_text::chain(&err))?;
+    Ok(estimate.map(|row| mysql_i64(&row, 0)).unwrap_or(0).max(1))
 }
 
 type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
@@ -1323,13 +1355,20 @@ async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &str, table:
     Ok(snapshot)
 }
 
+/// 估算行数：sys.partitions 的统计值；先用 TOP 1 确认是否为空，不在大表上跑 COUNT_BIG(*)。
 async fn tds_count(client: &TdsHandle, qualified: &str) -> Result<i64, String> {
-    let rows = tds_strings(client, &format!("SELECT COUNT_BIG(*) FROM {qualified}")).await?;
-    let text = rows
-        .first()
-        .and_then(|row| row.first().cloned())
-        .ok_or_else(|| "没有读到行数".to_owned())?;
-    text.parse::<i64>().map_err(|_| format!("不是整数 {text}"))
+    let any = tds_strings(client, &format!("SELECT TOP 1 1 FROM {qualified}")).await?;
+    if any.is_empty() {
+        return Ok(0);
+    }
+    let literal = qualified.replace('\'', "''");
+    let rows = tds_strings(
+        client,
+        &format!("SELECT CAST(ISNULL(SUM(p.rows), 0) AS bigint) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(N'{literal}') AND p.index_id IN (0, 1)"),
+    )
+    .await?;
+    let estimate = rows.first().and_then(|row| row.first()).and_then(|text| text.parse::<i64>().ok()).unwrap_or(0);
+    Ok(estimate.max(1))
 }
 
 async fn tds_view_definition(client: &TdsHandle, schema: &str, table: &str) -> Result<String, String> {
@@ -1523,11 +1562,24 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             snapshot.views.push(DependentSql { name, sql });
         }
     }
-    let count = client
-        .query_one(&format!("SELECT COUNT(*) FROM {}", qualified_table(Engine::Postgres, database, schema, table)?), &[])
+    // 估算行数：先用 LIMIT 1 确认有没有行，再读统计信息；不在大表上跑 COUNT(*)。
+    let qualified = qualified_table(Engine::Postgres, database, schema, table)?;
+    let any = client
+        .query_opt(&format!("SELECT 1 FROM {qualified} LIMIT 1"), &[])
         .await
         .map_err(|err| crate::error_text::chain(&err))?;
-    snapshot.row_count = Some(count.get(0));
+    snapshot.row_count = Some(if any.is_none() {
+        0
+    } else {
+        let estimate = client
+            .query_opt(
+                "SELECT GREATEST(c.reltuples, 0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema, &table],
+            )
+            .await
+            .map_err(|err| crate::error_text::chain(&err))?;
+        estimate.and_then(|row| row.try_get::<_, i64>(0).ok()).unwrap_or(0).max(1)
+    });
     snapshot.object_exists = true;
     if snapshot.kind == "view" {
         match postgres_view_definition(client, oid, database, schema, table, snapshot.materialized).await {

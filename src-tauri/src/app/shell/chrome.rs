@@ -1494,15 +1494,23 @@ impl Workbench {
                     .xsmall(),
                 )
             })
-            .when(row.has_more, |this| {
+            // 续读只在展开的节点上出现，并写明还剩多少；折叠的库上挂一个孤零零的图标只会让人困惑。
+            .when(row.has_more && (row.expanded || is_group), |this| {
+                let remaining = row.total.saturating_sub(row.loaded);
+                let label = if remaining > 0 {
+                    i18n::fill(&self.model.text("ui.nav.moreCount"), &[("count", &remaining.to_string())])
+                } else {
+                    self.model.text("catalog.tree.loadMore")
+                };
                 this.child(
-                    kit::icon_button(
+                    kit::tool_button(
                         SharedString::from(format!("nav-more-{focus_id}")),
-                        IconName::ChevronsDown,
-                        self.t("catalog.tree.loadMore"),
+                        Some(IconName::ChevronsDown),
+                        SharedString::from(label),
                         act(format!("nav-more:{focus_id}"), cx),
                     )
-                    .xsmall(),
+                    .xsmall()
+                    .tooltip(self.t("catalog.tree.loadMore")),
                 )
             })
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2345,7 +2353,9 @@ impl Workbench {
         let narrow = self.model.viewport_width <= 900;
         let view_w = self.model.viewport_width.max(240) as f32;
         let view_h = self.model.viewport_height.max(240) as f32;
-        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 640_f32.min(view_w - 80.) };
+        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 820_f32.min(view_w - 80.) };
+        // 左右分栏要给字段留出至少 440 的宽度，否则退回上下排布。
+        let wide = panel_w >= 700.;
         // 顶部锚定：换引擎时表单高度会变，居中会让整块上下跳；固定上沿只让下沿伸缩。
         let panel_top = (view_h * 0.1).clamp(20., 96.);
         let panel_h = (view_h - panel_top - 40.).max(200.);
@@ -2384,9 +2394,9 @@ impl Workbench {
             &p,
             cx,
         );
-        let general = stack_frame(|| {
-        let mut general = div().flex().flex_col().gap(px(14.));
-        general = general.child(
+        // 表单按“它是谁 / 连到哪 / 用谁的身份”分块：每块左侧是标题与一句说明，右侧是字段。
+        // 宽面板左右排布，窄面板上下排布；所有控件照常渲染，Tab 顺序与之前一致。
+        let quick_fill = stack_frame(|| {
             kit::sunken(&p)
                 .p(px(10.))
                 .flex()
@@ -2394,60 +2404,72 @@ impl Workbench {
                 .items_end()
                 .gap(px(8.))
                 .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.quickUrl"), "url", url_input, &p)))
-                .child(apply_url),
-        );
-        let (name_hint, name_masked) = self.field_hint(DraftField::Name);
-        let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
-        general = general.child(
+                .child(apply_url)
+                .into_any_element()
+        });
+        let identity = stack_frame(|| {
+            let (name_hint, name_masked) = self.field_hint(DraftField::Name);
+            let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
             div()
                 .flex()
                 .flex_wrap()
+                .items_end()
                 .gap(px(12.))
                 .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
-                .child(kit::form_row(self.t("ui.conn.env"), env_items, &p)),
-        );
-        if file_based {
-            let (file_hint, file_masked) = self.field_hint(DraftField::File);
-            let (file, _) = self.field_input(DraftField::File, &file_hint, file_masked, window, cx);
-            let browse = self.modal_button(
-                conn_modal::BROWSE_FILE,
-                Some(IconName::FolderOpen),
-                self.t("ui.conn.browse"),
-                false,
-                conn_modal::ModalAction::DraftFile,
-                &p,
-                cx,
-            );
-            general = general.child(
+                .child(kit::form_row(self.t("ui.conn.env"), env_items, &p))
+                .into_any_element()
+        });
+        let (server, auth) = if file_based {
+            let server = stack_frame(|| {
+                let (file_hint, file_masked) = self.field_hint(DraftField::File);
+                let (file, _) = self.field_input(DraftField::File, &file_hint, file_masked, window, cx);
+                let browse = self.modal_button(
+                    conn_modal::BROWSE_FILE,
+                    Some(IconName::FolderOpen),
+                    self.t("ui.conn.browse"),
+                    false,
+                    conn_modal::ModalAction::DraftFile,
+                    &p,
+                    cx,
+                );
                 div()
                     .flex()
                     .flex_wrap()
                     .items_end()
                     .gap(px(8.))
                     .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.file"), "file_path", file, &p)))
-                    .child(browse),
-            );
+                    .child(browse)
+                    .into_any_element()
+            });
+            (server, None)
         } else {
-            let (host_hint, host_masked) = self.field_hint(DraftField::Host);
-            let (host, _) = self.field_input(DraftField::Host, &host_hint, host_masked, window, cx);
-            let (port_hint, port_masked) = self.field_hint(DraftField::Port);
-            let (port, _) = self.field_input(DraftField::Port, &port_hint, port_masked, window, cx);
-            let (db_hint, db_masked) = self.field_hint(DraftField::Database);
-            let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
-            let (user_hint, user_masked) = self.field_hint(DraftField::Username);
-            let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
-            let (password_hint, password_masked) = self.field_hint(DraftField::Password);
-            let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
-            general = general
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(12.))
-                        .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
-                        .child(div().w(px(110.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p))),
-                )
-                .child(
+            let server = stack_frame(|| {
+                let (host_hint, host_masked) = self.field_hint(DraftField::Host);
+                let (host, _) = self.field_input(DraftField::Host, &host_hint, host_masked, window, cx);
+                let (port_hint, port_masked) = self.field_hint(DraftField::Port);
+                let (port, _) = self.field_input(DraftField::Port, &port_hint, port_masked, window, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(12.))
+                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
+                            .child(div().w(px(110.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p))),
+                    )
+                    .into_any_element()
+            });
+            let auth = stack_frame(|| {
+                let (user_hint, user_masked) = self.field_hint(DraftField::Username);
+                let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
+                let (password_hint, password_masked) = self.field_hint(DraftField::Password);
+                let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
+                let (db_hint, db_masked) = self.field_hint(DraftField::Database);
+                let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
+                let mut auth = div().flex().flex_col().gap(px(12.)).child(
                     div()
                         .flex()
                         .flex_wrap()
@@ -2455,20 +2477,21 @@ impl Workbench {
                         .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.user"), "username", user, &p)))
                         .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.password"), "password", password.mask_toggle(), &p))),
                 );
-            // 服务端拒绝凭据时分不清用户名还是密码：结论单独占一行，落在这一组下方，
-            // 而不是塞进用户名那一格（见 T3 review 的 advisory）。
-            if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == "credentials").cloned() {
-                general = general.child(credentials_row(&issue, &self.model.text("connections.status.error"), &p));
-            }
-            general = general.child(self.field_row(self.t("ui.conn.database"), "database", database, &p));
-            if engine == Engine::Mongodb {
-                let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
-                let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
-                general = general.child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p));
-            }
-        }
-        general.into_any_element()
-        });
+                // 服务端拒绝凭据时分不清用户名还是密码：结论单独占一行，落在这一组下方，
+                // 而不是塞进用户名那一格（见 T3 review 的 advisory）。
+                if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == "credentials").cloned() {
+                    auth = auth.child(credentials_row(&issue, &self.model.text("connections.status.error"), &p));
+                }
+                auth = auth.child(self.field_row(self.t("ui.conn.database"), "database", database, &p));
+                if engine == Engine::Mongodb {
+                    let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
+                    let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
+                    auth = auth.child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p));
+                }
+                auth.into_any_element()
+            });
+            (server, Some(auth))
+        };
 
         // 安全：TLS 与 SSH 分帧，两段表单的临时值不能留在同一个未优化栈帧里。
         let tls = if file_based {
@@ -2686,7 +2709,33 @@ impl Workbench {
         } else {
             self.t("connections.editor.newTitle")
         };
-        let subtitle = SharedString::from(kit::engine_label(engine.as_str()));
+        // 副标题实时显示这条连接会连到哪里：改字段时一眼确认地址、端口和用户。
+        let target = if file_based {
+            draft.file_path.trim().to_owned()
+        } else if draft.host.trim().is_empty() {
+            String::new()
+        } else {
+            let user = draft.username.trim();
+            let port = draft.port.trim();
+            let mut text = if user.is_empty() { draft.host.trim().to_owned() } else { format!("{user}@{}", draft.host.trim()) };
+            if !port.is_empty() {
+                text.push(':');
+                text.push_str(port);
+            }
+            if !draft.database.trim().is_empty() {
+                text.push('/');
+                text.push_str(draft.database.trim());
+            }
+            if draft.ssh_on && !draft.ssh_host.trim().is_empty() {
+                text.push_str(&format!(" · SSH {}", draft.ssh_host.trim()));
+            }
+            text
+        };
+        let subtitle = if target.is_empty() {
+            SharedString::from(kit::engine_label(engine.as_str()))
+        } else {
+            SharedString::from(format!("{} · {target}", kit::engine_label(engine.as_str())))
+        };
         let close = self.modal_icon_button(
             conn_modal::CLOSE,
             IconName::X,
@@ -2710,11 +2759,11 @@ impl Workbench {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
                     .min_w(px(0.))
                     .child(div().id("conn-form-title").truncate().tooltip_text(title.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(kit::muted(subtitle, &p)),
+                    .child(div().id("conn-form-target").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(subtitle)),
             )
-            .child(div().flex_1())
             .child(close);
         header.into_any_element()
         });
@@ -2805,9 +2854,18 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(18.))
-                    .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
-                    .child(form_section(self.t("ui.conn.general"), general, &p))
-                    .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
+                    .child(form_block(self.t("ui.conn.pickEngine"), None, engine_row, wide, &p))
+                    .child(form_block(self.t("ui.conn.block.quick"), Some(self.t("ui.conn.block.quickHint")), quick_fill, wide, &p))
+                    .child(form_block(self.t("ui.conn.block.identity"), Some(self.t("ui.conn.block.identityHint")), identity, wide, &p))
+                    .child(form_block(
+                        if file_based { self.t("ui.conn.file") } else { self.t("ui.conn.block.server") },
+                        Some(if file_based { self.t("ui.conn.block.fileHint") } else { self.t("ui.conn.block.serverHint") }),
+                        server,
+                        wide,
+                        &p,
+                    ))
+                    .children(auth.map(|auth| form_block(self.t("ui.conn.block.auth"), Some(self.t("ui.conn.block.authHint")), auth, wide, &p)))
+                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, &p)))
                     .child(notes),
             );
 
@@ -5862,13 +5920,24 @@ fn field_issue_text(issue: &crate::app::views::connections::FieldIssue, text: &d
     }
 }
 
-fn form_section(title: SharedString, body: impl IntoElement, p: &Palette) -> AnyElement {
-    div()
+/// 连接表单的一块：宽面板时左侧标题 + 说明、右侧字段；窄面板时上下排布。块与块之间用细线分开。
+fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoElement, wide: bool, p: &Palette) -> AnyElement {
+    let heading = div()
         .flex()
         .flex_col()
-        .gap(px(10.))
-        .child(kit::eyebrow(title, p))
-        .child(kit::card(p).p(px(16.)).child(body))
+        .gap(px(3.))
+        .when(wide, |this| this.w(px(176.)).flex_none().pt(px(2.)))
+        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(title))
+        .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(hint)));
+    div()
+        .flex()
+        .when(wide, |this| this.flex_row().gap(px(24.)))
+        .when(!wide, |this| this.flex_col().gap(px(10.)))
+        .pb(px(18.))
+        .border_b_1()
+        .border_color(p.line_soft)
+        .child(heading)
+        .child(div().flex_1().min_w(px(0.)).child(body))
         .into_any_element()
 }
 

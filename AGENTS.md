@@ -11,6 +11,7 @@ Run commands from the repository root:
 - `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked`: lint the Rust crate.
 - `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin rillsql` then `cargo run --manifest-path src-tauri/Cargo.toml --bin rillsql-package --features packager --locked -- --formats nsis`: package with cargo-packager 0.11.8. Do not start the second command until the first exits; it must not call cargo while the target directory lock is held. Windows can produce NSIS. macOS app/DMG and Linux DEB/AppImage are configured, but a release is complete only when all four installers and the signed updater manifest exist.
 - `docker compose -f docker/compose.yaml up -d`: start local PostgreSQL, MySQL, and MariaDB fixtures.
+- `scripts/macos-install-app.sh [--dock]`: macOS only. Builds the release binary, assembles an ad-hoc signed `RillSQL.app` in `~/Applications` (override with `APP_DIR`), and with `--dock` pins it to the Dock. Use this for local launches from Launchpad, Spotlight, or the Dock. Release installers still come from `rillsql-package`.
 
 ## Coding Style & Naming Conventions
 Match existing code: four-space indentation in Rust, snake_case functions and modules. Keep the crate free of a crate-level `allow` that would hide Clippy warnings. No dedicated frontend formatter is part of the product build.
