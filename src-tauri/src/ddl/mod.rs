@@ -13,6 +13,7 @@ pub(crate) use introspect::{load, load_comments, load_partial};
 #[allow(unused_imports)]
 pub(crate) use model::{Action, Column, ColumnDraft, Engine as DdlEngine, ForeignKeyDraft, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus};
 pub(crate) use plan::plan as preview_plan;
+pub(crate) use plan::is_no_change;
 pub(crate) use plan::rebuilt_definition;
 
 pub fn module_id() -> &'static str {

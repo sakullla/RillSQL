@@ -7194,6 +7194,52 @@ fn sqlite_tree_ddl_viewer_and_drop_go_through_the_confirm_layer(cx: &mut gpui_ki
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 真实 SQLite：在结构页改列名并执行成功后，结构从数据库重读——草稿以新列名为原名，
+/// 不再把刚执行的改动显示成“1 处修改未应用”。
+#[gpui_kit::test]
+fn structure_reloads_after_a_successful_column_change(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+    sqlite_exec_on_file(&database, "CREATE TABLE renameme (id INTEGER PRIMARY KEY, body TEXT)");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("refresh-tree", cx))).unwrap();
+    let table = wait_for_nav_object(cx, window, &view, "renameme");
+    let spec = cx.update(|cx| {
+        let node = view.read(cx).model.nav.node(&table).cloned().unwrap();
+        super::nav::spec_for(&node, "local").unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-structure-for:{spec}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.structure.read(cx).session.kept_columns.iter().any(|column| column.name == "body")),
+        "结构没有读回来"
+    );
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.structure.update(cx, |pane, cx| {
+                let column = pane.session.kept_columns.iter_mut().find(|column| column.name == "body").unwrap();
+                column.name = "note".into();
+                pane.preview(cx);
+            });
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| !view.structure.read(cx).session.preview_sql().is_empty()), "没有生成预览");
+    assert_eq!(cx.update(|cx| view.read(cx).structure.read(cx).pending_changes()), 1);
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.structure.update(cx, |pane, cx| pane.confirm(cx)))).unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, cx| {
+            let pane = view.structure.read(cx);
+            pane.session.kept_columns.iter().any(|column| column.original.as_deref() == Some("note")) && pane.pending_changes() == 0
+        }),
+        "执行成功后结构没有按数据库重读"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn sqlite_tables(path: &std::path::Path) -> Vec<String> {
     let path = path.to_path_buf();
     std::thread::spawn(move || {
@@ -10454,6 +10500,36 @@ async fn a_missing_password_prompts_and_reconnects_with_the_typed_one() {
     model.conn_modal.open = true;
     model.open_password_prompt(&id, false);
     assert!(model.password_prompt.is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 测试连接缺密码：表单里的密码占位说明“没存、连接时再问”，测试失败后键盘移到密码框，
+/// 不停在顶上的连接串上。
+#[tokio::test]
+async fn a_failed_test_points_the_keyboard_at_the_blamed_field() {
+    let dir = std::env::temp_dir().join(format!("rillsql-test-focus-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut draft = sample_draft(Engine::Postgres);
+    draft.save_password = false;
+    let saved = services.connections.save(draft, crate::connections::model::SecretInput::default()).await.unwrap();
+    let id = saved.connection.id.clone();
+    let mut model = seeded_model(services.connections.list().await.unwrap());
+    assert!(!model.connections.rows.iter().any(|row| row.saved.id == id && row.saved.password_saved));
+    model.connections.selected = Some(id.clone());
+    model.connections.edit_selected();
+    model.conn_modal.open_from(crate::app::model::FocusTarget::Connections, None, "test");
+    model.conn_modal.focus_first_pending = false;
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    let issue = model.connections.issues.first().expect("缺密码要落到字段上");
+    assert_eq!(super::chrome::issue_field(&issue.field), Some(crate::app::shell::model::DraftField::Password), "{}", issue.field);
+    assert!(model.conn_modal.focus_first_pending, "测试失败后把键盘交给出错的字段");
+    for name in ["password", "credentials", "host", "port", "username", "database", "file_path", "ca_file", "ssh_host", "ssh_port", "ssh_user", "ssh_password"] {
+        assert!(super::chrome::issue_field(name).is_some(), "{name} 没有对应的输入框");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

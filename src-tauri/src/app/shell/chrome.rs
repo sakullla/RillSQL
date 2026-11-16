@@ -3037,9 +3037,15 @@ impl Workbench {
         });
 
         if focus_first {
-            // 打开就把键盘交给首个字段：不用先点一下才能输入。
-            let handle = first_field.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
+            // 打开就把键盘交给首个字段：不用先点一下才能输入。因为某个字段出错而打开
+            // （比如测试连接缺密码）时，键盘直接落在那个字段上，而不是顶上的连接串。
+            match self.model.connections.issues.iter().find_map(|issue| issue_field(&issue.field)) {
+                Some(field) if self.fields.contains(field) => self.fields.focus(field, window, cx),
+                _ => {
+                    let handle = first_field.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+            }
         }
         shell
     }
@@ -3345,6 +3351,14 @@ impl Workbench {
         row.into_any_element()
     }
 
+    /// 正在编辑的已保存连接，钥匙串里有没有它的密码。
+    fn editing_password_saved(&self) -> bool {
+        let Some(id) = self.model.connections.editor.as_ref().and_then(|draft| draft.id.as_deref()) else {
+            return false;
+        };
+        self.model.connections.rows.iter().any(|row| row.saved.id == id && row.saved.password_saved)
+    }
+
     /// 每个草稿字段的占位符与掩码：渲染与 Tab 聚焦读同一份，避免两处写不同文案。
     fn field_hint(&self, field: DraftField) -> (String, bool) {
         let existing = self.model.connections.editor.as_ref().is_some_and(|draft| draft.id.is_some());
@@ -3369,7 +3383,9 @@ impl Workbench {
             DraftField::SshPort => "22".to_owned(),
             DraftField::SshKey => "~/.ssh/id_ed25519".to_owned(),
             DraftField::CaFile => "ca.pem".to_owned(),
-            DraftField::Password if existing => self.model.text("ui.conn.passwordKeep"),
+            // “留空则沿用已保存的密码”只在真的存了密码时成立；没存时留空意味着连接时再问。
+            DraftField::Password if existing && self.editing_password_saved() => self.model.text("ui.conn.passwordKeep"),
+            DraftField::Password if existing => self.model.text("ui.conn.passwordAskLater"),
             // 名称留空时保存会用主机名（SQLite 用文件名）：占位里直接说出来，用户知道不填也行、会叫什么。
             DraftField::Name => match self.model.connections.editor.as_ref().and_then(default_connection_name) {
                 Some(name) => i18n::fill(&self.model.text("ui.conn.nameDefault"), &[("name", &name)]),
@@ -6479,4 +6495,26 @@ fn default_connection_name(draft: &crate::connections::model::ConnectionDraft) -
         draft.host.trim().to_owned()
     };
     (!name.is_empty()).then_some(name)
+}
+
+/// 连接表单里字段问题的名字对应到哪个输入框：打开表单时键盘落在第一个出问题的字段上。
+pub(super) fn issue_field(name: &str) -> Option<DraftField> {
+    Some(match name {
+        // “credentials” 是用户名与密码一起被拒：先改的通常是密码。
+        "password" | "credentials" => DraftField::Password,
+        "host" => DraftField::Host,
+        "port" => DraftField::Port,
+        "username" => DraftField::Username,
+        "database" => DraftField::Database,
+        "name" => DraftField::Name,
+        "passphrase" => DraftField::Passphrase,
+        "replica" => DraftField::Replica,
+        "file_path" => DraftField::File,
+        "ca_file" => DraftField::CaFile,
+        "ssh_host" => DraftField::SshHost,
+        "ssh_port" => DraftField::SshPort,
+        "ssh_user" => DraftField::SshUser,
+        "ssh_password" => DraftField::SshPassword,
+        _ => return None,
+    })
 }

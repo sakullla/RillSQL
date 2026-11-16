@@ -129,8 +129,10 @@ pub struct GridPane {
     /// 日期 / 时间格编辑时的日历；第一次用到时创建，选中某天只替换日期部分。
     calendar: Option<Entity<gpui_kit::component::calendar::CalendarState>>,
     _calendar_subscription: Option<gpui_kit::Subscription>,
-    /// 编辑框处理完 Enter 后，同一次按键还会冒泡到网格；这里消费掉那一次回声。
-    suppress_enter: bool,
+    /// 编辑框处理完 Enter 后，同一次按键可能还会冒泡到网格；这里消费掉那一次回声。
+    /// 记的是时间而不是开关：被快捷键（Ctrl/⌘+S 等）消费的按键不会经过网格的 key_down，
+    /// 一个永久开关会一直挂着，吞掉之后真正的那次 Enter（例如在变更预览里确认写入）。
+    suppress_enter: Option<std::time::Instant>,
     /// 编辑栏要等下一次绘制才能拿到 Window，先把请求记下来。
     pending_edit: Option<PendingEdit>,
     notice: String,
@@ -207,9 +209,15 @@ pub struct GridPane {
     /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
     pending_batch: bool,
     search_subscription: Option<gpui_kit::Subscription>,
+    /// 目标连接是不是生产环境（由外壳按环境标签判定）。生产库的变更预览只接受点按确认，
+    /// 回车不写入；外壳没告诉之前按生产处理。
+    prod_target: bool,
     _subscription: gpui_kit::Subscription,
     _edit_subscription: gpui_kit::Subscription,
 }
+
+/// 编辑框提交后同一次 Enter 冒泡到网格的时间窗：回声在同一轮事件里到达，人再按一次远比这慢。
+const ENTER_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// 等回填时要重跑的命令，以及发起时的快照代次。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,7 +297,7 @@ impl GridPane {
         let record_input = cx.new(|cx| InputState::new(window, cx));
         let record_subscription = cx.subscribe(&record_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                this.suppress_enter = true;
+                this.suppress_enter = Some(std::time::Instant::now());
                 this.finish_record_edit(cx);
             }
         });
@@ -303,7 +311,7 @@ impl GridPane {
         // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
         let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                this.suppress_enter = true;
+                this.suppress_enter = Some(std::time::Instant::now());
                 this.finish_edit(cx);
             }
         });
@@ -320,7 +328,8 @@ impl GridPane {
             edit_target: None,
             calendar: None,
             _calendar_subscription: None,
-            suppress_enter: false,
+            suppress_enter: None,
+            prod_target: true,
             pending_edit: None,
             notice: String::new(),
             grid_focus,
@@ -369,6 +378,24 @@ impl GridPane {
             _subscription: subscription,
             _edit_subscription: edit_subscription,
         }
+    }
+
+    /// 外壳按环境标签告诉网格目标是不是生产库。
+    pub fn set_prod_target(&mut self, prod: bool) {
+        self.prod_target = prod;
+    }
+
+    fn preview_hint_key(&self) -> &'static str {
+        if self.prod_target { "grid.preview.prodHint" } else { "grid.preview.keysHint" }
+    }
+
+    /// 变更预览里按回车：非生产库直接确认写入；生产库只能点按确认，回车留在预览上。
+    fn preview_enter(&mut self, cx: &mut Context<Self>) {
+        if self.prod_target {
+            return;
+        }
+        self.confirm(cx);
+        self.refocus = true;
     }
 
     pub fn set_locale(&mut self, locale: Locale) -> bool {
@@ -2603,12 +2630,22 @@ fn cell_padding(m: kit::Metrics) -> gpui_kit::Edges<Pixels> {
 
 /// 单元格的悬停提示：长文本截断后仍能看到整段值；大值/二进制指向查看面板；
 /// NULL 与空字符串不给提示（它们本身已经有自己的画法）。
-fn cell_tooltip(locale: Locale, kind: session::CellKind, text: &str) -> Option<SharedString> {
+/// 格子的悬停提示。文本只在可能显示不全时才提示（多行，或估算宽度放不进这一列）：
+/// 每格都弹出和格子里一模一样的字，扫过表格时只是噪音。估算偏宽，宁可多提示。
+fn cell_tooltip(locale: Locale, kind: session::CellKind, text: &str, column_width: f32) -> Option<SharedString> {
     match kind {
-        session::CellKind::Text if !text.is_empty() => Some(SharedString::from(text.to_owned())),
+        session::CellKind::Text if !text.is_empty() && text_may_clip(text, column_width) => Some(SharedString::from(text.to_owned())),
         session::CellKind::Large | session::CellKind::Binary => Some(SharedString::from(i18n::text(locale, "grid.value.openFullHint"))),
         _ => None,
     }
+}
+
+fn text_may_clip(text: &str, column_width: f32) -> bool {
+    if text.contains('\n') || text.chars().count() > 80 {
+        return true;
+    }
+    // 估算按 13px 字号的字宽；留出左右内边距和一点余量（粗体、宽字形）。
+    session::text_width_estimate(text, 7.8) * 1.1 + 20.0 > column_width
 }
 
 fn dirty_mark(state: session::CellDirty) -> u8 {
@@ -2817,9 +2854,8 @@ impl Render for GridPane {
                     "arrowright" => "right",
                     other => other,
                 };
-                if this.suppress_enter {
-                    this.suppress_enter = false;
-                    if key == "enter" {
+                if let Some(at) = this.suppress_enter.take() {
+                    if key == "enter" && at.elapsed() < ENTER_ECHO_WINDOW {
                         cx.stop_propagation();
                         return;
                     }
@@ -2839,6 +2875,12 @@ impl Render for GridPane {
                         cx.stop_propagation();
                         this.cancel_record_edit(cx);
                     }
+                    return;
+                }
+                if key == "enter" && this.session.preview_open() {
+                    cx.stop_propagation();
+                    this.preview_enter(cx);
+                    cx.notify();
                     return;
                 }
                 if key == "escape" {
@@ -4135,8 +4177,15 @@ impl GridPane {
                         .child(
                             div()
                                 .flex()
-                                .justify_end()
+                                .items_center()
                                 .gap(px(8.))
+                                .child(
+                                    div()
+                                        .id("grid-preview-hint")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(kit::muted(t(self.preview_hint_key()), p)),
+                                )
                                 .child(grid_button("grid-preview-cancel", false, t("grid.preview.cancel"), entity.clone()))
                                 .child(grid_button("grid-preview-confirm", true, t("grid.preview.confirm"), entity.clone())),
                         ),
@@ -4773,11 +4822,12 @@ impl TableDelegate for SheetDelegate {
         // 免得和真的存着这几个字的文本混在一起。
         let placeholder = null || kind == session::CellKind::Empty;
         let temporal_kind = self.logical(col_ix).and_then(|logical| self.temporal.get(logical).copied().flatten());
+        let column_width = self.columns.get(col_ix).map(|column| column.1).unwrap_or(120.);
         let tooltip = match temporal_kind {
             Some(temporal_kind) if kind == session::CellKind::Text => temporal::describe(temporal_kind, &text, self.locale, chrono::Local::now().naive_local())
                 .map(SharedString::from)
-                .or_else(|| cell_tooltip(self.locale, kind, &text)),
-            _ => cell_tooltip(self.locale, kind, &text),
+                .or_else(|| cell_tooltip(self.locale, kind, &text, column_width)),
+            _ => cell_tooltip(self.locale, kind, &text, column_width),
         };
         // 行号与数字列右对齐、行号用弱色：数据列的位数可比，行号不和数据抢视线。
         let row_number = self.logical(col_ix).is_none();
@@ -8381,6 +8431,49 @@ mod workbench_tests {
         cx.update(|cx| pane.read(cx).preview_open())
     }
 
+    /// 变更预览里按回车：非生产库直接确认（提交后预览关闭）；生产库或外壳尚未告知环境时，
+    /// 回车不写入，预览保持打开，页脚提示改为点按确认。
+    #[gpui_kit::test]
+    fn enter_confirms_the_change_preview_except_on_production(cx: &mut TestAppContext) {
+        // 确认写入在 tokio 线程上执行（这里连接不存在，结果是失败回填），允许测试调度器等待它。
+        cx.executor().allow_parking();
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-insert", cx);
+                let _ = pane.command("grid-preview", cx);
+            });
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.render_frame(cx);
+            assert!(window.find("grid-preview-confirm").visible());
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(pane_preview_open(&pane, cx), "默认按生产处理：回车不写入");
+        assert_eq!(cx.update(|cx| pane.read(cx).preview_hint_key()), "grid.preview.prodHint");
+        // 之前编辑格子留下的回声标记已经过时（中间的 Ctrl/⌘+S 被快捷键消费，没经过网格）：
+        // 不能再吞掉这次确认用的 Enter。
+        cx.update(|cx| pane.update(cx, |pane, _| {
+            pane.set_prod_target(false);
+            pane.suppress_enter = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2));
+        }));
+        assert_eq!(cx.update(|cx| pane.read(cx).preview_hint_key()), "grid.preview.keysHint");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        while pane_preview_open(&pane, cx) && started.elapsed() < std::time::Duration::from_secs(5) {
+            cx.run_until_parked();
+            std::thread::park_timeout(std::time::Duration::from_millis(20));
+        }
+        assert!(!pane_preview_open(&pane, cx), "非生产库回车即提交，结果回来后预览关闭");
+    }
+
     #[gpui_kit::test]
     fn set_value_on_selection_stages_one_batch_from_the_edit_bar(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -8736,16 +8829,21 @@ mod workbench_tests {
             let shown = delegate.cell_label(3, 2, cx).expect("长文本");
             assert_eq!(shown.len(), long.len());
             assert_eq!(
-                cell_tooltip(Locale::ZhCn, session::CellKind::Text, &shown).as_deref(),
+                cell_tooltip(Locale::ZhCn, session::CellKind::Text, &shown, 140.).as_deref(),
                 Some(long.as_str()),
                 "悬停提示拿得到完整值"
             );
+            // 放得下的短值不重复弹出同样的字；列被拖窄后同一个值才需要提示。
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Text, "4000", 140.).is_none());
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Text, "北京", 140.).is_none());
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Text, "2047243.12", 64.).is_some());
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Text, "第一行\n第二行", 640.).is_some(), "多行值格子里只显示第一行");
             assert_eq!(
-                cell_tooltip(Locale::ZhCn, session::CellKind::Large, "大值 2048").as_deref(),
+                cell_tooltip(Locale::ZhCn, session::CellKind::Large, "大值 2048", 140.).as_deref(),
                 Some(i18n::text(Locale::ZhCn, "grid.value.openFullHint").as_str()),
                 "大值指向查看面板"
             );
-            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Null, "NULL").is_none(), "NULL 不再额外提示");
+            assert!(cell_tooltip(Locale::ZhCn, session::CellKind::Null, "NULL", 140.).is_none(), "NULL 不再额外提示");
         })
         .unwrap();
     }

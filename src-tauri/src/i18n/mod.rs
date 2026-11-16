@@ -659,6 +659,8 @@ dict! {
     "grid.status.rejectedKept" => "被拒绝的修改仍保留", "Rejected edits are kept";
     "grid.preview.title" => "变更预览", "Change preview";
     "grid.preview.confirm" => "确认写入", "Confirm write";
+    "grid.preview.keysHint" => "回车确认写入 · Esc 取消", "Enter to write · Esc to cancel";
+    "grid.preview.prodHint" => "生产环境：请点按“确认写入”", "Production: click “Confirm write” to apply";
     "grid.preview.cancel" => "取消预览", "Cancel preview";
     "grid.commit.needPreview" => "先打开预览并确认后才会写入。", "Open the preview and confirm before anything is written.";
     "structure.section.columns" => "字段", "Columns";
@@ -923,6 +925,7 @@ dict! {
     "ui.conn.user" => "用户名", "User";
     "ui.conn.password" => "密码", "Password";
     "ui.conn.passwordKeep" => "留空则沿用已保存的密码", "Leave blank to keep the saved one";
+    "ui.conn.passwordAskLater" => "未保存密码；留空则连接时询问", "Not saved; leave blank to be asked when connecting";
     "ui.conn.database" => "数据库", "Database";
     "ui.conn.optional" => "可选", "Optional";
     "ui.conn.redisDb" => "库索引，默认 0", "DB index, default 0";
@@ -988,7 +991,7 @@ dict! {
     "ui.grid.empty" => "没有数据", "No rows";
     "ui.grid.emptyResult" => "查询没有返回行", "The query returned no rows";
     "ui.grid.pending" => "有未提交的修改", "Unsaved changes";
-    "ui.exchange.source" => "当前表", "Current table";
+    "ui.exchange.source" => "来源", "Source";
     "ui.exchange.noTable" => "先在资源管理器里打开一张表，再导入或导出。", "Open a table from the explorer first.";
     "ui.exchange.format" => "文件格式", "File format";
     "ui.exchange.export" => "导出", "Export";
@@ -1001,6 +1004,8 @@ dict! {
     "ui.exchange.importNeedsTableHint" => "切换到“当前表数据”并打开一张表后，才能选择文件并确认写入。", "Switch to “Current table data” and open a table before choosing a file and confirming the write.";
     "ui.exchange.noTableData" => "当前没有表数据；先在对象树里打开一张表。", "No table data yet; open a table in the object tree first.";
     "ui.exchange.queryResult" => "查询结果", "Query result";
+    "ui.exchange.exportResult" => "导出结果", "Export result";
+    "ui.exchange.resultCount" => "查询结果已全部读取，导出全部 {count} 行", "The whole result is loaded; exports all {count} rows";
     "ui.exchange.noResult" => "当前查询还没有结果；先执行一次查询。", "The current query has no result yet; run it first.";
     "ui.exchange.tableLoading" => "表数据正在读取，当前行数尚未完整。", "Table data is still loading; the row count is not final yet.";
     "ui.exchange.loadedOnly" => "查询结果只有已读取的行；全量导出不可用。", "A query result only has its loaded rows; full export is unavailable.";

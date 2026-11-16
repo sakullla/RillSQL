@@ -1727,3 +1727,29 @@ async fn object_actions_refuse_sql_that_differs_from_the_preview() {
     assert!(table_exists(&session, "notes_old").await);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// PostgreSQL 报回来的默认值带序列和类型转换（nextval('…'::regclass)、'paid'::text），
+/// 不是手输的字面量。没改它们时不能拦下整张表的修改；手动改成同样的写法仍按规则拦下。
+#[test]
+fn untouched_postgres_defaults_do_not_block_other_column_changes() {
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "rillsql", "shop", "orders");
+    let mut id = column("id", "bigint", false, true);
+    id.default_sql = Some("nextval('shop.orders_id_seq'::regclass)".to_owned());
+    let mut status = column("status", "text", true, false);
+    status.default_sql = Some("'paid'::text".to_owned());
+    snapshot.columns = vec![id, status, column("amount", "numeric(10,2)", true, false)];
+    snapshot.row_count = Some(3);
+    let unchanged: Vec<ColumnDraft> = snapshot.columns.iter().map(draft_of).collect();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: unchanged.clone() });
+    assert_eq!(planned.blocked, vec!["没有字段变更。".to_owned()], "没改任何东西时只说没有变更");
+    let mut renamed = unchanged.clone();
+    renamed[2].name = "total".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: renamed });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps.len(), 1);
+    assert!(planned.steps[0].sql.contains("RENAME COLUMN \"amount\" TO \"total\""), "{}", planned.steps[0].sql);
+    let mut typed = unchanged;
+    typed[2].default_sql = "nextval('other_seq'::regclass)".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: typed });
+    assert!(planned.blocked.iter().any(|item| item.contains("默认值")), "手改的默认值仍按规则检查：{:?}", planned.blocked);
+}

@@ -1951,6 +1951,11 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
         state
     }
 
+    /// 这个字段在本轮渲染里建过输入框（隐藏的分组里没有）。
+    pub fn contains(&self, key: K) -> bool {
+        self.inputs.contains_key(&key)
+    }
+
     pub fn focus(&self, key: K, window: &mut Window, cx: &mut App) {
         if let Some(state) = self.inputs.get(&key) {
             state.update(cx, |state, cx| state.focus(window, cx));

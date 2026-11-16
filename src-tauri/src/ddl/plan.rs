@@ -60,7 +60,7 @@ pub fn display_sql(snapshot: &Snapshot) -> String {
 
 fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft]) -> Plan {
     let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, name);
-    let mut blocked = validate_columns(snapshot.engine, columns, true);
+    let mut blocked = validate_columns(snapshot, columns, true);
     if !valid_name(name) {
         blocked.push("表名无效。".to_owned());
     }
@@ -90,12 +90,19 @@ fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft]) -> Plan
     }
 }
 
+const NO_COLUMN_CHANGE: &str = "没有字段变更。";
+
+/// 预览拦下的原因只是“草稿和现状一样”：界面据此用说明而不是错误的口吻。
+pub(crate) fn is_no_change(text: &str) -> bool {
+    text == NO_COLUMN_CHANGE
+}
+
 fn plan_alter(snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft]) -> Plan {
     let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
     if let Some(message) = guard_table(snapshot, table) {
         return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
     }
-    let mut blocked = validate_columns(snapshot.engine, drafts, false);
+    let mut blocked = validate_columns(snapshot, drafts, false);
     blocked.extend(alter_precheck(snapshot, drafts));
     let risks = alter_risks(snapshot, drafts);
     if !blocked.is_empty() {
@@ -103,7 +110,7 @@ fn plan_alter(snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft]) -> Plan 
     }
     let changes = diff_columns(snapshot, drafts);
     if changes.is_empty() {
-        return finish(snapshot.engine, false, target, vec!["没有字段变更。".to_owned()], risks, Vec::new());
+        return finish(snapshot.engine, false, target, vec![NO_COLUMN_CHANGE.to_owned()], risks, Vec::new());
     }
     if snapshot.engine == Engine::Sqlite {
         match sqlite_direct_alters(snapshot, table, &changes) {
@@ -1580,7 +1587,8 @@ fn alter_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
     risks
 }
 
-fn validate_columns(engine: Engine, columns: &[ColumnDraft], create: bool) -> Vec<String> {
+fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) -> Vec<String> {
+    let engine = snapshot.engine;
     let mut blocked = Vec::new();
     let mut names = Vec::new();
     for (index, column) in columns.iter().enumerate() {
@@ -1595,10 +1603,16 @@ fn validate_columns(engine: Engine, columns: &[ColumnDraft], create: bool) -> Ve
             blocked.push(format!("字段名 {name} 重复。"));
         }
         names.push(name.to_owned());
-        if !valid_type(engine, &column.type_name) {
+        // 修改表时，没动过的类型和默认值是数据库自己报回来的（如 PostgreSQL 的
+        // nextval('…'::regclass)、'paid'::text），不会被写进语句，也就不按手输规则拦下：
+        // 否则带自增序列或带类型转换默认值的表连改一个列名都做不到。
+        let original = if create { None } else { original_of(snapshot, column) };
+        let type_kept = original.is_some_and(|original| same_type(&column.type_name, &original.type_name));
+        let default_kept = original.is_some_and(|original| normalize_default(&column.default_sql) == original.default_sql.as_deref().map(str::trim));
+        if !type_kept && !valid_type(engine, &column.type_name) {
             blocked.push(format!("字段 {name} 的类型 {} 不能按 {} 规则生成。", column.type_name.trim(), engine.as_str()));
         }
-        if !column.default_sql.trim().is_empty() && !valid_default(engine, &column.default_sql) {
+        if !default_kept && !column.default_sql.trim().is_empty() && !valid_default(engine, &column.default_sql) {
             blocked.push(format!("字段 {name} 的默认值不是允许的字面量或当前时间函数。"));
         }
         if create && column.auto && !column.primary {

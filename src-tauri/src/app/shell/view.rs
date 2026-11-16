@@ -963,8 +963,10 @@ impl Workbench {
                 if self.table_view_spec.as_deref() != Some(spec.as_str()) {
                     self.table_view_spec = Some(spec.clone());
                     let page_size = u64::try_from(self.model.settings.page_size.max(1)).unwrap_or(1);
+                    let prod = super::danger::env_is_prod(&target.environment, Some(&self.model.env_tags));
                     self.table.update(cx, |pane, cx| {
                         pane.set_locale(locale);
+                        pane.set_prod_target(prod);
                         pane.open_table(target, page_size, cx);
                     });
                 }

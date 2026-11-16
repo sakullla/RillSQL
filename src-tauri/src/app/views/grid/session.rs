@@ -4803,7 +4803,7 @@ const COLUMN_AUTO_MAX_WIDTH: f32 = 320.0;
 const COLUMN_SAMPLE_ROWS: usize = 200;
 
 /// 一段文字在网格正文字号下的大致宽度：全角字符按一个字宽，其余按半个字宽。
-fn text_width_estimate(text: &str, half: f32) -> f32 {
+pub(crate) fn text_width_estimate(text: &str, half: f32) -> f32 {
     text.lines()
         .next()
         .unwrap_or("")
@@ -7379,6 +7379,23 @@ mod width_estimate_tests {
         let merged = merge_widths(&previous, vec![column("email", "TEXT", false), column("id", "INTEGER", true)], &rows);
         assert_eq!(merged[0].width, 333.0);
         assert!(merged[1].width < 140.0);
+    }
+
+    #[test]
+    fn query_columns_with_number_values_align_right() {
+        let mut grid = SharedGrid::new();
+        grid.show_query_sheet(
+            "select city, count(*) as orders, sum(amount) as total from orders group by city",
+            vec!["city".into(), "orders".into(), "total".into()],
+            vec![
+                vec![Some("Paris".into()), Some("4000".into()), Some("2047243.12".into())],
+                vec![None, Some("4000".into()), Some("2006277.07".into())],
+            ],
+            false,
+            Some(2),
+        );
+        let numeric: Vec<bool> = (0..3).map(|column| grid.column_header(column).unwrap().numeric).collect();
+        assert_eq!(numeric, vec![false, true, true]);
     }
 
     #[test]

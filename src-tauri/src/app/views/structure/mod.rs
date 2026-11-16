@@ -167,8 +167,15 @@ impl FieldWidths {
     /// `content_w` 是字段表真实可用的内容宽（外壳内容区宽减去 structure-body 左右内边距），
     /// 不是窗口视口宽。
     fn of(content_w: f32, create: bool) -> Self {
-        let wide = Self::wide();
-        if wide.min_total(create) <= content_w { wide } else { Self::compact() }
+        let mut wide = Self::wide();
+        let slack = content_w - wide.min_total(create);
+        if slack < 0. {
+            return Self::compact();
+        }
+        // 宽屏的余量不全给字段名：默认值常是表达式（nextval('…'::regclass)、CURRENT_TIMESTAMP），
+        // 分它四成（最多加 260），字段名仍拿剩下的大头。
+        wide.default += (slack * 0.4).min(260.);
+        wide
     }
 }
 
@@ -537,6 +544,13 @@ impl StructureSession {
         self.armed
     }
 
+    /// 预览被拦下的唯一原因是“什么都没改”：这是说明，不是错误。
+    pub fn preview_unchanged(&self) -> bool {
+        self.preview.as_ref().is_some_and(|plan| {
+            plan.steps.is_empty() && !plan.blocked.is_empty() && plan.blocked.iter().all(|text| crate::ddl::is_no_change(text))
+        })
+    }
+
     pub fn blocked(&self) -> Vec<String> {
         self.preview.as_ref().map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect()).unwrap_or_default()
     }
@@ -901,6 +915,11 @@ impl StructurePane {
                                     let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
                                     if drops_table && all_ok && !receipt.steps.is_empty() {
                                         this.dropped = Some(this.session.target.clone());
+                                    }
+                                    // 修改已有表全部成功：按数据库的新结构重读，草稿也从新结构重建。
+                                    // 否则旧快照还在，刚执行的改动会继续显示成“1 处修改未应用”。
+                                    if created_name.is_none() && !drops_table && all_ok && !receipt.steps.is_empty() {
+                                        this.reload_after_execute();
                                     }
                                     if let Some(name) = created_name.clone() {
                                         if all_ok && !receipt.steps.is_empty() && !name.trim().is_empty() {
@@ -1350,6 +1369,23 @@ impl StructurePane {
 
     /// 读取失败的统一呈现：原因 + 重试（重试不清用户草稿）。所有页签共用同一块。
     fn load_error_state(&self, entity: &Entity<StructurePane>, p: &Palette, locale: Locale) -> AnyElement {
+        // 连接还没打开（恢复会话时标签先于连接出现）不是读取出错：和表数据页一样给中性说明
+        // 和“连接并读取”主按钮，不用红色错误态；连上后自动重读。
+        if self.connection_closed() {
+            let owner = entity.clone();
+            let connect = kit::primary_button("structure-retry", Some(IconName::Plug), SharedString::from(i18n::text(locale, "grid.action.connectRead")), move |_, _, cx| {
+                owner.update(cx, |pane, cx| pane.retry_load(cx));
+            })
+            .into_any_element();
+            return kit::empty_state_with_action(
+                IconName::Plug,
+                SharedString::from(i18n::text(locale, "grid.state.offlineTitle")),
+                SharedString::from(i18n::text(locale, "grid.state.offlineHint")),
+                connect,
+                p,
+            )
+            .into_any_element();
+        }
         let owner = entity.clone();
         let retry = kit::secondary_button("structure-retry", None, SharedString::from(i18n::text(locale, "common.retry")), move |_, _, cx| {
             owner.update(cx, |pane, cx| pane.retry_load(cx));
@@ -1507,6 +1543,21 @@ impl StructurePane {
             Section::ForeignKeys => snapshot.foreign_keys.len(),
             _ => 0,
         }
+    }
+
+    /// 目标连接当前没有打开的会话。
+    fn connection_closed(&self) -> bool {
+        let connection = &self.session.target.connection_id;
+        !connection.is_empty() && self.services.connections.catalog_session(connection).is_none()
+    }
+
+    /// 结构变更执行成功后：丢掉旧快照与据它生成的草稿，下一帧从数据库重读。
+    fn reload_after_execute(&mut self) {
+        self.drafts_ready = false;
+        self.loaded_for.clear();
+        self.snapshot = None;
+        self.ddl_view = None;
+        self.ddl_text.clear();
     }
 
     /// 读取失败后的重试：清掉失败原因与已读标记，下一帧重新读取（不清用户草稿）。
@@ -1957,7 +2008,8 @@ impl StructurePane {
             .border_color(p.line)
             .text_size(px(TypeScale::XS))
             .text_color(p.text_faint)
-            .child(div().flex_1().min_w(px(widths.name_min)).child(t("structure.field.column")))
+            // 名称列前有 12px 的主键图标槽和 4px 间距，表头文字与输入框左缘对齐。
+            .child(div().flex_1().min_w(px(widths.name_min)).pl(px(16.)).child(t("structure.field.column")))
             .child(div().w(px(widths.kind)).flex_none().child(t("structure.field.type")))
             .child(div().w(px(widths.nullable)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
             .child(div().w(px(widths.default)).flex_none().child(t("ui.structure.default")))
@@ -2084,7 +2136,8 @@ impl StructurePane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn)))
+                    // 主键图标占一个固定槽：每行的名称输入框左缘对齐，不因有没有钥匙错开。
+                    .child(div().w(px(12.)).flex_none().when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn))))
                     .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name)),
             )
             .child(div().w(px(widths.kind)).flex_none().flex().items_center().gap(px(2.)).when(dropped, |this| this.opacity(0.5)).child(div().flex_1().min_w(px(0.)).child(kind)).child(type_menu))
@@ -2911,6 +2964,10 @@ impl StructurePane {
             let note_text = self.session.note();
             let risks = self.session.preview_risks();
             let blocked_text = self.session.blocked().join(" ");
+            // 没有语句可执行（什么都没改，或被规则拦下）时：不画空的 SQL 框，确认不可点。
+            // 只是“没有变更”时用中性色说明，不当成错误标红。
+            let nothing_to_run = sql.trim().is_empty();
+            let only_unchanged = nothing_to_run && self.session.preview_unchanged();
             let preview_title = t("structure.preview.title");
             let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
             let cancel_label = t("structure.action.cancel");
@@ -2995,7 +3052,7 @@ impl StructurePane {
                                 .flex_col()
                                 .gap(px(10.))
                                 .child(kit::muted(banner, p))
-                                .child(
+                                .when(!nothing_to_run, |this| this.child(
                                     div()
                                         .id("structure-preview-sql")
                                         .max_h(px(240.))
@@ -3008,7 +3065,7 @@ impl StructurePane {
                                         .font_family(cx.theme().mono_font_family.clone())
                                         .text_size(px(TypeScale::SM))
                                         .child(SharedString::from(sql)),
-                                )
+                                ))
                                 .child(kit::muted(target, p))
                                 .when(!risks.is_empty(), |this| {
                                     let mut list = div().flex().flex_col().gap(px(4.));
@@ -3018,15 +3075,17 @@ impl StructurePane {
                                     }
                                     this.child(list)
                                 })
-                                .when(!rule.is_empty(), |this| this.child(kit::muted(SharedString::from(rule), p)))
+                                .when(!rule.is_empty() && !nothing_to_run, |this| this.child(kit::muted(SharedString::from(rule), p)))
                                 .when(!blocked_text.is_empty(), |this| {
+                                    let (fg, bg) = if only_unchanged { (p.text_muted, p.hover) } else { (p.danger, p.danger_soft) };
                                     this.child(
                                         div()
+                                            .id("structure-preview-blocked")
                                             .px(px(12.))
                                             .py(px(8.))
                                             .rounded(px(Radius::PANEL))
-                                            .bg(p.danger_soft)
-                                            .text_color(p.danger)
+                                            .bg(bg)
+                                            .text_color(fg)
                                             .text_size(px(TypeScale::SM))
                                             .child(SharedString::from(blocked_text.clone())),
                                     )
@@ -3048,9 +3107,9 @@ impl StructurePane {
                                 .border_color(p.line_soft)
                                 .child(kit::secondary_button("structure-cancel", None, cancel_label, cancel))
                                 .child(if dangerous || armed {
-                                    kit::danger_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(confirm_blocked).into_any_element()
+                                    kit::danger_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(confirm_blocked || nothing_to_run).into_any_element()
                                 } else {
-                                    kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).into_any_element()
+                                    kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(nothing_to_run).into_any_element()
                                 }),
                         ),
                 )
@@ -3103,6 +3162,26 @@ mod tests {
             engine: engine.into(),
             environment: "dev".into(),
         }
+    }
+
+    /// 什么都没改就预览：没有语句、确认不可点；“没有字段变更”是中性说明，不是错误。
+    /// 带 nextval 默认值的主键原样保留，不再被当成非法默认值拦下。
+    #[test]
+    fn previewing_an_untouched_table_is_a_neutral_no_op() {
+        let mut session = StructureSession::new(target("postgres", "orders"));
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "shop", "orders");
+        let mut id = column("id", "bigint", true);
+        id.default_sql = Some("nextval('shop.orders_id_seq'::regclass)".to_owned());
+        snapshot.columns = vec![id, column("status", "text", false)];
+        session.kept_columns = column_drafts(&snapshot);
+        session.arm_fixture(&snapshot);
+        assert!(session.preview_sql().is_empty(), "{:?}", session.preview_sql());
+        assert!(session.preview_unchanged(), "{:?}", session.blocked());
+        session.kept_columns[1].name = "state".into();
+        session.arm_fixture(&snapshot);
+        assert!(!session.preview_unchanged());
+        assert!(session.blocked().is_empty(), "{:?}", session.blocked());
+        assert_eq!(session.preview_sql().len(), 1);
     }
 
     #[test]
@@ -3766,6 +3845,13 @@ mod tests {
         }
         // 反向：宽档确实更宽，档位不是摆设。
         assert!(FieldWidths::wide().min_total(false) > FieldWidths::compact().min_total(false));
+        // 宽屏余量分一部分给默认值（表达式放得下），整行仍不超出内容宽。
+        for (content_w, create) in [(1040., false), (1040., true), (2400., false)] {
+            let widths = FieldWidths::of(content_w, create);
+            assert!(widths.default > FieldWidths::wide().default, "{content_w}: 默认值列应变宽");
+            assert!(widths.default <= FieldWidths::wide().default + 260.);
+            assert!(widths.min_total(create) <= content_w, "{content_w}: 行宽 {} 超出", widths.min_total(create));
+        }
     }
 
     /// 空索引列表整块换成空态：既没有表头，也没有"表头 + 破折号"的占位行。
@@ -3912,6 +3998,44 @@ mod tests {
             literals.push(literal);
         }
         literals
+    }
+
+    /// 连接还没打开时，结构页和表数据页一样给中性的“连接未打开”和“连接并读取”主按钮，
+    /// 不是红色的“读取结构失败”；点它请外壳去连接，而不是再读一次必然失败的结构。
+    #[gpui_kit::test]
+    fn an_unopened_connection_offers_connect_instead_of_an_error(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("unopened");
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = pane_with_snapshot(services.clone(), 2);
+                    pane.session.target.connection_id = "closed-connection".into();
+                    pane.snapshot = None;
+                    pane.session.kept_columns.clear();
+                    pane.drafts_ready = false;
+                    // 已经读过一次（因连接未打开而失败），渲染时不再自动重读。
+                    pane.loaded_for = "closed-connection|app|public|orders".into();
+                    pane.load_error = "这条连接还没有打开，没有另开新的连接。".to_owned();
+                    pane
+                })
+            })
+            .expect("structure pane")
+        });
+        let (error, empty, label) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.try_find("error-state").is_some(), window.try_find("empty-state").is_some(), window.find("structure-retry").label().map(str::to_owned))
+            })
+            .unwrap();
+        assert!(!error, "连接没打开不是读取错误");
+        assert!(empty, "给中性的说明");
+        assert_eq!(label.as_deref(), Some(i18n::text(Locale::ZhCn, "grid.action.connectRead").as_str()));
+        cx.update_window(window, |_, window, cx| window.click("structure-retry", cx)).unwrap();
+        assert_eq!(cx.update(|cx| pane.update(cx, |pane, _| pane.take_connect_request())).as_deref(), Some("closed-connection"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 读取失败与读取中在定义类页签（DDL / 危险操作）也要给原因、重试与骨架，

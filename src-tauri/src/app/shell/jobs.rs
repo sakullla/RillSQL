@@ -368,6 +368,10 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 // 测试失败保留草稿与机密：只补一条字段错误与说明，模态不关。
                 model.notice_key = model.connections.message_key;
                 model.notice_detail = model.connections.message_detail.clone();
+                // 失败落在某个字段上（如缺密码）：键盘移到那个字段，直接改了再测。
+                if current && model.conn_modal.open && !model.connections.issues.is_empty() {
+                    model.conn_modal.focus_first_pending = true;
+                }
             }
         }
         JobDone::Open(token, outcome) => {

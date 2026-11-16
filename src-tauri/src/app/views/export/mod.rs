@@ -1316,7 +1316,8 @@ impl Render for ExchangePane {
                         .text_color(p.text_muted)
                         .child(SharedString::from(i18n::fill(&i18n::text(locale, "ui.exchange.loadedRows"), &[("count", &self.source.rows.len().to_string()), ("partial", &partial)]))),
                 );
-                if self.source.kind.is_query() {
+                // 查询结果已经读到末尾时，已读取的行就是完整结果，不再说“全量导出不可用”。
+                if self.source.kind.is_query() && self.source.truncated {
                     source_body = source_body.child(
                         div()
                             .text_size(px(TypeScale::XS))
@@ -1391,12 +1392,20 @@ impl Render for ExchangePane {
         panel = stack_frame(|| {
         let mut panel = panel;
         let mut export = div().id("exchange-export-card").test_support().flex().flex_col().gap(px(6.)).min_w(px(0.)).max_w_full();
+        // 查询结果已全部读取：已读取的行就是整个结果，入口直接叫“导出结果”，也不再摆一条
+        // 不可用的“导出全部结果”——那条说的限制在这里并不存在。
+        let complete_query = self.source.kind.is_query() && !self.source.truncated;
         if loaded_ready {
+            let (title, hint) = if complete_query {
+                (t("ui.exchange.exportResult"), "ui.exchange.resultCount")
+            } else {
+                (t("export.export.loaded"), "ui.exchange.loadedOnlyCount")
+            };
             export = export.child(action_row(
                 "exchange-exchange-export-loaded",
                 IconName::FileDown,
-                t("export.export.loaded"),
-                SharedString::from(i18n::fill(&i18n::text(locale, "ui.exchange.loadedOnlyCount"), &[("count", &self.source.rows.len().to_string())])),
+                title,
+                SharedString::from(i18n::fill(&i18n::text(locale, hint), &[("count", &self.source.rows.len().to_string())])),
                 &p,
                 act("exchange-export-loaded"),
             ));
@@ -1410,7 +1419,9 @@ impl Render for ExchangePane {
                 &p,
             ));
         }
-        if self.source.full_available() {
+        if complete_query && loaded_ready {
+            // 见上：完整的查询结果没有“更全”的版本可导。
+        } else if self.source.full_available() {
             export = export.child(action_row(
                 "exchange-exchange-export-full",
                 IconName::Download,
@@ -2503,5 +2514,31 @@ mod unified_state_tests {
         assert!(cx.did_prompt_for_new_path(), "读取中的「全库导出」必须真的打开保存对话框");
         let blocked_after_dump = cx.update(|cx| pane.read(cx).tasks().iter().filter(|task| task.phase == Phase::Blocked).count());
         assert_eq!(blocked_after_dump, blocked, "全库导出不应在读取中被挡下");
+    }
+
+    /// 查询结果已全部读取时，已读取的行就是整个结果：入口叫“导出结果”，不再摆一条
+    /// 不可用的“导出全部结果”；结果被截断时仍如实说明只能导出已读取部分。
+    #[gpui_kit::test]
+    fn a_complete_query_result_exports_as_the_whole_result(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, pane) = open_pane(cx, 900.);
+        bind(cx, &pane, query_source(&["city", "total"], false));
+        frame(cx, window);
+        cx.update_window(window, |_, window, _cx| {
+            let export = window.within("exchange-export-card");
+            let loaded = export.try_find("exchange-exchange-export-loaded").expect("导出结果");
+            assert_eq!(loaded.role(), Some(gpui_kit::Role::Button));
+            assert!(export.try_find("exchange-exchange-export-full").is_none(), "完整结果不再列出不可用的全量导出");
+        })
+        .unwrap();
+        let mut partial = query_source(&["city", "total"], false);
+        partial.truncated = true;
+        bind(cx, &pane, partial);
+        frame(cx, window);
+        cx.update_window(window, |_, window, _cx| {
+            let export = window.within("exchange-export-card");
+            assert!(export.try_find("exchange-exchange-export-full").is_some(), "截断的结果仍说明全量导出不可用");
+        })
+        .unwrap();
     }
 }
