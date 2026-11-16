@@ -88,8 +88,9 @@ pub struct QueryPane {
     metadata_seen: HashSet<String>,
     metadata_reads: HashMap<String, futures::future::AbortHandle>,
     /// 补全用的整库对象清单正在读取的（连接, 库）；读完或失败后移除，失败的过一会儿再试。
-    object_reads: HashMap<(String, String), std::time::Instant>,
+    object_reads: HashMap<(String, String), ObjectRead>,
     metadata_context: Option<(String, u64, Option<Target>)>,
+    completion_stamp: Option<(String, u64, Option<Target>, bool)>,
     metadata_epoch: u64,
     metadata_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     services: Arc<AppServices>,
@@ -416,9 +417,28 @@ fn load_more_targets_match(results_target: Option<&desk::Target>, current: Optio
     }
 }
 
+enum ObjectRead {
+    Pending(futures::future::AbortHandle),
+    Failed(std::time::Instant),
+}
+
+impl ObjectRead {
+    fn blocks_retry(&self) -> bool {
+        match self {
+            Self::Pending(_) => true,
+            Self::Failed(since) => since.elapsed() < std::time::Duration::from_secs(30),
+        }
+    }
+
+    fn abort(&self) {
+        if let Self::Pending(handle) = self { handle.abort(); }
+    }
+}
+
 impl Drop for QueryPane {
     fn drop(&mut self) {
         for handle in self.metadata_reads.values() { handle.abort(); }
+        for read in self.object_reads.values() { read.abort(); }
     }
 }
 
@@ -454,6 +474,7 @@ impl QueryPane {
             metadata_reads: HashMap::new(),
             object_reads: HashMap::new(),
             metadata_context: None,
+            completion_stamp: None,
             metadata_epoch: 0,
             metadata_gate: Arc::clone(&services.metadata_gate),
             services,
@@ -536,6 +557,8 @@ impl QueryPane {
     pub fn captured_selection(&self) -> Option<(String, usize, usize)> {
         self.captured.clone()
     }
+
+    pub fn catalog_revision(&self) -> u64 { self.desk.catalog_revision() }
 
     pub fn tree_objects(&self) -> &[TreeObject] {
         self.desk.objects()
@@ -1785,6 +1808,9 @@ impl QueryPane {
         }).collect();
         for connection in connections.iter().filter(|connection| connection.status != crate::catalog::model::ConnStatus::Connected) {
             self.desk.forget_objects(Some(&connection.id));
+            self.object_reads.retain(|(id, _), read| {
+                if id == &connection.id { read.abort(); false } else { true }
+            });
         }
         self.desk.set_objects(objects, databases);
         self.desk.set_links(links);
@@ -2003,6 +2029,8 @@ impl QueryPane {
     }
 
     pub fn invalidate_metadata(&mut self) {
+        for (_, read) in self.object_reads.drain() { read.abort(); }
+        self.desk.forget_objects(None);
         for (_, handle) in self.metadata_reads.drain() { handle.abort(); }
         self.metadata_epoch = self.metadata_epoch.wrapping_add(1);
         self.metadata_seen.clear();
@@ -2018,7 +2046,7 @@ impl QueryPane {
             return;
         }
         let key = (target.connection_id.clone(), target.database.clone());
-        if self.object_reads.get(&key).is_some_and(|since| since.elapsed() < std::time::Duration::from_secs(30)) {
+        if self.object_reads.get(&key).is_some_and(ObjectRead::blocks_retry) {
             return;
         }
         if !matches!(self.services.connections.session_condition(&target.connection_id), Some(crate::connections::SessionCondition::Connected)) {
@@ -2033,14 +2061,18 @@ impl QueryPane {
             crate::catalog::Engine::Sqlserver if target.schema.is_empty() => "dbo".to_owned(),
             _ => target.schema.clone(),
         };
-        self.object_reads.insert(key.clone(), std::time::Instant::now());
+        let (handle, abort) = futures::future::AbortHandle::new_pair();
+        self.object_reads.insert(key.clone(), ObjectRead::Pending(handle.clone()));
         let services = Arc::clone(&self.services);
         let gate = Arc::clone(&self.metadata_gate);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let read_target = target.clone();
-        runtime().spawn(async move {
+        runtime().spawn(futures::future::Abortable::new(async move {
             let result = crate::catalog::nav_read::limited_metadata(gate, &read_target.connection_id, async {
                 let session = services.connections.catalog_session(&read_target.connection_id).ok_or_else(|| "连接没有打开".to_owned())?;
+                if let crate::connections::CatalogSession::Mysql(pool) = &session {
+                    return crate::catalog::read::read_mysql_completion_objects(pool, &read_target.database).await.map(|objects| (schema, objects));
+                }
                 let page = crate::catalog::read_object_page(&session, engine, &read_target.database, &schema, 0, FULL_LIST).await;
                 match page.error {
                     Some(error) if page.objects.is_empty() => Err(error),
@@ -2050,11 +2082,12 @@ impl QueryPane {
             .await
             .and_then(|value| value);
             let _ = tx.send(result);
-        });
+        }, abort));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             let _ = cx.update(|cx| {
                 this.update(cx, |pane, cx| {
+                    if handle.is_aborted() { return; }
                     // 失败保留时间戳：30 秒内不反复重试，之后切回这个库会再读一次。
                     if let Ok((schema, rows)) = result {
                         pane.object_reads.remove(&key);
@@ -2071,6 +2104,8 @@ impl QueryPane {
                             })
                             .collect();
                         pane.desk.remember_objects(&target.connection_id, &target.database, objects);
+                    } else {
+                        pane.object_reads.insert(key, ObjectRead::Failed(std::time::Instant::now()));
                     }
                     cx.notify();
                 })
@@ -2386,12 +2421,16 @@ impl QueryPane {
         self.ensure_known_objects(cx);
         let id = self.desk.active_id().map(str::to_owned);
         if let Some(editor) = id.as_deref().and_then(|id| self.editors.get(id)) {
-            let scope = self.desk.completion_scope();
+            let (revision, target, provider) = self.desk.completion_stamp();
+            let stamp = (id.clone().unwrap_or_default(), revision, target, provider);
+            let changed = self.completion_stamp.as_ref() != Some(&stamp);
+            let scope = changed.then(|| self.desk.completion_scope());
+            self.completion_stamp = Some(stamp);
             let locale = self.locale;
             let link_target = self.desk.target().map(|target| (target.connection_id, target.database));
             editor.update(cx, |editor, _| {
                 editor.set_locale(locale);
-                editor.set_completion_scope(scope);
+                if let Some(scope) = scope { editor.set_completion_scope(scope); }
                 editor.set_link_target(link_target);
             });
         }
@@ -3593,6 +3632,17 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
+
+    #[test]
+    fn pending_object_read_never_expires_while_waiting_for_capacity() {
+        let (handle, _) = futures::future::AbortHandle::new_pair();
+        let pending = ObjectRead::Pending(handle.clone());
+        assert!(pending.blocks_retry());
+        pending.abort();
+        assert!(handle.is_aborted());
+        assert!(!ObjectRead::Failed(std::time::Instant::now() - std::time::Duration::from_secs(31)).blocks_retry());
+        assert!(ObjectRead::Failed(std::time::Instant::now()).blocks_retry());
+    }
 
     /// 没执行到的语句：执行层写的是中文说明，界面按当前语言只显示状态词；其它说明（数据库错误）原样保留。
     #[test]

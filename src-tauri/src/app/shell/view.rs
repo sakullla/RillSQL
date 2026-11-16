@@ -52,6 +52,7 @@ pub struct Workbench {
     pub(super) mongo: Entity<MongoPane>,
     applied_tool: Option<String>,
     applied_locale: Option<crate::i18n::Locale>,
+    applied_catalog_revision: Option<u64>,
     /// 共享表格网格当前展示的表规格；暂存必须归属到这张表对应的工作项。
     table_view_spec: Option<String>,
     /// 交换面板显式选择的来源；切换工作项后按新工作项重建。
@@ -117,6 +118,7 @@ pub struct Workbench {
     pub(super) explorer_scroll: gpui_kit::ScrollHandle,
     /// 命令面板列表滚动：上下/Home/End 导航与循环越界时把选中行滚进可视区。
     pub(super) palette_scroll: gpui_kit::ScrollHandle,
+    pub(super) palette_virtual_scroll: gpui_kit::UniformListScrollHandle,
     pub(super) palette_scroll_seen: Option<(usize, String, super::model::PaletteScope)>,
     /// 历史/保存查询列表滚动：方向键移动时跟随选中卡片。
     pub(super) history_scroll: gpui_kit::ScrollHandle,
@@ -293,6 +295,7 @@ impl Workbench {
             mongo,
             applied_tool: None,
             applied_locale: None,
+            applied_catalog_revision: None,
             table_view_spec: None,
             exchange_kind: ExchangeSourceKind::Table,
             exchange_item: None,
@@ -340,6 +343,7 @@ impl Workbench {
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
             palette_scroll: gpui_kit::ScrollHandle::new(),
+            palette_virtual_scroll: gpui_kit::UniformListScrollHandle::new(),
             palette_scroll_seen: None,
             history_scroll: gpui_kit::ScrollHandle::new(),
             launcher_scroll: gpui_kit::ScrollHandle::new(),
@@ -855,6 +859,9 @@ impl Workbench {
     /// 对象索引只在渲染时从查询页同步一次；资源管理器、对象筛选和快速打开都读这份快照。
     fn sync_catalog(&mut self, cx: &mut Context<Self>) {
         let pane = self.query.read(cx);
+        let revision = pane.catalog_revision();
+        if self.applied_catalog_revision == Some(revision) { return; }
+        self.applied_catalog_revision = Some(revision);
         self.model.set_catalog(pane.tree_objects(), pane.tree_error());
     }
 
@@ -1632,14 +1639,10 @@ impl Workbench {
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let result = match nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await {
-                Ok((session, held)) => {
-                    let body = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, offset, page)).await;
-                    drop(held);
-                    body
-                }
-                Err(message) => Err(message),
-            };
+            let result = crate::catalog::nav_read::limited_metadata(gate, &node.connection_id, async {
+                let (session, _held) = nav_read_session(&services, node.engine, &node.connection_id, &node.database, current.as_deref()).await?;
+                Ok(crate::catalog::read::read_navigation_kind_page(&session, node.engine, &node.database, &node.schema, kind, offset, page).await)
+            }).await.and_then(|result| result);
             let _ = tx.send(result);
         }, abort));
         cx.spawn(async move |_, cx| {
@@ -1650,7 +1653,8 @@ impl Workbench {
                     if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
                     this.nav_reads.remove(&group_id);
                     match result {
-                        Ok(Ok(body)) => {
+                        Ok(Ok((body, total_known))) => {
+                            if body.error.is_none() { this.model.nav.set_kind_total_known(&group_id, total_known); }
                             if node.paged { this.model.nav.set_kind_slice(&group_id, &body.objects, body.total, offset, body.error); }
                             else { this.model.nav.set_kind_page(&group_id, &body.objects, body.total, body.error); }
                         }

@@ -1,0 +1,11 @@
+running 1 test
+connect: 4.080545875s
+outline (40 databases, warm authenticated pool): 2.003980584s
+page offset 0: 4.0110905s
+page offset 100: 2.002025083s
+page offset 5900: 2.001987292s
+page offset 6000: 2.000740291s
+completion (6000 objects): 2.018376041s
+test connections::tests::mysql_large_catalog_fast_path_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1215 filtered out; finished in 18.14s

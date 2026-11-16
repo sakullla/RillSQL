@@ -1609,3 +1609,53 @@ async fn usage_table_migrates_onto_an_existing_config_database() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
+/// Run fixture with --databases 40 --objects 6000; all queries have injected latency.
+#[tokio::test]
+#[ignore = "requires large MySQL latency fixture on port 33067"]
+async fn mysql_large_catalog_fast_path_fixture() {
+    use crate::catalog::read::{read_catalog_outline, read_navigation_kind_page, read_mysql_completion_objects};
+    use crate::catalog::ObjectKind;
+    use crate::connections::CatalogSession;
+    use std::time::Instant;
+    use crate::connections::{drivers, model::{ConnectionDraft, TlsMode}, route::resolve_route};
+    let mut draft = ConnectionDraft::blank(Engine::Mysql);
+    draft.name = "fixture".into();
+    draft.host = "127.0.0.1".into();
+    draft.port = "33067".into();
+    draft.username = "fixture".into();
+    draft.database = "shop".into();
+    draft.tls_mode = TlsMode::Off;
+    let saved = crate::connections::model::normalize(&draft, "fixture".into()).unwrap();
+    let route = resolve_route(&saved, None).unwrap();
+    let started = Instant::now();
+    let opened = drivers::open_mysql(&saved, &route, "fixture").await.unwrap();
+    eprintln!("connect: {:?}", started.elapsed());
+    assert_eq!(opened.connection_id, 0, "取消不能误杀目录连接");
+    let session = CatalogSession::Mysql(opened.meta_pool.clone());
+    let started = Instant::now();
+    let outline = read_catalog_outline(Engine::Mysql, &session).await;
+    assert!(outline.error.is_none(), "{:?}", outline.error);
+    assert_eq!(outline.databases.len(), 40);
+    assert!(outline.databases.iter().flat_map(|db| &db.schemas).all(|schema| schema.objects.is_empty()));
+    eprintln!("outline (40 databases, warm authenticated pool): {:?}", started.elapsed());
+    for (offset, length, known) in [(0, 100, false), (100, 100, false), (5900, 100, true), (6000, 0, true)] {
+        let started = Instant::now();
+        let (body, total_known) = read_navigation_kind_page(&session, Engine::Mysql, "shop", "", ObjectKind::Table, offset, 100).await;
+        assert!(body.error.is_none(), "{:?}", body.error);
+        assert_eq!(body.objects.len(), length);
+        assert_eq!(total_known, known);
+        assert_eq!(body.total, offset + length + usize::from(!known));
+        if length > 0 { assert_eq!(body.objects[0].name, format!("table_{offset:06}")); }
+        eprintln!("page offset {offset}: {:?}", started.elapsed());
+    }
+    let started = Instant::now();
+    let names = read_mysql_completion_objects(&opened.meta_pool, "shop").await.unwrap();
+    assert_eq!(names.len(), 6000);
+    assert_eq!(names.last().unwrap().name, "table_005999");
+    eprintln!("completion (6000 objects): {:?}", started.elapsed());
+    drop(session);
+    opened.meta_pool.disconnect().await.unwrap();
+    opened.pool.disconnect().await.unwrap();
+}
+

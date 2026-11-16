@@ -966,7 +966,11 @@ pub fn columns_of(documents: &[MongoDoc]) -> Vec<String> {
 /// 嵌套对象和数组用 `{N}` / `[N]` 徽标，标量没有徽标。
 pub fn cell_badge(json: &str, column: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
-    match value.get(column)? {
+    cell_badge_value(value.get(column))
+}
+
+fn cell_badge_value(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
         serde_json::Value::Object(map) => Some(format!("{{{}}}", map.len())),
         serde_json::Value::Array(items) => Some(format!("[{}]", items.len())),
         _ => None,
@@ -981,8 +985,11 @@ pub fn cell_fragment(json: &str, column: &str) -> Option<String> {
 
 pub fn cell_text(json: &str, column: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return String::new() };
-    let Some(object) = value.as_object() else { return String::new() };
-    let Some(value) = object.get(column) else { return String::new() };
+    cell_text_value(value.get(column))
+}
+
+fn cell_text_value(value: Option<&serde_json::Value>) -> String {
+    let Some(value) = value else { return String::new() };
     if value.is_null() {
         return "null".to_owned();
     }
@@ -1582,14 +1589,16 @@ impl MongoPane {
                 .border_b_1()
                 .border_color(p.line_soft)
                 .hover(|style| style.bg(p.hover));
+            let parsed = serde_json::from_str::<serde_json::Value>(&doc.json).ok();
             for (column_index, name) in shown.iter().enumerate() {
+                let value = parsed.as_ref().and_then(|value| value.get(name));
                 let focused = docs_focused && self.focused_cell == Some((index, column_index));
                 row = row.child(doc_cell(
                     index,
                     column_index,
                     name,
-                    cell_text(&doc.json, name),
-                    cell_badge(&doc.json, name),
+                    cell_text_value(value),
+                    cell_badge_value(value),
                     mono,
                     focus_handle.clone(),
                     focused,

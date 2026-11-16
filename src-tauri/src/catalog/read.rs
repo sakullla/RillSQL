@@ -321,6 +321,62 @@ pub async fn read_object_kind_page(
     }
 }
 
+/// 导航只需要一个窗口和是否还有下一页。MySQL 不统计总数、不读取 table_rows，
+/// 后者在旧版本/部分代理上可能触发表统计信息读取。其它引擎保留原计数语义。
+pub async fn read_navigation_kind_page(
+    session: &CatalogSession, engine: Engine, database: &str, schema: &str,
+    kind: ObjectKind, offset: usize, limit: usize,
+) -> (ObjectPageBody, bool) {
+    let CatalogSession::Mysql(pool) = session else {
+        return (read_object_kind_page(session, engine, database, schema, kind, offset, limit).await, true);
+    };
+    let limit = read_limit(limit, 0);
+    let result = async {
+        let mut conn = pool.get_conn().await.map_err(read_failure)?;
+        let sql = mysql_navigation_page_sql(engine, database, kind, offset, limit);
+        let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(read_failure)?;
+        rows.iter().map(mysql_object).collect::<Result<Vec<_>, _>>()
+    }.await;
+    match result {
+        Ok(mut objects) => {
+            let has_more = objects.len() > limit;
+            objects.truncate(limit);
+            let total = offset.saturating_add(objects.len()).saturating_add(usize::from(has_more));
+            (ObjectPageBody { objects, total, error: None, kind_reports: Vec::new() }, !has_more)
+        }
+        Err(error) => (empty_page(error), false),
+    }
+}
+
+// 十六进制字符串不受 NO_BACKSLASH_ESCAPES / ANSI_QUOTES 影响，也不把库名当 SQL。
+fn mysql_catalog_literal(value: &str) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() { write!(&mut hex, "{byte:02x}").expect("write string"); }
+    format!("CONVERT(X'{hex}' USING utf8mb4)")
+}
+
+fn mysql_navigation_page_sql(engine: Engine, database: &str, kind: ObjectKind, offset: usize, limit: usize) -> String {
+    // 只替换模板中的两个参数；替换值只含十六进制字符。
+    let list = kind_sql(engine, kind).list.replace("table_rows", "NULL");
+    let list = list.replacen('?', &mysql_catalog_literal(database), 1)
+        .replacen('?', &limit.saturating_add(1).to_string(), 1);
+    format!("{list} OFFSET {offset}")
+}
+
+/// 补全用的轻量名字清单。一次读取所选库，不逐类 COUNT、不读统计或定义，
+/// 也不把 5,000 个对象的截断页错误地记作完整清单。
+pub async fn read_mysql_completion_objects(pool: &mysql_async::Pool, database: &str) -> Result<Vec<ObjectRow>, String> {
+    let mut conn = pool.get_conn().await.map_err(read_failure)?;
+    let db = mysql_catalog_literal(database);
+    let sql = format!("SELECT table_name, CASE table_type WHEN 'VIEW' THEN 'view' WHEN 'SEQUENCE' THEN 'sequence' ELSE 'table' END AS kind, NULL, '', '' FROM information_schema.tables WHERE table_schema = {db} AND table_type IN ('BASE TABLE', 'VIEW', 'SEQUENCE') \
+        UNION ALL SELECT routine_name, LOWER(routine_type), NULL, '', '' FROM information_schema.routines WHERE routine_schema = {db} \
+        UNION ALL SELECT trigger_name, 'trigger', NULL, '', event_object_table FROM information_schema.triggers WHERE trigger_schema = {db} \
+        UNION ALL SELECT event_name, 'event', NULL, '', '' FROM information_schema.events WHERE event_schema = {db}");
+    let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(read_failure)?;
+    rows.iter().map(mysql_object).collect()
+}
+
 pub async fn read_object_page(session: &CatalogSession, engine: Engine, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
     let limit = read_limit(limit, 0);
     match session {
@@ -1487,6 +1543,22 @@ async fn read_sqlserver_definition(client: &TdsHandle, schema: &str, name: &str,
 #[cfg(test)]
 mod latency_fixture_tests {
     use super::*;
+
+    #[test]
+    fn mysql_navigation_uses_one_bounded_query_without_statistics() {
+        for engine in [Engine::Mysql, Engine::Mariadb] {
+            for kind in listed_kinds(engine) {
+                let database = "库'\\?; DROP DATABASE x; --";
+                let sql = mysql_navigation_page_sql(engine, database, *kind, 900, 100);
+                assert!(sql.ends_with("LIMIT 101 OFFSET 900"), "{sql}");
+                assert!(!sql.to_lowercase().contains("count("));
+                assert!(!sql.to_lowercase().contains("table_rows"));
+                assert!(!sql.contains(database));
+                assert!(!sql.contains('?'));
+                assert!(sql.contains(&mysql_catalog_literal(database)));
+            }
+        }
+    }
 
     /// Uses scripts/verify-catalog-mysql.py, which rejects growing-prefix/eager reads.
     #[tokio::test]

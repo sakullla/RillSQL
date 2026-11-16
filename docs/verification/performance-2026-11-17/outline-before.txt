@@ -1,0 +1,24 @@
+running 1 test
+outline baseline=true renders=100 result_bytes=10240000 pinned_bytes=10240000 elapsed_us=263709
+test query::desk::tests::benchmark_outline_refresh_without_result_copies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1215 filtered out; finished in 0.35s
+
+        0.47 real         0.28 user         0.08 sys
+            66682880  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                4242  page reclaims
+                 464  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                1788  involuntary context switches
+          5137512515  instructions retired
+          1342491092  cycles elapsed
+            50676408  peak memory footprint

@@ -177,6 +177,8 @@ pub struct NavNode {
     pub expandable: bool,
     /// 已知对象总量；0 表示未知。
     pub total: usize,
+    /// 总数未知时只显示已加载数量，不能将续页探针当成真实总数。
+    pub total_unknown: bool,
     /// 已经读进来的对象数量。
     pub loaded: usize,
     pub has_more: bool,
@@ -215,6 +217,7 @@ impl NavNode {
             object_kind: None,
             expandable: false,
             total: 0,
+            total_unknown: false,
             loaded: 0,
             has_more: false,
             cursor: None,
@@ -294,6 +297,8 @@ pub struct NavRow {
     pub error: Option<String>,
     pub has_more: bool,
     pub total: usize,
+    /// 总数未知时只显示已加载数量，不能将续页探针当成真实总数。
+    pub total_unknown: bool,
     pub loaded: usize,
     /// 高亮区间（字节偏移），只在搜索命中时给出。
     pub highlight: Option<(usize, usize)>,
@@ -627,6 +632,7 @@ impl NavTree {
                         if let Some(old) = previous.get(&group_id) {
                             group.loaded = old.loaded;
                             group.total = old.total;
+                            group.total_unknown = old.total_unknown;
                             group.has_more = old.has_more;
                         }
                     }
@@ -1102,6 +1108,10 @@ impl NavTree {
         }
     }
 
+    pub fn set_kind_total_known(&mut self, group_id: &str, known: bool) {
+        if let Some(node) = self.nodes.get_mut(group_id) { node.total_unknown = !known; }
+    }
+
     pub fn needs_group(&self, id: &str) -> bool {
         self.nodes.get(id).is_some_and(|node| node.kind == NavKind::Group && node.unloaded && !node.loading && node.error.is_none())
     }
@@ -1442,6 +1452,7 @@ impl NavTree {
             error: node.error.clone(),
             has_more: node.has_more,
             total: node.total,
+            total_unknown: node.total_unknown,
             loaded: node.loaded,
             detail: if matches!(node.kind, NavKind::Column | NavKind::Index) { node.cursor.clone().unwrap_or_default() } else { String::new() },
             primary: node.primary,
@@ -1815,6 +1826,29 @@ mod tests {
         tree.apply_changed(&[first, second], &changed);
         assert!(!tree.node(&group).unwrap().unloaded);
         assert_eq!(tree.node(&group).unwrap().loaded, 1);
+    }
+
+    #[test]
+    fn unknown_totals_keep_paging_and_survive_failed_reads() {
+        let mut connection = NavConnection::new("huge", "Huge", Engine::Mysql, ConnStatus::Connected);
+        connection.outline_only = true;
+        connection.databases = vec![DatabaseNode { name: "shop".into(), error: None, schemas: vec![SchemaNode::empty("")] }];
+        let mut tree = NavTree::new();
+        tree.apply(&[connection.clone()]);
+        let group = group_node_id("huge", "shop", "", ObjectKind::Table);
+        tree.set_kind_total_known(&group, false);
+        tree.set_kind_slice(&group, &[ObjectRow::table("a", None)], 2, 0, None);
+        assert!(tree.node(&group).unwrap().has_more);
+        tree.set_kind_slice(&group, &[], 0, 1, Some("timeout".into()));
+        assert!(tree.node(&group).unwrap().total_unknown);
+        assert_eq!(tree.node(&group).unwrap().loaded, 1);
+        tree.apply(&[connection]);
+        assert!(tree.node(&group).unwrap().total_unknown);
+        tree.set_kind_total_known(&group, true);
+        tree.set_kind_slice(&group, &[ObjectRow::table("b", None)], 2, 1, None);
+        assert!(!tree.node(&group).unwrap().has_more);
+        assert!(!tree.node(&group).unwrap().total_unknown);
+        assert_eq!(tree.node(&group).unwrap().total, 2);
     }
 
     #[test]

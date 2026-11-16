@@ -589,8 +589,8 @@ impl RedisPane {
     fn finish_scan(&mut self, result: Result<ScanPage, String>, cx: &mut Context<Self>) {
         match result {
             Ok(page) => {
-                let base = if self.scan_reset { Vec::new() } else { self.keys.clone() };
-                self.keys = merge_keys(&base, &page.keys);
+                if self.scan_reset { self.keys.clear(); }
+                self.keys = merge_keys(std::mem::take(&mut self.keys), page.keys);
                 self.cursor = page.cursor;
                 self.done = page.done;
                 self.error.clear();
@@ -1383,16 +1383,18 @@ fn parse_spec(spec: &str) -> Option<(String, String, String)> {
     Some((id, name, if database.is_empty() { "0".into() } else { database }))
 }
 
-fn merge_keys(loaded: &[RedisKeyInfo], page: &[RedisKeyInfo]) -> Vec<RedisKeyInfo> {
-    let mut out = loaded.to_vec();
+fn merge_keys(mut loaded: Vec<RedisKeyInfo>, page: Vec<RedisKeyInfo>) -> Vec<RedisKeyInfo> {
+    let mut positions: std::collections::HashMap<String, usize> = loaded.iter().enumerate()
+        .map(|(index, key)| (key.name.clone(), index)).collect();
     for item in page {
-        if let Some(existing) = out.iter_mut().find(|key| key.name == item.name) {
-            *existing = item.clone();
+        if let Some(index) = positions.get(&item.name).copied() {
+            loaded[index] = item;
         } else {
-            out.push(item.clone());
+            positions.insert(item.name.clone(), loaded.len());
+            loaded.push(item);
         }
     }
-    out
+    loaded
 }
 
 fn mutation_key(mutation: &RedisMutation) -> String {
@@ -2455,8 +2457,8 @@ mod tests {
         assert!(parse_ttl("-1").is_err());
         assert!(parse_ttl("1.5").is_err());
         let merged = merge_keys(
-            &[RedisKeyInfo { name: "a".into(), key_type: "string".into(), ttl_ms: Some(-1) }],
-            &[RedisKeyInfo { name: "a".into(), key_type: "hash".into(), ttl_ms: Some(10) }, RedisKeyInfo { name: "b".into(), key_type: "list".into(), ttl_ms: None }],
+            vec![RedisKeyInfo { name: "a".into(), key_type: "string".into(), ttl_ms: Some(-1) }],
+            vec![RedisKeyInfo { name: "a".into(), key_type: "hash".into(), ttl_ms: Some(10) }, RedisKeyInfo { name: "b".into(), key_type: "list".into(), ttl_ms: None }],
         );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].key_type, "hash");
@@ -2465,6 +2467,21 @@ mod tests {
         let prompt = danger_prompt(Locale::ZhCn, "flushall");
         assert!(prompt.contains("FLUSHALL"), "{prompt}");
         assert_ne!(i18n::text(Locale::En, "redis.tab.keysRefused"), "redis.tab.keysRefused");
+    }
+
+    #[test]
+    fn large_key_pages_move_existing_storage_and_replace_duplicates_in_order() {
+        let keys: Vec<_> = (0..10_000).map(|index| RedisKeyInfo { name: format!("key-{index}"), key_type: "string".into(), ttl_ms: None }).collect();
+        let first_name = keys[0].name.as_ptr();
+        let merged = merge_keys(keys, vec![
+            RedisKeyInfo { name: "key-9999".into(), key_type: "hash".into(), ttl_ms: Some(10) },
+            RedisKeyInfo { name: "new".into(), key_type: "list".into(), ttl_ms: None },
+            RedisKeyInfo { name: "new".into(), key_type: "set".into(), ttl_ms: Some(20) },
+        ]);
+        assert_eq!(merged.len(), 10_001);
+        assert_eq!(merged[0].name.as_ptr(), first_name, "旧键字符串没有复制");
+        assert_eq!(merged[9999].key_type, "hash");
+        assert_eq!(merged[10_000].key_type, "set");
     }
 
     #[gpui_kit::test]

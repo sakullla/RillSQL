@@ -1322,7 +1322,6 @@ impl Render for DiagramPane {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let search = self.search_field(window, cx);
-        let summary = SharedString::from(self.lines().join("\n"));
         let diagram = self.diagram.clone();
         let hovered = self.hovered.clone();
         let highlight = self.highlight.clone();
@@ -1975,7 +1974,7 @@ impl Render for DiagramPane {
             .child(header)
             .child(body)
             .child(footer)
-            .child(div().id("diagram-summary").hidden().child(summary))
+            .when(cfg!(test), |this| this.child(div().id("diagram-summary").hidden().child(SharedString::from(self.lines().join("\n")))))
         })
     }
 }

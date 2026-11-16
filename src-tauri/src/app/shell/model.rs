@@ -2086,7 +2086,8 @@ impl WorkbenchModel {
 
     pub fn palette_entries(&self) -> Vec<PaletteEntry> {
         let mut entries = Vec::new();
-        for command in COMMANDS {
+        let scope = self.effective_palette_scope();
+        for command in COMMANDS.iter().filter(|_| matches!(scope, PaletteScope::All | PaletteScope::Commands)) {
             entries.push(PaletteEntry {
                 id: command.id.to_owned(),
                 group: "command",
@@ -2096,7 +2097,7 @@ impl WorkbenchModel {
                 shortcut: super::menus::command_chord(command.id),
             });
         }
-        for row in &self.connections.rows {
+        for row in self.connections.rows.iter().filter(|_| matches!(scope, PaletteScope::All | PaletteScope::Connections)) {
             entries.push(PaletteEntry {
                 id: format!("palette-connection:{}", row.saved.id),
                 group: "connection",
@@ -2106,10 +2107,10 @@ impl WorkbenchModel {
                 shortcut: None,
             });
         }
-        entries.extend(self.database_entries());
-        entries.extend(self.catalog_entries());
-        entries.extend(self.saved_entries());
-        filter_palette(&entries, &self.palette_query, self.effective_palette_scope())
+        if matches!(scope, PaletteScope::All | PaletteScope::Connections) { entries.extend(self.database_entries()); }
+        if matches!(scope, PaletteScope::All | PaletteScope::Objects) { entries.extend(self.catalog_entries()); }
+        if matches!(scope, PaletteScope::All | PaletteScope::Saved) { entries.extend(self.saved_entries()); }
+        filter_palette(entries, &self.palette_query, scope)
     }
 
     /// 快速打开里的已加载库：只有读到过的库才出现，不凭空列出未读取的目录。
@@ -5433,60 +5434,24 @@ pub fn next_epoch() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn filter_palette(entries: &[PaletteEntry], query: &str, scope: PaletteScope) -> Vec<PaletteEntry> {
+fn filter_palette(entries: Vec<PaletteEntry>, query: &str, scope: PaletteScope) -> Vec<PaletteEntry> {
     let trimmed = query.trim().to_lowercase();
-    let query_body = trimmed.strip_prefix('>').map(str::trim).unwrap_or(trimmed.as_str());
-    let scoped: Vec<PaletteEntry> = match scope {
-        PaletteScope::All => entries.to_vec(),
-        // 快速打开只收窄到能“打开数据”的对象；连接、库和保存的查询留给命令搜索。
-        PaletteScope::Objects => entries
-            .iter()
-            .filter(|entry| matches!(entry.group, "table" | "view"))
-            .cloned()
-            .collect(),
-        PaletteScope::Commands => entries.iter().filter(|entry| entry.group == "command").cloned().collect(),
-        PaletteScope::Connections => entries
-            .iter()
-            .filter(|entry| matches!(entry.group, "connection" | "database"))
-            .cloned()
-            .collect(),
-        PaletteScope::Saved => entries.iter().filter(|entry| entry.group == "saved").cloned().collect(),
-    };
-    if query_body.is_empty() {
-        let mut ordered = scoped;
-        if scope == PaletteScope::All {
-            ordered.sort_by_key(|entry| palette_group_rank(entry.group));
-        }
-        return ordered;
-    }
-    rank(&scoped, query_body)
-}
-
-fn rank(entries: &[PaletteEntry], query: &str) -> Vec<PaletteEntry> {
-    let scored: Vec<(u8, usize, PaletteEntry)> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let score = palette_score(entry, query);
-            (score > 0).then_some((score, index, entry.clone()))
-        })
-        .collect();
-    let mut groups: Vec<&str> = Vec::new();
-    for entry in entries {
-        if !groups.contains(&entry.group) {
-            groups.push(entry.group);
-        }
-    }
-    groups.sort_by_key(|group| palette_group_rank(group));
-    let mut ordered = Vec::new();
-    for group in groups {
-        let mut group_items: Vec<_> = scored.iter().filter(|(_, _, entry)| entry.group == group).collect();
-        group_items.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        for item in group_items {
-            ordered.push(item.2.clone());
-        }
-    }
-    ordered
+    let query = trimmed.strip_prefix('>').map(str::trim).unwrap_or(trimmed.as_str());
+    // 所有权一路移动到结果；不在筛选、评分、分组时复制整份目录三次。
+    let mut scored: Vec<_> = entries.into_iter().enumerate().filter_map(|(index, entry)| {
+        let included = match scope {
+            PaletteScope::All => true,
+            PaletteScope::Objects => matches!(entry.group, "table" | "view"),
+            PaletteScope::Commands => entry.group == "command",
+            PaletteScope::Connections => matches!(entry.group, "connection" | "database"),
+            PaletteScope::Saved => entry.group == "saved",
+        };
+        if !included { return None; }
+        let score = if query.is_empty() { 1 } else { palette_score(&entry, query) };
+        (score > 0).then_some((palette_group_rank(entry.group), std::cmp::Reverse(score), index, entry))
+    }).collect();
+    scored.sort_unstable_by_key(|(group, score, index, _)| (*group, *score, *index));
+    scored.into_iter().map(|(_, _, _, entry)| entry).collect()
 }
 
 /// 名字命中优先，其次是上下文（库.模式 · 连接）命中；两类都不命中就不出现。

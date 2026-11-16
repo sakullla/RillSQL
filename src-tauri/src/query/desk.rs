@@ -204,6 +204,7 @@ struct TabState {
     lint: Vec<LintFinding>,
     completions: Vec<CompletionEntry>,
     outline: Vec<OutlineItem>,
+    outline_stamp: Option<(u64, u64, String)>,
     pending: Option<PendingSend>,
     provider: bool,
     note: String,
@@ -259,6 +260,9 @@ pub struct Desk {
     objects: Vec<TreeObject>,
     /// 补全专用的完整对象清单（按连接+库整库读取，不受资源管理器分页影响）。
     known_objects: HashMap<(String, String), Vec<TreeObject>>,
+    known_order: std::collections::VecDeque<(String, String)>,
+    completion_revision: u64,
+    catalog_revision: u64,
     /// 按连接/库/模式/表记住的列及其元数据；同一个表名在不同模式里不互相覆盖。
     columns: HashMap<String, Vec<ColumnMeta>>,
     /// 按连接/库/模式/表记住的对象注释；读不到注释的对象不在表里。
@@ -288,6 +292,9 @@ impl Desk {
             seq: 0,
             objects: Vec::new(),
             known_objects: HashMap::new(),
+            known_order: std::collections::VecDeque::new(),
+            completion_revision: 0,
+            catalog_revision: 0,
             columns: HashMap::new(),
             comments: HashMap::new(),
             foreign_keys: Vec::new(),
@@ -417,6 +424,7 @@ impl Desk {
             lint: Vec::new(),
             completions: Vec::new(),
             outline: Vec::new(),
+            outline_stamp: None,
             pending: None,
             provider: true,
             note: String::new(),
@@ -574,6 +582,7 @@ impl Desk {
     }
 
     pub fn set_links(&mut self, links: Vec<OpenLink>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         for link in &links {
             if !link.environment.is_empty() {
                 self.environments.insert(link.id.clone(), link.environment.clone());
@@ -1078,7 +1087,7 @@ impl Desk {
     }
 
     pub fn format_active(&mut self) -> TextResult {
-        let Some(tab) = self.active_tab().cloned() else {
+        let Some(tab) = self.active_tab() else {
             return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget") };
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
@@ -1094,7 +1103,7 @@ impl Desk {
     }
 
     pub fn expand_active(&mut self) -> TextResult {
-        let Some(tab) = self.active_tab().cloned() else {
+        let Some(tab) = self.active_tab() else {
             return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget") };
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
@@ -1107,7 +1116,7 @@ impl Desk {
     }
 
     pub fn explain_active(&mut self) -> Result<String, String> {
-        let Some(tab) = self.active_tab().cloned() else {
+        let Some(tab) = self.active_tab() else {
             return Err(assist_text("query.errors.needTarget"));
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
@@ -1120,21 +1129,18 @@ impl Desk {
     }
 
     pub fn refresh_outline(&mut self) {
-        let Some(tab) = self.active_tab().cloned() else {
-            return;
-        };
+        let view_gen = self.view_gen;
+        let Some(tab) = self.active_mut() else { return };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("postgres");
         let engine = if assist::known_engine(engine) { engine } else { "postgres" };
+        let stamp = (tab.version, view_gen, engine.to_owned());
+        if tab.outline_stamp.as_ref() == Some(&stamp) { return; }
         let list = assist::outline_statements(&tab.draft, engine);
-        let previous: Vec<(String, String, usize, Option<u64>)> = tab
-            .results
-            .iter()
+        let previous: Vec<_> = tab.results.iter()
             .map(|item| (item.sql.clone(), item.status.clone(), if item.columns.is_empty() { 0 } else { item.rows.len() }, item.affected))
             .collect();
-        let merged = assist::merge_outline(list, &previous);
-        if let Some(tab) = self.active_mut() {
-            tab.outline = merged;
-        }
+        tab.outline = assist::merge_outline(list, &previous);
+        tab.outline_stamp = Some(stamp);
     }
 
     pub fn issue(&mut self, tasks: &TaskBoard) -> Option<Ticket> {
@@ -1256,7 +1262,7 @@ impl Desk {
         override_sql: Option<String>,
         limit: u64,
     ) -> BeginRun {
-        let Some(tab) = self.active_tab().cloned() else {
+        let Some(tab) = self.active_tab() else {
             return BeginRun::Rejected(assist_text("query.errors.needTarget"));
         };
         if tab.running {
@@ -1286,8 +1292,10 @@ impl Desk {
                 return BeginRun::Variables(variables);
             }
         }
-        let token = tasks.begin(&owner(&tab.id));
-        let origin = run_origin(&tab, &pick, override_sql.is_some(), &target.engine);
+        let tab_id = tab.id.clone();
+        let version = tab.version;
+        let token = tasks.begin(&owner(&tab_id));
+        let origin = run_origin(tab, &pick, override_sql.is_some(), &target.engine);
         if let Some(tab) = self.active_mut() {
             tab.running = true;
             tab.cancelled = false;
@@ -1308,9 +1316,9 @@ impl Desk {
         self.executions += 1;
         self.record_frequency(&pick.sql);
         BeginRun::Ready(PreparedRun {
-            tab_id: tab.id,
+            tab_id,
             token,
-            version: tab.version,
+            version,
             sql: pick.sql,
             connection_id: target.connection_id,
             connection_name: target.connection_name,
@@ -1347,6 +1355,7 @@ impl Desk {
         table: &str,
         columns: Vec<ColumnMeta>,
     ) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.columns.insert(column_key(connection_id, database, schema, table), columns);
     }
 
@@ -1356,28 +1365,40 @@ impl Desk {
     }
 
     pub fn remember_table_comment(&mut self, connection: &str, database: &str, schema: &str, table: &str, comment: Option<String>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         let key = column_key(connection, database, schema, table);
         if let Some(comment) = comment { self.comments.insert(key, comment); } else { self.comments.remove(&key); }
     }
 
     /// 对象注释随目录一起替换；键与列相同（连接/库/模式/表）。
     pub fn set_object_comments(&mut self, comments: HashMap<String, String>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.comments = comments;
     }
 
     pub fn remember_table_keys(&mut self, connection: &str, database: &str, schema: &str, table: &str, keys: Vec<super::meta::TableKey>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.foreign_keys.retain(|key| !(key.connection_id == connection && key.database == database && key.from_schema == schema && key.from_table == table));
         collect_keys(&mut self.foreign_keys, connection, database, schema, table, keys);
     }
 
     /// 真实外键随目录一起替换；空集表示还没读到或引擎没有外键。
     pub fn set_foreign_keys(&mut self, keys: Vec<assist::ForeignKey>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.foreign_keys = keys;
     }
 
     /// 记下某个库的完整对象清单。资源管理器只按页读对象，补全不能只认得已经展开的那一页。
     pub fn remember_objects(&mut self, connection_id: &str, database: &str, objects: Vec<TreeObject>) {
-        self.known_objects.insert((connection_id.to_owned(), database.to_owned()), objects);
+        self.completion_revision = self.completion_revision.wrapping_add(1);
+        let key = (connection_id.to_owned(), database.to_owned());
+        self.known_order.retain(|old| old != &key);
+        self.known_order.push_back(key.clone());
+        self.known_objects.insert(key, objects);
+        // 多库切换不会无限保留每个库的完整补全清单；被淘汰的库下次按需重读。
+        while self.known_order.len() > 8 {
+            if let Some(old) = self.known_order.pop_front() { self.known_objects.remove(&old); }
+        }
     }
 
     pub fn knows_objects(&self, connection_id: &str, database: &str) -> bool {
@@ -1386,6 +1407,12 @@ impl Desk {
 
     /// 连接断开或刷新目录后，整库清单需要重读。
     pub fn forget_objects(&mut self, connection_id: Option<&str>) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
+        self.known_order.retain(|(connection, _)| connection_id.is_some_and(|id| connection != id));
+        let prefix = connection_id.map(|id| format!("{id}\u{1}"));
+        self.columns.retain(|key, _| prefix.as_ref().is_some_and(|prefix| !key.starts_with(prefix)));
+        self.comments.retain(|key, _| prefix.as_ref().is_some_and(|prefix| !key.starts_with(prefix)));
+        self.foreign_keys.retain(|key| connection_id.is_some_and(|id| key.connection_id != id));
         match connection_id {
             Some(id) => self.known_objects.retain(|(connection, _), _| connection != id),
             None => self.known_objects.clear(),
@@ -1393,11 +1420,15 @@ impl Desk {
     }
 
     pub fn set_objects(&mut self, objects: Vec<TreeObject>, databases: Vec<String>) {
+        self.catalog_revision = self.catalog_revision.wrapping_add(1);
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.databases = databases;
         self.objects = objects;
     }
 
     pub fn set_tree_error(&mut self, error: &str) {
+        self.catalog_revision = self.catalog_revision.wrapping_add(1);
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         self.tree_error = error.to_owned();
     }
 
@@ -1433,9 +1464,12 @@ impl Desk {
         let Some(target) = target else {
             return Vec::new();
         };
-        self.objects
-            .iter()
+        let known = self.known_objects.get(&(target.connection_id.clone(), target.database.clone()));
+        let mut seen = std::collections::HashSet::new();
+        self.objects.iter().chain(known.into_iter().flatten())
             .filter(|object| object.connection_id == target.connection_id && object.database == target.database)
+            .filter(|object| seen.insert((object.schema.as_str(), object.name.as_str())))
+            .filter(|object| self.columns.contains_key(&column_key(&object.connection_id, &object.database, &object.schema, &object.name)))
             .map(|object| CompletionSource {
                 alias: String::new(),
                 label: if object.schema.is_empty() {
@@ -1462,6 +1496,13 @@ impl Desk {
         complete::resolve(&scope, text, offset)
     }
 
+    /// 草稿和光标不属于元数据：键入、滚动和结果刷新不重建整库快照。
+    pub fn completion_stamp(&self) -> (u64, Option<Target>, bool) {
+        (self.completion_revision, self.target(), self.active_tab().is_some_and(|tab| tab.provider))
+    }
+
+    pub fn catalog_revision(&self) -> u64 { self.catalog_revision }
+
     /// 当前标签的补全上下文。编辑器打字时据此给出与 Ctrl+Space 相同的候选。
     pub fn completion_scope(&self) -> Option<assist::CompletionScope> {
         let tab = self.active_tab()?;
@@ -1470,7 +1511,7 @@ impl Desk {
             .target
             .as_ref()
             .and_then(|target| self.known_objects.get(&(target.connection_id.clone(), target.database.clone())));
-        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         let objects: Vec<CatalogObject> = self
             .objects
             .iter()
@@ -1480,7 +1521,7 @@ impl Desk {
                     .is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database)
             })
             .chain(known.into_iter().flatten())
-            .filter(|object| seen.insert((object.schema.clone(), object.name.clone())))
+            .filter(|object| seen.insert((object.schema.as_str(), object.name.as_str())))
             .map(|object| CatalogObject {
                 name: object.name.clone(),
                 schema: object.schema.clone(),
@@ -1558,6 +1599,7 @@ impl Desk {
 
     /// 记录一次实际执行的语句里的标识符词频；只用于同分排序。
     pub fn record_frequency(&mut self, sql: &str) {
+        self.completion_revision = self.completion_revision.wrapping_add(1);
         for name in complete::identifiers(sql) {
             let slot = self.frequency.entry(name).or_insert(0);
             *slot = slot.saturating_add(1);
@@ -1617,6 +1659,7 @@ impl Desk {
             lint: Vec::new(),
             completions: Vec::new(),
             outline: Vec::new(),
+            outline_stamp: None,
             pending: None,
             provider: keep_provider,
             note: String::new(),
@@ -3060,6 +3103,89 @@ mod tests {
         assert_eq!(weight("id"), Some(1));
         assert_eq!(weight("item"), Some(2));
         assert_eq!(weight("select"), None, "关键字不计入词频");
+    }
+
+    #[test]
+    fn known_table_columns_complete_without_expanding_the_explorer() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("my", "shop", "mysql", "shop");
+        desk.set_provider(true);
+        desk.remember_objects("my", "shop", vec![TreeObject {
+            connection_id: "my".into(), connection_name: "shop".into(), engine: "mysql".into(),
+            database: "shop".into(), schema: String::new(), name: "orders".into(), kind: "table".into(),
+        }]);
+        assert!(desk.completion_scope().unwrap().sources.is_empty(), "名字清单不复制空列列表");
+        desk.remember_columns("my", "shop", "orders", vec!["order_id".into()]);
+        let sql = "select o. from orders o";
+        let entries = desk.completion_for(sql, "select o.".len(), Locale::En);
+        assert!(entries.iter().any(|entry| entry.label.contains("order_id")), "{entries:?}");
+    }
+
+    #[test]
+    #[ignore = "manual outline render CPU/memory benchmark"]
+    fn benchmark_outline_refresh_without_result_copies() {
+        use std::{hint::black_box, time::Instant};
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.set_draft("select * from orders");
+        desk.set_active_sheet(vec!["body".into()], (0..10_000).map(|_| vec![Some("x".repeat(1024))]).collect());
+        desk.pin_current().unwrap();
+        desk.refresh_outline();
+        let baseline = std::env::var_os("RILLSQL_BENCH_BASELINE").is_some();
+        let started = Instant::now();
+        for _ in 0..100 {
+            if baseline {
+                // v0.2.38 refresh_outline 首先复制整个 TabState，包括结果和固定结果。
+                let tab = black_box(desk.active_tab().cloned().unwrap());
+                let list = assist::outline_statements(&tab.draft, "postgres");
+                let previous: Vec<_> = tab.results.iter().map(|item| (item.sql.clone(), item.status.clone(), item.rows.len(), item.affected)).collect();
+                black_box(assist::merge_outline(list, &previous));
+            } else {
+                desk.refresh_outline();
+                black_box(desk.active_tab().unwrap().outline.len());
+            }
+        }
+        eprintln!("outline baseline={baseline} renders=100 result_bytes=10240000 pinned_bytes=10240000 elapsed_us={}", started.elapsed().as_micros());
+        assert_eq!(desk.results()[0].rows.len(), 10_000);
+    }
+
+    #[test]
+    fn completion_stamp_tracks_metadata_but_not_cursor_or_draft() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("my", "shop", "mysql", "shop");
+        desk.set_provider(true);
+        let initial = desk.completion_stamp();
+        desk.set_draft("select * from orders");
+        assert_eq!(desk.completion_stamp(), initial, "输入不复制整库元数据");
+        desk.remember_columns("my", "shop", "orders", vec!["id".into()]);
+        assert_ne!(desk.completion_stamp(), initial);
+        let columns = desk.completion_stamp();
+        desk.remember_table_comment("my", "shop", "", "orders", Some("Orders".into()));
+        assert_ne!(desk.completion_stamp(), columns);
+        let comment = desk.completion_stamp();
+        desk.set_provider(false);
+        assert_ne!(desk.completion_stamp(), comment);
+    }
+
+    #[test]
+    fn completion_cache_is_bounded_and_disconnect_releases_only_its_metadata() {
+        let mut desk = Desk::new();
+        for index in 0..40 { desk.remember_objects("my", &format!("db{index}"), Vec::new()); }
+        assert_eq!(desk.known_objects.len(), 8);
+        assert!(!desk.knows_objects("my", "db0"));
+        assert!(desk.knows_objects("my", "db39"));
+        desk.remember_columns("my", "db39", "orders", vec!["id".into()]);
+        desk.remember_columns("other", "db39", "orders", vec!["id".into()]);
+        desk.remember_table_comment("my", "db39", "", "orders", Some("large comment".into()));
+        desk.forget_objects(Some("my"));
+        assert!(desk.known_objects.is_empty());
+        assert_eq!(desk.columns.len(), 1);
+        assert!(desk.columns.contains_key(&column_key("other", "db39", "", "orders")));
+        assert!(desk.comments.is_empty());
+        desk.forget_objects(None);
+        assert!(desk.columns.is_empty());
     }
 
     #[test]

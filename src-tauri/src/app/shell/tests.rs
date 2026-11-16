@@ -7772,6 +7772,7 @@ fn mysql_lazy_navigation_latency_fixture(cx: &mut gpui_kit::TestAppContext) {
     let (window, view) = open_workbench(cx, Arc::clone(&services), false);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, _| {
+            view.model.settings.object_page = 100;
             view.model.connections.rows = rows;
             view.model.connections.status.insert("fixture".into(), crate::app::views::connections::LinkStatus::Connected);
         });
@@ -10487,4 +10488,60 @@ fn tree_tooltips_do_not_repeat_the_node_name() {
     assert_eq!(nav_row_tooltip("pg / shop / public / orders.id", "id"), "pg / shop / public / orders.id");
     // 路径不以自己结尾（分组节点）时照常拼上名字。
     assert_eq!(nav_row_tooltip("pg / shop / public", "表"), "pg / shop / public / 表");
+}
+
+#[gpui_kit::test]
+fn large_palette_virtualizes_rows_and_end_reaches_the_last_object(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::SharedString;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-palette-large-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 640., 680.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+            view.model.connections.status.insert("pg".into(), crate::app::views::connections::LinkStatus::Connected);
+            let tables: Vec<_> = (0..6000)
+                .map(|ix| tree_object("pg", "Atlas", "postgres", "shop", "public", &format!("tbl_{ix:02}"), "table"))
+                .collect();
+            let nav_conn = crate::catalog::NavConnection {
+                id: "pg".into(),
+                name: "Atlas".into(),
+                engine: Engine::Postgres,
+                status: crate::catalog::model::ConnStatus::Connected,
+                default_database: Some("shop".into()),
+                databases: Vec::new(),
+                outline_only: false,
+                error: None,
+            };
+            view.query.update(cx, |pane, cx| pane.adopt_navigation(&[nav_conn], tables.clone(), cx));
+            let _ = view.model.set_catalog(&tables, "");
+            view.perform("command-palette", cx);
+        });
+    });
+    let total = cx.update(|cx| view.read(cx).model.palette_entries().len());
+    assert!(total > 50, "总条目应超过旧的 40 条上限：{total}");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(SharedString::from("pal-3000")).is_none(), "不为屏幕外的几千条候选创建元素");
+        window.press("end", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let last_id = SharedString::from(format!("pal-{}", total - 1));
+        let row = window.find(last_id);
+        assert_eq!(row.selected(), Some(true), "末项真实渲染且为选中态");
+        let list_b = window.find("palette-list").bounds();
+        let row_b = row.bounds();
+        assert!(
+            f32::from(row_b.origin.y + row_b.size.height) <= f32::from(list_b.origin.y + list_b.size.height) + 1.5,
+            "End 跳到末项后列表自动滚动到可视区（row_bottom={}, list_bottom={}）",
+            f32::from(row_b.origin.y + row_b.size.height),
+            f32::from(list_b.origin.y + list_b.size.height),
+        );
+    })
+    .unwrap();
+    let offset_y = cx.update(|cx| f32::from(view.read(cx).palette_virtual_scroll.0.borrow().base_handle.offset().y));
+    assert!(offset_y < -1.0, "palette-list 实际发生了纵向滚动：{offset_y}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

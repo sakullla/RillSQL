@@ -430,6 +430,46 @@ fn overlaps(left: Rect, right: Rect) -> bool {
     left.0 <= right.2 && right.0 <= left.2 && left.1 <= right.3 && right.1 <= left.3
 }
 
+/// 按矩形边界扫描并集减去洞的面积，内存取决于选区数量，不随选中格子数增长。
+fn selected_cell_count(regions: &[Rect], holes: &[Rect], rows: usize, columns: usize) -> usize {
+    let clip = |rect: &Rect| {
+        let end_row = rect.2.saturating_add(1).min(rows);
+        let end_column = rect.3.saturating_add(1).min(columns);
+        (rect.0 < end_row && rect.1 < end_column).then_some((rect.0, rect.1, end_row, end_column))
+    };
+    let regions: Vec<_> = regions.iter().filter_map(clip).collect();
+    if regions.is_empty() { return 0; }
+    let holes: Vec<_> = holes.iter().filter_map(clip).collect();
+    if regions.len() == 1 && holes.is_empty() {
+        let (r0, c0, r1, c1) = regions[0];
+        return (r1 - r0).saturating_mul(c1 - c0);
+    }
+    let mut boundaries: Vec<_> = regions.iter().chain(&holes).flat_map(|rect| [rect.0, rect.2]).collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut total = 0usize;
+    let mut events = Vec::with_capacity((regions.len() + holes.len()) * 2);
+    for band in boundaries.windows(2) {
+        events.clear();
+        for (rects, is_hole) in [(&regions, false), (&holes, true)] {
+            for rect in rects.iter().filter(|rect| rect.0 <= band[0] && rect.2 > band[0]) {
+                events.push((rect.1, if is_hole { 0 } else { 1i64 }, if is_hole { 1i64 } else { 0 }));
+                events.push((rect.3, if is_hole { 0 } else { -1 }, if is_hole { -1 } else { 0 }));
+            }
+        }
+        events.sort_unstable_by_key(|event| event.0);
+        let (mut included, mut excluded, mut previous, mut width) = (0i64, 0i64, 0usize, 0usize);
+        for &(column, plus, minus) in &events {
+            if included > 0 && excluded == 0 { width += column - previous; }
+            included += plus;
+            excluded += minus;
+            previous = column;
+        }
+        total = total.saturating_add(width.saturating_mul(band[1] - band[0]));
+    }
+    total
+}
+
 /// 正在用 Ctrl/Cmd 拖出来的区域：按下时就知道这一拖是加还是减，松开才落定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RegionDrag {
@@ -1819,7 +1859,8 @@ impl SharedGrid {
 
     /// 选中的格子数：非连续选择把各区域并起来再减掉洞，不是包围盒的面积。
     pub fn selection_count(&self) -> usize {
-        self.selection().len()
+        if !self.selected { return 0; }
+        selected_cell_count(&self.regions, &self.minus, self.rows.len(), self.columns.len())
     }
 
     /// 多格选区的即时统计（选中格数；存在 2 个及以上数值格时给出求和与均值）。
@@ -1829,15 +1870,14 @@ impl SharedGrid {
         if r0 == r1 && c0 == c1 && self.regions.len() <= 1 {
             return None;
         }
-        let cells = self.selection();
-        let count = cells.len();
+        let count = self.selection_count();
         if count < 2 {
             return None;
         }
         let mut numeric_count = 0usize;
         let mut sum = 0.0f64;
         if count <= 4_096 {
-            for (row, column) in cells {
+            for (row, column) in self.selection() {
                 if row < self.rows.len() && column < self.columns.len() {
                     let shown = self.show_cell(row, column, false);
                     if shown.kind == CellKind::Text {
@@ -7541,5 +7581,29 @@ mod filter_model_tests {
         assert!(grid.applied_expression().is_none());
         assert_eq!(grid.filter_sql(), "");
         assert_eq!(grid.loaded_len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod selection_performance_tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_counts_match_cell_enumeration_with_overlaps_holes_and_clipping() {
+        let mut seed = 7u64;
+        let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 32) as usize % 12 };
+        for _ in 0..200 {
+            let regions: Vec<_> = (0..4).map(|_| rect_of((next(), next()), (next(), next()))).collect();
+            let holes: Vec<_> = (0..3).map(|_| rect_of((next(), next()), (next(), next()))).collect();
+            let expected = (0..9).flat_map(|r| (0..7).map(move |c| (r, c)))
+                .filter(|&(r, c)| regions.iter().any(|rect| rect_has(*rect, r, c)) && !holes.iter().any(|rect| rect_has(*rect, r, c))).count();
+            assert_eq!(selected_cell_count(&regions, &holes, 9, 7), expected, "{regions:?} / {holes:?}");
+        }
+    }
+
+    #[test]
+    fn billion_cell_selection_counts_without_allocating_per_cell() {
+        assert_eq!(selected_cell_count(&[(0, 0, 999_999, 999)], &[], 1_000_000, 1000), 1_000_000_000);
+        assert_eq!(selected_cell_count(&[(0, 0, 999_999, 999)], &[(0, 0, 499_999, 499)], 1_000_000, 1000), 750_000_000);
     }
 }

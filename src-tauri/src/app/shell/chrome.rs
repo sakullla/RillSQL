@@ -1512,7 +1512,7 @@ impl Workbench {
                         .when(!empty_group, |this| this.bg(p.hover))
                         .text_size(px(TypeScale::XS))
                         .text_color(if empty_group { p.text_faint } else { p.text_muted })
-                        .child(SharedString::from(row.total.to_string())),
+                        .child(SharedString::from(if row.total_unknown { format!("{}+", row.loaded) } else { row.total.to_string() })),
                 )
             })
             .when(row.stale, |this| {
@@ -1547,7 +1547,7 @@ impl Workbench {
             // 续读只在展开的节点上出现，并写明还剩多少；折叠的库上挂一个孤零零的图标只会让人困惑。
             .when(row.has_more && (row.expanded || is_group), |this| {
                 let remaining = row.total.saturating_sub(row.loaded);
-                let label = if remaining > 0 {
+                let label = if remaining > 0 && !row.total_unknown {
                     i18n::fill(&self.model.text("ui.nav.moreCount"), &[("count", &remaining.to_string())])
                 } else {
                     self.model.text("catalog.tree.loadMore")
@@ -5063,18 +5063,44 @@ impl Workbench {
                 };
                 list = list.child(empty);
             }
+            // 大目录只构建可见行，Home/End 与鼠标滚动仍能访问全部结果。
+            let entries = if entries.len() > 200 {
+                let mut rows = Vec::with_capacity(entries.len() + 6);
+                let mut last = "";
+                let mut selected_row = 0;
+                for (index, entry) in entries.iter().enumerate() {
+                    if entry.group != last {
+                        rows.push((None, entry.group));
+                        last = entry.group;
+                    }
+                    if index == self.model.palette_index { selected_row = rows.len(); }
+                    rows.push((Some(index), entry.group));
+                }
+                let seen = (self.model.palette_index, self.model.palette_query.clone(), active_scope);
+                if self.palette_scroll_seen.as_ref() != Some(&seen) {
+                    self.palette_virtual_scroll.scroll_to_item(selected_row, gpui_kit::ScrollStrategy::Nearest);
+                    self.palette_scroll_seen = Some(seen);
+                }
+                let row_h = m.row_h + 4.;
+                let owner = cx.entity().downgrade();
+                let virtual_list = gpui_kit::uniform_list("palette-virtual-list", rows.len(), move |range, _, cx| {
+                    owner.update(cx, |this, cx| {
+                        range.map(|index| match rows[index] {
+                            (Some(entry_index), _) => this.palette_row(entry_index, entries[entry_index].clone(), cx),
+                            (None, group) => div().h(px(row_h)).flex().items_center().px(px(10.))
+                                .text_size(px(TypeScale::XS)).text_color(Palette::of(cx).text_faint)
+                                .child(this.t(super::model::palette_kind_key(group))).into_any_element(),
+                        }).collect::<Vec<_>>()
+                    }).unwrap_or_default()
+                }).track_scroll(&self.palette_virtual_scroll).h(px(list_max_h - 12.));
+                list = list.child(virtual_list);
+                Vec::new()
+            } else { entries };
             let mut last_group = "";
             let mut child_count = 0usize;
             let mut selected_child: Option<usize> = None;
             for (index, entry) in entries.into_iter().enumerate() {
                 let selected = index == self.model.palette_index;
-                let id = entry.id.clone();
-                // 快捷键来自菜单同源（COMMANDS → SHORTCUTS），类型标注来自条目种类。
-                let chord = entry.shortcut;
-                let type_label = self.t(super::model::palette_kind_key(entry.group));
-                let show_kind = entry.group != "command";
-                let detail = entry.detail.clone();
-                let icon = palette_icon(&entry.id);
                 // 分组标题只在组变化时出现一次；类型标注仍在行内，滚动到中段也认得出。
                 if entry.group != last_group {
                     last_group = entry.group;
@@ -5094,79 +5120,7 @@ impl Workbench {
                 if selected {
                     selected_child = Some(if index == 0 { 0 } else { child_count });
                 }
-                let row = stack_frame(|| {
-                    kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
-                        .test_support()
-                        .role(gpui_kit::Role::MenuItem)
-                        .aria_label(SharedString::from(entry.label.clone()))
-                        .aria_selected(selected)
-                        .flex_none()
-                        .h(px(m.row_h + 4.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .rounded(px(Radius::CONTROL))
-                        .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
-                        .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(22.))
-                                .rounded(px(Radius::CONTROL))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(if selected { p.raised } else { p.hover })
-                                .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_muted })),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
-                                // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
-                                .when(!detail.is_empty(), |this| {
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!("pal-detail-{index}")))
-                                            .test_support()
-                                            .flex_none()
-                                            .max_w(px(190.))
-                                            .truncate()
-                                            .text_size(px(TypeScale::XS))
-                                            .text_color(if selected { p.accent_text } else { p.text_faint })
-                                            .child(SharedString::from(detail)),
-                                    )
-                                })
-                                // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询。
-                                // 也是无障碍名称的一部分：读屏能听到这一行是什么类型。
-                                // 命令占了面板的大半，每行都写一遍“命令”只是噪音；它们由分组标题和快捷键认出。
-                                .when(show_kind, |this| this.child(
-                                    div()
-                                        .id(SharedString::from(format!("pal-kind-{index}")))
-                                        .test_support()
-                                        .flex_none()
-                                        .text_size(px(TypeScale::XS))
-                                        .text_color(if selected { p.accent_text } else { p.text_faint })
-                                        .aria_label(type_label.clone())
-                                        .child(type_label),
-                                )),
-                        )
-                        .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
-                        .when(selected && chord.is_none(), |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.accent_text)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.model.shell.close_overlay();
-                            this.perform(&id, cx);
-                            if !this.model.shell.palette_open && !this.model.shell.help_open {
-                                this.restore_focus(window, cx);
-                            }
-                        }))
-                        .into_any_element()
-                });
+                let row = self.palette_row(index, entry, cx);
                 list = list.child(row);
                 child_count += 1;
             }
@@ -5224,6 +5178,93 @@ impl Workbench {
             .pt(px(72.))
             .child(panel)
             .into_any_element()
+    }
+
+    #[inline(never)]
+    fn palette_row(&self, index: usize, entry: super::model::PaletteEntry, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = self.metrics();
+        let selected = index == self.model.palette_index;
+        let id = entry.id.clone();
+        // 快捷键来自菜单同源（COMMANDS → SHORTCUTS），类型标注来自条目种类。
+        let chord = entry.shortcut;
+        let type_label = self.t(super::model::palette_kind_key(entry.group));
+        let show_kind = entry.group != "command";
+        let detail = entry.detail.clone();
+        let icon = palette_icon(&entry.id);
+        stack_frame(|| {
+            kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
+                .test_support()
+                .role(gpui_kit::Role::MenuItem)
+                .aria_label(SharedString::from(entry.label.clone()))
+                .aria_selected(selected)
+                .flex_none()
+                .h(px(m.row_h + 4.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .rounded(px(Radius::CONTROL))
+                .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
+                .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(22.))
+                        .rounded(px(Radius::CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(if selected { p.raised } else { p.hover })
+                        .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_muted })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
+                        // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
+                        .when(!detail.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("pal-detail-{index}")))
+                                    .test_support()
+                                    .flex_none()
+                                    .max_w(px(190.))
+                                    .truncate()
+                                    .text_size(px(TypeScale::XS))
+                                    .text_color(if selected { p.accent_text } else { p.text_faint })
+                                    .child(SharedString::from(detail)),
+                            )
+                        })
+                        // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询。
+                        // 也是无障碍名称的一部分：读屏能听到这一行是什么类型。
+                        // 命令占了面板的大半，每行都写一遍“命令”只是噪音；它们由分组标题和快捷键认出。
+                        .when(show_kind, |this| this.child(
+                            div()
+                                .id(SharedString::from(format!("pal-kind-{index}")))
+                                .test_support()
+                                .flex_none()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(if selected { p.accent_text } else { p.text_faint })
+                                .aria_label(type_label.clone())
+                                .child(type_label),
+                        )),
+                )
+                .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
+                .when(selected && chord.is_none(), |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.accent_text)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.model.shell.close_overlay();
+                    this.perform(&id, cx);
+                    if !this.model.shell.palette_open && !this.model.shell.help_open {
+                        this.restore_focus(window, cx);
+                    }
+                }))
+                .into_any_element()
+        })
     }
 
     #[inline(never)]

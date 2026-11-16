@@ -110,22 +110,24 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     let opts = mysql_async::Opts::from(builder);
     let pool = Pool::new(opts.clone());
     let meta_pool = Pool::new(meta_opts);
-    let mut conn = pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
+    // 建连验证直接使用目录池；连接成功后库列表复用这条已认证连接。
+    // 执行池仍独占会话，在第一次执行时创建，避免首屏串行做两次握手。
+    let mut conn = meta_pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let version: Option<(String,)> = conn
         .query_first("SELECT VERSION()")
         .await
         .map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
-    let connection_id: Option<u64> = conn
-        .query_first("SELECT CONNECTION_ID()")
-        .await
-        .map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
     let version = version.map(|row| row.0).unwrap_or_else(|| "未知版本".to_owned());
+    drop(conn);
+    // 让池的 recycler 接回已认证连接，紧接着的目录请求就能复用它。
+    tokio::task::yield_now().await;
     Ok(MysqlOpen {
         pool,
         meta_pool,
         version: version_note(config.engine, &version),
         kill_opts: opts,
-        connection_id: connection_id.unwrap_or(0),
+        // 执行器拿到专用连接后用握手 id 更新取消目标，不能取消目录连接。
+        connection_id: 0,
     })
 }
 

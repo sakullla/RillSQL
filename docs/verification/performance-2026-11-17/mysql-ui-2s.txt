@@ -1,0 +1,13 @@
+Compiling rillsql v0.2.39 (/Users/yanggeng/github/RillSQL/src-tauri)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `rillsql` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.59s
+     Running unittests src/lib.rs (/Users/yanggeng/.cache/cargo-target/debug/deps/rillsql_lib-cb98052c50339e80)
+
+running 1 test
+test app::shell::tests::mysql_lazy_navigation_latency_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1215 filtered out; finished in 20.50s
