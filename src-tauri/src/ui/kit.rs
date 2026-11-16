@@ -584,6 +584,7 @@ impl Metrics {
 
     /// 发布密度；变了返回 true，调用方据此通知子视图重绘。
     pub fn publish(self, cx: &mut App) -> bool {
+        FIELD_H.with(|cell| cell.set(self.control_h));
         if cx.try_global::<DensityMetrics>().is_some_and(|global| global.0 == self) {
             return false;
         }
@@ -1963,9 +1964,26 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
     }
 }
 
-/// 文本框外观：小号、带 id，与按钮共享紧凑控件尺寸。
+// 有框单行输入框的高度跟随当前密度的 `control_h`，与同一行的按钮、分段控件齐高。
+// 组件库的 small 档是 1.5rem，而工作台 rem 是 13px，只剩 19.5px，比旁边控件矮一截。
+// 密度由外壳每帧在界面线程上发布（`Metrics::publish`），这里不需要 cx；没发布过时取紧凑档。
+// 按线程存放：界面只在一个线程上渲染，并行的测试各自一个线程，互不串档。
+thread_local! {
+    static FIELD_H: std::cell::Cell<f32> = std::cell::Cell::new(Metrics::compact().control_h);
+}
+
+pub fn field_h() -> f32 {
+    FIELD_H.with(std::cell::Cell::get)
+}
+
+/// 文本框外观：小号、带 id，高度与按钮共享当前密度的控件尺寸。
 pub fn text_input(id: impl Into<ElementId>, state: &Entity<InputState>, label: impl Into<SharedString>) -> Input {
-    Input::new(state).id(id).small().aria_label(label)
+    gpui_kit::Styled::h(Input::new(state).id(id).small().aria_label(label), px(field_h()))
+}
+
+/// 嵌在别的容器里的无外观输入框（单元格原位编辑、筛选条件块）：高度由容器决定，不套用表单高度。
+pub fn inline_input(id: impl Into<ElementId>, state: &Entity<InputState>, label: impl Into<SharedString>) -> Input {
+    Input::new(state).id(id).small().appearance(false).aria_label(label)
 }
 
 /// 无框搜索输入框：用于命令面板、目标选择器等头部内嵌搜索，不再叠第二圈边框与外发光。

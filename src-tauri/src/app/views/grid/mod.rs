@@ -3450,7 +3450,7 @@ impl GridPane {
                         .flex_1()
                         .min_w(px(120.))
                         // 输入框的可读名字用"直接写 WHERE 表达式"；示例长句留在占位符里。
-                        .child(kit::text_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle")).appearance(false).xsmall()),
+                        .child(kit::inline_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle")).xsmall()),
                 );
             }
             row = row.child(
@@ -3557,7 +3557,7 @@ impl GridPane {
                     row = row.child(
                         div()
                             .w(px(if draft.op == "in" { 180. } else { 120. }))
-                            .child(kit::text_input(SharedString::from(format!("grid-filter-value-{index}")), state, placeholder).appearance(false).xsmall()),
+                            .child(kit::inline_input(SharedString::from(format!("grid-filter-value-{index}")), state, placeholder).xsmall()),
                     );
                 }
             }
@@ -3568,7 +3568,7 @@ impl GridPane {
                         .child(
                             div()
                                 .w(px(120.))
-                                .child(kit::text_input(SharedString::from(format!("grid-filter-upper-{index}")), state, t("grid.filter.upper")).appearance(false).xsmall()),
+                                .child(kit::inline_input(SharedString::from(format!("grid-filter-upper-{index}")), state, t("grid.filter.upper")).xsmall()),
                         );
                 }
             }
@@ -4823,7 +4823,7 @@ impl TableDelegate for SheetDelegate {
                             }
                         })
                     })
-                    .child(kit::text_input("grid-edit-input", input, SharedString::from(i18n::text(self.locale, "shell.shortcuts.editCell"))).appearance(false).small())
+                    .child(kit::inline_input("grid-edit-input", input, SharedString::from(i18n::text(self.locale, "shell.shortcuts.editCell"))))
                     .test_support()
                     .into_any_element();
             }
@@ -4919,11 +4919,13 @@ impl TableDelegate for SheetDelegate {
         let header = div()
             .id(("grid-th", col_ix))
             .debug_selector(move || format!("grid-th-{col_ix}"))
+            .relative()
             .size_full()
             .flex()
             .items_center()
-            .truncate()
-            .child(SharedString::from(name))
+            .overflow_hidden()
+            // 列窄时先让出类型缩写（收缩权重大），列名最后才省略。
+            .child(div().min_w(px(0.)).flex_shrink(1.).truncate().child(SharedString::from(name)))
             .test_support();
         let Some(logical) = self.logical(col_ix) else {
             return header.into_any_element();
@@ -4947,15 +4949,14 @@ impl TableDelegate for SheetDelegate {
                 div()
                     .id(("grid-th-type", col_ix))
                     .debug_selector(move || format!("grid-th-type-{col_ix}"))
-                    .flex_none()
+                    .min_w(px(0.))
+                    .flex_shrink(1000.)
+                    .overflow_hidden()
                     .px(px(4.))
                     .text_size(px(TypeScale::XS))
                     .text_color(p.text_faint)
                     .child(SharedString::from(abbr)),
             );
-        }
-        if let Some(descending) = sorted {
-            header = header.child(div().flex_none().px(px(4.)).text_size(px(TypeScale::XS)).child(SharedString::from(if descending { "↓" } else { "↑" })));
         }
         if frozen {
             header = header.child(
@@ -4966,6 +4967,49 @@ impl TableDelegate for SheetDelegate {
                     .child(kit::icon(IconName::Bookmark, 12., p.text_faint)),
             );
         }
+        // 排序开关贴在表头右侧：排着序时常亮并标出方向，没排序时悬停表头才出现。
+        // 点它在 升序 → 降序 → 不排序 之间轮换；按下不冒泡，免得同时把整列选中。
+        // 它浮在表头右缘、不占排版宽度：没排序时列名和类型照常排满，悬停时才盖住最右一点；
+        // 排着序时给表头右侧留出位置，常亮的方向标记不压住文字。
+        let head_bg = cx.theme().table_head;
+        let group = SharedString::from(format!("grid-th-group-{col_ix}"));
+        let (sort_icon, sort_key) = match sorted {
+            Some(false) => (IconName::ArrowUpNarrowWide, "grid.menu.sortDesc"),
+            Some(true) => (IconName::ArrowDownWideNarrow, "grid.menu.clearSort"),
+            None => (IconName::ArrowDownUp, "grid.menu.sortAsc"),
+        };
+        let sort_owner = self.owner.clone();
+        let sort_label = SharedString::from(i18n::text(self.locale, sort_key));
+        header = header.group(group.clone()).when(sorted.is_some(), |this| this.pr(px(20.))).child(
+            div()
+                .id(("grid-th-sort", col_ix))
+                .debug_selector(move || format!("grid-th-sort-{col_ix}"))
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(sort_label.clone())
+                .tooltip_text(sort_label)
+                .absolute()
+                .right(px(0.))
+                .top(relative(0.5))
+                .mt(px(-9.))
+                .size(px(18.))
+                .rounded(px(Radius::CONTROL))
+                .bg(head_bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when(sorted.is_none(), |this| this.opacity(0.).group_hover(group, |style| style.opacity(1.)))
+                .hover(|style| style.bg(p.hover))
+                .child(kit::icon(sort_icon, 12., if sorted.is_some() { p.accent } else { p.text_faint }))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(owner) = sort_owner.as_ref().and_then(|owner| owner.upgrade()) {
+                        owner.update(cx, |pane, cx| pane.column_command(logical, "column-sort-cycle", cx));
+                    }
+                }),
+        );
         let owner = self.owner.clone();
         let locale = self.locale;
         let state = ColumnMenuState {
@@ -7041,6 +7085,49 @@ mod pane_tests {
 
     /// 真实点击表头坐标：# 列头不是数据列，不能把高亮、复制和统计挪到第一列数据上；
     /// 点第一列数据的列头才是整列选择，并且画出来的高亮格子数与复制、统计一致。
+    /// 有框输入框与同排按钮齐高：跟随当前密度的 control_h，而不是组件库 1.5rem（19.5px）的默认高度。
+    #[gpui_kit::test]
+    fn bordered_inputs_match_the_density_control_height(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        for metrics in [kit::Metrics::compact(), kit::Metrics::standard()] {
+            cx.update_window(window, |_, window, cx| {
+                let _ = metrics.publish(cx);
+                plant(&pane, cx);
+                window.render_frame(cx);
+                let search = window.find("grid-search").bounds();
+                assert!((f32::from(search.size.height) - metrics.control_h).abs() < 0.5, "查找框 {search:?} 应为 {}", metrics.control_h);
+            })
+            .unwrap();
+        }
+    }
+
+    /// 表头右侧的排序开关：真实点击在 升序 → 降序 → 不排序 之间轮换，且不顺手把整列选中。
+    #[gpui_kit::test]
+    fn the_header_sort_toggle_cycles_without_selecting_the_column(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut expected = vec![Some(("name", false)), Some(("name", true)), None].into_iter();
+        for _ in 0..3 {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            let toggle = visual.debug_bounds("grid-th-sort-2").expect("name 列头的排序开关");
+            let head = visual.debug_bounds("grid-th-2").expect("name 列头");
+            assert!(toggle.origin.x + toggle.size.width <= head.origin.x + head.size.width + px(0.5), "开关在列头里：{toggle:?} / {head:?}");
+            visual.simulate_click(toggle.center(), Modifiers::default());
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            let want = expected.next().unwrap();
+            cx.update(|cx| {
+                let pane = pane.read(cx);
+                assert_eq!(pane.session.sort_state(), want);
+                assert_eq!(pane.session.selection_bounds(), None, "点排序开关不选中整列");
+                assert!(!matches!(pane.table.read(cx).selection(), TableSelection::Column(_)));
+            });
+        }
+    }
+
     #[gpui_kit::test]
     fn real_header_click_keeps_the_row_number_column_out_of_the_selection(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);

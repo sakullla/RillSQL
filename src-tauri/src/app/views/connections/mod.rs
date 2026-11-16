@@ -86,6 +86,21 @@ pub struct ConnectionPage {
     /// 每条连接最近一次连接失败的原因。状态栏的提示会被下一条消息覆盖，
     /// 这里按连接留住，资源管理器在失败的连接下面直接写出原因。连上后清掉。
     pub failures: BTreeMap<String, String>,
+    /// 最近一次打开失败是因为缺密码（false）或密码被拒绝（true）：外壳据此弹出密码输入框，
+    /// 取走后清空。
+    pub credential_prompt: Option<(String, bool)>,
+}
+
+/// 打开失败是不是缺密码或密码被拒：返回 Some(被拒绝)。服务端拒绝凭据的错误码随驱动不同
+/// （PostgreSQL 落在通用的阶段失败码上），所以以失败阶段为准：数据库认证阶段失败即凭据问题。
+pub fn credential_failure(report: &TestReport) -> Option<bool> {
+    use crate::connections::error_codes;
+    let failed = report.stages.iter().find(|stage| stage.status == StageStatus::Err)?;
+    if failed.kind != StageKind::DatabaseAuthentication {
+        return None;
+    }
+    let code = failed.code.as_deref().or(report.code.as_deref());
+    Some(code != Some(error_codes::CONN_PASSWORD_REQUIRED))
 }
 
 
@@ -398,6 +413,7 @@ impl ConnectionPage {
                 self.message_detail = if name.is_empty() { String::new() } else { format!("· {name}") };
             }
             Ok(outcome) => {
+                self.credential_prompt = credential_failure(&outcome.report).map(|rejected| (id.clone(), rejected));
                 self.failures.insert(id.clone(), failure_reason(&outcome.report));
                 self.status.insert(id, LinkStatus::Failed);
                 self.message_key = Some("connections.status.error");

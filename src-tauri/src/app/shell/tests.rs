@@ -10394,3 +10394,97 @@ fn tab_strip_double_click_url_enter_collapse_all_and_back_navigation_work_cleanl
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 连接缺密码：直接弹出密码框；输入后用这次的密码重连，失败时挂起的动作随之重放。
+/// 密码被服务端拒绝时再次弹出并标明“被拒绝”；连接表单开着时不弹（表单自己有密码栏）。
+#[tokio::test]
+async fn a_missing_password_prompts_and_reconnects_with_the_typed_one() {
+    use crate::app::shell::conn_modal::{ConnectAction, ConnectIntent};
+    use crate::app::shell::model::DraftField;
+    let dir = std::env::temp_dir().join(format!("rillsql-password-prompt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut draft = sample_draft(Engine::Postgres);
+    draft.name = "Atlas".into();
+    draft.save_password = false;
+    let saved = services.connections.save(draft, crate::connections::model::SecretInput::default()).await.unwrap();
+    let id = saved.connection.id.clone();
+    let mut model = seeded_model(services.connections.list().await.unwrap());
+
+    let intent = ConnectIntent::new(id.clone(), ConnectAction::Expand, None);
+    model.queue_connect(intent.clone());
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    let prompt = model.password_prompt.clone().expect("缺密码时弹出密码框");
+    assert_eq!(prompt.id, id);
+    assert!(!prompt.rejected, "没有密码不是密码被拒");
+    assert_eq!(model.focused_field, Some(DraftField::PromptPassword));
+    assert!(model.connect_retry.is_some(), "失败的动作挂着等重放");
+
+    // 空密码不提交。
+    let _ = model.dispatch("password-submit");
+    assert!(model.password_prompt.is_some());
+    assert_eq!(model.pending_len(), 0);
+
+    model.set_field(DraftField::PromptPassword, "typed-secret".into());
+    assert_eq!(model.field_value(DraftField::PromptPassword), "typed-secret");
+    assert!(!format!("{:?}", model.password_prompt).contains("typed-secret"), "调试输出不带密码");
+    let _ = model.dispatch("password-submit");
+    assert!(model.password_prompt.is_none());
+    assert!(model.connect_retry.is_none(), "挂起的动作随这次连接重放");
+    assert_eq!(model.connect_intents, vec![intent]);
+    assert_eq!(model.connections.status.get(&id), Some(&LinkStatus::Connecting));
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(&mut model, token);
+    assert_eq!(request.job, PendingJob::OpenConnection);
+    assert_eq!(request.secrets.password, "typed-secret", "这次连接用输入的密码");
+
+    // 被拒绝：再弹一次并说明原因。
+    model.connections.credential_prompt = Some((id.clone(), true));
+    let prompt = model.connections.credential_prompt.take().unwrap();
+    model.open_password_prompt(&prompt.0, prompt.1);
+    assert!(model.password_prompt.as_ref().is_some_and(|prompt| prompt.rejected && prompt.text.is_empty()));
+    let _ = model.dispatch("password-cancel");
+    assert!(model.password_prompt.is_none());
+    assert_ne!(model.focused_field, Some(DraftField::PromptPassword));
+
+    // 连接表单开着：不叠一个密码框。
+    model.conn_modal.open = true;
+    model.open_password_prompt(&id, false);
+    assert!(model.password_prompt.is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn credential_failures_are_recognised_by_stage_not_by_driver_code() {
+    use crate::app::views::connections::credential_failure;
+    use crate::connections::stages::{StageKind, StageStatus, StageView, TestReport, TestStatus};
+    let report = |kind: StageKind, code: &str| TestReport {
+        status: TestStatus::Err,
+        fail_stage: None,
+        hint: None,
+        summary: None,
+        fingerprint: None,
+        algorithm: None,
+        stages: vec![StageView { kind, label: String::new(), status: StageStatus::Err, message: String::new(), code: Some(code.to_owned()) }],
+        code: Some(code.to_owned()),
+    };
+    assert_eq!(credential_failure(&report(StageKind::DatabaseAuthentication, "conn.password_required")), Some(false));
+    assert_eq!(credential_failure(&report(StageKind::DatabaseAuthentication, "conn.auth_failed")), Some(true));
+    // PostgreSQL 的认证失败落在通用阶段失败码上，同样算被拒绝。
+    assert_eq!(credential_failure(&report(StageKind::DatabaseAuthentication, "conn.stage_failed")), Some(true));
+    assert_eq!(credential_failure(&report(StageKind::Network, "conn.network_failed")), None);
+    assert_eq!(credential_failure(&report(StageKind::SshAuthentication, "conn.ssh_auth_failed")), None);
+}
+
+#[test]
+fn tree_tooltips_do_not_repeat_the_node_name() {
+    use crate::app::shell::chrome::nav_row_tooltip;
+    assert_eq!(nav_row_tooltip("127.0.0.1 / rillsql", "rillsql"), "127.0.0.1 / rillsql");
+    assert_eq!(nav_row_tooltip("127.0.0.1 / rillsql / shop", "shop"), "127.0.0.1 / rillsql / shop");
+    assert_eq!(nav_row_tooltip("pg / shop / public / orders", "orders"), "pg / shop / public / orders");
+    assert_eq!(nav_row_tooltip("pg / shop / public / orders.id", "id"), "pg / shop / public / orders.id");
+    // 路径不以自己结尾（分组节点）时照常拼上名字。
+    assert_eq!(nav_row_tooltip("pg / shop / public", "表"), "pg / shop / public / 表");
+}

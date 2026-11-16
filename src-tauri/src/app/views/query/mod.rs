@@ -295,42 +295,55 @@ pub fn rewrite_note(locale: Locale, rewrite: &AutoRewrite) -> String {
     i18n::fill(&i18n::text(locale, "query.rewrite.note"), &[("clause", &rewrite_clause(locale, rewrite))])
 }
 
-/// 失败语句的改写说明与实际执行的语句。没有改写或没有实际语句时不占位置，
-/// 手写 LIMIT 的报错因此不带任何改写说明。
+/// 语句文本的代码块：等宽、浅底、细边框，与说明文字分得开，长语句自动换行。
+fn sql_block(id: &'static str, sql: String, mono: &SharedString, p: &Palette) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label(SharedString::from(sql.clone()))
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(Radius::CONTROL))
+        .border_1()
+        .border_color(p.line)
+        .bg(p.sunken)
+        .font_family(mono.clone())
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .child(SharedString::from(sql))
+        .into_any_element()
+}
+
+/// 失败语句的语句区：被自动改写过时，先一行说明改写，再给出真正执行过的语句；
+/// 没有改写（手写 LIMIT、DDL）时只给出语句本身。草稿就在编辑器里，不再把原句重复一遍。
 #[inline(never)]
-fn rewrite_block(result: &desk::StatementView, locale: Locale, mono: &SharedString, p: &Palette) -> Option<AnyElement> {
-    let rewrite = result.rewrite.as_ref()?;
-    let sent = result.sent_sql.clone()?;
+fn statement_sql_block(result: &desk::StatementView, failed: bool, locale: Locale, mono: &SharedString, p: &Palette) -> AnyElement {
+    let rewritten = if failed { result.rewrite.as_ref().zip(result.sent_sql.clone()) } else { None };
+    let Some((rewrite, sent)) = rewritten else {
+        return sql_block("query-statement-sql", result.sql.clone(), mono, p);
+    };
     let note = rewrite_note(locale, rewrite);
-    Some(
-        div()
-            .id("query-rewrite")
-            .test_support()
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .child(
-                div()
-                    .id("query-rewrite-note")
-                    .test_support()
-                    .aria_label(SharedString::from(note.clone()))
-                    .text_size(px(TypeScale::SM))
-                    .text_color(p.warn)
-                    .child(SharedString::from(note)),
-            )
-            .child(div().id("query-rewrite-label").text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(i18n::text(locale, "query.rewrite.sent"))))
-            .child(
-                div()
-                    .id("query-rewrite-sql")
-                    .test_support()
-                    .aria_label(SharedString::from(sent.clone()))
-                    .font_family(mono.clone())
-                    .text_size(px(TypeScale::SM))
-                    .text_color(p.text_muted)
-                    .child(SharedString::from(sent)),
-            )
-            .into_any_element(),
-    )
+    div()
+        .id("query-rewrite")
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .id("query-rewrite-note")
+                .test_support()
+                .aria_label(SharedString::from(note.clone()))
+                .flex()
+                .items_start()
+                .gap(px(6.))
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .child(div().flex_none().pt(px(2.)).child(kit::icon(IconName::Info, 13., p.text_faint)))
+                .child(div().flex_1().min_w(px(0.)).child(SharedString::from(note))),
+        )
+        .child(sql_block("query-rewrite-sql", sent, mono, p))
+        .into_any_element()
 }
 
 pub fn elapsed_label(ms: u64) -> String {
@@ -3449,8 +3462,7 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
             )
         })
         // 失败且被自动改写时，说明改写并给出真正执行过的语句；手写 LIMIT 没有这一段。
-        .when_some(if failed { rewrite_block(result, locale, mono, p) } else { None }, |this, block| this.child(block))
-        .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
+        .child(statement_sql_block(result, failed, locale, mono, p))
         .into_any_element()
 }
 

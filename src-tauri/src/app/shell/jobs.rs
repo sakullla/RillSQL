@@ -383,6 +383,10 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.pending_open_secrets = None;
             }
             model.fail_pending_intents();
+            // 缺密码或密码被拒：直接问密码，而不是只留一个必然再失败的“重试”。
+            if let Some((id, rejected)) = model.connections.credential_prompt.take() {
+                model.open_password_prompt(&id, rejected);
+            }
         }
         JobDone::Disconnect(token, id) => {
             if accepted(services, owner, token) {

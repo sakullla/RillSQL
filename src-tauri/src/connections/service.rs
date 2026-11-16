@@ -427,6 +427,10 @@ pub struct Service {
     probes: Probes,
     /// lost 会话的自动重连计划：有限次退避，确定性错误直接放弃（R4）。
     reconnects: Mutex<HashMap<String, ReconnectPlan>>,
+    /// 本次运行里手动输入、没有存进凭据库的机密（凭据账户名 → 机密），只在内存里。
+    /// 选择不保存密码或系统钥匙串不可用时，同一次运行里切换数据库、手动重连不必再问一遍；
+    /// 自动重连仍只用凭据库里的密码（没保存就等手动入口）。删除或重新保存这条连接时作废，进程退出即消失。
+    typed: Mutex<HashMap<String, Secret>>,
 }
 
 impl Service {
@@ -447,6 +451,7 @@ impl Service {
             pending: Mutex::new(HashMap::new()),
             probes,
             reconnects: Mutex::new(HashMap::new()),
+            typed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -609,6 +614,8 @@ impl Service {
         let mut saved = crate::connections::model::normalize(&draft, id).map_err(ServiceError::Fields)?;
         let store = self.store().await.map_err(ServiceError::Message)?;
         let existing = store.get(&saved.id).await.map_err(|err| ServiceError::Message(db_err(err)))?;
+        // 配置要改了：这次运行里手输的机密可能已对不上新配置，作废，下次连接按新配置再要。
+        self.forget_typed(&saved.id);
         if saved.env != ENV_NONE && store.tag(&saved.env).await.map_err(|err| ServiceError::Message(db_err(err)))?.is_none() {
             saved.env = ENV_NONE.to_owned();
         }
@@ -704,6 +711,7 @@ impl Service {
         let existing = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
         let _ = self.secrets.delete(&password_account(id));
         let _ = self.secrets.delete(&ssh_password_account(id));
+        self.forget_typed(id);
         store.delete(id).await.map_err(db_err)?;
         if let Some(ssh) = &existing.ssh {
             let still = store.ssh_host_still_used(&ssh.host, ssh.port, id).await.map_err(db_err)?;
@@ -893,13 +901,23 @@ impl Service {
         if let Some(secret) = typed.filter(|item| !item.is_empty()) {
             return Some(secret.clone());
         }
-        if !saved {
-            return None;
+        if saved {
+            if let Ok(Some(value)) = self.secrets.get(account) {
+                return Some(Secret::new(value));
+            }
         }
-        match self.secrets.get(account) {
-            Ok(value) => value.map(Secret::new),
-            Err(_) => None,
-        }
+        self.typed.lock().expect("typed secrets").get(account).cloned()
+    }
+
+    /// 这次运行里是否记着这条连接手动输入过的数据库密码。
+    pub fn remembers_password(&self, id: &str) -> bool {
+        self.typed.lock().expect("typed secrets").contains_key(&password_account(id))
+    }
+
+    fn forget_typed(&self, id: &str) {
+        let mut typed = self.typed.lock().expect("typed secrets");
+        typed.remove(&password_account(id));
+        typed.remove(&ssh_password_account(id));
     }
 
     async fn exercise(&self, id: &str, input: SecretInput, open: bool) -> Result<OpenOutcome, String> {
@@ -1100,6 +1118,15 @@ impl Service {
             );
             // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
             self.reconnects.lock().expect("reconnects").remove(session_id);
+            // 认证通过的手输机密记在内存里，供切换数据库和自动重连复用。
+            let mut typed = self.typed.lock().expect("typed secrets");
+            if let Some(secret) = input.password.as_ref().filter(|item| !item.is_empty()) {
+                typed.insert(password_account(&config.id), secret.clone());
+            }
+            if let Some(secret) = input.ssh_password.as_ref().filter(|item| !item.is_empty()) {
+                typed.insert(ssh_password_account(&config.id), secret.clone());
+            }
+            drop(typed);
             opened = true;
         }
         if opened {
@@ -2096,7 +2123,7 @@ fn classify_db(error: &StageError) -> StageKind {
     if hint.contains("网络连接失败") || hint.contains("隧道没有") || hint.contains("通道没有打通") {
         return StageKind::Network;
     }
-    if hint.contains("用户名和密码") || hint.contains("数据库认证") {
+    if hint.contains("用户名和密码") || hint.contains("数据库认证") || hint.contains("数据库名") {
         return StageKind::DatabaseAuthentication;
     }
     let lower = format!("{message} {hint}").to_ascii_lowercase();

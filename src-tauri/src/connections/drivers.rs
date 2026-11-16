@@ -683,13 +683,13 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
     pg.connect_timeout(Duration::from_secs(15));
     let tls_for_cancel = if plan.use_tls { Some(postgres_tls(config, &plan)?) } else { None };
     let client = if let Some(tls) = tls_for_cancel.clone() {
-        let (client, connection) = pg.connect(tls).await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
+        let (client, connection) = pg.connect(tls).await.map_err(|err| postgres_connect_error(&err, route.tls_mode, true))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
         client
     } else {
-        let (client, connection) = pg.connect(NoTls).await.map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改走加密连接重试。"))?;
+        let (client, connection) = pg.connect(NoTls).await.map_err(|err| postgres_connect_error(&err, route.tls_mode, false))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -788,6 +788,24 @@ fn finish_client_config(
         }
         (None, None) => Ok(builder.with_no_client_auth()),
         _ => Err(stages::fail_code(crate::connections::error_codes::CONN_TLS_CERT_MISSING, "客户端证书和私钥需要同时填写", "没有改用不验证的连接。")),
+    }
+}
+
+/// PostgreSQL 建连失败。服务端回了 SQLSTATE 就说明网络和握手都通了，按它分类：
+/// 28xxx 是认证失败（密码错误、用户不存在），3D000 是库不存在；
+/// 只有没有 SQLSTATE 的传输层错误才算网络或加密失败。明文连接以前把密码错误也说成“网络连接失败”。
+fn postgres_connect_error(err: &tokio_postgres::Error, mode: TlsMode, tls: bool) -> StageError {
+    postgres_failure(err.code().map(|code| code.code()), crate::error_text::chain(err), mode, tls)
+}
+
+fn postgres_failure(sqlstate: Option<&str>, text: String, mode: TlsMode, tls: bool) -> StageError {
+    use crate::connections::error_codes;
+    match sqlstate {
+        Some(code) if code.starts_with("28") => stages::fail_code(error_codes::CONN_AUTH_FAILED, text, "请检查数据库用户名和密码。"),
+        Some("3D000") => stages::fail_code(error_codes::CONN_STAGE_FAILED, text, "服务器上没有这个数据库，请检查连接里的数据库名。"),
+        Some(_) => stages::fail_code(error_codes::CONN_STAGE_FAILED, text, "服务器拒绝了这次连接，原因见上。"),
+        None if tls => db_stage(mode, text),
+        None => stages::fail_code(error_codes::CONN_NETWORK_FAILED, text, "网络连接失败，没有改走加密连接重试。"),
     }
 }
 
@@ -1036,5 +1054,27 @@ mod tls_hint_tests {
         let other = db_stage(TlsMode::Verify, "TLS handshake eof".into());
         let StageError::Fail { hint, .. } = other else { panic!() };
         assert!(!hint.contains("CA 文件"), "其他 TLS 失败保持原说明：{hint}");
+    }
+    fn code_of(stage: StageError) -> (&'static str, String) {
+        let StageError::Fail { code, hint, .. } = stage else { panic!("应当是失败阶段") };
+        (code, hint)
+    }
+
+    #[test]
+    fn a_rejected_postgres_password_is_an_auth_failure_not_a_network_one() {
+        // 明文与加密两条路径：服务端回了 28P01 就是认证失败，不能说成网络连接失败。
+        for tls in [false, true] {
+            let (code, hint) = code_of(postgres_failure(Some("28P01"), "password authentication failed for user \"postgres\"".into(), TlsMode::Off, tls));
+            assert_eq!(code, crate::connections::error_codes::CONN_AUTH_FAILED);
+            assert!(hint.contains("用户名和密码"), "{hint}");
+        }
+        let (code, _) = code_of(postgres_failure(Some("28000"), "role \"nobody\" does not exist".into(), TlsMode::Off, false));
+        assert_eq!(code, crate::connections::error_codes::CONN_AUTH_FAILED);
+        let (_, hint) = code_of(postgres_failure(Some("3D000"), "database \"nope\" does not exist".into(), TlsMode::Off, false));
+        assert!(hint.contains("数据库名"), "{hint}");
+        // 没有 SQLSTATE 的才是传输层错误。
+        let (code, hint) = code_of(postgres_failure(None, "Connection refused (os error 111)".into(), TlsMode::Off, false));
+        assert_eq!(code, crate::connections::error_codes::CONN_NETWORK_FAILED);
+        assert!(hint.contains("网络连接失败"), "{hint}");
     }
 }

@@ -522,6 +522,9 @@ dict! {
     "conn.page.user" => "用户", "User";
     "conn.page.tls" => "加密", "Encryption";
     "conn.page.ssh" => "SSH 隧道", "SSH tunnel";
+    "conn.page.password" => "密码", "Password";
+    "conn.page.passwordSaved" => "已保存在系统钥匙串", "Saved in the system keychain";
+    "conn.page.passwordAsk" => "未保存，连接时询问", "Not saved; asked when connecting";
     "conn.page.group" => "分组", "Group";
     "conn.page.tag" => "标签", "Tag";
     "conn.page.none" => "无", "None";
@@ -1399,6 +1402,12 @@ dict! {
     "admin.preview.irreversible" => "管理操作确认后立即执行，数据库不提供撤销；要回退得另做一次反向操作。", "Admin actions run as soon as you confirm, the database offers no undo, and reverting takes another operation.";
     "admin.preview.danger" => "这是危险操作：确认后立即执行，且无法用一次撤销退回。", "This is a dangerous operation: it runs as soon as you confirm and cannot be undone in one step.";
     // 连接分组：分组只是组织元数据，删除分组不删连接。
+    // 连接缺密码或密码被拒时的输入框。
+    "ui.passwordPrompt.title" => "输入 {name} 的密码", "Password for {name}";
+    "ui.passwordPrompt.missing" => "没有保存这条连接的密码。输入后连接；本次运行内记住，不写入配置和钥匙串。", "No password is saved for this connection. It is kept for this session only, not written to settings or the keychain.";
+    "ui.passwordPrompt.rejected" => "服务器拒绝了这个密码，请重新输入。", "The server rejected this password. Enter it again.";
+    "ui.passwordPrompt.connect" => "连接", "Connect";
+    "ui.passwordPrompt.edit" => "编辑连接…", "Edit connection…";
     "ui.group.new" => "新建分组", "New group";
     "ui.group.rename" => "重命名分组", "Rename group";
     "ui.group.collapse" => "折叠分组", "Collapse group";

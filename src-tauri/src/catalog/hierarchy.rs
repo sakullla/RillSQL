@@ -667,7 +667,9 @@ impl NavTree {
     }
 
     fn object_node(&self, connection: &NavConnection, database: &str, schema: &str, object: &ObjectRow, id: &str) -> NavNode {
-        let mut node = NavNode::new(NavKind::Object, id.to_owned(), display_name(schema, &object.name));
+        // 对象总是挂在自己的模式节点下面（筛选时也保留树形），标签只写对象名：
+        // 再加 “shop.” 前缀是重复信息，还把窄侧栏里的名字挤成 “shop.custo…”。完整路径在悬停提示里。
+        let mut node = NavNode::new(NavKind::Object, id.to_owned(), object.name.clone());
         node.parent = None;
         node.path = format!("{} / {}", object_path_text(&connection.name, database, schema), object.name);
         node.connection_id = connection.id.clone();
@@ -1633,13 +1635,6 @@ impl NavTree {
     }
 }
 
-fn display_name(schema: &str, name: &str) -> String {
-    if schema.is_empty() || schema == "dbo" || schema == "public" {
-        name.to_owned()
-    } else {
-        format!("{schema}.{name}")
-    }
-}
 
 fn object_path_text(connection: &str, database: &str, schema: &str) -> String {
     let mut parts = vec![connection.to_owned()];

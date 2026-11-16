@@ -144,6 +144,9 @@ impl Workbench {
         if self.model.danger.is_none() {
             self.danger_focused_epoch = None;
         }
+        if self.model.password_prompt.is_none() {
+            self.password_focused_epoch = None;
+        }
         if page != AppPage::History || !self.model.history.rename_open {
             self.history_rename_focused = false;
         }
@@ -282,6 +285,9 @@ impl Workbench {
         if self.model.danger.is_some() {
             root = root.child(self.danger_layer(window, cx));
         }
+        if self.model.password_prompt.is_some() {
+            root = root.child(self.password_layer(window, cx));
+        }
         root.into_any_element()
     }
 
@@ -323,6 +329,26 @@ impl Workbench {
             self.restore_focus(window, cx);
             cx.notify();
             return;
+        }
+        // 密码输入框：Esc 取消，回车用输入的密码连接。
+        if self.model.password_prompt.is_some() && self.model.menu.is_none() && !self.model.conn_modal.open {
+            match key {
+                "escape" => {
+                    self.perform("password-cancel", cx);
+                    self.restore_focus(window, cx);
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    self.perform("password-submit", cx);
+                    if self.model.password_prompt.is_none() {
+                        self.restore_focus(window, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
         // 分组输入面板与删除确认：Esc 只取消这一层，不改任何数据。
         if key == "escape" && self.model.group_delete.is_some() && self.model.menu.is_none() {
@@ -380,6 +406,7 @@ impl Workbench {
             || self.model.tag_manager.is_some()
             || self.model.shell.help_open
             || self.model.danger.is_some()
+            || self.model.password_prompt.is_some()
             || self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only);
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
@@ -1355,7 +1382,7 @@ impl Workbench {
         } else if row.path.is_empty() {
             label.clone()
         } else {
-            SharedString::from(format!("{} / {}", row.path, row.name))
+            SharedString::from(nav_row_tooltip(&row.path, &row.name))
         };
         let is_group = matches!(row.kind, NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup);
         // 已读完、确实一个对象都没有的种类分组：不画展开箭头，名称与数量弱化，看起来不像“展开了却丢了内容”。
@@ -5743,6 +5770,48 @@ impl Workbench {
         })
     }
 
+    /// 连接缺密码或密码被拒：就地要密码并重连，挂起的动作随后重放。
+    fn password_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let Some(prompt) = self.model.password_prompt.clone() else {
+            return div().into_any_element();
+        };
+        let row = self.model.connections.rows.iter().find(|row| row.saved.id == prompt.id).cloned();
+        let name = row.as_ref().map(|row| row.saved.name.clone()).unwrap_or_default();
+        let detail = row.as_ref().map(connection_detail).unwrap_or_default();
+        let title = SharedString::from(i18n::fill(&self.model.text("ui.passwordPrompt.title"), &[("name", &name)]));
+        let (input, _) = self.field_input(DraftField::PromptPassword, &self.model.text("ui.conn.password"), true, window, cx);
+        if self.password_focused_epoch != Some(prompt.epoch) {
+            self.password_focused_epoch = Some(prompt.epoch);
+            self.fields.focus(DraftField::PromptPassword, window, cx);
+        }
+        let note: AnyElement = if prompt.rejected {
+            div()
+                .id("password-rejected")
+                .test_support()
+                .aria_label(self.t("ui.passwordPrompt.rejected"))
+                .child(banner(IconName::TriangleAlert, self.t("ui.passwordPrompt.rejected"), p.danger, p.danger_soft))
+                .into_any_element()
+        } else {
+            div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("ui.passwordPrompt.missing")).into_any_element()
+        };
+        let ready = !prompt.text.is_empty();
+        let dialog = dialog_card("password-prompt", IconName::KeyRound, p.accent, title, SharedString::from(detail), &p)
+            .test_support()
+            .child(div().flex().flex_col().gap(px(10.)).child(input.mask_toggle()).child(note))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(kit::tool_button("cmd-password-edit", Some(IconName::Pencil), self.t("ui.passwordPrompt.edit"), act("password-edit", cx)))
+                    .child(div().flex_1())
+                    .child(kit::secondary_button("cmd-password-cancel", None, self.t("common.cancel"), act("password-cancel", cx)))
+                    .child(kit::primary_button("cmd-password-submit", Some(IconName::Plug), self.t("ui.passwordPrompt.connect"), act("password-submit", cx)).disabled(!ready)),
+            );
+        backdrop("password-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+    }
+
     fn exchange_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
@@ -6292,6 +6361,14 @@ pub(super) fn connection_detail(row: &crate::connections::ConnectionRecord) -> S
         text = format!("{user}@{text}");
     }
     text
+}
+
+/// 树节点的悬停全路径。库、模式、对象节点的路径本身已以自己的名字结尾，
+/// 再拼一次名字就成了 “127.0.0.1 / rillsql / rillsql”。
+pub(super) fn nav_row_tooltip(path: &str, name: &str) -> String {
+    let path = path.trim_end();
+    let own = path == name || path.ends_with(&format!(" / {name}")) || path.ends_with(&format!(".{name}"));
+    if own || name.is_empty() { path.to_owned() } else { format!("{path} / {name}") }
 }
 
 fn one_line(sql: &str) -> String {

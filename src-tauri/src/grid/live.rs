@@ -1157,15 +1157,22 @@ fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, exp
     Ok(format!("SELECT {count} FROM {}{clause}", sql::qualified_name(schema)))
 }
 
+/// 排序列一律带上表名限定。选择列表里的列都被转成文本（PostgreSQL 的 `"id"::text`
+/// 输出列名仍叫 id），而 ORDER BY 里的裸名字优先匹配输出列：不限定就会按文本排，
+/// 整数主键成了 1、10、100、1000……；限定后指向表里的原始列，按真实类型排序。
+fn order_column(schema: &TableSchema, column: &str) -> String {
+    format!("{}.{}", sql::qualified_name(schema), sql::quote_ident(schema.engine, column))
+}
+
 fn order_clause(schema: &TableSchema, sort: Option<&Sort>) -> String {
     if let Some(sort) = sort {
-        return format!(" ORDER BY {} {}", sql::quote_ident(schema.engine, &sort.column), if sort.descending { "DESC" } else { "ASC" });
+        return format!(" ORDER BY {} {}", order_column(schema, &sort.column), if sort.descending { "DESC" } else { "ASC" });
     }
     if !schema.key.is_empty() {
         let columns = schema
             .key
             .iter()
-            .map(|name| format!("{} ASC", sql::quote_ident(schema.engine, name)))
+            .map(|name| format!("{} ASC", order_column(schema, name)))
             .collect::<Vec<_>>()
             .join(", ");
         return format!(" ORDER BY {columns}");
@@ -2022,5 +2029,40 @@ pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name:
             let (_names, rows) = sqlserver_rows(client, &sql).await?;
             Ok(assemble_foreign_keys(&rows))
         }
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::grid::store::{Column, Sort, TableSchema};
+
+    fn schema(engine: Engine, schema: &str) -> TableSchema {
+        let col = |name: &str, type_name: &str| Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: false, primary: name == "id", unique: false, auto: false };
+        TableSchema {
+            engine,
+            schema: schema.to_owned(),
+            name: "customers".to_owned(),
+            kind: "table",
+            columns: vec![col("id", "integer"), col("amount", "numeric")],
+            key: vec!["id".to_owned()],
+        }
+    }
+
+    #[test]
+    fn order_by_targets_the_table_column_not_the_text_cast() {
+        // PostgreSQL 的 `"id"::text` 输出列仍叫 id；ORDER BY "id" 会按文本排出 1、10、100……
+        let pg = schema(Engine::Postgres, "shop");
+        let default = page_sql(&pg, &[], None, None, None, 100, 0, 1024).unwrap();
+        assert!(default.contains("\"id\"::text"), "{default}");
+        assert!(default.contains(" ORDER BY \"shop\".\"customers\".\"id\" ASC LIMIT 100"), "{default}");
+        let sorted = page_sql(&pg, &[], None, None, Some(&Sort { column: "amount".to_owned(), descending: true }), 100, 0, 1024).unwrap();
+        assert!(sorted.contains(" ORDER BY \"shop\".\"customers\".\"amount\" DESC"), "{sorted}");
+        let full = page_sql_full(&pg, &[], None, None, None, 10).unwrap();
+        assert!(full.contains(" ORDER BY \"shop\".\"customers\".\"id\" ASC LIMIT 10"), "{full}");
+        let mysql = page_sql(&schema(Engine::Mysql, "app"), &[], None, None, None, 5, 0, 1024).unwrap();
+        assert!(mysql.contains(" ORDER BY `app`.`customers`.`id` ASC LIMIT 5"), "{mysql}");
+        let mssql = page_sql(&schema(Engine::Sqlserver, "dbo"), &[], None, None, None, 5, 10, 1024).unwrap();
+        assert!(mssql.contains(" ORDER BY [dbo].[customers].[id] ASC OFFSET 10 ROWS"), "{mssql}");
     }
 }

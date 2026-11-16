@@ -455,6 +455,8 @@ impl Workbench {
                 facts.push(("conn.page.address", if address.is_empty() { none.clone() } else { address }));
                 facts.push(("conn.page.database", saved.database.clone().filter(|value| !value.is_empty()).unwrap_or_else(|| none.clone())));
                 facts.push(("conn.page.user", saved.username.clone().filter(|value| !value.is_empty()).unwrap_or_else(|| none.clone())));
+                // 密码存在哪里：没存进钥匙串的连接每次运行第一次连接时会弹框要密码，这里先说清楚。
+                facts.push(("conn.page.password", self.model.text(if saved.password_saved { "conn.page.passwordSaved" } else { "conn.page.passwordAsk" })));
                 let tls = match saved.tls.as_ref().map(|tls| tls.mode) {
                     None | Some(TlsMode::Off) => "conn.page.tlsOff",
                     Some(TlsMode::Require) => "conn.page.tlsRequire",

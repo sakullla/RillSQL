@@ -190,6 +190,8 @@ pub enum DraftField {
     GroupName,
     /// 标签管理：新建或编辑中的标签名。
     TagLabel,
+    /// 连接缺密码或密码被拒时的密码输入框。
+    PromptPassword,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -308,6 +310,30 @@ pub enum GroupOp {
     /// group 为空表示移回顶层。
     Assign { connection: String, group: Option<String> },
     Collapsed { id: String, collapsed: bool },
+}
+
+/// 连接缺密码或密码被拒时的输入框：只为这次连接要密码，不改配置、不写凭据库；
+/// 连上后服务在本次运行内记住它，切换数据库与自动重连不再重复询问。
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasswordPrompt {
+    pub id: String,
+    pub text: String,
+    /// 上一次的密码被服务端拒绝（而不是没有密码）。
+    pub rejected: bool,
+    /// 每次打开递增：视图据此只在新打开时聚焦一次输入框。
+    pub epoch: u64,
+}
+
+impl std::fmt::Debug for PasswordPrompt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PasswordPrompt")
+            .field("id", &self.id)
+            .field("typed", &!self.text.is_empty())
+            .field("rejected", &self.rejected)
+            .field("epoch", &self.epoch)
+            .finish()
+    }
 }
 
 /// 分组名输入框：新建与重命名共用一个小面板，不另开模态。
@@ -472,6 +498,9 @@ pub struct WorkbenchModel {
     /// “保存并连接”刚存下的那次输入机密（连接 id + 机密）：紧接着的 OpenConnection
     /// 用它连接，而不是用被 close_connection_modal 清空后的空机密。连上或重新打开表单即清。
     pub pending_open_secrets: Option<(String, Secrets)>,
+    /// 连接缺密码或密码被拒时弹出的密码输入框。
+    pub password_prompt: Option<PasswordPrompt>,
+    pub password_prompt_epoch: u64,
     /// 命令面板的范围筛选（全部 / 表与视图 / 命令 / 连接 / 保存的查询）。
     pub palette_scope: PaletteScope,
     /// 键盘在历史页移动选中项后，下一帧把该条目滚入视口一次。
@@ -580,6 +609,8 @@ impl WorkbenchModel {
             connect_intents: Vec::new(),
             connect_retry: None,
             pending_open_secrets: None,
+            password_prompt: None,
+            password_prompt_epoch: 0,
             palette_scope: PaletteScope::All,
             history_reveal: false,
             launcher_reveal: false,
@@ -731,6 +762,9 @@ impl WorkbenchModel {
     }
 
     fn local(&mut self, id: &str) -> bool {
+        if id.starts_with("password-") {
+            return self.password_command(id);
+        }
         // 分组命令与连接菜单里的“移动到分组”共用同一批 id。
         if id.starts_with("tags-") || id.starts_with("tag-") {
             return self.tag_command(id);
@@ -2834,6 +2868,60 @@ impl WorkbenchModel {
         self.connections.rows.iter().filter(|row| row.saved.env == id).count()
     }
 
+    /// 连接因缺密码或密码被拒而失败：弹出密码输入框。连接表单开着时不弹，表单自己有密码栏。
+    pub fn open_password_prompt(&mut self, id: &str, rejected: bool) {
+        if self.conn_modal.open || !self.connections.rows.iter().any(|row| row.saved.id == id) {
+            return;
+        }
+        self.password_prompt_epoch += 1;
+        self.password_prompt = Some(PasswordPrompt { id: id.to_owned(), text: String::new(), rejected, epoch: self.password_prompt_epoch });
+        self.focused_field = Some(DraftField::PromptPassword);
+    }
+
+    /// 密码输入框的命令：用这次输入的密码重连（并重放失败时挂起的动作）、取消、或改去编辑连接。
+    fn password_command(&mut self, id: &str) -> bool {
+        match id {
+            "password-submit" => {
+                if self.password_prompt.as_ref().is_none_or(|prompt| prompt.text.is_empty()) {
+                    return true;
+                }
+                let prompt = self.password_prompt.take().expect("prompt");
+                self.clear_prompt_focus();
+                let secrets = Secrets { password: prompt.text, ..Secrets::default() };
+                self.pending_open_secrets = Some((prompt.id.clone(), secrets));
+                self.connections.selected = Some(prompt.id.clone());
+                // 失败时挂起的那个动作（展开、打开表、运行查询）随这次连接一起重放。
+                let intent = match self.connect_retry.take() {
+                    Some(intent) if intent.connection_id == prompt.id => intent,
+                    other => {
+                        self.connect_retry = other;
+                        super::conn_modal::ConnectIntent::new(prompt.id.clone(), super::conn_modal::ConnectAction::Expand, None)
+                    }
+                };
+                self.queue_connect(intent);
+            }
+            "password-cancel" => {
+                self.password_prompt = None;
+                self.clear_prompt_focus();
+            }
+            "password-edit" => {
+                if let Some(prompt) = self.password_prompt.take() {
+                    self.clear_prompt_focus();
+                    self.connections.selected = Some(prompt.id);
+                    self.conn_command("conn-edit");
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn clear_prompt_focus(&mut self) {
+        if self.focused_field == Some(DraftField::PromptPassword) {
+            self.focused_field = None;
+        }
+    }
+
     /// 分组相关的命令入口。菜单、键盘与拖拽都只发这些 id。
     fn group_command(&mut self, id: &str) -> bool {
         match id {
@@ -4829,6 +4917,11 @@ impl WorkbenchModel {
                     prompt.set_new_name(value);
                 }
             }
+            DraftField::PromptPassword => {
+                if let Some(prompt) = self.password_prompt.as_mut() {
+                    prompt.text = value;
+                }
+            }
             other => {
                 if let Some(draft) = self.connections.editor.as_mut() {
                     *field_slot(draft, other) = value;
@@ -4874,6 +4967,7 @@ impl WorkbenchModel {
             DraftField::TagLabel => self.tag_manager.as_ref().and_then(|manager| manager.editing.as_ref()).map(|draft| draft.label.clone()).unwrap_or_default(),
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
             DraftField::DangerNewName => self.danger.as_ref().map(|prompt| prompt.new_name.clone()).unwrap_or_default(),
+            DraftField::PromptPassword => self.password_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
         }
     }

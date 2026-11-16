@@ -657,6 +657,48 @@ impl DatabaseProbe for RememberDatabase {
     }
 }
 
+/// 钥匙串不可用（或选择不保存密码）时，连接时手输的密码只在本次运行的内存里：
+/// 切换数据库直接复用它；删除或重新保存连接后作废；始终不进配置文件。
+#[tokio::test]
+async fn a_typed_password_is_remembered_for_this_run_only() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let probe = Arc::new(RememberDatabase::default());
+    let service = Service::with_probes(
+        config_path.clone(),
+        Arc::new(UnavailableStore),
+        Probes { ssh: None, database: Some(probe.clone()), sqlite: None, health: None },
+    );
+    let typed = secrets("typed-only-secret", "", "");
+    let saved = service.save(remote_draft(Engine::Postgres), SecretInput { save_password: false, ..typed.clone() }).await.unwrap();
+    let id = saved.connection.id.clone();
+    assert!(!saved.connection.password_saved);
+
+    // 没有密码：在网络之前就停在认证阶段，错误码让界面直接问密码。
+    let missing = service.open(&id, SecretInput::default()).await.unwrap();
+    assert!(!missing.connected);
+    assert_eq!(missing.report.code.as_deref(), Some(super::error_codes::CONN_PASSWORD_REQUIRED));
+    assert!(!service.remembers_password(&id));
+
+    assert!(service.open(&id, typed.clone()).await.unwrap().connected);
+    assert!(service.remembers_password(&id));
+    // 切换数据库不再带密码也能连上：以前这里会报“请填写数据库密码”。
+    service.focus_database(&id, "rillsql").await.unwrap();
+    assert_eq!(probe.seen.lock().expect("seen").as_slice(), ["app", "rillsql"]);
+    assert_secret_absent(&String::from_utf8_lossy(&persisted_bytes(&config_path)), &typed);
+    assert_secret_absent(&service.logs().join("\n"), &typed);
+
+    // 重新保存（配置可能变了）后作废，下次连接重新要密码。
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some(id.clone());
+    service.save(draft, SecretInput { save_password: false, ..SecretInput::default() }).await.unwrap();
+    assert!(!service.remembers_password(&id));
+    assert!(service.open(&id, typed.clone()).await.unwrap().connected);
+    service.delete(&id).await.unwrap();
+    assert!(!service.remembers_password(&id), "删除连接一并忘掉手输的密码");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn stored_password_is_reused_without_being_copied_into_the_config() {
     let dir = temp_workspace();

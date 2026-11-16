@@ -123,6 +123,7 @@ pub struct Workbench {
     /// 连接启动台“全部连接”列表滚动：方向键移动时跟随选中行。
     pub(super) launcher_scroll: gpui_kit::ScrollHandle,
     pub(super) danger_focused_epoch: Option<u64>,
+    pub(super) password_focused_epoch: Option<u64>,
     pub(super) history_rename_focused: bool,
     /// 工作项页签条的横向滚动。跨帧保存偏移，不能每帧新建句柄；
     /// Ctrl+Tab、新建或关闭之后要把当前页签滚进可视区。
@@ -343,6 +344,7 @@ impl Workbench {
             history_scroll: gpui_kit::ScrollHandle::new(),
             launcher_scroll: gpui_kit::ScrollHandle::new(),
             danger_focused_epoch: None,
+            password_focused_epoch: None,
             history_rename_focused: false,
             tab_scroll: gpui_kit::ScrollHandle::new(),
             tab_scroll_seen: None,
