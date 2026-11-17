@@ -3392,64 +3392,14 @@ impl GridPane {
                 });
             }
         };
-        let mut header = div()
-            .id("grid-filter-header")
-            .debug_selector(|| "grid-filter-header".to_owned())
-            .w_full()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                div()
-                    .id("grid-filter-title")
-                    .flex()
-                    .items_center()
-                    .tooltip_text(t("grid.filter.modeHint"))
-                    .child(kit::icon(IconName::Funnel, 13., p.text_muted)),
-            )
-            .child(modes);
-        if unapplied {
-            // 条件改了还没应用：与条件行里的圆点同一个意思，这里靠动作一侧也能看见。
-            header = header.child(
-                div()
-                    .id("grid-filter-unapplied-badge")
-                    .debug_selector(|| "grid-filter-unapplied-badge".to_owned())
-                    .mx(px(2.))
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(p.accent)
-                    .tooltip_text(t(if mode == session::FilterMode::Sql { "grid.filter.sqlUnapplied" } else { "grid.filter.unapplied" })),
-            );
-        }
-        header = header
-            .child(div().flex_1().min_w(px(0.)))
-            .children((mode == session::FilterMode::Visual).then(|| kit::icon_button("grid-filter-add-strip", IconName::Plus, t("grid.filter.add"), add).into_any_element()))
-            // 有未应用的条件时"应用"是主按钮：这里才是让条件真正生效的一步。
-            .child(if unapplied {
-                kit::primary_button("grid-filter-apply", Some(IconName::Check), t("grid.filter.apply"), apply.clone()).into_any_element()
-            } else {
-                kit::icon_button("grid-filter-apply", IconName::Check, t("grid.filter.apply"), apply).into_any_element()
-            })
-            .child(kit::icon_button("grid-filter-clear", IconName::X, t("grid.filter.clearAll"), clear));
-        let mut strip = div()
-            .id("grid-filters")
-            .debug_selector(|| "grid-filters".to_owned())
-            .flex_none()
-            .px(px(10.))
-            .py(px(3.))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .border_b_1()
-            .border_color(p.line)
-            .bg(p.chrome)
-            .child(header);
-        if mode == session::FilterMode::Visual {
+        // 一行排开：写法切换 | 条件（可视化条件块或 SQL 表达式框，占满中间） | 未应用提示、应用、清除。
+        // 动作紧跟在条件后面，不被推到窗口另一头；窄窗口里整行换行，条件框单独占一行。
+        let content = if mode == session::FilterMode::Visual {
             let mut rows = div()
                 .id("grid-filter-rows")
                 .debug_selector(|| "grid-filter-rows".to_owned())
-                .w_full()
+                .flex_1()
+                .min_w(px(220.))
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -3478,34 +3428,117 @@ impl GridPane {
                         .child(t("grid.filter.emptyVisual")),
                 );
             }
-            strip = strip.child(rows);
+            // “添加条件”跟在最后一个条件后面：加完的条件就出现在按钮原来的位置。
+            rows.child(kit::tool_button("grid-filter-add-strip", Some(IconName::Plus), t("grid.filter.add"), add).into_any_element())
+                .into_any_element()
         } else {
+            // SQL 条件是一个看得出边界的输入框：前面固定写 WHERE，说明这里只填条件；等宽字体与编辑器一致。
+            let mono = cx.theme().mono_font_family.clone();
             let mut row = div()
                 .id("grid-filter-sql-row")
                 .debug_selector(|| "grid-filter-sql-row".to_owned())
-                .w_full()
+                .flex_1()
+                .min_w(px(220.))
+                .h(px(28.))
+                .pl(px(8.))
+                .pr(px(4.))
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .tooltip_text(t("grid.filter.sqlTitle"));
+                .rounded(px(Radius::CONTROL))
+                .border_1()
+                // 改了还没应用时边框用强调色，与可视化条件块同一个意思。
+                .border_color(if unapplied { p.accent } else { p.line_strong })
+                .bg(p.surface)
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(mono.clone())
+                        .text_size(px(TypeScale::SM))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(p.accent_text)
+                        .child(SharedString::from("WHERE")),
+                );
             if let Some(state) = self.sql_input.clone() {
                 row = row.child(
                     div()
                         .flex_1()
-                        .min_w(px(120.))
+                        .min_w(px(0.))
+                        .font_family(mono)
                         // 输入框的可读名字用"直接写 WHERE 表达式"；示例长句留在占位符里。
-                        .child(kit::inline_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle")).xsmall()),
+                        .child(kit::inline_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle"))),
                 );
             }
-            row = row.child(
+            row.child(
                 div()
                     .id("grid-filter-sql-hint")
                     .flex_none()
                     .tooltip_text(t("grid.filter.sqlHint"))
-                    .child(kit::icon(IconName::Info, 13., p.text_muted)),
+                    .child(kit::icon(IconName::Info, 13., p.text_faint)),
+            )
+            .into_any_element()
+        };
+        let mut actions = div().id("grid-filter-actions").debug_selector(|| "grid-filter-actions".to_owned()).flex_none().flex().items_center().gap(px(4.));
+        if unapplied {
+            // 条件改了还没应用：写成字，而不是只有一个小圆点。
+            actions = actions.child(
+                div()
+                    .id("grid-filter-unapplied-badge")
+                    .debug_selector(|| "grid-filter-unapplied-badge".to_owned())
+                    .px(px(6.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::CONTROL))
+                    .bg(p.accent_soft)
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.accent_text)
+                    .tooltip_text(t(if mode == session::FilterMode::Sql { "grid.filter.sqlUnapplied" } else { "grid.filter.unapplied" }))
+                    .child(t("grid.filter.unapplied")),
             );
-            strip = strip.child(row);
         }
+        // 有未应用的条件时“应用”是主按钮；没有改动时退成描边按钮，仍可点来按当前条件重读。按钮文字始终写出来。
+        actions = actions
+            .child(if unapplied {
+                kit::primary_button("grid-filter-apply", Some(IconName::Check), t("grid.filter.apply"), apply).tooltip(SharedString::from("Enter")).into_any_element()
+            } else {
+                kit::secondary_button("grid-filter-apply", Some(IconName::Check), t("grid.filter.apply"), apply).into_any_element()
+            })
+            .child(kit::tool_button("grid-filter-clear", Some(IconName::X), t("grid.filter.clear"), clear).tooltip(t("grid.filter.clearAll")));
+        let header = div()
+            .id("grid-filter-header")
+            .debug_selector(|| "grid-filter-header".to_owned())
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .id("grid-filter-title")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    // 说明只挂在漏斗图标上：悬停写法切换时不弹出一大段提示挡住表格。
+                    .child(div().id("grid-filter-mode-help").tooltip_text(t("grid.filter.modeHint")).child(kit::icon(IconName::Funnel, 13., p.text_muted)))
+                    .child(modes),
+            )
+            .child(content)
+            .child(actions);
+        let mut strip = div()
+            .id("grid-filters")
+            .debug_selector(|| "grid-filters".to_owned())
+            .flex_none()
+            .px(px(10.))
+            .py(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(p.line)
+            .bg(p.chrome)
+            .child(header);
         if let Some(error) = filter_error {
             strip = strip.child(filter_note("grid-filter-error", error, p.danger));
         } else if let Some(hint) = hint {
@@ -9007,7 +9040,15 @@ mod filter_ui_tests {
                             });
                         });
                         visual.update(|window, cx| window.render_frame(cx));
-                        assert!(visual.debug_bounds("grid-filter-sql-row").is_some(), "{width}/{dark}/{locale:?} SQL 输入行");
+                        let sql = visual.debug_bounds("grid-filter-sql-row").expect("SQL 输入行");
+                        assert!(f32::from(sql.size.height) >= 26., "{width}/{dark}/{locale:?} SQL 条件是看得出边界的输入框");
+                        // 应用 / 清除紧跟在输入框后面（同一行时）或换到下一行，不越界。
+                        let actions = visual.debug_bounds("grid-filter-actions").expect("动作");
+                        assert!(f32::from(actions.origin.x + actions.size.width) <= width + 1., "{width}/{dark}/{locale:?} 动作不越界");
+                        if (f32::from(actions.origin.y) - f32::from(sql.origin.y)).abs() < 4. {
+                            let gap = f32::from(actions.origin.x) - f32::from(sql.origin.x + sql.size.width);
+                            assert!((0. ..=12.).contains(&gap), "{width}/{dark}/{locale:?} 动作贴着输入框：{gap}");
+                        }
                         assert!(visual.debug_bounds("grid-filter-rows").is_none(), "SQL 形态不画可视化条件行");
                     }
                 }

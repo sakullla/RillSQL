@@ -95,6 +95,12 @@ pub struct QueryPane {
     metadata_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     services: Arc<AppServices>,
     editors: HashMap<String, Entity<SqlEditor>>,
+    /// 每个编辑器“有没有选区”的翻转：工具条的“运行 / 运行选中”跟着它改字。
+    editor_watch: HashMap<String, gpui_kit::Subscription>,
+    /// 每个查询标签本次执行的开始时刻；执行中的结果头显示实时耗时。
+    run_clock: HashMap<String, std::time::Instant>,
+    /// 执行中按固定间隔重绘耗时；没有执行时自己结束。
+    run_ticker: Option<gpui_kit::Task<()>>,
     links: HashMap<String, DraftLink>,
     grid: Entity<GridPane>,
     locale: Locale,
@@ -347,6 +353,16 @@ fn statement_sql_block(result: &desk::StatementView, failed: bool, locale: Local
         .into_any_element()
 }
 
+/// 执行中的实时耗时：一分钟内精确到 0.1 秒，之后按分秒显示。
+pub fn running_label(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{:.1} s", elapsed.as_secs_f64())
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
 pub fn elapsed_label(ms: u64) -> String {
     if ms >= 1000 {
         format!("{:.2} s", ms as f64 / 1000.)
@@ -479,6 +495,9 @@ impl QueryPane {
             metadata_gate: Arc::clone(&services.metadata_gate),
             services,
             editors: HashMap::new(),
+            editor_watch: HashMap::new(),
+            run_clock: HashMap::new(),
+            run_ticker: None,
             links: HashMap::new(),
             grid,
             locale: Locale::ZhCn,
@@ -1159,6 +1178,8 @@ impl QueryPane {
         self.context_active = context && active.is_some_and(|id| self.desk.has_tab(id));
         self.desk.retain_tabs(&ids, &self.services.tasks);
         self.editors.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.editor_watch.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.desk.refresh_outline();
@@ -1214,6 +1235,15 @@ impl QueryPane {
                     });
                 }));
             });
+            // 选区出现或消失时重绘工具条；光标在选区内外移动不打扰查询页。
+            let selected = std::cell::Cell::new(false);
+            let watch = cx.observe(&editor, move |_, editor, cx| {
+                let has = editor.read(cx).caret().chars > 0;
+                if selected.replace(has) != has {
+                    cx.notify();
+                }
+            });
+            self.editor_watch.insert(id.clone(), watch);
             self.editors.insert(id.clone(), editor);
             self.links.insert(id, DraftLink { applied: sql.clone(), editor: sql, dirty: false });
         }
@@ -1522,6 +1552,7 @@ impl QueryPane {
 
     fn spawn_run(&mut self, prepared: PreparedRun, cx: &mut Context<Self>) {
         let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+        self.run_clock.insert(prepared.tab_id.clone(), std::time::Instant::now());
         let services = Arc::clone(&self.services);
         let timeout_ms = self.timeout_ms;
         #[cfg(test)]
@@ -1574,9 +1605,58 @@ impl QueryPane {
             }
         })
         .detach();
+        self.ensure_run_ticker(cx);
         // 运行态由结果标题的 spinner 表达；note 留给错误或提示，避免“正在执行”重复两遍。
         self.desk.set_active_note("");
         cx.notify();
+    }
+
+    /// 执行中每 200ms 重绘一次结果头，让耗时实时走动；所有执行结束后自己停下。
+    /// 测试里不开计时循环：执行器不会自己推进时钟。
+    fn ensure_run_ticker(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        // 每次执行换一个新的循环：旧循环随句柄丢弃而取消，不会出现两个同时重绘。
+        self.run_ticker = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                let keep = view
+                    .update(cx, |pane, cx| {
+                        let running = !pane.desk.running_ids().is_empty();
+                        if running {
+                            cx.notify();
+                        }
+                        running
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// 活动标签这次执行已经走了多久；没有在执行时为 None。
+    fn running_for(&self) -> Option<std::time::Duration> {
+        let id = self.desk.active_id()?;
+        if !self.desk.running_ids().iter().any(|running| running == id) {
+            return None;
+        }
+        self.run_clock.get(id).map(std::time::Instant::elapsed)
+    }
+
+    /// “正在执行 3.4 s”；还没有开始时刻（测试直接种入的运行态）时只写“正在执行”。
+    fn running_text(&self) -> String {
+        match self.running_for() {
+            Some(elapsed) => i18n::fill(&i18n::text(self.locale, "query.status.runningFor"), &[("elapsed", &running_label(elapsed))]),
+            None => i18n::text(self.locale, "query.status.running"),
+        }
+    }
+
+    /// 活动编辑器里有没有选中文本：有选区时“运行”只执行选中部分。
+    fn has_selection(&self, cx: &App) -> bool {
+        self.desk.active_id().and_then(|id| self.editors.get(id)).is_some_and(|editor| editor.read(cx).caret().chars > 0)
     }
 
     /// 一条执行快照到达界面：中间批次也要立刻落到结果和网格上，
@@ -2665,11 +2745,20 @@ impl QueryPane {
     fn render_toolbar(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>, cx: &App) -> AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        // 没有选区时“运行”执行光标所在语句，有选区时只执行选中部分：按钮文字直接说清楚这次会跑什么。
+        let selected = self.has_selection(cx);
         let run: AnyElement = if running {
-            kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", entity)).into_any_element()
+            kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", entity))
+                .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "ui.query.stop"), kit::shortcut("Ctrl+."))))
+                .into_any_element()
         } else {
-            kit::primary_button("query-act-execute-query", Some(IconName::Play), t("ui.query.run"), pane_act("execute-query", entity))
-                .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "shell.shortcuts.runSelection"), kit::shortcut("Ctrl+Enter"))))
+            let (label, tip) = if selected {
+                (t("query.run.selection"), i18n::text(locale, "query.run.selectionTip"))
+            } else {
+                (t("ui.query.run"), i18n::text(locale, "query.editor.menu.runCurrent"))
+            };
+            kit::primary_button("query-act-execute-query", Some(IconName::Play), label, pane_act("execute-query", entity))
+                .tooltip(SharedString::from(format!("{tip} · {}", kit::shortcut("Ctrl+Enter"))))
                 .into_any_element()
         };
         let more = self.render_more_menu(entity);
@@ -2685,10 +2774,11 @@ impl QueryPane {
             .border_b_1()
             .border_color(p.line)
             .child(run)
+            // 第二个按钮是“运行全部”：没有选区时“运行”已经只跑当前语句，再放一个“执行当前语句”就是重复。
             .when(!running && !self.narrow, |this| {
                 this.child(
-                    kit::secondary_button("query-act-run-current", Some(IconName::CornerDownLeft), t("query.editor.menu.runCurrent"), pane_act("run-current", entity))
-                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.editor.menu.runCurrent"), kit::shortcut("Ctrl+Shift+Enter")))),
+                    kit::secondary_button("query-act-run-script", Some(IconName::ListOrdered), t("query.run.all"), pane_act("run-script", entity))
+                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.run.allTip"), kit::shortcut("Ctrl+Alt+Enter")))),
                 )
             })
             .child(kit::vline(p))
@@ -2737,7 +2827,7 @@ impl QueryPane {
                     })
                 };
                 menu.item(item("run-current", IconName::CornerDownLeft, "query.editor.menu.runCurrent", Some("Ctrl+Shift+Enter")))
-                    .item(item("run-script", IconName::Play, "query.run.runScript", None))
+                    .item(item("run-script", IconName::ListOrdered, "query.run.runScript", Some("Ctrl+Alt+Enter")))
                     .separator()
                     .item(item("autocomplete", IconName::Sparkles, "shell.shortcuts.autocomplete", Some("Ctrl+Space")))
                     .item(item("expand-star", IconName::Columns3, "query.complete.expandStar", None))
@@ -2918,6 +3008,7 @@ impl QueryPane {
     #[inline(never)]
     fn render_result_tabs(&mut self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
+        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|item| item == id));
         let result_view = self.desk.result_view();
         let titles = self.desk.result_titles();
         let single = self.desk.results().len() <= 1;
@@ -2958,14 +3049,13 @@ impl QueryPane {
                     .unwrap_or_else(|| format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
                 // 跳过的语句没有结果可看：状态写进标题，不只靠颜色表达。
                 let label = if skipped { format!("{semantic} {}", i18n::text(locale, "query.log.skipped")) } else { semantic };
-                let dot = if statement_failed(result) {
-                    p.danger
-                } else if skipped {
-                    p.text_faint
-                } else if result.status == "cancelled" {
-                    p.warn
-                } else {
-                    p.ok
+                let dot = match statement_progress(self.desk.results(), index, running) {
+                    Progress::Running => p.accent,
+                    Progress::Queued => p.text_faint,
+                    Progress::Done if statement_failed(result) => p.danger,
+                    Progress::Done if skipped => p.text_faint,
+                    Progress::Done if result.status == "cancelled" => p.warn,
+                    Progress::Done => p.ok,
                 };
                 let entity = entity.clone();
                 let click = format!("statement:{index}");
@@ -3043,11 +3133,12 @@ impl QueryPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let mut items: Vec<AnyElement> = vec![div().flex_1().into_any_element()];
         let active_result = self.desk.shown_result();
-        let summary = active_result.filter(|result| !(statement_failed(result) && result.columns.is_empty())).map(|result| {
+        // 还没执行完的语句没有行数可报：“0 行”会被读成“查询结果为空”。
+        let summary = active_result.filter(|result| !(statement_failed(result) && result.columns.is_empty()) && !statement_pending(result)).map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
                 format!("{affected} ✓")
             } else {
-                format!("{} {}", result.rows.len(), i18n::text(locale, "ui.grid.rows"))
+                format!("{} {}", crate::app::views::grid::group_digits(result.rows.len() as i64), i18n::text(locale, "ui.grid.rows"))
             }
         });
         let failed_note = self.failure_view().is_some();
@@ -3063,7 +3154,7 @@ impl QueryPane {
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(Spinner::new().xsmall().color(p.accent))
-                    .child(t("query.status.running"))
+                    .child(SharedString::from(self.running_text()))
                     .into_any_element(),
             );
         }
@@ -3283,19 +3374,49 @@ impl QueryPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(kit::loading_state(t("query.status.running"), p))
+                    .child(kit::loading_state(SharedString::from(self.running_text()), p))
                     .into_any_element();
             }
+            // 空结果页顺带教会三种执行方式：快捷键和工具条按钮是一一对应的。
+            let hint = |key: &str, chord: &str| {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(i18n::text(locale, key)))
+                    .child(kit::kbd(kit::shortcut(chord), p))
+            };
             return div()
+                .id("query-results-empty")
+                .test_support()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), p).child(div().flex().gap(px(6.)).child(kit::kbd(kit::shortcut("Ctrl+Enter"), p))))
+                .child(
+                    kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), p).child(
+                        div()
+                            .mt(px(4.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(hint("query.empty.run", "Ctrl+Enter"))
+                            .child(hint("query.empty.runCurrent", "Ctrl+Shift+Enter"))
+                            .child(hint("query.empty.runAll", "Ctrl+Alt+Enter")),
+                    ),
+                )
                 .into_any_element();
         };
         if result.columns.is_empty() {
-            return statement_outcome(result, &self.desk.active_note(), locale, mono, p, metrics, entity);
+            let progress = if self.desk.result_view() == ResultView::Current {
+                statement_progress(self.desk.results(), self.desk.statement(), running)
+            } else {
+                Progress::Done
+            };
+            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity);
         }
         // 结果是执行计划：画成计划视图（摘要、问题与建议、计划树、节点详情）；“原始结果”仍是网格。
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
@@ -3451,6 +3572,33 @@ fn failure_status(result: &desk::StatementView, with_jump: bool, locale: Locale,
     items
 }
 
+/// 执行层还没给出任何结果的语句。已经发布过行的语句是 "running"：它有结果可看，不算在这里。
+fn statement_pending(view: &desk::StatementView) -> bool {
+    view.status == "pending"
+}
+
+/// 一条语句在本次执行里的进度：语句按顺序执行，执行中第一条还没有结果的语句正在跑，后面的在排队。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Progress {
+    Done,
+    Running,
+    Queued,
+}
+
+fn statement_progress(results: &[desk::StatementView], index: usize, running: bool) -> Progress {
+    let Some(view) = results.get(index) else {
+        return Progress::Done;
+    };
+    if !running || !statement_pending(view) {
+        return Progress::Done;
+    }
+    if results.iter().position(statement_pending) == Some(index) {
+        Progress::Running
+    } else {
+        Progress::Queued
+    }
+}
+
 fn statement_failed(view: &desk::StatementView) -> bool {
     view.status == "error" || view.status == "failed"
 }
@@ -3479,7 +3627,38 @@ fn error_copy_button(locale: Locale, _p: &Palette, _metrics: Metrics, entity: &E
 
 /// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。
 #[inline(never)]
-fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, mono: &SharedString, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+#[allow(clippy::too_many_arguments)]
+fn statement_outcome(result: &desk::StatementView, progress: Progress, note: &str, locale: Locale, mono: &SharedString, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    if progress != Progress::Done {
+        // 执行中：正在跑的这一条转圈，排在后面的写“等待执行”，都不能画成成功的对勾。
+        let (text, indicator) = match progress {
+            Progress::Running => (i18n::text(locale, "query.status.running"), Spinner::new().small().color(p.accent).into_any_element()),
+            _ => (i18n::text(locale, "query.status.queued"), kit::icon(IconName::Clock, 16., p.text_faint).into_any_element()),
+        };
+        return div()
+            .id("query-statement-outcome")
+            .test_support()
+            .flex_1()
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .id("query-statement-progress")
+                    .test_support()
+                    .aria_label(SharedString::from(text.clone()))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(TypeScale::MD))
+                    .text_color(p.text_muted)
+                    .child(indicator)
+                    .child(SharedString::from(text)),
+            )
+            .child(statement_sql_block(result, false, locale, mono, p))
+            .into_any_element();
+    }
     let failed = result.status == "error" || result.status == "failed";
     let skipped = result.status == "skipped";
     let cancelled = result.status == "cancelled";
@@ -3726,6 +3905,23 @@ mod tests {
             range: None,
             error_mark: None,
         }
+    }
+
+    /// 执行中：已经发布过行的语句有结果可看；第一条还没结果的语句在跑，后面的排队；执行结束后都不算进行中。
+    #[test]
+    fn statement_progress_marks_only_the_first_unfinished_statement_as_running() {
+        let results = vec![sheet("select 1", false, "running"), sheet("select pg_sleep(4)", false, "pending"), sheet("select 3", false, "pending")];
+        let progress = (0..3).map(|index| statement_progress(&results, index, true)).collect::<Vec<_>>();
+        assert_eq!(progress, vec![Progress::Done, Progress::Running, Progress::Queued]);
+        assert!((0..3).all(|index| statement_progress(&results, index, false) == Progress::Done));
+        assert_eq!(statement_progress(&results, 9, true), Progress::Done);
+    }
+
+    #[test]
+    fn running_time_reads_in_tenths_then_minutes() {
+        assert_eq!(running_label(std::time::Duration::from_millis(3_420)), "3.4 s");
+        assert_eq!(running_label(std::time::Duration::from_millis(59_940)), "59.9 s");
+        assert_eq!(running_label(std::time::Duration::from_secs(125)), "2m 05s");
     }
 
     #[test]
@@ -5162,6 +5358,32 @@ mod tests {
                 pane.command("side-mode:object", cx);
                 assert_eq!(pane.side.get("q").copied(), before, "不得改隐藏查询的右侧面板");
             });
+        })
+        .unwrap();
+    }
+
+    /// 没有选区时“运行”就是执行当前语句：工具条的第二个按钮给“运行全部”，选中文本后主按钮改说“运行选中”。
+    #[gpui_kit::test]
+    fn the_run_button_names_what_it_will_run(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[bound("a", "select 1;\nselect 2;")], Some("a"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-act-execute-query").label(), Some("运行"));
+            assert!(window.try_find("query-act-run-script").is_some(), "运行全部在工具条上");
+            assert!(window.try_find("query-act-run-current").is_none(), "不再放一个和“运行”重复的按钮");
+            assert!(window.try_find("query-results-empty").is_some(), "空结果页列出三种执行方式");
+            let editor = pane.read(cx).editors.get("a").cloned().unwrap();
+            editor.update(cx, |editor, cx| editor.select_range(10..18, cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-act-execute-query").label(), Some("运行选中"));
+            editor.update(cx, |editor, cx| editor.select_range(2..2, cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-act-execute-query").label(), Some("运行"));
         })
         .unwrap();
     }

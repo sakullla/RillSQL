@@ -363,6 +363,7 @@ dict! {
     "grid.filter.add" => "添加条件", "Add filter";
     "grid.filter.apply" => "应用条件", "Apply filters";
     "grid.filter.clearAll" => "清除全部条件", "Clear all filters";
+    "grid.filter.clear" => "清除", "Clear";
     "grid.filter.remove" => "删除这条条件", "Remove this filter";
     "grid.filter.value" => "值", "Value";
     "grid.filter.and" => "且", "and";
@@ -1546,6 +1547,19 @@ dict! {
     "redis.console.useScan" => "改用模式过滤 (SCAN)", "Filter with SCAN";
     "redis.console.completeHint" => "Tab 补全 · ↑↓ 选择", "Tab to complete · ↑↓ select";
     "redis.string.save" => "保存修改", "Save value";
+    "shell.shortcuts.runScript" => "执行整个脚本（全部语句）", "Run the whole script (every statement)";
+    "query.run.selection" => "运行选中", "Run selection";
+    "query.run.selectionTip" => "执行选中的 SQL", "Run the selected SQL";
+    "query.run.all" => "运行全部", "Run all";
+    "query.run.allTip" => "按顺序执行编辑器里的全部语句", "Run every statement in the editor, in order";
+    "query.editor.caret" => "行 {line}，列 {col}", "Ln {line}, Col {col}";
+    "query.editor.selection" => "已选 {chars} 个字符", "{chars} selected";
+    "query.editor.selectionLines" => "已选 {chars} 个字符，{lines} 行", "{chars} selected, {lines} lines";
+    "query.status.queued" => "等待执行", "Waiting to run";
+    "query.empty.runCurrent" => "只运行光标所在语句", "Run only the statement at the cursor";
+    "query.status.runningFor" => "正在执行 {elapsed}", "Running {elapsed}";
+    "query.empty.run" => "运行选中内容或光标所在语句", "Run the selection or the statement at the cursor";
+    "query.empty.runAll" => "运行全部语句", "Run every statement";
 }
 
 #[cfg(test)]

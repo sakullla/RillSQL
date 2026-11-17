@@ -273,6 +273,9 @@ fn follow_uri(sink: &ObjectSink, uri: &str, cx: &mut App) -> bool {
     true
 }
 
+/// track 的去重键：(文本版本, 光标, 选区起止, 文本长度, 深色)。
+type TrackKey = (u64, usize, (usize, usize), usize, bool);
+
 pub struct SqlEditor {
     state: Entity<EditorState>,
     version: Rc<Cell<u64>>,
@@ -292,8 +295,10 @@ pub struct SqlEditor {
     dismissed: Option<usize>,
     /// 光标所在语句的范围（低对比底色）。
     current_statement: Option<Range<usize>>,
-    /// 上次按光标计算时的 (版本, 光标, 长度, 深色)，同一帧内只算一次。
-    tracked: Option<(u64, usize, usize, bool)>,
+    /// 上次按光标计算时的 (版本, 光标, 选区, 长度, 深色)，同一帧内只算一次。
+    tracked: Option<TrackKey>,
+    /// 底部状态行：光标行列与选区大小，随 track 一起更新。
+    caret: Caret,
     statement_marks: RangeDecorationCollection,
     error_marks: RangeDecorationCollection,
     error_gutter: GutterDecorationCollection,
@@ -464,6 +469,7 @@ impl SqlEditor {
             dismissed: None,
             current_statement: None,
             tracked: None,
+            caret: Caret::default(),
             statement_marks,
             error_marks,
             error_gutter,
@@ -487,21 +493,25 @@ impl SqlEditor {
 
     /// 光标移动或文本变化后重算当前语句高亮和签名提示；同一状态只算一次。
     fn track(&mut self, cx: &mut Context<Self>) -> bool {
-        let (text, cursor) = {
+        let (text, cursor, selection) = {
             let state = self.state.read(cx);
-            (state.text().clone(), state.cursor())
+            (state.text().clone(), state.cursor(), state.selected_range())
         };
         let dark = cx.theme().is_dark();
-        let key = (self.version.get(), cursor, text.len(), dark);
+        let key = (self.version.get(), cursor, (selection.start, selection.end), text.len(), dark);
         let previous = self.tracked;
         if previous == Some(key) {
             return false;
         }
         self.tracked = Some(key);
         let value = text.to_string();
+        // 状态行只在光标或选区真的变了时才要求重绘；文本变化本来就会重绘。
+        let caret = caret_of(&value, selection, cursor);
+        let caret_moved = caret != self.caret;
+        self.caret = caret;
         let engine = self.engine();
         let current = statement_at(&engine, &value, cursor);
-        if current != self.current_statement || previous.is_some_and(|(_, _, _, was)| was != dark) {
+        if current != self.current_statement || previous.is_some_and(|(_, _, _, _, was)| was != dark) {
             self.current_statement = current.clone();
             let mut color = Palette::of(cx).accent;
             color.a = if dark { 0.10 } else { 0.06 };
@@ -517,10 +527,15 @@ impl SqlEditor {
             _ => {}
         }
         if hint == self.signature {
-            return false;
+            return caret_moved;
         }
         self.signature = hint;
         true
+    }
+
+    /// 底部状态行读到的光标与选区（测试和查询页读取）。
+    pub fn caret(&self) -> Caret {
+        self.caret
     }
 
     /// Esc：关掉这对括号的签名提示，直到光标离开或进入另一个调用。
@@ -936,22 +951,96 @@ impl Render for SqlEditor {
         let (background, foreground) = self.theme_colors(cx.theme().is_dark());
         let focused = self.is_focused(window, cx);
         let popup = self.signature.clone().filter(|_| focused).map(|hint| self.signature_popup(&hint, cx));
+        let status = self.caret_status(cx);
         div()
             .id("sql-editor")
             .relative()
             .size_full()
+            .flex()
+            .flex_col()
             .text_size(px(self.font_size))
             .text_color(rgb(foreground))
             .child(
-                Editor::new(&self.state)
-                    .h(gpui_kit::relative(1.))
-                    .bordered(false)
-                    .aria_label("SQL")
-                    .text_size(px(self.font_size))
-                    .bg(rgb(background))
-                    .text_color(rgb(foreground)),
+                div().flex_1().min_h(px(0.)).child(
+                    Editor::new(&self.state)
+                        .h(gpui_kit::relative(1.))
+                        .bordered(false)
+                        .aria_label("SQL")
+                        .text_size(px(self.font_size))
+                        .bg(rgb(background))
+                        .text_color(rgb(foreground)),
+                ),
             )
+            .child(status)
             .children(popup)
+    }
+}
+
+/// 编辑器底部状态行要显示的光标位置与选区大小。行列从 1 开始，列按字符数计。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caret {
+    pub line: usize,
+    pub col: usize,
+    /// 选中的字符数；没有选区时为 0。
+    pub chars: usize,
+    /// 选区跨过的行数；没有选区时为 0。
+    pub lines: usize,
+}
+
+/// 按字节偏移算出光标行列与选区大小。偏移越界或不在字符边界上时向前收到最近的边界。
+pub fn caret_of(text: &str, selection: Range<usize>, head: usize) -> Caret {
+    let floor = |offset: usize| {
+        let mut offset = offset.min(text.len());
+        while !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    };
+    let head = floor(head);
+    let before = &text[..head];
+    let line_start = before.rfind('\n').map(|at| at + 1).unwrap_or(0);
+    let line = before.matches('\n').count() + 1;
+    let col = before[line_start..].chars().count() + 1;
+    let (start, end) = (floor(selection.start.min(selection.end)), floor(selection.start.max(selection.end)));
+    if start == end {
+        return Caret { line, col, chars: 0, lines: 0 };
+    }
+    let picked = &text[start..end];
+    let chars = picked.chars().count();
+    // 选区停在下一行行首时，那一行没有被选中任何字符，不算进去。
+    let lines = picked.trim_end_matches('\n').matches('\n').count() + 1;
+    Caret { line, col, chars, lines }
+}
+
+impl SqlEditor {
+    /// 底部状态行：右对齐的“已选…”与“行 n，列 m”。比编辑器正文低一档，不和代码抢视线。
+    fn caret_status(&self, cx: &App) -> gpui_kit::AnyElement {
+        let p = Palette::of(cx);
+        let locale = self.locale.get();
+        let caret = self.caret;
+        let position = i18n::fill(&i18n::text(locale, "query.editor.caret"), &[("line", &caret.line.max(1).to_string()), ("col", &caret.col.max(1).to_string())]);
+        let selection = match caret.lines {
+            0 => None,
+            1 => Some(i18n::fill(&i18n::text(locale, "query.editor.selection"), &[("chars", &caret.chars.to_string())])),
+            lines => Some(i18n::fill(&i18n::text(locale, "query.editor.selectionLines"), &[("chars", &caret.chars.to_string()), ("lines", &lines.to_string())])),
+        };
+        div()
+            .id("sql-editor-status")
+            .flex_none()
+            .h(px(22.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(14.))
+            .border_t_1()
+            .border_color(p.line)
+            .bg(p.chrome)
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint)
+            .children(selection.map(|text| div().id("sql-editor-selection").text_color(p.text_muted).child(SharedString::from(text))))
+            .child(div().id("sql-editor-caret").child(SharedString::from(position)))
+            .into_any_element()
     }
 }
 
@@ -1247,6 +1336,39 @@ mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    #[test]
+    fn caret_counts_lines_and_characters_not_bytes() {
+        let text = "select 1;\n-- 中文注释\nselect 2;";
+        // 光标在第二行“中文”之后：列按字符计，不按 UTF-8 字节。
+        let head = text.find("注释").unwrap();
+        assert_eq!(caret_of(text, head..head, head), Caret { line: 2, col: 6, chars: 0, lines: 0 });
+        assert_eq!(caret_of(text, 0..0, 0), Caret { line: 1, col: 1, chars: 0, lines: 0 });
+        // 选中第一整行连同换行：停在下一行行首，那一行不算进选区。
+        let first = text.find('\n').unwrap() + 1;
+        assert_eq!(caret_of(text, 0..first, first), Caret { line: 2, col: 1, chars: 10, lines: 1 });
+        // 反向选区与越界、非字符边界的偏移都收到合法位置。
+        let all = caret_of(text, text.len() + 5..0, 0);
+        assert_eq!((all.chars, all.lines), (text.chars().count(), 3));
+        let inside = text.find("中").unwrap() + 1;
+        assert_eq!(caret_of(text, inside..inside, inside).col, 4);
+    }
+
+    #[gpui_kit::test]
+    fn the_status_line_follows_the_cursor_and_selection(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_sql("select 1;\nselect 22;", window, cx));
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| editor.select_range(10..16, cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).caret(), Caret { line: 2, col: 7, chars: 6, lines: 1 });
+            editor.update(cx, |editor, cx| editor.select_range(3..3, cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).caret(), Caret { line: 1, col: 4, chars: 0, lines: 0 });
+        })
+        .unwrap();
+    }
 
     fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<SqlEditor>) {
         cx.update(gpui_kit::init);

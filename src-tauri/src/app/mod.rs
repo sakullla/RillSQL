@@ -31,6 +31,7 @@ actions!(
         NewQuery,
         ExecuteQuery,
         ExecuteCurrent,
+        ExecuteScript,
         OpenStructure,
         CompareDatabases,
         NewConnection,
@@ -163,6 +164,13 @@ pub(crate) fn bind_keys(cx: &mut App) {
                 concat!("ctrl-shift-", $key)
             }
         };
+        (alt $key:literal) => {
+            if cfg!(target_os = "macos") {
+                concat!("cmd-alt-", $key)
+            } else {
+                concat!("ctrl-alt-", $key)
+            }
+        };
     }
     cx.bind_keys([
         gpui_kit::KeyBinding::new(chord!("k"), CommandPalette, None),
@@ -176,6 +184,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!(","), OpenSettings, None),
         gpui_kit::KeyBinding::new(chord!("enter"), ExecuteQuery, None),
         gpui_kit::KeyBinding::new(chord!(shift "enter"), ExecuteCurrent, None),
+        gpui_kit::KeyBinding::new(chord!(alt "enter"), ExecuteScript, None),
         gpui_kit::KeyBinding::new(chord!("."), RequestCancel, None),
         gpui_kit::KeyBinding::new("ctrl-space", ShowAutocomplete, None),
         gpui_kit::KeyBinding::new(chord!("/"), ToggleComment, None),
@@ -217,6 +226,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(NewQuery, "new-query");
     bind!(ExecuteQuery, "execute-query");
     bind!(ExecuteCurrent, "run-current");
+    bind!(ExecuteScript, "run-script");
     bind!(OpenStructure, "open-structure");
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
@@ -300,6 +310,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(NewQuery, "new-query");
     bind!(ExecuteQuery, "execute-query");
     bind!(ExecuteCurrent, "run-current");
+    bind!(ExecuteScript, "run-script");
     bind!(OpenStructure, "open-structure");
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
@@ -406,6 +417,7 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
         Menu::new(label("shell.menu.query")).items([
             MenuItem::action(label("shell.command.execute"), ExecuteQuery),
             MenuItem::action(label("shell.shortcuts.runCurrent"), ExecuteCurrent),
+            MenuItem::action(label("shell.shortcuts.runScript"), ExecuteScript),
             MenuItem::action(label("shell.shortcuts.requestCancel"), RequestCancel),
             MenuItem::separator(),
             MenuItem::action(label("shell.command.history"), ShowHistory),
