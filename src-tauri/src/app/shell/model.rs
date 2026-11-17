@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 
-use crate::app::views::connections::{blank_draft, ConnectionPage, Secrets};
+use crate::app::views::connections::{blank_draft, draft_fingerprint, draft_is_untouched, ConnectionPage, Secrets};
 use crate::app::views::history::{HistoryPage, HistorySection, LoadPlan};
 use crate::app::views::settings::{SaveState, SettingsForm, SettingsSection};
 use crate::app::views::welcome::WelcomePage;
@@ -926,7 +926,7 @@ impl WorkbenchModel {
                 let _ = self.shell.dispatch("settings");
             }
             "conn-edit" | "conn-duplicate" | "conn-new-launcher" | "conn-new-sidebar" | "conn-modal-close" | "conn-cancel"
-            | "conn-retry" | "conn-new-query" => {
+            | "conn-escape" | "conn-discard" | "conn-discard-keep" | "conn-retry" | "conn-new-query" => {
                 self.conn_command(id);
             },
             "conn-delete" => {
@@ -964,7 +964,10 @@ impl WorkbenchModel {
                     match self.connections.issues.first() {
                         Some(issue) => {
                             self.connections.message_key = None;
+                            self.connections.test_report = None;
                             self.notice_key = Some(issue.key);
+                            // 错误写在字段旁，但那个字段可能已经滚出视口：键盘直接落到第一个要改的字段上。
+                            self.conn_modal.focus_first_pending = true;
                         }
                         None => {
                             // 每次都拿到新代号：只有这一代的结果能收回指示，晚到的旧结果不行。
@@ -990,15 +993,24 @@ impl WorkbenchModel {
             }
             "conn-save" | "conn-save-connect" => {
                 // 普通保存只保存；"保存并连接"保存成功后再走一次按需连接。
+                // 上一次保存还没回来：连按两次回车或连点两下不能把同一份新建草稿存成两条连接。
+                if self.conn_modal.saving {
+                    return true;
+                }
                 self.conn_modal.save_and_connect = id == "conn-save-connect";
+                self.conn_modal.discard_armed = false;
                 self.connections.issues = self.connections.validate();
                 if self.connections.editor.is_some() && self.connections.issues.is_empty() {
                     self.notice_key = None;
                     self.notice_detail.clear();
+                    self.connections.message_key = None;
+                    self.connections.message_detail.clear();
+                    self.conn_modal.saving = self.conn_modal.open;
                     self.enqueue(PendingJob::SaveConnection);
                 } else if let Some(issue) = self.connections.issues.first() {
                     self.notice_key = Some(issue.key);
                     self.notice_detail = issue.field.clone();
+                    self.conn_modal.focus_first_pending = self.conn_modal.open;
                 } else {
                     self.notice_key = Some("connections.editor.newTitle");
                 }
@@ -1021,8 +1033,12 @@ impl WorkbenchModel {
             "conn-apply-url" => {
                 // 解析失败落在连接串字段下面：错误和出错的输入框在一起，而不是跑到状态栏。
                 self.connections.clear_issue("url");
-                if let Err(key) = self.connections.apply_url(&self.url_buffer) {
-                    self.connections.issues.push(crate::app::views::connections::FieldIssue::new("url", key));
+                match self.connections.apply_url(&self.url_buffer) {
+                    Ok(()) => self.note_url_applied(),
+                    Err(key) => {
+                        self.conn_modal.url_applied = false;
+                        self.connections.issues.push(crate::app::views::connections::FieldIssue::new("url", key));
+                    }
                 }
             }
             "conn-filter-engine" => {
@@ -1074,10 +1090,26 @@ impl WorkbenchModel {
                     self.set_palette_scope(scope);
                 }
             }
-            "conn-ssh-toggle" => self.connections.toggle_ssh(),
+            "conn-ssh-toggle" => {
+                self.connections.toggle_ssh();
+                self.conn_touched();
+            }
+            // 密码存不存进系统钥匙串：以前表单上没有这个选择，复制或导入的连接永远存不上密码。
+            "conn-save-password-toggle" => {
+                if let Some(draft) = self.connections.editor.as_mut() {
+                    draft.save_password = !draft.save_password;
+                }
+                self.conn_touched();
+            }
             // 安全选项的两种内部切换入口：键盘/测试按控件 id 走，界面上是同一组分段控件。
-            "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
-            "conn-ca-mode" => self.connections.cycle_ca_mode(),
+            "conn-ssh-auth" => {
+                self.connections.cycle_ssh_auth();
+                self.conn_touched();
+            }
+            "conn-ca-mode" => {
+                self.connections.cycle_ca_mode();
+                self.conn_touched();
+            }
             "menu-object" => self.open_tree_menu(false),
             "menu-object-item" => self.open_tree_menu(true),
             "menu-grid" => self.open_grid_menu(),
@@ -1552,7 +1584,46 @@ impl WorkbenchModel {
         self.connections.start_new(engine.unwrap_or(Engine::Postgres));
         self.connections.issues.clear();
         self.focused_field = Some(DraftField::Name);
+        // 上一次粘贴的连接串（可能带密码）不该出现在下一张表单里。
+        self.url_buffer.clear();
         self.conn_modal.open_from(origin, control, trigger);
+        self.conn_modal.baseline = draft_fingerprint(&self.connections.editor, &self.connections.secrets);
+    }
+
+    /// 表单里有没有未保存的修改：和打开那一刻比。新建表单只选了类型/环境不算。
+    pub fn conn_dirty(&self) -> bool {
+        let Some(draft) = self.connections.editor.as_ref() else { return false };
+        if !self.conn_modal.open {
+            return false;
+        }
+        if draft_fingerprint(&self.connections.editor, &self.connections.secrets) == self.conn_modal.baseline {
+            return false;
+        }
+        !draft_is_untouched(draft, &self.connections.secrets)
+    }
+
+    /// 表单内容被改动：收起“放弃修改？”的确认和上一次测试/保存的结论。
+    pub fn conn_touched(&mut self) {
+        self.conn_modal.discard_armed = false;
+        self.connections.draft_touched();
+    }
+
+    /// 连接串解析成功：在连接串下面就地说明，状态栏那条在模态背后看不清。
+    fn note_url_applied(&mut self) {
+        self.conn_touched();
+        self.conn_modal.url_applied = true;
+        self.notice_key = Some("ui.conn.urlApplied");
+        self.notice_detail.clear();
+    }
+
+    /// 复制出来的连接叫什么：“名称 副本”，已经有了就编号，列表里不出现两条同名连接。
+    fn duplicate_name(&self, source: &str) -> String {
+        let base = i18n::fill(&self.text("ui.conn.copyName"), &[("name", source.trim())]);
+        let taken = |name: &str| self.connections.rows.iter().any(|row| row.saved.name == name);
+        if !taken(&base) {
+            return base;
+        }
+        (2..).map(|n| format!("{base} {n}")).find(|name| !taken(name)).unwrap_or(base)
     }
 
     /// 编辑（或复制）一行配置：草稿来自这一行，屏幕上的改动不影响已保存配置直到保存成功。
@@ -1560,7 +1631,14 @@ impl WorkbenchModel {
         self.pending_open_secrets = None;
         self.connections.selected = Some(id.to_owned());
         if duplicate {
+            let source = self.connections.rows.iter().find(|row| row.saved.id == id).map(|row| row.saved.name.clone());
             self.connections.duplicate_selected();
+            if let Some(source) = source {
+                let name = self.duplicate_name(&source);
+                if let Some(draft) = self.connections.editor.as_mut() {
+                    draft.name = name;
+                }
+            }
         } else {
             self.connections.edit_selected();
         }
@@ -1571,7 +1649,10 @@ impl WorkbenchModel {
         self.connections.message_key = None;
         self.connections.message_detail.clear();
         self.focused_field = Some(DraftField::Name);
+        self.url_buffer.clear();
         self.conn_modal.open_from(origin, control, trigger);
+        // 没动过的副本关掉不用问：再复制一次就是同一份。
+        self.conn_modal.baseline = draft_fingerprint(&self.connections.editor, &self.connections.secrets);
         true
     }
 
@@ -1583,6 +1664,8 @@ impl WorkbenchModel {
         self.connections.issues.clear();
         self.connections.message_key = None;
         self.connections.message_detail.clear();
+        self.connections.test_report = None;
+        self.url_buffer.clear();
         self.connections.confirm_delete = false;
         self.shell.focus = restored.0;
         Some(restored)
@@ -1605,8 +1688,30 @@ impl WorkbenchModel {
             "conn-new-sidebar" => {
                 self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Sidebar, Some(ModalControl::SidebarNew), id);
             }
-            "conn-cancel" | "conn-modal-close" => {
+            "conn-cancel" | "conn-modal-close" | "conn-escape" => {
+                if self.conn_modal.discard_armed {
+                    // 确认条已经在问了：再按一次 Esc 是“算了，继续编辑”；取消/关闭按钮不替用户作答。
+                    if id == "conn-escape" {
+                        self.conn_modal.discard_armed = false;
+                        // 确认条收起，它的按钮不在了：键盘回到表单里。
+                        self.conn_modal.focus_first_pending = true;
+                    }
+                } else if self.conn_modal.saving {
+                    // 保存已经发出：结果回来会自己关闭（或留下失败原因），这一下不抢着关。
+                } else if self.conn_dirty() {
+                    // 填了一半的表单不因为一次 Esc 就没了：先问一句。
+                    self.conn_modal.discard_armed = true;
+                    self.conn_modal.focus_discard_pending = true;
+                } else {
+                    let _ = self.close_connection_modal();
+                }
+            }
+            "conn-discard" => {
                 let _ = self.close_connection_modal();
+            }
+            "conn-discard-keep" => {
+                self.conn_modal.discard_armed = false;
+                self.conn_modal.focus_first_pending = true;
             }
             "conn-retry" => {
                 let _ = self.retry_pending_connect();
@@ -1775,7 +1880,7 @@ impl WorkbenchModel {
 
     /// 模态里这一帧应该存在的全部 Tab 停靠点（真实 Tab 由 GPUI 的 focus trap 在容器内成环）。
     pub fn modal_stops(&self) -> Vec<super::conn_modal::ModalStop> {
-        ConnectionModal::stops(&self.connections, &super::conn_modal::env_ids(&self.env_tags))
+        self.conn_modal.stops_for(&self.connections, &super::conn_modal::env_ids(&self.env_tags))
     }
 
     pub fn open_menu(&mut self, place: MenuPlace, target: MenuTarget) {
@@ -4861,8 +4966,12 @@ impl WorkbenchModel {
             DraftField::Password => {
                 self.connections.secrets.password = value;
                 self.connections.clear_issue("password");
+                // 服务端拒绝凭据的结论挂在用户名+密码这一组上：改了其中一个就不再成立。
+                self.connections.clear_issue("credentials");
+                self.conn_touched();
             }
             DraftField::SshPassword => {
+                self.conn_touched();
                 self.connections.secrets.ssh_password = value.clone();
                 self.connections.clear_issue("ssh_password");
                 if !value.trim().is_empty() {
@@ -4871,7 +4980,10 @@ impl WorkbenchModel {
                     }
                 }
             }
-            DraftField::Passphrase => self.connections.secrets.ssh_passphrase = value,
+            DraftField::Passphrase => {
+                self.connections.secrets.ssh_passphrase = value;
+                self.conn_touched();
+            }
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
             DraftField::Url => {
                 // 一次多出好几个字符基本就是粘贴：能完整解析就直接填好下面的字段，省掉再点“解析”。
@@ -4879,8 +4991,9 @@ impl WorkbenchModel {
                 let pasted = value.trim().len() > self.url_buffer.trim().len() + 1;
                 self.url_buffer = value;
                 self.connections.clear_issue("url");
+                self.conn_modal.url_applied = false;
                 if pasted && !self.url_buffer.trim().is_empty() && self.connections.apply_url(&self.url_buffer).is_ok() {
-                    self.notice_key = Some("ui.conn.urlApplied");
+                    self.note_url_applied();
                 }
             }
             DraftField::Filter => self.connections.filter_text = value,
@@ -4933,6 +5046,10 @@ impl WorkbenchModel {
                 if let Some(name) = issue_field(other) {
                     self.connections.clear_issue(name);
                 }
+                if other == DraftField::Username {
+                    self.connections.clear_issue("credentials");
+                }
+                self.conn_touched();
             }
         }
     }

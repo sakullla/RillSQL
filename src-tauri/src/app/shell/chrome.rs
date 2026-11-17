@@ -302,7 +302,15 @@ impl Workbench {
         // 连接模态打开时，Esc 关闭、Tab 在模态里循环、回车等于当前页脚动作。
         if self.model.conn_modal.open && self.model.menu.is_none() && !self.model.shell.palette_open && self.model.danger.is_none() {
             if key == "escape" {
-                self.perform("conn-cancel", cx);
+                // 有未保存的修改时 Esc 先问一句；确认条已经在问时再按 Esc 是“继续编辑”。
+                self.perform("conn-escape", cx);
+                cx.notify();
+                return;
+            }
+            // Cmd/Ctrl+Enter 在任何字段里都是“保存并连接”。全局的“执行”绑定在模态打开时也转到这里，
+            // 这一处兼顾按键没有先被动作绑定接走的情况。
+            if key == "enter" && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control) {
+                self.perform("conn-save-connect", cx);
                 cx.notify();
                 return;
             }
@@ -2513,14 +2521,36 @@ impl Workbench {
         // 表单按“它是谁 / 连到哪 / 用谁的身份”分块：每块左侧是标题与一句说明，右侧是字段。
         // 宽面板左右排布，窄面板上下排布；所有控件照常渲染，Tab 顺序与之前一致。
         let quick_fill = stack_frame(|| {
+            // 解析成功就地说一句：状态栏那条提示在模态背后，看不清。连接串再被改动就收起。
+            let applied = self.model.conn_modal.url_applied && !self.model.connections.issues.iter().any(|issue| issue.field == "url");
             kit::sunken(&p)
                 .p(px(10.))
                 .flex()
-                .flex_wrap()
-                .items_end()
-                .gap(px(8.))
-                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.quickUrl"), "url", url_input, &p)))
-                .child(apply_url)
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.quickUrl"), "url", url_input, &p)))
+                        .child(apply_url),
+                )
+                .when(applied, |this| {
+                    this.child(
+                        div()
+                            .id("conn-url-applied")
+                            .test_support()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.ok)
+                            .child(kit::icon(IconName::CircleCheck, 12., p.ok))
+                            .child(self.t("ui.conn.urlApplied")),
+                    )
+                })
                 .into_any_element()
         });
         let identity = stack_frame(|| {
@@ -2598,6 +2628,23 @@ impl Workbench {
                 if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == "credentials").cloned() {
                     auth = auth.child(credentials_row(&issue, &self.model.text("connections.status.error"), &p));
                 }
+                // 密码存不存进钥匙串由用户决定，并说清现在这样的后果：关掉且原来存过，保存时会删掉那份。
+                let save_detail = if draft.save_password {
+                    "ui.conn.savePasswordOn"
+                } else if self.editing_password_saved() {
+                    "ui.conn.savePasswordDrop"
+                } else {
+                    "ui.conn.savePasswordOff"
+                };
+                auth = auth.child(self.modal_switch(
+                    conn_modal::SAVE_PASSWORD,
+                    "conn-save-password-toggle",
+                    draft.save_password,
+                    self.t("ui.conn.savePassword"),
+                    self.t(save_detail),
+                    &p,
+                    cx,
+                ));
                 auth = auth.child(self.field_row(self.t("ui.conn.database"), "database", database, &p));
                 if engine == Engine::Mongodb {
                     let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
@@ -2796,28 +2843,9 @@ impl Workbench {
         }
 
         // 页头、说明、页脚和面板分帧：调试构建不复用栈槽，叠在一起会让单次栈探测过大。
-        let notes = stack_frame(|| {
-        // 测试/打开结果与无处归属的问题：集中在主体末尾，每条只说一次。
-        let mut notes = div().flex().flex_col().gap(px(6.));
-        for issue in self.model.connections.issues.iter().filter(|issue| !field_issue_placed(&issue.field)) {
-            notes = notes.child(banner(IconName::CircleAlert, self.t(issue.key), p.danger, p.danger_soft));
-        }
-        if let Some(key) = self.model.connections.message_key {
-            let ok = key == "connections.status.connected" || key == "connections.editor.test.ok";
-            let detail = self.model.connections.message_detail.clone();
-            let text = if detail.is_empty() {
-                self.model.text(key)
-            } else {
-                format!("{} · {}", self.model.text(key), detail)
-            };
-            notes = notes.child(if ok {
-                banner(IconName::CircleCheck, SharedString::from(text), p.ok, p.ok_soft)
-            } else {
-                banner(IconName::CircleAlert, SharedString::from(text), p.danger, p.danger_soft)
-            });
-        }
-        notes.into_any_element()
-        });
+        // 结论条：固定在页脚上方，不随主体滚动。以前测试/保存的结果画在主体末尾，表单一长就在视口外，
+        // 点了“测试连接”却看不到结果。
+        let status = stack_frame(|| self.modal_status_strip(pad, &p, cx));
 
         let header = stack_frame(|| {
         let title = if existing {
@@ -2893,21 +2921,10 @@ impl Workbench {
 
         let footer = stack_frame(|| {
         // 固定页脚：保存、保存并连接、测试和取消始终在同一位置，不必先滚到底。
+        // 测试是“试一下”，放左边；取消 / 保存 / 保存并连接是离开表单的三条路，放右边，主操作在最右。
         let running = self.model.connections.test_running();
-        let intro = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .min_w(px(0.))
-            .when(running, |this| {
-                this.child(Spinner::new().xsmall().color(p.accent)).child(
-                    div()
-                        .id("conn-test-running")
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.text_muted)
-                        .child(self.model.text("connections.editor.test.running")),
-                )
-            });
+        let saving = self.model.conn_modal.saving;
+        let connect_after = self.model.conn_modal.save_and_connect;
         let cancel = self.modal_button(
             "conn-cancel",
             None,
@@ -2917,29 +2934,45 @@ impl Workbench {
             &p,
             cx,
         );
-        let test = self.modal_button(
+        // 测试在跑时按钮自己转圈并写明“正在测试”：再点一次仍会重新测（改了字段后不必等旧的那次）。
+        let test = self.modal_button_with(
             "conn-test",
+            Some(IconName::Zap),
+            if running { self.t("connections.editor.test.running") } else { self.t("connections.editor.test.button") },
+            ModalTone::Plain,
+            if saving { ModalBusy::Blocked } else { ModalBusy::Idle },
             None,
-            self.t("connections.editor.test.button"),
-            false,
             conn_modal::ModalAction::Command("conn-test"),
             &p,
             cx,
         );
-        let save = self.modal_button(
+        let save = self.modal_button_with(
             "conn-save",
             None,
-            self.t("common.save"),
-            false,
+            if saving && !connect_after { self.t("ui.conn.saving") } else { self.t("common.save") },
+            ModalTone::Plain,
+            match (saving, connect_after) {
+                (false, _) => ModalBusy::Idle,
+                (true, false) => ModalBusy::Working,
+                (true, true) => ModalBusy::Blocked,
+            },
+            None,
             conn_modal::ModalAction::Command("conn-save"),
             &p,
             cx,
         );
-        let save_connect = self.modal_button(
+        let chord = if cfg!(target_os = "macos") { "⌘↵" } else { "Ctrl+Enter" };
+        let save_connect = self.modal_button_with(
             "conn-save-connect",
             None,
-            self.t("connections.editor.saveConnect"),
-            true,
+            if saving && connect_after { self.t("ui.conn.saving") } else { self.t("connections.editor.saveConnect") },
+            ModalTone::Primary,
+            match (saving, connect_after) {
+                (false, _) => ModalBusy::Idle,
+                (true, true) => ModalBusy::Working,
+                (true, false) => ModalBusy::Blocked,
+            },
+            Some(SharedString::from(i18n::fill(&self.model.text("ui.conn.saveConnectTip"), &[("chord", chord)]))),
             conn_modal::ModalAction::Command("conn-save-connect"),
             &p,
             cx,
@@ -2955,10 +2988,16 @@ impl Workbench {
             .border_t_1()
             .border_color(p.line)
             .bg(p.surface)
-            .child(intro)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(test)
+                    .when(running, |this| this.child(div().id("conn-test-running").test_support().aria_label(self.t("connections.editor.test.running")).child(Spinner::new().xsmall().color(p.accent)))),
+            )
             .child(div().flex_1())
             .child(cancel)
-            .child(test)
             .child(save)
             .child(save_connect);
         footer.into_any_element()
@@ -2988,8 +3027,7 @@ impl Workbench {
                         &p,
                     ))
                     .children(auth.map(|auth| form_block(self.t("ui.conn.block.auth"), Some(self.t("ui.conn.block.authHint")), auth, wide, &p)))
-                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, &p)))
-                    .child(notes),
+                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, &p))),
             );
 
 
@@ -3004,6 +3042,7 @@ impl Workbench {
             .overflow_hidden()
             .child(header)
             .child(body)
+            .children(status)
             .child(footer);
         let panel = div()
             .id("conn-modal-panel")
@@ -3041,10 +3080,18 @@ impl Workbench {
             // （比如测试连接缺密码）时，键盘直接落在那个字段上，而不是顶上的连接串。
             match self.model.connections.issues.iter().find_map(|issue| issue_field(&issue.field)) {
                 Some(field) if self.fields.contains(field) => self.fields.focus(field, window, cx),
+                // 编辑或复制已有连接：字段都填好了，用不着连接串，键盘落在名称上（复制后第一件事就是改名）。
+                _ if !draft.name.trim().is_empty() && self.fields.contains(DraftField::Name) => self.fields.focus(DraftField::Name, window, cx),
                 _ => {
                     let handle = first_field.read(cx).focus_handle(cx);
                     window.focus(&handle, cx);
                 }
+            }
+        }
+        if std::mem::take(&mut self.model.conn_modal.focus_discard_pending) {
+            // 确认条出现：键盘落在“继续编辑”上，回车不会误删填好的表单；Tab 一下到“放弃修改”。
+            if let Some(handle) = self.modal_controls.get(conn_modal::DISCARD_KEEP).cloned() {
+                window.focus(&handle, cx);
             }
         }
         shell
@@ -3067,36 +3114,34 @@ impl Workbench {
         let Some(action) = self.modal_actions.get(id).cloned() else { return false };
         match action {
             conn_modal::ModalAction::Engine(engine) => {
-                if let Some(editor) = self.model.connections.editor.as_mut() {
-                    if editor.engine != engine {
-                        let keep_name = editor.name.clone();
-                        let keep_id = editor.id.clone();
-                        let mut fresh = crate::app::views::connections::blank_draft(engine);
-                        fresh.name = keep_name;
-                        fresh.id = keep_id;
-                        *editor = fresh;
-                    }
-                }
+                // 换类型不清空表单：主机、用户、TLS、SSH 等能沿用的都留着。
+                self.model.connections.change_engine(engine);
+                self.model.conn_touched();
             }
             conn_modal::ModalAction::Env(env) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
                     editor.env = env;
                 }
+                // 环境只是标签，不影响连不连得上：测试结论留着，只收起放弃确认。
+                self.model.conn_modal.discard_armed = false;
             }
             conn_modal::ModalAction::Tls(mode) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
                     editor.tls_mode = mode;
                 }
+                self.model.conn_touched();
             }
             conn_modal::ModalAction::Ca(mode) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
                     editor.ca_mode = mode;
                 }
+                self.model.conn_touched();
             }
             conn_modal::ModalAction::SshAuth(kind) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
                     editor.ssh_auth = kind;
                 }
+                self.model.conn_touched();
             }
             conn_modal::ModalAction::Command(command) => {
                 self.perform(command, cx);
@@ -3218,10 +3263,30 @@ impl Workbench {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let tone = if primary { ModalTone::Primary } else { ModalTone::Plain };
+        self.modal_button_with(id, icon, label, tone, ModalBusy::Idle, None, action, p, cx)
+    }
+
+    /// 同 `modal_button`，另外能表达危险动作、“正在进行”（转圈代替图标）和“暂不可用”（变淡、点按不生效）。
+    /// 不可用时仍留在 Tab 序列里：序列不随异步状态跳动，焦点也不会突然丢失。
+    #[allow(clippy::too_many_arguments)]
+    fn modal_button_with(
+        &mut self,
+        id: &str,
+        icon: Option<IconName>,
+        label: SharedString,
+        tone: ModalTone,
+        busy: ModalBusy,
+        tip: Option<SharedString>,
+        action: conn_modal::ModalAction,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let handle = self.modal_control(cx, id, action);
         let click_id = id.to_owned();
         let element_id = SharedString::from(id);
         let height = self.metrics().control_h;
+        let inert = busy != ModalBusy::Idle;
         let mut button = kit::interactive_states(div().id(element_id), p, false)
             .test_support()
             .role(gpui_kit::Role::Button)
@@ -3230,33 +3295,180 @@ impl Workbench {
             .h(px(height))
             .px(px(12.))
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(6.))
             .rounded(px(Radius::CONTROL))
             .border_1()
             .text_size(px(TypeScale::SM))
-            .when(primary, |this| {
-                this.bg(p.accent)
-                    .text_color(p.on_accent)
-                    .font_weight(FontWeight::MEDIUM)
-                    .border_color(p.accent)
-                    .hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover))
-                    .active(|style| style.bg(p.accent_active))
-            })
-            .when(!primary, |this| {
-                this.bg(if p.dark { p.raised } else { p.surface })
-                    .border_color(p.line)
-                    .text_color(p.text)
-                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
-                    .active(|style| style.bg(p.active))
-            });
-        if let Some(icon) = icon {
-            button = button.child(kit::icon(icon, 13., if primary { p.on_accent } else { p.text_muted }));
+            .when(inert, |this| this.opacity(0.6))
+            .when_some(tip, |this, tip| this.tooltip_text(tip));
+        button = match tone {
+            ModalTone::Primary => button
+                .bg(p.accent)
+                .text_color(p.on_accent)
+                .font_weight(FontWeight::MEDIUM)
+                .border_color(p.accent)
+                .when(!inert, |this| this.hover(|style| style.bg(p.accent_hover).border_color(p.accent_hover)).active(|style| style.bg(p.accent_active))),
+            ModalTone::Plain => button
+                .bg(if p.dark { p.raised } else { p.surface })
+                .border_color(p.line)
+                .text_color(p.text)
+                .when(!inert, |this| this.hover(|style| style.bg(p.hover).border_color(p.line_strong)).active(|style| style.bg(p.active))),
+            ModalTone::Danger => button
+                .bg(if p.dark { p.raised } else { p.surface })
+                .border_color(p.danger.opacity(0.45))
+                .text_color(p.danger)
+                .font_weight(FontWeight::MEDIUM)
+                .when(!inert, |this| this.hover(|style| style.bg(p.danger_soft).border_color(p.danger))),
+        };
+        let icon_color = match tone {
+            ModalTone::Primary => p.on_accent,
+            ModalTone::Plain => p.text_muted,
+            ModalTone::Danger => p.danger,
+        };
+        if busy == ModalBusy::Working {
+            button = button.child(Spinner::new().xsmall().color(icon_color));
+        } else if let Some(icon) = icon {
+            button = button.child(kit::icon(icon, 13., icon_color));
         }
         button
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.activate_modal_control(&click_id, cx);
+                if !inert {
+                    this.activate_modal_control(&click_id, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// 页脚上方的结论条：放弃修改的确认、测试结论、保存失败的原因、没有对应字段的问题。
+    /// 它不在滚动区里，所以无论表单滚到哪，按下页脚按钮后的结果都在按钮正上方。
+    fn modal_status_strip(&mut self, pad: f32, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if self.model.conn_modal.discard_armed {
+            let title = self.t("ui.conn.discard.title");
+            let keep = self.modal_button_with(
+                conn_modal::DISCARD_KEEP,
+                None,
+                self.t("ui.conn.discard.keep"),
+                ModalTone::Plain,
+                ModalBusy::Idle,
+                None,
+                conn_modal::ModalAction::Command("conn-discard-keep"),
+                p,
+                cx,
+            );
+            let discard = self.modal_button_with(
+                conn_modal::DISCARD_CONFIRM,
+                None,
+                self.t("ui.conn.discard.confirm"),
+                ModalTone::Danger,
+                ModalBusy::Idle,
+                None,
+                conn_modal::ModalAction::Command("conn-discard"),
+                p,
+                cx,
+            );
+            // 正在问要不要放弃时只问这一件事，别的结论先让开。
+            rows.push(
+                div()
+                    .id("conn-discard-prompt")
+                    .test_support()
+                    .role(gpui_kit::Role::Group)
+                    .aria_label(title.clone())
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(Radius::PANEL))
+                    .bg(p.warn_soft)
+                    .border_1()
+                    .border_color(p.warn.opacity(0.30))
+                    .child(kit::icon(IconName::TriangleAlert, 15., p.warn))
+                    .child(div().flex_1().min_w(px(120.)).text_size(px(TypeScale::SM)).text_color(p.text).child(title))
+                    .child(keep)
+                    .child(discard)
+                    .into_any_element(),
+            );
+        } else {
+            for issue in self.model.connections.issues.iter().filter(|issue| !field_issue_placed(&issue.field)) {
+                rows.push(banner(IconName::CircleAlert, self.t(issue.key), p.danger, p.danger_soft));
+            }
+            // “正在测试”由测试按钮自己表达，不再占一条。
+            if let Some(key) = self.model.connections.message_key.filter(|key| *key != "connections.editor.test.running") {
+                let tested = matches!(key, "connections.editor.test.ok" | "connections.editor.test.wait" | "connections.editor.test.failed");
+                match self.model.connections.test_report.as_ref().filter(|_| tested) {
+                    Some(report) => rows.push(test_verdict(report, &self.model.text(key), p)),
+                    None => {
+                        let ok = key == "connections.status.connected" || key == "connections.editor.test.ok";
+                        let detail = self.model.connections.message_detail.clone();
+                        let text = if detail.is_empty() { self.model.text(key) } else { format!("{} · {}", self.model.text(key), detail) };
+                        rows.push(if ok {
+                            banner(IconName::CircleCheck, SharedString::from(text), p.ok, p.ok_soft)
+                        } else {
+                            banner(IconName::CircleAlert, SharedString::from(text), p.danger, p.danger_soft)
+                        });
+                    }
+                }
+            }
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("conn-modal-status")
+                .test_support()
+                .flex_none()
+                .px(px(pad))
+                .pt(px(10.))
+                .pb(px(10.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .border_t_1()
+                .border_color(p.line_soft)
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// 模态里的开关：开关、名称和一句“现在这样意味着什么”。整行可点，也是 Tab 停靠点。
+    #[allow(clippy::too_many_arguments)]
+    fn modal_switch(
+        &mut self,
+        id: &'static str,
+        command: &'static str,
+        on: bool,
+        label: SharedString,
+        detail: SharedString,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let handle = self.modal_control(cx, id, conn_modal::ModalAction::Command(command));
+        kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Switch)
+            .aria_label(label.clone())
+            .aria_description(detail.clone())
+            .aria_selected(on)
+            .track_focus(&handle)
+            .self_start()
+            .max_w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(10.))
+            .gap_y(px(2.))
+            .rounded(px(Radius::CONTROL))
+            .child(switch_visual(on, p))
+            .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(label))
+            .child(div().min_w(px(0.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(detail))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.activate_modal_control(id, cx);
             }))
             .into_any_element()
     }
@@ -3377,7 +3589,8 @@ impl Workbench {
         };
         let placeholder = match field {
             DraftField::Host => "localhost".to_owned(),
-            DraftField::Port => String::new(),
+            // 端口清空后仍看得到这种数据库的默认端口。
+            DraftField::Port => engine.map(|engine| crate::app::views::connections::default_port(engine).to_owned()).unwrap_or_default(),
             DraftField::Replica => "rs0".to_owned(),
             DraftField::SshHost => "bastion.example.com".to_owned(),
             DraftField::SshPort => "22".to_owned(),
@@ -6212,6 +6425,83 @@ fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoEl
         .into_any_element()
 }
 
+/// 测试连接的结论：一句话说结果，失败时写出卡在哪一步、服务端原话和处理建议，
+/// 下面一行列出走过的每个阶段——经跳板机、TLS 的连接一眼看出是哪一段不通。
+fn test_verdict(report: &crate::connections::stages::TestReport, headline: &str, p: &Palette) -> AnyElement {
+    use crate::connections::stages::{StageStatus, TestStatus};
+    let (fg, bg, mark) = match report.status {
+        TestStatus::Ok => (p.ok, p.ok_soft, IconName::CircleCheck),
+        TestStatus::Wait => (p.warn, p.warn_soft, IconName::TriangleAlert),
+        TestStatus::Err => (p.danger, p.danger_soft, IconName::CircleAlert),
+    };
+    let blocked = report.stages.iter().find(|stage| matches!(stage.status, StageStatus::Err | StageStatus::Wait));
+    let title = match (report.status, blocked) {
+        (TestStatus::Ok, _) => match report.summary.as_deref().map(str::trim).filter(|summary| !summary.is_empty()) {
+            Some(summary) => format!("{headline} · {summary}"),
+            None => headline.to_owned(),
+        },
+        (TestStatus::Err, Some(stage)) if !stage.label.trim().is_empty() => format!("{headline} · {}", stage.label.trim()),
+        _ => headline.to_owned(),
+    };
+    let detail = blocked.map(|stage| stage.message.trim().to_owned()).filter(|message| !message.is_empty());
+    let hint = report.hint.as_deref().map(str::trim).filter(|hint| !hint.is_empty() && Some(*hint) != detail.as_deref()).map(str::to_owned);
+    let mut stages = div().flex().flex_wrap().gap_x(px(12.)).gap_y(px(2.));
+    let mut shown = 0;
+    for stage in &report.stages {
+        let (icon, color) = match stage.status {
+            StageStatus::Ok => (IconName::Check, p.ok),
+            StageStatus::Err => (IconName::X, p.danger),
+            StageStatus::Wait => (IconName::TriangleAlert, p.warn),
+            // 前一步失败后没执行的阶段不列：它们没有结论。
+            StageStatus::Skipped => continue,
+        };
+        shown += 1;
+        stages = stages.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_muted)
+                .child(kit::icon(icon, 11., color))
+                .child(SharedString::from(stage.label.clone())),
+        );
+    }
+    let spoken = [Some(title.clone()), detail.clone(), hint.clone()].into_iter().flatten().collect::<Vec<_>>().join("\n");
+    div()
+        .id("conn-test-verdict")
+        .test_support()
+        .role(gpui_kit::Role::Group)
+        .aria_label(SharedString::from(spoken))
+        .px(px(12.))
+        .py(px(8.))
+        .flex()
+        .items_start()
+        .gap(px(8.))
+        .rounded(px(Radius::PANEL))
+        .bg(bg)
+        .border_1()
+        .border_color(fg.opacity(0.26))
+        .child(div().flex_none().pt(px(1.)).child(kit::icon(mark, 15., fg)))
+        .child(
+            div()
+                .id("conn-test-verdict-text")
+                .flex_1()
+                .min_w(px(0.))
+                // 驱动的报错可能很长：结论条自己滚，不把表单主体挤没。
+                .max_h(px(132.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(fg).child(SharedString::from(title)))
+                .when_some(detail, |this, detail| this.child(div().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(detail))))
+                .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(hint))))
+                .when(shown > 1, |this| this.child(stages)),
+        )
+        .into_any_element()
+}
+
 fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::Hsla) -> AnyElement {
     div()
         .px(px(12.))
@@ -6228,6 +6518,22 @@ fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::
         .child(kit::icon(icon, 15., fg))
         .child(div().flex_1().min_w(px(0.)).child(text))
         .into_any_element()
+}
+
+/// 模态按钮的语气：普通、主操作、危险（放弃修改）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModalTone {
+    Plain,
+    Primary,
+    Danger,
+}
+
+/// 模态按钮此刻能不能点：Idle 正常；Working 是它自己的请求在路上（转圈）；Blocked 是别的请求在路上。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModalBusy {
+    Idle,
+    Working,
+    Blocked,
 }
 
 fn switch_visual(on: bool, p: &Palette) -> AnyElement {

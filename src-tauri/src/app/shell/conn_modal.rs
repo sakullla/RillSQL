@@ -34,6 +34,11 @@ pub const BROWSE_KEY: &str = "conn-browse-key";
 pub const BROWSE_SSH: &str = "conn-browse-ssh";
 /// SSH 开关。
 pub const SSH_TOGGLE: &str = "conn-ssh-toggle";
+/// “保存密码”开关。
+pub const SAVE_PASSWORD: &str = "conn-save-password";
+/// 放弃修改确认条上的两个按钮：继续编辑 / 放弃修改。
+pub const DISCARD_KEEP: &str = "conn-discard-keep";
+pub const DISCARD_CONFIRM: &str = "conn-discard";
 
 pub fn engine_control_id(engine: Engine) -> String {
     format!("conn-engine-{}", engine.as_str())
@@ -143,6 +148,16 @@ pub struct ConnectionModal {
     /// 这一帧真正画出来的可交互 id（渲染登记）。测试拿它和 stops 对账，
     /// 保证“画出来的控件”与“Tab 能到的控件”是同一份清单。
     pub rendered: Vec<String>,
+    /// 打开那一刻草稿 + 机密的指纹：关闭时和它比，判断有没有未保存的修改。
+    pub baseline: u64,
+    /// 有未保存的修改时按了 Esc / 取消 / 关闭：先问一句，不直接丢掉填好的表单。
+    pub discard_armed: bool,
+    /// 下一帧把焦点交给确认条上的“继续编辑”。
+    pub focus_discard_pending: bool,
+    /// 保存请求已发出、结果还没回来：期间不再接受第二次保存，否则新建会存出两条。
+    pub saving: bool,
+    /// 连接串刚被解析并填进了下面的字段；连接串再被改动就收起。
+    pub url_applied: bool,
 }
 
 impl Default for ConnectionModal {
@@ -159,6 +174,11 @@ impl Default for ConnectionModal {
             last_control: None,
             restore_origin: false,
             rendered: Vec::new(),
+            baseline: 0,
+            discard_armed: false,
+            focus_discard_pending: false,
+            saving: false,
+            url_applied: false,
         }
     }
 }
@@ -175,6 +195,10 @@ impl ConnectionModal {
         self.test_running = false;
         self.test_generation = self.test_generation.saturating_add(1);
         self.rendered.clear();
+        self.discard_armed = false;
+        self.focus_discard_pending = false;
+        self.saving = false;
+        self.url_applied = false;
     }
 
     /// 关闭并交还焦点归属；重复关闭不产生第二次还焦。
@@ -186,6 +210,10 @@ impl ConnectionModal {
         self.save_and_connect = false;
         self.test_running = false;
         self.focus_first_pending = false;
+        self.discard_armed = false;
+        self.focus_discard_pending = false;
+        self.saving = false;
+        self.url_applied = false;
         let origin = self.origin;
         let control = self.control.take();
         self.trigger = None;
@@ -244,6 +272,7 @@ impl ConnectionModal {
             stops.push(ModalStop::Field(DraftField::Port));
             stops.push(ModalStop::Field(DraftField::Username));
             stops.push(ModalStop::Field(DraftField::Password));
+            stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
             stops.push(ModalStop::Field(DraftField::Database));
             if draft.engine == Engine::Mongodb {
                 stops.push(ModalStop::Field(DraftField::Replica));
@@ -281,10 +310,23 @@ impl ConnectionModal {
                 }
             }
         }
-        stops.push(ModalStop::Cancel);
+        // 页脚：测试在左，取消 / 保存 / 保存并连接在右。
         stops.push(ModalStop::Test);
+        stops.push(ModalStop::Cancel);
         stops.push(ModalStop::Save);
         stops.push(ModalStop::SaveConnect);
+        stops
+    }
+
+    /// 这一帧的完整停靠点：放弃修改的确认条出现时，它的两个按钮排在页脚动作之前。
+    pub fn stops_for(&self, page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
+        let mut stops = Self::stops(page, envs);
+        if self.discard_armed {
+            if let Some(at) = stops.iter().position(|stop| *stop == ModalStop::Test) {
+                stops.insert(at, ModalStop::Control(DISCARD_CONFIRM.to_owned()));
+                stops.insert(at, ModalStop::Control(DISCARD_KEEP.to_owned()));
+            }
+        }
         stops
     }
 }
@@ -381,6 +423,7 @@ mod tests {
             BROWSE_CERT,
             BROWSE_KEY,
             SSH_TOGGLE,
+            SAVE_PASSWORD,
             "conn-ssh-auth-key",
             BROWSE_SSH,
         ] {
@@ -395,6 +438,7 @@ mod tests {
         assert!(sqlite.iter().all(|stop| *stop != ModalStop::Field(DraftField::Host)), "文件型没有 host");
         assert!(sqlite.contains(&ModalStop::Field(DraftField::File)));
         assert!(!controls(&sqlite).iter().any(|id| id == SSH_TOGGLE), "文件型没有 SSH");
+        assert!(!controls(&sqlite).iter().any(|id| id == SAVE_PASSWORD), "文件型没有密码可存");
 
         let mut remote = page(Engine::Postgres);
         remote.editor.as_mut().unwrap().ssh_on = true;
@@ -448,5 +492,23 @@ mod tests {
         assert!(!modal.save_and_connect);
         assert!(modal.rendered.is_empty(), "关闭后不再留上一帧的登记");
         assert!(modal.close().is_none(), "重复关闭不再还焦一次");
+    }
+
+    /// 放弃修改的确认条只在需要时进入 Tab 序列，并排在页脚动作之前；重新打开表单不带着上一次的确认。
+    #[test]
+    fn the_discard_prompt_adds_its_two_buttons_before_the_footer() {
+        let page = page(Engine::Postgres);
+        let mut modal = ConnectionModal::default();
+        modal.open_from(FocusTarget::Sidebar, None, "test");
+        assert_eq!(modal.stops_for(&page, &[]), ConnectionModal::stops(&page, &[]));
+        modal.discard_armed = true;
+        modal.saving = true;
+        let stops = modal.stops_for(&page, &[]);
+        let at = |id: &str| stops.iter().position(|stop| stop.control_id() == Some(id)).unwrap_or_else(|| panic!("缺少 {id}"));
+        assert!(at(DISCARD_KEEP) < at(DISCARD_CONFIRM), "安全的那个在前");
+        assert!(at(DISCARD_CONFIRM) < at("conn-test"));
+        assert_eq!(stops.last(), Some(&ModalStop::SaveConnect));
+        modal.open_from(FocusTarget::Sidebar, None, "test");
+        assert!(!modal.discard_armed && !modal.saving);
     }
 }

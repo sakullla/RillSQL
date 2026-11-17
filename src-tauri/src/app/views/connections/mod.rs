@@ -89,6 +89,9 @@ pub struct ConnectionPage {
     /// 最近一次打开失败是因为缺密码（false）或密码被拒绝（true）：外壳据此弹出密码输入框，
     /// 取走后清空。
     pub credential_prompt: Option<(String, bool)>,
+    /// 最近一次测试的完整结果（各阶段成败）。只属于屏幕上这份草稿：草稿一改就清掉，
+    /// 表单不会在改了地址之后还挂着上一份配置的“连接成功”。
+    pub test_report: Option<TestReport>,
 }
 
 /// 打开失败是不是缺密码或密码被拒：返回 Some(被拒绝)。服务端拒绝凭据的错误码随驱动不同
@@ -157,6 +160,29 @@ impl ConnectionPage {
         self.issues.clear();
         self.confirm_delete = false;
         self.message_key = None;
+        self.message_detail.clear();
+        self.test_report = None;
+    }
+
+    /// 草稿或本次机密被改动：上一次测试/保存的结论说的已经不是屏幕上这份配置，收起来。
+    /// 正在跑的测试不动——它的结果回来时会因为指纹对不上而被丢弃。
+    pub fn draft_touched(&mut self) {
+        self.test_report = None;
+        if self.message_key != Some("connections.editor.test.running") {
+            self.message_key = None;
+            self.message_detail.clear();
+        }
+    }
+
+    /// 在表单里换数据库类型：能沿用的字段都留着（见 [`switch_engine`]）。
+    pub fn change_engine(&mut self, engine: Engine) {
+        let Some(draft) = self.editor.as_ref() else { return };
+        if draft.engine == engine {
+            return;
+        }
+        self.editor = Some(switch_engine(draft, engine));
+        self.issues.clear();
+        self.draft_touched();
     }
 
     pub fn edit_selected(&mut self) {
@@ -166,6 +192,7 @@ impl ConnectionPage {
         self.secrets = Secrets::default();
         self.issues.clear();
         self.confirm_delete = false;
+        self.test_report = None;
     }
 
     pub fn apply_url(&mut self, text: &str) -> Result<(), &'static str> {
@@ -207,6 +234,7 @@ impl ConnectionPage {
         self.editor = Some(draft);
         self.secrets = Secrets::default();
         self.issues.clear();
+        self.test_report = None;
     }
 
     /// 只打开确认，不因为再次调用就放行删除。
@@ -294,6 +322,7 @@ impl ConnectionPage {
         self.test_running_generation = Some(generation);
         self.message_key = Some("connections.editor.test.running");
         self.message_detail.clear();
+        self.test_report = None;
     }
 
     /// 还有一次测试在跑（页脚指示点与禁用重复提交都读它）。
@@ -371,6 +400,7 @@ impl ConnectionPage {
                     TestStatus::Wait => "connections.editor.test.wait",
                     TestStatus::Err => "connections.editor.test.failed",
                 });
+                self.test_report = Some(report.clone());
                 match report.status {
                     // 测试成功只说明这份配置能连上，不等于已经建立会话：不写 Connected。
                     TestStatus::Ok | TestStatus::Wait => self.issues.clear(),
@@ -387,6 +417,7 @@ impl ConnectionPage {
                 self.message_detail = detail;
                 self.message_key = Some("connections.status.error");
                 self.issues.clear();
+                self.test_report = None;
                 if let Some(id) = row_id {
                     self.status.insert(id.clone(), LinkStatus::Failed);
                     self.failures.insert(id, self.message_detail.clone());
@@ -467,6 +498,63 @@ pub fn blank_draft(engine: Engine) -> ConnectionDraft {
         ssh_key: String::new(),
         save_password: engine != Engine::Sqlite,
     }
+}
+
+/// 表单里换数据库类型时的新草稿。
+///
+/// 以前换类型等于清空表单：填好主机、用户、跳板机之后发现该选 MariaDB 而不是 MySQL，就得全部重填。
+/// 现在两种联网的引擎之间沿用主机、用户名、默认库、TLS 与 SSH；端口、环境、TLS 模式只在
+/// 用户改过（不等于旧引擎的默认值）时才沿用，否则换成新引擎的默认值。
+/// 文件型（SQLite）与联网引擎之间没有可沿用的地址，只留名称与环境。
+pub fn switch_engine(current: &ConnectionDraft, engine: Engine) -> ConnectionDraft {
+    if current.engine == engine {
+        return current.clone();
+    }
+    let before = blank_draft(current.engine);
+    let mut next = blank_draft(engine);
+    next.id = current.id.clone();
+    next.name = current.name.clone();
+    if current.env != before.env {
+        next.env = current.env.clone();
+    }
+    if current.engine == Engine::Sqlite || engine == Engine::Sqlite {
+        return next;
+    }
+    // 整串 mongodb:// URI 只有 MongoDB 认；换到别的引擎时它不是一个主机名。
+    if engine == Engine::Mongodb || !Engine::host_is_mongo_uri(&current.host) {
+        next.host = current.host.clone();
+    }
+    let port = current.port.trim();
+    if !port.is_empty() && port != before.port.trim() {
+        next.port = current.port.clone();
+    }
+    next.username = current.username.clone();
+    // Redis 的“库”是 0 起的索引，不是库名：两边不互相沿用。
+    if current.engine != Engine::Redis && engine != Engine::Redis {
+        next.database = current.database.clone();
+    }
+    if current.tls_mode != before.tls_mode {
+        next.tls_mode = current.tls_mode;
+    }
+    next.ca_mode = current.ca_mode;
+    next.ca_file = current.ca_file.clone();
+    next.client_cert = current.client_cert.clone();
+    next.client_key = current.client_key.clone();
+    next.ssh_on = current.ssh_on;
+    next.ssh_host = current.ssh_host.clone();
+    next.ssh_port = current.ssh_port.clone();
+    next.ssh_user = current.ssh_user.clone();
+    next.ssh_auth = current.ssh_auth;
+    next.ssh_key = current.ssh_key.clone();
+    next.save_password = current.save_password;
+    next
+}
+
+/// 新建草稿是不是还没填过东西：只选了类型或环境不算。关闭表单时据此决定要不要先问一句。
+pub fn draft_is_untouched(draft: &ConnectionDraft, secrets: &Secrets) -> bool {
+    let mut blank = blank_draft(draft.engine);
+    blank.env = draft.env.clone();
+    draft.id.is_none() && *draft == blank && secrets.password.is_empty() && secrets.ssh_password.is_empty() && secrets.ssh_passphrase.is_empty()
 }
 
 pub fn draft_from_saved(saved: &crate::connections::model::SavedConnection) -> ConnectionDraft {
@@ -1012,6 +1100,97 @@ mod tests {
         assert!(!page.test_running());
         assert_eq!(page.message_key, None);
         assert!(page.issues.is_empty());
+    }
+
+    /// 换数据库类型不清空表单：联网引擎之间沿用地址、用户、TLS 与 SSH；
+    /// 端口等只在用户改过时才沿用；文件型与联网引擎之间只留名称和环境。
+    #[test]
+    fn switching_engine_keeps_what_still_applies() {
+        let mut draft = blank_draft(Engine::Mysql);
+        draft.name = "订单库".into();
+        draft.host = "db.example.test".into();
+        draft.username = "app".into();
+        draft.database = "shop".into();
+        draft.ssh_on = true;
+        draft.ssh_host = "bastion.example.test".into();
+        draft.ssh_user = "jump".into();
+        draft.save_password = false;
+
+        let maria = switch_engine(&draft, Engine::Mariadb);
+        assert_eq!(maria.engine, Engine::Mariadb);
+        assert_eq!((maria.name.as_str(), maria.host.as_str(), maria.username.as_str(), maria.database.as_str()), ("订单库", "db.example.test", "app", "shop"));
+        assert!(maria.ssh_on && maria.ssh_host == "bastion.example.test" && maria.ssh_user == "jump");
+        assert!(!maria.save_password, "是否保存密码是用户的选择，跟着走");
+
+        // 没改过的端口换成新引擎的默认值；改过的端口留着。
+        let pg = switch_engine(&draft, Engine::Postgres);
+        assert_eq!(pg.port, default_port(Engine::Postgres));
+        draft.port = "13306".into();
+        assert_eq!(switch_engine(&draft, Engine::Postgres).port, "13306");
+
+        // 没动过的环境与 TLS 模式跟新引擎的默认值走；改过的留着。
+        let redis = switch_engine(&draft, Engine::Redis);
+        assert_eq!((redis.env.as_str(), redis.tls_mode), ("local", TlsMode::Off));
+        assert_eq!(redis.database, "0", "库名不是 Redis 的库索引");
+        draft.env = "prod".into();
+        draft.tls_mode = TlsMode::Require;
+        let redis = switch_engine(&draft, Engine::Redis);
+        assert_eq!((redis.env.as_str(), redis.tls_mode), ("prod", TlsMode::Require));
+
+        // 文件型没有地址可沿用；换回来也不会带出一个文件路径当主机。
+        let sqlite = switch_engine(&draft, Engine::Sqlite);
+        assert_eq!((sqlite.name.as_str(), sqlite.env.as_str()), ("订单库", "prod"));
+        assert!(sqlite.host.is_empty() && !sqlite.ssh_on && !sqlite.save_password);
+        let mut file = blank_draft(Engine::Sqlite);
+        file.file_path = "/tmp/notes.db".into();
+        let back = switch_engine(&file, Engine::Postgres);
+        assert!(back.host.is_empty() && back.file_path.is_empty());
+
+        // 整串 MongoDB URI 不是别的引擎的主机名。
+        let mut mongo = blank_draft(Engine::Mongodb);
+        mongo.host = "mongodb+srv://cluster.example.test/shop".into();
+        assert!(switch_engine(&mongo, Engine::Postgres).host.is_empty());
+
+        // 编辑已有连接时换类型，仍是同一条连接。
+        draft.id = Some("c1".into());
+        assert_eq!(switch_engine(&draft, Engine::Postgres).id.as_deref(), Some("c1"));
+        assert_eq!(switch_engine(&draft, Engine::Mysql), draft, "同一类型原样返回");
+    }
+
+    /// 只选了类型或环境的新草稿不算“填过”；填了任何字段或密码就算。
+    #[test]
+    fn an_untouched_new_draft_is_recognised() {
+        let mut draft = blank_draft(Engine::Mysql);
+        let secrets = Secrets::default();
+        assert!(draft_is_untouched(&draft, &secrets));
+        draft.env = "prod".into();
+        assert!(draft_is_untouched(&draft, &secrets));
+        assert!(!draft_is_untouched(&draft, &Secrets { password: "x".into(), ..Secrets::default() }));
+        draft.host = "db".into();
+        assert!(!draft_is_untouched(&draft, &secrets));
+        let mut saved = blank_draft(Engine::Mysql);
+        saved.id = Some("c1".into());
+        assert!(!draft_is_untouched(&saved, &secrets), "已保存的连接走基线比较，不走这里");
+    }
+
+    /// 测试结论只属于被测的那份草稿：改了草稿就收起，正在跑的测试不受影响。
+    #[test]
+    fn touching_the_draft_retires_the_last_test_verdict() {
+        let tasks = TaskBoard::new();
+        let mut page = editing_page(Engine::Postgres);
+        let token = page.begin(&tasks);
+        page.expect_test(1);
+        let fingerprint = draft_fingerprint(&page.editor, &page.secrets);
+        assert!(page.note_test(&tasks, token, 1, fingerprint, Ok(ok_report())));
+        assert!(page.test_report.is_some());
+        assert_eq!(page.message_key, Some("connections.editor.test.ok"));
+        page.draft_touched();
+        assert!(page.test_report.is_none());
+        assert_eq!(page.message_key, None);
+
+        page.expect_test(2);
+        page.draft_touched();
+        assert_eq!(page.message_key, Some("connections.editor.test.running"), "指示由结果回来时收起");
     }
 
     /// 指纹只看内容：改字段、改机密、关表单都会得到不同的值。

@@ -7771,7 +7771,9 @@ fn sidebar_copy_and_test_remain_usable_while_catalog_is_loading(cx: &mut gpui_ki
         assert!(window.find("conn-form").visible());
         let draft = view.read(cx).model.connections.editor.as_ref().unwrap();
         assert!(draft.id.is_none());
-        assert!(draft.name.ends_with(" copy"));
+        // 副本的名字跟界面语言走（“… 副本” / “… copy”），不再固定拼一个英文后缀。
+        let source = view.read(cx).model.connections.rows.iter().find(|row| row.saved.id == "notes").map(|row| row.saved.name.clone()).unwrap();
+        assert_eq!(draft.name, i18n::fill(&view.read(cx).model.text("ui.conn.copyName"), &[("name", &source)]));
         // 模态是覆盖层：先关掉它，下面对象树的右键才有机会收到点击。
         view.update(cx, |view, cx| view.perform("conn-cancel", cx));
         view.update(cx, |view, _| view.model.shell.page = AppPage::Workspace);
@@ -10619,5 +10621,338 @@ fn large_palette_virtualizes_rows_and_end_reaches_the_last_object(cx: &mut gpui_
     .unwrap();
     let offset_y = cx.update(|cx| f32::from(view.read(cx).palette_virtual_scroll.0.borrow().base_handle.offset().y));
     assert!(offset_y < -1.0, "palette-list 实际发生了纵向滚动：{offset_y}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 填了一半的表单不因为一次 Esc / 取消就没了：有未保存的修改时先问一句。
+/// 空表单、只选了类型或环境、没动过的已有连接都直接关，不多问。
+#[test]
+fn closing_a_filled_form_asks_before_discarding() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+
+    let _ = model.dispatch("new-connection");
+    assert!(!model.conn_dirty());
+    model.connections.change_engine(Engine::Mysql);
+    model.connections.editor.as_mut().unwrap().env = "prod".into();
+    assert!(!model.conn_dirty(), "只选了类型和环境不算填过");
+    let _ = model.dispatch("conn-escape");
+    assert!(!model.conn_modal.open);
+
+    let _ = model.dispatch("new-connection");
+    model.set_field(DraftField::Host, "db.example.test".into());
+    assert!(model.conn_dirty());
+    let _ = model.dispatch("conn-escape");
+    assert!(model.conn_modal.open && model.conn_modal.discard_armed, "第一次只问，不关");
+    assert!(model.conn_modal.focus_discard_pending, "键盘交给“继续编辑”");
+    let ids: Vec<String> = model.modal_stops().iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
+    assert!(ids.iter().any(|id| id == super::conn_modal::DISCARD_KEEP) && ids.iter().any(|id| id == super::conn_modal::DISCARD_CONFIRM));
+
+    // 取消按钮和关闭图标不替用户作答；再按一次 Esc 是“继续编辑”。
+    let _ = model.dispatch("conn-cancel");
+    let _ = model.dispatch("conn-modal-close");
+    assert!(model.conn_modal.open && model.conn_modal.discard_armed);
+    let _ = model.dispatch("conn-escape");
+    assert!(model.conn_modal.open && !model.conn_modal.discard_armed);
+    assert_eq!(model.connections.editor.as_ref().unwrap().host, "db.example.test", "草稿原样留着");
+    assert!(!model.modal_stops().iter().any(|stop| stop.control_id() == Some(super::conn_modal::DISCARD_KEEP)));
+
+    // 继续输入就收起确认；只输入了密码也算填过。
+    let _ = model.dispatch("conn-cancel");
+    assert!(model.conn_modal.discard_armed);
+    model.set_field(DraftField::Username, "app".into());
+    assert!(!model.conn_modal.discard_armed);
+    let _ = model.dispatch("conn-cancel");
+    let _ = model.dispatch("conn-discard");
+    assert!(!model.conn_modal.open && model.connections.editor.is_none(), "确认后才丢");
+    let _ = model.dispatch("new-connection");
+    model.set_field(DraftField::Password, "s3cret".into());
+    assert!(model.conn_dirty());
+    let _ = model.dispatch("conn-discard");
+
+    // 编辑已有连接：没改直接关；改了才问，“继续编辑”留在表单里。
+    model.connections.selected = Some("pg".into());
+    let _ = model.dispatch("conn-edit");
+    let _ = model.dispatch("conn-cancel");
+    assert!(!model.conn_modal.open);
+    let _ = model.dispatch("conn-edit");
+    model.set_field(DraftField::Host, "other.example.test".into());
+    let _ = model.dispatch("conn-cancel");
+    assert!(model.conn_modal.open && model.conn_modal.discard_armed);
+    let _ = model.dispatch("conn-discard-keep");
+    assert!(model.conn_modal.open && !model.conn_modal.discard_armed);
+    assert!(model.conn_modal.focus_first_pending, "确认条收起后键盘回到表单");
+    assert_eq!(model.connections.rows[0].saved.host.as_deref(), Some("db.example.test"), "已保存的配置没有被动过");
+}
+
+/// 连按两次回车或连点两下保存：第一次的结果回来之前不再接受第二次，
+/// 否则同一份新建草稿会存成两条连接。失败后按钮要能再点。
+#[tokio::test]
+async fn a_second_save_is_ignored_until_the_first_one_answers() {
+    let dir = std::env::temp_dir().join(format!("rillsql-double-save-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let file = sqlite_file(&dir, "notes.sqlite").await;
+    let _ = model.dispatch("conn-engine:sqlite");
+    let draft = model.connections.editor.as_mut().unwrap();
+    draft.name = "笔记".into();
+    draft.file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-save");
+    let _ = model.dispatch("conn-save-connect");
+    let _ = model.dispatch("conn-save");
+    assert_eq!(model.pending_len(), 1, "只排了一次保存");
+    assert!(model.conn_modal.saving);
+    assert!(!model.conn_modal.save_and_connect, "被忽略的第二次不改写第一次的意图");
+    let _ = model.dispatch("conn-escape");
+    assert!(model.conn_modal.open && !model.conn_modal.discard_armed, "保存在路上时 Esc 不弹确认");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.connections.rows.len(), 1, "只存出一条");
+    assert!(!model.conn_modal.open && !model.conn_modal.saving);
+
+    // 保存失败：模态留着、原因写在表单里，保存重新可用。
+    let _ = model.dispatch("new-connection");
+    model.conn_modal.saving = true;
+    let token = model.prepare_list_token(&services.tasks);
+    apply_done(&mut model, &services, "connections", jobs::JobDone::Notice(token, Err("磁盘已满".into())));
+    assert!(model.conn_modal.open && !model.conn_modal.saving);
+    assert_eq!(model.connections.message_detail, "磁盘已满");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 表单上有“保存密码”开关：以前没有，复制或导入的连接（不带密码）编辑时输入的密码
+/// 会被静静丢掉，永远存不上。关掉开关则把已存的那份删掉。
+#[tokio::test]
+async fn the_save_password_switch_decides_whether_the_password_is_kept() {
+    let dir = std::env::temp_dir().join(format!("rillsql-save-password-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut draft = sample_draft(Engine::Postgres);
+    draft.save_password = false;
+    let id = services.connections.save(draft, crate::connections::model::SecretInput::default()).await.unwrap().connection.id;
+    let mut model = seeded_model(services.connections.list().await.unwrap());
+    let saved = |model: &WorkbenchModel| model.connections.rows.iter().find(|row| row.saved.id == id).is_some_and(|row| row.saved.password_saved);
+    assert!(!saved(&model));
+
+    model.connections.selected = Some(id.clone());
+    let _ = model.dispatch("conn-edit");
+    assert!(!model.connections.editor.as_ref().unwrap().save_password);
+    assert!(model.modal_stops().iter().any(|stop| stop.control_id() == Some(super::conn_modal::SAVE_PASSWORD)), "开关是表单里的一个停靠点");
+    let _ = model.dispatch("conn-save-password-toggle");
+    assert!(model.connections.editor.as_ref().unwrap().save_password);
+    assert!(model.conn_dirty(), "拨开关也是一处修改");
+    model.set_field(DraftField::Password, "s3cret".into());
+    let _ = model.dispatch("conn-save");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(saved(&model), "打开开关后输入的密码存进了钥匙串");
+
+    let _ = model.dispatch("conn-edit");
+    assert!(model.connections.editor.as_ref().unwrap().save_password, "开关显示实际状态");
+    let _ = model.dispatch("conn-save-password-toggle");
+    let _ = model.dispatch("conn-save");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(!saved(&model), "关掉开关后已存的密码被删除");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 副本按界面语言命名并避开重名；上一张表单粘贴的连接串（可能带密码）不留到下一张表单；
+/// 连接串解析成功有就地提示，连接串再被改动就收起。
+#[test]
+fn duplicates_are_named_uniquely_and_the_url_box_starts_empty() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    let first = i18n::fill(&model.text("ui.conn.copyName"), &[("name", "Atlas")]);
+    assert_ne!(first, "Atlas copy", "默认界面是中文，副本名不该是英文后缀");
+    model.connections.rows.push(record_for("pg2", &first, Engine::Postgres));
+
+    let _ = model.dispatch("new-connection");
+    model.set_field(DraftField::Url, "postgres://app:s3cret@db.example.test:5432/shop".into());
+    assert!(model.conn_modal.url_applied, "粘贴的连接串解析成功");
+    assert_eq!(model.connections.editor.as_ref().unwrap().host, "db.example.test");
+    model.set_field(DraftField::Url, "postgres://app:s3cret@db.example.test:5432/sho".into());
+    assert!(!model.conn_modal.url_applied, "连接串又被改了：提示收起");
+    let _ = model.dispatch("conn-apply-url");
+    assert!(model.conn_modal.url_applied, "点“解析”同样有提示");
+    let _ = model.dispatch("conn-discard");
+    assert!(model.field_value(DraftField::Url).is_empty(), "关闭后不留连接串");
+
+    model.connections.selected = Some("pg".into());
+    model.set_field(DraftField::Url, "postgres://app:s3cret@db.example.test/shop".into());
+    let _ = model.dispatch("conn-duplicate");
+    let draft = model.connections.editor.as_ref().unwrap();
+    assert_eq!(draft.name, format!("{first} 2"), "已有同名副本时编号");
+    assert!(draft.id.is_none());
+    assert!(model.field_value(DraftField::Url).is_empty(), "打开另一张表单时连接串框是空的");
+    assert!(!model.conn_modal.url_applied);
+    assert!(!model.conn_dirty(), "没动过的副本关掉不用问");
+    let _ = model.dispatch("conn-cancel");
+    assert!(!model.conn_modal.open);
+}
+
+/// 测试结论只说屏幕上这份配置：成功后改了地址，结论就收起；字段不合法时不发请求，
+/// 键盘落到第一个要改的字段上；服务端拒绝凭据的结论在改了用户名或密码后收起。
+#[tokio::test]
+async fn a_test_verdict_is_retired_when_the_draft_changes() {
+    let dir = std::env::temp_dir().join(format!("rillsql-verdict-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let file = sqlite_file(&dir, "notes.sqlite").await;
+    let _ = model.dispatch("conn-engine:sqlite");
+    model.conn_modal.focus_first_pending = false;
+    let _ = model.dispatch("conn-test");
+    assert_eq!(model.pending_len(), 0, "没选文件不发请求");
+    assert!(model.conn_modal.focus_first_pending, "键盘落到要改的字段上");
+    let _ = model.dispatch("conn-save");
+    assert_eq!(model.pending_len(), 0);
+    assert!(!model.conn_modal.saving, "没通过校验的保存不占着按钮");
+
+    model.set_field(DraftField::File, file.display().to_string());
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.connections.message_key, Some("connections.editor.test.ok"));
+    let report = model.connections.test_report.clone().expect("留着各阶段的结果");
+    assert!(report.stages.len() > 1);
+
+    model.set_field(DraftField::Name, "笔记".into());
+    assert!(model.connections.test_report.is_none(), "草稿改了，上一次的结论不再成立");
+    assert_eq!(model.connections.message_key, None);
+
+    model.connections.issues.push(crate::app::views::connections::FieldIssue::new("credentials", "connections.status.error"));
+    model.set_field(DraftField::Password, "retry".into());
+    assert!(model.connections.issues.is_empty(), "改了密码，“凭据被拒”的结论收起");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 真实绘制：换类型保留已填字段；保存密码开关可点；测试结论与放弃确认都画在页脚上方、
+/// 面板之内（表单再长也不在滚动区里）；Esc → 确认 → Esc 继续编辑 → 放弃；
+/// 画出来的控件与 Tab 序列一致；Cmd/Ctrl+Enter 就是“保存并连接”。
+#[gpui_kit::test]
+fn the_modal_keeps_verdicts_and_the_discard_prompt_above_the_footer(cx: &mut gpui_kit::TestAppContext) {
+    use crate::connections::stages::{StageKind, StageStatus, StageView, TestReport, TestStatus};
+    let dir = std::env::temp_dir().join(format!("rillsql-modal-strip-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("new-connection", cx)));
+    let bottom = |snapshot: &gpui_kit::test::ElementSnapshot| f32::from(snapshot.bounds().origin.y + snapshot.bounds().size.height);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("conn-modal-status").is_none(), "没有结论时不占地方");
+        view.update(cx, |view, _| {
+            view.model.set_field(DraftField::Host, "db.example.test".into());
+            view.model.set_field(DraftField::Username, "app".into());
+        });
+        window.render_frame(cx);
+        window.click("conn-engine-mariadb", cx);
+        window.render_frame(cx);
+        {
+            let draft = view.read(cx).model.connections.editor.clone().unwrap();
+            assert_eq!(draft.engine, Engine::Mariadb);
+            assert_eq!((draft.host.as_str(), draft.username.as_str(), draft.port.as_str()), ("db.example.test", "app", "3306"), "换类型不清空表单");
+        }
+
+        assert!(window.find("conn-save-password").visible());
+        window.click("conn-save-password", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.connections.editor.as_ref().unwrap().save_password);
+        window.click("conn-save-password", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.connections.editor.as_ref().unwrap().save_password);
+
+        // 最长的表单形状 + 一条失败结论：结论仍在面板里、页脚按钮正上方。
+        view.update(cx, |view, _| {
+            let draft = view.model.connections.editor.as_mut().unwrap();
+            draft.tls_mode = crate::connections::model::TlsMode::Verify;
+            draft.ca_mode = CaMode::File;
+            draft.ssh_on = true;
+            let stage = |kind: StageKind, status: StageStatus, message: &str| StageView { kind, label: kind.label_zh().to_owned(), status, message: message.to_owned(), code: None };
+            view.model.connections.test_report = Some(TestReport {
+                status: TestStatus::Err,
+                fail_stage: Some(StageKind::DatabaseAuthentication.label_zh().to_owned()),
+                hint: Some("检查用户名和密码".into()),
+                summary: None,
+                fingerprint: None,
+                algorithm: None,
+                stages: vec![
+                    stage(StageKind::Network, StageStatus::Ok, "已连接"),
+                    stage(StageKind::Tls, StageStatus::Ok, "已加密"),
+                    stage(StageKind::DatabaseAuthentication, StageStatus::Err, "Access denied for user 'app'"),
+                    stage(StageKind::ServerVersion, StageStatus::Skipped, "未执行"),
+                ],
+                code: None,
+            });
+            view.model.connections.message_key = Some("connections.editor.test.failed");
+        });
+        window.render_frame(cx);
+        let verdict = window.find("conn-test-verdict");
+        assert!(verdict.visible());
+        let label = verdict.label().unwrap_or_default().to_string();
+        assert!(label.contains(StageKind::DatabaseAuthentication.label_zh()) && label.contains("Access denied") && label.contains("检查用户名和密码"), "{label}");
+        let save = window.find("conn-save-connect");
+        assert!(save.visible());
+        assert!(bottom(&verdict) <= f32::from(save.bounds().origin.y) + 0.5, "结论在页脚按钮上方");
+        assert!(bottom(&save) <= 800.5, "页脚仍在窗口内");
+        let test = window.find("conn-test");
+        let cancel = window.find("conn-cancel");
+        assert!(f32::from(test.bounds().origin.x) < f32::from(cancel.bounds().origin.x), "测试在左，离开表单的动作在右");
+        assert!(f32::from(cancel.bounds().origin.x) < f32::from(save.bounds().origin.x));
+
+        // 改了字段：结论收起。
+        view.update(cx, |view, _| view.model.set_field(DraftField::Username, "root".into()));
+        window.render_frame(cx);
+        assert!(window.try_find("conn-test-verdict").is_none());
+
+        // Esc：先问；确认条的两个按钮进入 Tab 序列，画出来的与序列一致。
+        window.press("escape", cx);
+        window.render_frame(cx);
+        let prompt = window.find("conn-discard-prompt");
+        assert!(prompt.visible() && view.read(cx).model.conn_modal.open);
+        assert!(bottom(&prompt) <= f32::from(window.find("conn-save-connect").bounds().origin.y) + 0.5);
+        {
+            let view = view.read(cx);
+            let expected: Vec<String> = view.model.modal_stops().iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
+            let rendered = view.model.conn_modal.rendered.clone();
+            assert!(rendered.iter().any(|id| id == "conn-discard-keep") && rendered.iter().any(|id| id == "conn-discard"));
+            assert_eq!(rendered.len(), expected.len(), "{rendered:?} vs {expected:?}");
+        }
+        // 键盘在“继续编辑”上：回车留下来，不丢表单。
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.conn_modal.open && window.try_find("conn-discard-prompt").is_none());
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.conn_modal.open && window.try_find("conn-discard-prompt").is_none(), "再按 Esc 是继续编辑");
+        assert_eq!(view.read(cx).model.connections.editor.as_ref().unwrap().host, "db.example.test");
+
+        // Cmd/Ctrl+Enter：保存并连接。这份草稿缺 CA 文件，所以停在校验上，但确实是那条命令。
+        window.dispatch_action(Box::new(crate::app::ExecuteQuery), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        {
+            let model = &view.read(cx).model;
+            assert!(model.conn_modal.save_and_connect, "Cmd/Ctrl+Enter 走的是保存并连接");
+            assert!(model.connections.issues.iter().any(|issue| issue.field == "ca_file"));
+            assert!(!model.commands.iter().any(|id| id == "execute-query"), "没有落到背后的查询上");
+        }
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.click("conn-discard", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.conn_modal.open, "放弃修改后关闭");
+        assert!(view.read(cx).model.connections.rows.is_empty());
+    })
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

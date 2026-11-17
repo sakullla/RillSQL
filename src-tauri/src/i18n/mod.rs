@@ -1474,6 +1474,16 @@ dict! {
     "ui.conn.block.auth" => "身份验证", "Authentication";
     "ui.conn.block.authHint" => "密码保存在系统钥匙串；默认库可留空", "Passwords live in the system keychain; the default database is optional";
     "ui.conn.block.securityHint" => "TLS 加密与 SSH 跳板机", "TLS encryption and SSH bastion";
+    "ui.conn.copyName" => "{name} 副本", "{name} copy";
+    "ui.conn.savePassword" => "保存密码", "Save password";
+    "ui.conn.savePasswordOn" => "存入系统钥匙串，以后直接连接", "Kept in the system keychain; connects without asking";
+    "ui.conn.savePasswordOff" => "不保存；每次启动后第一次连接时询问", "Not kept; asked on the first connection of each run";
+    "ui.conn.savePasswordDrop" => "不保存；保存后会删除钥匙串里已存的密码", "Not kept; saving removes the password stored in the keychain";
+    "ui.conn.discard.title" => "有未保存的修改，要放弃吗？", "Discard unsaved changes?";
+    "ui.conn.discard.keep" => "继续编辑", "Keep editing";
+    "ui.conn.discard.confirm" => "放弃修改", "Discard";
+    "ui.conn.saving" => "正在保存…", "Saving…";
+    "ui.conn.saveConnectTip" => "保存并连接 · {chord}", "Save and connect · {chord}";
     "grid.numeric.unrecognized" => "这不像一个数字，已按原样暂存，保存时由数据库校验", "This does not look like a number; it is staged as typed and the database will validate it on save";
     "grid.temporal.format" => "格式 {format}，也可输入 2023/7/4 9:05、20230704", "Format {format}; 2023/7/4 9:05 or 20230704 also work";
     "grid.temporal.willSave" => "将保存为 {value}", "Will save as {value}";

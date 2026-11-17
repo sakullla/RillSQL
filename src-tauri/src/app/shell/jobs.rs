@@ -279,6 +279,10 @@ async fn load_history(services: &AppServices) -> Result<(Vec<HistoryEntry>, Vec<
 }
 
 pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &str, done: JobDone) {
+    // 保存有了结果（成功或失败）：表单重新接受保存。失败时模态还开着，按钮要能再点。
+    if owner == "connections" && matches!(done, JobDone::Saved(..) | JobDone::Notice(_, Err(_))) {
+        model.conn_modal.saving = false;
+    }
     match done {
         JobDone::Rows(token, Ok(snapshot)) => {
             if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
