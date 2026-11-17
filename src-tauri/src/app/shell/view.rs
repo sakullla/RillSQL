@@ -528,7 +528,12 @@ impl Workbench {
                 // 对象菜单以右键/当前对象为准；没有选中对象时退回当前工作项的目标。
                 // 文档集合没有关系型比较：说明原因，不换成别的对象。
                 "compare-object" => {
-                    let target = self.model.object_target().or_else(|| self.model.compare_target());
+                    let target = self
+                        .model
+                        .object_target()
+                        .or_else(|| self.model.nav_scope_target())
+                        .or_else(|| self.model.compare_target());
+                    self.model.nav_menu_node = None;
                     if target.as_ref().is_some_and(|target| !target.is_relational()) {
                         self.model.notice_key = Some("catalog.tree.relationalOnly");
                         self.model.notice_detail = target.as_ref().map(|target| target.name.clone()).unwrap_or_default();
@@ -2328,8 +2333,9 @@ impl Workbench {
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
+                let raw = error.to_string();
                 self.model.notice_key = Some("connections.page.importRillSql");
-                self.model.notice_detail = error.to_string();
+                self.model.notice_detail = humanize_dialog_error(&raw, self.model.locale());
             }
             Err(error) => {
                 self.model.notice_key = Some("connections.page.importRillSql");
@@ -2358,8 +2364,9 @@ impl Workbench {
             },
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
+                let raw = error.to_string();
                 self.model.notice_key = Some("connections.page.exportButton");
-                self.model.notice_detail = error.to_string();
+                self.model.notice_detail = humanize_dialog_error(&raw, self.model.locale());
             }
             Err(error) => {
                 self.model.notice_key = Some("connections.page.exportButton");
@@ -2370,7 +2377,7 @@ impl Workbench {
         cx.notify();
     }
 
-    fn finish_sqlite_prompt<E: std::fmt::Display>(
+    pub(super) fn finish_sqlite_prompt<E: std::fmt::Display>(
         &mut self,
         message: Result<Result<Option<Vec<std::path::PathBuf>>, E>, futures::channel::oneshot::Canceled>,
         cx: &mut Context<Self>,
@@ -2389,8 +2396,28 @@ impl Workbench {
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
-                self.model.notice_key = Some("connections.validate.chooseFile");
-                self.model.notice_detail = error.to_string();
+                let raw = error.to_string();
+                if is_portal_dialog_error(&raw) {
+                    // 无桌面 Portal（容器、远程 X11/Wayland）时原生对话框不可用：
+                    // 直接打开 SQLite 连接表单并把光标放到文件路径框，让用户能继续。
+                    let origin = self.model.shell.focus;
+                    self.model.open_connection_modal(
+                        Some(crate::connections::model::Engine::Sqlite),
+                        origin,
+                        None,
+                        "open-sqlite",
+                    );
+                    self.model.connections.issues.push(crate::app::views::connections::FieldIssue::new(
+                        "file_path",
+                        "ui.sqlite.portalFallback",
+                    ));
+                    self.model.conn_modal.focus_first_pending = true;
+                    self.model.notice_key = Some("ui.sqlite.portalFallback");
+                    self.model.notice_detail.clear();
+                } else {
+                    self.model.notice_key = Some("connections.validate.chooseFile");
+                    self.model.notice_detail = raw;
+                }
             }
             Err(error) => {
                 self.model.notice_key = Some("connections.validate.chooseFile");
@@ -2930,4 +2957,21 @@ pub fn legacy_webview_root() -> Option<std::path::PathBuf> {
         roaming_app_data: std::env::var_os("APPDATA").map(std::path::PathBuf::from),
         xdg_data_home: std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from),
     })
+}
+
+/// 识别无桌面 Portal / D-Bus 时的原生文件框失败，避免把底层 zbus 报错原样抛给用户。
+pub(super) fn is_portal_dialog_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("portal request failed")
+        || lower.contains("org.freedesktop.portal")
+        || lower.contains("org.freedesktop.dbus.error.serviceunknown")
+        || lower.contains("zbus")
+}
+
+pub(super) fn humanize_dialog_error(error: &str, locale: crate::i18n::Locale) -> String {
+    if is_portal_dialog_error(error) {
+        crate::i18n::text(locale, "ui.filePicker.portalUnavailable")
+    } else {
+        error.to_owned()
+    }
 }

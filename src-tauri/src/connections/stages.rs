@@ -26,6 +26,13 @@ impl StageKind {
         }
     }
 
+    pub fn tls_label_en(mode: TlsMode) -> &'static str {
+        match mode {
+            TlsMode::Verify => "Encrypt & verify certificate",
+            TlsMode::Require | TlsMode::Off => "Encrypt connection",
+        }
+    }
+
     pub fn label_zh(self) -> &'static str {
         match self {
             StageKind::SshHostIdentity => "确认 SSH 跳板机身份",
@@ -40,6 +47,96 @@ impl StageKind {
             StageKind::ForeignKeys => "检查外键设置",
         }
     }
+
+    pub fn label_en(self) -> &'static str {
+        match self {
+            StageKind::SshHostIdentity => "Verify SSH host identity",
+            StageKind::SshAuthentication => "Authenticate SSH bastion",
+            StageKind::Tunnel => "Open SSH tunnel to database",
+            StageKind::Network => "Connect to database server",
+            StageKind::Tls => "Encrypt connection",
+            StageKind::DatabaseAuthentication => "Authenticate database",
+            StageKind::ServerVersion => "Read server version",
+            StageKind::OpenFile => "Open database file",
+            StageKind::ReadSchema => "Read schema catalog",
+            StageKind::ForeignKeys => "Check foreign-key settings",
+        }
+    }
+}
+
+/// 按当前界面语言返回阶段标题：后端结构保持中文以兼容既有断言，英文界面在呈现层切换。
+pub fn localize_stage_label(stage: &StageView, locale: crate::i18n::Locale) -> String {
+    if locale != crate::i18n::Locale::En {
+        return stage.label.clone();
+    }
+    if stage.kind == StageKind::Tls && stage.label.contains("核对证书") {
+        return StageKind::tls_label_en(TlsMode::Verify).to_owned();
+    }
+    stage.kind.label_en().to_owned()
+}
+
+/// 按当前界面语言返回测试总结（如 SQLite 的外键状态），驱动返回的版本号保持原样。
+pub fn localize_report_summary(summary: &str, locale: crate::i18n::Locale) -> String {
+    let trimmed = summary.trim();
+    if locale != crate::i18n::Locale::En {
+        return trimmed.to_owned();
+    }
+    match trimmed {
+        "外键检查：已开启" => "Foreign keys: enabled".to_owned(),
+        "外键检查：已关闭" => "Foreign keys: disabled".to_owned(),
+        "已连接" | "完成" => "Connected".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// 按当前界面语言翻译阶段错误正文；驱动附带的英文原始详情保留。
+pub fn localize_stage_message(stage: &StageView, locale: crate::i18n::Locale) -> String {
+    let raw = stage.message.trim();
+    if locale != crate::i18n::Locale::En {
+        return raw.to_owned();
+    }
+    if let Some(fp) = raw.strip_prefix("等待确认 SSH 服务器指纹 ") {
+        return format!("Waiting to trust SSH server fingerprint {fp}");
+    }
+    match stage.code.as_deref() {
+        Some(error_codes::CONN_PASSWORD_REQUIRED) => "Database password is required".to_owned(),
+        Some(error_codes::CONN_SQLITE_FILE_MISSING) => "Database file was not found".to_owned(),
+        Some(error_codes::CONN_TLS_CA_MISSING) => "CA certificate file was not found".to_owned(),
+        Some(error_codes::CONN_TLS_CERT_MISSING) => "Client certificate or key file was not found".to_owned(),
+        Some(error_codes::CONN_SSH_KEY_UNREADABLE) => "Could not read SSH private key file".to_owned(),
+        Some(error_codes::CONN_TUNNEL_NOT_READY) => "SSH tunnel is not ready".to_owned(),
+        _ => raw.to_owned(),
+    }
+}
+
+/// 按当前界面语言翻译失败阶段的处理建议。
+pub fn localize_report_hint(report: &TestReport, locale: crate::i18n::Locale) -> Option<String> {
+    let raw = report.hint.as_deref().map(str::trim).filter(|hint| !hint.is_empty())?;
+    if locale != crate::i18n::Locale::En {
+        return Some(raw.to_owned());
+    }
+    let translated = match report.code.as_deref() {
+        Some(error_codes::CONN_PASSWORD_REQUIRED) => {
+            "No saved password was found in the keychain and none was entered for this attempt."
+        }
+        Some(error_codes::CONN_AUTH_FAILED) | Some(error_codes::CONN_REDIS_AUTH_FAILED) => {
+            "Verify the database username and password."
+        }
+        Some(error_codes::CONN_NETWORK_FAILED) => {
+            "Check the host, port, firewall rules, and whether the database server is running."
+        }
+        Some(error_codes::CONN_SQLITE_FILE_MISSING) | Some(error_codes::CONN_SQLITE_OPEN_FAILED) => {
+            "Verify the file path and local read/write permissions."
+        }
+        Some(error_codes::CONN_SSH_AUTH_FAILED) => {
+            "Check the SSH username, private key or passphrase, and bastion password."
+        }
+        Some(error_codes::CONN_HOST_KEY_CHANGED) => {
+            "Connection blocked before sending credentials. Verify the new host fingerprint via a trusted channel, forget the old key, and test again."
+        }
+        _ => raw,
+    };
+    Some(translated.to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

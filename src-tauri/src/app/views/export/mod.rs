@@ -1359,7 +1359,7 @@ impl Render for ExchangePane {
                 }),
             ));
         }
-        let range_enabled = self.source.kind == ExchangeSourceKind::Query || self.source.rows.len() > 100;
+        let range_enabled = self.source.rows.len() > 100 || self.row_limit.is_some();
         panel = panel.child(section(
             t("ui.exchange.source"),
             kit::card(&p)

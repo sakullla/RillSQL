@@ -320,6 +320,8 @@ pub struct PasswordPrompt {
     pub text: String,
     /// 上一次的密码被服务端拒绝（而不是没有密码）。
     pub rejected: bool,
+    /// 连接成功后顺带把密码存入系统钥匙串，省去再去编辑表单重填一次。
+    pub save_password: bool,
     /// 每次打开递增：视图据此只在新打开时聚焦一次输入框。
     pub epoch: u64,
 }
@@ -331,6 +333,7 @@ impl std::fmt::Debug for PasswordPrompt {
             .field("id", &self.id)
             .field("typed", &!self.text.is_empty())
             .field("rejected", &self.rejected)
+            .field("save_password", &self.save_password)
             .field("epoch", &self.epoch)
             .finish()
     }
@@ -1116,6 +1119,7 @@ impl WorkbenchModel {
             "menu-tab" => self.open_tab_menu(),
             "menu-editor" => self.open_editor_menu(),
             "menu-connection" => self.open_connection_menu(),
+            "menu-explorer-connection" => self.open_explorer_connection_menu(),
             "menu-history" => self.open_history_menu(),
             "update-install" => {
                 let _ = self.request_update_download();
@@ -1506,7 +1510,7 @@ impl WorkbenchModel {
     }
 
     fn open_diagram_from_object(&mut self) {
-        let Some(target) = self.object_target() else {
+        let Some(target) = self.object_target().or_else(|| self.nav_scope_target()) else {
             self.shell.page = AppPage::Diagram;
             self.diagram_spec = None;
             return;
@@ -1517,6 +1521,7 @@ impl WorkbenchModel {
             return;
         }
         if let Some(spec) = crate::app::views::diagram::spec_from_object(&target.spec()) {
+            self.nav_menu_node = None;
             self.diagram_spec = Some(spec);
             self.shell.page = AppPage::Diagram;
         }
@@ -1925,6 +1930,55 @@ impl WorkbenchModel {
         self.append_move_to_group();
     }
 
+    /// 资源管理器的连接行右键菜单：已连接的关系型库在连接行上直达刷新、建表、关系图、对比与管理页。
+    pub fn open_explorer_connection_menu(&mut self) {
+        let selected = self.connections.selected.clone();
+        let connected = selected
+            .as_deref()
+            .is_some_and(|id| self.connections.row_status(id) == LinkStatus::Connected);
+        let relational = selected
+            .as_deref()
+            .and_then(|id| self.connections.rows.iter().find(|row| row.saved.id == id))
+            .is_some_and(|row| {
+                !matches!(
+                    row.saved.engine,
+                    crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb
+                )
+            });
+        self.open_menu(MenuPlace::ObjectTree, MenuTarget::Connection);
+        self.menu = Some(OpenMenu::with_items(
+            MenuPlace::ObjectTree,
+            super::menus::explorer_connection_menu_items(connected, relational),
+        ));
+        if let Some(id) = selected.as_deref() {
+            let root = crate::catalog::hierarchy::connection_node_id(id);
+            if self.nav.node(&root).is_some() {
+                self.nav.set_focus(&root);
+                self.sync_object_spec_from_focus();
+                self.nav_menu_node = Some(root);
+            }
+        }
+        self.append_move_to_group();
+    }
+
+    pub fn has_connected(&self) -> bool {
+        self.connections
+            .rows
+            .iter()
+            .any(|row| self.connections.row_status(&row.saved.id) == LinkStatus::Connected)
+    }
+
+    pub fn has_blocking_dialog(&self) -> bool {
+        self.conn_modal.open
+            || self.password_prompt.is_some()
+            || self.connections.confirm_delete
+            || self.group_delete.is_some()
+            || self.close_prompt.is_some()
+            || self.danger.is_some()
+            || self.tag_manager.is_some()
+            || self.ddl_view.as_ref().is_some_and(|view| !view.copy_only)
+    }
+
     /// 分组标题右键：菜单只属于被点的这一个分组。
     pub fn open_group_menu(&mut self, group_id: &str) -> bool {
         let Some(group) = self.group(group_id).cloned() else { return false };
@@ -1999,6 +2053,22 @@ impl WorkbenchModel {
         self.nav_menu_node = None;
         if self.menu.take().is_some() {
             self.shell.focus = self.menu_return;
+            return Effect::None;
+        }
+        if self.password_prompt.is_some() {
+            let _ = self.password_command("password-cancel");
+            return Effect::None;
+        }
+        if self.connections.confirm_delete {
+            self.connections.confirm_delete = false;
+            return Effect::None;
+        }
+        if self.group_delete.take().is_some() {
+            return Effect::None;
+        }
+        // 连接模态：点遮罩走取消（未改动直接关，有未存改动先问是否放弃，绝不静默丢输入）。
+        if self.conn_modal.open {
+            self.conn_command("conn-cancel");
             return Effect::None;
         }
         // 标签管理：Esc/点外面先收起编辑或删除确认，再关对话框。
@@ -2980,20 +3050,35 @@ impl WorkbenchModel {
             return;
         }
         self.password_prompt_epoch += 1;
-        self.password_prompt = Some(PasswordPrompt { id: id.to_owned(), text: String::new(), rejected, epoch: self.password_prompt_epoch });
+        self.password_prompt = Some(PasswordPrompt {
+            id: id.to_owned(),
+            text: String::new(),
+            rejected,
+            save_password: false,
+            epoch: self.password_prompt_epoch,
+        });
         self.focused_field = Some(DraftField::PromptPassword);
     }
 
-    /// 密码输入框的命令：用这次输入的密码重连（并重放失败时挂起的动作）、取消、或改去编辑连接。
+    /// 密码输入框的命令：用这次输入的密码重连（并重放失败时挂起的动作）、切换记住到钥匙串、取消、或改去编辑连接。
     fn password_command(&mut self, id: &str) -> bool {
         match id {
+            "password-toggle-save" => {
+                if let Some(prompt) = self.password_prompt.as_mut() {
+                    prompt.save_password = !prompt.save_password;
+                }
+            }
             "password-submit" => {
                 if self.password_prompt.as_ref().is_none_or(|prompt| prompt.text.is_empty()) {
                     return true;
                 }
                 let prompt = self.password_prompt.take().expect("prompt");
                 self.clear_prompt_focus();
-                let secrets = Secrets { password: prompt.text, ..Secrets::default() };
+                let secrets = Secrets {
+                    password: prompt.text,
+                    save_password: prompt.save_password,
+                    ..Secrets::default()
+                };
                 self.pending_open_secrets = Some((prompt.id.clone(), secrets));
                 self.connections.selected = Some(prompt.id.clone());
                 // 失败时挂起的那个动作（展开、打开表、运行查询）随这次连接一起重放。
@@ -4877,6 +4962,16 @@ impl WorkbenchModel {
     /// 对象树里选中的对象目标。菜单动作以它为准，避免被活动工作项的旧目标顶掉。
     pub fn object_target(&self) -> Option<ObjectTarget> {
         self.object_spec.as_deref().and_then(ObjectTarget::parse)
+    }
+
+    /// 对象树里的连接/库/模式/种类分组范围目标：供连接或库右键直达关系图、对比库时携带当前库身份。
+    pub fn nav_scope_target(&self) -> Option<ObjectTarget> {
+        let id = self.nav_menu_node.clone().or_else(|| self.nav.focus().map(str::to_owned))?;
+        let node = self.nav.node(&id)?;
+        if !matches!(node.kind, NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group) {
+            return None;
+        }
+        self.scope_spec(node).as_deref().and_then(ObjectTarget::parse)
     }
 
     /// 当前对象：优先活动工作项自己的目标，其次对象树里的选择。

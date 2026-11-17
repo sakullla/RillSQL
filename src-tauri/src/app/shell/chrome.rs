@@ -629,7 +629,7 @@ impl Workbench {
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.palette.title"))
                     .w(px(if narrow { 176. } else { 360. }))
-                    .h(px(m.control_h + 2.))
+                    .h(px(m.control_h))
                     .px(px(10.))
                     .flex()
                     .items_center()
@@ -748,7 +748,8 @@ impl Workbench {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(4.))
+                    .justify_center()
+                    .gap(px(6.))
                     .child(self.launcher_action(
                         "explorer-new",
                         IconName::Plus,
@@ -759,7 +760,7 @@ impl Workbench {
                         &p,
                         cx,
                     ))
-                    .child(kit::tool_button(
+                    .child(kit::secondary_button(
                         "explorer-sqlite",
                         Some(IconName::FolderOpen),
                         self.t("common.openSqlite"),
@@ -849,15 +850,19 @@ impl Workbench {
                                             .xsmall()
                                             .disabled(!self.model.nav.has_expanded()),
                                     )
-                                    .child(kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx)).xsmall())
+                                    .child(
+                                        kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx))
+                                            .xsmall()
+                                            .disabled(!self.model.has_connected()),
+                                    )
                                     // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
                                     .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
-                                    .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("new-connection", cx)).xsmall()),
+                                    .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("conn-new-sidebar", cx)).xsmall()),
                             ),
                     )
                     // 没有连接时没有可筛的对象，筛选框不出现。
                     .when(!self.model.connections.rows.is_empty(), |this| {
-                        this.child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                        this.child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
                     })
                     .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
@@ -1222,7 +1227,7 @@ impl Workbench {
                 this.menu_at = event.position;
                 this.model.connections.selected = Some(menu_id.clone());
                 this.model.set_explorer_current(super::explorer::ExplorerRow::Connection(menu_id.clone()));
-                this.perform("menu-connection", cx);
+                this.perform("menu-explorer-connection", cx);
             }))
             // 拖拽归组：拖到分组标题上放手，落库路径与右键“移动到分组”完全相同。
             .on_drag(
@@ -1390,7 +1395,7 @@ impl Workbench {
         } else if row.path.is_empty() {
             label.clone()
         } else {
-            SharedString::from(nav_row_tooltip(&row.path, &row.name))
+            SharedString::from(localized_nav_tooltip(&row.path, &row.name, label.as_ref(), row.label_key.is_some()))
         };
         let is_group = matches!(row.kind, NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup);
         // 已读完、确实一个对象都没有的种类分组：不画展开箭头，名称与数量弱化，看起来不像“展开了却丢了内容”。
@@ -1453,7 +1458,7 @@ impl Workbench {
                     .justify_center()
                     .cursor_pointer()
                     .flex_none()
-                    .w(px(14.))
+                    .w(px(16.))
                     .when(row.expandable && !empty_group, |this| {
                         this.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -1582,7 +1587,13 @@ impl Workbench {
                 this.model.shell.focus = FocusTarget::Sidebar;
                 window.focus(&this.nav_focus, cx);
                 this.perform(&format!("nav-focus:{click_id}"), cx);
-                if event.click_count() >= 2 {
+                if is_group && !empty_group {
+                    // 纯分组目录行（表 / 视图 / 列 / 索引）与用户连接组一样单击即展开/折叠；
+                    // 连点第二下忽略，避免双击展开又立即收起。
+                    if event.click_count() == 1 {
+                        this.perform(&format!("nav-toggle:{click_id}"), cx);
+                    }
+                } else if event.click_count() >= 2 {
                     // 双击容器在树上展开/折叠，对象打开自己的数据或文档页。
                     if let Some(command) = this.model.nav_toggle_command(&click_id) {
                         this.perform(&command, cx);
@@ -2113,7 +2124,7 @@ impl Workbench {
                 self.t("common.newConnection"),
                 self.t("ui.welcome.newConnDesc"),
                 None,
-                "new-connection",
+                "conn-new-sidebar",
                 cx,
             ))
             .child(quick_card(
@@ -2477,7 +2488,7 @@ impl Workbench {
         let narrow = self.model.viewport_width <= 900;
         let view_w = self.model.viewport_width.max(240) as f32;
         let view_h = self.model.viewport_height.max(240) as f32;
-        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 820_f32.min(view_w - 80.) };
+        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 900_f32.min(view_w - 80.) };
         // 左右分栏要给字段留出至少 440 的宽度，否则退回上下排布。
         let wide = panel_w >= 700.;
         // 顶部锚定：换引擎时表单高度会变，居中会让整块上下跳；固定上沿只让下沿伸缩。
@@ -2522,7 +2533,19 @@ impl Workbench {
         // 宽面板左右排布，窄面板上下排布；所有控件照常渲染，Tab 顺序与之前一致。
         let quick_fill = stack_frame(|| {
             // 解析成功就地说一句：状态栏那条提示在模态背后，看不清。连接串再被改动就收起。
-            let applied = self.model.conn_modal.url_applied && !self.model.connections.issues.iter().any(|issue| issue.field == "url");
+            let url_issue = self.model.connections.issues.iter().find(|issue| issue.field == "url");
+            let applied = self.model.conn_modal.url_applied && url_issue.is_none();
+            let issue_row = url_issue.map(|issue| {
+                let msg = SharedString::from(field_issue_text(issue, &|key| self.model.text(key)));
+                div()
+                    .id("conn-issue-url")
+                    .test_support()
+                    .aria_label(msg.clone())
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.danger)
+                    .child(msg)
+                    .into_any_element()
+            });
             kit::sunken(&p)
                 .p(px(10.))
                 .flex()
@@ -2532,11 +2555,12 @@ impl Workbench {
                     div()
                         .flex()
                         .flex_wrap()
-                        .items_end()
+                        .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.quickUrl"), "url", url_input, &p)))
+                        .child(div().flex_1().min_w(px(180.)).child(url_input))
                         .child(apply_url),
                 )
+                .children(issue_row)
                 .when(applied, |this| {
                     this.child(
                         div()
@@ -2559,7 +2583,7 @@ impl Workbench {
             div()
                 .flex()
                 .flex_wrap()
-                .items_end()
+                .items_start()
                 .gap(px(12.))
                 .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
                 .child(kit::form_row(self.t("ui.conn.env"), env_items, &p))
@@ -2578,13 +2602,31 @@ impl Workbench {
                     &p,
                     cx,
                 );
+                let file_issue = self.model.connections.issues.iter().find(|issue| issue.field == "file_path").map(|issue| {
+                    let msg = SharedString::from(field_issue_text(issue, &|key| self.model.text(key)));
+                    div()
+                        .id("conn-issue-file_path")
+                        .test_support()
+                        .aria_label(msg.clone())
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.danger)
+                        .child(msg)
+                        .into_any_element()
+                });
                 div()
                     .flex()
-                    .flex_wrap()
-                    .items_end()
-                    .gap(px(8.))
-                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.file"), "file_path", file, &p)))
-                    .child(browse)
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w(px(180.)).child(file))
+                            .child(browse),
+                    )
+                    .children(file_issue)
                     .into_any_element()
             });
             (server, None)
@@ -3016,18 +3058,19 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(18.))
-                    .child(form_block(self.t("ui.conn.pickEngine"), None, engine_row, wide, &p))
-                    .child(form_block(self.t("ui.conn.block.quick"), Some(self.t("ui.conn.block.quickHint")), quick_fill, wide, &p))
-                    .child(form_block(self.t("ui.conn.block.identity"), Some(self.t("ui.conn.block.identityHint")), identity, wide, &p))
+                    .child(form_block(self.t("ui.conn.pickEngine"), None, engine_row, wide, false, &p))
+                    .child(form_block(self.t("ui.conn.block.quick"), Some(self.t("ui.conn.block.quickHint")), quick_fill, wide, false, &p))
+                    .child(form_block(self.t("ui.conn.block.identity"), Some(self.t("ui.conn.block.identityHint")), identity, wide, false, &p))
                     .child(form_block(
                         if file_based { self.t("ui.conn.file") } else { self.t("ui.conn.block.server") },
                         Some(if file_based { self.t("ui.conn.block.fileHint") } else { self.t("ui.conn.block.serverHint") }),
                         server,
                         wide,
+                        file_based,
                         &p,
                     ))
-                    .children(auth.map(|auth| form_block(self.t("ui.conn.block.auth"), Some(self.t("ui.conn.block.authHint")), auth, wide, &p)))
-                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, &p))),
+                    .children(auth.map(|auth| form_block(self.t("ui.conn.block.auth"), Some(self.t("ui.conn.block.authHint")), auth, wide, false, &p)))
+                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, true, &p))),
             );
 
 
@@ -3049,6 +3092,8 @@ impl Workbench {
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("connections.editor.newTitle"))
             .occlude()
+            // 面板内部的点击不能穿透到遮罩层，否则 backdrop 会把焦点抢回底页。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // 模态的焦点陷阱交给 GPUI：Root 的 Tab/Shift+Tab 在这个容器内成环，
             // 走的是真实焦点，不会像自绘序列那样被 Root 的绑定抢先吃掉。
             .focus_trap("conn-modal", &trap)
@@ -3401,7 +3446,7 @@ impl Workbench {
             if let Some(key) = self.model.connections.message_key.filter(|key| *key != "connections.editor.test.running") {
                 let tested = matches!(key, "connections.editor.test.ok" | "connections.editor.test.wait" | "connections.editor.test.failed");
                 match self.model.connections.test_report.as_ref().filter(|_| tested) {
-                    Some(report) => rows.push(test_verdict(report, &self.model.text(key), p)),
+                    Some(report) => rows.push(test_verdict(report, &self.model.text(key), self.model.locale(), p)),
                     None => {
                         let ok = key == "connections.status.connected" || key == "connections.editor.test.ok";
                         let detail = self.model.connections.message_detail.clone();
@@ -3778,25 +3823,53 @@ impl Workbench {
             multiple: false,
             prompt: Some(self.t("ui.conn.browse")),
         });
+        let issue_name = match field {
+            DraftField::CaFile => "ca_file",
+            DraftField::ClientCert => "client_cert",
+            DraftField::ClientKey => "client_key",
+            DraftField::SshKey => "ssh_key",
+            _ => "file_path",
+        };
         cx.spawn(async move |this, cx| {
-            let chosen = match receiver.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                _ => None,
+            let outcome = match receiver.await {
+                Ok(Ok(Some(paths))) => Ok(paths.into_iter().next()),
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(err) => Err(err.to_string()),
             };
-            let Some(path) = chosen else { return };
-            let accepted = crate::app::accept_open_path(&path);
-            cx.update(|cx| {
-                let _ = this.update(cx, |view, cx| {
-                    match accepted {
-                        Ok(path) => view.model.set_field(field, path.display().to_string()),
-                        Err(detail) => {
-                            view.model.notice_key = Some("connections.status.error");
-                            view.model.notice_detail = detail;
-                        }
-                    }
-                    cx.notify();
-                });
-            });
+            match outcome {
+                Ok(Some(path)) => {
+                    let accepted = crate::app::accept_open_path(&path);
+                    cx.update(|cx| {
+                        let _ = this.update(cx, |view, cx| {
+                            match accepted {
+                                Ok(path) => view.model.set_field(field, path.display().to_string()),
+                                Err(detail) => {
+                                    view.model.notice_key = Some("connections.status.error");
+                                    view.model.notice_detail = detail;
+                                }
+                            }
+                            cx.notify();
+                        });
+                    });
+                }
+                Ok(None) => {}
+                Err(raw) => {
+                    cx.update(|cx| {
+                        let _ = this.update(cx, |view, cx| {
+                            view.model.connections.clear_issue(issue_name);
+                            let issue = if super::view::is_portal_dialog_error(&raw) {
+                                crate::app::views::connections::FieldIssue::new(issue_name, "ui.filePicker.portalUnavailable")
+                            } else {
+                                crate::app::views::connections::FieldIssue::with_detail(issue_name, "connections.status.error", raw)
+                            };
+                            view.model.connections.issues.push(issue);
+                            view.model.conn_modal.focus_first_pending = true;
+                            cx.notify();
+                        });
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -3809,32 +3882,52 @@ impl Workbench {
             prompt: Some(self.t("connections.validate.chooseFile")),
         });
         cx.spawn(async move |this, cx| {
-            let chosen = match receiver.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                _ => None,
+            let outcome = match receiver.await {
+                Ok(Ok(Some(paths))) => Ok(paths.into_iter().next()),
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(err) => Err(err.to_string()),
             };
-            // 取消保留原来的文件路径。
-            let Some(path) = chosen else { return };
-            let accepted = crate::app::accept_open_path(&path);
-            cx.update(|cx| {
-                let _ = this.update(cx, |view, cx| {
-                    match accepted {
-                        Ok(path) => {
-                            if let Some(editor) = view.model.connections.editor.as_mut() {
-                                if editor.name.trim().is_empty() {
-                                    editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
+            match outcome {
+                Ok(Some(path)) => {
+                    let accepted = crate::app::accept_open_path(&path);
+                    cx.update(|cx| {
+                        let _ = this.update(cx, |view, cx| {
+                            match accepted {
+                                Ok(path) => {
+                                    if let Some(editor) = view.model.connections.editor.as_mut() {
+                                        if editor.name.trim().is_empty() {
+                                            editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
+                                        }
+                                    }
+                                    view.model.set_field(DraftField::File, path.display().to_string());
+                                }
+                                Err(detail) => {
+                                    view.model.notice_key = Some("connections.status.error");
+                                    view.model.notice_detail = detail;
                                 }
                             }
-                            view.model.set_field(DraftField::File, path.display().to_string());
-                        }
-                        Err(detail) => {
-                            view.model.notice_key = Some("connections.status.error");
-                            view.model.notice_detail = detail;
-                        }
-                    }
-                    cx.notify();
-                });
-            });
+                            cx.notify();
+                        });
+                    });
+                }
+                Ok(None) => {}
+                Err(raw) => {
+                    cx.update(|cx| {
+                        let _ = this.update(cx, |view, cx| {
+                            view.model.connections.clear_issue("file_path");
+                            let issue = if super::view::is_portal_dialog_error(&raw) {
+                                crate::app::views::connections::FieldIssue::new("file_path", "ui.sqlite.portalFallback")
+                            } else {
+                                crate::app::views::connections::FieldIssue::with_detail("file_path", "connections.validate.chooseFile", raw)
+                            };
+                            view.model.connections.issues.push(issue);
+                            view.model.conn_modal.focus_first_pending = true;
+                            cx.notify();
+                        });
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -4239,7 +4332,7 @@ impl Workbench {
             .items_center()
             .gap(px(10.))
             .child(tabs)
-            .child(div().w(px(260.)).child(search.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+            .child(div().w(px(260.)).child(search.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
             .when(section == HistorySection::Runs, |this| this.child(status_seg))
             .child(kit::tool_button("history-filter-connection", Some(IconName::Funnel), connection_label, act("history-filter-connection", cx)))
             .when(has_filters, |this| this.child(kit::tool_button("history-filter-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))))
@@ -5389,7 +5482,7 @@ impl Workbench {
                         .child(
                             input
                                 .appearance(false)
-                                .prefix(kit::icon(IconName::Search, 15., p.text_faint))
+                                .prefix(kit::input_prefix(IconName::Search, 15., p.text_faint))
                                 .cleanable(true),
                         )
                         .child(scopes),
@@ -5457,16 +5550,18 @@ impl Workbench {
                         .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
                         // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
                         .when(!detail.is_empty(), |this| {
+                            let full_detail = SharedString::from(detail.clone());
                             this.child(
                                 div()
                                     .id(SharedString::from(format!("pal-detail-{index}")))
                                     .test_support()
+                                    .tooltip_text(full_detail.clone())
                                     .flex_none()
-                                    .max_w(px(190.))
+                                    .max_w(px(if show_kind { 190. } else { 256. }))
                                     .truncate()
                                     .text_size(px(TypeScale::XS))
                                     .text_color(if selected { p.accent_text } else { p.text_faint })
-                                    .child(SharedString::from(detail)),
+                                    .child(full_detail),
                             )
                         })
                         // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询。
@@ -6063,12 +6158,27 @@ impl Workbench {
                 .child(banner(IconName::TriangleAlert, self.t("ui.passwordPrompt.rejected"), p.danger, p.danger_soft))
                 .into_any_element()
         } else {
-            div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("ui.passwordPrompt.missing")).into_any_element()
+            let key = if prompt.save_password { "ui.conn.savePasswordOn" } else { "ui.passwordPrompt.missing" };
+            div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t(key)).into_any_element()
         };
+        let save_on = prompt.save_password;
+        let save_toggle = kit::interactive_states(div().id("cmd-password-save"), &p, false)
+            .test_support()
+            .role(gpui_kit::Role::Switch)
+            .aria_label(self.t("ui.passwordPrompt.save"))
+            .aria_selected(save_on)
+            .self_start()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(Radius::CONTROL))
+            .child(switch_visual(save_on, &p))
+            .child(div().text_size(px(TypeScale::SM)).text_color(p.text).child(self.t("ui.passwordPrompt.save")))
+            .on_click(act("password-toggle-save", cx));
         let ready = !prompt.text.is_empty();
         let dialog = dialog_card("password-prompt", IconName::KeyRound, p.accent, title, SharedString::from(detail), &p)
             .test_support()
-            .child(div().flex().flex_col().gap(px(10.)).child(input.mask_toggle()).child(note))
+            .child(div().flex().flex_col().gap(px(10.)).child(input.mask_toggle()).child(save_toggle).child(note))
             .child(
                 div()
                     .flex()
@@ -6405,21 +6515,20 @@ fn field_issue_text(issue: &crate::app::views::connections::FieldIssue, text: &d
 }
 
 /// 连接表单的一块：宽面板时左侧标题 + 说明、右侧字段；窄面板时上下排布。块与块之间用细线分开。
-fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoElement, wide: bool, p: &Palette) -> AnyElement {
+fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoElement, wide: bool, last: bool, p: &Palette) -> AnyElement {
     let heading = div()
         .flex()
         .flex_col()
         .gap(px(3.))
-        .when(wide, |this| this.w(px(176.)).flex_none().pt(px(2.)))
+        .when(wide, |this| this.w(px(160.)).flex_none().pt(px(2.)))
         .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(title))
         .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(hint)));
     div()
         .flex()
         .when(wide, |this| this.flex_row().gap(px(24.)))
         .when(!wide, |this| this.flex_col().gap(px(10.)))
-        .pb(px(18.))
-        .border_b_1()
-        .border_color(p.line_soft)
+        .when(!last, |this| this.pb(px(18.)).border_b_1().border_color(p.line_soft))
+        .when(last, |this| this.pb(px(4.)))
         .child(heading)
         .child(div().flex_1().min_w(px(0.)).child(body))
         .into_any_element()
@@ -6427,24 +6536,27 @@ fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoEl
 
 /// 测试连接的结论：一句话说结果，失败时写出卡在哪一步、服务端原话和处理建议，
 /// 下面一行列出走过的每个阶段——经跳板机、TLS 的连接一眼看出是哪一段不通。
-fn test_verdict(report: &crate::connections::stages::TestReport, headline: &str, p: &Palette) -> AnyElement {
-    use crate::connections::stages::{StageStatus, TestStatus};
+pub(super) fn test_verdict(report: &crate::connections::stages::TestReport, headline: &str, locale: i18n::Locale, p: &Palette) -> AnyElement {
+    use crate::connections::stages::{
+        localize_report_hint, localize_report_summary, localize_stage_label, localize_stage_message, StageStatus, TestStatus,
+    };
     let (fg, bg, mark) = match report.status {
         TestStatus::Ok => (p.ok, p.ok_soft, IconName::CircleCheck),
         TestStatus::Wait => (p.warn, p.warn_soft, IconName::TriangleAlert),
         TestStatus::Err => (p.danger, p.danger_soft, IconName::CircleAlert),
     };
     let blocked = report.stages.iter().find(|stage| matches!(stage.status, StageStatus::Err | StageStatus::Wait));
-    let title = match (report.status, blocked) {
-        (TestStatus::Ok, _) => match report.summary.as_deref().map(str::trim).filter(|summary| !summary.is_empty()) {
+    let blocked_label = blocked.map(|stage| localize_stage_label(stage, locale));
+    let title = match (report.status, blocked_label.as_deref()) {
+        (TestStatus::Ok, _) => match report.summary.as_deref().map(|s| localize_report_summary(s, locale)).filter(|summary| !summary.is_empty()) {
             Some(summary) => format!("{headline} · {summary}"),
             None => headline.to_owned(),
         },
-        (TestStatus::Err, Some(stage)) if !stage.label.trim().is_empty() => format!("{headline} · {}", stage.label.trim()),
+        (TestStatus::Err, Some(label)) if !label.trim().is_empty() => format!("{headline} · {}", label.trim()),
         _ => headline.to_owned(),
     };
-    let detail = blocked.map(|stage| stage.message.trim().to_owned()).filter(|message| !message.is_empty());
-    let hint = report.hint.as_deref().map(str::trim).filter(|hint| !hint.is_empty() && Some(*hint) != detail.as_deref()).map(str::to_owned);
+    let detail = blocked.map(|stage| localize_stage_message(stage, locale)).filter(|message| !message.is_empty());
+    let hint = localize_report_hint(report, locale).filter(|hint| Some(hint.as_str()) != detail.as_deref());
     let mut stages = div().flex().flex_wrap().gap_x(px(12.)).gap_y(px(2.));
     let mut shown = 0;
     for stage in &report.stages {
@@ -6464,7 +6576,7 @@ fn test_verdict(report: &crate::connections::stages::TestReport, headline: &str,
                 .text_size(px(TypeScale::XS))
                 .text_color(p.text_muted)
                 .child(kit::icon(icon, 11., color))
-                .child(SharedString::from(stage.label.clone())),
+                .child(SharedString::from(localize_stage_label(stage, locale))),
         );
     }
     let spoken = [Some(title.clone()), detail.clone(), hint.clone()].into_iter().flatten().collect::<Vec<_>>().join("\n");
@@ -6612,7 +6724,10 @@ pub(super) fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) 
                 this.model.history.confirm_clear = false;
                 this.model.history.confirm_delete = false;
                 this.apply_effect(effect, cx);
-                this.restore_focus(window, cx);
+                // 若模态仍开着（例如脏表单刚弹出“放弃修改？”确认），键盘必须留在模态内，不能还焦给底页。
+                if !this.model.has_blocking_dialog() {
+                    this.restore_focus(window, cx);
+                }
                 cx.notify();
             });
         })
@@ -6732,6 +6847,25 @@ pub(super) fn nav_row_tooltip(path: &str, name: &str) -> String {
     let path = path.trim_end();
     let own = path == name || path.ends_with(&format!(" / {name}")) || path.ends_with(&format!(".{name}"));
     if own || name.is_empty() { path.to_owned() } else { format!("{path} / {name}") }
+}
+
+/// 本地化分组节点（表 / 视图 / 列 / 索引）的路径末尾原本带内部英文代号（如 `/ view`），
+/// 悬停提示换成当前语言标签，不再露出内部标识符。
+pub(super) fn localized_nav_tooltip(path: &str, name: &str, label: &str, localized: bool) -> String {
+    if !localized || label.is_empty() {
+        return nav_row_tooltip(path, name);
+    }
+    let path = path.trim_end();
+    if !name.is_empty() {
+        if path == name {
+            return label.to_owned();
+        }
+        let suffix = format!(" / {name}");
+        if let Some(prefix) = path.strip_suffix(&suffix) {
+            return nav_row_tooltip(prefix, label);
+        }
+    }
+    nav_row_tooltip(path, label)
 }
 
 fn one_line(sql: &str) -> String {

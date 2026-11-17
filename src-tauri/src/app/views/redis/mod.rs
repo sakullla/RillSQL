@@ -1668,7 +1668,7 @@ impl Render for RedisPane {
                         div()
                             .flex()
                             .gap(px(4.))
-                            .child(div().flex_1().child(kit::text_input("redis-pattern", &pattern, self.text("redis.tab.patternLabel")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint))))
+                            .child(div().flex_1().child(kit::text_input("redis-pattern", &pattern, self.text("redis.tab.patternLabel")).small().prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))))
                             .child(redis_button("redis-filter", Some(IconName::ListFilter), &self.text("redis.tab.filter"), Kind::Tool, &entity))
                             .child(redis_icon("redis-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), &entity)),
                     )
@@ -2163,7 +2163,7 @@ impl RedisPane {
                 let entry_value = self.redis_input(Field::EntryValue, "redis-hash-value", "redis.value.value", "value", window, cx);
                 let needle = self.hash_query.trim().to_ascii_lowercase();
                 let mut body = div().flex().flex_col().gap(px(pad));
-                body = body.child(kit::text_input("redis-hash-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)));
+                body = body.child(kit::text_input("redis-hash-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)));
                 body = body.child(
                     div()
                         .flex()
@@ -2218,7 +2218,7 @@ impl RedisPane {
                 let query = self.redis_input(Field::SetQuery, "redis-set-filter", "redis.value.member", "", window, cx);
                 let member = self.redis_input(Field::EntryMember, "redis-set-member", "redis.value.member", "member", window, cx);
                 let needle = self.set_query.trim().to_ascii_lowercase();
-                let mut body = div().flex().flex_col().gap(px(pad)).child(kit::text_input("redis-set-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)));
+                let mut body = div().flex().flex_col().gap(px(pad)).child(kit::text_input("redis-set-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)));
                 body = body.child(
                     div()
                         .flex()

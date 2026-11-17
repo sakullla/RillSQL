@@ -10478,6 +10478,9 @@ async fn a_missing_password_prompts_and_reconnects_with_the_typed_one() {
 
     model.set_field(DraftField::PromptPassword, "typed-secret".into());
     assert_eq!(model.field_value(DraftField::PromptPassword), "typed-secret");
+    assert!(!model.password_prompt.as_ref().unwrap().save_password, "默认不写入钥匙串");
+    let _ = model.dispatch("password-toggle-save");
+    assert!(model.password_prompt.as_ref().unwrap().save_password, "可一键勾选记住到系统钥匙串");
     assert!(!format!("{:?}", model.password_prompt).contains("typed-secret"), "调试输出不带密码");
     let _ = model.dispatch("password-submit");
     assert!(model.password_prompt.is_none());
@@ -10488,6 +10491,7 @@ async fn a_missing_password_prompts_and_reconnects_with_the_typed_one() {
     let request = request_of(&mut model, token);
     assert_eq!(request.job, PendingJob::OpenConnection);
     assert_eq!(request.secrets.password, "typed-secret", "这次连接用输入的密码");
+    assert!(request.secrets.save_password, "勾选后把保存意图一并传给连接任务");
 
     // 被拒绝：再弹一次并说明原因。
     model.connections.credential_prompt = Some((id.clone(), true));
@@ -10952,6 +10956,115 @@ fn the_modal_keeps_verdicts_and_the_discard_prompt_above_the_footer(cx: &mut gpu
         window.render_frame(cx);
         assert!(!view.read(cx).model.conn_modal.open, "放弃修改后关闭");
         assert!(view.read(cx).model.connections.rows.is_empty());
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn localized_group_tooltips_and_english_verdict_stages_never_leak_raw_slugs_or_chinese() {
+    use crate::app::shell::chrome::localized_nav_tooltip;
+    use crate::connections::error_codes;
+    use crate::connections::stages::{
+        localize_report_hint, localize_report_summary, localize_stage_label, localize_stage_message,
+        StageKind, StageStatus, StageView, TestReport, TestStatus,
+    };
+    use crate::i18n::Locale;
+
+    assert_eq!(localized_nav_tooltip("Shop 商城主库 / main / view", "view", "视图", true), "Shop 商城主库 / main / 视图");
+    assert_eq!(localized_nav_tooltip("Shop 商城主库 / main / view", "view", "Views", true), "Shop 商城主库 / main / Views");
+    assert_eq!(localized_nav_tooltip("pg / shop / public / orders", "orders", "orders", false), "pg / shop / public / orders");
+
+    let stage = StageView {
+        kind: StageKind::DatabaseAuthentication,
+        label: StageKind::DatabaseAuthentication.label_zh().to_owned(),
+        status: StageStatus::Err,
+        message: "请填写数据库密码".to_owned(),
+        code: Some(error_codes::CONN_PASSWORD_REQUIRED.to_owned()),
+    };
+    let report = TestReport {
+        status: TestStatus::Err,
+        fail_stage: Some(stage.label.clone()),
+        hint: Some("凭据库没有可用密码，本次也没有输入。".to_owned()),
+        summary: None,
+        fingerprint: None,
+        algorithm: None,
+        stages: vec![stage.clone()],
+        code: Some(error_codes::CONN_PASSWORD_REQUIRED.to_owned()),
+    };
+    assert_eq!(localize_stage_label(&stage, Locale::En), "Authenticate database");
+    assert_eq!(localize_stage_message(&stage, Locale::En), "Database password is required");
+    assert!(localize_report_hint(&report, Locale::En).unwrap().contains("keychain"));
+    assert_eq!(localize_report_summary("外键检查：已开启", Locale::En), "Foreign keys: enabled");
+    assert_eq!(localize_stage_label(&stage, Locale::ZhCn), StageKind::DatabaseAuthentication.label_zh());
+}
+
+#[test]
+fn backdrop_dismiss_guards_dirty_modal_and_explorer_connection_menu_reaches_relational_tools() {
+    use crate::catalog::hierarchy::connection_node_id;
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let mut model = seeded_model(vec![record_for("shop", "Shop", Engine::Sqlite)]);
+    model.connections.status.insert("shop".into(), LinkStatus::Connected);
+    let sqlite_nav = nav_connection(
+        Engine::Sqlite,
+        "shop",
+        "Shop",
+        vec![nav_database("main", vec![ObjectRow::fresh("orders", ObjectKind::Table)])],
+    );
+    model.apply_navigation(&[sqlite_nav], false);
+    model.nav.expand(&connection_node_id("shop"));
+
+    // 工作台新建连接按钮不切走底页；未改动时点遮罩直接关闭，改过字段后点遮罩先弹放弃确认且不关模态。
+    assert_eq!(model.shell.page, crate::app::AppPage::Workspace);
+    let _ = model.dispatch("conn-new-sidebar");
+    assert_eq!(model.shell.page, crate::app::AppPage::Workspace, "工作台新建连接保持在工作台");
+    let _ = model.dismiss();
+    assert!(!model.conn_modal.open, "未填内容的模态点遮罩即关");
+
+    let _ = model.dispatch("conn-new-sidebar");
+    model.set_field(DraftField::Host, "db.internal".into());
+    let _ = model.dismiss();
+    assert!(model.conn_modal.open && model.conn_modal.discard_armed, "填过内容的模态点遮罩先确认");
+    assert!(model.has_blocking_dialog(), "确认期间仍视为阻塞弹窗，不还焦底页");
+    let _ = model.dispatch("conn-discard");
+    assert!(!model.conn_modal.open);
+
+    // 密码框与删除确认同样归 dismiss 关闭。
+    model.open_password_prompt("shop", false);
+    assert!(model.password_prompt.is_some());
+    let _ = model.dispatch("password-toggle-save");
+    assert!(model.password_prompt.as_ref().unwrap().save_password);
+    let _ = model.dismiss();
+    assert!(model.password_prompt.is_none());
+
+    // 资源管理器已连接关系型库的连接行右键菜单带刷新、建表、关系图、对比与管理页，并携带该库身份。
+    model.connections.selected = Some("shop".into());
+    let _ = model.dispatch("menu-explorer-connection");
+    let ids: Vec<&str> = model.menu.as_ref().expect("menu").items.iter().map(|item| item.id).collect();
+    for expected in ["conn-disconnect", "tree-refresh-node", "tree-create-table", "open-diagram", "compare-object", "open-admin"] {
+        assert!(ids.contains(&expected), "资源管理器连接菜单应包含 {expected}: {ids:?}");
+    }
+    assert_eq!(model.nav_scope_target().map(|t| t.connection_id), Some("shop".to_owned()));
+}
+
+#[gpui_kit::test]
+fn portal_dialog_failure_falls_back_to_sqlite_modal_with_friendly_guidance(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-portal-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.finish_sqlite_prompt::<&str>(
+                Ok(Err("Portal request failed: org.freedesktop.DBus.Error.ServiceUnknown: Portal not provided")),
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        let model = &view.read(cx).model;
+        assert!(model.conn_modal.open, "Portal 失败后自动降级打开 SQLite 连接模态框");
+        assert_eq!(model.connections.editor.as_ref().map(|d| d.engine), Some(Engine::Sqlite));
+        assert_eq!(model.notice_key, Some("ui.sqlite.portalFallback"));
+        assert!(window.find("conn-issue-file_path").visible(), "文件路径框下方直接给出友好说明");
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);

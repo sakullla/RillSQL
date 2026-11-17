@@ -1391,13 +1391,19 @@ impl Render for ComparePane {
                 .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card))
         });
 
+        let guide_open = self.show_empty_guide();
         let actions = stack_frame(|| {
+        let structure_btn = if guide_open {
+            kit::secondary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
+        } else {
+            kit::primary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
+        };
         let mut actions = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(8.))
-            .child(kit::primary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity)))
+            .child(structure_btn)
             .child(kit::secondary_button("compare-data", Some(IconName::Rows3), t(self, "compare.dialog.compareData"), compare_act("compare-data", &entity)));
         if self.running {
             actions = actions
@@ -1696,11 +1702,12 @@ impl ComparePane {
                 .items_center()
                 .gap(px(8.))
                 .child(kit::pill(SharedString::from(title.clone()), if baseline { p.ok } else { p.info }, if baseline { p.ok_soft } else { p.accent_soft }))
-                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p))
-                .child(div().ml_auto().child(kit::icon(IconName::ChevronDown, 14., p.text_faint))),
+                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p)),
         );
         let mut connections = kit::sunken(&p)
             .id(SharedString::from(format!("compare-connections:{which}")))
+            .p(px(3.))
+            .gap(px(2.))
             .flex()
             .flex_col()
             .max_h(px(m.control_h * 4.5))
@@ -1710,14 +1717,14 @@ impl ComparePane {
             connections = if self.choices_loading {
                 connections.child(kit::skeleton_state(3, &m, &p))
             } else {
-                connections.child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p))
+                connections.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p)))
             };
         }
         for choice in self.choices.clone() {
             let id = format!("compare-{which}:{}", choice.id);
             let selected = side_connection == choice.id;
             connections = connections.child(
-                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {}", choice.name)), SharedString::from(choice.name.clone()), selected, Some(IconName::Database), &p, m)
+                list_choice(SharedString::from(id.clone()), SharedString::from(format!("{title} {}", choice.name)), SharedString::from(choice.name.clone()), selected, IconName::Database, &p, m)
                     .on_click(compare_act(id, &entity)),
             );
             if selected {
@@ -1732,6 +1739,8 @@ impl ComparePane {
                 let database_label = self.text("compare.dialog.database");
                 let mut list = kit::sunken(&p)
                     .id(SharedString::from(format!("compare-databases:{which}")))
+                    .p(px(3.))
+                    .gap(px(2.))
                     .flex()
                     .flex_col()
                     .max_h(px(m.control_h * 4.5))
@@ -1739,7 +1748,7 @@ impl ComparePane {
                 for name in &choice.databases {
                     let id = format!("compare-database:{which}:{name}");
                     list = list.child(
-                        chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {database_label} {name}")), SharedString::from(name.clone()), side_database == *name, Some(IconName::Database), &p, m)
+                        list_choice(SharedString::from(id.clone()), SharedString::from(format!("{title} {database_label} {name}")), SharedString::from(name.clone()), side_database == *name, IconName::Database, &p, m)
                             .on_click(compare_act(id, &entity)),
                     );
                 }
@@ -1751,6 +1760,8 @@ impl ComparePane {
                     Some(SchemaState::Ready(names)) => {
                         let mut list = kit::sunken(&p)
                             .id(SharedString::from(format!("compare-schemas:{which}")))
+                            .p(px(3.))
+                            .gap(px(2.))
                             .flex()
                             .flex_col()
                             .max_h(px(m.control_h * 4.5))
@@ -1758,7 +1769,7 @@ impl ComparePane {
                         for name in names {
                             let id = format!("compare-schema:{which}:{name}");
                             list = list.child(
-                                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {schema_label} {name}")), SharedString::from(name.clone()), side_schema == name, Some(IconName::Layers), &p, m)
+                                list_choice(SharedString::from(id.clone()), SharedString::from(format!("{title} {schema_label} {name}")), SharedString::from(name.clone()), side_schema == name, IconName::Layers, &p, m)
                                     .on_click(compare_act(id, &entity)),
                             );
                         }
@@ -1923,6 +1934,39 @@ fn compare_act(id: impl Into<String>, entity: &Entity<ComparePane>) -> impl Fn(&
         let id = id.clone();
         entity.update(cx, |pane, cx| pane.command(&id, cx));
     }
+}
+
+/// 凹陷选择列表里的一行：未选中时不画第二圈方框，选中时以柔和强调底 + 右侧勾标清晰表达。
+fn list_choice(
+    id: SharedString,
+    label: SharedString,
+    text: SharedString,
+    selected: bool,
+    icon: IconName,
+    p: &Palette,
+    m: kit::Metrics,
+) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    kit::interactive_states(div().id(id), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label)
+        .aria_selected(selected)
+        .h(px(m.tree_row_h + 2.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .rounded(px(Radius::CONTROL))
+        .text_size(px(TypeScale::SM))
+        .when(selected, |this| {
+            this.bg(p.accent_soft)
+                .text_color(p.accent_text)
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+        })
+        .when(!selected, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
+        .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint }))
+        .child(div().flex_1().min_w(px(0.)).truncate().child(text))
+        .when(selected, |this| this.child(kit::icon(IconName::Check, 13., p.accent_text)))
 }
 
 /// 可选中的小块：显示文字与无障碍名称分开，测试按名称找。

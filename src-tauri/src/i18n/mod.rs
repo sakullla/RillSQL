@@ -880,7 +880,7 @@ dict! {
     "mongo.docs.deletedNote" => "已删除 {n} 篇文档。", "Deleted {n} documents.";
     "mongo.docs.deletePrompt" => "将删除这篇文档（_id {id}），删除后不可恢复。确认删除？", "Delete the document (_id {id})? This cannot be undone.";
     "mongo.docJson.invalid" => "这份文档不是合法 JSON：", "This document is not valid JSON:";
-    "ui.search.placeholder" => "搜索命令、连接…", "Search commands, connections…";
+    "ui.search.placeholder" => "搜索命令、连接或对象…", "Search commands, connections, or objects…";
     "ui.explorer.filter" => "筛选连接", "Filter connections";
     "ui.explorer.filterObjects" => "筛选已加载对象", "Filter loaded objects";
     "ui.explorer.noObjects" => "尚未读取对象", "No objects loaded yet";
@@ -909,7 +909,7 @@ dict! {
     "ui.conn.general" => "连接信息", "Connection";
     "ui.conn.security" => "安全", "Security";
     "ui.conn.url" => "连接串（可选）", "Connection string (optional)";
-    "ui.conn.urlHint" => "粘贴后点“解析”，如", "Paste and parse, e.g.";
+    "ui.conn.urlHint" => "粘贴即可自动识别，或点“解析”，如", "Paste to auto-detect or click Parse, e.g.";
     "ui.conn.parse" => "解析", "Parse";
     "ui.conn.urlApplied" => "已按连接串填好连接信息", "Connection details filled from the URL";
     "ui.conn.name" => "名称", "Name";
@@ -1454,9 +1454,9 @@ dict! {
     "ui.query.targetHintConn" => "切换连接", "Switch connection";
     "ui.welcome.subtitle" => "轻量、现代的多引擎数据库工作台", "Modern, lightweight multi-engine database workbench";
     "ui.welcome.quickStart" => "快速开始", "Quick start";
-    "ui.welcome.newConnDesc" => "连接 PostgreSQL、MySQL、SQL Server、Redis、MongoDB 等", "Connect PostgreSQL, MySQL, SQL Server, Redis, MongoDB, and more";
+    "ui.welcome.newConnDesc" => "连接 PostgreSQL、MySQL、SQL Server、Redis 等", "Connect PostgreSQL, MySQL, SQL Server, Redis, MongoDB, and more";
     "ui.welcome.openSqliteDesc" => "直接打开本机 .sqlite / .db 文件浏览与编辑", "Open a local .sqlite / .db file to browse and edit";
-    "ui.welcome.newQueryDesc" => "新建空白 SQL 编辑器，按 Ctrl+Enter 立即执行", "Open a SQL editor and press Ctrl+Enter to run";
+    "ui.welcome.newQueryDesc" => "新建空白 SQL 编辑器，立即编写并执行查询", "Open a blank SQL editor to write and run queries";
     "ui.welcome.myConnections" => "我的连接", "My connections";
     "ui.welcome.manageConnections" => "连接管理", "Manage";
     "ui.welcome.enginesHint" => "原生支持 PostgreSQL · MySQL · MariaDB · SQLite · SQL Server · Redis · MongoDB", "Native support for PostgreSQL · MySQL · MariaDB · SQLite · SQL Server · Redis · MongoDB";
@@ -1472,7 +1472,7 @@ dict! {
     "ui.conn.block.serverHint" => "数据库服务的地址与端口", "Address and port of the database server";
     "ui.conn.block.fileHint" => "本机上的 .sqlite / .db 文件", "A local .sqlite / .db file";
     "ui.conn.block.auth" => "身份验证", "Authentication";
-    "ui.conn.block.authHint" => "密码保存在系统钥匙串；默认库可留空", "Passwords live in the system keychain; the default database is optional";
+    "ui.conn.block.authHint" => "可选是否存入系统钥匙串；默认库可留空", "Choose whether to save passwords in the keychain; default database is optional";
     "ui.conn.block.securityHint" => "TLS 加密与 SSH 跳板机", "TLS encryption and SSH bastion";
     "ui.conn.copyName" => "{name} 副本", "{name} copy";
     "ui.conn.savePassword" => "保存密码", "Save password";
@@ -1504,6 +1504,9 @@ dict! {
     "ui.status.shortcutsHint" => "查看键盘快捷键", "Keyboard shortcuts";
     "grid.selection.summary" => "已选 {count} 格", "{count} selected";
     "grid.selection.stats" => "求和 {sum} · 均值 {avg}", "Sum {sum} · Avg {avg}";
+    "ui.passwordPrompt.save" => "记住到系统钥匙串", "Save to system keychain";
+    "ui.sqlite.portalFallback" => "系统文件对话框不可用，请直接填写 SQLite 文件路径", "System file dialog is unavailable; enter the SQLite file path directly";
+    "ui.filePicker.portalUnavailable" => "系统文件对话框不可用（未检测到桌面 Portal 服务）", "System file dialog is unavailable (desktop portal service not found)";
 }
 
 #[cfg(test)]

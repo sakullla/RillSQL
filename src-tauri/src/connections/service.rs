@@ -1130,9 +1130,23 @@ impl Service {
             opened = true;
         }
         if opened {
+            let saved_in_keychain = input.save_password
+                && input
+                    .password
+                    .as_ref()
+                    .filter(|item| !item.is_empty())
+                    .is_some_and(|secret| self.secrets.put(&password_account(&config.id), secret.expose()).is_ok());
             // 只有真的打开了会话才记最近使用时间：保存连接、测试草稿都不写这一行。
             match self.store().await {
                 Ok(store) => {
+                    if saved_in_keychain {
+                        if let Ok(Some(mut persisted)) = store.get(session_id).await {
+                            persisted.password_saved = true;
+                            if let Err(err) = store.upsert(&persisted).await {
+                                self.log(format!("密码保存标记没有写入：{err}"));
+                            }
+                        }
+                    }
                     if let Err(err) = store.touch_last_used(session_id, now_millis()).await {
                         self.log(format!("最近使用时间没有写入：{err}"));
                     }

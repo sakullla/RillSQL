@@ -172,46 +172,48 @@ pub fn render_record(
                 };
                 let name = if field.hidden { format!("{} {}", field.name, i18n::text(locale, "grid.record.hidden")) } else { field.name.clone() };
                 let abbr = type_abbr(&field.type_name);
+                let label_w = (width * 0.38).clamp(112., 168.);
+                let col_tip = if field.type_name.trim().is_empty() {
+                    SharedString::from(name.clone())
+                } else {
+                    SharedString::from(format!("{name} · {}", field.type_name.trim()))
+                };
                 div()
                         .id(("grid-record-field", column))
                         .debug_selector(move || format!("grid-record-field-{column}"))
                         .flex_none()
                         .min_h(px(m.row_h))
                         .px(px(8.))
-                        .py(px(m.row_pad_y - 1.))
+                        .py(px((m.row_pad_y - 1.).max(2.)))
                         .flex()
-                        .items_start()
+                        .items_center()
                         .gap(px(8.))
                         .border_b_1()
                         .border_color(p.line_soft)
                         .child(
                             div()
-                                .w(px(m.row_h * 4.))
+                                .id(("grid-record-name", column))
+                                .w(px(label_w))
                                 .flex_none()
                                 .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(4.))
-                                        .child(div().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
-                                        .when(!abbr.is_empty(), |this| {
-                                            this.child(
-                                                div()
-                                                    .id(("grid-record-badge", column))
-                                                    .debug_selector(move || format!("grid-record-badge-{column}"))
-                                                    .flex_none()
-                                                    .px(px(4.))
-                                                    .rounded(px(Radius::TAG))
-                                                    .bg(p.hover)
-                                                    .text_size(px(TypeScale::XS))
-                                                    .text_color(p.text_faint)
-                                                    .child(SharedString::from(abbr.clone())),
-                                            )
-                                        }),
-                                )
-                                .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(field.type_name.clone()))),
+                                .items_center()
+                                .gap(px(4.))
+                                .tooltip_text(col_tip)
+                                .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
+                                .when(!abbr.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .id(("grid-record-badge", column))
+                                            .debug_selector(move || format!("grid-record-badge-{column}"))
+                                            .flex_none()
+                                            .px(px(4.))
+                                            .rounded(px(Radius::TAG))
+                                            .bg(p.hover)
+                                            .text_size(px(TypeScale::XS))
+                                            .text_color(p.text_faint)
+                                            .child(SharedString::from(abbr.clone())),
+                                    )
+                                }),
                         )
                         .child(match (edit.column == Some(column), edit.input.as_ref()) {
                             // 就地暂存：值直接变成文本输入，Enter 暂存、Esc 取消，没有弹窗。
@@ -256,7 +258,7 @@ pub fn render_record(
                                     .child(kit::pill(t("grid.record.preview"), p.accent_text, p.accent_soft)),
                             )
                         })
-                        .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open))
+                        .child(kit::icon_button(("grid-record-open", column), IconName::Maximize, t("grid.record.openValue"), open).xsmall())
                 }));
             }
         }

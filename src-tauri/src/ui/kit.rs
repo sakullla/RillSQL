@@ -817,7 +817,7 @@ pub fn metric_value(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
-fn tabular_figures() -> FontFeatures {
+pub fn tabular_figures() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
 }
 
@@ -1994,6 +1994,11 @@ pub fn inline_input(id: impl Into<ElementId>, state: &Entity<InputState>, label:
 /// 无框搜索输入框：用于命令面板、目标选择器等头部内嵌搜索，不再叠第二圈边框与外发光。
 pub fn borderless_input(id: impl Into<ElementId>, state: &Entity<InputState>, label: impl Into<SharedString>) -> Input {
     Input::new(state).id(id).small().appearance(false).bordered(false).focus_bordered(false).aria_label(label)
+}
+
+/// 搜索/筛选输入框左侧的前置图标容器：统一留出右侧间距，避免无外观输入框里光标贴在图标上。
+pub fn input_prefix(name: IconName, size: f32, color: Hsla) -> gpui_kit::Div {
+    div().mr(px(4.)).flex().items_center().child(icon(name, size, color))
 }
 
 /// 表单行：上方小标签，下方控件。

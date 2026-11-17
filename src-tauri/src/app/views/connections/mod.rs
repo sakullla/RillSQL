@@ -23,6 +23,7 @@ pub struct Secrets {
     pub password: String,
     pub ssh_password: String,
     pub ssh_passphrase: String,
+    pub save_password: bool,
 }
 
 
@@ -742,7 +743,13 @@ fn secret_input(secrets: &Secrets) -> SecretInput {
 
 pub async fn open_row(services: &AppServices, id: &str, secrets: &Secrets) -> Result<OpenOutcome, String> {
     services
-        .open_connection(id, none_if_empty(&secrets.password), none_if_empty(&secrets.ssh_password), none_if_empty(&secrets.ssh_passphrase))
+        .open_connection_with_save(
+            id,
+            none_if_empty(&secrets.password),
+            none_if_empty(&secrets.ssh_password),
+            none_if_empty(&secrets.ssh_passphrase),
+            secrets.save_password,
+        )
         .await
 }
 

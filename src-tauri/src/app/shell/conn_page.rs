@@ -101,7 +101,7 @@ impl Workbench {
                         .flex_wrap()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w(px(180.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                        .child(div().flex_1().min_w(px(180.)).child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
                         .child(self.filter_button("conn-filter-engine", IconName::Database, SharedString::from(engine), engine_open, "conn-filter-engine", &p, cx))
                         .when(filtering, |this| this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)))),
                 )

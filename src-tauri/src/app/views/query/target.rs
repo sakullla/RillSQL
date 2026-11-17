@@ -375,7 +375,7 @@ pub fn popover(
     }
 
     let search = picker.search.clone().map(|state| {
-        kit::borderless_input("query-target-search", &state, t("ui.query.targetSearch")).prefix(kit::icon(IconName::Search, 14., p.text_faint)).cleanable(true)
+        kit::borderless_input("query-target-search", &state, t("ui.query.targetSearch")).prefix(kit::input_prefix(IconName::Search, 14., p.text_faint)).cleanable(true)
     });
     let hint = |keys: &'static str, label: SharedString| div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, p)).child(label);
     let footer = div()

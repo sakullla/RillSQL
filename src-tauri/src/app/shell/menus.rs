@@ -126,6 +126,29 @@ pub fn connection_link_item(connected: bool) -> MenuItem {
     }
 }
 
+/// 资源管理器里连接行的右键菜单：在基础连接操作之上，对已打开的连接补齐刷新目录、
+/// 建表、关系图、对比与数据库管理（尤其 SQLite 不单独画库节点，连接行就是库级入口）。
+pub fn explorer_connection_menu_items(connected: bool, relational: bool) -> Vec<MenuItem> {
+    let mut items = vec![
+        connection_link_item(connected),
+        with_icon(item("conn-new-query", "shell.command.newQuery"), IconName::SquareTerminal),
+    ];
+    if connected {
+        items.push(with_icon(item("tree-refresh-node", "catalog.tree.refreshNode"), IconName::RefreshCw));
+        if relational {
+            items.push(sep(with_icon(item("tree-create-table", "structure.action.createTable"), IconName::Plus)));
+            items.push(with_icon(item("open-diagram", "catalog.tree.diagram"), IconName::ChartNetwork));
+            items.push(with_icon(item("compare-object", "shell.command.compare"), IconName::GitCompare));
+            items.push(with_icon(item("open-admin", "ui.tool.admin"), IconName::Gauge));
+        }
+    }
+    items.push(sep(with_icon(item("conn-edit", "connections.page.menuEdit"), IconName::Pencil)));
+    items.push(with_icon(item("conn-duplicate", "common.copy"), IconName::Copy));
+    items.push(with_icon(item("conn-test", "connections.editor.test.button"), IconName::Zap));
+    items.push(sep(with_icon(danger("conn-delete", "connections.page.menuDelete"), IconName::Trash)));
+    items
+}
+
 fn item(id: &'static str, label_key: &'static str) -> MenuItem {
     leaf(id, label_key, false, true, None)
 }

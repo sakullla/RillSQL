@@ -996,7 +996,9 @@ impl SharedGrid {
             Some(count) if self.offset == 0 && loaded as i64 >= count => format!("{} {unit}", group_digits(count)),
             Some(count) if loaded == 0 => format!("0 / {} {unit}", group_digits(count)),
             Some(count) => format!("{}–{} / {} {unit}", group_digits(first as i64), group_digits(last as i64), group_digits(count)),
-            None if self.offset > 0 && loaded > 0 => format!("{}–{} {unit}", group_digits(first as i64), group_digits(last as i64)),
+            None if (self.offset > 0 || (self.mode == GridMode::Table && self.truncated)) && loaded > 0 => {
+                format!("{}–{} {unit}", group_digits(first as i64), group_digits(last as i64))
+            }
             None => format!("{} {unit}", group_digits(loaded as i64)),
         }
     }
@@ -5121,6 +5123,15 @@ mod tests {
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(-1000), "-1,000");
         assert_eq!(group_digits(999), "999");
+
+        // 总数未知但已知还有下一页的表数据：第 1 页写“1–100 行”而不是“100 行”，避免被误读为整表只有 100 行。
+        let mut paged = SharedGrid::new();
+        let page_rows = (0..100).map(|index| row(&index.to_string(), vec![Some(&index.to_string()), Some("甲")], true)).collect();
+        paged.replace_fetched(vec![text_column("id"), text_column("name")], page_rows, 0, None, true, Some(schema()));
+        assert_eq!(paged.range_text(), "1–100 行");
+        let complete_rows = (0..42).map(|index| row(&index.to_string(), vec![Some(&index.to_string()), Some("甲")], true)).collect();
+        paged.replace_fetched(vec![text_column("id"), text_column("name")], complete_rows, 0, None, false, Some(schema()));
+        assert_eq!(paged.range_text(), "42 行");
         grid.select_all_loaded();
         assert_eq!(grid.selection_count(), 200);
         assert!(grid.selection_within_loaded());

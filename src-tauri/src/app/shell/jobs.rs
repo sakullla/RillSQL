@@ -388,7 +388,13 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 .as_ref()
                 .is_some_and(|(id, _)| model.connections.row_status(id) == crate::app::views::connections::LinkStatus::Connected);
             if used {
-                model.pending_open_secrets = None;
+                if let Some((id, secrets)) = model.pending_open_secrets.take() {
+                    if secrets.save_password && !secrets.password.trim().is_empty() {
+                        if let Some(row) = model.connections.rows.iter_mut().find(|row| row.saved.id == id) {
+                            row.saved.password_saved = true;
+                        }
+                    }
+                }
             }
             model.fail_pending_intents();
             // 缺密码或密码被拒：直接问密码，而不是只留一个必然再失败的“重试”。

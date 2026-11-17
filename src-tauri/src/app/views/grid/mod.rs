@@ -3064,7 +3064,7 @@ impl GridPane {
             div().w(px(220.)).child(
                 kit::text_input("grid-search", &search, t("grid.action.searchHint"))
                     .small()
-                    .prefix(kit::icon(IconName::Search, 13., p.text_faint))
+                    .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
                     .cleanable(true),
             ),
         );
@@ -4888,7 +4888,12 @@ impl TableDelegate for SheetDelegate {
             .flex()
             .items_center()
             .overflow_hidden()
-            .when(numeric && !placeholder, |this| this.justify_end().text_right())
+            .when(numeric && !placeholder, |this| {
+                this.justify_end()
+                    .text_right()
+                    .font_features(kit::tabular_figures())
+                    .when(!row_number, |this| this.pr(px(4.)))
+            })
             .when(row_number, |this| this.text_color(p.text_faint))
             .when(placeholder, |this| this.text_color(p.text_faint).italic())
             .when(mark == 3, |this| this.line_through())

@@ -87,6 +87,17 @@ impl AppServices {
     }
 
     pub async fn open_connection(&self, id: &str, password: Option<String>, ssh_password: Option<String>, ssh_passphrase: Option<String>) -> Result<OpenOutcome, String> {
+        self.open_connection_with_save(id, password, ssh_password, ssh_passphrase, false).await
+    }
+
+    pub async fn open_connection_with_save(
+        &self,
+        id: &str,
+        password: Option<String>,
+        ssh_password: Option<String>,
+        ssh_passphrase: Option<String>,
+        save_password: bool,
+    ) -> Result<OpenOutcome, String> {
         self.connections
             .open(
                 id,
@@ -94,7 +105,7 @@ impl AppServices {
                     password: password.map(Secret::new),
                     ssh_password: ssh_password.map(Secret::new),
                     ssh_passphrase: ssh_passphrase.map(Secret::new),
-                    save_password: false,
+                    save_password,
                 },
             )
             .await

@@ -1199,7 +1199,7 @@ impl Render for MongoPane {
                     ),
             )
             .child(div().w(px(8.)))
-            .child(div().flex_1().min_w(px(200.)).child(kit::text_input("mongo-filter-field", &filter, self.text("mongo.tab.filterLabel")).small().prefix(kit::icon(IconName::Funnel, 13., p.text_faint))))
+            .child(div().flex_1().min_w(px(200.)).child(kit::text_input("mongo-filter-field", &filter, self.text("mongo.tab.filterLabel")).small().prefix(kit::input_prefix(IconName::Funnel, 13., p.text_faint))))
             .child(mongo_button("mongo-filter", None, &self.text("mongo.tab.apply"), Kind::Secondary, &entity))
             .child(mongo_button("mongo-clear-filter", None, &self.text("mongo.tab.clearFilter"), Kind::Tool, &entity))
             .child(kit::vline(&p))
