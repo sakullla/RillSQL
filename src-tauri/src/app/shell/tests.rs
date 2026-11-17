@@ -11069,3 +11069,39 @@ fn portal_dialog_failure_falls_back_to_sqlite_modal_with_friendly_guidance(cx: &
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn opening_sql_file_preserves_filename_title_and_connection_target() {
+    let mut model = seeded_model(vec![record_for("uat", "qsyn-uat", Engine::Mysql)]);
+    model.connections.status.insert("uat".into(), LinkStatus::Connected);
+    let _ = model.dispatch("new-query");
+    if let Some(tab) = model.tabs.last_mut() {
+        tab.connection_id = Some("uat".into());
+        tab.connection_name = Some("qsyn-uat".into());
+        tab.database = Some("qsyn3_tms_business2".into());
+    }
+
+    model.open_sql_file(
+        std::path::Path::new("/tmp/driver_ranking_report.sql"),
+        "SELECT * FROM workshop_driver_ranking LIMIT 20;".into(),
+    );
+    let id = model.active_tab.clone().expect("active sql tab id");
+    let opened = model.tabs.iter().find(|t| t.id == id).expect("opened sql tab");
+    assert_eq!(opened.title, "driver_ranking_report.sql");
+    assert_eq!(opened.path.as_deref(), Some("/tmp/driver_ranking_report.sql"));
+    assert_eq!(opened.connection_id.as_deref(), Some("uat"), "继承当前活动数据库目标");
+    assert_eq!(opened.database.as_deref(), Some("qsyn3_tms_business2"));
+
+    // 重复打开同一个路径的 .sql 文件只聚焦并刷新内容，不产生重复标签页；切换语言也不抹掉文件名。
+    let tabs_before = model.tabs.len();
+    model.open_sql_file(
+        std::path::Path::new("/tmp/driver_ranking_report.sql"),
+        "SELECT id, driver_name FROM workshop_driver_ranking;".into(),
+    );
+    let id_again = model.active_tab.clone().expect("active sql tab id");
+    assert_eq!(id_again, id);
+    assert_eq!(model.tabs.len(), tabs_before);
+    let _ = model.dispatch("locale-en");
+    let after_locale = model.tabs.iter().find(|t| t.id == id).expect("opened sql tab");
+    assert_eq!(after_locale.title, "driver_ranking_report.sql");
+}

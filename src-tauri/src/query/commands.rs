@@ -200,9 +200,19 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         started_at: started_at.clone(),
         elapsed_ms: 0,
     };
+    let mysql_fallback = service.mysql_fallback_pool(&request.connection_id);
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
-    let mut driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport, request.timeout_ms).await {
+    let mut driver = match exec::LiveDriver::attach_with_fallback(
+        session,
+        mysql_fallback,
+        &request.engine,
+        &request.database,
+        transport,
+        request.timeout_ms,
+    )
+    .await
+    {
         Ok(driver) => driver,
         Err(err) => return Err(err),
     };

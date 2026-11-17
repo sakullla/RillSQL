@@ -1124,10 +1124,44 @@ fn fallback_objects(gather: &mut Gather<'_>, scope: &CompletionScope, statement:
     gather.push_keywords();
 }
 
+fn redis_plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) -> Plan {
+    let keys: Vec<String> = scope.objects.iter().map(|obj| obj.name.clone()).collect();
+    let (start, end, items) = crate::redis::complete::complete_command_line(text, cursor, &keys, locale);
+    let candidates = items
+        .into_iter()
+        .map(|item| Candidate {
+            label: item.label,
+            insert: item.insert,
+            kind: match item.kind {
+                "key" => "table",
+                "database" => "database",
+                _ => "keyword",
+            },
+            detail: format!("{} · {}", item.detail, item.summary),
+            group: if item.kind == "key" { group::OBJECT } else { group::KEYWORD },
+            keyword: item.kind == "command",
+            info: None,
+        })
+        .collect();
+    Plan {
+        candidates,
+        note: None,
+        span: Span { start, end },
+        clause: None,
+    }
+}
+
 /// 计算一次补全计划。text 是编辑器全文，cursor 是光标字节偏移。
 pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) -> Plan {
     let end = floor_boundary(text, cursor);
     let mut plan = Plan { span: Span { start: end, end }, ..Default::default() };
+    if scope.engine == "redis" {
+        if !scope.provider {
+            plan.note = Some(i18n::text(locale, "query.complete.state.noProvider"));
+            return plan;
+        }
+        return redis_plan(scope, text, end, locale);
+    }
     if !scope.provider || !known_engine(&scope.engine) {
         plan.note = Some(i18n::text(locale, "query.complete.state.noProvider"));
         return plan;

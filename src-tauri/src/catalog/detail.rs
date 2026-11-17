@@ -43,17 +43,17 @@ pub fn columns_sql(engine: Engine, database: &str, schema: &str, table: &str) ->
         Engine::Redis | Engine::Mongodb => None,
         Engine::Sqlite => Some(format!("PRAGMA table_info({})", quote_ident("sqlite", table))),
         Engine::Postgres => Some(format!(
-            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, d.description FROM information_schema.columns c LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema LEFT JOIN pg_catalog.pg_class t ON t.relnamespace = n.oid AND t.relname = c.table_name LEFT JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = c.ordinal_position::int WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
+            "SELECT c.column_name, COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), c.data_type), c.is_nullable, c.column_default, d.description FROM information_schema.columns c LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema LEFT JOIN pg_catalog.pg_class t ON t.relnamespace = n.oid AND t.relname = c.table_name LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = c.ordinal_position::int AND NOT a.attisdropped LEFT JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = c.ordinal_position::int WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
             literal(schema),
             literal(table)
         )),
         Engine::Sqlserver => Some(format!(
-            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, CAST(ep.value AS nvarchar(4000)) FROM information_schema.columns c LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.name = 'MS_Description' AND ep.major_id = OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)) AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)), c.column_name, 'ColumnId') WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
+            "SELECT c.column_name, CASE WHEN c.data_type IN ('varchar','nvarchar','char','nchar','varbinary','binary') AND c.character_maximum_length IS NOT NULL THEN c.data_type + '(' + CASE WHEN c.character_maximum_length = -1 THEN 'MAX' ELSE CAST(c.character_maximum_length AS varchar(16)) END + ')' WHEN c.data_type IN ('decimal','numeric') AND c.numeric_precision IS NOT NULL THEN c.data_type + '(' + CAST(c.numeric_precision AS varchar(16)) + ',' + CAST(ISNULL(c.numeric_scale, 0) AS varchar(16)) + ')' ELSE c.data_type END, c.is_nullable, c.column_default, CAST(ep.value AS nvarchar(4000)) FROM information_schema.columns c LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.name = 'MS_Description' AND ep.major_id = OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)) AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)), c.column_name, 'ColumnId') WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
             literal(schema),
             literal(table)
         )),
         Engine::Mysql | Engine::Mariadb => Some(format!(
-            "SELECT column_name, data_type, is_nullable, column_default, column_comment FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+            "SELECT column_name, column_type, is_nullable, column_default, column_comment FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
             literal(database),
             literal(table)
         )),

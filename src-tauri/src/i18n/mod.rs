@@ -882,7 +882,9 @@ dict! {
     "mongo.docJson.invalid" => "这份文档不是合法 JSON：", "This document is not valid JSON:";
     "ui.search.placeholder" => "搜索命令、连接或对象…", "Search commands, connections, or objects…";
     "ui.explorer.filter" => "筛选连接", "Filter connections";
-    "ui.explorer.filterObjects" => "筛选已加载对象", "Filter loaded objects";
+    "ui.explorer.filterObjects" => "搜索库、表、视图…", "Search databases, tables, views…";
+    "ui.nav.loadAll" => "全部", "All";
+    "ui.nav.loadAllTip" => "一次读取剩余全部对象", "Load all remaining objects";
     "ui.explorer.noObjects" => "尚未读取对象", "No objects loaded yet";
     "ui.explorer.noMatch" => "没有匹配的对象", "No matching objects";
     "ui.explorer.error" => "读取对象失败", "Could not load objects";
@@ -1456,6 +1458,7 @@ dict! {
     "ui.welcome.quickStart" => "快速开始", "Quick start";
     "ui.welcome.newConnDesc" => "连接 PostgreSQL、MySQL、SQL Server、Redis 等", "Connect PostgreSQL, MySQL, SQL Server, Redis, MongoDB, and more";
     "ui.welcome.openSqliteDesc" => "直接打开本机 .sqlite / .db 文件浏览与编辑", "Open a local .sqlite / .db file to browse and edit";
+    "ui.welcome.openSqlDesc" => "打开或拖入本机 .sql 脚本到查询编辑器", "Open or drop a local .sql script into the query editor";
     "ui.welcome.newQueryDesc" => "新建空白 SQL 编辑器，立即编写并执行查询", "Open a blank SQL editor to write and run queries";
     "ui.welcome.myConnections" => "我的连接", "My connections";
     "ui.welcome.manageConnections" => "连接管理", "Manage";
@@ -1507,6 +1510,42 @@ dict! {
     "ui.passwordPrompt.save" => "记住到系统钥匙串", "Save to system keychain";
     "ui.sqlite.portalFallback" => "系统文件对话框不可用，请直接填写 SQLite 文件路径", "System file dialog is unavailable; enter the SQLite file path directly";
     "ui.filePicker.portalUnavailable" => "系统文件对话框不可用（未检测到桌面 Portal 服务）", "System file dialog is unavailable (desktop portal service not found)";
+    "ui.conn.tab.general" => "常规", "General";
+    "ui.conn.tab.ssh" => "SSH 隧道", "SSH Tunnel";
+    "ui.conn.tab.tls" => "SSL / TLS", "SSL / TLS";
+    "ui.conn.importUrl" => "粘贴 URL", "Paste URL";
+    "ui.conn.redisDbLabel" => "库索引 (0–15)", "DB Index (0–15)";
+    "ui.conn.redisAclUser" => "ACL 用户名 (可选)", "ACL User (optional)";
+    "ui.conn.redisAclHint" => "默认留空即可", "Leave blank for default";
+    "ui.conn.defaultDatabase" => "默认数据库 (可选)", "Default DB (optional)";
+    "conn.page.layoutBoard" => "看板", "Board";
+    "conn.page.layoutList" => "列表", "List";
+    "conn.page.onlineCount" => "{count} 已连接", "{count} connected";
+    "redis.db.switch" => "切换逻辑库", "Switch database";
+    "redis.db.keysCount" => "{n} 键", "{n} keys";
+    "redis.copy.keyName" => "复制键名", "Copy key name";
+    "redis.copy.keyValue" => "复制键值", "Copy value";
+    "redis.copy.field" => "复制字段名", "Copy field";
+    "redis.copy.member" => "复制成员", "Copy member";
+    "redis.copy.id" => "复制消息 ID", "Copy message ID";
+    "redis.copy.prefix" => "复制命名空间前缀", "Copy namespace prefix";
+    "redis.copied.keyName" => "已复制键名", "Key name copied";
+    "redis.copied.value" => "已复制内容", "Value copied";
+    "redis.menu.open" => "查看键内容", "Inspect key";
+    "redis.menu.fillCommand" => "填入控制台命令", "Fill command in console";
+    "redis.menu.filterPrefix" => "按此前缀过滤", "Filter by prefix";
+    "redis.menu.newInPrefix" => "在此前缀下新建键", "New key under prefix";
+    "redis.menu.expandCollapse" => "展开 / 折叠", "Expand / Collapse";
+    "redis.menu.formatView" => "格式化查看", "Format inspector";
+    "redis.inspector.title" => "结构化值查看器", "Formatted Inspector";
+    "redis.inspector.pickEntry" => "点击任意条目可自动识别并格式化 JSON / XML / 十六进制内容", "Select an entry to auto-detect and format JSON, XML, or Hex";
+    "redis.console.clear" => "清空输出", "Clear output";
+    "redis.console.copyOutput" => "复制输出", "Copy output";
+    "redis.console.prev" => "上一条历史命令", "Previous command";
+    "redis.console.next" => "下一条历史命令", "Next command";
+    "redis.console.useScan" => "改用模式过滤 (SCAN)", "Filter with SCAN";
+    "redis.console.completeHint" => "Tab 补全 · ↑↓ 选择", "Tab to complete · ↑↓ select";
+    "redis.string.save" => "保存修改", "Save value";
 }
 
 #[cfg(test)]

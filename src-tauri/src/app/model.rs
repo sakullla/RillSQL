@@ -249,6 +249,7 @@ pub struct Shortcut {
 
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "new-query", label_key: "shell.command.newQuery", icon: "code", chord: Some("Mod+T") },
+    CommandSpec { id: "open-sql-file", label_key: "query.fileIo.open", icon: "file", chord: Some("Mod+O") },
     CommandSpec { id: "execute-query", label_key: "shell.command.execute", icon: "play", chord: Some("Mod+Enter") },
     CommandSpec { id: "open-structure", label_key: "shell.command.newStructure", icon: "table", chord: None },
     CommandSpec { id: "compare", label_key: "shell.command.compare", icon: "table", chord: None },
@@ -691,6 +692,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.command.selectAll" => "全选",
         "common.save" => "保存",
         "common.cancel" => "取消",
+        "query.fileIo.open" => "打开 SQL 文件",
         _ => return None,
     })
 }
@@ -767,6 +769,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.command.selectAll" => "Select all",
         "common.save" => "Save",
         "common.cancel" => "Cancel",
+        "query.fileIo.open" => "Open SQL file",
         _ => return None,
     })
 }
@@ -839,6 +842,7 @@ mod tests {
             ids,
             [
                 "new-query",
+                "open-sql-file",
                 "execute-query",
                 "open-structure",
                 "compare",

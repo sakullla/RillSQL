@@ -26,6 +26,13 @@ pub struct RenameOutcome {
     pub renamed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyspaceDb {
+    pub db: u8,
+    pub keys: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOutcome {
@@ -109,4 +116,47 @@ pub async fn exec(service: &Service, connection_id: &str, command: String, args:
     })
     .await?;
     Ok(ExecOutcome { command: word, reply })
+}
+
+/// 解析 `INFO keyspace` 输出里的 `dbN:keys=K,...` 行。
+pub fn parse_info_keyspace(info: &str) -> Vec<KeyspaceDb> {
+    let mut list = Vec::new();
+    for line in info.lines() {
+        let trimmed = line.trim();
+        let Some((db_part, stats)) = trimmed.split_once(':') else { continue };
+        let Some(num) = db_part.strip_prefix("db") else { continue };
+        let Ok(db) = num.parse::<u8>() else { continue };
+        let mut count = 0u64;
+        for pair in stats.split(',') {
+            if let Some(val) = pair.trim().strip_prefix("keys=") {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    count = parsed;
+                }
+            }
+        }
+        list.push(KeyspaceDb { db, keys: count });
+    }
+    list.sort_by_key(|item| item.db);
+    list
+}
+
+/// 读取实例各逻辑库（db0–db15）的键数量统计。
+pub async fn list_keyspaces(service: &Service, connection_id: &str) -> Result<Vec<KeyspaceDb>, String> {
+    with_redis(service, connection_id, move |conn, _| async move {
+        let mut guard = conn.lock().await;
+        let info: String = redis::cmd("INFO").arg("keyspace").query_async(&mut *guard).await.unwrap_or_default();
+        Ok(parse_info_keyspace(&info))
+    })
+    .await
+}
+
+/// 切换 Redis 会话当前逻辑库（SELECT db），并返回最新的键空间统计。
+pub async fn select_db(service: &Service, connection_id: &str, db: u8) -> Result<Vec<KeyspaceDb>, String> {
+    with_redis(service, connection_id, move |conn, _| async move {
+        let mut guard = conn.lock().await;
+        let _: () = redis::cmd("SELECT").arg(db).query_async(&mut *guard).await?;
+        let info: String = redis::cmd("INFO").arg("keyspace").query_async(&mut *guard).await.unwrap_or_default();
+        Ok(parse_info_keyspace(&info))
+    })
+    .await
 }

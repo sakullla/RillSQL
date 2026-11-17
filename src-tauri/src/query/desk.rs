@@ -124,6 +124,7 @@ pub struct PinnedResult {
     pub run: u64,
     pub statement: usize,
     pub view: StatementView,
+    pub column_types: Vec<String>,
     /// 产生这份结果的那次执行用的目标（连接/库/模式）。显示固定结果时按它绑定表格，
     /// 不跟着标签之后切换的库走；来源无法证明（外部写入的结果）时为 None，表格按未定位只读处理。
     pub target: Option<Target>,
@@ -200,6 +201,7 @@ struct TabState {
     token: Option<TaskToken>,
     run_id: Option<String>,
     results: Vec<StatementView>,
+    result_column_types: Vec<Vec<String>>,
     status: String,
     lint: Vec<LintFinding>,
     completions: Vec<CompletionEntry>,
@@ -420,6 +422,7 @@ impl Desk {
             token: None,
             run_id: None,
             results: Vec::new(),
+            result_column_types: Vec::new(),
             status: String::new(),
             lint: Vec::new(),
             completions: Vec::new(),
@@ -775,7 +778,8 @@ impl Desk {
         // 固定前页签上显示的就是这条语句在本批结果里的自动标题（同批重名带序号），
         // 固定后必须逐字保持一致，不能拿单条语句重算。
         let auto_title = Self::batch_titles(tab).into_iter().nth(statement).flatten();
-        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target, auto_title, custom_title: None });
+        let column_types = tab.result_column_types.get(statement).cloned().unwrap_or_default();
+        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), column_types, target, auto_title, custom_title: None });
         tab.result_view = ResultView::Pinned(id);
         self.view_gen = self.view_gen.saturating_add(1);
         Some(id)
@@ -847,6 +851,23 @@ impl Desk {
             return None;
         }
         tab.results.get(tab.statement.min(tab.results.len() - 1))
+    }
+
+    /// 当前展示结果对应的驱动真实列类型（没有结果或未知时返回空切片）。
+    pub fn shown_column_types(&self) -> &[String] {
+        let Some(tab) = self.active_tab() else { return &[] };
+        if let ResultView::Pinned(id) = tab.result_view {
+            if let Some(pinned) = tab.pinned.iter().find(|pinned| pinned.id == id) {
+                return &pinned.column_types;
+            }
+        }
+        if tab.results.is_empty() {
+            return &[];
+        }
+        tab.result_column_types
+            .get(tab.statement.min(tab.results.len() - 1))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 正在看固定结果时它自己的来源目标：Some(Some) 是产生它的那次执行的目标，Some(None) 是来源无法证明；
@@ -1048,6 +1069,7 @@ impl Desk {
         tab.token = None;
         tab.run_id = None;
         tab.results.clear();
+        tab.result_column_types.clear();
         tab.results_target = None;
         tab.results_fresh = false;
         tab.log.clear();
@@ -1187,11 +1209,13 @@ impl Desk {
                 TaskOutcome::Current { .. } => {
                     tab.running = pending;
                     tab.status = run.status.clone();
+                    let col_types: Vec<Vec<String>> = run.statements.iter().map(|stmt| stmt.column_types.clone()).collect();
                     let mut results: Vec<StatementView> = run.statements.into_iter().map(statement_view).collect();
                     if let Some(origin) = tab.run_origin.as_ref() {
                         place_statements(&tab.draft, origin, &mut results);
                     }
                     tab.results = results;
+                    tab.result_column_types = col_types;
                     tab.results_target = tab.run_target.clone();
                     tab.results_fresh = true;
                     tab.run_id = Some(run.id);
@@ -1655,6 +1679,7 @@ impl Desk {
             token: None,
             run_id: None,
             results: Vec::new(),
+            result_column_types: Vec::new(),
             status: String::new(),
             lint: Vec::new(),
             completions: Vec::new(),

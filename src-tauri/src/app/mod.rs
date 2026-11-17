@@ -35,6 +35,7 @@ actions!(
         CompareDatabases,
         NewConnection,
         OpenSqlite,
+        OpenSqlFile,
         ShowHistory,
         SaveQuery,
         SavedQueries,
@@ -167,6 +168,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!("k"), CommandPalette, None),
         gpui_kit::KeyBinding::new(chord!("p"), QuickOpen, None),
         gpui_kit::KeyBinding::new(chord!("t"), NewQuery, None),
+        gpui_kit::KeyBinding::new(chord!("o"), OpenSqlFile, None),
         gpui_kit::KeyBinding::new(chord!("w"), CloseTab, None),
         gpui_kit::KeyBinding::new(chord!("b"), ToggleSidebar, None),
         gpui_kit::KeyBinding::new("ctrl-tab", NextTab, None),
@@ -219,6 +221,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
     bind!(OpenSqlite, "open-sqlite");
+    bind!(OpenSqlFile, "open-sql-file");
     bind!(ShowHistory, "history");
     bind!(SaveQuery, "save-query");
     bind!(SavedQueries, "saved-queries");
@@ -301,6 +304,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
     bind!(OpenSqlite, "open-sqlite");
+    bind!(OpenSqlFile, "open-sql-file");
     bind!(ShowHistory, "history");
     bind!(SaveQuery, "save-query");
     bind!(SavedQueries, "saved-queries");
@@ -348,13 +352,14 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
 }
 
 /// 程序坞菜单里的命令：应用没有窗口时也能直接用它们把工作台带回来。
-const DOCK_COMMANDS: [&str; 5] = ["new-query", "new-connection", "connections", "open-sqlite", "history"];
+const DOCK_COMMANDS: [&str; 6] = ["new-query", "open-sql-file", "new-connection", "connections", "open-sqlite", "history"];
 
 /// macOS 程序坞图标的右键菜单：常用入口一步直达。
 fn install_dock_menu(cx: &mut App, shell: &Shell) {
     let label = |key: &'static str| shell.text(key).to_string();
     cx.set_dock_menu(vec![
         MenuItem::action(label("shell.command.newQuery"), NewQuery),
+        MenuItem::action(label("query.fileIo.open"), OpenSqlFile),
         MenuItem::action(label("shell.command.newConnection"), NewConnection),
         MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
         MenuItem::separator(),
@@ -369,6 +374,7 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
     cx.set_menus([
         Menu::new(label("shell.menu.file")).items([
             MenuItem::action(label("shell.command.newQuery"), NewQuery),
+            MenuItem::action(label("query.fileIo.open"), OpenSqlFile),
             MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
             MenuItem::action(label("shell.command.saveQuery"), SaveQuery),
             MenuItem::separator(),

@@ -2,6 +2,7 @@
 //! 键空间浏览一律走 SCAN 游标（禁 KEYS）；写删类操作由前端确认后携带 confirmed 标记执行。
 
 pub mod commands;
+pub(crate) mod complete;
 pub(crate) mod exec;
 pub(crate) mod keys;
 

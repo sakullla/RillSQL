@@ -377,6 +377,203 @@ pub async fn read_mysql_completion_objects(pool: &mysql_async::Pool, database: &
     rows.iter().map(mysql_object).collect()
 }
 
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('%');
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
+/// 资源管理器全局搜索：跨未展开的库与超过第一页的对象直接向数据库检索匹配名字，
+/// 解决库里有几百上千张表时“前 100 张以外的表搜不出来”的问题。
+pub async fn search_catalog_objects(
+    session: &CatalogSession,
+    engine: Engine,
+    query: &str,
+) -> Vec<(String, String, ObjectRow)> {
+    const LIMIT: usize = 300;
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let pattern = escape_like(trimmed);
+    match (engine, session) {
+        (Engine::Sqlite, CatalogSession::Sqlite { pool, .. }) => {
+            let Ok(dbs) = sqlite_database_names(pool).await else {
+                return Vec::new();
+            };
+            let mut hits = Vec::new();
+            for db in dbs {
+                let db_name = sqlite_database_or_main(&db.name);
+                let sql = format!(
+                    "SELECT name, type, '' AS sig, COALESCE(tbl_name, '') AS rel FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' AND LOWER(name) LIKE LOWER(?1) ESCAPE '\\' ORDER BY name LIMIT ?2",
+                    quote_sqlite(db_name)
+                );
+                let rows: Result<Vec<(String, String, String, String)>, _> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                    .bind(&pattern)
+                    .bind(LIMIT as i64)
+                    .fetch_all(pool)
+                    .await;
+                if let Ok(rows) = rows {
+                    for (name, kind, signature, relation) in rows {
+                        hits.push((
+                            db.name.clone(),
+                            String::new(),
+                            ObjectRow {
+                                kind: parse_kind(&kind),
+                                name,
+                                estimated_rows: None,
+                                stale: false,
+                                signature,
+                                relation,
+                                materialized: false,
+                            },
+                        ));
+                        if hits.len() >= LIMIT {
+                            return hits;
+                        }
+                    }
+                }
+            }
+            hits
+        }
+        (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(pool)) => {
+            let Ok(mut conn) = pool.get_conn().await else {
+                return Vec::new();
+            };
+            let pat = mysql_catalog_literal(&pattern.to_lowercase());
+            let sql = format!(
+                "SELECT table_schema, table_name, CASE table_type WHEN 'VIEW' THEN 'view' WHEN 'SEQUENCE' THEN 'sequence' ELSE 'table' END AS kind, '' AS sig, '' AS rel \
+                 FROM information_schema.tables \
+                 WHERE table_schema NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
+                   AND LOWER(table_name) LIKE {pat} ESCAPE '\\\\' \
+                 UNION ALL \
+                 SELECT routine_schema, routine_name, LOWER(routine_type), '', '' \
+                 FROM information_schema.routines \
+                 WHERE routine_schema NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
+                   AND LOWER(routine_name) LIKE {pat} ESCAPE '\\\\' \
+                 ORDER BY 1, 2 LIMIT {LIMIT}"
+            );
+            let Ok(rows) = conn.query::<mysql_async::Row, _>(sql).await else {
+                return Vec::new();
+            };
+            let mut hits = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let Ok(db) = mysql_string(row, 0) else { continue };
+                let Ok(name) = mysql_string(row, 1) else { continue };
+                let Ok(kind) = mysql_string(row, 2) else { continue };
+                hits.push((
+                    db,
+                    String::new(),
+                    ObjectRow {
+                        kind: parse_kind(&kind),
+                        name,
+                        estimated_rows: None,
+                        stale: false,
+                        signature: mysql_text(row, 3),
+                        relation: mysql_text(row, 4),
+                        materialized: false,
+                    },
+                ));
+            }
+            hits
+        }
+        (Engine::Postgres, CatalogSession::Postgres(client)) => {
+            let Ok(db) = current_database(client).await else {
+                return Vec::new();
+            };
+            let sql = "SELECT n.nspname, c.relname, \
+                CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' WHEN 'S' THEN 'sequence' ELSE 'table' END, \
+                (c.relkind = 'm') \
+                FROM pg_catalog.pg_class c \
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                  AND n.nspname NOT LIKE 'pg_toast%' \
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
+                  AND c.relname ILIKE $1 ESCAPE '\\' \
+                ORDER BY n.nspname, c.relname LIMIT 300";
+            let Ok(rows) = client.query(sql, &[&pattern]).await else {
+                return Vec::new();
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let schema: String = row.get(0);
+                    let name: String = row.get(1);
+                    let kind: String = row.get(2);
+                    let materialized: bool = row.get(3);
+                    (
+                        db.clone(),
+                        schema,
+                        ObjectRow {
+                            kind: parse_kind(&kind),
+                            name,
+                            estimated_rows: None,
+                            stale: false,
+                            signature: String::new(),
+                            relation: String::new(),
+                            materialized,
+                        },
+                    )
+                })
+                .collect()
+        }
+        (Engine::Sqlserver, CatalogSession::Sqlserver(client)) => {
+            let Ok(db) = sqlserver_current_database(client).await else {
+                return Vec::new();
+            };
+            let escaped = pattern.replace('\'', "''");
+            let sql = format!(
+                "SELECT TOP {LIMIT} s.name, o.name, \
+                 CASE o.type WHEN 'V' THEN 'view' WHEN 'P' THEN 'procedure' WHEN 'SO' THEN 'sequence' WHEN 'TR' THEN 'trigger' \
+                 WHEN 'FN' THEN 'function' WHEN 'IF' THEN 'function' WHEN 'TF' THEN 'function' ELSE 'table' END \
+                 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                 WHERE o.is_ms_shipped = 0 AND o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SO') \
+                   AND LOWER(o.name) LIKE LOWER(N'{escaped}') ESCAPE '\\' \
+                 ORDER BY s.name, o.name"
+            );
+            let Ok((_, rows)) = crate::grid::sqlserver_rows(client, &sql).await else {
+                return Vec::new();
+            };
+            rows.into_iter()
+                .filter_map(|row| {
+                    let schema = match row.first()? {
+                        crate::grid::Cell::Text(text) => text.clone(),
+                        crate::grid::Cell::Null => return None,
+                    };
+                    let name = match row.get(1)? {
+                        crate::grid::Cell::Text(text) => text.clone(),
+                        crate::grid::Cell::Null => return None,
+                    };
+                    let kind = match row.get(2)? {
+                        crate::grid::Cell::Text(text) => text.clone(),
+                        crate::grid::Cell::Null => "table".to_owned(),
+                    };
+                    Some((
+                        db.clone(),
+                        schema,
+                        ObjectRow {
+                            kind: parse_kind(&kind),
+                            name,
+                            estimated_rows: None,
+                            stale: false,
+                            signature: String::new(),
+                            relation: String::new(),
+                            materialized: false,
+                        },
+                    ))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub async fn read_object_page(session: &CatalogSession, engine: Engine, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
     let limit = read_limit(limit, 0);
     match session {

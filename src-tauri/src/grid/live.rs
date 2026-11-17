@@ -1586,7 +1586,7 @@ async fn describe_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str
     let kind = if kind_text.eq_ignore_ascii_case("VIEW") { "view" } else { "table" };
     let column_rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
         &mut conn,
-        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
         (database.to_owned(), table.to_owned()),
     )
     .await

@@ -6,7 +6,7 @@ mod temporal;
 pub use session::group_digits;
 
 use std::ops::DerefMut;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use session::{display_banner, operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
 
@@ -616,22 +616,24 @@ impl GridPane {
 
     /// 查询结果进网格。截断与完整行数由查询页给出：网格据此区分"已到末尾"与
     /// "这个结果不能由网格继续"，不会把被截断的结果说成已读完。
-    pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
+    pub fn show_query_typed(&mut self, target: GridTarget, sheet: QuerySheet, column_types: Vec<String>, cx: &mut Context<Self>) {
         self.counting = None;
         self.count_scope = None;
         self.session.target = target;
         self.session.locale = self.locale;
-        // 新的结果集意味着旧的编辑目标不再存在，先结束编辑。
         self.edit_target = None;
         self.pending_edit = None;
-        // 记录面板这次暂存属于上一份结果：留在这里，下一份结果的同名列会继承上一张表的文字。
         self.record_row_changed();
         self.press = None;
         self.pending_page = None;
         let QuerySheet { sql, columns, rows, truncated, full_count } = sheet;
-        let token = self.session.show_query_sheet(&sql, columns, rows, truncated, full_count);
+        let token = self.session.show_query_sheet_typed(&sql, columns, column_types, rows, truncated, full_count);
         self.sync_table(cx);
         self.schedule_locate(token, cx);
+    }
+
+    pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
+        self.show_query_typed(target, sheet, Vec::new(), cx);
     }
 
     pub fn open_table(&mut self, target: GridTarget, limit: u64, cx: &mut Context<Self>) {
@@ -5307,8 +5309,8 @@ impl GridPane {
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("grid runtime"))
+    // 全局共用同一个 Tokio 运行时：mysql_async 连接池、SSH 转发器与网格读流不再跨运行时。
+    crate::app::shell::jobs::runtime()
 }
 
 #[cfg(test)]

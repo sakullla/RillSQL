@@ -362,6 +362,7 @@ fn command_action(id: &str) -> Box<dyn gpui_kit::Action> {
     use crate::app::*;
     match id {
         "new-query" => Box::new(NewQuery),
+        "open-sql-file" => Box::new(OpenSqlFile),
         "open-sqlite" => Box::new(OpenSqlite),
         "save-query" => Box::new(SaveQuery),
         "theme-dark" => Box::new(ThemeDark),

@@ -1240,6 +1240,20 @@ impl Service {
         })
     }
 
+    /// MySQL / MariaDB 已认证的目录连接池：当独立执行连接受限于 max_user_connections、
+    /// 代理并发上限或跳板机通道限制而无法新建时，回退复用这条已连通的池，不让 SQL 永远挂起。
+    pub fn mysql_fallback_pool(&self, id: &str) -> Option<mysql_async::Pool> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        if session.health.is_lost() {
+            return None;
+        }
+        match &session.kind {
+            SessionKind::Mysql { meta, .. } => Some(meta.clone()),
+            _ => None,
+        }
+    }
+
     /// Redis 会话句柄：键浏览、值读取与命令行共用同一条多路复用连接（互斥锁串行）。
     /// 返回共享的健康句柄供执行路径报告断线（R4 探活消费）。
     pub fn redis_session(

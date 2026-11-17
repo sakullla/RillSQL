@@ -111,6 +111,7 @@ pub struct Workbench {
     nav_refresh_tasks: std::collections::HashMap<Option<String>, futures::future::AbortHandle>,
     nav_revision: std::collections::HashMap<String, u64>,
     nav_reads: std::collections::HashMap<String, (String, futures::future::AbortHandle)>,
+    nav_search_abort: Option<futures::future::AbortHandle>,
     nav_gate: Arc<crate::catalog::nav_read::MetadataGate>,
     /// 定义查看器的只读编辑器（SQL 高亮），按读取编号填入文本。
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
@@ -339,6 +340,7 @@ impl Workbench {
             nav_refresh_tasks: std::collections::HashMap::new(),
             nav_revision: std::collections::HashMap::new(),
             nav_reads: std::collections::HashMap::new(),
+            nav_search_abort: None,
             nav_gate: metadata_gate,
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
@@ -462,6 +464,15 @@ impl Workbench {
             if let Some(command) = self.model.history.delete_command() {
                 self.perform(command, cx);
             }
+            return;
+        }
+        if id == "open-sql-file" {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            self.prompt_sql_files(cx);
             return;
         }
         if id == "open-sqlite" {
@@ -1196,7 +1207,9 @@ impl Workbench {
                 super::nav::NavRequest::Refresh { connection } => self.spawn_nav_refresh(connection, cx),
                 super::nav::NavRequest::Database(id) => self.spawn_nav_database(id, cx),
                 super::nav::NavRequest::Details(id) => self.spawn_nav_details(id, cx),
-                super::nav::NavRequest::More(id) => self.spawn_nav_more(id, cx),
+                super::nav::NavRequest::More(id) => self.spawn_nav_more_with_limit(id, None, cx),
+                super::nav::NavRequest::All(id) => self.spawn_nav_more_with_limit(id, Some(5_000), cx),
+                super::nav::NavRequest::Search(query) => self.spawn_nav_search(query, cx),
                 super::nav::NavRequest::Group(id) => self.spawn_nav_group(id, cx),
                 super::nav::NavRequest::Reload(id) => self.spawn_nav_reload(id, cx),
                 super::nav::NavRequest::Definition(id) => self.spawn_definition(id, cx),
@@ -1571,10 +1584,10 @@ impl Workbench {
         .detach();
     }
 
-    fn spawn_nav_more(&mut self, node_id: String, cx: &mut Context<Self>) {
+    fn spawn_nav_more_with_limit(&mut self, node_id: String, override_limit: Option<usize>, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
         if node.paged && node.kind == crate::catalog::hierarchy::NavKind::Group {
-            self.spawn_nav_kind(node_id, if node.unloaded { 0 } else { node.loaded }, cx);
+            self.spawn_nav_kind_with_limit(node_id, if node.unloaded { 0 } else { node.loaded }, override_limit, cx);
             return;
         }
         // 排队的 More 请求已经由模型标好加载态（并且在那里去重）；这里再按 loading
@@ -1585,7 +1598,7 @@ impl Workbench {
         let connection_id = node.connection_id.clone();
         let gate = Arc::clone(&self.nav_gate);
         let services = Arc::clone(&self.services);
-        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let page = override_limit.unwrap_or_else(|| usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(500));
         let offset = node.loaded;
         let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
@@ -1629,10 +1642,10 @@ impl Workbench {
     /// 排队的 Group 请求已经由模型标好加载态，这里不能再按 loading 提前返回，
     /// 否则排队的重试永远不发读取请求、加载态也永远不落。
     fn spawn_nav_group(&mut self, group_id: String, cx: &mut Context<Self>) {
-        self.spawn_nav_kind(group_id, 0, cx);
+        self.spawn_nav_kind_with_limit(group_id, 0, None, cx);
     }
 
-    fn spawn_nav_kind(&mut self, group_id: String, offset: usize, cx: &mut Context<Self>) {
+    fn spawn_nav_kind_with_limit(&mut self, group_id: String, offset: usize, override_limit: Option<usize>, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&group_id).cloned() else { return };
         let Some(kind) = node.object_kind else { return };
         self.model.nav.begin_group(&group_id);
@@ -1641,7 +1654,7 @@ impl Workbench {
         let connection_id = node.connection_id.clone();
         let services = Arc::clone(&self.services);
         let gate = Arc::clone(&self.nav_gate);
-        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let page = override_limit.unwrap_or_else(|| usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(500));
         let current = self.model.nav_connection_database(&node.connection_id);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1673,6 +1686,78 @@ impl Workbench {
                 });
             });
         }).detach();
+    }
+
+    fn spawn_nav_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if let Some(previous) = self.nav_search_abort.take() {
+            previous.abort();
+        }
+        let trimmed = query.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let targets: Vec<(String, String, crate::catalog::Engine)> = self
+            .model
+            .connections
+            .rows
+            .iter()
+            .filter(|row| {
+                self.model.connections.row_status(&row.saved.id) == crate::app::views::connections::LinkStatus::Connected
+                    && row.saved.engine.is_relational()
+            })
+            .map(|row| (row.saved.id.clone(), row.saved.name.clone(), row.saved.engine))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let (handle, abort) = futures::future::AbortHandle::new_pair();
+        self.nav_search_abort = Some(handle.clone());
+        let services = Arc::clone(&self.services);
+        let gate = Arc::clone(&self.nav_gate);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let needle = trimmed.clone();
+        jobs::runtime().spawn(futures::future::Abortable::new(async move {
+            let mut batches = Vec::new();
+            for (conn_id, conn_name, engine) in targets {
+                let Some(session) = services.connections.catalog_session(&conn_id) else { continue };
+                let needle_clone = needle.clone();
+                if let Ok(hits) = crate::catalog::nav_read::limited_metadata(
+                    Arc::clone(&gate),
+                    &conn_id,
+                    async move { crate::catalog::read::search_catalog_objects(&session, engine, &needle_clone).await },
+                )
+                .await
+                {
+                    if !hits.is_empty() {
+                        batches.push((conn_id, conn_name, engine, hits));
+                    }
+                }
+            }
+            let _ = tx.send(batches);
+        }, abort));
+        cx.spawn(async move |_, cx| {
+            let Ok(batches) = rx.await else { return };
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    if handle.is_aborted() || this.model.object_filter.trim() != trimmed {
+                        return;
+                    }
+                    let mut changed = false;
+                    for (conn_id, conn_name, engine, hits) in batches {
+                        if this.model.nav.merge_search_hits(&conn_id, &conn_name, engine, &hits) {
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        this.sync_navigation_index(cx);
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
     }
 
     /// 连接成功的续接动作执行一次；连接失败的留在重试入口里，不丢用户想打开的对象。
@@ -2081,7 +2166,12 @@ impl Workbench {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
-                            this.model.apply_settings(&startup.state.shell);
+                            let mut shell_settings = startup.state.shell;
+                            if shell_settings.object_page == 100 {
+                                // 旧版本默认值为 100，升级到 500，避免大库每 100 张表就截断一次。
+                                shell_settings.object_page = 500;
+                            }
+                            this.model.apply_settings(&shell_settings);
                             // 保存的主题（含深色）要在启动时就写进组件库主题，否则重启后仍是浅色色板。
                             this.apply_effect(Effect::ApplyTheme, cx);
                             // 启动时的自动更新检查只走这个开关；关闭时不发起检查。
@@ -2295,6 +2385,23 @@ impl Workbench {
         .detach();
     }
 
+    fn prompt_sql_files(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(SharedString::from(self.model.text("query.fileIo.open"))),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                cx.update(|cx| {
+                    let _ = this.update(cx, |view, cx| view.open_dropped_or_picked_paths(&paths, false, cx));
+                });
+            }
+        })
+        .detach();
+    }
+
     fn prompt_sqlite(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -2386,6 +2493,9 @@ impl Workbench {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
                     match crate::app::accept_open_path(&path) {
+                        Ok(path) if is_sql_extension(&path) => {
+                            self.open_sql_paths(vec![path], cx);
+                        }
                         Ok(path) => self.apply_sqlite_path(path),
                         Err(error) => {
                             self.model.notice_key = Some("connections.validate.chooseFile");
@@ -2580,21 +2690,76 @@ impl Workbench {
     }
 
     pub(super) fn accept_exchange_drop(&mut self, paths: &gpui_kit::ExternalPaths, cx: &mut Context<Self>) {
-        let mut opened = false;
-        for path in paths.paths() {
-            if let Ok(path) = crate::app::accept_drop_path(path) {
-                opened = true;
+        self.open_dropped_or_picked_paths(paths.paths(), true, cx);
+    }
+
+    pub(super) fn open_dropped_or_picked_paths(
+        &mut self,
+        raw_paths: &[std::path::PathBuf],
+        allow_exchange_import: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sql_paths = Vec::new();
+        let mut exchange_opened = false;
+        for raw in raw_paths {
+            let Ok(path) = crate::app::accept_drop_path(raw) else { continue };
+            if is_sql_extension(&path) || !allow_exchange_import && !is_sqlite_extension(&path) {
+                sql_paths.push(path);
+            } else if is_sqlite_extension(&path) {
+                self.apply_sqlite_path(path);
+            } else if allow_exchange_import {
+                exchange_opened = true;
                 self.exchange.update(cx, |pane, cx| {
                     pane.open = true;
                     pane.preview_file(path, crate::export::ImportEntry::Drop, cx);
                 });
             }
         }
-        if opened {
-            self.model.exchange_open = true;
+        if !sql_paths.is_empty() {
+            self.open_sql_paths(sql_paths, cx);
         }
-        self.refresh_exchange(cx);
+        if exchange_opened {
+            self.model.exchange_open = true;
+            self.refresh_exchange(cx);
+        }
+        self.persist_if_needed(cx);
         cx.notify();
+    }
+
+    fn open_sql_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let mut results = Vec::with_capacity(paths.len());
+            for path in paths {
+                let p = path.clone();
+                let loaded = crate::application::run_blocking(move || crate::query::assist::read_sql_file(&p)).await;
+                results.push((path, loaded));
+            }
+            let _ = tx.send(results);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(results) = rx.await else { return };
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    for (path, loaded) in results {
+                        match loaded {
+                            Ok(file) => {
+                                view.model.shell.note_opened(path.clone());
+                                view.model.open_sql_file(&path, file.sql);
+                                view.query.update(cx, |pane, _| pane.request_focus());
+                            }
+                            Err(error) => {
+                                view.model.notice_key = Some("query.fileIo.open");
+                                view.model.notice_detail = error;
+                            }
+                        }
+                    }
+                    view.persist_if_needed(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn load_env_tags(&mut self, cx: &mut Context<Self>) {
@@ -2884,6 +3049,18 @@ fn query_command(id: &str) -> bool {
         // 外壳必须认得同一份清单再转发回去，否则这类命令会在外壳这一层被静默丢掉。
         || crate::app::views::query::runs_query(id)
         || id.starts_with("outline:")
+}
+
+pub(super) fn is_sql_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+}
+
+pub(super) fn is_sqlite_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "sqlite" | "sqlite3" | "db" | "db3" | "s3db"))
 }
 
 pub(super) fn nav_key(key: &str) -> Option<NavKey> {

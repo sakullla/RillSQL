@@ -122,6 +122,8 @@ pub struct WorkItem {
     pub kind: WorkItemKind,
     /// 表 / 结构 / Redis / MongoDB 的目标规格；查询项为空。
     pub spec: Option<String>,
+    /// 从外部 `.sql` 文件打开时记住路径，标签标题保持为文件名。
+    pub path: Option<String>,
     pub draft: String,
     pub last_executed_sql: Option<String>,
     pub uncommitted_cells: bool,
@@ -141,6 +143,7 @@ impl WorkItem {
             title,
             kind: WorkItemKind::Query,
             spec: None,
+            path: None,
             draft,
             last_executed_sql: None,
             uncommitted_cells: false,
@@ -510,6 +513,8 @@ pub struct WorkbenchModel {
     pub history_reveal: bool,
     /// 键盘在连接页移动选中项后，下一帧把该行滚入视口一次。
     pub launcher_reveal: bool,
+    /// 连接页布局：true 为卡片看板，false 为紧凑列表。
+    pub conn_board_cards: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -617,6 +622,7 @@ impl WorkbenchModel {
             palette_scope: PaletteScope::All,
             history_reveal: false,
             launcher_reveal: false,
+            conn_board_cards: true,
         }
     }
 
@@ -901,6 +907,17 @@ impl WorkbenchModel {
             }
             return true;
         }
+        if let Some(conn_id) = id.strip_prefix("connection-edit:") {
+            self.connections.selected = Some(conn_id.to_owned());
+            let origin = if self.shell.page == AppPage::Connections { FocusTarget::Connections } else { FocusTarget::Sidebar };
+            self.edit_connection(conn_id, false, origin, None, id);
+            return true;
+        }
+        if let Some(conn_id) = id.strip_prefix("connection-query:") {
+            self.connections.selected = Some(conn_id.to_owned());
+            self.conn_command("conn-new-query");
+            return true;
+        }
         match id {
             "activity-workspace" => {
                 if self.shell.page == AppPage::Workspace {
@@ -966,10 +983,12 @@ impl WorkbenchModel {
                     self.connections.issues = self.connections.validate();
                     match self.connections.issues.first() {
                         Some(issue) => {
+                            let issue_field_name = issue.field.clone();
                             self.connections.message_key = None;
                             self.connections.test_report = None;
                             self.notice_key = Some(issue.key);
-                            // 错误写在字段旁，但那个字段可能已经滚出视口：键盘直接落到第一个要改的字段上。
+                            // 错误写在字段旁：自动切到该字段所在分栏并把键盘落到该字段上。
+                            self.conn_modal.sync_tab_for_issue(&issue_field_name);
                             self.conn_modal.focus_first_pending = true;
                         }
                         None => {
@@ -1011,8 +1030,10 @@ impl WorkbenchModel {
                     self.conn_modal.saving = self.conn_modal.open;
                     self.enqueue(PendingJob::SaveConnection);
                 } else if let Some(issue) = self.connections.issues.first() {
+                    let issue_field_name = issue.field.clone();
                     self.notice_key = Some(issue.key);
-                    self.notice_detail = issue.field.clone();
+                    self.notice_detail = issue_field_name.clone();
+                    self.conn_modal.sync_tab_for_issue(&issue_field_name);
                     self.conn_modal.focus_first_pending = self.conn_modal.open;
                 } else {
                     self.notice_key = Some("connections.editor.newTitle");
@@ -1097,6 +1118,24 @@ impl WorkbenchModel {
                 self.connections.toggle_ssh();
                 self.conn_touched();
             }
+            "conn-tab-general" => {
+                self.conn_modal.tab = super::conn_modal::ModalTab::General;
+            }
+            "conn-tab-ssh" => {
+                self.conn_modal.tab = super::conn_modal::ModalTab::Ssh;
+            }
+            "conn-tab-tls" => {
+                self.conn_modal.tab = super::conn_modal::ModalTab::Tls;
+            }
+            "conn-url-toggle" => {
+                self.conn_modal.url_open = !self.conn_modal.url_open;
+            }
+            "conn-layout-board" => {
+                self.conn_board_cards = true;
+            }
+            "conn-layout-list" => {
+                self.conn_board_cards = false;
+            }
             // 密码存不存进系统钥匙串：以前表单上没有这个选择，复制或导入的连接永远存不上密码。
             "conn-save-password-toggle" => {
                 if let Some(draft) = self.connections.editor.as_mut() {
@@ -1144,6 +1183,10 @@ impl WorkbenchModel {
             "preview-down" => self.settings.step_preview_kb(-1),
             "object-page-up" => self.settings.step_object_page(50),
             "object-page-down" => self.settings.step_object_page(-50),
+            "object-page-200" => self.settings.set_object_page(200),
+            "object-page-500" => self.settings.set_object_page(500),
+            "object-page-1000" => self.settings.set_object_page(1000),
+            "object-page-2000" => self.settings.set_object_page(2000),
             "tree-open-data"
             | "tree-copy-name"
             | "tree-select-sql"
@@ -3604,6 +3647,15 @@ impl WorkbenchModel {
             self.nav_requests.push_back(NavRequest::More(scope));
             return true;
         }
+        if let Some(rest) = id.strip_prefix("nav-all:") {
+            let scope = self.nav_storage_scope(rest);
+            if self.nav.node(&scope).is_some_and(|node| node.loading) {
+                return true;
+            }
+            self.nav.begin_scope(&scope);
+            self.nav_requests.push_back(NavRequest::All(scope));
+            return true;
+        }
         if let Some(rest) = id.strip_prefix("nav-toggle:") {
             if self.nav.toggle(rest) && self.nav.is_expanded(rest) {
                 if self.nav.needs_details(rest) { self.request_nav_details(rest); }
@@ -4572,6 +4624,7 @@ impl WorkbenchModel {
             title,
             kind,
             spec: Some(spec),
+            path: None,
             draft: String::new(),
             last_executed_sql: None,
             uncommitted_cells: false,
@@ -4677,7 +4730,16 @@ impl WorkbenchModel {
                 }
             }
             WorkItemKind::Admin => self.text("ui.tool.admin"),
-            WorkItemKind::Redis | WorkItemKind::Mongo => field(1),
+            WorkItemKind::Redis => {
+                let db = field(2);
+                let db = db.trim().trim_start_matches("db");
+                if db.is_empty() {
+                    field(1)
+                } else {
+                    format!("{} · db{db}", field(1))
+                }
+            }
+            WorkItemKind::Mongo => field(1),
         }
     }
 
@@ -4942,14 +5004,111 @@ impl WorkbenchModel {
         }
     }
 
-    /// 查询标签按当前语言的“查询 N / Query N”重新编号；表、结构等项保留对象名。
+    /// 打开外部 `.sql` 文件：保留文件名作为标签标题，自动继承当前连接与数据库上下文（只载入草稿，不自动执行）。
+    pub fn open_sql_file(&mut self, path: &std::path::Path, sql: String) {
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("query.sql")
+            .to_owned();
+        let path_str = path.display().to_string();
+        let inherited = self
+            .active_tab()
+            .filter(|tab| tab.connection_id.as_deref().is_some_and(|id| !id.is_empty()))
+            .map(|tab| {
+                (
+                    tab.connection_id.clone(),
+                    tab.connection_name.clone(),
+                    tab.database.clone(),
+                    tab.engine.clone(),
+                )
+            })
+            .or_else(|| {
+                self.active_scope().map(|scope| {
+                    (
+                        Some(scope.connection_id),
+                        Some(scope.connection_name),
+                        (!scope.database.is_empty()).then_some(scope.database),
+                        Some(scope.engine),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.connections
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        self.connections.row_status(&row.saved.id)
+                            == crate::app::views::connections::LinkStatus::Connected
+                    })
+                    .map(|row| {
+                        (
+                            Some(row.saved.id.clone()),
+                            Some(row.saved.name.clone()),
+                            row.saved.database.clone(),
+                            Some(row.saved.engine.as_str().to_owned()),
+                        )
+                    })
+            });
+
+        if let Some(existing_id) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.kind.is_query() && tab.path.as_deref() == Some(path_str.as_str()) && !tab.running)
+            .map(|tab| tab.id.clone())
+        {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == existing_id) {
+                tab.draft = sql;
+                tab.title = title;
+                tab.last_executed_sql = None;
+            }
+            self.activate_item(&existing_id);
+        } else if let Some(blank_id) = self
+            .active_tab()
+            .filter(|tab| tab.kind.is_query() && tab.draft.trim().is_empty() && tab.path.is_none() && !tab.running)
+            .map(|tab| tab.id.clone())
+        {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == blank_id) {
+                tab.draft = sql;
+                tab.path = Some(path_str);
+                tab.title = title;
+                tab.last_executed_sql = None;
+                if tab.connection_id.is_none() {
+                    if let Some((cid, cname, db, eng)) = inherited {
+                        tab.connection_id = cid;
+                        tab.connection_name = cname;
+                        tab.database = db;
+                        tab.engine = eng;
+                    }
+                }
+            }
+            self.activate_item(&blank_id);
+        } else {
+            let (cid, cname, db, eng) = inherited.unwrap_or((None, None, None, None));
+            self.open_bound_query(sql, cid, cname, db, eng);
+            if let Some(tab) = self.active_mut() {
+                tab.path = Some(path_str);
+                tab.title = title;
+            }
+        }
+        self.shell.page = AppPage::Workspace;
+        self.tool = WorkTool::Query;
+        self.shell.focus = FocusTarget::Editor;
+        self.notice_key = Some("history.page.loadOnlySql");
+        self.notice_detail.clear();
+    }
+
+    /// 查询标签按当前语言的“查询 N / Query N”重新编号；从 `.sql` 文件打开的标签保留文件名。
     fn relabel_query_tabs(&mut self) {
         let template = i18n::text(self.locale(), "ui.query.tabTitle");
         let mut ordinal = 0;
         for tab in &mut self.tabs {
             if tab.kind.is_query() {
                 ordinal += 1;
-                tab.title = i18n::fill(&template, &[("n", &ordinal.to_string())]);
+                if tab.path.is_none() {
+                    tab.title = i18n::fill(&template, &[("n", &ordinal.to_string())]);
+                }
             }
         }
     }
@@ -5093,10 +5252,15 @@ impl WorkbenchModel {
             }
             DraftField::Filter => self.connections.filter_text = value,
             DraftField::ObjectFilter => {
-                // 资源管理器搜索与对象索引是同一份：显示完整路径并高亮，清除后恢复树。
+                // 资源管理器搜索与对象索引是同一份：显示完整路径并高亮，同时异步向已连接数据库检索未分页/未展开的对象。
                 self.object_filter = value;
                 let query = self.object_filter.clone();
                 self.nav_search(&query);
+                self.nav_requests.retain(|req| !matches!(req, NavRequest::Search(_)));
+                let trimmed = query.trim();
+                if !trimmed.is_empty() {
+                    self.nav_requests.push_back(NavRequest::Search(trimmed.to_owned()));
+                }
             }
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
@@ -5132,6 +5296,13 @@ impl WorkbenchModel {
                 }
             }
             other => {
+                if other == DraftField::Host && value.contains("://") && value.trim().len() > 6 {
+                    let trimmed = value.trim().to_owned();
+                    if self.connections.apply_url(&trimmed).is_ok() {
+                        self.note_url_applied();
+                        return;
+                    }
+                }
                 if let Some(draft) = self.connections.editor.as_mut() {
                     *field_slot(draft, other) = value;
                     if other == DraftField::CaFile && !draft.ca_file.trim().is_empty() {
@@ -5418,7 +5589,7 @@ fn tab_to_session(tab: &WorkItem) -> SessionTab {
         connection_status: None,
         target_text: None,
         target_notice: None,
-        path: None,
+        path: tab.path.clone(),
         last_executed_sql: tab.last_executed_sql.clone(),
         table_pane: None,
         structure_section: None,
@@ -5445,6 +5616,7 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
         title: tab.title.clone(),
         kind,
         spec,
+        path: tab.path.clone(),
         draft: tab.draft.clone(),
         last_executed_sql: tab.last_executed_sql.clone(),
         uncommitted_cells: false,

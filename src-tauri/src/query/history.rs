@@ -55,6 +55,7 @@ impl HistoryStore {
         }
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
+            .busy_timeout(std::time::Duration::from_secs(3))
             .create_if_missing(true);
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)

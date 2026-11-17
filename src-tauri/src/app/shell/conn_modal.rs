@@ -24,6 +24,12 @@ pub enum ModalControl {
 
 /// 关闭图标（头部右端）。
 pub const CLOSE: &str = "conn-modal-close";
+/// 展开/收起连接串快速解析栏。
+pub const URL_TOGGLE: &str = "conn-url-toggle";
+/// 连接表单的三个平铺分栏（常规 / SSH 隧道 / SSL·TLS）。
+pub const TAB_GENERAL: &str = "conn-tab-general";
+pub const TAB_SSH: &str = "conn-tab-ssh";
+pub const TAB_TLS: &str = "conn-tab-tls";
 /// URL 行的“解析”按钮。
 pub const APPLY_URL: &str = "conn-apply-url";
 /// 文件型连接的“浏览”按钮。
@@ -39,6 +45,24 @@ pub const SAVE_PASSWORD: &str = "conn-save-password";
 /// 放弃修改确认条上的两个按钮：继续编辑 / 放弃修改。
 pub const DISCARD_KEEP: &str = "conn-discard-keep";
 pub const DISCARD_CONFIRM: &str = "conn-discard";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModalTab {
+    #[default]
+    General,
+    Ssh,
+    Tls,
+}
+
+impl ModalTab {
+    pub fn control_id(self) -> &'static str {
+        match self {
+            ModalTab::General => TAB_GENERAL,
+            ModalTab::Ssh => TAB_SSH,
+            ModalTab::Tls => TAB_TLS,
+        }
+    }
+}
 
 pub fn engine_control_id(engine: Engine) -> String {
     format!("conn-engine-{}", engine.as_str())
@@ -100,6 +124,8 @@ pub enum ModalStop {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModalAction {
     Engine(Engine),
+    Tab(ModalTab),
+    ToggleUrl,
     Env(String),
     Tls(TlsMode),
     Ca(CaMode),
@@ -158,6 +184,10 @@ pub struct ConnectionModal {
     pub saving: bool,
     /// 连接串刚被解析并填进了下面的字段；连接串再被改动就收起。
     pub url_applied: bool,
+    /// 当前激活的配置分栏（常规 / SSH 隧道 / SSL·TLS）。
+    pub tab: ModalTab,
+    /// 是否展开连接串快速解析栏。
+    pub url_open: bool,
 }
 
 impl Default for ConnectionModal {
@@ -179,6 +209,8 @@ impl Default for ConnectionModal {
             focus_discard_pending: false,
             saving: false,
             url_applied: false,
+            tab: ModalTab::General,
+            url_open: false,
         }
     }
 }
@@ -199,6 +231,8 @@ impl ConnectionModal {
         self.focus_discard_pending = false;
         self.saving = false;
         self.url_applied = false;
+        self.tab = ModalTab::General;
+        self.url_open = false;
     }
 
     /// 关闭并交还焦点归属；重复关闭不产生第二次还焦。
@@ -214,6 +248,8 @@ impl ConnectionModal {
         self.focus_discard_pending = false;
         self.saving = false;
         self.url_applied = false;
+        self.tab = ModalTab::General;
+        self.url_open = false;
         let origin = self.origin;
         let control = self.control.take();
         self.trigger = None;
@@ -248,9 +284,42 @@ impl ConnectionModal {
         self.rendered.push(id.into());
     }
 
-    /// 模态内的 Tab 序列：按引擎与安全选项决定屏幕上真的存在哪些字段与控件。
-    /// 顺序与 connection_modal_layer 的绘制顺序一致，供测试对账。
+    /// 连接串输入框当前是否展示：手动展开、刚完成解析或存在 URL 校验错误时展示。
+    pub fn url_visible(&self, page: &ConnectionPage) -> bool {
+        self.url_open || self.url_applied || page.issues.iter().any(|issue| issue.field == "url")
+    }
+
+    pub fn effective_tab(&self, engine: Engine) -> ModalTab {
+        if engine == Engine::Sqlite {
+            ModalTab::General
+        } else {
+            self.tab
+        }
+    }
+
+    /// 校验或测试落到某个具体字段时，自动切到包含该字段的分栏（或展开 URL 栏）。
+    pub fn sync_tab_for_issue(&mut self, field: &str) {
+        match field {
+            "url" => self.url_open = true,
+            "ssh_host" | "ssh_port" | "ssh_user" | "ssh_key" | "ssh_password" | "passphrase" => {
+                self.tab = ModalTab::Ssh;
+            }
+            "ca_file" | "client_cert" | "client_key" => {
+                self.tab = ModalTab::Tls;
+            }
+            _ => {
+                self.tab = ModalTab::General;
+            }
+        }
+    }
+
+    /// 默认初始形态（常规分栏、URL 栏收起）下的 Tab 序列。
     pub fn stops(page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
+        Self::default().stops_for(page, envs)
+    }
+
+    /// 这一帧的完整停靠点：严格与 connection_modal_layer 当前分栏和展开态的绘制顺序一致。
+    pub fn stops_for(&self, page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
         let Some(draft) = page.editor.as_ref() else {
             return Vec::new();
         };
@@ -258,75 +327,96 @@ impl ConnectionModal {
         for engine in engines() {
             stops.push(ModalStop::Control(engine_control_id(engine)));
         }
-        stops.push(ModalStop::Field(DraftField::Url));
-        stops.push(ModalStop::Control(APPLY_URL.to_owned()));
-        stops.push(ModalStop::Field(DraftField::Name));
-        for env in envs {
-            stops.push(ModalStop::Control(env_control_id(env)));
+        if draft.engine != Engine::Sqlite {
+            for tab in [ModalTab::General, ModalTab::Ssh, ModalTab::Tls] {
+                stops.push(ModalStop::Control(tab.control_id().to_owned()));
+            }
         }
+        stops.push(ModalStop::Control(URL_TOGGLE.to_owned()));
+        if self.url_visible(page) {
+            stops.push(ModalStop::Field(DraftField::Url));
+            stops.push(ModalStop::Control(APPLY_URL.to_owned()));
+        }
+
         if draft.engine == Engine::Sqlite {
             stops.push(ModalStop::Field(DraftField::File));
             stops.push(ModalStop::Control(BROWSE_FILE.to_owned()));
+            stops.push(ModalStop::Field(DraftField::Name));
+            for env in envs {
+                stops.push(ModalStop::Control(env_control_id(env)));
+            }
         } else {
-            stops.push(ModalStop::Field(DraftField::Host));
-            stops.push(ModalStop::Field(DraftField::Port));
-            stops.push(ModalStop::Field(DraftField::Username));
-            stops.push(ModalStop::Field(DraftField::Password));
-            stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
-            stops.push(ModalStop::Field(DraftField::Database));
-            if draft.engine == Engine::Mongodb {
-                stops.push(ModalStop::Field(DraftField::Replica));
-            }
-            for mode in [TlsMode::Off, TlsMode::Require, TlsMode::Verify] {
-                stops.push(ModalStop::Control(tls_control_id(mode).to_owned()));
-            }
-            if draft.tls_mode == TlsMode::Verify {
-                for mode in [CaMode::System, CaMode::File] {
-                    stops.push(ModalStop::Control(ca_control_id(mode).to_owned()));
+            match self.effective_tab(draft.engine) {
+                ModalTab::General => {
+                    stops.push(ModalStop::Field(DraftField::Host));
+                    stops.push(ModalStop::Field(DraftField::Port));
+                    if draft.engine == Engine::Redis {
+                        stops.push(ModalStop::Field(DraftField::Database));
+                        stops.push(ModalStop::Field(DraftField::Password));
+                        stops.push(ModalStop::Field(DraftField::Username));
+                        stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
+                    } else {
+                        stops.push(ModalStop::Field(DraftField::Username));
+                        stops.push(ModalStop::Field(DraftField::Password));
+                        stops.push(ModalStop::Field(DraftField::Database));
+                        if draft.engine == Engine::Mongodb {
+                            stops.push(ModalStop::Field(DraftField::Replica));
+                        }
+                        stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
+                    }
+                    stops.push(ModalStop::Field(DraftField::Name));
+                    for env in envs {
+                        stops.push(ModalStop::Control(env_control_id(env)));
+                    }
                 }
-                if draft.ca_mode == CaMode::File {
-                    stops.push(ModalStop::Field(DraftField::CaFile));
-                    stops.push(ModalStop::Control(BROWSE_CA.to_owned()));
+                ModalTab::Ssh => {
+                    stops.push(ModalStop::Control(SSH_TOGGLE.to_owned()));
+                    if draft.ssh_on {
+                        stops.push(ModalStop::Field(DraftField::SshHost));
+                        stops.push(ModalStop::Field(DraftField::SshPort));
+                        stops.push(ModalStop::Field(DraftField::SshUser));
+                        for kind in [SshAuthKind::Key, SshAuthKind::Password] {
+                            stops.push(ModalStop::Control(ssh_auth_control_id(kind).to_owned()));
+                        }
+                        if draft.ssh_auth == SshAuthKind::Key {
+                            stops.push(ModalStop::Field(DraftField::SshKey));
+                            stops.push(ModalStop::Control(BROWSE_SSH.to_owned()));
+                            stops.push(ModalStop::Field(DraftField::Passphrase));
+                        } else {
+                            stops.push(ModalStop::Field(DraftField::SshPassword));
+                        }
+                    }
                 }
-                stops.push(ModalStop::Field(DraftField::ClientCert));
-                stops.push(ModalStop::Control(BROWSE_CERT.to_owned()));
-                stops.push(ModalStop::Field(DraftField::ClientKey));
-                stops.push(ModalStop::Control(BROWSE_KEY.to_owned()));
+                ModalTab::Tls => {
+                    for mode in [TlsMode::Off, TlsMode::Require, TlsMode::Verify] {
+                        stops.push(ModalStop::Control(tls_control_id(mode).to_owned()));
+                    }
+                    if draft.tls_mode == TlsMode::Verify {
+                        for mode in [CaMode::System, CaMode::File] {
+                            stops.push(ModalStop::Control(ca_control_id(mode).to_owned()));
+                        }
+                        if draft.ca_mode == CaMode::File {
+                            stops.push(ModalStop::Field(DraftField::CaFile));
+                            stops.push(ModalStop::Control(BROWSE_CA.to_owned()));
+                        }
+                        stops.push(ModalStop::Field(DraftField::ClientCert));
+                        stops.push(ModalStop::Control(BROWSE_CERT.to_owned()));
+                        stops.push(ModalStop::Field(DraftField::ClientKey));
+                        stops.push(ModalStop::Control(BROWSE_KEY.to_owned()));
+                    }
+                }
             }
-            stops.push(ModalStop::Control(SSH_TOGGLE.to_owned()));
-            if draft.ssh_on {
-                stops.push(ModalStop::Field(DraftField::SshHost));
-                stops.push(ModalStop::Field(DraftField::SshPort));
-                stops.push(ModalStop::Field(DraftField::SshUser));
-                for kind in [SshAuthKind::Key, SshAuthKind::Password] {
-                    stops.push(ModalStop::Control(ssh_auth_control_id(kind).to_owned()));
-                }
-                if draft.ssh_auth == SshAuthKind::Key {
-                    stops.push(ModalStop::Field(DraftField::SshKey));
-                    stops.push(ModalStop::Control(BROWSE_SSH.to_owned()));
-                    stops.push(ModalStop::Field(DraftField::Passphrase));
-                } else {
-                    stops.push(ModalStop::Field(DraftField::SshPassword));
-                }
-            }
+        }
+
+        if self.discard_armed {
+            stops.push(ModalStop::Control(DISCARD_KEEP.to_owned()));
+            stops.push(ModalStop::Control(DISCARD_CONFIRM.to_owned()));
         }
         // 页脚：测试在左，取消 / 保存 / 保存并连接在右。
         stops.push(ModalStop::Test);
         stops.push(ModalStop::Cancel);
         stops.push(ModalStop::Save);
         stops.push(ModalStop::SaveConnect);
-        stops
-    }
-
-    /// 这一帧的完整停靠点：放弃修改的确认条出现时，它的两个按钮排在页脚动作之前。
-    pub fn stops_for(&self, page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
-        let mut stops = Self::stops(page, envs);
-        if self.discard_armed {
-            if let Some(at) = stops.iter().position(|stop| *stop == ModalStop::Test) {
-                stops.insert(at, ModalStop::Control(DISCARD_CONFIRM.to_owned()));
-                stops.insert(at, ModalStop::Control(DISCARD_KEEP.to_owned()));
-            }
-        }
         stops
     }
 }
@@ -402,34 +492,45 @@ mod tests {
             .collect()
     }
 
-    /// 控件停靠点覆盖“能改变配置的那几组”：引擎、环境、TLS/CA、SSH、解析与浏览、关闭。
+    /// 控件停靠点覆盖各分栏（常规、SSH 隧道、SSL/TLS）与可展开连接串解析栏。
     #[test]
     fn stops_include_every_interactive_group_not_just_fields() {
         let mut page = page(Engine::Postgres);
         page.editor.as_mut().unwrap().tls_mode = TlsMode::Verify;
         page.editor.as_mut().unwrap().ca_mode = CaMode::File;
         page.editor.as_mut().unwrap().ssh_on = true;
-        let ids = controls(&ConnectionModal::stops(&page, &["dev".to_owned(), "prod".to_owned()]));
+        let envs = ["dev".to_owned(), "prod".to_owned()];
+
+        let mut modal = ConnectionModal { url_open: true, tab: ModalTab::General, ..ConnectionModal::default() };
+        let general_ids = controls(&modal.stops_for(&page, &envs));
         for expected in [
             CLOSE,
+            URL_TOGGLE,
             APPLY_URL,
+            TAB_GENERAL,
+            TAB_SSH,
+            TAB_TLS,
             "conn-engine-sqlite",
             "conn-engine-postgres",
             "conn-env-dev",
             "conn-env-prod",
-            "conn-tls-verify",
-            "conn-ca-file",
-            BROWSE_CA,
-            BROWSE_CERT,
-            BROWSE_KEY,
-            SSH_TOGGLE,
             SAVE_PASSWORD,
-            "conn-ssh-auth-key",
-            BROWSE_SSH,
         ] {
-            assert!(ids.iter().any(|id| id == expected), "缺少停靠点 {expected}: {ids:?}");
+            assert!(general_ids.iter().any(|id| id == expected), "常规分栏缺少停靠点 {expected}: {general_ids:?}");
         }
-        assert!(!ids.iter().any(|id| id == BROWSE_FILE), "非文件型连接没有文件浏览按钮");
+        assert!(!general_ids.iter().any(|id| id == BROWSE_FILE), "非文件型连接没有文件浏览按钮");
+
+        modal.tab = ModalTab::Tls;
+        let tls_ids = controls(&modal.stops_for(&page, &envs));
+        for expected in ["conn-tls-verify", "conn-ca-file", BROWSE_CA, BROWSE_CERT, BROWSE_KEY] {
+            assert!(tls_ids.iter().any(|id| id == expected), "TLS 分栏缺少停靠点 {expected}: {tls_ids:?}");
+        }
+
+        modal.tab = ModalTab::Ssh;
+        let ssh_ids = controls(&modal.stops_for(&page, &envs));
+        for expected in [SSH_TOGGLE, "conn-ssh-auth-key", BROWSE_SSH] {
+            assert!(ssh_ids.iter().any(|id| id == expected), "SSH 分栏缺少停靠点 {expected}: {ssh_ids:?}");
+        }
     }
 
     #[test]
@@ -437,13 +538,14 @@ mod tests {
         let sqlite = ConnectionModal::stops(&page(Engine::Sqlite), &[]);
         assert!(sqlite.iter().all(|stop| *stop != ModalStop::Field(DraftField::Host)), "文件型没有 host");
         assert!(sqlite.contains(&ModalStop::Field(DraftField::File)));
-        assert!(!controls(&sqlite).iter().any(|id| id == SSH_TOGGLE), "文件型没有 SSH");
+        assert!(!controls(&sqlite).iter().any(|id| id == TAB_SSH), "文件型没有 SSH 分栏");
         assert!(!controls(&sqlite).iter().any(|id| id == SAVE_PASSWORD), "文件型没有密码可存");
 
         let mut remote = page(Engine::Postgres);
         remote.editor.as_mut().unwrap().ssh_on = true;
         remote.editor.as_mut().unwrap().ssh_auth = SshAuthKind::Password;
-        let stops = ConnectionModal::stops(&remote, &[]);
+        let mut modal = ConnectionModal { tab: ModalTab::Ssh, ..ConnectionModal::default() };
+        let stops = modal.stops_for(&remote, &[]);
         assert!(stops.contains(&ModalStop::Field(DraftField::SshPassword)));
         assert!(!stops.contains(&ModalStop::Field(DraftField::SshKey)), "密码认证没有私钥字段");
         assert!(!controls(&stops).iter().any(|id| id == BROWSE_SSH), "密码认证没有私钥浏览");
@@ -451,7 +553,9 @@ mod tests {
         remote.editor.as_mut().unwrap().tls_mode = TlsMode::Verify;
         remote.editor.as_mut().unwrap().ca_mode = CaMode::File;
         remote.editor.as_mut().unwrap().ssh_on = false;
-        assert!(ConnectionModal::stops(&remote, &[]).contains(&ModalStop::Field(DraftField::CaFile)));
+        modal.sync_tab_for_issue("ca_file");
+        assert_eq!(modal.tab, ModalTab::Tls);
+        assert!(modal.stops_for(&remote, &[]).contains(&ModalStop::Field(DraftField::CaFile)));
     }
 
     /// 首尾相接靠的是 GPUI 的 focus trap（Root 的 Tab 动作在容器内成环）；

@@ -697,6 +697,18 @@ impl SharedGrid {
     /// 查询结果进入网格：截断与完整行数由查询页给出，网格据此区分"已读到末尾"
     /// 和"这个结果不能由网格继续"，不再把两者都写成完成。
     pub fn show_query_sheet(&mut self, sql: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, truncated: bool, full_count: Option<i64>) -> u64 {
+        self.show_query_sheet_typed(sql, columns, Vec::new(), rows, truncated, full_count)
+    }
+
+    pub fn show_query_sheet_typed(
+        &mut self,
+        sql: &str,
+        columns: Vec<String>,
+        column_types: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+        truncated: bool,
+        full_count: Option<i64>,
+    ) -> u64 {
         self.mode = GridMode::Query;
         self.sql = sql.to_owned();
         self.token = self.token.saturating_add(1);
@@ -711,9 +723,15 @@ impl SharedGrid {
             .iter()
             .enumerate()
             .map(|(index, name)| {
+                let raw_type = column_types
+                    .get(index)
+                    .map(|item| item.trim())
+                    .filter(|item| !item.is_empty() && *item != "类型未知")
+                    .unwrap_or("")
+                    .to_owned();
                 let mut column = GridColumn {
                     name: name.clone(),
-                    type_name: "text".to_owned(),
+                    type_name: raw_type,
                     nullable: true,
                     primary: false,
                     unique: false,
@@ -721,8 +739,10 @@ impl SharedGrid {
                     width: 140.0,
                     editable: false,
                 };
-                // 查询结果的类型名是占位，不进表头宽度；只按列名与首屏值估宽。
-                let probe = GridColumn { type_name: String::new(), ..column.clone() };
+                let probe = GridColumn {
+                    type_name: type_abbr(&column.type_name),
+                    ..column.clone()
+                };
                 column.width = estimate_width(&probe, rows.iter().map(|row| row.get(index).and_then(|value| value.as_deref())));
                 column
             })
@@ -4329,12 +4349,17 @@ pub struct ColumnHeader {
 impl SharedGrid {
     pub fn column_header(&self, column: usize) -> Option<ColumnHeader> {
         let item = self.columns.get(column)?;
+        let known_type = !item.type_name.trim().is_empty() && item.type_name.trim() != "类型未知";
         Some(ColumnHeader {
-            // 查询结果的列类型是占位的 text，画出来会把整数列也标成 TEXT；没有可靠类型就不标。
-            abbr: if self.mode == GridMode::Query { String::new() } else { type_abbr(&item.type_name) },
+            // 查询结果只有在驱动报告了真实类型（或单表定位拿到表结构）时才标出类型徽标。
+            abbr: if known_type { type_abbr(&item.type_name) } else { String::new() },
             primary: item.primary,
             foreign: self.foreign_key_for(&item.name).is_some(),
-            numeric: if self.mode == GridMode::Query { self.values_look_numeric(column) } else { numeric_type(&item.type_name) },
+            numeric: if known_type {
+                numeric_type(&item.type_name) || (self.mode == GridMode::Query && self.values_look_numeric(column))
+            } else {
+                self.values_look_numeric(column)
+            },
         })
     }
 
@@ -4376,31 +4401,54 @@ fn looks_numeric(text: &str) -> bool {
     trimmed.parse::<f64>().is_ok_and(f64::is_finite) && trimmed.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
 }
 
-/// 字段类型缩成表头和记录徽标用的短码。
+/// 字段类型缩成表头和记录徽标用的短码，保留真实 SQL 类型语义（区分 VARCHAR / CHAR / TEXT 等）。
 pub fn type_abbr(type_name: &str) -> String {
     let lower = type_name.trim().to_ascii_lowercase();
-    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    if lower.is_empty() || lower == "类型未知" || lower == "null" {
+        return String::new();
+    }
+    if lower.starts_with("character varying") {
+        return "VARCHAR".to_owned();
+    }
+    if lower.starts_with("timestamp") {
+        return "TS".to_owned();
+    }
+    if lower.starts_with("double precision") {
+        return "DOUBLE".to_owned();
+    }
+    let base = lower.split(['(', ' ', '[']).next().unwrap_or("");
     match base {
-        "int" | "integer" | "int2" | "int4" | "int8" | "bigint" | "smallint" | "tinyint" | "serial" | "bigserial" | "mediumint" | "smallserial" | "year" => "INT",
+        "bigint" | "int8" | "bigserial" => "BIGINT",
+        "tinyint" => "TINYINT",
+        "smallint" | "int2" | "smallserial" => "SMALLINT",
+        "int" | "integer" | "int4" | "serial" | "mediumint" => "INT",
+        "year" => "YEAR",
         "json" | "jsonb" => "JSON",
         "xml" => "XML",
         "bool" | "boolean" | "bit" => "BOOL",
-        "blob" | "bytea" | "binary" | "varbinary" | "image" | "raw" | "byte" => "BLOB",
-        "timestamp" | "timestamptz" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => "TS",
+        "blob" | "tinyblob" | "mediumblob" | "longblob" | "bytea" | "image" | "raw" | "byte" => "BLOB",
+        "binary" => "BINARY",
+        "varbinary" => "VARBIN",
+        "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => "DATETIME",
+        "timestamptz" => "TS",
         "date" => "DATE",
         "time" | "timetz" => "TIME",
-        "text" | "varchar" | "nvarchar" | "char" | "nchar" | "clob" | "string" | "citext" | "tinytext" | "mediumtext" | "longtext" | "varchar2" | "nvarchar2" | "ntext" | "bpchar" | "name" | "uuid" | "uniqueidentifier" => {
-            if base == "uuid" || base == "uniqueidentifier" {
-                "UUID"
-            } else {
-                "TEXT"
-            }
-        }
-        "float" | "float4" | "float8" | "double" | "real" => "FLOAT",
-        "numeric" | "decimal" | "money" | "smallmoney" | "number" => "NUM",
+        "varchar" | "varchar2" | "varying" => "VARCHAR",
+        "nvarchar" | "nvarchar2" => "NVARCHAR",
+        "char" | "bpchar" | "character" => "CHAR",
+        "nchar" => "NCHAR",
+        "uuid" | "uniqueidentifier" => "UUID",
+        "enum" => "ENUM",
+        "set" => "SET",
+        "text" | "clob" | "string" | "citext" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "name" => "TEXT",
+        "double" | "float8" => "DOUBLE",
+        "float" | "float4" | "real" => "FLOAT",
+        "decimal" | "dec" => "DECIMAL",
+        "numeric" | "number" => "NUMERIC",
+        "money" | "smallmoney" => "MONEY",
         "" => "",
         other => {
-            let short: String = other.chars().filter(|ch| ch.is_ascii_alphanumeric()).take(4).collect();
+            let short: String = other.chars().filter(|ch| ch.is_ascii_alphanumeric()).take(7).collect();
             return short.to_ascii_uppercase();
         }
     }
@@ -7609,6 +7657,31 @@ mod filter_model_tests {
         assert!(grid.applied_expression().is_none());
         assert_eq!(grid.filter_sql(), "");
         assert_eq!(grid.loaded_len(), 3);
+    }
+
+    #[test]
+    fn type_abbr_distinguishes_varchar_from_text_and_query_results_keep_driver_types() {
+        assert_eq!(type_abbr("varchar(64)"), "VARCHAR");
+        assert_eq!(type_abbr("character varying(128)"), "VARCHAR");
+        assert_eq!(type_abbr("nvarchar(50)"), "NVARCHAR");
+        assert_eq!(type_abbr("char(8)"), "CHAR");
+        assert_eq!(type_abbr("longtext"), "TEXT");
+        assert_eq!(type_abbr("bigint unsigned"), "BIGINT");
+        assert_eq!(type_abbr("decimal(10,2)"), "DECIMAL");
+        assert_eq!(type_abbr("datetime"), "DATETIME");
+        assert_eq!(type_abbr("timestamp with time zone"), "TS");
+
+        let mut grid = SharedGrid::new();
+        grid.show_query_sheet_typed(
+            "SELECT id, driver_name, score FROM workshop_driver_ranking",
+            vec!["id".into(), "driver_name".into(), "score".into()],
+            vec!["bigint".into(), "varchar(64)".into(), "decimal(10,2)".into()],
+            vec![vec![Some("1".into()), Some("张三".into()), Some("98.50".into())]],
+            false,
+            None,
+        );
+        let cols: Vec<_> = grid.columns.iter().map(|c| c.type_name.as_str()).collect();
+        assert_eq!(cols, vec!["bigint", "varchar(64)", "decimal(10,2)"]);
     }
 }
 

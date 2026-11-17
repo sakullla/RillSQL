@@ -1588,6 +1588,91 @@ impl NavTree {
         }
     }
 
+    /// 将服务端按关键字检索到的对象合入目录树：不覆盖已有分页游标与 `has_more`，
+    /// 让未展开库或第 100+ 页以外的表立即可见、可点击打开。
+    pub fn merge_search_hits(
+        &mut self,
+        connection_id: &str,
+        connection_name: &str,
+        engine: Engine,
+        hits: &[(String, String, ObjectRow)],
+    ) -> bool {
+        if hits.is_empty() {
+            return false;
+        }
+        let root_id = connection_node_id(connection_id);
+        if !self.nodes.contains_key(&root_id) {
+            return false;
+        }
+        let connection = NavConnection::new(connection_id.to_owned(), connection_name.to_owned(), engine, ConnStatus::Connected);
+        let mut added = false;
+        for (database, schema, object) in hits {
+            let scope_id = if !engine.shows_databases() {
+                root_id.clone()
+            } else {
+                let db_id = database_node_id(connection_id, database);
+                if !self.nodes.contains_key(&db_id) {
+                    let mut db_node = NavNode::new(NavKind::Database, db_id.clone(), database.clone());
+                    db_node.path = format!("{connection_name} / {database}");
+                    db_node.connection_id = connection_id.to_owned();
+                    db_node.connection_name = connection_name.to_owned();
+                    db_node.engine = engine;
+                    db_node.database = database.clone();
+                    db_node.name = database.clone();
+                    db_node.expandable = true;
+                    db_node.unloaded = engine.shows_schemas();
+                    self.attach(&root_id, db_node);
+                }
+                if engine.shows_schemas() && !schema.is_empty() {
+                    let sc_id = schema_node_id(connection_id, database, schema);
+                    if !self.nodes.contains_key(&sc_id) {
+                        let mut sc_node = NavNode::new(NavKind::Schema, sc_id.clone(), schema.clone());
+                        sc_node.path = format!("{connection_name} / {database} / {schema}");
+                        sc_node.connection_id = connection_id.to_owned();
+                        sc_node.connection_name = connection_name.to_owned();
+                        sc_node.engine = engine;
+                        sc_node.database = database.clone();
+                        sc_node.schema = schema.clone();
+                        sc_node.name = schema.clone();
+                        sc_node.expandable = true;
+                        self.attach(&db_id, sc_node);
+                    }
+                    sc_id
+                } else {
+                    db_id
+                }
+            };
+            let group_id = group_node_id(connection_id, database, schema, object.kind);
+            if !self.nodes.contains_key(&group_id) {
+                let mut group = NavNode::new(NavKind::Group, group_id.clone(), String::new());
+                group.label_key = Some(kind_label_key(object.kind));
+                group.path = schema_path(connection_name, database, schema, object.kind);
+                group.connection_id = connection_id.to_owned();
+                group.connection_name = connection_name.to_owned();
+                group.engine = engine;
+                group.database = database.clone();
+                group.schema = schema.clone();
+                group.name = kind_name(object.kind).to_owned();
+                group.object_kind = Some(object.kind);
+                group.expandable = true;
+                group.unloaded = true;
+                group.paged = true;
+                self.attach(&scope_id, group);
+            }
+            let object_id = object_node_id(connection_id, database, schema, object);
+            if self.nodes.contains_key(&object_id) {
+                continue;
+            }
+            let node = self.object_node(&connection, database, schema, object, &object_id);
+            self.attach(&group_id, node);
+            added = true;
+        }
+        if added && !self.query.is_empty() && self.focus.is_none() {
+            self.focus = self.visible().first().map(|row| row.id.clone());
+        }
+        added
+    }
+
     /// 搜索：先记住展开与焦点，清除后原样恢复。
     pub fn search(&mut self, query: &str) -> bool {
         let trimmed = query.trim().to_owned();
@@ -2259,5 +2344,38 @@ mod tests {
         tree.apply(&[failed]);
         assert_eq!(tree.node(&connection_node_id("pg")).unwrap().error.as_deref(), Some("密码错误"));
         assert_eq!(tree.visible().len(), 1);
+    }
+
+    #[test]
+    fn server_search_hits_merge_objects_beyond_initial_page_without_losing_pagination() {
+        let mut group = schema("", (0..100).map(|ix| table(&format!("alpha_table_{ix:03}"))).collect());
+        group.total = 250;
+        group.kind_reports = vec![KindReport {
+            kind: ObjectKind::Table,
+            total: 250,
+            error: None,
+        }];
+        let mut conn = NavConnection::new("uat", "qsyn-uat", Engine::Mysql, ConnStatus::Connected);
+        conn.databases = vec![database("tms_business", vec![group])];
+
+        let mut tree = NavTree::new();
+        tree.apply(&[conn]);
+        tree.expand(&connection_node_id("uat"));
+        tree.expand(&database_node_id("uat", "tms_business"));
+
+        // 第 140 张表尚未分页加载时，合并服务端搜索命中能够立即定位到它，且保留原有的 has_more 标记。
+        let hits = vec![(
+            "tms_business".to_owned(),
+            String::new(),
+            table("workshop_driver_ranking"),
+        )];
+        assert!(tree.merge_search_hits("uat", "qsyn-uat", Engine::Mysql, &hits));
+
+        let db_id = database_node_id("uat", "tms_business");
+        let db_node = tree.node(&db_id).expect("库节点");
+        assert!(db_node.has_more, "合并搜索命中不能破坏未读完分页的 has_more 标记");
+        let group_id = group_node_id("uat", "tms_business", "", ObjectKind::Table);
+        tree.expand(&group_id);
+        assert!(tree.visible().iter().any(|row| row.label == "workshop_driver_ranking"));
     }
 }

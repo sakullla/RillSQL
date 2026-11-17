@@ -113,7 +113,8 @@ impl Forwarder {
         Ok(())
     }
 
-    /// 持续接受本地连接，直到 `shutdown` 结束。每条 accept 只打开一条到数据库地址的 direct-tcpip。
+    /// 持续接受本地连接，直到 `shutdown` 结束。每条 accept 在独立任务里打开 direct-tcpip（带超时），
+    /// 避免单条通道缓慢或被跳板机拒绝时阻塞后续 accept、甚至退出整个监听循环导致新查询永远挂死。
     pub async fn serve_until<O: DirectTcpOpener + 'static>(
         self,
         opener: Arc<O>,
@@ -129,9 +130,18 @@ impl Forwarder {
                 _ = &mut shutdown => return Ok(()),
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.map_err(|err| ForwardError::Io(err.to_string()))?;
-                    let remote = opener.open_direct_tcpip(&channel_host, channel_port).await?;
+                    let opener = Arc::clone(&opener);
+                    let host = channel_host.clone();
                     tokio::spawn(async move {
-                        let _ = copy_both(stream, remote).await;
+                        let opened = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            opener.open_direct_tcpip(&host, channel_port),
+                        )
+                        .await;
+                        if let Ok(Ok(remote)) = opened {
+                            let _ = copy_both(stream, remote).await;
+                        }
+                        // 超时或失败时直接丢弃 stream，立即向客户端发出 EOF/RST，而不是静默挂起。
                     });
                 }
             }

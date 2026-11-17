@@ -2,10 +2,11 @@
 //! 窄窗口只留列表，操作跟在选中行上。标签由用户自己维护（新建、改名、换色、删除）。
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, AnyElement, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
+    div, px, AnyElement, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
 };
 
 use crate::app::views::connections::LinkStatus;
@@ -46,27 +47,112 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 头部两行：标题 + 主操作（新建连接）与次要入口（图标）；搜索、引擎筛选与标签条。
+    /// 头部两行：标题与在线概览 + 视图切换（看板/列表）与主操作；搜索、引擎筛选与环境标签条。
     pub(super) fn launcher_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
         let filter = self.input_for(DraftField::Filter, &self.model.text("ui.conn.search"), false, window, cx);
         let shown = self.model.connections.filtered().len();
         let total = self.model.connections.rows.len();
+        let online = self
+            .model
+            .connections
+            .rows
+            .iter()
+            .filter(|row| self.model.connections.row_status(&row.saved.id) == LinkStatus::Connected)
+            .count();
         let count = if shown == total { total.to_string() } else { format!("{shown} / {total}") };
-        let engine = self.model.connections.filter_engine.map(|engine| kit::engine_label(engine.as_str()).to_owned()).unwrap_or_else(|| self.model.text("connections.filter.engine"));
+        let engine = self
+            .model
+            .connections
+            .filter_engine
+            .map(|engine| kit::engine_label(engine.as_str()).to_owned())
+            .unwrap_or_else(|| self.model.text("connections.filter.engine"));
         let engine_open = self.model.conn_filter_menu == Some(super::model::ConnFilterMenu::Engine);
-        let filtering = self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty() || !self.model.connections.filter_text.trim().is_empty();
+        let filtering = self.model.connections.filter_engine.is_some()
+            || !self.model.connections.filter_env.is_empty()
+            || !self.model.connections.filter_text.trim().is_empty();
+        let board_mode = self.model.conn_board_cards;
+        let wide_tools = self.model.viewport_width >= 980;
         let icon = |id: &'static str, icon: IconName, key: &str, command: &'static str, cx: &mut Context<Self>| {
             kit::icon_button(id, icon, self.model.text(key), act(command, cx)).small().into_any_element()
         };
-        let secondary = [
-            icon("launcher-group-new", IconName::FolderPlus, "ui.group.new", "group-new", cx),
-            icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx),
-            icon("launcher-sqlite", IconName::FolderOpen, "common.openSqlite", "open-sqlite", cx),
-            icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx),
-            icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx),
-        ];
+        let layout_toggle = div()
+            .flex_none()
+            .p(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.sunken)
+            .border_1()
+            .border_color(p.line_soft)
+            .child(
+                kit::interactive_states(div().id("conn-layout-board"), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t("conn.page.layoutBoard"))
+                    .aria_selected(board_mode)
+                    .h(px(m.control_h - 6.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::XS))
+                    .when(board_mode, |this| {
+                        this.bg(if p.dark { p.raised } else { p.surface })
+                            .text_color(p.text)
+                            .font_weight(FontWeight::MEDIUM)
+                            .shadow_sm()
+                    })
+                    .when(!board_mode, |this| this.text_color(p.text_muted).hover(|s| s.text_color(p.text)))
+                    .child(kit::icon(IconName::LayoutDashboard, 12., if board_mode { p.accent_text } else { p.text_muted }))
+                    .child(self.t("conn.page.layoutBoard"))
+                    .on_click(act("conn-layout-board", cx)),
+            )
+            .child(
+                kit::interactive_states(div().id("conn-layout-list"), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t("conn.page.layoutList"))
+                    .aria_selected(!board_mode)
+                    .h(px(m.control_h - 6.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::XS))
+                    .when(!board_mode, |this| {
+                        this.bg(if p.dark { p.raised } else { p.surface })
+                            .text_color(p.text)
+                            .font_weight(FontWeight::MEDIUM)
+                            .shadow_sm()
+                    })
+                    .when(board_mode, |this| this.text_color(p.text_muted).hover(|s| s.text_color(p.text)))
+                    .child(kit::icon(IconName::List, 12., if !board_mode { p.accent_text } else { p.text_muted }))
+                    .child(self.t("conn.page.layoutList"))
+                    .on_click(act("conn-layout-list", cx)),
+            );
+
+        let secondary: Vec<AnyElement> = if wide_tools {
+            vec![
+                kit::tool_button("launcher-group-new", Some(IconName::FolderPlus), self.t("ui.group.new"), act("group-new", cx)).small().into_any_element(),
+                kit::tool_button("launcher-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)).small().into_any_element(),
+                icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx),
+                icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx),
+                icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx),
+            ]
+        } else {
+            vec![
+                icon("launcher-group-new", IconName::FolderPlus, "ui.group.new", "group-new", cx),
+                icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx),
+                icon("launcher-sqlite", IconName::FolderOpen, "common.openSqlite", "open-sqlite", cx),
+                icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx),
+                icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx),
+            ]
+        };
         let focus = self.conn_launcher_focus.clone();
         div()
             .flex_none()
@@ -81,15 +167,43 @@ impl Workbench {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
-                    .child(div().px(px(6.)).rounded(px(Radius::TAG)).bg(p.hover).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(count)))
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded(px(Radius::TAG))
+                            .bg(p.hover)
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(count)),
+                    )
+                    .when(online > 0, |this| {
+                        let online_text = crate::i18n::fill(&self.model.text("conn.page.onlineCount"), &[("count", &online.to_string())]);
+                        this.child(
+                            div()
+                                .px(px(7.))
+                                .py(px(1.))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.ok_soft)
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.ok)
+                                .child(kit::status_dot(p.ok))
+                                .child(SharedString::from(online_text)),
+                        )
+                    })
                     .child(div().flex_1())
                     .when(!self.model.tabs.is_empty() && self.model.viewport_width >= 760, |this| {
                         this.child(kit::tool_button("conn-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
                             .child(kit::vline(&p))
                     })
+                    .when(total > 0 && self.model.viewport_width >= 680, |this| this.child(layout_toggle))
                     .children(secondary)
                     .child(kit::vline(&p))
                     .child(self.launcher_action("conn-new", IconName::Plus, self.t("common.newConnection"), Some(&focus), "conn-new-launcher", true, &p, cx)),
@@ -135,13 +249,16 @@ impl Workbench {
         bar.child(kit::tool_button("conn-tag-manage", Some(IconName::Settings2), self.t("conn.page.manageTags"), act("tags-manage", cx)).xsmall()).into_any_element()
     }
 
-    /// 列表：失败重试条 → 最近 → 分组 / 未分组。只有这一块滚动。
+    /// 列表/看板：失败重试条 → 最近 → 分组 / 未分组。只有这一块滚动。
     pub(super) fn launcher_body(&mut self, wide: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
         let all: Vec<ConnectionRecord> = self.model.connections.launcher_all().into_iter().cloned().collect();
         let recent: Vec<ConnectionRecord> = self.model.connections.launcher_recent(5).into_iter().cloned().collect();
-        let filtering = !self.model.connections.filter_text.trim().is_empty() || self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty();
+        let filtering = !self.model.connections.filter_text.trim().is_empty()
+            || self.model.connections.filter_engine.is_some()
+            || !self.model.connections.filter_env.is_empty();
+        let cards = self.model.conn_board_cards && self.model.viewport_width >= 720;
         let mut body = div()
             .id("launcher-scroll")
             .track_scroll(&self.launcher_scroll)
@@ -151,9 +268,9 @@ impl Workbench {
             .min_w(px(0.))
             .h_full()
             .overflow_y_scroll()
-            .px(px(m.page_pad - 6.))
-            .py(px(8.))
-            .gap(px(1.));
+            .px(px(if cards { m.page_pad } else { m.page_pad - 6. }))
+            .py(px(if cards { 12. } else { 8. }))
+            .gap(px(if cards { 8. } else { 1. }));
         let mut child_count = 0usize;
         let mut selected_child: Option<usize> = None;
         if self.model.connections.rows.is_empty() {
@@ -163,8 +280,6 @@ impl Workbench {
                     IconName::Database,
                     self.t("ui.explorer.empty"),
                     self.t("ui.explorer.emptyHint"),
-                    // 第一次打开时三条起步路径都给文字按钮：新建、打开本机 SQLite、导入已有的连接清单。
-                    // 页头那排只有图标，第一次用的人认不出“导入”。
                     div()
                         .flex()
                         .flex_wrap()
@@ -178,15 +293,22 @@ impl Workbench {
                 .into_any_element();
         }
         if let Some(retry) = self.model.connect_retry.clone() {
-            let name = self.model.connections.rows.iter().find(|row| row.saved.id == retry.connection_id).map(|row| row.saved.name.clone()).unwrap_or_else(|| retry.connection_id.clone());
+            let name = self
+                .model
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == retry.connection_id)
+                .map(|row| row.saved.name.clone())
+                .unwrap_or_else(|| retry.connection_id.clone());
             body = body.child(
                 div()
                     .id("launcher-connect-retry")
                     .test_support()
-                    .mx(px(6.))
+                    .mx(px(if cards { 0. } else { 6. }))
                     .mb(px(6.))
-                    .px(px(8.))
-                    .py(px(6.))
+                    .px(px(10.))
+                    .py(px(7.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -194,7 +316,6 @@ impl Workbench {
                     .bg(p.danger_soft)
                     .child(kit::icon(IconName::CircleAlert, 13., p.danger))
                     .child({
-                        // 横幅写出这条连接最近一次失败的原因（首行），完整原因和处理建议在悬停提示里。
                         let reason = self.model.connections.failures.get(&retry.connection_id).cloned().unwrap_or_default();
                         let head = reason.lines().next().unwrap_or_default().to_owned();
                         let label = if head.is_empty() {
@@ -237,26 +358,38 @@ impl Workbench {
                 .into_any_element();
         }
         if !recent.is_empty() && !filtering && all.len() > recent.len() + 2 {
-            body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.launcher.recent"), &p)));
+            body = body.child(div().px(px(if cards { 0. } else { 6. })).child(super::chrome::section_label(self.t("connections.launcher.recent"), &p)));
             child_count += 1;
-            for row in &recent {
-                body = body.child(self.launcher_row(row, wide, &p, cx, "recent"));
+            if cards {
+                body = body.child(self.launcher_card_grid(&recent, &p, cx, "recent"));
                 child_count += 1;
+            } else {
+                for row in &recent {
+                    body = body.child(self.launcher_row(row, wide, &p, cx, "recent"));
+                    child_count += 1;
+                }
             }
         }
         let layout = self.model.group_layout();
         let shown = |id: &str| all.iter().find(|row| row.saved.id == id).cloned();
         if layout.groups.is_empty() {
             if !recent.is_empty() && !filtering && all.len() > recent.len() + 2 {
-                body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.launcher.all"), &p)));
+                body = body.child(div().px(px(if cards { 0. } else { 6. })).child(super::chrome::section_label(self.t("connections.launcher.all"), &p)));
                 child_count += 1;
             }
-            for row in &all {
-                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+            if cards {
+                if all.iter().any(|row| self.model.connections.selected.as_deref() == Some(row.saved.id.as_str())) {
                     selected_child = Some(child_count);
                 }
-                body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
-                child_count += 1;
+                body = body.child(self.launcher_card_grid(&all, &p, cx, "all"));
+            } else {
+                for row in &all {
+                    if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                        selected_child = Some(child_count);
+                    }
+                    body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
+                    child_count += 1;
+                }
             }
             if std::mem::take(&mut self.model.launcher_reveal) {
                 if let Some(child_ix) = selected_child {
@@ -279,25 +412,39 @@ impl Workbench {
             if rows.is_empty() {
                 body = body.child(div().pl(px(32.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("connections.group.emptyHint")));
                 child_count += 1;
-            }
-            for row in &rows {
-                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+            } else if cards {
+                if rows.iter().any(|row| self.model.connections.selected.as_deref() == Some(row.saved.id.as_str())) {
                     selected_child = Some(child_count);
                 }
-                body = body.child(div().pl(px(16.)).child(self.launcher_row(row, wide, &p, cx, "all")));
+                body = body.child(div().pl(px(8.)).child(self.launcher_card_grid(&rows, &p, cx, "all")));
                 child_count += 1;
+            } else {
+                for row in &rows {
+                    if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                        selected_child = Some(child_count);
+                    }
+                    body = body.child(div().pl(px(16.)).child(self.launcher_row(row, wide, &p, cx, "all")));
+                    child_count += 1;
+                }
             }
         }
         let ungrouped: Vec<ConnectionRecord> = layout.ungrouped.iter().filter_map(|id| shown(id)).collect();
         if !ungrouped.is_empty() {
-            body = body.child(div().px(px(6.)).child(super::chrome::section_label(self.t("connections.group.ungrouped"), &p)));
+            body = body.child(div().px(px(if cards { 0. } else { 6. })).child(super::chrome::section_label(self.t("connections.group.ungrouped"), &p)));
             child_count += 1;
-            for row in &ungrouped {
-                if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+            if cards {
+                if ungrouped.iter().any(|row| self.model.connections.selected.as_deref() == Some(row.saved.id.as_str())) {
                     selected_child = Some(child_count);
                 }
-                body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
-                child_count += 1;
+                body = body.child(self.launcher_card_grid(&ungrouped, &p, cx, "all"));
+            } else {
+                for row in &ungrouped {
+                    if self.model.connections.selected.as_deref() == Some(row.saved.id.as_str()) {
+                        selected_child = Some(child_count);
+                    }
+                    body = body.child(self.launcher_row(row, wide, &p, cx, "all"));
+                    child_count += 1;
+                }
             }
         }
         if std::mem::take(&mut self.model.launcher_reveal) {
@@ -306,6 +453,240 @@ impl Workbench {
             }
         }
         body.into_any_element()
+    }
+
+    /// 响应式连接卡片网格。
+    fn launcher_card_grid(&mut self, rows: &[ConnectionRecord], p: &Palette, cx: &mut Context<Self>, prefix: &'static str) -> AnyElement {
+        let mut grid = div().flex().flex_wrap().gap(px(10.));
+        for row in rows {
+            grid = grid.child(self.launcher_card(row, p, cx, prefix));
+        }
+        grid.into_any_element()
+    }
+
+    /// 连接看板卡片：引擎徽标、环境、在线状态、等宽地址、SSH/TLS 标识与一键直达操作。
+    fn launcher_card(&mut self, row: &ConnectionRecord, p: &Palette, cx: &mut Context<Self>, prefix: &'static str) -> AnyElement {
+        let id = row.saved.id.clone();
+        let status = self.model.connections.row_status(&id);
+        let (dot, state_key) = status_parts(status, p);
+        let detail = connection_detail(row);
+        let shown_detail = match row.saved.file_path.as_deref() {
+            Some(path) if !path.is_empty() => short_path(path),
+            _ => detail.clone(),
+        };
+        let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
+        let label = format!("{} {} {}", row.saved.name, row.saved.engine.as_str(), self.model.text(state_key));
+        let aware = format!("{detail} · {}", self.model.text(state_key));
+        let row_id = if prefix == "all" { format!("conn-row-{id}") } else { format!("launcher-{prefix}-{id}") };
+        let group = SharedString::from(format!("conn-card-group-{prefix}-{id}"));
+        let (select_id, menu_id, open_id, query_id, edit_id, more_id) =
+            (id.clone(), id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+        let connected = status == LinkStatus::Connected;
+        let open_label = if connected { "conn.page.open" } else { "connections.page.connect" };
+        let has_ssh = row.saved.ssh.is_some();
+        let has_tls = row.saved.tls.as_ref().is_some_and(|tls| tls.mode != TlsMode::Off);
+        let failed_reason = self.model.connections.failures.get(&id).and_then(|s| s.lines().next()).map(str::to_owned);
+
+        let status_badge = div()
+            .flex_none()
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(px(Radius::TAG))
+            .bg(match status {
+                LinkStatus::Connected => p.ok_soft,
+                LinkStatus::Failed => p.danger_soft,
+                LinkStatus::Connecting => p.accent_soft,
+                LinkStatus::Disconnected => p.sunken,
+            })
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .text_size(px(TypeScale::XS))
+            .text_color(match status {
+                LinkStatus::Connected => p.ok,
+                LinkStatus::Failed => p.danger,
+                LinkStatus::Connecting => p.accent_text,
+                LinkStatus::Disconnected => p.text_muted,
+            })
+            .child(kit::status_dot(dot))
+            .child(self.model.text(state_key));
+
+        let actions = div()
+            .pt(px(8.))
+            .border_t_1()
+            .border_color(p.line_soft)
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                kit::tool_button(
+                    SharedString::from(format!("launcher-open-{prefix}-{id}")),
+                    Some(if connected { IconName::SquareArrowOutUpRight } else { IconName::Plug }),
+                    self.model.text(open_label),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.perform(&format!("connection:{open_id}"), cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .child(
+                kit::tool_button(
+                    SharedString::from(format!("launcher-query-{prefix}-{id}")),
+                    Some(IconName::SquareTerminal),
+                    self.model.text("conn.page.newQuery"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.perform(&format!("connection-query:{query_id}"), cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .child(div().flex_1())
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-edit-{prefix}-{id}")),
+                    IconName::Pencil,
+                    self.model.text("conn.page.edit"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.perform(&format!("connection-edit:{edit_id}"), cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-more-{prefix}-{id}")),
+                    IconName::Ellipsis,
+                    self.model.text("conn.page.more"),
+                    cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        this.menu_at = event.position();
+                        this.model.connections.selected = Some(more_id.clone());
+                        this.perform("menu-connection", cx);
+                    }),
+                )
+                .xsmall(),
+            );
+
+        kit::row_states(div().id(SharedString::from(row_id)), p)
+            .test_support()
+            .group(group)
+            .role(gpui_kit::Role::ListItem)
+            .aria_label(SharedString::from(label))
+            .aria_selected(selected)
+            .aria_description(SharedString::from(aware.clone()))
+            .when(self.model.menu.is_none(), |this| this.tooltip_text(SharedString::from(aware)))
+            .flex_1()
+            .min_w(px(250.))
+            .max_w(px(380.))
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .rounded(px(Radius::PANEL))
+            .border_1()
+            .when(selected, |this| this.border_color(p.accent).bg(if p.dark { p.raised } else { p.surface }).shadow_sm())
+            .when(!selected, |this| {
+                this.border_color(p.line)
+                    .bg(if p.dark { p.raised } else { p.surface })
+                    .hover(|style| style.border_color(p.line_strong).bg(p.hover))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .child(kit::engine_badge(row.saved.engine.as_str(), 30.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex_shrink(1.)
+                                    .truncate()
+                                    .text_size(px(TypeScale::MD))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(row.saved.name.clone())),
+                            )
+                            .children(self.env_pill(&row.saved.env, p)),
+                    )
+                    .child(status_badge),
+            )
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(shown_detail)),
+                    )
+                    .when(has_ssh, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.sunken)
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child("SSH"),
+                        )
+                    })
+                    .when(has_tls, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.sunken)
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child("TLS"),
+                        )
+                    }),
+            )
+            .when_some(failed_reason, |this, err| {
+                this.child(
+                    div()
+                        .px(px(6.))
+                        .py(px(3.))
+                        .rounded(px(Radius::CONTROL))
+                        .bg(p.danger_soft)
+                        .truncate()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.danger)
+                        .child(SharedString::from(err)),
+                )
+            })
+            .child(actions)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.menu_at = event.position;
+                    this.model.connections.selected = Some(menu_id.clone());
+                    this.perform("menu-connection", cx);
+                }),
+            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                this.model.connections.selected = Some(select_id.clone());
+                if event.click_count() >= 2 {
+                    this.perform(&format!("connection:{select_id}"), cx);
+                } else {
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
     }
 
     /// 一行：徽标 / 名称与标签 / 地址 / 状态；悬停或选中时露出“打开”和“更多”。双击打开。
@@ -426,11 +807,14 @@ impl Workbench {
         } else {
             kit::primary_button("conn-detail-open", Some(IconName::Plug), self.t("connections.page.connect"), cx.listener(move |this, _: &ClickEvent, _, cx| this.perform(&format!("connection:{open_id}"), cx)))
         };
-        let mut actions = div().flex().flex_wrap().gap(px(6.)).child(primary.small());
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .child(primary.small())
+            .child(kit::secondary_button("conn-detail-query", Some(IconName::SquareTerminal), self.t("conn.page.newQuery"), act("conn-new-query", cx)).small());
         if connected {
-            actions = actions
-                .child(kit::secondary_button("conn-detail-query", Some(IconName::SquareTerminal), self.t("conn.page.newQuery"), act("conn-new-query", cx)).small())
-                .child(kit::secondary_button("conn-detail-disconnect", Some(IconName::Unplug), self.t("conn.page.disconnect"), act("conn-disconnect", cx)).small());
+            actions = actions.child(kit::secondary_button("conn-detail-disconnect", Some(IconName::Unplug), self.t("conn.page.disconnect"), act("conn-disconnect", cx)).small());
         }
         let tools = div()
             .flex()

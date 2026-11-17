@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -1082,7 +1082,17 @@ impl QueryPane {
                 self.variable_values.clear();
                 cx.notify();
             }
-            "open-sql-file" => self.prompt_open(cx),
+            "open-sql-file" => {
+                if let Some(owner) = self.owner.clone() {
+                    cx.defer(move |cx| {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.update(cx, |view, cx| view.perform("open-sql-file", cx));
+                        }
+                    });
+                } else {
+                    self.prompt_open(cx);
+                }
+            }
             "save-sql-file" => self.prompt_save(cx),
             _ => {}
         }
@@ -1798,6 +1808,14 @@ impl QueryPane {
         let mut databases = Vec::new();
         let links = connections.iter().filter(|connection| connection.status == crate::catalog::model::ConnStatus::Connected).map(|connection| {
             let mut names: Vec<String> = connection.databases.iter().map(|database| database.name.clone()).collect();
+            if connection.engine == crate::connections::model::Engine::Redis {
+                for db in 0..16u8 {
+                    let item = db.to_string();
+                    if !names.contains(&item) {
+                        names.push(item);
+                    }
+                }
+            }
             // 连接配置里的默认库排在最前：换到这条连接时先落在它上面，而不是列表里随便一个库。
             if let Some(name) = connection.default_database.as_ref().filter(|name| !name.is_empty()) {
                 names.retain(|item| item != name);
@@ -2350,6 +2368,7 @@ impl QueryPane {
         };
         let sheet = shown;
         let columns = if sheet.columns.is_empty() { vec!["status".to_owned()] } else { sheet.columns.clone() };
+        let column_types = if sheet.columns.is_empty() { Vec::new() } else { self.desk.shown_column_types().to_vec() };
         let rows = if sheet.columns.is_empty() {
             vec![vec![Some(statement_message(self.locale, &sheet.status, &sheet.message))]]
         } else {
@@ -2369,7 +2388,7 @@ impl QueryPane {
         self.grid.update(cx, |grid, cx| {
             let mut target = target;
             target.engine = engine;
-            grid.show_query(target, sheet, cx);
+            grid.show_query_typed(target, sheet, column_types, cx);
         });
     }
 
@@ -2675,6 +2694,12 @@ impl QueryPane {
             .child(kit::vline(p))
             .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity)))
             .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity)))
+            .when(!self.narrow, |this| {
+                this.child(
+                    kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("query.fileIo.open"), pane_act("open-sql-file", entity))
+                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.fileIo.open"), kit::shortcut("Ctrl+O")))),
+                )
+            })
             .child(more)
             .child(div().flex_1())
             .children(pickers)
@@ -3577,7 +3602,6 @@ pub fn requires_active_query(id: &str) -> bool {
             | "expand-star"
             | "confirm-variables"
             | "cancel-variables"
-            | "open-sql-file"
             | "save-sql-file"
             | "save-query"
             | "pin-result"
@@ -3624,8 +3648,8 @@ fn target_of(tab: &TabSnap) -> Option<Target> {
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("query runtime"))
+    // 与连接建立、SSH 转发和目录读取共用单一 Tokio I/O 反应器，避免跨运行时死锁或悬挂。
+    crate::app::shell::jobs::runtime()
 }
 
 #[cfg(test)]

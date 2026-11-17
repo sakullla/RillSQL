@@ -647,7 +647,8 @@ impl Workbench {
             ))
             .child(div().flex_1())
             .child(
-                controls(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)).into_any_element())
+                controls(kit::icon_button("top-open-sql", IconName::FileText, self.t("query.fileIo.open"), act("open-sql-file", cx)).into_any_element())
+                    .child(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)))
                     .when(!narrow, |this| {
                         this.child(
                             kit::icon_button("top-exchange", IconName::ArrowDownUp, self.t("shell.command.openExchange"), act("open-exchange", cx))
@@ -1557,7 +1558,7 @@ impl Workbench {
                     .xsmall(),
                 )
             })
-            // 续读只在展开的节点上出现，并写明还剩多少；折叠的库上挂一个孤零零的图标只会让人困惑。
+            // 续读只在展开的节点上出现，并写明还剩多少；同时提供“全部”一键读完，不必反复点 100 条。
             .when(row.has_more && (row.expanded || is_group), |this| {
                 let remaining = row.total.saturating_sub(row.loaded);
                 let label = if remaining > 0 && !row.total_unknown {
@@ -1574,6 +1575,16 @@ impl Workbench {
                     )
                     .xsmall()
                     .tooltip(self.t("catalog.tree.loadMore")),
+                )
+                .child(
+                    kit::tool_button(
+                        SharedString::from(format!("nav-all-{focus_id}")),
+                        None,
+                        self.t("ui.nav.loadAll"),
+                        act(format!("nav-all:{focus_id}"), cx),
+                    )
+                    .xsmall()
+                    .tooltip(self.t("ui.nav.loadAllTip")),
                 )
             })
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2144,6 +2155,15 @@ impl Workbench {
                 Some("Ctrl+T"),
                 "new-query",
                 cx,
+            ))
+            .child(quick_card(
+                "welcome-card-open-sql",
+                IconName::FileText,
+                self.t("query.fileIo.open"),
+                self.t("ui.welcome.openSqlDesc"),
+                Some("Ctrl+O"),
+                "open-sql-file",
+                cx,
             ));
 
         let retry_banner = self.model.connect_retry.clone().map(|retry| {
@@ -2485,114 +2505,230 @@ impl Workbench {
         let existing = draft.id.is_some();
         let engine = draft.engine;
         let file_based = engine == Engine::Sqlite;
-        let narrow = self.model.viewport_width <= 900;
+        let narrow = self.model.viewport_width <= 720;
         let view_w = self.model.viewport_width.max(240) as f32;
         let view_h = self.model.viewport_height.max(240) as f32;
-        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 900_f32.min(view_w - 80.) };
-        // 左右分栏要给字段留出至少 440 的宽度，否则退回上下排布。
-        let wide = panel_w >= 700.;
-        // 顶部锚定：换引擎时表单高度会变，居中会让整块上下跳；固定上沿只让下沿伸缩。
-        let panel_top = (view_h * 0.1).clamp(20., 96.);
-        let panel_h = (view_h - panel_top - 40.).max(200.);
-        let pad = if narrow { 16. } else { m.page_pad };
+        let panel_w = if narrow { (view_w - 32.).max(240.) } else { 640_f32.min(view_w - 64.) };
+        let panel_top = (view_h * 0.08).clamp(18., 72.);
+        let panel_h = (view_h - panel_top - 32.).max(220.);
+        let pad = if narrow { 14. } else { m.page_pad };
         let focus_first = std::mem::take(&mut self.model.conn_modal.focus_first_pending);
+        let active_tab = self.model.conn_modal.effective_tab(engine);
+        let url_visible = self.model.conn_modal.url_visible(&self.model.connections);
 
-        // 引擎选择：一排徽标，每个都是 Tab 停靠点。
-        let mut engine_row = div().flex().flex_wrap().gap(px(6.));
-        for candidate in engines() {
-            let selected = candidate == engine;
-            engine_row = engine_row.child(self.modal_engine_item(candidate, selected, &p, cx));
-        }
-
-        let envs = conn_modal::env_ids(&self.model.env_tags);
-        let mut env_items = segment_track(&p);
-        for env in &envs {
-            env_items = env_items.child(self.modal_segment_item(
-                conn_modal::env_control_id(env),
-                self.env_text(env),
-                draft.env == *env,
-                conn_modal::ModalAction::Env(env.clone()),
+        // 1. 页头：引擎徽标 + 实时标题与连接地址预览 + 关闭图标（首个 Tab 停靠点）。
+        let header = stack_frame(|| {
+            let title = if existing {
+                let trimmed = draft.name.trim();
+                if trimmed.is_empty() {
+                    default_connection_name(&draft)
+                        .map(SharedString::from)
+                        .unwrap_or_else(|| self.t("connections.editor.newTitle"))
+                } else {
+                    SharedString::from(draft.name.clone())
+                }
+            } else {
+                self.t("connections.editor.newTitle")
+            };
+            let target = if file_based {
+                draft.file_path.trim().to_owned()
+            } else if draft.host.trim().is_empty() {
+                String::new()
+            } else {
+                let user = draft.username.trim();
+                let port = draft.port.trim();
+                let mut text = if user.is_empty() { draft.host.trim().to_owned() } else { format!("{user}@{}", draft.host.trim()) };
+                if !port.is_empty() {
+                    text.push(':');
+                    text.push_str(port);
+                }
+                if !draft.database.trim().is_empty() {
+                    text.push('/');
+                    text.push_str(draft.database.trim());
+                }
+                if draft.ssh_on && !draft.ssh_host.trim().is_empty() {
+                    text.push_str(&format!(" · SSH {}", draft.ssh_host.trim()));
+                }
+                if draft.tls_mode != TlsMode::Off {
+                    text.push_str(" · TLS");
+                }
+                text
+            };
+            let subtitle = if target.is_empty() {
+                SharedString::from(kit::engine_label(engine.as_str()))
+            } else {
+                SharedString::from(format!("{} · {target}", kit::engine_label(engine.as_str())))
+            };
+            let close = self.modal_icon_button(
+                conn_modal::CLOSE,
+                IconName::X,
+                self.t("common.close"),
+                conn_modal::ModalAction::Command("conn-cancel"),
                 &p,
                 cx,
-            ));
-        }
+            );
 
-        // 首个字段就是 URL：打开模态后焦点直接落在它上面。
-        let (url_hint, url_masked) = self.field_hint(DraftField::Url);
-        let (url_input, first_field) = self.field_input(DraftField::Url, &url_hint, url_masked, window, cx);
-        let apply_url = self.modal_button(
-            conn_modal::APPLY_URL,
-            Some(IconName::WandSparkles),
-            self.t("ui.conn.parse"),
-            false,
-            conn_modal::ModalAction::Command("conn-apply-url"),
-            &p,
-            cx,
-        );
-        // 表单按“它是谁 / 连到哪 / 用谁的身份”分块：每块左侧是标题与一句说明，右侧是字段。
-        // 宽面板左右排布，窄面板上下排布；所有控件照常渲染，Tab 顺序与之前一致。
-        let quick_fill = stack_frame(|| {
-            // 解析成功就地说一句：状态栏那条提示在模态背后，看不清。连接串再被改动就收起。
-            let url_issue = self.model.connections.issues.iter().find(|issue| issue.field == "url");
-            let applied = self.model.conn_modal.url_applied && url_issue.is_none();
-            let issue_row = url_issue.map(|issue| {
-                let msg = SharedString::from(field_issue_text(issue, &|key| self.model.text(key)));
-                div()
-                    .id("conn-issue-url")
-                    .test_support()
-                    .aria_label(msg.clone())
-                    .text_size(px(TypeScale::XS))
-                    .text_color(p.danger)
-                    .child(msg)
-                    .into_any_element()
-            });
-            kit::sunken(&p)
-                .p(px(10.))
+            div()
+                .flex_none()
                 .flex()
-                .flex_col()
-                .gap(px(6.))
+                .items_center()
+                .gap(px(10.))
+                .px(px(pad))
+                .py(px(12.))
+                .border_b_1()
+                .border_color(p.line)
+                .child(kit::engine_badge(engine.as_str(), 30.))
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().flex_1().min_w(px(180.)).child(url_input))
-                        .child(apply_url),
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .id("conn-form-title")
+                                .truncate()
+                                .tooltip_text(title.clone())
+                                .text_size(px(TypeScale::LG))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id("conn-form-target")
+                                .truncate()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child(subtitle),
+                        ),
                 )
-                .children(issue_row)
-                .when(applied, |this| {
-                    this.child(
+                .child(close)
+                .into_any_element()
+        });
+
+        // 2. 紧凑引擎选择条 + 分栏切换（常规 / SSH 隧道 / SSL·TLS）+ 可选 URL 快速解析开关。
+        let top_controls = stack_frame(|| {
+            let mut engine_row = div().flex().flex_wrap().items_center().gap(px(5.));
+            for candidate in engines() {
+                engine_row = engine_row.child(self.modal_engine_item(candidate, candidate == engine, &p, cx));
+            }
+
+            let mut subbar = div().flex().flex_wrap().items_center().gap(px(8.));
+            if !file_based {
+                let mut tabs = segment_track(&p);
+                for (tab, key, enabled_dot) in [
+                    (conn_modal::ModalTab::General, "ui.conn.tab.general", false),
+                    (conn_modal::ModalTab::Ssh, "ui.conn.tab.ssh", draft.ssh_on),
+                    (conn_modal::ModalTab::Tls, "ui.conn.tab.tls", draft.tls_mode != TlsMode::Off),
+                ] {
+                    tabs = tabs.child(self.modal_tab_item(tab, self.t(key), active_tab == tab, enabled_dot, &p, cx));
+                }
+                subbar = subbar.child(tabs);
+            } else {
+                subbar = subbar.child(
+                    div()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_muted)
+                        .child(self.t("ui.conn.block.fileHint")),
+                );
+            }
+            subbar = subbar.child(div().flex_1()).child(self.modal_url_toggle(url_visible, &p, cx));
+
+            div()
+                .flex_none()
+                .px(px(pad))
+                .py(px(10.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .bg(p.chrome)
+                .border_b_1()
+                .border_color(p.line_soft)
+                .child(engine_row)
+                .child(subbar)
+                .into_any_element()
+        });
+
+        // 3. 可折叠连接串解析栏：仅在需要时展开，平时不抢占首屏空间。
+        let mut primary_focus: Option<Entity<InputState>> = None;
+        let url_drawer = if url_visible {
+            Some(stack_frame(|| {
+                let (url_hint, url_masked) = self.field_hint(DraftField::Url);
+                let (url_input, url_state) = self.field_input(DraftField::Url, &url_hint, url_masked, window, cx);
+                if self.model.conn_modal.url_open {
+                    primary_focus = Some(url_state);
+                }
+                let apply_url = self.modal_button(
+                    conn_modal::APPLY_URL,
+                    Some(IconName::WandSparkles),
+                    self.t("ui.conn.parse"),
+                    false,
+                    conn_modal::ModalAction::Command("conn-apply-url"),
+                    &p,
+                    cx,
+                );
+                let url_issue = self.model.connections.issues.iter().find(|issue| issue.field == "url");
+                let applied = self.model.conn_modal.url_applied && url_issue.is_none();
+                let issue_row = url_issue.map(|issue| {
+                    let msg = SharedString::from(field_issue_text(issue, &|key| self.model.text(key)));
+                    div()
+                        .id("conn-issue-url")
+                        .test_support()
+                        .aria_label(msg.clone())
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.danger)
+                        .child(msg)
+                        .into_any_element()
+                });
+                div()
+                    .flex_none()
+                    .px(px(pad))
+                    .py(px(8.))
+                    .bg(p.sunken)
+                    .border_b_1()
+                    .border_color(p.line_soft)
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(
                         div()
-                            .id("conn-url-applied")
-                            .test_support()
                             .flex()
                             .items_center()
-                            .gap(px(5.))
-                            .text_size(px(TypeScale::XS))
-                            .text_color(p.ok)
-                            .child(kit::icon(IconName::CircleCheck, 12., p.ok))
-                            .child(self.t("ui.conn.urlApplied")),
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w(px(160.)).child(url_input))
+                            .child(apply_url),
                     )
-                })
-                .into_any_element()
-        });
-        let identity = stack_frame(|| {
-            let (name_hint, name_masked) = self.field_hint(DraftField::Name);
-            let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
-            div()
-                .flex()
-                .flex_wrap()
-                .items_start()
-                .gap(px(12.))
-                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
-                .child(kit::form_row(self.t("ui.conn.env"), env_items, &p))
-                .into_any_element()
-        });
-        let (server, auth) = if file_based {
-            let server = stack_frame(|| {
+                    .children(issue_row)
+                    .when(applied, |this| {
+                        this.child(
+                            div()
+                                .id("conn-url-applied")
+                                .test_support()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.ok)
+                                .child(kit::icon(IconName::CircleCheck, 12., p.ok))
+                                .child(self.t("ui.conn.urlApplied")),
+                        )
+                    })
+                    .into_any_element()
+            }))
+        } else {
+            None
+        };
+
+        // 4. 主体内容：按当前引擎与激活分栏平铺渲染，一屏内即可完成填写。
+        let envs = conn_modal::env_ids(&self.model.env_tags);
+        let tab_body = if file_based {
+            stack_frame(|| {
                 let (file_hint, file_masked) = self.field_hint(DraftField::File);
-                let (file, _) = self.field_input(DraftField::File, &file_hint, file_masked, window, cx);
+                let (file, file_state) = self.field_input(DraftField::File, &file_hint, file_masked, window, cx);
+                if primary_focus.is_none() {
+                    primary_focus = Some(file_state);
+                }
                 let browse = self.modal_button(
                     conn_modal::BROWSE_FILE,
                     Some(IconName::FolderOpen),
@@ -2613,528 +2749,530 @@ impl Workbench {
                         .child(msg)
                         .into_any_element()
                 });
+                let (name_hint, name_masked) = self.field_hint(DraftField::Name);
+                let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
+                let mut env_items = segment_track(&p);
+                for env in &envs {
+                    env_items = env_items.child(self.modal_segment_item(
+                        conn_modal::env_control_id(env),
+                        self.env_text(env),
+                        draft.env == *env,
+                        conn_modal::ModalAction::Env(env.clone()),
+                        &p,
+                        cx,
+                    ));
+                }
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
+                    .gap(px(14.))
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().flex_1().min_w(px(180.)).child(file))
-                            .child(browse),
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_end()
+                                    .gap(px(8.))
+                                    .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.file"), file, &p)))
+                                    .child(browse),
+                            )
+                            .children(file_issue),
                     )
-                    .children(file_issue)
-                    .into_any_element()
-            });
-            (server, None)
-        } else {
-            let server = stack_frame(|| {
-                let (host_hint, host_masked) = self.field_hint(DraftField::Host);
-                let (host, _) = self.field_input(DraftField::Host, &host_hint, host_masked, window, cx);
-                let (port_hint, port_masked) = self.field_hint(DraftField::Port);
-                let (port, _) = self.field_input(DraftField::Port, &port_hint, port_masked, window, cx);
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
                     .child(
                         div()
+                            .pt(px(12.))
+                            .border_t_1()
+                            .border_color(p.line_soft)
                             .flex()
                             .flex_wrap()
+                            .items_start()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
-                            .child(div().w(px(110.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p))),
+                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
+                            .child(kit::form_row(self.t("ui.conn.env"), env_items, &p)),
                     )
                     .into_any_element()
-            });
-            let auth = stack_frame(|| {
-                let (user_hint, user_masked) = self.field_hint(DraftField::Username);
-                let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
-                let (password_hint, password_masked) = self.field_hint(DraftField::Password);
-                let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
-                let (db_hint, db_masked) = self.field_hint(DraftField::Database);
-                let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
-                let mut auth = div().flex().flex_col().gap(px(12.)).child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(12.))
-                        .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.user"), "username", user, &p)))
-                        .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.password"), "password", password.mask_toggle(), &p))),
-                );
-                // 服务端拒绝凭据时分不清用户名还是密码：结论单独占一行，落在这一组下方，
-                // 而不是塞进用户名那一格（见 T3 review 的 advisory）。
-                if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == "credentials").cloned() {
-                    auth = auth.child(credentials_row(&issue, &self.model.text("connections.status.error"), &p));
-                }
-                // 密码存不存进钥匙串由用户决定，并说清现在这样的后果：关掉且原来存过，保存时会删掉那份。
-                let save_detail = if draft.save_password {
-                    "ui.conn.savePasswordOn"
-                } else if self.editing_password_saved() {
-                    "ui.conn.savePasswordDrop"
-                } else {
-                    "ui.conn.savePasswordOff"
-                };
-                auth = auth.child(self.modal_switch(
-                    conn_modal::SAVE_PASSWORD,
-                    "conn-save-password-toggle",
-                    draft.save_password,
-                    self.t("ui.conn.savePassword"),
-                    self.t(save_detail),
-                    &p,
-                    cx,
-                ));
-                auth = auth.child(self.field_row(self.t("ui.conn.database"), "database", database, &p));
-                if engine == Engine::Mongodb {
-                    let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
-                    let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
-                    auth = auth.child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p));
-                }
-                auth.into_any_element()
-            });
-            (server, Some(auth))
-        };
+            })
+        } else {
+            match active_tab {
+                conn_modal::ModalTab::General => stack_frame(|| {
+                    let (host_hint, host_masked) = self.field_hint(DraftField::Host);
+                    let (host, host_state) = self.field_input(DraftField::Host, &host_hint, host_masked, window, cx);
+                    if primary_focus.is_none() {
+                        primary_focus = Some(host_state);
+                    }
+                    let (port_hint, port_masked) = self.field_hint(DraftField::Port);
+                    let (port, _) = self.field_input(DraftField::Port, &port_hint, port_masked, window, cx);
 
-        // 安全：TLS 与 SSH 分帧，两段表单的临时值不能留在同一个未优化栈帧里。
-        let tls = if file_based {
-            None
-        } else {
-            Some(stack_frame(|| {
-            let mut security = div().flex().flex_col().gap(px(14.));
-            let mut tls_items = segment_track(&p);
-            for (mode, key) in [(TlsMode::Off, "connections.page.tlsOff"), (TlsMode::Require, "ui.conn.tlsRequire"), (TlsMode::Verify, "ui.conn.tlsVerify")] {
-                tls_items = tls_items.child(self.modal_segment_item(
-                    conn_modal::tls_control_id(mode),
-                    self.t(key),
-                    draft.tls_mode == mode,
-                    conn_modal::ModalAction::Tls(mode),
-                    &p,
-                    cx,
-                ));
-            }
-            security = security.child(kit::form_row(self.t("connections.editor.tls.title"), tls_items, &p));
-            if draft.tls_mode == TlsMode::Verify {
-                let mut ca_items = segment_track(&p);
-                for (mode, key) in [(CaMode::System, "connections.editor.tls.caSystem"), (CaMode::File, "connections.editor.tls.caFile")] {
-                    ca_items = ca_items.child(self.modal_segment_item(
-                        conn_modal::ca_control_id(mode),
-                        self.t(key),
-                        draft.ca_mode == mode,
-                        conn_modal::ModalAction::Ca(mode),
-                        &p,
-                        cx,
-                    ));
-                }
-                security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), ca_items, &p));
-                if draft.ca_mode == CaMode::File {
-                    let (ca_hint, ca_masked) = self.field_hint(DraftField::CaFile);
-                    let (ca, _) = self.field_input(DraftField::CaFile, &ca_hint, ca_masked, window, cx);
-                    security = security.child(self.path_row(
-                        self.t("connections.editor.tls.caFile"),
-                        "ca_file",
-                        conn_modal::BROWSE_CA,
-                        self.t("connections.editor.tls.browseCa"),
-                        conn_modal::ModalAction::Path(DraftField::CaFile),
-                        ca,
-                        &p,
-                        cx,
-                    ));
-                }
-                let (cert_hint, cert_masked) = self.field_hint(DraftField::ClientCert);
-                let (cert, _) = self.field_input(DraftField::ClientCert, &cert_hint, cert_masked, window, cx);
-                let (key_hint, key_masked) = self.field_hint(DraftField::ClientKey);
-                let (key, _) = self.field_input(DraftField::ClientKey, &key_hint, key_masked, window, cx);
-                security = security.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(12.))
-                        .child(div().flex_1().min_w(px(160.)).child(self.path_row(
-                            self.t("connections.editor.tls.clientCert"),
-                            "client_cert",
-                            conn_modal::BROWSE_CERT,
-                            self.t("connections.editor.tls.browseCert"),
-                            conn_modal::ModalAction::Path(DraftField::ClientCert),
-                            cert,
-                            &p,
-                            cx,
-                        )))
-                        .child(div().flex_1().min_w(px(160.)).child(self.path_row(
-                            self.t("connections.editor.tls.clientKey"),
-                            "client_key",
-                            conn_modal::BROWSE_KEY,
-                            self.t("connections.editor.tls.browseKey"),
-                            conn_modal::ModalAction::Path(DraftField::ClientKey),
-                            key,
-                            &p,
-                            cx,
-                        ))),
-                );
-            }
-            security.into_any_element()
-            }))
-        };
-        let ssh = if file_based {
-            None
-        } else {
-            Some(stack_frame(|| {
-            let mut security = div().flex().flex_col().gap(px(14.));
-            let ssh_on = draft.ssh_on;
-            let ssh_handle = self.modal_control(cx, conn_modal::SSH_TOGGLE, conn_modal::ModalAction::Command("conn-ssh-toggle"));
-            security = security.child(
-                kit::interactive_states(div().id(conn_modal::SSH_TOGGLE), &p, false)
-                    .test_support()
-                    .role(gpui_kit::Role::Switch)
-                    .aria_label(self.t("connections.editor.ssh.title"))
-                    .aria_selected(ssh_on)
-                    .track_focus(&ssh_handle)
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(switch_visual(ssh_on, &p))
-                    .tooltip_text(self.t("ui.conn.sshHint"))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(self.t("connections.editor.ssh.title")))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.activate_modal_control(conn_modal::SSH_TOGGLE, cx);
-                    })),
-            );
-            if ssh_on {
-                let (ssh_host_hint, ssh_host_masked) = self.field_hint(DraftField::SshHost);
-                let (ssh_host, _) = self.field_input(DraftField::SshHost, &ssh_host_hint, ssh_host_masked, window, cx);
-                let (ssh_port_hint, ssh_port_masked) = self.field_hint(DraftField::SshPort);
-                let (ssh_port, _) = self.field_input(DraftField::SshPort, &ssh_port_hint, ssh_port_masked, window, cx);
-                let (ssh_user_hint, ssh_user_masked) = self.field_hint(DraftField::SshUser);
-                let (ssh_user, _) = self.field_input(DraftField::SshUser, &ssh_user_hint, ssh_user_masked, window, cx);
-                let mut auth_items = segment_track(&p);
-                for (kind, key) in [
-                    (SshAuthKind::Key, "connections.editor.ssh.authKey"),
-                    (SshAuthKind::Password, "connections.editor.ssh.authPassword"),
-                ] {
-                    auth_items = auth_items.child(self.modal_segment_item(
-                        conn_modal::ssh_auth_control_id(kind),
-                        self.t(key),
-                        draft.ssh_auth == kind,
-                        conn_modal::ModalAction::SshAuth(kind),
-                        &p,
-                        cx,
-                    ));
-                }
-                let mut ssh = div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .when(!narrow, |this| this.pl(px(46.)))
-                    .child(
-                        div()
+                    let save_detail = if draft.save_password {
+                        "ui.conn.savePasswordOn"
+                    } else if self.editing_password_saved() {
+                        "ui.conn.savePasswordDrop"
+                    } else {
+                        "ui.conn.savePasswordOff"
+                    };
+
+                    let mut section = div().flex().flex_col().gap(px(12.));
+                    if engine == Engine::Redis {
+                        let (db_hint, db_masked) = self.field_hint(DraftField::Database);
+                        let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
+                        let (password_hint, password_masked) = self.field_hint(DraftField::Password);
+                        let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
+                        let (user_hint, user_masked) = self.field_hint(DraftField::Username);
+                        let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
+
+                        section = section
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
+                                    .child(div().w(px(96.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p)))
+                                    .child(div().w(px(124.)).child(self.field_row(self.t("ui.conn.redisDbLabel"), "database", database, &p))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.password"), "password", password.mask_toggle(), &p)))
+                                    .child(div().w(px(184.)).child(self.field_row(self.t("ui.conn.redisAclUser"), "username", user, &p))),
+                            );
+                    } else {
+                        let (user_hint, user_masked) = self.field_hint(DraftField::Username);
+                        let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
+                        let (password_hint, password_masked) = self.field_hint(DraftField::Password);
+                        let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
+                        let (db_hint, db_masked) = self.field_hint(DraftField::Database);
+                        let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
+
+                        let mut db_row = div()
                             .flex()
                             .flex_wrap()
-                            .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.sshHost"), "ssh_host", ssh_host, &p)))
-                            .child(div().w(px(90.)).child(self.field_row(self.t("connections.editor.ssh.port"), "ssh_port", ssh_port, &p))),
-                    )
-                    .child(
+                            .gap(px(10.))
+                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.defaultDatabase"), "database", database, &p)));
+                        if engine == Engine::Mongodb {
+                            let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
+                            let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
+                            db_row = db_row.child(div().w(px(164.)).child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p)));
+                        }
+
+                        section = section
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
+                                    .child(div().w(px(108.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.user"), "username", user, &p)))
+                                    .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.password"), "password", password.mask_toggle(), &p))),
+                            )
+                            .child(db_row);
+                    }
+
+                    if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == "credentials").cloned() {
+                        section = section.child(credentials_row(&issue, &self.model.text("connections.status.error"), &p));
+                    }
+                    section = section.child(self.modal_switch(
+                        conn_modal::SAVE_PASSWORD,
+                        "conn-save-password-toggle",
+                        draft.save_password,
+                        self.t("ui.conn.savePassword"),
+                        self.t(save_detail),
+                        &p,
+                        cx,
+                    ));
+
+                    let (name_hint, name_masked) = self.field_hint(DraftField::Name);
+                    let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
+                    let mut env_items = segment_track(&p);
+                    for env in &envs {
+                        env_items = env_items.child(self.modal_segment_item(
+                            conn_modal::env_control_id(env),
+                            self.env_text(env),
+                            draft.env == *env,
+                            conn_modal::ModalAction::Env(env.clone()),
+                            &p,
+                            cx,
+                        ));
+                    }
+                    section = section.child(
                         div()
+                            .pt(px(12.))
+                            .border_t_1()
+                            .border_color(p.line_soft)
                             .flex()
                             .flex_wrap()
-                            .items_end()
-                            .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.sshUser"), "ssh_user", ssh_user, &p)))
-                            .child(kit::form_row(self.t("connections.editor.ssh.authLabel"), auth_items, &p)),
+                            .items_start()
+                            .gap(px(10.))
+                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
+                            .child(kit::form_row(self.t("ui.conn.env"), env_items, &p)),
                     );
-                if draft.ssh_auth == SshAuthKind::Key {
-                    let (ssh_key_hint, ssh_key_masked) = self.field_hint(DraftField::SshKey);
-                    let (ssh_key, _) = self.field_input(DraftField::SshKey, &ssh_key_hint, ssh_key_masked, window, cx);
-                    let (passphrase_hint, passphrase_masked) = self.field_hint(DraftField::Passphrase);
-                    let (passphrase, _) = self.field_input(DraftField::Passphrase, &passphrase_hint, passphrase_masked, window, cx);
-                    ssh = ssh.child(
-                        div()
+                    section.into_any_element()
+                }),
+                conn_modal::ModalTab::Ssh => stack_frame(|| {
+                    let mut security = div().flex().flex_col().gap(px(12.));
+                    let ssh_on = draft.ssh_on;
+                    let ssh_handle = self.modal_control(cx, conn_modal::SSH_TOGGLE, conn_modal::ModalAction::Command("conn-ssh-toggle"));
+                    security = security.child(
+                        kit::interactive_states(div().id(conn_modal::SSH_TOGGLE), &p, false)
+                            .test_support()
+                            .role(gpui_kit::Role::Switch)
+                            .aria_label(self.t("connections.editor.ssh.title"))
+                            .aria_selected(ssh_on)
+                            .track_focus(&ssh_handle)
+                            .p(px(10.))
+                            .rounded(px(Radius::PANEL))
+                            .border_1()
+                            .border_color(if ssh_on { p.accent.opacity(0.45) } else { p.line_soft })
+                            .bg(if ssh_on { p.accent_soft } else { p.sunken })
                             .flex()
-                            .flex_wrap()
-                            .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(self.path_row(
-                                self.t("connections.editor.ssh.keyFile"),
-                                "ssh_key",
-                                conn_modal::BROWSE_SSH,
-                                self.t("connections.editor.ssh.browseKey"),
-                                conn_modal::ModalAction::Path(DraftField::SshKey),
-                                ssh_key,
+                            .items_center()
+                            .gap(px(10.))
+                            .child(switch_visual(ssh_on, &p))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(self.t("connections.editor.ssh.title")))
+                                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.t("ui.conn.sshHint"))),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.activate_modal_control(conn_modal::SSH_TOGGLE, cx);
+                            })),
+                    );
+                    if ssh_on {
+                        let (ssh_host_hint, ssh_host_masked) = self.field_hint(DraftField::SshHost);
+                        let (ssh_host, ssh_host_state) = self.field_input(DraftField::SshHost, &ssh_host_hint, ssh_host_masked, window, cx);
+                        if primary_focus.is_none() {
+                            primary_focus = Some(ssh_host_state);
+                        }
+                        let (ssh_port_hint, ssh_port_masked) = self.field_hint(DraftField::SshPort);
+                        let (ssh_port, _) = self.field_input(DraftField::SshPort, &ssh_port_hint, ssh_port_masked, window, cx);
+                        let (ssh_user_hint, ssh_user_masked) = self.field_hint(DraftField::SshUser);
+                        let (ssh_user, _) = self.field_input(DraftField::SshUser, &ssh_user_hint, ssh_user_masked, window, cx);
+                        let mut auth_items = segment_track(&p);
+                        for (kind, key) in [
+                            (SshAuthKind::Key, "connections.editor.ssh.authKey"),
+                            (SshAuthKind::Password, "connections.editor.ssh.authPassword"),
+                        ] {
+                            auth_items = auth_items.child(self.modal_segment_item(
+                                conn_modal::ssh_auth_control_id(kind),
+                                self.t(key),
+                                draft.ssh_auth == kind,
+                                conn_modal::ModalAction::SshAuth(kind),
                                 &p,
                                 cx,
-                            )))
-                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.passphrase"), "passphrase", passphrase.mask_toggle(), &p))),
-                    );
-                } else {
-                    let (ssh_password_hint, ssh_password_masked) = self.field_hint(DraftField::SshPassword);
-                    let (ssh_password, _) = self.field_input(DraftField::SshPassword, &ssh_password_hint, ssh_password_masked, window, cx);
-                    ssh = ssh.child(self.field_row(self.t("ui.conn.sshPassword"), "ssh_password", ssh_password.mask_toggle(), &p));
-                }
-                security = security.child(ssh);
+                            ));
+                        }
+                        let mut ssh = div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.sshHost"), "ssh_host", ssh_host, &p)))
+                                    .child(div().w(px(96.)).child(self.field_row(self.t("connections.editor.ssh.port"), "ssh_port", ssh_port, &p))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_end()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.sshUser"), "ssh_user", ssh_user, &p)))
+                                    .child(kit::form_row(self.t("connections.editor.ssh.authLabel"), auth_items, &p)),
+                            );
+                        if draft.ssh_auth == SshAuthKind::Key {
+                            let (ssh_key_hint, ssh_key_masked) = self.field_hint(DraftField::SshKey);
+                            let (ssh_key, _) = self.field_input(DraftField::SshKey, &ssh_key_hint, ssh_key_masked, window, cx);
+                            let (passphrase_hint, passphrase_masked) = self.field_hint(DraftField::Passphrase);
+                            let (passphrase, _) = self.field_input(DraftField::Passphrase, &passphrase_hint, passphrase_masked, window, cx);
+                            ssh = ssh.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(10.))
+                                    .child(div().flex_1().min_w(px(180.)).child(self.path_row(
+                                        self.t("connections.editor.ssh.keyFile"),
+                                        "ssh_key",
+                                        conn_modal::BROWSE_SSH,
+                                        self.t("connections.editor.ssh.browseKey"),
+                                        conn_modal::ModalAction::Path(DraftField::SshKey),
+                                        ssh_key,
+                                        &p,
+                                        cx,
+                                    )))
+                                    .child(div().w(px(190.)).child(self.field_row(self.t("ui.conn.passphrase"), "passphrase", passphrase.mask_toggle(), &p))),
+                            );
+                        } else {
+                            let (ssh_password_hint, ssh_password_masked) = self.field_hint(DraftField::SshPassword);
+                            let (ssh_password, _) = self.field_input(DraftField::SshPassword, &ssh_password_hint, ssh_password_masked, window, cx);
+                            ssh = ssh.child(self.field_row(self.t("ui.conn.sshPassword"), "ssh_password", ssh_password.mask_toggle(), &p));
+                        }
+                        security = security.child(ssh);
+                    }
+                    security.into_any_element()
+                }),
+                conn_modal::ModalTab::Tls => stack_frame(|| {
+                    let mut security = div().flex().flex_col().gap(px(12.));
+                    let mut tls_items = segment_track(&p);
+                    for (mode, key) in [
+                        (TlsMode::Off, "connections.page.tlsOff"),
+                        (TlsMode::Require, "ui.conn.tlsRequire"),
+                        (TlsMode::Verify, "ui.conn.tlsVerify"),
+                    ] {
+                        tls_items = tls_items.child(self.modal_segment_item(
+                            conn_modal::tls_control_id(mode),
+                            self.t(key),
+                            draft.tls_mode == mode,
+                            conn_modal::ModalAction::Tls(mode),
+                            &p,
+                            cx,
+                        ));
+                    }
+                    security = security.child(kit::form_row(self.t("connections.editor.tls.title"), tls_items, &p));
+                    if draft.tls_mode == TlsMode::Verify {
+                        let mut ca_items = segment_track(&p);
+                        for (mode, key) in [
+                            (CaMode::System, "connections.editor.tls.caSystem"),
+                            (CaMode::File, "connections.editor.tls.caFile"),
+                        ] {
+                            ca_items = ca_items.child(self.modal_segment_item(
+                                conn_modal::ca_control_id(mode),
+                                self.t(key),
+                                draft.ca_mode == mode,
+                                conn_modal::ModalAction::Ca(mode),
+                                &p,
+                                cx,
+                            ));
+                        }
+                        security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), ca_items, &p));
+                        if draft.ca_mode == CaMode::File {
+                            let (ca_hint, ca_masked) = self.field_hint(DraftField::CaFile);
+                            let (ca, ca_state) = self.field_input(DraftField::CaFile, &ca_hint, ca_masked, window, cx);
+                            if primary_focus.is_none() {
+                                primary_focus = Some(ca_state);
+                            }
+                            security = security.child(self.path_row(
+                                self.t("connections.editor.tls.caFile"),
+                                "ca_file",
+                                conn_modal::BROWSE_CA,
+                                self.t("connections.editor.tls.browseCa"),
+                                conn_modal::ModalAction::Path(DraftField::CaFile),
+                                ca,
+                                &p,
+                                cx,
+                            ));
+                        }
+                        let (cert_hint, cert_masked) = self.field_hint(DraftField::ClientCert);
+                        let (cert, _) = self.field_input(DraftField::ClientCert, &cert_hint, cert_masked, window, cx);
+                        let (key_hint, key_masked) = self.field_hint(DraftField::ClientKey);
+                        let (key, _) = self.field_input(DraftField::ClientKey, &key_hint, key_masked, window, cx);
+                        security = security.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(10.))
+                                .child(div().flex_1().min_w(px(160.)).child(self.path_row(
+                                    self.t("connections.editor.tls.clientCert"),
+                                    "client_cert",
+                                    conn_modal::BROWSE_CERT,
+                                    self.t("connections.editor.tls.browseCert"),
+                                    conn_modal::ModalAction::Path(DraftField::ClientCert),
+                                    cert,
+                                    &p,
+                                    cx,
+                                )))
+                                .child(div().flex_1().min_w(px(160.)).child(self.path_row(
+                                    self.t("connections.editor.tls.clientKey"),
+                                    "client_key",
+                                    conn_modal::BROWSE_KEY,
+                                    self.t("connections.editor.tls.browseKey"),
+                                    conn_modal::ModalAction::Path(DraftField::ClientKey),
+                                    key,
+                                    &p,
+                                    cx,
+                                ))),
+                        );
+                    }
+                    security.into_any_element()
+                }),
             }
-            security.into_any_element()
-            }))
         };
-        let mut security = div().flex().flex_col().gap(px(14.));
-        if let Some(tls) = tls {
-            security = security.child(tls);
-        }
-        if let Some(ssh) = ssh {
-            security = security.child(ssh);
-        }
 
-        // 页头、说明、页脚和面板分帧：调试构建不复用栈槽，叠在一起会让单次栈探测过大。
-        // 结论条：固定在页脚上方，不随主体滚动。以前测试/保存的结果画在主体末尾，表单一长就在视口外，
-        // 点了“测试连接”却看不到结果。
+        // 5. 结论条与放弃修改确认条（固定在页脚正上方）。
         let status = stack_frame(|| self.modal_status_strip(pad, &p, cx));
 
-        let header = stack_frame(|| {
-        let title = if existing {
-            let trimmed = draft.name.trim();
-            if trimmed.is_empty() {
-                default_connection_name(&draft)
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| self.t("connections.editor.newTitle"))
-            } else {
-                SharedString::from(draft.name.clone())
-            }
-        } else {
-            self.t("connections.editor.newTitle")
-        };
-        // 副标题实时显示这条连接会连到哪里：改字段时一眼确认地址、端口和用户。
-        let target = if file_based {
-            draft.file_path.trim().to_owned()
-        } else if draft.host.trim().is_empty() {
-            String::new()
-        } else {
-            let user = draft.username.trim();
-            let port = draft.port.trim();
-            let mut text = if user.is_empty() { draft.host.trim().to_owned() } else { format!("{user}@{}", draft.host.trim()) };
-            if !port.is_empty() {
-                text.push(':');
-                text.push_str(port);
-            }
-            if !draft.database.trim().is_empty() {
-                text.push('/');
-                text.push_str(draft.database.trim());
-            }
-            if draft.ssh_on && !draft.ssh_host.trim().is_empty() {
-                text.push_str(&format!(" · SSH {}", draft.ssh_host.trim()));
-            }
-            text
-        };
-        let subtitle = if target.is_empty() {
-            SharedString::from(kit::engine_label(engine.as_str()))
-        } else {
-            SharedString::from(format!("{} · {target}", kit::engine_label(engine.as_str())))
-        };
-        let close = self.modal_icon_button(
-            conn_modal::CLOSE,
-            IconName::X,
-            self.t("common.close"),
-            conn_modal::ModalAction::Command("conn-cancel"),
-            &p,
-            cx,
-        );
-
-        let header = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .px(px(pad))
-            .py(px(12.))
-            .border_b_1()
-            .border_color(p.line)
-            .child(kit::engine_badge(engine.as_str(), 28.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(div().id("conn-form-title").truncate().tooltip_text(title.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(div().id("conn-form-target").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(subtitle)),
-            )
-            .child(close);
-        header.into_any_element()
-        });
-
+        // 6. 固定页脚：顺序与 stops_for 一致（测试 → 取消 → 保存 → 保存并连接）。
         let footer = stack_frame(|| {
-        // 固定页脚：保存、保存并连接、测试和取消始终在同一位置，不必先滚到底。
-        // 测试是“试一下”，放左边；取消 / 保存 / 保存并连接是离开表单的三条路，放右边，主操作在最右。
-        let running = self.model.connections.test_running();
-        let saving = self.model.conn_modal.saving;
-        let connect_after = self.model.conn_modal.save_and_connect;
-        let cancel = self.modal_button(
-            "conn-cancel",
-            None,
-            self.t("common.cancel"),
-            false,
-            conn_modal::ModalAction::Command("conn-cancel"),
-            &p,
-            cx,
-        );
-        // 测试在跑时按钮自己转圈并写明“正在测试”：再点一次仍会重新测（改了字段后不必等旧的那次）。
-        let test = self.modal_button_with(
-            "conn-test",
-            Some(IconName::Zap),
-            if running { self.t("connections.editor.test.running") } else { self.t("connections.editor.test.button") },
-            ModalTone::Plain,
-            if saving { ModalBusy::Blocked } else { ModalBusy::Idle },
-            None,
-            conn_modal::ModalAction::Command("conn-test"),
-            &p,
-            cx,
-        );
-        let save = self.modal_button_with(
-            "conn-save",
-            None,
-            if saving && !connect_after { self.t("ui.conn.saving") } else { self.t("common.save") },
-            ModalTone::Plain,
-            match (saving, connect_after) {
-                (false, _) => ModalBusy::Idle,
-                (true, false) => ModalBusy::Working,
-                (true, true) => ModalBusy::Blocked,
-            },
-            None,
-            conn_modal::ModalAction::Command("conn-save"),
-            &p,
-            cx,
-        );
-        let chord = if cfg!(target_os = "macos") { "⌘↵" } else { "Ctrl+Enter" };
-        let save_connect = self.modal_button_with(
-            "conn-save-connect",
-            None,
-            if saving && connect_after { self.t("ui.conn.saving") } else { self.t("connections.editor.saveConnect") },
-            ModalTone::Primary,
-            match (saving, connect_after) {
-                (false, _) => ModalBusy::Idle,
-                (true, true) => ModalBusy::Working,
-                (true, false) => ModalBusy::Blocked,
-            },
-            Some(SharedString::from(i18n::fill(&self.model.text("ui.conn.saveConnectTip"), &[("chord", chord)]))),
-            conn_modal::ModalAction::Command("conn-save-connect"),
-            &p,
-            cx,
-        );
-        let footer = div()
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(8.))
-            .px(px(pad))
-            .py(px(10.))
-            .border_t_1()
-            .border_color(p.line)
-            .bg(p.surface)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(test)
-                    .when(running, |this| this.child(div().id("conn-test-running").test_support().aria_label(self.t("connections.editor.test.running")).child(Spinner::new().xsmall().color(p.accent)))),
-            )
-            .child(div().flex_1())
-            .child(cancel)
-            .child(save)
-            .child(save_connect);
-        footer.into_any_element()
+            let running = self.model.connections.test_running();
+            let saving = self.model.conn_modal.saving;
+            let connect_after = self.model.conn_modal.save_and_connect;
+            let test = self.modal_button_with(
+                "conn-test",
+                Some(IconName::Zap),
+                if running { self.t("connections.editor.test.running") } else { self.t("connections.editor.test.button") },
+                ModalTone::Plain,
+                if saving { ModalBusy::Blocked } else { ModalBusy::Idle },
+                None,
+                conn_modal::ModalAction::Command("conn-test"),
+                &p,
+                cx,
+            );
+            let cancel = self.modal_button(
+                "conn-cancel",
+                None,
+                self.t("common.cancel"),
+                false,
+                conn_modal::ModalAction::Command("conn-cancel"),
+                &p,
+                cx,
+            );
+            let save = self.modal_button_with(
+                "conn-save",
+                None,
+                if saving && !connect_after { self.t("ui.conn.saving") } else { self.t("common.save") },
+                ModalTone::Plain,
+                match (saving, connect_after) {
+                    (false, _) => ModalBusy::Idle,
+                    (true, false) => ModalBusy::Working,
+                    (true, true) => ModalBusy::Blocked,
+                },
+                None,
+                conn_modal::ModalAction::Command("conn-save"),
+                &p,
+                cx,
+            );
+            let chord = if cfg!(target_os = "macos") { "⌘↵" } else { "Ctrl+Enter" };
+            let save_connect = self.modal_button_with(
+                "conn-save-connect",
+                None,
+                if saving && connect_after { self.t("ui.conn.saving") } else { self.t("connections.editor.saveConnect") },
+                ModalTone::Primary,
+                match (saving, connect_after) {
+                    (false, _) => ModalBusy::Idle,
+                    (true, true) => ModalBusy::Working,
+                    (true, false) => ModalBusy::Blocked,
+                },
+                Some(SharedString::from(i18n::fill(&self.model.text("ui.conn.saveConnectTip"), &[("chord", chord)]))),
+                conn_modal::ModalAction::Command("conn-save-connect"),
+                &p,
+                cx,
+            );
+            div()
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .px(px(pad))
+                .py(px(10.))
+                .border_t_1()
+                .border_color(p.line)
+                .bg(p.surface)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(test)
+                        .when(running, |this| {
+                            this.child(
+                                div()
+                                    .id("conn-test-running")
+                                    .test_support()
+                                    .aria_label(self.t("connections.editor.test.running"))
+                                    .child(Spinner::new().xsmall().color(p.accent)),
+                            )
+                        }),
+                )
+                .child(div().flex_1())
+                .child(cancel)
+                .child(save)
+                .child(save_connect)
+                .into_any_element()
         });
 
         let shell = stack_frame(|| {
-        let body = div()
-            .id("conn-modal-scroll")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .px(px(pad))
-                    .py(px(12.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.))
-                    .child(form_block(self.t("ui.conn.pickEngine"), None, engine_row, wide, false, &p))
-                    .child(form_block(self.t("ui.conn.block.quick"), Some(self.t("ui.conn.block.quickHint")), quick_fill, wide, false, &p))
-                    .child(form_block(self.t("ui.conn.block.identity"), Some(self.t("ui.conn.block.identityHint")), identity, wide, false, &p))
-                    .child(form_block(
-                        if file_based { self.t("ui.conn.file") } else { self.t("ui.conn.block.server") },
-                        Some(if file_based { self.t("ui.conn.block.fileHint") } else { self.t("ui.conn.block.serverHint") }),
-                        server,
-                        wide,
-                        file_based,
-                        &p,
-                    ))
-                    .children(auth.map(|auth| form_block(self.t("ui.conn.block.auth"), Some(self.t("ui.conn.block.authHint")), auth, wide, false, &p)))
-                    .when(!file_based, |this| this.child(form_block(self.t("ui.conn.security"), Some(self.t("ui.conn.block.securityHint")), security, wide, true, &p))),
-            );
+            let body = div()
+                .id("conn-modal-scroll")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(div().px(px(pad)).py(px(14.)).child(tab_body));
 
+            let trap = self.modal_focus.clone();
+            let content = div()
+                .id("conn-form")
+                .test_support()
+                .flex()
+                .flex_col()
+                .size_full()
+                .overflow_hidden()
+                .child(header)
+                .child(top_controls)
+                .children(url_drawer)
+                .child(body)
+                .children(status)
+                .child(footer);
+            let panel = div()
+                .id("conn-modal-panel")
+                .role(gpui_kit::Role::Group)
+                .aria_label(self.t("connections.editor.newTitle"))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .focus_trap("conn-modal", &trap)
+                .w(px(panel_w))
+                .max_h(px(panel_h))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(p.surface)
+                .border_1()
+                .border_color(p.line)
+                .rounded(px(Radius::PANEL))
+                .shadow_lg()
+                .child(content);
 
-        let trap = self.modal_focus.clone();
-        let content = div()
-            // 保留 conn-form 这个 test-support 锚点：它就是“屏幕上那个连接表单”。
-            .id("conn-form")
-            .test_support()
-            .flex()
-            .flex_col()
-            .size_full()
-            .overflow_hidden()
-            .child(header)
-            .child(body)
-            .children(status)
-            .child(footer);
-        let panel = div()
-            .id("conn-modal-panel")
-            .role(gpui_kit::Role::Group)
-            .aria_label(self.t("connections.editor.newTitle"))
-            .occlude()
-            // 面板内部的点击不能穿透到遮罩层，否则 backdrop 会把焦点抢回底页。
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            // 模态的焦点陷阱交给 GPUI：Root 的 Tab/Shift+Tab 在这个容器内成环，
-            // 走的是真实焦点，不会像自绘序列那样被 Root 的绑定抢先吃掉。
-            .focus_trap("conn-modal", &trap)
-            .w(px(panel_w))
-            .max_h(px(panel_h))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(p.surface)
-            .border_1()
-            .border_color(p.line)
-            .rounded(px(Radius::PANEL))
-            .shadow_lg()
-            .child(content);
-
-        backdrop("conn-modal-backdrop", 0.32, cx)
-            .flex()
-            .items_start()
-            .justify_center()
-            .px(px(20.))
-            .pt(px(panel_top))
-            .pb(px(20.))
-            .child(panel)
-            .into_any_element()
+            backdrop("conn-modal-backdrop", 0.32, cx)
+                .flex()
+                .items_start()
+                .justify_center()
+                .px(px(20.))
+                .pt(px(panel_top))
+                .pb(px(20.))
+                .child(panel)
+                .into_any_element()
         });
 
         if focus_first {
-            // 打开就把键盘交给首个字段：不用先点一下才能输入。因为某个字段出错而打开
-            // （比如测试连接缺密码）时，键盘直接落在那个字段上，而不是顶上的连接串。
             match self.model.connections.issues.iter().find_map(|issue| issue_field(&issue.field)) {
                 Some(field) if self.fields.contains(field) => self.fields.focus(field, window, cx),
-                // 编辑或复制已有连接：字段都填好了，用不着连接串，键盘落在名称上（复制后第一件事就是改名）。
                 _ if !draft.name.trim().is_empty() && self.fields.contains(DraftField::Name) => self.fields.focus(DraftField::Name, window, cx),
                 _ => {
-                    let handle = first_field.read(cx).focus_handle(cx);
-                    window.focus(&handle, cx);
+                    if let Some(first_field) = primary_focus {
+                        let handle = first_field.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                    }
                 }
             }
         }
         if std::mem::take(&mut self.model.conn_modal.focus_discard_pending) {
-            // 确认条出现：键盘落在“继续编辑”上，回车不会误删填好的表单；Tab 一下到“放弃修改”。
             if let Some(handle) = self.modal_controls.get(conn_modal::DISCARD_KEEP).cloned() {
                 window.focus(&handle, cx);
             }
@@ -3162,6 +3300,16 @@ impl Workbench {
                 // 换类型不清空表单：主机、用户、TLS、SSH 等能沿用的都留着。
                 self.model.connections.change_engine(engine);
                 self.model.conn_touched();
+            }
+            conn_modal::ModalAction::Tab(tab) => {
+                self.model.conn_modal.tab = tab;
+                self.model.conn_modal.discard_armed = false;
+            }
+            conn_modal::ModalAction::ToggleUrl => {
+                self.model.conn_modal.url_open = !self.model.conn_modal.url_open;
+                if self.model.conn_modal.url_open {
+                    self.model.conn_modal.focus_first_pending = true;
+                }
             }
             conn_modal::ModalAction::Env(env) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
@@ -3216,7 +3364,7 @@ impl Workbench {
         self.activate_modal_control(&id, cx)
     }
 
-    /// 引擎徽标：一整块可点，也是 Tab 停靠点。
+    /// 引擎徽标：紧凑单行排布，7 种引擎在一行内完整可见，每个都是 Tab 停靠点。
     fn modal_engine_item(&mut self, engine: Engine, selected: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let id = conn_modal::engine_control_id(engine);
         let handle = self.modal_control(cx, &id, conn_modal::ModalAction::Engine(engine));
@@ -3228,11 +3376,11 @@ impl Workbench {
             .aria_label(label)
             .aria_selected(selected)
             .track_focus(&handle)
-            .h(px(self.metrics().control_h))
-            .px(px(8.))
+            .h(px(self.metrics().control_h - 2.))
+            .px(px(7.))
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(5.))
             .rounded(px(Radius::CONTROL))
             .border_1()
             .when(selected, |this| {
@@ -3246,11 +3394,90 @@ impl Workbench {
                     .bg(if p.dark { p.raised } else { p.surface })
                     .hover(|style| style.bg(p.hover).border_color(p.line_strong))
             })
-            .child(kit::engine_badge(name, 16.))
-            .child(div().text_size(px(TypeScale::SM)).child(kit::engine_label(name)))
+            .child(kit::engine_badge(name, 15.))
+            .child(div().text_size(px(TypeScale::XS)).child(kit::engine_label(name)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let id = conn_modal::engine_control_id(engine);
                 this.activate_modal_control(&id, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// 连接模态的配置分栏项（常规 / SSH 隧道 / SSL·TLS），已开启的隧道或加密带状态圆点。
+    fn modal_tab_item(
+        &mut self,
+        tab: conn_modal::ModalTab,
+        label: SharedString,
+        selected: bool,
+        enabled_dot: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = tab.control_id();
+        let handle = self.modal_control(cx, id, conn_modal::ModalAction::Tab(tab));
+        let height = self.metrics().control_h - 4.;
+        kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Tab)
+            .aria_label(label.clone())
+            .aria_selected(selected)
+            .track_focus(&handle)
+            .h(px(height))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(Radius::CONTROL))
+            .text_size(px(TypeScale::SM))
+            .when(selected, |this| {
+                this.bg(if p.dark { p.raised } else { p.surface })
+                    .text_color(p.text)
+                    .font_weight(FontWeight::MEDIUM)
+                    .shadow_sm()
+            })
+            .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
+            .child(label)
+            .when(enabled_dot, |this| this.child(kit::status_dot(p.ok)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.activate_modal_control(id, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// 展开/收起连接串快速填充栏的紧凑按钮。
+    fn modal_url_toggle(&mut self, active: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let id = conn_modal::URL_TOGGLE;
+        let handle = self.modal_control(cx, id, conn_modal::ModalAction::ToggleUrl);
+        let label = self.t("ui.conn.importUrl");
+        kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .aria_expanded(active)
+            .track_focus(&handle)
+            .h(px(self.metrics().control_h - 4.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(Radius::CONTROL))
+            .border_1()
+            .text_size(px(TypeScale::XS))
+            .when(active, |this| {
+                this.border_color(p.accent)
+                    .bg(p.accent_soft)
+                    .text_color(p.accent_text)
+                    .font_weight(FontWeight::MEDIUM)
+            })
+            .when(!active, |this| {
+                this.border_color(p.line_soft)
+                    .text_color(p.text_muted)
+                    .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line))
+            })
+            .child(kit::icon(IconName::WandSparkles, 12., if active { p.accent_text } else { p.text_muted }))
+            .child(label)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.activate_modal_control(conn_modal::URL_TOGGLE, cx);
             }))
             .into_any_element()
     }
@@ -3627,13 +3854,14 @@ impl Workbench {
             DraftField::File => "connections.validate.chooseFile",
             DraftField::Database if redis => "ui.conn.redisDb",
             DraftField::Database => "ui.conn.optional",
+            DraftField::Username if redis => "ui.conn.redisAclHint",
             DraftField::CaFile => "",
             DraftField::ClientCert | DraftField::ClientKey => "",
             DraftField::Passphrase => "ui.conn.optional",
             _ => "",
         };
         let placeholder = match field {
-            DraftField::Host => "localhost".to_owned(),
+            DraftField::Host => "127.0.0.1".to_owned(),
             // 端口清空后仍看得到这种数据库的默认端口。
             DraftField::Port => engine.map(|engine| crate::app::views::connections::default_port(engine).to_owned()).unwrap_or_default(),
             DraftField::Replica => "rs0".to_owned(),
@@ -4783,7 +5011,7 @@ impl Workbench {
                     s.preview_kb >= PREVIEW_RANGE.1,
                     cx,
                 );
-                let object_page = stepper(
+                let object_page_step = stepper(
                     self,
                     "object-page",
                     s.object_page.to_string(),
@@ -4791,6 +5019,24 @@ impl Workbench {
                     s.object_page >= OBJECT_PAGE_RANGE.1,
                     cx,
                 );
+                let mut object_page = div().flex().items_center().gap(px(6.));
+                for preset in [200_i64, 500, 1000, 2000] {
+                    let cmd = format!("object-page-{preset}");
+                    let selected = s.object_page == preset;
+                    object_page = object_page.child(
+                        kit::filter_chip(
+                            SharedString::from(format!("settings-object-page-{preset}")),
+                            SharedString::from(preset.to_string()),
+                            None,
+                            None,
+                            None,
+                            selected,
+                            &p,
+                            act(cmd, cx),
+                        ),
+                    );
+                }
+                object_page = object_page.child(object_page_step);
                 div()
                 .flex()
                 .flex_col()
@@ -6514,26 +6760,6 @@ fn field_issue_text(issue: &crate::app::views::connections::FieldIssue, text: &d
     }
 }
 
-/// 连接表单的一块：宽面板时左侧标题 + 说明、右侧字段；窄面板时上下排布。块与块之间用细线分开。
-fn form_block(title: SharedString, hint: Option<SharedString>, body: impl IntoElement, wide: bool, last: bool, p: &Palette) -> AnyElement {
-    let heading = div()
-        .flex()
-        .flex_col()
-        .gap(px(3.))
-        .when(wide, |this| this.w(px(160.)).flex_none().pt(px(2.)))
-        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(title))
-        .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(hint)));
-    div()
-        .flex()
-        .when(wide, |this| this.flex_row().gap(px(24.)))
-        .when(!wide, |this| this.flex_col().gap(px(10.)))
-        .when(!last, |this| this.pb(px(18.)).border_b_1().border_color(p.line_soft))
-        .when(last, |this| this.pb(px(4.)))
-        .child(heading)
-        .child(div().flex_1().min_w(px(0.)).child(body))
-        .into_any_element()
-}
-
 /// 测试连接的结论：一句话说结果，失败时写出卡在哪一步、服务端原话和处理建议，
 /// 下面一行列出走过的每个阶段——经跳板机、TLS 的连接一眼看出是哪一段不通。
 pub(super) fn test_verdict(report: &crate::connections::stages::TestReport, headline: &str, locale: i18n::Locale, p: &Palette) -> AnyElement {
@@ -6772,6 +6998,7 @@ fn palette_icon(id: &str) -> IconName {
         "open-admin" => IconName::Gauge,
         "open-exchange" => IconName::ArrowDownUp,
         "new-connection" => IconName::Plus,
+        "open-sql-file" => IconName::FileText,
         "open-sqlite" => IconName::FolderOpen,
         "history" => IconName::Clock,
         "save-query" => IconName::Save,

@@ -183,9 +183,11 @@ pub fn insert_text_at(draft: &str, at: usize, text: &str) -> (String, usize) {
     (out, end)
 }
 
-/// Redis 的键浏览规格：连接|名称|库号。
+/// Redis 的键浏览规格：连接|名称|库号（统一去掉 db 前缀，避免 8 与 db8 打开两个重复标签）。
 pub fn redis_spec(connection_id: &str, connection_name: &str, keyspace: &str) -> String {
-    format!("{connection_id}|{connection_name}|{keyspace}")
+    let db = keyspace.trim().trim_start_matches("db");
+    let db = if db.is_empty() { "0" } else { db };
+    format!("{connection_id}|{connection_name}|{db}")
 }
 
 /// MongoDB 的文档浏览规格：连接|名称|库|集合。
@@ -204,6 +206,10 @@ pub enum NavRequest {
     Database(String),
     /// 继续读取一个库/模式范围的对象。
     More(String),
+    /// 一次读取一个库/模式/种类范围剩余的全部对象。
+    All(String),
+    /// 按关键字向已打开连接检索匹配对象（突破首屏分页与未展开库限制）。
+    Search(String),
     /// 只重读一个对象种类分组（局部失败后的重试，或“刷新此节点”）。
     Group(String),
     /// 从第一页重新读一个库/模式范围（“刷新此节点”）；展开状态保留。

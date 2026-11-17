@@ -6,7 +6,7 @@ mod conn_modal;
 mod conn_page;
 mod danger;
 pub(crate) mod explorer;
-mod jobs;
+pub(crate) mod jobs;
 pub(crate) mod layout;
 mod menus;
 mod model;

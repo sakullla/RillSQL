@@ -374,6 +374,9 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_detail = model.connections.message_detail.clone();
                 // 失败落在某个字段上（如缺密码）：键盘移到那个字段，直接改了再测。
                 if current && model.conn_modal.open && !model.connections.issues.is_empty() {
+                    if let Some(issue) = model.connections.issues.first() {
+                        model.conn_modal.sync_tab_for_issue(&issue.field);
+                    }
                     model.conn_modal.focus_first_pending = true;
                 }
             }

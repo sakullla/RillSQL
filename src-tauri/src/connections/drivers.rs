@@ -73,14 +73,15 @@ pub struct MysqlOpen {
     pub connection_id: u64,
 }
 
-/// 元数据池的连接上限。目录读取本身已按连接限流到 2 个，这里再给结构页、表浏览和补全留余量。
-pub const MYSQL_META_CONNECTIONS: usize = 4;
+/// 元数据池的连接上限。目录读取本身已按连接限流到 2 个，保留 2 条短生命周期空闲连接即可，
+/// 避免占满受限账号的 max_user_connections 或 SSH 跳板机的 MaxSessions。
+pub const MYSQL_META_CONNECTIONS: usize = 2;
 
-fn mysql_pool_opts(max: usize) -> mysql_async::PoolOpts {
+fn mysql_pool_opts(max: usize, idle_ttl: Duration) -> mysql_async::PoolOpts {
     mysql_async::PoolOpts::new()
         .with_constraints(mysql_async::PoolConstraints::new(0, max.max(1)).expect("mysql pool"))
         .with_reset_connection(false)
-        .with_inactive_connection_ttl(Duration::from_secs(28_800))
+        .with_inactive_connection_ttl(idle_ttl)
 }
 
 pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str) -> Result<MysqlOpen, StageError> {
@@ -102,17 +103,25 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
         builder = builder.db_name(Some(database.clone()));
     }
     // 查询执行独占池里这一条连接。空闲时留着它，归还时不发 COM_RESET_CONNECTION。
-    builder = builder.pool_opts(mysql_pool_opts(1));
+    builder = builder.pool_opts(mysql_pool_opts(1, Duration::from_secs(28_800)));
     if plan.ssl_opts_present {
         builder = builder.ssl_opts(Some(mysql_ssl(&plan, config.tls.as_ref())?));
     }
-    let meta_opts = mysql_async::Opts::from(builder.clone().pool_opts(mysql_pool_opts(MYSQL_META_CONNECTIONS)));
+    let meta_opts = mysql_async::Opts::from(
+        builder
+            .clone()
+            .pool_opts(mysql_pool_opts(MYSQL_META_CONNECTIONS, Duration::from_secs(45))),
+    );
     let opts = mysql_async::Opts::from(builder);
     let pool = Pool::new(opts.clone());
     let meta_pool = Pool::new(meta_opts);
     // 建连验证直接使用目录池；连接成功后库列表复用这条已认证连接。
     // 执行池仍独占会话，在第一次执行时创建，避免首屏串行做两次握手。
-    let mut conn = meta_pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, crate::error_text::chain(&err)))?;
+    let mut conn = match tokio::time::timeout(Duration::from_secs(15), meta_pool.get_conn()).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(err)) => return Err(db_stage(route.tls_mode, crate::error_text::chain(&err))),
+        Err(_) => return Err(db_stage(route.tls_mode, "连接 MySQL 服务器超时（15 秒未完成握手）".to_owned())),
+    };
     let version: Option<(String,)> = conn
         .query_first("SELECT VERSION()")
         .await
