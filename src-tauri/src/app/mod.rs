@@ -186,7 +186,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!(shift "enter"), ExecuteCurrent, None),
         gpui_kit::KeyBinding::new(chord!(alt "enter"), ExecuteScript, None),
         gpui_kit::KeyBinding::new(chord!("."), RequestCancel, None),
-        gpui_kit::KeyBinding::new("ctrl-space", ShowAutocomplete, None),
+        gpui_kit::KeyBinding::new(if cfg!(target_os = "macos") { "alt-space" } else { "ctrl-space" }, ShowAutocomplete, None),
         gpui_kit::KeyBinding::new(chord!("/"), ToggleComment, None),
         gpui_kit::KeyBinding::new(chord!("j"), ToggleResults, None),
         gpui_kit::KeyBinding::new(chord!(shift "f"), FormatSql, None),

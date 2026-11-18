@@ -1856,6 +1856,26 @@ fn table_cell(cell: ColumnSpec, child: impl IntoElement) -> gpui_kit::Div {
         .child(child)
 }
 
+/// 长列表下拉（表、列、模式、类型）：限高可滚动，标出当前值；输入框里已经填了一部分时只列匹配项，
+/// 几百张表时不再铺满整个窗口。没有匹配时退回完整列表，免得用户以为没得选。
+fn choice_menu(menu: PopupMenu, choices: &[String], current: &str, pick: impl Fn(String, &mut App) + Clone + 'static) -> PopupMenu {
+    let needle = current.trim().to_lowercase();
+    let exact = choices.iter().any(|choice| choice == current.trim());
+    let filtered: Vec<&String> = if needle.is_empty() || exact {
+        choices.iter().collect()
+    } else {
+        let hits: Vec<&String> = choices.iter().filter(|choice| choice.to_lowercase().contains(&needle)).collect();
+        if hits.is_empty() { choices.iter().collect() } else { hits }
+    };
+    let mut menu = menu.min_w(px(220.)).max_w(px(420.)).max_h(px(360.)).scrollable(true);
+    for choice in filtered {
+        let value = choice.clone();
+        let pick = pick.clone();
+        menu = menu.item(PopupMenuItem::new(choice.clone()).checked(choice == current.trim()).on_click(move |_, _, cx| pick(value.clone(), cx)));
+    }
+    menu
+}
+
 fn row_menu(entity: &Entity<StructurePane>, entries: &[MenuEntry], mut menu: PopupMenu) -> PopupMenu {
     for entry in entries {
         menu = menu.item(menu_entry(entity, entry));
@@ -2065,25 +2085,22 @@ impl StructurePane {
         let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
         let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "NULL", window, cx);
         let types = type_choices(engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+        let current_type = if types.iter().any(|item| item.eq_ignore_ascii_case(column.type_name.trim())) { column.type_name.trim().to_uppercase() } else { String::new() };
         let type_entity = entity.clone();
         let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
             .ghost()
             .xsmall()
             .icon(IconName::ChevronDown)
             .tooltip(t("structure.field.pickType"))
-            .dropdown_menu(move |mut menu, _, _| {
-                for choice in types.clone() {
-                    let entity = type_entity.clone();
-                    let choice = choice.clone();
-                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                        let choice = choice.clone();
-                        entity.update(cx, |pane, cx| {
-                            pane.write_draft(20_000 + index as u32, choice);
-                            cx.notify();
-                        });
-                    }));
-                }
-                menu
+            .dropdown_menu(move |menu, _, _| {
+                let entity = type_entity.clone();
+                // 类型下拉列全部常用类型并勾出当前值，不按输入筛选：这里换类型，不是搜类型。
+                choice_menu(menu, &types, &current_type, move |choice, cx| {
+                    entity.update(cx, |pane, cx| {
+                        pane.write_draft(20_000 + index as u32, choice);
+                        cx.notify();
+                    });
+                })
             });
         let toggle = |id: String, on: bool, which: &'static str, label: SharedString, enabled: bool| {
             let owner = entity.clone();
@@ -2289,18 +2306,14 @@ impl StructurePane {
                         .icon(IconName::Plus)
                         .label(t("structure.index.addColumn"))
                         .disabled(remaining.is_empty())
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for name in remaining.clone() {
-                                let entity = add_entity.clone();
-                                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
-                                    let name = name.clone();
-                                    entity.update(cx, |pane, cx| {
-                                        pane.toggle_index_column(&name);
-                                        cx.notify();
-                                    });
-                                }));
-                            }
-                            menu
+                        .dropdown_menu(move |menu, _, _| {
+                            let entity = add_entity.clone();
+                            choice_menu(menu, &remaining, "", move |name, cx| {
+                                entity.update(cx, |pane, cx| {
+                                    pane.toggle_index_column(&name);
+                                    cx.notify();
+                                });
+                            })
                         }),
                 );
                 form.child(kit::form_row(t("structure.section.columns"), chips, &p))
@@ -2315,6 +2328,9 @@ impl StructurePane {
                 let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
                 let tables = self.fk_tables.clone();
                 let columns = self.fk_columns.clone();
+                let current_fk_column = self.session.fk_column.clone();
+                let current_fk_ref_table = self.session.fk_ref_table.clone();
+                let current_fk_ref_column = self.session.fk_ref_column.clone();
                 let local: Vec<String> = self
                     .snapshot
                     .as_ref()
@@ -2330,19 +2346,14 @@ impl StructurePane {
                         .icon(IconName::ChevronDown)
                         .tooltip(t("structure.field.column"))
                         .accessibility_label(t("structure.field.column"))
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for choice in local.clone() {
-                                let column_entity = column_entity.clone();
-                                let choice = choice.clone();
-                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                    let choice = choice.clone();
-                                    column_entity.update(cx, |pane, cx| {
-                                        pane.choose_fk("fk_column", choice);
-                                        cx.notify();
-                                    });
-                                }));
-                            }
-                            menu
+                        .dropdown_menu(move |menu, _, _| {
+                            let column_entity = column_entity.clone();
+                            choice_menu(menu, &local, &current_fk_column, move |choice, cx| {
+                                column_entity.update(cx, |pane, cx| {
+                                    pane.choose_fk("fk_column", choice);
+                                    cx.notify();
+                                });
+                            })
                         })
                         .into_any_element()
                 });
@@ -2353,19 +2364,14 @@ impl StructurePane {
                         .icon(IconName::ChevronDown)
                         .tooltip(t("ui.structure.refTable"))
                         .accessibility_label(t("ui.structure.refTable"))
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for choice in tables.clone() {
-                                let table_entity = table_entity.clone();
-                                let choice = choice.clone();
-                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                    let choice = choice.clone();
-                                    table_entity.update(cx, |pane, cx| {
-                                        pane.choose_fk("fk_ref_table", choice);
-                                        cx.notify();
-                                    });
-                                }));
-                            }
-                            menu
+                        .dropdown_menu(move |menu, _, _| {
+                            let table_entity = table_entity.clone();
+                            choice_menu(menu, &tables, &current_fk_ref_table, move |choice, cx| {
+                                table_entity.update(cx, |pane, cx| {
+                                    pane.choose_fk("fk_ref_table", choice);
+                                    cx.notify();
+                                });
+                            })
                         })
                         .into_any_element()
                 });
@@ -2376,19 +2382,14 @@ impl StructurePane {
                         .icon(IconName::ChevronDown)
                         .tooltip(t("ui.structure.refColumn"))
                         .accessibility_label(t("ui.structure.refColumn"))
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for choice in columns.clone() {
-                                let ref_entity = ref_entity.clone();
-                                let choice = choice.clone();
-                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                    let choice = choice.clone();
-                                    ref_entity.update(cx, |pane, cx| {
-                                        pane.choose_fk("fk_ref_column", choice);
-                                        cx.notify();
-                                    });
-                                }));
-                            }
-                            menu
+                        .dropdown_menu(move |menu, _, _| {
+                            let ref_entity = ref_entity.clone();
+                            choice_menu(menu, &columns, &current_fk_ref_column, move |choice, cx| {
+                                ref_entity.update(cx, |pane, cx| {
+                                    pane.choose_fk("fk_ref_column", choice);
+                                    cx.notify();
+                                });
+                            })
                         })
                         .into_any_element()
                 });
@@ -2413,6 +2414,7 @@ impl StructurePane {
                 if shows_ref_schema(&self.session.target.engine) {
                     let schema = self.field("fk_ref_schema", "structure.fk.refSchema", "public", window, cx);
                     let schemas = self.fk_schemas.clone();
+                    let current_fk_ref_schema = self.session.fk_ref_schema.clone();
                     let schema_entity = entity.clone();
                     form = form.child(
                         div()
@@ -2427,19 +2429,14 @@ impl StructurePane {
                                     .icon(IconName::ChevronDown)
                                     .tooltip(t("structure.fk.refSchema"))
                                     .accessibility_label(t("structure.fk.refSchema"))
-                                    .dropdown_menu(move |mut menu, _, _| {
-                                        for choice in schemas.clone() {
-                                            let schema_entity = schema_entity.clone();
-                                            let choice = choice.clone();
-                                            menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
-                                                let choice = choice.clone();
-                                                schema_entity.update(cx, |pane, cx| {
-                                                    pane.choose_fk("fk_ref_schema", choice);
-                                                    cx.notify();
-                                                });
-                                            }));
-                                        }
-                                        menu
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let schema_entity = schema_entity.clone();
+                                        choice_menu(menu, &schemas, &current_fk_ref_schema, move |choice, cx| {
+                                            schema_entity.update(cx, |pane, cx| {
+                                                pane.choose_fk("fk_ref_schema", choice);
+                                                cx.notify();
+                                            });
+                                        })
                                     }),
                             ),
                     );

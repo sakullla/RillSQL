@@ -1131,14 +1131,17 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
 }
 
 pub fn shortcut(key: &str) -> String {
-    // 菜单表里的组合键用平台无关的 Mod+ 记法；显示时换成本平台的修饰键。
-    let key = key.replace("Mod+", "Ctrl+");
+    // 菜单表里的组合键用平台无关的 Mod+ 记法（历史上也写作 Ctrl+）：macOS 显示 ⌘，其它平台显示 Ctrl。
+    // 真正按 Control 键的组合写作 Control+（例如 Control+Tab），macOS 上显示 ⌃，不能误显示成 ⌘。
     if cfg!(target_os = "macos") {
-        key.replace("Ctrl+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥")
+        key.replace("Control+", "⌃").replace("Mod+", "⌘").replace("Ctrl+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥")
     } else {
-        key.to_owned()
+        key.replace("Control+", "Ctrl+").replace("Mod+", "Ctrl+")
     }
 }
+
+/// 触发补全的组合键：macOS 上 ⌃Space 切输入法、⌘Space 是聚焦搜索，都被系统占用，改用 ⌥Space。
+pub const AUTOCOMPLETE_CHORD: &str = if cfg!(target_os = "macos") { "Alt+Space" } else { "Control+Space" };
 
 pub fn vline(p: &Palette) -> AnyElement {
     div().flex_none().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.line).into_any_element()

@@ -2212,6 +2212,8 @@ impl SharedGrid {
             Some(FullState::Ready(_)) => (CellPhase::Full, String::new()),
             Some(FullState::Loading) => (CellPhase::Loading, String::new()),
             Some(FullState::Failed(message)) => (CellPhase::Error, message.clone()),
+            // 结果集里本来就是完整值（没被截断、不是二进制信封）：直接就是原值，不再标成“预览”。
+            None if !self.needs_full(row, column) => (CellPhase::Full, String::new()),
             None => (CellPhase::Preview, String::new()),
         };
         self.viewer = Some(ViewerState { row_id, column_name: name, phase, message });

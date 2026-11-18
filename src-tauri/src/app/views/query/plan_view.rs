@@ -3,7 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{div, px, relative, AnyElement, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _};
+use gpui_kit::{div, px, relative, AnyElement, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _};
 
 use crate::i18n::{self, Locale};
 use crate::query::plan::{OpKind, Plan};
@@ -94,25 +94,47 @@ impl PlanView<'_> {
     }
 
     /// 计划主体：问题与建议、计划树、详情面板。
+    ///
+    /// 同一条建议只完整说一遍（顶部建议条）；树行与详情只用标签点出“这里有问题”，点建议直接跳到对应节点。
     pub fn body(&self, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let lines = self.plan.lines();
         let selected = self.selected.min(lines.len().saturating_sub(1));
         let max_cost = self.plan.max_cost().filter(|cost| *cost > 0.);
+        // 只有一个节点时代价占比永远是 100%，那根条没有信息量，不画。
+        let show_share = max_cost.is_some() && lines.len() > 1;
 
-        // 问题与建议：每条一句“哪里 + 是什么 + 可以怎么做”。
         let findings = self.plan.findings();
         let advice = (!findings.is_empty()).then(|| {
-            let mut list = div().id("query-plan-findings").flex_none().flex().flex_col().gap(px(4.)).px(px(12.)).py(px(8.)).bg(p.warn_soft).border_b_1().border_color(p.line);
-            for (issue, object) in findings {
-                let place = object.unwrap_or_default();
+            let mut list = div()
+                .id("query-plan-findings")
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(px(8.))
+                .py(px(6.))
+                .bg(p.warn_soft)
+                .border_b_1()
+                .border_color(p.line);
+            for (at, (issue, object)) in findings.iter().enumerate() {
+                let place = object.clone().unwrap_or_default();
+                let target = lines
+                    .iter()
+                    .position(|line| line.node.issues.contains(issue) && line.node.object == *object)
+                    .unwrap_or(0);
                 list = list.child(
-                    div()
+                    kit::interactive_states(div().id(SharedString::from(format!("query-plan-finding-{at}"))), p, false)
+                        .test_support()
+                        .px(px(6.))
+                        .py(px(4.))
+                        .rounded(px(Radius::CONTROL))
                         .flex()
                         .items_start()
                         .gap(px(8.))
                         .text_size(px(TypeScale::SM))
+                        .hover(|style| style.bg(p.warn.opacity(0.08)))
                         .child(div().pt(px(2.)).child(kit::icon(IconName::Lightbulb, 13., p.warn)))
                         .child(
                             div()
@@ -120,18 +142,18 @@ impl PlanView<'_> {
                                 .min_w(px(0.))
                                 .flex()
                                 .flex_wrap()
-                                .gap(px(6.))
+                                .gap_x(px(6.))
                                 .child(div().font_weight(FontWeight::SEMIBOLD).text_color(p.warn).child(t(issue.label_key())))
                                 .when(!place.is_empty(), |this| this.child(div().font_family(self.mono.clone()).text_color(p.text).child(SharedString::from(place.clone()))))
                                 .child(div().text_color(p.text_muted).child(SharedString::from(i18n::fill(&i18n::text(locale, issue.hint_key()), &[("object", &place)])))),
-                        ),
+                        )
+                        .on_click(click(entity, format!("plan-select:{target}"))),
                 );
             }
             list
         });
 
-        // 计划树：每个节点一行；缩进表示父子，代价条按最大节点代价归一。
-        let mut tree = div().id("query-plan-tree").flex_1().min_w(px(0.)).h_full().overflow_y_scroll().flex().flex_col().py(px(4.));
+        let mut tree = div().id("query-plan-tree").flex_1().min_w(px(0.)).h_full().overflow_y_scroll().flex().flex_col();
         tree = tree.child(
             div()
                 .flex_none()
@@ -139,11 +161,16 @@ impl PlanView<'_> {
                 .px(px(12.))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(10.))
+                .border_b_1()
+                .border_color(p.line_soft)
+                .bg(p.chrome)
                 .text_size(px(TypeScale::XS))
-                .text_color(p.text_faint)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text_muted)
                 .child(div().flex_1().child(t("query.plan.colOperation")))
-                .when(max_cost.is_some(), |this| this.child(div().w(px(150.)).flex_none().child(t("query.plan.cost"))))
+                .when(show_share, |this| this.child(div().w(px(150.)).flex_none().child(t("query.plan.colShare"))))
+                .when(max_cost.is_some(), |this| this.child(div().w(px(72.)).flex_none().flex().justify_end().child(t("query.plan.cost"))))
                 .child(div().w(px(80.)).flex_none().flex().justify_end().child(t("query.plan.colRows"))),
         );
         for (index, line) in lines.iter().enumerate() {
@@ -162,40 +189,60 @@ impl PlanView<'_> {
                 _ => 0.,
             };
             let is_selected = index == selected;
+            let indent = 12. + line.depth as f32 * 18.;
             let mut row = kit::row_states(div().id(SharedString::from(format!("query-plan-node-{index}"))), p)
                 .flex_none()
                 .min_h(px(self.metrics.row_h + 4.))
-                .pl(px(12. + line.depth as f32 * 18.))
+                .py(px(4.))
+                .pl(px(indent))
                 .pr(px(12.))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(10.))
+                .border_b_1()
+                .border_color(p.line_soft)
                 .when(is_selected, |this| this.bg(p.selection))
                 .when(!is_selected, |this| this.hover(|style| style.bg(p.hover)))
                 .on_click(click(entity, format!("plan-select:{index}")));
-            // 缩进引导线：画一条竖线把子节点和父节点连起来。
             if line.depth > 0 {
-                row = row.relative().child(div().absolute().top_0().bottom_0().left(px(12. + (line.depth as f32 - 1.) * 18. + 6.)).w(px(1.)).bg(p.line));
+                row = row.relative().child(div().absolute().top_0().bottom_0().left(px(indent - 12.)).w(px(1.)).bg(p.line));
             }
-            let mut label = div()
-                .flex_1()
-                .min_w(px(0.))
+            let mut head = div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
+                .min_w(px(0.))
                 .child(kit::icon(icon, 14., tone))
                 .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(node.op.clone())));
             if let Some(object) = &node.object {
-                label = label.child(div().flex_none().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object.clone())));
+                head = head.child(div().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object.clone())));
             }
             for issue in &node.issues {
-                label = label.child(kit::pill(SharedString::from(i18n::text(locale, issue.label_key())), p.warn, p.warn_soft));
+                head = head.child(kit::pill(SharedString::from(i18n::text(locale, issue.label_key())), p.warn, p.warn_soft));
             }
-            if !node.detail.is_empty() {
-                label = label.child(div().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(node.detail.clone())));
-            }
+            // 条件、用到的索引等补充说明放第二行，不再和操作名挤在一行里被截掉。
+            let label = div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(head)
+                .when(!node.detail.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .pl(px(20.))
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family(self.mono.clone())
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from(node.detail.clone())),
+                    )
+                });
             row = row.child(label);
-            if max_cost.is_some() {
+            if show_share {
+                let percent = (share * 100.).round() as i64;
                 row = row.child(
                     div()
                         .w(px(150.))
@@ -212,14 +259,17 @@ impl PlanView<'_> {
                                 .overflow_hidden()
                                 .child(div().h_full().w(relative(share.max(0.02))).rounded(px(Radius::TAG)).bg(if share > 0.6 { p.warn } else { p.accent })),
                         )
-                        .child(div().w(px(56.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(node.cost.map(cost_text).unwrap_or_default()))),
+                        .child(div().w(px(34.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(format!("{percent}%")))),
                 );
             }
-            row = row.child(div().w(px(80.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(node.rows.map(rows_text).unwrap_or_default())));
+            if max_cost.is_some() {
+                row = row.child(div().w(px(72.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(node.cost.map(cost_text).unwrap_or_else(|| "—".into()))));
+            }
+            row = row.child(div().w(px(80.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(node.rows.map(rows_text).unwrap_or_else(|| "—".into()))));
             tree = tree.child(row);
         }
 
-        // 详情：选中节点的全部原始属性（窄窗口里放到树下面）。
+        // 详情：先给关键数字，再列引擎原始属性；问题只用标签点出，完整建议在顶部建议条里。
         let node = lines.get(selected).map(|line| line.node);
         let mut detail = div()
             .id("query-plan-detail")
@@ -228,35 +278,84 @@ impl PlanView<'_> {
             .p(px(12.))
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(10.))
             .bg(p.chrome)
-            .when(self.narrow, |this| this.w_full().max_h(px(200.)).border_t_1())
+            .when(self.narrow, |this| this.w_full().max_h(px(220.)).border_t_1())
             .when(!self.narrow, |this| this.w(px(300.)).h_full().border_l_1())
             .border_color(p.line);
         if let Some(node) = node {
+            let metric = |label: SharedString, value: String| {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .bg(p.surface)
+                    .border_1()
+                    .border_color(p.line_soft)
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(label))
+                    .child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).font_features(kit::tabular_figures()).text_color(p.text).child(SharedString::from(value)))
+            };
+            let total = self.plan.total_cost().filter(|total| *total > 0.);
+            let share = match (node.cost, total) {
+                (Some(cost), Some(total)) if lines.len() > 1 => Some(format!("{}%", ((cost / total) * 100.).round().clamp(0., 100.) as i64)),
+                _ => None,
+            };
             detail = detail
-                .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(node.op.clone())))
-                .when_some(node.object.clone(), |this, object| this.child(div().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object))));
-            for issue in &node.issues {
-                detail = detail.child(
-                    div()
-                        .p(px(8.))
-                        .rounded(px(Radius::CONTROL))
-                        .bg(p.warn_soft)
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.warn)
-                        .child(SharedString::from(i18n::fill(&i18n::text(locale, issue.hint_key()), &[("object", node.object.as_deref().unwrap_or(""))]))),
-                );
-            }
-            for (key, value) in &node.props {
-                detail = detail.child(
+                .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(1.))
-                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(key.clone())))
-                        .child(div().font_family(self.mono.clone()).text_size(px(TypeScale::XS)).text_color(p.text).child(SharedString::from(value.clone()))),
+                        .gap(px(4.))
+                        .child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(node.op.clone())))
+                        .when_some(node.object.clone(), |this, object| this.child(div().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object))))
+                        .when(!node.issues.is_empty(), |this| {
+                            let mut pills = div().flex().flex_wrap().gap(px(4.));
+                            for issue in &node.issues {
+                                pills = pills.child(kit::pill(SharedString::from(i18n::text(locale, issue.label_key())), p.warn, p.warn_soft));
+                            }
+                            this.child(pills)
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .when_some(node.cost, |this, cost| this.child(metric(t("query.plan.cost"), cost_text(cost))))
+                        .when_some(share, |this, share| this.child(metric(t("query.plan.colShare"), share)))
+                        .when_some(node.rows, |this, rows| this.child(metric(t("query.plan.colRows"), rows_text(rows)))),
+                )
+                .when(!node.detail.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .p(px(8.))
+                            .rounded(px(Radius::CONTROL))
+                            .bg(p.sunken)
+                            .font_family(self.mono.clone())
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text)
+                            .child(SharedString::from(node.detail.clone())),
+                    )
+                });
+            if !node.props.is_empty() {
+                let mut props = div().flex().flex_col().gap(px(6.)).pt(px(8.)).border_t_1().border_color(p.line_soft).child(
+                    div().text_size(px(TypeScale::XS)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(t("query.plan.rawProps")),
                 );
+                for (key, value) in &node.props {
+                    props = props.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(key.clone())))
+                            .child(div().font_family(self.mono.clone()).text_size(px(TypeScale::XS)).text_color(p.text).child(SharedString::from(value.clone()))),
+                    );
+                }
+                detail = detail.child(props);
             }
         }
         let main = div()

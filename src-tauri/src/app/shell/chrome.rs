@@ -1473,12 +1473,21 @@ impl Workbench {
             .child(kit::icon(icon, 13., icon_tint))
             .child(body)
             .when(quick_table, |this| {
+                // 悬停快捷按钮浮在行尾，不常驻占宽：表名能用满整行，只有悬停时才盖住末尾几个字。
                 this.child(
                     div()
-                        .flex_none()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(4.))
+                        .pl(px(6.))
                         .flex()
                         .items_center()
                         .gap(px(1.))
+                        .invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                        .bg(if row.focused { p.active } else { p.hover })
+                        .rounded(px(Radius::CONTROL))
                         .child(explorer_hover_icon(
                             SharedString::from(format!("nav-quick-data-{id}")),
                             group.clone(),
@@ -1517,7 +1526,23 @@ impl Workbench {
             .when(leaf_column && column_marks.contains("not null") && !row.primary, |this| {
                 this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from("*")))
             })
-            .when(is_group && !row.unloaded && row.error.is_none(), |this| {
+            .when(row.search_hits > 0 && !(is_group && row.expanded), |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("nav-hits-{id}")))
+                        .test_support()
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded(px(Radius::TAG))
+                        .bg(p.accent_soft)
+                        .text_size(px(TypeScale::XS))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.accent_text)
+                        .tooltip_text(SharedString::from(i18n::fill(&self.model.text("ui.nav.searchHits"), &[("n", &row.search_hits.to_string())])))
+                        .child(SharedString::from(row.search_hits.to_string())),
+                )
+            })
+            .when(is_group && !row.unloaded && row.error.is_none() && row.search_hits == 0, |this| {
                 this.child(
                     div()
                         .flex_none()
@@ -2167,14 +2192,10 @@ impl Workbench {
             ));
 
         let retry_banner = self.model.connect_retry.clone().map(|retry| {
-            let name = self
-                .model
-                .connections
-                .rows
-                .iter()
-                .find(|row| row.saved.id == retry.connection_id)
-                .map(|row| row.saved.name.clone())
-                .unwrap_or_else(|| retry.connection_id.clone());
+            let saved = self.model.connections.rows.iter().find(|row| row.saved.id == retry.connection_id).map(|row| row.saved.name.clone());
+            // 连接已经删掉时不再显示一串 id，也不给没有意义的“重试”，只留关闭。
+            let exists = saved.is_some();
+            let name = saved.unwrap_or_else(|| self.model.text("connections.retry.missing"));
             let reason = self.model.connections.failures.get(&retry.connection_id).cloned().unwrap_or_default();
             let head = reason.lines().next().unwrap_or_default().to_owned();
             let label = if head.is_empty() {
@@ -2186,7 +2207,17 @@ impl Workbench {
                 kit::BannerTone::Danger,
                 IconName::CircleAlert,
                 SharedString::from(label),
-                Some(kit::secondary_button("welcome-retry-connect", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx)).xsmall().into_any_element()),
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .when(exists, |this| {
+                            this.child(kit::secondary_button("welcome-retry-connect", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx)).xsmall())
+                        })
+                        .child(kit::icon_button("welcome-retry-dismiss", IconName::X, self.t("common.close"), act("conn-retry-dismiss", cx)).xsmall())
+                        .into_any_element(),
+                ),
                 &p,
             )
             .id("welcome-connect-retry")
@@ -6531,9 +6562,9 @@ fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) 
         .items_center()
         .overflow_hidden()
         .text_size(px(TypeScale::SM))
-        .child(head)
-        .child(div().bg(p.selection).rounded(px(Radius::CONTROL)).font_weight(FontWeight::MEDIUM).child(hit))
-        .child(tail)
+        .child(div().flex_none().child(head))
+        .child(div().flex_none().bg(p.selection).rounded(px(Radius::TAG)).text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).child(hit))
+        .child(div().flex_1().min_w(px(0.)).truncate().child(tail))
         .into_any_element()
 }
 

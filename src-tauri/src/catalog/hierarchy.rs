@@ -306,6 +306,8 @@ pub struct NavRow {
     pub detail: String,
     /// 列是否属于主键。
     pub primary: bool,
+    /// 搜索时这个容器下面命中的对象数（含自身）。不在搜索里为 0。
+    pub search_hits: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -317,7 +319,14 @@ pub struct NavTree {
     query: String,
     saved_expansion: Option<BTreeSet<String>>,
     saved_focus: Option<String>,
+    /// 搜索期间用户手动展开 / 折叠过的容器。搜索词一变就清空，清除搜索后不影响原来的展开现场。
+    search_opened: BTreeSet<String>,
+    search_closed: BTreeSet<String>,
 }
+
+/// 搜索时容器默认展开的命中上限：命中少就直接摊开，命中多的库先收起并标出命中数，
+/// 避免一个常见词把几百张表一股脑铺满侧栏。
+pub const SEARCH_AUTO_OPEN: usize = 15;
 
 /// 键盘移动后要执行的动作。树自己处理展开状态，其余交给外壳。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +364,8 @@ impl NavTree {
             query: String::new(),
             saved_expansion: None,
             saved_focus: None,
+            search_opened: BTreeSet::new(),
+            search_closed: BTreeSet::new(),
         }
     }
 
@@ -378,8 +389,64 @@ impl NavTree {
         &self.query
     }
 
+    /// 是否展开。搜索期间，搜索框架里的容器按搜索自己的展开状态回答。
     pub fn is_expanded(&self, id: &str) -> bool {
+        if self.in_search_frame(id) {
+            return self.search_open(id);
+        }
         self.expanded.contains(id)
+    }
+
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    fn needle(&self) -> String {
+        self.query.trim().to_lowercase()
+    }
+
+    /// 搜索期间，这个节点是否由筛选逻辑绘制（自己和祖先都没有按名字命中）。
+    /// 命中的对象 / 库下面的子树按普通展开状态绘制，不算在搜索框架里。
+    fn in_search_frame(&self, id: &str) -> bool {
+        if !self.searching() {
+            return false;
+        }
+        let needle = self.needle();
+        let mut current = Some(id.to_owned());
+        while let Some(at) = current {
+            let Some(node) = self.nodes.get(&at) else { return false };
+            if Self::name_hits(node, &needle) {
+                return false;
+            }
+            current = node.parent.clone();
+        }
+        true
+    }
+
+    /// 搜索框架里容器的展开状态：用户的选择优先；默认连接展开，命中不多的容器展开。
+    fn search_open(&self, id: &str) -> bool {
+        if self.search_closed.contains(id) {
+            return false;
+        }
+        if self.search_opened.contains(id) {
+            return true;
+        }
+        let Some(node) = self.nodes.get(id) else { return false };
+        // 只在库这一层按命中数决定收不收：库展开后，模式与“表 / 视图”分组跟着展开，不用再点一层。
+        match node.kind {
+            NavKind::Database => self.subtree_hit_count(id, &self.needle()) <= SEARCH_AUTO_OPEN,
+            _ => true,
+        }
+    }
+
+    fn set_search_open(&mut self, id: &str, open: bool) {
+        if open {
+            self.search_closed.remove(id);
+            self.search_opened.insert(id.to_owned());
+        } else {
+            self.search_opened.remove(id);
+            self.search_closed.insert(id.to_owned());
+        }
     }
 
     pub fn focus_node(&self) -> Option<&NavNode> {
@@ -744,6 +811,11 @@ impl NavTree {
         if !node.expandable {
             return false;
         }
+        if self.in_search_frame(id) {
+            let open = self.search_open(id);
+            self.set_search_open(id, !open);
+            return true;
+        }
         if self.expanded.remove(id) {
             return true;
         }
@@ -770,6 +842,11 @@ impl NavTree {
     }
 
     pub fn collapse(&mut self, id: &str) -> bool {
+        if self.in_search_frame(id) {
+            let was = self.search_open(id);
+            self.set_search_open(id, false);
+            return was;
+        }
         self.expanded.remove(id)
     }
 
@@ -778,6 +855,15 @@ impl NavTree {
     }
 
     pub fn collapse_all(&mut self) -> bool {
+        if self.searching() {
+            // 搜索中「全部折叠」只收起搜索结果的层级，清除搜索后原来的展开现场照旧恢复。
+            let frame: Vec<String> = self.nodes.keys().filter(|id| self.in_search_frame(id)).cloned().collect();
+            self.search_opened.clear();
+            for id in frame {
+                self.search_closed.insert(id);
+            }
+            return true;
+        }
         if self.expanded.is_empty() {
             return false;
         }
@@ -1324,6 +1410,11 @@ impl NavTree {
 
     /// 记录展开意图：节点还没读进树时也保留，下一次 apply 有这条连接就会展开。
     pub fn expand_reserved(&mut self, id: &str) -> bool {
+        if self.in_search_frame(id) {
+            let was = self.search_open(id);
+            self.set_search_open(id, true);
+            return !was;
+        }
         self.expanded.insert(id.to_owned())
     }
 
@@ -1359,7 +1450,7 @@ impl NavTree {
     pub fn visible_under(&self, root_id: &str) -> Vec<NavRow> {
         let mut rows = Vec::new();
         let needle = self.query.trim().to_lowercase();
-        let expanded = self.expanded.contains(root_id) || !needle.is_empty();
+        let expanded = if needle.is_empty() { self.expanded.contains(root_id) } else { self.search_open(root_id) };
         if expanded {
             if let Some(root) = self.nodes.get(root_id) {
                 for child in &root.children {
@@ -1398,15 +1489,19 @@ impl NavTree {
             && node.name.to_lowercase().contains(needle)
     }
 
-    fn subtree_hits(&self, id: &str, needle: &str) -> bool {
-        let Some(node) = self.nodes.get(id) else { return false };
-        Self::name_hits(node, needle) || node.children.iter().any(|child| self.subtree_hits(child, needle))
+    /// 子树里按名字命中的节点数（命中的节点自己算一个，不再往下数）。
+    fn subtree_hit_count(&self, id: &str, needle: &str) -> usize {
+        let Some(node) = self.nodes.get(id) else { return 0 };
+        if Self::name_hits(node, needle) {
+            return 1;
+        }
+        node.children.iter().map(|child| self.subtree_hit_count(child, needle)).sum()
     }
 
     fn walk_filtered(&self, id: &str, depth: usize, needle: &str, rows: &mut Vec<NavRow>) {
         let Some(node) = self.nodes.get(id) else { return };
-        if Self::name_hits(node, needle) && node.kind == NavKind::Object {
-            // 命中的对象本身照常显示：用户展开它就能看到列和索引。
+        if Self::name_hits(node, needle) {
+            // 命中的对象、库、模式本身照常显示，按普通展开状态浏览：展开对象看列，展开库看全部内容。
             let at = rows.len();
             self.walk(id, depth, rows);
             if let Some(row) = rows.get_mut(at) {
@@ -1414,14 +1509,17 @@ impl NavTree {
             }
             return;
         }
-        if !self.subtree_hits(id, needle) {
+        let hits = self.subtree_hit_count(id, needle);
+        if hits == 0 {
             return;
         }
-        let mut row = self.row_of(node, depth, true);
-        if Self::name_hits(node, needle) {
-            row.highlight = match_span(&row.label, needle);
-        }
+        let open = self.search_open(id);
+        let mut row = self.row_of(node, depth, open);
+        row.search_hits = hits;
         rows.push(row);
+        if !open {
+            return;
+        }
         for child in &node.children {
             self.walk_filtered(child, depth + 1, needle, rows);
         }
@@ -1456,6 +1554,7 @@ impl NavTree {
             loaded: node.loaded,
             detail: if matches!(node.kind, NavKind::Column | NavKind::Index) { node.cursor.clone().unwrap_or_default() } else { String::new() },
             primary: node.primary,
+            search_hits: 0,
         }
     }
 
@@ -1516,6 +1615,11 @@ impl NavTree {
         let Some(node) = self.nodes.get(id).cloned() else { return NavAction::None };
         match node.kind {
             NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group => {
+                if self.in_search_frame(&node.id) {
+                    // 搜索结果只包含已读到的节点：展开即可，不发按需读取。
+                    self.set_search_open(&node.id, true);
+                    return NavAction::None;
+                }
                 if self.expanded.insert(node.id.clone()) {
                     NavAction::Load(node.id.clone())
                 } else {
@@ -1560,6 +1664,11 @@ impl NavTree {
             kind,
             NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup
         );
+        if containers && expandable && self.in_search_frame(id) {
+            let open = self.search_open(id);
+            self.set_search_open(id, !open);
+            return NavAction::None;
+        }
         if containers && expandable {
             if self.expanded.remove(id) {
                 return NavAction::None;
@@ -1576,7 +1685,12 @@ impl NavTree {
     /// 左方向键：已展开就折叠，否则回到父节点。
     pub fn retreat(&mut self, id: &str) -> NavAction {
         let Some(node) = self.nodes.get(id).cloned() else { return NavAction::None };
-        if node.expandable && self.expanded.remove(&node.id) {
+        if node.expandable && self.in_search_frame(&node.id) {
+            if self.search_open(&node.id) {
+                self.set_search_open(&node.id, false);
+                return NavAction::None;
+            }
+        } else if node.expandable && self.expanded.remove(&node.id) {
             return NavAction::None;
         }
         match node.parent {
@@ -1684,6 +1798,8 @@ impl NavTree {
             self.saved_focus = self.focus.clone();
         }
         self.query = trimmed;
+        self.search_opened.clear();
+        self.search_closed.clear();
         if !self.query.is_empty() {
             self.focus = self.visible().first().map(|row| row.id.clone());
         } else {

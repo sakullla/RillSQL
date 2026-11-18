@@ -946,7 +946,7 @@ impl WorkbenchModel {
                 let _ = self.shell.dispatch("settings");
             }
             "conn-edit" | "conn-duplicate" | "conn-new-launcher" | "conn-new-sidebar" | "conn-modal-close" | "conn-cancel"
-            | "conn-escape" | "conn-discard" | "conn-discard-keep" | "conn-retry" | "conn-new-query" => {
+            | "conn-escape" | "conn-discard" | "conn-discard-keep" | "conn-retry" | "conn-retry-dismiss" | "conn-new-query" => {
                 self.conn_command(id);
             },
             "conn-delete" => {
@@ -1763,6 +1763,10 @@ impl WorkbenchModel {
             }
             "conn-retry" => {
                 let _ = self.retry_pending_connect();
+            }
+            "conn-retry-dismiss" => {
+                // 关掉失败提示：不再重试这次连接，失败原因仍留在连接行上可查。
+                self.connect_retry = None;
             }
             "conn-new-query" => {
                 let Some(id) = self.connections.selected.clone() else { return };

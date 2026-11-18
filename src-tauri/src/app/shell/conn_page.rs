@@ -299,8 +299,9 @@ impl Workbench {
                 .rows
                 .iter()
                 .find(|row| row.saved.id == retry.connection_id)
-                .map(|row| row.saved.name.clone())
-                .unwrap_or_else(|| retry.connection_id.clone());
+                .map(|row| row.saved.name.clone());
+            let exists = name.is_some();
+            let name = name.unwrap_or_else(|| self.model.text("connections.retry.missing"));
             body = body.child(
                 div()
                     .id("launcher-connect-retry")
@@ -335,7 +336,8 @@ impl Workbench {
                             .text_color(p.danger)
                             .child(SharedString::from(label))
                     })
-                    .child(kit::tool_button("launcher-connect-retry-action", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx))),
+                    .when(exists, |this| this.child(kit::tool_button("launcher-connect-retry-action", Some(IconName::RefreshCw), self.t("common.retry"), act("conn-retry", cx))))
+                    .child(kit::icon_button("launcher-connect-retry-dismiss", IconName::X, self.t("common.close"), act("conn-retry-dismiss", cx)).xsmall()),
             );
             child_count += 1;
         }

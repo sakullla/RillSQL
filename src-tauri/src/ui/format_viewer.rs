@@ -420,7 +420,21 @@ impl Render for FormatViewer {
     }
 }
 
+/// 这个值真正能用的视图：识别出的格式 + 纯文本；有原始字节或是二进制时才给十六进制。
+/// 一个日期、一个数字不会再列出 JSON / XML / YAML / SQL 让人挨个点着试。
+pub fn format_choices(detected: DataFormat, manual: Option<DataFormat>, has_bytes: bool) -> Vec<DataFormat> {
+    let mut wanted = vec![detected, DataFormat::Text];
+    if has_bytes || detected == DataFormat::Hex {
+        wanted.push(DataFormat::Hex);
+    }
+    if let Some(manual) = manual {
+        wanted.push(manual);
+    }
+    DataFormat::ALL.into_iter().filter(|format| wanted.contains(format)).collect()
+}
+
 fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, metrics: &kit::Metrics, locked: bool) -> AnyElement {
+    let choices = format_choices(viewer.detected, viewer.manual, viewer.bytes.is_some());
     let mut formats = div()
         .flex()
         .flex_wrap()
@@ -429,7 +443,7 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
         .gap(px(2.))
         .rounded(px(Radius::CONTROL))
         .bg(p.sunken);
-    for format in DataFormat::ALL {
+    for format in choices.iter().copied().filter(|_| choices.len() > 1) {
         let selected = viewer.format() == format;
         let target = entity.clone();
         let label = viewer.text(format_key(format));
@@ -480,7 +494,7 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
             actions = actions.child(text_button(entity, "format-expand", None, viewer.text("format.action.expandAll"), false, |this, cx| this.expand_all(cx)));
             actions = actions.child(text_button(entity, "format-collapse", None, viewer.text("format.action.collapseAll"), false, |this, cx| this.collapse_all(cx)));
         }
-    } else if viewer.format() != DataFormat::Hex {
+    } else if !matches!(viewer.format(), DataFormat::Hex | DataFormat::Text) {
         actions = actions.child(text_button(entity, "format-reformat", Some(IconName::Sparkles), viewer.text("format.action.pretty"), locked, |this, cx| this.reformat(cx)));
     }
     if viewer.format() != DataFormat::Hex && (viewer.format() != DataFormat::Json || viewer.code_view) {
@@ -520,7 +534,19 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
         .border_b_1()
         .border_color(p.line)
         .bg(p.chrome)
-        .child(formats)
+        .when(choices.len() > 1, |this| this.child(formats))
+        .when(choices.len() <= 1, |this| {
+            // 只有一种视图时不给切换器，只标出这是什么：少一排没有意义的按钮。
+            this.child(
+                div()
+                    .id("format-kind")
+                    .test_support()
+                    .text_size(px(TypeScale::XS))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(p.text_muted)
+                    .child(viewer.text(format_key(viewer.format()))),
+            )
+        })
         .child(actions)
         .into_any_element()
 }

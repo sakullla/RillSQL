@@ -4000,16 +4000,28 @@ impl GridPane {
                 .border_color(p.line)
                 .child(kit::icon(status_icon, 14., status_color))
                 .child(div().flex_1().min_w(px(160.)).truncate().text_size(px(TypeScale::SM)).text_color(status_color).child(status_text))
-                .child(action("now", t("grid.temporal.now")))
-                .when(kind != temporal::TemporalKind::Time, |this| {
-                    this.child(action("today", t("grid.temporal.today")))
-                        .child(action("prev", t("grid.temporal.prevDay")))
-                        .child(action("next", t("grid.temporal.nextDay")))
+                // 只留真正常用的三件事：填当前时间、从日历挑日期、置空。前一天 / 后一天这类微调直接改文本更快。
+                .child(if kind == temporal::TemporalKind::Date {
+                    action("today", t("grid.temporal.today"))
+                } else {
+                    action("now", t("grid.temporal.now"))
                 })
                 .children(calendar)
                 .child(kit::tool_button("grid-temporal-null", None, t("grid.value.null"), set_null).xsmall())
-                .child(kit::kbd("Enter", p))
-                .child(kit::kbd("Esc", p))
+                .child(kit::vline(p))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(kit::kbd("Enter", p))
+                        .child(t("common.save"))
+                        .child(div().w(px(4.)))
+                        .child(kit::kbd("Esc", p))
+                        .child(t("common.cancel")),
+                )
                 .into_any_element(),
         )
     }
@@ -4077,10 +4089,14 @@ impl GridPane {
             CellPhase::Error => SharedString::from(state.as_ref().map(|state| state.message.clone()).unwrap_or_default()),
             _ => SharedString::from(if shown.body.is_empty() { shown.label.clone() } else { shown.body.clone() }),
         };
-        let title = state
-            .as_ref()
-            .map(|state| SharedString::from(format!("{}.{}", self.session.banner(), state.column_name)))
-            .unwrap_or_else(|| t("grid.value.copyValue"));
+        let column_name = state.as_ref().map(|state| state.column_name.clone()).unwrap_or_default();
+        let column_type = self
+            .session
+            .viewer_cell()
+            .and_then(|(_, column)| self.session.column_type(column))
+            .map(|kind| kind.to_uppercase())
+            .unwrap_or_default();
+        let source = SharedString::from(self.session.banner());
         let copy = {
             let entity = entity.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
@@ -4119,8 +4135,13 @@ impl GridPane {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(kit::eyebrow(tag, p))
-                    .child(div().flex_1().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(title))
+                    // 列名与类型放在最前面：用户先确认看的是哪一格；完整值不再挂“完整”标签，只有预览 / 加载 / 失败才标出来。
+                    .when(phase != CellPhase::Full, |this| this.child(kit::eyebrow(tag, p)))
+                    .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(column_name.clone())))
+                    .when(!column_type.is_empty(), |this| {
+                        this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(column_type.clone())))
+                    })
+                    .child(div().id("grid-value-source").flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).tooltip_text(source.clone()).child(source))
                     .child(kit::icon_button("grid-value-copy", IconName::Copy, t("grid.value.copyValue"), copy))
                     .child(kit::icon_button("grid-value-close", IconName::X, t("grid.value.close"), close)),
             );

@@ -11227,3 +11227,42 @@ fn opening_sql_file_preserves_filename_title_and_connection_target() {
     let after_locale = model.tabs.iter().find(|t| t.id == id).expect("opened sql tab");
     assert_eq!(after_locale.title, "driver_ranking_report.sql");
 }
+
+/// 搜索结果：命中少的库直接展开，命中多的库先收起并标出命中数；搜索期间任何层级都能手动折叠 / 展开，
+/// 清除搜索后回到原来的展开现场。
+#[test]
+fn nav_search_opens_small_branches_collapses_large_ones_and_stays_toggleable() {
+    use crate::catalog::hierarchy::SEARCH_AUTO_OPEN;
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let mut model = seeded_model(vec![record_for("main", "Main", Engine::Mysql)]);
+    model.connections.status.insert("main".into(), LinkStatus::Connected);
+    let few: Vec<ObjectRow> = vec![ObjectRow::fresh("waybill_info", ObjectKind::Table), ObjectRow::fresh("orders", ObjectKind::Table)];
+    let many: Vec<ObjectRow> = (0..SEARCH_AUTO_OPEN + 5).map(|i| ObjectRow::fresh(format!("waybill_log_{i}"), ObjectKind::Table)).collect();
+    model.apply_navigation(&[nav_connection(Engine::Mysql, "main", "Main", vec![nav_database("small", few), nav_database("big", many)])], false);
+    let conn = crate::catalog::hierarchy::connection_node_id("main");
+    model.nav_search("waybill");
+    let rows = model.nav_rows_for("main");
+    let small = rows.iter().find(|row| row.label == "small").expect("命中少的库在结果里");
+    let big = rows.iter().find(|row| row.label == "big").expect("命中多的库在结果里");
+    assert!(small.expanded, "命中少的库默认展开");
+    assert!(!big.expanded, "命中多的库默认收起");
+    assert_eq!(big.search_hits, SEARCH_AUTO_OPEN + 5, "收起的库标出命中数");
+    assert!(rows.iter().any(|row| row.label == "waybill_info"));
+    assert!(!rows.iter().any(|row| row.label.starts_with("waybill_log_")), "收起的库不把几十张表铺出来");
+
+    // 搜索期间可以折叠展开的库、展开收起的库。
+    let small_id = small.id.clone();
+    let big_id = big.id.clone();
+    let _ = model.dispatch(&format!("nav-toggle:{small_id}"));
+    let _ = model.dispatch(&format!("nav-toggle:{big_id}"));
+    let rows = model.nav_rows_for("main");
+    assert!(!rows.iter().any(|row| row.label == "waybill_info"), "搜索中折叠生效");
+    assert!(rows.iter().any(|row| row.label.starts_with("waybill_log_")), "搜索中展开生效");
+    assert!(model.nav_connection_expanded("main"), "连接在搜索中默认展开");
+    model.toggle_nav_connection("main");
+    assert!(model.nav_rows_for("main").is_empty(), "搜索中连接也能收起");
+
+    model.nav_clear_search();
+    assert!(!model.nav.is_expanded(&big_id), "清除搜索后不残留搜索里的展开");
+    let _ = conn;
+}

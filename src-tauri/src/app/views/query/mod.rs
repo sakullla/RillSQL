@@ -2830,7 +2830,7 @@ impl QueryPane {
                 menu.item(item("run-current", IconName::CornerDownLeft, "query.editor.menu.runCurrent", Some("Ctrl+Shift+Enter")))
                     .item(item("run-script", IconName::ListOrdered, "query.run.runScript", Some("Ctrl+Alt+Enter")))
                     .separator()
-                    .item(item("autocomplete", IconName::Sparkles, "shell.shortcuts.autocomplete", Some("Ctrl+Space")))
+                    .item(item("autocomplete", IconName::Sparkles, "shell.shortcuts.autocomplete", Some(kit::AUTOCOMPLETE_CHORD)))
                     .item(item("expand-star", IconName::Columns3, "query.complete.expandStar", None))
                     .item(item("toggle-outline", IconName::ListOrdered, "query.outline.heading", None))
                     .separator()

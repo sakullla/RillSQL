@@ -575,6 +575,8 @@ dict! {
     "query.plan.viewRaw" => "原始结果", "Raw output";
     "query.plan.colOperation" => "操作", "Operation";
     "query.plan.colRows" => "预估行数", "Est. rows";
+    "query.plan.colShare" => "代价占比", "Cost share";
+    "query.plan.rawProps" => "引擎原始属性", "Engine attributes";
     "query.plan.issue.fullScan" => "全表扫描", "Full scan";
     "query.plan.issue.tempSort" => "临时排序", "Extra sort";
     "query.plan.issue.tempTable" => "临时表", "Temp table";
@@ -1546,6 +1548,8 @@ dict! {
     "redis.console.next" => "下一条历史命令", "Next command";
     "redis.console.useScan" => "改用模式过滤 (SCAN)", "Filter with SCAN";
     "redis.console.completeHint" => "Tab 补全 · ↑↓ 选择", "Tab to complete · ↑↓ select";
+    "connections.retry.missing" => "已删除的连接", "a deleted connection";
+    "ui.nav.searchHits" => "{n} 个匹配", "{n} matches";
     "redis.string.save" => "保存修改", "Save value";
     "redis.hash.edit" => "编辑字段", "Edit field";
     "redis.hash.save" => "写入字段", "Save field";
