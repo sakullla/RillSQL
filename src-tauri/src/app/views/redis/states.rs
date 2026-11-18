@@ -443,7 +443,8 @@ fn every_redis_copy_key_used_in_the_source_exists_in_the_catalog() {
         keys
     }
     let catalog = i18n::catalog_keys();
-    let found = literals(include_str!("mod.rs"));
+    let mut found = literals(include_str!("mod.rs"));
+    found.extend(literals(include_str!("view.rs")));
     assert!(found.len() >= 30, "扫描到 {} 个文案键，太少说明扫描没生效", found.len());
     for key in found {
         assert!(catalog.contains(&key.as_str()), "{key} 被当作文案键使用，但字典里没有它");

@@ -848,6 +848,14 @@ fn scan_spots(sql: &str) -> Vec<Spot> {
                     i += 2;
                     continue;
                 }
+                // 命名参数只认独立的 `:name`：紧跟在标识符或数字后面的冒号（`user:1001`、`12:30`、
+                // Redis 键名里的命名空间分隔符）不是参数；`:` 后必须是字母或下划线，`:123` 也不是。
+                let glued = sql[..i].chars().next_back().is_some_and(ident_cont);
+                let named = ch_at(sql, step(sql, i)).is_some_and(ident_start);
+                if glued || !named {
+                    i = step(sql, i);
+                    continue;
+                }
                 let mut end = step(sql, i);
                 while end < sql.len() && ident_cont(ch_at(sql, end).unwrap_or(' ')) {
                     end = step(sql, end);
@@ -1619,6 +1627,15 @@ mod tests {
         values.insert("name".to_owned(), "O'Hare".to_owned());
         values.insert("?1".to_owned(), String::new());
         assert_eq!(substitute_variables("select :name, ?", &values), "select 'O''Hare', NULL");
+        // 键名里的命名空间冒号、时间字面量、冒号后接数字都不是命名参数，不能弹出「填写变量」。
+        assert!(find_variables("hget analyzerAreaInOutCity209831:1269820826354053120").is_empty());
+        assert!(find_variables("select * from t where at = 12:30 or v = :1").is_empty());
+        assert_eq!(find_variables("select a from t where id=:id").len(), 1);
+        assert_eq!(
+            substitute_variables("get user:1001", &HashMap::new()),
+            "get user:1001",
+            "没有参数时原样保留"
+        );
         let outline = outline_statements("select 1;\nselect 2;", "sqlite");
         assert_eq!(outline.len(), 2);
         let merged = merge_outline(outline, &[("select 1;".to_owned(), "ok".to_owned(), 1, None)]);
