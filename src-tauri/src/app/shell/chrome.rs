@@ -1199,6 +1199,7 @@ impl Workbench {
                     group.clone(),
                     IconName::SquareTerminal,
                     self.t("shell.command.newQuery"),
+                    self.model.menu.is_none(),
                     p,
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         cx.stop_propagation();
@@ -1402,7 +1403,7 @@ impl Workbench {
         // 已读完、确实一个对象都没有的种类分组：不画展开箭头，名称与数量弱化，看起来不像“展开了却丢了内容”。
         let empty_group = row.kind == NavKind::Group && !row.unloaded && !row.loading && row.error.is_none() && row.total == 0 && row.loaded == 0 && !row.has_more;
         let body = match row.highlight {
-            Some((start, end)) if end > start && end <= label.len() => highlight_label(&label, start, end, p),
+            Some((start, end)) if end > start && end <= label.len() => highlight_label(&id, &label, start, end, p),
             _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(empty_group, |this| this.text_color(p.text_faint)).child(label.clone()).into_any_element(),
         };
         let click_id = id.clone();
@@ -1471,47 +1472,65 @@ impl Workbench {
                     }),
             )
             .child(kit::icon(icon, 13., icon_tint))
-            .child(body)
-            .when(quick_table, |this| {
-                // 悬停快捷按钮浮在行尾，不常驻占宽：表名能用满整行，只有悬停时才盖住末尾几个字。
-                this.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .right(px(4.))
-                        .pl(px(6.))
-                        .flex()
-                        .items_center()
-                        .gap(px(1.))
-                        .invisible()
-                        .group_hover(group.clone(), |style| style.visible())
-                        .bg(if row.focused { p.active } else { p.hover })
-                        .rounded(px(Radius::CONTROL))
-                        .child(explorer_hover_icon(
-                            SharedString::from(format!("nav-quick-data-{id}")),
-                            group.clone(),
-                            IconName::Table,
-                            self.t("catalog.tree.openData"),
-                            p,
-                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.perform(&format!("nav-open-data:{open_data_id}"), cx);
-                            }),
-                        ))
-                        .child(explorer_hover_icon(
-                            SharedString::from(format!("nav-quick-struct-{id}")),
-                            group.clone(),
-                            IconName::Columns3,
-                            self.t("catalog.tree.viewStructure"),
-                            p,
-                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.perform(&format!("nav-open-structure:{open_struct_id}"), cx);
-                            }),
-                        )),
-                )
-            })
+            .child(
+                // 名称区占满行内剩余宽度；悬停快捷按钮浮在名称区末尾，不常驻占宽，
+                // 也不盖住行尾的命中数、加载、错误与重试：悬停时只遮住名称最后几个字。
+                div()
+                    .id(SharedString::from(format!("nav-name-{id}")))
+                    .test_support()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(body)
+                    .when(quick_table, |this| {
+                        let tip = self.model.menu.is_none();
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("nav-quick-{id}")))
+                                .test_support()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .pl(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(1.))
+                                .invisible()
+                                .group_hover(group.clone(), |style| style.visible())
+                                // 底色与行当前底色一致：选中行是选中底，其余是悬停底，不出现色块。
+                                .bg(if row.focused { p.selection } else { p.hover })
+                                .rounded(px(Radius::CONTROL))
+                                .child(explorer_hover_icon(
+                                    SharedString::from(format!("nav-quick-data-{id}")),
+                                    group.clone(),
+                                    IconName::Table,
+                                    self.t("catalog.tree.openData"),
+                                    tip,
+                                    p,
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.perform(&format!("nav-open-data:{open_data_id}"), cx);
+                                    }),
+                                ))
+                                .child(explorer_hover_icon(
+                                    SharedString::from(format!("nav-quick-struct-{id}")),
+                                    group.clone(),
+                                    IconName::Columns3,
+                                    self.t("catalog.tree.viewStructure"),
+                                    tip,
+                                    p,
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.perform(&format!("nav-open-structure:{open_struct_id}"), cx);
+                                    }),
+                                )),
+                        )
+                    }),
+            )
             .when(!detail_text.is_empty(), |this| {
                 this.child(
                     div()
@@ -1538,7 +1557,9 @@ impl Workbench {
                         .text_size(px(TypeScale::XS))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(p.accent_text)
-                        .tooltip_text(SharedString::from(i18n::fill(&self.model.text("ui.nav.searchHits"), &[("n", &row.search_hits.to_string())])))
+                        .when(self.model.menu.is_none(), |this| {
+                            this.tooltip_text(SharedString::from(i18n::fill(&self.model.text("ui.nav.searchHits"), &[("n", &row.search_hits.to_string())])))
+                        })
                         .child(SharedString::from(row.search_hits.to_string())),
                 )
             })
@@ -1564,7 +1585,15 @@ impl Workbench {
                 this.child(
                     div()
                         .id(SharedString::from(format!("nav-err-{id}")))
-                        .tooltip_text(SharedString::from(full.clone()))
+                        .test_support()
+                        .aria_label(SharedString::from(full.clone()))
+                        .when(self.model.menu.is_none(), |this| this.tooltip_text(SharedString::from(full.clone())))
+                        // 错误与名称分享剩余宽度（名称占三分之二），窄侧栏里对象名不会被错误挤没；
+                        // 完整原因在悬停提示和无障碍名称里。
+                        .flex_basis(px(0.))
+                        .flex_grow(0.5)
+                        .flex_shrink(1.)
+                        .min_w(px(0.))
                         .truncate()
                         .max_w(px(120.))
                         .text_size(px(TypeScale::XS))
@@ -6520,11 +6549,13 @@ impl Workbench {
 // ---------------------------------------------------------------- 小部件
 
 /// 对象树行尾的悬停快捷动作图标：平时透明、行悬停时浮现，不抢树自身的 Tab 停靠点。
+/// 右键菜单开着时（`tip == false`）不挂提示，免得提示浮层盖住菜单。
 fn explorer_hover_icon(
     id: SharedString,
     group: SharedString,
     icon: IconName,
     label: SharedString,
+    tip: bool,
     p: &Palette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
@@ -6533,7 +6564,7 @@ fn explorer_hover_icon(
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
-        .tooltip_text(label)
+        .when(tip, |this| this.tooltip_text(label))
         .flex_none()
         .size(px(18.))
         .rounded(px(Radius::CONTROL))
@@ -6550,7 +6581,8 @@ fn explorer_hover_icon(
 }
 
 /// 搜索命中的一段：前缀与后缀保持普通文本，中间用当前主题的选中底色强调。
-fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) -> AnyElement {
+/// 长名称时前缀与后缀各自省略，命中段保持完整可见：命中在长名称末尾也不会被裁掉。
+fn highlight_label(id: &str, label: &SharedString, start: usize, end: usize, p: &Palette) -> AnyElement {
     let text = label.as_ref();
     let head = if start > 0 { SharedString::from(text[..start].to_owned()) } else { SharedString::from("") };
     let hit = SharedString::from(text[start..end].to_owned());
@@ -6562,8 +6594,18 @@ fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) 
         .items_center()
         .overflow_hidden()
         .text_size(px(TypeScale::SM))
-        .child(div().flex_none().child(head))
-        .child(div().flex_none().bg(p.selection).rounded(px(Radius::TAG)).text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).child(hit))
+        .child(div().min_w(px(0.)).flex_shrink(1.).truncate().child(head))
+        .child(
+            div()
+                .id(SharedString::from(format!("nav-match-{id}")))
+                .test_support()
+                .flex_none()
+                .bg(p.selection)
+                .rounded(px(Radius::TAG))
+                .text_color(p.accent_text)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(hit),
+        )
         .child(div().flex_1().min_w(px(0.)).truncate().child(tail))
         .into_any_element()
 }

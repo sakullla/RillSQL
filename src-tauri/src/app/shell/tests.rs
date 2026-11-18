@@ -11364,3 +11364,367 @@ fn system_appearance_events_drive_follow_system_theme_without_touching_the_works
     assert_eq!(after.5, "system");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------- 对象树悬停动作与命中标记（T4）
+
+/// 对象树夹具里的稳定节点 id：长名称表、普通表、视图和读取失败的表。
+struct ObjectTreeIds {
+    long: String,
+    long_name: String,
+    orders: String,
+    recent: String,
+    audit: String,
+    expanded: Vec<String>,
+}
+
+/// 一条已连上的 PostgreSQL 连接，shop/public 下有长名称表、普通表、视图和一张读取失败的表；
+/// 树沿用户点击的同一批命令展开到对象行。目录只在模型里，不访问任何数据库。
+/// 外观走 T3 的系统外观同步入口（跟随系统偏好），浅/深色是真实应用到组件库的主题。
+fn object_tree_workbench(
+    cx: &mut gpui_kit::TestAppContext,
+    width: f32,
+    dark: bool,
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>, std::path::PathBuf, ObjectTreeIds) {
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tree-hover-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 800.);
+    let long_name = format!("{}waybill", "customer_order_settlement_archive_history_".repeat(2));
+    let long = ObjectRow::table(long_name.clone(), Some(12));
+    let orders = ObjectRow::table("orders", Some(4));
+    let recent = ObjectRow::view("recent");
+    let audit = ObjectRow::table("waybill_audit", Some(1));
+    let ids = ObjectTreeIds {
+        long: nav_id("pg", "shop", "public", &long),
+        long_name,
+        orders: nav_id("pg", "shop", "public", &orders),
+        recent: nav_id("pg", "shop", "public", &recent),
+        audit: nav_id("pg", "shop", "public", &audit),
+        expanded: vec![
+            connection_node_id("pg"),
+            database_node_id("pg", "shop"),
+            schema_node_id("pg", "shop", "public"),
+            group_node_id("pg", "shop", "public", ObjectKind::Table),
+            group_node_id("pg", "shop", "public", ObjectKind::View),
+        ],
+    };
+    let connection = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![long, orders, recent, audit])]);
+    let expand = ids.expanded[1..].to_vec();
+    let audit_id = ids.audit.clone();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("activity-workspace", cx);
+            view.model.connections.rows = vec![record_for("pg", "销售库", Engine::Postgres)];
+            view.model.connections.status.insert("pg".to_owned(), LinkStatus::Connected);
+            view.model.apply_navigation(&[connection], false);
+            view.model.expand_nav_connection("pg");
+            for id in &expand {
+                assert!(view.model.dispatch(&format!("nav-toggle:{id}")).is_some(), "{id} 没有接受展开命令");
+            }
+            assert!(view.model.nav.set_error(&audit_id, "permission denied for table waybill_audit"));
+            view.model.shell.sidebar_open = true;
+            if dark {
+                view.sync_window_appearance(gpui_kit::WindowAppearance::Dark, cx);
+            }
+            cx.notify();
+        });
+    });
+    {
+        use gpui_kit::component::ActiveTheme as _;
+        assert_eq!(cx.update(|cx| cx.theme().is_dark()), dark, "{width}: 主题经外观同步应用");
+    }
+    (window, view, dir, ids)
+}
+
+fn ensure_sidebar_open(cx: &mut gpui_kit::TestAppContext, view: &gpui_kit::Entity<super::view::Workbench>) {
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            if !view.model.shell.sidebar_open {
+                view.model.shell.sidebar_open = true;
+                cx.notify();
+            }
+        })
+    });
+}
+
+/// 表名默认用满行宽；悬停快捷动作只在真实鼠标悬停时浮现，点击打开的是被悬停那一行的
+/// 数据或结构，不展开这一行也不落到别的对象上。覆盖 1360/900/640 × 浅/深色。
+#[gpui_kit::test]
+fn object_tree_hover_actions_open_the_hovered_object_at_every_width_and_theme(cx: &mut gpui_kit::TestAppContext) {
+    for width in [1360f32, 900., 640.] {
+        for dark in [false, true] {
+            let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
+            let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
+            let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.long));
+            let data_id = gpui_kit::SharedString::from(format!("nav-quick-data-{}", ids.long));
+            let struct_id = gpui_kit::SharedString::from(format!("nav-quick-struct-{}", ids.long));
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let sidebar = window.find("sidebar").bounds();
+                let row = window.find(row_id.clone()).bounds();
+                let name = window.find(format!("nav-name-{}", ids.long)).bounds();
+                assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 对象行不横向溢出侧栏");
+                assert!(f32::from(row.right()) <= width + 0.5, "{tag}: 对象行不出窗口");
+                // 行尾没有状态时，名称区一直延伸到行内边距：快捷按钮不常驻占宽。
+                assert!(
+                    f32::from(name.right()) >= f32::from(row.right()) - 4.5,
+                    "{tag}: 长表名应使用可用行宽，名称区 {:?} 行 {:?}",
+                    name,
+                    row
+                );
+                assert!(!window.find(data_id.clone()).visible(), "{tag}: 未悬停时不显示打开数据");
+                assert!(!window.find(struct_id.clone()).visible(), "{tag}: 未悬停时不显示查看结构");
+
+                window.hover(row_id.clone(), cx);
+                let data = window.find(data_id.clone());
+                let structure = window.find(struct_id.clone());
+                assert!(data.visible() && structure.visible(), "{tag}: 悬停后两个快捷动作可见");
+                let (data, structure) = (data.bounds(), structure.bounds());
+                for bounds in [data, structure] {
+                    assert!(
+                        f32::from(bounds.left()) >= f32::from(name.left()) - 0.5 && f32::from(bounds.right()) <= f32::from(name.right()) + 0.5,
+                        "{tag}: 快捷动作留在名称区内 {bounds:?} / {name:?}"
+                    );
+                    assert!(f32::from(bounds.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 快捷动作不出侧栏");
+                }
+                assert!(f32::from(data.right()) <= f32::from(structure.left()) + 0.5, "{tag}: 数据在前、结构在后");
+                // 悬停另一行时，上一行的快捷动作收起，只有当前行的出现。
+                window.hover(format!("nav-{}", ids.orders), cx);
+                assert!(!window.find(data_id.clone()).visible(), "{tag}: 离开后长表名行的动作收起");
+                assert!(window.find(format!("nav-quick-data-{}", ids.orders)).visible(), "{tag}: 当前悬停行的动作出现");
+                // 视图同样有打开数据/结构；读取失败的对象只给重试，不给快捷打开。
+                window.hover(format!("nav-{}", ids.recent), cx);
+                assert!(window.find(format!("nav-quick-struct-{}", ids.recent)).visible(), "{tag}: 视图也有快捷动作");
+                assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
+
+                window.hover(row_id.clone(), cx);
+                window.click(data_id.clone(), cx);
+            })
+            .unwrap();
+            cx.update(|cx| {
+                let view = view.read(cx);
+                let tab = view.model.active_tab().expect("打开数据工作项");
+                assert_eq!(tab.kind, WorkItemKind::Table, "{tag}: 快捷数据打开表格页");
+                let spec = tab.spec.clone().unwrap_or_default();
+                assert!(spec.contains(&format!("|{}|", ids.long_name)), "{tag}: 打开的是被悬停的长表名：{spec}");
+                assert!(!view.model.nav.is_expanded(&ids.long), "{tag}: 点快捷动作不展开这一行");
+                assert_eq!(view.model.executions, 0, "{tag}: 打开数据不执行查询语句");
+            });
+            ensure_sidebar_open(cx, &view);
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let orders_row = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
+                window.hover(orders_row, cx);
+                window.click(format!("nav-quick-struct-{}", ids.orders), cx);
+            })
+            .unwrap();
+            cx.update(|cx| {
+                let view = view.read(cx);
+                let tab = view.model.active_tab().expect("结构工作项");
+                assert_eq!(tab.kind, WorkItemKind::Structure, "{tag}: 快捷结构打开结构页");
+                let spec = tab.spec.clone().unwrap_or_default();
+                assert!(spec.contains("|orders|"), "{tag}: 结构属于被悬停的 orders：{spec}");
+                assert!(!view.model.nav.is_expanded(&ids.orders), "{tag}: 点快捷结构不展开 orders");
+                let opened: Vec<_> = view
+                    .model
+                    .tabs
+                    .iter()
+                    .filter(|tab| matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure))
+                    .filter_map(|tab| tab.spec.clone())
+                    .collect();
+                assert_eq!(opened.len(), 2, "{tag}: 两次点击只开两个对应工作项：{opened:?}");
+                assert!(!opened.iter().any(|spec| spec.contains("|recent|") || spec.contains("|waybill_audit|")), "{tag}: 没有误开其他对象");
+            });
+            let _ = cx.update_window(window, |_, window, _| window.remove_window());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// 共存边界：加载中的对象行，悬停动作只盖住名称末尾、不压住加载指示；搜索时长名称末尾的
+/// 命中段完整可见，容器的命中数在名称之外且不出侧栏；读取失败的对象只给错误与重试。
+/// 右键命中数落在这一行的菜单上；清除搜索后回到搜索前的展开现场。覆盖 1360/900/640 × 浅/深色。
+#[gpui_kit::test]
+fn object_tree_search_hits_loading_errors_and_long_names_coexist_with_hover_actions(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::ColumnInfo;
+    for width in [1360f32, 900., 640.] {
+        for dark in [false, true] {
+            let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
+            let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
+            let orders = ids.orders.clone();
+            let schema = ids.expanded[2].clone();
+            let before_expanded: Vec<bool> = cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    // orders 已读到列，正在重读索引：行尾有加载指示，悬停动作仍可用。
+                    let column = |name: &str| ColumnInfo { name: name.to_owned(), data_type: "text".to_owned(), nullable: true, primary: false };
+                    assert!(view.model.nav.set_details(&orders, Ok(vec![column("id"), column("note")]), Ok(Vec::new())));
+                    assert!(view.model.nav.begin_details(&orders), "orders 进入加载中");
+                    cx.notify();
+                    ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect()
+                })
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let sidebar = window.find("sidebar").bounds();
+                let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
+                let row = window.find(row_id.clone()).bounds();
+                let name = window.find(format!("nav-name-{}", ids.orders)).bounds();
+                assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 加载中的行不溢出");
+                assert!(f32::from(name.right()) < f32::from(row.right()) - 10., "{tag}: 加载指示在名称区之外占位 {name:?} / {row:?}");
+                window.hover(row_id, cx);
+                let quick = window.find(format!("nav-quick-{}", ids.orders));
+                assert!(quick.visible(), "{tag}: 加载中仍可悬停打开");
+                assert!(f32::from(quick.bounds().right()) <= f32::from(name.right()) + 0.5, "{tag}: 悬停动作不压住加载指示");
+
+                // 读取失败的对象：错误文字和重试都在侧栏内，错误不压住重试，没有快捷打开。
+                let error = window.find(format!("nav-err-{}", ids.audit));
+                assert!(error.visible(), "{tag}: 节点错误可见");
+                let retry = window.find(format!("nav-retry-{}", ids.audit));
+                assert!(retry.visible() && f32::from(retry.bounds().right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 重试在侧栏内");
+                assert!(f32::from(error.bounds().right()) <= f32::from(retry.bounds().left()) + 0.5, "{tag}: 错误文字不压住重试");
+                window.hover(format!("nav-{}", ids.audit), cx);
+                assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
+
+                window.click("field-ObjectFilter", cx);
+                window.input("waybill", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill", "{tag}: 筛选框输入进入树搜索");
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let sidebar = window.find("sidebar").bounds();
+                // 长名称：命中段在名称末尾，前缀省略，命中段完整留在名称区内。
+                let long_name = window.find(format!("nav-name-{}", ids.long)).bounds();
+                let hit = window.find(format!("nav-match-{}", ids.long));
+                assert!(hit.visible(), "{tag}: 长名称末尾的命中段可见");
+                let hit = hit.bounds();
+                assert!(
+                    f32::from(hit.left()) >= f32::from(long_name.left()) - 0.5 && f32::from(hit.right()) <= f32::from(long_name.right()) + 0.5,
+                    "{tag}: 命中段不被裁出名称区 {hit:?} / {long_name:?}"
+                );
+                assert!(f32::from(hit.size.width) > 20., "{tag}: 命中段有完整宽度 {hit:?}");
+                // 悬停长名称：快捷动作仍在名称区内，命中行照样可打开。
+                window.hover(format!("nav-{}", ids.long), cx);
+                assert!(window.find(format!("nav-quick-data-{}", ids.long)).visible(), "{tag}: 命中行可悬停打开");
+                // 失败对象在搜索里也保留错误与重试。
+                assert!(window.find(format!("nav-err-{}", ids.audit)).visible(), "{tag}: 搜索中节点错误可见");
+                let audit_name = window.find(format!("nav-name-{}", ids.audit)).bounds();
+                let audit_error = window.find(format!("nav-err-{}", ids.audit)).bounds();
+                assert!(
+                    f32::from(audit_name.size.width) >= 40. && audit_name.size.width >= audit_error.size.width,
+                    "{tag}: 节点错误不把对象名挤没：名称 {audit_name:?} 错误 {audit_error:?}"
+                );
+                assert!(window.find(format!("nav-match-{}", ids.audit)).visible(), "{tag}: 失败对象的命中段可见");
+
+                // 容器上的命中数：在名称区之外，不出侧栏。
+                let hits = window.find(format!("nav-hits-{schema}"));
+                assert!(hits.visible(), "{tag}: 模式行标出命中数");
+                let hits = hits.bounds();
+                let name = window.find(format!("nav-name-{schema}")).bounds();
+                assert!(f32::from(name.right()) <= f32::from(hits.left()) + 0.5, "{tag}: 命中数不压在名称上");
+                assert!(f32::from(hits.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 命中数不出侧栏");
+
+                // 在命中数上右键：菜单属于这一行，并且画在视口里。
+                window.right_click(format!("nav-hits-{schema}"), cx);
+                window.render_frame(cx);
+                let item = window.find("ctx-tree-copy-name");
+                assert!(item.visible(), "{tag}: 右键菜单项可见");
+                assert!(f32::from(item.bounds().right()) <= width + 0.5, "{tag}: 菜单不出窗口");
+            })
+            .unwrap();
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    assert_eq!(view.model.nav_menu_node.as_deref(), Some(schema.as_str()), "{tag}: 菜单只属于被右键的模式行");
+                    assert!(view.model.menu.is_some(), "{tag}: 菜单已打开");
+                    view.model.menu = None;
+                    cx.notify();
+                })
+            });
+            // 清除搜索（选中全部再删除）：回到搜索前的展开现场。
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("field-ObjectFilter", cx);
+                window.press("secondary-a", cx);
+                window.press("backspace", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.update(|cx| {
+                let view = view.read(cx);
+                assert!(view.model.nav.query().is_empty(), "{tag}: 清空筛选框结束树搜索");
+                let after: Vec<bool> = ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect();
+                assert_eq!(after, before_expanded, "{tag}: 清除搜索后恢复原展开现场");
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find(format!("nav-match-{}", ids.long)).is_none(), "{tag}: 清除后不残留高亮");
+                assert!(window.try_find(format!("nav-hits-{schema}")).is_none(), "{tag}: 清除后不残留命中数");
+                assert!(window.find(format!("nav-{}", ids.recent)).visible(), "{tag}: 未命中的视图重新出现");
+                assert!(window.find(format!("nav-{}", ids.orders)).visible(), "{tag}: 未命中的 orders 重新出现");
+            })
+            .unwrap();
+            let _ = cx.update_window(window, |_, window, _| window.remove_window());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// 对象树只有一个 Tab 停靠点：点行把焦点交给树容器，悬停图标不是焦点目标；
+/// 键盘上下移动后回车打开数据，命令面板的“结构”打开同一个对象的结构页。
+#[gpui_kit::test]
+fn object_tree_keeps_one_tab_stop_and_keyboard_opens_data_and_structure(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir, ids) = object_tree_workbench(cx, 1360., false);
+    cx.update(crate::app::bind_keys);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(format!("nav-{}", ids.recent), cx);
+        assert_eq!(window.find("explorer-list").focused(), Some(true), "点行后焦点在树容器上");
+        window.hover(format!("nav-{}", ids.orders), cx);
+        let quick = window.find(format!("nav-quick-data-{}", ids.orders));
+        assert!(quick.visible(), "悬停图标出现");
+        assert_eq!(quick.focused(), None, "悬停图标没有焦点绑定，不是 Tab 停靠点");
+        assert_eq!(window.find(format!("nav-quick-struct-{}", ids.orders)).focused(), None);
+    })
+    .unwrap();
+    // 键盘上移直到落在 orders 上（树行顺序由目录决定，测试不假定具体步数）。
+    for _ in 0..8 {
+        let focus = cx.update(|cx| view.read(cx).model.nav.focus().map(str::to_owned));
+        if focus.as_deref() == Some(ids.orders.as_str()) {
+            break;
+        }
+        cx.update_window(window, |_, window, cx| window.press("up", cx)).unwrap();
+    }
+    assert_eq!(cx.update(|cx| view.read(cx).model.nav.focus().map(str::to_owned)), Some(ids.orders.clone()), "方向键在树内移动到 orders");
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(window.find("explorer-list").focused(), Some(true), "方向键期间焦点仍在树容器");
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let tab = view.model.active_tab().expect("回车打开数据");
+        assert_eq!(tab.kind, WorkItemKind::Table);
+        assert!(tab.spec.clone().unwrap_or_default().contains("|orders|"), "回车打开键盘选中的 orders");
+    });
+    // 键盘打开结构：命令面板里的结构命令使用树上选中的对象。
+    let label = cx.update(|cx| view.read(cx).model.text("shell.command.newStructure"));
+    cx.update_window(window, |_, window, cx| {
+        window.press("secondary-k", cx);
+        window.input(&label, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let first = cx.update(|cx| view.read(cx).model.palette_entries().first().map(|entry| entry.id.clone()));
+    assert_eq!(first.as_deref(), Some("open-structure"), "命令面板首项就是结构命令");
+    cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let tab = view.model.active_tab().expect("结构工作项");
+        assert_eq!(tab.kind, WorkItemKind::Structure, "键盘路径打开结构页");
+        assert!(tab.spec.clone().unwrap_or_default().contains("|orders|"), "结构属于树上选中的 orders");
+    });
+    let _ = cx.update_window(window, |_, window, _| window.remove_window());
+    let _ = std::fs::remove_dir_all(dir);
+}
