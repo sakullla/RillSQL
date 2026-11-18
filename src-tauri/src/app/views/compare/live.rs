@@ -94,11 +94,17 @@ async fn live_engines_compare_a_made_difference_and_read_the_diagram() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    if seen.is_empty() && errors.iter().all(|err| fixture_unreachable(err)) {
+    // 夹具按引擎各自启动：连不上的引擎跳过并写明，连上了却比较失败的才算失败。
+    // 只起了部分夹具（例如没有 SQL Server）时，其余引擎照样要通过。
+    let (offline, failed): (Vec<_>, Vec<_>) = errors.into_iter().partition(|err| fixture_unreachable(err));
+    for err in &offline {
+        eprintln!("跳过结构比较（夹具不在线）：{err}");
+    }
+    if seen.is_empty() && failed.is_empty() {
         eprintln!("跳过结构比较：本机没有数据库夹具");
         return;
     }
-    assert!(errors.is_empty(), "已看到：{}\n失败：{}", seen.join(" | "), errors.join(" | "));
+    assert!(failed.is_empty(), "已看到：{}\n失败：{}", seen.join(" | "), failed.join(" | "));
     println!("{}", seen.join("\n"));
 }
 

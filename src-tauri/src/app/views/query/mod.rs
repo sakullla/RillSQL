@@ -4544,7 +4544,9 @@ mod tests {
         let mut landed = false;
         let mut note = String::new();
         let mut polls = 0u32;
-        while started.elapsed() < std::time::Duration::from_secs(60) {
+        // 这条语句是纯 CPU 计算，忙碌的机器上要接近一分钟；等待上限只防止测试挂死，
+        // 不当作性能断言（它要证明的是超过 10 秒的执行仍会回到结果）。
+        while started.elapsed() < std::time::Duration::from_secs(240) {
             cx.run_until_parked();
             let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
             landed = cx.update(|cx| pane.read(cx).cell(0, 0, cx) == "1296000000");

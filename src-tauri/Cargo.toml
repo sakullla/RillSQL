@@ -94,3 +94,5 @@ main = true
 installer-icon = "icons/icon.ico"
 languages = ["SimpChinese", "English"]
 installer-mode = "currentUser"
+# 自带模板：只改了“应用仍在运行”的检查（等应用自己退出 → 插件结束进程 → taskkill），见 windows/installer.nsi。
+template = "windows/installer.nsi"

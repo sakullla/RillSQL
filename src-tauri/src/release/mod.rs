@@ -640,6 +640,11 @@ mod tests {
         assert!(cargo.contains("identifier = \"app.rillsql.desktop\""));
         assert!(cargo.contains("product-name = \"RillSQL\""));
         assert!(cargo.contains("installer-mode = \"currentUser\""));
+        // Windows 安装器用自带模板：应用内更新启动安装器后应用才退出，安装器要等它关完，结束失败时再用 taskkill。
+        assert!(cargo.contains("template = \"windows/installer.nsi\""));
+        let nsis = fs::read_to_string(root.join("src-tauri/windows/installer.nsi")).unwrap();
+        assert!(nsis.contains("Var AppWaitTicks") && nsis.contains("wait_loop:") && nsis.contains("taskkill.exe"), "安装器等待应用退出的检查还在");
+        assert_eq!(nsis.matches("!macro CheckIfAppIsRunning").count(), 1);
         assert!(!cargo.contains("tauri"));
         let cargo_lock = fs::read_to_string(root.join("src-tauri/Cargo.lock")).unwrap();
         assert_eq!(rillsql_lock_version(&cargo_lock).as_deref(), Some(PRODUCT_VERSION));
