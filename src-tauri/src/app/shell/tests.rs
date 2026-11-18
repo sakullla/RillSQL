@@ -2854,7 +2854,8 @@ fn exchange_blocks_empty_mapping_stops_the_earlier_import_and_fails_only_that_ta
     })
     .unwrap();
     assert!(
-        pump_for(cx, window, &view, std::time::Duration::from_secs(8), |view, app| {
+        // 目标库的 busy_timeout 是 5 秒，可能连续命中不止一次；CI 的 macOS 机器负载高时 8 秒不够。
+        pump_for(cx, window, &view, std::time::Duration::from_secs(30), |view, app| {
             view.exchange_tasks(app).iter().any(|task| task.kind == "migrate" && task.phase == Phase::Failed)
         }),
         "锁定的目标库应让这次迁移失败"
