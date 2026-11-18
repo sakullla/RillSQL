@@ -274,6 +274,11 @@ impl Workbench {
                     cx.notify();
                 });
             }),
+            // 跟随系统主题：系统外观变化由 GPUI 窗口事件推送，不轮询。
+            // 句柄随工作台释放，回调只同步主题，不触碰草稿、标签、连接或后台任务。
+            cx.observe_window_appearance(window, |this, window, cx| {
+                this.sync_window_appearance(window.appearance(), cx);
+            }),
         ];
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
@@ -1208,6 +1213,24 @@ impl Workbench {
         self.adopt_shell(effect, cx);
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
         crate::ui::kit::apply_theme(dark, cx);
+    }
+
+    /// 窗口外观事件的落点：记录最新系统外观，只在解析出的主题真的变化时走 ApplyTheme。
+    /// 显式浅色/深色下只记下外观，之后切回“跟随系统”时直接用这份最新值；
+    /// 重复的同一外观（含 Vibrant 变体与普通变体之间）什么也不做。
+    pub(crate) fn sync_window_appearance(&mut self, appearance: WindowAppearance, cx: &mut Context<Self>) {
+        let prefers_dark = matches!(appearance, WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        if self.model.shell.prefers_dark == prefers_dark {
+            return;
+        }
+        let before = self.model.shell.resolved_theme();
+        let effect = self.model.shell.set_prefers_dark(prefers_dark);
+        if self.model.shell.resolved_theme() == before {
+            // 显式偏好不受系统外观影响；子视图持有的外壳副本在下次 adopt 时同步。
+            return;
+        }
+        self.apply_effect(effect, cx);
+        cx.notify();
     }
 
     /// 连上或断开连接后刷新对象树，资源管理器才看得到表。

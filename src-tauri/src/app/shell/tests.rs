@@ -11266,3 +11266,101 @@ fn nav_search_opens_small_branches_collapses_large_ones_and_stays_toggleable() {
     assert!(!model.nav.is_expanded(&big_id), "清除搜索后不残留搜索里的展开");
     let _ = conn;
 }
+
+/// 跟随系统主题：窗口外观事件经 ApplyTheme 落到实际绘制主题，显式偏好不被覆盖，
+/// 重复外观不重复应用，草稿、标签和后台任务现场原样保留。
+/// GPUI 的 TestWindow::simulate_appearance_change 只在 gpui crate 内可达，这里直接驱动
+/// 订阅回调调用的同一个落点 sync_window_appearance。
+#[gpui_kit::test]
+fn system_appearance_events_drive_follow_system_theme_without_touching_the_workspace(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::WindowAppearance;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-appearance-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(crate::app::bind_keys);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            view.perform("new-query", cx);
+        });
+        window.render_frame(cx);
+        window.press("secondary-a", cx);
+        window.input("select 7", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let applied = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let _theme_watch = cx.update(|cx| {
+        let applied = std::rc::Rc::clone(&applied);
+        cx.observe_global::<gpui_kit::component::Theme>(move |_| applied.set(applied.get() + 1))
+    });
+    let snapshot = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update(|cx| {
+            let view = view.read(cx);
+            (
+                view.query_editor_text(cx),
+                view.model.active_tab.clone(),
+                view.model.tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(),
+                view.model.pending.len(),
+                view.model.shell.page,
+                view.model.settings.theme.clone(),
+            )
+        })
+    };
+    let before = snapshot(cx);
+    assert_eq!(before.0, "select 7");
+    assert_eq!(before.5, "system");
+    let event = |cx: &mut gpui_kit::TestAppContext, appearance: WindowAppearance| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.sync_window_appearance(appearance, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let state = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update(|cx| (view.read(cx).shell().prefers_dark, view.read(cx).shell().resolved_theme(), cx.theme().is_dark()))
+    };
+    assert!(!cx.update(|cx| cx.theme().is_dark()), "测试窗口初始为浅色外观");
+
+    // System：Light → Dark / VibrantDark / VibrantLight 都跟着走，同一明暗重复到达不再应用。
+    event(cx, WindowAppearance::Dark);
+    assert_eq!(state(cx), (true, crate::app::ResolvedTheme::Dark, true), "系统变深后跟随系统必须立即变深");
+    let after_dark = applied.get();
+    assert!(after_dark > 0, "外观变化必须走 ApplyTheme 更新组件库主题");
+    event(cx, WindowAppearance::VibrantDark);
+    event(cx, WindowAppearance::Dark);
+    assert_eq!(applied.get(), after_dark, "同一明暗的重复外观不重复应用主题");
+    event(cx, WindowAppearance::VibrantLight);
+    assert_eq!(state(cx), (false, crate::app::ResolvedTheme::Light, false), "Vibrant 浅色同样切回浅色");
+
+    // 显式偏好：系统外观只被记录，不改变解析主题；切回 System 时用最近一次外观。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-light", cx)));
+    let explicit = applied.get();
+    event(cx, WindowAppearance::Dark);
+    assert_eq!(state(cx), (true, crate::app::ResolvedTheme::Light, false), "显式浅色不被系统深色覆盖");
+    assert_eq!(applied.get(), explicit, "显式偏好下外观事件不应用主题");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-system", cx)));
+    assert_eq!(state(cx), (true, crate::app::ResolvedTheme::Dark, true), "切回跟随系统立即使用最近的系统深色");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-dark", cx)));
+    event(cx, WindowAppearance::Light);
+    assert_eq!(state(cx), (false, crate::app::ResolvedTheme::Dark, true), "显式深色不被系统浅色覆盖");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-system", cx)));
+    assert_eq!(state(cx), (false, crate::app::ResolvedTheme::Light, false), "切回跟随系统使用最近的系统浅色");
+    cx.run_until_parked();
+
+    // 外观事件前后，草稿、活动标签、工作项和排队作业不变；只有显式切换改了主题设置。
+    event(cx, WindowAppearance::Dark);
+    let after = snapshot(cx);
+    assert_eq!(after.0, before.0, "草稿保留");
+    assert_eq!(after.1, before.1, "活动标签保留");
+    assert_eq!(after.2, before.2, "工作项不重建");
+    assert_eq!(after.3, before.3, "不重放或新增后台作业");
+    assert_eq!(after.4, before.4, "页面不变");
+    assert_eq!(after.5, "system");
+    let _ = std::fs::remove_dir_all(&dir);
+}
