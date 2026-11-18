@@ -1308,6 +1308,8 @@ impl Desk {
             if let Err(reason) = assist::prepare_send(&original, &pick, &target.engine) {
                 return BeginRun::Rejected(reason);
             }
+        }
+        if override_sql.is_none() && target.engine != "redis" {
             let variables = assist::find_variables(&pick.sql);
             if !variables.is_empty() {
                 if let Some(tab) = self.active_mut() {

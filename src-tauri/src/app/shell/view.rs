@@ -608,6 +608,12 @@ impl Workbench {
             cx.notify();
             return;
         }
+        // Redis 工作台可以在同一标签中切库，新查询沿用面板里实际显示的库。
+        let redis_database = (id == "new-query"
+            && self.model.tool == WorkTool::Redis
+            && self.applied_redis.is_some()
+            && self.applied_redis == self.model.redis_spec)
+            .then(|| self.redis.read(cx).database().to_owned());
         let Some(effect) = self.model.dispatch(id) else {
             if id.starts_with("redis-") {
                 self.redis.update(cx, |pane, cx| pane.command(id, cx));
@@ -628,6 +634,11 @@ impl Workbench {
             }
             return;
         };
+        if let Some(database) = redis_database {
+            if let Some(tab) = self.model.active_mut().filter(|tab| tab.kind.is_query() && tab.engine.as_deref() == Some("redis")) {
+                tab.database = Some(database);
+            }
+        }
         // 新建查询或从定义查看器转入查询后光标直接落在编辑器里：点完就能编辑。
         if matches!(effect, Effect::FocusEditor)
             || (matches!(id, "new-query" | "ddl-open-query") && self.model.tool == super::model::WorkTool::Query)
@@ -2842,7 +2853,7 @@ impl Workbench {
         // 表数据页的“重试”在连接没打开时同样走按需连接；连上后 refresh_tree_on_connect 触发重读。
         // 查询页目标选择器里点了“连接”：同一条按需连接入口。
         if let Some(id) = self.query.update(cx, |pane, _| pane.take_connect_request()) {
-            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+            self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::ConnectOnly, None));
         }
         if let Some(id) = self.structure.update(cx, |pane, _| pane.take_connect_request()) {
             self.model.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));

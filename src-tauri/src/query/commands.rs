@@ -151,17 +151,6 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     }
     let notices = report.notices;
     let parts = report.pieces;
-    let session = service.query_session(&request.connection_id).ok_or_else(|| {
-        // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
-        if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
-            "连接已断开，自动重连成功后才能执行。没有把这次语句排队重发。".to_owned()
-        } else {
-            "这条连接还没有打开，没有另开新的连接。".to_owned()
-        }
-    })?;
-    if matches!(session, CatalogSession::Scripted) {
-        return Err("这个连接没有连着可查询的数据库".to_owned());
-    }
     let transport = service.cancel_transport(&request.connection_id).unwrap_or(CancelTransport::None);
     let via_ssh = transport.via_ssh();
     let id = uuid::Uuid::new_v4().to_string();
@@ -203,6 +192,17 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     let mysql_fallback = service.mysql_fallback_pool(&request.connection_id);
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
+    let session = service.query_session(&request.connection_id).await?.ok_or_else(|| {
+        // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
+        if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
+            "连接已断开，自动重连成功后才能执行。没有把这次语句排队重发。".to_owned()
+        } else {
+            "这条连接还没有打开，没有另开新的连接。".to_owned()
+        }
+    })?;
+    if matches!(session, CatalogSession::Scripted) {
+        return Err("这个连接没有连着可查询的数据库".to_owned());
+    }
     let mut driver = match exec::LiveDriver::attach_with_fallback(
         session,
         mysql_fallback,

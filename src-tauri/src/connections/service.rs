@@ -172,7 +172,7 @@ enum SessionKind {
     Mysql { exec: mysql_async::Pool, meta: mysql_async::Pool },
     Postgres(Arc<tokio_postgres::Client>),
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
-    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
+    Redis { browser: Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>, client: redis::Client },
     /// mongodb::Client 内部共享连接池，克隆廉价；库/集合/文档操作共用这一个句柄。
     Mongo(mongodb::Client),
     Scripted,
@@ -1096,8 +1096,8 @@ impl Service {
                 SessionKind::Postgres(Arc::new(client))
             } else if let Some(client) = attempt.sqlserver.take() {
                 SessionKind::Sqlserver(Arc::new(tokio::sync::Mutex::new(client)))
-            } else if let Some(conn) = attempt.redis.take() {
-                SessionKind::Redis(Arc::new(tokio::sync::Mutex::new(conn)))
+            } else if let Some((client, conn)) = attempt.redis.take() {
+                SessionKind::Redis { browser: Arc::new(tokio::sync::Mutex::new(conn)), client }
             } else if let Some(client) = attempt.mongo.take() {
                 SessionKind::Mongo(client)
             } else {
@@ -1209,35 +1209,26 @@ impl Service {
         }
         // 读路径也算活动：目录/网格读取会刷新空闲计时，避免长任务期间误探活。
         session.health.note_activity();
-        Some(match &session.kind {
-            SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
-                pool: pool.clone(),
-                foreign_keys: session.foreign_keys,
-            },
-            SessionKind::Mysql { meta, .. } => CatalogSession::Mysql(meta.clone()),
-            SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
-            SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
-            SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
-            SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
-            SessionKind::Scripted => CatalogSession::Scripted,
-        })
+        Some(clone_catalog_handle(session))
     }
 
-    /// SQL 执行用的会话句柄。MySQL / MariaDB 走独立的执行连接，
-    /// 其余引擎与 catalog_session 相同。
-    pub fn query_session(&self, id: &str) -> Option<CatalogSession> {
-        let exec = {
+    /// Redis 的 SELECT 作用于整个网络连接。查询批次独占命令连接，避免和键浏览器互相切库。
+    pub async fn query_session(&self, id: &str) -> Result<Option<CatalogSession>, String> {
+        let client = {
             let sessions = self.sessions.lock().expect("sessions");
-            match &sessions.get(id)?.kind {
-                SessionKind::Mysql { exec, .. } => Some(exec.clone()),
-                _ => None,
+            let Some(session) = sessions.get(id).filter(|session| !session.health.is_lost()) else {
+                return Ok(None);
+            };
+            session.health.note_activity();
+            match &session.kind {
+                SessionKind::Mysql { exec, .. } => return Ok(Some(CatalogSession::Mysql(exec.clone()))),
+                SessionKind::Redis { client, .. } => client.clone(),
+                _ => return Ok(Some(clone_catalog_handle(session))),
             }
         };
-        let session = self.catalog_session(id)?;
-        Some(match exec {
-            Some(pool) => CatalogSession::Mysql(pool),
-            None => session,
-        })
+        let config = redis::AsyncConnectionConfig::new().set_connection_timeout(Duration::from_secs(15));
+        let conn = client.get_multiplexed_async_connection_with_config(&config).await.map_err(|err| err.to_string())?;
+        Ok(Some(CatalogSession::Redis(Arc::new(tokio::sync::Mutex::new(conn)))))
     }
 
     /// MySQL / MariaDB 已认证的目录连接池：当独立执行连接受限于 max_user_connections、
@@ -1267,7 +1258,7 @@ impl Service {
         }
         session.health.note_activity();
         match &session.kind {
-            SessionKind::Redis(conn) => Some((Arc::clone(conn), Arc::clone(&session.health))),
+            SessionKind::Redis { browser, .. } => Some((Arc::clone(browser), Arc::clone(&session.health))),
             _ => None,
         }
     }
@@ -1321,7 +1312,7 @@ impl Service {
             if epochs.get(&target.id).copied() != target.epoch { return; }
             let sessions = self.sessions.lock().expect("sessions");
             match sessions.get(&target.id) {
-                Some(session) if !session.health.is_lost() => Some(clone_catalog_handle(&session.kind)),
+                Some(session) if !session.health.is_lost() => Some(clone_catalog_handle(session)),
                 _ => None,
             }
         };
@@ -1542,16 +1533,16 @@ struct SessionHealthProbe {
     health: Arc<SessionHealth>,
 }
 
-fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
-    match kind {
+fn clone_catalog_handle(session: &Session) -> CatalogSession {
+    match &session.kind {
         SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
             pool: pool.clone(),
-            foreign_keys: None,
+            foreign_keys: session.foreign_keys,
         },
         SessionKind::Mysql { meta, .. } => CatalogSession::Mysql(meta.clone()),
         SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
         SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
-        SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
+        SessionKind::Redis { browser, .. } => CatalogSession::Redis(Arc::clone(browser)),
         SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
         SessionKind::Scripted => CatalogSession::Scripted,
     }
@@ -1719,7 +1710,7 @@ struct Attempt {
     mysql_pool: Option<(mysql_async::Pool, mysql_async::Pool)>,
     postgres: Option<tokio_postgres::Client>,
     sqlserver: Option<TdsClient>,
-    redis: Option<redis::aio::MultiplexedConnection>,
+    redis: Option<(redis::Client, redis::aio::MultiplexedConnection)>,
     mongo: Option<mongodb::Client>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
@@ -1905,7 +1896,7 @@ impl Attempt {
                 self.cancel = CancelTransport::Redis {
                     health: Arc::new(SessionHealth::default()),
                 };
-                self.redis = Some(opened.conn);
+                self.redis = Some((opened.client, opened.conn));
                 opened.version
             }),
             Engine::Mongodb => drivers::open_mongo(&self.config, &route, &password).await.map(|opened| {

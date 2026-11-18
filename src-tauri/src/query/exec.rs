@@ -900,7 +900,9 @@ impl LiveDriver {
         let attached = match session {
             CatalogSession::Scripted => Attached::Scripted,
             CatalogSession::Redis(conn) => {
-                if let Ok(db) = database.trim().trim_start_matches("db").parse::<u8>() {
+                if !database.trim().is_empty() {
+                    let db = database.trim().strip_prefix("db").unwrap_or(database.trim()).parse::<u32>()
+                        .map_err(|_| format!("Redis 库号无效：{database}"))?;
                     let mut guard = conn.lock().await;
                     let _: () = redis::cmd("SELECT")
                         .arg(db)
@@ -1085,8 +1087,9 @@ fn is_unsupported_timeout_var(message: &str) -> bool {
 }
 
 async fn align_mysql(conn: &mut mysql_async::Conn, engine: &str, database: &str) -> Result<(), String> {
-    let value: Option<String> = conn.query_first("SELECT DATABASE()").await.map_err(|err| crate::error_text::chain(&err))?;
-    let current = value.unwrap_or_default();
+    // DATABASE() returns one row containing SQL NULL until a schema is selected.
+    let value: Option<Option<String>> = conn.query_first("SELECT DATABASE()").await.map_err(|err| crate::error_text::chain(&err))?;
+    let current = value.flatten().unwrap_or_default();
     match database_gate(engine, &current, database) {
         DatabaseGate::Refuse => Err(refuse_message(&current, database)),
         DatabaseGate::Switch => {

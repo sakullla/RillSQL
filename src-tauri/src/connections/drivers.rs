@@ -345,6 +345,7 @@ pub(crate) fn sqlserver_stage(mode: TlsMode, err: &tiberius::error::Error) -> St
 }
 
 pub struct RedisOpen {
+    pub client: redis::Client,
     pub conn: redis::aio::MultiplexedConnection,
     pub version: String,
 }
@@ -398,6 +399,7 @@ pub async fn open_redis(config: &SavedConnection, route: &Route, password: &str)
         .await
         .map_err(|err| redis_stage(route.tls_mode, &err))?;
     Ok(RedisOpen {
+        client,
         conn,
         version: redis_server_version(&info_text),
     })

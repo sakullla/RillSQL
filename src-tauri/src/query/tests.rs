@@ -1092,6 +1092,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
     let same: Option<Option<String>> = again.query_first("SELECT CONNECTION_ID()").await.unwrap();
     let queries = stub.queries.lock().expect("queries").clone();
     let failures = stub.failures.lock().expect("failures").clone();
+    assert!(queries.iter().any(|sql| sql == "USE `app`"), "{queries:?}");
     assert_eq!(stub.resets.load(Ordering::SeqCst), 0, "归还连接时执行了 COM_RESET_CONNECTION queries={queries:?} failures={failures:?}");
     assert_eq!(stub.accepts.load(Ordering::SeqCst), 1, "执行为同一批另开了连接 queries={queries:?} failures={failures:?}");
     assert_eq!(kept.as_ref().map(Option::as_deref), Some(Some("stay")), "queries={queries:?} failures={failures:?}");
@@ -1136,7 +1137,7 @@ async fn handle_mysql(mut stream: tokio::net::TcpStream, id: u32, stub: Arc<Mysq
     write_packet(&mut stream, 0, &mysql_handshake(id)).await?;
     let (seq, _) = read_packet(&mut stream).await?;
     write_packet(&mut stream, seq.wrapping_add(1), &mysql_ok()).await?;
-    let mut database = "app".to_owned();
+    let mut database: Option<String> = None;
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     loop {
         let (seq, payload) = match read_packet(&mut stream).await {
@@ -1152,7 +1153,7 @@ async fn handle_mysql(mut stream: tokio::net::TcpStream, id: u32, stub: Arc<Mysq
             0x0e => write_packet(&mut stream, reply, &mysql_ok()).await?,
             0x1f => {
                 stub.resets.fetch_add(1, Ordering::SeqCst);
-                database = "app".to_owned();
+                database = None;
                 vars.clear();
                 write_packet(&mut stream, reply, &mysql_ok()).await?;
             }
@@ -1163,9 +1164,9 @@ async fn handle_mysql(mut stream: tokio::net::TcpStream, id: u32, stub: Arc<Mysq
                 if upper.contains("CONNECTION_ID") {
                     write_text_rows(&mut stream, &mut reply, &[Some(id.to_string())]).await?;
                 } else if upper.contains("DATABASE()") {
-                    write_text_rows(&mut stream, &mut reply, &[Some(database.clone())]).await?;
+                    write_text_rows(&mut stream, &mut reply, std::slice::from_ref(&database)).await?;
                 } else if upper.starts_with("USE") {
-                    database = upper.trim_start_matches("USE").trim().trim_matches('`').to_owned();
+                    database = Some(sql[3..].trim().trim_matches('`').to_owned());
                     write_packet(&mut stream, reply, &mysql_ok()).await?;
                 } else if upper.starts_with("SET") {
                     if let Some((name, value)) = mysql_set_var(&sql) {

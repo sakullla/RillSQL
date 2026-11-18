@@ -12,7 +12,7 @@ use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, She
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
 use crate::connections::groups::{layout_groups, validate_group_name, ConnectionGroup, GroupLayout};
-use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind};
+use crate::connections::model::{CaMode, Engine, EnvTag, SavedConnection, SshAuthKind};
 use crate::app::views::connections::LinkStatus;
 use crate::app::views::query::object_spec;
 use crate::catalog::hierarchy::{NavKind, NavNode, NavRow, NavTree, ObjectKey};
@@ -1769,11 +1769,11 @@ impl WorkbenchModel {
                 if let Some(row) = self.connections.rows.iter().find(|row| row.saved.id == id) {
                     let name = row.saved.name.clone();
                     let engine = row.saved.engine.as_str().to_owned();
-                    let database = row.saved.database.clone();
+                    let database = self.default_query_database(&row.saved);
                     self.open_bound_query(String::new(), Some(id.clone()), Some(name), database, Some(engine));
                 }
                 // 查询草稿马上就能写；连接在后台建立，失败时重试仍回到这条连接。
-                self.queue_connect(ConnectIntent::new(id, ConnectAction::Expand, None));
+                self.queue_connect(ConnectIntent::new(id, ConnectAction::ConnectOnly, None));
             }
             _ => {}
         }
@@ -4933,23 +4933,28 @@ impl WorkbenchModel {
             let id = tab.connection_id.clone()?;
             let row = self.connections.rows.iter().find(|row| row.saved.id == id)?;
             let engine = tab.engine.clone().unwrap_or_else(|| row.saved.engine.as_str().to_owned());
-            // 文档库与键值库没有 SQL 编辑器，不把它们带进新查询。
-            if matches!(row.saved.engine, crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb) {
+            if row.saved.engine == Engine::Mongodb {
                 return None;
             }
-            let database = tab.database.clone().filter(|db| !db.is_empty()).or_else(|| self.only_database(&id));
+            let database = tab.database.clone().filter(|db| !db.is_empty()).or_else(|| self.default_query_database(&row.saved));
             return Some((id, tab.connection_name.clone().unwrap_or_else(|| row.saved.name.clone()), database, engine));
         }
         let mut connected = self.connections.rows.iter().filter(|row| {
             self.connections.row_status(&row.saved.id) == LinkStatus::Connected
-                && !matches!(row.saved.engine, crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb)
+                && row.saved.engine != Engine::Mongodb
         });
         let row = connected.next()?;
         if connected.next().is_some() {
             return None;
         }
-        let database = row.saved.database.clone().filter(|db| !db.is_empty()).or_else(|| self.only_database(&row.saved.id));
+        let database = self.default_query_database(&row.saved);
         Some((row.saved.id.clone(), row.saved.name.clone(), database, row.saved.engine.as_str().to_owned()))
+    }
+
+    fn default_query_database(&self, saved: &SavedConnection) -> Option<String> {
+        saved.database.clone().filter(|db| !db.is_empty())
+            .or_else(|| (saved.engine == Engine::Redis).then(|| "0".to_owned()))
+            .or_else(|| self.only_database(&saved.id))
     }
 
     /// 树上这条连接只有一个库时返回它（SQLite 的 main、只配了一个库的服务器）；多个库不替用户选。
@@ -5201,7 +5206,7 @@ impl WorkbenchModel {
         self.activate_item(&id)
     }
 
-    fn active_mut(&mut self) -> Option<&mut WorkItem> {
+    pub(super) fn active_mut(&mut self) -> Option<&mut WorkItem> {
         let id = self.active_tab.clone()?;
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }

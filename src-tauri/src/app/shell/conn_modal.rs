@@ -424,6 +424,8 @@ impl ConnectionModal {
 /// 按需连接要续接的动作。鼠标和键盘走同一条路径，因此这里只描述“连上之后做什么”。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectAction {
+    /// 查询标签已打开，只需建立连接。
+    ConnectOnly,
     /// 展开对象树（chevron）。
     Expand,
     /// 连上后进入工作区（启动台/命令搜索里的连接行双击）。
@@ -462,7 +464,7 @@ impl ConnectIntent {
     /// 连接成功后要执行的命令；Expand 只改树状态，没有命令。
     pub fn command(&self) -> Option<&str> {
         match self.action {
-            ConnectAction::Expand => None,
+            ConnectAction::ConnectOnly | ConnectAction::Expand => None,
             ConnectAction::OpenWorkspace => Some("activity-workspace"),
             ConnectAction::OpenData => Some("tree-open-data"),
             ConnectAction::OpenStructure => Some("open-structure"),

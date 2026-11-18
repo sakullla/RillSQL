@@ -1143,7 +1143,7 @@ impl Workbench {
         let chevron_id = id.clone();
         let query_id = id.clone();
         let group = SharedString::from(format!("side-conn-group-{id}"));
-        let relational_conn = !matches!(row.saved.engine, Engine::Redis | Engine::Mongodb);
+        let supports_query = row.saved.engine != Engine::Mongodb;
         kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
             .group(group.clone())
@@ -1193,7 +1193,7 @@ impl Workbench {
             .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
             .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(name))
             .when(status == LinkStatus::Connecting, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
-            .when(relational_conn, |this| {
+            .when(supports_query, |this| {
                 this.child(explorer_hover_icon(
                     SharedString::from(format!("side-query-{id}")),
                     group.clone(),

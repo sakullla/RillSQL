@@ -7789,6 +7789,100 @@ fn sidebar_copy_and_test_remain_usable_while_catalog_is_loading(cx: &mut gpui_ki
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Run against the mysql and redis services in docker/compose.yaml.
+#[gpui_kit::test]
+#[ignore = "requires the MySQL and Redis development fixtures"]
+fn query_editor_runs_mysql_and_redis_fixtures(cx: &mut gpui_kit::TestAppContext) {
+    use crate::connections::model::{ConnectionDraft, Secret, SecretInput, TlsMode};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-query-fixtures-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let key = format!("rillsql:query-test:{}", uuid::Uuid::new_v4());
+    let rows = jobs::runtime().block_on(async {
+        for (engine, port, password) in [
+            (Engine::Mysql, std::env::var("RILLSQL_MYSQL_PORT").unwrap_or_else(|_| "3306".into()), "rillsql"),
+            (Engine::Redis, std::env::var("RILLSQL_REDIS_PORT").unwrap_or_else(|_| "6379".into()), "rillsql-redis"),
+        ] {
+            let id = engine.as_str();
+            let mut draft = ConnectionDraft::blank(engine);
+            draft.id = Some(id.into());
+            draft.name = id.into();
+            draft.host = "127.0.0.1".into();
+            draft.port = port;
+            draft.tls_mode = TlsMode::Off;
+            draft.save_password = false;
+            draft.database.clear();
+            if engine == Engine::Mysql {
+                draft.username = "rillsql".into();
+            } else {
+                draft.username.clear();
+                draft.database = "8".into();
+            }
+            services.connections.save(draft, SecretInput::default()).await.unwrap();
+            let opened = services.connections.open(id, SecretInput { password: Some(Secret::new(password)), ..Default::default() }).await.unwrap();
+            assert!(opened.connected, "{:?}", opened.report);
+        }
+        let (redis, _) = services.connections.redis_session("redis").unwrap();
+        redis::pipe().atomic()
+            .cmd("HSET").arg(&key).arg("state").arg("ready").ignore()
+            .cmd("EXPIRE").arg(&key).arg(120).ignore()
+            .query_async::<()>(&mut *redis.lock().await).await.unwrap();
+        services.list_connections().await.unwrap()
+    });
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.connections.rows = rows;
+            for id in ["mysql", "redis"] {
+                view.model.connections.status.insert(id.into(), LinkStatus::Connected);
+            }
+            view.model.open_bound_query("SELECT 1".into(), Some("mysql".into()), Some("mysql".into()), Some("rillsql".into()), Some("mysql".into()));
+        });
+        window.render_frame(cx);
+        window.click("query-act-execute-query", cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| view.query_cell(0, 0, cx) == "1" && !view.model.active_tab().unwrap().running), "SELECT 1");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("nav-open-keyspace:redis\u{1}0", cx);
+        });
+        window.render_frame(cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| !view.redis.read(cx).running()));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("redis-db-pick:8", cx)));
+    assert!(pump_until(cx, window, &view, |view, cx| view.redis.read(cx).database() == "8" && !view.redis.read(cx).running()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            let id = view.model.active_tab.clone().unwrap();
+            let tab = view.model.tabs.iter_mut().find(|tab| tab.id == id).unwrap();
+            assert_eq!(tab.connection_id.as_deref(), Some("redis"));
+            assert_eq!(tab.database.as_deref(), Some("8"));
+            tab.draft = format!("HGET {key}");
+        });
+        window.render_frame(cx);
+        window.click("query-act-execute-query", cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| view.query_cell(0, 0, cx).contains("wrong number of arguments") && !view.model.active_tab().unwrap().running));
+    // A browser on db0 and a query tab on db8 must keep independent selections.
+    jobs::runtime().block_on(crate::application::redis::select_db(&services.connections, "redis", 0)).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.model.active_mut().unwrap().draft = format!("HGET {key} state"));
+        window.render_frame(cx);
+        window.click("query-act-execute-query", cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| view.query_cell(0, 0, cx) == "ready" && !view.model.active_tab().unwrap().running), "HGET key field");
+    let (browser, _) = services.connections.redis_session("redis").unwrap();
+    let in_browser = jobs::runtime().block_on(async {
+        redis::cmd("EXISTS").arg(&key).query_async::<bool>(&mut *browser.lock().await).await.unwrap()
+    });
+    assert!(!in_browser, "query changed the browser database");
+    services.connections.disconnect("redis");
+    services.connections.disconnect("mysql");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[gpui_kit::test]
 #[ignore = "requires scripts/verify-catalog-mysql.py on loopback port 33067"]
 fn mysql_lazy_navigation_latency_fixture(cx: &mut gpui_kit::TestAppContext) {
@@ -9639,6 +9733,33 @@ fn blank_query_inherits_the_obvious_target() {
     model.connections.status.insert("b".into(), LinkStatus::Connected);
     assert!(model.dispatch("new-query").is_some());
     assert_eq!(model.active_tab().unwrap().connection_id, None);
+}
+
+#[test]
+fn new_query_keeps_the_redis_target_with_other_connections_open() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let mut redis = pg_saved("cache", "dev");
+    redis.saved.engine = Engine::Redis;
+    redis.saved.database = None;
+    model.connections.rows.push(redis);
+    model.connections.status.insert("cache".into(), LinkStatus::Connected);
+    model.dispatch("new-query").unwrap();
+    assert_eq!(model.active_tab().unwrap().database.as_deref(), Some("0"));
+
+    model.connections.rows.push(pg_saved("pg", "dev"));
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    model.dispatch("open-redis:cache|缓存|8").unwrap();
+    model.dispatch("new-query").unwrap();
+    let tab = model.active_tab().unwrap();
+    assert_eq!(tab.connection_id.as_deref(), Some("cache"));
+    assert_eq!(tab.engine.as_deref(), Some("redis"));
+    assert_eq!(tab.database.as_deref(), Some("8"));
+
+    model.connections.selected = Some("cache".into());
+    model.dispatch("conn-new-query").unwrap();
+    let ready = model.take_ready_intents();
+    assert_eq!(ready[0].action, super::conn_modal::ConnectAction::ConnectOnly);
+    assert_eq!(model.active_tab().unwrap().database.as_deref(), Some("0"));
 }
 
 /// 命令面板的“检查更新”：打开设置里的更新卡片并立即发起手动检查（不看自动检查开关）。

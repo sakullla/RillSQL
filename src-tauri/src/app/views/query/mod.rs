@@ -1590,7 +1590,8 @@ impl QueryPane {
         });
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            while let Some(item) = received.recv().await {
+            loop {
+                let item = received.recv().await.unwrap_or_else(|| Err("查询任务意外结束，未收到执行结果。".to_owned()));
                 let mut keep = false;
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
