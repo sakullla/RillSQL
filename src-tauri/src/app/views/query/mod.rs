@@ -161,6 +161,16 @@ pub struct QueryPane {
     /// 执行计划视图：看计划树还是引擎原始结果；树上选中的节点（前序下标）。
     plan_raw: bool,
     plan_selected: usize,
+    /// 计划树容器的焦点：整棵树只占一个 Tab 停靠点，只有它持有焦点时才处理导航键。
+    plan_focus: gpui_kit::FocusHandle,
+    /// 计划树的滚动句柄：跨帧保存，键盘或建议跳转后把选中节点滚进视口。
+    plan_scroll: gpui_kit::ScrollHandle,
+    /// 下一帧要滚进视口的节点（前序下标）。
+    plan_reveal: Option<usize>,
+    /// 最近一次画出的计划节点数；键盘导航按它钳制首尾，0 表示当前没有可选节点。
+    plan_len: usize,
+    /// 当前计划属于哪份结果（标签、执行批次、语句、结果页）；换了结果就回到树视图第一个节点。
+    plan_key: Option<(Option<String>, u64, usize, ResultView)>,
     /// 目标选择器：候选连接（含未打开的）与弹层状态；选未打开的连接时请外壳先连接。
     target_choices: Vec<target::TargetChoice>,
     target_picker: target::TargetPicker,
@@ -545,6 +555,11 @@ impl QueryPane {
             pin_rename: None,
             plan_raw: false,
             plan_selected: 0,
+            plan_focus: cx.focus_handle().tab_stop(true),
+            plan_scroll: gpui_kit::ScrollHandle::new(),
+            plan_reveal: None,
+            plan_len: 0,
+            plan_key: None,
             target_choices: Vec::new(),
             target_picker: target::TargetPicker::default(),
             connect_request: None,
@@ -911,14 +926,31 @@ impl QueryPane {
 
     fn command_impl(&mut self, id: &str, cx: &mut Context<Self>) {
         // 执行计划视图：切换计划树 / 原始结果、选中计划节点。只改视图状态。
+        // 建议跳转、鼠标点节点和树内方向键都只改 plan_selected 这一份选中，并把它滚进视口。
         if let Some(view) = id.strip_prefix("plan-view:") {
             self.plan_raw = view == "raw";
+            if !self.plan_raw {
+                self.plan_reveal = Some(self.plan_selected);
+            }
             cx.notify();
             return;
         }
         if let Some(index) = id.strip_prefix("plan-select:").and_then(|index| index.parse::<usize>().ok()) {
+            let index = match self.plan_len {
+                0 => index,
+                len => index.min(len - 1),
+            };
             self.plan_selected = index;
+            self.plan_reveal = Some(index);
             cx.notify();
+            return;
+        }
+        if let Some(key) = id.strip_prefix("plan-nav:") {
+            if let Some(index) = plan_view::step(self.plan_selected, self.plan_len, key) {
+                self.plan_selected = index;
+                self.plan_reveal = Some(index);
+                cx.notify();
+            }
             return;
         }
         // 行注释：命令层没有窗口，先挂起，下一帧只对真正有焦点的 SQL 编辑器执行。
@@ -3423,7 +3455,34 @@ impl QueryPane {
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
         let sent = result.sent_sql.clone().unwrap_or_else(|| result.sql.clone());
         if let Some(plan) = crate::query::plan::parse(&engine, &sent, &result.columns, &result.rows) {
-            let view = plan_view::PlanView { plan: &plan, selected: self.plan_selected, raw: self.plan_raw, locale, metrics, mono: mono.clone(), narrow: self.narrow };
+            // 新的结果（换标签、再次执行、换语句或固定页）从树视图第一个节点开始看；
+            // 同一份结果里切原始结果再回来保留选中。选中始终钳制在有效节点上。
+            let key = (self.desk.active_id().map(str::to_owned), self.desk.log_batch(), self.desk.statement(), self.desk.result_view());
+            if self.plan_key.as_ref() != Some(&key) {
+                self.plan_key = Some(key);
+                self.plan_raw = false;
+                self.plan_selected = 0;
+                self.plan_reveal = Some(0);
+            }
+            self.plan_len = plan.lines().len();
+            self.plan_selected = self.plan_selected.min(self.plan_len.saturating_sub(1));
+            if !self.plan_raw {
+                if let Some(index) = self.plan_reveal.take() {
+                    // 子元素 0 是列标题行，节点 i 是第 i + 1 个子元素。
+                    self.plan_scroll.scroll_to_item(index.min(self.plan_len.saturating_sub(1)) + 1);
+                }
+            }
+            let view = plan_view::PlanView {
+                plan: &plan,
+                selected: self.plan_selected,
+                raw: self.plan_raw,
+                locale,
+                metrics,
+                mono: mono.clone(),
+                narrow: self.narrow,
+                focus: self.plan_focus.clone(),
+                scroll: self.plan_scroll.clone(),
+            };
             let header = view.header(p, entity);
             let body = if self.plan_raw {
                 div().id("query-grid").test_support().flex_1().min_h(px(0.)).child(self.grid.clone()).into_any_element()
@@ -6071,5 +6130,181 @@ mod tests {
             assert!(window.try_find("query-target-popover").is_none(), "点新建后关闭弹层");
         })
         .unwrap();
+    }
+
+    /// SQLite 的 EXPLAIN QUERY PLAN 结果：每个 detail 一个顶层节点，按给定顺序成为前序下标。
+    fn plan_sheet(details: &[&str]) -> desk::StatementView {
+        let mut view = result("EXPLAIN QUERY PLAN select * from a", "ok", &["id", "parent", "notused", "detail"], &[], None, "");
+        view.rows = details
+            .iter()
+            .enumerate()
+            .map(|(index, detail)| vec![Some((index + 2).to_string()), Some("0".to_owned()), Some("0".to_owned()), Some((*detail).to_owned())])
+            .collect();
+        view
+    }
+
+    /// 首个节点全表扫描 a，中间是主键查找，最后一个节点全表扫描 z：两条建议分别指向首尾。
+    fn long_plan() -> desk::StatementView {
+        let mut details = vec!["SCAN a".to_owned()];
+        details.extend((1..39).map(|index| format!("SEARCH t{index} USING INTEGER PRIMARY KEY (rowid=?)")));
+        details.push("SCAN z".to_owned());
+        plan_sheet(&details.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    fn plan_state(pane: &Entity<QueryPane>, window: &Window, cx: &App) -> (usize, bool) {
+        let pane = pane.read(cx);
+        (pane.plan_selected, pane.plan_focus.is_focused(window))
+    }
+
+    /// 节点行完整落在计划树的可视区内。
+    fn node_in_view(window: &Window, index: usize) -> bool {
+        let tree = window.find("query-plan-tree").bounds();
+        let node = window.find(SharedString::from(format!("query-plan-node-{index}"))).bounds();
+        node.top() >= tree.top() - px(0.5) && node.bottom() <= tree.bottom() + px(0.5)
+    }
+
+    fn assert_plan_selected(window: &Window, index: usize, label: &str) {
+        let node = window.find(SharedString::from(format!("query-plan-node-{index}")));
+        assert_eq!(node.selected(), Some(true), "节点 {index} 应为选中态");
+        assert_eq!(window.find("query-plan-detail").label(), Some(label), "详情跟着选中节点 {index}");
+        assert!(node_in_view(window, index), "选中节点 {index} 滚进了可视区");
+    }
+
+    /// 计划树只有持有焦点时才吃 Up/Down/Home/End：点节点聚焦树，首尾不越界，选中滚进视口、详情同步；
+    /// 编辑器有焦点时同样的方向键属于编辑器，不移动计划选中。
+    #[gpui_kit::test]
+    fn plan_tree_keyboard_moves_the_shared_selection_only_while_focused(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![long_plan()]);
+            });
+            window.render_frame(cx);
+            assert_plan_selected(window, 0, "SCAN a");
+            assert!(!node_in_view(window, 39), "长计划超出可视区，末节点需要滚动才能看到");
+            assert_eq!(window.find("query-plan-tree").role(), Some(gpui_kit::Role::Tree));
+
+            // 编辑器持有焦点：方向键和 End 属于编辑器，计划选中不动。
+            let editor = pane.read(cx).editors.get("q").cloned().expect("editor");
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+            window.render_frame(cx);
+            assert!(editor.read(cx).is_focused(window, cx), "编辑器持有焦点");
+            for key in ["down", "end"] {
+                window.press(key, cx);
+            }
+            assert_eq!(plan_state(&pane, window, cx), (0, false), "编辑器的键不被计划树抢走");
+            assert_eq!(editor.read(cx).value(cx), "select 1", "编辑器草稿不变");
+
+            // 点节点：焦点交给树，选中同一节点。
+            window.click("query-plan-node-1", cx);
+            assert_eq!(plan_state(&pane, window, cx), (1, true), "点节点选中它并聚焦计划树");
+            assert_plan_selected(window, 1, "SEARCH t1");
+            window.press("down", cx);
+            assert_plan_selected(window, 2, "SEARCH t2");
+            window.press("up", cx);
+            window.press("up", cx);
+            assert_plan_selected(window, 0, "SCAN a");
+            window.press("up", cx);
+            assert_eq!(plan_state(&pane, window, cx), (0, true), "首节点再按 Up 不越界");
+            window.press("end", cx);
+            assert_plan_selected(window, 39, "SCAN z");
+            window.press("down", cx);
+            assert_eq!(plan_state(&pane, window, cx), (39, true), "末节点再按 Down 不越界");
+            assert!(!node_in_view(window, 0), "到末尾后首节点滚出了视口");
+            window.press("home", cx);
+            assert_plan_selected(window, 0, "SCAN a");
+            // 带修饰键的组合不是树导航，留给外壳和编辑器的快捷键。
+            window.press("shift-down", cx);
+            assert_eq!(plan_state(&pane, window, cx), (0, true), "Shift+Down 不移动计划选中");
+        })
+        .unwrap();
+    }
+
+    /// 建议行鼠标点击与 Enter 激活走同一条 plan-select；树是紧跟建议之后的唯一 Tab 停靠点；
+    /// 计划/原始结果往返保留选中；新结果回到树视图首节点；单节点导航原位不动。
+    #[gpui_kit::test]
+    fn plan_findings_and_tree_share_one_selection_across_views_and_results(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![long_plan()]);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-plan-finding-1").is_some(), "两条建议：a 与 z 的全表扫描");
+
+            // 鼠标点建议：跳到末节点并滚进视口；建议行不抢焦点。
+            window.click("query-plan-finding-1", cx);
+            assert_plan_selected(window, 39, "SCAN z");
+            assert!(!pane.read(cx).plan_focus.is_focused(window), "点建议不把焦点挪到树上");
+
+            // 点节点后，Tab 往回一步就是最后一条建议，Enter 激活它，再 Tab 回到树。
+            window.click("query-plan-node-37", cx);
+            assert_eq!(plan_state(&pane, window, cx), (37, true));
+            // 建议行的焦点句柄是隐式的，用“它被激活”观察焦点落在哪一条上。
+            window.focus_prev(cx);
+            window.render_frame(cx);
+            assert_eq!(plan_state(&pane, window, cx), (37, false), "Tab 往回离开计划树");
+            window.press("enter", cx);
+            assert_plan_selected(window, 39, "SCAN z");
+            assert!(!pane.read(cx).plan_focus.is_focused(window), "键盘激活建议后焦点留在建议上");
+            window.focus_prev(cx);
+            window.render_frame(cx);
+            window.press("space", cx);
+            assert_plan_selected(window, 0, "SCAN a");
+            window.focus_next(cx);
+            window.render_frame(cx);
+            window.press("enter", cx);
+            assert_plan_selected(window, 39, "SCAN z");
+            window.focus_next(cx);
+            window.render_frame(cx);
+            assert_eq!(plan_state(&pane, window, cx), (39, true), "最后一条建议之后紧跟计划树");
+            window.press("home", cx);
+            assert_plan_selected(window, 0, "SCAN a");
+            window.focus_next(cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).plan_focus.is_focused(window), "再 Tab 一次离开计划树");
+
+            // 计划 → 原始结果 → 计划：选中保留，仍在视口里。
+            window.click("query-plan-node-1", cx);
+            window.press("end", cx);
+            window.press("up", cx);
+            assert_plan_selected(window, 38, "SEARCH t38");
+            window.click("plan-view-raw", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-plan-tree").is_none(), "原始结果页不画计划树");
+            assert_eq!(pane.read(cx).plan_selected, 38);
+            window.click("plan-view-tree", cx);
+            window.render_frame(cx);
+            assert_plan_selected(window, 38, "SEARCH t38");
+
+            // 停在原始结果页时来了新结果：回到树视图第一个节点。
+            window.click("plan-view-raw", cx);
+            pane.update(cx, |pane, _| pane.desk.plant_run(vec![plan_sheet(&["SCAN only"])]));
+            window.render_frame(cx);
+            assert!(!pane.read(cx).plan_raw, "新结果从树视图开始看");
+            assert_plan_selected(window, 0, "SCAN only");
+            assert!(window.try_find("query-plan-node-1").is_none());
+
+            // 单节点：方向键和 Home/End 都留在原位。
+            window.click("query-plan-node-0", cx);
+            for key in ["down", "up", "end", "home"] {
+                window.press(key, cx);
+                assert_eq!(plan_state(&pane, window, cx), (0, true), "单节点按 {key} 保持原位");
+            }
+            assert_plan_selected(window, 0, "SCAN only");
+        })
+        .unwrap();
+    }
+
+    /// 导航步进是纯钳制：空计划没有可选节点，越界的旧选中先收回到末节点。
+    #[test]
+    fn plan_step_clamps_and_rejects_an_empty_plan() {
+        assert_eq!(plan_view::step(0, 0, "down"), None, "空计划不建立选中");
+        assert_eq!(plan_view::step(0, 1, "down"), Some(0));
+        assert_eq!(plan_view::step(9, 3, "up"), Some(1), "旧选中越界时按末节点起步");
+        assert_eq!(plan_view::step(1, 3, "end"), Some(2));
+        assert_eq!(plan_view::step(2, 3, "home"), Some(0));
     }
 }

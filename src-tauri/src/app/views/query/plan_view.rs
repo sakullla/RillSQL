@@ -1,9 +1,12 @@
 //! 执行计划视图：顶部摘要（代价、预估行数、问题数）、问题与建议、缩进计划树（代价占比条）
 //! 和选中节点的属性详情。数据来自 `query::plan`，与引擎无关；“原始结果”切回网格看引擎原文。
+//!
+//! 计划树是一个 Tab 停靠点（焦点在树容器上，节点行不进 Tab 顺序）：树持有焦点时 Up/Down/Home/End
+//! 移动选中，点节点把焦点交给树。建议、鼠标和键盘都只改 `QueryPane::plan_selected` 这一份选中。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{div, px, relative, AnyElement, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _};
+use gpui_kit::{div, px, relative, AnyElement, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _};
 
 use crate::i18n::{self, Locale};
 use crate::query::plan::{OpKind, Plan};
@@ -19,6 +22,37 @@ pub struct PlanView<'a> {
     pub metrics: Metrics,
     pub mono: SharedString,
     pub narrow: bool,
+    /// 计划树容器的焦点（唯一 Tab 停靠点）与滚动句柄，由 `QueryPane` 跨帧持有。
+    pub focus: FocusHandle,
+    pub scroll: ScrollHandle,
+}
+
+/// 计划树里的导航键：只认不带修饰键的 Up/Down/Home/End，其它键（含 Cmd/Ctrl/Alt/Shift 组合）照常冒泡。
+pub fn nav_key(event: &gpui_kit::KeyDownEvent) -> Option<&'static str> {
+    let modifiers = &event.keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.shift || modifiers.platform {
+        return None;
+    }
+    match event.keystroke.key.as_str() {
+        "up" | "arrowup" => Some("up"),
+        "down" | "arrowdown" => Some("down"),
+        "home" => Some("home"),
+        "end" => Some("end"),
+        _ => None,
+    }
+}
+
+/// 键盘导航后的选中：首尾不越界，空计划没有可选节点。
+pub fn step(selected: usize, len: usize, key: &str) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    let current = selected.min(last);
+    Some(match key {
+        "up" => current.saturating_sub(1),
+        "down" => (current + 1).min(last),
+        "home" => 0,
+        "end" => last,
+        _ => current,
+    })
 }
 
 /// 代价显示：大数取整分组，小数保留两位并去掉多余的零。
@@ -33,6 +67,17 @@ pub fn cost_text(value: f64) -> String {
 
 pub fn rows_text(value: f64) -> String {
     crate::app::views::grid::group_digits(value.round() as i64)
+}
+
+/// 节点的可读名称（操作 + 对象）：树行与详情面板的无障碍名称用同一份，详情跟着选中节点走。
+fn node_label(lines: &[crate::query::plan::PlanLine<'_>], index: usize) -> String {
+    lines
+        .get(index)
+        .map(|line| match &line.node.object {
+            Some(object) => format!("{} {object}", line.node.op),
+            None => line.node.op.clone(),
+        })
+        .unwrap_or_default()
 }
 
 fn click(entity: &Entity<QueryPane>, id: String) -> impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static {
@@ -125,8 +170,10 @@ impl PlanView<'_> {
                     .position(|line| line.node.issues.contains(issue) && line.node.object == *object)
                     .unwrap_or(0);
                 list = list.child(
+                    // 建议行是普通 Tab 停靠点：Enter/Space 与鼠标点击走同一条 plan-select，焦点留在建议上。
                     kit::interactive_states(div().id(SharedString::from(format!("query-plan-finding-{at}"))), p, false)
                         .test_support()
+                        .role(gpui_kit::Role::Button)
                         .px(px(6.))
                         .py(px(4.))
                         .rounded(px(Radius::CONTROL))
@@ -153,7 +200,9 @@ impl PlanView<'_> {
             list
         });
 
-        let mut tree = div().id("query-plan-tree").flex_1().min_w(px(0.)).h_full().overflow_y_scroll().flex().flex_col();
+        // 滚动区只放列标题和节点行（子元素 0 是列标题，节点 i 是第 i + 1 个），
+        // 焦点与描边在外层容器上，描边不挤占滚动区的可视范围。
+        let mut tree = div().id("query-plan-tree-scroll").track_scroll(&self.scroll).flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
         tree = tree.child(
             div()
                 .flex_none()
@@ -190,7 +239,13 @@ impl PlanView<'_> {
             };
             let is_selected = index == selected;
             let indent = 12. + line.depth as f32 * 18.;
+            let focus = self.focus.clone();
+            let select = entity.clone();
             let mut row = kit::row_states(div().id(SharedString::from(format!("query-plan-node-{index}"))), p)
+                .test_support()
+                .role(gpui_kit::Role::TreeItem)
+                .aria_label(SharedString::from(node_label(&lines, index)))
+                .aria_selected(is_selected)
                 .flex_none()
                 .min_h(px(self.metrics.row_h + 4.))
                 .py(px(4.))
@@ -203,7 +258,11 @@ impl PlanView<'_> {
                 .border_color(p.line_soft)
                 .when(is_selected, |this| this.bg(p.selection))
                 .when(!is_selected, |this| this.hover(|style| style.bg(p.hover)))
-                .on_click(click(entity, format!("plan-select:{index}")));
+                .on_click(move |_, window, cx| {
+                    // 点节点：焦点交给树（之后方向键接着走），选中走与建议、键盘同一条命令。
+                    window.focus(&focus, cx);
+                    select.update(cx, |pane, cx| pane.command(&format!("plan-select:{index}"), cx));
+                });
             if line.depth > 0 {
                 row = row.relative().child(div().absolute().top_0().bottom_0().left(px(indent - 12.)).w(px(1.)).bg(p.line));
             }
@@ -273,6 +332,8 @@ impl PlanView<'_> {
         let node = lines.get(selected).map(|line| line.node);
         let mut detail = div()
             .id("query-plan-detail")
+            .test_support()
+            .aria_label(SharedString::from(node_label(&lines, selected)))
             .flex_none()
             .overflow_y_scroll()
             .p(px(12.))
@@ -358,6 +419,31 @@ impl PlanView<'_> {
                 detail = detail.child(props);
             }
         }
+        let ring = p.accent;
+        let nav = entity.clone();
+        let tree = div()
+            .id("query-plan-tree")
+            .test_support()
+            .role(gpui_kit::Role::Tree)
+            .aria_label(t("query.plan.title"))
+            .track_focus(&self.focus)
+            // 焦点只在树容器上：键盘聚焦时容器描边，选中行仍用选中底色。
+            .border_1()
+            .border_color(gpui_kit::transparent_black())
+            .focus_visible(move |style| style.border_color(ring))
+            .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                if let Some(key) = nav_key(event) {
+                    cx.stop_propagation();
+                    nav.update(cx, |pane, cx| pane.command(&format!("plan-nav:{key}"), cx));
+                }
+            })
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .when(!self.narrow, |this| this.h_full())
+            .flex()
+            .flex_col()
+            .child(tree);
         let main = div()
             .flex_1()
             .min_h(px(0.))
