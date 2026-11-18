@@ -1856,24 +1856,49 @@ fn table_cell(cell: ColumnSpec, child: impl IntoElement) -> gpui_kit::Div {
         .child(child)
 }
 
-/// 长列表下拉（表、列、模式、类型）：限高可滚动，标出当前值；输入框里已经填了一部分时只列匹配项，
-/// 几百张表时不再铺满整个窗口。没有匹配时退回完整列表，免得用户以为没得选。
-fn choice_menu(menu: PopupMenu, choices: &[String], current: &str, pick: impl Fn(String, &mut App) + Clone + 'static) -> PopupMenu {
-    let needle = current.trim().to_lowercase();
-    let exact = choices.iter().any(|choice| choice == current.trim());
-    let filtered: Vec<&String> = if needle.is_empty() || exact {
-        choices.iter().collect()
-    } else {
-        let hits: Vec<&String> = choices.iter().filter(|choice| choice.to_lowercase().contains(&needle)).collect();
-        if hits.is_empty() { choices.iter().collect() } else { hits }
-    };
-    let mut menu = menu.min_w(px(220.)).max_w(px(420.)).max_h(px(360.)).scrollable(true);
-    for choice in filtered {
-        let value = choice.clone();
-        let pick = pick.clone();
-        menu = menu.item(PopupMenuItem::new(choice.clone()).checked(choice == current.trim()).on_click(move |_, _, cx| pick(value.clone(), cx)));
+/// 长列表下拉按当前输入得到的结果。没有可选项与输入无命中是两种不同的结论，都不能点。
+#[derive(Debug, PartialEq, Eq)]
+enum ChoiceMatch<'a> {
+    /// 原始选项为空：没有可选的表、列、模式或类型。
+    Unavailable,
+    /// 有选项但当前输入一项都不匹配：保留输入，提示修改或清空。
+    NoMatch,
+    /// 要列出的选项：输入为空或已是精确值时为全部，否则为大小写不敏感的部分匹配。
+    Items(Vec<&'a String>),
+}
+
+fn match_choices<'a>(choices: &'a [String], current: &str) -> ChoiceMatch<'a> {
+    if choices.is_empty() {
+        return ChoiceMatch::Unavailable;
     }
-    menu
+    let current = current.trim();
+    let needle = current.to_lowercase();
+    if needle.is_empty() || choices.iter().any(|choice| choice == current) {
+        return ChoiceMatch::Items(choices.iter().collect());
+    }
+    let hits: Vec<&String> = choices.iter().filter(|choice| choice.to_lowercase().contains(&needle)).collect();
+    if hits.is_empty() { ChoiceMatch::NoMatch } else { ChoiceMatch::Items(hits) }
+}
+
+/// 长列表下拉（表、列、模式、类型）：限高可滚动，标出当前值；输入框里已经填了一部分时只列匹配项，
+/// 几百张表时不再铺满整个窗口。没有匹配时给不可点的“无匹配选项”并保留输入，清空输入即恢复全部；
+/// 原本就没有选项时给“无可用选项”。两种提示都不触发选择、不改草稿。
+fn choice_menu(menu: PopupMenu, choices: &[String], current: &str, locale: Locale, pick: impl Fn(String, &mut App) + Clone + 'static) -> PopupMenu {
+    let mut menu = menu.min_w(px(220.)).max_w(px(420.)).max_h(px(360.)).scrollable(true);
+    match match_choices(choices, current) {
+        ChoiceMatch::Unavailable => menu.item(PopupMenuItem::label(i18n::text(locale, "structure.choice.empty"))),
+        ChoiceMatch::NoMatch => menu
+            .item(PopupMenuItem::label(i18n::text(locale, "structure.choice.noMatch")))
+            .item(PopupMenuItem::label(i18n::text(locale, "structure.choice.noMatchHint"))),
+        ChoiceMatch::Items(filtered) => {
+            for choice in filtered {
+                let value = choice.clone();
+                let pick = pick.clone();
+                menu = menu.item(PopupMenuItem::new(choice.clone()).checked(choice == current.trim()).on_click(move |_, _, cx| pick(value.clone(), cx)));
+            }
+            menu
+        }
+    }
 }
 
 fn row_menu(entity: &Entity<StructurePane>, entries: &[MenuEntry], mut menu: PopupMenu) -> PopupMenu {
@@ -2085,7 +2110,8 @@ impl StructurePane {
         let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
         let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "NULL", window, cx);
         let types = type_choices(engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
-        let current_type = if types.iter().any(|item| item.eq_ignore_ascii_case(column.type_name.trim())) { column.type_name.trim().to_uppercase() } else { String::new() };
+        // 用列表里的原样拼写作当前值：既能勾出它，也让 choice_menu 按精确值列出全部类型，而不是把大小写不同的输入当筛选词。
+        let current_type = types.iter().find(|item| item.eq_ignore_ascii_case(column.type_name.trim())).cloned().unwrap_or_default();
         let type_entity = entity.clone();
         let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
             .ghost()
@@ -2095,7 +2121,7 @@ impl StructurePane {
             .dropdown_menu(move |menu, _, _| {
                 let entity = type_entity.clone();
                 // 类型下拉列全部常用类型并勾出当前值，不按输入筛选：这里换类型，不是搜类型。
-                choice_menu(menu, &types, &current_type, move |choice, cx| {
+                choice_menu(menu, &types, &current_type, locale, move |choice, cx| {
                     entity.update(cx, |pane, cx| {
                         pane.write_draft(20_000 + index as u32, choice);
                         cx.notify();
@@ -2308,7 +2334,7 @@ impl StructurePane {
                         .disabled(remaining.is_empty())
                         .dropdown_menu(move |menu, _, _| {
                             let entity = add_entity.clone();
-                            choice_menu(menu, &remaining, "", move |name, cx| {
+                            choice_menu(menu, &remaining, "", locale, move |name, cx| {
                                 entity.update(cx, |pane, cx| {
                                     pane.toggle_index_column(&name);
                                     cx.notify();
@@ -2348,7 +2374,7 @@ impl StructurePane {
                         .accessibility_label(t("structure.field.column"))
                         .dropdown_menu(move |menu, _, _| {
                             let column_entity = column_entity.clone();
-                            choice_menu(menu, &local, &current_fk_column, move |choice, cx| {
+                            choice_menu(menu, &local, &current_fk_column, locale, move |choice, cx| {
                                 column_entity.update(cx, |pane, cx| {
                                     pane.choose_fk("fk_column", choice);
                                     cx.notify();
@@ -2366,7 +2392,7 @@ impl StructurePane {
                         .accessibility_label(t("ui.structure.refTable"))
                         .dropdown_menu(move |menu, _, _| {
                             let table_entity = table_entity.clone();
-                            choice_menu(menu, &tables, &current_fk_ref_table, move |choice, cx| {
+                            choice_menu(menu, &tables, &current_fk_ref_table, locale, move |choice, cx| {
                                 table_entity.update(cx, |pane, cx| {
                                     pane.choose_fk("fk_ref_table", choice);
                                     cx.notify();
@@ -2384,7 +2410,7 @@ impl StructurePane {
                         .accessibility_label(t("ui.structure.refColumn"))
                         .dropdown_menu(move |menu, _, _| {
                             let ref_entity = ref_entity.clone();
-                            choice_menu(menu, &columns, &current_fk_ref_column, move |choice, cx| {
+                            choice_menu(menu, &columns, &current_fk_ref_column, locale, move |choice, cx| {
                                 ref_entity.update(cx, |pane, cx| {
                                     pane.choose_fk("fk_ref_column", choice);
                                     cx.notify();
@@ -2431,7 +2457,7 @@ impl StructurePane {
                                     .accessibility_label(t("structure.fk.refSchema"))
                                     .dropdown_menu(move |menu, _, _| {
                                         let schema_entity = schema_entity.clone();
-                                        choice_menu(menu, &schemas, &current_fk_ref_schema, move |choice, cx| {
+                                        choice_menu(menu, &schemas, &current_fk_ref_schema, locale, move |choice, cx| {
                                             schema_entity.update(cx, |pane, cx| {
                                                 pane.choose_fk("fk_ref_schema", choice);
                                                 cx.notify();
@@ -4113,6 +4139,163 @@ mod tests {
             cx.update_window(window, |_, window, cx| window.click("structure-retry", cx)).unwrap();
             assert!(cx.update(|cx| pane.read(cx).load_error_text().is_empty()), "{section:?}: 重试要清掉失败原因");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 长列表下拉的判定：空选项、空输入、精确值、大小写混合、部分命中、无命中与清空恢复各有确定结果，
+    /// 无命中不再无说明地退回完整列表（R5）。
+    #[test]
+    fn choice_matching_separates_no_options_from_no_match() {
+        let choices: Vec<String> = ["orders", "Order_Items", "customers", "products"].iter().map(|item| (*item).to_owned()).collect();
+        let all: Vec<&String> = choices.iter().collect();
+        assert_eq!(match_choices(&[], ""), ChoiceMatch::Unavailable, "没有选项");
+        assert_eq!(match_choices(&[], "orders"), ChoiceMatch::Unavailable, "有输入但原本没有选项，仍是无可用项而不是无命中");
+        assert_eq!(match_choices(&choices, ""), ChoiceMatch::Items(all.clone()), "空输入列全部");
+        assert_eq!(match_choices(&choices, "   "), ChoiceMatch::Items(all.clone()), "只有空白等同空输入");
+        assert_eq!(match_choices(&choices, "orders"), ChoiceMatch::Items(all.clone()), "已是精确值时列全部，便于换一个");
+        assert_eq!(match_choices(&choices, " orders "), ChoiceMatch::Items(all.clone()), "精确值忽略首尾空白");
+        assert_eq!(match_choices(&choices, "ORDER"), ChoiceMatch::Items(vec![&choices[0], &choices[1]]), "大小写不敏感的部分命中");
+        assert_eq!(match_choices(&choices, "omer"), ChoiceMatch::Items(vec![&choices[2]]));
+        assert_eq!(match_choices(&choices, "zzz"), ChoiceMatch::NoMatch, "无命中不能退回完整列表");
+        // 清空输入恢复全部。
+        assert_eq!(match_choices(&choices, ""), ChoiceMatch::Items(all));
+        // 两种提示文案不同，且两种语言都翻译过。
+        for locale in [Locale::ZhCn, Locale::En] {
+            let empty = i18n::text(locale, "structure.choice.empty");
+            let no_match = i18n::text(locale, "structure.choice.noMatch");
+            assert_ne!(empty, no_match, "{locale:?}: 无可用项与无命中要用不同说明");
+            assert_ne!(i18n::text(locale, "structure.choice.noMatchHint"), "structure.choice.noMatchHint");
+        }
+        assert_ne!(i18n::text(Locale::ZhCn, "structure.choice.noMatch"), i18n::text(Locale::En, "structure.choice.noMatch"));
+    }
+
+    /// 真实下拉路径：引用表输入无命中时菜单里没有可点项、输入与草稿不变；清空输入后重新打开列出全部，
+    /// 限高可滚动；部分匹配时点选写入正确的字段（R5 / R7）。
+    #[gpui_kit::test]
+    fn fk_table_menu_shows_no_match_keeps_input_and_recovers_after_clearing(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::{TestQueryExt as _, TestWindowExt};
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("choice-menu");
+        cx.update(gpui_kit::init);
+        let tables: Vec<String> = (0..60).map(|index| format!("table_{index:02}")).collect();
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)),
+            };
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| {
+                    cx.new(|_| {
+                        let mut pane = pane_with_snapshot(services.clone(), 3);
+                        pane.session.section = Section::ForeignKeys;
+                        pane.composer_open = true;
+                        pane.fk_tables = tables.clone();
+                        pane.session.fk_ref_table = "zzz".into();
+                        pane.session.fk_column = "col_1".into();
+                        pane
+                    })
+                },
+            )
+            .expect("structure pane")
+        });
+        let menu_items = |window: &mut Window| {
+            window
+                .find_all_by_role(gpui_kit::Role::MenuItem)
+                .into_iter()
+                .map(|item| (item.label().unwrap_or_default().to_owned(), item.disabled().unwrap_or(false)))
+                .collect::<Vec<_>>()
+        };
+
+        // 无命中：只有两条不可点的说明，没有任何表名。
+        let items = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("structure-fk-tables", cx);
+                window.render_frame(cx);
+                menu_items(window)
+            })
+            .unwrap();
+        let no_match = i18n::text(Locale::ZhCn, "structure.choice.noMatch");
+        let hint = i18n::text(Locale::ZhCn, "structure.choice.noMatchHint");
+        assert_eq!(items.iter().map(|(label, _)| label.clone()).collect::<Vec<_>>(), vec![no_match.clone(), hint.clone()], "无命中不能退回完整列表: {items:?}");
+        // 说明行是 PopupMenu 的 Label：无点击处理、键盘也跳过。逐条点击并尝试键盘确认，草稿都不变。
+        cx.update_window(window, |_, window, cx| {
+            window.click(gpui_kit::ElementId::Integer(0), cx);
+            window.render_frame(cx);
+            window.click(gpui_kit::ElementId::Integer(1), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let still_open = cx.update_window(window, |_, window, _| window.try_find("popup-menu").is_some()).unwrap();
+        assert!(still_open, "点说明行不算选择，菜单保持打开");
+        cx.update_window(window, |_, window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.fk_ref_table, "zzz", "点无命中说明不改输入");
+            assert_eq!(pane.session.fk_column, "col_1", "也不改其它未提交草稿");
+            assert!(!pane.session.preview_open());
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        // 清空输入后重新打开：全部 60 张表，菜单限高滚动。
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            pane.set_field("fk_ref_table", String::new());
+            cx.notify();
+        }));
+        let (items, menu_h) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("structure-fk-tables", cx);
+                window.render_frame(cx);
+                (menu_items(window), window.find("popup-menu").bounds().size.height)
+            })
+            .unwrap();
+        assert_eq!(items.len(), tables.len(), "清空输入恢复全部选项");
+        assert!(items.iter().all(|(_, disabled)| !*disabled));
+        assert!(f32::from(menu_h) <= 360. + 16., "长列表菜单仍限高（{}）", f32::from(menu_h));
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        // 部分匹配：只列命中的表，点选写入引用表字段，不碰本表列。
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            pane.set_field("fk_ref_table", "LE_4".into());
+            cx.notify();
+        }));
+        let items = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("structure-fk-tables", cx);
+                window.render_frame(cx);
+                menu_items(window)
+            })
+            .unwrap();
+        let labels = items.iter().map(|(label, _)| label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels, (40..50).map(|index| format!("table_{index}")).collect::<Vec<_>>(), "部分匹配只列命中项");
+        cx.update_window(window, |_, window, cx| {
+            let target = window.find_by_label("table_42");
+            window.click(target.path().last().unwrap().clone(), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.fk_ref_table, "table_42", "选中项写入引用表");
+            assert_eq!(pane.session.fk_column, "col_1", "本表列不被改写");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

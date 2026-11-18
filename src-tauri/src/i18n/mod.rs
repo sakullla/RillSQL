@@ -1296,6 +1296,9 @@ dict! {
     "structure.fk.onDelete" => "ON DELETE", "ON DELETE";
     "structure.fk.onUpdate" => "ON UPDATE", "ON UPDATE";
     "structure.fk.refSchema" => "引用 schema", "Referenced schema";
+    "structure.choice.empty" => "无可用选项", "No options available";
+    "structure.choice.noMatch" => "无匹配选项", "No matching options";
+    "structure.choice.noMatchHint" => "修改或清空输入以查看全部选项", "Change or clear the input to see all options";
     "structure.danger.typeName" => "输入对象名以确认", "Type the object name to confirm";
     "admin.action.refresh" => "刷新", "Refresh";
     "admin.action.connect" => "立即连接", "Connect now";
