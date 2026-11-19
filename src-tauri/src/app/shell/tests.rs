@@ -1971,7 +1971,7 @@ fn foreign_key_jump_opens_the_referenced_row_and_keeps_the_source_state(cx: &mut
         )
     });
     assert!(active_is_query, "跳转后当前工作项就是引用表的查询");
-    assert_eq!(sql, "SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1", "单键定位查询");
+    assert_eq!(sql, "SELECT id FROM main.authors WHERE id = 1", "单键定位查询");
     assert_eq!(connection.as_deref(), Some("notes"), "目标仍是被引用的那条连接");
     assert_eq!(database_name.as_deref(), Some("main"));
     assert_eq!(engine.as_deref(), Some("sqlite"));
@@ -1996,7 +1996,7 @@ fn foreign_key_jump_opens_the_referenced_row_and_keeps_the_source_state(cx: &mut
     let copied = cx.update(|cx| table.update(cx, |pane, cx| pane.command("grid-fk-select", cx)));
     assert_eq!(
         copied.as_deref(),
-        Some("SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1"),
+        Some("SELECT id FROM main.authors WHERE id = 1"),
         "生成查询复制同一段 SQL"
     );
     assert_eq!(cx.update(|cx| view.read(cx).model.tabs.len()), tabs_now, "复制不打开工作项");
@@ -4937,7 +4937,7 @@ fn insertions_change_the_draft_only_and_keep_the_selected_target() {
     let _ = model.dispatch(&format!("nav-insert-object:{orders_id}"));
     let tab = model.active_tab().cloned().expect("查询草稿");
     assert_eq!(tab.kind, WorkItemKind::Query);
-    assert_eq!(tab.draft, "\"public\".\"orders\"");
+    assert_eq!(tab.draft, "public.orders");
     assert_eq!(model.executions, 0);
     assert!(model.pending.is_empty());
 
@@ -4951,7 +4951,7 @@ fn insertions_change_the_draft_only_and_keep_the_selected_target() {
     let _ = model.dispatch(&format!("nav-insert-select:{orders_id}"));
     let tab = model.active_tab().cloned().expect("查询项");
     assert!(tab.draft.starts_with("select 1"), "{}", tab.draft);
-    assert!(tab.draft.contains("FROM \"public\".\"orders\""));
+    assert!(tab.draft.contains("FROM public.orders"));
     assert_eq!(model.tabs.len(), tabs, "插入不新建工作项");
     assert_eq!(model.executions, 0, "插入不执行");
 }
@@ -6407,7 +6407,7 @@ fn sql_templates_insert_into_a_bound_draft_and_never_run() {
     assert_eq!(tab.kind, WorkItemKind::Query);
     assert_eq!(tab.connection_id.as_deref(), Some("pg"));
     assert_eq!(tab.database.as_deref(), Some("shop"));
-    assert_eq!(tab.draft, "UPDATE \"public\".\"orders\"\nSET \"label\" = ?\nWHERE \"id\" = ?;");
+    assert_eq!(tab.draft, "UPDATE public.orders\nSET label = ?\nWHERE id = ?;");
     assert_eq!(model.executions, 0, "模板不执行");
     assert!(tab.last_executed_sql.is_none());
 
@@ -6419,10 +6419,10 @@ fn sql_templates_insert_into_a_bound_draft_and_never_run() {
     assert_eq!(model.tabs.len(), tabs);
     let draft = model.active_tab().unwrap().draft.clone();
     assert!(draft.starts_with("UPDATE"), "{draft}");
-    assert!(draft.ends_with("INSERT INTO \"public\".\"orders\" (\"id\", \"label\")\nVALUES (?, ?);"), "{draft}");
+    assert!(draft.ends_with("INSERT INTO public.orders (id, label)\nVALUES (?, ?);"), "{draft}");
     assert!(model.open_nav_menu(&orders));
     let _ = model.dispatch("tree-template-delete");
-    assert!(model.active_tab().unwrap().draft.ends_with("DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;"));
+    assert!(model.active_tab().unwrap().draft.ends_with("DELETE FROM public.orders\nWHERE id = ?;"));
     assert_eq!(model.executions, 0);
 
     // 读列失败：说明原因，不插入。
@@ -6506,7 +6506,7 @@ fn sql_templates_insert_at_the_draft_cursor() {
     model.nav_details_loaded(&orders, Ok(order_columns()), Ok(Vec::new()));
     let _ = model.dispatch("new-query");
     let tab_id = model.active_tab().expect("查询项").id.clone();
-    let delete = "DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;";
+    let delete = "DELETE FROM public.orders\nWHERE id = ?;";
     let set_draft = |model: &mut WorkbenchModel, text: &str| {
         model.tabs.iter_mut().find(|tab| tab.id == tab_id).unwrap().draft = text.to_owned();
     };

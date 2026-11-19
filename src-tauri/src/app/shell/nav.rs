@@ -244,14 +244,14 @@ mod tests {
 
     #[test]
     fn insert_texts_quote_identifiers_and_never_run() {
-        assert_eq!(insert_object_text(&key(Engine::Postgres, "shop", "public", "orders")), "\"public\".\"orders\"");
+        assert_eq!(insert_object_text(&key(Engine::Postgres, "shop", "public", "orders")), "public.orders");
         assert_eq!(
             insert_object_text(&key(Engine::Postgres, "shop", "public", "or\"ders")),
-            "\"public\".\"or\"\"ders\""
+            "public.\"or\"\"ders\""
         );
         let sql = select_text(&key(Engine::Postgres, "shop", "public", "orders"));
         assert!(sql.starts_with("SELECT *"));
-        assert!(sql.contains("FROM \"public\".\"orders\""));
+        assert!(sql.contains("FROM public.orders"));
         assert!(sql.ends_with(';'));
     }
 
@@ -270,29 +270,29 @@ mod tests {
         let pg = key(Engine::Postgres, "shop", "public", "orders");
         assert_eq!(
             template_text(TemplateKind::Insert, &pg, &columns),
-            "INSERT INTO \"public\".\"orders\" (\"id\", \"label\", \"note\")\nVALUES (?, ?, ?);"
+            "INSERT INTO public.orders (id, label, note)\nVALUES (?, ?, ?);"
         );
         assert_eq!(
             template_text(TemplateKind::Update, &pg, &columns),
-            "UPDATE \"public\".\"orders\"\nSET \"label\" = ?,\n    \"note\" = ?\nWHERE \"id\" = ?;"
+            "UPDATE public.orders\nSET label = ?,\n    note = ?\nWHERE id = ?;"
         );
-        assert_eq!(template_text(TemplateKind::Delete, &pg, &columns), "DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;");
+        assert_eq!(template_text(TemplateKind::Delete, &pg, &columns), "DELETE FROM public.orders\nWHERE id = ?;");
 
         let mysql = key(Engine::Mysql, "shop", "", "orders");
         let update = template_text(TemplateKind::Update, &mysql, &columns);
-        assert!(update.starts_with("UPDATE `shop`.`orders`"), "{update}");
-        assert!(update.contains("`label` = ?"), "{update}");
+        assert!(update.starts_with("UPDATE shop.orders"), "{update}");
+        assert!(update.contains("label = ?"), "{update}");
         let mariadb = key(Engine::Mariadb, "shop", "", "orders");
-        assert!(template_text(TemplateKind::Delete, &mariadb, &columns).contains("`id` = ?"));
+        assert!(template_text(TemplateKind::Delete, &mariadb, &columns).contains("id = ?"));
 
         // 没有主键：条件留给用户，不替他猜。
         let loose = vec![("a".to_owned(), false), ("b".to_owned(), false)];
         let sqlite = key(Engine::Sqlite, "main", "", "notes");
-        assert_eq!(template_text(TemplateKind::Delete, &sqlite, &loose), "DELETE FROM \"notes\"\nWHERE /* condition */;");
+        assert_eq!(template_text(TemplateKind::Delete, &sqlite, &loose), "DELETE FROM notes\nWHERE /* condition */;");
         let update = template_text(TemplateKind::Update, &sqlite, &loose);
-        assert!(update.contains("\"a\" = ?") && update.contains("\"b\" = ?") && update.ends_with("WHERE /* condition */;"), "{update}");
+        assert!(update.contains("a = ?") && update.contains("b = ?") && update.ends_with("WHERE /* condition */;"), "{update}");
         let sqlserver = key(Engine::Sqlserver, "shop", "dbo", "orders");
-        assert!(template_text(TemplateKind::Insert, &sqlserver, &columns).starts_with("INSERT INTO [dbo].[orders] ([id], [label], [note])"));
+        assert!(template_text(TemplateKind::Insert, &sqlserver, &columns).starts_with("INSERT INTO dbo.orders (id, label, note)"));
         assert_eq!(TemplateKind::parse("update"), Some(TemplateKind::Update));
         assert_eq!(TemplateKind::parse(TemplateKind::Delete.as_str()), Some(TemplateKind::Delete));
         assert_eq!(TemplateKind::parse("merge"), None);

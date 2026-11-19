@@ -83,7 +83,7 @@ fn between_and_in_filter_fixture_rows() {
     assert!(page.sql.contains("BETWEEN 5 AND 8"));
     let names = query_page(&store, &[one_of("name", &["小河", "000-first"])], None, 0, 100).unwrap();
     assert_eq!(names.matched, 3);
-    assert!(names.sql.contains("\"name\" IN ('小河', '000-first')"));
+    assert!(names.sql.contains("name IN ('小河', '000-first')"));
 }
 
 #[test]
@@ -107,11 +107,11 @@ fn search_clause_compiles_or_like_in_each_engine_dialect() {
         let clause = search_clause(engine, &columns, " 甲'x ").expect("非空关键字生成子句");
         let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
         let (id, name, email, joined) = match engine {
-            Engine::Postgres => (r#""id"::text"#.to_owned(), r#""name"::text"#.to_owned(), r#""email"::text"#.to_owned(), r#""joined"::text"#.to_owned()),
-            Engine::Mysql | Engine::Mariadb => ("CAST(`id` AS CHAR)".to_owned(), "CAST(`name` AS CHAR)".to_owned(), "CAST(`email` AS CHAR)".to_owned(), "CAST(`joined` AS CHAR)".to_owned()),
-            Engine::Sqlite => (r#"CAST("id" AS TEXT)"#.to_owned(), r#"CAST("name" AS TEXT)"#.to_owned(), r#"CAST("email" AS TEXT)"#.to_owned(), r#"CAST("joined" AS TEXT)"#.to_owned()),
+            Engine::Postgres => (r#"id::text"#.to_owned(), r#"name::text"#.to_owned(), r#"email::text"#.to_owned(), r#"joined::text"#.to_owned()),
+            Engine::Mysql | Engine::Mariadb => ("CAST(id AS CHAR)".to_owned(), "CAST(name AS CHAR)".to_owned(), "CAST(email AS CHAR)".to_owned(), "CAST(joined AS CHAR)".to_owned()),
+            Engine::Sqlite => (r#"CAST(id AS TEXT)"#.to_owned(), r#"CAST(name AS TEXT)"#.to_owned(), r#"CAST(email AS TEXT)"#.to_owned(), r#"CAST(joined AS TEXT)"#.to_owned()),
             // T-SQL 用括号标识符、NVARCHAR 投影与 N'' 模式串。
-            Engine::Sqlserver => ("CAST([id] AS NVARCHAR(MAX))".to_owned(), "CAST([name] AS NVARCHAR(MAX))".to_owned(), "CAST([email] AS NVARCHAR(MAX))".to_owned(), "CAST([joined] AS NVARCHAR(MAX))".to_owned()),
+            Engine::Sqlserver => ("CAST(id AS NVARCHAR(MAX))".to_owned(), "CAST(name AS NVARCHAR(MAX))".to_owned(), "CAST(email AS NVARCHAR(MAX))".to_owned(), "CAST(joined AS NVARCHAR(MAX))".to_owned()),
             // 循环只遍历关系型引擎；Redis 没有 SQL 编译。
             Engine::Redis | Engine::Mongodb => unreachable!("专项引擎不参与全文搜索方言测试"),
         };
@@ -136,8 +136,8 @@ fn search_clause_matches_pattern_characters_literally() {
 fn search_clause_skips_binary_geometry_and_unknown_columns() {
     let columns = rich_schema(Engine::Mysql).columns;
     let clause = search_clause(Engine::Mysql, &columns, "x").unwrap();
-    assert!(clause.contains("`id`"));
-    assert!(clause.contains("`name`"));
+    assert!(clause.contains("id"));
+    assert!(clause.contains("name"));
     assert!(!clause.contains("avatar"));
     assert!(!clause.contains("shape"));
     assert!(!clause.contains("mystery"));
@@ -150,16 +150,16 @@ fn search_clause_combines_with_filters_sort_and_paging() {
     let schema = schema_of(Engine::Mysql);
     let clause = search_clause(Engine::Mysql, &schema.columns, "小河").unwrap();
     let filter = Filter { column: "id".to_owned(), op: FilterOp::Gt, value: Some("10".to_owned()), second: None, values: Vec::new() };
-    assert_eq!(compile_where_with_search(&schema, std::slice::from_ref(&filter), Some("小河")).unwrap(), format!("`id` > 10 AND {clause}"));
+    assert_eq!(compile_where_with_search(&schema, std::slice::from_ref(&filter), Some("小河")).unwrap(), format!("id > 10 AND {clause}"));
     assert_eq!(compile_where_with_search(&schema, &[], Some("  ")).unwrap(), "");
     assert_eq!(compile_where_with_search(&schema, &[], None).unwrap(), "");
     assert_eq!(compile_where_with_search(&schema, &[one_of("id", &[])], Some("小河")).unwrap_err(), "IN 筛选至少要一个值");
 
     let sql = browse_sql_with_search(&schema, &[filter], Some("小河"), None, 20, 40).unwrap();
-    assert_eq!(sql, format!("SELECT * FROM `public`.`customers` WHERE `id` > 10 AND {clause} LIMIT 20 OFFSET 40"));
+    assert_eq!(sql, format!("SELECT * FROM public.customers WHERE id > 10 AND {clause} LIMIT 20 OFFSET 40"));
     let sort = Sort { column: "id".to_owned(), descending: true };
     let sorted = browse_sql_with_search(&schema, &[], Some("小河"), Some(&sort), 10, 0).unwrap();
-    assert_eq!(sorted, format!("SELECT * FROM `public`.`customers` WHERE {clause} ORDER BY `id` DESC LIMIT 10"));
+    assert_eq!(sorted, format!("SELECT * FROM public.customers WHERE {clause} ORDER BY id DESC LIMIT 10"));
     // 没有关键字时与既有 browse_sql 完全一致（存量行为不变）。
     assert_eq!(browse_sql_with_search(&schema, &[], None, Some(&sort), 10, 0).unwrap(), browse_sql(&schema, &[], Some(&sort), 10, 0).unwrap());
 }
@@ -198,20 +198,20 @@ fn sqlserver_paging_uses_offset_fetch_and_defaults_to_a_stable_order() {
     let sort = Sort { column: "id".to_owned(), descending: false };
     // 有排序时直接 OFFSET/FETCH。
     let sorted = browse_sql_with_search(&schema, &[], None, Some(&sort), 20, 40).unwrap();
-    assert_eq!(sorted, "SELECT * FROM [public].[customers] ORDER BY [id] ASC OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
+    assert_eq!(sorted, "SELECT * FROM [public].customers ORDER BY id ASC OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
     // 无排序时补恒定序（OFFSET/FETCH 必须跟在 ORDER BY 后面）。
     let unsorted = browse_sql_with_search(&schema, &[], None, None, 20, 40).unwrap();
-    assert_eq!(unsorted, "SELECT * FROM [public].[customers] ORDER BY (SELECT NULL) OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
+    assert_eq!(unsorted, "SELECT * FROM [public].customers ORDER BY (SELECT NULL) OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
     // 首页同样显式 OFFSET 0。
     let first = browse_sql_with_search(&schema, &[], None, Some(&sort), 20, 0).unwrap();
-    assert!(first.ends_with("ORDER BY [id] ASC OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY"));
+    assert!(first.ends_with("ORDER BY id ASC OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY"));
 }
 
 #[test]
 fn sqlserver_empty_insert_uses_default_values() {
     use super::sql::insert_sql;
     let schema = schema_of(Engine::Sqlserver);
-    assert_eq!(insert_sql(&schema, &[]), "INSERT INTO [public].[customers] DEFAULT VALUES");
+    assert_eq!(insert_sql(&schema, &[]), "INSERT INTO [public].customers DEFAULT VALUES");
 }
 
 #[test]
@@ -245,10 +245,10 @@ fn arbitrary_column_sort_combines_with_search_filters_and_paging() {
     let asc = Sort { column: "name".to_owned(), descending: false };
     let desc = Sort { column: "name".to_owned(), descending: true };
     let first = browse_sql_with_search(&store.schema, &[], None, Some(&asc), 10, 0).unwrap();
-    assert!(first.contains("ORDER BY \"name\" ASC"), "{first}");
+    assert!(first.contains("ORDER BY name ASC"), "{first}");
     assert!(first.ends_with("LIMIT 10"), "{first}");
     let second = browse_sql_with_search(&store.schema, &[], None, Some(&desc), 10, 10).unwrap();
-    assert!(second.contains("ORDER BY \"name\" DESC"), "{second}");
+    assert!(second.contains("ORDER BY name DESC"), "{second}");
     assert!(second.ends_with("LIMIT 10 OFFSET 10"), "{second}");
     // 取消排序：没有 ORDER BY，分页照旧可用。
     let plain = browse_sql_with_search(&store.schema, &[], None, None, 10, 20).unwrap();
@@ -283,7 +283,7 @@ fn combined_filters_search_sort_and_paging_separate_no_match_from_errors() {
     let sql = browse_sql_with_search(&store.schema, &filters, Some("客户"), Some(&sort), 3, 0).unwrap();
     assert!(sql.contains("> 5"), "{sql}");
     assert!(sql.contains("BETWEEN 8 AND 12"), "{sql}");
-    assert!(sql.contains("ORDER BY \"id\" DESC"), "{sql}");
+    assert!(sql.contains("ORDER BY id DESC"), "{sql}");
     assert!(sql.contains("LIMIT 3"), "{sql}");
 
     // 条件合法但没有行是无匹配，不是错误，也不是截断。
@@ -377,7 +377,7 @@ fn structured_conditions_and_their_sql_stay_equivalent() {
         Filter { column: "name".to_owned(), op: FilterOp::Null, value: None, second: None, values: Vec::new() },
     ];
     let generated = compile_where(&schema, &filters).unwrap();
-    assert_eq!(generated, "\"id\" > 10 AND \"name\" IS NULL");
+    assert_eq!(generated, "id > 10 AND name IS NULL");
     // 直接表达式整体加括号后再拼，自己的 OR 不会串到关键字条件上。
     let combined = compile_where_with_condition(&schema, &[], Some("小河"), Some(&generated)).unwrap();
     assert_eq!(

@@ -6332,8 +6332,8 @@ mod pane_tests {
                 pane.column_command(0, "column-sort-desc", cx);
                 assert_eq!(pane.cell(0, 1), "改", "排序后暂存值跟着行 identity 移动");
                 let sql = pane.preview(cx).unwrap();
-                assert!(sql[0].contains("\"id\" = 2"), "{sql:?}");
-                assert!(!sql[0].contains("\"id\" = 1"), "{sql:?}");
+                assert!(sql[0].contains("id = 2"), "{sql:?}");
+                assert!(!sql[0].contains("id = 1"), "{sql:?}");
             });
         });
     }
@@ -6763,7 +6763,7 @@ mod pane_tests {
                 assert_eq!(pane.session.continuation(false), Continuation::Complete);
                 // 暂存的那一行已经不在窗口里，但暂存本身仍然保留并可预览。
                 assert!(pane.session.uncommitted());
-                assert!(pane.preview(cx).unwrap().iter().any(|sql| sql.contains("\"id\" = 2")));
+                assert!(pane.preview(cx).unwrap().iter().any(|sql| sql.contains("id = 2")));
             });
         });
     }
@@ -7007,16 +7007,16 @@ mod pane_tests {
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 pane.session.select(1, 1, false);
-                assert_eq!(pane.command("grid-copy-where", cx).as_deref(), Some("WHERE \"customers\".\"name\" = '乙'"));
-                assert_eq!(pane.command("grid-copy-row-where", cx).as_deref(), Some("WHERE \"customers\".\"id\" = 2"));
-                assert_eq!(pane.command("grid-copy-column-where", cx).as_deref(), Some("WHERE \"customers\".\"name\" IN ('乙')"));
+                assert_eq!(pane.command("grid-copy-where", cx).as_deref(), Some("WHERE customers.name = '乙'"));
+                assert_eq!(pane.command("grid-copy-row-where", cx).as_deref(), Some("WHERE customers.id = 2"));
+                assert_eq!(pane.command("grid-copy-column-where", cx).as_deref(), Some("WHERE customers.name IN ('乙')"));
             });
         });
         settle(cx);
         cx.update(|cx| {
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
-                Some("WHERE \"customers\".\"name\" IN ('乙')"),
+                Some("WHERE customers.name IN ('乙')"),
                 "最后一个 WHERE 复制应进入剪贴板"
             );
         });
@@ -7787,7 +7787,7 @@ mod workbench_tests {
             ("grid-copy-as-csv", "\"id\",\"name\",\"note\"\r\n\"1\",\"a,\"\"b\"\"\",NULL\r\n\"2\",\"乙\",\"x\""),
             ("grid-copy-as-json", "[{\"id\":\"1\",\"name\":\"a,\\\"b\\\"\",\"note\":null},{\"id\":\"2\",\"name\":\"乙\",\"note\":\"x\"}]"),
             ("grid-copy-as-markdown", "| id | name | note |\r\n| --- | --- | --- |\r\n| 1 | a,\"b\" | NULL |\r\n| 2 | 乙 | x |"),
-            ("grid-copy-as-insert", "INSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (2, '乙', 'x');"),
+            ("grid-copy-as-insert", "INSERT INTO people (id, name, note) VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO people (id, name, note) VALUES (2, '乙', 'x');"),
         ];
         for (id, text) in expected {
             cx.update(|cx| {
@@ -7805,7 +7805,7 @@ mod workbench_tests {
                 let sheet = QuerySheet { sql: "select name from a join b on a.id = b.id".into(), columns: vec!["name".into()], rows: vec![vec![Some("甲".into())]], truncated: false, full_count: Some(1) };
                 pane.show_query(target(), sheet, cx);
                 pane.session.select(0, 0, false);
-                assert_eq!(pane.command("grid-copy-as-insert", cx).as_deref(), Some("INSERT INTO \"table_name\" (\"name\") VALUES ('甲');"));
+                assert_eq!(pane.command("grid-copy-as-insert", cx).as_deref(), Some("INSERT INTO table_name (name) VALUES ('甲');"));
                 pane.notice.clone()
             })
         });
@@ -8578,7 +8578,7 @@ mod workbench_tests {
             pane.session.select(1, 1, false);
             let _ = pane.command("grid-clone-row", cx);
             let sql = pane.preview(cx).unwrap();
-            assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('乙', 'x')".to_owned()]);
+            assert_eq!(sql, vec!["INSERT INTO people (name, note) VALUES ('乙', 'x')".to_owned()]);
             pane.cancel_preview(cx);
         }));
         assert_eq!(cx.update(|cx| pane.read(cx).notice.clone()), i18n::text(Locale::ZhCn, "grid.write.cloned"));

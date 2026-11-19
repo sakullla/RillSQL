@@ -5509,8 +5509,8 @@ mod tests {
         // 编辑目标由显示行号解析成行 id：降序显示第 0 行是 id 12，不是旧的焦点行。
         assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
         let sql = grid.open_preview().unwrap();
-        assert!(sql[0].contains("\"id\" = 12"), "{sql:?}");
-        assert!(!sql[0].contains("\"id\" = 11"), "{sql:?}");
+        assert!(sql[0].contains("id = 12"), "{sql:?}");
+        assert!(!sql[0].contains("id = 11"), "{sql:?}");
         assert_eq!(grid.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("12"));
 
         // 完整值查看同样按行 id，重新排序后仍读同一行。
@@ -5570,7 +5570,7 @@ mod tests {
         assert!(paged.uncommitted(), "翻页不应丢掉上一页的暂存");
         assert_eq!(paged.column_width(1), 320.0, "列宽按列名在翻页后保留");
         let sql = paged.open_preview().unwrap();
-        assert!(sql[0].contains("\"id\" = 20"), "{sql:?}");
+        assert!(sql[0].contains("id = 20"), "{sql:?}");
         assert_eq!(paged.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("20"));
     }
 
@@ -5696,8 +5696,8 @@ mod tests {
         assert_eq!(grid.cell_label(1, 1), "改");
         let sql = grid.open_preview().unwrap();
         assert!(sql[0].contains("改"), "{sql:?}");
-        assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
-        assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
+        assert!(sql[0].contains("id = 1"), "{sql:?}");
+        assert!(!sql[0].contains("id = 2"), "{sql:?}");
         let request = grid.confirm_request().unwrap();
         assert_eq!(request.changes[0].locator[0].value.as_deref(), Some("1"));
 
@@ -5712,8 +5712,8 @@ mod tests {
         filtered.set_filter("name", "eq", "乙");
         assert_eq!(filtered.cell_label(0, 0), "2");
         let sql = filtered.open_preview().unwrap();
-        assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
-        assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
+        assert!(sql[0].contains("id = 1"), "{sql:?}");
+        assert!(!sql[0].contains("id = 2"), "{sql:?}");
         assert_eq!(filtered.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("1"));
     }
 
@@ -6449,9 +6449,9 @@ mod tests {
         // 复制不改变选择：下一步的复制仍从同一格出发。
         assert_eq!(grid.focus_cell(), Some((1, 1)));
 
-        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '乙'");
-        assert_eq!(grid.where_text(CopyScope::Row), "WHERE \"customers\".\"id\" = 2");
-        assert_eq!(grid.where_text(CopyScope::Column), "WHERE \"customers\".\"name\" IN ('乙')");
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE customers.name = '乙'");
+        assert_eq!(grid.where_text(CopyScope::Row), "WHERE customers.id = 2");
+        assert_eq!(grid.where_text(CopyScope::Column), "WHERE customers.name IN ('乙')");
 
         // 筛选后同一行仍被找到，复制内容不漂移；筛掉后选择为空，不复制别行。
         grid.set_filter("name", "contains", "乙");
@@ -6470,11 +6470,11 @@ mod tests {
     fn where_copies_keep_null_and_staged_values_distinguishable() {
         let mut grid = identity_grid();
         grid.select(0, 1, false);
-        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '甲'");
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE customers.name = '甲'");
         assert_eq!(grid.stage_text(0, 1, None), Gate::Writable);
-        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" IS NULL");
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE customers.name IS NULL");
         assert_eq!(grid.stage_text(0, 1, Some("乙".into())), Gate::Writable);
-        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '乙'");
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE customers.name = '乙'");
         // 整列条件按选中行的去重值集合生成，NULL 单独写 IS NULL。
         grid.select(0, 1, false);
         grid.select(2, 1, true);
@@ -6690,7 +6690,7 @@ mod tests {
         assert_eq!(jump.table, "authors");
         assert_eq!(jump.columns, vec!["id".to_owned()]);
         assert_eq!(jump.values, vec![Some("1".to_owned())]);
-        assert_eq!(jump.sql, "SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1");
+        assert_eq!(jump.sql, "SELECT id FROM main.authors WHERE id = 1");
         // 不是外键列时不给目标。
         assert!(books.reference(0, 2).is_err());
 
@@ -6698,8 +6698,8 @@ mod tests {
         let composite = shops.reference(0, 1).expect("复合外键列齐时可以生成条件");
         assert_eq!(composite.columns, vec!["country".to_owned(), "city".to_owned()]);
         assert_eq!(composite.values, vec![Some("CN".to_owned()), Some("北京".to_owned())]);
-        assert!(composite.sql.contains("\"country\" = 'CN'"), "{}", composite.sql);
-        assert!(composite.sql.contains("\"city\" = '北京'"), "{}", composite.sql);
+        assert!(composite.sql.contains("country = 'CN'"), "{}", composite.sql);
+        assert!(composite.sql.contains("city = '北京'"), "{}", composite.sql);
         // 复合外键里有一个 NULL：拒绝生成不完整的条件。
         assert_eq!(shops.reference(1, 1), Err("grid.fk.null"));
         // 缺一列同样拒绝。
@@ -6739,7 +6739,7 @@ mod tests {
         grid.apply_full(&read, Some(value.clone()));
         let jump = grid.reference(0, 1).expect("读到原值后可以生成条件");
         assert!(jump.sql.contains(&value), "{}", jump.sql);
-        assert!(jump.sql.contains("\"vendors\""), "{}", jump.sql);
+        assert!(jump.sql.contains("vendors"), "{}", jump.sql);
 
         // 同名表在另一个模式里：引用的是外键声明的模式，不是当前表的模式。
         let mut other = load_table(&service, "bills", 1024).await;
@@ -6755,7 +6755,7 @@ mod tests {
         assert_eq!(target.table, "bills");
         assert_eq!(target.connection_id, "notes");
         assert_eq!(target.database, "main");
-        assert!(target.sql.contains("\"other\".\"bills\""), "{}", target.sql);
+        assert!(target.sql.contains("other.bills"), "{}", target.sql);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6995,11 +6995,11 @@ mod batch_tests {
         assert!(!insert.placeholder);
         assert_eq!(
             insert.text,
-            "INSERT INTO `people` (`id`, `name`, `note`) VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO `people` (`id`, `name`, `note`) VALUES (2, '乙', 'x');"
+            "INSERT INTO people (id, name, note) VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO people (id, name, note) VALUES (2, '乙', 'x');"
         );
         assert_eq!(insert.text.matches("INSERT INTO").count(), 2);
         let postgres = copy_sheet("postgres");
-        assert!(copied(&postgres, CopyFormat::Insert).starts_with("INSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (1, "));
+        assert!(copied(&postgres, CopyFormat::Insert).starts_with("INSERT INTO people (id, name, note) VALUES (1, "));
     }
 
     #[test]
@@ -7012,7 +7012,7 @@ mod batch_tests {
         query.select(0, 0, false);
         let insert = query.copy_as(CopyFormat::Insert).unwrap();
         assert!(insert.placeholder, "没有定位到表时要提示占位表名");
-        assert_eq!(insert.text, format!("INSERT INTO \"{PLACEHOLDER_TABLE}\" (\"name\") VALUES ('甲');"));
+        assert_eq!(insert.text, format!("INSERT INTO {PLACEHOLDER_TABLE} (name) VALUES ('甲');"));
 
         // 选区里有只读到预览、还没读到原值的格子：任何格式都停下，不拿预览信封充当原值。
         let envelope = format!("\u{1}t:3000:{}", "a".repeat(16));
@@ -7224,7 +7224,7 @@ mod batch_tests {
         assert_eq!(grid.stage_clone(), Ok(()));
         assert_eq!(grid.loaded_len(), 3);
         let sql = grid.open_preview().unwrap();
-        assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('名2', '备注')".to_owned()]);
+        assert_eq!(sql, vec!["INSERT INTO people (name, note) VALUES ('名2', '备注')".to_owned()]);
         let request = grid.confirm_request().unwrap();
         assert_eq!(request.changes.len(), 1);
         assert_eq!(request.changes[0].kind, "insert");
@@ -7241,10 +7241,10 @@ mod batch_tests {
         grid.select(inserted, 1, false);
         assert_eq!(grid.paste_tsv(Some("新名")), Ok(1));
         let sql = grid.open_preview().unwrap();
-        assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('新名', '备注')".to_owned()]);
+        assert_eq!(sql, vec!["INSERT INTO people (name, note) VALUES ('新名', '备注')".to_owned()]);
         grid.cancel_preview();
         assert!(grid.undo_last_stage());
-        assert_eq!(grid.open_preview().unwrap(), vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('名2', '备注')".to_owned()]);
+        assert_eq!(grid.open_preview().unwrap(), vec!["INSERT INTO people (name, note) VALUES ('名2', '备注')".to_owned()]);
     }
 
     async fn item_rows(path: &std::path::Path) -> Vec<(i64, String, Option<i64>)> {
@@ -7334,15 +7334,15 @@ mod batch_tests {
         let mut grid = people("sqlite", 1);
         grid.select(0, 1, false);
         let select_sql = grid.select_statement();
-        assert!(select_sql.starts_with("SELECT * FROM \"people\" WHERE "), "{select_sql}");
-        assert!(select_sql.contains("\"id\" = 1"), "{select_sql}");
+        assert!(select_sql.starts_with("SELECT * FROM people WHERE "), "{select_sql}");
+        assert!(select_sql.contains("id = 1"), "{select_sql}");
         let update_sql = grid.update_statement();
-        assert!(update_sql.starts_with("UPDATE \"people\" SET \"name\" = "), "{update_sql}");
+        assert!(update_sql.starts_with("UPDATE people SET name = "), "{update_sql}");
         assert!(update_sql.contains("WHERE "), "{update_sql}");
         assert!(!select_sql.contains('\u{1}') && !update_sql.contains('\u{1}'));
         assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
         let staged = grid.update_statement();
-        assert!(staged.contains("\"name\" = '改'"), "{staged}");
+        assert!(staged.contains("name = '改'"), "{staged}");
 
         let envelope = format!("\u{1}t:5000:{}", "z".repeat(8));
         let mut wide = SharedGrid::new();
@@ -7529,13 +7529,13 @@ mod filter_model_tests {
         // 切到 SQL：用 compile_where 生成可审阅表达式，切换本身不读取也不改来源。
         assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
         assert_eq!(grid.filter_mode(), FilterMode::Sql);
-        assert_eq!(grid.filter_sql(), "\"id\" > 1");
+        assert_eq!(grid.filter_sql(), "id > 1");
         assert_eq!(grid.applied_source(), FilterSource::Visual, "切换不应用");
         assert_eq!(grid.filters().len(), 1, "可视化草稿还在");
         // 未改过的生成结果可以回可视化。
         assert!(grid.switch_filter_mode(FilterMode::Visual).is_ok());
         assert_eq!(grid.filter_mode(), FilterMode::Visual);
-        assert_eq!(grid.filter_sql(), "\"id\" > 1", "SQL 草稿不被清空");
+        assert_eq!(grid.filter_sql(), "id > 1", "SQL 草稿不被清空");
         // 手写 SQL 无法反向映射：保留文本并说明原因。
         assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
         grid.set_filter_sql("id > 1 AND name IS NOT NULL");
