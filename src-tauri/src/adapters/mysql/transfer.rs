@@ -103,6 +103,13 @@ impl TransferDialect for MysqlTransfer {
         Ok((database.to_owned(), vec![String::new()]))
     }
 
+    async fn compare_table_snapshots(&self, session: &CatalogSession, database: &str, _schema: &str) -> Option<Result<Vec<(String, crate::ddl::Snapshot)>, String>> {
+        let CatalogSession::Mysql(pool) = session else {
+            return Some(Err(compare_mismatch()));
+        };
+        Some(super::ddl_read::load_mysql_tables(pool, self.engine, database).await)
+    }
+
     async fn compare_scope(&self, session: &CatalogSession, database: &str, _schema: &str) -> Result<(), String> {
         let CatalogSession::Mysql(pool) = session else {
             return Err(compare_mismatch());

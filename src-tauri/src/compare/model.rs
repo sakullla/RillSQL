@@ -194,12 +194,25 @@ impl Side {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffItem {
     pub kind: String,
     pub name: String,
     pub detail: String,
+    /// 差异所属对象（索引/外键差异归到它们的表）：结果页按它找并排定义与同步 SQL。
+    pub owner: String,
+    /// 基准与对照一侧的定义文本（表按对照侧限定名重建，便于逐行对照）；没有这一侧时为空。
+    pub baseline_definition: String,
+    pub target_definition: String,
+    /// 只让对照里这个对象变成基准的语句（不含依赖排序，整体脚本以 `script` 为准）。
+    pub sql: String,
+}
+
+impl DiffItem {
+    pub fn new(kind: impl Into<String>, name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { kind: kind.into(), name: name.into(), detail: detail.into(), ..Self::default() }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -229,7 +242,11 @@ pub struct StructureReport {
     pub only_baseline: Vec<DiffItem>,
     pub only_target: Vec<DiffItem>,
     pub changed: Vec<DiffItem>,
+    /// 两侧都有且没有差异的对象；结果页关掉“仅差异”时列出。
+    pub same: Vec<DiffItem>,
     pub tables: Vec<TableChoice>,
+    /// 有读取超过超时设置：界面按失败处理并给重试。
+    pub timed_out: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +294,43 @@ pub struct DataDiff {
     pub action: String,
     pub key: String,
     pub detail: String,
+    /// 行级字段差异：更新时是值不同的列；插入/删除时是整行（另一侧为空）。
+    pub fields: Vec<FieldDiff>,
+    /// 这一行对应的同步语句；拒绝或跳过时为空。
+    pub sql: String,
+}
+
+impl DataDiff {
+    pub fn skipped(table: &str, detail: impl Into<String>) -> Self {
+        Self { table: table.to_owned(), action: "skipped".to_owned(), key: String::new(), detail: detail.into(), fields: Vec::new(), sql: String::new() }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDiff {
+    pub column: String,
+    /// 基准一侧的值；`None` 表示这一侧没有这一行。SQL NULL 写成 `NULL`。
+    pub baseline: Option<String>,
+    pub target: Option<String>,
+    /// 两侧值确实不同（插入/删除整行展示时，键列等相同列为 false）。
+    pub changed: bool,
+}
+
+/// 一张表的数据对比摘要：结果页先按表列出，再下钻行级差异。
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DataTableSummary {
+    pub table: String,
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    /// 生成不了语句的行（字面量被拒绝、重复键）。
+    pub rejected: usize,
+    /// 整张表没有生成行变更时的原因（无主键、只在一侧、键未选定、读取失败…）。
+    pub skipped: Option<String>,
+    /// 用来对应行的键列；没有可用键时为空。
+    pub key: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -287,6 +341,14 @@ pub struct DataReport {
     pub incomplete: bool,
     pub notes: Vec<String>,
     pub diffs: Vec<DataDiff>,
+    pub tables: Vec<DataTableSummary>,
+    pub timed_out: bool,
+}
+
+impl DataReport {
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self { refused: Some(message.into()), script: String::new(), incomplete: false, notes: Vec::new(), diffs: Vec::new(), tables: Vec::new(), timed_out: false }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -304,6 +366,9 @@ pub struct StructureRequest {
     pub id: String,
     pub baseline: SideRequest,
     pub target: SideRequest,
+    /// 每次读取的超时（秒），取设置里的查询超时；0 时用目录读取的默认超时。
+    #[serde(default)]
+    pub timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -321,6 +386,8 @@ pub struct DataRequest {
     pub baseline: SideRequest,
     pub target: SideRequest,
     pub tables: Vec<DataTableRequest>,
+    #[serde(default)]
+    pub timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]

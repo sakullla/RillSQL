@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::catalog::commands::{self as catalog_commands, CatalogDto, ObjectLimit, PageDto};
 use crate::catalog::{read_definition, Engine};
 use crate::compare::{
-    compare_is_cancelled, list_schemas, read_data, read_structure, request_compare_cancel, DataReport, DataRequest, StructureReport, StructureRequest,
+    compare_is_cancelled, compare_progress as read_compare_progress, list_schemas, read_data, read_structure, request_compare_cancel, CompareProgress, DataReport, DataRequest,
+    StructureReport, StructureRequest,
 };
 use crate::connections::{Service, SessionStatus};
 use crate::diagram::Diagram;
@@ -77,6 +78,11 @@ pub fn cancel_compare(tasks: &TaskBoard, owner: &str, id: &str) {
 
 pub fn compare_cancelled(id: &str) -> bool {
     compare_is_cancelled(id)
+}
+
+/// 正在进行的对比读到哪一步（阶段、已读/总数）；结束后为 None。
+pub fn compare_progress(id: &str) -> Option<CompareProgress> {
+    read_compare_progress(id)
 }
 
 pub async fn read_diagram(service: &Service, connection_id: &str, database: &str, schema: &str) -> Result<Diagram, String> {

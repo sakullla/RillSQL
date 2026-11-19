@@ -22,7 +22,7 @@ use crate::grid::request_grid_export_cancel;
 use crate::state::{ImportReport, Platform, StateStore};
 
 pub(crate) use tasks::{run_blocking, TaskBoard, TaskOutcome};
-pub(crate) use work::{cancel_compare, cancel_dump, cancel_migrate, compare_cancelled};
+pub(crate) use work::{cancel_compare, cancel_dump, cancel_migrate, compare_cancelled, compare_progress};
 
 pub struct AppServices {
     pub connections: Arc<Service>,

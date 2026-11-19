@@ -4,17 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::grid::{delete_sql, insert_sql, reject_literal, update_sql, Cell, Column, Engine as GridEngine, TableSchema};
 
-use super::model::{DataDiff, DataInput, DataKey, DataReport, DataTable, Engine};
+use super::model::{DataDiff, DataInput, DataKey, DataReport, DataTable, DataTableSummary, Engine, FieldDiff};
 
 pub fn diff_data(input: &DataInput) -> DataReport {
     if Engine::parse(&input.baseline_engine).ok() != Engine::parse(&input.target_engine).ok() || Engine::parse(&input.target_engine).is_err() {
-        return DataReport {
-            refused: Some(crate::adapters::transfer::ENGINE_MISMATCH.to_owned()),
-            script: String::new(),
-            incomplete: false,
-            notes: Vec::new(),
-            diffs: Vec::new(),
-        };
+        return DataReport::refused(crate::adapters::transfer::ENGINE_MISMATCH);
     }
     let engine = GridEngine::parse(&input.target_engine).expect("engine checked");
     let mut notes = Vec::new();
@@ -25,48 +19,24 @@ pub fn diff_data(input: &DataInput) -> DataReport {
         notes.push("对比已取消，未完成的结果不是完整脚本。".to_owned());
     }
     if input.tables.is_empty() {
-        return DataReport {
-            refused: Some("没有选择要对比的表，不生成脚本。".to_owned()),
-            script: String::new(),
-            incomplete: false,
-            notes: Vec::new(),
-            diffs: Vec::new(),
-        };
+        return DataReport::refused("没有选择要对比的表，不生成脚本。");
     }
+    let mut tables = Vec::new();
     for table in &input.tables {
-        if let Some(side) = &table.only_side {
-            notes.push(format!("表 {} 只在{side}，这是结构差异，不编造行。", table.name));
-            diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: format!("只在{side}") });
-            continue;
-        }
-        if let Some(message) = &table.read_error {
-            incomplete = true;
-            notes.push(format!("表 {} 读取失败：{message}", table.name));
-            if table.baseline.is_empty() && table.target.is_empty() {
-                continue;
+        let mut summary = DataTableSummary { table: table.name.clone(), ..DataTableSummary::default() };
+        let start = diffs.len();
+        diff_one(engine, table, &mut summary, &mut statements, &mut diffs, &mut notes, &mut incomplete);
+        for diff in &diffs[start..] {
+            match diff.action.as_str() {
+                "insert" => summary.inserts += 1,
+                "update" => summary.updates += 1,
+                "delete" => summary.deletes += 1,
+                "rejected" => summary.rejected += 1,
+                "skipped" if summary.skipped.is_none() => summary.skipped = Some(diff.detail.clone()),
+                _ => {}
             }
         }
-        if table.keys_unknown {
-            notes.push(format!("表 {} 的索引或主键没有读到，不生成行变更。", table.name));
-            diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "索引或主键没有读到".to_owned() });
-            continue;
-        }
-        match resolve_key(&table.keys, table.chosen_key.as_deref()) {
-            KeyUse::Ready { columns, label } => {
-                if let Some(label) = label {
-                    notes.push(format!("表 {} 使用唯一键 {label}。", table.name));
-                }
-                diff_table(engine, table, &columns, &mut statements, &mut diffs, &mut notes, &mut incomplete);
-            }
-            KeyUse::None => {
-                notes.push(format!("表 {} 没有主键或唯一键，无法对应行，不生成行变更。", table.name));
-                diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "无法对应行".to_owned() });
-            }
-            KeyUse::Choose => {
-                notes.push(format!("表 {} 有多个唯一键，选定前不生成行变更。", table.name));
-                diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "尚未选定唯一键".to_owned() });
-            }
-        }
+        tables.push(summary);
     }
     notes.sort();
     notes.dedup();
@@ -76,6 +46,46 @@ pub fn diff_data(input: &DataInput) -> DataReport {
         incomplete,
         notes,
         diffs,
+        tables,
+        timed_out: false,
+    }
+}
+
+fn diff_one(engine: GridEngine, table: &DataTable, summary: &mut DataTableSummary, statements: &mut Vec<String>, diffs: &mut Vec<DataDiff>, notes: &mut Vec<String>, incomplete: &mut bool) {
+    if let Some(side) = &table.only_side {
+        notes.push(format!("表 {} 只在{side}，这是结构差异，不编造行。", table.name));
+        diffs.push(DataDiff::skipped(&table.name, format!("只在{side}")));
+        return;
+    }
+    if let Some(message) = &table.read_error {
+        *incomplete = true;
+        notes.push(format!("表 {} 读取失败：{message}", table.name));
+        if table.baseline.is_empty() && table.target.is_empty() {
+            summary.skipped = Some(format!("读取失败：{message}"));
+            return;
+        }
+    }
+    if table.keys_unknown {
+        notes.push(format!("表 {} 的索引或主键没有读到，不生成行变更。", table.name));
+        diffs.push(DataDiff::skipped(&table.name, "索引或主键没有读到"));
+        return;
+    }
+    match resolve_key(&table.keys, table.chosen_key.as_deref()) {
+        KeyUse::Ready { columns, label } => {
+            if let Some(label) = label {
+                notes.push(format!("表 {} 使用唯一键 {label}。", table.name));
+            }
+            summary.key = columns.clone();
+            diff_table(engine, table, &columns, statements, diffs, notes, incomplete);
+        }
+        KeyUse::None => {
+            notes.push(format!("表 {} 没有主键或唯一键，无法对应行，不生成行变更。", table.name));
+            diffs.push(DataDiff::skipped(&table.name, "没有主键或唯一键，无法按键对应两侧的行"));
+        }
+        KeyUse::Choose => {
+            notes.push(format!("表 {} 有多个唯一键，选定前不生成行变更。", table.name));
+            diffs.push(DataDiff::skipped(&table.name, "有多个唯一键，尚未选定用哪一个对应行"));
+        }
     }
 }
 
@@ -111,7 +121,7 @@ fn diff_table(engine: GridEngine, table: &DataTable, key: &[String], statements:
     let right = group_rows(&table.target, key);
     if left.missing_key || right.missing_key {
         notes.push(format!("表 {} 的键列没有同时出现在两侧行中，无法对应行，不生成行变更。", table.name));
-        diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "键列没有同时出现在两侧行中".to_owned() });
+        diffs.push(DataDiff::skipped(&table.name, "键列没有同时出现在两侧行中"));
         return;
     }
     note_column_gap(table, notes);
@@ -261,11 +271,13 @@ fn push_insert(schema: &TableSchema, table: &DataTable, key: &[String], row: &BT
     let label = key_label(row, key);
     if let Some(message) = rejection(schema, &values) {
         notes.push(format!("表 {} 键 {label} 未能生成语句：{message}", table.name));
-        diffs.push(DataDiff { table: table.name.clone(), action: "rejected".to_owned(), key: label, detail: message });
+        diffs.push(row_diff(table, "rejected", label, message, Vec::new(), String::new()));
         return;
     }
-    statements.push(insert_sql(schema, &values));
-    diffs.push(DataDiff { table: table.name.clone(), action: "insert".to_owned(), key: label, detail: "只在基准".to_owned() });
+    let sql = insert_sql(schema, &values);
+    statements.push(sql.clone());
+    let fields = values.iter().map(|(column, cell)| FieldDiff { column: column.clone(), baseline: Some(cell_text(cell)), target: None, changed: true }).collect();
+    diffs.push(row_diff(table, "insert", label, "只在基准".to_owned(), fields, statement_text(&sql)));
 }
 
 fn push_delete(schema: &TableSchema, table: &DataTable, key: &[String], row: &BTreeMap<String, Cell>, statements: &mut Vec<String>, diffs: &mut Vec<DataDiff>, notes: &mut Vec<String>) {
@@ -273,11 +285,13 @@ fn push_delete(schema: &TableSchema, table: &DataTable, key: &[String], row: &BT
     let label = key_label(row, key);
     if let Some(message) = rejection(schema, &locator) {
         notes.push(format!("表 {} 键 {label} 未能生成语句：{message}", table.name));
-        diffs.push(DataDiff { table: table.name.clone(), action: "rejected".to_owned(), key: label, detail: message });
+        diffs.push(row_diff(table, "rejected", label, message, Vec::new(), String::new()));
         return;
     }
-    statements.push(delete_sql(schema, &locator));
-    diffs.push(DataDiff { table: table.name.clone(), action: "delete".to_owned(), key: label, detail: "只在对照".to_owned() });
+    let sql = delete_sql(schema, &locator);
+    statements.push(sql.clone());
+    let fields = values_of(row, &schema.columns).iter().map(|(column, cell)| FieldDiff { column: column.clone(), baseline: None, target: Some(cell_text(cell)), changed: true }).collect();
+    diffs.push(row_diff(table, "delete", label, "只在对照".to_owned(), fields, statement_text(&sql)));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -309,11 +323,32 @@ fn push_update(
     let label = key_label(baseline, key);
     if let Some(message) = rejection(schema, &sets) {
         notes.push(format!("表 {} 键 {label} 未能生成语句：{message}", table.name));
-        diffs.push(DataDiff { table: table.name.clone(), action: "rejected".to_owned(), key: label, detail: message });
+        diffs.push(row_diff(table, "rejected", label, message, Vec::new(), String::new()));
         return;
     }
-    statements.push(update_sql(schema, &sets, &locator(baseline, key)));
-    diffs.push(DataDiff { table: table.name.clone(), action: "update".to_owned(), key: label, detail: "键相同，其他值不同".to_owned() });
+    let sql = update_sql(schema, &sets, &locator(baseline, key));
+    statements.push(sql.clone());
+    let fields = sets
+        .iter()
+        .map(|(column, cell)| FieldDiff { column: column.clone(), baseline: Some(cell_text(cell)), target: target.get(column).map(cell_text), changed: true })
+        .collect();
+    diffs.push(row_diff(table, "update", label, "键相同，其他值不同".to_owned(), fields, statement_text(&sql)));
+}
+
+fn row_diff(table: &DataTable, action: &str, key: String, detail: String, fields: Vec<FieldDiff>, sql: String) -> DataDiff {
+    DataDiff { table: table.name.clone(), action: action.to_owned(), key, detail, fields, sql }
+}
+
+fn cell_text(cell: &Cell) -> String {
+    match cell {
+        Cell::Null => "NULL".to_owned(),
+        Cell::Text(text) => text.clone(),
+    }
+}
+
+fn statement_text(sql: &str) -> String {
+    let text = sql.trim().trim_end_matches(';').trim();
+    if text.is_empty() { String::new() } else { format!("{text};") }
 }
 
 fn render(notes: &[String], statements: &[String], incomplete: bool) -> String {

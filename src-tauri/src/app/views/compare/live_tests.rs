@@ -108,6 +108,102 @@ async fn live_engines_compare_a_made_difference_and_read_the_diagram() {
     println!("{}", seen.join("\n"));
 }
 
+/// 同一 MySQL 连接下两个不同库的结构对比：必须在限定时间里返回完成状态，
+/// 两库一致时给出“无差异”，不能停在“正在对比…”。夹具不在线时跳过（可选运行）。
+#[tokio::test]
+async fn live_mysql_two_databases_on_one_connection_finish_with_no_difference() {
+    let dir = std::env::temp_dir().join(format!("rillsql-live-compare-same-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    let spec = LiveEngine {
+        id: "live-mysql-same",
+        name: "夹具 MySQL",
+        engine: Engine::Mysql,
+        engine_name: "mysql",
+        port: 3306,
+        user: "root",
+        password: "root",
+        tls: TlsMode::Off,
+        schema_scope: false,
+        diagram_schema: "",
+        customers: 2,
+    };
+    if let Err(err) = open_fixture(&services, &spec).await {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过 MySQL 同连接两库对比（夹具不在线）：{err}");
+            return;
+        }
+        panic!("打开 MySQL 夹具失败：{err}");
+    }
+    let session = services.connections.catalog_session(spec.id).expect("目录会话");
+    let suffix = format!("{:x}", uuid::Uuid::new_v4().as_u128());
+    let left = format!("t8a{}", &suffix[..8]);
+    let right = format!("t8b{}", &suffix[..8]);
+    let outcome = async {
+        create_side(&session, "mysql", &left, false).await?;
+        create_side(&session, "mysql", &right, false).await?;
+        let (baseline, target) = sides(&spec, "", &left, &right);
+        let request = StructureRequest { id: format!("live-same-{suffix}"), baseline, target, timeout_secs: 15 };
+        let tasks = TaskBoard::new();
+        let token = tasks.begin("compare");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::application::work::compare_structure(&services.connections, &tasks, "compare", token, &request),
+        )
+        .await
+        .map_err(|_| "同连接两库对比 60 秒内没有返回（仍在“正在对比…”）".to_owned())?;
+        let report = match outcome {
+            TaskOutcome::Current { value, .. } => value,
+            other => return Err(format!("对比没有以当前结果返回：{other:?}")),
+        };
+        if report.refused.is_some() || report.incomplete || report.timed_out {
+            return Err(format!("没有完成：refused={:?} incomplete={} timed_out={} notes={:?}", report.refused, report.incomplete, report.timed_out, report.notes));
+        }
+        if !(report.only_baseline.is_empty() && report.only_target.is_empty() && report.changed.is_empty()) {
+            return Err(format!("一致的两库报出了差异：{:?} {:?} {:?}", report.only_baseline, report.only_target, report.changed));
+        }
+        if !report.same.iter().any(|item| item.name == "t7_marker") || !report.script.contains("没有结构差异") {
+            return Err(format!("没有给出“无差异”：same={:?} script={}", report.same, report.script));
+        }
+        if crate::application::compare_progress(&request.id).is_some() {
+            return Err("结束后仍登记着进度".to_owned());
+        }
+        // 整库批量读到的表结构与逐表读取一致（种子库有主键、外键与索引）。
+        let batch = crate::adapters::transfer::transfer_of(Engine::Mysql)
+            .compare_table_snapshots(&session, "rillsql", "")
+            .await
+            .ok_or_else(|| "MySQL 没有批量读取".to_owned())??;
+        if !batch.iter().any(|(name, _)| name == "orders") {
+            return Err(format!("批量读取缺少 orders：{:?}", batch.iter().map(|(name, _)| name).collect::<Vec<_>>()));
+        }
+        for (name, snapshot) in &batch {
+            let request = crate::ddl::Request {
+                database: "rillsql".to_owned(),
+                schema: String::new(),
+                engine: crate::ddl::DdlEngine::parse("mysql")?,
+                action: crate::ddl::Action::DropTable { table: name.clone() },
+            };
+            let single = crate::ddl::load_partial(&session, &request, name).await?;
+            let shape = |snap: &crate::ddl::Snapshot| format!("{:?} {:?} {:?} {:?} {:?}", snap.columns, snap.indexes, snap.foreign_keys, snap.index_error, snap.foreign_key_error);
+            if shape(snapshot) != shape(&single) {
+                return Err(format!("{name} 批量与逐表读取不一致：\n{}\n{}", shape(snapshot), shape(&single)));
+            }
+        }
+        Ok(format!("mysql {left} 对 {right} 无差异，用时 {:?}", started.elapsed()))
+    }
+    .await;
+    let cleaned = cleanup_scopes(&session, "mysql", &[&left, &right]).await;
+    services.disconnect(spec.id);
+    let _ = std::fs::remove_dir_all(&dir);
+    match (outcome, cleaned) {
+        (Ok(line), Ok(())) => println!("{line}"),
+        (Ok(line), Err(err)) => panic!("{line}；清理失败 {err}"),
+        (Err(err), _) => panic!("{err}"),
+    }
+}
+
 fn fixture_unreachable(err: &str) -> bool {
     let text = err.to_ascii_lowercase();
     err.contains("没有打开会话")
@@ -149,6 +245,7 @@ async fn exercise(services: &AppServices, spec: &LiveEngine) -> Result<String, S
                 id: format!("live-{}", spec.engine_name),
                 baseline,
                 target,
+                timeout_secs: 0,
             };
             let outcome = crate::application::work::compare_structure(&services.connections, &tasks, "compare", token, &request).await;
             let report = match outcome {

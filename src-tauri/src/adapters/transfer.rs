@@ -198,6 +198,12 @@ pub trait TransferDialect: Sync {
     async fn sequence_owner(&self, _session: &CatalogSession, _schema: &str, _name: &str) -> Option<String> {
         None
     }
+
+    /// 一次读出整个库/模式里全部基本表的列、索引与外键（键为表名）。
+    /// 返回 `None` 表示这个方言不批量读取，对比按表逐个读取；`Some(Err)` 时对比同样退回逐表读取。
+    async fn compare_table_snapshots(&self, _session: &CatalogSession, _database: &str, _schema: &str) -> Option<Result<Vec<(String, crate::ddl::Snapshot)>, String>> {
+        None
+    }
 }
 
 /// 对象在一侧的限定名（按引擎层级取库或模式作容器段，每段按需引号）。

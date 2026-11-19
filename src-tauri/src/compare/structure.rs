@@ -13,12 +13,18 @@ use crate::adapters::quote_ident as quote;
 use crate::adapters::transfer::{qualify as qualify_on, transfer_of, InPlaceTypes, SequenceSpec, TableAlter, ViewReplace};
 
 pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
+    diff_sides(baseline, target, true).0
+}
+
+/// `annotate` 为真时给每条差异补上并排定义与只针对该对象的同步语句，并列出相同的对象。
+/// 单对象的同步语句复用同一套规划（`annotate` 为假），只是两侧只留这一个对象。
+fn diff_sides(baseline: &Side, target: &Side, annotate: bool) -> (StructureReport, Vec<String>) {
     if let Some(message) = refuse_pair(baseline, target) {
-        return empty_report(Some(message));
+        return (empty_report(Some(message)), Vec::new());
     }
     let engine = match Engine::parse(&target.engine) {
         Ok(engine) => engine,
-        Err(message) => return empty_report(Some(message)),
+        Err(message) => return (empty_report(Some(message)), Vec::new()),
     };
     let mut notes = Vec::new();
     let mut incomplete = false;
@@ -49,13 +55,25 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     let mut detach = Vec::new();
     let mut restore = Vec::new();
 
+    // 按身份建索引：两侧各几千个对象时逐个线性查找是 O(n²)。同一身份重复时保留第一个，与原先的 find 一致。
+    let index_of = |side: &'_ Side| {
+        let mut map = std::collections::HashMap::with_capacity(side.objects.len());
+        for (position, object) in side.objects.iter().enumerate() {
+            map.entry(identity(object)).or_insert(position);
+        }
+        map
+    };
+    let left_index = index_of(baseline);
+    let right_index = index_of(target);
     let mut keys = std::collections::BTreeSet::new();
-    for object in baseline.objects.iter().chain(target.objects.iter()) {
-        keys.insert(identity(object));
-    }
+    keys.extend(left_index.keys().cloned());
+    keys.extend(right_index.keys().cloned());
+    let mut owners: Vec<Owned> = Vec::new();
+    let mut same = Vec::new();
     for key in keys {
-        let left = baseline.objects.iter().find(|object| identity(object) == key);
-        let right = target.objects.iter().find(|object| identity(object) == key);
+        let left = left_index.get(&key).map(|position| &baseline.objects[*position]);
+        let right = right_index.get(&key).map(|position| &target.objects[*position]);
+        let marks = (only_baseline.len(), only_target.len(), changed.len());
         match (left, right) {
             (Some(base), None) => {
                 only_baseline.push(item(base, "仅基准拥有"));
@@ -105,6 +123,14 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
             }
             (None, None) => {}
         }
+        if annotate {
+            let ends = (only_baseline.len(), only_target.len(), changed.len());
+            if ends != marks {
+                owners.push(Owned { left, right, marks, ends });
+            } else if let (Some(base), Some(_)) = (left, right) {
+                same.push(item(base, "相同"));
+            }
+        }
     }
     preserve_dependents(engine, baseline, target, &mut drop_object, &mut create_object, &alters, &mut in_place, &mut detach, &mut restore);
     if blocked(baseline, target, Category::Index) {
@@ -133,7 +159,12 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     notes.sort();
     notes.dedup();
     let unchanged = only_baseline.is_empty() && only_target.is_empty() && changed.is_empty();
-    StructureReport {
+    if annotate {
+        for owned in &owners {
+            annotate_owner(engine, baseline, target, owned, &mut only_baseline, &mut only_target, &mut changed);
+        }
+    }
+    let report = StructureReport {
         refused: None,
         script: render_script(&notes, &statements, incomplete, unchanged, "没有结构差异。"),
         incomplete,
@@ -141,7 +172,74 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
         only_baseline,
         only_target,
         changed,
+        same,
         tables,
+        timed_out: false,
+    };
+    (report, statements)
+}
+
+/// 一个对象在主循环里产生的差异条目：`marks` 是处理它之前三张差异表的长度。
+struct Owned<'a> {
+    left: Option<&'a ObjectDef>,
+    right: Option<&'a ObjectDef>,
+    marks: (usize, usize, usize),
+    ends: (usize, usize, usize),
+}
+
+/// 给这个对象产生的差异补上两侧定义与只针对它的同步语句。
+fn annotate_owner(
+    engine: Engine,
+    baseline: &Side,
+    target: &Side,
+    owned: &Owned<'_>,
+    only_baseline: &mut [DiffItem],
+    only_target: &mut [DiffItem],
+    changed: &mut [DiffItem],
+) {
+    let Some(object) = owned.left.or(owned.right) else { return };
+    let single = |side: &Side, object: Option<&ObjectDef>| Side {
+        engine: side.engine.clone(),
+        database: side.database.clone(),
+        schema: side.schema.clone(),
+        connected: side.connected,
+        fatal: side.fatal.clone(),
+        objects: object.cloned().into_iter().collect(),
+        category_errors: side.category_errors.clone(),
+        cancelled: side.cancelled,
+        listing_complete: side.listing_complete,
+    };
+    let (_, statements) = diff_sides(&single(baseline, owned.left), &single(target, owned.right), false);
+    let sql = statements
+        .iter()
+        .map(|statement| statement.trim().trim_end_matches(';').trim())
+        .filter(|statement| !statement.is_empty())
+        .map(|statement| format!("{statement};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 两侧定义都按对照侧限定，库名/模式名不同不会让每一行都显示成差异。
+    let baseline_definition = owned.left.map(|object| definition_text(engine, target, object)).unwrap_or_default();
+    let target_definition = owned.right.map(|object| definition_text(engine, target, object)).unwrap_or_default();
+    let owner = display_name(object);
+    let (b, t, c) = owned.marks;
+    let (b_end, t_end, c_end) = owned.ends;
+    for item in only_baseline[b..b_end].iter_mut().chain(only_target[t..t_end].iter_mut()).chain(changed[c..c_end].iter_mut()) {
+        item.owner = owner.clone();
+        item.baseline_definition = baseline_definition.clone();
+        item.target_definition = target_definition.clone();
+        item.sql = sql.clone();
+    }
+}
+
+/// 并排展示用的定义：表按列/主键/外键重建并附上索引，其余对象用读到的定义原文。
+fn definition_text(engine: Engine, side: &Side, object: &ObjectDef) -> String {
+    match (object.kind, object.table.as_ref()) {
+        (Kind::Table, Some(shape)) => {
+            let mut lines = vec![format!("{};", create_table(engine, side, &object.name, shape, true))];
+            lines.extend(shape.indexes.iter().filter(|index| !skip_index(index, shape)).map(|index| format!("{};", create_index(engine, side, &object.name, index).trim_end_matches(';'))));
+            lines.join("\n")
+        }
+        _ => object.definition.trim().to_owned(),
     }
 }
 
@@ -154,7 +252,9 @@ fn empty_report(refused: Option<String>) -> StructureReport {
         only_baseline: Vec::new(),
         only_target: Vec::new(),
         changed: Vec::new(),
+        same: Vec::new(),
         tables: Vec::new(),
+        timed_out: false,
     }
 }
 
@@ -182,7 +282,7 @@ fn identity(object: &ObjectDef) -> String {
 }
 
 fn item(object: &ObjectDef, detail: &str) -> DiffItem {
-    DiffItem { kind: object.kind.label().to_owned(), name: display_name(object), detail: detail.to_owned() }
+    DiffItem::new(object.kind.label(), display_name(object), detail)
 }
 
 fn display_name(object: &ObjectDef) -> String {
@@ -350,7 +450,7 @@ fn compare_pair(
         index_creates.extend(left.indexes.iter().filter(|index| !skip_index(index, left)).map(|index| create_index(engine, target, &base.name, index)));
     }
     if fk_diff {
-        changed.push(DiffItem { kind: "外键".to_owned(), name: base.name.clone(), detail: "外键不同".to_owned() });
+        changed.push(DiffItem::new("外键", base.name.clone(), "外键不同"));
         if allow_ddl && with_fk && !inline_fk {
             for key in &right.foreign_keys {
                 if !left.foreign_keys.iter().any(|item| item.name == key.name && item == key) {
@@ -420,19 +520,19 @@ fn compare_indexes(
         let other = right.indexes.iter().find(|index| index.name == name);
         match (base, other) {
             (Some(base), None) => {
-                changed.push(DiffItem { kind: "索引".to_owned(), name: name.clone(), detail: format!("仅基准拥有，属于表 {table}") });
+                changed.push(DiffItem::new("索引", name.clone(), format!("仅基准拥有，属于表 {table}")));
                 if allow_ddl {
                     index_creates.push(create_index(engine, target, table, base));
                 }
             }
             (None, Some(other)) => {
-                changed.push(DiffItem { kind: "索引".to_owned(), name: name.clone(), detail: format!("仅对照拥有，属于表 {table}") });
+                changed.push(DiffItem::new("索引", name.clone(), format!("仅对照拥有，属于表 {table}")));
                 if allow_ddl {
                     index_drops.push(drop_index(engine, target, table, other));
                 }
             }
             (Some(base), Some(other)) if !same_index(base, other) => {
-                changed.push(DiffItem { kind: "索引".to_owned(), name: name.clone(), detail: format!("表 {table} 的唯一性、列顺序或定义文本不同") });
+                changed.push(DiffItem::new("索引", name.clone(), format!("表 {table} 的唯一性、列顺序或定义文本不同")));
                 if allow_ddl {
                     index_drops.push(drop_index(engine, target, table, other));
                     index_creates.push(create_index(engine, target, table, base));

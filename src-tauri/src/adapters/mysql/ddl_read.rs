@@ -73,21 +73,7 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     .await
     .map_err(|err| crate::error_text::chain(&err))?;
     for row in &columns {
-        let extra = mysql_string(row, 4).to_ascii_lowercase();
-        let generated = !mysql_string(row, 5).is_empty() || extra.contains("generated");
-        snapshot.columns.push(Column {
-            name: mysql_string(row, 0),
-            type_name: mysql_string(row, 1),
-            nullable: mysql_string(row, 2).eq_ignore_ascii_case("YES"),
-            default_sql: {
-                let value = mysql_string(row, 3);
-                if value.is_empty() { None } else { Some(value) }
-            },
-            primary: false,
-            auto: extra.contains("auto_increment"),
-            generated,
-            default_constraint: None,
-        });
+        snapshot.columns.push(mysql_column(row, 0));
     }
     let indexes: Vec<mysql_async::Row> = keep_rows(
         &mut snapshot.index_error,
@@ -100,27 +86,9 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
         .map_err(|err| crate::error_text::chain(&err)),
     );
     for row in &indexes {
-        let name = mysql_string(row, 0);
-        let column = IndexColumn { name: mysql_string(row, 2), descending: mysql_string(row, 3).eq_ignore_ascii_case("D") };
-        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == name) {
-            index.columns.push(column);
-        } else {
-            let primary = name.eq_ignore_ascii_case("PRIMARY");
-            snapshot.indexes.push(Index {
-                name,
-                unique: mysql_string(row, 1) == "0",
-                columns: vec![column],
-                protected: primary,
-                reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
-                partial: false,
-                expression: false,
-                sql: None,
-            });
-        }
+        push_mysql_index(&mut snapshot.indexes, row, 0);
     }
-    for column in &mut snapshot.columns {
-        column.primary = snapshot.indexes.iter().any(|index| index.name.eq_ignore_ascii_case("PRIMARY") && index.columns.iter().any(|item| item.name == column.name));
-    }
+    mark_mysql_primary(&mut snapshot);
     let foreign_keys: Vec<mysql_async::Row> = keep_rows(
         &mut snapshot.foreign_key_error,
         mysql_async::prelude::Queryable::exec(
@@ -134,12 +102,7 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     if snapshot.foreign_key_error.is_none() {
         push_mysql_fks(&mut snapshot.foreign_keys, &foreign_keys, false);
     }
-    for key in &snapshot.foreign_keys {
-        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == key.name) {
-            index.protected = true;
-            index.reason = format!("外键 {} 依赖此索引", key.name);
-        }
-    }
+    protect_mysql_fk_indexes(&mut snapshot);
     let incoming: Vec<mysql_async::Row> = keep_rows(
         &mut snapshot.foreign_key_error,
         mysql_async::prelude::Queryable::exec(
@@ -184,6 +147,139 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     Ok(snapshot)
 }
 
+fn mysql_column(row: &mysql_async::Row, at: usize) -> Column {
+    let extra = mysql_string(row, at + 4).to_ascii_lowercase();
+    let generated = !mysql_string(row, at + 5).is_empty() || extra.contains("generated");
+    Column {
+        name: mysql_string(row, at),
+        type_name: mysql_string(row, at + 1),
+        nullable: mysql_string(row, at + 2).eq_ignore_ascii_case("YES"),
+        default_sql: {
+            let value = mysql_string(row, at + 3);
+            if value.is_empty() { None } else { Some(value) }
+        },
+        primary: false,
+        auto: extra.contains("auto_increment"),
+        generated,
+        default_constraint: None,
+    }
+}
+
+/// statistics 的一行（INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION 从 `at` 起）并入索引列表。
+fn push_mysql_index(indexes: &mut Vec<Index>, row: &mysql_async::Row, at: usize) {
+    let name = mysql_string(row, at);
+    let column = IndexColumn { name: mysql_string(row, at + 2), descending: mysql_string(row, at + 3).eq_ignore_ascii_case("D") };
+    if let Some(index) = indexes.iter_mut().find(|index| index.name == name) {
+        index.columns.push(column);
+    } else {
+        let primary = name.eq_ignore_ascii_case("PRIMARY");
+        indexes.push(Index {
+            name,
+            unique: mysql_string(row, at + 1) == "0",
+            columns: vec![column],
+            protected: primary,
+            reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
+            partial: false,
+            expression: false,
+            sql: None,
+        });
+    }
+}
+
+fn mark_mysql_primary(snapshot: &mut Snapshot) {
+    for column in &mut snapshot.columns {
+        column.primary = snapshot.indexes.iter().any(|index| index.name.eq_ignore_ascii_case("PRIMARY") && index.columns.iter().any(|item| item.name == column.name));
+    }
+}
+
+fn protect_mysql_fk_indexes(snapshot: &mut Snapshot) {
+    for key in &snapshot.foreign_keys {
+        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == key.name) {
+            index.protected = true;
+            index.reason = format!("外键 {} 依赖此索引", key.name);
+        }
+    }
+}
+
+/// 对比用：一个库里全部基本表的列、索引与外键，三条查询读完（逐表读取每张表要七八次往返）。
+/// 只填对比用到的部分；行数、入向外键与建表原文不读。
+pub(super) async fn load_mysql_tables(pool: &mysql_async::Pool, engine: Engine, database: &str) -> Result<Vec<(String, Snapshot)>, String> {
+    use mysql_async::prelude::Queryable;
+    if database.is_empty() {
+        return Err("需要数据库名，没有另开连接。".to_owned());
+    }
+    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
+    let tables: Vec<mysql_async::Row> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
+            (database.to_owned(),),
+        )
+        .await
+        .map_err(|err| crate::error_text::chain(&err))?;
+    let mut snapshots: std::collections::BTreeMap<String, Snapshot> = std::collections::BTreeMap::new();
+    for row in &tables {
+        let name = mysql_string(row, 0);
+        let mut snapshot = Snapshot::bare(engine, database, database, &name);
+        snapshot.table_sql = String::new();
+        snapshot.row_count = None;
+        snapshots.insert(name, snapshot);
+    }
+    let columns: Vec<mysql_async::Row> = conn
+        .exec(
+            "SELECT c.TABLE_NAME, c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA, c.GENERATION_EXPRESSION FROM information_schema.columns c JOIN information_schema.tables t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE' WHERE c.table_schema = ? ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION",
+            (database.to_owned(),),
+        )
+        .await
+        .map_err(|err| crate::error_text::chain(&err))?;
+    for row in &columns {
+        if let Some(snapshot) = snapshots.get_mut(&mysql_string(row, 0)) {
+            snapshot.columns.push(mysql_column(row, 1));
+        }
+    }
+    let mut index_error = None;
+    let indexes = keep_rows(
+        &mut index_error,
+        conn.exec(
+            "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION FROM information_schema.statistics WHERE table_schema = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            (database.to_owned(),),
+        )
+        .await
+        .map_err(|err| crate::error_text::chain(&err)),
+    );
+    for row in &indexes {
+        if let Some(snapshot) = snapshots.get_mut(&mysql_string(row, 0)) {
+            push_mysql_index(&mut snapshot.indexes, row, 1);
+        }
+    }
+    let mut foreign_key_error = None;
+    let foreign_keys: Vec<mysql_async::Row> = keep_rows(
+        &mut foreign_key_error,
+        conn.exec(
+            "SELECT k.TABLE_NAME, k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, r.DELETE_RULE, r.UPDATE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME WHERE k.TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+            (database.to_owned(),),
+        )
+        .await
+        .map_err(|err| crate::error_text::chain(&err)),
+    );
+    let mut grouped: std::collections::BTreeMap<String, Vec<mysql_async::Row>> = std::collections::BTreeMap::new();
+    for row in foreign_keys {
+        grouped.entry(mysql_string(&row, 0)).or_default().push(row);
+    }
+    let mut out = Vec::with_capacity(snapshots.len());
+    for (name, mut snapshot) in snapshots {
+        snapshot.index_error = index_error.clone();
+        snapshot.foreign_key_error = foreign_key_error.clone();
+        mark_mysql_primary(&mut snapshot);
+        if snapshot.foreign_key_error.is_none() {
+            let rows = grouped.remove(&name).unwrap_or_default();
+            push_mysql_fks_at(&mut snapshot.foreign_keys, &rows, 1);
+        }
+        protect_mysql_fk_indexes(&mut snapshot);
+        out.push((name, snapshot));
+    }
+    Ok(out)
+}
+
 async fn mysql_table_definition(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<String, String> {
     let sql = format!(
         "SHOW CREATE TABLE {}.{}",
@@ -215,13 +311,18 @@ async fn mysql_view_definition(conn: &mut mysql_async::Conn, database: &str, tab
 }
 
 fn push_mysql_fks(target: &mut Vec<ForeignKey>, rows: &[mysql_async::Row], _incoming: bool) {
+    push_mysql_fks_at(target, rows, 0);
+}
+
+/// 外键行（CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, DELETE_RULE, UPDATE_RULE 从 `at` 起）。
+fn push_mysql_fks_at(target: &mut Vec<ForeignKey>, rows: &[mysql_async::Row], at: usize) {
     for row in rows {
-        let name = mysql_string(row, 0);
-        let column = mysql_string(row, 1);
-        let ref_table = mysql_string(row, 2);
-        let ref_column = mysql_string(row, 3);
-        let on_delete = mysql_string(row, 4);
-        let on_update = mysql_string(row, 5);
+        let name = mysql_string(row, at);
+        let column = mysql_string(row, at + 1);
+        let ref_table = mysql_string(row, at + 2);
+        let ref_column = mysql_string(row, at + 3);
+        let on_delete = mysql_string(row, at + 4);
+        let on_update = mysql_string(row, at + 5);
         if let Some(key) = target.iter_mut().find(|key| key.name == name) {
             key.columns.push(column);
             key.ref_columns.push(ref_column);

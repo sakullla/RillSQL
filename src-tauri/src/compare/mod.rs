@@ -9,8 +9,13 @@ pub(crate) mod structure;
 pub use data::diff_data;
 pub use structure::diff_structure;
 #[allow(unused_imports)]
-pub(crate) use model::{DataReport, DataRequest, DataTableRequest, KeyChoice, SideRequest, StructureReport, StructureRequest, TableChoice};
-pub(crate) use read::{is_cancelled as compare_is_cancelled, list_schemas, read_data, read_structure, request_cancel as request_compare_cancel};
+pub(crate) use model::{
+    DataDiff, DataReport, DataRequest, DataTableRequest, DataTableSummary, DiffItem, FieldDiff, KeyChoice, SideRequest, StructureReport, StructureRequest, TableChoice,
+};
+pub(crate) use read::{
+    is_cancelled as compare_is_cancelled, list_schemas, progress_of as compare_progress, read_data, read_structure, request_cancel as request_compare_cancel, timeout_message,
+    Progress as CompareProgress, Stage as CompareStage,
+};
 
 pub fn module_id() -> &'static str {
     let _linked = (

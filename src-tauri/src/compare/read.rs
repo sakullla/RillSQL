@@ -1,7 +1,14 @@
 //! 在已打开的会话上读取两侧。PostgreSQL 的另一个库只另开临时会话，不改连、不写配置。
+//!
+//! 每次读取都有超时（取设置的查询超时）；两侧并行读取，表结构能整库批量读的方言一次读完，
+//! 其余对象有限并发逐个读取。进度按请求 id 登记，界面轮询。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
+
+use futures::{stream, StreamExt};
 
 use crate::adapters::transfer::{relational_engine, transfer_of};
 use crate::adapters::{adapter, catalog_of, engine_of_session, fixed_database_named, session_matches};
@@ -18,6 +25,12 @@ use super::model::{
 use super::structure::{diff_structure, table_data_keys};
 
 static CANCELLED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static PROGRESS: Mutex<BTreeMap<String, Progress>> = Mutex::new(BTreeMap::new());
+
+/// 查询超时设置为 0（不限）时，单次元数据/行读取仍用目录读取的默认上限，避免一直卡在“正在对比…”。
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+/// 每侧同时读取对象定义的上限：会话池很小（MySQL 元数据池 2 条），再多只是在池上排队。
+const ENRICH_CONCURRENCY: usize = 4;
 
 pub fn begin_cancel(id: &str) {
     if !id.is_empty() {
@@ -35,33 +48,160 @@ pub fn is_cancelled(id: &str) -> bool {
     !id.is_empty() && CANCELLED.lock().expect("cancel").contains(id)
 }
 
+/// 对比进行到哪一步。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    /// 正在列出两侧的对象。
+    #[default]
+    Listing,
+    /// 正在读取对象定义（列、索引、外键、定义原文）。
+    Reading,
+    /// 正在读取行（数据对比）。
+    Rows,
+    /// 正在比较并生成脚本。
+    Diffing,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub stage: Stage,
+    /// 已读对象数（数据对比时是已读表数）。
+    pub done: usize,
+    /// 要读的对象总数；还不知道时为 0。
+    pub total: usize,
+}
+
+/// 正在进行的对比的进度；结束后不再登记。
+pub fn progress_of(id: &str) -> Option<Progress> {
+    PROGRESS.lock().expect("progress").get(id).copied()
+}
+
+/// 读取超时的说明：界面按失败显示并给重试。
+pub fn timeout_message(secs: u64) -> String {
+    let secs = if secs == 0 { DEFAULT_READ_TIMEOUT_SECS } else { secs };
+    format!("对比读取超过 {secs} 秒没有完成（查询超时设置），已停止。可以重试，或在设置里调大查询超时。")
+}
+
+/// 一次对比的读取上下文：请求 id（取消与进度）、单次读取超时、是否已有读取超时。
+struct Run {
+    id: String,
+    timeout: Duration,
+    secs: u64,
+    timed_out: AtomicBool,
+}
+
+impl Run {
+    fn new(id: &str, timeout_secs: u64) -> Self {
+        let secs = if timeout_secs == 0 { DEFAULT_READ_TIMEOUT_SECS } else { timeout_secs };
+        begin_cancel(id);
+        if !id.is_empty() {
+            PROGRESS.lock().expect("progress").insert(id.to_owned(), Progress::default());
+        }
+        Self { id: id.to_owned(), timeout: Duration::from_secs(secs), secs, timed_out: AtomicBool::new(false) }
+    }
+
+    fn cancelled(&self) -> bool {
+        is_cancelled(&self.id)
+    }
+
+    /// 已取消或已有读取超时：后面的读取不再发起。
+    fn stopped(&self) -> bool {
+        self.cancelled() || self.timed_out()
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::SeqCst)
+    }
+
+    fn timeout_message(&self) -> String {
+        timeout_message(self.secs)
+    }
+
+    /// 单次读取带超时；超时记在这次对比上，返回明确的超时说明。
+    async fn bounded<T>(&self, read: impl std::future::Future<Output = T>) -> Result<T, String> {
+        match tokio::time::timeout(self.timeout, read).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                self.timed_out.store(true, Ordering::SeqCst);
+                Err(self.timeout_message())
+            }
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Progress)) {
+        if self.id.is_empty() {
+            return;
+        }
+        if let Some(progress) = PROGRESS.lock().expect("progress").get_mut(&self.id) {
+            change(progress);
+        }
+    }
+
+    fn stage(&self, stage: Stage) {
+        self.update(|progress| {
+            if progress.stage != stage {
+                progress.stage = stage;
+                progress.done = 0;
+                progress.total = 0;
+            }
+        });
+    }
+
+    fn add_total(&self, count: usize) {
+        self.update(|progress| progress.total += count);
+    }
+
+    fn add_done(&self, count: usize) {
+        self.update(|progress| progress.done += count);
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        if !self.id.is_empty() {
+            PROGRESS.lock().expect("progress").remove(&self.id);
+        }
+    }
+}
+
 struct Held {
     _ephemeral: Option<crate::connections::EphemeralRead>,
     session: CatalogSession,
 }
 
 pub async fn read_structure(service: &Service, request: &StructureRequest) -> StructureReport {
-    begin_cancel(&request.id);
-    let baseline = load_side(service, &request.baseline, &request.id).await;
-    let target = load_side(service, &request.target, &request.id).await;
-    diff_structure(&baseline, &target)
+    let run = Run::new(&request.id, request.timeout_secs);
+    let (baseline, target) = tokio::join!(load_side(service, &request.baseline, &run, None), load_side(service, &request.target, &run, None));
+    run.stage(Stage::Diffing);
+    let mut report = diff_structure(&baseline, &target);
+    report.timed_out = run.timed_out();
+    report
 }
 
 pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
-    begin_cancel(&request.id);
+    let run = Run::new(&request.id, request.timeout_secs);
     if request.tables.is_empty() {
         return diff_data(&DataInput { baseline_engine: request.baseline.engine.clone(), target_engine: request.target.engine.clone(), tables: Vec::new(), cancelled: false });
     }
-    let baseline = load_side(service, &request.baseline, &request.id).await;
-    let target = load_side(service, &request.target, &request.id).await;
+    // 数据对比只需要选中表的结构：名单照常读全，定义只读这些表。
+    let wanted: BTreeSet<String> = request.tables.iter().map(|table| table.name.clone()).collect();
+    let (baseline, target) = tokio::join!(
+        load_side(service, &request.baseline, &run, Some(&wanted)),
+        load_side(service, &request.target, &run, Some(&wanted)),
+    );
     if let Some(message) = refuse_loaded(&baseline, &target) {
-        return DataReport { refused: Some(message), script: String::new(), incomplete: false, notes: Vec::new(), diffs: Vec::new() };
+        let mut report = DataReport::refused(message);
+        report.timed_out = run.timed_out();
+        return report;
     }
+    run.stage(Stage::Rows);
+    run.add_total(request.tables.len());
     let mut tables = Vec::new();
-    let mut cancelled = is_cancelled(&request.id) || baseline.cancelled || target.cancelled;
+    let mut cancelled = run.cancelled() || baseline.cancelled || target.cancelled;
     for wanted in &request.tables {
-        if is_cancelled(&request.id) {
-            cancelled = true;
+        if run.stopped() {
+            cancelled |= run.cancelled();
+            let reason = if run.timed_out() { run.timeout_message() } else { "对比已取消".to_owned() };
             tables.push(DataTable {
                 name: wanted.name.clone(),
                 qualify: String::new(),
@@ -70,18 +210,25 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
                 chosen_key: wanted.key.clone(),
                 baseline: Vec::new(),
                 target: Vec::new(),
-                read_error: Some("对比已取消".to_owned()),
+                read_error: Some(reason),
                 only_side: None,
                 keys_unknown: false,
             });
             continue;
         }
-        tables.push(load_data_table(service, &request.baseline, &request.target, &baseline, &target, &wanted.name, wanted.key.clone(), &request.id).await);
-        if is_cancelled(&request.id) {
+        tables.push(load_data_table(service, &request.baseline, &request.target, &baseline, &target, &wanted.name, wanted.key.clone(), &run).await);
+        run.add_done(1);
+        if run.cancelled() {
             cancelled = true;
         }
     }
-    diff_data(&DataInput { baseline_engine: request.baseline.engine.clone(), target_engine: request.target.engine.clone(), tables, cancelled })
+    run.stage(Stage::Diffing);
+    let mut report = diff_data(&DataInput { baseline_engine: request.baseline.engine.clone(), target_engine: request.target.engine.clone(), tables, cancelled });
+    report.timed_out = run.timed_out();
+    if report.timed_out {
+        report.incomplete = true;
+    }
+    report
 }
 
 fn refuse_loaded(baseline: &Side, target: &Side) -> Option<String> {
@@ -91,7 +238,8 @@ fn refuse_loaded(baseline: &Side, target: &Side) -> Option<String> {
     baseline.fatal.clone().or(target.fatal.clone()).map(|message| format!("{message} 不生成脚本。"))
 }
 
-async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) -> Side {
+/// `only` 给出时只读这些表的定义（数据对比）；对象名单仍然读全。
+async fn load_side(service: &Service, request: &SideRequest, run: &Run, only: Option<&BTreeSet<String>>) -> Side {
     let fixed = fixed_database_named(&request.engine);
     let database = match fixed {
         Some(fixed) if request.database.is_empty() => fixed.to_owned(),
@@ -125,26 +273,32 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
         return side;
     }
     side.connected = true;
-    let held = match hold_session(service, &existing, request, &database).await {
+    let held = match run.bounded(hold_session(service, &existing, request, &database)).await.and_then(|held| held) {
         Ok(held) => held,
         Err(message) => {
             side.fatal = Some(message);
             return side;
         }
     };
-    if let Err(message) = transfer_of(engine).compare_scope(&held.session, &database, &request.schema).await {
+    if let Err(message) = run.bounded(transfer_of(engine).compare_scope(&held.session, &database, &request.schema)).await.and_then(|checked| checked) {
         side.fatal = Some(message);
         return side;
     }
     let mut offset = 0usize;
     let mut seen = 0usize;
     loop {
-        if is_cancelled(cancel_id) {
+        if run.cancelled() {
             side.cancelled = true;
             side.listing_complete = false;
             break;
         }
-        let page = read_object_page(&held.session, engine, &database, &request.schema, offset, 200).await;
+        let page = match run.bounded(read_object_page(&held.session, engine, &database, &request.schema, offset, 200)).await {
+            Ok(page) => page,
+            Err(message) => {
+                side.fatal = Some(message);
+                return side;
+            }
+        };
         if let Some(message) = page.error {
             side.fatal = Some(message);
             return side;
@@ -168,18 +322,76 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
         offset = seen;
     }
     if side.listing_complete {
-        for object in &mut side.objects {
-            if is_cancelled(cancel_id) {
-                side.cancelled = true;
-                object.read_error = Some("对比已取消".to_owned());
-                continue;
-            }
-            side.category_errors.extend(enrich(&held.session, request, &database, object).await);
-        }
+        run.stage(Stage::Reading);
+        enrich_all(&held.session, request, &database, engine, &mut side, run, only).await;
     }
     side.category_errors.sort();
     side.category_errors.dedup();
     side
+}
+
+/// 读完定义的对象、它带来的类别读取失败、是否因取消而跳过。
+type Enriched = (ObjectDef, Vec<(Category, String)>, bool);
+
+/// 读取对象定义：先试整库批量读表结构，读不到的表和其余对象有限并发逐个读取。
+async fn enrich_all(session: &CatalogSession, request: &SideRequest, database: &str, engine: Engine, side: &mut Side, run: &Run, only: Option<&BTreeSet<String>>) {
+    let wanted = |object: &ObjectDef| only.is_none_or(|names| object.kind == Kind::Table && names.contains(&object.name));
+    let total = side.objects.iter().filter(|object| wanted(object)).count();
+    run.add_total(total);
+    let has_tables = side.objects.iter().any(|object| wanted(object) && object.kind == Kind::Table);
+    let mut batch: HashMap<String, Snapshot> = HashMap::new();
+    if has_tables && !run.stopped() {
+        match run.bounded(transfer_of(engine).compare_table_snapshots(session, database, &request.schema)).await {
+            Ok(Some(Ok(snapshots))) => batch = snapshots.into_iter().collect(),
+            // 批量读失败时退回逐表读取，逐表读取会把具体原因记在对象上。
+            Ok(Some(Err(_))) | Ok(None) => {}
+            Err(message) => {
+                side.fatal = Some(message);
+                return;
+            }
+        }
+    }
+    let objects = std::mem::take(&mut side.objects);
+    let results: Vec<Enriched> = stream::iter(objects)
+        .map(|mut object| {
+            let snapshot = if object.kind == Kind::Table { batch.remove(&object.name) } else { None };
+            let selected = wanted(&object);
+            async move {
+                if !selected {
+                    return (object, Vec::new(), false);
+                }
+                if let Some(snapshot) = snapshot {
+                    let errors = absorb_snapshot(&mut object, &snapshot);
+                    run.add_done(1);
+                    return (object, errors, false);
+                }
+                if run.stopped() {
+                    let cancelled = run.cancelled();
+                    object.read_error = Some(if cancelled { "对比已取消".to_owned() } else { run.timeout_message() });
+                    return (object, Vec::new(), cancelled);
+                }
+                let errors = match run.bounded(enrich(session, request, database, &mut object)).await {
+                    Ok(errors) => errors,
+                    Err(message) => {
+                        object.read_error = Some(message);
+                        Vec::new()
+                    }
+                };
+                run.add_done(1);
+                (object, errors, false)
+            }
+        })
+        .buffered(ENRICH_CONCURRENCY)
+        .collect()
+        .await;
+    for (object, errors, cancelled) in results {
+        side.cancelled |= cancelled;
+        side.category_errors.extend(errors);
+        side.objects.push(object);
+    }
+    if run.timed_out() && side.fatal.is_none() {
+        side.fatal = Some(run.timeout_message());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,7 +403,7 @@ async fn load_data_table(
     target: &Side,
     name: &str,
     chosen_key: Option<String>,
-    cancel_id: &str,
+    run: &Run,
 ) -> DataTable {
     let left = baseline.objects.iter().find(|object| object.kind == Kind::Table && object.name == name);
     let right = target.objects.iter().find(|object| object.kind == Kind::Table && object.name == name);
@@ -233,15 +445,15 @@ async fn load_data_table(
     let side_database = |request: &SideRequest| fixed_database_named(&request.engine).map(str::to_owned).unwrap_or_else(|| request.database.clone());
     let base_database = side_database(baseline_request);
     let target_database = side_database(target_request);
-    let base_held = match hold_session(service, &base_session, baseline_request, &base_database).await {
+    let base_held = match run.bounded(hold_session(service, &base_session, baseline_request, &base_database)).await.and_then(|held| held) {
         Ok(held) => held,
         Err(message) => return failed_table(name, chosen_key, message),
     };
-    let target_held = match hold_session(service, &target_session, target_request, &target_database).await {
+    let target_held = match run.bounded(hold_session(service, &target_session, target_request, &target_database)).await.and_then(|held| held) {
         Ok(held) => held,
         Err(message) => return failed_table(name, chosen_key, message),
     };
-    let described = match describe(&target_held.session, &target_database, &target_request.schema, name, &target_request.engine).await {
+    let described = match run.bounded(describe(&target_held.session, &target_database, &target_request.schema, name, &target_request.engine)).await.and_then(|schema| schema) {
         Ok(schema) => schema,
         Err(message) => return failed_table(name, chosen_key, message),
     };
@@ -257,8 +469,11 @@ async fn load_data_table(
         read_error: None,
         only_side: None,
     };
-    let (baseline_rows, baseline_error) = read_all_rows(&base_held.session, &base_database, &baseline_request.schema, name, &baseline_request.engine, cancel_id).await;
-    let (target_rows, target_error) = read_all_rows(&target_held.session, &target_database, &target_request.schema, name, &target_request.engine, cancel_id).await;
+    // 两侧的行并行读取。
+    let ((baseline_rows, baseline_error), (target_rows, target_error)) = tokio::join!(
+        read_all_rows(&base_held.session, &base_database, &baseline_request.schema, name, &baseline_request.engine, run),
+        read_all_rows(&target_held.session, &target_database, &target_request.schema, name, &target_request.engine, run),
+    );
     table.baseline = baseline_rows;
     table.target = target_rows;
     table.read_error = baseline_error.or(target_error);
@@ -295,8 +510,8 @@ fn unread_keys_table(name: &str, chosen_key: Option<String>) -> DataTable {
     }
 }
 
-async fn read_all_rows(session: &CatalogSession, database: &str, schema: &str, table: &str, engine: &str, cancel_id: &str) -> (Vec<BTreeMap<String, Cell>>, Option<String>) {
-    let described = match describe(session, database, schema, table, engine).await {
+async fn read_all_rows(session: &CatalogSession, database: &str, schema: &str, table: &str, engine: &str, run: &Run) -> (Vec<BTreeMap<String, Cell>>, Option<String>) {
+    let described = match run.bounded(describe(session, database, schema, table, engine)).await.and_then(|schema| schema) {
         Ok(schema) => schema,
         Err(message) => return (Vec::new(), Some(message)),
     };
@@ -304,10 +519,10 @@ async fn read_all_rows(session: &CatalogSession, database: &str, schema: &str, t
     let limit = 200u64;
     let mut rows = Vec::new();
     loop {
-        if is_cancelled(cancel_id) {
+        if run.cancelled() {
             return (rows, Some("对比已取消".to_owned()));
         }
-        match fetch_page(session, &described, offset, limit).await {
+        match run.bounded(fetch_page(session, &described, offset, limit)).await.and_then(|page| page) {
             Ok(page) => {
                 let count = page.len() as u64;
                 rows.extend(page);
@@ -544,4 +759,38 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
         .schemas
         .ok_or_else(|| format!("{} 缺少 schema 查询", adapter(engine).meta().label()))?;
     transfer_of(engine).schema_names(&held.session, sql).await
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_read_past_the_timeout_stops_the_run_with_a_clear_message() {
+        let mut run = Run::new("read-timeout-test", 15);
+        run.timeout = Duration::from_millis(20);
+        assert!(progress_of("read-timeout-test").is_some(), "开始后登记进度");
+        let result = run.bounded(std::future::pending::<()>()).await;
+        let message = result.expect_err("挂起的读取必须超时");
+        assert!(message.contains("15 秒") && message.contains("超时"), "{message}");
+        assert!(run.timed_out() && run.stopped());
+        assert!(run.bounded(async { 1 }).await.is_ok(), "超时只标记这次对比，不影响已完成的读取");
+        drop(run);
+        assert!(progress_of("read-timeout-test").is_none(), "结束后不再登记进度");
+        assert!(timeout_message(0).contains(&DEFAULT_READ_TIMEOUT_SECS.to_string()), "超时设为不限时按默认上限说明");
+    }
+
+    #[tokio::test]
+    async fn progress_counts_up_within_a_stage_and_resets_on_the_next() {
+        let run = Run::new("progress-test", 0);
+        run.add_total(10);
+        run.add_done(3);
+        assert_eq!(progress_of("progress-test"), Some(Progress { stage: Stage::Listing, done: 3, total: 10 }));
+        run.stage(Stage::Reading);
+        run.add_total(4);
+        run.add_done(1);
+        assert_eq!(progress_of("progress-test"), Some(Progress { stage: Stage::Reading, done: 1, total: 4 }));
+        request_cancel("progress-test");
+        assert!(run.cancelled() && run.stopped() && !run.timed_out());
+    }
 }

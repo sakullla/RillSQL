@@ -913,6 +913,9 @@ impl Workbench {
             let saved: Vec<&str> = self.model.connections.rows.iter().map(|row| row.saved.id.as_str()).collect();
             self.query.update(cx, |pane, cx| pane.retain_saved_targets(&saved, cx));
         }
+        // 对比的每次读取都按查询超时设置收口，避免一直停在“正在对比…”。
+        let compare_timeout = u64::try_from(self.model.settings.query_timeout_sec.max(0)).unwrap_or(0);
+        self.compare.update(cx, |pane, _| pane.set_query_timeout_sec(compare_timeout));
         let page_size = u64::try_from(settings.page_size.max(1)).unwrap_or(1);
         let preview_kb = u64::try_from(settings.preview_kb.max(1)).unwrap_or(1);
         let null_copy = settings.null_copy.clone();

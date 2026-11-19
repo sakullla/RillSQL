@@ -16,8 +16,8 @@ use gpui_kit::{
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
-use crate::application::{AppServices, cancel_compare, compare_cancelled};
-use crate::compare::{DataReport, DataRequest, DataTableRequest, SideRequest, StructureReport, StructureRequest};
+use crate::application::{AppServices, cancel_compare, compare_cancelled, compare_progress};
+use crate::compare::{CompareProgress, CompareStage, DataReport, DataRequest, DataTableRequest, DiffItem, SideRequest, StructureReport, StructureRequest};
 use crate::connections::model::Engine;
 use crate::i18n::{self, Locale};
 
@@ -161,6 +161,8 @@ pub struct ComparePane {
     placed: Option<PlacedScript>,
     /// 把对比生成的写脚本放进查询编辑器前，再确认一次。
     pending_place: Option<RunKind>,
+    /// 待确认放入的是差异树选中对象的语句，而不是整体脚本。
+    pending_item_sql: Option<String>,
     place_prompt: String,
     schema_draft: BTreeMap<String, String>,
     schema_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
@@ -177,6 +179,19 @@ pub struct ComparePane {
     schema_reload: bool,
     filter_input: Option<(Entity<InputState>, gpui_kit::Subscription)>,
     script_editors: BTreeMap<&'static str, (Entity<EditorState>, String)>,
+    /// 设置里的查询超时（秒）；对比的每次读取都按它收口，0 时后端用默认上限。
+    query_timeout_sec: u64,
+    /// 后台对比任务的中止句柄：取消时直接中止，不等下一个读取点。
+    abort: Option<tokio::task::AbortHandle>,
+    /// 后台登记的进度（阶段、已读/总数），运行中定时轮询。
+    progress: Option<CompareProgress>,
+    ticker: Option<gpui_kit::Task<()>>,
+    /// 差异树只列有差异的对象；关掉后也列出两侧相同的对象。
+    only_diffs: bool,
+    /// 差异树里选中的条目（`b:序号`、`t:序号`、`c:序号`、`s:序号`）。
+    picked: Option<String>,
+    /// 数据对比下钻的表。
+    data_table: Option<String>,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -207,6 +222,7 @@ impl ComparePane {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             placed: None,
             pending_place: None,
+            pending_item_sql: None,
             place_prompt: String::new(),
             schema_draft: BTreeMap::new(),
             schema_inputs: BTreeMap::new(),
@@ -219,6 +235,13 @@ impl ComparePane {
             schema_reload: false,
             filter_input: None,
             script_editors: BTreeMap::new(),
+            query_timeout_sec: 0,
+            abort: None,
+            progress: None,
+            ticker: None,
+            only_diffs: true,
+            picked: None,
+            data_table: None,
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -228,6 +251,10 @@ impl ComparePane {
 
     pub fn set_locale(&mut self, locale: Locale) {
         self.locale = locale;
+    }
+
+    pub fn set_query_timeout_sec(&mut self, secs: u64) {
+        self.query_timeout_sec = secs;
     }
 
     pub fn running(&self) -> bool {
@@ -354,6 +381,27 @@ impl ComparePane {
         self.ensure_schemas(false, cx);
     }
 
+    /// 只改结果页呈现的命令（筛选、仅差异、选中差异条目、数据下钻）；处理了返回真。
+    fn view_command(&mut self, id: &str) -> bool {
+        match id {
+            "compare-filter:all" => self.diff_filter = DiffFilter::All,
+            "compare-filter:baseline" => self.diff_filter = DiffFilter::Baseline,
+            "compare-filter:target" => self.diff_filter = DiffFilter::Target,
+            "compare-filter:changed" => self.diff_filter = DiffFilter::Changed,
+            "compare-only-diffs" => self.only_diffs = !self.only_diffs,
+            _ => {
+                if let Some(key) = id.strip_prefix("compare-pick:") {
+                    self.picked = Some(key.to_owned());
+                } else if let Some(table) = id.strip_prefix("compare-data-table:") {
+                    self.data_table = if self.data_table.as_deref() == Some(table) { None } else { Some(table.to_owned()) };
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     #[cfg(test)]
     pub fn arm_pause(&mut self) {
         self.armed_pause = true;
@@ -381,6 +429,10 @@ impl ComparePane {
         }
         if id == "compare-back" {
             self.back = true;
+            cx.notify();
+            return;
+        }
+        if self.view_command(id) {
             cx.notify();
             return;
         }
@@ -421,6 +473,7 @@ impl ComparePane {
             self.confirm_place();
         } else if id == "compare-place-cancel" {
             self.pending_place = None;
+            self.pending_item_sql = None;
             self.place_prompt.clear();
         } else if id == "compare-swap" {
             self.swap_sides();
@@ -428,14 +481,12 @@ impl ComparePane {
             self.select_all_tables();
         } else if id == "compare-clear" {
             self.clear_table_selection();
-        } else if id == "compare-filter:all" {
-            self.diff_filter = DiffFilter::All;
-        } else if id == "compare-filter:baseline" {
-            self.diff_filter = DiffFilter::Baseline;
-        } else if id == "compare-filter:target" {
-            self.diff_filter = DiffFilter::Target;
-        } else if id == "compare-filter:changed" {
-            self.diff_filter = DiffFilter::Changed;
+        } else if id == "compare-copy:item" {
+            if let Some(sql) = self.picked_item().map(|item| item.sql.clone()).filter(|sql| !sql.trim().is_empty()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(sql));
+            }
+        } else if id == "compare-place:item" {
+            self.ask_place_item();
         } else if id == "compare-copy:structure" {
             self.copy_script(RunKind::Structure, cx);
         } else if id == "compare-copy:data" {
@@ -571,14 +622,20 @@ impl ComparePane {
             self.token = None;
             self.running = false;
         }
+        if let Some(handle) = self.abort.take() {
+            handle.abort();
+        }
         self.structure = None;
         self.data = None;
+        self.picked = None;
+        self.data_table = None;
         self.structure_status = Status::Idle;
         self.data_status = Status::Idle;
         self.selected.clear();
         self.chosen_key.clear();
         self.placed = None;
         self.pending_place = None;
+        self.pending_item_sql = None;
         self.place_prompt.clear();
         self.clear_error();
     }
@@ -759,7 +816,7 @@ impl ComparePane {
         let baseline = self.side_request(&self.baseline)?;
         let target = self.side_request(&self.target)?;
         let id = format!("compare-{}", uuid::Uuid::new_v4());
-        Some(StructureRequest { id, baseline, target })
+        Some(StructureRequest { id, baseline, target, timeout_secs: self.query_timeout_sec })
     }
 
     fn data_request(&self) -> Option<DataRequest> {
@@ -781,7 +838,7 @@ impl ComparePane {
             })
             .unwrap_or_default();
         let id = format!("compare-data-{}", uuid::Uuid::new_v4());
-        Some(DataRequest { id, baseline, target, tables })
+        Some(DataRequest { id, baseline, target, tables, timeout_secs: self.query_timeout_sec })
     }
 
     fn side_request(&self, side: &SidePick) -> Option<SideRequest> {
@@ -843,56 +900,53 @@ impl ComparePane {
 
     fn spawn_structure(&mut self, request: StructureRequest, cx: &mut Context<Self>) {
         let token = self.begin_run(request.id.clone(), RunKind::Structure);
-        let flag = Arc::clone(&self.cancel_flag);
         let services = Arc::clone(&self.services);
         let gate = self.take_gate();
-        let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            crate::app::views::grid::runtime_for_views().spawn(async move {
-                if let Some(gate) = gate {
-                    let _ = gate.await;
-                }
-                let outcome = crate::application::work::compare_structure(&services.connections, &services.tasks, OWNER, token, &request).await;
-                let _ = tx.send(outcome);
-            });
-            let outcome = rx.await;
-            cx.update(|cx| {
-                if let Some(view) = view.upgrade() {
-                    view.update(cx, |pane, cx| {
-                        match outcome {
-                            Ok(outcome) => pane.finish_structure(token, &flag, outcome),
-                            Err(_) => pane.finish_lost(token),
-                        }
-                        cx.notify();
-                    });
-                }
-            });
-        })
-        .detach();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = crate::app::views::grid::runtime_for_views().spawn(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            let outcome = crate::application::work::compare_structure(&services.connections, &services.tasks, OWNER, token, &request).await;
+            let _ = tx.send(outcome);
+        });
+        self.abort = Some(handle.abort_handle());
+        self.await_run(token, rx, Self::finish_structure, cx);
     }
 
     fn spawn_data(&mut self, request: DataRequest, cx: &mut Context<Self>) {
         let token = self.begin_run(request.id.clone(), RunKind::Data);
-        let flag = Arc::clone(&self.cancel_flag);
         let services = Arc::clone(&self.services);
         let gate = self.take_gate();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = crate::app::views::grid::runtime_for_views().spawn(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            let outcome = crate::application::work::compare_data(&services.connections, &services.tasks, OWNER, token, &request).await;
+            let _ = tx.send(outcome);
+        });
+        self.abort = Some(handle.abort_handle());
+        self.await_run(token, rx, Self::finish_data, cx);
+    }
+
+    /// 等后台结果写回；任务被中止（取消）时发送端随之丢弃，token 已作废，不会再写回。
+    fn await_run<T: Send + 'static>(
+        &mut self,
+        token: TaskToken,
+        rx: tokio::sync::oneshot::Receiver<TaskOutcome<T>>,
+        finish: fn(&mut Self, TaskToken, &AtomicBool, TaskOutcome<T>),
+        cx: &mut Context<Self>,
+    ) {
+        let flag = Arc::clone(&self.cancel_flag);
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            crate::app::views::grid::runtime_for_views().spawn(async move {
-                if let Some(gate) = gate {
-                    let _ = gate.await;
-                }
-                let outcome = crate::application::work::compare_data(&services.connections, &services.tasks, OWNER, token, &request).await;
-                let _ = tx.send(outcome);
-            });
             let outcome = rx.await;
             cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |pane, cx| {
                         match outcome {
-                            Ok(outcome) => pane.finish_data(token, &flag, outcome),
+                            Ok(outcome) => finish(pane, token, &flag, outcome),
                             Err(_) => pane.finish_lost(token),
                         }
                         cx.notify();
@@ -901,6 +955,36 @@ impl ComparePane {
             });
         })
         .detach();
+        self.start_ticker(token, cx);
+    }
+
+    /// 运行中每 250ms 读一次后台进度并重绘；这次运行结束或被取消后自己停下。
+    /// 测试里不开计时循环：执行器不会自己推进时钟。
+    fn start_ticker(&mut self, token: TaskToken, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        self.ticker = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                let keep = view
+                    .update(cx, |pane, cx| {
+                        if pane.token != Some(token) || !pane.running {
+                            return false;
+                        }
+                        let next = compare_progress(&pane.run_id);
+                        if next != pane.progress {
+                            pane.progress = next;
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
     }
 
     fn begin_run(&mut self, id: String, kind: RunKind) -> TaskToken {
@@ -913,6 +997,7 @@ impl ComparePane {
         self.token = Some(token);
         self.running = true;
         self.run_kind = Some(kind);
+        self.progress = None;
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         match kind {
             RunKind::Structure => self.structure_status = Status::Running,
@@ -921,12 +1006,20 @@ impl ComparePane {
         token
     }
 
+    /// 取消立即生效：中止后台任务、作废这次的 token、结束运行状态，可以马上再发起一次。
     fn cancel(&mut self) {
         if !self.running {
             return;
         }
         self.cancel_flag.store(true, Ordering::SeqCst);
         cancel_compare(&self.services.tasks, OWNER, &self.run_id);
+        if let Some(handle) = self.abort.take() {
+            handle.abort();
+        }
+        self.running = false;
+        self.token = None;
+        self.progress = None;
+        self.ticker = None;
         // 先记成已取消。迟到的成功结果也不能把这份取消覆盖掉。
         self.notify(self.text("compare.status.cancelled"));
         match self.run_kind {
@@ -951,6 +1044,8 @@ impl ComparePane {
             || compare_cancelled(&self.run_id);
         self.running = false;
         self.token = None;
+        self.abort = None;
+        self.progress = None;
         if cancelled {
             self.structure = None;
             self.structure_status = Status::Cancelled;
@@ -976,6 +1071,8 @@ impl ComparePane {
             || compare_cancelled(&self.run_id);
         self.running = false;
         self.token = None;
+        self.abort = None;
+        self.progress = None;
         if cancelled {
             self.data = None;
             self.data_status = Status::Cancelled;
@@ -996,6 +1093,9 @@ impl ComparePane {
             return;
         }
         self.running = false;
+        self.token = None;
+        self.abort = None;
+        self.progress = None;
         // 任务丢了结果拿不回来：这是失败，统一错误态直接给重试。
         self.fail(self.text("compare.status.failed"), retry_for(self.run_kind));
         match self.run_kind {
@@ -1011,6 +1111,15 @@ impl ComparePane {
     }
 
     fn install_structure(&mut self, report: StructureReport) {
+        self.picked = None;
+        if report.timed_out {
+            // 读取超时：明确的失败 + 重试，不留一份看似完整的结果。
+            let message = report.refused.clone().unwrap_or_else(|| crate::compare::timeout_message(self.query_timeout_sec));
+            self.structure = None;
+            self.structure_status = Status::Failed;
+            self.fail(message, RetryAction::Structure);
+            return;
+        }
         if report.refused.is_some() {
             self.structure_status = Status::Refused;
             self.structure = Some(Arc::new(report));
@@ -1021,10 +1130,20 @@ impl ComparePane {
             self.selected.insert(table.name.clone(), table.on_both);
         }
         self.structure_status = if report.incomplete { Status::Incomplete } else { Status::Ready };
+        // 默认选中第一条差异，右侧直接有并排定义可看。
+        self.picked = first_entry(&report);
         self.structure = Some(Arc::new(report));
     }
 
     fn install_data(&mut self, report: DataReport) {
+        self.data_table = None;
+        if report.timed_out {
+            let message = report.refused.clone().unwrap_or_else(|| crate::compare::timeout_message(self.query_timeout_sec));
+            self.data = None;
+            self.data_status = Status::Failed;
+            self.fail(message, RetryAction::Data);
+            return;
+        }
         if report.refused.is_some() {
             self.data_status = Status::Refused;
         } else if report.incomplete {
@@ -1046,6 +1165,7 @@ impl ComparePane {
         if refused || status == Status::Cancelled || script.trim().is_empty() {
             return;
         }
+        self.pending_item_sql = None;
         let lines = script.lines().count();
         self.place_prompt = if self.locale == Locale::En {
             format!("Put a {lines}-line write script into the query editor? It is not executed.")
@@ -1056,6 +1176,14 @@ impl ComparePane {
     }
 
     fn confirm_place(&mut self) {
+        if let Some(sql) = self.pending_item_sql.take() {
+            self.pending_place = None;
+            if self.structure_status != Status::Cancelled && !sql.trim().is_empty() {
+                self.placed = Some(self.place_for(&sql));
+            }
+            self.place_prompt.clear();
+            return;
+        }
         match self.pending_place.take() {
             Some(RunKind::Structure) => self.place_structure(),
             Some(RunKind::Data) => self.place_data(),
@@ -1177,7 +1305,7 @@ impl ComparePane {
         self.push_side(&mut lines, true);
         self.push_side(&mut lines, false);
         if self.running {
-            lines.push(self.text("compare.dialog.comparing"));
+            lines.push(self.progress_text());
         }
         match self.error_kind {
             // 失败：统一错误态里的标题、原因与重试按钮。
@@ -1215,7 +1343,17 @@ impl ComparePane {
                         ("{changed}", &report.changed.len().to_string()),
                     ],
                 ));
+                lines.push(format!("{} {}", self.text("compare.summary.same"), report.same.len()));
+                for (kind, plus, minus, changed) in kind_summary(report) {
+                    lines.push(format!("kind {kind} +{plus} −{minus} ~{changed}"));
+                }
+                if report.only_baseline.is_empty() && report.only_target.is_empty() && report.changed.is_empty() {
+                    lines.push(self.text("compare.summary.noDiff"));
+                }
                 lines.push(self.text(self.diff_filter.key()));
+                if self.only_diffs {
+                    lines.push(self.text("compare.filter.onlyDiffs"));
+                }
                 if !self.diff_query.trim().is_empty() {
                     lines.push(format!("search {}", self.diff_query.trim()));
                 }
@@ -1228,6 +1366,7 @@ impl ComparePane {
                 for item in report.changed.iter().filter(|item| self.shows_diff(DiffFilter::Changed, &item.name)) {
                     lines.push(format!("{} {} {}", item.kind, item.name, item.detail));
                 }
+                self.tree_lines(report, &mut lines);
                 for note in &report.notes {
                     lines.push(note.clone());
                 }
@@ -1252,6 +1391,7 @@ impl ComparePane {
                 }
                 if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
                     lines.push(self.text("compare.dialog.structureScript"));
+                    lines.push(self.text("compare.script.whole"));
                     lines.push(self.text("compare.script.copy"));
                     lines.push(report.script.clone());
                 }
@@ -1272,6 +1412,7 @@ impl ComparePane {
                     let key = if diff.key.is_empty() { String::new() } else { format!(" {} {}", self.text("compare.dialog.key"), diff.key) };
                     lines.push(format!("{} {}{key}", diff.table, diff.detail));
                 }
+                self.data_lines(report, &mut lines);
                 for note in &report.notes {
                     lines.push(note.clone());
                 }
@@ -1349,12 +1490,14 @@ fn empty_structure(refused: Option<String>) -> StructureReport {
         only_baseline: Vec::new(),
         only_target: Vec::new(),
         changed: Vec::new(),
+        same: Vec::new(),
         tables: Vec::new(),
+        timed_out: false,
     }
 }
 
 fn empty_data(refused: Option<String>) -> DataReport {
-    DataReport { refused, script: String::new(), incomplete: false, notes: Vec::new(), diffs: Vec::new() }
+    DataReport { refused, script: String::new(), incomplete: false, notes: Vec::new(), diffs: Vec::new(), tables: Vec::new(), timed_out: false }
 }
 
 use crate::ui::kit::stack_frame;
@@ -1409,7 +1552,7 @@ impl Render for ComparePane {
         if self.running {
             actions = actions
                 .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
-                .child(kit::inline_loading(t(self, "compare.dialog.comparing"), &m, &p));
+                .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p));
         } else {
             actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
@@ -1427,7 +1570,7 @@ impl Render for ComparePane {
                     .flex()
                     .flex_col()
                     .gap(px(m.pane_pad()))
-                    .child(kit::inline_loading(t(self, "compare.dialog.comparing"), &m, &p))
+                    .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p))
                     .child(kit::skeleton_state(5, &m, &p)),
             );
         }
@@ -1497,136 +1640,12 @@ impl Render for ComparePane {
         });
 
         if let Some(report) = self.structure.clone() {
-            let card = stack_frame(|| {
-            let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad()));
-            let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
-            card = card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(kit::title(t(self, "compare.dialog.structureScript"), TypeScale::LG, &p))
-                    .when(can_place, |this| {
-                        this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity)))
-                    }),
-            );
-            if let Some(refused) = &report.refused {
-                card = card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft));
-            } else {
-                card = card.child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(stat(self.text("compare.dialog.baseline"), report.only_baseline.len(), p.ok, &p))
-                        .child(stat(self.text("compare.dialog.target"), report.only_target.len(), p.danger, &p))
-                        .child(stat(self.text("ui.compare.changed"), report.changed.len(), p.warn, &p)),
-                );
-                card = card.child(self.diff_toolbar(&report, &entity, &p, &m, window, cx));
-                let mut diffs = div().flex().flex_col().gap(px(2.));
-                for item in report.only_baseline.iter().filter(|item| self.shows_diff(DiffFilter::Baseline, &item.name)) {
-                    diffs = diffs.child(diff_row("+", fill(&self.text("compare.dialog.onlyBaseline"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.ok, &p));
-                }
-                for item in report.only_target.iter().filter(|item| self.shows_diff(DiffFilter::Target, &item.name)) {
-                    diffs = diffs.child(diff_row("−", fill(&self.text("compare.dialog.onlyTarget"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.danger, &p));
-                }
-                for item in report.changed.iter().filter(|item| self.shows_diff(DiffFilter::Changed, &item.name)) {
-                    diffs = diffs.child(diff_row("~", format!("{} {} · {}", item.kind, item.name, item.detail), p.warn, &p));
-                }
-                card = card.child(diffs);
-                card = stack_frame(|| {
-                let mut card = card;
-                for note in &report.notes {
-                    card = card.child(kit::muted(SharedString::from(note.clone()), &p));
-                }
-                if report.incomplete || self.structure_status == Status::Incomplete {
-                    card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.scriptIncomplete"), p.warn, p.warn_soft));
-                }
-                if report.tables.is_empty() {
-                    card = card.child(kit::muted(t(self, "compare.dialog.noTables"), &p));
-                } else {
-                    let mut tables = div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(6.))
-                        .child(kit::tool_button("compare-select-all", Some(IconName::SquareCheck), t(self, "compare.action.selectAll"), compare_act("compare-select-all", &entity)))
-                        .child(kit::tool_button("compare-clear", Some(IconName::Square), t(self, "compare.action.clear"), compare_act("compare-clear", &entity)));
-                    for table in report.tables.iter().filter(|table| name_matches(&table.name, &self.diff_query)) {
-                        let on = self.selected.get(&table.name).copied().unwrap_or(false);
-                        let mark = if on { "on" } else { "off" };
-                        tables = tables.child(
-                            chip(SharedString::from(format!("compare-toggle:{}", table.name)), SharedString::from(format!("{mark} {}", table.name)), SharedString::from(table.name.clone()), on, Some(if on { IconName::SquareCheck } else { IconName::Square }), &p, m)
-                                .on_click(compare_act(format!("compare-toggle:{}", table.name), &entity)),
-                        );
-                    }
-                    card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p)).child(tables));
-                    for table in report.tables.iter().filter(|table| table.needs_key_choice) {
-                        let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
-                        for key in &table.keys {
-                            let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
-                            let mark = if chosen { "chosen" } else { "key" };
-                            let id = format!("compare-key:{}|{}", table.name, key.name);
-                            keys = keys.child(
-                                chip(SharedString::from(id.clone()), SharedString::from(format!("{mark} {} {}", table.name, key.name)), SharedString::from(format!("{} ({})", key.name, key.columns.join(", "))), chosen, Some(IconName::Key), &p, m)
-                                    .on_click(compare_act(id, &entity)),
-                            );
-                        }
-                        card = card.child(keys);
-                    }
-                }
-                if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
-                    card = card.child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .child(kit::tool_button("compare-copy:structure", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:structure", &entity))),
-                    );
-                    card = card.child(self.script_view("compare-structure-script", &report.script, window, cx, &p));
-                }
-                card
-                });
-            }
-            card.into_any_element()
-            });
+            let card = self.structure_card(&report, &entity, stacked, window, cx);
             body = body.child(card);
         }
 
         if let Some(report) = self.data.clone() {
-            let card = stack_frame(|| {
-            let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
-            let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(kit::title(t(self, "compare.dialog.dataTitle"), TypeScale::LG, &p))
-                    .when(can_place, |this| {
-                        this.child(kit::primary_button("compare-place:data", Some(IconName::SquareTerminal), t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity)))
-                    }),
-            );
-            if let Some(refused) = &report.refused {
-                card = card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft));
-            } else {
-                if report.incomplete || self.data_status == Status::Incomplete {
-                    card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.dataScriptIncomplete"), p.warn, p.warn_soft));
-                }
-                let mut diffs = div().flex().flex_col().gap(px(2.));
-                for diff in &report.diffs {
-                    let key = if diff.key.is_empty() { String::new() } else { format!(" · {} {}", self.text("compare.dialog.key"), diff.key) };
-                    diffs = diffs.child(diff_row("•", format!("{} {}{key}", diff.table, diff.detail), p.info, &p));
-                }
-                card = card.child(diffs);
-                for note in &report.notes {
-                    card = card.child(kit::muted(SharedString::from(note.clone()), &p));
-                }
-                if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
-                    card = card.child(
-                        div().flex().justify_end().child(kit::tool_button("compare-copy:data", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:data", &entity))),
-                    );
-                    card = card.child(self.script_view("compare-data-script", &report.script, window, cx, &p));
-                }
-            }
-            card.into_any_element()
-            });
+            let card = self.data_card(&report, &entity, window, cx);
             body = body.child(card);
         } else {
             body = body.child(div().hidden().child(kit::tool_button("compare-place:data", None, t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity))));
@@ -1886,6 +1905,22 @@ impl ComparePane {
             .items_center()
             .gap(px(m.pane_pad()))
             .child(kit::segmented_sized(filters, p, m.control_h))
+            .child(
+                kit::interactive_states(div().id("compare-only-diffs"), p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Switch)
+                    .aria_label(SharedString::from(self.text("compare.filter.onlyDiffs")))
+                    .aria_selected(self.only_diffs)
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(4.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
+                    .child(kit::switch_visual(self.only_diffs, p))
+                    .child(SharedString::from(self.text("compare.filter.onlyDiffs")))
+                    .on_click(compare_act("compare-only-diffs", entity)),
+            )
             .child(div().w(px(200.)).child(kit::text_input("compare-filter-search", &search, self.text("compare.filter.search")).small()))
             .into_any_element()
     }
@@ -1925,6 +1960,622 @@ impl ComparePane {
                 ),
             )
             .into_any_element()
+    }
+}
+
+/// 差异树里的一条：属于哪一类差异，以及它在报告里的位置（作为选中键）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryClass {
+    Baseline,
+    Target,
+    Changed,
+    Same,
+}
+
+impl EntryClass {
+    fn mark(self) -> &'static str {
+        match self {
+            EntryClass::Baseline => "+",
+            EntryClass::Target => "−",
+            EntryClass::Changed => "~",
+            EntryClass::Same => "=",
+        }
+    }
+
+    fn filter(self) -> Option<DiffFilter> {
+        match self {
+            EntryClass::Baseline => Some(DiffFilter::Baseline),
+            EntryClass::Target => Some(DiffFilter::Target),
+            EntryClass::Changed => Some(DiffFilter::Changed),
+            EntryClass::Same => None,
+        }
+    }
+}
+
+struct Entry<'a> {
+    key: String,
+    class: EntryClass,
+    item: &'a DiffItem,
+}
+
+fn entries(report: &StructureReport) -> Vec<Entry<'_>> {
+    let mut out = Vec::new();
+    for (class, prefix, items) in [
+        (EntryClass::Baseline, "b", &report.only_baseline),
+        (EntryClass::Target, "t", &report.only_target),
+        (EntryClass::Changed, "c", &report.changed),
+        (EntryClass::Same, "s", &report.same),
+    ] {
+        for (index, item) in items.iter().enumerate() {
+            out.push(Entry { key: format!("{prefix}:{index}"), class, item });
+        }
+    }
+    out
+}
+
+/// 差异条目的默认选中：第一条有差异的对象。
+fn first_entry(report: &StructureReport) -> Option<String> {
+    entries(report).into_iter().find(|entry| entry.class != EntryClass::Same).map(|entry| entry.key)
+}
+
+fn entry_item<'a>(report: &'a StructureReport, key: &str) -> Option<&'a DiffItem> {
+    let (prefix, index) = key.split_once(':')?;
+    let index: usize = index.parse().ok()?;
+    match prefix {
+        "b" => report.only_baseline.get(index),
+        "t" => report.only_target.get(index),
+        "c" => report.changed.get(index),
+        "s" => report.same.get(index),
+        _ => None,
+    }
+}
+
+/// 差异树分组顺序：对象种类在前，表下属的索引、外键在后。后端给的是种类标签。
+fn kind_rank(kind: &str) -> usize {
+    const ORDER: &[&str] = &["表", "视图", "函数", "过程", "触发器", "序列", "枚举", "域", "索引", "外键"];
+    ORDER.iter().position(|label| *label == kind).unwrap_or(ORDER.len())
+}
+
+/// 并排定义的逐行标记：这一侧的行在另一侧找不到（按出现次数计）时为真。
+fn line_marks(mine: &str, other: &str) -> Vec<(String, bool)> {
+    let mut pool: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in other.lines() {
+        *pool.entry(line.trim()).or_default() += 1;
+    }
+    mine.lines()
+        .map(|line| {
+            let key = line.trim();
+            let found = pool.get_mut(key).filter(|count| **count > 0).map(|count| *count -= 1).is_some();
+            (line.to_owned(), !found && !key.is_empty())
+        })
+        .collect()
+}
+
+/// 结果页按种类汇总：(种类, 仅基准, 仅对照, 变更)。
+fn kind_summary(report: &StructureReport) -> Vec<(String, usize, usize, usize)> {
+    let mut map: BTreeMap<(usize, String), (usize, usize, usize)> = BTreeMap::new();
+    for item in &report.only_baseline {
+        map.entry((kind_rank(&item.kind), item.kind.clone())).or_default().0 += 1;
+    }
+    for item in &report.only_target {
+        map.entry((kind_rank(&item.kind), item.kind.clone())).or_default().1 += 1;
+    }
+    for item in &report.changed {
+        map.entry((kind_rank(&item.kind), item.kind.clone())).or_default().2 += 1;
+    }
+    map.into_iter().map(|((_, kind), (b, t, c))| (kind, b, t, c)).collect()
+}
+
+/// 数据下钻最多列出的行数；完整语句在数据脚本里。
+const DATA_ROWS_SHOWN: usize = 200;
+
+impl ComparePane {
+    /// 运行中显示的文字：总是以“正在对比…”开头，有后台进度时附上阶段与计数。
+    fn progress_text(&self) -> String {
+        let base = self.text("compare.dialog.comparing");
+        let Some(progress) = self.progress else { return base };
+        let stage = match progress.stage {
+            CompareStage::Listing => self.text("compare.progress.listing"),
+            CompareStage::Reading => fill(&self.text("compare.progress.reading"), &[("{done}", &progress.done.to_string()), ("{total}", &progress.total.to_string())]),
+            CompareStage::Rows => fill(&self.text("compare.progress.rows"), &[("{done}", &progress.done.to_string()), ("{total}", &progress.total.to_string())]),
+            CompareStage::Diffing => self.text("compare.progress.diffing"),
+        };
+        format!("{base} {stage}")
+    }
+
+    fn picked_item(&self) -> Option<&DiffItem> {
+        let report = self.structure.as_ref()?;
+        entry_item(report, self.picked.as_deref()?)
+    }
+
+    fn ask_place_item(&mut self) {
+        let Some(sql) = self.picked_item().map(|item| item.sql.clone()).filter(|sql| !sql.trim().is_empty()) else {
+            return;
+        };
+        if self.structure_status == Status::Cancelled {
+            return;
+        }
+        let lines = sql.lines().count();
+        self.place_prompt = if self.locale == Locale::En {
+            format!("Put a {lines}-line write script into the query editor? It is not executed.")
+        } else {
+            format!("将把 {lines} 行写操作脚本放入查询编辑器，不会执行。确认放入？")
+        };
+        self.pending_item_sql = Some(sql);
+        self.pending_place = Some(RunKind::Structure);
+    }
+
+    /// 差异树当前可见的条目：按筛选、“仅差异”与搜索过滤（搜索同时匹配所属对象）。
+    fn visible_entries<'a>(&self, report: &'a StructureReport) -> Vec<Entry<'a>> {
+        let mut list: Vec<Entry<'a>> = entries(report)
+            .into_iter()
+            .filter(|entry| match entry.class.filter() {
+                Some(filter) => self.diff_filter == DiffFilter::All || self.diff_filter == filter,
+                None => !self.only_diffs && self.diff_filter == DiffFilter::All,
+            })
+            .filter(|entry| name_matches(&entry.item.name, &self.diff_query) || name_matches(&entry.item.owner, &self.diff_query))
+            .collect();
+        list.sort_by_key(|entry| (kind_rank(&entry.item.kind), entry.item.kind.clone(), entry.class == EntryClass::Same));
+        list
+    }
+
+    fn tree_lines(&self, report: &StructureReport, lines: &mut Vec<String>) {
+        let mut current = None;
+        for entry in self.visible_entries(report) {
+            if current.as_deref() != Some(entry.item.kind.as_str()) {
+                current = Some(entry.item.kind.clone());
+                lines.push(format!("group {}", entry.item.kind));
+            }
+            let mark = if self.picked.as_deref() == Some(entry.key.as_str()) { "picked" } else { "item" };
+            lines.push(format!("{mark} {} {} {} · {}", entry.class.mark(), entry.item.kind, entry.item.name, entry.item.detail));
+        }
+        if let Some(item) = self.picked_item() {
+            lines.push(format!("detail {} {}", item.kind, item.name));
+            if !item.baseline_definition.is_empty() {
+                lines.push(format!("baseline-def {}", item.baseline_definition));
+            }
+            if !item.target_definition.is_empty() {
+                lines.push(format!("target-def {}", item.target_definition));
+            }
+            lines.push(self.text("compare.detail.itemSql"));
+            if item.sql.trim().is_empty() {
+                lines.push(self.text("compare.detail.noSql"));
+            } else {
+                lines.push(format!("item-sql {}", item.sql));
+            }
+        }
+    }
+
+    fn data_lines(&self, report: &DataReport, lines: &mut Vec<String>) {
+        for table in &report.tables {
+            let counts = fill(
+                &self.text("compare.data.summary"),
+                &[("{insert}", &table.inserts.to_string()), ("{update}", &table.updates.to_string()), ("{delete}", &table.deletes.to_string())],
+            );
+            let mut line = format!("table {} {counts}", table.table);
+            if table.rejected > 0 {
+                line.push_str(&format!(" {}", fill(&self.text("compare.data.rejected"), &[("{count}", &table.rejected.to_string())])));
+            }
+            if let Some(reason) = &table.skipped {
+                line.push_str(&format!(" skipped {reason}"));
+            }
+            lines.push(line);
+        }
+        if let Some(name) = &self.data_table {
+            lines.push(format!("drill {name}"));
+            for diff in report.diffs.iter().filter(|diff| &diff.table == name && diff.action != "skipped").take(DATA_ROWS_SHOWN) {
+                lines.push(format!("row {} {}", diff.action, diff.key));
+                for field in &diff.fields {
+                    lines.push(format!(
+                        "field {} {} -> {}",
+                        field.column,
+                        field.baseline.as_deref().unwrap_or("∅"),
+                        field.target.as_deref().unwrap_or("∅")
+                    ));
+                }
+                if !diff.sql.is_empty() {
+                    lines.push(format!("row-sql {}", diff.sql));
+                }
+            }
+        }
+    }
+}
+
+impl ComparePane {
+    fn structure_card(&mut self, report: &Arc<StructureReport>, entity: &Entity<Self>, stacked: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
+        let t = |this: &Self, key: &str| SharedString::from(this.text(key));
+        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad()));
+        let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(kit::title(t(self, "compare.dialog.structureScript"), TypeScale::LG, &p))
+                .when(can_place, |this| {
+                    this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", entity)))
+                }),
+        );
+        if let Some(refused) = &report.refused {
+            return card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft)).into_any_element();
+        }
+        // 摘要：四类计数 + 按种类的细分。
+        card = card.child(
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(stat(self.text("compare.summary.added"), report.only_baseline.len(), p.ok, &p))
+                .child(stat(self.text("compare.summary.removed"), report.only_target.len(), p.danger, &p))
+                .child(stat(self.text("compare.summary.changed"), report.changed.len(), p.warn, &p))
+                .child(stat(self.text("compare.summary.same"), report.same.len(), p.text_muted, &p)),
+        );
+        let summary = kind_summary(report);
+        if summary.is_empty() {
+            card = card.child(note_banner(IconName::Check, self.text("compare.summary.noDiff"), p.ok, p.ok_soft));
+        } else {
+            let mut kinds = div().id("compare-kind-summary").flex().flex_wrap().gap(px(6.));
+            for (kind, plus, minus, changed) in summary {
+                let mut parts = Vec::new();
+                if plus > 0 {
+                    parts.push(format!("+{plus}"));
+                }
+                if minus > 0 {
+                    parts.push(format!("−{minus}"));
+                }
+                if changed > 0 {
+                    parts.push(format!("~{changed}"));
+                }
+                kinds = kinds.child(kit::pill(SharedString::from(format!("{kind} {}", parts.join(" "))), p.text, p.chrome));
+            }
+            card = card.child(kinds);
+        }
+        card = card.child(self.diff_toolbar(report, entity, &p, &m, window, cx));
+        // 差异树 + 选中项的并排定义与同步 SQL。
+        let tree = self.diff_tree(report, entity, &p, &m);
+        let detail = self.diff_detail(entity, &p, &m, window, cx);
+        let split = if stacked {
+            div().flex().flex_col().gap(px(m.pane_pad())).child(tree).child(detail)
+        } else {
+            div()
+                .flex()
+                .items_start()
+                .gap(px(m.pane_pad()))
+                .child(div().w(px(300.)).flex_none().child(tree))
+                .child(div().flex_1().min_w(px(0.)).child(detail))
+        };
+        card = card.child(split);
+        for note in &report.notes {
+            card = card.child(kit::muted(SharedString::from(note.clone()), &p));
+        }
+        if report.incomplete || self.structure_status == Status::Incomplete {
+            card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.scriptIncomplete"), p.warn, p.warn_soft));
+        }
+        if report.tables.is_empty() {
+            card = card.child(kit::muted(t(self, "compare.dialog.noTables"), &p));
+        } else {
+            let mut tables = div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .child(kit::tool_button("compare-select-all", Some(IconName::SquareCheck), t(self, "compare.action.selectAll"), compare_act("compare-select-all", entity)))
+                .child(kit::tool_button("compare-clear", Some(IconName::Square), t(self, "compare.action.clear"), compare_act("compare-clear", entity)));
+            for table in report.tables.iter().filter(|table| name_matches(&table.name, &self.diff_query)) {
+                let on = self.selected.get(&table.name).copied().unwrap_or(false);
+                let mark = if on { "on" } else { "off" };
+                tables = tables.child(
+                    chip(SharedString::from(format!("compare-toggle:{}", table.name)), SharedString::from(format!("{mark} {}", table.name)), SharedString::from(table.name.clone()), on, Some(if on { IconName::SquareCheck } else { IconName::Square }), &p, m)
+                        .on_click(compare_act(format!("compare-toggle:{}", table.name), entity)),
+                );
+            }
+            card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p)).child(tables));
+            for table in report.tables.iter().filter(|table| table.needs_key_choice) {
+                let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
+                for key in &table.keys {
+                    let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
+                    let mark = if chosen { "chosen" } else { "key" };
+                    let id = format!("compare-key:{}|{}", table.name, key.name);
+                    keys = keys.child(
+                        chip(SharedString::from(id.clone()), SharedString::from(format!("{mark} {} {}", table.name, key.name)), SharedString::from(format!("{} ({})", key.name, key.columns.join(", "))), chosen, Some(IconName::Key), &p, m)
+                            .on_click(compare_act(id, entity)),
+                    );
+                }
+                card = card.child(keys);
+            }
+        }
+        if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(kit::eyebrow(t(self, "compare.script.whole"), &p))
+                    .child(kit::tool_button("compare-copy:structure", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:structure", entity))),
+            );
+            card = card.child(self.script_view("compare-structure-script", &report.script, window, cx, &p));
+        }
+        card.into_any_element()
+    }
+
+    fn diff_tree(&self, report: &StructureReport, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics) -> AnyElement {
+        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).flex().flex_col().gap(px(1.)).max_h(px(420.)).overflow_y_scroll();
+        let visible = self.visible_entries(report);
+        if visible.is_empty() {
+            tree = tree.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.tree.empty")), p)));
+        }
+        let mut current: Option<String> = None;
+        for entry in visible {
+            if current.as_deref() != Some(entry.item.kind.as_str()) {
+                current = Some(entry.item.kind.clone());
+                tree = tree.child(div().px(px(8.)).pt(px(6.)).pb(px(2.)).child(kit::eyebrow(SharedString::from(entry.item.kind.clone()), p)));
+            }
+            let tone = match entry.class {
+                EntryClass::Baseline => p.ok,
+                EntryClass::Target => p.danger,
+                EntryClass::Changed => p.warn,
+                EntryClass::Same => p.text_faint,
+            };
+            let picked = self.picked.as_deref() == Some(entry.key.as_str());
+            let id = format!("compare-pick:{}", entry.key);
+            let row = kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(SharedString::from(format!("{} {} {}", entry.class.mark(), entry.item.kind, entry.item.name)))
+                .aria_selected(picked)
+                .min_h(px(m.tree_row_h))
+                .px(px(8.))
+                .py(px(2.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(Radius::CONTROL))
+                .text_size(px(TypeScale::SM))
+                .when(picked, |this| this.bg(p.accent_soft).text_color(p.accent_text))
+                .when(!picked, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
+                .child(div().w(px(12.)).flex_none().font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(entry.class.mark()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .child(div().truncate().child(SharedString::from(entry.item.name.clone())))
+                        .when(entry.class != EntryClass::Same, |this| {
+                            this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(entry.item.detail.clone())))
+                        }),
+                )
+                .on_click(compare_act(id, entity));
+            tree = tree.child(row);
+        }
+        tree.into_any_element()
+    }
+
+    fn diff_detail(&mut self, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(item) = self.picked_item().cloned() else {
+            return kit::sunken(p).p(px(12.)).child(kit::muted(SharedString::from(self.text("compare.detail.pick")), p)).into_any_element();
+        };
+        let mono = gpui_kit::component::ActiveTheme::theme(&**cx).mono_font_family.clone();
+        let side = |label: String, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla, mine: &str, other: &str, missing: String| {
+            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).flex().flex_col().max_h(px(320.)).overflow_y_scroll().font_family(mono.clone()).text_size(px(TypeScale::XS));
+            if mine.trim().is_empty() {
+                block = block.child(div().px(px(4.)).text_color(p.text_faint).child(SharedString::from(missing)));
+            } else {
+                for (line, differs) in line_marks(mine, other) {
+                    block = block.child(
+                        div()
+                            .px(px(4.))
+                            .whitespace_nowrap()
+                            .when(differs, |this| this.bg(soft).text_color(tone))
+                            .when(!differs, |this| this.text_color(p.text))
+                            .child(SharedString::from(if line.is_empty() { " ".to_owned() } else { line })),
+                    );
+                }
+            }
+            div().flex_1().flex_basis(px(0.)).min_w(px(0.)).flex().flex_col().gap(px(4.)).child(kit::eyebrow(SharedString::from(label), p)).child(block)
+        };
+        let missing = self.text("compare.detail.missing");
+        let baseline = side(self.text("compare.dialog.baseline"), p.ok, p.ok_soft, &item.baseline_definition, &item.target_definition, missing.clone());
+        let target = side(self.text("compare.dialog.target"), p.danger, p.danger_soft, &item.target_definition, &item.baseline_definition, missing);
+        let title = if item.owner.is_empty() || item.owner == item.name { format!("{} {}", item.kind, item.name) } else { format!("{} {} · {}", item.kind, item.name, item.owner) };
+        let mut detail = div()
+            .id("compare-diff-detail")
+            .flex()
+            .flex_col()
+            .gap(px(m.pane_pad()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_size(px(TypeScale::MD)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child(SharedString::from(title)))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", item.detail, self.text("compare.detail.legend"))))),
+            )
+            .child(div().flex().gap(px(8.)).child(baseline).child(target));
+        let can_place = self.structure_status != Status::Cancelled && !item.sql.trim().is_empty();
+        detail = detail.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(kit::eyebrow(SharedString::from(self.text("compare.detail.itemSql")), p))
+                .when(can_place, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .child(kit::tool_button("compare-copy:item", Some(IconName::Copy), SharedString::from(self.text("compare.detail.copyItem")), compare_act("compare-copy:item", entity)))
+                            .child(kit::tool_button("compare-place:item", Some(IconName::SquareTerminal), SharedString::from(self.text("compare.detail.placeItem")), compare_act("compare-place:item", entity))),
+                    )
+                }),
+        );
+        if item.sql.trim().is_empty() {
+            detail = detail.child(kit::muted(SharedString::from(self.text("compare.detail.noSql")), p));
+        } else {
+            detail = detail.child(self.script_view("compare-item-script", &item.sql, window, cx, p));
+        }
+        detail.into_any_element()
+    }
+
+    fn data_card(&mut self, report: &Arc<DataReport>, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
+        let t = |this: &Self, key: &str| SharedString::from(this.text(key));
+        let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
+        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(kit::title(t(self, "compare.dialog.dataTitle"), TypeScale::LG, &p))
+                .when(can_place, |this| {
+                    this.child(kit::primary_button("compare-place:data", Some(IconName::SquareTerminal), t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", entity)))
+                }),
+        );
+        if let Some(refused) = &report.refused {
+            return card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft)).into_any_element();
+        }
+        if report.incomplete || self.data_status == Status::Incomplete {
+            card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.dataScriptIncomplete"), p.warn, p.warn_soft));
+        }
+        let changed_rows: usize = report.tables.iter().map(|table| table.inserts + table.updates + table.deletes).sum();
+        if changed_rows == 0 && report.tables.iter().all(|table| table.skipped.is_none() && table.rejected == 0) {
+            card = card.child(note_banner(IconName::Check, self.text("compare.data.noDiff"), p.ok, p.ok_soft));
+        } else {
+            card = card.child(kit::muted(t(self, "compare.data.drillHint"), &p));
+        }
+        let mut list = kit::sunken(&p).id("compare-data-tables").p(px(4.)).flex().flex_col().gap(px(1.));
+        for table in &report.tables {
+            let id = format!("compare-data-table:{}", table.table);
+            let open = self.data_table.as_deref() == Some(table.table.as_str());
+            let counts = fill(
+                &self.text("compare.data.summary"),
+                &[("{insert}", &table.inserts.to_string()), ("{update}", &table.updates.to_string()), ("{delete}", &table.deletes.to_string())],
+            );
+            let mut info = div().flex_1().min_w(px(0.)).flex().flex_col().gap(px(1.)).child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())));
+            let sub = if let Some(reason) = &table.skipped {
+                reason.clone()
+            } else if !table.key.is_empty() {
+                fill(&self.text("compare.data.keyColumns"), &[("{columns}", &table.key.join(", "))])
+            } else {
+                String::new()
+            };
+            if !sub.is_empty() {
+                info = info.child(div().truncate().text_size(px(TypeScale::XS)).text_color(if table.skipped.is_some() { p.warn } else { p.text_muted }).child(SharedString::from(sub)));
+            }
+            let mut stats = div().flex_none().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM));
+            if table.skipped.is_none() {
+                if table.inserts + table.updates + table.deletes == 0 && table.rejected == 0 {
+                    stats = stats.child(div().text_color(p.ok).child(SharedString::from(self.text("compare.data.same"))));
+                } else {
+                    stats = stats.child(div().text_color(p.text_muted).child(SharedString::from(counts)));
+                }
+                if table.rejected > 0 {
+                    stats = stats.child(div().text_color(p.danger).child(SharedString::from(fill(&self.text("compare.data.rejected"), &[("{count}", &table.rejected.to_string())]))));
+                }
+            }
+            let row = kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(SharedString::from(format!("{} {}", table.table, self.text("compare.data.drillHint"))))
+                .aria_selected(open)
+                .px(px(8.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(Radius::CONTROL))
+                .text_size(px(TypeScale::SM))
+                .when(open, |this| this.bg(p.accent_soft))
+                .when(!open, |this| this.hover(|style| style.bg(p.hover)))
+                .child(kit::icon(if open { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
+                .child(info)
+                .child(stats)
+                .on_click(compare_act(id, entity));
+            list = list.child(row);
+            if open {
+                list = list.child(self.data_rows(report, &table.table, &p, cx));
+            }
+        }
+        card = card.child(list);
+        for note in &report.notes {
+            card = card.child(kit::muted(SharedString::from(note.clone()), &p));
+        }
+        if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(kit::eyebrow(t(self, "compare.dialog.dataScript"), &p))
+                    .child(kit::tool_button("compare-copy:data", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:data", entity))),
+            );
+            card = card.child(self.script_view("compare-data-script", &report.script, window, cx, &p));
+        }
+        card.into_any_element()
+    }
+
+    /// 一张表的行级差异：按键对齐，字段级高亮基准值与对照值，并附该行的同步语句。
+    fn data_rows(&self, report: &DataReport, table: &str, p: &Palette, cx: &App) -> AnyElement {
+        let mono = gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.clone();
+        let rows: Vec<_> = report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").collect();
+        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).flex().flex_col().gap(px(6.)).max_h(px(420.)).overflow_y_scroll();
+        if rows.is_empty() {
+            let reason = report.tables.iter().find(|item| item.table == table).and_then(|item| item.skipped.clone()).unwrap_or_else(|| self.text("compare.data.same"));
+            return block.child(kit::muted(SharedString::from(reason), p)).into_any_element();
+        }
+        for diff in rows.iter().take(DATA_ROWS_SHOWN) {
+            let (label, tone, soft) = match diff.action.as_str() {
+                "insert" => (self.text("compare.data.action.insert"), p.ok, p.ok_soft),
+                "delete" => (self.text("compare.data.action.delete"), p.danger, p.danger_soft),
+                "update" => (self.text("compare.data.action.update"), p.warn, p.warn_soft),
+                _ => (self.text("compare.data.action.rejected"), p.danger, p.danger_soft),
+            };
+            let mut entry = div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .p(px(6.))
+                .rounded(px(Radius::CONTROL))
+                .border_1()
+                .border_color(p.line)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(TypeScale::SM))
+                        .child(kit::pill(SharedString::from(label), tone, soft))
+                        .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(format!("{} {}", self.text("compare.dialog.key"), diff.key)))),
+                );
+            if diff.action == "rejected" {
+                entry = entry.child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(diff.detail.clone())));
+            }
+            for field in &diff.fields {
+                let value = |text: &Option<String>| text.clone().unwrap_or_else(|| "∅".to_owned());
+                entry = entry.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(TypeScale::XS))
+                        .font_family(mono.clone())
+                        .child(div().w(px(140.)).flex_none().truncate().text_color(p.text_muted).child(SharedString::from(field.column.clone())))
+                        .child(div().flex_1().min_w(px(0.)).truncate().px(px(4.)).when(field.changed && field.baseline.is_some(), |this| this.bg(p.ok_soft).text_color(p.ok)).child(SharedString::from(value(&field.baseline))))
+                        .child(div().flex_none().text_color(p.text_faint).child("→"))
+                        .child(div().flex_1().min_w(px(0.)).truncate().px(px(4.)).when(field.changed && field.target.is_some(), |this| this.bg(p.danger_soft).text_color(p.danger)).child(SharedString::from(value(&field.target)))),
+                );
+            }
+            if !diff.sql.is_empty() {
+                entry = entry.child(div().text_size(px(TypeScale::XS)).font_family(mono.clone()).text_color(p.text_muted).truncate().child(SharedString::from(diff.sql.clone())));
+            }
+            block = block.child(entry);
+        }
+        if rows.len() > DATA_ROWS_SHOWN {
+            block = block.child(kit::muted(SharedString::from(fill(&self.text("compare.data.truncated"), &[("{count}", &DATA_ROWS_SHOWN.to_string())])), p));
+        }
+        block.into_any_element()
     }
 }
 
@@ -2002,19 +2653,6 @@ fn stat(label: String, value: usize, tone: gpui_kit::Hsla, p: &Palette) -> AnyEl
         .gap(px(2.))
         .child(div().text_size(px(TypeScale::XL)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(tone).child(SharedString::from(value.to_string())))
         .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(label)))
-        .into_any_element()
-}
-
-fn diff_row(mark: &'static str, text: String, tone: gpui_kit::Hsla, p: &Palette) -> AnyElement {
-    div()
-        .flex()
-        .gap(px(8.))
-        .px(px(8.))
-        .py(px(4.))
-        .rounded(px(Radius::CONTROL))
-        .hover(|style| style.bg(p.hover))
-        .child(div().w(px(12.)).font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(mark))
-        .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::SM)).child(SharedString::from(text)))
         .into_any_element()
 }
 
@@ -2209,6 +2847,158 @@ mod tests {
         assert_eq!(pane.error_kind, ErrorKind::None);
         assert!(pane.error.is_empty());
         assert!(pane.show_empty_guide(), "清掉提示后回到初始指导");
+    }
+
+    fn sqlite_pair(pane: &mut ComparePane) {
+        pane.choices = vec![
+            Choice { id: "left".into(), name: "左".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
+            Choice { id: "right".into(), name: "右".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
+        ];
+        pane.baseline = SidePick { connection_id: "left".into(), database: "main".into(), schema: String::new() };
+        pane.target = SidePick { connection_id: "right".into(), database: "main".into(), schema: String::new() };
+    }
+
+    /// 取消当场结束运行状态（不等后台下一个读取点），并且马上可以再次发起，而不是报“上一次还在读”。
+    #[gpui_kit::test]
+    fn cancel_ends_the_run_at_once_and_a_new_compare_can_start(cx: &mut gpui_kit::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let pane = cx.update(|cx| {
+            cx.new(|_| {
+                let mut pane = temp_pane();
+                sqlite_pair(&mut pane);
+                pane.set_query_timeout_sec(15);
+                pane
+            })
+        });
+        pane.update(cx, |pane, cx| {
+            // 闸门不放开：后台任务一直停在第一个 await，模拟卡住的读取。
+            pane.arm_pause();
+            pane.command("compare-structure", cx);
+            assert!(pane.running(), "{}", pane.lines().join("\n"));
+            assert!(pane.lines().join("\n").contains("正在对比"));
+            let abort = pane.abort.clone().expect("后台任务可中止");
+            pane.command("compare-cancel", cx);
+            assert!(!pane.running(), "取消后立即不再运行");
+            assert!(pane.token.is_none(), "这次运行的 token 作废，迟到结果不会写回");
+            assert_eq!(pane.structure_status, Status::Cancelled);
+            assert!(pane.lines().join("\n").contains("已取消"));
+            assert!(!pane.lines().join("\n").contains("正在对比"));
+            let _ = abort;
+            // 再次发起：不会被“上一次还在读”挡住。
+            pane.arm_pause();
+            pane.command("compare-structure", cx);
+            assert!(pane.running());
+            assert_ne!(pane.error_kind, ErrorKind::Notice, "{}", pane.error);
+            pane.command("compare-cancel", cx);
+            assert!(!pane.running());
+        });
+    }
+
+    /// 读取超时：明确的失败说明 + 重试，重试重发同一步。
+    #[test]
+    fn a_timed_out_compare_is_a_failure_with_retry() {
+        let mut pane = temp_pane();
+        sqlite_pair(&mut pane);
+        let mut report = empty_structure(Some(format!("{} 不生成脚本。", crate::compare::timeout_message(15))));
+        report.timed_out = true;
+        pane.install_structure(report);
+        assert_eq!(pane.structure_status, Status::Failed);
+        assert!(pane.structure.is_none());
+        assert_eq!(pane.error_kind, ErrorKind::Failure(RetryAction::Structure));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("15 秒") && text.contains("重试"), "{text}");
+
+        let mut data = empty_data(Some(crate::compare::timeout_message(0)));
+        data.timed_out = true;
+        pane.install_data(data);
+        assert_eq!(pane.data_status, Status::Failed);
+        assert_eq!(pane.error_kind, ErrorKind::Failure(RetryAction::Data));
+    }
+
+    fn annotated(name: &str, detail: &str, sql: &str) -> DiffItem {
+        DiffItem {
+            kind: "表".into(),
+            name: name.into(),
+            detail: detail.into(),
+            owner: name.into(),
+            baseline_definition: format!("CREATE TABLE {name} (\n  id integer,\n  note text\n);"),
+            target_definition: format!("CREATE TABLE {name} (\n  id integer,\n  note integer\n);"),
+            sql: sql.into(),
+        }
+    }
+
+    #[test]
+    fn the_result_tree_groups_filters_and_shows_the_picked_item() {
+        let mut pane = temp_pane();
+        sqlite_pair(&mut pane);
+        let mut report = empty_structure(None);
+        report.changed.push(annotated("orders", "列不同", "ALTER TABLE orders ALTER COLUMN note TYPE text;"));
+        report.only_baseline.push(DiffItem { kind: "视图".into(), name: "v_new".into(), detail: "仅基准拥有".into(), owner: "v_new".into(), baseline_definition: "CREATE VIEW v_new AS SELECT 1".into(), sql: "CREATE VIEW v_new AS SELECT 1;".into(), ..DiffItem::default() });
+        report.same.push(DiffItem::new("表", "customers", "相同"));
+        report.script = "ALTER TABLE orders ALTER COLUMN note TYPE text;\nCREATE VIEW v_new AS SELECT 1;".into();
+        pane.install_structure(report);
+        assert_eq!(pane.picked.as_deref(), Some("b:0"), "默认选中第一条差异");
+        let text = pane.lines().join("\n");
+        assert!(text.contains("kind 表 +0 −0 ~1") && text.contains("kind 视图 +1 −0 ~0"), "{text}");
+        assert!(text.contains("group 表") && text.contains("group 视图"), "{text}");
+        assert!(!text.contains("customers"), "仅差异时不列相同对象：{text}");
+        assert!(text.contains("item-sql CREATE VIEW v_new"), "{text}");
+
+        assert!(pane.view_command("compare-pick:c:0"));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("picked ~ 表 orders"), "{text}");
+        assert!(text.contains("baseline-def CREATE TABLE orders") && text.contains("note text"), "{text}");
+        assert!(text.contains("item-sql ALTER TABLE orders"), "{text}");
+
+        assert!(pane.view_command("compare-only-diffs"));
+        assert!(pane.lines().join("\n").contains("item = 表 customers"), "关掉仅差异后列出相同对象");
+        assert!(pane.view_command("compare-filter:changed"));
+        let text = pane.lines().join("\n");
+        assert!(!text.contains("item = 表 customers") && !text.contains("item + 视图 v_new"), "{text}");
+
+        // 选中对象的语句放入查询前同样要确认，确认后只放这一个对象的语句。
+        pane.ask_place_item();
+        assert!(pane.pending_place.is_some() && pane.placed.is_none());
+        pane.confirm_place();
+        assert_eq!(pane.take_place().map(|placed| placed.sql), Some("ALTER TABLE orders ALTER COLUMN note TYPE text;".to_owned()));
+
+        // 无差异：明确说一致。
+        let mut same = empty_structure(None);
+        same.same.push(DiffItem::new("表", "orders", "相同"));
+        pane.install_structure(same);
+        assert!(pane.picked.is_none());
+        assert!(pane.lines().join("\n").contains("两侧结构一致"), "{}", pane.lines().join("\n"));
+    }
+
+    #[test]
+    fn data_results_list_tables_and_drill_into_field_differences() {
+        let mut pane = temp_pane();
+        sqlite_pair(&mut pane);
+        let mut report = empty_data(None);
+        report.tables = vec![
+            crate::compare::DataTableSummary { table: "orders".into(), inserts: 1, updates: 1, deletes: 0, rejected: 0, skipped: None, key: vec!["id".into()] },
+            crate::compare::DataTableSummary { table: "notes".into(), skipped: Some("没有主键或唯一键，无法按键对应两侧的行".into()), ..Default::default() },
+        ];
+        report.diffs = vec![crate::compare::DataDiff {
+            table: "orders".into(),
+            action: "update".into(),
+            key: "1".into(),
+            detail: "键相同，其他值不同".into(),
+            fields: vec![crate::compare::FieldDiff { column: "note".into(), baseline: Some("new".into()), target: Some("old".into()), changed: true }],
+            sql: "UPDATE orders SET note = 'new' WHERE id = 1;".into(),
+        }];
+        report.script = "UPDATE orders SET note = 'new' WHERE id = 1;".into();
+        pane.install_data(report);
+        let text = pane.lines().join("\n");
+        assert!(text.contains("table orders 插入 1 · 更新 1 · 删除 0"), "{text}");
+        assert!(text.contains("table notes") && text.contains("没有主键"), "{text}");
+        assert!(!text.contains("field note"), "下钻前不展开行：{text}");
+        assert!(pane.view_command("compare-data-table:orders"));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("drill orders") && text.contains("field note new -> old") && text.contains("row-sql UPDATE orders"), "{text}");
+        assert!(pane.view_command("compare-data-table:orders"));
+        assert!(!pane.lines().join("\n").contains("drill orders"), "再点一次收起");
     }
 
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {
@@ -2413,7 +3203,8 @@ mod workbench {
         let (services, target_file) = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite compare setup");
         cx.update(gpui_kit::init);
         let (window, view) = cx.update(|cx| {
-            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(800.)) };
+            // 结果页有差异树与并排定义，窗口拉高让下方的数据表选择也在可视区里。
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(1800.)) };
             let (window, view) = gpui_kit::open_window(
                 WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
                 cx,
@@ -2576,6 +3367,8 @@ mod workbench {
                             only_baseline: Vec::new(),
                             only_target: Vec::new(),
                             changed: Vec::new(),
+                            same: Vec::new(),
+                            timed_out: false,
                             tables: vec![crate::compare::TableChoice {
                                 name: "orders".into(),
                                 on_both: true,

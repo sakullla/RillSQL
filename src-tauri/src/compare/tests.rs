@@ -1466,6 +1466,7 @@ async fn sqlite_compare_reads_both_connections_and_does_not_execute_the_script()
             id: "structure".to_owned(),
             baseline: super::model::SideRequest { connection_id: "base".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             target: super::model::SideRequest { connection_id: "other".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
+            timeout_secs: 0,
         },
     )
     .await;
@@ -1490,6 +1491,7 @@ async fn sqlite_compare_reads_both_connections_and_does_not_execute_the_script()
             baseline: super::model::SideRequest { connection_id: "base".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             target: super::model::SideRequest { connection_id: "other".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             tables: vec![super::model::DataTableRequest { name: "orders".to_owned(), key: None }, super::model::DataTableRequest { name: "customers".to_owned(), key: None }],
+            timeout_secs: 0,
         },
     )
     .await;
@@ -1549,4 +1551,89 @@ fn sqlserver_alter_emits_constraint_based_default_changes() {
     assert!(report.script.contains("ALTER TABLE dbo.notes ALTER COLUMN status nvarchar(40) NOT NULL"), "{}", report.script);
     let alter_column_line = report.script.lines().find(|line| line.contains("ALTER COLUMN status")).expect("ALTER COLUMN 语句");
     assert!(!alter_column_line.to_ascii_uppercase().contains("DEFAULT"), "ALTER COLUMN 不能内联 DEFAULT：{alter_column_line}");
+}
+
+#[test]
+fn identical_sides_report_no_difference_and_list_the_same_objects() {
+    let baseline = Side::ready("sqlite", "main", "", vec![orders("text"), ObjectDef::defined(Kind::View, "v_orders", "CREATE VIEW v_orders AS SELECT id FROM orders")]);
+    let target = Side::ready("sqlite", "main", "", vec![orders("text"), ObjectDef::defined(Kind::View, "v_orders", "CREATE VIEW v_orders AS SELECT id FROM orders")]);
+    let report = diff_structure(&baseline, &target);
+    assert!(report.refused.is_none() && !report.incomplete && !report.timed_out);
+    assert!(report.only_baseline.is_empty() && report.only_target.is_empty() && report.changed.is_empty(), "{report:?}");
+    assert_eq!(report.same.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), vec!["orders", "v_orders"]);
+    assert!(report.script.contains("没有结构差异"), "{}", report.script);
+}
+
+#[test]
+fn each_difference_carries_side_by_side_definitions_and_its_own_sql() {
+    let customers = ObjectDef::table("customers", shape(vec![column("id", "integer", false, true)], Vec::new()));
+    let legacy = ObjectDef::table("legacy", shape(vec![column("id", "integer", false, true)], Vec::new()));
+    let baseline = Side::ready("postgres", "app", "public", vec![orders("text"), customers]);
+    let target = Side::ready("postgres", "app", "public", vec![orders("integer"), legacy]);
+    let report = diff_structure(&baseline, &target);
+    let changed = report.changed.iter().find(|item| item.name == "orders").expect("orders 有变更");
+    assert_eq!(changed.owner, "orders");
+    assert!(changed.baseline_definition.contains("note text"), "{}", changed.baseline_definition);
+    assert!(changed.target_definition.contains("note integer"), "{}", changed.target_definition);
+    assert!(changed.sql.to_ascii_uppercase().contains("ALTER TABLE"), "{}", changed.sql);
+    assert!(!changed.sql.contains("customers") && !changed.sql.contains("legacy"), "单个对象的 SQL 不带其他对象：{}", changed.sql);
+    let created = report.only_baseline.iter().find(|item| item.name == "customers").expect("customers 只在基准");
+    assert!(created.sql.to_ascii_uppercase().contains("CREATE TABLE") && created.sql.contains("customers"), "{}", created.sql);
+    assert!(created.target_definition.is_empty());
+    let dropped = report.only_target.iter().find(|item| item.name == "legacy").expect("legacy 只在对照");
+    assert!(dropped.sql.to_ascii_uppercase().contains("DROP TABLE") && dropped.sql.contains("legacy"), "{}", dropped.sql);
+    assert!(dropped.baseline_definition.is_empty());
+    // 每个对象的语句都出现在整体脚本里。
+    for item in [changed, created, dropped] {
+        for statement in item.sql.lines() {
+            assert!(report.script.contains(statement.trim_end_matches(';')), "{statement} 不在整体脚本里：{}", report.script);
+        }
+    }
+}
+
+#[test]
+fn many_objects_diff_by_identity_without_mixing_them_up() {
+    let count = 3000;
+    let make = |index: usize, type_name: &str| ObjectDef::table(format!("t{index:05}"), shape(vec![column("id", "integer", false, true), column("v", type_name, true, false)], Vec::new()));
+    let baseline: Vec<ObjectDef> = (0..count).map(|index| make(index, if index % 100 == 0 { "text" } else { "integer" })).chain([make(99_999, "integer")]).collect();
+    // 对照倒序并多一张表：匹配不能依赖顺序。
+    let target: Vec<ObjectDef> = (0..count).rev().map(|index| make(index, "integer")).chain([make(77_777, "integer")]).collect();
+    let started = std::time::Instant::now();
+    let report = diff_structure(&Side::ready("sqlite", "main", "", baseline), &Side::ready("sqlite", "main", "", target));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    assert_eq!(report.changed.len(), count / 100, "{:?}", report.changed.iter().take(3).collect::<Vec<_>>());
+    assert!(report.changed.iter().all(|item| item.name.trim_start_matches('t').parse::<usize>().is_ok_and(|n| n % 100 == 0)));
+    assert_eq!(report.only_baseline.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), vec!["t99999"]);
+    assert_eq!(report.only_target.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), vec!["t77777"]);
+    assert_eq!(report.same.len(), count - count / 100);
+}
+
+#[test]
+fn data_report_summarizes_each_table_and_keeps_field_level_differences() {
+    let table = data_table(
+        "orders",
+        orders_columns(),
+        primary(),
+        vec![row(&[("id", Some("1")), ("note", Some("new"))]), row(&[("id", Some("3")), ("note", None)])],
+        vec![row(&[("id", Some("1")), ("note", Some("old"))]), row(&[("id", Some("2")), ("note", Some("gone"))])],
+    );
+    let keyless = data_table("notes", vec![DataColumn { name: "label".to_owned(), type_name: "text".to_owned(), nullable: true }], Vec::new(), vec![row(&[("label", Some("a"))])], Vec::new());
+    let report = diff_data(&DataInput { baseline_engine: "sqlite".to_owned(), target_engine: "sqlite".to_owned(), tables: vec![table, keyless], cancelled: false });
+    let orders = report.tables.iter().find(|item| item.table == "orders").expect("orders 摘要");
+    assert_eq!((orders.inserts, orders.updates, orders.deletes, orders.rejected), (1, 1, 1, 0));
+    assert_eq!(orders.key, vec!["id".to_owned()]);
+    assert!(orders.skipped.is_none());
+    let notes = report.tables.iter().find(|item| item.table == "notes").expect("notes 摘要");
+    assert!(notes.skipped.as_deref().is_some_and(|reason| reason.contains("没有主键")), "{notes:?}");
+    let update = report.diffs.iter().find(|diff| diff.action == "update").expect("更新行");
+    assert_eq!(update.fields.len(), 1);
+    assert_eq!(update.fields[0].column, "note");
+    assert_eq!(update.fields[0].baseline.as_deref(), Some("new"));
+    assert_eq!(update.fields[0].target.as_deref(), Some("old"));
+    assert!(update.sql.to_ascii_uppercase().starts_with("UPDATE"), "{}", update.sql);
+    let insert = report.diffs.iter().find(|diff| diff.action == "insert").expect("插入行");
+    assert!(insert.fields.iter().any(|field| field.column == "note" && field.baseline.as_deref() == Some("NULL") && field.target.is_none()));
+    assert!(report.script.contains(insert.sql.trim_end_matches(';')));
+    let delete = report.diffs.iter().find(|diff| diff.action == "delete").expect("删除行");
+    assert!(delete.fields.iter().any(|field| field.column == "note" && field.target.as_deref() == Some("gone") && field.baseline.is_none()));
 }
