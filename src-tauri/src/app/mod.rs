@@ -4,7 +4,7 @@ pub mod shell;
 pub mod views;
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Menu, MenuItem, Point, SharedString, TitlebarOptions,
+    App, AppContext as _, Bounds, Menu, MenuItem, Pixels, SharedString, TitlebarOptions,
     WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
 };
 
@@ -104,7 +104,8 @@ fn open_workbench_window(cx: &mut App) -> gpui_kit::Entity<Workbench> {
         cx.set_global(WorkbenchServices(std::sync::Arc::new(crate::application::AppServices::from_state(&crate::connections::commands::ConnectionsState::new()))));
     }
     let services = std::sync::Arc::clone(&cx.global::<WorkbenchServices>().0);
-    let (window, root) = gpui_kit::open_window(window_options(), cx, |window, cx| {
+    let options = window_options(cx);
+    let (window, root) = gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| Workbench::with_services(window, cx, services, true))
     }).expect("open GPUI window");
     let shell = root.read(cx).shell().clone();
@@ -128,12 +129,51 @@ pub(crate) fn reopen_workbench(cx: &mut App, open: impl FnOnce(&mut App)) {
 struct WorkbenchActionTarget(gpui_kit::WeakEntity<Workbench>);
 impl gpui_kit::Global for WorkbenchActionTarget {}
 
-fn window_options() -> WindowOptions {
+const WORKBENCH_DEFAULT_WIDTH: f32 = 1280.0;
+const WORKBENCH_DEFAULT_HEIGHT: f32 = 820.0;
+const WORKBENCH_MIN_WIDTH: f32 = 640.0;
+const WORKBENCH_MIN_HEIGHT: f32 = 420.0;
+const WORKBENCH_WORK_AREA_MARGIN: f32 = 24.0;
+
+/// 根据显示器的可见工作区（扣除任务栏 / 程序坞）计算居中的初始窗口矩形。
+/// 在 125% / 150% 高分屏笔记本上自动留出边距并收敛尺寸，避免窗口贴死在左上角 (0, 0)。
+pub(crate) fn centered_workbench_bounds(visible_bounds: Option<Bounds<Pixels>>) -> Bounds<Pixels> {
+    let default_size = size(px(WORKBENCH_DEFAULT_WIDTH), px(WORKBENCH_DEFAULT_HEIGHT));
+    let Some(visible) = visible_bounds else {
+        return Bounds {
+            origin: point(px(80.), px(60.)),
+            size: default_size,
+        };
+    };
+    let avail_w = visible.size.width.as_f32();
+    let avail_h = visible.size.height.as_f32();
+    if avail_w < WORKBENCH_MIN_WIDTH * 0.5 || avail_h < WORKBENCH_MIN_HEIGHT * 0.5 {
+        return Bounds {
+            origin: point(px(80.), px(60.)),
+            size: default_size,
+        };
+    }
+
+    let max_w = (avail_w - WORKBENCH_WORK_AREA_MARGIN * 2.0).max(WORKBENCH_MIN_WIDTH.min(avail_w));
+    let max_h = (avail_h - WORKBENCH_WORK_AREA_MARGIN * 2.0).max(WORKBENCH_MIN_HEIGHT.min(avail_h));
+    let width = WORKBENCH_DEFAULT_WIDTH.min(max_w).round();
+    let height = WORKBENCH_DEFAULT_HEIGHT.min(max_h).round();
+
+    let origin_x = visible.origin.x.as_f32() + ((avail_w - width) * 0.5).max(0.0).round();
+    let origin_y = visible.origin.y.as_f32() + ((avail_h - height) * 0.5).max(0.0).round();
+
+    Bounds {
+        origin: point(px(origin_x), px(origin_y)),
+        size: size(px(width), px(height)),
+    }
+}
+
+fn window_options(cx: &App) -> WindowOptions {
+    let display = cx.primary_display().or_else(|| cx.displays().into_iter().next());
+    let bounds = centered_workbench_bounds(display.as_ref().map(|d| d.visible_bounds()));
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: Point::default(),
-            size: size(px(1280.), px(820.)),
-        })),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id: display.as_ref().map(|d| d.id()),
         // 顶栏自己画成标题栏：macOS 透明标题栏保留红绿灯，Windows 去掉系统标题栏，
         // Linux 用客户端装饰（GNOME Wayland 不提供服务端标题栏）。
         titlebar: Some(TitlebarOptions {
@@ -143,7 +183,7 @@ fn window_options() -> WindowOptions {
         }),
         app_owns_titlebar_drag: true,
         window_decorations: Some(WindowDecorations::Client),
-        window_min_size: Some(size(px(640.), px(420.))),
+        window_min_size: Some(size(px(WORKBENCH_MIN_WIDTH), px(WORKBENCH_MIN_HEIGHT))),
         ..Default::default()
     }
 }
@@ -428,6 +468,43 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
             MenuItem::action(label("shell.command.compare"), CompareDatabases),
         ]),
     ]);
+}
+
+#[cfg(test)]
+mod window_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn centers_workbench_in_standard_and_hidpi_work_areas_instead_of_top_left_zero() {
+        // 1920x1080 @ 100%（底部任务栏 48px）
+        let fhd = centered_workbench_bounds(Some(Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1920.), px(1032.)),
+        }));
+        assert_eq!(fhd.origin, point(px(320.), px(106.)));
+        assert_eq!(fhd.size, size(px(1280.), px(820.)));
+
+        // 1920x1080 @ 150% 笔记本逻辑工作区（1280x672）：留出四周间距并居中，绝不贴死在 (0, 0)
+        let hidpi_150 = centered_workbench_bounds(Some(Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1280.), px(672.)),
+        }));
+        assert_eq!(hidpi_150.origin, point(px(24.), px(24.)));
+        assert_eq!(hidpi_150.size, size(px(1232.), px(624.)));
+
+        // 顶部/左侧任务栏或副屏负坐标也能准确落在可见工作区中心
+        let offset_display = centered_workbench_bounds(Some(Bounds {
+            origin: point(px(-1920.), px(40.)),
+            size: size(px(1920.), px(1040.)),
+        }));
+        assert_eq!(offset_display.origin, point(px(-1600.), px(150.)));
+        assert_eq!(offset_display.size, size(px(1280.), px(820.)));
+
+        // 无显示器回退也不落回 (0, 0)
+        let fallback = centered_workbench_bounds(None);
+        assert_eq!(fallback.origin, point(px(80.), px(60.)));
+        assert_eq!(fallback.size, size(px(1280.), px(820.)));
+    }
 }
 
 
