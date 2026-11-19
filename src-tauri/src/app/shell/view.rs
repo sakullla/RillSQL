@@ -926,6 +926,7 @@ impl Workbench {
             // 上限变了就重读表数据并关掉查看面板，旧行列不再按新上限解释。
             pane.set_preview_kb(preview_kb, cx);
             pane.set_null_copy(&null_copy);
+            pane.set_empty_hint(settings.empty_display != "blank", cx);
         });
     }
 

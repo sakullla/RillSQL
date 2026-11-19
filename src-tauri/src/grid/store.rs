@@ -10,7 +10,7 @@ pub enum Cell {
     Text(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Column {
     pub name: String,
     pub type_name: String,
@@ -18,6 +18,13 @@ pub struct Column {
     pub primary: bool,
     pub unique: bool,
     pub auto: bool,
+    /// 列默认值的原文（数据库报回的写法）；没有默认值为 None。默认 NULL 也算没有：新增行本来就是 NULL。
+    /// 解析成四态由适配器的类型规则完成（`ddl::existing_default`）。
+    pub default: Option<String>,
+    /// 生成列（计算列）：值由数据库算出，新增与修改都不能写。
+    pub generated: bool,
+    /// 枚举列的可选值（按定义顺序）；不是枚举时为空。来自适配器（类型定义或枚举目录）。
+    pub choices: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +180,7 @@ pub fn touch_api() -> usize {
 
 #[cfg(test)]
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool, unique: bool, auto: bool) -> Column {
-    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, primary, unique, auto }
+    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, primary, unique, auto, ..Column::default() }
 }
 
 #[cfg(test)]

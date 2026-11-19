@@ -200,7 +200,7 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     use super::store::{Cell, Column, Engine, TableSchema};
 
     fn col(name: &str, type_name: &str) -> Column {
-        Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false }
+        Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false, ..Column::default() }
     }
     fn schema(engine: Engine, kind: &'static str, key: &[&str], columns: Vec<Column>) -> TableSchema {
         TableSchema {
@@ -1454,4 +1454,41 @@ async fn direct_expression_drives_page_count_and_full_export() {
     let leftover = live::count_rows_search(&session, "main", "", "items", "sqlite", &[], None, None).await.unwrap();
     assert_eq!(leftover, 5, "被拒绝的表达式没有执行任何写入");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R7：describe 保存列默认值与生成列标记（SQLite 走真实 PRAGMA；其余引擎的解析见各适配器的 column_trait_tests）。
+#[tokio::test]
+async fn sqlite_describe_keeps_column_defaults_and_generated_columns() {
+    use super::live;
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-defaults-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("defaults.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, created_time TEXT DEFAULT CURRENT_TIMESTAMP, status TEXT NOT NULL DEFAULT 'new', \
+         note TEXT DEFAULT NULL, price INTEGER, qty INTEGER, total INTEGER GENERATED ALWAYS AS (price * qty) VIRTUAL)",
+    )
+    .execute(&setup)
+    .await
+    .unwrap();
+    setup.close().await;
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("orders", "订单", &database).await.unwrap();
+    let session = service.catalog_session("orders").expect("已打开会话");
+    let schema = live::describe(&session, "main", "", "orders", "sqlite").await.unwrap();
+    let column = |name: &str| schema.columns.iter().find(|column| column.name == name).unwrap_or_else(|| panic!("缺少列 {name}"));
+    assert!(column("id").auto);
+    assert_eq!(column("created_time").default.as_deref(), Some("CURRENT_TIMESTAMP"));
+    assert_eq!(column("status").default.as_deref(), Some("'new'"));
+    assert_eq!(column("note").default, None, "默认 NULL 与没有默认值一样");
+    assert_eq!(column("price").default, None);
+    assert!(column("total").generated, "生成列来自 table_xinfo");
+    assert!(!column("price").generated);
+    let _ = fs::remove_dir_all(&dir);
 }

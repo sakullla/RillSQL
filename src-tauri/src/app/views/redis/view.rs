@@ -1171,6 +1171,17 @@ impl RedisPane {
         match &detail.value {
             RedisValue::String { text } => {
                 let viewer = self.ensure_string_viewer(text, window, cx);
+                // 空字符串（R20）：编辑区本身留空，上方一行弱化提示说明这是空字符串、不是没读到。
+                let empty_hint = text.is_empty().then(|| {
+                    div()
+                        .id("redis-string-empty")
+                        .debug_selector(|| "redis-string-empty".to_owned())
+                        .flex_none()
+                        .pb(px(4.))
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(self.text("redis.value.emptyString")))
+                });
                 div()
                     .flex_1()
                     .min_h(px(200.))
@@ -1181,6 +1192,7 @@ impl RedisPane {
                     .border_1()
                     .border_color(p.line)
                     .bg(p.surface)
+                    .children(empty_hint)
                     .child(div().flex_1().min_h(px(0.)).child(viewer))
                     .into_any_element()
             }
@@ -1506,14 +1518,21 @@ impl RedisPane {
                     Tone::Muted => p.text_muted,
                     Tone::Accent => p.accent_text,
                 };
+                // 空字符串（R20）：更浅、更小的“空”提示，和真实数据、和网格里的 NULL 都一眼可分。
+                let (shown, empty) = match super::value_cell(&text) {
+                    super::ValueCell::Empty => (self.text("grid.value.emptyLabel"), true),
+                    super::ValueCell::Text(_) => (text, false),
+                };
                 el = el.child(
                     cell(col.width)
                         .truncate()
                         .font_family(mono.clone())
                         .text_size(px(TypeScale::SM))
-                        .text_color(color)
+                        .when(empty, |c| c.text_size(px(TypeScale::XS)))
+                        .text_color(if empty { p.text_faint } else { color })
+                        .when(empty, |c| c.opacity(0.6))
                         .when(matches!(col.tone, Tone::Accent), |c| c.font_features(kit::tabular_figures()))
-                        .child(SharedString::from(text)),
+                        .child(SharedString::from(shown)),
                 );
             }
             let mut actions = div()

@@ -336,9 +336,17 @@ pub fn grid_items(facts: &GridMenuFacts) -> Vec<MenuItem> {
         branch("submenu-copy-as", "grid.menu.copyAs", IconName::ClipboardList, copy_as),
         sep(keyed(with_icon(item("grid-value-open", "grid.value.openFull"), IconName::Eye), "Mod+Enter")),
     ];
-    if facts.table {
+    // 表数据页，以及解锁后可写的查询结果（R17）：编辑与三种明确设值（R7/R20）。组合键来自快捷键注册表。
+    if facts.table || facts.writable {
+        let chord = |id: &str| crate::app::keymap::shortcut(id).map(crate::app::keymap::Shortcut::chord);
+        let valued = |entry: MenuItem, id: &str| match chord(id) {
+            Some(found) => keyed(entry, found),
+            None => entry,
+        };
         items.push(keyed(with_icon(writable_only(item("edit-cell", "grid.menu.editCell"), writable), IconName::SquarePen), "Enter"));
-        items.push(with_icon(writable_only(item("grid-set-null", "grid.menu.setNull"), writable), IconName::Eraser));
+        items.push(valued(with_icon(writable_only(item("grid-set-null", "grid.menu.setNull"), writable), IconName::Eraser), "grid-set-null"));
+        items.push(valued(writable_only(item("grid-set-empty", "grid.value.setEmpty"), writable), "grid-set-empty"));
+        items.push(valued(writable_only(item("grid-set-default", "grid.value.setDefault"), writable), "grid-set-default"));
     }
     if facts.cell_dirty {
         items.push(with_icon(item("grid-undo-cell", "grid.write.undoCell"), IconName::Undo2));
@@ -881,7 +889,7 @@ mod tests {
         }
 
         let readonly = grid_items(&GridMenuFacts { table: true, ..GridMenuFacts::default() });
-        for id in ["edit-cell", "grid-set-null", "grid-insert", "grid-clone-row", "mark-delete"] {
+        for id in ["edit-cell", "grid-set-null", "grid-set-empty", "grid-set-default", "grid-insert", "grid-clone-row", "mark-delete"] {
             let item = readonly.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{id}"));
             assert!(!item.enabled && item.reason_key == Some("grid.errors.viewReadonly"), "{id}");
         }

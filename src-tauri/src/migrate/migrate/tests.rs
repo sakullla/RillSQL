@@ -359,8 +359,8 @@ fn row_identity_prefers_mapped_key_values() {
 #[test]
 fn batch_insert_uses_the_target_engine_and_column_types() {
     let columns = vec![
-        Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: false, auto: false },
-        Column { name: "body".to_owned(), type_name: "blob".to_owned(), nullable: true, primary: false, unique: false, auto: false },
+        Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: false, auto: false, ..Default::default() },
+        Column { name: "body".to_owned(), type_name: "blob".to_owned(), nullable: true, primary: false, unique: false, auto: false, ..Default::default() },
     ];
     let rows = vec![
         vec![Cell::Text("1".to_owned()), Cell::Text("0AFF".to_owned())],

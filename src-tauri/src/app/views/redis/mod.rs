@@ -584,8 +584,13 @@ impl RedisPane {
         }
     }
 
+    /// 复制一段值。空字符串也是值（R20）：剪贴板得到空文本，提示说清复制的是空字符串。
     fn copy_text(&mut self, text: String, note_key: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+            self.copied = String::new();
+            self.note = self.text("redis.copied.empty");
+            self.error.clear();
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
@@ -952,7 +957,8 @@ impl RedisPane {
                 self.copy_text(val, "redis.copied.value", cx);
             }
         } else if let Some(index) = id.strip_prefix("redis-list-set:") {
-            if self.entry_value.trim().is_empty() {
+            // 表单开着时这是“写回”：清空后提交就是写入空字符串（R20），不能当成“重新载入原值”。
+            if list_set_fills(self.entry_form_open, &self.entry_value) {
                 if let Some(val) = self.list_item(index) {
                     self.entry_value = val;
                     if let Ok(ix) = index.parse::<usize>() {
@@ -1385,13 +1391,12 @@ impl RedisPane {
     }
 
     fn copy_value(&mut self, cx: &mut Context<Self>) {
-        let raw = self
-            .detail
-            .as_ref()
-            .map(|detail| format_value(&detail.value, self.locale))
-            .unwrap_or_default();
-        if raw.is_empty() {
+        let Some(raw) = self.detail.as_ref().and_then(|detail| value_copy_text(&detail.value, self.locale)) else {
             self.show_error(self.text("redis.tab.pickKey"));
+            return;
+        };
+        if raw.is_empty() {
+            self.copy_text(raw, "redis.copied.value", cx);
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(raw.clone()));
@@ -2010,9 +2015,36 @@ fn format_value(value: &RedisValue, locale: Locale) -> String {
     }
 }
 
+/// 值区域里一格要怎么画（R20）：空字符串画成弱化的“空”提示，不当成普通数据，也不和“没有内容”混淆。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ValueCell {
+    Empty,
+    Text(String),
+}
+
+pub(crate) fn value_cell(text: &str) -> ValueCell {
+    if text.is_empty() { ValueCell::Empty } else { ValueCell::Text(one_line(text)) }
+}
+
+/// “复制值”得到的文本：字符串原样（空字符串就是空文本，不是“这个键没有内容”这句说明）；
+/// 集合按行展开；键不存在时没有可复制的值。
+pub(crate) fn value_copy_text(value: &RedisValue, locale: Locale) -> Option<String> {
+    match value {
+        RedisValue::None {} => None,
+        RedisValue::String { text } => Some(text.clone()),
+        other => Some(format_value(other, locale)),
+    }
+}
+
+/// 列表条目的“设置”按钮：表单没打开时先载入原值；表单打开时就是提交，空文本也照样写回。
+pub(crate) fn list_set_fills(form_open: bool, draft: &str) -> bool {
+    !form_open && draft.trim().is_empty()
+}
+
 fn value_empty(value: &RedisValue) -> bool {
     match value {
-        RedisValue::String { text } => text.is_empty(),
+        // 空字符串是一个值，不是“没有内容”。
+        RedisValue::String { .. } => false,
         RedisValue::Hash { entries } => entries.is_empty(),
         RedisValue::List { items } | RedisValue::Set { items } => items.is_empty(),
         RedisValue::ZSet { entries } => entries.is_empty(),
@@ -2184,6 +2216,32 @@ mod tests {
         assert!(short.chars().count() <= 24, "{short}");
         assert_eq!(middle_ellipsis("user:1", 24), "user:1");
         assert_eq!(one_line("a\nb\tc"), "a b c");
+    }
+
+    /// R20：Redis 值查看与网格同一套规则——空字符串单独分类、复制得到空文本、清空提交就是写入空字符串。
+    #[test]
+    fn empty_strings_are_classified_copied_and_written_as_values() {
+        assert_eq!(value_cell(""), ValueCell::Empty);
+        assert_eq!(value_cell("a\nb"), ValueCell::Text("a b".to_owned()));
+        assert_eq!(value_cell(" "), ValueCell::Text(" ".to_owned()), "空白不是空字符串");
+        let empty = RedisValue::String { text: String::new() };
+        assert_eq!(value_copy_text(&empty, Locale::ZhCn).as_deref(), Some(""), "复制空字符串得到空文本");
+        assert_eq!(format_value(&empty, Locale::ZhCn), "", "不再把空字符串说成“没有内容”");
+        assert_eq!(value_copy_text(&RedisValue::None {}, Locale::ZhCn), None);
+        assert_eq!(value_copy_text(&RedisValue::List { items: vec!["a".into(), String::new()] }, Locale::ZhCn).as_deref(), Some("a\n"));
+        // 列表“设置”：表单没开时载入原值；表单开着时空文本也直接提交。
+        assert!(list_set_fills(false, ""));
+        assert!(!list_set_fills(true, ""));
+        assert!(!list_set_fills(false, "x"));
+        let plan = crate::adapters::redis::keys::prepare_mutation(&RedisMutation::ListSet { key: "k".into(), index: 0, value: String::new() }, true).expect("空字符串可以写入");
+        assert_eq!(plan.steps[0].word, "LSET");
+        assert_eq!(plan.steps[0].args, vec!["k".to_owned(), "0".to_owned(), String::new()]);
+        let plan = crate::adapters::redis::keys::prepare_mutation(
+            &RedisMutation::HashSet { key: "h".into(), field: "f".into(), value: String::new() },
+            true,
+        )
+        .expect("哈希值可以是空字符串");
+        assert_eq!(plan.steps[0].args.last().map(String::as_str), Some(""));
         assert_eq!(parse_ttl("").unwrap(), None);
         assert_eq!(parse_ttl("15").unwrap(), Some(15));
         assert!(parse_ttl("-1").is_err());

@@ -542,9 +542,9 @@ fn render_formats_keep_nulls_quotes_and_column_order_byte_for_byte() {
     assert_eq!(markdown, "| name | id | note |\r\n| --- | --- | --- |\r\n| 甲 | 1 | NULL |\r\n| a,\"b\" | 2 | NULL |");
 
     let columns = vec![
-        Column { name: "name".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false },
-        Column { name: "id".into(), type_name: "integer".into(), nullable: false, primary: true, unique: true, auto: false },
-        Column { name: "note".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false },
+        Column { name: "name".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false, ..Default::default() },
+        Column { name: "id".into(), type_name: "integer".into(), nullable: false, primary: true, unique: true, auto: false, ..Default::default() },
+        Column { name: "note".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false, ..Default::default() },
     ];
     let mysql = render_insert_for(Engine::Mysql, "", "people", &columns, &table);
     assert_eq!(

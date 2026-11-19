@@ -1260,6 +1260,7 @@ impl WorkbenchModel {
             "timeout-15" => self.settings.query_timeout_sec = 15,
             "timeout-60" => self.settings.query_timeout_sec = 60,
             "null-NULL" | "null-empty" | "null-N" => self.settings.null_copy = id.trim_start_matches("null-").to_owned(),
+            "empty-hint" | "empty-blank" => self.settings.empty_display = id.trim_start_matches("empty-").to_owned(),
             "page-size-up" => self.settings.step_page_size(50),
             "page-size-down" => self.settings.step_page_size(-50),
             "preview-up" => self.settings.step_preview_kb(1),

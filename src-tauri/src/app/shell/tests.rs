@@ -3481,6 +3481,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         null_copy: "bogus".into(),
         query_timeout_sec: -5,
         auto_check_updates: true,
+        empty_display: "hint".into(),
     };
     model.apply_settings(&illegal);
     assert_eq!(model.settings.theme, "system");
@@ -3610,6 +3611,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         null_copy: "NULL".into(),
         query_timeout_sec: 0,
         auto_check_updates: true,
+        empty_display: "hint".into(),
     });
     let _ = std::fs::remove_dir_all(&dir);
 }

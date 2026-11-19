@@ -193,7 +193,7 @@ async fn describe_sqlserver(client: &TdsHandle, schema: &str, table: &str) -> Re
     let column_rows = sqlserver_rows(
         client,
         &format!(
-            "SELECT c.name, TYPE_NAME(c.user_type_id), c.is_nullable, c.is_identity, dc.definition FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{}' AND o.name = N'{}' ORDER BY c.column_id",
+            "SELECT c.name, TYPE_NAME(c.user_type_id), c.is_nullable, c.is_identity, dc.definition, c.is_computed FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{}' AND o.name = N'{}' ORDER BY c.column_id",
             escape_tds_text(schema),
             escape_tds_text(table)
         ),
@@ -272,8 +272,14 @@ async fn describe_sqlserver(client: &TdsHandle, schema: &str, table: &str) -> Re
         let identity = cells.get(3).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
         let primary = pk.iter().any(|item| item == &name);
         let unique = primary || groups.iter().any(|group| group.1 && group.2.len() == 1 && group.2[0] == name);
+        let definition = cells.get(4).and_then(|cell| match cell {
+            Cell::Text(text) => Some(text.clone()),
+            _ => None,
+        });
+        let computed = cells.get(5).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
+        let (generated, default) = column_traits(&type_name, identity, computed, definition.as_deref());
         // IDENTITY 列即网格的自增列：插入时省略、UPDATE 不进 SET。
-        columns.push(Column { name, type_name, nullable, primary, unique, auto: identity });
+        columns.push(Column { name, type_name, nullable, primary, unique, auto: identity, default, generated, choices: Vec::new() });
     }
     Ok(TableSchema { engine: Engine::Sqlserver, schema: schema.to_owned(), name: table.to_owned(), kind, columns, key })
 }
@@ -304,4 +310,39 @@ pub(crate) fn foreign_key_sql(schema: &str, table: &str) -> String {
     }
     sql.push_str(" ORDER BY fk.name, fkc.constraint_column_id");
     sql
+}
+
+/// 网格列的生成标记与默认值（R7）：计算列与 rowversion/timestamp 列由服务器给值，不能写；
+/// 默认约束的定义（外层括号、N 前缀由类型规则剥掉）解析为 NULL 时不算默认值。
+pub(crate) fn column_traits(type_name: &str, identity: bool, computed: bool, definition: Option<&str>) -> (bool, Option<String>) {
+    let base = type_name.trim().to_ascii_lowercase();
+    let generated = computed || base == "rowversion" || base == "timestamp";
+    if identity || generated {
+        return (generated, None);
+    }
+    let default = definition
+        .filter(|raw| {
+            !matches!(
+                crate::ddl::sql::existing_default(Engine::Sqlserver, Some(raw)),
+                crate::ddl::DefaultSpec::None | crate::ddl::DefaultSpec::Null
+            )
+        })
+        .map(str::to_owned);
+    (false, default)
+}
+
+#[cfg(test)]
+mod column_trait_tests {
+    use super::column_traits;
+
+    #[test]
+    fn describe_keeps_default_constraints_and_marks_computed_columns() {
+        assert_eq!(column_traits("datetime2", false, false, Some("(getdate())")), (false, Some("(getdate())".to_owned())));
+        assert_eq!(column_traits("int", false, false, Some("((0))")), (false, Some("((0))".to_owned())));
+        assert_eq!(column_traits("nvarchar", false, false, Some("(NULL)")), (false, None));
+        assert_eq!(column_traits("int", true, false, None), (false, None));
+        assert_eq!(column_traits("int", false, true, None), (true, None));
+        assert_eq!(column_traits("rowversion", false, false, None), (true, None));
+        assert_eq!(column_traits("nvarchar", false, false, None), (false, None));
+    }
 }

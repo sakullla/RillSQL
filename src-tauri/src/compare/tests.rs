@@ -564,8 +564,8 @@ fn data_script_inserts_updates_and_deletes_without_executing_a_connection() {
         name: "orders".to_owned(),
         kind: "table",
         columns: vec![
-            Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: false, auto: false },
-            Column { name: "note".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false },
+            Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: false, auto: false, ..Default::default() },
+            Column { name: "note".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false, ..Default::default() },
         ],
         key: vec!["id".to_owned()],
     };

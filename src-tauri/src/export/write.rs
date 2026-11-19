@@ -155,7 +155,7 @@ fn write_markdown_field(writer: &mut impl Write, value: &str) -> io::Result<()> 
 fn render_text(writer: &mut impl Write, columns: &[String], rows: &[Vec<Option<String>>], options: FormatOptions<'_>, control: &ExportControl) -> io::Result<()> {
     let mut json_fields = Vec::<(&str, usize)>::new();
     let mut positions = HashMap::<&str, usize>::new();
-    let sql_columns: Vec<Column> = if options.format == "insert" { columns.iter().map(|name| Column { name: name.clone(), type_name: "TEXT".into(), nullable: true, primary: false, unique: false, auto: false }).collect() } else { Vec::new() };
+    let sql_columns: Vec<Column> = if options.format == "insert" { columns.iter().map(|name| Column { name: name.clone(), type_name: "TEXT".into(), nullable: true, primary: false, unique: false, auto: false, ..Default::default() }).collect() } else { Vec::new() };
     match options.format {
         "csv" | "" => {
             if options.bom { writer.write_all("\u{feff}".as_bytes())?; }

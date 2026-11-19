@@ -458,6 +458,7 @@ fn plain_columns(names: &[String], known: &[Column]) -> Vec<Column> {
             primary: false,
             unique: false,
             auto: false,
+            ..Column::default()
         })
         .collect()
 }
@@ -1118,7 +1119,7 @@ mod order_tests {
     use crate::grid::store::{Column, Sort, TableSchema};
 
     fn schema(engine: Engine, schema: &str) -> TableSchema {
-        let col = |name: &str, type_name: &str| Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: false, primary: name == "id", unique: false, auto: false };
+        let col = |name: &str, type_name: &str| Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: false, primary: name == "id", unique: false, auto: false, ..Column::default() };
         TableSchema {
             engine,
             schema: schema.to_owned(),

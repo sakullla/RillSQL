@@ -132,7 +132,7 @@ async fn describe_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str
     let kind = if kind_text.eq_ignore_ascii_case("VIEW") { "view" } else { "table" };
     let column_rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
         &mut conn,
-        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA, COLUMN_DEFAULT FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
         (database.to_owned(), table.to_owned()),
     )
     .await
@@ -170,8 +170,22 @@ async fn describe_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str
         let extra = mysql_text(row, 4)?;
         let primary = pk.iter().any(|item| item == &name);
         let unique = primary || groups.iter().any(|group| group.1 && group.2.len() == 1 && group.2[0] == name);
-        let auto = extra.to_ascii_lowercase().contains("auto_increment");
-        columns.push(Column { name, type_name, nullable, primary, unique, auto });
+        let raw_default = match mysql_cell(row.as_ref(5).unwrap_or(&mysql_async::Value::NULL)) {
+            Cell::Text(text) => Some(text),
+            Cell::Null => None,
+        };
+        let traits = column_traits(engine, &type_name, raw_default.as_deref(), &extra);
+        columns.push(Column {
+            name,
+            type_name,
+            nullable,
+            primary,
+            unique,
+            auto: traits.auto,
+            default: traits.default,
+            generated: traits.generated,
+            choices: traits.choices,
+        });
     }
     Ok(TableSchema { engine, schema: database.to_owned(), name: table.to_owned(), kind, columns, key })
 }
@@ -180,5 +194,89 @@ fn mysql_text(row: &mysql_async::Row, index: usize) -> Result<String, String> {
     match mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL)) {
         Cell::Text(text) => Ok(text),
         Cell::Null => Err("元数据列是空值".to_owned()),
+    }
+}
+
+/// 由 information_schema.columns 的一行推出的网格列特性（R7）：自增、默认值、生成列与枚举值。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ColumnTraits {
+    pub auto: bool,
+    pub default: Option<String>,
+    pub generated: bool,
+    pub choices: Vec<String>,
+}
+
+/// MySQL 8 的 COLUMN_DEFAULT 字面量不带引号、表达式默认在 EXTRA 里标 DEFAULT_GENERATED；
+/// MariaDB 的字面量带引号、没有默认值的可空列报回文本 NULL。两者都按类型规则解析成四态，
+/// 无默认值与默认 NULL 一律记为 None（新增行本来就是 NULL）。生成列（VIRTUAL/STORED/PERSISTENT GENERATED）
+/// 不能写；表达式默认（DEFAULT_GENERATED）不是生成列。
+pub(crate) fn column_traits(engine: Engine, type_name: &str, raw_default: Option<&str>, extra: &str) -> ColumnTraits {
+    let extra = extra.to_ascii_uppercase();
+    let auto = extra.contains("AUTO_INCREMENT");
+    let generated = ["VIRTUAL GENERATED", "STORED GENERATED", "PERSISTENT GENERATED"].iter().any(|flag| extra.contains(flag));
+    let default = if auto || generated {
+        None
+    } else {
+        raw_default.filter(|raw| {
+            !matches!(crate::ddl::sql::existing_default(engine, Some(raw)), crate::ddl::DefaultSpec::None | crate::ddl::DefaultSpec::Null)
+        })
+        .map(str::to_owned)
+    };
+    ColumnTraits { auto, default, generated, choices: enum_choices(type_name) }
+}
+
+/// `enum('a','b''c')` 的可选值（按定义顺序，'' 还原成 '）。SET 允许多选，不给单选下拉。
+pub(crate) fn enum_choices(type_name: &str) -> Vec<String> {
+    let text = type_name.trim();
+    let Some(body) = text.get(..5).filter(|head| head.eq_ignore_ascii_case("enum(")).and_then(|_| text[5..].strip_suffix(')')) else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+        let mut value = String::new();
+        while let Some(inner) = chars.next() {
+            if inner == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    value.push('\'');
+                    continue;
+                }
+                break;
+            }
+            value.push(inner);
+        }
+        values.push(value);
+    }
+    values
+}
+
+#[cfg(test)]
+mod column_trait_tests {
+    use super::*;
+
+    #[test]
+    fn describe_keeps_defaults_generated_columns_and_enum_values() {
+        let created = column_traits(Engine::Mysql, "datetime", Some("CURRENT_TIMESTAMP"), "DEFAULT_GENERATED");
+        assert_eq!(created, ColumnTraits { auto: false, default: Some("CURRENT_TIMESTAMP".to_owned()), generated: false, choices: Vec::new() });
+        let id = column_traits(Engine::Mysql, "bigint", None, "auto_increment");
+        assert!(id.auto && id.default.is_none() && !id.generated);
+        assert_eq!(column_traits(Engine::Mysql, "varchar(20)", Some("active"), "").default.as_deref(), Some("active"));
+        // 没有默认值与默认 NULL 都不算默认值：MySQL 报 SQL NULL，MariaDB 报文本 NULL。
+        assert_eq!(column_traits(Engine::Mysql, "varchar(20)", None, "").default, None);
+        assert_eq!(column_traits(Engine::Mariadb, "varchar(20)", Some("NULL"), "").default, None);
+        assert_eq!(column_traits(Engine::Mariadb, "varchar(20)", Some("'active'"), "").default.as_deref(), Some("'active'"));
+        let total = column_traits(Engine::Mysql, "int", None, "STORED GENERATED");
+        assert!(total.generated && total.default.is_none());
+        assert!(column_traits(Engine::Mariadb, "int", None, "VIRTUAL GENERATED").generated);
+        assert_eq!(
+            column_traits(Engine::Mysql, "enum('draft','it''s','done')", Some("draft"), "").choices,
+            vec!["draft".to_owned(), "it's".to_owned(), "done".to_owned()]
+        );
+        assert!(enum_choices("set('a','b')").is_empty());
+        assert!(enum_choices("varchar(10)").is_empty());
     }
 }

@@ -57,6 +57,13 @@ pub struct ShellSettings {
     pub null_copy: String,
     pub query_timeout_sec: i64,
     pub auto_check_updates: bool,
+    /// 空字符串在网格里怎么画（R20）：`hint` 弱化提示（默认），`blank` 完全留空。旧文件没有这一项时取默认。
+    #[serde(default = "default_empty_display")]
+    pub empty_display: String,
+}
+
+fn default_empty_display() -> String {
+    "hint".to_owned()
 }
 
 impl Default for ShellSettings {
@@ -73,6 +80,7 @@ impl Default for ShellSettings {
             null_copy: "NULL".to_owned(),
             query_timeout_sec: 0,
             auto_check_updates: true,
+            empty_display: default_empty_display(),
         }
     }
 }

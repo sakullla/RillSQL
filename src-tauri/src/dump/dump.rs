@@ -1159,9 +1159,9 @@ mod tests {
             name: "docs".to_owned(),
             kind: "table",
             columns: vec![
-                grid::Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: true, auto: false },
-                grid::Column { name: "body".to_owned(), type_name: "bytea".to_owned(), nullable: true, primary: false, unique: false, auto: false },
-                grid::Column { name: "note".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false },
+                grid::Column { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: true, auto: false, ..grid::Column::default() },
+                grid::Column { name: "body".to_owned(), type_name: "bytea".to_owned(), nullable: true, primary: false, unique: false, auto: false, ..grid::Column::default() },
+                grid::Column { name: "note".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false, ..grid::Column::default() },
             ],
             key: vec!["id".to_owned()],
         };

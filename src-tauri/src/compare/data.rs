@@ -202,6 +202,7 @@ fn grid_schema(engine: GridEngine, table: &DataTable, key: &[String]) -> TableSc
                 primary: key.iter().any(|item| item == &column.name),
                 unique: false,
                 auto: false,
+                ..Column::default()
             })
             .collect(),
         key: key.to_vec(),

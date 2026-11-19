@@ -754,6 +754,52 @@ fn meaningful(text: &str, hash: bool) -> bool {
     strip_comments(text, hash).chars().any(|ch| !ch.is_whitespace())
 }
 
+/// 去掉注释后的语句文本（字符串与引号标识符里的内容原样保留，注释换成一个空格）。
+/// 按引擎决定 `#` 是否是注释；多字节字符按字符整体保留。
+pub fn strip_sql_comments(engine: &str, sql: &str) -> String {
+    let hash = crate::adapters::query::lexis_named(engine).hash_comments;
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut copied = 0usize;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        let comment_end = if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            Some(eol_at(sql, i + 2))
+        } else if hash && bytes[i] == b'#' {
+            Some(eol_at(sql, i + 1))
+        } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut k = i + 2;
+            while k + 1 < bytes.len() && !(bytes[k] == b'*' && bytes[k + 1] == b'/') {
+                k += 1;
+            }
+            Some((k + 2).min(bytes.len()))
+        } else {
+            None
+        };
+        if let Some(end) = comment_end {
+            out.push_str(&sql[copied..i]);
+            out.push(' ');
+            i = end;
+            copied = end;
+            continue;
+        }
+        if crate::adapters::query::is_quote_byte(bytes[i]) {
+            quote = Some(bytes[i]);
+        }
+        i += 1;
+    }
+    out.push_str(&sql[copied.min(sql.len())..]);
+    out
+}
+
 fn strip_comments(sql: &str, hash: bool) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::new();

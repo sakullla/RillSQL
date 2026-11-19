@@ -130,6 +130,14 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut::new("copy-sql-value", "table", "Mod+Shift+C", "shell.shortcuts.copySqlValue"),
     Shortcut::new("paste-cells", "table", "Mod+V", "shell.shortcuts.pasteCells"),
     Shortcut::new("grid-undo", "table", "Mod+Z", "shell.shortcuts.undoStage"),
+    // 结果区查找（R10）：网格（含其中的输入框）有焦点时展开查找栏并聚焦，编辑器里的 ⌘F 仍是编辑器自己的查找。
+    Shortcut::new("grid-find", "table", "Mod+F", "grid.find.toggle")
+        .binds(&[|key, _| Some(KeyBinding::new(key, crate::app::views::grid::GridFind, Some("Grid")))]),
+    // 单元格设值（R7/R20）：三者是不同的值，编辑中与选中格上都可用；由网格按本表解析按键（条目 id 即网格命令）。
+    Shortcut::new("grid-set-null", "table", "Mod+Shift+N", "grid.value.setNull"),
+    Shortcut::new("grid-set-empty", "table", "Mod+Shift+Backspace", "grid.value.setEmpty"),
+    Shortcut::new("grid-set-default", "table", "Mod+Shift+D", "grid.value.setDefault"),
+    Shortcut::new("grid-next-cell", "table", "Tab / Shift+Tab", "shell.shortcuts.nextCell"),
     Shortcut::new("explorer-move", "explorer", "↑ ↓", "shell.shortcuts.explorerMove"),
     Shortcut::new("explorer-expand", "explorer", "← →", "shell.shortcuts.explorerExpand"),
     Shortcut::new("explorer-open", "explorer", "Enter", "shell.shortcuts.explorerOpen"),

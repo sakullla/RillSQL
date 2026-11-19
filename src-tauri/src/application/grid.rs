@@ -258,6 +258,9 @@ fn schema_dto(schema: &TableSchema, database: &str, foreign_keys: Option<Vec<For
                 primary: column.primary,
                 unique: column.unique,
                 auto: column.auto,
+                default: column.default.clone(),
+                generated: column.generated,
+                choices: column.choices.clone(),
             })
             .collect(),
     }

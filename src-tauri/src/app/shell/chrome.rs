@@ -5239,6 +5239,13 @@ impl Workbench {
                     &[("null-NULL", "ui.settings.nullWord", s.null_copy == "NULL"), ("null-empty", "ui.settings.nullEmpty", s.null_copy == "empty"), ("null-N", "ui.settings.nullN", s.null_copy == "N")],
                     cx,
                 );
+                let empty_seg = seg(
+                    self,
+                    &[("empty-hint", "ui.settings.emptyHint", s.empty_display != "blank"), ("empty-blank", "ui.settings.emptyBlank", s.empty_display == "blank")],
+                    cx,
+                );
+                // 复制 NULL 也写成空文本时，粘贴回来或在别处看到的 NULL 与空字符串分不出来：就地说明。
+                let null_hint = (s.null_copy == "empty").then(|| self.t("ui.settings.nullEmptyClash"));
                 let page_size = stepper(
                     self,
                     "page-size",
@@ -5292,7 +5299,8 @@ impl Workbench {
                         (self.t("shell.settings.rowsPerPage"), None, page_size.into_any_element()),
                         (self.t("shell.settings.previewLimit"), None, preview.into_any_element()),
                         (self.t("shell.settings.objectPage"), None, object_page.into_any_element()),
-                        (self.t("shell.settings.nullCopy"), None, null_seg),
+                        (self.t("shell.settings.nullCopy"), null_hint, null_seg),
+                        (self.t("shell.settings.emptyDisplay"), None, empty_seg),
                         (self.t("shell.settings.timeout"), None, timeout_seg),
                     ],
                     &p,

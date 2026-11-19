@@ -4,7 +4,7 @@ use super::sql::{
 use super::store::{customers_fixture, matches, query_page, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 fn col(name: &str, type_name: &str) -> Column {
-    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false }
+    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false, ..Column::default() }
 }
 
 fn schema_of(engine: Engine) -> TableSchema {
@@ -179,7 +179,7 @@ fn sqlserver_cell_literals_cover_binary_and_bool() {
     use super::sql::sql_cell;
     use super::store::Column;
     fn col(type_name: &str) -> Column {
-        Column { name: "c".to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false }
+        Column { name: "c".to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false, ..Column::default() }
     }
     // 0x 前缀的二进制字面量；空二进制是 0x。
     assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("varbinary")), &Cell::Text("0xAB10".to_owned())), "0xab10".to_owned());

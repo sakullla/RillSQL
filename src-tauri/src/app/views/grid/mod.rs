@@ -36,7 +36,7 @@ use session::{
 
 // Tab / Shift+Tab 在网格里是「下一格 / 上一格」，不是焦点遍历：绑定在网格自己的 key context 上，
 // 才比外壳的 Tab（焦点遍历）更靠近焦点、先拿到这个键；表格自己有同名绑定，优先级更高。
-gpui_kit::actions!(rillsql_grid, [GridNextCell, GridPrevCell]);
+gpui_kit::actions!(rillsql_grid, [GridNextCell, GridPrevCell, GridFind]);
 
 /// 外键跳转要打开的引用表工作项：目标身份和定位查询一起交给外壳，由它真正打开并定位。
 /// 网格只算出目标，不自己开工作项，也不把这段 SQL 当作"已经跳过去"。
@@ -209,6 +209,12 @@ pub struct GridPane {
     /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
     pending_batch: bool,
     search_subscription: Option<gpui_kit::Subscription>,
+    /// 查找栏是否展开（R10）。默认收起；⌘F/Ctrl+F 或工具栏按钮展开并聚焦，Esc 收起，查找条件保留。
+    find_open: bool,
+    /// 下一次绘制把键盘焦点交给查找输入框（打开查找栏时要等拿到 Window）。
+    focus_find: bool,
+    /// 单元格编辑里输入与列类型不符时的就地提示；有提示时编辑框不关闭、值不暂存。
+    edit_error: Option<String>,
     /// 目标连接是不是生产环境（由外壳按环境标签判定）。生产库的变更预览只接受点按确认，
     /// 回车不写入；外壳没告诉之前按生产处理。
     prod_target: bool,
@@ -308,6 +314,10 @@ impl GridPane {
             gpui_kit::KeyBinding::new("tab", GridNextCell, Some("Grid")),
             gpui_kit::KeyBinding::new("shift-tab", GridPrevCell, Some("Grid")),
         ]);
+        // 查找栏快捷键（R10）来自快捷键注册表；外壳启动时同样注册，这里保证单独使用网格时也生效。
+        if let Some(find) = crate::app::keymap::shortcut("grid-find") {
+            cx.bind_keys(crate::app::keymap::bindings_of(find, cfg!(target_os = "macos")));
+        }
         // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
         let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -375,6 +385,9 @@ impl GridPane {
             pending_fit: None,
             pending_batch: false,
             search_subscription: None,
+            find_open: false,
+            focus_find: false,
+            edit_error: None,
             _subscription: subscription,
             _edit_subscription: edit_subscription,
         }
@@ -487,6 +500,14 @@ impl GridPane {
     }
 
     /// TSV 里数据库 NULL 的显示文本来自设置；SQL 字面量不受影响。
+    /// 空字符串画成弱化提示（true）还是留空（false）。值没变时不重绘。
+    pub fn set_empty_hint(&mut self, hint: bool, cx: &mut Context<Self>) {
+        if self.session.set_empty_hint(hint) {
+            self.sync_table(cx);
+            cx.notify();
+        }
+    }
+
     pub fn set_null_copy(&mut self, value: &str) {
         self.session.set_null_copy(crate::app::views::settings::null_display(value));
     }
@@ -639,9 +660,59 @@ impl GridPane {
         self.press = None;
         self.pending_page = None;
         let QuerySheet { sql, columns, rows, truncated, full_count } = sheet;
-        let token = self.session.show_query_sheet_typed(&sql, columns, column_types, rows, truncated, full_count);
+        // 查询结果默认只读：不再自动读主键，由“解锁编辑”按需发起（R17）。
+        let _token = self.session.show_query_sheet_typed(&sql, columns, column_types, rows, truncated, full_count);
+        self.edit_error = None;
         self.sync_table(cx);
-        self.schedule_locate(token, cx);
+    }
+
+    /// “解锁编辑”：对这份结果自己的语句（去注释）证明单表并读主键；通过后可编辑，不通过把原因留在标签旁。
+    pub fn unlock(&mut self, cx: &mut Context<Self>) {
+        let live = self.live_target();
+        match self.session.begin_unlock(live) {
+            Ok(_) => {
+                self.notice.clear();
+                // 同一份结果可以重试：上一次读取失败后仍允许再发一次。
+                self.scheduled = 0;
+                let token = self.session.token;
+                self.schedule_locate(token, cx);
+            }
+            Err(reason) => self.notice = i18n::text(self.locale, reason),
+        }
+        cx.notify();
+    }
+
+    /// 打开查找栏并把焦点交给输入框；再按一次（栏已展开且焦点在里面）收起。
+    pub fn toggle_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = !self.find_open;
+        if self.find_open {
+            self.focus_find = true;
+        } else {
+            self.refocus = true;
+        }
+        cx.notify();
+    }
+
+    pub fn open_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.focus_find = true;
+        cx.notify();
+    }
+
+    /// Esc 收起查找栏：关键字和筛选不清除，工具栏按钮的徽标说明它们仍在生效。
+    pub fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = false;
+        self.refocus = true;
+        cx.notify();
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find_open
+    }
+
+    /// 正在生效的查找/筛选条件数：关键字算一条，每条已应用的筛选各算一条。
+    pub fn active_conditions(&self) -> usize {
+        usize::from(!self.session.find_text().trim().is_empty()) + self.session.filters().len()
     }
 
     pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
@@ -733,14 +804,42 @@ impl GridPane {
                 self.abandon_edit();
                 None
             }
-            "grid-set-null" => {
-                self.select_first_if_needed();
-                if let Some((row, column)) = self.session.focus_cell() {
-                    // 显式 NULL：不经过任何特殊文本，直接写数据库 NULL。
-                    let gate = self.session.stage_text(row, column, None);
+            // 显式 NULL / 空字符串 / 恢复默认（R7、R20）：正在编辑时作用于编辑中的那一格并结束编辑，
+            // 否则作用于焦点格。三者是不同的值，绝不互相转换。
+            "grid-set-null" | "grid-set-empty" => {
+                let value = if id == "grid-set-empty" { Some(String::new()) } else { None };
+                if let Some((row_id, column)) = self.value_target() {
+                    let gate = self.session.stage_text_by_id(&row_id, column, value);
                     self.notice = self.session.gate_text(gate);
+                    if gate == Gate::Validation {
+                        self.notice = self.session.overlay_message_by_id(&row_id, column);
+                    }
+                    self.edit_error = None;
                     self.abandon_edit();
                 }
+                None
+            }
+            "grid-set-default" => {
+                if let Some((row_id, column)) = self.value_target() {
+                    self.notice = match self.session.stage_default_by_id(&row_id, column) {
+                        Ok(gate) => self.session.gate_text(gate),
+                        Err(key) => i18n::text(self.locale, key),
+                    };
+                    self.edit_error = None;
+                    self.abandon_edit();
+                }
+                None
+            }
+            "grid-unlock" => {
+                self.unlock(cx);
+                None
+            }
+            "grid-find-toggle" => {
+                self.toggle_find(cx);
+                None
+            }
+            "grid-find-close" => {
+                self.close_find(cx);
                 None
             }
             "commit" => {
@@ -1112,6 +1211,16 @@ impl GridPane {
             self.open_navigation(navigation, cx);
         }
         copied
+    }
+
+    /// 设值命令作用的格子：正在单格编辑时是编辑中的那一格，否则是焦点格（稳定行 id、逻辑列）。
+    fn value_target(&mut self) -> Option<(String, usize)> {
+        if let Some(target) = self.edit_target.as_ref().filter(|target| target.cells.is_empty()) {
+            return Some((target.row_id.clone(), target.column));
+        }
+        self.select_first_if_needed();
+        let (row, column) = self.session.focus_cell()?;
+        SharedGrid::row_id(&self.session, row).map(|row_id| (row_id.to_owned(), column))
     }
 
     /// 批量暂存的结果写进提示：成功说暂存了几格，拒绝说具体原因（已有暂存不变）。
@@ -1891,6 +2000,7 @@ impl GridPane {
             let gate = self.session.stage_text_by_id(&previous.row_id, previous.column, value);
             self.notice = self.session.gate_text(gate);
         }
+        self.edit_error = None;
         let original = self.session.raw_value(pending.row, pending.column);
         let text = self.session.edit_text(pending.row, pending.column);
         self.edit_target = Some(EditTarget { row_id, column: pending.column, original, cells: Vec::new() });
@@ -1935,12 +2045,19 @@ impl GridPane {
                 }
             },
             _ => {
-                // 数字列：两端空白去掉；明显不是数字的输入照样提交，但先提醒一句。
-                let numeric = self.session.column_type(target.column).is_some_and(session::numeric_type);
+                // 数字列：两端空白去掉；不是数字就地报错，编辑框不关、值不暂存（R7）。
+                let family = self.session.column_type(target.column).map(crate::grid::value_family);
+                let integer = family == Some(crate::grid::ValueFamily::Integer);
+                let numeric = integer || matches!(family, Some(crate::grid::ValueFamily::Decimal | crate::grid::ValueFamily::Float));
                 if numeric && !text.trim().is_empty() {
                     let trimmed = text.trim().to_owned();
-                    if trimmed.replace(',', "").parse::<f64>().is_err() {
-                        format_note = Some(i18n::text(self.locale, "grid.numeric.unrecognized"));
+                    let valid = if integer { crate::grid::integer_text(&trimmed) } else { crate::grid::decimal_text(&trimmed) };
+                    if !valid {
+                        let kind = i18n::text(self.locale, if integer { "grid.numeric.integer" } else { "grid.numeric.number" });
+                        self.edit_error = Some(i18n::fill(&i18n::text(self.locale, "grid.numeric.invalid"), &[("value", &trimmed), ("kind", &kind)]));
+                        self.edit_target = Some(target);
+                        cx.notify();
+                        return;
                     }
                     trimmed
                 } else {
@@ -1948,11 +2065,28 @@ impl GridPane {
                 }
             }
         };
+        // 新增行里交给默认值的格子：什么都没输入就保持“默认 / 自动生成”，不写一个 NULL 进去。
+        if text.is_empty() && self.session.cell_pristine(&target.row_id, target.column) {
+            self.edit_error = None;
+            self.pending_edit = None;
+            self.refocus = true;
+            self.sync_table(cx);
+            cx.notify();
+            return;
+        }
         // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
         let value = match (&target.original, text.is_empty()) {
             (Some(None), true) => None,
             _ => Some(text),
         };
+        // 与暂存同一套类型检查（布尔、JSON、二进制……）：不合就地报错，编辑框保持打开。
+        if let Some(problem) = self.session.edit_problem(target.column, value.as_deref()) {
+            self.edit_error = Some(problem);
+            self.edit_target = Some(target);
+            cx.notify();
+            return;
+        }
+        self.edit_error = None;
         let gate = self.session.stage_text_by_id(&target.row_id, target.column, value);
         self.notice = self.session.gate_text(gate);
         if let Some(note) = format_note.filter(|_| self.notice.is_empty()) {
@@ -2021,6 +2155,7 @@ impl GridPane {
     fn cancel_edit(&mut self) {
         self.edit_target = None;
         self.pending_edit = None;
+        self.edit_error = None;
         self.notice.clear();
         self.refocus = true;
     }
@@ -2028,7 +2163,22 @@ impl GridPane {
     fn abandon_edit(&mut self) {
         self.edit_target = None;
         self.pending_edit = None;
+        self.edit_error = None;
         self.refocus = true;
+    }
+
+    /// 编辑面板上点选的值（布尔、枚举、日历之外的 NULL 等）：直接作为这一格的新值暂存并结束编辑。
+    fn pick_edit_value(&mut self, value: Option<String>, cx: &mut Context<Self>) {
+        let Some(target) = self.edit_target.take().filter(|target| target.cells.is_empty()) else {
+            return;
+        };
+        let gate = self.session.stage_text_by_id(&target.row_id, target.column, value);
+        self.notice = self.session.gate_text(gate);
+        self.edit_error = None;
+        self.pending_edit = None;
+        self.refocus = true;
+        self.sync_table(cx);
+        cx.notify();
     }
 
     /// 表头右键菜单的命令。`column` 是数据列序号（不含行号列）。
@@ -2523,20 +2673,29 @@ impl GridPane {
                 let result = crate::application::grid::describe(&services.connections, &request).await;
                 let _ = tx.send(result);
             });
-            if let Ok(Ok(dto)) = rx.await {
-                cx.update(|cx| {
-                    if let Some(view) = view.upgrade() {
-                        view.update(cx, |this, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| match result {
+                        Ok(Ok(dto)) => {
                             this.session.set_foreign_keys(foreign_keys_of(&dto));
                             if let Ok(schema) = schema_from_dto(&dto) {
                                 if this.session.finish_locate(token, schema) {
                                     this.sync_table(cx);
                                 }
                             }
-                        });
-                    }
-                });
-            }
+                            cx.notify();
+                        }
+                        // 读结构失败：回到可解锁状态并说明原因，用户可以再点一次。
+                        Ok(Err(message)) if this.session.token == token => {
+                            this.session.relock();
+                            this.notice = message;
+                            cx.notify();
+                        }
+                        _ => {}
+                    });
+                }
+            });
         })
         .detach();
     }
@@ -2782,6 +2941,9 @@ impl Render for GridPane {
                 cx.notify();
             });
         }
+        // 单元格内编辑器的锚定面板：每帧重建，交给正在编辑的那一格画在它下方。
+        let edit_panel = if editing.is_some() { self.build_edit_panel(&Palette::of(cx), &cx.entity(), window, cx) } else { None };
+        self.table.update(cx, |state, _| state.delegate_mut().edit_panel = edit_panel);
         // 自适应列宽要用窗口量字宽：表格量完发出列宽事件，会话按逻辑列记下新宽度。
         if let Some(logical) = self.pending_fit.take() {
             if let Some(display) = self.session.logical_to_display(logical) {
@@ -2841,6 +3003,15 @@ impl Render for GridPane {
         // 网格又画在查询页/表数据页的布局递归深处，叠上记录视图会撑爆 Windows 主线程默认 1 MB 栈。
         self.sync_format_viewer(window, cx);
         let tools = self.render_tools(loading, &p, m, &entity, window, cx);
+        let find_bar = self.render_find_bar(&p, m, &entity, window, cx);
+        if std::mem::take(&mut self.focus_find) {
+            // ⌘F / 工具栏按钮：查找栏一出现，光标就在输入框里。
+            if let Some(search) = self.search.clone() {
+                let handle = search.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+                self.refocus = false;
+            }
+        }
         let filters_strip = self.render_filters(&p, &entity, window, cx);
 
         let mut column = div()
@@ -2859,6 +3030,10 @@ impl Render for GridPane {
             .on_action(cx.listener(|this, _: &GridPrevCell, window, cx| {
                 this.step_cell(false, window, cx);
             }))
+            // ⌘F / Ctrl+F（快捷键注册表里的 grid-find）：展开查找栏并聚焦；已展开时同样把焦点交回输入框。
+            .on_action(cx.listener(|this, _: &GridFind, _, cx| {
+                this.open_find(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let key = match key {
@@ -2874,13 +3049,25 @@ impl Render for GridPane {
                         return;
                     }
                 }
-                // 文本输入接管字符、光标、选区、粘贴和撤销，这里只处理取消编辑。
+                // 文本输入接管字符、光标、选区、粘贴和撤销，这里只处理取消编辑与“设为 NULL/空字符串/默认值”。
                 if this.edit_target.is_some() {
                     if key == "escape" {
                         cx.stop_propagation();
                         this.cancel_edit();
                         cx.notify();
+                    } else if let Some(id @ ("grid-set-null" | "grid-set-empty" | "grid-set-default")) =
+                        grid_shortcut(key, event.keystroke.modifiers.secondary(cx), event.keystroke.modifiers.shift)
+                    {
+                        cx.stop_propagation();
+                        let _ = this.command(id, cx);
+                        cx.notify();
                     }
+                    return;
+                }
+                // 查找输入框里按 Esc：收起查找栏，关键字保留（工具栏按钮的徽标说明仍在生效）。
+                if key == "escape" && this.find_open && this.search.as_ref().is_some_and(|search| search.read(cx).focus_handle(cx).is_focused(window)) {
+                    cx.stop_propagation();
+                    this.close_find(cx);
                     return;
                 }
                 // 记录面板的就地暂存：Esc 取消，其它键交给字段输入框自己处理。
@@ -2942,6 +3129,7 @@ impl Render for GridPane {
                 }
             }))
             .child(tools)
+            .children(find_bar)
             .children(self.render_changes_bar(&p, m, &entity))
             .children(self.render_read_error(&p, m, &entity))
             .children(filters_strip)
@@ -2950,9 +3138,6 @@ impl Render for GridPane {
         column = column.child(self.render_grid_body(loading, &p, m, &entity, cx));
         if let Some(bar) = self.render_edit_bar(&p, &entity) {
             column = column.child(bar);
-        }
-        if let Some(assist) = self.render_temporal_assist(&p, &entity, window, cx) {
-            column = column.child(assist);
         }
         column = column.children(self.render_value_viewer(&p, &entity, cx));
         if let Some(preview) = self.render_preview(&p, &entity, cx) {
@@ -3067,34 +3252,45 @@ impl GridPane {
             search.update(cx, |state, cx| state.set_value("", window, cx));
         }
         let table_mode = self.session.mode == GridMode::Table;
-        // 查询结果、没有目标表、连接已关闭或失联时，整表筛选的开关不该看起来可以用。
-        // 这里同时把失去连接的整表筛选退回已读取行，原因随后一起画出来。
-        let scope_block = self.sync_find_scope();
-        let find_scope = self.session.find_scope();
-        let searching = !self.session.find_text().trim().is_empty();
+        // 每帧对齐连接状态：失去连接的整表筛选退回已读取行（查找栏收起时同样要对齐）。
+        let _ = self.sync_find_scope();
         let filters = self.session.filters().len();
-
-        let mut left = div().id("grid-tools-left").flex().flex_wrap().items_center().gap(px(4.)).min_w(px(0.)).child(
-            div().w(px(220.)).child(
-                kit::text_input("grid-search", &search, t("grid.action.searchHint"))
-                    .small()
-                    .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
-                    .cleanable(true),
-            ),
-        );
-        // 查找范围只在真的在查找、且能切到整表时出现：没有可选的另一档就不常驻一个开关。
-        if searching && scope_block.is_none() {
-            left = left.child(
-                div().id("grid-find-scope-hint").debug_selector(|| "grid-find-scope-hint".to_owned()).child(
-                    kit::tool_button(
-                        "grid-find-scope",
-                        Some(if find_scope == FindScope::Server { IconName::Database } else { IconName::Rows3 }),
-                        if find_scope == FindScope::Server { t("grid.find.server") } else { t("grid.find.loaded") },
-                        pane_click(entity, "grid-find-scope"),
-                    ),
-                ),
+        // 查找栏默认收起（R10）：工具栏只放一个查找按钮。展开时按钮高亮；收起但仍有生效的关键字或筛选时
+        // 按钮带计数徽标并说明“显示的不是全部行”，免得把筛过的结果当成全部数据。
+        let active = self.active_conditions();
+        let mut find_button = kit::tool_button("grid-find-toggle", Some(IconName::Search), t("grid.action.search"), pane_click(entity, "grid-find-toggle"))
+            .tooltip(SharedString::from(match crate::app::keymap::shortcut("grid-find") {
+                Some(shortcut) => format!("{}  {}", i18n::text(locale, "grid.find.toggle"), crate::app::keymap::display_chord(shortcut.chord())),
+                None => i18n::text(locale, "grid.find.toggle"),
+            }));
+        if self.find_open {
+            find_button = find_button.selected(true);
+        }
+        let mut find_slot = div().id("grid-find-slot").debug_selector(|| "grid-find-slot".to_owned()).relative().flex_none().child(find_button);
+        if active > 0 {
+            find_slot = find_slot.child(
+                div()
+                    .id("grid-find-badge")
+                    .debug_selector(|| "grid-find-badge".to_owned())
+                    .test_support()
+                    .absolute()
+                    .top(px(-3.))
+                    .right(px(-3.))
+                    .min_w(px(14.))
+                    .h(px(14.))
+                    .px(px(3.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(p.accent)
+                    .text_color(p.on_accent)
+                    .text_size(px(TypeScale::XS))
+                    .tooltip_text(t("grid.find.active"))
+                    .child(SharedString::from(active.to_string())),
             );
         }
+        let mut left = div().id("grid-tools-left").flex().flex_wrap().items_center().gap(px(4.)).min_w(px(0.)).child(find_slot);
         let filter_label = if filters > 0 {
             SharedString::from(format!("{} {filters}", i18n::text(locale, "grid.action.filter")))
         } else {
@@ -3145,14 +3341,79 @@ impl GridPane {
             .border_b_1()
             .border_color(p.line)
             .child(left)
-            .child(self.render_tools_status(loading, p))
+            .child(self.render_tools_status(loading, p, entity))
             .child(self.render_tools_actions(table_mode, p, entity));
         tools.into_any_element()
     }
 
+    /// 查找栏（R10）：展开时在工具条下面占一条固定高度的横条，结果区只整体下移一次、不随输入跳动。
+    /// 输入框、查找范围在这里；Esc（焦点在输入框里）收起，关键字保留。
+    #[inline(never)]
+    fn render_find_bar(&mut self, p: &Palette, m: kit::Metrics, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        if !self.find_open {
+            return None;
+        }
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let search = self.search_input(window, cx);
+        // 查询结果、没有目标表、连接已关闭或失联时，整表筛选的开关不该看起来可以用。
+        // 这里同时把失去连接的整表筛选退回已读取行，原因随后一起画出来。
+        let scope_block = self.sync_find_scope();
+        let find_scope = self.session.find_scope();
+        let searching = !self.session.find_text().trim().is_empty();
+        let mut bar = div()
+            .id("grid-find-bar")
+            .debug_selector(|| "grid-find-bar".to_owned())
+            .test_support()
+            .flex_none()
+            .h(px(m.strip_h()))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .bg(p.raised)
+            .border_b_1()
+            .border_color(p.line)
+            .child(
+                div().w(px(260.)).child(
+                    kit::text_input("grid-search", &search, t("grid.action.searchHint"))
+                        .small()
+                        .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
+                        .cleanable(true),
+                ),
+            );
+        // 查找范围只在真的在查找、且能切到整表时出现：没有可选的另一档就不常驻一个开关。
+        if searching && scope_block.is_none() {
+            bar = bar.child(
+                div().id("grid-find-scope-hint").debug_selector(|| "grid-find-scope-hint".to_owned()).child(
+                    kit::tool_button(
+                        "grid-find-scope",
+                        Some(if find_scope == FindScope::Server { IconName::Database } else { IconName::Rows3 }),
+                        if find_scope == FindScope::Server { t("grid.find.server") } else { t("grid.find.loaded") },
+                        pane_click(entity, "grid-find-scope"),
+                    ),
+                ),
+            );
+        }
+        bar = bar.child(div().flex_1()).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_faint)
+                .child(kit::kbd("Esc", p))
+                .child(t("common.close")),
+        ).child(kit::icon_button("grid-find-close", IconName::X, t("common.close"), {
+            let entity = entity.clone();
+            move |_, _, cx| entity.update(cx, |pane, cx| pane.close_find(cx))
+        }).xsmall());
+        Some(bar.into_any_element())
+    }
+
     /// 中间的状态区：只读标记与一句当前操作的反馈。占住剩余空间、靠右，放不下就截断。
     #[inline(never)]
-    fn render_tools_status(&self, loading: bool, p: &Palette) -> gpui_kit::AnyElement {
+    fn render_tools_status(&self, loading: bool, p: &Palette, entity: &Entity<GridPane>) -> gpui_kit::AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let mut status = div()
@@ -3197,6 +3458,34 @@ impl GridPane {
                     .text_size(px(TypeScale::XS))
                     .text_color(p.accent_text)
                     .child(SharedString::from(summary_txt)),
+            );
+        }
+        // 查询结果（R17）：结构上是单表 SELECT 的给一个可点的“解锁编辑”，代替只读标签；
+        // 正在读主键时说“正在确认…”；其余（联接、聚合、无主键…）保持只读，并把具体原因写在标签旁。
+        if self.session.unlockable() {
+            return status
+                .child(
+                    div().id("grid-unlock-slot").debug_selector(|| "grid-unlock-slot".to_owned()).child(
+                        kit::tool_button("grid-unlock", Some(IconName::LockOpen), t("grid.unlock.action"), pane_click(entity, "grid-unlock")).tooltip(t("grid.unlock.hint")),
+                    ),
+                )
+                .into_any_element();
+        }
+        if !self.session.writable() && self.session.mode == GridMode::Query && !self.session.readonly_reason().is_empty() {
+            let key = self.session.readonly_reason().to_owned();
+            let text = if key == "grid.readonly.locatePending" { t("grid.unlock.checking") } else { t(&key) };
+            status = status.child(
+                div()
+                    .id("grid-readonly-detail")
+                    .debug_selector(|| "grid-readonly-detail".to_owned())
+                    .test_support()
+                    .min_w(px(0.))
+                    .max_w(px(420.))
+                    .truncate()
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_muted)
+                    .tooltip_text(text.clone())
+                    .child(text),
             );
         }
         // 可编辑是默认状态，不挂标签；只读时给一个带锁的小标签，原因放在悬停提示里。
@@ -3889,6 +4178,13 @@ impl GridPane {
     /// 网格自己的 Tab / Shift+Tab：逐格移动选择并让滚动跟过去；
     /// 走到首格或末格时不再拦截，把 Tab 交还给外壳的焦点遍历，键盘用户不会被关在网格里。
     fn step_cell(&mut self, forward: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        // 编辑中按 Tab / Shift+Tab：先像 Enter 一样提交这一格，再移到下一格；类型不符时留在原格报错。
+        if self.edit_target.as_ref().is_some_and(|target| target.cells.is_empty()) {
+            self.finish_edit(cx);
+            if self.edit_target.is_some() {
+                return;
+            }
+        }
         if !self.session.move_tab(forward) {
             cx.propagate();
             return;
@@ -3954,88 +4250,167 @@ impl GridPane {
         Some(strip.into_any_element())
     }
 
-    /// 日期 / 时间格的编辑辅助条：格式提示、实时校验、现在 / 今天 / 前后一天 / 日历 / NULL。
-    /// 只改输入框里的文本，提交仍然是 Enter，取消仍然是 Esc。
+    /// 单元格内编辑器的锚定面板（R7）：画在正在编辑的格子正下方，跟着格子走，不再是底部辅助栏。
+    /// 按列类型族给出：日期/日期时间的日历与“现在/今天”，时间的“现在”，布尔的开关，枚举的下拉；
+    /// 输入与列类型不符时在这里就地报错。普通文本列没有面板，保持格子干净。
+    /// 面板上的动作只改输入框或直接暂存这一格；Enter/Tab 提交、Esc 取消的语义不变。
     #[inline(never)]
-    fn render_temporal_assist(&mut self, p: &Palette, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let kind = self.temporal_edit()?;
+    fn build_edit_panel(&mut self, p: &Palette, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let target = self.edit_target.as_ref().filter(|target| target.cells.is_empty())?.clone();
+        let column = target.column;
+        let family = self.session.column_type(column).map(crate::grid::value_family);
+        let temporal_kind = self.edit_temporal_kind(column);
+        let choices = self.session.column_choices(column).to_vec();
+        let boolean = family == Some(crate::grid::ValueFamily::Bool);
+        let error = self.edit_error.clone();
+        if temporal_kind.is_none() && choices.is_empty() && !boolean && error.is_none() {
+            return None;
+        }
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let current = self.edit_input.read(cx).value().to_string();
-        let parsed = temporal::normalize(kind, &current);
-        let (status_icon, status_color, status_text) = match &parsed {
-            Ok(None) => (IconName::Info, p.text_faint, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.format"), &[("format", kind.format_hint())]))),
-            Ok(Some(normalized)) if normalized == current.trim() => (IconName::CircleCheck, p.ok, SharedString::from(
-                temporal::describe(kind, normalized, locale, chrono::Local::now().naive_local()).unwrap_or_else(|| normalized.clone()),
-            )),
-            Ok(Some(normalized)) => (IconName::CornerDownLeft, p.accent_text, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.willSave"), &[("value", normalized)]))),
-            Err(()) => (IconName::TriangleAlert, p.warn, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.unrecognized"), &[("format", kind.format_hint())]))),
-        };
-        let action = |id: &'static str, label: SharedString| {
+        let pick = |id: SharedString, label: SharedString, value: Option<String>, selected: bool| {
             let owner = entity.clone();
-            kit::tool_button(SharedString::from(format!("grid-temporal-{id}")), None, label, move |_, window, cx| {
-                owner.update(cx, |pane, cx| pane.temporal_action(id, window, cx));
+            let button = kit::tool_button(id, None, label, move |_, _, cx| {
+                let value = value.clone();
+                owner.update(cx, |pane, cx| pane.pick_edit_value(value, cx));
             })
-            .xsmall()
+            .xsmall();
+            if selected { button.selected(true) } else { button }
         };
-        let calendar = (kind != temporal::TemporalKind::Time).then(|| {
-            let state = self.ensure_calendar(window, cx);
-            if let Some(day) = temporal::date_of(kind, &current) {
-                state.update(cx, |calendar, cx| calendar.set_date(day, window, cx));
+        let mut panel = div()
+            .id("grid-edit-panel")
+            .debug_selector(|| "grid-edit-panel".to_owned())
+            .test_support()
+            .occlude()
+            .mt(px(2.))
+            .min_w(px(220.))
+            .max_w(px(360.))
+            .p(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.line)
+            .rounded(px(Radius::CONTROL))
+            .shadow_md();
+        if let Some(error) = error {
+            panel = panel.child(
+                div()
+                    .id("grid-edit-error")
+                    .debug_selector(|| "grid-edit-error".to_owned())
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.danger)
+                    .child(kit::icon(IconName::CircleAlert, 13., p.danger))
+                    .child(div().min_w(px(0.)).child(SharedString::from(error))),
+            );
+        }
+        if !choices.is_empty() {
+            // 枚举：可选值一列排开，点一下就暂存；仍可直接在格子里输入。
+            let mut list = div().id("grid-edit-choices").debug_selector(|| "grid-edit-choices".to_owned()).test_support().flex().flex_col().gap(px(2.));
+            for (index, choice) in choices.iter().enumerate() {
+                list = list.child(pick(SharedString::from(format!("grid-edit-choice-{index}")), SharedString::from(choice.clone()), Some(choice.clone()), *choice == current));
             }
-            gpui_kit::component::popover::Popover::new("grid-temporal-calendar")
-                .anchor(gpui_kit::Anchor::BottomLeft)
-                .trigger(Button::new("grid-temporal-calendar-button").ghost().xsmall().icon(IconName::Calendar).label(t("grid.temporal.calendar")))
-                .content(move |_, _, _| gpui_kit::component::calendar::Calendar::new(&state).small())
-        });
-        let set_null = {
-            let entity = entity.clone();
-            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
-                entity.update(cx, |pane, cx| {
-                    let _ = pane.command("grid-set-null", cx);
-                });
+            panel = panel.child(list);
+        } else if boolean {
+            // 布尔：开 / 关两档，写成 true / false，由各方言的布尔字面量规则落库。
+            let on = matches!(current.trim().to_ascii_lowercase().as_str(), "t" | "true" | "1" | "yes");
+            let off = matches!(current.trim().to_ascii_lowercase().as_str(), "f" | "false" | "0" | "no");
+            panel = panel.child(
+                div()
+                    .id("grid-edit-bool")
+                    .debug_selector(|| "grid-edit-bool".to_owned())
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(pick("grid-edit-true".into(), t("grid.bool.true"), Some("true".to_owned()), on))
+                    .child(pick("grid-edit-false".into(), t("grid.bool.false"), Some("false".to_owned()), off)),
+            );
+        }
+        if let Some(kind) = temporal_kind {
+            let parsed = temporal::normalize(kind, &current);
+            let (status_icon, status_color, status_text) = match &parsed {
+                Ok(None) => (IconName::Info, p.text_faint, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.format"), &[("format", kind.format_hint())]))),
+                Ok(Some(normalized)) if normalized == current.trim() => (IconName::CircleCheck, p.ok, SharedString::from(
+                    temporal::describe(kind, normalized, locale, chrono::Local::now().naive_local()).unwrap_or_else(|| normalized.clone()),
+                )),
+                Ok(Some(normalized)) => (IconName::CornerDownLeft, p.accent_text, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.willSave"), &[("value", normalized)]))),
+                Err(()) => (IconName::TriangleAlert, p.warn, SharedString::from(i18n::fill(&i18n::text(locale, "grid.temporal.unrecognized"), &[("format", kind.format_hint())]))),
+            };
+            if kind != temporal::TemporalKind::Time {
+                // 日历直接画在面板里：选中某天只替换日期部分，时间部分保留，Enter 才提交。
+                let state = self.ensure_calendar(window, cx);
+                if let Some(day) = temporal::date_of(kind, &current) {
+                    state.update(cx, |calendar, cx| calendar.set_date(day, window, cx));
+                }
+                panel = panel.child(
+                    div()
+                        .id("grid-edit-calendar")
+                        .debug_selector(|| "grid-edit-calendar".to_owned())
+                        .test_support()
+                        .child(gpui_kit::component::calendar::Calendar::new(&state).small()),
+                );
             }
-        };
-        Some(
-            div()
-                .id("grid-temporal-assist")
-                .test_support()
-                .flex_none()
-                .px(px(12.))
-                .py(px(6.))
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(6.))
-                .bg(p.raised)
-                .border_t_1()
-                .border_color(p.line)
-                .child(kit::icon(status_icon, 14., status_color))
-                .child(div().flex_1().min_w(px(160.)).truncate().text_size(px(TypeScale::SM)).text_color(status_color).child(status_text))
-                // 只留真正常用的三件事：填当前时间、从日历挑日期、置空。前一天 / 后一天这类微调直接改文本更快。
-                .child(if kind == temporal::TemporalKind::Date {
-                    action("today", t("grid.temporal.today"))
-                } else {
-                    action("now", t("grid.temporal.now"))
+            let action = |id: &'static str, label: SharedString| {
+                let owner = entity.clone();
+                kit::tool_button(SharedString::from(format!("grid-temporal-{id}")), None, label, move |_, window, cx| {
+                    owner.update(cx, |pane, cx| pane.temporal_action(id, window, cx));
                 })
-                .children(calendar)
-                .child(kit::tool_button("grid-temporal-null", None, t("grid.value.null"), set_null).xsmall())
-                .child(kit::vline(p))
+                .xsmall()
+            };
+            panel = panel
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(4.))
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.text_faint)
-                        .child(kit::kbd("Enter", p))
-                        .child(t("common.save"))
-                        .child(div().w(px(4.)))
-                        .child(kit::kbd("Esc", p))
-                        .child(t("common.cancel")),
+                        .gap(px(6.))
+                        .child(kit::icon(status_icon, 13., status_color))
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(status_color).child(status_text)),
                 )
-                .into_any_element(),
-        )
+                .child(div().flex().items_center().gap(px(4.)).child(if kind == temporal::TemporalKind::Date {
+                    action("today", t("grid.temporal.today"))
+                } else {
+                    action("now", t("grid.temporal.now"))
+                }));
+        }
+        // 明确的设值入口：NULL、默认值和空字符串彼此不同，只在适用时出现。
+        let mut values = div().flex().flex_wrap().items_center().gap(px(4.));
+        if self.session.column_nullable(column) {
+            values = values.child(pick("grid-edit-null".into(), t("grid.value.setNull"), None, false));
+        }
+        if self.session.column_has_default(column) {
+            let owner = entity.clone();
+            values = values.child(
+                kit::tool_button("grid-edit-default", None, t("grid.value.setDefault"), move |_, _, cx| {
+                    owner.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-set-default", cx);
+                    });
+                })
+                .xsmall(),
+            );
+        }
+        panel = panel.child(values).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_faint)
+                .child(kit::kbd("Enter", p))
+                .child(t("common.save"))
+                .child(div().w(px(4.)))
+                .child(kit::kbd("Tab", p))
+                .child(div().w(px(4.)))
+                .child(kit::kbd("Esc", p))
+                .child(t("common.cancel")),
+        );
+        Some(panel.into_any_element())
     }
 
     /// 单元格编辑栏；选区设值时说清会写到几格。
@@ -4362,6 +4737,8 @@ struct SheetDelegate {
     /// 正在原位编辑的格子（已读取行下标、逻辑列）；输入框直接画在这一格里。
     editing: Option<(usize, usize)>,
     edit_input: Option<Entity<InputState>>,
+    /// 正在编辑的格子下方的锚定面板（日历、布尔、枚举、就地报错）；由 GridPane 每帧放进来，画一次就取走。
+    edit_panel: Option<gpui_kit::AnyElement>,
     /// 单元格左右内边距：按当前密度发布，正文格与表头格共用同一个值。
     cell_pad: gpui_kit::Edges<Pixels>,
     /// 键盘焦点所在的格子（已读取行下标、逻辑列）：只有键盘刚动过、焦点还在网格里时才画焦点环。
@@ -4453,19 +4830,25 @@ struct SelectionPaint {
     holes: Vec<(usize, usize, usize, usize)>,
 }
 
-/// 表格获得焦点时的快捷键。与快捷键帮助里登记的组合一致。
+/// 表格获得焦点时的快捷键：直接按快捷键注册表（`keymap::SHORTCUTS` 的 table 组）解析，
+/// 帮助面板、菜单上的组合键与这里是同一份。由注册表自己绑定动作的项（如 ⌘F）不在这里处理。
+/// 粘贴只在网格拿到键盘焦点时生效；编辑栏里的 Ctrl/⌘+V 仍由文本输入自己处理。
 fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str> {
-    match (key, secondary, shift) {
-        ("c", true, true) => Some("copy-sql-value"),
-        ("c", true, false) => Some("copy-region"),
-        ("a", true, false) => Some("select-all-cells"),
-        ("z", true, false) => Some("grid-undo"),
-        // 粘贴只在网格拿到键盘焦点时生效；编辑栏里的 Ctrl/⌘+V 仍由文本输入自己处理。
-        ("v", true, false) => Some("grid-paste"),
-        ("delete", false, _) => Some("mark-delete"),
-        ("f2", false, _) => Some("edit-cell"),
-        _ => None,
-    }
+    let mac = cfg!(target_os = "macos");
+    let lead = if secondary { if mac { "cmd-" } else { "ctrl-" } } else { "" };
+    let exact = format!("{lead}{}{key}", if shift { "shift-" } else { "" });
+    // Delete、F2 这类单键不区分 Shift。
+    let loose = (!secondary).then(|| key.to_owned());
+    crate::app::keymap::SHORTCUTS
+        .iter()
+        // Tab 由 GridNextCell/GridPrevCell 动作处理（走到边界要交还外壳），这一行只用于展示。
+        .filter(|shortcut| shortcut.group == "table" && shortcut.bind.is_empty() && shortcut.id != "grid-next-cell")
+        .find(|shortcut| {
+            let strokes = crate::app::keymap::keystrokes(shortcut.chord_for(mac), mac);
+            strokes.iter().any(|stroke| *stroke == exact || loose.as_deref() == Some(stroke.as_str()))
+        })
+        // 条目 id 即网格命令；只有粘贴的登记名与命令名不同。
+        .map(|shortcut| if shortcut.id == "paste-cells" { "grid-paste" } else { shortcut.command.unwrap_or(shortcut.id) })
 }
 
 fn format_stat_num(value: f64) -> String {
@@ -4886,9 +5269,11 @@ impl TableDelegate for SheetDelegate {
         // 真正存着 "NULL" 的字符串是普通文本，NULL 与空字符串各自可辨认。
         let kind = self.cell_kind_at(row_ix, col_ix, cx);
         let null = kind == session::CellKind::Null;
-        // 空字符串显示的是占位标签，不是数据：和 NULL 一样用弱色斜体，
-        // 免得和真的存着这几个字的文本混在一起。
-        let placeholder = null || kind == session::CellKind::Empty;
+        // 占位标签不是数据（R7/R20）：NULL 是弱色斜体；空字符串是更浅、更小的正体“空”（设置可留空）；
+        // 新增行的“默认: …”“自动生成”是弱色正体。四者一眼可分，也不会和真的存着这些字的文本混在一起。
+        let empty = kind == session::CellKind::Empty;
+        let pending = matches!(kind, session::CellKind::Default | session::CellKind::Auto);
+        let placeholder = null || empty || pending;
         let temporal_kind = self.logical(col_ix).and_then(|logical| self.temporal.get(logical).copied().flatten());
         let column_width = self.columns.get(col_ix).map(|column| column.1).unwrap_or(120.);
         let tooltip = match temporal_kind {
@@ -4919,9 +5304,11 @@ impl TableDelegate for SheetDelegate {
         if let (Some(edit), Some(input)) = (self.editing, self.edit_input.as_ref()) {
             if logical.is_some() && edit == (row_ix, column) {
                 // 原位编辑：输入框占满这一格，强调色描边；Enter 写入暂存，Esc 取消。
+                let panel = self.edit_panel.take();
                 return div()
                     .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
                     .debug_selector(move || format!("grid-cell-{row_ix}-{col_ix}"))
+                    .relative()
                     .size_full()
                     .flex()
                     .items_center()
@@ -4941,7 +5328,30 @@ impl TableDelegate for SheetDelegate {
                             }
                         })
                     })
+                    // Tab / Shift+Tab 在输入框里同样落到表格的“下一列/上一列”：在格子这一层接住，
+                    // 先提交这一格（类型不符就留在原格报错），再移到下一格 —— 与 Enter 提交、Esc 取消一致。
+                    .when_some(self.owner.clone(), |this, owner| {
+                        let back = owner.clone();
+                        this.on_action(move |_: &gpui_kit::base::actions::SelectNextColumn, window, cx| {
+                            if let Some(pane) = owner.upgrade() {
+                                pane.update(cx, |pane, cx| pane.step_cell(true, window, cx));
+                            }
+                        })
+                        .on_action(move |_: &gpui_kit::base::actions::SelectPrevColumn, window, cx| {
+                            if let Some(pane) = back.upgrade() {
+                                pane.update(cx, |pane, cx| pane.step_cell(false, window, cx));
+                            }
+                        })
+                    })
                     .child(kit::inline_input("grid-edit-input", input, SharedString::from(i18n::text(self.locale, "shell.shortcuts.editCell"))))
+                    // 面板锚在格子左下角，延后绘制并贴住窗口边缘：不被表格裁掉，也不把行撑高。
+                    .when_some(panel, |this, panel| {
+                        this.child(
+                            div().absolute().top_full().left_0().child(
+                                gpui_kit::deferred(gpui_kit::anchored().snap_to_window_with_margin(px(8.)).child(panel)).with_priority(3),
+                            ),
+                        )
+                    })
                     .test_support()
                     .into_any_element();
             }
@@ -4963,7 +5373,9 @@ impl TableDelegate for SheetDelegate {
                     .when(!row_number, |this| this.pr(px(4.)))
             })
             .when(row_number, |this| this.text_color(p.text_faint))
-            .when(placeholder, |this| this.text_color(p.text_faint).italic())
+            .when(null, |this| this.text_color(p.text_faint).italic())
+            .when(empty, |this| this.text_color(p.text_faint).opacity(0.6).text_size(px(TypeScale::XS)))
+            .when(pending, |this| this.text_color(p.text_faint))
             .when(mark == 3, |this| this.line_through())
             .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
             .when_some(tooltip, |this, tip| this.tooltip_text(tip))
@@ -5248,6 +5660,7 @@ impl GridPane {
                 auto: true,
                 width: 80.0,
                 editable: true,
+                ..GridColumn::default()
             },
             GridColumn {
                 name: "name".into(),
@@ -5258,6 +5671,7 @@ impl GridPane {
                 auto: false,
                 width: 140.0,
                 editable: true,
+                ..GridColumn::default()
             },
         ];
         self.session.load_local(
@@ -5355,6 +5769,7 @@ impl GridPane {
                 auto: false,
                 width: 120.0,
                 editable: true,
+                ..GridColumn::default()
             })
             .collect();
         let grid_rows = rows
@@ -5391,7 +5806,19 @@ mod shortcut_tests {
         assert_eq!(grid_shortcut("z", true, false), Some("grid-undo"));
         assert_eq!(grid_shortcut("delete", false, false), Some("mark-delete"));
         assert_eq!(grid_shortcut("f2", false, false), Some("edit-cell"));
+        assert_eq!(grid_shortcut("v", true, false), Some("grid-paste"));
         assert_eq!(grid_shortcut("c", false, false), None);
+        // R7/R20：设为 NULL / 空字符串 / 恢复默认来自同一张注册表。
+        assert_eq!(grid_shortcut("n", true, true), Some("grid-set-null"));
+        assert_eq!(grid_shortcut("backspace", true, true), Some("grid-set-empty"));
+        assert_eq!(grid_shortcut("d", true, true), Some("grid-set-default"));
+        assert_eq!(grid_shortcut("n", true, false), None);
+        // ⌘F 由注册表绑定成 GridFind 动作，不经按键解析。
+        assert_eq!(grid_shortcut("f", true, false), None);
+        let find = crate::app::keymap::shortcut("grid-find").expect("查找栏快捷键已登记");
+        assert_eq!(find.group, "table");
+        assert_eq!(find.chord_for(true), "Mod+F");
+        assert!(!crate::app::keymap::bindings_of(find, true).is_empty() && !crate::app::keymap::bindings_of(find, false).is_empty());
     }
 
     /// 网格状态、动作和提示用到的文案键必须在字典里真的有这一行：
@@ -5517,6 +5944,190 @@ mod pane_tests {
         });
     }
 
+    /// R10：查找栏默认收起；网格焦点下 ⌘F/Ctrl+F 展开并把光标放进输入框；Esc 收起但关键字保留，
+    /// 工具栏按钮带生效计数徽标；再点按钮重新展开。展开是一条固定高度的横条。
+    #[gpui_kit::test]
+    fn find_bar_is_hidden_until_the_shortcut_and_esc_keeps_an_active_badge(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.request_focus());
+            window.render_frame(cx);
+            assert!(window.try_find("grid-find-bar").is_none(), "查找栏默认不显示");
+            assert!(window.try_find("grid-search").is_none());
+            assert!(window.try_find("grid-find-badge").is_none(), "没有生效条件时没有徽标");
+            window.press("secondary-f", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("grid-find-bar").visible(), "快捷键展开查找栏");
+            let focused = pane.read(cx).search.as_ref().is_some_and(|search| search.read(cx).focus_handle(cx).is_focused(window));
+            assert!(focused, "光标在查找输入框里");
+            window.input("乙", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).loaded_len(), 1, "关键字在已读取行里生效");
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!pane.read(cx).find_open(), "Esc 收起查找栏");
+            assert!(window.try_find("grid-find-bar").is_none());
+            assert_eq!(pane.read(cx).loaded_len(), 1, "收起不清除关键字");
+            assert_eq!(pane.read(cx).active_conditions(), 1);
+            assert!(window.find("grid-find-badge").visible(), "收起但条件仍生效：按钮带徽标");
+            window.click("grid-find-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.find("grid-find-bar").visible(), "点按钮再次展开查看或清除");
+        })
+        .unwrap();
+    }
+
+    /// R7：单元格内编辑器按类型分派。DATETIME 格的日历锚在格子下方；INT 列输入 abc 就地报错、编辑框不关、
+    /// 不进暂存；布尔列在面板上点“是”直接暂存；Tab 提交并移到下一格。
+    #[gpui_kit::test]
+    fn cell_editors_follow_the_column_type_and_reject_bad_numbers_in_place(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("created", "datetime"), ("qty", "integer"), ("flag", "boolean"), ("name", "text")],
+                    vec![vec![Some("1"), Some("2024-03-01 08:00:00"), Some("5"), Some("false"), Some("甲")]],
+                    "id",
+                    cx,
+                );
+                pane.choose_cell(0, 1);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).editing());
+            assert!(window.find("grid-edit-panel").visible(), "日期时间格出现锚定面板");
+            assert!(window.find("grid-edit-calendar").visible(), "面板里是日历");
+        })
+        .unwrap();
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            let cell = visual.debug_bounds("grid-cell-0-2").expect("正在编辑的格子");
+            let panel = visual.debug_bounds("grid-edit-panel").expect("锚定面板");
+            assert!(panel.origin.y >= cell.origin.y + cell.size.height - px(1.), "面板在格子下方：{cell:?} / {panel:?}");
+            assert!((panel.origin.x - cell.origin.x).abs() < px(2.), "面板左边与格子对齐：{cell:?} / {panel:?}");
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            assert!(!pane.read(cx).editing());
+            pane.update(cx, |pane, cx| {
+                pane.choose_cell(0, 2);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("grid-edit-panel").is_none(), "数字列平时没有面板");
+            window.press("secondary-a", cx);
+            window.input("abc", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).editing(), "类型不符时编辑框不关");
+            assert!(window.find("grid-edit-error").visible(), "就地报错");
+            assert!(!pane.read(cx).uncommitted(), "abc 没有暂存");
+            assert_eq!(pane.read(cx).cell(0, 2), "5");
+            window.press("secondary-a", cx);
+            window.input("7", cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 2), "7", "Tab 提交这一格");
+            assert_eq!(pane.read(cx).session.focus_cell(), Some((0, 3)), "并移到下一格");
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).editing(), "布尔格进入编辑：{:?} {}", pane.read(cx).session.focus_cell(), pane.read(cx).notice);
+            assert!(window.find("grid-edit-bool").visible(), "布尔列给出开关");
+            window.click("grid-edit-true", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(!pane.read(cx).editing());
+            assert_eq!(pane.read(cx).cell(0, 3), "true");
+        });
+    }
+
+    /// R17：查询结果默认只读，单表有主键的结果显示“解锁编辑”；点了以后读主键，通过即可编辑并预览 UPDATE。
+    #[gpui_kit::test]
+    fn query_results_unlock_on_request_and_preview_an_update(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services(
+            "unlock",
+            &["CREATE TABLE keyed (id INTEGER PRIMARY KEY, name TEXT)".to_owned(), "INSERT INTO keyed VALUES (1, '甲')".to_owned()],
+        );
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let sheet = query_sheet("-- 备注, 不影响\nSELECT id, name\nFROM keyed", &["id", "name"], vec![vec![Some("1"), Some("甲")]], false);
+                pane.show_query(table_target("keyed"), sheet, cx);
+            });
+            window.render_frame(cx);
+            assert!(!pane.read(cx).writable(), "默认只读");
+            assert!(window.find("grid-unlock").visible(), "单表结果显示解锁编辑");
+            window.click("grid-unlock", cx);
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        while !cx.update(|cx| pane.read(cx).writable()) && started.elapsed() < std::time::Duration::from_secs(5) {
+            cx.run_until_parked();
+            std::thread::park_timeout(std::time::Duration::from_millis(20));
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).writable(), "解锁后可编辑");
+            assert!(window.try_find("grid-unlock").is_none());
+            pane.update(cx, |pane, cx| {
+                pane.choose_cell(0, 1);
+                assert_eq!(pane.edit_focus(Some("乙".into()), cx), Gate::Writable);
+                let sql = pane.preview(cx).expect("预览");
+                assert_eq!(sql.len(), 1);
+                assert!(sql[0].starts_with("UPDATE") && sql[0].contains("'乙'"), "{sql:?}");
+            });
+            // 联接结果仍只读并说明原因，不给解锁入口。
+            pane.update(cx, |pane, cx| {
+                pane.cancel_preview(cx);
+                let sheet = query_sheet("SELECT k.name FROM keyed k JOIN keyed j ON j.id = k.id", &["name"], vec![vec![Some("甲")]], false);
+                pane.show_query(table_target("keyed"), sheet, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("grid-unlock").is_none());
+            assert!(window.find("grid-readonly-detail").visible(), "原因写在标签旁");
+            assert_eq!(pane.read(cx).session.readonly_reason(), "grid.readonly.join");
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[gpui_kit::test]
     fn lazy_cells_follow_the_session_and_hidden_column_mapping(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -5605,10 +6216,10 @@ mod pane_tests {
                 let right = f32::from(b.origin.x + b.size.width);
                 assert!(f32::from(b.origin.x) >= -0.5 && right <= width + 0.5, "{id} 被裁切：{b:?}");
             }
-            // 换行后动作组在搜索框下方：说明是换行而不是被挤出窗口。
-            let search = window.find("grid-search").bounds();
-            let insert = window.find("grid-insert").bounds();
-            assert!(insert.origin.y > search.origin.y, "窄宽度下动作组换到下一行：{search:?} / {insert:?}");
+            // 查找栏默认收起（R10）：工具条上只有查找按钮，它同样完整可见。
+            assert!(window.try_find("grid-search").is_none(), "查找输入框默认不显示");
+            let find = window.find("grid-find-toggle").bounds();
+            assert!(f32::from(find.origin.x) >= -0.5 && f32::from(find.origin.x + find.size.width) <= width + 0.5, "查找按钮被裁切：{find:?}");
         })
         .unwrap();
         // 暂存一处修改后出现未提交修改条：预览按钮在条上，同样完整可见、可点。
@@ -5880,8 +6491,8 @@ mod pane_tests {
             name: "customers".to_owned(),
             kind: "table".to_owned(),
             columns: vec![
-                ColumnDto { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: true, auto: true },
-                ColumnDto { name: "name".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false },
+                ColumnDto { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false, primary: true, unique: true, auto: true, default: None, generated: false, choices: Vec::new() },
+                ColumnDto { name: "name".to_owned(), type_name: "text".to_owned(), nullable: true, primary: false, unique: false, auto: false, default: None, generated: false, choices: Vec::new() },
             ],
             key: vec!["id".to_owned()],
             foreign_keys: None,
@@ -7216,6 +7827,7 @@ mod pane_tests {
             cx.update_window(window, |_, window, cx| {
                 let _ = metrics.publish(cx);
                 plant(&pane, cx);
+                pane.update(cx, |pane, cx| pane.open_find(cx));
                 window.render_frame(cx);
                 let search = window.find("grid-search").bounds();
                 assert!((f32::from(search.size.height) - metrics.control_h).abs() < 0.5, "查找框 {search:?} 应为 {}", metrics.control_h);

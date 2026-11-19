@@ -26,6 +26,10 @@ pub enum CellKind {
     Binary,
     Large,
     Unset,
+    /// 新增行里还没动过、提交时交给数据库默认值的格子（R7）。
+    Default,
+    /// 新增行里由数据库生成的格子：自增或生成列。
+    Auto,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,7 +138,7 @@ pub enum Gate {
     Execution,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GridColumn {
     pub name: String,
     pub type_name: String,
@@ -144,6 +148,12 @@ pub struct GridColumn {
     pub auto: bool,
     pub width: f32,
     pub editable: bool,
+    /// 列默认值原文；没有默认值（或默认 NULL）为 None。新增行据此显示“默认”并在 INSERT 里省略。
+    pub default: Option<String>,
+    /// 生成列：值由数据库算出，新增行显示“自动生成”，不能写。
+    pub generated: bool,
+    /// 枚举列的可选值；单元格编辑器据此给出下拉。
+    pub choices: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -576,6 +586,11 @@ pub struct SharedGrid {
     batches: Vec<(u64, Vec<(usize, Overlay)>)>,
     /// 由"复制为新行"产生的新增行：它们的主键和自增列留空时不写进 INSERT。
     cloned: Vec<String>,
+    /// 空字符串画成弱化提示（默认）还是留空；来自设置 empty_display。
+    empty_hint: bool,
+    /// 新增行里仍交给数据库给值的格子（行 id、列名）：有默认值、自增或生成列，且用户还没动过。
+    /// 它们显示“默认 / 自动生成”，INSERT 里不写；用户改过或明确设为 NULL 后移出，“恢复默认”再放回。
+    pristine: HashSet<(String, String)>,
 }
 
 impl Default for SharedGrid {
@@ -646,7 +661,18 @@ impl SharedGrid {
             frozen: None,
             batches: Vec::new(),
             cloned: Vec::new(),
+            pristine: HashSet::new(),
+            empty_hint: true,
         }
+    }
+
+    /// 返回 true 表示画法真的变了。
+    pub fn set_empty_hint(&mut self, hint: bool) -> bool {
+        std::mem::replace(&mut self.empty_hint, hint) != hint
+    }
+
+    pub fn empty_hint(&self) -> bool {
+        self.empty_hint
     }
 
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
@@ -660,6 +686,7 @@ impl SharedGrid {
         self.overlays.clear();
         self.batches.clear();
         self.cloned.clear();
+        self.pristine.clear();
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
@@ -713,10 +740,10 @@ impl SharedGrid {
         self.sql = sql.to_owned();
         self.token = self.token.saturating_add(1);
         self.schema = None;
-        // 单表 SELECT 只在结构证明成功后短暂只读；联接、聚合或多语句从一开始就说明原因。
+        // 查询结果默认只读（R17）。结构上像单表 SELECT 的给出“解锁编辑”，由用户点按后再读主键；
+        // 联接、聚合等从一开始就说明原因。每个结果页签只看它自己的语句。
         self.readonly_reason = match prove_single_table(&self.target.engine, sql) {
-            // 结构上像单表 SELECT，但唯一键还没读到：原因写清楚，而不是一句"只读"。
-            Ok(_) => "grid.readonly.locatePending".to_owned(),
+            Ok(_) => "grid.readonly.locked".to_owned(),
             Err(reason) => reason.to_owned(),
         };
         self.columns = columns
@@ -738,6 +765,7 @@ impl SharedGrid {
                     auto: false,
                     width: 140.0,
                     editable: false,
+                    ..GridColumn::default()
                 };
                 let probe = GridColumn {
                     type_name: type_abbr(&column.type_name),
@@ -765,6 +793,7 @@ impl SharedGrid {
         self.overlays.clear();
         self.batches.clear();
         self.cloned.clear();
+        self.pristine.clear();
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
@@ -833,6 +862,9 @@ impl SharedGrid {
                 column.primary = origin.primary;
                 column.unique = origin.unique;
                 column.auto = origin.auto;
+                column.default = origin.default.clone();
+                column.generated = origin.generated;
+                column.choices = origin.choices.clone();
             }
             column.editable = editable.iter().any(|item| item == name);
         }
@@ -850,6 +882,39 @@ impl SharedGrid {
         self.readonly_reason.clear();
         self.rows = self.source.clone();
         true
+    }
+
+    /// 查询结果能否点“解锁编辑”：结构证明已通过、还没开始读主键。
+    pub fn unlockable(&self) -> bool {
+        self.mode == GridMode::Query && self.readonly_reason == "grid.readonly.locked"
+    }
+
+    /// 点了“解锁编辑”：再证明一次这条语句（去注释后）是单表 SELECT。通过后进入“正在确认唯一键”，
+    /// 由调用方读结构并交给 finish_locate；不通过则把具体原因留在只读标签旁。
+    pub fn begin_unlock(&mut self, live: bool) -> Result<TableProof, &'static str> {
+        if self.mode != GridMode::Query {
+            return Err("grid.readonly.notSelect");
+        }
+        let proof = match prove_single_table(&self.target.engine, &self.sql) {
+            Ok(proof) => proof,
+            Err(reason) => {
+                self.readonly_reason = reason.to_owned();
+                return Err(reason);
+            }
+        };
+        if !live {
+            self.readonly_reason = "grid.readonly.offline".to_owned();
+            return Err("grid.readonly.offline");
+        }
+        self.readonly_reason = "grid.readonly.locatePending".to_owned();
+        Ok(proof)
+    }
+
+    /// 解锁时读主键失败：回到“可解锁”，原因由界面另行提示。
+    pub fn relock(&mut self) {
+        if self.mode == GridMode::Query && self.readonly_reason == "grid.readonly.locatePending" {
+            self.readonly_reason = "grid.readonly.locked".to_owned();
+        }
     }
 
     pub fn writable(&self) -> bool {
@@ -916,6 +981,7 @@ impl SharedGrid {
             self.overlays.clear();
             self.batches.clear();
             self.cloned.clear();
+            self.pristine.clear();
             // 换了表：隐藏和冻结属于旧表的列，不带到新表上。
             self.hidden.clear();
             self.frozen = None;
@@ -2249,6 +2315,18 @@ impl SharedGrid {
     }
 
     pub fn show_cell(&self, row: usize, column: usize, opened: bool) -> ShownCell {
+        let mut shown = self.show_cell_raw(row, column, opened);
+        // 设置为“留空”时空字符串什么也不画；语义（CellKind::Empty）不变，复制和编辑仍按空字符串处理。
+        if shown.kind == CellKind::Empty && !self.empty_hint {
+            shown.label.clear();
+        }
+        shown
+    }
+
+    fn show_cell_raw(&self, row: usize, column: usize, opened: bool) -> ShownCell {
+        if let Some(shown) = self.pristine_cell(row, column) {
+            return shown;
+        }
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
         // 已经读到原值就显示原值；否则显示预览信封里的片段，并把它标成预览。
         if let Some(Some(text)) = self.full_text_at(row, column) {
@@ -2660,6 +2738,7 @@ impl SharedGrid {
     pub fn cell_label(&self, row: usize, column: usize) -> String {
         if let Some(overlay) = self.overlay_at(row, column).filter(|item| item.kind == "update" && item.gate != Gate::Writable) {
             return match &overlay.value {
+                Some(text) if text.is_empty() && !self.empty_hint => String::new(),
                 Some(text) if text.is_empty() => i18n::text(self.locale, "grid.value.emptyLabel"),
                 Some(text) => text.clone(),
                 None => "NULL".to_owned(),
@@ -2713,7 +2792,11 @@ impl SharedGrid {
 
     /// 当前格子是否真的可写；不可写时给出具体原因。只看结构，不看已存值。
     pub fn write_reason(&self, row: usize, column: usize) -> String {
-        self.gate_text(self.structural_gate(Some(row), column))
+        let gate = self.structural_gate(Some(row), column);
+        if gate == Gate::Readonly && self.column_generated(column) && (self.writable() || self.rows.get(row).is_some_and(|item| item.inserted)) {
+            return i18n::text(self.locale, "grid.readonly.generated");
+        }
+        self.gate_text(gate)
     }
 
     /// 把 Gate 翻成界面文案；可写时为空。
@@ -2760,11 +2843,17 @@ impl SharedGrid {
             return Gate::Readonly;
         };
         let draw_row = display.unwrap_or(usize::MAX);
+        // 生成列由数据库算出：新增行与已有行都不能写。
+        if self.column_generated(column) {
+            return Gate::Readonly;
+        }
         if inserted {
             let message = self.validation_message(column, value.as_deref());
             let gate = if message.is_some() { Gate::Validation } else { Gate::Writable };
             self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
             if gate == Gate::Writable {
+                // 用户动过这一格：之后写进 INSERT 的是这个值（包括明确设成的 NULL），不再交给默认值。
+                self.pristine.remove(&(row_id.to_owned(), column_name.clone()));
                 if let Some(origin) = self.source.iter_mut().find(|item| item.id == row_id) {
                     if let Some(slot) = Arc::make_mut(origin).values.get_mut(column) {
                         *slot = value.clone();
@@ -2841,6 +2930,10 @@ impl SharedGrid {
         self.seq += 1;
         let values = vec![None; self.columns.len()];
         self.source.push(Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
+        // 有默认值、自增或生成的列先交给数据库：显示“默认 / 自动生成”而不是 NULL，INSERT 里不写。
+        for column in self.columns.iter().filter(|column| column.auto || column.generated || column.default.is_some()) {
+            self.pristine.insert((id.clone(), column.name.clone()));
+        }
         self.recompute();
         // 新增行在筛选/查找下可能不在显示快照里，身份必须始终用新行自己的 id，
         // 不能退化成最后一行，否则预览会把别人的行当成新增内容。
@@ -2888,6 +2981,18 @@ impl SharedGrid {
             .iter()
             .find(|item| item.row == row && item.column == column)
             .map(|item| item.message.clone())
+            .unwrap_or_default()
+    }
+
+    /// 按稳定行 id 取这一格被拦下的暂存的原因（界面文案）。
+    pub fn overlay_message_by_id(&self, row_id: &str, column: usize) -> String {
+        let Some(name) = self.columns.get(column).map(|item| item.name.as_str()) else {
+            return String::new();
+        };
+        self.overlays
+            .iter()
+            .find(|item| item.kind == "update" && item.row_id == row_id && item.column_name == name)
+            .map(|item| if item.message.starts_with("grid.") { i18n::text(self.locale, &item.message) } else { item.message.clone() })
             .unwrap_or_default()
     }
 
@@ -3642,7 +3747,7 @@ impl SharedGrid {
     /// 结构上是否允许写这一格：不看已存值，所以预览信封里的旧值仍可被替换。
     fn structural_gate(&self, row: Option<usize>, column: usize) -> Gate {
         if row.is_some_and(|row| self.rows.get(row).is_some_and(|item| item.inserted)) {
-            return Gate::Writable;
+            return if self.column_generated(column) { Gate::Readonly } else { Gate::Writable };
         }
         let query_waiting = self.mode == GridMode::Query && !self.writable() && self.readonly_reason != "grid.status.unlocated";
         if query_waiting || self.schema.as_ref().is_some_and(|schema| schema.kind != "table") {
@@ -3657,6 +3762,9 @@ impl SharedGrid {
         if self.mode == GridMode::Query && self.columns.get(column).is_some_and(|item| !item.editable) {
             return Gate::Readonly;
         }
+        if self.column_generated(column) {
+            return Gate::Readonly;
+        }
         Gate::Writable
     }
 
@@ -3669,10 +3777,32 @@ impl SharedGrid {
 
     /// 暂存前的写回校验和查看/复制/WHERE/导出/commit 用同一个上限：
     /// 上限来自读出这份行列时的 preview_kb，协议形状但确实没被截断的文本因此还能保存。
+    /// 编辑框提交前的类型检查：与暂存校验同一套规则，给出不能暂存的原因。
+    pub fn edit_problem(&self, column: usize, value: Option<&str>) -> Option<String> {
+        self.validation_message(column, value)
+    }
+
     fn validation_message(&self, column: usize, value: Option<&str>) -> Option<String> {
         let schema = self.schema.as_ref()?;
         let name = self.columns.get(column)?.name.as_str();
         let origin = schema.columns.iter().find(|item| item.name == name)?;
+        // 网格编辑里的数字列只收数字（R7）：`abc` 在暂存前就拦下，不等数据库报错。
+        // 只管这里的用户输入；对比、迁移等读出来的原值仍按原样生成字面量。
+        if let Some(text) = value {
+            let family = value_family(&origin.type_name);
+            if family == ValueFamily::Integer && !crate::grid::integer_text(text) {
+                return Some(i18n::fill(
+                    &i18n::text(self.locale, "grid.numeric.invalid"),
+                    &[("value", text.trim()), ("kind", &i18n::text(self.locale, "grid.numeric.integer"))],
+                ));
+            }
+            if matches!(family, ValueFamily::Decimal | ValueFamily::Float) && !crate::grid::decimal_text(text) {
+                return Some(i18n::fill(
+                    &i18n::text(self.locale, "grid.numeric.invalid"),
+                    &[("value", text.trim()), ("kind", &i18n::text(self.locale, "grid.numeric.number"))],
+                ));
+            }
+        }
         crate::grid::reject_literal_with(origin, &cell_of(value.map(str::to_owned)), false, self.sheet_preview_bytes)
     }
 
@@ -3703,6 +3833,9 @@ impl SharedGrid {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, column)| {
+                            if self.pristine_value(&row.id, column) {
+                                return None;
+                            }
                             let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
                             if value.is_none() && self.unassigned(&row.id, column) {
                                 return None;
@@ -3733,6 +3866,9 @@ impl SharedGrid {
             .iter()
             .enumerate()
             .filter_map(|(index, column)| {
+                if self.pristine_value(&row.id, column) {
+                    return None;
+                }
                 let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
                 if value.is_none() && self.unassigned(&row.id, column) {
                     return None;
@@ -3745,7 +3881,116 @@ impl SharedGrid {
     /// 新增行里留空就不写进 INSERT 的列：自增列总是如此；"复制为新行"的主键列也一样，
     /// 由数据库给值或报错，而不是显式写一个 NULL 主键。
     fn unassigned(&self, row_id: &str, column: &GridColumn) -> bool {
-        column.auto || (column.primary && self.cloned.iter().any(|item| item == row_id))
+        column.auto || column.generated || (column.primary && self.cloned.iter().any(|item| item == row_id))
+    }
+
+    /// 新增行的这一格仍交给数据库给值：生成列永远如此；默认值/自增列在用户没有改过（也没有批量设值）时如此。
+    fn pristine_value(&self, row_id: &str, column: &GridColumn) -> bool {
+        if column.generated {
+            return true;
+        }
+        self.pristine.contains(&(row_id.to_owned(), column.name.clone()))
+            && !self.overlays.iter().any(|item| item.kind == "update" && item.gate == Gate::Writable && item.row_id == row_id && item.column_name == column.name)
+    }
+
+    /// 新增行里交给数据库的格子怎么画：自增与生成列是“自动生成”，有默认值的是“默认: 表达式”。
+    fn pristine_cell(&self, row: usize, column: usize) -> Option<ShownCell> {
+        let item = self.rows.get(row).filter(|item| item.inserted)?;
+        let origin = self.columns.get(column)?;
+        if !self.pristine_value(&item.id, origin) {
+            return None;
+        }
+        if origin.auto || origin.generated {
+            return Some(ShownCell { kind: CellKind::Auto, label: i18n::text(self.locale, "grid.value.autoLabel"), body: String::new(), preview: false });
+        }
+        let shown = self.default_text(origin).unwrap_or_default();
+        Some(ShownCell {
+            kind: CellKind::Default,
+            label: i18n::fill(&i18n::text(self.locale, "grid.value.defaultLabel"), &[("value", &shown)]),
+            body: String::new(),
+            preview: false,
+        })
+    }
+
+    /// 列默认值的四态（由适配器的类型规则解析原文）。没有结构或没有默认值时为 None 态。
+    fn default_spec(&self, column: &GridColumn) -> crate::ddl::DefaultSpec {
+        let Some(engine) = self.schema.as_ref().map(|schema| schema.engine).or_else(|| Engine::parse(&self.target.engine).ok()) else {
+            return crate::ddl::DefaultSpec::None;
+        };
+        crate::ddl::sql::existing_default(engine, column.default.as_deref())
+    }
+
+    /// 默认值给人看的写法：字面量写值本身，表达式原样。
+    pub fn default_text(&self, column: &GridColumn) -> Option<String> {
+        match self.default_spec(column) {
+            crate::ddl::DefaultSpec::Literal(value) => Some(value),
+            crate::ddl::DefaultSpec::Expression(text) => Some(text),
+            crate::ddl::DefaultSpec::Null => Some("NULL".to_owned()),
+            crate::ddl::DefaultSpec::None => None,
+        }
+    }
+
+    /// 这一列能不能“恢复默认”：有默认值、自增或生成列。
+    pub fn column_has_default(&self, column: usize) -> bool {
+        self.columns.get(column).is_some_and(|item| item.auto || item.generated || item.default.is_some())
+    }
+
+    /// 生成列不能写：新增与修改都由数据库算出。
+    pub fn column_generated(&self, column: usize) -> bool {
+        self.columns.get(column).is_some_and(|item| item.generated)
+    }
+
+    /// 枚举列的可选值（来自适配器读到的结构）。
+    pub fn column_choices(&self, column: usize) -> &[String] {
+        self.columns.get(column).map(|item| item.choices.as_slice()).unwrap_or(&[])
+    }
+
+    /// 这一列是否可为 NULL（查询结果没有结构时按可空处理）。
+    pub fn column_nullable(&self, column: usize) -> bool {
+        self.columns.get(column).is_none_or(|item| item.nullable)
+    }
+
+    /// 这一格是不是新增行里仍交给数据库给值的格子；编辑时据此把“没改动”当作保持默认。
+    pub fn cell_pristine(&self, row_id: &str, column: usize) -> bool {
+        let Some(origin) = self.columns.get(column) else {
+            return false;
+        };
+        self.any_row(row_id).is_some_and(|row| row.inserted) && self.pristine_value(row_id, origin)
+    }
+
+    /// 把一格恢复为默认值（R7）。新增行：交还给数据库默认值/自增，INSERT 不写这一列。
+    /// 已有行：字面量默认值与默认 NULL 按普通修改暂存；表达式默认值（CURRENT_TIMESTAMP 等）只能在新增行使用。
+    /// 失败时返回界面文案键。
+    pub fn stage_default_by_id(&mut self, row_id: &str, column: usize) -> Result<Gate, &'static str> {
+        let Some(origin) = self.columns.get(column).cloned() else {
+            return Err("grid.default.none");
+        };
+        let Some(inserted) = self.any_row(row_id).map(|row| row.inserted) else {
+            return Err("grid.default.none");
+        };
+        if inserted {
+            if !(origin.auto || origin.generated || origin.default.is_some()) {
+                return Err("grid.default.none");
+            }
+            self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == origin.name));
+            for slot in self.source.iter_mut().chain(self.rows.iter_mut()).filter(|item| item.id == row_id) {
+                if let Some(value) = Arc::make_mut(slot).values.get_mut(column) {
+                    *value = None;
+                }
+            }
+            self.pristine.insert((row_id.to_owned(), origin.name.clone()));
+            self.close_preview();
+            return Ok(Gate::Writable);
+        }
+        if origin.generated {
+            return Err("grid.readonly.generated");
+        }
+        match self.default_spec(&origin) {
+            crate::ddl::DefaultSpec::Literal(value) => Ok(self.stage_text_by_id(row_id, column, Some(value))),
+            crate::ddl::DefaultSpec::Null => Ok(self.stage_text_by_id(row_id, column, None)),
+            crate::ddl::DefaultSpec::Expression(_) => Err("grid.default.expression"),
+            crate::ddl::DefaultSpec::None => Err("grid.default.none"),
+        }
     }
 
     fn writable_overlay(&self, row_id: &str, column_name: &str) -> Option<Option<String>> {
@@ -3979,6 +4224,9 @@ impl SharedGrid {
             if origin.primary || origin.auto {
                 return Err(BatchReject::KeyColumn(origin.name.clone()));
             }
+            if origin.generated {
+                return Err(BatchReject::Blocked { column: origin.name.clone(), reason: i18n::text(self.locale, "grid.readonly.generated") });
+            }
             if !origin.editable {
                 return Err(BatchReject::Blocked { column: origin.name.clone(), reason: self.gate_text(Gate::Readonly) });
             }
@@ -4098,7 +4346,7 @@ impl SharedGrid {
         };
         let mut values = Vec::with_capacity(self.columns.len());
         for (column, origin) in self.columns.iter().enumerate() {
-            if origin.primary || origin.auto {
+            if origin.primary || origin.auto || origin.generated {
                 values.push(None);
                 continue;
             }
@@ -4555,7 +4803,14 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
     if report.refusal.is_some() {
         return Err("grid.readonly.unparsed");
     }
-    let pieces = report.pieces.into_iter().map(|piece| piece.text.trim().to_owned()).filter(|text| !text.is_empty()).collect::<Vec<_>>();
+    // 证明只看代码：注释（行尾 `-- a, b`、`/* (x) */`）里的逗号、括号和关键字不算，
+    // 换行与多个空白折成一个空格，`SELECT id\nFROM t` 与单行写法同样能证明。
+    let pieces = report
+        .pieces
+        .into_iter()
+        .map(|piece| crate::query::strip_sql_comments(engine, &piece.text).split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
     if pieces.len() != 1 {
         return Err("grid.readonly.multiStatement");
     }
@@ -4664,6 +4919,9 @@ fn column_from_dto(column: &ColumnDto) -> Column {
         primary: column.primary,
         unique: column.unique,
         auto: column.auto,
+        default: column.default.clone(),
+        generated: column.generated,
+        choices: column.choices.clone(),
     }
 }
 
@@ -4680,6 +4938,9 @@ pub fn columns_from_schema(schema: &TableSchema, editable: bool) -> Vec<GridColu
             auto: column.auto,
             width: 140.0,
             editable: editable && schema.kind == "table",
+            default: column.default.clone(),
+            generated: column.generated,
+            choices: column.choices.clone(),
         })
         .collect()
 }
@@ -4699,7 +4960,7 @@ pub fn rows_from_page(columns: &[GridColumn], page: &PageDto) -> Vec<GridRow> {
 
 #[allow(dead_code)]
 pub fn column_of(name: &str, type_name: &str, primary: bool) -> Column {
-    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto: primary }
+    Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto: primary, ..Column::default() }
 }
 
 #[allow(dead_code)]
@@ -4890,6 +5151,9 @@ fn domain_column(column: &GridColumn) -> Column {
         primary: column.primary,
         unique: column.unique,
         auto: column.auto,
+        default: column.default.clone(),
+        generated: column.generated,
+        choices: column.choices.clone(),
     }
 }
 
@@ -4937,6 +5201,7 @@ mod tests {
             auto: name == "id",
             width: 120.0,
             editable: true,
+            ..GridColumn::default()
         }
     }
 
@@ -5473,7 +5738,7 @@ mod tests {
         bad.load_local(
             vec![
                 text_column("id"),
-                GridColumn { name: "blob".into(), type_name: "blob".into(), nullable: true, primary: false, unique: false, auto: false, width: 80.0, editable: true },
+                GridColumn { name: "blob".into(), type_name: "blob".into(), nullable: true, primary: false, unique: false, auto: false, width: 80.0, editable: true, ..GridColumn::default() },
             ],
             vec![row("1", vec![Some("1"), Some("abcd")], true)],
             Some(1),
@@ -5977,7 +6242,7 @@ mod tests {
         grid.load_local(
             vec![
                 text_column("id"),
-                GridColumn { name: "payload".into(), type_name: "blob".into(), nullable: true, primary: false, unique: false, auto: false, width: 80.0, editable: true },
+                GridColumn { name: "payload".into(), type_name: "blob".into(), nullable: true, primary: false, unique: false, auto: false, width: 80.0, editable: true, ..GridColumn::default() },
             ],
             vec![row("1", vec![Some("1"), Some("abcd")], true)],
             Some(1),
@@ -6803,13 +7068,181 @@ mod tests {
                 assert_ne!(i18n::text(locale, reason), reason, "{reason} 缺少文案");
             }
         }
-        // 单表 SELECT 在确认唯一键前给出专门原因，而不是笼统的"只读"。
+        // 单表 SELECT 默认只读并可以“解锁编辑”（R17）；点了以后在确认唯一键前给出专门原因，而不是笼统的"只读"。
         let mut pending = SharedGrid::new();
         pending.target.engine = "sqlite".into();
         pending.target.connection_id = "notes".into();
         pending.show_query_sheet("select name from keyed", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        assert_eq!(pending.readonly_reason(), "grid.readonly.locked");
+        assert!(pending.unlockable());
+        assert_eq!(pending.begin_unlock(false), Err("grid.readonly.offline"), "连接没打开时说明原因");
+        pending.show_query_sheet("select name from keyed", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        assert!(pending.begin_unlock(true).is_ok());
         assert_eq!(pending.readonly_reason(), "grid.readonly.locatePending");
+        assert!(!pending.unlockable(), "正在确认时不再给第二个解锁入口");
+        pending.relock();
+        assert!(pending.unlockable(), "读主键失败后可以再试");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn defaults_schema() -> TableSchema {
+        let col = |name: &str, type_name: &str, nullable: bool| Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, ..Column::default() };
+        let columns = vec![
+            Column { primary: true, unique: true, auto: true, ..col("id", "bigint", false) },
+            Column { default: Some("CURRENT_TIMESTAMP".to_owned()), ..col("created_time", "datetime", false) },
+            Column { default: Some("active".to_owned()), ..col("status", "varchar(20)", false) },
+            col("note", "varchar(200)", true),
+            col("qty", "int", true),
+            Column { generated: true, ..col("total", "int", true) },
+            Column { choices: vec!["draft".to_owned(), "done".to_owned()], ..col("state", "enum('draft','done')", true) },
+        ];
+        schema_from_parts("mysql", "shop", "orders", "table", columns, vec!["id".to_owned()]).unwrap()
+    }
+
+    fn defaults_grid(rows: Vec<GridRow>) -> SharedGrid {
+        let schema = defaults_schema();
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "mysql".into();
+        grid.target.connection_id = "shop".into();
+        grid.target.database = "shop".into();
+        grid.target.table = "orders".into();
+        let count = rows.len() as i64;
+        grid.load_local(columns_from_schema(&schema, true), rows, Some(count), Some(schema));
+        grid
+    }
+
+    fn insert_statement(grid: &mut SharedGrid) -> String {
+        let sql = grid.open_preview().expect("有可预览的新增行");
+        grid.close_preview();
+        sql.into_iter().find(|statement| statement.starts_with("INSERT")).expect("INSERT 语句")
+    }
+
+    /// R7：新增行里有默认值的列显示“默认”、自增与生成列显示“自动生成”，提交的 INSERT 不写这些没动过的列；
+    /// 改过、明确设为 NULL 的列照写；“恢复默认”再交还给数据库。INT 列输入 abc 就地报错、不进 INSERT。
+    #[test]
+    fn new_rows_leave_defaults_auto_and_generated_columns_to_the_database() {
+        let mut grid = defaults_grid(Vec::new());
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        let (id, created, status, note, qty, total) = (0, 1, 2, 3, 4, 5);
+        assert_eq!(grid.cell_kind_at(0, id), CellKind::Auto);
+        assert_eq!(grid.cell_label(0, id), i18n::text(Locale::ZhCn, "grid.value.autoLabel"));
+        assert_eq!(grid.cell_kind_at(0, created), CellKind::Default);
+        assert_eq!(grid.cell_label(0, created), "默认: CURRENT_TIMESTAMP");
+        assert_eq!(grid.cell_label(0, status), "默认: active");
+        assert_eq!(grid.cell_kind_at(0, total), CellKind::Auto, "生成列由数据库算出");
+        assert_eq!(grid.cell_kind_at(0, note), CellKind::Null, "没有默认值的可空列是 NULL");
+        let sql = insert_statement(&mut grid);
+        for column in ["id", "created_time", "status", "total"] {
+            assert!(!sql.contains(column), "INSERT 不应写 {column}：{sql}");
+        }
+        assert!(sql.contains("note"), "{sql}");
+
+        // INT 列输入 abc：就地给出类型错误，不进入暂存（INSERT 不变）。
+        let row_id = grid.row_id(0).unwrap().to_owned();
+        let problem = grid.edit_problem(qty, Some("abc")).expect("abc 不是整数");
+        assert!(problem.contains("abc"), "{problem}");
+        assert_eq!(grid.stage_text_by_id(&row_id, qty, Some("abc".into())), Gate::Validation);
+        assert!(!insert_statement(&mut grid).contains("abc"));
+        assert_eq!(grid.stage_text_by_id(&row_id, qty, Some("12".into())), Gate::Writable);
+        assert!(insert_statement(&mut grid).contains("12"));
+
+        // 改过的默认列照写；恢复默认后再次交给数据库。
+        assert_eq!(grid.stage_text_by_id(&row_id, status, Some("vip".into())), Gate::Writable);
+        assert_eq!(grid.cell_kind_at(0, status), CellKind::Text);
+        assert!(insert_statement(&mut grid).contains("'vip'"));
+        assert_eq!(grid.stage_default_by_id(&row_id, status), Ok(Gate::Writable));
+        assert_eq!(grid.cell_kind_at(0, status), CellKind::Default);
+        assert!(!insert_statement(&mut grid).contains("status"));
+
+        // 明确设为 NULL 是用户的选择：写进 INSERT，而不是悄悄换回默认值。
+        assert_eq!(grid.stage_text_by_id(&row_id, created, None), Gate::Writable);
+        assert_eq!(grid.cell_kind_at(0, created), CellKind::Null);
+        assert!(insert_statement(&mut grid).contains("created_time"));
+
+        // 生成列不能写，原因具体。
+        assert_eq!(grid.stage_text_by_id(&row_id, total, Some("1".into())), Gate::Readonly);
+        assert_eq!(grid.write_reason(0, total), i18n::text(Locale::ZhCn, "grid.readonly.generated"));
+        assert_eq!(grid.column_choices(6), ["draft".to_owned(), "done".to_owned()]);
+    }
+
+    /// R7：已有行“恢复默认”——字面量默认值按普通修改暂存；表达式默认值只能在新增行交给数据库，说明原因。
+    #[test]
+    fn restoring_a_default_on_an_existing_row_stages_literals_and_explains_expressions() {
+        let values = vec![Some("1"), Some("2024-01-01 00:00:00"), Some("vip"), None, Some("3"), Some("9"), Some("done")];
+        let mut grid = defaults_grid(vec![row("1", values, true)]);
+        assert!(grid.writable());
+        assert_eq!(grid.stage_default_by_id("1", 2), Ok(Gate::Writable));
+        assert_eq!(grid.cell_label(0, 2), "active");
+        assert_eq!(grid.stage_default_by_id("1", 1), Err("grid.default.expression"));
+        assert_eq!(grid.stage_default_by_id("1", 3), Err("grid.default.none"));
+        assert_eq!(grid.stage_default_by_id("1", 5), Err("grid.readonly.generated"));
+        assert_eq!(grid.stage_text(0, 5, Some("1".into())), Gate::Readonly, "生成列在已有行上同样不能改");
+    }
+
+    /// R20：空字符串与 NULL 分开分类；设置为留空时只是不画提示，复制仍是空文本，编辑框为空；清空提交是空字符串。
+    #[test]
+    fn empty_strings_stay_distinct_from_null_in_display_copy_and_edit() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("")], true), row("2", vec![Some("2"), None], true)],
+            Some(2),
+            Some(schema()),
+        );
+        assert_eq!(grid.cell_kind_at(0, 1), CellKind::Empty);
+        assert_eq!(grid.cell_kind_at(1, 1), CellKind::Null);
+        assert_eq!(grid.cell_label(0, 1), i18n::text(Locale::ZhCn, "grid.value.emptyLabel"));
+        assert_ne!(grid.cell_label(0, 1), grid.cell_label(1, 1));
+        assert!(grid.set_empty_hint(false));
+        assert_eq!(grid.cell_label(0, 1), "", "设置为留空");
+        assert_eq!(grid.cell_kind_at(0, 1), CellKind::Empty, "留空只改画法，不改语义");
+        grid.select(0, 1, false);
+        assert_eq!(grid.copy_cell(), "", "复制空字符串得到空文本");
+        assert_eq!(grid.edit_text(0, 1), "", "编辑空字符串时输入框为空");
+        assert_eq!(grid.raw_value(0, 1), Some(Some(String::new())), "原值是空字符串，不是 NULL");
+        assert_eq!(grid.stage_text(0, 1, Some("abc".into())), Gate::Writable);
+        assert_eq!(grid.cell_label(0, 1), "abc");
+        assert_eq!(grid.stage_text(1, 1, Some(String::new())), Gate::Writable, "清空提交为空字符串");
+        assert_eq!(grid.cell_kind_at(1, 1), CellKind::Empty);
+    }
+
+    /// R17 复现：带注释的单条 SELECT 曾被判成多表、括号或不是 SELECT（注释里的逗号、括号、换行后的 FROM），
+    /// 结果只读且没有解锁入口。切分本身给出一条语句；证明改为只看去掉注释、折叠空白后的代码。
+    #[test]
+    fn commented_single_selects_prove_as_one_table_and_joins_stay_readonly() {
+        for engine in ["mysql", "postgres", "sqlite", "sqlserver"] {
+            for sql in [
+                "SELECT * FROM orders -- a, b",
+                "SELECT * FROM orders\n-- trailing (comment)",
+                "SELECT id, name -- the name; really\nFROM orders",
+                "/* list (all) */ SELECT * FROM orders WHERE id > 1",
+                "-- 订单\nSELECT id,\n       name\nFROM orders\nWHERE id = 1;",
+            ] {
+                let report = crate::query::split_sql(engine, sql);
+                assert_eq!(report.pieces.len(), 1, "{engine}: {sql:?} 应当是一条语句");
+                let proof = prove_single_table(engine, sql).unwrap_or_else(|reason| panic!("{engine}: {sql:?} -> {reason}"));
+                assert_eq!(proof.table, "orders", "{engine}: {sql:?}");
+            }
+            // 注释不能把真正的联接、聚合藏起来，也不能把多语句并成一条。
+            assert_eq!(prove_single_table(engine, "SELECT * FROM a -- note\nJOIN b ON a.id = b.id"), Err("grid.readonly.join"));
+            assert_eq!(prove_single_table(engine, "SELECT * FROM a; -- x\nSELECT * FROM b"), Err("grid.readonly.multiStatement"));
+        }
+        // 多语句脚本里每个结果页签只拿到它自己的语句：两条单表 SELECT 各自可以解锁，JOIN 那页保持只读并说明原因。
+        let script = "-- 第一段\nSELECT * FROM orders;\n/* 第二段 */ SELECT * FROM items;\nSELECT * FROM orders o JOIN items i ON i.order_id = o.id";
+        let pieces = crate::query::split_sql("mysql", script).pieces;
+        assert_eq!(pieces.len(), 3);
+        let unlockable = pieces
+            .iter()
+            .map(|piece| {
+                let mut grid = SharedGrid::new();
+                grid.target.engine = "mysql".into();
+                grid.show_query_sheet(&piece.text, vec!["id".into()], vec![vec![Some("1".into())]], false, Some(1));
+                (grid.unlockable(), grid.readonly_reason().to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unlockable[0], (true, "grid.readonly.locked".to_owned()));
+        assert_eq!(unlockable[1], (true, "grid.readonly.locked".to_owned()));
+        assert_eq!(unlockable[2], (false, "grid.readonly.join".to_owned()));
     }
 
     #[tokio::test]
@@ -6914,7 +7347,7 @@ mod batch_tests {
     use super::*;
 
     fn column(name: &str, type_name: &str, primary: bool, auto: bool) -> GridColumn {
-        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto, width: 120.0, editable: true }
+        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto, width: 120.0, editable: true, ..GridColumn::default() }
     }
 
     fn people_schema(engine: &str, note_type: &str) -> TableSchema {
@@ -7413,7 +7846,7 @@ mod width_estimate_tests {
     use super::*;
 
     fn column(name: &str, type_name: &str, primary: bool) -> GridColumn {
-        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary, unique: false, auto: false, width: 140.0, editable: false }
+        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary, unique: false, auto: false, width: 140.0, editable: false, ..GridColumn::default() }
     }
 
     /// 首屏估宽：短数字列收窄，邮箱/时间戳放得下，超长文本封顶，NULL 按字面宽度算。

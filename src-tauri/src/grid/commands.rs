@@ -141,6 +141,11 @@ pub struct ColumnDto {
     pub primary: bool,
     pub unique: bool,
     pub auto: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    pub generated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]

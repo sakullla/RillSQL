@@ -116,6 +116,14 @@ pub struct SettingsForm {
     pub null_copy: String,
     pub query_timeout_sec: i64,
     pub auto_check_updates: bool,
+    pub empty_display: String,
+}
+
+/// 空字符串的两种画法：弱化提示（默认）或留空。
+pub const EMPTY_DISPLAYS: &[&str] = &["hint", "blank"];
+
+pub fn normalize_empty_display(value: &str) -> &'static str {
+    if value == "blank" { "blank" } else { "hint" }
 }
 
 impl Default for SettingsForm {
@@ -139,6 +147,7 @@ impl SettingsForm {
             null_copy: normalize_null(&settings.null_copy).to_owned(),
             query_timeout_sec: settings.query_timeout_sec.max(0),
             auto_check_updates: settings.auto_check_updates,
+            empty_display: normalize_empty_display(&settings.empty_display).to_owned(),
         }
     }
 
@@ -156,6 +165,7 @@ impl SettingsForm {
             null_copy: normalize_null(&self.null_copy).to_owned(),
             query_timeout_sec: self.query_timeout_sec.max(0),
             auto_check_updates: self.auto_check_updates,
+            empty_display: normalize_empty_display(&self.empty_display).to_owned(),
         }
     }
 
@@ -173,6 +183,7 @@ impl SettingsForm {
             null_copy: form.null_copy,
             query_timeout_sec: form.query_timeout_sec,
             auto_check_updates: form.auto_check_updates,
+            empty_display: form.empty_display,
         }
     }
 
@@ -405,6 +416,22 @@ mod tests {
         assert!(!serde_json::to_string(&settings).unwrap().contains("password"));
     }
 
+    /// R20：空字符串显示设置默认是弱化提示，可改为留空；旧状态文件没有这一项时取默认，非法值归一。
+    #[test]
+    fn empty_display_defaults_to_a_hint_and_survives_old_state_files() {
+        assert_eq!(ShellSettings::default().empty_display, "hint");
+        let old: ShellSettings = serde_json::from_str(
+            r#"{"theme":"system","density":"compact","editorFont":13,"editorTheme":"auto","locale":"zh-CN","pageSize":100,"previewKb":1,"objectPage":500,"nullCopy":"NULL","queryTimeoutSec":0,"autoCheckUpdates":true}"#,
+        )
+        .expect("旧文件仍能读入");
+        assert_eq!(old.empty_display, "hint");
+        let mut form = SettingsForm::from_settings(&old);
+        form.empty_display = "blank".into();
+        assert_eq!(form.to_settings().empty_display, "blank");
+        form.empty_display = "bogus".into();
+        assert_eq!(form.to_settings().empty_display, "hint");
+    }
+
     #[test]
     fn every_field_moves_both_ways_and_illegal_stored_values_normalize() {
         let illegal = ShellSettings {
@@ -419,6 +446,7 @@ mod tests {
             null_copy: "bogus".into(),
             query_timeout_sec: -5,
             auto_check_updates: true,
+            empty_display: "hint".into(),
         };
         let mut form = SettingsForm::from_settings(&illegal);
         assert_eq!(form.theme, "system");

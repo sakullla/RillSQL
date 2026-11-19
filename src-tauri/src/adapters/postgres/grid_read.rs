@@ -190,6 +190,23 @@ async fn describe_postgres(client: &tokio_postgres::Client, schema: &str, table:
         }
     }
     let key = if !pk.is_empty() { pk.clone() } else { groups.first().map(|group| group.1.clone()).unwrap_or_default() };
+    // 生成列与枚举值各读一次：information_schema.columns.is_generated 在没有生成列的旧版本里恒为 NEVER，
+    // 不需要按服务器版本分支；枚举值来自 pg_enum，按定义顺序。
+    let generated_rows = client
+        .query(
+            "SELECT column_name::text FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND is_generated = 'ALWAYS'",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(db_err)?;
+    let generated_names = generated_rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+    let enum_rows = client
+        .query(
+            "SELECT a.attname, e.enumlabel::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_enum e ON e.enumtypid = a.atttypid WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum, e.enumsortorder",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(db_err)?;
     let mut columns = Vec::new();
     for row in &columns_rows {
         let name: String = row.get(0);
@@ -197,10 +214,48 @@ async fn describe_postgres(client: &tokio_postgres::Client, schema: &str, table:
         let not_null: bool = row.get(2);
         let identity: String = row.get(3);
         let default: Option<String> = row.get(4);
-        let auto = identity == "a" || identity == "d" || default.as_deref().unwrap_or("").starts_with("nextval(");
+        let generated = generated_names.iter().any(|item| item == &name);
+        let (auto, default) = column_traits(&identity, default.as_deref(), generated);
+        let choices = enum_rows.iter().filter(|item| item.get::<_, String>(0) == name).map(|item| item.get::<_, String>(1)).collect();
         let primary = pk.iter().any(|item| item == &name);
         let unique = primary || groups.iter().any(|group| group.1.len() == 1 && group.1[0] == name);
-        columns.push(Column { name, type_name, nullable: !not_null, primary, unique, auto });
+        columns.push(Column { name, type_name, nullable: !not_null, primary, unique, auto, default, generated, choices });
     }
     Ok(TableSchema { engine: Engine::Postgres, schema: schema.to_owned(), name: table.to_owned(), kind, columns, key })
+}
+
+/// 网格列的自增与默认值（R7）：标识列和 nextval 默认是自增，不再另记默认值；生成列的表达式不是默认值；
+/// 默认 NULL（含 `NULL::type`）与没有默认值一样记为 None。
+pub(crate) fn column_traits(identity: &str, raw_default: Option<&str>, generated: bool) -> (bool, Option<String>) {
+    let auto = identity == "a" || identity == "d" || raw_default.unwrap_or("").starts_with("nextval(");
+    if auto || generated {
+        return (auto, None);
+    }
+    let default = raw_default
+        .filter(|raw| {
+            !matches!(
+                crate::ddl::sql::existing_default(Engine::Postgres, Some(raw)),
+                crate::ddl::DefaultSpec::None | crate::ddl::DefaultSpec::Null
+            )
+        })
+        .map(str::to_owned);
+    (false, default)
+}
+
+#[cfg(test)]
+mod column_trait_tests {
+    use super::column_traits;
+
+    #[test]
+    fn describe_keeps_defaults_and_marks_identity_and_generated_columns() {
+        assert_eq!(column_traits("", Some("CURRENT_TIMESTAMP"), false), (false, Some("CURRENT_TIMESTAMP".to_owned())));
+        assert_eq!(column_traits("", Some("'active'::character varying"), false), (false, Some("'active'::character varying".to_owned())));
+        assert_eq!(column_traits("", Some("nextval('orders_id_seq'::regclass)"), false), (true, None));
+        assert_eq!(column_traits("a", None, false), (true, None));
+        assert_eq!(column_traits("d", None, false), (true, None));
+        assert_eq!(column_traits("", Some("NULL::text"), false), (false, None));
+        assert_eq!(column_traits("", None, false), (false, None));
+        // 生成列：pg_attrdef 里存的是生成表达式，不是默认值。
+        assert_eq!(column_traits("", Some("(price * qty)"), true), (false, None));
+    }
 }

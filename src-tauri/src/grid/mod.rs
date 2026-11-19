@@ -12,7 +12,7 @@ pub(crate) use live::{
     Mutation, MutationKind, LivePage,
 };
 pub(crate) use sql::{
-    compile_where, delete_sql, gate_filter_expression, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal,
+    compile_where, decimal_text, delete_sql, gate_filter_expression, insert_sql, integer_text, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal,
     reject_literal_with, select_list, sql_cell, update_sql, value_family, PreviewValue, ValueFamily, DEFAULT_PREVIEW_BYTES,
 };
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};

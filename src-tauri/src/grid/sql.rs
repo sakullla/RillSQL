@@ -79,6 +79,22 @@ pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool, previe
     }
 }
 
+/// 整数写法：可带正负号的十进制数字（两端空白不算）。
+pub fn integer_text(value: &str) -> bool {
+    let text = value.trim();
+    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// 小数/浮点写法：数字、一个小数点和可选的指数；不收 inf/NaN 这类 Rust 能解析但 SQL 不认的写法。
+pub fn decimal_text(value: &str) -> bool {
+    let text = value.trim();
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'+' | b'e' | b'E'))
+        && text.bytes().any(|byte| byte.is_ascii_digit())
+        && text.parse::<f64>().is_ok()
+}
+
 /// 二进制预览，或页查询才会发出的长文本预览。短文本碰巧写成协议形状时不是预览。
 fn blocks_preview(family: ValueFamily, value: &str, preview_bytes: usize) -> bool {
     if family == ValueFamily::Binary {

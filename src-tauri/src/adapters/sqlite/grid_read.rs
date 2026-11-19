@@ -159,7 +159,8 @@ async fn describe_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<TableSc
     let kind = kind.ok_or_else(|| format!("找不到表或视图 {table}"))?;
     let kind = if kind.eq_ignore_ascii_case("view") { "view" } else { "table" };
     let quoted = quote(table);
-    let info = sqlx::query(audited(&format!("PRAGMA table_info({quoted})"))).fetch_all(pool).await.map_err(db_err)?;
+    // table_xinfo 比 table_info 多一列 hidden：2/3 是生成列（虚拟/存储），1 是虚拟表的隐藏列（不显示）。
+    let info = sqlx::query(audited(&format!("PRAGMA table_xinfo({quoted})"))).fetch_all(pool).await.map_err(db_err)?;
     if info.is_empty() {
         return Err(format!("找不到表或视图 {table}"));
     }
@@ -175,10 +176,19 @@ async fn describe_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<TableSc
             Cell::Null => String::new(),
         };
         let not_null = sqlite_number(row, 3)? != 0;
+        let raw_default = match sqlite_cell(row, 4)? {
+            Cell::Text(text) => Some(text),
+            Cell::Null => None,
+        };
         let pk = sqlite_number(row, 5)?;
+        let hidden = sqlite_number(row, 6).unwrap_or(0);
+        if hidden == 1 {
+            continue;
+        }
         if pk > 0 {
             pk_order.push((pk, name.clone()));
         }
+        let (generated, default) = column_traits(hidden, raw_default.as_deref());
         columns.push(Column {
             name,
             type_name,
@@ -186,6 +196,9 @@ async fn describe_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<TableSc
             primary: pk > 0,
             unique: false,
             auto: false,
+            default,
+            generated,
+            choices: Vec::new(),
         });
     }
     pk_order.sort_by_key(|(order, _)| *order);
@@ -245,4 +258,22 @@ fn sqlite_number(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<i64, Str
         Cell::Text(text) => text.parse::<i64>().map_err(|_| format!("不是整数 {text}")),
         Cell::Null => Ok(0),
     }
+}
+
+/// 网格列的生成标记与默认值（R7）：table_xinfo 的 hidden 为 2/3 是生成列；dflt_value 是默认值原文，
+/// 解析为 NULL 时不算默认值。
+pub(crate) fn column_traits(hidden: i64, raw_default: Option<&str>) -> (bool, Option<String>) {
+    let generated = hidden == 2 || hidden == 3;
+    if generated {
+        return (true, None);
+    }
+    let default = raw_default
+        .filter(|raw| {
+            !matches!(
+                crate::ddl::sql::existing_default(Engine::Sqlite, Some(raw)),
+                crate::ddl::DefaultSpec::None | crate::ddl::DefaultSpec::Null
+            )
+        })
+        .map(str::to_owned);
+    (false, default)
 }
