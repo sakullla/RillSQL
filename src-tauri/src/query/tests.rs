@@ -110,6 +110,42 @@ fn clearly_read_only_is_conservative_about_hidden_writes() {
     }
 }
 
+/// 评审复现（A2 回归）：code_words 曾硬编码“单引号里反斜杠转义”，与 split_sql 的适配器词法不一致。
+/// MySQL 双引号字符串里的 \" 让 INTO OUTFILE 被当成字符串内容，写文件语句被判只读并在启动页自动重放；
+/// PG 则反过来把 'a\' 当成未闭合，SELECT INTO 被藏进字符串。现在 code_words 与 split_sql 同一规则，
+/// 并且字符串里出现读法取决于设置的反斜杠时一律按写入处理。
+#[test]
+fn clearly_read_only_follows_adapter_backslash_rules() {
+    for (engine, sql) in [
+        ("mysql", "SELECT \"a\\\"\", 1 INTO OUTFILE \"/tmp/f\""),
+        ("mariadb", "SELECT \"a\\\"\", 1 INTO OUTFILE \"/tmp/f\""),
+        ("mysql", "SELECT 'a\\' INTO OUTFILE '/tmp/x' -- '"),
+        ("mysql", "SELECT 'it\\'s' FROM t"),
+        ("postgres", "SELECT 'a\\', 1 INTO t FROM x -- '"),
+        ("postgres", "SELECT E'a\\', 1 FROM x -- ' INTO t"),
+        ("postgres", "SELECT 'C:\\tmp' FROM t"),
+    ] {
+        assert!(!split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当按写入处理");
+    }
+    // 不认反斜杠的引擎、反引号标识符与双写引号不受影响。
+    for (engine, sql) in [
+        ("sqlite", "SELECT 'C:\\tmp' FROM t"),
+        ("sqlserver", "SELECT 'C:\\tmp' FROM t"),
+        ("mysql", "SELECT `a\\b` FROM t"),
+        ("mysql", "SELECT 'it''s' FROM t"),
+        ("postgres", "SELECT 'it''s' FROM t"),
+    ] {
+        assert!(split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当是只读");
+    }
+    // 词法一致：MySQL 的 \" 不结束双引号字符串，INTO 在代码里可见。
+    let (words, _) = split::top_level_words("mysql", "SELECT \"a\\\"\", 1 INTO OUTFILE \"/tmp/f\"");
+    assert!(words.iter().any(|(word, _, _)| word == "INTO"), "{words:?}");
+    let (words, _) = split::top_level_words("postgres", "SELECT 'a\\', 1 INTO t FROM x -- '");
+    assert!(words.iter().any(|(word, _, _)| word == "INTO"), "{words:?}");
+    assert!(split::has_mode_dependent_escape("mysql", "SELECT 'a\\'''"));
+    assert!(!split::has_mode_dependent_escape("mysql", "SELECT 1 -- a\\b"));
+}
+
 #[test]
 fn engine_boundaries_keep_routine_bodies_and_hash_rules() {
     let mysql = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\nEND$$\nDELIMITER ;\nSELECT 1;";
@@ -2359,9 +2395,17 @@ fn single_table_proof_reads_quoted_names_and_dialect_strings() {
     assert_eq!((proof.schema.as_deref(), proof.table.as_str()), (Some("dbo"), "a]b"));
     // dollar-quote 里的注释标记不能把后面的 JOIN 藏起来。
     assert_eq!(prove_single_table("postgres", "SELECT $$ -- $$ AS x FROM a JOIN b ON true"), Err("grid.readonly.join"));
-    // MySQL 反斜杠转义的引号同理。
-    assert_eq!(prove_single_table("mysql", "SELECT 'it\\'s -- ' AS x FROM a JOIN b ON 1"), Err("grid.readonly.join"));
-    assert!(prove_single_table("mysql", "SELECT 'it\\'s' AS x FROM orders").is_ok());
+    // 字符串里的反斜杠在 MySQL NO_BACKSLASH_ESCAPES/ANSI_QUOTES 与 PG E'…' 下读法不同：一律不证明，说明原因。
+    assert_eq!(prove_single_table("mysql", "SELECT 'it\\'s -- ' AS x FROM a JOIN b ON 1"), Err("grid.readonly.ambiguousEscape"));
+    assert_eq!(prove_single_table("mysql", "SELECT 'it\\'s' AS x FROM orders"), Err("grid.readonly.ambiguousEscape"));
+    // 评审复现：默认读法证明为 orders，NO_BACKSLASH_ESCAPES 服务器却看到 JOIN。
+    assert_eq!(prove_single_table("mysql", "SELECT 'a\\' FROM a JOIN b -- ' FROM orders"), Err("grid.readonly.ambiguousEscape"));
+    assert_eq!(prove_single_table("postgres", "SELECT E'a\\', 1 FROM a JOIN b -- ' FROM orders"), Err("grid.readonly.ambiguousEscape"));
+    // 没有歧义的写法照常证明：双写引号、反引号里的反斜杠、不认反斜杠的引擎。
+    assert!(prove_single_table("mysql", "SELECT 'it''s' AS x FROM orders").is_ok());
+    assert!(prove_single_table("mysql", "SELECT `a\\b` FROM orders").is_ok());
+    assert!(prove_single_table("sqlite", "SELECT 'C:\\tmp' AS p FROM orders").is_ok());
+    assert!(prove_single_table("sqlserver", "SELECT 'C:\\tmp' AS p FROM orders").is_ok());
     // 切分同样按 MySQL 的反斜杠转义：字符串里的分号不切开语句；PG 不认反斜杠转义。
     assert_eq!(split::split_sql("mysql", "SELECT 'a\\'; b' FROM t; SELECT 2").pieces.len(), 2);
     assert_eq!(split::split_sql("postgres", "SELECT 'a\\'; SELECT 2").pieces.len(), 2);

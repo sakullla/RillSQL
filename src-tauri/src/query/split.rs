@@ -157,7 +157,12 @@ pub fn is_clearly_read_only(engine: &str, sql: &str) -> bool {
     let dialect = crate::adapters::query::side_effect_words_named(engine);
     let executable = crate::adapters::query::lexis_named(engine).executable_comments;
     report.pieces.iter().all(|piece| {
-        let (words, _) = code_words(engine, &piece.text, false, executable);
+        let scan = scan_code_words(engine, &piece.text, false, executable);
+        // 字符串里的反斜杠在其他设置或前缀下读法不同（MySQL NO_BACKSLASH_ESCAPES、PG E'…'），边界可能移位：按写入处理。
+        if scan.mode_dependent {
+            return false;
+        }
+        let words = scan.words;
         let Some((lead, _, _)) = words.first() else { return false };
         READ_ONLY_LEADS.contains(&lead.as_str())
             && !words.iter().any(|(word, _, _)| WRITE_WORDS.contains(&word.as_str()) || dialect.contains(&word.as_str()))
@@ -172,6 +177,26 @@ pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>,
 /// 代码词及其字节区间：字符串、注释、dollar-quote 与方括号标识符里的词不出现；
 /// top_only 时只收括号外的词。executable 时 `/*!`、`/*M!` 注释里的内容按代码扫描。
 fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec<(String, usize, usize)>, usize) {
+    let scan = scan_code_words(engine, sql, top_only, executable);
+    (scan.words, scan.end_of_code)
+}
+
+/// 字符串（反引号标识符除外）里出现反斜杠，而该引擎的反斜杠读法取决于设置或前缀（`Lexis::backslash_ambiguous`）：
+/// MySQL 家族开启 NO_BACKSLASH_ESCAPES 或 ANSI_QUOTES、PostgreSQL 的 E'…' 时，同一段文本的引号边界会不同，
+/// 由此推出的“只读”“单表”结论不可靠。两种读法第一次分歧必然发生在这样的反斜杠上，
+/// 所以按默认读法检测它就足以判定是否存在歧义。
+pub fn has_mode_dependent_escape(engine: &str, sql: &str) -> bool {
+    let executable = crate::adapters::query::lexis_named(engine).executable_comments;
+    scan_code_words(engine, sql, false, executable).mode_dependent
+}
+
+struct CodeWords {
+    words: Vec<(String, usize, usize)>,
+    end_of_code: usize,
+    mode_dependent: bool,
+}
+
+fn scan_code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> CodeWords {
     let bytes = sql.as_bytes();
     let lexis = crate::adapters::query::lexis_named(engine);
     let hash = lexis.hash_comments;
@@ -182,6 +207,7 @@ fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec
     let mut dollar: Option<String> = None;
     let mut words = Vec::new();
     let mut end_of_code = 0usize;
+    let mut mode_dependent = false;
     while i < bytes.len() {
         if let Some(tag) = dollar.clone() {
             let marker = format!("${tag}$");
@@ -196,6 +222,15 @@ fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec
             continue;
         }
         if let Some(q) = quote {
+            // 反斜杠转义与 split_sql/scan_code 同一规则：由适配器词法决定（MySQL 家族的 '…' 与 "…"）。
+            if bytes[i] == b'\\' && crate::adapters::query::backslash_ambiguous_in(lexis, q) {
+                mode_dependent = true;
+            }
+            if crate::adapters::query::backslash_escapes_in(lexis, q) && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 1 + utf8_len(bytes[i + 1]);
+                end_of_code = i;
+                continue;
+            }
             if bytes[i] == q {
                 if q == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                     i += 2;
@@ -204,11 +239,6 @@ fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec
                 }
                 quote = None;
                 i += 1;
-                end_of_code = i;
-                continue;
-            }
-            if q == b'\'' && bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
                 end_of_code = i;
                 continue;
             }
@@ -321,7 +351,7 @@ fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec
         i += utf8_len(bytes[i]);
         end_of_code = i;
     }
-    (words, end_of_code)
+    CodeWords { words, end_of_code, mode_dependent }
 }
 
 #[cfg(test)]

@@ -485,7 +485,10 @@ fn grid_and_query_facades_resolve_through_the_registry() {
     // 词法：MySQL 家族认 # 注释与 DELIMITER；T-SQL 认括号标识符与 GO；其余标准写法。
     assert!(lexis_named("mysql").hash_comments && lexis_named("mariadb").delimiter_command);
     assert!(lexis_named("sqlserver").transact && !lexis_named("sqlserver").delimiter_command);
-    assert_eq!(lexis_named("postgres"), Lexis::default());
+    // PG 只多一项：E'…' 与 standard_conforming_strings 让字符串里的反斜杠读法有歧义。
+    assert_eq!(lexis_named("postgres"), Lexis { backslash_ambiguous: true, ..Lexis::default() });
+    assert!(lexis_named("mysql").backslash_ambiguous && lexis_named("mariadb").backslash_ambiguous);
+    assert!(!lexis_named("sqlite").backslash_ambiguous && !lexis_named("sqlserver").backslash_ambiguous);
     assert_eq!(label_named("sqlserver"), "SQL Server");
     assert_eq!(label_named("oracle"), "");
 

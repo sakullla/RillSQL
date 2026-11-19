@@ -500,19 +500,23 @@ pub struct Lexis {
     pub executable_comments: bool,
     /// 字符串里的反斜杠转义下一个字符（MySQL 家族默认 sql_mode）：`'a\'b'` 是一个字符串。
     pub backslash_escapes: bool,
+    /// 字符串里的反斜杠是否转义取决于会话设置或字符串前缀：MySQL 家族的 NO_BACKSLASH_ESCAPES/ANSI_QUOTES，
+    /// PostgreSQL 的 E'…' 与 standard_conforming_strings。为 true 时，含反斜杠的字符串让
+    /// 只读判定与单表证明保守拒绝（同一文本在不同设置下引号边界不同）。
+    pub backslash_ambiguous: bool,
 }
 
 impl Default for Lexis {
     /// 标准 SQL：没有 `#` 注释与 T-SQL 写法，也不认 DELIMITER。
     fn default() -> Self {
-        Self { hash_comments: false, transact: false, delimiter_command: false, executable_comments: false, backslash_escapes: false }
+        Self { hash_comments: false, transact: false, delimiter_command: false, executable_comments: false, backslash_escapes: false, backslash_ambiguous: false }
     }
 }
 
 impl Lexis {
     /// 引擎未知（或不是 SQL 引擎）时：保守地照常处理 DELIMITER。
     /// 可执行注释也按代码检查，只读判定因此更保守。
-    pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true, executable_comments: true, backslash_escapes: false };
+    pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true, executable_comments: true, backslash_escapes: false, backslash_ambiguous: true };
 }
 
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A5 起提供冲突识别）

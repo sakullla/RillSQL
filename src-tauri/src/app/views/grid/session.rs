@@ -4835,6 +4835,11 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
     if report.refusal.is_some() {
         return Err("grid.readonly.unparsed");
     }
+    // 字符串里的反斜杠在其他会话设置（MySQL NO_BACKSLASH_ESCAPES/ANSI_QUOTES、PG E'…'）下可能改变引号边界，
+    // 按默认读法证明的单表可能并不是服务器看到的语句：保守拒绝。
+    if crate::query::split::has_mode_dependent_escape(engine, sql) {
+        return Err("grid.readonly.ambiguousEscape");
+    }
     // 证明只看代码：注释（行尾 `-- a, b`、`/* (x) */`）里的逗号、括号和关键字不算，
     // 引号外的换行与多个空白折成一个空格，`SELECT id\nFROM t` 与单行写法同样能证明；
     // 引号标识符与字符串里的空白原样保留，注释的词法（`#`、反斜杠、dollar-quote）按引擎。

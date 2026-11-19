@@ -155,6 +155,12 @@ pub fn backslash_escapes_in(lexis: Lexis, quote: u8) -> bool {
     lexis.backslash_escapes && quote != b'`'
 }
 
+/// 这种引号里的反斜杠在其他会话设置或字符串前缀下可能有另一种读法（见 [`Lexis::backslash_ambiguous`]）。
+/// 反引号标识符里的反斜杠总是普通字符。
+pub fn backslash_ambiguous_in(lexis: Lexis, quote: u8) -> bool {
+    lexis.backslash_ambiguous && quote != b'`'
+}
+
 /// 这个字符是某个方言的标识符引号（开或闭）。
 pub fn is_identifier_quote(ch: char) -> bool {
     identifier_quote_chars().contains(&ch)

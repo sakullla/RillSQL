@@ -494,6 +494,7 @@ dict! {
     "grid.readonly.setOperation" => "这是集合运算（UNION/INTERSECT/EXCEPT）的结果，所以只读。", "This is a set operation (UNION/INTERSECT/EXCEPT) result, so the grid is read-only.";
     "grid.readonly.notSelect" => "这不是单条 SELECT，网格不会把写入重放，所以只读。", "This is not a single SELECT, so the grid is read-only.";
     "grid.readonly.unparsed" => "语句没有解析清楚，无法证明可以写回，所以只读。", "The statement could not be parsed cleanly, so the grid is read-only.";
+    "grid.readonly.ambiguousEscape" => "字符串里有反斜杠，它在不同的服务器设置下读法不同，无法证明是一张表，所以只读。", "A string contains a backslash, which servers read differently depending on their settings, so a single table cannot be proven; the grid is read-only.";
     "grid.readonly.locatePending" => "正在确认唯一键，确认前只读。", "The unique key is still being checked, so the grid is read-only for now.";
     "grid.readonly.queryResult" => "查询结果不能新增行；表数据页才可新增。", "Rows cannot be inserted into a query result; open the table data to insert.";
 

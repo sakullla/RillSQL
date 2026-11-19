@@ -1,6 +1,6 @@
 //! PostgreSQL 的 SQL 语法：标识符引号、保留字、网格投影、语句超时与执行计划。
 
-use crate::adapters::SqlSyntax;
+use crate::adapters::{Lexis, SqlSyntax};
 use crate::query::functions::FunctionSig;
 use crate::query::plan::PlanNode;
 
@@ -13,6 +13,12 @@ impl SqlSyntax for PostgresSyntax {
 
     fn reserved_words(&self) -> &'static [&'static str] {
         RESERVED
+    }
+
+    /// 普通字符串不转义反斜杠（standard_conforming_strings 默认开），
+    /// 但 E'…' 与关闭该设置的会话会转义：含反斜杠的字符串按有歧义处理。
+    fn lexis(&self) -> Lexis {
+        Lexis { backslash_ambiguous: true, ..Lexis::default() }
     }
 
     /// 未加引号的名字被折叠成小写；含大写的名字必须加引号。
