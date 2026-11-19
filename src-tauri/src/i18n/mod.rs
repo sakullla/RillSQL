@@ -563,6 +563,10 @@ dict! {
     "tags.tone.prod" => "红色", "Red";
     "tags.tone.info" => "蓝色", "Blue";
     "tags.tone.local" => "灰色", "Gray";
+    "tags.nameRequired" => "请填写标签名称", "Enter a tag name";
+    "tags.duplicate" => "已经有名为“{name}”的标签", "A tag named \"{name}\" already exists";
+    "tags.showConnections" => "查看使用这个标签的连接", "Show connections using this tag";
+    "tags.untag" => "移出此标签", "Remove from this tag";
     "ui.query.chooseTarget" => "选择连接与库", "Choose connection and database";
     "ui.query.targetSearch" => "搜索连接或库", "Search connections or databases";
     "ui.query.targetConnections" => "连接", "Connections";
@@ -911,6 +915,11 @@ dict! {
     "ui.welcome.manage" => "管理", "Manage";
     "ui.welcome.allHistory" => "全部历史", "All history";
     "ui.welcome.noRecent" => "还没有执行记录。", "Nothing run yet.";
+    "ui.welcome.runOpen" => "在新查询中打开", "Open in new query";
+    "ui.welcome.runCopy" => "复制 SQL", "Copy SQL";
+    "ui.welcome.runHistory" => "在历史中查看", "View in history";
+    "ui.welcome.runAgain" => "再次执行", "Run again";
+    "ui.welcome.runWriteLoaded" => "这条是写入语句：已在新查询中打开，确认无误后再执行。", "This statement writes data. It is open in a new query; review it, then run it yourself.";
     "ui.conn.search" => "搜索连接", "Search connections";
     "ui.conn.new" => "新建", "New";
     "ui.conn.import" => "导入", "Import";

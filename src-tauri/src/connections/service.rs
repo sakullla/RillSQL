@@ -372,6 +372,15 @@ impl Service {
         Ok(())
     }
 
+    /// 标签面板里“移出此标签”：连接变为无标签，其余配置不变。
+    pub async fn untag_connection(&self, id: &str) -> Result<(), String> {
+        let store = self.store().await?;
+        if !store.clear_env(id).await.map_err(db_err)? {
+            return Err("找不到这个连接".to_owned());
+        }
+        Ok(())
+    }
+
     /// 分组与成员关系一次读出；资源管理器、启动台与分组命令都只认这一份快照。
     pub async fn groups(&self) -> Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String> {
         let store = self.store().await?;

@@ -438,6 +438,8 @@ pub struct StructureSession {
     armed: bool,
     pub locale: Locale,
     note: Note,
+    /// 外壳按连接当前标签与标签表色调算出的生产判断；没有下发时按环境 id 判断。
+    pub prod: Option<bool>,
 }
 
 impl StructureSession {
@@ -474,6 +476,7 @@ impl StructureSession {
             armed: false,
             locale: Locale::ZhCn,
             note: Note::Empty,
+            prod: None,
         }
     }
 
@@ -504,7 +507,7 @@ impl StructureSession {
     }
 
     pub fn production(&self) -> bool {
-        matches!(self.target.environment.as_str(), "prod" | "production")
+        self.prod.unwrap_or(matches!(self.target.environment.as_str(), "prod" | "production"))
     }
 
     pub fn danger_name_ok(&self) -> bool {
@@ -911,6 +914,11 @@ impl StructurePane {
 
     pub fn bind(&mut self, target: GridTarget) {
         self.bind_item(target, "");
+    }
+
+    /// 外壳下发的生产判断（按标签表色调现算）；标签改色后再次下发即生效。
+    pub fn set_prod_target(&mut self, prod: bool) {
+        self.session.prod = Some(prod);
     }
 
     pub fn bind_item(&mut self, target: GridTarget, item: &str) {

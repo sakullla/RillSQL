@@ -2283,6 +2283,7 @@ impl Workbench {
             for row in &quick_connections {
                 let id = row.saved.id.clone();
                 let open_id = id.clone();
+                let menu_id = id.clone();
                 let status = self.model.connections.row_status(&id);
                 let (dot, state_key) = status_parts(status, &p);
                 let detail = match row.saved.file_path.as_deref() {
@@ -2291,6 +2292,7 @@ impl Workbench {
                 };
                 conn_rows = conn_rows.child(
                     list_row(SharedString::from(format!("welcome-conn-{id}")), &p, m.row_pad_y)
+                        .test_support()
                         .tooltip_text(SharedString::from(format!("{} · {}", row.saved.name, self.model.text(state_key))))
                         .child(kit::engine_badge(row.saved.engine.as_str(), 22.))
                         .child(
@@ -2313,6 +2315,12 @@ impl Workbench {
                                 }),
                         )
                         .child(kit::status_dot(dot))
+                        // 右键与连接管理页同一份菜单（连接/断开、新建查询、编辑、复制、测试、移动分组、删除）。
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.menu_at = event.position;
+                            this.model.connections.selected = Some(menu_id.clone());
+                            this.perform("menu-connection", cx);
+                        }))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.model.connections.selected = Some(open_id.clone());
                             if this.model.connections.row_status(&open_id) == LinkStatus::Connected {
@@ -2355,8 +2363,10 @@ impl Workbench {
             let mut history_rows = div().flex().flex_col().gap(px(2.));
             for entry in recent_runs.iter() {
                 let id = entry.id.clone();
+                let menu_id = id.clone();
                 history_rows = history_rows.child(
                     list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
+                        .test_support()
                         .child(kit::icon(IconName::Clock, 14., p.text_faint))
                         .child(
                             div()
@@ -2378,6 +2388,12 @@ impl Workbench {
                                 .text_color(p.text_faint)
                                 .child(SharedString::from(entry.connection_name.clone())),
                         )
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.menu_at = event.position;
+                            if this.model.open_welcome_run_menu(&menu_id) {
+                                cx.notify();
+                            }
+                        }))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.model.history.selected_run = Some(id.clone());
                             this.model.history.section = HistorySection::Runs;

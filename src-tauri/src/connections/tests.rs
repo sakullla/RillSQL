@@ -862,6 +862,19 @@ async fn users_keep_their_own_environment_tags() {
     let coerced = service.save(missing, SecretInput::default()).await.unwrap();
     assert_eq!(coerced.connection.env, "none");
 
+    // 标签面板“移出此标签”：只改这一条连接的 env，名称等配置不动；不存在的连接报错。
+    let mut other = remote_draft(Engine::Postgres);
+    other.save_password = false;
+    other.name = "移出测试".into();
+    other.env = created.id.clone();
+    let other = service.save(other, SecretInput::default()).await.unwrap();
+    service.untag_connection(&other.connection.id).await.unwrap();
+    let listed = service.list().await.unwrap();
+    let untagged = listed.iter().find(|item| item.saved.id == other.connection.id).unwrap();
+    assert_eq!((untagged.saved.env.as_str(), untagged.saved.name.as_str()), ("none", "移出测试"));
+    assert_eq!(listed.iter().find(|item| item.saved.id == saved.connection.id).unwrap().saved.env, created.id, "其他连接不受影响");
+    assert!(service.untag_connection("no-such-connection").await.is_err());
+
     let catalogs = crate::catalog::commands::load_catalog(&service, 0, &[], None, false).await.unwrap();
     let preview = catalogs.iter().find(|item| item.id == saved.connection.id).unwrap();
     assert_eq!(preview.env_label, "预发");

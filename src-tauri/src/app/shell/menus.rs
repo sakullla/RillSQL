@@ -143,6 +143,17 @@ pub fn explorer_connection_menu_items(connected: bool, relational: bool) -> Vec<
     items
 }
 
+/// 启动页“最近执行”行的右键菜单：在新查询中打开、复制完整 SQL、到历史页查看这一条、再次执行。
+/// 再次执行对写入语句只打开不执行，由用户确认后自己运行。
+pub fn welcome_run_items() -> Vec<MenuItem> {
+    vec![
+        with_icon(item("welcome-run-open", "ui.welcome.runOpen"), IconName::SquarePen),
+        with_icon(item("welcome-run-copy", "ui.welcome.runCopy"), IconName::Copy),
+        with_icon(item("welcome-run-history", "ui.welcome.runHistory"), IconName::Clock),
+        sep(with_icon(item("welcome-run-again", "ui.welcome.runAgain"), IconName::Play)),
+    ]
+}
+
 fn item(id: &'static str, label_key: &'static str) -> MenuItem {
     leaf(id, label_key, false, true, None)
 }

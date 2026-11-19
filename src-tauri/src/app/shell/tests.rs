@@ -9958,12 +9958,313 @@ fn tag_manager_validates_saves_and_untags_connections_on_delete() {
     assert!(model.tag_job.is_none(), "删除先确认");
     model.dispatch("tag-delete-confirm:staging");
     assert_eq!(model.tag_job.take(), Some(TagJob::Delete("staging".into())));
-    model.finish_tag_job(Some("staging".into()), Ok(Vec::new()));
+    model.finish_tag_job(&TagJob::Delete("staging".into()), Ok(Vec::new()));
     assert_eq!(model.connections.rows[0].saved.env, "none");
     assert!(model.connections.filter_env.is_empty());
     assert!(model.tag_manager.is_some(), "对话框留着继续管理");
     model.dismiss();
     assert!(model.tag_manager.is_none());
+}
+
+/// R12 标签面板：空名与重名就地报错不进后台；使用数可展开查看关联连接并逐条移出；
+/// 删除确认显示受影响数，确认后这些连接变为无标签；新标签保存后筛选栏立即可用。
+#[test]
+fn tag_panel_reports_name_errors_inline_and_manages_tagged_connections() {
+    use super::model::TagJob;
+    use crate::connections::model::EnvTag;
+    let mut model = WorkbenchModel::new(Shell::default());
+    let mut rows = Vec::new();
+    for (id, name) in [("c1", "订单"), ("c2", "库存"), ("c3", "日志"), ("c4", "报表")] {
+        let mut row = record_for(id, name, Engine::Postgres);
+        row.saved.env = "staging".into();
+        rows.push(row);
+    }
+    rows.push(record_for("c5", "本地", Engine::Postgres));
+    model.connections.rows = rows;
+    let staging = EnvTag { id: "staging".into(), label: "预发".into(), tone: "info".into(), position: 4 };
+    model.apply_env_tags(vec![staging.clone()]);
+    model.dispatch("tags-manage");
+
+    // 空名：就地报错（不经后台）。
+    model.dispatch("tag-new");
+    model.dispatch("tag-save");
+    assert_eq!(model.tag_manager.as_ref().unwrap().error.as_deref(), Some(model.text("tags.nameRequired").as_str()));
+    assert!(model.tag_job.is_none());
+    // 重名（忽略首尾空白与大小写）：同样就地报错。
+    model.set_field(DraftField::TagLabel, " 预发 ".into());
+    model.dispatch("tag-save");
+    let error = model.tag_manager.as_ref().unwrap().error.clone().expect("重名要报错");
+    assert!(error.contains("预发"), "{error}");
+    assert!(model.tag_job.is_none(), "重名不发后台任务");
+    // 编辑自己时同名不算重名。
+    model.dispatch("tag-edit:staging");
+    model.dispatch("tag-save");
+    assert_eq!(model.tag_job.take(), Some(TagJob::Save { id: Some("staging".into()), label: "预发".into(), tone: "info".into() }));
+    let job = TagJob::Save { id: Some("staging".into()), label: "预发".into(), tone: "info".into() };
+    model.finish_tag_job(&job, Ok(vec![staging.clone()]));
+
+    // 新建标签：保存成功后立即进入标签表（筛选栏与连接表单都从这里取）。
+    model.dispatch("tag-new");
+    model.set_field(DraftField::TagLabel, "灰度".into());
+    model.dispatch("tag-save");
+    let job = model.tag_job.take().expect("保存进入后台");
+    let gray = EnvTag { id: "gray".into(), label: "灰度".into(), tone: "dev".into(), position: 5 };
+    model.finish_tag_job(&job, Ok(vec![staging.clone(), gray.clone()]));
+    assert!(model.env_tags.iter().any(|tag| tag.id == "gray"), "新标签立即可筛选");
+    assert!(model.tag_manager.as_ref().unwrap().editing.is_none());
+
+    // 使用数展开：列出关联连接（按名称排序），逐条移出。
+    assert_eq!(model.tag_usage("staging"), 4);
+    model.dispatch("tag-expand:staging");
+    assert_eq!(model.tag_manager.as_ref().unwrap().expanded.as_deref(), Some("staging"));
+    let names: Vec<String> = model.tag_connections("staging").into_iter().map(|(_, name)| name).collect();
+    assert_eq!(names.len(), 4);
+    model.dispatch("tag-untag:c3");
+    assert_eq!(model.tag_job.take(), Some(TagJob::Untag { connection: "c3".into() }));
+    model.finish_tag_job(&TagJob::Untag { connection: "c3".into() }, Ok(vec![staging.clone(), gray.clone()]));
+    assert_eq!(model.connections.rows.iter().find(|row| row.saved.id == "c3").unwrap().saved.env, "none");
+    assert_eq!(model.tag_usage("staging"), 3);
+    assert_eq!(model.tag_manager.as_ref().unwrap().expanded.as_deref(), Some("staging"), "移出后保持展开继续调整");
+    model.dispatch("tag-expand:staging");
+    assert!(model.tag_manager.as_ref().unwrap().expanded.is_none(), "再点一次收起");
+
+    // 删除：确认前不动；确认后剩下的 3 条都变为无标签。
+    model.dispatch("tag-delete:staging");
+    assert!(model.tag_job.is_none());
+    assert_eq!(model.tag_manager.as_ref().unwrap().confirm_delete.as_deref(), Some("staging"));
+    let message = crate::i18n::fill(&model.text("tags.deleteConfirm"), &[("count", &model.tag_usage("staging").to_string())]);
+    assert!(message.contains('3'), "{message}");
+    model.dispatch("tag-delete-confirm:staging");
+    let job = model.tag_job.take().unwrap();
+    model.finish_tag_job(&job, Ok(vec![gray]));
+    assert!(model.connections.rows.iter().all(|row| row.saved.env != "staging"));
+    assert_eq!(model.tag_usage("staging"), 0);
+}
+
+/// R12 标签面板渲染：使用数可点开关联连接列表，每行有“移出此标签”按钮，点击进入后台移出。
+#[gpui_kit::test]
+fn tag_panel_lists_tagged_connections_with_remove_buttons(cx: &mut gpui_kit::TestAppContext) {
+    use crate::connections::model::EnvTag;
+    let dir = std::env::temp_dir().join(format!("rillsql-tag-panel-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let mut rows = Vec::new();
+            for (id, name) in [("c1", "订单"), ("c2", "库存")] {
+                let mut row = record_for(id, name, Engine::Postgres);
+                row.saved.env = "staging".into();
+                rows.push(row);
+            }
+            view.model.connections.rows = rows;
+            view.model.apply_env_tags(vec![EnvTag { id: "staging".into(), label: "预发".into(), tone: "info".into(), position: 4 }]);
+            view.perform("tags-manage", cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("tag-untag-c1").is_none(), "默认不展开");
+        window.click("tag-usage-staging", cx);
+        window.render_frame(cx);
+        assert!(window.find("tag-untag-c1").visible());
+        assert!(window.find("tag-untag-c2").visible());
+        window.click("tag-untag-c1", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        let manager = model.tag_manager.as_ref().unwrap();
+        assert!(manager.busy || model.tag_job.is_some(), "移出进入后台任务");
+        assert_eq!(manager.expanded.as_deref(), Some("staging"));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R12 安全语义：把标签改成生产色后，连接的生产判断与已打开的危险确认随之更新；改回后恢复。
+#[test]
+fn changing_a_tag_tone_updates_production_judgement() {
+    use super::model::TagJob;
+    use crate::catalog::hierarchy::ObjectKey;
+    use crate::catalog::model::ObjectKind;
+    use crate::connections::model::EnvTag;
+    let mut model = WorkbenchModel::new(Shell::default());
+    let mut row = record_for("c1", "订单", Engine::Postgres);
+    row.saved.env = "live".into();
+    model.connections.rows = vec![row];
+    let live = |tone: &str| EnvTag { id: "live".into(), label: "线上".into(), tone: tone.into(), position: 1 };
+    model.apply_env_tags(vec![live("dev")]);
+    assert!(!model.connection_is_prod("c1"));
+    let key = ObjectKey {
+        connection_id: "c1".into(),
+        connection_name: "订单".into(),
+        engine: Engine::Postgres,
+        database: "app".into(),
+        schema: "public".into(),
+        name: "orders".into(),
+        kind: ObjectKind::Table,
+    };
+    let mut prompt = super::danger::DangerPrompt::new(super::danger::DangerKind::DropTable, "n", key, "live");
+    prompt.apply_tags(Some(&model.env_tags));
+    model.danger = Some(prompt);
+    assert!(!model.danger.as_ref().unwrap().prod);
+    let revision = model.env_tags_revision;
+
+    model.dispatch("tags-manage");
+    model.dispatch("tag-edit:live");
+    model.dispatch("tag-tone:prod");
+    model.dispatch("tag-save");
+    let job = model.tag_job.take().unwrap();
+    assert_eq!(job, TagJob::Save { id: Some("live".into()), label: "线上".into(), tone: "prod".into() });
+    model.finish_tag_job(&job, Ok(vec![live("prod")]));
+    assert!(model.connection_is_prod("c1"), "改成生产色后按生产处理");
+    assert!(model.danger.as_ref().unwrap().prod, "已打开的危险确认随之要求输入名称");
+    assert!(model.env_tags_revision > revision, "视图据版本号刷新表数据/结构页的生产提示");
+
+    model.finish_tag_job(&TagJob::Untag { connection: "c1".into() }, Ok(vec![live("prod")]));
+    assert!(!model.connection_is_prod("c1"), "移出生产标签后不再按生产处理");
+}
+
+/// R14 启动页右键：连接行出现与连接管理一致的菜单，新建查询绑定该连接；最近执行行提供
+/// 在新查询中打开、复制完整 SQL、在历史中查看与再次执行（写入语句只载入不执行）。
+#[gpui_kit::test]
+fn welcome_rows_open_context_menus_and_dispatch_their_actions(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-welcome-menu-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let read_sql = "-- 最近订单\nselect *\nfrom orders\nwhere id = 1";
+    let write_sql = "delete from orders where id = 9";
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
+            view.model.history.runs = vec![history_run("r1", read_sql, "pg", "ok"), history_run("r2", write_sql, "pg", "ok")];
+            cx.notify();
+        });
+    });
+    let clear_tabs = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.model.tabs.clear();
+                view.model.active_tab = None;
+                view.model.shell.page = AppPage::Workspace;
+                view.model.notice_key = None;
+                cx.notify();
+            })
+        });
+    };
+    let menu_commands = |cx: &mut gpui_kit::TestAppContext| -> (MenuPlace, Vec<String>) {
+        cx.update(|cx| {
+            let model = &view.read(cx).model;
+            let menu = model.menu.as_ref().expect("右键出现菜单");
+            (menu.place, super::menus::flatten_items(&menu.items).iter().map(|item| item.command()).collect())
+        })
+    };
+
+    // 1. 最近执行：复制 SQL 写入完整的多行语句，而不是行内显示的单行摘要。
+    cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("旧内容".to_owned())));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click("welcome-run-r1", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (place, commands) = menu_commands(cx);
+    assert_eq!(place, MenuPlace::HistoryEntry);
+    assert_eq!(commands, ["welcome-run-open", "welcome-run-copy", "welcome-run-history", "welcome-run-again"]);
+    cx.update_window(window, |_, window, cx| {
+        window.click("ctx-welcome-run-copy", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let clipboard = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(clipboard.as_deref(), Some(read_sql));
+    assert!(cx.update(|cx| view.read(cx).model.menu.is_none()), "选中后菜单收起");
+
+    // 2. 在新查询中打开：语句与连接绑定进入新的查询项，不执行。
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("welcome-run-r1", cx);
+        window.click("ctx-welcome-run-open", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        let tab = model.active_tab().expect("新查询");
+        assert!(tab.kind.is_query());
+        assert_eq!((tab.draft.as_str(), tab.connection_id.as_deref()), (read_sql, Some("pg")));
+        assert!(!model.connect_intents.iter().any(|intent| intent.replay.is_some()), "打开不执行");
+    });
+    clear_tabs(cx);
+
+    // 3. 再次执行写入语句：只载入并提示确认，不发起执行。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click("welcome-run-r2", cx);
+        window.click("ctx-welcome-run-again", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert_eq!(model.active_tab().map(|tab| tab.draft.as_str()), Some(write_sql));
+        assert_eq!(model.notice_key, Some("ui.welcome.runWriteLoaded"));
+        assert!(!model.connect_intents.iter().any(|intent| intent.replay.is_some()), "写入语句不自动执行");
+        assert!(!model.rerun_pending);
+    });
+    clear_tabs(cx);
+
+    // 4. 再次执行只读语句：走普通执行命令，连接未打开时先连上再重放这次执行。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click("welcome-run-r1", cx);
+        window.click("ctx-welcome-run-again", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert_eq!(model.active_tab().map(|tab| tab.draft.as_str()), Some(read_sql));
+        let replays: Vec<&str> = model.connect_intents.iter().filter_map(|intent| intent.replay.as_deref()).collect();
+        assert_eq!(replays, ["execute-query"], "按需连接后重放执行");
+    });
+    clear_tabs(cx);
+    cx.update(|cx| view.update(cx, |view, _| view.model.connect_intents.clear()));
+
+    // 5. 连接行右键：与连接管理同一份菜单；新建查询打开绑定该连接的查询。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click("welcome-conn-pg", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (place, commands) = menu_commands(cx);
+    assert_eq!(place, MenuPlace::ConnectionRow);
+    for expected in ["conn-connect", "conn-new-query", "conn-edit", "conn-duplicate", "conn-test", "conn-delete"] {
+        assert!(commands.iter().any(|command| command == expected), "缺少 {expected}：{commands:?}");
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.click("ctx-conn-new-query", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let tab = view.read(cx).model.active_tab().cloned().expect("新建查询");
+        assert!(tab.kind.is_query());
+        assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+    });
+    clear_tabs(cx);
+
+    // 6. 在历史中查看：切到历史页、选中这一条并打开预览。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click("welcome-run-r2", cx);
+        window.click("ctx-welcome-run-history", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert_eq!(model.shell.page, AppPage::History);
+        assert_eq!(model.history.section, HistorySection::Runs);
+        assert_eq!(model.history.selected_run.as_deref(), Some("r2"));
+        assert!(model.history.preview_open);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------------------ 共享页签（T1）

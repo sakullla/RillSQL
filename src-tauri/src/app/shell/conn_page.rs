@@ -1349,7 +1349,36 @@ impl Workbench {
             }
             let usage = self.model.tag_usage(&tag.id);
             let confirming = manager.confirm_delete.as_deref() == Some(tag.id.as_str());
+            let expanded = usage > 0 && manager.expanded.as_deref() == Some(tag.id.as_str());
             let usage_text = if usage == 0 { self.model.text("tags.unused") } else { crate::i18n::fill(&self.model.text("tags.usage"), &[("count", &usage.to_string())]) };
+            // 使用数可点：展开关联连接，逐条移出这个标签。未使用时只是文字。
+            let usage_cell = if usage == 0 {
+                div().flex_1().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(usage_text)).into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .flex()
+                    .child(
+                        kit::interactive_states(div().id(SharedString::from(format!("tag-usage-{}", tag.id))), &p, false)
+                            .test_support()
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(SharedString::from(format!("{} {}", self.model.text("tags.showConnections"), usage_text)))
+                            .aria_expanded(expanded)
+                            .tooltip_text(self.t("tags.showConnections"))
+                            .px(px(4.))
+                            .rounded(px(Radius::CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.accent_text)
+                            .hover(|style| style.bg(p.hover))
+                            .child(SharedString::from(usage_text))
+                            .child(kit::icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }, 12., p.text_faint))
+                            .on_click(act(format!("tag-expand:{}", tag.id), cx)),
+                    )
+                    .into_any_element()
+            };
             let mut row = kit::row_states(div().id(SharedString::from(format!("tag-row-{}", tag.id))), &p)
                 .px(px(8.))
                 .py(px(6.))
@@ -1364,10 +1393,28 @@ impl Workbench {
                         .items_center()
                         .gap(px(8.))
                         .child(kit::env_tag(&tag.tone, SharedString::from(tag.label.clone()), &p))
-                        .child(div().flex_1().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(usage_text)))
+                        .child(usage_cell)
                         .child(kit::icon_button(SharedString::from(format!("tag-edit-{}", tag.id)), IconName::Pencil, self.model.text("tags.edit"), act(format!("tag-edit:{}", tag.id), cx)).xsmall())
                         .child(kit::icon_button(SharedString::from(format!("tag-delete-{}", tag.id)), IconName::Trash, self.model.text("tags.delete"), act(format!("tag-delete:{}", tag.id), cx)).xsmall()),
                 );
+            if expanded {
+                let mut members = div().id(SharedString::from(format!("tag-members-{}", tag.id))).flex().flex_col().gap(px(2.)).pl(px(12.));
+                for (connection, name) in self.model.tag_connections(&tag.id) {
+                    members = members.child(
+                        div()
+                            .id(SharedString::from(format!("tag-member-{connection}")))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(name)))
+                            .child(
+                                kit::icon_button(SharedString::from(format!("tag-untag-{connection}")), IconName::X, self.model.text("tags.untag"), act(format!("tag-untag:{connection}"), cx))
+                                    .xsmall(),
+                            ),
+                    );
+                }
+                row = row.child(members);
+            }
             if confirming {
                 let message = if usage == 0 { self.model.text("tags.deleteUnused") } else { crate::i18n::fill(&self.model.text("tags.deleteConfirm"), &[("count", &usage.to_string())]) };
                 row = row.bg(p.danger_soft).child(

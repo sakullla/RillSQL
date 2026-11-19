@@ -405,6 +405,16 @@ impl Store {
         Ok(())
     }
 
+    /// 把一条连接移出它的标签：只改 env，连接配置与机密都不动。返回是否找到这条连接。
+    pub async fn clear_env(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE connections SET env = 'none' WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.checkpoint().await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     pub async fn delete_tag(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE connections SET env = 'none' WHERE env = ?1")
             .bind(id)

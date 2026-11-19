@@ -53,6 +53,8 @@ pub struct Workbench {
     applied_tool: Option<String>,
     applied_locale: Option<crate::i18n::Locale>,
     applied_catalog_revision: Option<u64>,
+    /// 已按哪一版标签表下发过生产判断；标签改名改色或连接移出标签后重新下发。
+    applied_tags_revision: u64,
     /// 共享表格网格当前展示的表规格；暂存必须归属到这张表对应的工作项。
     table_view_spec: Option<String>,
     /// 交换面板显式选择的来源；切换工作项后按新工作项重建。
@@ -341,6 +343,7 @@ impl Workbench {
             applied_tool: None,
             applied_locale: None,
             applied_catalog_revision: None,
+            applied_tags_revision: 0,
             table_view_spec: None,
             exchange_kind: ExchangeSourceKind::Table,
             exchange_item: None,
@@ -509,6 +512,18 @@ impl Workbench {
             if let Some(command) = self.model.history.delete_command() {
                 self.perform(command, cx);
             }
+            return;
+        }
+        // 启动页“再次执行”：先像“在新查询中打开”一样载入，只读语句再走普通执行命令
+        // （同一条按需连接与执行路径）；写入语句只载入，等用户确认后自己执行。
+        if id == "welcome-run-again" {
+            let _ = self.model.dispatch(id);
+            self.adopt_shell(Effect::None, cx);
+            if std::mem::take(&mut self.model.rerun_pending) {
+                self.perform("execute-query", cx);
+            }
+            self.persist_if_needed(cx);
+            cx.notify();
             return;
         }
         // 唯一的“打开文件”入口（⌘O / Ctrl+O、顶栏、欢迎页、连接页、菜单、Dock 都到这里）。
@@ -1040,7 +1055,7 @@ impl Workbench {
                 if self.table_view_spec.as_deref() != Some(spec.as_str()) {
                     self.table_view_spec = Some(spec.clone());
                     let page_size = u64::try_from(self.model.settings.page_size.max(1)).unwrap_or(1);
-                    let prod = super::danger::env_is_prod(&target.environment, Some(&self.model.env_tags));
+                    let prod = self.prod_for(&target);
                     self.table.update(cx, |pane, cx| {
                         pane.set_locale(locale);
                         pane.set_prod_target(prod);
@@ -1048,10 +1063,14 @@ impl Workbench {
                     });
                 }
             }
-            WorkTool::Structure => self.structure.update(cx, |pane, _| {
-                pane.set_locale(locale);
-                pane.bind_item(target, &item);
-            }),
+            WorkTool::Structure => {
+                let prod = self.prod_for(&target);
+                self.structure.update(cx, |pane, _| {
+                    pane.set_locale(locale);
+                    pane.bind_item(target, &item);
+                    pane.set_prod_target(prod);
+                });
+            }
             WorkTool::Admin => {
                 // 重新绑定会清掉探测闩；允许本帧按当前连接状态再探一次。
                 self.admin_link = None;
@@ -1902,13 +1921,42 @@ impl Workbench {
         }));
     }
 
+    /// 目标连接此刻是否按生产处理：连接还在时按它当前的标签现算，否则按打开时记下的环境。
+    fn prod_for(&self, target: &GridTarget) -> bool {
+        if self.model.connections.rows.iter().any(|row| row.saved.id == target.connection_id) {
+            self.model.connection_is_prod(&target.connection_id)
+        } else {
+            super::danger::env_is_prod(&target.environment, Some(&self.model.env_tags))
+        }
+    }
+
+    /// 标签表换了（改色、改名、删除或连接移出标签）：已打开的表数据页与结构页按新标签重算生产提示。
+    fn sync_prod_targets(&mut self, cx: &mut Context<Self>) {
+        if self.applied_tags_revision == self.model.env_tags_revision {
+            return;
+        }
+        self.applied_tags_revision = self.model.env_tags_revision;
+        if let Some(target) = self.table_view_spec.as_deref().and_then(parse_target) {
+            let prod = self.prod_for(&target);
+            self.table.update(cx, |pane, cx| {
+                pane.set_prod_target(prod);
+                cx.notify();
+            });
+        }
+        let structure = self.structure.read(cx).session.target.clone();
+        if !structure.connection_id.is_empty() {
+            let prod = self.prod_for(&structure);
+            self.structure.update(cx, |pane, cx| {
+                pane.set_prod_target(prod);
+                cx.notify();
+            });
+        }
+    }
+
     /// 标签管理的读写：保存或删除后重读标签列表，结果交回模型。
     fn pump_tag_job(&mut self, cx: &mut Context<Self>) {
         let Some(job) = self.model.tag_job.take() else { return };
-        let deleted = match &job {
-            super::model::TagJob::Delete(id) => Some(id.clone()),
-            super::model::TagJob::Save { .. } => None,
-        };
+        let done = job.clone();
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1916,6 +1964,7 @@ impl Workbench {
             let outcome = match job {
                 super::model::TagJob::Save { id, label, tone } => services.connections.save_tag(id, label, tone).await.map(|_| ()).map_err(|err| err.message()),
                 super::model::TagJob::Delete(id) => services.connections.delete_tag(&id).await,
+                super::model::TagJob::Untag { connection } => services.connections.untag_connection(&connection).await,
             };
             let result = match outcome {
                 Ok(()) => services.connections.list_tags().await,
@@ -1928,7 +1977,7 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    this.model.finish_tag_job(deleted, result);
+                    this.model.finish_tag_job(&done, result);
                     cx.notify();
                 });
             });
@@ -2842,7 +2891,7 @@ impl Workbench {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
-                            this.model.env_tags = tags;
+                            this.model.apply_env_tags(tags);
                             cx.notify();
                         });
                     }
@@ -2962,6 +3011,7 @@ impl Render for Workbench {
         self.pump_danger(cx);
         self.pump_update(cx);
         self.pump_tag_job(cx);
+        self.sync_prod_targets(cx);
         self.flush_clipboard(cx);
         // 结构页删除、改名或修改结构成功后，对象树、工作项与网格列结构缓存同步更新。
         if let Some((target, is_view)) = self.structure.update(cx, |pane, _| pane.take_dropped_object()) {

@@ -259,6 +259,8 @@ pub struct TagManager {
     pub editing: Option<TagDraft>,
     /// 等第二次确认的删除。
     pub confirm_delete: Option<String>,
+    /// 展开查看关联连接的标签：可在这里把连接逐条移出该标签。
+    pub expanded: Option<String>,
     pub error: Option<String>,
     pub busy: bool,
 }
@@ -275,6 +277,8 @@ pub struct TagDraft {
 pub enum TagJob {
     Save { id: Option<String>, label: String, tone: String },
     Delete(String),
+    /// 把一条连接移出它当前的标签（连接变为无标签）。
+    Untag { connection: String },
 }
 
 /// 对象树“查看 / 复制 DDL”的读取状态。`copy_only` 时不显示查看器，读到就写剪贴板。
@@ -490,6 +494,10 @@ pub struct WorkbenchModel {
     pub viewport_height: i32,
     /// 自定义环境标签。列表、欢迎页、状态栏和表单按 id 取名称与色调。
     pub env_tags: Vec<EnvTag>,
+    /// 每次换上新标签表加一：视图据此刷新各页面缓存的生产判断。
+    pub env_tags_revision: u64,
+    /// 启动页“再次执行”已把只读语句载入新查询：视图取走后走正常的执行命令（含按需连接）。
+    pub rerun_pending: bool,
     /// 用户自定义分组（名称、顺序、折叠），来自配置库而不是会话快照。
     pub groups: Vec<ConnectionGroup>,
     /// 连接 id → 分组 id；没有条目就是未分组，不写哨兵值。
@@ -623,6 +631,8 @@ impl WorkbenchModel {
             history_dragging: false,
             viewport_height: 900,
             env_tags: Vec::new(),
+            env_tags_revision: 0,
+            rerun_pending: false,
             groups: Vec::new(),
             group_members: std::collections::BTreeMap::new(),
             group_prompt: None,
@@ -814,6 +824,9 @@ impl WorkbenchModel {
         // 分组命令与连接菜单里的“移动到分组”共用同一批 id。
         if id.starts_with("tags-") || id.starts_with("tag-") {
             return self.tag_command(id);
+        }
+        if id.starts_with("welcome-run-") {
+            return self.welcome_run_command(id);
         }
         if (id.starts_with("group-") || id.starts_with("conn-move-group")) && self.group_command(id) {
             return true;
@@ -2113,6 +2126,58 @@ impl WorkbenchModel {
         self.open_menu(MenuPlace::HistoryEntry, target);
     }
 
+    /// 启动页“最近执行”行右键：菜单绑定这一条执行记录。
+    pub fn open_welcome_run_menu(&mut self, run_id: &str) -> bool {
+        if !self.history.runs.iter().any(|entry| entry.id == run_id) {
+            return false;
+        }
+        self.history.section = HistorySection::Runs;
+        self.history.selected_run = Some(run_id.to_owned());
+        self.open_menu(MenuPlace::HistoryEntry, MenuTarget::Run);
+        self.menu = Some(OpenMenu::with_items(MenuPlace::HistoryEntry, super::menus::welcome_run_items()));
+        true
+    }
+
+    /// 启动页最近执行菜单的四个动作，都作用于 history.selected_run 这一条。
+    fn welcome_run_command(&mut self, id: &str) -> bool {
+        self.history.section = HistorySection::Runs;
+        match id {
+            "welcome-run-open" => self.load_selected_history(),
+            "welcome-run-copy" => {
+                // 复制的是这条记录的完整 SQL，与当前活动编辑器无关。
+                let sql = self.history.selected_run_entry().map(|entry| entry.sql.clone()).unwrap_or_default();
+                self.copied = sql.clone();
+                if !sql.is_empty() {
+                    self.clipboard_out = Some(sql);
+                }
+            }
+            "welcome-run-history" => {
+                let run = self.history.selected_run.clone();
+                let _ = self.dispatch("history");
+                self.shell.page = AppPage::History;
+                // 筛选可能把这一条藏起来：清掉筛选，选中并打开预览。
+                self.history.reset_filters();
+                self.history.selected_run = run;
+                self.history.preview_open = true;
+            }
+            "welcome-run-again" => {
+                let Some(plan) = self.history.plan_run(&self.known_ids()) else { return true };
+                let write = crate::query::split::is_write(&plan.sql);
+                let bound = !plan.needs_target;
+                self.apply_load(plan);
+                if write {
+                    // 写入语句不直接重放：留在新查询里，用户确认后自己执行。
+                    self.notice_key = Some("ui.welcome.runWriteLoaded");
+                    self.notice_detail.clear();
+                } else if bound {
+                    self.rerun_pending = true;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub fn open_editor_menu(&mut self) {
         self.open_menu(MenuPlace::Editor, MenuTarget::QueryTab);
     }
@@ -2173,7 +2238,7 @@ impl WorkbenchModel {
         }
         // 标签管理：Esc/点外面先收起编辑或删除确认，再关对话框。
         if let Some(manager) = self.tag_manager.as_mut() {
-            if manager.editing.take().is_none() && manager.confirm_delete.take().is_none() {
+            if manager.editing.take().is_none() && manager.confirm_delete.take().is_none() && manager.expanded.take().is_none() {
                 self.tag_manager = None;
             }
             return Effect::None;
@@ -3123,9 +3188,10 @@ impl WorkbenchModel {
                 }
             }
             "tag-save" => {
+                let Some(draft) = self.tag_manager.as_ref().and_then(|manager| manager.editing.clone()) else { return true };
+                let checked = self.check_tag_label(&draft);
                 let Some(manager) = self.tag_manager.as_mut() else { return true };
-                let Some(draft) = manager.editing.clone() else { return true };
-                match crate::connections::model::validate_tag_label(&draft.label) {
+                match checked {
                     Ok(label) => {
                         manager.busy = true;
                         manager.error = None;
@@ -3153,6 +3219,16 @@ impl WorkbenchModel {
                     }
                 } else if let Some(rest) = id.strip_prefix("tag-delete:") {
                     manager.confirm_delete = Some(rest.to_owned());
+                } else if let Some(rest) = id.strip_prefix("tag-expand:") {
+                    // 再点一次收起；同一时刻只展开一个标签的关联连接。
+                    manager.expanded = if manager.expanded.as_deref() == Some(rest) { None } else { Some(rest.to_owned()) };
+                } else if let Some(rest) = id.strip_prefix("tag-untag:") {
+                    if manager.busy || !self.connections.rows.iter().any(|row| row.saved.id == rest) {
+                        return true;
+                    }
+                    manager.busy = true;
+                    manager.error = None;
+                    self.tag_job = Some(TagJob::Untag { connection: rest.to_owned() });
                 } else if let Some(rest) = id.strip_prefix("tag-delete-confirm:") {
                     manager.confirm_delete = None;
                     manager.busy = true;
@@ -3166,33 +3242,95 @@ impl WorkbenchModel {
     }
 
     /// 标签读写的结果回到模型：成功关闭编辑、换上新列表；失败把原因留在对话框里。
-    pub fn finish_tag_job(&mut self, deleted: Option<String>, result: Result<Vec<EnvTag>, String>) {
-        // 删掉的标签在库里已改成无标签；内存里的连接同步改掉，不必整表重读。
-        if let (Some(id), Ok(_)) = (deleted.as_deref(), result.as_ref()) {
-            for row in &mut self.connections.rows {
-                if row.saved.env == id {
-                    row.saved.env = crate::connections::model::ENV_NONE.to_owned();
+    pub fn finish_tag_job(&mut self, job: &TagJob, result: Result<Vec<EnvTag>, String>) {
+        // 删掉的标签/移出的连接在库里已改成无标签；内存里的连接同步改掉，不必整表重读。
+        if result.is_ok() {
+            match job {
+                TagJob::Delete(id) => {
+                    for row in &mut self.connections.rows {
+                        if row.saved.env == *id {
+                            row.saved.env = crate::connections::model::ENV_NONE.to_owned();
+                        }
+                    }
+                    if self.connections.filter_env == *id {
+                        self.connections.filter_env.clear();
+                    }
                 }
-            }
-            if self.connections.filter_env == id {
-                self.connections.filter_env.clear();
+                TagJob::Untag { connection } => {
+                    if let Some(row) = self.connections.rows.iter_mut().find(|row| row.saved.id == *connection) {
+                        row.saved.env = crate::connections::model::ENV_NONE.to_owned();
+                    }
+                }
+                TagJob::Save { .. } => {}
             }
         }
+        let saved = matches!(job, TagJob::Save { .. });
         let Some(manager) = self.tag_manager.as_mut() else {
             if let Ok(tags) = result {
-                self.env_tags = tags;
+                self.apply_env_tags(tags);
             }
             return;
         };
         manager.busy = false;
         match result {
             Ok(tags) => {
-                manager.editing = None;
+                // 移出单条连接不打断正在进行的改名/新建；保存与删除完成后收起编辑。
+                if saved || matches!(job, TagJob::Delete(_)) {
+                    manager.editing = None;
+                }
+                if matches!(job, TagJob::Delete(_)) {
+                    manager.expanded = None;
+                }
                 manager.error = None;
-                self.env_tags = tags;
+                self.apply_env_tags(tags);
             }
             Err(message) => manager.error = Some(message),
         }
+    }
+
+    /// 换上新的标签表：筛选栏、连接色块直接读它；已打开的危险确认按新色调重算是否生产，
+    /// 视图看到版本号变化后再刷新表数据页与结构页的生产提示。
+    pub fn apply_env_tags(&mut self, tags: Vec<EnvTag>) {
+        self.env_tags = tags;
+        self.env_tags_revision = self.env_tags_revision.wrapping_add(1);
+        if let Some(prompt) = self.danger.as_mut() {
+            prompt.apply_tags(Some(&self.env_tags));
+        }
+    }
+
+    /// 这条连接此刻是否按生产处理：按连接当前的标签和标签表的色调现算，不用打开时的旧值。
+    pub fn connection_is_prod(&self, connection_id: &str) -> bool {
+        let Some(row) = self.connections.rows.iter().find(|row| row.saved.id == connection_id) else { return false };
+        super::danger::env_is_prod(&row.saved.env, Some(&self.env_tags))
+    }
+
+    /// 标签名就地校验：空名、保留名与重名都在面板里直接说明，不等后台往返。
+    fn check_tag_label(&self, draft: &TagDraft) -> Result<String, String> {
+        if draft.label.trim().is_empty() {
+            return Err(self.text("tags.nameRequired"));
+        }
+        let label = crate::connections::model::validate_tag_label(&draft.label)?;
+        let duplicate = self
+            .env_tags
+            .iter()
+            .any(|tag| Some(tag.id.as_str()) != draft.id.as_deref() && tag.label.trim().to_lowercase() == label.to_lowercase());
+        if duplicate {
+            return Err(crate::i18n::fill(&self.text("tags.duplicate"), &[("name", &label)]));
+        }
+        Ok(label)
+    }
+
+    /// 使用某个标签的连接（按名称排序），供标签面板展开查看与移除。
+    pub fn tag_connections(&self, id: &str) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = self
+            .connections
+            .rows
+            .iter()
+            .filter(|row| row.saved.env == id)
+            .map(|row| (row.saved.id.clone(), row.saved.name.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows
     }
 
     /// 某个标签被多少条连接使用：删除前告诉用户影响。
