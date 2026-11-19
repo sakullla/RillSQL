@@ -142,6 +142,9 @@ impl Workbench {
             self.palette_focused = false;
             self.palette_scroll_seen = None;
         }
+        if !help_open {
+            self.help_focused = false;
+        }
         if self.model.danger.is_none() {
             self.danger_focused_epoch = None;
         }
@@ -274,6 +277,9 @@ impl Workbench {
         if self.model.group_delete.is_some() {
             root = root.child(self.group_delete_layer(cx));
         }
+        if !self.model.open_choices.is_empty() {
+            root = root.child(self.open_choice_layer(cx));
+        }
         if self.model.history.confirm_clear {
             root = root.child(self.clear_history_layer(cx));
         }
@@ -359,6 +365,13 @@ impl Workbench {
                 _ => {}
             }
         }
+        // 打开方式询问：Esc 跳过这个文件。
+        if key == "escape" && !self.model.open_choices.is_empty() && self.model.menu.is_none() {
+            self.perform("open-choice-cancel", cx);
+            self.restore_focus(window, cx);
+            cx.notify();
+            return;
+        }
         // 分组输入面板与删除确认：Esc 只取消这一层，不改任何数据。
         if key == "escape" && self.model.group_delete.is_some() && self.model.menu.is_none() {
             self.perform("group-delete-cancel", cx);
@@ -423,6 +436,7 @@ impl Workbench {
         let modal_blocks_page = self.model.history.confirm_open()
             || self.model.connections.confirm_delete
             || self.model.group_delete.is_some()
+            || !self.model.open_choices.is_empty()
             || self.model.group_prompt.is_some()
             || self.model.tag_manager.is_some()
             || self.model.shell.help_open
@@ -593,6 +607,9 @@ impl Workbench {
             // 查询页的结果网格属于 QueryPane。公开焦点入口是编辑器；表格页才回到共享网格。
             FocusTarget::Grid if self.model.tool == super::model::WorkTool::Query => self.query.update(cx, |pane, _| pane.request_focus()),
             FocusTarget::Grid => self.table.update(cx, |pane, _| pane.request_focus()),
+            // 查询编辑器只画在工作区；在别的页面（连接页、历史页）关掉浮层时把焦点交回工作台根，
+            // 否则焦点落在已经不在界面上的浮层输入框里，Esc、方向键都没人接。
+            FocusTarget::Editor if self.model.shell.page != AppPage::Workspace => window.focus(&self.focus, cx),
             FocusTarget::Editor => self.query.update(cx, |pane, _| pane.request_focus()),
             _ => window.focus(&self.focus, cx),
         }
@@ -660,8 +677,8 @@ impl Workbench {
             ))
             .child(div().flex_1())
             .child(
-                controls(kit::icon_button("top-open-sql", IconName::FileText, self.t("query.fileIo.open"), act("open-sql-file", cx)).into_any_element())
-                    .child(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)))
+                // 唯一的“打开文件”入口：.sql 进编辑器，SQLite 文件建连接，认不出时询问。
+                controls(kit::icon_button("top-open-file", IconName::FolderOpen, self.t("shell.command.openFile"), act("open-file", cx)).into_any_element())
                     .when(!narrow, |this| {
                         this.child(
                             kit::icon_button("top-exchange", IconName::ArrowDownUp, self.t("shell.command.openExchange"), act("open-exchange", cx))
@@ -738,7 +755,10 @@ impl Workbench {
         let p = Palette::of(cx);
         let m = self.metrics();
         let width = self.model.layout().sidebar_width as f32;
-        let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
+        let (filter, filter_state) =
+            self.field_input(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
+        // Esc 清空筛选框：与框内 × 一样以空值送达，走唯一的清除入口；框已空时 Esc 照常向外传递。
+        filter_state.update(cx, |state, _| state.set_clean_on_escape(true));
         let group_prompt = self.group_prompt_panel(window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
         // 可见行先拍成扁平序列（分组标题 → 连接 → 树行），渲染只创建视口窗口里的行。
@@ -776,10 +796,10 @@ impl Workbench {
                         cx,
                     ))
                     .child(kit::secondary_button(
-                        "explorer-sqlite",
+                        "explorer-open-file",
                         Some(IconName::FolderOpen),
-                        self.t("common.openSqlite"),
-                        act("open-sqlite", cx),
+                        self.t("shell.command.openFile"),
+                        act("open-file", cx),
                     )),
                 &p,
             ));
@@ -2207,15 +2227,6 @@ impl Workbench {
                 cx,
             ))
             .child(quick_card(
-                "welcome-card-sqlite",
-                IconName::FolderOpen,
-                self.t("common.openSqlite"),
-                self.t("ui.welcome.openSqliteDesc"),
-                None,
-                "open-sqlite",
-                cx,
-            ))
-            .child(quick_card(
                 "welcome-card-query",
                 IconName::SquareTerminal,
                 self.t("shell.command.newQuery"),
@@ -2225,12 +2236,12 @@ impl Workbench {
                 cx,
             ))
             .child(quick_card(
-                "welcome-card-open-sql",
-                IconName::FileText,
-                self.t("query.fileIo.open"),
-                self.t("ui.welcome.openSqlDesc"),
-                Some("Ctrl+O"),
-                "open-sql-file",
+                "welcome-card-open-file",
+                IconName::FolderOpen,
+                self.t("shell.command.openFile"),
+                self.t("ui.welcome.openFileDesc"),
+                crate::app::keymap::command_chord("open-file"),
+                "open-file",
                 cx,
             ));
 
@@ -5677,28 +5688,125 @@ impl Workbench {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if help {
             panel = stack_frame(|| {
-            let mut panel = panel;
-            let mut list = div().id("help-list").flex().flex_col().overflow_y_scroll().p(px(8.));
-            let mut group = "";
-            for shortcut in crate::app::model::SHORTCUTS {
-                if shortcut.group != group {
-                    group = shortcut.group;
-                    list = list.child(div().px(px(8.)).pt(px(10.)).pb(px(4.)).child(kit::eyebrow(self.t(&format!("ui.help.{group}")), &p)));
-                }
+            // 固定高度：左侧分组导航与右侧列表各自滚动，长列表能完整滚到底。
+            let mut panel = panel.h(px(max_panel_h));
+            let input = self.input_for(DraftField::HelpQuery, &self.model.text("ui.help.search"), false, window, cx);
+            if !self.help_focused {
+                self.help_focused = true;
+                self.fields.focus(DraftField::HelpQuery, window, cx);
+            }
+            let searching = !self.model.help_query.trim().is_empty();
+            let sections = self.model.help_sections();
+            // 分组导航：搜索时不限定分组，导航只做跳转提示，不高亮。
+            let selected = if searching { None } else { Some(self.model.help_group) };
+            let mut nav = div()
+                .id("help-groups")
+                .test_support()
+                .role(gpui_kit::Role::List)
+                .aria_label(self.t("ui.help.groups"))
+                .flex_none()
+                .w(px(132.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .p(px(8.))
+                .border_r_1()
+                .border_color(p.line)
+                .overflow_y_scroll();
+            let nav_item = |id: String, label: SharedString, count: usize, on: bool, command: String, cx: &mut Context<Self>| {
+                div()
+                    .id(SharedString::from(id))
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(label.clone())
+                    .aria_selected(on)
+                    .px(px(8.))
+                    .h(px(m.menu_row_h))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .cursor_pointer()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(if on { p.accent_text } else { p.text })
+                    .when(on, |this| this.bg(p.accent_soft))
+                    .when(!on, |this| this.hover(|style| style.bg(p.hover)))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(div().text_color(p.text_faint).font_features(kit::tabular_figures()).child(SharedString::from(count.to_string())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.model.help_query.clear();
+                        this.perform(&command, cx);
+                        this.fields.focus(DraftField::HelpQuery, window, cx);
+                        cx.notify();
+                    }))
+            };
+            nav = nav.child(nav_item(
+                "help-group-all".into(),
+                self.t("ui.help.all"),
+                crate::app::keymap::SHORTCUTS.len(),
+                selected == Some(None),
+                "help-group-all".into(),
+                cx,
+            ));
+            for group in crate::app::keymap::GROUPS {
+                let count = crate::app::keymap::SHORTCUTS.iter().filter(|shortcut| shortcut.group == group).count();
+                nav = nav.child(nav_item(
+                    format!("help-group-{group}"),
+                    self.t(&format!("ui.help.{group}")),
+                    count,
+                    selected == Some(Some(group)),
+                    format!("help-group:{group}"),
+                    cx,
+                ));
+            }
+            let mut list = div()
+                .id("help-list")
+                .test_support()
+                .role(gpui_kit::Role::List)
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .p(px(8.));
+            if sections.is_empty() {
                 list = list.child(
                     div()
-                        .px(px(8.))
-                        .h(px(m.menu_row_h))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .child(div().flex_1().truncate().child(self.t(shortcut.label_key)))
-                        .child(kit::kbd(kit::shortcut(&shortcut.chord.replace("Mod+", "Ctrl+")), &p)),
+                        .id("help-empty")
+                        .test_support()
+                        .p(px(16.))
+                        .text_size(px(TypeScale::SM))
+                        .text_color(p.text_faint)
+                        .child(self.t("ui.help.noMatch")),
                 );
+            }
+            let show_headings = sections.len() > 1 || searching || self.model.help_group.is_none();
+            for (group, items) in sections {
+                if show_headings {
+                    list = list.child(div().px(px(8.)).pt(px(10.)).pb(px(4.)).child(kit::eyebrow(self.t(&format!("ui.help.{group}")), &p)));
+                }
+                for shortcut in items {
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!("help-row-{}", shortcut.id)))
+                            .test_support()
+                            .flex_none()
+                            .px(px(8.))
+                            .min_h(px(m.menu_row_h))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(div().flex_1().min_w(px(0.)).child(self.t(shortcut.label_key)))
+                            .child(kit::kbd(crate::app::keymap::display_chord(shortcut.chord()), &p)),
+                    );
+                }
             }
             panel = panel
                 .child(
                     div()
+                        .flex_none()
                         .px(px(16.))
                         .h(px(m.topbar_h + 4.))
                         .flex()
@@ -5713,7 +5821,16 @@ impl Workbench {
                             cx.notify();
                         }))),
                 )
-                .child(list);
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .border_b_1()
+                        .border_color(p.line)
+                        .child(input.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)),
+                )
+                .child(div().flex_1().min_h(px(0.)).flex().flex_row().child(nav).child(list));
             panel
             });
         } else {
@@ -6267,6 +6384,30 @@ impl Workbench {
                 .child(kit::danger_button("cmd-group-delete-confirm", Some(IconName::Trash), self.t("ui.group.delete"), act("group-delete-confirm", cx))),
         );
         backdrop("group-delete-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+    }
+
+    /// “打开文件”认不出类型时询问打开方式：SQL 文本进编辑器，或按数据库文件建连接。
+    fn open_choice_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let name = self
+            .model
+            .open_choices
+            .front()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = i18n::fill(&self.model.text("ui.openFile.askBody"), &[("name", &name)]);
+        let dialog = dialog_card("open-choice", IconName::FolderOpen, p.accent, self.t("ui.openFile.askTitle"), SharedString::from(body), &p).child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(8.))
+                .child(kit::secondary_button("cmd-open-choice-cancel", None, self.t("common.cancel"), act("open-choice-cancel", cx)))
+                .child(kit::secondary_button("cmd-open-as-database", Some(IconName::Database), self.t("ui.openFile.asDatabase"), act("open-as-database", cx)))
+                .child(kit::primary_button("cmd-open-as-sql", Some(IconName::FileText), self.t("ui.openFile.asSql"), act("open-as-sql", cx))),
+        );
+        backdrop("open-choice-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn clear_history_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -7213,8 +7354,7 @@ fn palette_icon(id: &str) -> IconName {
         "open-admin" => IconName::Gauge,
         "open-exchange" => IconName::ArrowDownUp,
         "new-connection" => IconName::Plus,
-        "open-sql-file" => IconName::FileText,
-        "open-sqlite" => IconName::FolderOpen,
+        "open-file" => IconName::FolderOpen,
         "history" => IconName::Clock,
         "save-query" => IconName::Save,
         "connections" => IconName::Plug,

@@ -67,6 +67,11 @@ impl EngineMeta for SqliteAdapter {
         &["sqlite", "sqlite3", "db", "db3", "s3db"]
     }
 
+    fn file_signature(&self) -> Option<&'static [u8]> {
+        // SQLite 数据库文件固定以这 16 字节开头（含结尾的 NUL）。
+        Some(b"SQLite format 3\0")
+    }
+
     fn defaults_to_local(&self) -> bool {
         true
     }

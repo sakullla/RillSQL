@@ -166,7 +166,7 @@ impl Foundation {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(SharedString::from(self.shell.text("shell.command.openSqlite"))),
+            prompt: Some(SharedString::from(self.shell.text("shell.command.openFile"))),
         });
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
@@ -286,9 +286,9 @@ impl Render for Foundation {
             self.shell.resolved_theme(),
             self.shell.locale.code(),
             page_name(self.shell.page),
-            palette_command.and_then(|command| command.chord).unwrap_or(""),
+            palette_command.and_then(|command| command.chord()).unwrap_or(""),
             palette_shortcut
-                .map(|shortcut| format!("{} {}", shortcut.group, shortcut.chord))
+                .map(|shortcut| format!("{} {}", shortcut.group, shortcut.chord()))
                 .unwrap_or_default(),
             if has_editor_control { self.status.as_ref() } else { "" }
         );
@@ -303,7 +303,7 @@ impl Render for Foundation {
             self.shell.text("shell.shortcuts.commandPalette")
         };
         let new_query = self.shell.text("shell.command.newQuery");
-        let open_label = self.shell.text("shell.command.openSqlite");
+        let open_label = self.shell.text("shell.command.openFile");
         let save_label = self.shell.text("shell.command.saveQuery");
         div()
             .id("foundation")
@@ -327,7 +327,7 @@ impl Render for Foundation {
                         .flex()
                         .gap(pad)
                         .child(action_button("new-query", new_query))
-                        .child(action_button("open-sqlite", open_label))
+                        .child(action_button("open-file", open_label))
                         .child(action_button("save-query", save_label))
                         .child(action_button("theme-dark", self.shell.text("shell.theme.dark")))
                         .child(action_button("theme-light", self.shell.text("shell.theme.light")))
@@ -362,8 +362,7 @@ fn command_action(id: &str) -> Box<dyn gpui_kit::Action> {
     use crate::app::*;
     match id {
         "new-query" => Box::new(NewQuery),
-        "open-sql-file" => Box::new(OpenSqlFile),
-        "open-sqlite" => Box::new(OpenSqlite),
+        "open-file" => Box::new(OpenFile),
         "save-query" => Box::new(SaveQuery),
         "theme-dark" => Box::new(ThemeDark),
         "theme-light" => Box::new(ThemeLight),
@@ -464,7 +463,7 @@ mod tests {
         let (window, view) = open(cx);
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            view.update(cx, |view, cx| view.perform("open-sqlite", cx));
+            view.update(cx, |view, cx| view.perform("open-file", cx));
         })
         .unwrap();
         assert!(cx.did_prompt_for_paths());
@@ -516,7 +515,7 @@ mod tests {
         let (window, view) = open(cx);
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            view.update(cx, |view, cx| view.perform("open-sqlite", cx));
+            view.update(cx, |view, cx| view.perform("open-file", cx));
         })
         .unwrap();
         assert!(cx.did_prompt_for_paths());

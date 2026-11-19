@@ -141,12 +141,12 @@ impl Workbench {
         let mut secondary: Vec<AnyElement> = if wide_tools {
             vec![
                 kit::tool_button("launcher-group-new", Some(IconName::FolderPlus), self.t("ui.group.new"), act("group-new", cx)).small().into_any_element(),
-                kit::tool_button("launcher-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)).small().into_any_element(),
+                kit::tool_button("launcher-open-file", Some(IconName::FolderOpen), self.t("shell.command.openFile"), act("open-file", cx)).small().into_any_element(),
             ]
         } else {
             vec![
                 icon("launcher-group-new", IconName::FolderPlus, "ui.group.new", "group-new", cx),
-                icon("launcher-sqlite", IconName::FolderOpen, "common.openSqlite", "open-sqlite", cx),
+                icon("launcher-open-file", IconName::FolderOpen, "shell.command.openFile", "open-file", cx),
             ]
         };
         if total == 0 {
@@ -299,7 +299,6 @@ impl Workbench {
                         .items_center()
                         .gap(px(6.))
                         .child(kit::primary_button("launcher-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("conn-new-launcher", cx)))
-                        .child(kit::secondary_button("launcher-empty-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)))
                         .child(kit::secondary_button("launcher-empty-import", Some(IconName::Download), self.t("ui.conn.importList"), act("conn-import", cx))),
                     &p,
                 ))

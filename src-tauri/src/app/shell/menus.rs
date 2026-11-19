@@ -100,20 +100,14 @@ fn dynamic(id: &'static str, label_key: &'static str, text: String, action: Stri
     MenuItem { text: Some(text), action: Some(action), ..leaf(id, label_key, false, true, None) }
 }
 
-/// 已有命令或快捷键表里的按键。没有登记的动作不编一个新的。
+/// 已有命令或快捷键表里的按键：都来自快捷键注册表。没有登记的动作不编一个新的。
 fn chord_for(id: &'static str) -> Option<&'static str> {
-    if let Some(chord) = crate::app::COMMANDS.iter().find(|command| command.id == id).and_then(|command| command.chord) {
-        return Some(chord);
-    }
-    crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == id).map(|shortcut| shortcut.chord)
+    command_chord(id)
 }
 
-/// 快速打开的行内快捷键：与菜单同源（COMMANDS → SHORTCUTS），不另编一份。
+/// 快速打开的行内快捷键：与菜单同源（快捷键注册表），不另编一份。
 pub(super) fn command_chord(id: &str) -> Option<&'static str> {
-    match crate::app::COMMANDS.iter().find(|command| command.id == id) {
-        Some(command) => command.chord,
-        None => crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == id).map(|shortcut| shortcut.chord),
-    }
+    crate::app::keymap::command_chord(id).or_else(|| crate::app::keymap::shortcut(id).map(|shortcut| shortcut.chord()))
 }
 
 /// 连接行菜单的第一项跟着连接状态走：已连接时是“断开连接”，否则是“连接”。

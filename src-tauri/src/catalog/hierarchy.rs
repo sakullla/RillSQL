@@ -311,6 +311,8 @@ pub struct NavTree {
     /// 搜索期间用户手动展开 / 折叠过的容器。搜索词一变就清空，清除搜索后不影响原来的展开现场。
     search_opened: BTreeSet<String>,
     search_closed: BTreeSet<String>,
+    /// 只由服务端搜索命中合入、还没被正常读取确认过的节点。清除搜索时撤掉，树回到搜索前的样子。
+    search_provisional: BTreeSet<String>,
 }
 
 /// 搜索时容器默认展开的命中上限：命中少就直接摊开，命中多的库先收起并标出命中数，
@@ -355,6 +357,7 @@ impl NavTree {
             saved_focus: None,
             search_opened: BTreeSet::new(),
             search_closed: BTreeSet::new(),
+            search_provisional: BTreeSet::new(),
         }
     }
 
@@ -473,6 +476,10 @@ impl NavTree {
             }
         }
         self.expanded.retain(|id| self.nodes.contains_key(id));
+        // 重建过的连接里，节点要么已经不在，要么来自真实读取：都不再算搜索临时节点。
+        let nodes = &self.nodes;
+        self.search_provisional
+            .retain(|id| nodes.get(id).is_some_and(|node| !changed.contains(&node.connection_id)));
         if self.focus.as_deref().is_some_and(|id| !self.nodes.contains_key(id)) {
             self.focus = self
                 .visible()
@@ -919,6 +926,7 @@ impl NavTree {
         );
         // 按库读取只给「库 → 模式 → 种类分组」这一层：对象仍按分组分页按需读。
         connection.outline_only = node.engine.shows_schemas();
+        self.confirm_loaded(database_id);
         let previous = BTreeMap::new();
         for schema in &items {
             self.push_schema(&connection, database_id, &node.database, schema, &previous);
@@ -939,6 +947,7 @@ impl NavTree {
         if object.kind != NavKind::Object {
             return false;
         }
+        self.confirm_loaded(id);
         let mut new_children = Vec::new();
         let mut first_error: Option<String> = None;
         let col_group = column_group_id(id);
@@ -1069,6 +1078,7 @@ impl NavTree {
             }
             return true;
         }
+        self.confirm_loaded(scope_id);
         let mut added = false;
         for object in objects {
             let group_id = group_node_id(&scope.connection_id, &database, &schema, object.kind);
@@ -1087,8 +1097,10 @@ impl NavTree {
                 group.expandable = true;
                 self.attach(scope_id, group);
             }
+            self.confirm_loaded(&group_id);
             let object_id = object_node_id(&scope.connection_id, &database, &schema, object);
             if self.nodes.contains_key(&object_id) {
+                self.confirm_loaded(&object_id);
                 continue;
             }
             let connection = NavConnection::new(scope.connection_id.clone(), scope.connection_name.clone(), scope.engine, ConnStatus::Connected);
@@ -1121,6 +1133,7 @@ impl NavTree {
             return false;
         }
         let Some(kind) = group.object_kind else { return false };
+        self.confirm_loaded(group_id);
         let connection = NavConnection::new(
             group.connection_id.clone(),
             group.connection_name.clone(),
@@ -1136,6 +1149,7 @@ impl NavTree {
             if let Some(existing) = self.nodes.get_mut(&object_id) {
                 // 上一轮标记过删除的对象这次又读到了：恢复成可用行，不再另建一条。
                 existing.stale = false;
+                self.confirm_loaded(&object_id);
                 continue;
             }
             let node = self.object_node(&connection, &group.database, &group.schema, object, &object_id);
@@ -1294,6 +1308,7 @@ impl NavTree {
             }
             return false;
         }
+        self.confirm_loaded(scope_id);
         let full = objects.len() >= total;
         let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let connection = NavConnection::new(scope.connection_id.clone(), scope.connection_name.clone(), scope.engine, ConnStatus::Connected);
@@ -1308,6 +1323,7 @@ impl NavTree {
         }
         for object in objects {
             let group_id = self.ensure_scope_group(scope_id, &scope, object.kind);
+            self.confirm_loaded(&group_id);
             if failed.contains_key(&group_id) {
                 continue;
             }
@@ -1315,6 +1331,7 @@ impl NavTree {
             read.entry(group_id.clone()).or_default().insert(object_id.clone());
             if let Some(existing) = self.nodes.get_mut(&object_id) {
                 existing.stale = false;
+                self.confirm_loaded(&object_id);
                 continue;
             }
             let node = self.object_node(&connection, &scope.database, &scope.schema, object, &object_id);
@@ -1752,6 +1769,7 @@ impl NavTree {
                     db_node.expandable = true;
                     db_node.unloaded = engine.shows_schemas();
                     self.attach(&root_id, db_node);
+                    self.search_provisional.insert(db_id.clone());
                 }
                 if engine.shows_schemas() && !schema.is_empty() {
                     let sc_id = schema_node_id(connection_id, database, schema);
@@ -1766,6 +1784,7 @@ impl NavTree {
                         sc_node.name = schema.clone();
                         sc_node.expandable = true;
                         self.attach(&db_id, sc_node);
+                        self.search_provisional.insert(sc_id.clone());
                     }
                     sc_id
                 } else {
@@ -1788,6 +1807,7 @@ impl NavTree {
                 group.unloaded = true;
                 group.paged = true;
                 self.attach(&scope_id, group);
+                self.search_provisional.insert(group_id.clone());
             }
             let object_id = object_node_id(connection_id, database, schema, object);
             if self.nodes.contains_key(&object_id) {
@@ -1795,6 +1815,7 @@ impl NavTree {
             }
             let node = self.object_node(&connection, database, schema, object, &object_id);
             self.attach(&group_id, node);
+            self.search_provisional.insert(object_id);
             added = true;
         }
         if added && !self.query.is_empty() && self.focus.is_none() {
@@ -1824,8 +1845,43 @@ impl NavTree {
         true
     }
 
+    /// 清除搜索：恢复搜索前的展开与焦点，并撤掉只由搜索命中合入的节点。
     pub fn clear_search(&mut self) -> bool {
-        self.search("")
+        let cleared = self.search("");
+        let pruned = self.prune_search_provisional();
+        cleared || pruned
+    }
+
+    /// 仍未被正常读取确认的搜索合入节点数量。
+    pub fn search_provisional_count(&self) -> usize {
+        self.search_provisional.iter().filter(|id| self.nodes.contains_key(*id)).count()
+    }
+
+    /// 节点被正常读取（展开、分页、读详情）确认：它和它的祖先都不再是搜索临时节点。
+    fn confirm_loaded(&mut self, id: &str) {
+        if self.search_provisional.is_empty() {
+            return;
+        }
+        let mut current = Some(id.to_owned());
+        while let Some(node_id) = current {
+            self.search_provisional.remove(&node_id);
+            current = self.nodes.get(&node_id).and_then(|node| node.parent.clone());
+        }
+    }
+
+    fn prune_search_provisional(&mut self) -> bool {
+        let ids = std::mem::take(&mut self.search_provisional);
+        let mut removed = false;
+        for id in ids {
+            if self.nodes.contains_key(&id) {
+                self.remove_subtree(&id);
+                removed = true;
+            }
+        }
+        if removed && self.focus.as_deref().is_some_and(|id| !self.nodes.contains_key(id)) {
+            self.focus = self.roots.first().cloned();
+        }
+        removed
     }
 
     fn restore_view(&mut self) {

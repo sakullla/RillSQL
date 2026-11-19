@@ -710,6 +710,11 @@ fn ui_metadata_comes_from_every_adapter() {
         for ext in meta.file_extensions() {
             assert_eq!(super::engine_for_file_extension(&ext.to_ascii_uppercase()), Some(engine));
         }
+        assert_eq!(meta.file_based(), meta.file_signature().is_some(), "{engine:?} 只有文件型引擎有文件头魔数");
+        if let Some(signature) = meta.file_signature() {
+            assert_eq!(super::engine_for_file_header(signature), Some(engine), "{engine:?} 文件头认回本引擎");
+            assert!(super::file_signature_len() >= signature.len());
+        }
         assert!(!meta.database_hint_key().is_empty());
         assert_eq!(super::is_relational_named(meta.id()), adapter(engine).capabilities().relational);
         assert_eq!(engine.workbench(), meta.workbench());
@@ -749,6 +754,12 @@ fn ui_metadata_matches_the_previous_tables() {
     for ext in ["sqlite", "sqlite3", "db", "db3", "s3db", "DB"] {
         assert_eq!(super::engine_for_file_extension(ext), Some(Engine::Sqlite), "{ext}");
     }
+    let mut header = b"SQLite format 3\0".to_vec();
+    header.extend_from_slice(&[0x10, 0x00, 0x01, 0x01]);
+    assert_eq!(super::engine_for_file_header(&header), Some(Engine::Sqlite), "SQLite 文件头");
+    assert_eq!(super::engine_for_file_header(b"SQLite format 2"), None);
+    assert_eq!(super::engine_for_file_header(b"select 1;"), None);
+    assert_eq!(super::engine_for_file_header(b""), None);
     assert!(!Workbench::Mongo.has_query_editor());
     assert!(Workbench::Redis.has_query_editor() && Workbench::Relational.has_query_editor());
 }

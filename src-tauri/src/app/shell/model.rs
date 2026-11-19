@@ -163,6 +163,9 @@ impl WorkItem {
     }
 }
 
+/// 一条连接的服务端搜索命中：(连接 id, 连接名, 引擎, [(库, 模式, 对象)])。
+pub type SearchBatch = (String, String, crate::catalog::Engine, Vec<(String, String, crate::catalog::model::ObjectRow)>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DraftField {
     Name,
@@ -190,6 +193,8 @@ pub enum DraftField {
     SaveName,
     RenameName,
     PaletteQuery,
+    /// 快捷键面板的搜索框。
+    HelpQuery,
     BundlePassphrase,
     /// 危险操作确认层：生产环境要求输入的对象名。
     DangerConfirm,
@@ -423,6 +428,8 @@ pub struct WorkbenchModel {
     pub object_spec: Option<String>,
     /// 资源管理器对象区的筛选词。只匹配对象名，不动连接列表的 `Filter`。
     pub object_filter: String,
+    /// 对象搜索代数：每次改词或清除都递增，异步检索带着发起时的代数回来，不一致就丢弃。
+    pub nav_search_generation: u64,
     /// 最近一次从查询页同步的对象索引；资源管理器、对象筛选和快速打开共用这一份。
     pub catalog: Vec<TreeObject>,
     /// 最近一次对象读取的错误；与空目录、筛选无命中分开呈现。
@@ -433,6 +440,11 @@ pub struct WorkbenchModel {
     pub nav_error: String,
     /// 模型只排队异步读取，由视图发起并回填。
     pub nav_requests: VecDeque<NavRequest>,
+    /// “打开文件”选中、但从文件头和扩展名都认不出类型的文件：逐个询问以 SQL 文本还是数据库文件打开。
+    pub open_choices: VecDeque<std::path::PathBuf>,
+    /// 快捷键面板：搜索词（动作名或按键）与当前分组（None 为全部）。
+    pub help_query: String,
+    pub help_group: Option<&'static str>,
     /// 正在读取的目录任务数；空目录与“还在读”必须能分辨。
     pub nav_loading: u32,
     /// 最近一次完整读取结果；单条连接重试时用它保住其它连接。
@@ -578,11 +590,15 @@ impl WorkbenchModel {
             table_spec: None,
             object_spec: None,
             object_filter: String::new(),
+            nav_search_generation: 0,
             catalog: Vec::new(),
             catalog_error: String::new(),
             nav: NavTree::new(),
             nav_error: String::new(),
             nav_requests: VecDeque::new(),
+            open_choices: VecDeque::new(),
+            help_query: String::new(),
+            help_group: None,
             nav_loading: 0,
             nav_source: Vec::new(),
             nav_menu_node: None,
@@ -755,7 +771,13 @@ impl WorkbenchModel {
                     self.enqueue(PendingJob::RefreshHistory);
                 }
             }
-            "help" | "shortcut-help" => self.menu = None,
+            "help" | "shortcut-help" => {
+                self.menu = None;
+                // 按打开前的焦点区域预选分组：编辑器→编辑器，表格→表格，对象树→对象树，其余→全局。
+                let focus = self.shell.focus_before_overlay().unwrap_or(self.shell.focus);
+                self.help_group = Some(crate::app::keymap::group_for_focus(focus));
+                self.help_query.clear();
+            }
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
             "open-admin" => self.open_admin(),
             "open-structure" => {
@@ -777,6 +799,15 @@ impl WorkbenchModel {
     }
 
     fn local(&mut self, id: &str) -> bool {
+        if id == "help-group-all" {
+            self.help_group = None;
+            return true;
+        }
+        if let Some(group) = id.strip_prefix("help-group:") {
+            let Some(group) = crate::app::keymap::GROUPS.iter().find(|known| **known == group) else { return false };
+            self.help_group = Some(group);
+            return true;
+        }
         if id.starts_with("password-") {
             return self.password_command(id);
         }
@@ -1091,7 +1122,7 @@ impl WorkbenchModel {
                 self.conn_filter_menu = None;
             }
             "explorer-clear-filter" => {
-                self.object_filter.clear();
+                self.clear_object_filter();
             }
             "palette-clear" => {
                 self.palette_query.clear();
@@ -2715,6 +2746,62 @@ impl WorkbenchModel {
 
     pub fn nav_clear_search(&mut self) -> bool {
         self.nav.clear_search()
+    }
+
+    /// 快捷键面板当前显示的条目，按分组排好：有搜索词时在全部分组里按动作名或按键找，
+    /// 否则只列当前分组（未选分组列全部）。
+    pub fn help_sections(&self) -> Vec<(&'static str, Vec<&'static crate::app::keymap::Shortcut>)> {
+        let query = self.help_query.trim();
+        crate::app::keymap::GROUPS
+            .iter()
+            .filter(|group| !query.is_empty() || self.help_group.is_none_or(|selected| selected == **group))
+            .map(|group| {
+                let items: Vec<_> = crate::app::keymap::SHORTCUTS
+                    .iter()
+                    .filter(|shortcut| shortcut.group == *group)
+                    .filter(|shortcut| crate::app::keymap::matches(shortcut, &self.text(shortcut.label_key), query))
+                    .collect();
+                (*group, items)
+            })
+            .filter(|(_, items)| !items.is_empty())
+            .collect()
+    }
+
+    /// 对象树搜索的唯一清除入口：框内 ×、全删、Esc、无命中行的按钮都走这里。
+    /// 清空筛选词、结束树搜索并恢复搜索前展开、撤掉只由搜索合入的节点，
+    /// 丢掉排队的检索并让进行中的检索中止；迟到的结果因代数不符被丢弃。
+    pub fn clear_object_filter(&mut self) -> bool {
+        let active = !self.object_filter.is_empty()
+            || !self.nav.query().is_empty()
+            || self.nav.search_provisional_count() > 0
+            || self.nav_requests.iter().any(|req| matches!(req, NavRequest::Search(_)));
+        self.object_filter.clear();
+        self.nav_search_generation = self.nav_search_generation.wrapping_add(1);
+        self.nav_requests.retain(|req| !matches!(req, NavRequest::Search(_) | NavRequest::CancelSearch));
+        if active {
+            self.nav_requests.push_back(NavRequest::CancelSearch);
+        }
+        self.nav.clear_search();
+        active
+    }
+
+    /// 服务端检索结果回到模型：代数与筛选词都还对得上才合入树，否则说明期间改过词或清除过，丢弃。
+    pub fn apply_search_hits(
+        &mut self,
+        generation: u64,
+        query: &str,
+        batches: Vec<SearchBatch>,
+    ) -> bool {
+        if generation != self.nav_search_generation || self.object_filter.trim() != query.trim() || self.nav.query().is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (conn_id, conn_name, engine, hits) in batches {
+            if self.nav.merge_search_hits(&conn_id, &conn_name, engine, &hits) {
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn sync_object_spec_from_focus(&mut self) {
@@ -5387,20 +5474,25 @@ impl WorkbenchModel {
             }
             DraftField::Filter => self.connections.filter_text = value,
             DraftField::ObjectFilter => {
+                // 全删（含框内 × 与 Esc，它们都以空值送达）走唯一的清除入口。
+                if value.trim().is_empty() {
+                    self.clear_object_filter();
+                    self.object_filter = value;
+                    return;
+                }
                 // 资源管理器搜索与对象索引是同一份：显示完整路径并高亮，同时异步向已连接数据库检索未分页/未展开的对象。
                 self.object_filter = value;
+                self.nav_search_generation = self.nav_search_generation.wrapping_add(1);
                 let query = self.object_filter.clone();
                 self.nav_search(&query);
                 self.nav_requests.retain(|req| !matches!(req, NavRequest::Search(_)));
-                let trimmed = query.trim();
-                if !trimmed.is_empty() {
-                    self.nav_requests.push_back(NavRequest::Search(trimmed.to_owned()));
-                }
+                self.nav_requests.push_back(NavRequest::Search(query.trim().to_owned()));
             }
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
             DraftField::RenameName => self.history.rename_text = value,
             DraftField::PaletteQuery => self.palette_query = value,
+            DraftField::HelpQuery => self.help_query = value,
             DraftField::GroupName => {
                 if let Some(prompt) = self.group_prompt.as_mut() {
                     prompt.text = value;
@@ -5482,6 +5574,7 @@ impl WorkbenchModel {
             DraftField::SaveName => self.history.save_name.clone(),
             DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
+            DraftField::HelpQuery => self.help_query.clone(),
             DraftField::GroupName => self.group_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
             DraftField::TagLabel => self.tag_manager.as_ref().and_then(|manager| manager.editing.as_ref()).map(|draft| draft.label.clone()).unwrap_or_default(),
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
@@ -5543,7 +5636,7 @@ impl WorkbenchModel {
             "shell.sidebar.explorer",
             "shell.command.newQuery",
             "shell.command.execute",
-            "shell.command.openSqlite",
+            "shell.command.openFile",
             "shell.command.saveQuery",
             "shell.command.history",
             "shell.palette.title",
@@ -5653,7 +5746,7 @@ impl WorkbenchModel {
                 "ui.settings.retrySave",
                 "ui.settings.localHint",
             ],
-            _ if self.show_welcome() => vec!["shell.welcome.resumeTitle", "shell.welcome.recent", "shell.welcome.saved", "common.newConnection", "common.openSqlite"],
+            _ if self.show_welcome() => vec!["shell.welcome.resumeTitle", "shell.welcome.recent", "shell.welcome.saved", "common.newConnection", "shell.command.openFile"],
             _ => vec!["shell.statusbar.noTarget", "query.editor.area"],
         }
     }

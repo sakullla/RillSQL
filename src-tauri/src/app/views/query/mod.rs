@@ -1139,7 +1139,7 @@ impl QueryPane {
                 if let Some(owner) = self.owner.clone() {
                     cx.defer(move |cx| {
                         if let Some(owner) = owner.upgrade() {
-                            owner.update(cx, |view, cx| view.perform("open-sql-file", cx));
+                            owner.update(cx, |view, cx| view.perform("open-file", cx));
                         }
                     });
                 } else {
@@ -2828,7 +2828,11 @@ impl QueryPane {
             .when(!self.narrow, |this| {
                 this.child(
                     kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("query.fileIo.open"), pane_act("open-sql-file", entity))
-                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.fileIo.open"), kit::shortcut("Ctrl+O")))),
+                        .tooltip(SharedString::from(format!(
+                            "{} · {}",
+                            i18n::text(locale, "query.fileIo.open"),
+                            kit::shortcut(crate::app::keymap::command_chord("open-file").unwrap_or_default())
+                        ))),
                 )
             })
             .child(more)
@@ -2874,7 +2878,7 @@ impl QueryPane {
                     .item(item("expand-star", IconName::Columns3, "query.complete.expandStar", None))
                     .item(item("toggle-outline", IconName::ListOrdered, "query.outline.heading", None))
                     .separator()
-                    .item(item("open-sql-file", IconName::FolderOpen, "query.fileIo.open", Some("Ctrl+O")))
+                    .item(item("open-sql-file", IconName::FolderOpen, "query.fileIo.open", crate::app::keymap::command_chord("open-file")))
                     .item(item("save-sql-file", IconName::Download, "query.fileIo.save", None))
             })
             .into_any_element()

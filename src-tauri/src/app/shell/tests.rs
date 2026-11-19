@@ -1441,7 +1441,7 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
     std::fs::write(&sqlite, b"sqlite").unwrap();
     let sqlite_opened = sqlite.canonicalize().unwrap();
     cx.update_window(window, |_, _, cx| {
-        view.update(cx, |view, cx| view.perform("open-sqlite", cx));
+        view.update(cx, |view, cx| view.perform("open-file", cx));
     })
     .unwrap();
     assert!(cx.did_prompt_for_paths());
@@ -9506,8 +9506,8 @@ fn palette_command_shortcuts_match_the_shortcut_help_and_menu_source() {
     for command in crate::app::COMMANDS {
         let entry = entries.iter().find(|entry| entry.id == command.id).expect("命令面板缺命令");
         let source = command
-            .chord
-            .or_else(|| crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == command.id).map(|shortcut| shortcut.chord));
+            .chord()
+            .or_else(|| crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == command.id).map(|shortcut| shortcut.chord()));
         assert_eq!(entry.shortcut, source, "{} 的快捷键要和菜单/快捷键表同源", command.id);
         with_chord += usize::from(entry.shortcut.is_some());
     }
@@ -11301,7 +11301,7 @@ fn portal_dialog_failure_falls_back_to_sqlite_modal_with_friendly_guidance(cx: &
     let (window, view) = open_workbench(cx, services_at(&dir), false);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| {
-            view.finish_sqlite_prompt::<&str>(
+            view.finish_open_prompt::<&str>(
                 Ok(Err("Portal request failed: org.freedesktop.DBus.Error.ServiceUnknown: Portal not provided")),
                 cx,
             );
@@ -11967,4 +11967,459 @@ fn table_rename_and_drop_sync_open_tabs_and_invalidate_tree_details() {
     // 删除表后自动收起已失效的干净数据与结构标签页。
     model.object_dropped("pg", "shop", "public", "orders_v2", ObjectKind::Table);
     assert!(model.tabs.iter().all(|tab| !matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure)));
+}
+
+// ---------------------------------------------------------------- R1 对象树搜索清除
+
+/// 已展开到对象的 PG 连接；搜索“ord”时服务端另外命中一张未分页的表和一个没读过的库。
+fn search_clear_model() -> (WorkbenchModel, usize, Vec<super::model::SearchBatch>, Vec<String>) {
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let orders = ObjectRow::table("orders", Some(1));
+    let people = ObjectRow::table("people", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders, people])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.connections.rows = vec![record_for("pg", "销售库", Engine::Postgres)];
+    model.connections.status.insert("pg".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[pg], false);
+    expand_all(
+        &mut model,
+        &[
+            connection_node_id("pg"),
+            database_node_id("pg", "shop"),
+            schema_node_id("pg", "shop", "public"),
+            group_node_id("pg", "shop", "public", ObjectKind::Table),
+        ],
+    );
+    let before = model.nav_rows().len();
+    let archive = ObjectRow::table("order_archive", Some(9));
+    let cold = ObjectRow::table("order_cold", Some(3));
+    let provisional = vec![
+        nav_id("pg", "shop", "public", &archive),
+        database_node_id("pg", "cold"),
+        nav_id("pg", "cold", "public", &cold),
+    ];
+    let hits = vec![(
+        "pg".to_owned(),
+        "销售库".to_owned(),
+        Engine::Postgres,
+        vec![("shop".to_owned(), "public".to_owned(), archive), ("cold".to_owned(), "public".to_owned(), cold)],
+    )];
+    (model, before, hits, provisional)
+}
+
+fn queued_searches(model: &WorkbenchModel) -> (usize, usize) {
+    let search = model.nav_requests.iter().filter(|req| matches!(req, super::nav::NavRequest::Search(_))).count();
+    let cancel = model.nav_requests.iter().filter(|req| matches!(req, super::nav::NavRequest::CancelSearch)).count();
+    (search, cancel)
+}
+
+#[test]
+fn explorer_clear_filter_command_ends_search_drops_queued_reads_and_removes_merged_nodes() {
+    let (mut model, before, hits, provisional) = search_clear_model();
+    let expanded_before: Vec<bool> = model.nav_rows().iter().map(|row| row.expanded).collect();
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    assert_eq!(queued_searches(&model), (1, 0), "输入后排队一次服务端检索");
+    let generation = model.nav_search_generation;
+    assert!(model.apply_search_hits(generation, "ord", hits));
+    for id in &provisional {
+        assert!(model.nav_node(id).is_some(), "{id}: 搜索命中合入树");
+    }
+    assert!(model.nav_rows().iter().any(|row| row.label == "order_archive"));
+
+    // 无命中行与框内按钮共用的命令。
+    let _ = model.dispatch("explorer-clear-filter");
+    assert!(model.object_filter.is_empty());
+    assert_eq!(model.field_value(DraftField::ObjectFilter), "");
+    assert!(model.nav.query().is_empty(), "清除后 nav.query 为空");
+    assert!(!model.nav_searching());
+    assert_eq!(queued_searches(&model), (0, 1), "排队的检索被丢弃，并通知视图中止进行中的检索");
+    for id in &provisional {
+        assert!(model.nav_node(id).is_none(), "{id}: 仅由搜索合入的节点被撤除");
+    }
+    assert_eq!(model.nav.search_provisional_count(), 0);
+    assert_eq!(model.nav_rows().len(), before, "树回到搜索前");
+    let expanded_after: Vec<bool> = model.nav_rows().iter().map(|row| row.expanded).collect();
+    assert_eq!(expanded_after, expanded_before, "恢复搜索前展开");
+    assert!(model.nav_rows().iter().all(|row| row.highlight.is_none()), "不残留高亮");
+}
+
+#[test]
+fn late_search_results_after_clearing_are_discarded() {
+    let (mut model, before, hits, provisional) = search_clear_model();
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let stale = model.nav_search_generation;
+    // 全删：输入框以空值送达，同样走清除入口。
+    model.set_field(DraftField::ObjectFilter, String::new());
+    assert!(!model.apply_search_hits(stale, "ord", hits.clone()), "清除后迟到的结果被丢弃");
+    assert_eq!(model.nav_rows().len(), before);
+    assert!(provisional.iter().all(|id| model.nav_node(id).is_none()));
+
+    // 重新输入同一个词：上一轮的迟到结果代数不符，仍然丢弃；本轮结果正常合入。
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    assert!(!model.apply_search_hits(stale, "ord", hits.clone()), "旧代数的结果不合入新一轮搜索");
+    assert!(provisional.iter().all(|id| model.nav_node(id).is_none()));
+    let current = model.nav_search_generation;
+    assert!(model.apply_search_hits(current, "ord", hits));
+    assert!(provisional.iter().all(|id| model.nav_node(id).is_some()));
+}
+
+#[test]
+fn nodes_loaded_normally_during_search_survive_clearing() {
+    use crate::catalog::hierarchy::database_node_id;
+    let (mut model, _, hits, _) = search_clear_model();
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let generation = model.nav_search_generation;
+    assert!(model.apply_search_hits(generation, "ord", hits));
+    // 用户在搜索期间真的读了“cold”库：库节点不再是临时节点。
+    let cold = database_node_id("pg", "cold");
+    let _ = model.nav.set_database(&cold, Ok(Vec::new()));
+    let _ = model.dispatch("explorer-clear-filter");
+    assert!(model.nav_node(&cold).is_some(), "正常读取过的库在清除后保留");
+}
+
+#[test]
+fn twenty_type_and_clear_cycles_always_restore_the_tree() {
+    let (mut model, before, hits, provisional) = search_clear_model();
+    for cycle in 0..20 {
+        while model.take_nav_request().is_some() {}
+        let word = if cycle % 2 == 0 { "ord" } else { "order" };
+        model.set_field(DraftField::ObjectFilter, "o".into());
+        model.set_field(DraftField::ObjectFilter, word.into());
+        assert_eq!(queued_searches(&model), (1, 0), "{cycle}: 只保留最后一次检索");
+        let generation = model.nav_search_generation;
+        assert!(model.apply_search_hits(generation, word, hits.clone()), "{cycle}");
+        match cycle % 3 {
+            0 => model.set_field(DraftField::ObjectFilter, String::new()),
+            1 => {
+                let _ = model.dispatch("explorer-clear-filter");
+            }
+            _ => {
+                assert!(model.clear_object_filter());
+            }
+        }
+        assert!(model.nav.query().is_empty(), "{cycle}: query 为空");
+        assert!(model.object_filter.is_empty(), "{cycle}: 筛选词为空");
+        assert_eq!(queued_searches(&model), (0, 1), "{cycle}: 无排队检索");
+        assert_eq!(model.nav.search_provisional_count(), 0, "{cycle}");
+        assert!(provisional.iter().all(|id| model.nav_node(id).is_none()), "{cycle}: 合入节点撤除");
+        assert_eq!(model.nav_rows().len(), before, "{cycle}: 树恢复");
+        assert!(!model.apply_search_hits(generation, word, hits.clone()), "{cycle}: 迟到结果丢弃");
+    }
+}
+
+/// 真实输入框：Esc 与无命中行的清除按钮都走同一个清除入口，框内文字随之清空。
+#[gpui_kit::test]
+fn escape_and_no_match_button_clear_the_object_filter_in_the_window(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir, ids) = object_tree_workbench(cx, 1360., false);
+    let before: Vec<bool> = ids.expanded.iter().map(|id| cx.update(|cx| view.read(cx).model.nav.is_expanded(id))).collect();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("field-ObjectFilter", cx);
+        window.input("waybill", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill");
+    cx.update_window(window, |_, window, cx| {
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.model.object_filter.is_empty(), "Esc 清空筛选词");
+        assert!(view.model.nav.query().is_empty(), "Esc 结束树搜索");
+        let after: Vec<bool> = ids.expanded.iter().map(|id| view.model.nav.is_expanded(id)).collect();
+        assert_eq!(after, before, "Esc 后恢复展开");
+    });
+
+    // 无命中：行内按钮清除，框内文字同步清空（再输入时从空框开始）。
+    cx.update_window(window, |_, window, cx| {
+        window.click("field-ObjectFilter", cx);
+        window.input("zzzz", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "zzzz");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("explorer-clear-filter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.model.object_filter.is_empty(), "按钮清空筛选词");
+        assert!(view.model.nav.query().is_empty(), "按钮结束树搜索");
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("field-ObjectFilter", cx);
+        window.input("ord", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "ord", "框内文字已被清空，不残留 zzzz");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------- R5 打开文件合并
+
+/// 顶栏、欢迎页、连接页、命令表与菜单命令里只剩一个“打开文件”入口。
+#[gpui_kit::test]
+fn every_surface_offers_exactly_one_open_file_entry(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-open-entry-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let ids: Vec<&str> = crate::app::COMMANDS.iter().map(|command| command.id).collect();
+    assert!(ids.contains(&"open-file"));
+    assert!(!ids.contains(&"open-sqlite") && !ids.contains(&"open-sql-file"), "命令表不再有两个打开入口");
+    assert_eq!(crate::app::Shell::command("open-file").and_then(|command| command.chord()), Some("Mod+O"));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("top-open-file").visible(), "顶栏有打开文件");
+        for gone in ["top-sqlite", "top-open-sql", "welcome-card-sqlite", "welcome-card-open-sql"] {
+            assert!(window.try_find(gone).is_none(), "{gone} 已合并");
+        }
+        assert!(window.find("welcome-card-open-file").visible(), "欢迎页只有一张打开文件卡片");
+        view.update(cx, |view, cx| view.perform("activity-connections", cx));
+        window.render_frame(cx);
+        assert!(window.find("launcher-open-file").visible(), "连接页有打开文件");
+        for gone in ["launcher-sqlite", "launcher-empty-sqlite"] {
+            assert!(window.try_find(gone).is_none(), "{gone} 已合并");
+        }
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 打开文件：文件头认出的数据库直接建连接；认不出的询问打开方式，Esc 跳过、选 SQL 进编辑器、选数据库建连接。
+#[gpui_kit::test]
+fn open_file_routes_by_header_and_asks_for_unknown_files(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-open-file-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let pick = |cx: &mut gpui_kit::TestAppContext, path: std::path::PathBuf| {
+        cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("open-file", cx))).unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(move |options| {
+            assert!(options.files && !options.directories && options.multiple);
+            Some(vec![path.clone()])
+        });
+        cx.run_until_parked();
+    };
+
+    // 扩展名不对，但文件头是数据库：直接建本地文件连接，不询问。
+    let mut header = b"SQLite format 3\0".to_vec();
+    header.extend_from_slice(&[0x10, 0x00, 0x01, 0x01]);
+    let backup = dir.join("backup.bin");
+    std::fs::write(&backup, &header).unwrap();
+    pick(cx, backup.canonicalize().unwrap());
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.open_choices.is_empty(), "认得出的文件不询问");
+        let draft = model.connections.editor.as_ref().expect("数据库文件建连接");
+        assert_eq!(draft.engine, crate::adapters::registry::LOCAL_FILE);
+        assert_eq!(draft.file_path, backup.canonicalize().unwrap().display().to_string());
+    });
+
+    // 认不出的文件：弹出询问；Esc 跳过，不打开任何东西。
+    let notes = dir.join("notes.txt");
+    std::fs::write(&notes, "select 42;\n").unwrap();
+    let notes = notes.canonicalize().unwrap();
+    pick(cx, notes.clone());
+    let tabs = cx.update(|cx| view.read(cx).model.tabs.len());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("cmd-open-as-sql").visible() && window.find("cmd-open-as-database").visible(), "询问打开方式");
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("cmd-open-as-sql").is_none(), "Esc 关闭询问");
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.open_choices.is_empty());
+        assert_eq!(model.tabs.len(), tabs, "跳过的文件不打开");
+    });
+
+    // 选“作为 SQL 文本打开”：内容进查询编辑器。
+    pick(cx, notes.clone());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("cmd-open-as-sql", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert!(model.open_choices.is_empty());
+        assert!(model.tabs.iter().any(|tab| tab.title.contains("notes")), "文本进入查询编辑器：{:?}", model.tabs.iter().map(|tab| tab.title.clone()).collect::<Vec<_>>());
+    });
+
+    // 选“作为数据库打开”：按本地文件数据库建连接。
+    pick(cx, notes.clone());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("cmd-open-as-database", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let draft = view.read(cx).model.connections.editor.as_ref().cloned().expect("按数据库打开");
+        assert_eq!(draft.file_path, notes.display().to_string());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- R6 快捷键注册表与面板
+
+#[test]
+fn shortcut_registry_drives_commands_menus_and_the_help_panel() {
+    // 命令表的组合键全部来自注册表；注册表里有命令的项都能被外壳执行。
+    for command in crate::app::COMMANDS {
+        assert_eq!(command.chord(), crate::app::keymap::command_chord(command.id), "{}", command.id);
+    }
+    let mut model = WorkbenchModel::new(Shell::default());
+    for shortcut in crate::app::keymap::SHORTCUTS {
+        if let Some(command) = shortcut.command {
+            assert!(model.dispatch(command).is_some(), "{} 的命令 {command} 没有处理者", shortcut.id);
+            model.shell.close_overlay();
+            model.close_prompt = None;
+        }
+    }
+    // 每一条按键绑定都出现在面板数据里：面板列出全部条目。
+    model.help_query.clear();
+    model.help_group = None;
+    let listed: Vec<&str> = model.help_sections().iter().flat_map(|(_, items)| items.iter().map(|item| item.id)).collect();
+    for shortcut in crate::app::keymap::SHORTCUTS {
+        assert!(listed.contains(&shortcut.id), "{} 没有出现在快捷键面板里", shortcut.id);
+    }
+    assert_eq!(listed.len(), crate::app::keymap::SHORTCUTS.len());
+    assert!(listed.contains(&"open-file"), "⌘O 打开文件登记在面板里");
+}
+
+#[test]
+fn help_panel_searches_names_and_keys_and_preselects_the_focused_group() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.focus = crate::app::FocusTarget::Editor;
+    let _ = model.dispatch("help");
+    assert!(model.shell.help_open);
+    assert_eq!(model.help_group, Some("editor"), "编辑器里打开面板预选编辑器分组");
+    let sections = model.help_sections();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].0, "editor");
+    model.shell.close_overlay();
+
+    model.shell.focus = crate::app::FocusTarget::Grid;
+    let _ = model.dispatch("help");
+    assert_eq!(model.help_group, Some("table"));
+    model.shell.close_overlay();
+    model.shell.focus = crate::app::FocusTarget::Sidebar;
+    let _ = model.dispatch("help");
+    assert_eq!(model.help_group, Some("explorer"));
+
+    // 搜索动作名：跨分组查找，不受预选分组限制。
+    model.set_field(DraftField::HelpQuery, "注释".into());
+    let ids: Vec<&str> = model.help_sections().iter().flat_map(|(_, items)| items.iter().map(|item| item.id)).collect();
+    assert_eq!(ids, ["toggle-comment"]);
+    // 搜索按键：符号或文字都可以。
+    for query in ["Mod+/", "ctrl+/", "⌘/"] {
+        model.set_field(DraftField::HelpQuery, query.into());
+        let ids: Vec<&str> = model.help_sections().iter().flat_map(|(_, items)| items.iter().map(|item| item.id)).collect();
+        assert!(ids.contains(&"toggle-comment"), "{query}: {ids:?}");
+    }
+    model.set_field(DraftField::HelpQuery, "zzzz-no-such".into());
+    assert!(model.help_sections().is_empty());
+    // 分组导航。
+    model.set_field(DraftField::HelpQuery, String::new());
+    let _ = model.dispatch("help-group:table");
+    assert_eq!(model.help_group, Some("table"));
+    assert!(model.help_sections().iter().all(|(group, _)| *group == "table"));
+    let _ = model.dispatch("help-group-all");
+    assert_eq!(model.help_sections().len(), crate::app::keymap::GROUPS.len());
+    assert!(model.dispatch("help-group:nope").is_none(), "未知分组不接受");
+}
+
+/// 真实窗口：面板有搜索框、分组导航，搜“注释”只剩一行；列表能滚到最后一项。
+#[gpui_kit::test]
+fn help_panel_renders_search_groups_and_scrolls_to_the_end(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-help-panel-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1100., 600.);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.perform("help", cx));
+        window.render_frame(cx);
+        assert!(window.find("palette").visible(), "面板打开");
+        assert!(window.find("field-HelpQuery").visible(), "顶部有搜索框");
+        window.render_frame(cx);
+        // 打开即可输入：焦点已在搜索框。
+        assert!(view.read(cx).fields.is_focused(DraftField::HelpQuery, window, cx), "打开面板后焦点在搜索框");
+        window.input("Mod+K", cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| view.read(cx).model.help_query.clone()), "Mod+K", "打开面板后直接输入进入搜索框");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("help-row-command-palette").visible(), "按键也能搜索");
+        for group in crate::app::keymap::GROUPS {
+            assert!(window.find(format!("help-group-{group}")).visible(), "{group} 分组导航");
+        }
+        window.click("help-group-all", cx);
+        window.render_frame(cx);
+        let list = window.find("help-list").bounds();
+        let panel = window.find("palette").bounds();
+        assert!(f32::from(list.bottom()) <= f32::from(panel.bottom()) + 0.5, "列表在面板内");
+        window.scroll(
+            "help-list",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::Point::new(gpui_kit::px(0.), gpui_kit::px(-9000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let last = crate::app::keymap::SHORTCUTS.last().unwrap().id;
+        let row = window.find(format!("help-row-{last}"));
+        assert!(row.visible(), "滚到底后最后一项可见");
+        let list = window.find("help-list").bounds();
+        assert!(f32::from(row.bounds().bottom()) <= f32::from(list.bottom()) + 0.5, "最后一项完整显示在列表内");
+
+        window.click("field-HelpQuery", cx);
+        window.input("注释", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("help-row-toggle-comment").visible(),
+            "搜“注释”命中注释快捷键：{:?}",
+            view.read(cx).model.help_query
+        );
+        assert!(window.try_find("help-row-format").is_none(), "其余项被筛掉");
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| view.read(cx).model.help_query.clone()), "注释");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 注册表生成的绑定真的生效：⌘/Ctrl+O 打开文件对话框，Mod+K 打开命令面板。
+#[gpui_kit::test]
+fn registry_bindings_resolve_to_their_actions(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-keymap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, _view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(crate::app::bind_keys);
+    let mac = cfg!(target_os = "macos");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let resolve = |key: &'static str, window: &gpui_kit::Window, cx: &gpui_kit::App| {
+            let keystroke = gpui_kit::Keystroke::parse(key).unwrap();
+            let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&[keystroke], &window.context_stack());
+            bindings.first().map(|binding| binding.action().boxed_clone())
+        };
+        let open = resolve(if mac { "cmd-o" } else { "ctrl-o" }, window, cx).expect("打开文件已绑定");
+        assert!(open.partial_eq(&crate::app::OpenFile), "{}", open.name());
+        let palette = resolve(if mac { "cmd-k" } else { "ctrl-k" }, window, cx).expect("命令面板已绑定");
+        assert!(palette.partial_eq(&crate::app::CommandPalette), "{}", palette.name());
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -237,74 +237,37 @@ pub struct CommandSpec {
     pub id: &'static str,
     pub label_key: &'static str,
     pub icon: &'static str,
-    pub chord: Option<&'static str>,
 }
 
-pub struct Shortcut {
-    pub id: &'static str,
-    pub group: &'static str,
-    pub chord: &'static str,
-    pub label_key: &'static str,
+impl CommandSpec {
+    /// 组合键来自快捷键注册表，命令表不另写。
+    pub fn chord(&self) -> Option<&'static str> {
+        super::keymap::command_chord(self.id)
+    }
 }
+
+pub use super::keymap::{Shortcut, SHORTCUTS};
 
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { id: "new-query", label_key: "shell.command.newQuery", icon: "code", chord: Some("Mod+T") },
-    CommandSpec { id: "open-sql-file", label_key: "query.fileIo.open", icon: "file", chord: Some("Mod+O") },
-    CommandSpec { id: "execute-query", label_key: "shell.command.execute", icon: "play", chord: Some("Mod+Enter") },
-    CommandSpec { id: "open-structure", label_key: "shell.command.newStructure", icon: "table", chord: None },
-    CommandSpec { id: "compare", label_key: "shell.command.compare", icon: "table", chord: None },
-    CommandSpec { id: "open-admin", label_key: "ui.tool.admin", icon: "database", chord: None },
-    CommandSpec { id: "open-exchange", label_key: "shell.command.openExchange", icon: "arrow-down-up", chord: None },
-    CommandSpec { id: "new-connection", label_key: "shell.command.newConnection", icon: "plus", chord: None },
-    CommandSpec { id: "open-sqlite", label_key: "shell.command.openSqlite", icon: "file", chord: None },
-    CommandSpec { id: "history", label_key: "shell.command.history", icon: "history", chord: None },
-    CommandSpec { id: "save-query", label_key: "shell.command.saveQuery", icon: "file", chord: None },
-    CommandSpec { id: "saved-queries", label_key: "shell.command.savedQueries", icon: "code", chord: None },
-    CommandSpec { id: "connections", label_key: "shell.command.connections", icon: "database", chord: None },
-    CommandSpec { id: "settings", label_key: "shell.command.settings", icon: "sliders", chord: Some("Mod+,") },
-    CommandSpec { id: "sidebar", label_key: "shell.command.toggleSidebar", icon: "sidebar", chord: Some("Mod+B") },
-    CommandSpec { id: "theme-light", label_key: "shell.command.themeLight", icon: "sun", chord: None },
-    CommandSpec { id: "theme-dark", label_key: "shell.command.themeDark", icon: "moon", chord: None },
-    CommandSpec { id: "theme-system", label_key: "shell.command.themeSystem", icon: "monitor", chord: None },
-    CommandSpec { id: "help", label_key: "shell.command.help", icon: "keyboard", chord: Some("?") },
-    CommandSpec { id: "check-updates-show", label_key: "shell.command.checkUpdates", icon: "download", chord: None },
-];
-
-pub const SHORTCUTS: &[Shortcut] = &[
-    Shortcut { id: "command-palette", group: "global", chord: "Mod+K", label_key: "shell.shortcuts.commandPalette" },
-    Shortcut { id: "quick-open", group: "global", chord: "Mod+P", label_key: "shell.shortcuts.quickOpen" },
-    Shortcut { id: "new-query", group: "global", chord: "Mod+T", label_key: "shell.shortcuts.newQuery" },
-    Shortcut { id: "close-tab", group: "global", chord: "Mod+W", label_key: "shell.shortcuts.closeTab" },
-    Shortcut { id: "toggle-sidebar", group: "global", chord: "Mod+B", label_key: "shell.shortcuts.toggleSidebar" },
-    Shortcut { id: "next-tab", group: "global", chord: "Control+Tab", label_key: "shell.shortcuts.nextTab" },
-    Shortcut { id: "prev-tab", group: "global", chord: "Control+Shift+Tab", label_key: "shell.shortcuts.prevTab" },
-    Shortcut { id: "nth-tab", group: "global", chord: "Alt+1…9", label_key: "shell.shortcuts.nthTab" },
-    Shortcut { id: "open-settings", group: "global", chord: "Mod+,", label_key: "shell.shortcuts.openSettings" },
-    Shortcut { id: "shortcut-help", group: "global", chord: "?", label_key: "shell.shortcuts.shortcutHelp" },
-    Shortcut { id: "run-selection", group: "editor", chord: "Mod+Enter", label_key: "shell.shortcuts.runSelection" },
-    Shortcut { id: "run-current", group: "editor", chord: "Mod+Shift+Enter", label_key: "shell.shortcuts.runCurrent" },
-    Shortcut { id: "run-script", group: "editor", chord: "Mod+Alt+Enter", label_key: "shell.shortcuts.runScript" },
-    Shortcut { id: "request-cancel", group: "editor", chord: "Mod+.", label_key: "shell.shortcuts.requestCancel" },
-    Shortcut { id: "undo", group: "editor", chord: "Mod+Z", label_key: "shell.shortcuts.undo" },
-    Shortcut { id: "redo", group: "editor", chord: if cfg!(target_os = "macos") { "Mod+Shift+Z" } else { "Ctrl+Y / Ctrl+Shift+Z" }, label_key: "shell.shortcuts.redo" },
-    Shortcut { id: "find", group: "editor", chord: "Mod+F", label_key: "shell.shortcuts.find" },
-    Shortcut { id: "replace", group: "editor", chord: if cfg!(target_os = "macos") { "Mod+Alt+F" } else { "Ctrl+H" }, label_key: "shell.shortcuts.replace" },
-    Shortcut { id: "autocomplete", group: "editor", chord: crate::ui::kit::AUTOCOMPLETE_CHORD, label_key: "shell.shortcuts.autocomplete" },
-    Shortcut { id: "toggle-comment", group: "editor", chord: "Mod+/", label_key: "shell.shortcuts.toggleComment" },
-    Shortcut { id: "toggle-results", group: "editor", chord: "Mod+J", label_key: "shell.shortcuts.toggleResults" },
-    Shortcut { id: "format", group: "editor", chord: "Mod+Shift+F", label_key: "shell.shortcuts.format" },
-    Shortcut { id: "explain", group: "editor", chord: "Mod+Shift+E", label_key: "shell.shortcuts.explain" },
-    Shortcut { id: "leave-editor", group: "editor", chord: "Tab", label_key: "shell.shortcuts.leaveEditor" },
-    Shortcut { id: "move-cells", group: "table", chord: "↑ ↓ ← →", label_key: "shell.shortcuts.moveCells" },
-    Shortcut { id: "select-all-cells", group: "table", chord: "Mod+A", label_key: "shell.shortcuts.selectAllCells" },
-    Shortcut { id: "edit-cell", group: "table", chord: "Enter / F2", label_key: "shell.shortcuts.editCell" },
-    Shortcut { id: "cancel-edit", group: "table", chord: "Esc", label_key: "shell.shortcuts.cancelEdit" },
-    Shortcut { id: "mark-delete", group: "table", chord: "Delete", label_key: "shell.shortcuts.markDelete" },
-    Shortcut { id: "commit", group: "table", chord: "Mod+S", label_key: "shell.shortcuts.commit" },
-    Shortcut { id: "copy-region", group: "table", chord: "Mod+C", label_key: "shell.shortcuts.copyRegion" },
-    Shortcut { id: "copy-sql-value", group: "table", chord: "Mod+Shift+C", label_key: "shell.shortcuts.copySqlValue" },
-    Shortcut { id: "paste-cells", group: "table", chord: "Mod+V", label_key: "shell.shortcuts.pasteCells" },
-    Shortcut { id: "grid-undo", group: "table", chord: "Mod+Z", label_key: "shell.shortcuts.undoStage" },
+    CommandSpec { id: "new-query", label_key: "shell.command.newQuery", icon: "code" },
+    CommandSpec { id: "open-file", label_key: "shell.command.openFile", icon: "file" },
+    CommandSpec { id: "execute-query", label_key: "shell.command.execute", icon: "play" },
+    CommandSpec { id: "open-structure", label_key: "shell.command.newStructure", icon: "table" },
+    CommandSpec { id: "compare", label_key: "shell.command.compare", icon: "table" },
+    CommandSpec { id: "open-admin", label_key: "ui.tool.admin", icon: "database" },
+    CommandSpec { id: "open-exchange", label_key: "shell.command.openExchange", icon: "arrow-down-up" },
+    CommandSpec { id: "new-connection", label_key: "shell.command.newConnection", icon: "plus" },
+    CommandSpec { id: "history", label_key: "shell.command.history", icon: "history" },
+    CommandSpec { id: "save-query", label_key: "shell.command.saveQuery", icon: "file" },
+    CommandSpec { id: "saved-queries", label_key: "shell.command.savedQueries", icon: "code" },
+    CommandSpec { id: "connections", label_key: "shell.command.connections", icon: "database" },
+    CommandSpec { id: "settings", label_key: "shell.command.settings", icon: "sliders" },
+    CommandSpec { id: "sidebar", label_key: "shell.command.toggleSidebar", icon: "sidebar" },
+    CommandSpec { id: "theme-light", label_key: "shell.command.themeLight", icon: "sun" },
+    CommandSpec { id: "theme-dark", label_key: "shell.command.themeDark", icon: "moon" },
+    CommandSpec { id: "theme-system", label_key: "shell.command.themeSystem", icon: "monitor" },
+    CommandSpec { id: "help", label_key: "shell.command.help", icon: "keyboard" },
+    CommandSpec { id: "check-updates-show", label_key: "shell.command.checkUpdates", icon: "download" },
 ];
 
 const ICONS: &[&str] = &[
@@ -426,6 +389,11 @@ impl Shell {
         Effect::ApplyTheme
     }
 
+    /// 打开浮层之前的焦点区域；没有浮层时为 None。
+    pub fn focus_before_overlay(&self) -> Option<FocusTarget> {
+        self.focus_before_overlay
+    }
+
     pub fn close_overlay(&mut self) {
         if self.palette_open || self.help_open {
             self.palette_open = false;
@@ -482,7 +450,7 @@ impl Shell {
                 self.focus = FocusTarget::Connections;
                 Effect::None
             }
-            "open-sqlite" => {
+            "open-file" => {
                 self.pending_file = Some(FilePrompt::Open);
                 Effect::PromptOpen
             }
@@ -851,14 +819,13 @@ mod tests {
             ids,
             [
                 "new-query",
-                "open-sql-file",
+                "open-file",
                 "execute-query",
                 "open-structure",
                 "compare",
                 "open-admin",
                 "open-exchange",
                 "new-connection",
-                "open-sqlite",
                 "history",
                 "save-query",
                 "saved-queries",
@@ -902,13 +869,13 @@ mod tests {
         ];
         for (id, group, chord) in existing {
             let shortcut = Shell::shortcut(id).unwrap_or_else(|| panic!("{id} 仍在快捷键帮助里"));
-            assert_eq!((shortcut.group, shortcut.chord), (group, chord), "{id} 含义不变");
+            assert_eq!((shortcut.group, shortcut.chord()), (group, chord), "{id} 含义不变");
         }
         let paste = Shell::shortcut("paste-cells").expect("网格粘贴进入快捷键帮助");
-        assert_eq!((paste.group, paste.chord), ("table", "Mod+V"));
+        assert_eq!((paste.group, paste.chord()), ("table", "Mod+V"));
         assert!(translate(Locale::En, paste.label_key).starts_with("Paste TSV"));
         assert!(crate::i18n::text(crate::i18n::Locale::ZhCn, paste.label_key).contains("粘贴"));
-        let chords: Vec<_> = SHORTCUTS.iter().filter(|shortcut| shortcut.group == "table").map(|shortcut| shortcut.chord).collect();
+        let chords: Vec<_> = SHORTCUTS.iter().filter(|shortcut| shortcut.group == "table").map(|shortcut| shortcut.chord()).collect();
         assert_eq!(chords.iter().filter(|chord| **chord == "Mod+V").count(), 1, "表格组里 Mod+V 只有粘贴一项，不与既有项冲突");
     }
 
@@ -934,7 +901,8 @@ mod tests {
         assert_eq!(shell.focus, FocusTarget::Sidebar);
         assert_eq!(shell.dispatch("new-query"), Some(Effect::FocusEditor));
         assert_eq!(shell.focus, FocusTarget::Editor);
-        assert_eq!(shell.dispatch("open-sqlite"), Some(Effect::PromptOpen));
+        assert_eq!(shell.dispatch("open-file"), Some(Effect::PromptOpen));
+        assert_eq!(shell.dispatch("open-sqlite"), None, "打开文件只有一个入口");
         assert_eq!(shell.pending_file, Some(FilePrompt::Open));
         assert_eq!(shell.dispatch("not-a-command"), None);
         for command in COMMANDS {

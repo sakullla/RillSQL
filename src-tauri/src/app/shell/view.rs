@@ -104,6 +104,8 @@ pub struct Workbench {
     /// 启动台筛选浮层的锚点：来自按钮上这一次真实点击。
     pub(super) conn_filter_at: gpui_kit::Point<gpui_kit::Pixels>,
     pub(super) palette_focused: bool,
+    /// 快捷键面板打开后把焦点放进搜索框一次。
+    pub(super) help_focused: bool,
     pub(super) pending_browser: Option<String>,
     connected_seen: std::collections::BTreeSet<String>,
     nav_refresh_active: std::collections::BTreeSet<Option<String>>,
@@ -375,6 +377,7 @@ impl Workbench {
             menu_at: gpui_kit::Point::default(),
             conn_filter_at: gpui_kit::Point::default(),
             palette_focused: false,
+            help_focused: false,
             pending_browser: None,
             connected_seen: std::collections::BTreeSet::new(),
             nav_refresh_active: std::collections::BTreeSet::new(),
@@ -508,24 +511,29 @@ impl Workbench {
             }
             return;
         }
-        if id == "open-sql-file" {
-            if self.model.close_prompt.is_some() {
-                let _ = self.model.dispatch(id);
-                cx.notify();
-                return;
-            }
-            self.prompt_sql_files(cx);
-            return;
-        }
-        if id == "open-sqlite" {
+        // 唯一的“打开文件”入口（⌘O / Ctrl+O、顶栏、欢迎页、连接页、菜单、Dock 都到这里）。
+        if id == "open-file" {
             let Some(effect) = self.model.dispatch(id) else {
                 return;
             };
             if matches!(effect, Effect::PromptOpen) {
                 self.adopt_shell(Effect::None, cx);
-                self.prompt_sqlite(cx);
+                self.prompt_open_files(cx);
             } else {
                 self.apply_effect(effect, cx);
+            }
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        // 认不出类型的文件：用户选的打开方式。
+        if matches!(id, "open-as-sql" | "open-as-database" | "open-choice-cancel") {
+            if let Some(path) = self.model.open_choices.pop_front() {
+                match id {
+                    "open-as-sql" => self.open_sql_paths(vec![path], cx),
+                    "open-as-database" => self.apply_database_path(path, crate::adapters::registry::LOCAL_FILE),
+                    _ => {}
+                }
             }
             self.persist_if_needed(cx);
             cx.notify();
@@ -1281,6 +1289,11 @@ impl Workbench {
                 super::nav::NavRequest::More(id) => self.spawn_nav_more_with_limit(id, None, cx),
                 super::nav::NavRequest::All(id) => self.spawn_nav_more_with_limit(id, Some(5_000), cx),
                 super::nav::NavRequest::Search(query) => self.spawn_nav_search(query, cx),
+                super::nav::NavRequest::CancelSearch => {
+                    if let Some(previous) = self.nav_search_abort.take() {
+                        previous.abort();
+                    }
+                }
                 super::nav::NavRequest::Group(id) => self.spawn_nav_group(id, cx),
                 super::nav::NavRequest::Reload(id) => self.spawn_nav_reload(id, cx),
                 super::nav::NavRequest::Definition(id) => self.spawn_definition(id, cx),
@@ -1767,6 +1780,7 @@ impl Workbench {
         if trimmed.is_empty() {
             return;
         }
+        let generation = self.model.nav_search_generation;
         let targets: Vec<(String, String, crate::catalog::Engine)> = self
             .model
             .connections
@@ -1812,16 +1826,10 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if handle.is_aborted() || this.model.object_filter.trim() != trimmed {
+                    if handle.is_aborted() {
                         return;
                     }
-                    let mut changed = false;
-                    for (conn_id, conn_name, engine, hits) in batches {
-                        if this.model.nav.merge_search_hits(&conn_id, &conn_name, engine, &hits) {
-                            changed = true;
-                        }
-                    }
-                    if changed {
+                    if this.model.apply_search_hits(generation, &trimmed, batches) {
                         this.sync_navigation_index(cx);
                         cx.notify();
                     }
@@ -2456,34 +2464,17 @@ impl Workbench {
         .detach();
     }
 
-    fn prompt_sql_files(&mut self, cx: &mut Context<Self>) {
+    fn prompt_open_files(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some(SharedString::from(self.model.text("query.fileIo.open"))),
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                cx.update(|cx| {
-                    let _ = this.update(cx, |view, cx| view.open_dropped_or_picked_paths(&paths, false, cx));
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn prompt_sqlite(&mut self, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(SharedString::from(self.model.text("shell.command.openSqlite"))),
+            prompt: Some(SharedString::from(self.model.text("shell.command.openFile"))),
         });
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
             cx.update(|cx| {
-                let _ = this.update(cx, |view, cx| view.finish_sqlite_prompt(message, cx));
+                let _ = this.update(cx, |view, cx| view.finish_open_prompt(message, cx));
             });
         })
         .detach();
@@ -2555,24 +2546,25 @@ impl Workbench {
         cx.notify();
     }
 
-    pub(super) fn finish_sqlite_prompt<E: std::fmt::Display>(
+    pub(super) fn finish_open_prompt<E: std::fmt::Display>(
         &mut self,
         message: Result<Result<Option<Vec<std::path::PathBuf>>, E>, futures::channel::oneshot::Canceled>,
         cx: &mut Context<Self>,
     ) {
         match message {
             Ok(Ok(Some(paths))) => {
-                if let Some(path) = paths.into_iter().next() {
+                let mut accepted = Vec::with_capacity(paths.len());
+                for path in paths {
                     match crate::app::accept_open_path(&path) {
-                        Ok(path) if is_sql_extension(&path) => {
-                            self.open_sql_paths(vec![path], cx);
-                        }
-                        Ok(path) => self.apply_sqlite_path(path),
+                        Ok(path) => accepted.push(path),
                         Err(error) => {
                             self.model.notice_key = Some("connections.validate.chooseFile");
                             self.model.notice_detail = error;
                         }
                     }
+                }
+                if !accepted.is_empty() {
+                    self.open_dropped_or_picked_paths(&accepted, false, cx);
                 }
             }
             Ok(Ok(None)) => {}
@@ -2586,7 +2578,7 @@ impl Workbench {
                         Some(crate::adapters::registry::LOCAL_FILE),
                         origin,
                         None,
-                        "open-sqlite",
+                        "open-file",
                     );
                     self.model.connections.issues.push(crate::app::views::connections::FieldIssue::new(
                         "file_path",
@@ -2774,16 +2766,20 @@ impl Workbench {
         let mut exchange_opened = false;
         for raw in raw_paths {
             let Ok(path) = crate::app::accept_drop_path(raw) else { continue };
-            if is_sql_extension(&path) || !allow_exchange_import && !is_sqlite_extension(&path) {
-                sql_paths.push(path);
-            } else if is_sqlite_extension(&path) {
-                self.apply_sqlite_path(path);
-            } else if allow_exchange_import {
-                exchange_opened = true;
-                self.exchange.update(cx, |pane, cx| {
-                    pane.open = true;
-                    pane.preview_file(path, crate::export::ImportEntry::Drop, cx);
-                });
+            // 文件头优先于扩展名：认出数据库文件就建连接，.sql 进编辑器。
+            let header = crate::app::read_file_header(&path);
+            match crate::app::route_open_path(&path, &header) {
+                crate::app::OpenRoute::SqlText => sql_paths.push(path),
+                crate::app::OpenRoute::Database(engine) => self.apply_database_path(path, engine),
+                // 拖进来的其它文件（CSV、JSON…）走导入预览；从“打开文件”选的就问用户怎么打开。
+                crate::app::OpenRoute::Ask if allow_exchange_import => {
+                    exchange_opened = true;
+                    self.exchange.update(cx, |pane, cx| {
+                        pane.open = true;
+                        pane.preview_file(path, crate::export::ImportEntry::Drop, cx);
+                    });
+                }
+                crate::app::OpenRoute::Ask => self.model.open_choices.push_back(path),
             }
         }
         if !sql_paths.is_empty() {
@@ -2935,9 +2931,8 @@ impl Workbench {
         self.admin.update(cx, |pane, cx| pane.note_connection(connected, cx));
     }
 
-    fn apply_sqlite_path(&mut self, path: std::path::PathBuf) {
+    fn apply_database_path(&mut self, path: std::path::PathBuf, engine: crate::catalog::Engine) {
         self.model.shell.note_opened(path.clone());
-        let engine = crate::adapters::registry::LOCAL_FILE;
         let mut draft = blank_draft(engine);
         draft.file_path = path.display().to_string();
         draft.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or(engine.as_str()).to_owned();
@@ -3141,18 +3136,6 @@ fn query_command(id: &str) -> bool {
         // 外壳必须认得同一份清单再转发回去，否则这类命令会在外壳这一层被静默丢掉。
         || crate::app::views::query::runs_query(id)
         || id.starts_with("outline:")
-}
-
-pub(super) fn is_sql_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
-}
-
-pub(super) fn is_sqlite_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| crate::adapters::engine_for_file_extension(ext).is_some())
 }
 
 pub(super) fn nav_key(key: &str) -> Option<NavKey> {

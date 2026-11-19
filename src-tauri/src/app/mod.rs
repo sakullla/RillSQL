@@ -1,4 +1,5 @@
 mod files;
+pub mod keymap;
 mod model;
 pub mod shell;
 pub mod views;
@@ -12,7 +13,7 @@ use gpui_kit::component::input;
 
 use crate::ui::Foundation;
 
-pub use files::{accept_drop_path, accept_open_path, accept_save_path};
+pub use files::{accept_drop_path, accept_open_path, accept_save_path, read_file_header, route_open_path, OpenRoute};
 pub use model::{
     accept_versioned, dictionary_keys, shared_controls, translate, AppPage, CommandSpec, Density, Effect, FilePrompt, FocusTarget, Locale,
     ResolvedTheme, Shell, ThemePreference, COMMANDS,
@@ -35,8 +36,7 @@ actions!(
         OpenStructure,
         CompareDatabases,
         NewConnection,
-        OpenSqlite,
-        OpenSqlFile,
+        OpenFile,
         ShowHistory,
         SaveQuery,
         SavedQueries,
@@ -84,7 +84,8 @@ pub fn run() {
         bind_keys(cx);
         let root = open_workbench_window(cx);
         if dialog {
-            root.update(cx, |view, cx| view.perform("open-sqlite", cx));
+            // 原生文件对话框冒烟：走唯一的“打开文件”入口。
+            root.update(cx, |view, cx| view.perform("open-file", cx));
         }
         if smoke || dialog {
             cx.spawn(async move |cx| {
@@ -188,68 +189,20 @@ fn window_options(cx: &App) -> WindowOptions {
     }
 }
 
+/// 全局按键绑定全部来自快捷键注册表（`keymap::SHORTCUTS`），这里不另外手写。
 pub(crate) fn bind_keys(cx: &mut App) {
-    macro_rules! chord {
-        ($key:literal) => {
-            if cfg!(target_os = "macos") {
-                concat!("cmd-", $key)
-            } else {
-                concat!("ctrl-", $key)
-            }
-        };
-        (shift $key:literal) => {
-            if cfg!(target_os = "macos") {
-                concat!("cmd-shift-", $key)
-            } else {
-                concat!("ctrl-shift-", $key)
-            }
-        };
-        (alt $key:literal) => {
-            if cfg!(target_os = "macos") {
-                concat!("cmd-alt-", $key)
-            } else {
-                concat!("ctrl-alt-", $key)
-            }
-        };
-    }
-    cx.bind_keys([
-        gpui_kit::KeyBinding::new(chord!("k"), CommandPalette, None),
-        gpui_kit::KeyBinding::new(chord!("p"), QuickOpen, None),
-        gpui_kit::KeyBinding::new(chord!("t"), NewQuery, None),
-        gpui_kit::KeyBinding::new(chord!("o"), OpenSqlFile, None),
-        gpui_kit::KeyBinding::new(chord!("w"), CloseTab, None),
-        gpui_kit::KeyBinding::new(chord!("b"), ToggleSidebar, None),
-        gpui_kit::KeyBinding::new("ctrl-tab", NextTab, None),
-        gpui_kit::KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        gpui_kit::KeyBinding::new(chord!(","), OpenSettings, None),
-        gpui_kit::KeyBinding::new(chord!("enter"), ExecuteQuery, None),
-        gpui_kit::KeyBinding::new(chord!(shift "enter"), ExecuteCurrent, None),
-        gpui_kit::KeyBinding::new(chord!(alt "enter"), ExecuteScript, None),
-        gpui_kit::KeyBinding::new(chord!("."), RequestCancel, None),
-        gpui_kit::KeyBinding::new(if cfg!(target_os = "macos") { "alt-space" } else { "ctrl-space" }, ShowAutocomplete, None),
-        gpui_kit::KeyBinding::new(chord!("/"), ToggleComment, None),
-        gpui_kit::KeyBinding::new(chord!("j"), ToggleResults, None),
-        gpui_kit::KeyBinding::new(chord!(shift "f"), FormatSql, None),
-        gpui_kit::KeyBinding::new(chord!(shift "e"), ExplainSql, None),
-        gpui_kit::KeyBinding::new(chord!("s"), CommitEdit, None),
-        gpui_kit::KeyBinding::new("escape", Dismiss, Some("Palette")),
-    ]);
-    #[cfg(target_os = "macos")]
-    cx.bind_keys(editor_format_bindings());
-    // gpui-base 只给 Windows/Linux 绑了 Ctrl+Y 重做；补上常见的 Ctrl+Shift+Z。
-    #[cfg(not(target_os = "macos"))]
-    cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-shift-z", input::Redo, Some("Input"))]);
+    cx.bind_keys(keymap::key_bindings());
 }
 
 /// gpui-base 在 macOS 编辑器里把 ⌘⇧F 绑成“替换”，盖住了格式化 SQL。
-/// 同一上下文里后注册的绑定优先，这里把 ⌘⇧F 还给格式化，替换改用 ⌥⌘F。
-#[cfg(any(target_os = "macos", test))]
+/// 同一上下文里后注册的绑定优先：注册表的 macOS 绑定把 ⌘⇧F 还给格式化，替换改用 ⌥⌘F。
+#[cfg(test)]
 pub(crate) fn editor_format_bindings() -> Vec<gpui_kit::KeyBinding> {
-    const EDITOR: &str = "Input && mode == editor";
-    vec![
-        gpui_kit::KeyBinding::new("cmd-shift-f", FormatSql, Some(EDITOR)),
-        gpui_kit::KeyBinding::new("cmd-alt-f", input::Replace, Some(EDITOR)),
-    ]
+    ["format", "replace"]
+        .into_iter()
+        .filter_map(keymap::shortcut)
+        .flat_map(|shortcut| keymap::bindings_of(shortcut, true))
+        .collect()
 }
 
 pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
@@ -270,8 +223,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(OpenStructure, "open-structure");
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
-    bind!(OpenSqlite, "open-sqlite");
-    bind!(OpenSqlFile, "open-sql-file");
+    bind!(OpenFile, "open-file");
     bind!(ShowHistory, "history");
     bind!(SaveQuery, "save-query");
     bind!(SavedQueries, "saved-queries");
@@ -354,8 +306,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(OpenStructure, "open-structure");
     bind!(CompareDatabases, "compare");
     bind!(NewConnection, "new-connection");
-    bind!(OpenSqlite, "open-sqlite");
-    bind!(OpenSqlFile, "open-sql-file");
+    bind!(OpenFile, "open-file");
     bind!(ShowHistory, "history");
     bind!(SaveQuery, "save-query");
     bind!(SavedQueries, "saved-queries");
@@ -403,16 +354,15 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
 }
 
 /// 程序坞菜单里的命令：应用没有窗口时也能直接用它们把工作台带回来。
-const DOCK_COMMANDS: [&str; 6] = ["new-query", "open-sql-file", "new-connection", "connections", "open-sqlite", "history"];
+const DOCK_COMMANDS: [&str; 5] = ["new-query", "open-file", "new-connection", "connections", "history"];
 
 /// macOS 程序坞图标的右键菜单：常用入口一步直达。
 fn install_dock_menu(cx: &mut App, shell: &Shell) {
     let label = |key: &'static str| shell.text(key).to_string();
     cx.set_dock_menu(vec![
         MenuItem::action(label("shell.command.newQuery"), NewQuery),
-        MenuItem::action(label("query.fileIo.open"), OpenSqlFile),
+        MenuItem::action(label("shell.command.openFile"), OpenFile),
         MenuItem::action(label("shell.command.newConnection"), NewConnection),
-        MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
         MenuItem::separator(),
         MenuItem::action(label("shell.command.connections"), ShowConnections),
         MenuItem::action(label("shell.command.history"), ShowHistory),
@@ -425,8 +375,7 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
     cx.set_menus([
         Menu::new(label("shell.menu.file")).items([
             MenuItem::action(label("shell.command.newQuery"), NewQuery),
-            MenuItem::action(label("query.fileIo.open"), OpenSqlFile),
-            MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
+            MenuItem::action(label("shell.command.openFile"), OpenFile),
             MenuItem::action(label("shell.command.saveQuery"), SaveQuery),
             MenuItem::separator(),
             MenuItem::action(label("shell.command.quit"), Quit),

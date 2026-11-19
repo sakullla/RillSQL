@@ -166,6 +166,11 @@ pub trait EngineMeta: Sync {
         &[]
     }
 
+    /// 本地数据库文件的文件头魔数；打开文件时优先于扩展名判断。只有文件型引擎有。
+    fn file_signature(&self) -> Option<&'static [u8]> {
+        None
+    }
+
     /// 连接表单“连接串”占位示例。
     fn url_example(&self) -> &'static str;
 
@@ -679,6 +684,18 @@ pub fn is_relational_named(engine: &str) -> bool {
 /// 门面：按引擎名（id 或别名）取工作台类型；认不出时为 None。
 pub fn workbench_loose(engine: &str) -> Option<Workbench> {
     registry::parse_loose(engine).map(|engine| adapter(engine).meta().workbench())
+}
+
+/// 门面：文件开头的字节属于哪种文件型引擎的数据库文件（按文件头魔数）。
+pub fn engine_for_file_header(header: &[u8]) -> Option<Engine> {
+    registry::ENGINES
+        .into_iter()
+        .find(|engine| adapter(*engine).meta().file_signature().is_some_and(|signature| header.starts_with(signature)))
+}
+
+/// 门面：判断文件头需要读取的最大字节数。
+pub fn file_signature_len() -> usize {
+    registry::ENGINES.into_iter().filter_map(|engine| adapter(engine).meta().file_signature()).map(<[u8]>::len).max().unwrap_or(0)
 }
 
 /// 门面：扩展名（不含点，大小写不敏感）属于哪种文件型引擎。
