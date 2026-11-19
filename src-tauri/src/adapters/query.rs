@@ -66,6 +66,19 @@ pub fn lexis_named(engine: &str) -> Lexis {
     syntax_named(engine).map(|syntax| syntax.lexis()).unwrap_or(Lexis::UNKNOWN)
 }
 
+/// 引擎 id 的方言副作用词（见 [`SqlSyntax::side_effect_words`]）。
+/// 未知引擎保守地取所有方言的并集。
+pub fn side_effect_words_named(engine: &str) -> Vec<&'static str> {
+    match syntax_named(engine) {
+        Some(syntax) => syntax.side_effect_words().to_vec(),
+        None => registry::ENGINES
+            .into_iter()
+            .filter_map(|engine| adapter(engine).syntax())
+            .flat_map(|syntax| syntax.side_effect_words().iter().copied())
+            .collect(),
+    }
+}
+
 /// 引擎 id 的显示名；未知引擎为空。
 pub fn label_named(engine: &str) -> &'static str {
     registry::parse(engine).map(|engine| adapter(engine).meta().label()).unwrap_or_default()

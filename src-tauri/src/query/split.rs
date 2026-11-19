@@ -147,31 +147,37 @@ const WRITE_WORDS: &[&str] = &[
 /// 只读 = 以 SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH 开头，且字符串与注释以外的任何层级
 /// 都没有写入类关键字（覆盖 WITH d AS (DELETE ...) SELECT、EXPLAIN ANALYZE DELETE、SELECT ... INTO）。
 /// 切分被拒绝、没有语句或任何一条不确定时都返回 false：调用方应当把它当作写入。
+/// 方言专有的副作用词（T-SQL 无分号相接的 KILL/DBCC/RESTORE 等）由适配器提供；
+/// MySQL 家族的 `/*! ... */` 可执行注释按代码检查。
 pub fn is_clearly_read_only(engine: &str, sql: &str) -> bool {
     let report = split_sql(engine, sql);
     if report.refusal.is_some() || report.pieces.is_empty() {
         return false;
     }
+    let dialect = crate::adapters::query::side_effect_words_named(engine);
+    let executable = crate::adapters::query::lexis_named(engine).executable_comments;
     report.pieces.iter().all(|piece| {
-        let (words, _) = code_words(engine, &piece.text, false);
+        let (words, _) = code_words(engine, &piece.text, false, executable);
         let Some((lead, _, _)) = words.first() else { return false };
-        READ_ONLY_LEADS.contains(&lead.as_str()) && !words.iter().any(|(word, _, _)| WRITE_WORDS.contains(&word.as_str()))
+        READ_ONLY_LEADS.contains(&lead.as_str())
+            && !words.iter().any(|(word, _, _)| WRITE_WORDS.contains(&word.as_str()) || dialect.contains(&word.as_str()))
     })
 }
 
 /// 顶层代码词及其字节区间。字符串、注释、dollar-quote 和括号内的词不出现。
 pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>, usize) {
-    code_words(engine, sql, true)
+    code_words(engine, sql, true, false)
 }
 
 /// 代码词及其字节区间：字符串、注释、dollar-quote 与方括号标识符里的词不出现；
-/// top_only 时只收括号外的词。
-fn code_words(engine: &str, sql: &str, top_only: bool) -> (Vec<(String, usize, usize)>, usize) {
+/// top_only 时只收括号外的词。executable 时 `/*!`、`/*M!` 注释里的内容按代码扫描。
+fn code_words(engine: &str, sql: &str, top_only: bool, executable: bool) -> (Vec<(String, usize, usize)>, usize) {
     let bytes = sql.as_bytes();
     let lexis = crate::adapters::query::lexis_named(engine);
     let hash = lexis.hash_comments;
     let mut i = 0usize;
     let mut depth = 0i32;
+    let mut in_executable = false;
     let mut quote: Option<u8> = None;
     let mut dollar: Option<String> = None;
     let mut words = Vec::new();
@@ -213,6 +219,29 @@ fn code_words(engine: &str, sql: &str, top_only: bool) -> (Vec<(String, usize, u
         if bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
+        }
+        if in_executable && sql[i..].starts_with("*/") {
+            in_executable = false;
+            i += 2;
+            continue;
+        }
+        if executable && !in_executable {
+            let opener = if sql[i..].starts_with("/*!") {
+                Some(3)
+            } else if sql[i..].starts_with("/*M!") || sql[i..].starts_with("/*m!") {
+                Some(4)
+            } else {
+                None
+            };
+            if let Some(len) = opener {
+                i += len;
+                // 可选的版本号：该版本及以上的服务器会执行内容。
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                in_executable = true;
+                continue;
+            }
         }
         if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
             i += 2;

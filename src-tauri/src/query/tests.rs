@@ -65,6 +65,9 @@ fn clearly_read_only_is_conservative_about_hidden_writes() {
         ("postgres", "SELECT \"update\" FROM t -- insert later"),
         ("mysql", "SHOW TABLES; DESCRIBE t; EXPLAIN SELECT 1;"),
         ("sqlserver", "SELECT [delete] FROM t ORDER BY id DESC"),
+        ("sqlserver", "SELECT TOP 10 a.id, b.[kill] FROM a LEFT JOIN b ON a.id = b.id WHERE a.n IS NOT NULL ORDER BY a.id"),
+        ("mysql", "SELECT /*! SQL_NO_CACHE */ * FROM orders /* into nothing */"),
+        ("mariadb", "SELECT /*M!100100 1 AS */ n FROM t"),
     ] {
         assert!(split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当是只读");
     }
@@ -84,6 +87,24 @@ fn clearly_read_only_is_conservative_about_hidden_writes() {
         ("postgres", "SELECT * FROM t FOR UPDATE"),
         ("postgres", "SELECT 'unterminated"),
         ("postgres", "   -- only a comment"),
+        // T-SQL 批次里无分号相接的写入/运维语句。
+        ("sqlserver", "SELECT * FROM orders\nDBCC CHECKIDENT ('orders', RESEED, 0)"),
+        ("sqlserver", "SELECT 1 KILL 53"),
+        ("sqlserver", "SELECT 1 RESTORE DATABASE x FROM DISK='/tmp/x.bak'"),
+        ("sqlserver", "SELECT 1\nBACKUP DATABASE x TO DISK='/tmp/x.bak'"),
+        ("sqlserver", "SELECT 1 DENY SELECT ON t TO u"),
+        ("sqlserver", "SELECT 1 SHUTDOWN"),
+        ("sqlserver", "SELECT 1 RECONFIGURE"),
+        ("sqlserver", "SELECT 1 CHECKPOINT"),
+        ("sqlserver", "SELECT 1 DISABLE TRIGGER trg ON t"),
+        ("sqlserver", "SELECT 1 ENABLE TRIGGER trg ON t"),
+        ("sqlserver", "SELECT 1 RECEIVE TOP (1) * FROM q"),
+        ("sqlserver", "SELECT 1 WAITFOR DELAY '00:00:05'"),
+        // MySQL/MariaDB 会执行 /*! ... */ 里的代码。
+        ("mysql", "SELECT * FROM orders /*!50000 INTO OUTFILE '/tmp/o.csv' */"),
+        ("mysql", "SELECT * FROM orders /*! INTO OUTFILE '/tmp/o.csv' */"),
+        ("mariadb", "SELECT * FROM orders /*!50000 INTO OUTFILE '/tmp/o.csv' */"),
+        ("mariadb", "SELECT * FROM orders /*M!100100 INTO OUTFILE '/tmp/o.csv' */"),
     ] {
         assert!(!split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当按写入处理");
     }

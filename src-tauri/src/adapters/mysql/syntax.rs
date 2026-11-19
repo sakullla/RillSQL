@@ -53,7 +53,7 @@ impl SqlSyntax for MysqlSyntax {
     }
 
     fn lexis(&self) -> Lexis {
-        Lexis { hash_comments: true, transact: false, delimiter_command: true }
+        Lexis { hash_comments: true, transact: false, delimiter_command: true, executable_comments: true }
     }
 
     /// 同一条连接上用 USE 切到目标库。

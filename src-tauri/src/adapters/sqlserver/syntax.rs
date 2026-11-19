@@ -1,6 +1,8 @@
 //! SQL Server 的 SQL 语法：标识符引号、保留字、Unicode 字面量、OFFSET/FETCH 分页、
 //! 网格投影、T-SQL 词法、TOP 行数上限与 SHOWPLAN 执行计划。
 
+use std::sync::OnceLock;
+
 use crate::adapters::{Lexis, SqlSyntax};
 use crate::query::exec::CappedSql;
 use crate::query::functions::FunctionSig;
@@ -65,7 +67,7 @@ impl SqlSyntax for SqlserverSyntax {
     }
 
     fn lexis(&self) -> Lexis {
-        Lexis { hash_comments: false, transact: true, delimiter_command: false }
+        Lexis { hash_comments: false, transact: true, delimiter_command: false, executable_comments: false }
     }
 
     fn cap_rows(&self, sql: &str, cap: usize) -> Option<CappedSql> {
@@ -91,7 +93,38 @@ impl SqlSyntax for SqlserverSyntax {
     fn functions(&self) -> &'static [FunctionSig] {
         super::functions::SQLSERVER
     }
+
+    /// T-SQL 批次里语句可以不加分号首尾相接（`SELECT 1 KILL 53`），切分无法分开。
+    /// 因此按保留字白名单反推：除查询子句常用的保留字外，任何保留字出现即按可能写入处理，
+    /// 再补上不是保留字的语句开头（RECEIVE、SEND、ENABLE/DISABLE TRIGGER、THROW 等）。
+    fn side_effect_words(&self) -> &'static [&'static str] {
+        static WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+        WORDS.get_or_init(|| {
+            RESERVED
+                .iter()
+                .copied()
+                .filter(|word| !READ_ONLY_RESERVED.contains(word))
+                .chain(UNRESERVED_STATEMENT_WORDS.iter().copied())
+                .collect()
+        })
+    }
 }
+
+/// 只读查询里会出现的保留字（子句、运算、函数、类型名）。不在这里的保留字一律视为可能写入。
+const READ_ONLY_RESERVED: &[&str] = &[
+    "ALL", "AND", "ANY", "AS", "ASC", "BETWEEN", "BY", "CASE", "COALESCE", "COLLATE", "CONTAINS", "CONTAINSTABLE", "CONVERT",
+    "CROSS", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DESC", "DISTINCT", "DOUBLE", "ELSE", "END",
+    "ESCAPE", "EXCEPT", "EXISTS", "FOR", "FREETEXT", "FREETEXTTABLE", "FROM", "FULL", "GROUP", "HAVING", "IN", "INNER",
+    "INTERSECT", "IS", "JOIN", "LEFT", "LIKE", "NATIONAL", "NOT", "NULL", "NULLIF", "ON", "OPTION", "OR", "ORDER", "OUTER",
+    "OVER", "PERCENT", "PIVOT", "PRECISION", "RIGHT", "SELECT", "SEMANTICKEYPHRASETABLE", "SEMANTICSIMILARITYDETAILSTABLE",
+    "SEMANTICSIMILARITYTABLE", "SESSION_USER", "SOME", "SYSTEM_USER", "TABLESAMPLE", "THEN", "TOP", "TRY_CONVERT", "UNION",
+    "UNPIVOT", "USER", "VALUES", "VARYING", "WHEN", "WHERE", "WITH", "WITHIN",
+];
+
+/// 不是保留字、但能开始一条会改动数据或服务器状态的 T-SQL 语句的词。
+const UNRESERVED_STATEMENT_WORDS: &[&str] = &[
+    "RECEIVE", "SEND", "MOVE", "GET", "ENABLE", "DISABLE", "THROW", "CONVERSATION", "DIALOG", "OUTPUT", "UPSERT",
+];
 
 /// SQL Server 保留关键字。按字母序。
 const RESERVED: &[&str] = &[
