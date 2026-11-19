@@ -177,9 +177,9 @@ fn grid_commands_are_registered_beside_catalog() {
     for name in ["application::grid::describe(", "application::grid::page_described(", "application::grid::count(", "application::grid::commit("] {
         assert!(view.contains(name), "{name}");
     }
-    let drivers = fs::read_to_string(root.join("src/connections/drivers.rs")).unwrap();
-    let open = drivers.split("pub async fn open_sqlite").nth(1).unwrap();
-    let open = open.split("pub struct MysqlOpen").next().unwrap();
+    let drivers = fs::read_to_string(root.join("src/adapters/sqlite/connect.rs")).unwrap();
+    let open = drivers.split("pub(crate) async fn open_sqlite").nth(1).unwrap();
+    let open = open.split("pub(in crate::adapters) struct SqliteConnector").next().unwrap();
     assert!(open.contains("read_only(false)"));
     assert!(!open.contains("read_only(true)"));
     let live = fs::read_to_string(root.join("src/grid/live.rs")).unwrap();

@@ -1193,7 +1193,7 @@ fn fallback_objects(gather: &mut Gather<'_>, scope: &CompletionScope, statement:
 
 fn redis_plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) -> Plan {
     let keys: Vec<String> = scope.objects.iter().map(|obj| obj.name.clone()).collect();
-    let (start, end, items) = crate::redis::complete::complete_command_line(text, cursor, &keys, locale);
+    let (start, end, items) = crate::adapters::redis::complete::complete_command_line(text, cursor, &keys, locale);
     let candidates = items
         .into_iter()
         .map(|item| Candidate {

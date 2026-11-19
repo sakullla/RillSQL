@@ -1,7 +1,5 @@
 pub mod app;
 mod adapters;
-// Redis / MongoDB 后端已迁入各自适配器；目录（A2）与补全（A4）迁移前仍经这两个路径访问。
-pub(crate) use adapters::{mongodb as mongo, redis};
 mod application;
 mod catalog;
 mod compare;
@@ -84,19 +82,19 @@ fn command_surface() -> usize {
         std::any::type_name_of_val(&dump::commands::database_dump_cancel),
         std::any::type_name_of_val(&migrate::commands::migrate_data),
         std::any::type_name_of_val(&migrate::commands::migrate_cancel),
-        std::any::type_name_of_val(&redis::commands::redis_scan_keys),
-        std::any::type_name_of_val(&redis::commands::redis_read_key),
-        std::any::type_name_of_val(&redis::commands::redis_set_ttl),
-        std::any::type_name_of_val(&redis::commands::redis_delete_keys),
-        std::any::type_name_of_val(&redis::commands::redis_rename_key),
-        std::any::type_name_of_val(&redis::commands::redis_exec),
-        std::any::type_name_of_val(&mongo::commands::mongo_list_databases),
-        std::any::type_name_of_val(&mongo::commands::mongo_list_collections),
-        std::any::type_name_of_val(&mongo::commands::mongo_find_documents),
-        std::any::type_name_of_val(&mongo::commands::mongo_read_document),
-        std::any::type_name_of_val(&mongo::commands::mongo_replace_document),
-        std::any::type_name_of_val(&mongo::commands::mongo_insert_document),
-        std::any::type_name_of_val(&mongo::commands::mongo_delete_document),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_scan_keys),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_read_key),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_set_ttl),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_delete_keys),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_rename_key),
+        std::any::type_name_of_val(&adapters::redis::commands::redis_exec),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_list_databases),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_list_collections),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_find_documents),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_read_document),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_replace_document),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_insert_document),
+        std::any::type_name_of_val(&adapters::mongodb::commands::mongo_delete_document),
         std::any::type_name_of_val(&ddl::commands::ddl_describe),
         std::any::type_name_of_val(&ddl::commands::ddl_preview),
         std::any::type_name_of_val(&ddl::commands::ddl_execute),
@@ -168,8 +166,8 @@ fn fixed_dependency_markers() -> usize {
         compare::module_id(),
         dump::module_id(),
         migrate::module_id(),
-        redis::module_id(),
-        mongo::module_id(),
+        adapters::redis::module_id(),
+        adapters::mongodb::module_id(),
     ];
     markers.len()
 }
@@ -244,7 +242,7 @@ mod tests {
         for name in ["list_databases", "list_collections", "find_documents", "replace_document", "insert_document", "delete_document"] {
             assert!(view.contains(&format!("application::mongo::{name}(")), "{name}");
         }
-        assert_eq!(super::mongo::module_id(), "mongo");
+        assert_eq!(super::adapters::mongodb::module_id(), "mongo");
     }
 
     #[test]
@@ -254,7 +252,7 @@ mod tests {
         for name in ["scan_keys", "read_key", "set_ttl", "delete_keys", "rename_key", "exec"] {
             assert!(view.contains(&format!("application::redis::{name}(")), "{name}");
         }
-        assert_eq!(super::redis::module_id(), "redis");
+        assert_eq!(super::adapters::redis::module_id(), "redis");
     }
 
     #[test]

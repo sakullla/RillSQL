@@ -1024,7 +1024,7 @@ fn quote_mysql(name: &str) -> String {
 
 async fn read_mongo(client: &mongodb::Client, page: usize, windows: &[ObjectWindow]) -> Result<Vec<DatabaseNode>, String> {
     let mut names = client.list_database_names().await.map_err(read_failure)?;
-    names.retain(|name| !crate::mongo::docs::catalog_hidden(name));
+    names.retain(|name| !crate::adapters::mongodb::docs::catalog_hidden(name));
     names.sort();
     let mut databases = Vec::new();
     for name in names {
@@ -1036,7 +1036,7 @@ async fn read_mongo(client: &mongodb::Client, page: usize, windows: &[ObjectWind
 
 async fn read_mongo_outline(client: &mongodb::Client) -> Result<Vec<DatabaseNode>, String> {
     let mut names = client.list_database_names().await.map_err(read_failure)?;
-    names.retain(|name| !crate::mongo::docs::catalog_hidden(name));
+    names.retain(|name| !crate::adapters::mongodb::docs::catalog_hidden(name));
     names.sort();
     Ok(names
         .into_iter()

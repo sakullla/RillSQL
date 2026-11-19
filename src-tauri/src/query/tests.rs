@@ -335,11 +335,13 @@ async fn wait_opens(opener: &crate::connections::forward::RecordingOpener, count
 #[test]
 fn cancel_code_does_not_reuse_the_executing_stream() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cancel = std::fs::read_to_string(root.join("src/query/cancel.rs")).unwrap();
+    // MySQL 与 PostgreSQL 的取消实现位于各自适配器的 Canceller。
+    let mysql_cancel = std::fs::read_to_string(root.join("src/adapters/mysql/connect.rs")).unwrap();
+    let postgres_cancel = std::fs::read_to_string(root.join("src/adapters/postgres/connect.rs")).unwrap();
     let exec = std::fs::read_to_string(root.join("src/query/exec.rs")).unwrap();
-    assert!(cancel.contains("Pool::new"));
-    assert!(cancel.contains("cancel_query"));
-    assert!(!cancel.contains("cancel_query_raw"));
+    assert!(mysql_cancel.contains("Pool::new"));
+    assert!(postgres_cancel.contains("cancel_query"));
+    assert!(!postgres_cancel.contains("cancel_query_raw"));
     assert!(!exec.contains("open_sqlite"));
     assert!(!exec.contains("open_mysql"));
     assert!(!exec.contains("open_postgres"));
@@ -924,7 +926,7 @@ fn mysql_batch_checks_out_once_and_does_not_reset_on_return() {
     assert!(!mysql_run.contains("get_conn"), "每条语句不能重新借连接");
     assert_eq!(exec.matches("get_conn").count(), 1);
     assert!(exec.contains("reset_connection(false)"));
-    let drivers = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/connections/drivers.rs")).unwrap();
+    let drivers = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/adapters/mysql/connect.rs")).unwrap();
     assert!(drivers.contains("with_reset_connection(false)"), "池归还时不能把这条会话重置掉");
     assert!(drivers.contains("with_inactive_connection_ttl"), "空闲时必须留着这一条已打开的连接");
     assert!(!exec.contains("while result.next().await.map_err(|err| err.to_string())?.is_some() {}"));
