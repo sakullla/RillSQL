@@ -2827,10 +2827,10 @@ impl QueryPane {
             .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity)))
             .when(!self.narrow, |this| {
                 this.child(
-                    kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("query.fileIo.open"), pane_act("open-sql-file", entity))
+                    kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
                         .tooltip(SharedString::from(format!(
                             "{} · {}",
-                            i18n::text(locale, "query.fileIo.open"),
+                            i18n::text(locale, "shell.command.openFile"),
                             kit::shortcut(crate::app::keymap::command_chord("open-file").unwrap_or_default())
                         ))),
                 )
@@ -2878,7 +2878,7 @@ impl QueryPane {
                     .item(item("expand-star", IconName::Columns3, "query.complete.expandStar", None))
                     .item(item("toggle-outline", IconName::ListOrdered, "query.outline.heading", None))
                     .separator()
-                    .item(item("open-sql-file", IconName::FolderOpen, "query.fileIo.open", crate::app::keymap::command_chord("open-file")))
+                    .item(item("open-sql-file", IconName::FolderOpen, "shell.command.openFile", crate::app::keymap::command_chord("open-file")))
                     .item(item("save-sql-file", IconName::Download, "query.fileIo.save", None))
             })
             .into_any_element()

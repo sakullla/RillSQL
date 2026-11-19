@@ -13,7 +13,7 @@ use gpui_kit::component::input;
 
 use crate::ui::Foundation;
 
-pub use files::{accept_drop_path, accept_open_path, accept_save_path, read_file_header, route_open_path, OpenRoute};
+pub use files::{accept_drop_path, accept_open_path, accept_save_path, is_drop_import_path, read_file_header, route_open_path, OpenRoute};
 pub use model::{
     accept_versioned, dictionary_keys, shared_controls, translate, AppPage, CommandSpec, Density, Effect, FilePrompt, FocusTarget, Locale,
     ResolvedTheme, Shell, ThemePreference, COMMANDS,

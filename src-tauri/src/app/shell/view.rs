@@ -2771,8 +2771,8 @@ impl Workbench {
             match crate::app::route_open_path(&path, &header) {
                 crate::app::OpenRoute::SqlText => sql_paths.push(path),
                 crate::app::OpenRoute::Database(engine) => self.apply_database_path(path, engine),
-                // 拖进来的其它文件（CSV、JSON…）走导入预览；从“打开文件”选的就问用户怎么打开。
-                crate::app::OpenRoute::Ask if allow_exchange_import => {
+                // 拖进来的表格文件（CSV、JSON、Excel）走导入预览；其余认不出的文件与“打开文件”一样问用户怎么打开。
+                crate::app::OpenRoute::Ask if allow_exchange_import && crate::app::is_drop_import_path(&path) => {
                     exchange_opened = true;
                     self.exchange.update(cx, |pane, cx| {
                         pane.open = true;

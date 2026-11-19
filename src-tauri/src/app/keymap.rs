@@ -235,12 +235,20 @@ pub fn matches(shortcut: &Shortcut, label: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    if label.to_lowercase().contains(&query) {
-        return true;
+    label.to_lowercase().contains(&query) || key_matches(shortcut, &query)
+}
+
+/// 按键比较时忽略空白与连接用的 '+'：Ctrl /、ctrl+/、Ctrl+/ 是同一个按法。
+fn squeeze(text: &str) -> String {
+    text.to_lowercase().chars().filter(|ch| !ch.is_whitespace() && *ch != '+').collect()
+}
+
+/// 查询词是否命中这条快捷键的按键（任一平台、任一写法）。
+fn key_matches(shortcut: &Shortcut, query: &str) -> bool {
+    let needle = squeeze(query);
+    if needle.is_empty() {
+        return false;
     }
-    // 按键比较时忽略空白与连接用的 '+'：Ctrl /、ctrl+/、Ctrl+/ 是同一个按法。
-    let squeeze = |text: &str| text.to_lowercase().chars().filter(|ch| !ch.is_whitespace() && *ch != '+').collect::<String>();
-    let needle = squeeze(&query);
     let mut haystacks = Vec::new();
     for mac in [true, false] {
         let chord = shortcut.chord_for(mac);
@@ -256,6 +264,91 @@ pub fn matches(shortcut: &Shortcut, label: &str, query: &str) -> bool {
         haystacks.push(squeeze(&spelled.replace("Cmd+", "Command+").replace("Ctrl+", "Control+")));
     }
     haystacks.iter().any(|hay| hay.contains(&needle))
+}
+
+/// 动作名里命中查询词的一段（字节区间，忽略大小写）；用于面板高亮。
+pub fn label_match(label: &str, query: &str) -> Option<(usize, usize)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    let bounds: Vec<usize> = label.char_indices().map(|(i, _)| i).chain(std::iter::once(label.len())).collect();
+    for (n, &start) in bounds.iter().enumerate() {
+        for &end in &bounds[n + 1..] {
+            let lowered = label[start..end].to_lowercase();
+            if lowered == query {
+                return Some((start, end));
+            }
+            if !query.starts_with(&lowered) {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// 面板上显示的组合键（指定平台，见 [`display_chord_for`]）里命中查询词的一段（字节区间）。
+/// 只有按键确实命中时才返回；查询词用的是另一种写法（如 macOS 上输入 cmd+/）而对不上显示文字时，整段都算命中。
+pub fn chord_match(shortcut: &Shortcut, query: &str, mac: bool) -> Option<(usize, usize)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() || !key_matches(shortcut, &query) {
+        return None;
+    }
+    let shown = display_chord_for(shortcut.chord_for(mac), mac);
+    if shown.is_empty() {
+        return None;
+    }
+    // 显示文字里参与比较的字符及其字节位置（同样忽略空白与 '+'）。
+    let chars: Vec<(usize, String)> = shown
+        .char_indices()
+        .filter(|(_, ch)| !ch.is_whitespace() && *ch != '+')
+        .map(|(i, ch)| (i, ch.to_lowercase().collect::<String>()))
+        .collect();
+    let flat: String = chars.iter().map(|(_, ch)| ch.as_str()).collect();
+    // 把查询词换成显示用的写法再找：macOS 显示符号，其它平台显示 Ctrl/Alt/Shift。
+    let words: &[(&str, &[&str])] = if mac {
+        &[("command", &["⌘"]), ("cmd", &["⌘"]), ("mod", &["⌘"]), ("option", &["⌥"]), ("alt", &["⌥"]), ("shift", &["⇧"]), ("control", &["⌘", "⌃"]), ("ctrl", &["⌘", "⌃"])]
+    } else {
+        &[("command", &["ctrl"]), ("cmd", &["ctrl"]), ("mod", &["ctrl"]), ("control", &["ctrl"]), ("option", &["alt"]), ("⌘", &["ctrl"]), ("⌃", &["ctrl"]), ("⌥", &["alt"]), ("⇧", &["shift"])]
+    };
+    let mut needles = vec![squeeze(&query)];
+    for (word, replacements) in words {
+        let mut next = Vec::new();
+        for needle in &needles {
+            if needle.contains(word) {
+                for replacement in *replacements {
+                    next.push(needle.replace(word, replacement));
+                }
+            } else {
+                next.push(needle.clone());
+            }
+        }
+        needles = next;
+    }
+    for needle in needles.iter().filter(|needle| !needle.is_empty()) {
+        let Some(at) = flat.find(needle.as_str()) else { continue };
+        // flat 的字节位置换回显示文字的字符：逐个累加小写后的长度。
+        let mut offset = 0;
+        let mut first = None;
+        let mut last = None;
+        for (index, (_, ch)) in chars.iter().enumerate() {
+            let end = offset + ch.len();
+            if first.is_none() && end > at {
+                first = Some(index);
+            }
+            if end >= at + needle.len() {
+                last = Some(index);
+                break;
+            }
+            offset = end;
+        }
+        if let (Some(first), Some(last)) = (first, last) {
+            let start = chars[first].0;
+            let end = chars[last].0 + shown[chars[last].0..].chars().next().map_or(0, char::len_utf8);
+            return Some((start, end));
+        }
+    }
+    Some((0, shown.len()))
 }
 
 /// 打开快捷键面板时按焦点所在区域预选的分组。
@@ -340,6 +433,29 @@ mod tests {
         assert!(matches(format, "", "ctrl+shift+f"));
         assert!(!matches(format, "格式化", "注释"));
         assert!(matches(format, "格式化", "  "), "空查询列出全部");
+    }
+
+    #[test]
+    fn search_hits_are_located_for_highlighting() {
+        let label = "注释 / 取消注释";
+        assert_eq!(label_match(label, "注释"), Some((0, "注释".len())));
+        assert_eq!(label_match("Comment / uncomment", "UNCOMMENT"), Some((10, 19)));
+        assert_eq!(label_match(label, "  "), None);
+        assert_eq!(label_match("格式化", "注释"), None);
+
+        let comment = shortcut("toggle-comment").unwrap();
+        assert_eq!(chord_match(comment, "注释", true), None, "按动作名命中时按键不高亮");
+        // macOS 显示 ⌘/：符号、文字写法都定位到同一段。
+        for query in ["⌘/", "cmd+/", "Mod+/", "ctrl /", "command+/"] {
+            assert_eq!(chord_match(comment, query, true), Some((0, "⌘/".len())), "{query}");
+        }
+        assert_eq!(chord_match(comment, "/", true), Some(("⌘".len(), "⌘/".len())));
+        // 其它平台显示 Ctrl+/。
+        assert_eq!(chord_match(comment, "ctrl+/", false), Some((0, 6)));
+        assert_eq!(chord_match(comment, "⌘/", false), Some((0, 6)));
+        let format = shortcut("format").unwrap();
+        assert_eq!(chord_match(format, "shift+f", false), Some((5, 12)), "Ctrl+Shift+F 里的 Shift+F");
+        assert_eq!(chord_match(format, "⇧F", true), Some(("⌘".len(), "⌘⇧F".len())));
     }
 
     #[test]

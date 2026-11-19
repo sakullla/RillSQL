@@ -5788,6 +5788,23 @@ impl Workbench {
                     list = list.child(div().px(px(8.)).pt(px(10.)).pb(px(4.)).child(kit::eyebrow(self.t(&format!("ui.help.{group}")), &p)));
                 }
                 for shortcut in items {
+                    let label = self.t(shortcut.label_key);
+                    let query = self.model.help_query.as_str();
+                    let mac = cfg!(target_os = "macos");
+                    let shown = crate::app::keymap::display_chord_for(shortcut.chord_for(mac), mac);
+                    let label_hit = crate::app::keymap::label_match(label.as_ref(), query);
+                    let key_hit = crate::app::keymap::chord_match(shortcut, query, mac);
+                    let name = match label_hit {
+                        Some((start, end)) => help_hit_text(format!("help-match-{}", shortcut.id), label.as_ref(), start, end, &p)
+                            .flex_1()
+                            .min_w(px(0.))
+                            .into_any_element(),
+                        None => div().flex_1().min_w(px(0.)).child(label.clone()).into_any_element(),
+                    };
+                    let key = match key_hit {
+                        Some((start, end)) => kit::kbd_element(help_hit_text(format!("help-key-match-{}", shortcut.id), &shown, start, end, &p), &p),
+                        None => kit::kbd(shown, &p),
+                    };
                     list = list.child(
                         div()
                             .id(SharedString::from(format!("help-row-{}", shortcut.id)))
@@ -5798,8 +5815,8 @@ impl Workbench {
                             .flex()
                             .items_center()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(0.)).child(self.t(shortcut.label_key)))
-                            .child(kit::kbd(crate::app::keymap::display_chord(shortcut.chord()), &p)),
+                            .child(name)
+                            .child(key),
                     );
                 }
             }
@@ -6891,6 +6908,31 @@ fn highlight_label(id: &str, label: &SharedString, start: usize, end: usize, p: 
         )
         .child(div().flex_1().min_w(px(0.)).truncate().child(tail))
         .into_any_element()
+}
+
+/// 快捷键面板搜索命中的一段：动作名或组合键里命中的字用选中底色与粗体强调，其余保持普通文字。
+/// 命中段的无障碍名就是命中的文字。
+fn help_hit_text(id: String, text: &str, start: usize, end: usize, p: &Palette) -> gpui_kit::Div {
+    let (start, end) = if start < end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end) { (start, end) } else { (0, text.len()) };
+    let hit = SharedString::from(text[start..end].to_owned());
+    div()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .when(start > 0, |this| this.child(SharedString::from(text[..start].to_owned())))
+        .child(
+            div()
+                .id(SharedString::from(id))
+                .test_support()
+                .aria_label(hit.clone())
+                .flex_none()
+                .bg(p.selection)
+                .rounded(px(Radius::TAG))
+                .text_color(p.accent_text)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(hit),
+        )
+        .when(end < text.len(), |this| this.child(SharedString::from(text[end..].to_owned())))
 }
 
 fn nav_icon(kind: NavKind, object: Option<ObjectKind>) -> IconName {

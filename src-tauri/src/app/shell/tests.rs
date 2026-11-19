@@ -12268,6 +12268,35 @@ fn open_file_routes_by_header_and_asks_for_unknown_files(cx: &mut gpui_kit::Test
         let draft = view.read(cx).model.connections.editor.as_ref().cloned().expect("按数据库打开");
         assert_eq!(draft.file_path, notes.display().to_string());
     });
+
+    // 拖放走同一套规则：认不出、又不是导入格式的文件同样询问打开方式，不进导入预览。
+    let bare = dir.join("no-extension");
+    std::fs::write(&bare, "select 7;\n").unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.open_dropped_or_picked_paths(&[notes.clone(), bare.clone()], true, cx));
+        let model = &view.read(cx).model;
+        assert_eq!(model.open_choices.len(), 2, "拖入的未知文件进入询问队列");
+        assert!(!model.exchange_open, "未知文件不打开导入预览");
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("cmd-open-as-sql").visible() && window.find("cmd-open-as-database").visible(), "拖放也询问打开方式");
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert!(view.read(cx).model.open_choices.is_empty()));
+    // 表格文件仍走导入预览，不询问。
+    let csv = dir.join("rows.csv");
+    std::fs::write(&csv, "name\n甲\n").unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| view.open_dropped_or_picked_paths(std::slice::from_ref(&csv), true, cx));
+        let model = &view.read(cx).model;
+        assert!(model.open_choices.is_empty(), "CSV 不询问");
+        assert!(model.exchange_open, "CSV 打开导入预览");
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -12394,9 +12423,28 @@ fn help_panel_renders_search_groups_and_scrolls_to_the_end(cx: &mut gpui_kit::Te
             view.read(cx).model.help_query
         );
         assert!(window.try_find("help-row-format").is_none(), "其余项被筛掉");
+        // 命中的字在动作名里高亮；按动作名命中时组合键不高亮。
+        let hit = window.find("help-match-toggle-comment");
+        assert!(hit.visible(), "动作名里的命中段高亮可见");
+        assert_eq!(hit.label(), Some("注释"), "高亮的就是搜索词");
+        let row = window.find("help-row-toggle-comment").bounds();
+        let hit = hit.bounds();
+        assert!(f32::from(hit.left()) >= f32::from(row.left()) - 0.5 && f32::from(hit.right()) <= f32::from(row.right()) + 0.5, "高亮在行内");
+        assert!(window.try_find("help-key-match-toggle-comment").is_none(), "按名称命中时不高亮按键");
     })
     .unwrap();
     assert_eq!(cx.update(|cx| view.read(cx).model.help_query.clone()), "注释");
+    // 按按键搜索：组合键里命中的部分高亮。
+    cx.update(|cx| view.update(cx, |view, _| view.model.help_query = "Mod+/".into()));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let hit = window.find("help-key-match-toggle-comment");
+        assert!(hit.visible(), "组合键里的命中段高亮可见");
+        let expected = if cfg!(target_os = "macos") { "⌘/" } else { "Ctrl+/" };
+        assert_eq!(hit.label(), Some(expected));
+        assert!(window.try_find("help-match-toggle-comment").is_none(), "动作名未命中时不高亮名称");
+    })
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -60,6 +60,13 @@ pub fn route_open_path(path: &Path, header: &[u8]) -> OpenRoute {
     }
 }
 
+/// 拖放时交给数据交换导入预览的文件：导入认识的表格格式（.csv/.json 直接预览，.xlsx/.xls 给出走导入对话框的提示）。
+/// 其它认不出的文件与“打开文件”一样询问以 SQL 文本还是数据库文件打开。
+pub fn is_drop_import_path(path: &Path) -> bool {
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "csv" | "json" | "xlsx" | "xls")
+}
+
 /// 读出判断文件头需要的开头字节；读不到（权限、空文件）时返回已读到的部分。
 pub fn read_file_header(path: &Path) -> Vec<u8> {
     use std::io::Read;
@@ -128,5 +135,15 @@ mod tests {
         }
         assert_eq!(read_file_header(&dir.join("missing.db")), Vec::<u8>::new());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_tabular_formats_dropped_go_to_import_preview() {
+        for name in ["rows.csv", "ROWS.CSV", "data.json", "book.xlsx", "old.xls"] {
+            assert!(is_drop_import_path(Path::new(name)), "{name}");
+        }
+        for name in ["notes.txt", "no-extension", "query.sql", "shop.db", "dump.bak"] {
+            assert!(!is_drop_import_path(Path::new(name)), "{name}");
+        }
     }
 }

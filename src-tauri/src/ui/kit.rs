@@ -1099,6 +1099,11 @@ pub fn skeleton_state(rows: usize, layout: &Metrics, p: &Palette) -> impl gpui_k
 
 /// 键盘提示 kbd。
 pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
+    kbd_element(text.into(), p)
+}
+
+/// 按键帽样式包住任意内容（例如带搜索高亮的组合键）。
+pub fn kbd_element(content: impl IntoElement, p: &Palette) -> AnyElement {
     div()
         .flex_none()
         .px(px(5.))
@@ -1111,7 +1116,7 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
         .text_color(p.text_muted)
         .flex()
         .items_center()
-        .child(text.into())
+        .child(content)
         .into_any_element()
 }
 
