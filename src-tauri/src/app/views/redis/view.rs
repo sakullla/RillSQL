@@ -12,13 +12,11 @@ use gpui_kit::{hsla, Hsla};
 const MONO_CHAR_W: f32 = 7.2;
 /// 类型徽标宽度：键列表与详情头部共用，让键名列左缘对齐。
 const TYPE_BADGE_W: f32 = 38.;
-/// 键列表里同时渲染的行数上限；更多的键用模式过滤或命名空间树收窄。
-const KEY_ROWS_MAX: usize = 500;
 /// 条目表一次渲染的行数上限。
 const ENTRY_ROWS_MAX: usize = 2000;
 
 #[derive(Clone, Copy)]
-enum Kind {
+pub(super) enum Kind {
     Primary,
     Secondary,
     Subtle,
@@ -101,7 +99,7 @@ fn type_badge(kind: &str, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
-fn cmd_click(entity: &Entity<RedisPane>, id: impl Into<String>) -> impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static {
+pub(super) fn cmd_click(entity: &Entity<RedisPane>, id: impl Into<String>) -> impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static {
     let entity = entity.clone();
     let id: String = id.into();
     move |_, _, cx| {
@@ -110,7 +108,7 @@ fn cmd_click(entity: &Entity<RedisPane>, id: impl Into<String>) -> impl Fn(&Clic
     }
 }
 
-fn action(id: impl Into<String>, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<RedisPane>) -> kit::ActionButton {
+pub(super) fn action(id: impl Into<String>, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<RedisPane>) -> kit::ActionButton {
     let id: String = id.into();
     let click = cmd_click(entity, id.clone());
     let label = SharedString::from(label.to_owned());
@@ -125,7 +123,7 @@ fn action(id: impl Into<String>, icon: Option<IconName>, label: &str, kind: Kind
     }
 }
 
-fn icon_btn(id: impl Into<String>, icon: IconName, label: &str, entity: &Entity<RedisPane>) -> kit::IconButton {
+pub(super) fn icon_btn(id: impl Into<String>, icon: IconName, label: &str, entity: &Entity<RedisPane>) -> kit::IconButton {
     let id: String = id.into();
     let click = cmd_click(entity, id.clone());
     kit::icon_button(SharedString::from(id), icon, SharedString::from(label.to_owned()), click).small()
@@ -156,6 +154,17 @@ impl RedisPane {
             Some(Confirm::Ttl { key, seconds: Some(seconds) }) => format!("EXPIRE {} {seconds}", quote_arg(key)),
             Some(Confirm::Ttl { key, seconds: None }) => format!("PERSIST {}", quote_arg(key)),
             Some(Confirm::Mutation { mutation, .. }) => keys::mutation_preview(mutation),
+            Some(Confirm::Batch { preview, template, .. }) => {
+                let mut lines = vec![preview.command.clone(), format!("# {template}")];
+                lines.extend(preview.samples.iter().map(|key| format!("  {}", quote_arg(key))));
+                if preview.count > preview.samples.len() {
+                    lines.push(format!("  … +{}", preview.count - preview.samples.len()));
+                }
+                lines.join("\n")
+            }
+            Some(Confirm::SlowlogReset { node }) => if node.is_empty() { "SLOWLOG RESET".to_owned() } else { format!("SLOWLOG RESET  # {node}") },
+            Some(Confirm::ClientKill { id, addr, .. }) => format!("CLIENT KILL ID {id}  # {addr}"),
+            Some(Confirm::Publish { channel, message }) => format!("PUBLISH {} {}", quote_arg(channel), quote_arg(message)),
             None => String::new(),
         }
     }
@@ -182,11 +191,12 @@ impl RedisPane {
                     | RedisMutation::StreamDel { .. }
                     | RedisMutation::CreateKey { overwrite: true, .. }
             ),
+            Some(Confirm::Batch { op: BatchOp::Unlink, .. }) | Some(Confirm::SlowlogReset { .. }) | Some(Confirm::ClientKill { .. }) => true,
             _ => false,
         }
     }
 
-    fn count_label(&self, detail: &RedisKeyDetail) -> String {
+    pub(super) fn count_label(&self, detail: &RedisKeyDetail) -> String {
         let (key, n) = match &detail.value {
             RedisValue::String { text } => ("redis.count.string", text.chars().count()),
             RedisValue::Hash { entries } => ("redis.count.hash", entries.len()),
@@ -194,9 +204,17 @@ impl RedisPane {
             RedisValue::Set { items } => ("redis.count.set", items.len()),
             RedisValue::ZSet { entries } => ("redis.count.zset", entries.len()),
             RedisValue::Stream { messages } => ("redis.count.stream", messages.len()),
+            RedisValue::Json { text } => ("redis.count.string", text.chars().count()),
             RedisValue::None {} => return String::new(),
         };
-        i18n::fill(&self.text(key), &[("n", &n.to_string())])
+        let base = i18n::fill(&self.text(key), &[("n", &n.to_string())]);
+        // 分页读取的集合：已读条数 / 总数。
+        match detail.total {
+            Some(total) if detail.next.is_some() || (total as usize) > n && !matches!(detail.value, RedisValue::String { .. } | RedisValue::Json { .. }) => {
+                format!("{base} / {}", i18n::fill(&self.text("redis.count.total"), &[("n", &total.to_string())]))
+            }
+            _ => base,
+        }
     }
 }
 
@@ -210,13 +228,16 @@ impl Render for RedisPane {
         self.viewport_w = viewport_w;
         let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
         let show_keys = self.keys_visible(viewport_w);
+        let keys_page = self.page == Page::Keys;
+        let top_bar = self.render_top_bar(&p, &m, &entity);
+        let diag_page = if keys_page { None } else { Some(stack_frame(|| self.render_diag_page(&p, &m, &entity, window, cx))) };
 
-        let sidebar = if !narrow || show_keys {
+        let sidebar = if keys_page && (!narrow || show_keys) {
             Some(stack_frame(|| self.render_sidebar(&p, &m, &entity, narrow, viewport_w, window, cx)))
         } else {
             None
         };
-        let detail = if !narrow || !show_keys {
+        let detail = if keys_page && (!narrow || !show_keys) {
             Some(stack_frame(|| self.render_detail(&p, &m, &entity, viewport_h, window, cx)))
         } else {
             None
@@ -224,7 +245,7 @@ impl Render for RedisPane {
         let console = stack_frame(|| self.render_console(&p, &m, &entity, window, cx));
         let new_layer = if self.new_open { Some(stack_frame(|| self.render_new_key_dialog(&p, &m, &entity, window, cx))) } else { None };
         let mono = cx.theme().mono_font_family.clone();
-        let confirm_layer = if self.confirm.is_some() { Some(stack_frame(|| self.render_confirm_dialog(&p, &m, &entity, mono))) } else { None };
+        let confirm_layer = if self.confirm.is_some() { Some(stack_frame(|| self.render_confirm_dialog(&p, &m, &entity, mono, window, cx))) } else { None };
         let menu_layer = self.render_context_menu(&p, &entity);
 
         if let Some(field) = self.focus_request.take() {
@@ -234,12 +255,14 @@ impl Render for RedisPane {
         }
 
         stack_frame(|| {
-            let mut root = div()
+            let mut body = div().flex_1().min_h(px(0.)).min_w(px(0.)).flex();
+            let root = div()
                 .id("redis-pane")
                 .test_support()
                 .relative()
                 .size_full()
                 .flex()
+                .flex_col()
                 .bg(p.surface)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -269,7 +292,9 @@ impl Render for RedisPane {
                 )
                 .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| this.key_down(event, cx)));
 
-            if narrow {
+            if let Some(page) = diag_page {
+                body = body.flex_col().child(page).child(console);
+            } else if narrow {
                 let (toggle_icon, toggle_label) = if show_keys {
                     (IconName::ChevronRight, self.text("redis.nav.value"))
                 } else {
@@ -301,7 +326,7 @@ impl Render for RedisPane {
                         )
                     });
                 let content = if show_keys { sidebar } else { detail };
-                root = root
+                body = body
                     .flex_col()
                     .child(strip)
                     .child(div().id("redis-narrow-body").flex_1().min_h(px(0.)).flex().children(content))
@@ -340,12 +365,12 @@ impl Render for RedisPane {
                             cx.notify();
                         }),
                     );
-                root = root
+                body = body
                     .children(sidebar)
                     .child(splitter)
                     .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().children(detail).child(console));
             }
-            root.children(new_layer).children(confirm_layer).children(menu_layer).into_any_element()
+            root.child(top_bar).child(body).children(new_layer).children(confirm_layer).children(menu_layer).into_any_element()
         })
     }
 }
@@ -432,23 +457,6 @@ impl RedisPane {
         let side_w = if narrow { viewport_w } else { self.sidebar_w.clamp(SIDEBAR_MIN_W, max_side) };
         let pad = m.pane_pad();
 
-        let identity = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Redis), 22.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(TypeScale::MD))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.text)
-                    .child(SharedString::from(self.connection_name.clone())),
-            )
-            .child(self.render_db_button(p, entity));
-
         let search = div()
             .flex()
             .items_center()
@@ -463,7 +471,10 @@ impl RedisPane {
             )
             .child(icon_btn("redis-filter", IconName::ListFilter, &self.text("redis.tab.filter"), entity))
             .child(icon_btn("redis-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity))
+            .child(icon_btn("redis-prefs-toggle", IconName::Settings2, &self.text("redis.prefs.title"), entity).selected(self.prefs_open))
             .child(icon_btn("redis-new-key", IconName::Plus, &self.text("redis.action.newKey"), entity).primary());
+        let prefs = if self.prefs_open { Some(self.render_prefs_panel(p, entity, window, cx)) } else { None };
+        let batch_ttl = if self.batch_ttl_for.is_some() { Some(self.render_batch_ttl_bar(p, entity, window, cx)) } else { None };
 
         let header = div()
             .flex_none()
@@ -475,11 +486,15 @@ impl RedisPane {
             .gap(px(8.))
             .border_b_1()
             .border_color(p.line)
-            .child(identity)
             .child(search)
-            .child(self.render_type_bar(p, entity));
+            .children(prefs)
+            .child(self.render_type_bar(p, entity))
+            .children(self.render_batch_banner(p, entity))
+            .children(batch_ttl);
 
-        let list = stack_frame(|| self.render_key_list(p, m, entity, side_w, cx));
+        let rows = self.key_rows();
+        let templates = if self.view_mode == ViewMode::Template { Some(self.templates()) } else { None };
+        let list = stack_frame(|| self.render_key_list(p, m, entity, side_w, rows, templates, cx));
         let footer = self.render_key_footer(p, m, entity);
 
         div()
@@ -495,7 +510,113 @@ impl RedisPane {
             .into_any_element()
     }
 
-    fn render_db_button(&self, p: &Palette, entity: &Entity<Self>) -> AnyElement {
+    /// 键空间偏好：分隔符（空格分开，可多个）与扫描上限。按连接保存。
+    fn render_prefs_panel(&mut self, p: &Palette, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let seps = self.redis_input(Field::Separators, "redis-prefs-seps", "redis.prefs.separators", ": |", window, cx);
+        let cap = self.redis_input(Field::ScanCap, "redis-prefs-cap", "redis.prefs.cap", "200000", window, cx);
+        div()
+            .id("redis-prefs")
+            .test_support()
+            .p(px(8.))
+            .rounded(px(Radius::PANEL))
+            .bg(p.sunken)
+            .border_1()
+            .border_color(p.line_soft)
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_size(px(TypeScale::XS)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(SharedString::from(self.text("redis.prefs.title"))))
+            .child(kit::form_row(self.text("redis.prefs.separators"), kit::text_input("redis-prefs-seps", &seps, self.text("redis.prefs.separators")).small(), p))
+            .child(kit::form_row(self.text("redis.prefs.cap"), kit::text_input("redis-prefs-cap", &cap, self.text("redis.prefs.cap")).small(), p))
+            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.prefs.hint"))))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(6.))
+                    .when(!self.prefs.rules.is_empty(), |this| {
+                        this.child(action("redis-tpl-rules-reset", None, &i18n::fill(&self.text("redis.prefs.resetRules"), &[("n", &self.prefs.rules.len().to_string())]), Kind::Tool, entity).small())
+                    })
+                    .child(action("redis-prefs-close", None, &self.text("common.cancel"), Kind::Secondary, entity).small())
+                    .child(action("redis-prefs-save", Some(IconName::Check), &self.text("redis.prefs.save"), Kind::Primary, entity).small()),
+            )
+            .into_any_element()
+    }
+
+    /// 模板批量 TTL：输入秒数（留空 = 移除过期）后进确认。
+    fn render_batch_ttl_bar(&mut self, p: &Palette, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let hint = self.text("redis.ttl.hint");
+        let ttl = self.redis_input(Field::BatchTtl, "redis-batch-ttl", "redis.tab.ttlLabel", &hint, window, cx);
+        let template = self.batch_ttl_for.clone().unwrap_or_default();
+        div()
+            .id("redis-batch-ttl-bar")
+            .test_support()
+            .p(px(8.))
+            .rounded(px(Radius::PANEL))
+            .bg(p.sunken)
+            .border_1()
+            .border_color(p.line_soft)
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(i18n::fill(&self.text("redis.tpl.batchTtlFor"), &[("template", &template)]))))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().flex_1().min_w(px(0.)).child(kit::text_input("redis-batch-ttl", &ttl, self.text("redis.tab.ttlLabel")).small()))
+                    .child(action("redis-batch-ttl-apply", Some(IconName::Check), &self.text("redis.tab.setTtl"), Kind::Primary, entity).small())
+                    .child(icon_btn("redis-batch-ttl-close", IconName::X, &self.text("common.cancel"), entity)),
+            )
+            .into_any_element()
+    }
+
+    /// 批量操作进度：已处理 / 总数、失败数，进行中可取消，完成后可关闭。
+    fn render_batch_banner(&self, p: &Palette, entity: &Entity<Self>) -> Option<AnyElement> {
+        let batch = self.batch.as_ref()?;
+        let progress = batch.progress;
+        let word = match batch.op {
+            BatchOp::Unlink => self.text("redis.tpl.batchDelete"),
+            BatchOp::Ttl(_) => self.text("redis.tpl.batchTtl"),
+        };
+        let state = if !progress.finished {
+            self.text("redis.batch.running")
+        } else if progress.cancelled {
+            self.text("redis.batch.cancelled")
+        } else {
+            self.text("redis.batch.done")
+        };
+        let text = i18n::fill(
+            &self.text("redis.batch.progress"),
+            &[("op", &word), ("state", &state), ("done", &progress.done.to_string()), ("total", &progress.total.to_string()), ("failed", &progress.failed.to_string())],
+        );
+        let ratio = if progress.total == 0 { 0. } else { (progress.done + progress.failed) as f32 / progress.total as f32 };
+        let button = if progress.finished {
+            icon_btn("redis-batch-dismiss", IconName::X, &self.text("redis.error.dismiss"), entity).into_any_element()
+        } else {
+            action("redis-batch-cancel", Some(IconName::CircleStop), &self.text("common.cancel"), Kind::Secondary, entity).small().into_any_element()
+        };
+        Some(
+            div()
+                .id("redis-batch")
+                .test_support()
+                .role(gpui_kit::Role::Status)
+                .aria_label(SharedString::from(format!("{text} · {}", batch.template)))
+                .tooltip_text(SharedString::from(batch.template.clone()))
+                .p(px(8.))
+                .rounded(px(Radius::PANEL))
+                .bg(if progress.failed > 0 { p.warn_soft } else { p.sunken })
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().min_w(px(0.)).child(super::pages::progress_bar(&text, ratio, !progress.finished, p)))
+                .child(button)
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn render_db_button(&self, p: &Palette, entity: &Entity<Self>) -> AnyElement {
         let open = self.db_picker_open;
         let count = self
             .database
@@ -694,18 +815,27 @@ impl RedisPane {
             .gap(px(2.))
             .rounded(px(Radius::CONTROL))
             .bg(p.sunken)
-            .child(icon_btn("redis-view-flat", IconName::List, &self.text("redis.view.flat"), entity).xsmall().selected(!self.tree_view))
-            .child(icon_btn("redis-view-tree", IconName::ListTree, &self.text("redis.view.tree"), entity).xsmall().selected(self.tree_view));
+            .child(icon_btn("redis-view-tree", IconName::ListTree, &self.text("redis.view.tree"), entity).xsmall().selected(self.view_mode == ViewMode::Tree))
+            .child(icon_btn("redis-view-template", IconName::Shapes, &self.text("redis.view.template"), entity).xsmall().selected(self.view_mode == ViewMode::Template))
+            .child(icon_btn("redis-view-flat", IconName::List, &self.text("redis.view.flat"), entity).xsmall().selected(self.view_mode == ViewMode::Flat));
         div().flex().items_start().gap(px(6.)).child(chips).child(toggle).into_any_element()
     }
 
-    fn render_key_list(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, side_w: f32, cx: &mut Context<Self>) -> AnyElement {
-        let mono = cx.theme().mono_font_family.clone();
-        let key_rows = self.build_key_rows();
+    #[allow(clippy::too_many_arguments)]
+    fn render_key_list(
+        &self,
+        p: &Palette,
+        m: &kit::Metrics,
+        entity: &Entity<Self>,
+        side_w: f32,
+        rows: Rc<Vec<KeyRow>>,
+        templates: Option<Rc<Vec<TemplateGroup>>>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
         let scan_failed = self.error_source == ErrorSource::Scan && !self.error.is_empty();
         let pattern_active = !self.pattern.trim().is_empty();
-        let visible = key_rows.len();
-        let state = list_state(self.busy, scan_failed, self.keys.len(), visible, pattern_active, self.done);
+        let visible = rows.len();
+        let state = list_state(self.busy || self.scan.running, scan_failed, self.keys.len(), visible, pattern_active, self.done);
 
         let mut list = div()
             .id("redis-keys")
@@ -714,45 +844,48 @@ impl RedisPane {
             .flex_col()
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
             .px(px(6.))
             .py(px(6.))
             .gap(px(1.));
         match state {
-            ListState::Loading => list = list.child(kit::skeleton_state(8, m, p)),
+            ListState::Loading => return list.child(kit::skeleton_state(8, m, p)).into_any_element(),
             ListState::Error => {
                 let retry = action("redis-retry-scan", Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Secondary, entity).into_any_element();
-                list = list.child(kit::error_state_with_action(
-                    SharedString::from(self.text("redis.error.scan.heading")),
-                    SharedString::from(self.error.clone()),
-                    retry,
-                    p,
-                ));
+                return list
+                    .child(kit::error_state_with_action(
+                        SharedString::from(self.text("redis.error.scan.heading")),
+                        SharedString::from(self.error.clone()),
+                        retry,
+                        p,
+                    ))
+                    .into_any_element();
             }
             ListState::NoMatch => {
                 let clear = action("redis-clear-filter", Some(IconName::ListFilter), &self.text("redis.noMatch.clear"), Kind::Secondary, entity).into_any_element();
-                list = list.child(kit::no_match_state_with_action(
-                    IconName::Search,
-                    SharedString::from(self.text("redis.noMatch.heading")),
-                    SharedString::from(self.text("redis.noMatch.detail")),
-                    clear,
-                    p,
-                ));
+                return list
+                    .child(kit::no_match_state_with_action(
+                        IconName::Search,
+                        SharedString::from(self.text("redis.noMatch.heading")),
+                        SharedString::from(self.text("redis.noMatch.detail")),
+                        clear,
+                        p,
+                    ))
+                    .into_any_element();
             }
             ListState::Empty => {
                 let create = action("redis-new-key", Some(IconName::Plus), &self.text("redis.action.newKey"), Kind::Primary, entity).into_any_element();
-                list = list.child(kit::empty_state_with_action(
-                    IconName::Key,
-                    SharedString::from(self.text("redis.empty.heading")),
-                    SharedString::from(self.text("redis.empty.detail")),
-                    create,
-                    p,
-                ));
+                return list
+                    .child(kit::empty_state_with_action(
+                        IconName::Key,
+                        SharedString::from(self.text("redis.empty.heading")),
+                        SharedString::from(self.text("redis.empty.detail")),
+                        create,
+                        p,
+                    ))
+                    .into_any_element();
             }
             ListState::Rows => {
-                if self.busy {
-                    list = list.child(div().px(px(6.)).child(kit::inline_loading(SharedString::from(self.text("redis.list.busy")), m, p)));
-                } else if visible == 0 {
+                if visible == 0 && !self.scan.running && !self.busy {
                     list = list.child(
                         div()
                             .id("redis-keys-blank")
@@ -763,128 +896,197 @@ impl RedisPane {
                             .text_color(p.text_faint)
                             .child(SharedString::from(self.text("redis.tab.emptyList"))),
                     );
+                } else if self.busy || self.scan.running {
+                    // 增量读取：一行指示放在已读到的键上方，不盖住它们。
+                    list = list.child(div().flex_none().px(px(6.)).child(kit::inline_loading(SharedString::from(self.text("redis.list.busy")), m, p)));
                 }
             }
         }
-
-        // 键名列可用宽度：侧栏宽 − 列表内边距 − 行内边距 − 类型徽标 − 间距 − 行尾 TTL。
-        let base_w = side_w - 12. - 16. - TYPE_BADGE_W - 8.;
-        for row in key_rows.into_iter().take(KEY_ROWS_MAX) {
-            match row {
-                KeyRow::Folder { prefix, segment, depth, count, open } => {
-                    let id = format!("redis-folder:{prefix}");
-                    let menu_prefix = prefix.clone();
-                    let menu_entity = entity.clone();
-                    list = list.child(
-                        kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
-                            .test_support()
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(SharedString::from(prefix.clone()))
-                            .aria_expanded(open)
-                            .flex_none()
-                            .h(px(m.tree_row_h))
-                            .pl(px(6. + depth as f32 * 14.))
-                            .pr(px(8.))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .rounded(px(Radius::CONTROL))
-                            .text_size(px(TypeScale::SM))
-                            .text_color(p.text)
-                            .hover(|style| style.bg(p.hover))
-                            .child(kit::icon(if open { IconName::ChevronDown } else { IconName::ChevronRight }, 12., p.text_faint))
-                            .child(kit::icon(if open { IconName::FolderOpen } else { IconName::Folder }, 13., p.accent_text))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .font_family(mono.clone())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(SharedString::from(segment)),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(TypeScale::XS))
-                                    .font_features(kit::tabular_figures())
-                                    .text_color(p.text_faint)
-                                    .child(SharedString::from(count.to_string())),
-                            )
-                            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                let pfx = menu_prefix.clone();
-                                let pos = event.position;
-                                menu_entity.update(cx, |pane, cx| pane.open_folder_context_menu(pfx, pos, cx));
-                            })
-                            .on_click(cmd_click(entity, id)),
-                    );
-                }
-                KeyRow::Key { index, display, depth } => {
-                    let key = &self.keys[index];
-                    let selected = key.name == self.selected;
-                    let id = format!("redis-select:{index}");
-                    let label = format!("{} {} {}", key.key_type, key.name, describe_ttl(self.locale, key.ttl_ms));
-                    let menu_entity = entity.clone();
-                    let ttl = key.ttl_ms.filter(|ttl| *ttl >= 0);
-                    let ttl_w = if ttl.is_some() { 34. } else { 0. };
-                    let avail = (base_w - depth as f32 * 14. - ttl_w).max(0.);
-                    let shown = middle_ellipsis(&display, (avail / MONO_CHAR_W).floor() as usize);
-                    list = list.child(
-                        kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
-                            .test_support()
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(SharedString::from(label))
-                            .aria_selected(selected)
-                            .tooltip_text(SharedString::from(key.name.clone()))
-                            .flex_none()
-                            .h(px(m.tree_row_h + 2.))
-                            .pl(px(6. + depth as f32 * 14.))
-                            .pr(px(8.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .rounded(px(Radius::CONTROL))
-                            .when(selected, |this| this.bg(p.selection))
-                            .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-                            .child(type_badge(&key.key_type, p))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .font_family(mono.clone())
-                                    .text_size(px(TypeScale::SM))
-                                    .text_color(p.text)
-                                    .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
-                                    .child(SharedString::from(shown)),
-                            )
-                            .when_some(ttl, |this, ms| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(TypeScale::XS))
-                                        .font_features(kit::tabular_figures())
-                                        .text_color(if ms < 60_000 { p.warn } else { p.text_faint })
-                                        .child(SharedString::from(short_ttl(ms))),
-                                )
-                            })
-                            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                let pos = event.position;
-                                menu_entity.update(cx, |pane, cx| pane.open_key_context_menu(index, pos, cx));
-                            })
-                            .on_click(cmd_click(entity, id)),
-                    );
-                }
-            }
+        if visible == 0 {
+            return list.into_any_element();
         }
-        list.into_any_element()
+        // 虚拟列表：只渲染可见行，键数没有上限（内存索引上限由偏好控制）。
+        let owner = entity.downgrade();
+        let row_entity = entity.clone();
+        list.child(
+            gpui_kit::uniform_list("redis-key-rows", visible, move |range, _window, cx| {
+                let rows = Rc::clone(&rows);
+                let templates = templates.clone();
+                let entity = row_entity.clone();
+                owner
+                    .update(cx, |this, cx| {
+                        range.map(|index| this.key_row_element(&rows[index], templates.as_deref(), side_w, &entity, cx)).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .flex_1(),
+        )
+        .into_any_element()
     }
 
+    /// 列表的一行（虚拟列表按需调用）。
+    fn key_row_element(&self, row: &KeyRow, templates: Option<&Vec<TemplateGroup>>, side_w: f32, entity: &Entity<Self>, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
+        let mono = cx.theme().mono_font_family.clone();
+        // 键名列可用宽度：侧栏宽 − 列表内边距 − 行内边距 − 类型徽标 − 间距 − 行尾 TTL。
+        let base_w = side_w - 12. - 16. - TYPE_BADGE_W - 8.;
+        let row_h = m.tree_row_h + 2.;
+        match row {
+            KeyRow::Folder { prefix, segment, depth, count, open } => {
+                let id = format!("redis-folder:{prefix}");
+                let menu_prefix = prefix.clone();
+                let menu_entity = entity.clone();
+                kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(prefix.clone()))
+                    .aria_expanded(*open)
+                    .h(px(row_h))
+                    .pl(px(6. + *depth as f32 * 14.))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text)
+                    .hover(|style| style.bg(p.hover))
+                    .child(kit::icon(if *open { IconName::ChevronDown } else { IconName::ChevronRight }, 12., p.text_faint))
+                    .child(kit::icon(if *open { IconName::FolderOpen } else { IconName::Folder }, 13., p.accent_text))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono).font_weight(FontWeight::MEDIUM).child(SharedString::from(segment.clone())))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(TypeScale::XS))
+                            .font_features(kit::tabular_figures())
+                            .text_color(p.text_faint)
+                            .child(SharedString::from(count.to_string())),
+                    )
+                    .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let pfx = menu_prefix.clone();
+                        let pos = event.position;
+                        menu_entity.update(cx, |pane, cx| pane.open_folder_context_menu(pfx, pos, cx));
+                    })
+                    .on_click(cmd_click(entity, id))
+                    .into_any_element()
+            }
+            KeyRow::Template { group, open } => {
+                let Some(item) = templates.and_then(|groups| groups.get(*group)) else { return div().h(px(row_h)).into_any_element() };
+                let template = item.template.clone();
+                let id = format!("redis-tpl:{template}");
+                let menu_entity = entity.clone();
+                let menu_template = template.clone();
+                let memory = match self.template_memory.get(&template) {
+                    Some(Some(bytes)) => Some(i18n::fill(&self.text("redis.tpl.memoryEstimate"), &[("size", &keyspace::human_bytes(*bytes))])),
+                    Some(None) => Some(self.text("redis.tpl.memoryLoading")),
+                    None => None,
+                };
+                let dominant = item.types.first().map(|(kind, _)| kind.clone()).unwrap_or_default();
+                kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(format!("{template} {}", item.count)))
+                    .aria_expanded(*open)
+                    .h(px(row_h))
+                    .pl(px(6.))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text)
+                    .hover(|style| style.bg(p.hover))
+                    .child(kit::icon(if *open { IconName::ChevronDown } else { IconName::ChevronRight }, 12., p.text_faint))
+                    .child(type_badge(&dominant, &p))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono).font_weight(FontWeight::MEDIUM).child(SharedString::from(template.clone())))
+                    .when_some(memory, |this, memory| {
+                        this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(memory)))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(TypeScale::XS))
+                            .font_features(kit::tabular_figures())
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(item.count.to_string())),
+                    )
+                    .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let template = menu_template.clone();
+                        let pos = event.position;
+                        menu_entity.update(cx, |pane, cx| pane.open_template_context_menu(template, pos, cx));
+                    })
+                    .on_click(cmd_click(entity, id))
+                    .into_any_element()
+            }
+            KeyRow::Key { index, display, depth } => {
+                let Some(key) = self.keys.get(*index) else { return div().h(px(row_h)).into_any_element() };
+                let index = *index;
+                let selected = key.name == self.selected;
+                let id = format!("redis-select:{index}");
+                let label = format!("{} {} {}", key.key_type, key.name, describe_ttl(self.locale, key.ttl_ms));
+                let menu_entity = entity.clone();
+                let ttl = key.ttl_ms.filter(|ttl| *ttl >= 0);
+                let ttl_w = if ttl.is_some() { 34. } else { 0. };
+                let avail = (base_w - *depth as f32 * 14. - ttl_w).max(0.);
+                let shown = middle_ellipsis(display, (avail / MONO_CHAR_W).floor() as usize);
+                kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(label))
+                    .aria_selected(selected)
+                    .tooltip_text(SharedString::from(key.name.clone()))
+                    .h(px(row_h))
+                    .pl(px(6. + *depth as f32 * 14.))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(Radius::CONTROL))
+                    .when(selected, |this| this.bg(p.selection))
+                    .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+                    .child(type_badge(&key.key_type, &p))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family(mono)
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text)
+                            .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
+                            .child(SharedString::from(shown)),
+                    )
+                    .when_some(ttl, |this, ms| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(TypeScale::XS))
+                                .font_features(kit::tabular_figures())
+                                .text_color(if ms < 60_000 { p.warn } else { p.text_faint })
+                                .child(SharedString::from(short_ttl(ms))),
+                        )
+                    })
+                    .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let pos = event.position;
+                        menu_entity.update(cx, |pane, cx| pane.open_key_context_menu(index, pos, cx));
+                    })
+                    .on_click(cmd_click(entity, id))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// 页脚：扫描进度（已读取 / DBSIZE）、取消、上限提示与继续扫描。
     fn render_key_footer(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
         let scan_failed = self.error_source == ErrorSource::Scan && !self.error.is_empty();
         let bar = div()
+            .id("redis-scan-footer")
+            .test_support()
             .flex_none()
             .min_h(px(m.bar_h()))
             .px(px(m.pane_pad()))
@@ -896,46 +1098,52 @@ impl RedisPane {
             .border_color(p.line);
         if scan_failed && !self.keys.is_empty() {
             return bar
-                .id("redis-list-error")
-                .test_support()
                 .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(self.error.clone())))
+                .child(div().id("redis-list-error").test_support().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(self.error.clone())))
                 .child(action("redis-retry-scan", Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Tool, entity))
                 .into_any_element();
         }
-        let total = i18n::fill(&self.text("redis.db.keysCount"), &[("n", &self.keys.len().to_string())]);
-        let shown = if self.type_filter.is_empty() {
-            None
-        } else {
+        let read = self.keys.len().to_string();
+        let mut text = match self.scan.total {
+            Some(total) => i18n::fill(&self.text("redis.scan.progress"), &[("n", &read), ("total", &total.to_string())]),
+            None => i18n::fill(&self.text("redis.scan.read"), &[("n", &read)]),
+        };
+        if !self.type_filter.is_empty() {
             let visible = self.keys.iter().filter(|key| key.key_type == self.type_filter).count();
-            Some(i18n::fill(&self.text("redis.count.filtered"), &[("shown", &visible.to_string()), ("n", &self.keys.len().to_string())]))
+            text = format!("{text} · {}", i18n::fill(&self.text("redis.count.filtered"), &[("shown", &visible.to_string()), ("n", &read)]));
+        }
+        let state = if self.scan.running {
+            self.text("redis.scan.running")
+        } else if self.scan.capped {
+            i18n::fill(&self.text("redis.scan.capped"), &[("cap", &self.prefs.scan_cap.to_string())])
+        } else if self.done {
+            self.text("redis.list.allLoaded")
+        } else if self.scan.cancelled {
+            self.text("redis.scan.cancelled")
+        } else {
+            self.text("redis.list.moreLeft")
         };
-        let progress = if self.done { self.text("redis.list.allLoaded") } else { self.text("redis.list.moreLeft") };
-        let summary = match shown {
-            Some(shown) => format!("{shown} · {progress}"),
-            None => format!("{total} · {progress}"),
+        let pattern_note = (!self.pattern.trim().is_empty()).then(|| self.text("redis.scan.patternNote"));
+        let summary = match pattern_note {
+            Some(note) => format!("{text} · {state} · {note}"),
+            None => format!("{text} · {state}"),
         };
+        let ratio = self.scan.total.filter(|total| *total > 0).map(|total| (self.keys.len() as f32 / total as f32).min(1.)).unwrap_or(if self.done { 1. } else { 0. });
         bar.child(
             div()
+                .id("redis-scan-progress")
+                .test_support()
+                .role(gpui_kit::Role::Status)
+                .aria_label(SharedString::from(summary.clone()))
                 .flex_1()
                 .min_w(px(0.))
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .child(kit::status_dot(if self.done { p.ok } else { p.warn }))
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(TypeScale::XS))
-                        .font_features(kit::tabular_figures())
-                        .text_color(p.text_muted)
-                        .child(SharedString::from(summary)),
-                ),
+                .child(super::pages::progress_bar(&summary, ratio, self.scan.running, p)),
         )
-        .when(!self.done, |this| {
+        .when(self.scan.running, |this| this.child(action("redis-scan-cancel", Some(IconName::CircleStop), &self.text("common.cancel"), Kind::Tool, entity)))
+        .when(!self.scan.running && !self.done && !self.scan.capped, |this| {
             this.child(action("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, entity).disabled(self.busy))
         })
+        .when(self.scan.capped, |this| this.child(kit::icon(IconName::TriangleAlert, 13., p.warn)))
         .into_any_element()
     }
 
@@ -1058,12 +1266,37 @@ impl RedisPane {
             .child(SharedString::from(describe_ttl(self.locale, ttl_ms)))
             .on_click(cmd_click(entity, "redis-ttl-toggle"));
 
+        let chip = |text: String| {
+            div()
+                .h(px(22.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(Radius::CONTROL))
+                .bg(p.sunken)
+                .text_size(px(TypeScale::XS))
+                .font_features(kit::tabular_figures())
+                .text_color(p.text_muted)
+                .child(SharedString::from(text))
+        };
+        let placement = self.placement.clone().map(|place| {
+            let mut row = div().id("redis-key-placement").test_support().flex().items_center().gap(px(6.));
+            row = row.child(chip(i18n::fill(&self.text("redis.cluster.slot"), &[("n", &place.slot.to_string())])));
+            if let Some(node) = place.node {
+                row = row.child(chip(i18n::fill(&self.text("redis.cluster.node"), &[("addr", &node)])));
+            }
+            if let Some(tag) = place.hash_tag {
+                row = row.child(chip(i18n::fill(&self.text("redis.cluster.hashTag"), &[("tag", &tag)])));
+            }
+            row
+        });
         let meta = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(6.))
             .child(ttl_chip)
+            .children(placement)
             .when(!size.is_empty(), |this| {
                 this.child(
                     div()
@@ -1193,6 +1426,24 @@ impl RedisPane {
                     .border_color(p.line)
                     .bg(p.surface)
                     .children(empty_hint)
+                    .child(div().flex_1().min_h(px(0.)).child(viewer))
+                    .into_any_element()
+            }
+            RedisValue::Json { text } => {
+                let viewer = self.ensure_string_viewer(text, window, cx);
+                div()
+                    .id("redis-json-value")
+                    .test_support()
+                    .flex_1()
+                    .min_h(px(200.))
+                    .flex()
+                    .flex_col()
+                    .p(px(8.))
+                    .rounded(px(Radius::PANEL))
+                    .border_1()
+                    .border_color(p.line)
+                    .bg(p.surface)
+                    .child(div().flex_none().pb(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.value.json"))))
                     .child(div().flex_1().min_h(px(0.)).child(viewer))
                     .into_any_element()
             }
@@ -1388,7 +1639,7 @@ impl RedisPane {
                     inspected,
                 )
             }
-            RedisValue::String { .. } | RedisValue::None {} => (Vec::new(), 0, String::new(), None),
+            RedisValue::String { .. } | RedisValue::Json { .. } | RedisValue::None {} => (Vec::new(), 0, String::new(), None),
         };
 
         let shown = rows.len();
@@ -1420,6 +1671,19 @@ impl RedisPane {
                     .text_color(p.text_muted)
                     .child(SharedString::from(count_text)),
             )
+            .when(detail.next.is_some(), |this| {
+                this.child(
+                    action(
+                        "redis-value-more",
+                        Some(IconName::ChevronsDown),
+                        &self.text(if self.value_loading { "redis.value.loading" } else { "redis.value.more" }),
+                        Kind::Tool,
+                        entity,
+                    )
+                    .small()
+                    .disabled(self.value_loading),
+                )
+            })
             .child(
                 action(
                     "redis-entry-form",
@@ -1640,7 +1904,7 @@ impl RedisPane {
                     .child(div().flex_1().min_w(px(160.)).child(kit::text_input("redis-stream-value", &value, self.text("redis.value.value")).small()))
                     .child(action("redis-xadd", Some(IconName::Check), &self.text("redis.stream.add"), Kind::Primary, entity).small())
             }
-            RedisValue::String { .. } | RedisValue::None {} => form,
+            RedisValue::String { .. } | RedisValue::Json { .. } | RedisValue::None {} => form,
         };
         form.child(close).into_any_element()
     }
@@ -1728,7 +1992,12 @@ impl RedisPane {
                         return;
                     }
                     let value = value.clone();
-                    this.stage_mutation(RedisMutation::SetString { key: this.selected.clone(), value });
+                    let json = this.detail.as_deref().is_some_and(|detail| matches!(detail.value, RedisValue::Json { .. }));
+                    if json {
+                        this.stage_if_key(RedisMutation::JsonSet { key: this.selected.clone(), value });
+                    } else {
+                        this.stage_mutation(RedisMutation::SetString { key: this.selected.clone(), value });
+                    }
                     cx.notify();
                 }
             });
@@ -1998,9 +2267,33 @@ impl RedisPane {
 
     // ------------------------------------------------------------------ 对话框
 
-    fn render_confirm_dialog(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: SharedString) -> AnyElement {
+    fn render_confirm_dialog(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: SharedString, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let destructive = self.confirm_destructive();
-        let write_only = matches!(self.confirm, Some(Confirm::Mutation { .. }) | Some(Confirm::Ttl { .. }));
+        let write_only = matches!(self.confirm, Some(Confirm::Mutation { .. }) | Some(Confirm::Ttl { .. }) | Some(Confirm::Batch { .. }));
+        let ready = self.confirm_ready();
+        // 生产库：输入连接名才可确认（与对象树的危险操作同一规则）。
+        let typed = if self.prod_target {
+            let expected = self.confirm_expected();
+            let input = self.redis_input(Field::ConfirmTyped, "redis-confirm-typed", "redis.prod.typeName", &expected, window, cx);
+            Some(
+                div()
+                    .id("redis-confirm-prod")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(8.))
+                    .rounded(px(Radius::CONTROL))
+                    .bg(p.danger_soft)
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(i18n::fill(&self.text("redis.prod.typeName"), &[("name", &expected)]))))
+                    .child(kit::text_input("redis-confirm-typed", &input, self.text("redis.prod.typeName")).small())
+                    .when(self.confirm_typed_error, |this| {
+                        this.child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(self.text("redis.prod.mismatch"))))
+                    }),
+            )
+        } else {
+            None
+        };
         let lead = if write_only { self.text("redis.confirm.writeLead") } else { self.confirm_prompt.clone() };
         let (icon_name, fg, bg) = if destructive {
             (IconName::TriangleAlert, p.danger, p.danger_soft)
@@ -2053,6 +2346,7 @@ impl RedisPane {
             .when(destructive && write_only, |this| {
                 this.child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(self.text("redis.confirm.irreversible"))))
             })
+            .children(typed)
             .child(
                 div()
                     .pt(px(4.))
@@ -2068,7 +2362,8 @@ impl RedisPane {
                             if destructive { Kind::Danger } else { Kind::Primary },
                             entity,
                         )
-                        .small(),
+                        .small()
+                        .disabled(!ready),
                     ),
             );
         // 写删确认必须明确选择：点遮罩不取消，也不会穿透到下面的键列表。
@@ -2278,6 +2573,13 @@ impl RedisPane {
             Field::StreamValue => self.stream_value.clone(),
             Field::HashQuery => self.hash_query.clone(),
             Field::SetQuery => self.set_query.clone(),
+            Field::Separators => self.sep_input.clone(),
+            Field::ScanCap => self.cap_input.clone(),
+            Field::BatchTtl => self.batch_ttl_input.clone(),
+            Field::ConfirmTyped => self.confirm_typed.clone(),
+            Field::SubChannels => self.diag.sub_input.clone(),
+            Field::PubChannel => self.diag.pub_channel.clone(),
+            Field::PubMessage => self.diag.pub_message.clone(),
         };
         let _ = label_key;
         self.fields.bind_enter(
@@ -2316,6 +2618,16 @@ impl RedisPane {
                     Field::StreamValue => this.stream_value = value,
                     Field::HashQuery => this.hash_query = value,
                     Field::SetQuery => this.set_query = value,
+                    Field::Separators => this.sep_input = value,
+                    Field::ScanCap => this.cap_input = value,
+                    Field::BatchTtl => this.batch_ttl_input = value,
+                    Field::ConfirmTyped => {
+                        this.confirm_typed = value;
+                        this.confirm_typed_error = false;
+                    }
+                    Field::SubChannels => this.diag.sub_input = value,
+                    Field::PubChannel => this.diag.pub_channel = value,
+                    Field::PubMessage => this.diag.pub_message = value,
                 }
             },
             Some(|this: &mut Self, field, cx: &mut Context<Self>| {
@@ -2342,6 +2654,12 @@ impl RedisPane {
                     }
                     Field::StreamId | Field::StreamField | Field::StreamValue => "redis-xadd".into(),
                     Field::HashQuery | Field::SetQuery => "redis-entry-filter".into(),
+                    Field::Separators | Field::ScanCap => "redis-prefs-save".into(),
+                    Field::BatchTtl => "redis-batch-ttl-apply".into(),
+                    // 生产库的确认只能点按钮，回车不提交。
+                    Field::ConfirmTyped => return,
+                    Field::SubChannels => "redis-sub-start".into(),
+                    Field::PubChannel | Field::PubMessage => "redis-pub-send".into(),
                 };
                 this.command(&id, cx);
             }),

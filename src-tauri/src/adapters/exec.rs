@@ -19,7 +19,7 @@ pub enum Attached {
     Mysql(mysql_async::Conn),
     Postgres(Arc<tokio_postgres::Client>),
     Sqlserver(Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>),
-    Redis(Arc<tokio::sync::Mutex<::redis::aio::MultiplexedConnection>>),
+    Redis(Arc<tokio::sync::Mutex<redis::conn::RedisConn>>),
     Scripted,
 }
 
@@ -60,6 +60,15 @@ impl CatalogSession {
                     let db = database.trim().strip_prefix("db").unwrap_or(database.trim()).parse::<u32>()
                         .map_err(|_| format!("Redis 库号无效：{database}"))?;
                     let mut guard = conn.lock().await;
+                    // 集群只有 0 号库，SELECT 会被随机路由到某个节点；0 号库无需切换，其余库号明确拒绝。
+                    if guard.is_cluster() {
+                        if db != 0 {
+                            return Err(format!("Redis 集群只有 0 号库，不能切换到 {database}。"));
+                        }
+                        drop(guard);
+                        timeout_applied = false;
+                        return Ok((Attached::Redis(conn), timeout_applied));
+                    }
                     let _: () = ::redis::cmd("SELECT")
                         .arg(db)
                         .query_async(&mut *guard)

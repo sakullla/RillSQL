@@ -39,6 +39,13 @@ pub const DANGEROUS_COMMANDS: &[&str] = &[
     "SETBIT", "BITFIELD", "BITFIELD_RO", "GEOADD", "GEOSEARCHSTORE", "PFADD", "PFMERGE", "OBJECT_ENCONDING", "OBJECT_ENCODING",
     // 管理类
     "CONFIG_SET", "ACL_SETUSER", "ACL_DELUSER", "ACL_SAVE", "SCRIPT_FLUSH", "FUNCTION_FLUSH", "FUNCTION_DELETE", "FUNCTION_RESTORE", "CLIENT_KILL", "DEBUG",
+    // 诊断与运维：清空统计/慢日志、改写配置、断开客户端、复制与集群拓扑变更
+    "SLOWLOG_RESET", "CONFIG_RESETSTAT", "CONFIG_REWRITE", "LATENCY_RESET", "MEMORY_PURGE", "CLIENT_PAUSE", "CLIENT_NO_EVICT",
+    "SCRIPT_KILL", "FUNCTION_KILL", "REPLICAOF", "SLAVEOF", "FAILOVER",
+    "CLUSTER_RESET", "CLUSTER_FAILOVER", "CLUSTER_FORGET", "CLUSTER_FLUSHSLOTS", "CLUSTER_DELSLOTS", "CLUSTER_ADDSLOTS", "CLUSTER_SETSLOT",
+    "CLUSTER_MEET", "CLUSTER_REPLICATE",
+    // RedisJSON 写入
+    "JSON.SET", "JSON.DEL", "JSON.FORGET", "JSON.CLEAR", "JSON.MERGE", "JSON.ARRAPPEND", "JSON.ARRINSERT", "JSON.ARRPOP", "JSON.NUMINCRBY", "JSON.STRAPPEND", "JSON.TOGGLE",
     // 事务/订阅会改变会话状态
     "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH", "SELECT",
 ];
@@ -136,6 +143,18 @@ pub fn invocation_word(word: &str, args: &[String]) -> String {
     trimmed.to_owned()
 }
 
+/// 集群里多键命令的键跨了槽：服务端会以 CROSSSLOT 拒绝，发送前就说明原因与 hash tag 写法。
+pub fn crossslot_message(word: &str, args: &[String]) -> Option<String> {
+    let found = super::cluster::cross_slot(word, args)?;
+    let detail = found.keys.iter().map(|(key, slot)| format!("{key}→{slot}")).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "CROSSSLOT：{} 的 {} 个键分布在 {} 个槽（{detail}），集群会拒绝。把键写成同一个 hash tag（如 {{user:1}}:a、{{user:1}}:b）即可落在同一槽。",
+        word.to_ascii_uppercase(),
+        found.keys.len(),
+        found.slot_count()
+    ))
+}
+
 /// 执行前置检查：Blocked 无条件拒绝；Dangerous 必须带确认标记。
 #[cfg(test)]
 pub fn guard_command(word: &str, confirmed: bool) -> Result<(), String> {
@@ -167,7 +186,7 @@ pub fn expand_command(word: &str, args: &[String]) -> (String, Vec<String>) {
 
 /// 执行一条命令并结构化返回。调用方必须先通过 guard_invocation。
 pub async fn run_command(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut super::conn::RedisConn,
     word: &str,
     args: &[String],
 ) -> Result<RespReply, redis::RedisError> {

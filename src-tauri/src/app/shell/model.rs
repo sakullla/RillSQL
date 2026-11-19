@@ -806,7 +806,7 @@ impl WorkbenchModel {
                 self.menu = None;
                 // 按打开前的焦点区域预选分组：编辑器→编辑器，表格→表格，对象树→对象树，其余→全局。
                 let focus = self.shell.focus_before_overlay().unwrap_or(self.shell.focus);
-                self.help_group = Some(crate::app::keymap::group_for_focus(focus));
+                self.help_group = Some(crate::app::keymap::group_for_workbench(focus, self.tool == WorkTool::Redis));
                 self.help_query.clear();
             }
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),

@@ -12679,6 +12679,15 @@ fn help_panel_searches_names_and_keys_and_preselects_the_focused_group() {
     model.shell.focus = crate::app::FocusTarget::Sidebar;
     let _ = model.dispatch("help");
     assert_eq!(model.help_group, Some("explorer"));
+    model.shell.close_overlay();
+    // 键空间工作台：焦点不在编辑器/表格/对象树时预选键空间分组。
+    let tool = model.tool;
+    model.tool = super::model::WorkTool::Redis;
+    model.shell.focus = crate::app::FocusTarget::Palette;
+    let _ = model.dispatch("help");
+    assert_eq!(model.help_group, Some("keyspace"));
+    assert!(model.help_sections().iter().all(|(group, items)| *group == "keyspace" && items.len() == 5));
+    model.tool = tool;
 
     // 搜索动作名：跨分组查找，不受预选分组限制。
     model.set_field(DraftField::HelpQuery, "注释".into());

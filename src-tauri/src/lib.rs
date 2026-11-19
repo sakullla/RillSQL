@@ -248,8 +248,11 @@ mod tests {
     #[test]
     fn gpui_redis_calls_key_commands() {
         tauri_ipc_manifests_are_absent();
-        let view = source("src/app/views/redis/mod.rs");
-        for name in ["scan_keys", "read_key", "set_ttl", "delete_keys", "rename_key", "exec"] {
+        let view = source("src/app/views/redis/mod.rs") + &source("src/app/views/redis/actions.rs");
+        for name in [
+            "scan_keyspace", "read_key", "read_page", "set_ttl", "delete_keys", "rename_key", "exec", "batch", "slowlog", "slowlog_reset", "info",
+            "clients", "client_kill", "big_keys", "subscribe", "publish", "topology", "load_prefs", "save_prefs", "memory_samples",
+        ] {
             assert!(view.contains(&format!("application::redis::{name}(")), "{name}");
         }
         assert_eq!(super::adapters::redis::module_id(), "redis");

@@ -1,17 +1,25 @@
 //! Redis 适配器：没有 SQL 面。
 //!
-//! 键浏览器后端（R11）：SCAN 分页、类型化值读取、TTL 修改、删除/重命名与命令执行通道。
+//! 键浏览器后端（R11 / R4）：后台全量 SCAN（逐节点、可取消、有上限）、分隔符分组与模板归并、
+//! 分页值读取（含 RedisJSON）、TTL/删除/重命名、模板批量操作、诊断（慢日志/INFO/大键/客户端/Pub/Sub）、
+//! Cluster（自动识别、槽计算、跨槽提示、节点表）与命令执行通道。
 //! 键空间浏览一律走 SCAN 游标（禁 KEYS）；写删类操作由前端确认后携带 confirmed 标记执行。
 //! 会话经 `Session::as_redis()` 专属接口取得。
 
+pub(crate) mod batch;
 pub(crate) mod catalog;
+pub(crate) mod cluster;
 pub mod commands;
 pub(crate) mod complete;
 pub(crate) mod connect;
+pub(crate) mod conn;
 pub(crate) mod console;
+pub(crate) mod diag;
 mod english;
 pub(crate) mod exec;
 pub(crate) mod keys;
+pub(crate) mod keyspace;
+pub(crate) mod scan;
 
 use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FieldHint, FormField, UrlScheme, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};

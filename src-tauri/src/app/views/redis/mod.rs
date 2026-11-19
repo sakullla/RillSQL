@@ -1,7 +1,11 @@
-//! Redis 键浏览器。浏览只走 SCAN；支持命名空间树、DB0–DB15 实时切换、结构化格式化查看（JSON/XML/Hex）、
-//! 右键上下文菜单、一键复制、命令与键名自动补全，以及写删前二次确认。
+//! Redis 工作台（R4）。顶栏 = 连接/逻辑库 + 页签（键 | 慢日志 | 信息 | 大键 | 客户端 | Pub/Sub | 节点[集群]）。
+//! 键页：后台全量 SCAN（进度、可取消、上限提示）+ 虚拟列表，树/模板/平铺三种视图（分隔符按连接保存），
+//! 模板批量删除/TTL（预览 → 确认 → 分批执行），右侧键详情（分页取值、集群槽位）；控制台为可折叠底部面板。
+//! 所有写入先确认；连接挂生产标签时确认还要输入连接名。浏览只走 SCAN，禁 KEYS。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -21,7 +25,13 @@ use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::adapters::redis::complete::{self, RedisCompletion};
 use crate::adapters::redis::exec::{self, CommandRisk, RespReply};
-use crate::adapters::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ScanPage};
+use crate::adapters::redis::batch::{self as batch_ops, BatchOp, BatchPreview, BatchProgress};
+use crate::adapters::redis::cluster::{self, KeyPlacement};
+use crate::adapters::redis::conn::Topology;
+use crate::adapters::redis::diag::{BigKey, BigKeyEvent, ClientInfo, InfoSection, PubSubMessage, SlowEntry, SlowSort};
+use crate::adapters::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ValuePage};
+use crate::adapters::redis::keyspace::{self, KeyspacePrefs, TemplateGroup, TreeRow};
+use crate::adapters::redis::scan::{ScanEvent, ScanOptions, ScanResume};
 
 const SIDEBAR_DEFAULT_W: f32 = 304.;
 const SIDEBAR_MIN_W: f32 = 220.;
@@ -49,6 +59,13 @@ enum Field {
     StreamValue,
     HashQuery,
     SetQuery,
+    Separators,
+    ScanCap,
+    BatchTtl,
+    ConfirmTyped,
+    SubChannels,
+    PubChannel,
+    PubMessage,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +75,128 @@ enum Confirm {
     Exec { command: String, args: Vec<String>, line: String },
     Ttl { key: String, seconds: Option<i64> },
     Mutation { mutation: RedisMutation, key: String },
+    /// 模板批量操作：预览（数量与样例）就是确认框的内容。
+    Batch { template: String, keys: Vec<String>, op: BatchOp, preview: BatchPreview },
+    SlowlogReset { node: String },
+    ClientKill { node: String, id: String, addr: String },
+    Publish { channel: String, message: String },
 }
+
+/// 顶栏页签。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Keys,
+    Slowlog,
+    Info,
+    BigKeys,
+    Clients,
+    PubSub,
+    Nodes,
+}
+
+impl Page {
+    pub(crate) const ALL: [Page; 7] = [Page::Keys, Page::Slowlog, Page::Info, Page::BigKeys, Page::Clients, Page::PubSub, Page::Nodes];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Page::Keys => "keys",
+            Page::Slowlog => "slowlog",
+            Page::Info => "info",
+            Page::BigKeys => "bigkeys",
+            Page::Clients => "clients",
+            Page::PubSub => "pubsub",
+            Page::Nodes => "nodes",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Page> {
+        Page::ALL.into_iter().find(|page| page.id() == id)
+    }
+
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Page::Keys => "redis.page.keys",
+            Page::Slowlog => "redis.page.slowlog",
+            Page::Info => "redis.page.info",
+            Page::BigKeys => "redis.page.bigkeys",
+            Page::Clients => "redis.page.clients",
+            Page::PubSub => "redis.page.pubsub",
+            Page::Nodes => "redis.page.nodes",
+        }
+    }
+}
+
+/// 键列表的视图：命名空间树 / 模板归并 / 平铺。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewMode {
+    Tree,
+    Template,
+    Flat,
+}
+
+/// 后台扫描的状态：进度（已读取 / DBSIZE）、续扫位置、是否被取消或达到上限。
+#[derive(Clone, Debug)]
+struct ScanState {
+    running: bool,
+    cancel: Arc<AtomicBool>,
+    resume: ScanResume,
+    total: Option<u64>,
+    capped: bool,
+    cancelled: bool,
+    epoch: u64,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self { running: false, cancel: Arc::new(AtomicBool::new(false)), resume: ScanResume::default(), total: None, capped: false, cancelled: false, epoch: 0 }
+    }
+}
+
+/// 进行中的批量操作。
+#[derive(Clone, Debug)]
+struct BatchRun {
+    template: String,
+    op: BatchOp,
+    progress: BatchProgress,
+    cancel: Arc<AtomicBool>,
+}
+
+/// 诊断页的数据。每页第一次打开时读取，之后按刷新重读。
+#[derive(Default)]
+struct DiagState {
+    node: String,
+    busy: bool,
+    error: String,
+    slowlog: Vec<SlowEntry>,
+    slow_by_time: bool,
+    slow_asc: bool,
+    slow_loaded: bool,
+    info: Vec<InfoSection>,
+    info_loaded: bool,
+    clients: Vec<ClientInfo>,
+    clients_loaded: bool,
+    big: Vec<BigKey>,
+    big_running: bool,
+    big_scanned: u64,
+    big_total: Option<u64>,
+    big_cancel: Option<Arc<AtomicBool>>,
+    big_memory: bool,
+    big_done: bool,
+    sub_input: String,
+    sub_running: bool,
+    sub_ready: bool,
+    sub_cancel: Option<Arc<AtomicBool>>,
+    messages: VecDeque<PubSubMessage>,
+    pub_channel: String,
+    pub_message: String,
+    node_sizes: Vec<(String, u64)>,
+    nodes_loaded: bool,
+}
+
+/// 订阅消息列表最多保留的条数。
+const PUBSUB_KEEP: usize = 500;
+/// 模板展开后列出的成员上限（更多的用“按模板过滤”服务端扫描）。
+const TEMPLATE_MEMBERS_SHOWN: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Follow {
@@ -109,7 +247,8 @@ fn list_state(busy: bool, scan_failed: bool, total: usize, visible: usize, patte
     ListState::Rows
 }
 
-/// 命名空间树与列表的统一渲染行：树模式下文件夹与叶子键按真实层级穿插排列，绝不重复堆叠扁平列表。
+/// 命名空间树与列表的统一渲染行：树模式下文件夹与叶子键按真实层级穿插排列，绝不重复堆叠扁平列表；
+/// 模板模式下每个模板一行（键数、类型、内存估算），展开后列出成员键。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum KeyRow {
     Folder {
@@ -123,6 +262,10 @@ enum KeyRow {
         index: usize,
         display: String,
         depth: usize,
+    },
+    Template {
+        group: usize,
+        open: bool,
     },
 }
 
@@ -159,8 +302,31 @@ pub struct RedisPane {
     sidebar_drag_start: Option<(f32, f32)>,
     pattern: String,
     keys: Vec<RedisKeyInfo>,
-    cursor: u64,
+    key_pos: HashMap<String, usize>,
     done: bool,
+    scan: ScanState,
+    epoch: u64,
+    page: Page,
+    topology: Topology,
+    prefs: KeyspacePrefs,
+    prefs_open: bool,
+    sep_input: String,
+    cap_input: String,
+    view_mode: ViewMode,
+    rows_cache: Option<Rc<Vec<KeyRow>>>,
+    templates_cache: Option<Rc<Vec<TemplateGroup>>>,
+    open_templates: BTreeSet<String>,
+    template_memory: HashMap<String, Option<u64>>,
+    batch: Option<BatchRun>,
+    batch_keys: Vec<String>,
+    batch_ttl_for: Option<String>,
+    batch_ttl_input: String,
+    placement: Option<KeyPlacement>,
+    value_loading: bool,
+    prod_target: bool,
+    confirm_typed: String,
+    confirm_typed_error: bool,
+    diag: DiagState,
     selected: String,
     detail: Option<Arc<RedisKeyDetail>>,
     ttl_input: String,
@@ -178,14 +344,12 @@ pub struct RedisPane {
     busy: bool,
     generation: u64,
     copied: String,
-    scan_reset: bool,
     follow: Follow,
     pending_ttl: Option<i64>,
     ttl_was_persist: bool,
     focused: Option<Field>,
     fields: Fields<Field>,
     type_filter: String,
-    tree_view: bool,
     nav_choice: Option<bool>,
     viewport_w: f32,
     error_source: ErrorSource,
@@ -246,8 +410,31 @@ impl RedisPane {
             sidebar_drag_start: None,
             pattern: String::new(),
             keys: Vec::new(),
-            cursor: 0,
+            key_pos: HashMap::new(),
             done: false,
+            scan: ScanState::default(),
+            epoch: 0,
+            page: Page::Keys,
+            topology: Topology::default(),
+            prefs: KeyspacePrefs::default(),
+            prefs_open: false,
+            sep_input: String::new(),
+            cap_input: String::new(),
+            view_mode: ViewMode::Flat,
+            rows_cache: None,
+            templates_cache: None,
+            open_templates: BTreeSet::new(),
+            template_memory: HashMap::new(),
+            batch: None,
+            batch_keys: Vec::new(),
+            batch_ttl_for: None,
+            batch_ttl_input: String::new(),
+            placement: None,
+            value_loading: false,
+            prod_target: false,
+            confirm_typed: String::new(),
+            confirm_typed_error: false,
+            diag: DiagState::default(),
             selected: String::new(),
             detail: None,
             ttl_input: String::new(),
@@ -265,14 +452,12 @@ impl RedisPane {
             busy: false,
             generation: 0,
             copied: String::new(),
-            scan_reset: true,
             follow: Follow::None,
             pending_ttl: None,
             ttl_was_persist: false,
             focused: None,
             fields: Fields::default(),
             type_filter: String::new(),
-            tree_view: false,
             nav_choice: None,
             viewport_w: 1200.,
             error_source: ErrorSource::Command,
@@ -321,8 +506,44 @@ impl RedisPane {
         self.locale = locale;
     }
 
+    /// 有前台操作或后台扫描在进行。
     pub fn running(&self) -> bool {
-        self.busy
+        self.busy || self.scan.running
+    }
+
+    /// 外壳按环境标签告诉面板目标是不是生产库：生产库的每次写入确认都要输入连接名。
+    pub fn set_prod_target(&mut self, prod: bool) {
+        self.prod_target = prod;
+    }
+
+    pub fn prod_target(&self) -> bool {
+        self.prod_target
+    }
+
+    pub fn page(&self) -> Page {
+        self.page
+    }
+
+    pub fn scan_running(&self) -> bool {
+        self.scan.running
+    }
+
+    pub fn scan_capped(&self) -> bool {
+        self.scan.capped
+    }
+
+    pub fn topology(&self) -> &Topology {
+        &self.topology
+    }
+
+    /// 确认框里要求输入的文本（生产库）：连接名，没有名字时用连接 id。
+    fn confirm_expected(&self) -> String {
+        if self.connection_name.trim().is_empty() { self.connection_id.clone() } else { self.connection_name.trim().to_owned() }
+    }
+
+    /// 确认按钮可用：非生产库直接可用；生产库要求输入与连接名一致。
+    fn confirm_ready(&self) -> bool {
+        confirm_gate(self.prod_target, &self.confirm_typed, &self.confirm_expected())
     }
 
     pub fn set_pattern(&mut self, value: &str) {
@@ -396,12 +617,14 @@ impl RedisPane {
         self.connection_id = "missing".into();
         self.connection_name = "缓存".into();
         self.database = "0".into();
-        self.keys = vec![RedisKeyInfo { name: name.into(), key_type: "string".into(), ttl_ms: Some(-1) }];
+        self.set_keys(vec![RedisKeyInfo { name: name.into(), key_type: "string".into(), ttl_ms: Some(-1) }]);
         self.selected = name.into();
         self.detail = Some(Arc::new(RedisKeyDetail {
             key_type: "string".into(),
             ttl_ms: Some(-1),
             value: RedisValue::String { text: "hello".into() },
+            total: Some(5),
+            next: None,
         }));
     }
 
@@ -423,6 +646,27 @@ impl RedisPane {
 
     fn reset_target_state(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.stop_background();
+        self.scan = ScanState::default();
+        self.page = Page::Keys;
+        self.topology = Topology::default();
+        self.prefs = KeyspacePrefs::default();
+        self.prefs_open = false;
+        self.sep_input.clear();
+        self.cap_input.clear();
+        self.view_mode = ViewMode::Flat;
+        self.open_templates.clear();
+        self.template_memory.clear();
+        self.batch = None;
+        self.batch_keys.clear();
+        self.batch_ttl_for = None;
+        self.batch_ttl_input.clear();
+        self.placement = None;
+        self.value_loading = false;
+        self.confirm_typed.clear();
+        self.confirm_typed_error = false;
+        self.diag = DiagState::default();
         self.busy = false;
         self.connection_id.clear();
         self.connection_name.clear();
@@ -430,8 +674,7 @@ impl RedisPane {
         self.db_picker_open = false;
         self.db_counts.clear();
         self.pattern.clear();
-        self.keys.clear();
-        self.cursor = 0;
+        self.set_keys(Vec::new());
         self.done = false;
         self.selected.clear();
         self.detail = None;
@@ -450,11 +693,9 @@ impl RedisPane {
         self.rename_landed.clear();
         self.pending_ttl = None;
         self.ttl_was_persist = false;
-        self.scan_reset = true;
         self.follow = Follow::None;
         self.fields = Fields::default();
         self.type_filter.clear();
-        self.tree_view = false;
         self.nav_choice = None;
         self.error_source = ErrorSource::Command;
         self.expanded.clear();
@@ -514,29 +755,59 @@ impl RedisPane {
         if self.database.is_empty() {
             self.database = "0".into();
         }
-        self.refresh_keyspace_counts(cx);
-        self.scan_from_start(cx);
+        self.load_context(cx);
     }
 
-    fn refresh_keyspace_counts(&mut self, cx: &mut Context<Self>) {
+    /// 打开目标时：先读本连接的键空间偏好与拓扑，再开始后台扫描（分隔符、上限都按偏好）。
+    fn load_context(&mut self, cx: &mut Context<Self>) {
         if self.connection_id.is_empty() {
             return;
         }
+        // 会话没打开：直接走扫描，由它就地报“还没有打开”，不去读偏好。
+        let Some((handle, _)) = self.services.connections.redis_handle(&self.connection_id) else {
+            self.scan_from_start(cx);
+            return;
+        };
+        self.topology = handle.topology();
+        if self.topology.cluster {
+            self.database = "0".into();
+        }
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
-        let generation = self.generation;
+        self.scan.running = true;
+        self.run_bg(
+            cx,
+            async move { crate::application::redis::load_prefs(connections.as_ref(), &connection_id).await },
+            |pane, prefs, cx| {
+                pane.scan.running = false;
+                pane.prefs = prefs;
+                pane.invalidate_rows();
+                pane.refresh_keyspace_counts(cx);
+                pane.scan_from_start(cx);
+            },
+        );
+    }
+
+    /// 后台任务：结果只在目标没换（epoch 一致）时交回，不占用前台 busy。
+    fn run_bg<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+        finish: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) {
+        let epoch = self.epoch;
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
-                let _ = tx.send(crate::application::redis::list_keyspaces(connections.as_ref(), &connection_id).await);
+                let _ = tx.send(work.await);
             });
-            if let Ok(Ok(counts)) = rx.await {
+            if let Ok(result) = rx.await {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
-                            if pane.generation == generation {
-                                pane.db_counts = counts;
+                            if pane.epoch == epoch {
+                                finish(pane, result, cx);
                                 cx.notify();
                             }
                         });
@@ -547,6 +818,76 @@ impl RedisPane {
         .detach();
     }
 
+    /// 后台流：工作端经 `send` 推事件，界面端把已到达的事件合并处理。目标换了或接收方不在时工作端停下。
+    fn run_stream<E: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        work: impl FnOnce(Box<dyn Fn(E) -> bool + Send + Sync>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + 'static,
+        apply: fn(&mut Self, Vec<E>, &mut Context<Self>),
+    ) {
+        let epoch = self.epoch;
+        let view = cx.entity().downgrade();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<E>();
+        crate::app::views::grid::runtime_for_views().spawn(async move {
+            work(Box::new(move |event| tx.send(event).is_ok())).await;
+        });
+        cx.spawn(async move |_, cx| {
+            while let Some(first) = rx.recv().await {
+                // 把已经到达的事件一起处理；界面按帧合并重绘，不必在这里等待。
+                let mut events = vec![first];
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+                let alive = cx.update(|cx| {
+                    let Some(view) = view.upgrade() else { return false };
+                    view.update(cx, |pane, cx| {
+                        if pane.epoch != epoch {
+                            return false;
+                        }
+                        apply(pane, events, cx);
+                        cx.notify();
+                        true
+                    })
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 停下后台扫描、大键扫描与订阅（换目标或关闭时）。
+    fn stop_background(&mut self) {
+        self.scan.cancel.store(true, Ordering::SeqCst);
+        if let Some(cancel) = &self.diag.big_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(cancel) = &self.diag.sub_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if let Some(batch) = &self.batch {
+            batch.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn refresh_keyspace_counts(&mut self, cx: &mut Context<Self>) {
+        if self.connection_id.is_empty() {
+            return;
+        }
+        let connections = Arc::clone(&self.services.connections);
+        let connection_id = self.connection_id.clone();
+        self.run_bg(
+            cx,
+            async move { crate::application::redis::list_keyspaces(connections.as_ref(), &connection_id).await },
+            |pane, result, _| {
+                if let Ok(counts) = result {
+                    pane.db_counts = counts;
+                }
+            },
+        );
+    }
+
     fn switch_db(&mut self, db: u8, cx: &mut Context<Self>) {
         self.db_picker_open = false;
         self.context_menu = None;
@@ -555,12 +896,18 @@ impl RedisPane {
             self.database = target_db;
             return;
         }
+        if self.topology.cluster && db != 0 {
+            self.show_error_from(ErrorSource::Scan, self.text("redis.cluster.dbOnlyZero"));
+            return;
+        }
+        self.scan.cancel.store(true, Ordering::SeqCst);
+        self.scan.running = false;
         self.database = target_db;
-        self.keys.clear();
-        self.cursor = 0;
+        self.set_keys(Vec::new());
         self.done = false;
         self.selected.clear();
         self.detail = None;
+        self.placement = None;
         self.entry_focus = None;
         self.entry_viewer = None;
         self.entry_viewer_tag.clear();
@@ -603,7 +950,8 @@ impl RedisPane {
         if !self.console_open || !self.complete_open || self.command_input.trim().is_empty() {
             return (0, 0, Vec::new());
         }
-        let known_keys: Vec<String> = self.keys.iter().map(|k| k.name.clone()).collect();
+        // 键名补全只取索引前一部分：全量索引可达数十万键，逐帧复制会拖慢输入。
+        let known_keys: Vec<String> = self.keys.iter().take(5000).map(|k| k.name.clone()).collect();
         let (start, end, items) =
             complete::complete_command_line(&self.command_input, self.command_input.len(), &known_keys, self.locale);
         // 若唯一候选与当前输入完全一致，则无需再弹出补全浮层。
@@ -636,6 +984,10 @@ impl RedisPane {
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
         self.context_menu = None;
+        if self.command_extra(id, cx) {
+            cx.notify();
+            return;
+        }
         let local = matches!(
             id,
             "redis-cancel"
@@ -720,8 +1072,7 @@ impl RedisPane {
         } else if id == "redis-nav-toggle" {
             self.nav_choice = Some(!self.keys_visible(self.viewport_w));
         } else if id == "redis-more" {
-            if !self.done {
-                self.scan_reset = false;
+            if !self.done && !self.scan.running && !self.scan.capped {
                 self.follow = Follow::None;
                 self.load_keys(cx);
             }
@@ -835,6 +1186,8 @@ impl RedisPane {
         } else if id == "redis-cancel" {
             self.confirm = None;
             self.confirm_prompt.clear();
+            self.confirm_typed.clear();
+            self.confirm_typed_error = false;
         } else if id == "redis-entry-form" {
             self.entry_form_open = !self.entry_form_open;
             if self.entry_form_open {
@@ -887,12 +1240,17 @@ impl RedisPane {
             let out = if !self.pretty_reply.is_empty() { self.pretty_reply.clone() } else { self.reply.clone() };
             self.copy_text(out, "redis.copied.value", cx);
         } else if id == "redis-view-flat" {
-            self.tree_view = false;
+            self.view_mode = ViewMode::Flat;
+            self.invalidate_rows();
+        } else if id == "redis-view-template" {
+            self.view_mode = ViewMode::Template;
+            self.invalidate_rows();
         } else if id == "redis-view-tree" {
-            self.tree_view = true;
+            self.view_mode = ViewMode::Tree;
             if self.expanded.is_empty() {
                 self.expand_top_level();
             }
+            self.invalidate_rows();
         } else if let Some(kind) = id.strip_prefix("redis-type-") {
             self.type_filter = if kind == "all" { String::new() } else { kind.to_owned() };
         } else if let Some(prefix) = id.strip_prefix("redis-folder:") {
@@ -900,14 +1258,14 @@ impl RedisPane {
                 self.expanded.insert(prefix.to_owned());
             }
         } else if let Some(prefix) = id.strip_prefix("redis-folder-filter:") {
-            self.pattern = format!("{prefix}:*");
+            self.pattern = keyspace::folder_pattern(prefix, &self.prefs.separators);
             self.scan_from_start(cx);
         } else if let Some(prefix) = id.strip_prefix("redis-folder-copy:") {
             self.copy_text(prefix.to_owned(), "redis.copied.keyName", cx);
         } else if let Some(prefix) = id.strip_prefix("redis-folder-new:") {
             self.nav_choice = Some(true);
             self.new_open = true;
-            self.new_key = format!("{prefix}:");
+            self.new_key = format!("{prefix}{}", self.prefs.separators.first().map(String::as_str).unwrap_or(keyspace::DEFAULT_SEPARATOR));
             self.focus_request = Some(Field::NewKey);
         } else if id == "redis-history-older" {
             self.complete_open = false;
@@ -1007,54 +1365,148 @@ impl RedisPane {
         cx.notify();
     }
 
+    /// 从头扫描：清空内存键索引，按当前模式与偏好重新开始后台扫描。
     fn scan_from_start(&mut self, cx: &mut Context<Self>) {
-        self.cursor = 0;
-        self.done = false;
-        self.scan_reset = true;
         self.follow = Follow::None;
         self.note.clear();
+        self.rescan(cx);
+    }
+
+    /// 清空索引后重扫，保留当前提示（写命令执行后的“已执行”不被扫描冲掉）。
+    fn rescan(&mut self, cx: &mut Context<Self>) {
+        self.set_keys(Vec::new());
+        self.done = false;
+        self.scan.resume = ScanResume::default();
+        self.scan.total = None;
         self.load_keys(cx);
     }
 
+    /// 开始（或从续扫位置继续）后台扫描。已读结果保留；达到上限时停下并提示改用模式搜索。
     fn load_keys(&mut self, cx: &mut Context<Self>) {
         if self.connection_id.is_empty() {
             self.show_error_from(ErrorSource::Scan, self.text("redis.tab.needConnection"));
             return;
         }
+        self.scan.cancel.store(true, Ordering::SeqCst);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.scan.cancel = Arc::clone(&cancel);
+        self.scan.epoch = self.scan.epoch.wrapping_add(1);
+        self.scan.capped = false;
+        self.scan.cancelled = false;
+        if self.error_source == ErrorSource::Scan {
+            self.error.clear();
+        }
+        let budget = self.prefs.scan_cap.saturating_sub(self.keys.len());
+        if budget == 0 {
+            self.scan.capped = true;
+            self.scan.running = false;
+            return;
+        }
+        self.scan.running = true;
+        let scan_epoch = self.scan.epoch;
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
-        let cursor = if self.scan_reset { 0 } else { self.cursor };
+        let resume = self.scan.resume.clone();
         let pattern = {
             let trimmed = self.pattern.trim();
             if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
         };
-        self.spawn(
+        let options = ScanOptions { pattern, count: self.prefs.scan_count, budget };
+        self.run_stream(
             cx,
-            false,
-            async move { crate::application::redis::scan_keys(connections.as_ref(), &connection_id, Some(cursor), pattern, None).await },
-            Self::finish_scan,
+            move |send| {
+                Box::pin(async move {
+                    crate::application::redis::scan_keyspace(connections.as_ref(), &connection_id, resume, options, cancel, move |event| {
+                        send((scan_epoch, event))
+                    })
+                    .await;
+                })
+            },
+            Self::apply_scan_events,
         );
     }
 
-    fn finish_scan(&mut self, result: Result<ScanPage, String>, cx: &mut Context<Self>) {
-        match result {
-            Ok(page) => {
-                if self.scan_reset {
-                    self.keys.clear();
+    fn apply_scan_events(&mut self, events: Vec<(u64, ScanEvent)>, cx: &mut Context<Self>) {
+        let mut added = false;
+        for (epoch, event) in events {
+            if epoch != self.scan.epoch {
+                continue;
+            }
+            match event {
+                ScanEvent::Total(total) => self.scan.total = total,
+                ScanEvent::Batch(keys) => {
+                    self.absorb_keys(keys);
+                    added = true;
                 }
-                self.keys = merge_keys(std::mem::take(&mut self.keys), page.keys);
-                self.cursor = page.cursor;
-                self.done = page.done;
-                self.error.clear();
-                if self.tree_view && self.expanded.is_empty() {
-                    self.expand_top_level();
+                ScanEvent::Finished { resume, cancelled, capped } => {
+                    self.scan.running = false;
+                    self.done = resume.finished();
+                    self.scan.resume = resume;
+                    self.scan.cancelled = cancelled;
+                    self.scan.capped = capped;
+                    if self.follow == Follow::Read && !self.selected.is_empty() {
+                        self.follow = Follow::None;
+                        let name = self.selected.clone();
+                        self.select_key(name, cx);
+                    }
                 }
-                if self.follow == Follow::Read && !self.selected.is_empty() {
-                    let name = self.selected.clone();
-                    self.select_key(name, cx);
+                ScanEvent::Failed(message) => self.show_error_from(ErrorSource::Scan, message),
+            }
+        }
+        if added && self.view_mode == ViewMode::Tree && self.expanded.is_empty() {
+            self.expand_top_level();
+        }
+    }
+
+    /// 取消后台扫描：已读结果保留，可从续扫位置继续。
+    fn cancel_scan(&mut self) {
+        if !self.scan.running {
+            return;
+        }
+        self.scan.cancel.store(true, Ordering::SeqCst);
+        self.scan.running = false;
+        self.scan.cancelled = true;
+    }
+
+    /// 整体替换内存键索引。
+    fn set_keys(&mut self, keys: Vec<RedisKeyInfo>) {
+        self.key_pos = keys.iter().enumerate().map(|(index, key)| (key.name.clone(), index)).collect();
+        self.keys = keys;
+        self.invalidate_rows();
+    }
+
+    /// 并入一批扫描结果：已有的键原位更新，新键追加。
+    fn absorb_keys(&mut self, page: Vec<RedisKeyInfo>) {
+        for item in page {
+            match self.key_pos.get(&item.name) {
+                Some(&index) => self.keys[index] = item,
+                None => {
+                    self.key_pos.insert(item.name.clone(), self.keys.len());
+                    self.keys.push(item);
                 }
             }
-            Err(message) => self.show_error_from(ErrorSource::Scan, message),
+        }
+        self.invalidate_rows();
+    }
+
+    /// 从索引里移除一批键（删除、批量删除之后）。
+    fn drop_keys(&mut self, names: &std::collections::HashSet<String>) {
+        let keys = std::mem::take(&mut self.keys).into_iter().filter(|key| !names.contains(&key.name)).collect();
+        self.set_keys(keys);
+    }
+
+    /// 键列表、模板分组的缓存作废（键、展开、过滤、视图或分隔符变了）。
+    fn invalidate_rows(&mut self) {
+        self.rows_cache = None;
+        self.templates_cache = None;
+    }
+
+    /// 写入之后：重读选中的键（顺带更新索引里的类型/TTL）与各库键数，不重扫整个键空间。
+    fn after_write(&mut self, cx: &mut Context<Self>) {
+        self.refresh_keyspace_counts(cx);
+        if !self.selected.is_empty() {
+            let name = self.selected.clone();
+            self.select_key(name, cx);
         }
     }
 
@@ -1068,6 +1520,8 @@ impl RedisPane {
         }
         self.selected = name.clone();
         self.detail = None;
+        self.value_loading = false;
+        self.placement = self.topology.cluster.then(|| cluster::placement(&self.topology.nodes, &name));
         self.stream_focus = None;
         self.entry_focus = None;
         self.entry_viewer_tag.clear();
@@ -1094,6 +1548,14 @@ impl RedisPane {
     fn finish_read(&mut self, result: Result<RedisKeyDetail, String>, _: &mut Context<Self>) {
         match result {
             Ok(detail) => {
+                // 顺带更新内存索引里这个键的类型与 TTL：键已不存在就移除，新建的键补进来。
+                let name = self.selected.clone();
+                if detail.key_type == "none" {
+                    let gone: std::collections::HashSet<String> = std::iter::once(name).collect();
+                    self.drop_keys(&gone);
+                } else {
+                    self.absorb_keys(vec![RedisKeyInfo { name, key_type: detail.key_type.clone(), ttl_ms: detail.ttl_ms }]);
+                }
                 self.ttl_input = match detail.ttl_ms {
                     Some(ms) if ms >= 0 => (ms / 1000).to_string(),
                     _ => String::new(),
@@ -1152,10 +1614,7 @@ impl RedisPane {
                     i18n::fill(&self.text("redis.tab.ttlSet"), &[("n", &self.pending_ttl.unwrap_or(0).to_string())])
                 };
                 self.error.clear();
-                self.scan_reset = true;
-                self.cursor = 0;
-                self.follow = Follow::Read;
-                self.load_keys(cx);
+                self.after_write(cx);
             }
             Err(message) => self.show_error(message),
         }
@@ -1198,6 +1657,7 @@ impl RedisPane {
         }
         match exec::command_risk(&command) {
             CommandRisk::Blocked => self.show_error(self.text("redis.tab.keysRefused")),
+            _ if self.topology.cluster && self.crossslot_refused(&command, &args) => {}
             CommandRisk::Dangerous => {
                 let line = self.command_input.clone();
                 self.confirm_prompt = danger_prompt(self.locale, &command);
@@ -1210,9 +1670,23 @@ impl RedisPane {
     }
 
     fn run_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm.is_none() {
+            return;
+        }
+        // 生产库：输入的连接名不一致时确认框留着，不发送任何命令。
+        if !self.confirm_ready() {
+            self.confirm_typed_error = true;
+            return;
+        }
         let action = self.confirm.take();
         self.confirm_prompt.clear();
+        self.confirm_typed.clear();
+        self.confirm_typed_error = false;
         match action {
+            Some(Confirm::Batch { template, keys, op, .. }) => self.run_batch(template, keys, op, cx),
+            Some(Confirm::SlowlogReset { node }) => self.run_slowlog_reset(node, cx),
+            Some(Confirm::ClientKill { node, id, .. }) => self.run_client_kill(node, id, cx),
+            Some(Confirm::Publish { channel, message }) => self.run_publish(channel, message, cx),
             Some(Confirm::Delete { key }) => self.run_delete(key, cx),
             Some(Confirm::Rename { from, to }) => self.run_rename(from, to, cx),
             Some(Confirm::Exec { command, args, line }) => self.exec_command(command, args, true, line, cx),
@@ -1254,10 +1728,7 @@ impl RedisPane {
                 self.new_overwrite = false;
                 self.entry_form_open = false;
                 self.clear_entry_drafts();
-                self.scan_reset = true;
-                self.cursor = 0;
-                self.follow = Follow::Read;
-                self.load_keys(cx);
+                self.after_write(cx);
             }
             Err(message) => self.show_error(message),
         }
@@ -1292,12 +1763,11 @@ impl RedisPane {
             Ok(outcome) => {
                 self.note = i18n::fill(&self.text("redis.tab.deletedCount"), &[("n", &outcome.deleted.to_string())]);
                 self.error.clear();
-                self.selected.clear();
+                let gone: std::collections::HashSet<String> = std::iter::once(std::mem::take(&mut self.selected)).collect();
+                self.drop_keys(&gone);
                 self.detail = None;
-                self.scan_reset = true;
-                self.cursor = 0;
-                self.follow = Follow::None;
-                self.load_keys(cx);
+                self.placement = None;
+                self.refresh_keyspace_counts(cx);
             }
             Err(message) => self.show_error(message),
         }
@@ -1326,13 +1796,11 @@ impl RedisPane {
                 self.rename_open = false;
                 self.note = i18n::fill(&self.text("redis.tab.renamedNote"), &[("target", &target)]);
                 self.error.clear();
-                self.selected = target;
+                let gone: std::collections::HashSet<String> = std::iter::once(std::mem::replace(&mut self.selected, target)).collect();
+                self.drop_keys(&gone);
                 self.rename_to.clear();
                 self.detail = None;
-                self.scan_reset = true;
-                self.cursor = 0;
-                self.follow = Follow::Read;
-                self.load_keys(cx);
+                self.after_write(cx);
             }
             Err(message) => {
                 self.rename_landed.clear();
@@ -1380,11 +1848,12 @@ impl RedisPane {
                 self.pretty_reply = reply_pretty(&outcome.reply, 0);
                 self.note = self.text("redis.tab.executed");
                 self.error.clear();
-                self.scan_reset = true;
-                self.cursor = 0;
-                self.follow = if self.selected.is_empty() { Follow::None } else { Follow::Read };
                 self.refresh_keyspace_counts(cx);
-                self.load_keys(cx);
+                // 写命令可能增删任意键：重扫键空间（选中的键在扫描结束后重读）；只读命令不动列表。
+                if exec::command_risk(&outcome.command) == CommandRisk::Dangerous {
+                    self.follow = if self.selected.is_empty() { Follow::None } else { Follow::Read };
+                    self.rescan(cx);
+                }
             }
             Err(message) => self.show_error(message),
         }
@@ -1444,93 +1913,108 @@ impl RedisPane {
         }
     }
 
-    /// 构建列表或命名空间树行：列表模式只渲染键；树模式按 `:` 拆分层级并穿插渲染文件夹与叶子键。
+    /// 构建列表行：平铺只列键；树按连接配置的分隔符拆层并穿插文件夹与叶子键；模板按归并结果列出，
+    /// 展开的模板下列出成员键（至多 [`TEMPLATE_MEMBERS_SHOWN`] 个）。
     fn build_key_rows(&self) -> Vec<KeyRow> {
-        let filtered: Vec<(usize, &RedisKeyInfo)> = self
+        let filtered: Vec<(usize, &str)> = self
             .keys
             .iter()
             .enumerate()
             .filter(|(_, key)| self.type_filter.is_empty() || key.key_type == self.type_filter)
-            .take(500)
+            .map(|(index, key)| (index, key.name.as_str()))
             .collect();
-
-        if !self.tree_view {
-            return filtered
+        match self.view_mode {
+            ViewMode::Flat => filtered.into_iter().map(|(index, name)| KeyRow::Key { index, display: name.to_owned(), depth: 0 }).collect(),
+            ViewMode::Tree => keyspace::build_tree(&filtered, &self.prefs.separators, &self.expanded)
                 .into_iter()
-                .map(|(index, key)| KeyRow::Key { index, display: key.name.clone(), depth: 0 })
-                .collect();
-        }
-
-        // 统计每个前缀下的键数量并按字典序构建真实层级树。
-        let mut sorted = filtered;
-        sorted.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-
-        let mut folder_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (_, key) in &sorted {
-            let parts: Vec<&str> = key.name.split(':').collect();
-            if parts.len() >= 2 {
-                let mut prefix = String::new();
-                for part in &parts[..parts.len() - 1] {
-                    if !prefix.is_empty() {
-                        prefix.push(':');
+                .map(|row| match row {
+                    TreeRow::Folder { prefix, segment, depth, count, open } => KeyRow::Folder { prefix, segment, depth, count, open },
+                    TreeRow::Key { index, display, depth } => KeyRow::Key { index, display, depth },
+                })
+                .collect(),
+            ViewMode::Template => {
+                let groups = self.build_templates();
+                let mut rows = Vec::new();
+                for (group, item) in groups.iter().enumerate() {
+                    let open = self.open_templates.contains(&item.template);
+                    rows.push(KeyRow::Template { group, open });
+                    if open {
+                        for &index in item.members.iter().take(TEMPLATE_MEMBERS_SHOWN) {
+                            rows.push(KeyRow::Key { index, display: self.keys[index].name.clone(), depth: 1 });
+                        }
                     }
-                    prefix.push_str(part);
-                    *folder_counts.entry(prefix.clone()).or_insert(0) += 1;
                 }
+                rows
             }
         }
+    }
 
-        let mut rows = Vec::new();
-        let mut emitted_folders = BTreeSet::new();
-        for (index, key) in sorted {
-            let parts: Vec<&str> = key.name.split(':').collect();
-            if parts.len() < 2 {
-                rows.push(KeyRow::Key { index, display: key.name.clone(), depth: 0 });
-                continue;
-            }
-            let mut prefix = String::new();
-            let mut ancestors_open = true;
-            for (depth, &segment) in parts[..parts.len() - 1].iter().enumerate() {
-                if !prefix.is_empty() {
-                    prefix.push(':');
-                }
-                prefix.push_str(segment);
-                let open = self.expanded.contains(&prefix);
-                if ancestors_open && emitted_folders.insert(prefix.clone()) {
-                    let count = folder_counts.get(&prefix).copied().unwrap_or(0);
-                    rows.push(KeyRow::Folder {
-                        prefix: prefix.clone(),
-                        segment: segment.to_owned(),
-                        depth,
-                        count,
-                        open,
-                    });
-                }
-                if !open {
-                    ancestors_open = false;
-                }
-            }
-            if ancestors_open {
-                let leaf = (*parts.last().unwrap_or(&key.name.as_str())).to_owned();
-                let display = if leaf.is_empty() { key.name.clone() } else { leaf };
-                rows.push(KeyRow::Key {
-                    index,
-                    display,
-                    depth: parts.len() - 1,
-                });
-            }
+    fn build_templates(&self) -> Vec<TemplateGroup> {
+        let keys: Vec<(usize, &str, &str)> = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| self.type_filter.is_empty() || key.key_type == self.type_filter)
+            .map(|(index, key)| (index, key.name.as_str(), key.key_type.as_str()))
+            .collect();
+        keyspace::group_templates(&keys, &self.prefs.separators, &self.prefs.rules)
+    }
+
+    /// 缓存的模板分组（模板视图与模板操作共用）。
+    fn templates(&mut self) -> Rc<Vec<TemplateGroup>> {
+        if self.templates_cache.is_none() {
+            self.templates_cache = Some(Rc::new(self.build_templates()));
         }
-        rows
+        Rc::clone(self.templates_cache.as_ref().expect("templates"))
+    }
+
+    /// 缓存的列表行（渲染用；键或条件变了才重建）。
+    fn key_rows(&mut self) -> Rc<Vec<KeyRow>> {
+        if self.view_mode == ViewMode::Template {
+            let _ = self.templates();
+        }
+        if self.rows_cache.is_none() {
+            let rows = match self.view_mode {
+                ViewMode::Template => {
+                    let groups = self.templates();
+                    let mut rows = Vec::new();
+                    for (group, item) in groups.iter().enumerate() {
+                        let open = self.open_templates.contains(&item.template);
+                        rows.push(KeyRow::Template { group, open });
+                        if open {
+                            for &index in item.members.iter().take(TEMPLATE_MEMBERS_SHOWN) {
+                                rows.push(KeyRow::Key { index, display: self.keys[index].name.clone(), depth: 1 });
+                            }
+                        }
+                    }
+                    rows
+                }
+                _ => self.build_key_rows(),
+            };
+            self.rows_cache = Some(Rc::new(rows));
+        }
+        Rc::clone(self.rows_cache.as_ref().expect("rows"))
+    }
+
+    /// 模板的成员键名。
+    fn template_members(&mut self, template: &str) -> Vec<String> {
+        let groups = self.templates();
+        groups
+            .iter()
+            .find(|group| group.template == template)
+            .map(|group| group.members.iter().filter_map(|&index| self.keys.get(index).map(|key| key.name.clone())).collect())
+            .unwrap_or_default()
     }
 
     fn expand_top_level(&mut self) {
+        let separators = self.prefs.separators.clone();
         for key in &self.keys {
-            if let Some((top, _)) = key.name.split_once(':') {
-                if !top.is_empty() {
-                    self.expanded.insert(top.to_owned());
-                }
+            let segments = keyspace::split_segments(&key.name, &separators);
+            if segments.len() >= 2 && !segments[0].text.is_empty() {
+                self.expanded.insert(segments[0].text.to_owned());
             }
         }
+        self.invalidate_rows();
     }
 
     fn ask_create(&mut self) {
@@ -1944,6 +2428,7 @@ fn parse_spec(spec: &str) -> Option<(String, String, String)> {
     Some((id, name, if database.is_empty() { "0".into() } else { database }))
 }
 
+#[cfg(test)]
 fn merge_keys(mut loaded: Vec<RedisKeyInfo>, page: Vec<RedisKeyInfo>) -> Vec<RedisKeyInfo> {
     let mut positions: std::collections::HashMap<String, usize> = loaded
         .iter()
@@ -1976,7 +2461,8 @@ fn mutation_key(mutation: &RedisMutation) -> String {
         | RedisMutation::ZSetRem { key, .. }
         | RedisMutation::StreamAdd { key, .. }
         | RedisMutation::StreamDel { key, .. }
-        | RedisMutation::SetTtl { key, .. } => key.clone(),
+        | RedisMutation::SetTtl { key, .. }
+        | RedisMutation::JsonSet { key, .. } => key.clone(),
     }
 }
 
@@ -1999,7 +2485,7 @@ fn format_value(value: &RedisValue, locale: Locale) -> String {
         return i18n::text(locale, "redis.value.empty");
     }
     match value {
-        RedisValue::String { text } => text.clone(),
+        RedisValue::String { text } | RedisValue::Json { text } => text.clone(),
         RedisValue::Hash { entries } => entries.iter().map(|entry| format!("{}={}", entry.field, entry.value)).collect::<Vec<_>>().join("\n"),
         RedisValue::List { items } | RedisValue::Set { items } => items.join("\n"),
         RedisValue::ZSet { entries } => entries.iter().map(|entry| format!("{} {}", entry.member, entry.score)).collect::<Vec<_>>().join("\n"),
@@ -2031,7 +2517,7 @@ pub(crate) fn value_cell(text: &str) -> ValueCell {
 pub(crate) fn value_copy_text(value: &RedisValue, locale: Locale) -> Option<String> {
     match value {
         RedisValue::None {} => None,
-        RedisValue::String { text } => Some(text.clone()),
+        RedisValue::String { text } | RedisValue::Json { text } => Some(text.clone()),
         other => Some(format_value(other, locale)),
     }
 }
@@ -2044,7 +2530,7 @@ pub(crate) fn list_set_fills(form_open: bool, draft: &str) -> bool {
 fn value_empty(value: &RedisValue) -> bool {
     match value {
         // 空字符串是一个值，不是“没有内容”。
-        RedisValue::String { .. } => false,
+        RedisValue::String { .. } | RedisValue::Json { .. } => false,
         RedisValue::Hash { entries } => entries.is_empty(),
         RedisValue::List { items } | RedisValue::Set { items } => items.is_empty(),
         RedisValue::ZSet { entries } => entries.is_empty(),
@@ -2195,7 +2681,14 @@ pub(crate) fn one_line(text: &str) -> String {
     out
 }
 
+mod actions;
+mod pages;
 mod view;
+
+/// 确认门槛：非生产库直接可确认；生产库要求输入的文本（去首尾空白）与连接名完全一致。
+pub(crate) fn confirm_gate(prod: bool, typed: &str, expected: &str) -> bool {
+    !prod || (!expected.is_empty() && typed.trim() == expected)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2273,12 +2766,12 @@ mod tests {
             RedisKeyInfo { name: "user:1002".into(), key_type: "hash".into(), ttl_ms: None },
             RedisKeyInfo { name: "global_flag".into(), key_type: "string".into(), ttl_ms: None },
         ];
-        pane.tree_view = false;
+        pane.view_mode = ViewMode::Flat;
         let flat = pane.build_key_rows();
         assert_eq!(flat.len(), 3);
         assert!(flat.iter().all(|row| matches!(row, KeyRow::Key { depth: 0, .. })));
 
-        pane.tree_view = true;
+        pane.view_mode = ViewMode::Tree;
         // 未展开 user 文件夹时：只出现 global_flag 与 user 文件夹（count=2），两个子键收起隐藏。
         let collapsed = pane.build_key_rows();
         assert_eq!(collapsed.len(), 2, "{collapsed:?}");
@@ -2378,6 +2871,8 @@ mod tests {
                     key_type: "zset".into(),
                     ttl_ms: Some(-1),
                     value: RedisValue::ZSet { entries: Vec::new() },
+                    total: Some(0),
+                    next: None,
                 }));
                 pane.entry_score = "nope".into();
                 pane.entry_member = "张伟".into();
@@ -2409,3 +2904,6 @@ mod live_tests;
 
 #[cfg(test)]
 mod states;
+
+#[cfg(test)]
+mod workbench_tests;

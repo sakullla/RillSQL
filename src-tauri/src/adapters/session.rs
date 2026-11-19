@@ -28,8 +28,8 @@ pub enum CatalogSession {
     Postgres(Arc<tokio_postgres::Client>),
     /// tiberius 句柄不可共享借用，目录/查询/网格/对比都经这一把互斥锁串行使用同一条连接。
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
-    /// Redis 单条多路复用连接：键浏览、值读取与命令行共用，经互斥锁串行。
-    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
+    /// Redis 连接（单机多路复用或集群自动路由）。查询批次另开独占连接。
+    Redis(Arc<tokio::sync::Mutex<crate::adapters::redis::conn::RedisConn>>),
     /// MongoDB 客户端：库/集合目录与文档 CRUD 共用（驱动内部自带连接池）。
     Mongo(mongodb::Client),
     Scripted,
@@ -106,9 +106,10 @@ pub trait Session: Send + Sync {
     }
 }
 
-/// Redis 会话的专属接口：键浏览、值读取与命令行共用的多路复用连接。
+/// Redis 会话的专属接口：键浏览主连接，以及拓扑、按节点建连与 Pub/Sub 专用连接的句柄。
 pub trait RedisAccess: Send + Sync {
-    fn browser(&self) -> Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>;
+    fn browser(&self) -> Arc<tokio::sync::Mutex<crate::adapters::redis::conn::RedisConn>>;
+    fn handle(&self) -> crate::adapters::redis::conn::RedisHandle;
 }
 
 /// MongoDB 会话的专属接口：库/集合浏览与文档 CRUD 共用的客户端。

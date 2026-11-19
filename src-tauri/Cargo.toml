@@ -20,7 +20,7 @@ tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-serd
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["native-certs", "ring"] }
 mysql_async = { version = "0.37.1", default-features = false, features = ["chrono", "default-rustls-ring"] }
 tiberius = { version = "0.12.3", default-features = false, features = ["chrono", "rustls", "tds73"] }
-redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure", "cluster-async"] }
 # MongoDB（R12）：官方驱动，tokio + rustls TLS；SCRAM-SHA-1/256 内置协商。
 # compat-3-0-0 = bson 2.x 与既有依赖形态一致；dns-resolver 供 mongodb+srv:// 连接串。
 mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver"] }

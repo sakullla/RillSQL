@@ -22,7 +22,7 @@ fn rendered_controls_refuse_keys_and_keep_unconfirmed_input(cx: &mut TestAppCont
         window.render_frame(cx);
         assert_eq!(window.find("redis-filter").label(), Some("过滤"));
         assert_eq!(window.find("redis-refresh").label(), Some("刷新"));
-        assert_eq!(window.find("redis-more").label(), Some("再读取一批（SCAN）"));
+        assert_eq!(window.find("redis-more").label(), Some("继续扫描"));
         assert_eq!(window.find("redis-ttl").label(), Some("设置 TTL"));
         assert_eq!(window.find("redis-rename").label(), Some("重命名"));
         assert_eq!(window.find("redis-delete").label(), Some("删除"));
@@ -697,4 +697,218 @@ impl Drop for RedisCleanup {
             });
         }));
     }
+}
+
+// ------------------------------------------------------------------ R4：后台全量扫描、模板批量、集群（可选运行）
+
+async fn open_redis_at(services: Arc<AppServices>, id: &str, port: u16, db: &str) -> Result<(), String> {
+    let mut draft = ConnectionDraft::blank(Engine::Redis);
+    draft.id = Some(id.to_owned());
+    draft.name = format!("夹具 {port}");
+    draft.host = "127.0.0.1".into();
+    draft.port = port.to_string();
+    draft.database = db.into();
+    draft.tls_mode = TlsMode::Off;
+    draft.save_password = true;
+    services.save_connection(draft, Some("rillsql-redis".into()), None, None).await.map_err(|err| err.message())?;
+    let opened = services.open_connection(id, Some("rillsql-redis".into()), None, None).await?;
+    if !opened.connected || services.connections.redis_handle(id).is_none() {
+        return Err(opened.report.summary.unwrap_or_else(|| "Redis 会话没有建立".into()));
+    }
+    Ok(())
+}
+
+/// 跑一轮扫描，收集事件。`stop_after` 为 Some(n) 时收到第 n 批后取消。
+fn scan_once(
+    services: &Arc<AppServices>,
+    id: &str,
+    resume: crate::adapters::redis::scan::ScanResume,
+    pattern: &str,
+    budget: usize,
+    stop_after: Option<usize>,
+) -> (Vec<String>, Option<u64>, crate::adapters::redis::scan::ScanResume, bool, bool) {
+    use crate::adapters::redis::scan::{ScanEvent, ScanOptions};
+    let services = Arc::clone(services);
+    let id = id.to_owned();
+    let pattern = pattern.to_owned();
+    block(async move {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = std::sync::Mutex::new(Vec::new());
+        let batches = std::sync::atomic::AtomicUsize::new(0);
+        let options = ScanOptions { pattern: Some(pattern), count: 200, budget };
+        let flag = Arc::clone(&cancel);
+        crate::application::redis::scan_keyspace(services.connections.as_ref(), &id, resume, options, cancel, |event| {
+            if matches!(event, ScanEvent::Batch(_)) && stop_after.is_some_and(|n| batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= n) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            events.lock().unwrap().push(event);
+            true
+        })
+        .await;
+        let mut names = Vec::new();
+        let mut total = None;
+        let mut end = (Default::default(), false, false);
+        for event in events.into_inner().unwrap() {
+            match event {
+                ScanEvent::Total(value) => total = value,
+                ScanEvent::Batch(keys) => names.extend(keys.into_iter().map(|key| key.name)),
+                ScanEvent::Finished { resume, cancelled, capped } => end = (resume, cancelled, capped),
+                ScanEvent::Failed(message) => panic!("扫描失败：{message}"),
+            }
+        }
+        (names, total, end.0, end.1, end.2)
+    })
+}
+
+/// 2500 键逻辑库：后台连续 SCAN 读全（进度总数来自 DBSIZE），可取消且保留已读、可续扫，超过上限停下；
+/// 模板把 2500 个订单键归并为一个模板，批量 UNLINK 分批删完。不使用 KEYS。
+#[test]
+fn live_scan_reads_2500_keys_cancels_resumes_caps_and_batch_deletes() {
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-scan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    if let Err(err) = block(open_redis_at(Arc::clone(&services), "live-scan", 6379, "9")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过：Redis 夹具没有连上：{err}");
+            return;
+        }
+        panic!("Redis 夹具没有连上：{err}");
+    }
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let prefix = format!("rillsql:t9:{suffix}");
+    let names: Vec<String> = (0..2500).map(|index| format!("{prefix}:order:{index}")).collect();
+    {
+        let services = Arc::clone(&services);
+        let names = names.clone();
+        block(async move {
+            let (handle, _) = services.connections.redis_handle("live-scan").expect("handle");
+            let mut conn = handle.conn();
+            for chunk in names.chunks(500) {
+                let mut cmd = redis::cmd("MSET");
+                for name in chunk {
+                    cmd.arg(name).arg("v");
+                }
+                let _: () = cmd.query_async(&mut conn).await.expect("MSET");
+            }
+        });
+    }
+    let pattern = format!("{prefix}:*");
+    let fresh = crate::adapters::redis::scan::ScanResume::default();
+    let (all, total, resume, cancelled, capped) = scan_once(&services, "live-scan", fresh.clone(), &pattern, 200_000, None);
+    let unique: std::collections::BTreeSet<_> = all.iter().cloned().collect();
+    assert_eq!(unique.len(), 2500, "全部读到，没有 500 上限");
+    assert!(total.is_some_and(|total| total >= 2500), "进度总数来自 DBSIZE：{total:?}");
+    assert!(resume.finished() && !cancelled && !capped);
+
+    let (part, _, resume, cancelled, _) = scan_once(&services, "live-scan", fresh.clone(), &pattern, 200_000, Some(1));
+    assert!(cancelled, "取消生效");
+    assert!(!part.is_empty() && part.len() < 2500, "取消后保留已读的部分：{}", part.len());
+    let (rest, _, end, _, _) = scan_once(&services, "live-scan", resume, &pattern, 200_000, None);
+    let resumed: std::collections::BTreeSet<_> = part.into_iter().chain(rest).collect();
+    assert_eq!(resumed.len(), 2500, "从续扫位置继续能读全");
+    assert!(end.finished());
+
+    let (capped_keys, _, _, _, capped) = scan_once(&services, "live-scan", fresh, &pattern, 1000, None);
+    assert!(capped, "超过上限停止");
+    assert!(capped_keys.len() >= 1000 && capped_keys.len() < 2500, "{}", capped_keys.len());
+
+    let indexed: Vec<(usize, &str, &str)> = names.iter().enumerate().map(|(index, name)| (index, name.as_str(), "string")).collect();
+    let groups = crate::adapters::redis::keyspace::group_templates(&indexed, &[":".to_owned()], &[]);
+    assert_eq!(groups.len(), 1, "{:?}", groups.iter().map(|group| &group.template).collect::<Vec<_>>());
+    assert_eq!(groups[0].count, 2500);
+    assert_eq!(groups[0].template, "rillsql:t9:*:order:*");
+
+    let services_batch = Arc::clone(&services);
+    let progress = block(async move {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let steps = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::application::redis::batch(services_batch.connections.as_ref(), "live-scan", names, crate::adapters::redis::batch::BatchOp::Unlink, true, cancel, |_| {
+            steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        })
+        .await
+        .expect("batch");
+        (outcome, steps.into_inner())
+    });
+    assert_eq!(progress.0.done, 2500);
+    assert_eq!(progress.0.failed, 0);
+    assert!(progress.1 >= 5, "分批执行并报告进度：{}", progress.1);
+    let (left, _, _, _, _) = scan_once(&services, "live-scan", Default::default(), &pattern, 200_000, None);
+    assert!(left.is_empty(), "批量删除后没有剩余");
+    services.connections.disconnect("live-scan");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Redis Cluster 夹具（docker compose 的 redis-cluster，7001-7003）：自动识别集群、逐主节点扫描合并、
+/// 键详情的槽与节点、跨槽 MGET 的 CROSSSLOT 提示、诊断按节点汇总、按槽分组批量删除。
+#[test]
+fn live_cluster_scans_every_primary_explains_crossslot_and_batches_by_slot() {
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-cluster-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    if let Err(err) = block(open_redis_at(Arc::clone(&services), "live-cluster", 7001, "0")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过：Redis Cluster 夹具没有连上：{err}");
+            return;
+        }
+        panic!("Redis Cluster 夹具没有连上：{err}");
+    }
+    let (handle, _) = services.connections.redis_handle("live-cluster").expect("handle");
+    assert!(handle.is_cluster(), "INFO cluster 自动识别为集群");
+    let topology = handle.topology();
+    assert_eq!(topology.masters().len(), 3, "{topology:?}");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let names: Vec<String> = (0..300).map(|index| format!("rillsql:t9c:{suffix}:{index}")).collect();
+    {
+        let names = names.clone();
+        let handle = handle.clone();
+        block(async move {
+            let mut conn = handle.conn();
+            for name in &names {
+                let _: () = redis::cmd("SET").arg(name).arg("v").query_async(&mut conn).await.expect("SET 自动路由");
+            }
+        });
+    }
+    let pattern = format!("rillsql:t9c:{suffix}:*");
+    let (all, total, resume, _, _) = scan_once(&services, "live-cluster", Default::default(), &pattern, 200_000, None);
+    let unique: std::collections::BTreeSet<_> = all.into_iter().collect();
+    assert_eq!(unique.len(), 300, "键列表合并所有主节点");
+    assert_eq!(resume.cursors.len(), 3, "逐主节点扫描");
+    assert!(total.is_some_and(|total| total >= 300));
+    let slots: std::collections::BTreeSet<_> = names.iter().map(|name| crate::adapters::redis::cluster::key_slot(name)).collect();
+    assert!(slots.len() > 3, "样本键分布在多个槽");
+
+    let services_read = Arc::clone(&services);
+    let first = names[0].clone();
+    let detail = block(async move { crate::application::redis::read_key(services_read.connections.as_ref(), "live-cluster", first).await }).expect("read");
+    assert_eq!(detail.key_type, "string");
+    let place = crate::adapters::redis::cluster::placement(&handle.topology().nodes, &names[0]);
+    assert!(place.node.is_some(), "槽能对应到主节点");
+
+    let services_exec = Arc::clone(&services);
+    let (a, b) = (names[0].clone(), names.iter().find(|name| crate::adapters::redis::cluster::key_slot(name) != crate::adapters::redis::cluster::key_slot(&names[0])).cloned().unwrap());
+    let refused = block(async move { crate::application::redis::exec(services_exec.connections.as_ref(), "live-cluster", "MGET".into(), vec![a, b], false).await });
+    assert!(refused.as_ref().err().is_some_and(|message| message.contains("CROSSSLOT")), "{:?}", refused.map(|outcome| outcome.command));
+
+    let services_diag = Arc::clone(&services);
+    let (info, clients) = block(async move {
+        let info = crate::application::redis::info(services_diag.connections.as_ref(), "live-cluster", String::new()).await;
+        let clients = crate::application::redis::clients(services_diag.connections.as_ref(), "live-cluster", String::new()).await;
+        (info, clients)
+    });
+    assert!(info.expect("info").iter().any(|section| section.name == "Cluster"));
+    let clients = clients.expect("clients");
+    let nodes: std::collections::BTreeSet<_> = clients.iter().map(|client| client.node.clone()).collect();
+    assert_eq!(nodes.len(), 3, "客户端列表按节点汇总");
+
+    let services_batch = Arc::clone(&services);
+    let outcome = block(async move {
+        crate::application::redis::batch(services_batch.connections.as_ref(), "live-cluster", names, crate::adapters::redis::batch::BatchOp::Unlink, true, Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| true).await
+    })
+    .expect("batch");
+    assert_eq!((outcome.done, outcome.failed), (300, 0), "按槽分组的 UNLINK 不触发 CROSSSLOT");
+    services.connections.disconnect("live-cluster");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1102,13 +1102,24 @@ impl Workbench {
             return;
         }
         let locale = self.model.locale();
-        self.redis.update(cx, |pane, _| pane.set_locale(locale));
         let spec = self.model.redis_spec.clone().unwrap_or_default();
+        // 生产标签按连接当前的标签现算：写入确认要输入连接名。
+        let prod = self.redis_prod(&spec);
+        self.redis.update(cx, |pane, _| {
+            pane.set_locale(locale);
+            pane.set_prod_target(prod);
+        });
         if self.applied_redis.as_deref() == Some(spec.as_str()) {
             return;
         }
         self.applied_redis = Some(spec.clone());
         self.redis.update(cx, |pane, cx| pane.open_spec(&spec, cx));
+    }
+
+    /// 键浏览目标（`id|name|db`）对应的连接此刻是否按生产处理。
+    fn redis_prod(&self, spec: &str) -> bool {
+        let id = spec.split('|').next().unwrap_or("").trim();
+        !id.is_empty() && self.model.connection_is_prod(id)
     }
 
     /// 活动概览标签：已连接且待读时在后台读取统计；未连接的先按需连接（连上后下一帧再读）。
@@ -2004,6 +2015,13 @@ impl Workbench {
         if let Some(target) = self.table_view_spec.as_deref().and_then(parse_target) {
             let prod = self.prod_for(&target);
             self.table.update(cx, |pane, cx| {
+                pane.set_prod_target(prod);
+                cx.notify();
+            });
+        }
+        if let Some(spec) = self.model.redis_spec.clone() {
+            let prod = self.redis_prod(&spec);
+            self.redis.update(cx, |pane, cx| {
                 pane.set_prod_target(prod);
                 cx.notify();
             });

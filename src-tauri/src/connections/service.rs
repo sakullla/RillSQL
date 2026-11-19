@@ -321,6 +321,15 @@ impl Service {
         Ok(records)
     }
 
+    /// 按连接保存的界面偏好（JSON 文本），没有时为 None。
+    pub async fn connection_prefs(&self, id: &str, ns: &str) -> Result<Option<String>, String> {
+        self.store().await?.prefs(id, ns).await.map_err(db_err)
+    }
+
+    pub async fn save_connection_prefs(&self, id: &str, ns: &str, value: &str) -> Result<(), String> {
+        self.store().await?.save_prefs(id, ns, value).await.map_err(db_err)
+    }
+
     pub async fn list_tags(&self) -> Result<Vec<EnvTag>, String> {
         self.store().await?.list_tags().await.map_err(db_err)
     }
@@ -1053,12 +1062,12 @@ impl Service {
         session.session.shared_pool()
     }
 
-    /// Redis 会话句柄：键浏览、值读取与命令行共用同一条多路复用连接（互斥锁串行）。
+    /// Redis 会话句柄：键浏览、值读取与命令行共用的连接（多路复用，调用方克隆后并发使用）。
     /// 返回共享的健康句柄供执行路径报告断线（R4 探活消费）。
     pub fn redis_session(
         &self,
         id: &str,
-    ) -> Option<(std::sync::Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>, std::sync::Arc<SessionHealth>)> {
+    ) -> Option<(std::sync::Arc<tokio::sync::Mutex<crate::adapters::redis::conn::RedisConn>>, std::sync::Arc<SessionHealth>)> {
         let sessions = self.sessions.lock().expect("sessions");
         let session = sessions.get(id)?;
         if session.health.is_lost() {
@@ -1067,6 +1076,18 @@ impl Service {
         session.health.note_activity();
         let browser = session.session.as_redis()?.browser();
         Some((browser, Arc::clone(&session.health)))
+    }
+
+    /// Redis 会话的完整句柄：主连接、拓扑（单机/集群节点表）与按节点建连、Pub/Sub 专用连接的入口。
+    pub fn redis_handle(&self, id: &str) -> Option<(crate::adapters::redis::conn::RedisHandle, std::sync::Arc<SessionHealth>)> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        if session.health.is_lost() {
+            return None;
+        }
+        session.health.note_activity();
+        let handle = session.session.as_redis()?.handle();
+        Some((handle, Arc::clone(&session.health)))
     }
 
     /// MongoDB 会话句柄：库/集合浏览与文档 CRUD 共用这一个客户端（驱动内部连接池）。

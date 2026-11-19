@@ -124,6 +124,17 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        // 按连接保存的浏览偏好（如键空间分隔符与模板规则）。只是界面偏好，不进连接定义与导出形状。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS connection_prefs (
+                id TEXT NOT NULL,
+                ns TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (id, ns)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
         // 迁移只清理悬空引用，不删任何连接行：删过连接、导入过别的库之后仍能自洽。
         sqlx::query(
             "DELETE FROM connection_group_members
@@ -271,6 +282,10 @@ impl Store {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM connection_prefs WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         // 分组是组织元数据：连接删掉就一起清掉它的成员关系，分组本身留下。
         sqlx::query("DELETE FROM connection_group_members WHERE connection_id = ?1")
             .bind(id)
@@ -278,6 +293,30 @@ impl Store {
             .await?;
         self.checkpoint().await?;
         Ok(existing)
+    }
+
+    /// 按连接、按命名空间读一份偏好（JSON 文本）。
+    pub async fn prefs(&self, id: &str, ns: &str) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT value FROM connection_prefs WHERE id = ?1 AND ns = ?2")
+            .bind(id)
+            .bind(ns)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(|row| row.try_get::<String, _>(0)).transpose()
+    }
+
+    pub async fn save_prefs(&self, id: &str, ns: &str, value: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO connection_prefs (id, ns, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id, ns) DO UPDATE SET value = excluded.value",
+        )
+        .bind(id)
+        .bind(ns)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        self.checkpoint().await?;
+        Ok(())
     }
 
     /// 记一次成功打开。只写使用时间，不碰连接定义；密码等机密仍只在系统凭据库。

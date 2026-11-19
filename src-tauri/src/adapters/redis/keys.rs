@@ -35,6 +35,8 @@ pub enum RedisValue {
     Set { items: Vec<String> },
     ZSet { entries: Vec<ScoredMember> },
     Stream { messages: Vec<StreamMessage> },
+    /// RedisJSON 模块的 JSON 文档（`JSON.GET` 的文本）。
+    Json { text: String },
     /// 键不存在或类型暂不支持结构化渲染。
     None {},
 }
@@ -66,6 +68,24 @@ pub struct RedisKeyDetail {
     pub key_type: String,
     pub ttl_ms: Option<i64>,
     pub value: RedisValue,
+    /// 集合的元素总数（HLEN/LLEN/SCARD/ZCARD/XLEN）；字符串为字节长度。
+    pub total: Option<u64>,
+    /// 下一页的位置（HSCAN/SSCAN 游标、ZRANGE/LRANGE 偏移、XRANGE 起点）；None 表示已读完。
+    pub next: Option<String>,
+}
+
+/// 大集合每页读取的条目数。
+pub const VALUE_PAGE_SIZE: usize = 200;
+
+/// RedisJSON 模块注册的类型名。
+pub const JSON_TYPE: &str = "ReJSON-RL";
+
+/// 值的一页。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValuePage {
+    pub value: RedisValue,
+    pub next: Option<String>,
 }
 
 /// SCAN 参数组装（纯函数，供测试与命令组装共用）。游标 0=从头上开始；模式沿用 glob 语义（user:*）。
@@ -81,19 +101,42 @@ pub fn scan_args(cursor: u64, pattern: Option<&str>, count: usize) -> Vec<String
     args
 }
 
-/// 值读取的命令形态（纯函数，供测试断言；执行在 read_value）。
-/// zset 带 WITHSCORES、stream 用 XRANGE - + 全量；list 用 LRANGE 0 -1。
-#[allow(dead_code)]
-pub fn value_read_plan(key_type: &str) -> &'static [&'static str] {
+/// 分页读取一页值的命令（纯函数，供测试断言）。`token` 是上一页给出的位置：
+/// hash/set 为 HSCAN/SSCAN 游标；zset/list 为偏移；stream 为 XRANGE 起点（`(id` 表示不含该条）。
+/// 字符串与 JSON 一次读完。未知类型返回 None。
+pub fn page_command(key_type: &str, key: &str, token: Option<&str>, size: usize) -> Option<Vec<String>> {
+    let size = size.max(1);
+    let offset = token.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let words: Vec<String> = match key_type {
+        "string" => vec!["GET".into(), key.into()],
+        JSON_TYPE => vec!["JSON.GET".into(), key.into()],
+        "hash" => vec!["HSCAN".into(), key.into(), token.unwrap_or("0").into(), "COUNT".into(), size.to_string()],
+        "set" => vec!["SSCAN".into(), key.into(), token.unwrap_or("0").into(), "COUNT".into(), size.to_string()],
+        "zset" => vec!["ZRANGE".into(), key.into(), offset.to_string(), (offset + size - 1).to_string(), "WITHSCORES".into()],
+        "list" => vec!["LRANGE".into(), key.into(), offset.to_string(), (offset + size - 1).to_string()],
+        "stream" => vec!["XRANGE".into(), key.into(), token.unwrap_or("-").into(), "+".into(), "COUNT".into(), size.to_string()],
+        _ => return None,
+    };
+    Some(words)
+}
+
+/// 元素总数的命令。
+pub fn length_command(key_type: &str) -> Option<&'static str> {
     match key_type {
-        "string" => &["GET"],
-        "hash" => &["HGETALL"],
-        "list" => &["LRANGE", "0", "-1"],
-        "set" => &["SMEMBERS"],
-        "zset" => &["ZRANGE", "0", "-1", "WITHSCORES"],
-        "stream" => &["XRANGE", "-", "+"],
-        _ => &[],
+        "string" => Some("STRLEN"),
+        "hash" => Some("HLEN"),
+        "list" => Some("LLEN"),
+        "set" => Some("SCARD"),
+        "zset" => Some("ZCARD"),
+        "stream" => Some("XLEN"),
+        _ => None,
     }
+}
+
+/// 下一页位置：偏移类按本页条数推进，读满一页才可能还有下一页。
+pub fn next_offset(token: Option<&str>, got: usize, size: usize) -> Option<String> {
+    let offset = token.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    (got >= size.max(1)).then(|| (offset + got).to_string())
 }
 
 /// TTL 修改命令组装（纯函数）：Some(n)=EXPIRE n 秒；None=PERSIST（移除过期）。
@@ -129,7 +172,7 @@ fn flatten_pairs(values: Vec<redis::Value>) -> Vec<KeyValuePair> {
 
 /// SCAN 一页：返回下一游标与本页键的 TYPE/PTTL（一次 pipeline 批量读取）。
 pub async fn scan_keys(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut super::conn::RedisConn,
     cursor: u64,
     pattern: Option<&str>,
     count: usize,
@@ -172,65 +215,78 @@ pub async fn scan_keys(
     })
 }
 
-/// 读取单个键的类型、TTL 与按类型的值。
-pub async fn read_key(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> Result<RedisKeyDetail, redis::RedisError> {
+/// 读取单个键的类型、TTL、总数与第一页值。
+pub async fn read_key(conn: &mut super::conn::RedisConn, key: &str) -> Result<RedisKeyDetail, redis::RedisError> {
     let key_type: String = redis::cmd("TYPE").arg(key).query_async(conn).await?;
     let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(conn).await?;
-    let value = read_value(conn, key, &key_type).await?;
-    Ok(RedisKeyDetail {
-        key_type,
-        ttl_ms: Some(ttl_ms),
-        value,
-    })
+    let total = match length_command(&key_type) {
+        Some(word) => redis::cmd(word).arg(key).query_async::<Option<u64>>(conn).await.ok().flatten(),
+        None => None,
+    };
+    let page = read_page(conn, key, &key_type, None, VALUE_PAGE_SIZE).await?;
+    Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: page.value, total, next: page.next })
 }
 
-async fn read_value(
-    conn: &mut redis::aio::MultiplexedConnection,
+/// 读一页值。`token` 为上一页给出的 next。
+pub async fn read_page(
+    conn: &mut super::conn::RedisConn,
     key: &str,
     key_type: &str,
-) -> Result<RedisValue, redis::RedisError> {
-    let raw = match key_type {
-        "string" => {
-            let text: String = redis::cmd("GET").arg(key).query_async(conn).await?;
-            return Ok(RedisValue::String { text });
-        }
-        "hash" => redis::cmd("HGETALL").arg(key).query_async::<Vec<redis::Value>>(conn).await?,
-        "list" => redis::cmd("LRANGE").arg(key).arg(0).arg(-1).query_async::<Vec<redis::Value>>(conn).await?,
-        "set" => redis::cmd("SMEMBERS").arg(key).query_async::<Vec<redis::Value>>(conn).await?,
-        "zset" => redis::cmd("ZRANGE")
-            .arg(key)
-            .arg(0)
-            .arg(-1)
-            .arg("WITHSCORES")
-            .query_async::<Vec<redis::Value>>(conn)
-            .await?,
-        "stream" => redis::cmd("XRANGE").arg(key).arg("-").arg("+").query_async::<Vec<redis::Value>>(conn).await?,
-        _ => return Ok(RedisValue::None {}),
+    token: Option<&str>,
+    size: usize,
+) -> Result<ValuePage, redis::RedisError> {
+    let Some(words) = page_command(key_type, key, token, size) else {
+        return Ok(ValuePage { value: RedisValue::None {}, next: None });
     };
-    Ok(match key_type {
-        "hash" => RedisValue::Hash { entries: flatten_pairs(raw) },
-        "list" => RedisValue::List {
-            items: raw.into_iter().map(bulk_text).collect(),
-        },
-        "set" => RedisValue::Set {
-            items: raw.into_iter().map(bulk_text).collect(),
-        },
+    let mut cmd = redis::cmd(words[0].as_str());
+    for arg in &words[1..] {
+        cmd.arg(arg);
+    }
+    let raw: redis::Value = cmd.query_async(conn).await?;
+    Ok(decode_page(key_type, token, size, raw))
+}
+
+/// 把一页原始回复解码成值（纯函数）。
+pub fn decode_page(key_type: &str, token: Option<&str>, size: usize, raw: redis::Value) -> ValuePage {
+    let items = |value: redis::Value| match value {
+        redis::Value::Array(items) | redis::Value::Set(items) => items,
+        redis::Value::Map(pairs) => pairs.into_iter().flat_map(|(field, value)| [field, value]).collect(),
+        redis::Value::Nil => Vec::new(),
+        other => vec![other],
+    };
+    // HSCAN/SSCAN：[cursor, [items...]]。
+    let scan_reply = |raw: redis::Value| -> (Option<String>, Vec<redis::Value>) {
+        let mut parts = items(raw).into_iter();
+        let cursor = bulk_text(parts.next().unwrap_or(redis::Value::Nil));
+        let body = parts.next().map(items).unwrap_or_default();
+        (if cursor == "0" || cursor.is_empty() { None } else { Some(cursor) }, body)
+    };
+    match key_type {
+        "string" => ValuePage { value: RedisValue::String { text: bulk_text(raw) }, next: None },
+        JSON_TYPE => ValuePage { value: RedisValue::Json { text: bulk_text(raw) }, next: None },
+        "hash" => {
+            let (next, body) = scan_reply(raw);
+            ValuePage { value: RedisValue::Hash { entries: flatten_pairs(body) }, next }
+        }
+        "set" => {
+            let (next, body) = scan_reply(raw);
+            ValuePage { value: RedisValue::Set { items: body.into_iter().map(bulk_text).collect() }, next }
+        }
+        "list" => {
+            let list: Vec<String> = items(raw).into_iter().map(bulk_text).collect();
+            let next = next_offset(token, list.len(), size);
+            ValuePage { value: RedisValue::List { items: list }, next }
+        }
         "zset" => {
-            let entries = flatten_pairs(raw)
-                .into_iter()
-                .map(|pair| ScoredMember {
-                    member: pair.field,
-                    score: pair.value,
-                })
-                .collect();
-            RedisValue::ZSet { entries }
+            let entries: Vec<ScoredMember> =
+                flatten_pairs(items(raw)).into_iter().map(|pair| ScoredMember { member: pair.field, score: pair.value }).collect();
+            let next = next_offset(token, entries.len(), size);
+            ValuePage { value: RedisValue::ZSet { entries }, next }
         }
         "stream" => {
-            let mut messages = Vec::with_capacity(raw.len());
-            for entry in raw {
-                let redis::Value::Array(parts) = entry else {
-                    continue;
-                };
+            let mut messages = Vec::new();
+            for entry in items(raw) {
+                let redis::Value::Array(parts) = entry else { continue };
                 let mut parts = parts.into_iter();
                 let id = bulk_text(parts.next().unwrap_or(redis::Value::Nil));
                 let fields = match parts.next() {
@@ -239,15 +295,34 @@ async fn read_value(
                 };
                 messages.push(StreamMessage { id, fields });
             }
-            RedisValue::Stream { messages }
+            let next = (messages.len() >= size.max(1)).then(|| messages.last().map(|message| format!("({}", message.id))).flatten();
+            ValuePage { value: RedisValue::Stream { messages }, next }
         }
-        _ => RedisValue::None {},
-    })
+        _ => ValuePage { value: RedisValue::None {}, next: None },
+    }
+}
+
+/// 把下一页接到已读的值后面。HSCAN/SSCAN 可能重复返回同一成员，按字段/成员去重。
+pub fn append_page(current: &mut RedisValue, page: RedisValue) {
+    match (current, page) {
+        (RedisValue::Hash { entries }, RedisValue::Hash { entries: more }) => {
+            let mut seen: std::collections::HashSet<String> = entries.iter().map(|entry| entry.field.clone()).collect();
+            entries.extend(more.into_iter().filter(|entry| seen.insert(entry.field.clone())));
+        }
+        (RedisValue::Set { items }, RedisValue::Set { items: more }) => {
+            let mut seen: std::collections::HashSet<String> = items.iter().cloned().collect();
+            items.extend(more.into_iter().filter(|item| seen.insert(item.clone())));
+        }
+        (RedisValue::List { items }, RedisValue::List { items: more }) => items.extend(more),
+        (RedisValue::ZSet { entries }, RedisValue::ZSet { entries: more }) => entries.extend(more),
+        (RedisValue::Stream { messages }, RedisValue::Stream { messages: more }) => messages.extend(more),
+        (current, page) => *current = page,
+    }
 }
 
 /// 修改 TTL：Some(n)=EXPIRE；None=PERSIST。返回命令是否作用到键（0=键不存在）。
 pub async fn set_ttl(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut super::conn::RedisConn,
     key: &str,
     seconds: Option<i64>,
 ) -> Result<i64, redis::RedisError> {
@@ -317,6 +392,8 @@ pub enum RedisMutation {
     StreamAdd { key: String, id: String, fields: Vec<(String, String)> },
     StreamDel { key: String, id: String },
     SetTtl { key: String, seconds: Option<i64> },
+    /// RedisJSON：整篇替换（`JSON.SET key $ value`）。
+    JsonSet { key: String, value: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +581,13 @@ pub fn prepare_mutation(mutation: &RedisMutation, confirmed: bool) -> Result<Mut
             }
             push_step(&mut steps, "XDEL", vec![key.clone(), id.clone()]);
         }
+        RedisMutation::JsonSet { key, value } => {
+            require_key(key)?;
+            if serde_json::from_str::<serde_json::Value>(value).is_err() {
+                return Err("JSON 文本无效，没有写入。".to_owned());
+            }
+            push_step(&mut steps, "JSON.SET", vec![key.clone(), "$".into(), value.clone()]);
+        }
         RedisMutation::SetTtl { key, seconds } => {
             require_key(key)?;
             require_ttl(*seconds)?;
@@ -548,6 +632,7 @@ pub fn mutation_preview(mutation: &RedisMutation) -> String {
             Some(seconds) => format!("EXPIRE {key} {seconds}"),
             None => format!("PERSIST {key}"),
         },
+        RedisMutation::JsonSet { key, value } => format!("JSON.SET {key} $ {}", clip(value)),
     }
 }
 
@@ -573,7 +658,7 @@ fn clip(text: &str) -> String {
 
 /// 执行已经通过 `prepare_mutation` 的写计划。未确认、非法分值和已存在且未声明覆盖的键都不会写入。
 pub async fn apply_mutation(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut super::conn::RedisConn,
     mutation: &RedisMutation,
     confirmed: bool,
 ) -> Result<i64, MutationFault> {
@@ -605,7 +690,7 @@ pub async fn apply_mutation(
 }
 
 /// 删除键（DEL）。调用方必须先通过 `require_delete`。
-pub async fn delete_keys(conn: &mut redis::aio::MultiplexedConnection, keys: &[String]) -> Result<i64, redis::RedisError> {
+pub async fn delete_keys(conn: &mut super::conn::RedisConn, keys: &[String]) -> Result<i64, redis::RedisError> {
     let mut cmd = redis::cmd("DEL");
     for key in keys {
         cmd.arg(key);
@@ -614,6 +699,6 @@ pub async fn delete_keys(conn: &mut redis::aio::MultiplexedConnection, keys: &[S
 }
 
 /// 重命名键（RENAME）。调用方必须先通过 `require_rename`。
-pub async fn rename_key(conn: &mut redis::aio::MultiplexedConnection, from: &str, to: &str) -> Result<(), redis::RedisError> {
+pub async fn rename_key(conn: &mut super::conn::RedisConn, from: &str, to: &str) -> Result<(), redis::RedisError> {
     redis::cmd("RENAME").arg(from).arg(to).query_async(conn).await
 }

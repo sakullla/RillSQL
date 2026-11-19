@@ -42,7 +42,7 @@ fn redis_scalar_text(value: &redis::Value) -> Option<String> {
 }
 
 pub(in crate::adapters) async fn redis_query_run(
-    conn: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    conn: &Arc<tokio::sync::Mutex<super::conn::RedisConn>>,
     script: &str,
     limit: usize,
     cancel: &AtomicBool,

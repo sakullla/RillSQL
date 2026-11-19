@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use redis::ConnectionAddr;
 
+use super::cluster;
+use super::conn::{NodeFactory, RedisConn, RedisHandle, Topology};
 use crate::adapters::session::{CatalogSession, Connector, NoCancel, Opened, RedisAccess, Session};
 use crate::connections::model::{SavedConnection, TlsMode};
 use crate::connections::route::{self, Route};
@@ -14,6 +16,8 @@ pub(crate) struct RedisOpen {
     pub client: redis::Client,
     pub conn: redis::aio::MultiplexedConnection,
     pub version: String,
+    /// `INFO cluster` 报告 cluster_enabled:1。
+    pub cluster_enabled: bool,
 }
 
 /// Redis 连接：单条 MultiplexedConnection 会话（目录/键浏览/命令行共用）。
@@ -64,15 +68,71 @@ pub(crate) async fn open_redis(config: &SavedConnection, route: &Route, password
         .query_async(&mut conn)
         .await
         .map_err(|err| redis_stage(route.tls_mode, &err))?;
+    // 自动识别集群：INFO cluster 的 cluster_enabled:1。读不到（被 ACL 禁用等）按单机处理。
+    let cluster_text: String = redis::cmd("INFO").arg("cluster").query_async(&mut conn).await.unwrap_or_default();
     Ok(RedisOpen {
         client,
         conn,
         version: redis_server_version(&info_text),
+        cluster_enabled: cluster_enabled(&cluster_text),
     })
 }
 
+/// `INFO cluster` 里 `cluster_enabled:1` 即为集群节点。
+pub(crate) fn cluster_enabled(info: &str) -> bool {
+    info.lines().any(|line| line.trim() == "cluster_enabled:1")
+}
+
+/// 集群会话：从种子节点读节点表，再以全部主节点为初始节点建立自动路由的集群连接。
+/// 经 SSH 隧道时节点公告的地址在本机不可达，只能按单节点会话浏览（只看到该节点的槽）。
+async fn open_cluster(
+    seed: &mut redis::aio::MultiplexedConnection,
+    factory: &NodeFactory,
+    route: &Route,
+) -> Result<(redis::cluster_async::ClusterConnection, redis::cluster::ClusterClient, Vec<cluster::ClusterNode>), StageError> {
+    let text: String = redis::cmd("CLUSTER").arg("NODES").query_async(seed).await.map_err(|err| redis_stage(route.tls_mode, &err))?;
+    let nodes = cluster::parse_cluster_nodes(&text);
+    let mut initial: Vec<redis::ConnectionInfo> =
+        nodes.iter().filter(|node| node.master).map(|node| factory.info(&node.host, node.port, 0)).collect();
+    if initial.is_empty() {
+        initial.push(factory.info(&route.transport_host, route.transport_port, 0));
+    }
+    let mut builder = redis::cluster::ClusterClientBuilder::new(initial)
+        .connection_timeout(Duration::from_secs(15))
+        .response_timeout(Duration::from_secs(60));
+    if let Some(certs) = tls_certificates(&factory.config).map_err(|err| redis_stage(route.tls_mode, &err))? {
+        builder = builder.certs(certs);
+    }
+    let client = builder.build().map_err(|err| redis_stage(route.tls_mode, &err))?;
+    let conn = client.get_async_connection().await.map_err(|err| redis_stage(route.tls_mode, &err))?;
+    Ok((conn, client, nodes))
+}
+
+/// Verify 档的 CA / 客户端证书材料（集群客户端要单独传入）。
+fn tls_certificates(config: &SavedConnection) -> Result<Option<redis::TlsCertificates>, redis::RedisError> {
+    let tls = config.tls.as_ref();
+    let ca_file = tls.and_then(|tls| tls.ca_file.clone());
+    let cert = tls.and_then(|tls| tls.client_cert.clone());
+    let key = tls.and_then(|tls| tls.client_key.clone());
+    if ca_file.is_none() && cert.is_none() {
+        return Ok(None);
+    }
+    let read = |path: &str, what: &'static str| {
+        std::fs::read(path).map_err(|_| redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, what, path.to_owned())))
+    };
+    let root_cert = match ca_file {
+        Some(path) => Some(read(&path, "读不到 CA 证书")?),
+        None => None,
+    };
+    let client_tls = match (cert, key) {
+        (Some(cert), Some(key)) => Some(redis::ClientTlsConfig { client_cert: read(&cert, "读不到客户端证书")?, client_key: read(&key, "读不到客户端私钥")? }),
+        _ => None,
+    };
+    Ok(Some(redis::TlsCertificates { client_tls, root_cert }))
+}
+
 /// Verify 档带 CA 文件或客户端证书时，把 PEM 材料装进 TLS 参数；其余档位直接按 ConnectionInfo 建客户端。
-fn build_redis_client(info: redis::ConnectionInfo, config: &SavedConnection) -> Result<redis::Client, redis::RedisError> {
+pub(crate) fn build_redis_client(info: redis::ConnectionInfo, config: &SavedConnection) -> Result<redis::Client, redis::RedisError> {
     let tls = config.tls.as_ref();
     let ca_file = tls.and_then(|tls| tls.ca_file.clone());
     let client_cert = tls.and_then(|tls| tls.client_cert.clone());
@@ -162,10 +222,26 @@ pub(in crate::adapters) struct RedisConnector;
 #[async_trait::async_trait]
 impl Connector for RedisConnector {
     async fn open_remote(&self, config: &SavedConnection, route: &Route, password: &str) -> Result<Opened, StageError> {
-        let opened = open_redis(config, route, password).await?;
+        let mut opened = open_redis(config, route, password).await?;
+        let factory = NodeFactory { config: config.clone(), password: password.to_owned(), tls_mode: route.tls_mode };
+        let addr = format!("{}:{}", config.host.clone().unwrap_or_default(), config.port.unwrap_or(6379));
+        let tunneled = config.ssh.is_some();
+        let (conn, cluster_client, topology, version) = if opened.cluster_enabled && !tunneled {
+            let (conn, client, nodes) = open_cluster(&mut opened.conn, &factory, route).await?;
+            let version = format!("{} · Cluster", opened.version);
+            (RedisConn::Cluster(conn), Some(client), Topology { cluster: true, nodes, addr }, version)
+        } else {
+            (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr }, opened.version)
+        };
+        let handle = RedisHandle {
+            conn: conn.clone(),
+            topology: Arc::new(std::sync::RwLock::new(topology)),
+            factory: Arc::new(factory),
+            client: if cluster_client.is_some() { None } else { Some(opened.client.clone()) },
+        };
         Ok(Opened {
-            version: opened.version,
-            session: Arc::new(RedisSession { browser: Arc::new(tokio::sync::Mutex::new(opened.conn)), client: opened.client }),
+            version,
+            session: Arc::new(RedisSession { browser: Arc::new(tokio::sync::Mutex::new(conn)), client: opened.client, cluster: cluster_client, handle }),
             canceller: Arc::new(NoCancel),
             schema_note: None,
             foreign_keys: None,
@@ -173,10 +249,12 @@ impl Connector for RedisConnector {
     }
 }
 
-/// browser 是键浏览、值读取与命令行共用的多路复用连接；client 用来给查询批次另开独占连接。
+/// browser 是键浏览、值读取共用的主连接（多路复用，克隆后可并发）；client/cluster 用来给查询批次另开独占连接。
 struct RedisSession {
-    browser: Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
+    browser: Arc<tokio::sync::Mutex<RedisConn>>,
     client: redis::Client,
+    cluster: Option<redis::cluster::ClusterClient>,
+    handle: RedisHandle,
 }
 
 #[async_trait::async_trait]
@@ -187,14 +265,19 @@ impl Session for RedisSession {
 
     /// SELECT 作用于整个网络连接。查询批次独占一条命令连接，避免和键浏览器互相切库。
     async fn query(&self, _foreign_keys: Option<bool>) -> Result<CatalogSession, String> {
-        let config = redis::AsyncConnectionConfig::new().set_connection_timeout(Duration::from_secs(15));
-        let conn = self.client.get_multiplexed_async_connection_with_config(&config).await.map_err(|err| err.to_string())?;
+        let conn = match &self.cluster {
+            Some(cluster) => RedisConn::Cluster(cluster.get_async_connection().await.map_err(|err| err.to_string())?),
+            None => {
+                let config = redis::AsyncConnectionConfig::new().set_connection_timeout(Duration::from_secs(15));
+                RedisConn::Single(self.client.get_multiplexed_async_connection_with_config(&config).await.map_err(|err| err.to_string())?)
+            }
+        };
         Ok(CatalogSession::Redis(Arc::new(tokio::sync::Mutex::new(conn))))
     }
 
     async fn ping(&self) -> Result<(), String> {
-        let mut conn = self.browser.lock().await;
-        let pong: String = redis::cmd("PING").query_async(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
+        let mut conn = self.browser.lock().await.clone();
+        let pong: String = redis::cmd("PING").query_async(&mut conn).await.map_err(|err| crate::error_text::chain(&err))?;
         if pong.eq_ignore_ascii_case("pong") {
             Ok(())
         } else {
@@ -208,7 +291,11 @@ impl Session for RedisSession {
 }
 
 impl RedisAccess for RedisSession {
-    fn browser(&self) -> Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>> {
+    fn browser(&self) -> Arc<tokio::sync::Mutex<RedisConn>> {
         Arc::clone(&self.browser)
+    }
+
+    fn handle(&self) -> RedisHandle {
+        self.handle.clone()
     }
 }

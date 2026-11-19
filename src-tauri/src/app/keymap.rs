@@ -21,7 +21,7 @@ pub type BindFn = fn(&'static str, bool) -> Option<KeyBinding>;
 pub const EDITOR_CONTEXT: &str = "Input && mode == editor";
 
 /// 快捷键面板的分组（顺序即面板左侧导航顺序），文案键为 `ui.help.<group>`。
-pub const GROUPS: [&str; 4] = ["global", "editor", "table", "explorer"];
+pub const GROUPS: [&str; 5] = ["global", "editor", "table", "explorer", "keyspace"];
 
 pub struct Shortcut {
     pub id: &'static str,
@@ -146,6 +146,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut::new("explorer-expand", "explorer", "← →", "shell.shortcuts.explorerExpand"),
     Shortcut::new("explorer-open", "explorer", "Enter", "shell.shortcuts.explorerOpen"),
     Shortcut::new("explorer-clear-search", "explorer", "Esc", "shell.shortcuts.explorerClearSearch"),
+    // 键空间工作台（R4）：由工作台自己的按键处理与输入框回车解析，这里只登记用于面板展示。
+    Shortcut::new("keyspace-filter", "keyspace", "Enter", "shell.shortcuts.keyspaceFilter"),
+    Shortcut::new("keyspace-exec", "keyspace", "Enter", "shell.shortcuts.keyspaceExec"),
+    Shortcut::new("keyspace-complete", "keyspace", "Tab", "shell.shortcuts.keyspaceComplete"),
+    Shortcut::new("keyspace-history", "keyspace", "↑ ↓", "shell.shortcuts.keyspaceHistory"),
+    Shortcut::new("keyspace-dismiss", "keyspace", "Esc", "shell.shortcuts.keyspaceDismiss"),
 ];
 
 pub fn shortcut(id: &str) -> Option<&'static Shortcut> {
@@ -363,6 +369,14 @@ pub fn chord_match(shortcut: &Shortcut, query: &str, mac: bool) -> Option<(usize
     Some((0, shown.len()))
 }
 
+/// 键空间工作台打开时预选的分组：除编辑器、表格、对象树以外的焦点都落到键空间分组。
+pub fn group_for_workbench(focus: super::FocusTarget, keyspace: bool) -> &'static str {
+    match group_for_focus(focus) {
+        "global" if keyspace => "keyspace",
+        group => group,
+    }
+}
+
 /// 打开快捷键面板时按焦点所在区域预选的分组。
 pub fn group_for_focus(focus: super::FocusTarget) -> &'static str {
     match focus {
@@ -401,6 +415,23 @@ mod tests {
             // 生成的全部绑定 = 各项生成的绑定之和：bind_keys 不另外手写绑定。
             assert_eq!(key_bindings_for(mac).len(), SHORTCUTS.iter().map(|s| bindings_of(s, mac).len()).sum::<usize>());
         }
+    }
+
+    #[test]
+    fn keyspace_workbench_has_its_own_group_and_is_preselected() {
+        let items: Vec<_> = SHORTCUTS.iter().filter(|shortcut| shortcut.group == "keyspace").map(|shortcut| shortcut.id).collect();
+        assert_eq!(items, ["keyspace-filter", "keyspace-exec", "keyspace-complete", "keyspace-history", "keyspace-dismiss"]);
+        for shortcut in SHORTCUTS.iter().filter(|shortcut| shortcut.group == "keyspace") {
+            for locale in [crate::i18n::Locale::ZhCn, crate::i18n::Locale::En] {
+                assert!(crate::i18n::static_text(locale, shortcut.label_key).is_some(), "{} 缺文案", shortcut.id);
+            }
+        }
+        assert!(crate::i18n::static_text(crate::i18n::Locale::En, "ui.help.keyspace").is_some());
+        assert_eq!(group_for_workbench(super::super::FocusTarget::Editor, true), "editor", "编辑器焦点仍预选编辑器");
+        assert_eq!(group_for_workbench(super::super::FocusTarget::Sidebar, true), "explorer");
+        assert_ne!(group_for_workbench(super::super::FocusTarget::Editor, false), "keyspace");
+        assert_eq!(group_for_workbench(super::super::FocusTarget::Palette, true), "keyspace", "键空间工作台预选键空间分组");
+        assert_eq!(group_for_workbench(super::super::FocusTarget::Palette, false), "global");
     }
 
     #[test]

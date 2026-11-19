@@ -112,6 +112,31 @@ services:
     command: ["sh", "/seed/redis-seed.sh"]
     restart: "no"
 
+  # Redis Cluster 夹具（R4）：一个容器里起 3 个主节点（7001-7003，无副本），节点公告 127.0.0.1，
+  # 宿主机经映射端口直连每个节点；密码与单机夹具相同。live 测试按约定可选运行，连不上时跳过。
+  redis-cluster:
+    image: redis:7
+    ports:
+      - "127.0.0.1:7001-7003:7001-7003"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        for port in 7001 7002 7003; do
+        mkdir -p /data/$$port &&
+        redis-server --port $$port --cluster-enabled yes --cluster-config-file /data/$$port/nodes.conf
+        --cluster-announce-ip 127.0.0.1 --requirepass rillsql-redis --masterauth rillsql-redis
+        --appendonly no --save '' --dir /data/$$port --daemonize yes;
+        done &&
+        sleep 1 &&
+        (redis-cli --no-auth-warning -a rillsql-redis -p 7001 cluster info | grep -q 'cluster_state:ok'
+        || redis-cli --no-auth-warning -a rillsql-redis --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 0 --cluster-yes) &&
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a rillsql-redis -p 7001 cluster info | grep -q cluster_state:ok"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
   # MongoDB 8 夹具（R12）：root 用户密码认证（SCRAM）。官方镜像支持 /docker-entrypoint-initdb.d
   # 的 .js seed（首次建库时以 root 执行），不需要像 mssql/redis 那样另起 init 容器。
   mongo:
