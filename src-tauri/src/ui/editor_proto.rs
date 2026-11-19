@@ -17,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     deferred, point, AnyElement, App, AppContext as _, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
     EntityInputHandler as _, Focusable as _, FontWeight, GlobalElementId, InspectorElementId, InteractiveElement as _, IntoElement,
-    LayoutId, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px, rgb,
+    LayoutId, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, TestSupportExt as _, Window, div, px, rgb,
 };
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Documentation, Hover, HoverContents,
@@ -340,8 +340,14 @@ pub struct SqlEditor {
     errors: Vec<Range<usize>>,
     /// 当前执行错误（行尾标记与错误弹层读取）；与 errors 同时清除。
     exec_errors: Vec<ExecError>,
-    /// 鼠标停在第几个行尾错误标记上（展开错误弹层）。
+    /// 展开着第几个行尾错误标记的错误弹层。
     lens_open: Option<usize>,
+    /// 鼠标正停在第几个标记 / 第几个弹层上。标记和弹层之间隔着出错语句，
+    /// 离开其中一个时延迟收起，移到另一个上就保持展开。
+    lens_chip_hover: Option<usize>,
+    lens_card_hover: Option<usize>,
+    /// 点击标记后固定展开（再点一次收起），不依赖鼠标停留。
+    lens_pinned: Option<usize>,
     /// 执行错误和静态 lint 的原文，悬停与诊断共用。
     facts: Rc<RefCell<HoverFacts>>,
     stale_lint: u32,
@@ -574,6 +580,9 @@ impl SqlEditor {
             errors: Vec::new(),
             exec_errors: Vec::new(),
             lens_open: None,
+            lens_chip_hover: None,
+            lens_card_hover: None,
+            lens_pinned: None,
             facts,
             stale_lint: 0,
             stale_completion: 0,
@@ -691,7 +700,7 @@ impl SqlEditor {
         let locale = self.locale.get();
         self.facts.borrow_mut().errors = errors.iter().map(|error| (error.range.clone(), exec_error_markdown(error, locale))).collect();
         self.exec_errors = errors;
-        self.lens_open = None;
+        self.reset_lens();
         self.sync_diagnostics(cx);
         cx.notify();
     }
@@ -702,7 +711,7 @@ impl SqlEditor {
         }
         self.errors.clear();
         self.exec_errors.clear();
-        self.lens_open = None;
+        self.reset_lens();
         self.facts.borrow_mut().errors.clear();
         self.error_gutter.clear(cx);
         self.error_marks.clear(cx);
@@ -1264,6 +1273,27 @@ fn inside_input(state: &EditorState, top: Pixels, height: Pixels) -> bool {
     top >= input.origin.y && top + height <= input.origin.y + input.size.height
 }
 
+/// 离开错误标记或弹层后，等这么久再收起（够鼠标从标记移到隔着语句的弹层上）。
+const LENS_CLOSE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 错误弹层的顶边：出错语句（从首个显示行顶边到最后一个显示行底边）下方在编辑器里放得下就放下方，
+/// 否则上方放得下放上方；都放不下时仍放在语句下方，越过编辑器下缘压在结果区上，而不压在语句上。
+/// 语句的下缘已经滚到可见区以下时贴着编辑器下缘之外。
+fn popover_top(statement: (Pixels, Pixels), height: Pixels, input: (Pixels, Pixels)) -> Pixels {
+    let gap = px(4.);
+    let (first, last) = statement;
+    let (input_top, input_bottom) = input;
+    let below = last + gap;
+    if below + height <= input_bottom {
+        return below;
+    }
+    let above = first - gap - height;
+    if above >= input_top {
+        return above;
+    }
+    below.min(input_bottom)
+}
+
 fn kit_icon_alert(color: gpui_kit::Hsla) -> AnyElement {
     crate::ui::kit::icon(gpui_kit::assets::IconName::TriangleAlert, 11., color).into_any_element()
 }
@@ -1331,14 +1361,54 @@ impl SqlEditor {
             .text_size(px(TypeScale::XS))
             .text_color(p.text_faint)
             .children(selection.map(|text| div().id("sql-editor-selection").text_color(p.text_muted).child(SharedString::from(text))))
-            .child(div().id("sql-editor-caret").child(SharedString::from(position)))
+            .child(div().id("sql-editor-caret").test_support().child(SharedString::from(position)))
             .into_any_element()
     }
 }
 
 impl SqlEditor {
-    /// 行尾错误标记：出错行右侧一个简短标记（错误码 + 原文首行）。鼠标移上去展开错误弹层：
-    /// 错误码、完整信息和复制按钮。弹层向下展开、贴着编辑器右缘，不压住出错的那一行。
+    fn reset_lens(&mut self) {
+        self.lens_open = None;
+        self.lens_chip_hover = None;
+        self.lens_card_hover = None;
+        self.lens_pinned = None;
+    }
+
+    /// 第几个错误弹层正在显示（测试读取）。
+    pub fn error_popover_open(&self) -> Option<usize> {
+        self.lens_open.or(self.lens_pinned)
+    }
+
+    /// 标记或弹层的悬停变化。移上去立即展开；移开后延迟一小段再看两者是否都已离开，
+    /// 鼠标从标记移到弹层（中间隔着出错语句）不会让弹层先消失。
+    fn lens_hover(&mut self, index: usize, card: bool, hovered: bool, cx: &mut Context<Self>) {
+        let slot = if card { &mut self.lens_card_hover } else { &mut self.lens_chip_hover };
+        if hovered {
+            *slot = Some(index);
+            if self.lens_open != Some(index) {
+                self.lens_open = Some(index);
+                cx.notify();
+            }
+            return;
+        }
+        if *slot == Some(index) {
+            *slot = None;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LENS_CLOSE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.lens_open == Some(index) && this.lens_chip_hover != Some(index) && this.lens_card_hover != Some(index) {
+                    this.lens_open = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 行尾错误标记：出错行右侧一个简短标记（错误码 + 原文首行）。鼠标移上去或点击展开错误弹层：
+    /// 错误码、完整信息和复制按钮。弹层放在出错语句整段的下方（放不下时放在上方，都放不下时放到
+    /// 编辑器下缘之外），贴着编辑器右缘，不压住出错语句的任何一行。
     fn error_lenses(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.exec_errors.is_empty() {
             return Vec::new();
@@ -1347,6 +1417,7 @@ impl SqlEditor {
         let locale = self.locale.get();
         let mut seen_lines: Vec<usize> = Vec::new();
         let text = self.state.read(cx).text().clone();
+        let shown = self.error_popover_open();
         let mut out = Vec::new();
         for (index, error) in self.exec_errors.iter().enumerate() {
             let line = text.offset_to_point(error.range.start.min(text.len())).row;
@@ -1354,13 +1425,13 @@ impl SqlEditor {
                 continue;
             }
             seen_lines.push(line);
-            let open = self.lens_open == Some(index);
             let label = match error.code.as_deref() {
                 Some(code) => format!("{code} · {}", error.short()),
                 None => error.short(),
             };
             let chip = div()
                 .id(("sql-error-lens-chip", index))
+                .test_support()
                 .flex()
                 .items_center()
                 .gap(px(4.))
@@ -1370,28 +1441,20 @@ impl SqlEditor {
                 .bg(p.danger_soft)
                 .text_color(p.danger)
                 .text_size(px(TypeScale::XS))
+                .cursor_pointer()
+                .occlude()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.lens_hover(index, false, *hovered, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.lens_pinned = if this.lens_pinned == Some(index) { None } else { Some(index) };
+                    if this.lens_pinned.is_none() && this.lens_open == Some(index) && this.lens_chip_hover != Some(index) {
+                        this.lens_open = None;
+                    }
+                    cx.notify();
+                }))
                 .child(kit_icon_alert(p.danger))
                 .child(SharedString::from(label));
-            let mut lens = div()
-                .id(("sql-error-lens", index))
-                .flex()
-                .flex_col()
-                .items_end()
-                .gap(px(4.))
-                .occlude()
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    let next = if *hovered { Some(index) } else { None };
-                    if this.lens_open != next && (*hovered || this.lens_open == Some(index)) {
-                        this.lens_open = next;
-                        cx.notify();
-                    }
-                }))
-                .child(chip);
-            if open {
-                lens = lens.child(self.error_popover(index, error, locale, cx));
-            }
             let offset = error.range.start;
-            let floating = Floating::new(("sql-error-lens-anchor", index), self.state.clone(), lens, move |state, size| {
+            let floating = Floating::new(("sql-error-lens-anchor", index), self.state.clone(), chip, move |state, size| {
                 let (top, line_height) = row_top(state, offset)?;
                 let geometry = state.prepaint_caret_geometry()?;
                 let input = geometry.input_bounds();
@@ -1404,6 +1467,27 @@ impl SqlEditor {
                 Some(point(x, chip_top))
             });
             out.push(deferred(floating).with_priority(1).into_any_element());
+            if shown == Some(index) {
+                let card = self.error_popover(index, error, locale, cx);
+                let statement = error.statement.clone().unwrap_or_else(|| error.range.clone());
+                let floating = Floating::new(("sql-error-popover-anchor", index), self.state.clone(), card, move |state, size| {
+                    let geometry = state.prepaint_caret_geometry()?;
+                    let input = geometry.input_bounds();
+                    // 错误标记本身已经滚出可见区时不弹（与标记同进同出）。
+                    let (top, line_height) = row_top(state, offset)?;
+                    let chip_top = top + (line_height - px(18.)).max(px(0.)) / 2.;
+                    if !inside_input(state, chip_top, px(18.)) {
+                        return None;
+                    }
+                    let (first, _) = row_top(state, statement.start).unwrap_or((top, line_height));
+                    let (last, last_height) = row_top(state, statement.end).unwrap_or((top, line_height));
+                    let span = (first, last + last_height);
+                    let y = popover_top(span, size.height, (input.origin.y, input.origin.y + input.size.height));
+                    let x = (input.origin.x + input.size.width - size.width - px(14.)).max(input.origin.x);
+                    Some(point(x, y))
+                });
+                out.push(deferred(floating).with_priority(2).into_any_element());
+            }
         }
         out
     }
@@ -1417,6 +1501,9 @@ impl SqlEditor {
         };
         div()
             .id(("sql-error-popover", index))
+            .test_support()
+            .occlude()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.lens_hover(index, true, *hovered, cx)))
             .flex()
             .flex_col()
             .gap(px(6.))
@@ -2561,6 +2648,105 @@ select 1;";
             assert_eq!(long.short().chars().count(), SHORT_CHARS + 1, "行尾标记截断并带省略号");
             editor.update(cx, |editor, cx| editor.clear_errors(cx));
             assert!(editor.read(cx).diagnostic_text(bad, cx).is_none(), "清除后诊断一起清掉");
+        })
+        .unwrap();
+    }
+
+    /// 错误弹层的位置：语句下方放得下放下方，否则上方，都放不下越过编辑器下缘；任何情况都不与语句重叠。
+    #[test]
+    fn the_error_popover_is_placed_clear_of_the_failing_statement() {
+        let input = (px(0.), px(400.));
+        // 下方放得下。
+        assert_eq!(popover_top((px(40.), px(100.)), px(120.), input), px(104.));
+        // 下方放不下、上方放得下。
+        assert_eq!(popover_top((px(200.), px(380.)), px(120.), input), px(76.));
+        // 上下都放不下：放在语句下方，越过编辑器下缘。
+        assert_eq!(popover_top((px(60.), px(330.)), px(120.), input), px(334.));
+        // 语句下缘已经滚出可见区：贴着编辑器下缘之外。
+        assert_eq!(popover_top((px(20.), px(900.)), px(120.), input), px(400.));
+        for (statement, height) in [((px(40.), px(100.)), px(120.)), ((px(200.), px(380.)), px(120.)), ((px(60.), px(330.)), px(120.)), ((px(20.), px(900.)), px(120.))] {
+            let top = popover_top(statement, height, input);
+            let visible = (statement.0.max(input.0), statement.1.min(input.1));
+            assert!(top + height <= visible.0 || top >= visible.1, "弹层压住了可见的语句行：{statement:?} -> {top:?}");
+        }
+    }
+
+    /// R9：悬停或点击行尾标记展开错误弹层；弹层不压住多行出错语句的任何一行；
+    /// 鼠标从标记移到弹层（中间隔着语句）时弹层不消失，离开两者后才收起；点击标记后固定展开。
+    #[gpui_kit::test]
+    fn the_error_popover_stays_clear_of_the_statement_and_survives_moving_onto_it(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let sql = "select 1;\ninsert into orders(id, name)\nvalues (1, 'a'),\n       (1, 'b');\nselect 2;";
+        let start = sql.find("insert").unwrap();
+        let end = sql.find("'b');").unwrap() + "'b');".len();
+        let error = ExecError { range: start..end, statement: Some(start..end), code: Some("23505".to_owned()), message: "duplicate key value violates unique constraint \"orders_pkey\"".to_owned() };
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+            });
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
+            window.render_frame(cx);
+            window.hover(("sql-error-lens-chip", 0usize), cx);
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), Some(0), "悬停标记展开弹层");
+            window.render_frame(cx);
+            let card = window.find(("sql-error-popover", 0usize)).bounds();
+            let state = editor.read(cx).state.read(cx);
+            let (first, _) = row_top(state, start).expect("语句首行几何");
+            let (last, height) = row_top(state, end).expect("语句末行几何");
+            let card_top = card.origin.y;
+            let card_bottom = card.origin.y + card.size.height;
+            assert!(card_top >= last + height || card_bottom <= first, "弹层压住了出错语句：card {card:?}, statement {first:?}..{:?}", last + height);
+        })
+        .unwrap();
+        // 从标记移到弹层：标记先离开，延迟到了之后弹层仍在（鼠标在弹层上）。
+        cx.update_window(window, |_, window, cx| {
+            window.hover(("sql-error-popover", 0usize), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(LENS_CLOSE_DELAY * 2);
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), Some(0), "鼠标在弹层上时不收起");
+            window.click(("sql-error-popover-copy", 0usize), cx);
+            assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()), Some(error.copy_text()), "复制按钮复制错误码与原文");
+            // 两者都离开：延迟后收起。
+            window.hover("sql-editor-caret", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(LENS_CLOSE_DELAY * 2);
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), None, "离开标记和弹层后收起");
+            assert!(window.try_find(("sql-error-popover", 0usize)).is_none());
+            // 点击标记固定展开，鼠标离开也不收起；再点一次收起。
+            window.click(("sql-error-lens-chip", 0usize), cx);
+            window.hover("sql-editor-caret", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(LENS_CLOSE_DELAY * 2);
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), Some(0), "点击后固定展开");
+            assert!(window.find(("sql-error-popover", 0usize)).visible());
+            window.click(("sql-error-lens-chip", 0usize), cx);
+            window.hover("sql-editor-caret", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(LENS_CLOSE_DELAY * 2);
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), None, "再点一次收起");
         })
         .unwrap();
     }

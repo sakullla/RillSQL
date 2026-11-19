@@ -151,7 +151,7 @@ impl Attached {
             Self::Sqlite(pool) => sqlite::exec::sqlite_run(pool, sent, limit, cancel, sink, index).await.map_err(Failure::from),
             Self::Mysql(conn) => mysql::exec::mysql_run(conn, transport, sent, limit, cancel, sink, index)
                 .await
-                .map_err(|message| Failure { at: mysql::exec::mysql_error_line(&message).map(ErrorAt::Line), message }),
+                .map_err(|message| Failure { at: mysql::exec::mysql_error_line(&message).map(ErrorAt::Line), message, code: None }),
             Self::Postgres(client) => postgres::exec::postgres_run(client, sent, sql, limit, cancel, sink, index).await,
             Self::Sqlserver(client) => sqlserver::exec::sqlserver_run(client, sent, limit, cancel, sink, index).await,
             Self::Redis(conn) => redis::console::redis_query_run(conn, sent, limit, cancel, sink, index).await.map_err(Failure::from),

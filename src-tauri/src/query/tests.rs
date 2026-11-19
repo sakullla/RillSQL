@@ -359,7 +359,7 @@ async fn a_statement_error_skips_every_later_statement() {
     let driver = Scripted {
         steps: Mutex::new(vec![
             Ok(ok_count()),
-            Err(StatementStop::Error { message: "no such table: missing".to_owned(), at: None }),
+            Err(StatementStop::Error { message: "no such table: missing".to_owned(), at: None, code: None }),
             Ok(ok_count()),
         ]),
         calls: Mutex::new(Vec::new()),
@@ -497,6 +497,7 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
             affected: None,
             elapsed_ms: None,
             error_at: None,
+            error_code: None,
         }],
         started_at: String::new(),
         elapsed_ms: 1,
@@ -1537,7 +1538,7 @@ async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
     let driver = Scripted {
         steps: Mutex::new(vec![
             Ok(ok_count()),
-            Err(StatementStop::Error { message: "syntax error".to_owned(), at: Some(exec::ErrorAt::Line(2)) }),
+            Err(StatementStop::Error { message: "syntax error".to_owned(), at: Some(exec::ErrorAt::Line(2)), code: Some("42601".to_owned()) }),
             Ok(ok_count()),
         ]),
         calls: Mutex::new(Vec::new()),
@@ -1550,6 +1551,8 @@ async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
     assert_eq!(report.statements[1].status, "error");
     assert!(report.statements[1].elapsed_ms.is_some(), "失败的语句也执行过");
     assert_eq!(report.statements[1].error_at, Some(exec::ErrorAt::Line(2)));
+    assert_eq!(report.statements[1].error_code.as_deref(), Some("42601"), "驱动给出的错误码随语句报告带出");
+    assert_eq!(report.statements[0].error_code, None);
     assert_eq!(report.statements[2].status, "skipped");
     assert_eq!(report.statements[2].elapsed_ms, None, "没有执行的语句没有耗时");
 
@@ -1679,6 +1682,7 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
         affected: None,
         elapsed_ms: Some(3),
         error_at: at,
+        error_code: None,
     };
     let run = RunDto {
         id: "run".to_owned(),
@@ -1728,6 +1732,7 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
         affected: None,
         elapsed_ms: Some(2),
         error_at: at,
+        error_code: None,
     };
     let run = |status: &str, statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -1854,7 +1859,7 @@ impl StatementDriver for Capping {
         let capped = exec::cap_result_sql_detail(self.engine, sql, limit);
         // 自动追加的 LIMIT 接在残缺语句后面时，服务端报的就是这条错误。
         let outcome = if sql.trim_end().ends_with("WHERE") {
-            Err(StatementStop::Error { message: "near \"LIMIT\": syntax error".to_owned(), at: None })
+            Err(StatementStop::Error { message: "near \"LIMIT\": syntax error".to_owned(), at: None, code: None })
         } else {
             Ok(ok_count())
         };
@@ -1976,6 +1981,7 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
         affected: None,
         elapsed_ms: Some(2),
         error_at: at,
+        error_code: None,
     };
     let run = |statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -2069,6 +2075,7 @@ fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
         affected: None,
         elapsed_ms: Some(1),
         error_at: None,
+        error_code: None,
     };
     let run = |sql: &str, sent: &str, added: &str| RunDto {
         id: sql.to_owned(),
@@ -2148,6 +2155,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         affected: None,
         elapsed_ms: Some(1),
         error_at: None,
+        error_code: None,
         range: None,
         error_mark: None,
     }]);
@@ -2180,6 +2188,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         affected: None,
         elapsed_ms: Some(1),
         error_at: None,
+        error_code: None,
         range: None,
         error_mark: None,
     }]);

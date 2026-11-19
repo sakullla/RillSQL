@@ -37,8 +37,16 @@ fn tds_error_at(err: &tiberius::error::Error) -> Option<ErrorAt> {
     }
 }
 
+/// SQL Server 服务器错误号（如 2627 主键冲突）；不是服务器报错时没有错误号。
+fn tds_error_code(err: &tiberius::error::Error) -> Option<String> {
+    match err {
+        tiberius::error::Error::Server(token) => Some(token.code().to_string()),
+        _ => None,
+    }
+}
+
 fn tds_failure(err: &tiberius::error::Error) -> Failure {
-    Failure { message: crate::error_text::chain(err), at: tds_error_at(err) }
+    Failure { message: crate::error_text::chain(err), at: tds_error_at(err), code: tds_error_code(err) }
 }
 
 pub(in crate::adapters) async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>) -> Result<String, String> {

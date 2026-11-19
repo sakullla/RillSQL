@@ -61,6 +61,8 @@ pub struct StatementView {
     pub elapsed_ms: Option<u64>,
     /// 驱动报出的错误位置，相对这一条语句。
     pub error_at: Option<ErrorAt>,
+    /// 驱动给出的结构化错误码（如 PostgreSQL 的 SQLSTATE）；没有时为 None，界面再从错误文本里识别。
+    pub error_code: Option<String>,
     /// 这条语句在发起执行时草稿里的字节范围；对不上草稿时为 None，不猜位置。
     pub range: Option<(usize, usize)>,
     /// 失败语句在草稿里的错误标记：有驱动位置时给偏移或行，没有时整条语句标错。
@@ -673,6 +675,7 @@ impl Desk {
                 affected: None,
                 elapsed_ms: None,
                 error_at: None,
+                error_code: None,
                 range: None,
                 error_mark: None,
             }];
@@ -2017,6 +2020,7 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         affected: statement.affected,
         elapsed_ms: statement.elapsed_ms,
         error_at: statement.error_at,
+        error_code: statement.error_code,
         range: None,
         error_mark: None,
     }
@@ -2469,6 +2473,7 @@ mod tests {
                 affected: None,
                 elapsed_ms: None,
                 error_at: None,
+                error_code: None,
             }],
             started_at: String::new(),
             elapsed_ms: 0,
@@ -2585,6 +2590,7 @@ mod tests {
             affected: None,
             elapsed_ms: None,
             error_at: None,
+            error_code: None,
         });
         assert!(view.truncated, "截断标记必须跟到界面，才能提供加载更多");
     }
@@ -2956,6 +2962,7 @@ mod tests {
             affected: None,
             elapsed_ms: Some(1),
             error_at: None,
+            error_code: None,
             range: None,
             error_mark: None,
         }

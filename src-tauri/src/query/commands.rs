@@ -69,6 +69,8 @@ pub struct StatementDto {
     pub elapsed_ms: Option<u64>,
     /// 失败语句的驱动错误位置，相对这一条语句；驱动没给位置时为 None。
     pub error_at: Option<exec::ErrorAt>,
+    /// 失败语句的驱动错误码（如 PostgreSQL 的 SQLSTATE）；驱动没给时为 None。
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +174,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             affected: None,
             elapsed_ms: None,
             error_at: None,
+            error_code: None,
         })
         .collect::<Vec<_>>();
     let snapshot = RunDto {
@@ -322,6 +325,7 @@ fn statement_dto(statement: StatementReport) -> StatementDto {
         affected: statement.affected,
         elapsed_ms: statement.elapsed_ms,
         error_at: statement.error_at,
+        error_code: statement.error_code,
     }
 }
 
@@ -532,7 +536,7 @@ mod resource_tests {
                 rewrite: None,
                 columns: vec!["value".to_owned()], column_types: vec!["text".to_owned()],
                 rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
-                elapsed_ms: Some(1), error_at: None,
+                elapsed_ms: Some(1), error_at: None, error_code: None,
             }],
             started_at: String::new(), elapsed_ms: 0,
         }

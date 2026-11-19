@@ -32,7 +32,8 @@ pub enum ErrorAt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementStop {
     /// at 只在驱动确实给出位置时才有；没有位置（如 SQLite）就是 None，不推测。
-    Error { message: String, at: Option<ErrorAt> },
+    /// code 是驱动给出的结构化错误码（PostgreSQL 的 SQLSTATE 等）；驱动不给时为 None，界面再从文本里找。
+    Error { message: String, at: Option<ErrorAt>, code: Option<String> },
     Unknown { message: String },
     Cancelled { message: String },
 }
@@ -91,6 +92,8 @@ pub struct StatementReport {
     pub elapsed_ms: Option<u64>,
     /// 失败语句的驱动错误位置；只有 status 为 error 时可能有值。
     pub error_at: Option<ErrorAt>,
+    /// 失败语句的驱动错误码（结构化取得的）；只有 status 为 error 时可能有值。
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +133,7 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
         return StatementStop::Error {
             message: format!("执行超时，语句已停止。{message}"),
             at: None,
+            code: None,
         };
     }
     if is_disconnect(&message) && is_write(sql) {
@@ -137,7 +141,7 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
             message: format!("连接中断，无法确认写入是否完成。不会自动重放。{message}"),
         };
     }
-    StatementStop::Error { message, at: None }
+    StatementStop::Error { message, at: None, code: None }
 }
 
 /// 执行前的改写只在一处插入或替换文本（行数上限）。把改写后文本里的字符偏移映射回原文：
@@ -169,11 +173,13 @@ pub fn map_rewritten_char(original: &str, rewritten: &str, offset: usize) -> usi
 pub struct Failure {
     pub message: String,
     pub at: Option<ErrorAt>,
+    /// 驱动给出的结构化错误码；只在驱动错误对象里确实有时才填，不从文本猜。
+    pub code: Option<String>,
 }
 
 impl From<String> for Failure {
     fn from(message: String) -> Self {
-        Self { message, at: None }
+        Self { message, at: None, code: None }
     }
 }
 
@@ -309,6 +315,7 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     affected: value.affected,
                     elapsed_ms: Some(elapsed_ms(spent)),
                     error_at: None,
+                    error_code: None,
                 });
                 if cancel_flag.load(Ordering::SeqCst) {
                     if cancel.phase == "none" {
@@ -325,10 +332,10 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                 }
             }
             Err(stop) => {
-                let (statement_status, message, error_at) = match stop {
-                    StatementStop::Error { message, at } => ("error", message, at),
-                    StatementStop::Unknown { message } => ("unknown", message, None),
-                    StatementStop::Cancelled { message } => ("cancelled", message, None),
+                let (statement_status, message, error_at, error_code) = match stop {
+                    StatementStop::Error { message, at, code } => ("error", message, at, code),
+                    StatementStop::Unknown { message } => ("unknown", message, None, None),
+                    StatementStop::Cancelled { message } => ("cancelled", message, None, None),
                 };
                 if statement_status == "cancelled" {
                     cancel::on_statement_end(&mut cancel, "cancelled");
@@ -352,6 +359,7 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     // 被取消的语句只标“已取消”，不报一个不完整的耗时。
                     elapsed_ms: if statement_status == "cancelled" { None } else { Some(elapsed_ms(spent)) },
                     error_at,
+                    error_code,
                 });
                 for rest in &parts[index + 1..] {
                     statements.push(skipped(rest.text.clone(), "未执行"));
@@ -391,6 +399,7 @@ fn skipped(sql: String, message: &str) -> StatementReport {
         affected: None,
         elapsed_ms: None,
         error_at: None,
+        error_code: None,
     }
 }
 
@@ -646,7 +655,7 @@ impl StatementDriver for LiveDriver {
             }
         }
         let outcome = result.map_err(|failure| match classify_failure(sql, failure.message, cancel.load(Ordering::SeqCst)) {
-            StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at },
+            StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at, code: failure.code },
             other => other,
         });
         DriverReport { sent: capped, outcome }

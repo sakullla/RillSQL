@@ -6143,6 +6143,7 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
         affected: None,
         elapsed_ms: Some(7),
         error_at: None,
+        error_code: None,
         range: None,
         error_mark: None,
     };
@@ -6289,6 +6290,7 @@ fn query_workspace_scenario(cx: &mut gpui_kit::TestAppContext) -> [bool; 6] {
         affected: None,
         elapsed_ms: Some(3),
         error_at: None,
+        error_code: None,
         range: None,
         error_mark: None,
     };

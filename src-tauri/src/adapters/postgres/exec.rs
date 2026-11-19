@@ -29,7 +29,13 @@ fn pg_failure(err: &tokio_postgres::Error, sent: &str, statement: &str) -> Failu
         Some(ErrorAt::Char(offset)) => Some(ErrorAt::Char(map_rewritten_char(statement, sent, offset))),
         other => other,
     };
-    Failure { message: crate::error_text::chain(err), at }
+    Failure { message: crate::error_text::chain(err), at, code: pg_error_code(err) }
+}
+
+/// 服务器报错的 SQLSTATE（如 23505 唯一约束冲突）。tokio-postgres 的错误文本里不含它，
+/// 只能从 DbError 取；连接层错误没有 SQLSTATE。
+pub(crate) fn pg_error_code(err: &tokio_postgres::Error) -> Option<String> {
+    err.code().map(|state| state.code().to_owned())
 }
 
 pub(in crate::adapters) async fn run_postgres_statements(client: &tokio_postgres::Client, statements: &[String]) -> Result<(), String> {

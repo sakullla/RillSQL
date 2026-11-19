@@ -273,7 +273,8 @@ pub fn exec_errors(draft: &str, results: &[desk::StatementView]) -> Vec<crate::u
         .filter_map(|view| {
             let (range, message) = error_marks(draft, std::slice::from_ref(view)).into_iter().next()?;
             let statement = view.range.map(|(start, end)| start..end).filter(|range| range.start < range.end && range.end <= draft.len());
-            let code = crate::adapters::query::error_code(&view.message);
+            // 驱动结构化给出的错误码优先（PostgreSQL 的 SQLSTATE 只在这里有）；没有再从文本里识别。
+            let code = view.error_code.clone().or_else(|| crate::adapters::query::error_code(&view.message));
             Some(crate::ui::ExecError { range, statement, code, message })
         })
         .collect()
@@ -1913,6 +1914,14 @@ impl QueryPane {
         true
     }
 
+    /// 格式化失败之后编辑器里的文本改过：记下的位置不再对应原字符，收起“定位”按钮。
+    fn drop_stale_format_failure(&mut self, cx: &App) {
+        let stale = self.format_failure.as_ref().is_some_and(|(id, _, draft)| self.editors.get(id).is_some_and(|editor| editor.read(cx).value(cx) != *draft));
+        if stale {
+            self.format_failure = None;
+        }
+    }
+
     /// 最近一次格式化失败的位置（测试读取）。
     pub fn format_failure_at(&self) -> Option<usize> {
         self.format_failure.as_ref().map(|(_, at, _)| *at)
@@ -2812,6 +2821,7 @@ impl Render for QueryPane {
         self.apply_pending(window, cx);
         self.sync_error_marks(cx);
         self.refresh_folds(cx);
+        self.drop_stale_format_failure(cx);
         self.sync_grid(cx);
         self.take_focus(window, cx);
         self.ensure_target_search(window, cx);
@@ -4054,6 +4064,7 @@ mod tests {
             affected: None,
             elapsed_ms: None,
             error_at: None,
+            error_code: None,
             range: None,
             error_mark: None,
         }
@@ -4470,6 +4481,44 @@ mod tests {
         .unwrap();
     }
 
+    /// R18：格式化失败时编辑器内容不变，说明带行列；“定位”按钮与 jump-format-error 命令把光标放到失败处；
+    /// 草稿改过之后不再跳，按钮也收起。
+    #[gpui_kit::test]
+    fn a_format_failure_reports_line_and_column_and_jumps_there(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "SELECT 1;\nSELECT '未闭合";
+        let snap = bound("q", draft);
+        let at = draft.find('\'').unwrap();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("format", cx));
+            assert_eq!(pane.read(cx).format_failure_at(), Some(at));
+            let note = pane.read(cx).note();
+            assert!(note.contains('2') && note.contains('8'), "说明里带第 2 行第 8 列：{note}");
+            assert_eq!(pane.read(cx).desk.draft(), draft, "草稿不变");
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editor_text(cx), draft, "编辑器内容不变");
+            assert!(window.find("query-format-jump").visible(), "失败说明旁边有定位按钮");
+            window.click("query-format-jump", cx);
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).selected_range(cx), at..at + 1, "定位到未闭合的引号");
+            // 草稿改过之后：命令不跳到别的字符上，按钮收起。
+            editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
+            editor.update(cx, |editor, cx| editor.insert_at_selection("-- x\n", window, cx));
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("jump-format-error", cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).selected_range(cx), 5..5, "草稿变了不跳");
+            assert!(window.try_find("query-format-jump").is_none(), "草稿变了不再给定位按钮");
+            assert_eq!(pane.read(cx).format_failure_at(), None);
+        })
+        .unwrap();
+    }
+
     #[gpui_kit::test]
     fn draft_installs_fold_candidates(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -4794,6 +4843,7 @@ mod tests {
                 affected: None,
                 elapsed_ms: None,
                 error_at: None,
+                error_code: None,
             }],
             started_at: String::new(),
             elapsed_ms: 0,
@@ -4919,6 +4969,16 @@ mod tests {
         assert_eq!(errors[0].statement, Some(second..end));
         assert_eq!(errors[0].code.as_deref(), Some("1146"));
         assert!(errors[0].message.contains("doesn't exist"));
+        // PostgreSQL 的错误文本里没有 SQLSTATE：用驱动结构化给出的错误码，文本里识别不到也有码。
+        let pg = desk::StatementView {
+            message: "duplicate key value violates unique constraint \"orders_pkey\"\nDETAIL: Key (id)=(1) already exists.".to_owned(),
+            error_code: Some("23505".to_owned()),
+            ..failed(ErrorMark::Statement)
+        };
+        assert_eq!(crate::adapters::query::error_code(&pg.message), None, "文本里本来没有错误码");
+        let errors = exec_errors(draft, &[pg]);
+        assert_eq!(errors[0].code.as_deref(), Some("23505"));
+        assert_eq!(errors[0].statement, Some(second..end));
         // 成功的语句没有标记。
         assert!(error_ranges(draft, &[sheet("select 1", false, "ok")]).is_empty());
         // “at end of input”：偏移在语句末尾（全文末尾或换行上）不能得到空范围，改标前一个非空白字符。
@@ -5243,6 +5303,7 @@ mod tests {
             affected,
             elapsed_ms: Some(5),
             error_at: None,
+            error_code: None,
             range: None,
             error_mark: None,
         }
@@ -5827,6 +5888,40 @@ mod tests {
             window.press("secondary-/", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;", "非编辑器焦点下不该改写文本");
+        })
+        .unwrap();
+    }
+
+    /// R16：⌘⇧/（Ctrl+Shift+/）走生产键位与 QueryPane::command("toggle-block-comment") 的挂起路径：
+    /// 无选区时把光标所在语句包进块注释，再按一次去掉；一次撤销回到切换前；不执行查询。
+    #[gpui_kit::test]
+    fn the_block_comment_shortcut_wraps_the_caret_statement_and_undoes_in_one_step(cx: &mut TestAppContext) {
+        let (window, view) = open_shell(cx);
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 1;\nSELECT a,\n  b FROM t;".to_owned());
+            window.render_frame(cx);
+            assert!(view.read(cx).query_editor_focused(window, cx), "查询编辑器没有拿到焦点");
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;\nSELECT a,\n  b FROM t;");
+            window.press("secondary-shift-/", cx);
+            window.render_frame(cx);
+            let text = view.read(cx).query_editor_text(cx);
+            assert!(text.contains("/* ") && text.contains(" */"), "快捷键没有切换块注释：{text}");
+            assert_eq!(view.read(cx).query_draft(cx), text, "草稿跟着编辑器同步");
+            assert_eq!(view.read(cx).query_runs(cx), 0, "块注释不是执行");
+            assert_eq!(view.read(cx).query_pending_comment(cx), None, "请求已经消耗");
+            // 一次撤销回到切换前：整段只算一次编辑。
+            window.press("secondary-z", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;\nSELECT a,\n  b FROM t;");
+            // 再按一次加上、第三次去掉：恢复原样。
+            window.press("secondary-shift-/", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), text);
+            window.press("secondary-shift-/", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;\nSELECT a,\n  b FROM t;", "再按一次去掉块注释");
         })
         .unwrap();
     }

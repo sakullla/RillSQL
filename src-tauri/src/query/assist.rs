@@ -298,11 +298,11 @@ pub fn format_document(sql: &str, from: usize, to: usize) -> TextResult {
         return formatted;
     }
     let next = format!("{}{}{}", sql.get(..from).unwrap_or(""), formatted.sql, sql.get(to..).unwrap_or(""));
-    if line_comment_broken(sql, &next) {
-        return TextResult::refused(sql, "query.format.commentBreak");
+    if let Some(at) = line_comment_broken(sql, &next) {
+        return TextResult::refused(sql, "query.format.commentBreak").at(Some(at));
     }
-    if edge_whitespace_removed(sql, from, to, &formatted.sql) {
-        return TextResult::refused(sql, "query.format.edgeGlue");
+    if let Some(at) = edge_whitespace_removed(sql, from, to, &formatted.sql) {
+        return TextResult::refused(sql, "query.format.edgeGlue").at(Some(at));
     }
     TextResult::done(next)
 }
@@ -1310,8 +1310,11 @@ fn token_mismatch(source: &[Tok], formatted: &str) -> Option<usize> {
     None
 }
 
-fn line_comment_broken(source: &str, formatted: &str) -> bool {
+/// 格式化后行注释被换行截断时，返回原文里被截断处的字节偏移（界面据此给出行列并跳转）。
+fn line_comment_broken(source: &str, formatted: &str) -> Option<usize> {
     let marked = line_comment_marks(source);
+    let text = source;
+    let byte_at = |index: usize| text.char_indices().nth(index).map_or(text.len(), |(at, _)| at);
     let source: Vec<char> = source.chars().collect();
     let formatted: Vec<char> = formatted.chars().collect();
     let mut i = 0usize;
@@ -1321,7 +1324,7 @@ fn line_comment_broken(source: &str, formatted: &str) -> bool {
             let source_next = skip_blank(&source, i);
             let formatted_next = skip_blank(&formatted, j);
             if formatted_next.1 && comment_continues(&marked, source_next.0) {
-                return true;
+                return Some(byte_at(source_next.0));
             }
             i = source_next.0;
             j = formatted_next.0;
@@ -1334,7 +1337,7 @@ fn line_comment_broken(source: &str, formatted: &str) -> bool {
         if formatted[j].is_whitespace() {
             let formatted_next = skip_blank(&formatted, j);
             if formatted_next.1 && comment_continues(&marked, i) {
-                return true;
+                return Some(byte_at(i));
             }
             j = formatted_next.0;
             continue;
@@ -1342,7 +1345,7 @@ fn line_comment_broken(source: &str, formatted: &str) -> bool {
         i += 1;
         j += 1;
     }
-    false
+    None
 }
 
 fn comment_continues(marked: &[bool], index: usize) -> bool {
@@ -1433,27 +1436,29 @@ fn line_comment_marks(sql: &str) -> Vec<bool> {
     marked
 }
 
-fn edge_whitespace_removed(sql: &str, from: usize, to: usize, formatted: &str) -> bool {
+/// 选区格式化去掉了边缘空白、会把选区内外的记号粘在一起时，返回粘连处（选区起点或终点）。
+fn edge_whitespace_removed(sql: &str, from: usize, to: usize, formatted: &str) -> Option<usize> {
     let prefix = sql.get(..from).unwrap_or("");
     let selected = sql.get(from..to).unwrap_or("");
     let suffix = sql.get(to..).unwrap_or("");
     if selected.is_empty() || (prefix.is_empty() && suffix.is_empty()) {
-        return false;
+        return None;
     }
     let selected_chars: Vec<char> = selected.chars().collect();
     let formatted_chars: Vec<char> = formatted.chars().collect();
     if selected_chars.first().is_some_and(|ch| ch.is_whitespace()) && formatted_chars.first().is_none_or(|ch| !ch.is_whitespace()) && outside_touches(prefix, formatted, true) {
-        return true;
+        return Some(from);
     }
     if selected_chars.last().is_some_and(|ch| ch.is_whitespace()) && formatted_chars.last().is_none_or(|ch| !ch.is_whitespace()) && outside_touches(suffix, formatted, false) {
-        return true;
+        return Some(to);
     }
     if selected.chars().all(char::is_whitespace) && formatted.is_empty() {
         let left = prefix.chars().last();
         let right = suffix.chars().next();
-        return left.is_some_and(|ch| !ch.is_whitespace()) && right.is_some_and(|ch| !ch.is_whitespace());
+        let glued = left.is_some_and(|ch| !ch.is_whitespace()) && right.is_some_and(|ch| !ch.is_whitespace());
+        return glued.then_some(from);
     }
-    false
+    None
 }
 
 fn outside_touches(outside: &str, inside: &str, outside_is_before: bool) -> bool {
@@ -1665,6 +1670,27 @@ mod tests {
         assert_eq!(result.sql, doc);
         assert_eq!(result.position, Some(from + 7));
         assert_eq!(line_col("中文\n表名", "中文\n表".len()), (2, 2), "列按字符计");
+
+        // 选区格式化的安全检查拒绝时也带位置：会断开行注释时指向被断开的注释处。
+        let doc = "SELECT 1 -- a, b c\nFROM t";
+        let from = doc.find(", b").unwrap();
+        let to = doc.find("\nFROM").unwrap();
+        let result = format_document(doc, from, to);
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(result.sql, doc, "编辑器内容不变");
+        assert_eq!(result.reason_key, Some("query.format.commentBreak"));
+        let at = result.position.expect("注释断开处带位置");
+        assert!((from..=to).contains(&at), "位置落在选区内的注释上：{at}");
+        assert_eq!(line_col(doc, at).0, 1);
+        // 去掉选区边缘空白会让两侧粘连时指向选区边缘。
+        let doc = "SELECT a FROM t";
+        let from = doc.find(" FROM").unwrap();
+        let result = format_document(doc, from, doc.len());
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(result.sql, doc);
+        assert_eq!(result.reason_key, Some("query.format.edgeGlue"));
+        assert_eq!(result.position, Some(from));
+        assert_eq!(line_col(doc, from), (1, 9));
     }
 
     #[test]
