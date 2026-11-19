@@ -1,15 +1,15 @@
 //! SQLite 的 DDL 方言：只能改 main、按官方 12 步重建表、会话级外键开关，以及 PRAGMA/ATTACH/维护等库级动作。
 
-use crate::adapters::ddl::{AdminSections, DdlDialect};
+use crate::adapters::ddl::{AdminSections, DdlDialect, TableOptionSpec};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
-use crate::ddl::model::{Action, Column, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, Step};
+use crate::ddl::model::{Action, Column, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, Step, TableOptions};
 use crate::ddl::plan::{
-    changed_names, column_referenced, column_sql, create_statement, drafts_change_shape, finish, identity_drafts, index_touches_change, normalize_default,
+    changed_names, column_referenced, column_sql, create_statement, drafts_change_shape, finish, identity_drafts, index_touches_change, default_changed,
     preservable_indexes, push_fk_status, recreate_index_sql, renamed_any, same_type, Change,
 };
-use crate::ddl::sql::{mentions, non_null_default, valid_name};
+use crate::ddl::sql::{mentions, valid_name};
 
 use super::ddl_read;
 
@@ -74,15 +74,19 @@ impl DdlDialect for SqliteDdl {
         }
     }
 
-    fn create_table_suffix(&self, without_rowid: bool, strict: bool) -> String {
+    fn create_table_suffix(&self, options: &TableOptions) -> String {
         let mut suffix = String::new();
-        if without_rowid {
+        if options.without_rowid {
             suffix.push_str(" WITHOUT ROWID");
         }
-        if strict {
-            suffix.push_str(if without_rowid { ", STRICT" } else { " STRICT" });
+        if options.strict {
+            suffix.push_str(if options.without_rowid { ", STRICT" } else { " STRICT" });
         }
         suffix
+    }
+
+    fn table_option_spec(&self) -> TableOptionSpec {
+        TableOptionSpec { without_rowid: Some("WITHOUT ROWID"), strict: Some("STRICT"), ..TableOptionSpec::default() }
     }
 
     fn alter_plan(&self, snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
@@ -474,7 +478,8 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
     let temp = format!("_rill_new_{}", snapshot.name);
     let qualified_temp = quote_ident(Engine::Sqlite, &temp);
     let qualified_old = quote_ident(Engine::Sqlite, &snapshot.name);
-    let create = match create_statement(Engine::Sqlite, &snapshot.database, &snapshot.schema, &temp, drafts, foreign_keys, snapshot.autoincrement, snapshot.without_rowid, snapshot.strict) {
+    let options = TableOptions { without_rowid: snapshot.without_rowid, strict: snapshot.strict, ..TableOptions::default() };
+    let create = match create_statement(Engine::Sqlite, &snapshot.database, &snapshot.schema, &temp, drafts, foreign_keys, snapshot.autoincrement, &options) {
         Ok(sql) => sql,
         Err(message) => return finish(snapshot.engine, true, target, vec![message], risks, Vec::new()),
     };
@@ -623,7 +628,7 @@ fn sqlite_direct_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) ->
                 if draft.primary {
                     return SqlitePath::Rebuild;
                 }
-                if !draft.nullable && !non_null_default(&draft.default_sql) {
+                if !draft.nullable && !draft.default.has_value() {
                     return SqlitePath::Rebuild;
                 }
                 let qualified = match qualified(&snapshot.database, table) {
@@ -656,7 +661,7 @@ fn sqlite_direct_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) ->
                 let rename = draft.name.trim() != original.name;
                 let type_change = !same_type(&draft.type_name, &original.type_name);
                 let null_change = draft.nullable != original.nullable;
-                let default_change = normalize_default(&draft.default_sql) != original.default_sql.as_deref().map(str::trim);
+                let default_change = default_changed(Engine::Sqlite, original, draft);
                 if type_change || default_change {
                     return SqlitePath::Rebuild;
                 }

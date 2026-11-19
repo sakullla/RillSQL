@@ -1,12 +1,13 @@
 //! SQL Server 的 DDL 方言：按模式限定、IDENTITY、sp_rename 改名、具名默认值约束、先删后建的视图替换与扩展属性注释。
 
-use crate::adapters::ddl::{Comments, DdlDialect};
+use crate::adapters::ddl::{Comments, DdlDialect, TableOptionSpec};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{Column, ColumnDraft, Plan, Request, Risk, Snapshot, Step};
-use crate::ddl::plan::{normalize_default, same_type, statement_alter_plan, Change};
+use crate::ddl::plan::{default_changed, same_type, statement_alter_plan, Change};
+use crate::ddl::sql::default_sql;
 
 use super::ddl_read;
 
@@ -41,7 +42,7 @@ impl DdlDialect for SqlserverDdl {
     /// T-SQL 没有 ADD COLUMN 关键字，只有 ADD。
     fn alter_plan(&self, snapshot: &Snapshot, table: &str, _drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
         statement_alter_plan(snapshot, table, changes, target, risks, "ADD", &|qualified, original, draft| {
-            Ok(modify_column(&snapshot.schema, table, qualified, original, draft))
+            modify_column(&snapshot.schema, table, qualified, original, draft)
         })
     }
 
@@ -95,6 +96,10 @@ impl DdlDialect for SqlserverDdl {
     /// 外键没记目标模式时，目标表按本表所在模式限定。
     fn implied_reference_schema<'a>(&self, table_schema: &'a str) -> &'a str {
         table_schema
+    }
+
+    fn table_option_spec(&self) -> TableOptionSpec {
+        TableOptionSpec { comment: true, column_comments: true, ..TableOptionSpec::default() }
     }
 
     fn comment_statements(&self, snapshot: &Snapshot, _qualified: &str) -> Vec<String> {
@@ -155,7 +160,7 @@ impl DdlDialect for SqlserverDdl {
 
 /// T-SQL 改一个字段：重命名走 sp_rename；类型/可空性走 ALTER COLUMN（不含内联 DEFAULT）；
 /// 默认值是具名约束，走 DROP CONSTRAINT / ADD CONSTRAINT ... DEFAULT ... FOR。
-fn modify_column(schema: &str, table: &str, qualified: &str, original: &Column, draft: &ColumnDraft) -> Vec<Step> {
+fn modify_column(schema: &str, table: &str, qualified: &str, original: &Column, draft: &ColumnDraft) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     if draft.name.trim() != original.name {
         let rename_escaped = |value: &str| value.trim().replace('\'', "''");
@@ -182,11 +187,9 @@ fn modify_column(schema: &str, table: &str, qualified: &str, original: &Column, 
             label: format!("修改字段 {}", draft.name.trim()),
         });
     }
-    if normalize_default(&draft.default_sql) != original.default_sql.as_deref().map(str::trim) {
-        if draft.default_sql.trim().is_empty() {
-            let sql = format!("{};", sqlserver_drop_default_sql(qualified, draft.name.trim(), original.default_constraint.as_deref().unwrap_or("")));
-            steps.push(Step { sql, label: format!("删除默认值 {}", draft.name.trim()) });
-        } else {
+    if default_changed(Engine::Sqlserver, original, draft) {
+        let wanted = default_sql(Engine::Sqlserver, draft)?;
+        if let Some(expression) = wanted {
             // 既有默认值要先摘除：直接 ADD 同名约束报 2714、不同名报 1781，脚本必失败。
             // 与对比侧 tsql_default_change 同口径（有名走 DROP CONSTRAINT，无名按 sys.default_constraints 动态查找）。
             if original.default_sql.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
@@ -194,11 +197,14 @@ fn modify_column(schema: &str, table: &str, qualified: &str, original: &Column, 
                 steps.push(Step { sql: drop, label: format!("删除原默认值 {}", original.name) });
             }
             let table_name = sqlserver_bare_table_name(qualified);
-            let sql = format!("{};", sqlserver_add_default_sql(qualified, &table_name, draft.name.trim(), draft.default_sql.trim()));
+            let sql = format!("{};", sqlserver_add_default_sql(qualified, &table_name, draft.name.trim(), &expression));
             steps.push(Step { sql, label: format!("修改默认值 {}", draft.name.trim()) });
+        } else {
+            let sql = format!("{};", sqlserver_drop_default_sql(qualified, draft.name.trim(), original.default_constraint.as_deref().unwrap_or("")));
+            steps.push(Step { sql, label: format!("删除默认值 {}", draft.name.trim()) });
         }
     }
-    steps
+    Ok(steps)
 }
 
 /// SQL Server 的默认值是具名约束。删除时优先用读到的 sys.default_constraints 约束名；

@@ -208,6 +208,102 @@ impl Snapshot {
     }
 }
 
+/// 列默认值的四种状态（ADR-7）。无默认值不写 DEFAULT；NULL 写 `DEFAULT NULL`；字面量由方言按列类型
+/// 加引号与转义；表达式只接受白名单函数并原样写出。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "value", rename_all = "camelCase")]
+pub enum DefaultSpec {
+    #[default]
+    None,
+    Null,
+    Literal(String),
+    Expression(String),
+}
+
+/// 默认值模式（界面下拉用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultMode {
+    None,
+    Null,
+    Literal,
+    Expression,
+}
+
+impl DefaultMode {
+    pub const ALL: [DefaultMode; 4] = [DefaultMode::None, DefaultMode::Null, DefaultMode::Literal, DefaultMode::Expression];
+}
+
+impl DefaultSpec {
+    pub fn mode(&self) -> DefaultMode {
+        match self {
+            DefaultSpec::None => DefaultMode::None,
+            DefaultSpec::Null => DefaultMode::Null,
+            DefaultSpec::Literal(_) => DefaultMode::Literal,
+            DefaultSpec::Expression(_) => DefaultMode::Expression,
+        }
+    }
+
+    /// 字面量或表达式的原文；其余为空串。
+    pub fn text(&self) -> &str {
+        match self {
+            DefaultSpec::Literal(text) | DefaultSpec::Expression(text) => text,
+            _ => "",
+        }
+    }
+
+    /// 有非 NULL 的默认值（字面量或非空表达式）。
+    pub fn has_value(&self) -> bool {
+        match self {
+            DefaultSpec::Literal(_) => true,
+            DefaultSpec::Expression(text) => !text.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// 切换模式时保留已输入的值（字面量 ↔ 表达式）。
+    pub fn with_mode(&self, mode: DefaultMode) -> Self {
+        let text = self.text().to_owned();
+        match mode {
+            DefaultMode::None => DefaultSpec::None,
+            DefaultMode::Null => DefaultSpec::Null,
+            DefaultMode::Literal => DefaultSpec::Literal(text),
+            DefaultMode::Expression => DefaultSpec::Expression(text),
+        }
+    }
+
+    /// 改写值，模式不变；没有值的模式不受影响。返回是否改变。
+    pub fn set_text(&mut self, value: String) -> bool {
+        match self {
+            DefaultSpec::Literal(text) | DefaultSpec::Expression(text) if *text != value => {
+                *text = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 展示用（检索、变更说明）：无默认为空，NULL 为 `NULL`，其余为原文。
+    pub fn label(&self) -> String {
+        match self {
+            DefaultSpec::None => String::new(),
+            DefaultSpec::Null => "NULL".to_owned(),
+            DefaultSpec::Literal(text) | DefaultSpec::Expression(text) => text.clone(),
+        }
+    }
+}
+
+/// 建表时的表级选项。哪些选项有意义、可选值由方言给出（见 `DdlDialect::table_option_spec`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TableOptions {
+    pub engine: String,
+    pub charset: String,
+    pub collation: String,
+    pub comment: String,
+    pub without_rowid: bool,
+    pub strict: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnDraft {
@@ -215,7 +311,11 @@ pub struct ColumnDraft {
     pub name: String,
     pub type_name: String,
     pub nullable: bool,
-    pub default_sql: String,
+    #[serde(default)]
+    pub default: DefaultSpec,
+    /// 字段注释。只有建表时写出（修改表的注释不在这里改）。
+    #[serde(default)]
+    pub comment: String,
     pub primary: bool,
     pub auto: bool,
     pub dropped: bool,
@@ -243,7 +343,12 @@ pub struct ForeignKeyDraft {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Action {
-    CreateTable { name: String, columns: Vec<ColumnDraft> },
+    CreateTable {
+        name: String,
+        columns: Vec<ColumnDraft>,
+        #[serde(default)]
+        options: TableOptions,
+    },
     AlterColumns { table: String, columns: Vec<ColumnDraft> },
     CreateIndex { table: String, name: String, unique: bool, columns: Vec<IndexColumnDraft> },
     DropIndex { table: String, name: String },

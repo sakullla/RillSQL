@@ -12800,3 +12800,72 @@ fn registry_bindings_resolve_to_their_actions(cx: &mut gpui_kit::TestAppContext)
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R19：常用字段模板随应用状态启动恢复并下发给结构页；结构页保存模板后外壳写盘，再次启动（重启）仍在。
+#[gpui_kit::test]
+fn column_templates_restore_on_boot_and_persist_after_edit(cx: &mut gpui_kit::TestAppContext) {
+    use crate::ddl::templates::{ColumnTemplate, TemplateColumn, TemplateStore};
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-templates-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let audit = |name: &str| ColumnTemplate {
+        id: format!("custom:{name}"),
+        name: name.to_owned(),
+        engines: Vec::new(),
+        columns: vec![TemplateColumn { name: "created_user_id".into(), type_name: "bigint".into(), nullable: true, ..TemplateColumn::default() }],
+    };
+    let mut seeded = TemplateStore::default();
+    seeded.upsert(audit("审计字段")).unwrap();
+    let state = AppState::new(ShellSettings::default(), SessionState::default()).with_templates(seeded.clone());
+    std::fs::write(services.state.path(), crate::state::to_bytes(&state).unwrap()).unwrap();
+
+    let wait = |cx: &mut gpui_kit::TestAppContext, window: gpui_kit::AnyWindowHandle, done: &dyn Fn(&mut gpui_kit::App) -> bool| {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(30) {
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            if cx.update(|cx| done(cx)) {
+                return true;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(25));
+        }
+        false
+    };
+
+    let (window, view) = open_workbench(cx, Arc::clone(&services), true);
+    let restored = wait(cx, window, &|cx| {
+        let view = view.read(cx);
+        view.model.column_templates == seeded && view.structure.read(cx).templates() == &seeded
+    });
+    assert!(restored, "启动时恢复模板并下发给结构页");
+
+    // 结构页里新增一个模板：经 sink 交回外壳并写盘。
+    let mut edited = seeded.clone();
+    edited.upsert(audit("操作人")).unwrap();
+    let structure = cx.update(|cx| view.read(cx).structure.clone());
+    let edited_for_pane = edited.clone();
+    cx.update(|cx| {
+        structure.update(cx, |pane, cx| {
+            pane.set_templates(edited_for_pane);
+            pane.open_template_manager();
+            pane.toggle_builtin_hidden("builtin:uuid", cx);
+        })
+    });
+    let mut expected = edited.clone();
+    expected.set_hidden("builtin:uuid", true);
+    let path = services.state.path().to_path_buf();
+    let written = wait(cx, window, &|_| {
+        std::fs::read(&path).ok().and_then(|bytes| crate::state::parse_stored(&bytes).ok()).is_some_and(|state| state.column_templates == expected)
+    });
+    assert!(written, "模板改动写入 app-state.json");
+    cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
+    cx.update(|_| drop(view));
+
+    // 重启：新的工作台从同一份状态文件读回。
+    let (window, view) = open_workbench(cx, Arc::clone(&services), true);
+    let restored = wait(cx, window, &|cx| view.read(cx).structure.read(cx).templates() == &expected);
+    assert!(restored, "重启后自定义模板仍在");
+    cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

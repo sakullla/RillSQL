@@ -1,6 +1,7 @@
 //! MySQL 家族的类型规则：可手输的类型、默认值候选、常用字段类型与外键动作（没有 SET DEFAULT）。
 
-use crate::adapters::ddl::{PresetTypes, TypeRules};
+use crate::adapters::ddl::{generic_parse_default, ParamType, PresetTypes, TypeRules};
+use crate::ddl::model::DefaultSpec;
 
 pub(in crate::adapters) struct MysqlTypes;
 
@@ -34,8 +35,38 @@ impl TypeRules for MysqlTypes {
         ]
     }
 
-    fn default_choices(&self) -> &'static [&'static str] {
-        &["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]
+    fn param_types(&self) -> &'static [ParamType] {
+        &[
+            ParamType { label: "varchar(n)", insert: "varchar(255)" },
+            ParamType { label: "char(n)", insert: "char(36)" },
+            ParamType { label: "decimal(p,s)", insert: "decimal(10,2)" },
+            ParamType { label: "varbinary(n)", insert: "varbinary(255)" },
+            ParamType { label: "datetime(fsp)", insert: "datetime(3)" },
+            ParamType { label: "timestamp(fsp)", insert: "timestamp(3)" },
+        ]
+    }
+
+    fn expression_choices(&self) -> &'static [&'static str] {
+        &["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP()", "CURRENT_DATE"]
+    }
+
+    /// information_schema 的 COLUMN_DEFAULT：MySQL 给出不带引号的字面量原文，MariaDB 给出带引号的字面量与 `NULL`。
+    /// 带括号或当前时间关键字的是表达式；其余不带引号的原文按字面量。
+    fn parse_default(&self, raw: &str) -> DefaultSpec {
+        let text = raw.trim();
+        let parsed = generic_parse_default(text);
+        let DefaultSpec::Expression(_) = parsed else {
+            return parsed;
+        };
+        let upper = text.to_ascii_uppercase();
+        if text.contains('(') || text.contains('\'') || upper.starts_with("CURRENT_") || upper.starts_with("LOCALTIME") || upper == "NOW()" {
+            return parsed;
+        }
+        DefaultSpec::Literal(text.to_owned())
+    }
+
+    fn text_default(&self, _type_name: &str, value: &str) -> String {
+        super::ddl::mysql_text(value)
     }
 
     fn default_column_type(&self) -> &'static str {

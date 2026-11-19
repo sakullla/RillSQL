@@ -277,7 +277,8 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             name: "id".into(),
             type_name: "INTEGER".into(),
             nullable: false,
-            default_sql: String::new(),
+            default: crate::ddl::DefaultSpec::None,
+            comment: String::new(),
             primary: true,
             auto: true,
             dropped: false,
@@ -287,7 +288,8 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             name: "name".into(),
             type_name: "TEXT".into(),
             nullable: true,
-            default_sql: String::new(),
+            default: crate::ddl::DefaultSpec::None,
+            comment: String::new(),
             primary: false,
             auto: false,
             dropped: false,
@@ -297,7 +299,8 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             name: "extra".into(),
             type_name: "TEXT".into(),
             nullable: true,
-            default_sql: String::new(),
+            default: crate::ddl::DefaultSpec::None,
+            comment: String::new(),
             primary: false,
             auto: false,
             dropped: false,
@@ -419,7 +422,7 @@ fn tabs_follow_the_object_and_original_names_let_alter_precheck_proceed() {
     created.table_name = "notes".into();
     created.kept_columns = vec![default_id("sqlite")];
     match created.action() {
-        Action::CreateTable { name, columns } => {
+        Action::CreateTable { name, columns, .. } => {
             assert_eq!(name, "notes");
             assert_eq!(columns[0].name, "id");
             assert!(columns[0].primary && columns[0].original.is_none());
@@ -500,7 +503,7 @@ fn production_danger_needs_the_object_name_and_a_failed_note_keeps_the_draft() {
     assert_eq!(pane.session.column_name, "nickname");
     assert_eq!(pane.session.kept_columns[0].name, "id");
     match pane.session.action() {
-        Action::CreateTable { name, columns } => {
+        Action::CreateTable { name, columns, .. } => {
             assert_eq!(name, "notes");
             assert!(columns.iter().any(|column| column.name == "nickname"));
         }
@@ -1197,7 +1200,7 @@ fn draft_diagnostics_catch_duplicates_invalid_types_and_missing_not_null_default
     pane.revert_column(1);
 
     // 非法默认值
-    pane.session.kept_columns[1].default_sql = "DROP TABLE orders".into();
+    pane.session.kept_columns[1].default = crate::ddl::DefaultSpec::Expression("DROP TABLE orders".into());
     assert!(pane.draft_diagnostic().is_some());
     pane.revert_column(1);
 
@@ -1206,7 +1209,7 @@ fn draft_diagnostics_catch_duplicates_invalid_types_and_missing_not_null_default
     let last = pane.session.kept_columns.len() - 1;
     pane.session.kept_columns[last].nullable = false;
     assert!(pane.draft_diagnostic().is_some(), "非空表新增无默认值的 NOT NULL 列需提前预警");
-    pane.session.kept_columns[last].default_sql = "0".into();
+    pane.session.kept_columns[last].default = crate::ddl::DefaultSpec::Literal("0".into());
     assert!(pane.draft_diagnostic().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1219,12 +1222,14 @@ fn create_table_presets_and_live_sql_preview_update_immediately() {
     pane.begin_create(target("postgres", ""));
     assert!(pane.live_composer_sql().is_none(), "未填表名前不生成无效 SQL");
     pane.session.table_name = "audit_events".into();
-    pane.apply_column_preset(ColumnPreset::Timestamps);
-    pane.apply_column_preset(ColumnPreset::StatusRemark);
+    pane.apply_template(crate::ddl::templates::BUILTIN_TIMESTAMPS);
+    pane.apply_template(crate::ddl::templates::BUILTIN_STATUS_REMARK);
     // 重复点击同一预设不会插入重名列
     let count_before = pane.session.kept_columns.len();
-    pane.apply_column_preset(ColumnPreset::Timestamps);
+    let (added, skipped) = pane.apply_template(crate::ddl::templates::BUILTIN_TIMESTAMPS);
     assert_eq!(pane.session.kept_columns.len(), count_before);
+    assert!(added.is_empty() && skipped == vec!["created_at".to_owned(), "updated_at".to_owned()], "重名时提示并跳过：{skipped:?}");
+    assert!(pane.session.note().contains("created_at"), "重名提示就近显示：{}", pane.session.note());
 
     let sql = pane.live_composer_sql().expect("实时建表 SQL");
     assert!(sql.contains("CREATE TABLE") && sql.contains("audit_events"), "{sql}");
@@ -1485,5 +1490,283 @@ fn escape_closes_the_preview_dialog_without_executing(cx: &mut gpui_kit::TestApp
     })
     .unwrap();
     assert!(!cx.update(|cx| pane.read(cx).session.preview_open()), "Esc 关闭预览确认层");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R2：新建表的草稿问题逐行就近给出（表名、空名、重名、非法类型、自增非主键、非法默认值），有问题时预览不可提交。
+#[gpui_kit::test]
+fn create_table_issues_sit_on_their_rows_and_block_preview(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("create-issues");
+    cx.update(gpui_kit::init);
+    let (window, pane) = cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = StructurePane::new(services.clone());
+                    pane.begin_create(target("mysql", ""));
+                    pane
+                })
+            },
+        )
+        .expect("structure pane")
+    });
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            assert!(pane.draft_issues().iter().any(|issue| issue.field == IssueField::TableName && issue.row.is_none()), "未填表名");
+            assert!(pane.create_blocked());
+            pane.session.table_name = "orders".into();
+            assert!(pane.draft_issues().is_empty(), "{:?}", pane.draft_issues());
+            pane.add_column();
+            pane.add_column();
+            pane.add_column();
+            pane.session.kept_columns[1].name = "title".into();
+            pane.session.kept_columns[2].name = "TITLE".into();
+            pane.session.kept_columns[3].name = "  ".into();
+            let issues = pane.draft_issues();
+            assert!(issues.iter().any(|issue| issue.row == Some(2) && issue.field == IssueField::Name && issue.text.contains("TITLE")), "{issues:?}");
+            assert!(issues.iter().any(|issue| issue.row == Some(3) && issue.field == IssueField::Name), "{issues:?}");
+            assert!(!issues.iter().any(|issue| issue.row == Some(1)), "第一个同名字段不报：{issues:?}");
+            pane.session.kept_columns[2].name = "price".into();
+            pane.session.kept_columns[2].type_name = "money!".into();
+            pane.session.kept_columns[3].name = "seq".into();
+            pane.session.kept_columns[3].auto = true;
+            pane.session.kept_columns[1].default = crate::ddl::DefaultSpec::Null;
+            pane.session.kept_columns[1].nullable = false;
+            let issues = pane.draft_issues();
+            assert!(issues.iter().any(|issue| issue.row == Some(2) && issue.field == IssueField::Type), "{issues:?}");
+            assert!(issues.iter().any(|issue| issue.row == Some(3) && issue.field == IssueField::Auto), "{issues:?}");
+            assert!(issues.iter().any(|issue| issue.row == Some(1) && issue.field == IssueField::Default), "{issues:?}");
+            assert!(pane.create_blocked());
+            assert!(pane.live_composer_sql().is_none(), "有问题时不生成可执行 SQL");
+            pane.preview_current(cx);
+            assert!(!pane.previewing && !pane.session.preview_open(), "预览不可提交");
+            assert_eq!(pane.session.note, Note::Key("structure.diag.fixFirst"));
+            cx.notify();
+        })
+    });
+    let (row_issue, preview_disabled) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.try_find("structure-row-issue-2").is_some(), window.find("structure-preview").disabled().unwrap_or(false))
+        })
+        .unwrap();
+    assert!(row_issue, "问题显示在该行下方");
+    assert!(preview_disabled, "预览按钮不可用");
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            pane.session.kept_columns[1].nullable = true;
+            pane.session.kept_columns[2].type_name = "decimal(10,2)".into();
+            pane.session.kept_columns[3].auto = false;
+            assert!(pane.draft_issues().is_empty(), "{:?}", pane.draft_issues());
+            let sql = pane.live_composer_sql().expect("修正后实时生成");
+            assert!(sql.contains("title varchar(255) DEFAULT NULL") && sql.contains("price decimal(10,2)"), "{sql}");
+            cx.notify();
+        })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R2：只用键盘完成 表名 → 3 个字段 → 主键 → 预览 SQL；Alt+↑/↓ 调整顺序，拖拽同样能调整。
+#[gpui_kit::test]
+fn keyboard_only_create_table_reaches_the_preview(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("create-keyboard");
+    // 最后一步的预览走真实的后台运行时（连接未打开，只会得到说明）。
+    cx.executor().allow_parking();
+    cx.update(gpui_kit::init);
+    let (window, pane) = cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = StructurePane::new(services.clone());
+                    pane.begin_create(target("mysql", ""));
+                    pane
+                })
+            },
+        )
+        .expect("structure pane")
+    });
+    let step = |cx: &mut gpui_kit::TestAppContext, action: &dyn Fn(&mut gpui_kit::Window, &mut App)| {
+        cx.update_window(window, |_, window, cx| {
+            action(window, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+    let focused = |cx: &mut gpui_kit::TestAppContext, key: u32| cx.update_window(window, |_, window, cx| pane.read(cx).draft_fields.is_focused(key, window, cx)).unwrap();
+
+    step(cx, &|window, cx| window.render_frame(cx));
+    assert!(focused(cx, 4), "打开新建表时表名框获得焦点");
+    step(cx, &|window, cx| window.input("orders", cx));
+    step(cx, &|window, cx| window.press("enter", cx));
+    assert!(focused(cx, 10_000), "表名回车进入第一个字段名");
+    // 主键：Alt+P 取消再设回。
+    step(cx, &|window, cx| window.press("alt-p", cx));
+    assert!(!cx.update(|cx| pane.read(cx).session.kept_columns[0].primary));
+    step(cx, &|window, cx| window.press("alt-p", cx));
+    assert!(cx.update(|cx| pane.read(cx).session.kept_columns[0].primary), "Alt+P 设为主键");
+    // 回车新增字段：名称获得焦点并全选，直接输入即改写。
+    step(cx, &|window, cx| window.press("enter", cx));
+    step(cx, &|window, cx| window.render_frame(cx));
+    assert!(focused(cx, 10_001), "新增字段的名称获得焦点");
+    step(cx, &|window, cx| window.input("title", cx));
+    step(cx, &|window, cx| window.press("enter", cx));
+    step(cx, &|window, cx| window.render_frame(cx));
+    assert!(focused(cx, 10_002));
+    step(cx, &|window, cx| window.input("amount", cx));
+    // Alt+↑ 把 amount 移到 title 前面，焦点跟着字段走。
+    step(cx, &|window, cx| window.press("alt-up", cx));
+    let names = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>());
+    assert_eq!(names, vec!["id", "amount", "title"]);
+    assert!(focused(cx, 10_001), "移动后焦点仍在 amount");
+    step(cx, &|window, cx| window.press("alt-down", cx));
+    let names = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>());
+    assert_eq!(names, vec!["id", "title", "amount"]);
+    // Tab 能走到类型框。
+    step(cx, &|window, cx| window.press("tab", cx));
+    assert!(focused(cx, 20_002), "Tab 从字段名到类型");
+
+    let sql = cx.update(|cx| pane.read(cx).live_composer_sql()).expect("实时 SQL");
+    assert!(sql.contains("CREATE TABLE") && sql.contains("orders") && sql.contains("PRIMARY KEY (id)"), "{sql}");
+    assert!(sql.find("title").unwrap() < sql.find("amount").unwrap(), "{sql}");
+
+    // 拖拽：把 amount 拖到第一行。
+    step(cx, &|window, cx| window.drag_to("structure-col-grip-2", "structure-row-columns-0", cx));
+    let names = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>());
+    assert_eq!(names, vec!["amount", "id", "title"], "拖拽调整顺序");
+
+    // ⌘/Ctrl+Enter 预览 SQL。
+    step(cx, &|window, cx| window.press("ctrl-enter", cx));
+    let (previewing, columns) = cx.update(|cx| (pane.read(cx).previewing, pane.read(cx).session.kept_columns.len()));
+    assert!(previewing, "组合回车触发预览");
+    assert_eq!(columns, 3, "组合回车不会新增字段");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R19：自定义模板在管理面板里新建保存后交给外壳持久化；新建表与修改表的常用字段菜单同源，套用重名时提示。
+#[gpui_kit::test]
+fn custom_templates_are_managed_saved_and_shared_by_create_and_alter_menus(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt};
+    let (services, dir) = offline_services("templates");
+    cx.update(gpui_kit::init);
+    let saved: std::sync::Arc<std::sync::Mutex<Vec<crate::ddl::templates::TemplateStore>>> = Default::default();
+    let (window, pane) = cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = StructurePane::new(services.clone());
+                    pane.begin_create(target("mysql", ""));
+                    pane.session.table_name = "orders".into();
+                    pane
+                })
+            },
+        )
+        .expect("structure pane")
+    });
+    let store_saved = saved.clone();
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            let store_saved = store_saved.clone();
+            pane.set_templates_sink(std::sync::Arc::new(move |templates, _| store_saved.lock().unwrap().push(templates)));
+        })
+    });
+    // 打开管理面板，新建“审计字段”两字段模板并保存。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-column-presets", cx);
+        window.render_frame(cx);
+        let manage = window.find_by_label(&i18n::text(Locale::ZhCn, "structure.templates.manage"));
+        window.click(manage.path().last().unwrap().clone(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(cx.update(|cx| pane.read(cx).template_manager_open()), "菜单末项打开管理面板");
+    cx.update_window(window, |_, window, cx| {
+        window.click("structure-template-new", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            pane.write_draft(8, "审计字段".into());
+            pane.write_draft(50_000, "created_user_id".into());
+            pane.write_draft(60_000, "bigint".into());
+            pane.template_add_column();
+            pane.write_draft(50_001, "modified_user_id".into());
+            pane.write_draft(60_001, "bigint".into());
+            pane.template_toggle_engine(None);
+            cx.notify();
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-template-save", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    {
+        let saved = saved.lock().unwrap();
+        let last = saved.last().expect("保存后交给外壳持久化");
+        assert_eq!(last.custom.len(), 1);
+        assert_eq!(last.custom[0].name, "审计字段");
+        assert_eq!(last.custom[0].columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), vec!["created_user_id", "modified_user_id"]);
+    }
+    // 隐藏内置“软删除”，菜单不再列出。
+    cx.update_window(window, |_, window, cx| {
+        window.click("structure-template-hide-builtin:softDelete", cx);
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(!cx.update(|cx| pane.read(cx).template_manager_open()), "Esc 关闭管理面板");
+    let labels = cx
+        .update_window(window, |_, window, cx| {
+            window.click("structure-column-presets", cx);
+            window.render_frame(cx);
+            window.find_all_by_role(gpui_kit::Role::MenuItem).into_iter().map(|item| item.label().unwrap_or_default().to_owned()).collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(labels.iter().any(|label| label.starts_with("审计字段")), "{labels:?}");
+    assert!(labels.iter().any(|label| label == &i18n::text(Locale::ZhCn, "structure.preset.uuid")), "{labels:?}");
+    assert!(!labels.iter().any(|label| label == &i18n::text(Locale::ZhCn, "structure.preset.softDelete")), "隐藏的内置模板不再出现：{labels:?}");
+    cx.update_window(window, |_, window, cx| {
+        let item = window.find_all_by_role(gpui_kit::Role::MenuItem).into_iter().find(|item| item.label().unwrap_or_default().starts_with("审计字段")).unwrap();
+        window.click(item.path().last().unwrap().clone(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let names = cx.update(|cx| pane.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>());
+    assert_eq!(names, vec!["id", "created_user_id", "modified_user_id"], "一次点击加入两字段");
+    let id = cx.update(|cx| pane.read(cx).templates().custom[0].id.clone());
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            let (added, skipped) = pane.apply_template(&id);
+            assert!(added.is_empty() && skipped.len() == 2, "重名不重复添加");
+            assert!(pane.session.note().contains("created_user_id"));
+        })
+    });
+
+    // 修改表的菜单与新建表同源：含 UUID 与自定义模板（适用于全部引擎）。
+    let store = saved.lock().unwrap().last().cloned().unwrap();
+    let mut alter = pane_with_snapshot(services.clone(), 3);
+    alter.set_templates(store);
+    let ids = alter.available_templates().into_iter().map(|template| template.id).collect::<Vec<_>>();
+    assert!(ids.contains(&crate::ddl::templates::BUILTIN_UUID.to_owned()) && ids.contains(&id), "{ids:?}");
+    alter.apply_template(&id);
+    assert!(alter.session.kept_columns.iter().any(|column| column.name == "created_user_id" && column.original.is_none()));
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -7,13 +7,14 @@ pub(crate) mod introspect;
 pub(crate) mod model;
 pub(crate) mod plan;
 pub(crate) mod sql;
+pub(crate) mod templates;
 
 pub(crate) use exec::{preview, Receipt};
 pub(crate) use introspect::{load, load_comments, load_partial};
 #[allow(unused_imports)]
 pub(crate) use model::{
-    Action, Column, ColumnDraft, DependentSql, Engine as DdlEngine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index,
-    IndexColumn, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus,
+    Action, Column, ColumnDraft, DefaultMode, DefaultSpec, DependentSql, Engine as DdlEngine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index,
+    IndexColumn, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus, TableOptions,
 };
 pub(crate) use plan::plan as preview_plan;
 pub(crate) use plan::{fk_sql_for_display, index_sql_for_display, is_no_change, rebuilt_definition};

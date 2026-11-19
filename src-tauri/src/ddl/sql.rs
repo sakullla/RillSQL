@@ -4,7 +4,7 @@
 use crate::adapters::ddl::{ddl_of, no_structure_editing, types_of};
 use crate::adapters::{registry, adapter};
 
-use super::model::Engine;
+use super::model::{ColumnDraft, DefaultSpec, Engine};
 
 /// 按方言最小引号，统一由适配器 SqlSyntax 判定。
 pub use crate::adapters::quote_ident;
@@ -33,9 +33,51 @@ pub fn valid_default(engine: Engine, raw: &str) -> bool {
     types_of(engine).is_some_and(|types| types.extra_default(text, &upper))
 }
 
-pub fn non_null_default(raw: &str) -> bool {
-    let text = raw.trim();
-    !text.is_empty() && !text.eq_ignore_ascii_case("null")
+/// 读入列的默认值原文（数据库报回的写法）→ 四态。缺失为无默认值；解析由方言的类型规则完成。
+pub fn existing_default(engine: Engine, raw: Option<&str>) -> DefaultSpec {
+    let Some(raw) = raw else {
+        return DefaultSpec::None;
+    };
+    match types_of(engine) {
+        Some(types) => types.parse_default(raw),
+        None => crate::adapters::ddl::generic_parse_default(raw),
+    }
+}
+
+/// 默认值要写进语句的 SQL：无默认为 None；NULL 为 `NULL`；字面量按方言与列类型加引号；表达式原样。
+/// 不合规则的值给出原因。
+pub fn default_sql(engine: Engine, draft: &ColumnDraft) -> Result<Option<String>, String> {
+    if let Some(problem) = default_problem(engine, draft) {
+        return Err(problem);
+    }
+    Ok(match &draft.default {
+        DefaultSpec::None => None,
+        DefaultSpec::Null => Some("NULL".to_owned()),
+        DefaultSpec::Literal(value) => Some(match types_of(engine) {
+            Some(types) => types.literal_default(&draft.type_name, value),
+            None => crate::adapters::ddl::quote_text(value),
+        }),
+        DefaultSpec::Expression(text) => Some(text.trim().to_owned()),
+    })
+}
+
+/// 默认值不能生成的原因：非空列默认 NULL、数值列的字面量不是数字、表达式为空或不在白名单里。
+pub fn default_problem(engine: Engine, draft: &ColumnDraft) -> Option<String> {
+    let name = draft.name.trim();
+    match &draft.default {
+        DefaultSpec::None => None,
+        DefaultSpec::Null if !draft.nullable => Some(format!("字段 {name} 不允许 NULL，默认值不能是 NULL。")),
+        DefaultSpec::Null => None,
+        DefaultSpec::Literal(value) => {
+            let base = crate::adapters::ddl::type_base(&draft.type_name);
+            let numeric = types_of(engine).is_some_and(|types| types.numeric_type(&base));
+            (numeric && !is_number(value.trim())).then(|| format!("字段 {name} 是数值类型，默认值 {} 不是数字。", value.trim()))
+        }
+        DefaultSpec::Expression(text) if text.trim().is_empty() => Some(format!("字段 {name} 的默认值表达式为空。")),
+        DefaultSpec::Expression(text) => {
+            (!valid_default(engine, text)).then(|| format!("字段 {name} 的默认值不是允许的字面量或当前时间函数。"))
+        }
+    }
 }
 
 pub fn valid_type(engine: Engine, raw: &str) -> bool {
@@ -72,7 +114,7 @@ pub fn mentions(sql: &str, name: &str) -> bool {
         .any(|word| word.eq_ignore_ascii_case(needle))
 }
 
-fn is_number(value: &str) -> bool {
+pub(crate) fn is_number(value: &str) -> bool {
     let mut chars = value.chars().peekable();
     if chars.peek() == Some(&'+') || chars.peek() == Some(&'-') {
         chars.next();

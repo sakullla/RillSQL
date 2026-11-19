@@ -1,12 +1,12 @@
 //! MySQL 家族（MySQL / MariaDB）的 DDL 方言：按库限定、CHANGE COLUMN 改字段、AUTO_INCREMENT、InnoDB 表选项、
 //! RENAME TABLE，以及事件启停的库级动作。MariaDB 复用同一实现，按 `engine` 区分。
 
-use crate::adapters::ddl::{AdminSections, DdlDialect, ViewModifier};
+use crate::adapters::ddl::{AdminSections, DdlDialect, TableOptionSpec, ViewModifier};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
-use crate::ddl::model::{Action, ColumnDraft, Plan, Request, Risk, Snapshot, Step};
+use crate::ddl::model::{Action, ColumnDraft, Plan, Request, Risk, Snapshot, Step, TableOptions};
 use crate::ddl::plan::{column_sql, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
 use crate::ddl::sql::{qualified_table, valid_name};
 
@@ -36,8 +36,36 @@ impl DdlDialect for MysqlDdl {
         "这些语句逐条执行，失败即停。MySQL 与 MariaDB 会立即提交每条结构变更语句，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。"
     }
 
-    fn create_table_suffix(&self, _without_rowid: bool, _strict: bool) -> String {
-        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4".to_owned()
+    /// 没选的选项按 InnoDB + utf8mb4 写出；排序规则与表注释只有填了才写。
+    fn create_table_suffix(&self, options: &TableOptions) -> String {
+        let pick = |value: &str, fallback: &str| if value.trim().is_empty() { fallback.to_owned() } else { value.trim().to_owned() };
+        let mut suffix = format!(" ENGINE={} DEFAULT CHARSET={}", pick(&options.engine, "InnoDB"), pick(&options.charset, "utf8mb4"));
+        if !options.collation.trim().is_empty() {
+            suffix.push_str(&format!(" COLLATE={}", options.collation.trim()));
+        }
+        if !options.comment.trim().is_empty() {
+            suffix.push_str(&format!(" COMMENT={}", mysql_text(options.comment.trim())));
+        }
+        suffix
+    }
+
+    fn table_option_spec(&self) -> TableOptionSpec {
+        let collations: &'static [&'static str] = match self.engine {
+            Engine::Mariadb => &["utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_unicode_520_ci", "utf8mb4_bin"],
+            _ => &["utf8mb4_0900_ai_ci", "utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"],
+        };
+        TableOptionSpec {
+            engines: &["InnoDB", "MyISAM", "MEMORY", "ARCHIVE"],
+            charsets: &["utf8mb4", "utf8mb3", "latin1", "ascii", "binary"],
+            collations,
+            comment: true,
+            column_comments: true,
+            ..TableOptionSpec::default()
+        }
+    }
+
+    fn inline_column_comment(&self, comment: &str) -> Option<String> {
+        Some(format!(" COMMENT {}", mysql_text(comment)))
     }
 
     fn auto_clause_after_null(&self, draft: &ColumnDraft) -> &'static str {
@@ -182,6 +210,11 @@ impl DdlDialect for MysqlDdl {
         snapshot.event_enabled = ddl_read::mysql_event_enabled(pool, &request.database, event).await?;
         Ok(())
     }
+}
+
+/// MySQL 字符串字面量：单引号翻倍，反斜杠也要翻倍（默认 sql_mode 下反斜杠是转义符）。
+pub(in crate::adapters) fn mysql_text(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// MySQL 家族的库级动作。`supported` 为假时是别的引擎请求了它：给出同一个动作的拒绝计划。

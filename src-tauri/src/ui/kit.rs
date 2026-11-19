@@ -1903,6 +1903,36 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
         on_change: fn(&mut V, K, String, &mut Context<V>),
         on_enter: Option<fn(&mut V, K, &mut Context<V>)>,
     ) -> Entity<InputState> {
+        self.bind_enter_with(key, value, spec, window, cx, on_change, on_enter, false)
+    }
+
+    /// 同 `bind_enter`，但只响应不带 Ctrl/⌘/Shift 的回车（组合回车留给外层快捷键，如 ⌘Enter 预览）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_plain_enter<V: 'static>(
+        &mut self,
+        key: K,
+        value: &str,
+        spec: FieldSpec<'_>,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_change: fn(&mut V, K, String, &mut Context<V>),
+        on_enter: fn(&mut V, K, &mut Context<V>),
+    ) -> Entity<InputState> {
+        self.bind_enter_with(key, value, spec, window, cx, on_change, Some(on_enter), true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_enter_with<V: 'static>(
+        &mut self,
+        key: K,
+        value: &str,
+        spec: FieldSpec<'_>,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        on_change: fn(&mut V, K, String, &mut Context<V>),
+        on_enter: Option<fn(&mut V, K, &mut Context<V>)>,
+        plain_only: bool,
+    ) -> Entity<InputState> {
         if let Some(state) = self.inputs.get(&key).cloned() {
             // 语言切换后占位符也要跟随，否则已创建的输入框会保留旧语言文案。
             let desired = spec.placeholder.to_owned();
@@ -1930,7 +1960,10 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
                     on_change(this, key, text, cx);
                     cx.notify();
                 }
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter { secondary, shift } => {
+                    if plain_only && (*secondary || *shift) {
+                        return;
+                    }
                     if let Some(on_enter) = on_enter {
                         on_enter(this, key, cx);
                         cx.notify();
@@ -1952,6 +1985,16 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
     pub fn focus(&self, key: K, window: &mut Window, cx: &mut App) {
         if let Some(state) = self.inputs.get(&key) {
             state.update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    /// 聚焦并全选：新建出来的默认名可以直接整段改写。
+    pub fn focus_select_all(&self, key: K, window: &mut Window, cx: &mut App) {
+        if let Some(state) = self.inputs.get(&key) {
+            state.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.select_all(window, cx);
+            });
         }
     }
 

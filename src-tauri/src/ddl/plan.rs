@@ -4,12 +4,12 @@
 use crate::adapters::ddl::{ddl_of, no_structure_editing, DdlDialect, ViewModifier};
 use crate::adapters::adapter;
 
-use super::model::{fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, Snapshot, Step};
-use super::sql::{mentions, non_null_default, qualified_table, quote_ident, valid_default, valid_name, valid_type};
+use super::model::{fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, Snapshot, Step, TableOptions};
+use super::sql::{default_problem, default_sql, existing_default, mentions, qualified_table, quote_ident, valid_name, valid_type};
 
 pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
     match action {
-        Action::CreateTable { name, columns } => plan_create(snapshot, name, columns),
+        Action::CreateTable { name, columns, options } => plan_create(snapshot, name, columns, options),
         Action::AlterColumns { table, columns } => plan_alter(snapshot, table, columns),
         Action::CreateIndex { table, name, unique, columns } => plan_create_index(snapshot, table, name, *unique, columns),
         Action::DropIndex { table, name } => plan_drop_index(snapshot, table, name),
@@ -53,23 +53,31 @@ pub fn display_sql(snapshot: &Snapshot) -> String {
             name: column.name.clone(),
             type_name: column.type_name.clone(),
             nullable: column.nullable,
-            default_sql: column.default_sql.clone().unwrap_or_default(),
+            default: existing_default(snapshot.engine, column.default_sql.as_deref()),
+            comment: String::new(),
             primary: column.primary,
             auto: column.auto,
             dropped: false,
         })
         .collect();
-    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name, &columns, &snapshot.foreign_keys, snapshot.autoincrement, snapshot.without_rowid, snapshot.strict) {
+    let options = TableOptions { without_rowid: snapshot.without_rowid, strict: snapshot.strict, ..TableOptions::default() };
+    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name, &columns, &snapshot.foreign_keys, snapshot.autoincrement, &options) {
         Ok(sql) => sql,
         Err(message) => message,
     }
 }
 
-fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft]) -> Plan {
+fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft], options: &TableOptions) -> Plan {
     let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, name);
     let mut blocked = validate_columns(snapshot, columns, true);
     if !valid_name(name) {
         blocked.push("表名无效。".to_owned());
+    }
+    for (label, value) in [("ENGINE", &options.engine), ("CHARSET", &options.charset), ("COLLATE", &options.collation)] {
+        let text = value.trim();
+        if !text.is_empty() && !text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            blocked.push(format!("表选项 {label} 的值 {text} 无效。"));
+        }
     }
     if snapshot.object_exists {
         blocked.push(format!("表 {name} 已经存在。不会覆盖已有表或数据。"));
@@ -91,10 +99,49 @@ fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft]) -> Plan
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
     let autoincrement = columns.iter().any(|column| !column.dropped && column.primary && column.auto);
-    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, name.trim(), columns, &[], autoincrement, false, false) {
-        Ok(sql) => finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("创建 {name}"), sql }]),
+    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, name.trim(), columns, &[], autoincrement, options) {
+        Ok(sql) => {
+            let mut steps = vec![Step { label: format!("创建 {name}"), sql }];
+            steps.extend(create_comment_steps(snapshot, name.trim(), columns, options));
+            finish(snapshot.engine, false, target, Vec::new(), risks, steps)
+        }
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
+}
+
+/// 建表后另写的注释语句（不支持内联注释的方言）。内联注释的方言在这里不产生语句。
+fn create_comment_steps(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft], options: &TableOptions) -> Vec<Step> {
+    let Some(dialect) = ddl_of(snapshot.engine) else {
+        return Vec::new();
+    };
+    let spec = dialect.table_option_spec();
+    let mut created = Snapshot::bare(snapshot.engine, &snapshot.database, &snapshot.schema, name);
+    if spec.comment && !options.comment.trim().is_empty() {
+        created.table_comment = Some(options.comment.trim().to_owned());
+    }
+    for draft in columns.iter().filter(|draft| !draft.dropped) {
+        created.columns.push(Column {
+            name: draft.name.trim().to_owned(),
+            type_name: draft.type_name.trim().to_owned(),
+            nullable: draft.nullable,
+            default_sql: None,
+            primary: draft.primary,
+            auto: draft.auto,
+            generated: false,
+            default_constraint: None,
+        });
+        if spec.column_comments && !draft.comment.trim().is_empty() && dialect.inline_column_comment(draft.comment.trim()).is_none() {
+            created.column_comments.insert(draft.name.trim().to_owned(), draft.comment.trim().to_owned());
+        }
+    }
+    let Ok(qualified) = dialect.create_table_name(&snapshot.database, &snapshot.schema, name) else {
+        return Vec::new();
+    };
+    dialect
+        .comment_statements(&created, &qualified)
+        .into_iter()
+        .map(|sql| Step { label: format!("写入注释 {name}"), sql })
+        .collect()
 }
 
 const NO_COLUMN_CHANGE: &str = "没有字段变更。";
@@ -630,7 +677,7 @@ fn diff_columns<'a>(snapshot: &'a Snapshot, drafts: &'a [ColumnDraft]) -> Vec<Ch
                 let changed = draft.name.trim() != original.name
                     || !same_type(&draft.type_name, &original.type_name)
                     || draft.nullable != original.nullable
-                    || normalize_default(&draft.default_sql) != original.default_sql.as_deref().map(str::trim);
+                    || default_changed(snapshot.engine, original, draft);
                 if changed {
                     changes.push(Change::Modify { original, draft });
                 }
@@ -671,15 +718,15 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
             if draft.primary {
                 blocked.push(format!("不能给已有表追加主键列 {}。", draft.name.trim()));
             }
-            if !draft.nullable && !non_null_default(&draft.default_sql) {
+            if !draft.nullable && !draft.default.has_value() {
                 if let Some(message) = ddl_of(snapshot.engine).and_then(|dialect| dialect.add_not_null_without_default(draft.name.trim())) {
                     blocked.push(message);
                 }
             }
-            if !draft.nullable && !non_null_default(&draft.default_sql) && snapshot.row_count.unwrap_or(0) > 0 {
+            if !draft.nullable && !draft.default.has_value() && snapshot.row_count.unwrap_or(0) > 0 {
                 blocked.push(format!("新增非空字段 {} 没有默认值，已有行无法满足 NOT NULL。", draft.name.trim()));
             }
-            if !draft.nullable && !non_null_default(&draft.default_sql) && snapshot.row_count.is_none() {
+            if !draft.nullable && !draft.default.has_value() && snapshot.row_count.is_none() {
                 blocked.push(format!("没能确认表 {} 是否已有数据，不能新增没有默认值的非空字段 {}。", snapshot.name, draft.name.trim()));
             }
             continue;
@@ -764,12 +811,14 @@ fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) 
         // 否则带自增序列或带类型转换默认值的表连改一个列名都做不到。
         let original = if create { None } else { original_of(snapshot, column) };
         let type_kept = original.is_some_and(|original| same_type(&column.type_name, &original.type_name));
-        let default_kept = original.is_some_and(|original| normalize_default(&column.default_sql) == original.default_sql.as_deref().map(str::trim));
+        let default_kept = original.is_some_and(|original| !default_changed(engine, original, column));
         if !type_kept && !valid_type(engine, &column.type_name) {
             blocked.push(format!("字段 {name} 的类型 {} 不能按 {} 规则生成。", column.type_name.trim(), engine.as_str()));
         }
-        if !default_kept && !column.default_sql.trim().is_empty() && !valid_default(engine, &column.default_sql) {
-            blocked.push(format!("字段 {name} 的默认值不是允许的字面量或当前时间函数。"));
+        if !default_kept {
+            if let Some(problem) = default_problem(engine, column) {
+                blocked.push(problem);
+            }
         }
         if create && column.auto && !column.primary {
             blocked.push(format!("字段 {name} 只有主键才能自增。"));
@@ -868,8 +917,7 @@ pub(crate) fn create_statement(
     drafts: &[ColumnDraft],
     foreign_keys: &[ForeignKey],
     autoincrement: bool,
-    without_rowid: bool,
-    strict: bool,
+    options: &TableOptions,
 ) -> Result<String, String> {
     let dialect = dialect_of(engine)?;
     let qualified = dialect.create_table_name(database, schema, table)?;
@@ -909,7 +957,7 @@ pub(crate) fn create_statement(
     if lines.is_empty() {
         return Err("至少需要一个字段。".to_owned());
     }
-    let suffix = dialect.create_table_suffix(without_rowid, strict);
+    let suffix = dialect.create_table_suffix(options);
     Ok(format!("CREATE TABLE {qualified} (\n  {}\n){suffix};", lines.join(",\n  ")))
 }
 
@@ -918,9 +966,7 @@ pub(crate) fn column_sql(engine: Engine, draft: &ColumnDraft, inline_auto: bool)
     if !valid_type(engine, &draft.type_name) {
         return Err(format!("类型 {} 无效。", draft.type_name.trim()));
     }
-    if !draft.default_sql.trim().is_empty() && !valid_default(engine, &draft.default_sql) {
-        return Err(format!("默认值 {} 无效。", draft.default_sql.trim()));
-    }
+    let default = default_sql(engine, draft).map_err(|_| format!("默认值 {} 无效。", draft.default.label().trim()))?;
     let dialect = dialect_of(engine)?;
     let mut sql = format!("{} {}", quote_ident(engine, draft.name.trim()), draft.type_name.trim());
     sql.push_str(dialect.auto_clause_before_null(draft));
@@ -928,9 +974,12 @@ pub(crate) fn column_sql(engine: Engine, draft: &ColumnDraft, inline_auto: bool)
         sql.push_str(" NOT NULL");
     }
     sql.push_str(dialect.auto_clause_after_null(draft));
-    if non_null_default(&draft.default_sql) && !draft.auto {
+    if let Some(default) = default.filter(|_| !draft.auto) {
         sql.push_str(" DEFAULT ");
-        sql.push_str(draft.default_sql.trim());
+        sql.push_str(&default);
+    }
+    if let Some(comment) = Some(draft.comment.trim()).filter(|text| !text.is_empty()).and_then(|text| dialect.inline_column_comment(text)) {
+        sql.push_str(&comment);
     }
     Ok(sql)
 }
@@ -1054,7 +1103,8 @@ pub(crate) fn identity_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             name: column.name.clone(),
             type_name: column.type_name.clone(),
             nullable: column.nullable,
-            default_sql: column.default_sql.clone().unwrap_or_default(),
+            default: existing_default(snapshot.engine, column.default_sql.as_deref()),
+            comment: String::new(),
             primary: column.primary,
             auto: column.auto,
             dropped: false,
@@ -1083,9 +1133,9 @@ pub(crate) fn same_type(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
-pub(crate) fn normalize_default(value: &str) -> Option<&str> {
-    let text = value.trim();
-    if text.is_empty() { None } else { Some(text) }
+/// 草稿的默认值和读到的原列不同（按四态比较：数据库的写法差异不算变更）。
+pub(crate) fn default_changed(engine: Engine, original: &Column, draft: &ColumnDraft) -> bool {
+    draft.default != existing_default(engine, original.default_sql.as_deref())
 }
 
 fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan {

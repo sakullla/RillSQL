@@ -5,7 +5,7 @@ use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
     fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request,
-    SequenceState, Snapshot, Step, StepStatus,
+    DefaultSpec, SequenceState, Snapshot, Step, StepStatus, TableOptions,
 };
 use super::plan::plan;
 use crate::connections::{CatalogSession, Service};
@@ -35,12 +35,18 @@ fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> Column 
 }
 
 fn draft_of(column: &Column) -> ColumnDraft {
+    draft_for(Engine::Postgres, column)
+}
+
+/// 按引擎的类型规则读入默认值（各方言报回的默认值写法不同）。
+fn draft_for(engine: Engine, column: &Column) -> ColumnDraft {
     ColumnDraft {
         original: Some(column.name.clone()),
         name: column.name.clone(),
         type_name: column.type_name.clone(),
         nullable: column.nullable,
-        default_sql: column.default_sql.clone().unwrap_or_default(),
+        default: crate::ddl::sql::existing_default(engine, column.default_sql.as_deref()),
+        comment: String::new(),
         primary: column.primary,
         auto: column.auto,
         dropped: false,
@@ -613,7 +619,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "id".to_owned(),
                     type_name: "INTEGER".to_owned(),
                     nullable: false,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: true,
                     auto: false,
                     dropped: false,
@@ -623,7 +630,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "note".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -633,7 +641,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "extra".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -656,7 +665,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "id".to_owned(),
                     type_name: "INTEGER".to_owned(),
                     nullable: false,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: true,
                     auto: false,
                     dropped: false,
@@ -666,7 +676,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "note".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -676,7 +687,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "extra".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -700,7 +712,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "id".to_owned(),
                     type_name: "INTEGER".to_owned(),
                     nullable: false,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: true,
                     auto: false,
                     dropped: false,
@@ -710,7 +723,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "note".to_owned(),
                     type_name: "INTEGER".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -720,7 +734,8 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     name: "extra".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
-                    default_sql: String::new(),
+                    default: DefaultSpec::None,
+                    comment: String::new(),
                     primary: false,
                     auto: false,
                     dropped: false,
@@ -784,7 +799,8 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 name: "id".to_owned(),
                 type_name: "INTEGER".to_owned(),
                 nullable: false,
-                default_sql: String::new(),
+                default: DefaultSpec::None,
+                comment: String::new(),
                 primary: true,
                 auto: false,
                 dropped: false,
@@ -794,7 +810,8 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 name: "note".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: false,
-                default_sql: String::new(),
+                default: DefaultSpec::None,
+                comment: String::new(),
                 primary: false,
                 auto: false,
                 dropped: false,
@@ -870,7 +887,8 @@ fn kept_column(name: &str, type_name: &str, primary: bool) -> ColumnDraft {
         name: name.to_owned(),
         type_name: type_name.to_owned(),
         nullable: !primary,
-        default_sql: String::new(),
+        default: DefaultSpec::None,
+        comment: String::new(),
         primary,
         auto: false,
         dropped: false,
@@ -1035,7 +1053,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     snapshot.row_count = Some(0);
 
     // 改类型：ALTER COLUMN 只含列名/类型/NULL 性，不带 DEFAULT。
-    let mut drafts = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    let mut drafts = snapshot.columns.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect::<Vec<_>>();
     drafts.iter_mut().find(|column| column.name == "status").unwrap().type_name = "nvarchar(40)".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drafts });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
@@ -1047,24 +1065,24 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     }), "ALTER COLUMN 不能内联 DEFAULT：{:?}", planned.steps);
 
     // 删默认值：用 sys.default_constraints 读到的约束名走 DROP CONSTRAINT。
-    let mut drop_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
-    drop_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = String::new();
+    let mut drop_default = snapshot.columns.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect::<Vec<_>>();
+    drop_default.iter_mut().find(|column| column.name == "status").unwrap().default = DefaultSpec::None;
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_default });
     assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE dbo.notes DROP CONSTRAINT DF_notes_status;")), "{:?}", planned.steps);
 
     // 约束名缺失时按 sys.default_constraints 动态查找，不猜 DF_ 前缀名。
     let mut unnamed = snapshot.clone();
     unnamed.columns[1].default_constraint = None;
-    let mut drop_unnamed = unnamed.columns.iter().map(draft_of).collect::<Vec<_>>();
-    drop_unnamed.iter_mut().find(|column| column.name == "status").unwrap().default_sql = String::new();
+    let mut drop_unnamed = unnamed.columns.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect::<Vec<_>>();
+    drop_unnamed.iter_mut().find(|column| column.name == "status").unwrap().default = DefaultSpec::None;
     let planned = plan(&unnamed, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_unnamed });
     let dynamic = planned.steps.iter().find(|step| step.sql.contains("DROP CONSTRAINT")).expect("应当生成删除默认值的语句");
     assert!(dynamic.sql.contains("sys.default_constraints"), "{:?}", planned.steps);
     assert!(dynamic.sql.contains("OBJECT_ID(N'dbo.notes')"), "{:?}", planned.steps);
 
     // 改默认值：先摘既有约束再 ADD（同名 2714 / 不同名 1781 都会失败），ADD 用 DF_<表>_<列> 名。
-    let mut change_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
-    change_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = "N'done'".to_owned();
+    let mut change_default = snapshot.columns.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect::<Vec<_>>();
+    change_default.iter_mut().find(|column| column.name == "status").unwrap().default = DefaultSpec::Literal("done".to_owned());
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: change_default });
     let drop_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE dbo.notes DROP CONSTRAINT DF_notes_status;"));
     let add_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE dbo.notes ADD CONSTRAINT DF_notes_status DEFAULT N'done' FOR status;"));
@@ -1074,7 +1092,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     assert!(drop < add, "DROP 必须在 ADD 之前：{:?}", planned.steps);
 
     // 重命名：sp_rename，不生成 MySQL 式 CHANGE。
-    let mut renamed = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    let mut renamed = snapshot.columns.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect::<Vec<_>>();
     renamed.iter_mut().find(|column| column.name == "status").unwrap().name = "state".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: renamed });
     assert!(planned.steps.iter().any(|step| step.sql.contains("EXEC sp_rename N'dbo.notes.status', N'state', 'COLUMN';")), "{:?}", planned.steps);
@@ -1082,7 +1100,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     // 新增列：T-SQL 是 ADD，不是 ADD COLUMN。
     let mut add = snapshot.columns.clone();
     add.push(column("extra", "int", true, false));
-    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: add.iter().map(draft_of).collect() });
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: add.iter().map(|column| draft_for(Engine::Sqlserver, column)).collect() });
     assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE dbo.notes ADD extra int;")), "{:?}", planned.steps);
     assert!(!planned.steps.iter().any(|step| step.sql.contains("ADD COLUMN")), "{:?}", planned.steps);
 
@@ -1098,11 +1116,13 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
                 name: "id".to_owned(),
                 type_name: "int".to_owned(),
                 nullable: false,
-                default_sql: String::new(),
+                default: DefaultSpec::None,
+                comment: String::new(),
                 primary: true,
                 auto: true,
                 dropped: false,
             }],
+            options: TableOptions::default(),
         },
     );
     assert!(create.steps.iter().any(|step| step.sql.contains("id int NOT NULL IDENTITY(1, 1)")), "{:?}", create.steps);
@@ -1851,7 +1871,288 @@ fn untouched_postgres_defaults_do_not_block_other_column_changes() {
     assert_eq!(planned.steps.len(), 1);
     assert!(planned.steps[0].sql.contains("RENAME COLUMN amount TO total"), "{}", planned.steps[0].sql);
     let mut typed = unchanged;
-    typed[2].default_sql = "nextval('other_seq'::regclass)".to_owned();
+    typed[2].default = DefaultSpec::Expression("nextval('other_seq'::regclass)".to_owned());
     let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: typed });
     assert!(planned.blocked.iter().any(|item| item.contains("默认值")), "手改的默认值仍按规则检查：{:?}", planned.blocked);
+}
+
+/// ADR-7：默认值四态在建表路径上按方言生成（MySQL / PostgreSQL / SQLite / SQL Server）。
+fn new_column(name: &str, type_name: &str, nullable: bool, default: DefaultSpec) -> ColumnDraft {
+    ColumnDraft { original: None, name: name.to_owned(), type_name: type_name.to_owned(), nullable, default, comment: String::new(), primary: false, auto: false, dropped: false }
+}
+
+fn fresh(engine: Engine) -> Snapshot {
+    let (database, schema) = match engine {
+        Engine::Mysql | Engine::Mariadb => ("shop", ""),
+        Engine::Postgres => ("app", "public"),
+        Engine::Sqlserver => ("rillsql", "dbo"),
+        _ => ("main", ""),
+    };
+    let mut snapshot = Snapshot::bare(engine, database, schema, "audit");
+    snapshot.object_exists = false;
+    snapshot
+}
+
+fn create_sql(engine: Engine, columns: Vec<ColumnDraft>, options: TableOptions) -> Vec<String> {
+    let planned = plan(&fresh(engine), &Action::CreateTable { name: "audit".to_owned(), columns, options });
+    assert!(planned.blocked.is_empty(), "{engine:?}: {:?}", planned.blocked);
+    planned.steps.into_iter().map(|step| step.sql).collect()
+}
+
+#[test]
+fn default_spec_four_states_generate_dialect_sql_on_create() {
+    for (engine, text_type, int_type, now) in [
+        (Engine::Mysql, "varchar(64)", "int", "CURRENT_TIMESTAMP"),
+        (Engine::Postgres, "varchar(64)", "integer", "CURRENT_TIMESTAMP"),
+        (Engine::Sqlite, "TEXT", "INTEGER", "CURRENT_TIMESTAMP"),
+        (Engine::Sqlserver, "nvarchar(64)", "int", "CURRENT_TIMESTAMP"),
+    ] {
+        let columns = vec![
+            new_column("plain", text_type, true, DefaultSpec::None),
+            new_column("maybe", text_type, true, DefaultSpec::Null),
+            new_column("created", "timestamp", false, DefaultSpec::Expression(now.to_owned())),
+            new_column("label", text_type, false, DefaultSpec::Literal("it's".to_owned())),
+            new_column("amount", int_type, false, DefaultSpec::Literal("42".to_owned())),
+        ];
+        let columns = if engine == Engine::Sqlserver {
+            columns.into_iter().map(|mut column| {
+                if column.name == "created" {
+                    column.type_name = "datetime2".to_owned();
+                }
+                column
+            }).collect()
+        } else {
+            columns
+        };
+        let sql = create_sql(engine, columns, TableOptions::default()).join("\n");
+        let line = |name: &str| sql.lines().find(|line| line.trim_start().starts_with(name)).unwrap_or_else(|| panic!("{engine:?} 缺少字段 {name}：{sql}")).to_owned();
+        assert!(!line("plain").contains("DEFAULT"), "{engine:?}: 无默认值不写 DEFAULT：{sql}");
+        assert!(line("maybe").contains("DEFAULT NULL"), "{engine:?}: NULL 写 DEFAULT NULL：{sql}");
+        assert!(line("created").contains(&format!("DEFAULT {now}")) && !line("created").contains('\''), "{engine:?}: 表达式不加引号：{sql}");
+        let expected_text = if engine == Engine::Sqlserver { "DEFAULT N'it''s'" } else { "DEFAULT 'it''s'" };
+        assert!(line("label").contains(expected_text), "{engine:?}: 字符串字面量按方言加引号转义：{sql}");
+        assert!(line("amount").ends_with("DEFAULT 42") || line("amount").contains("DEFAULT 42,") || line("amount").contains("DEFAULT 42"), "{engine:?}: 数字原样：{sql}");
+        assert!(!line("amount").contains("'42'"), "{engine:?}: 数值列的数字不加引号：{sql}");
+    }
+    // MySQL 字符串里的反斜杠也要转义。
+    let sql = create_sql(Engine::Mysql, vec![new_column("path", "varchar(64)", true, DefaultSpec::Literal(r"C:\tmp".to_owned()))], TableOptions::default()).join("\n");
+    assert!(sql.contains(r"DEFAULT 'C:\\tmp'"), "{sql}");
+    // varchar 列上的数字字面量仍按字符串写。
+    let sql = create_sql(Engine::Postgres, vec![new_column("code", "varchar(8)", true, DefaultSpec::Literal("007".to_owned()))], TableOptions::default()).join("\n");
+    assert!(sql.contains("DEFAULT '007'"), "{sql}");
+}
+
+#[test]
+fn default_spec_rejects_null_on_not_null_and_text_on_numeric_columns() {
+    for engine in [Engine::Mysql, Engine::Postgres, Engine::Sqlite, Engine::Sqlserver] {
+        let planned = plan(&fresh(engine), &Action::CreateTable {
+            name: "audit".to_owned(),
+            columns: vec![new_column("flag", "int", false, DefaultSpec::Null)],
+            options: TableOptions::default(),
+        });
+        assert!(planned.steps.is_empty() && planned.blocked.iter().any(|item| item.contains("不能是 NULL")), "{engine:?}: {:?}", planned.blocked);
+        let planned = plan(&fresh(engine), &Action::CreateTable {
+            name: "audit".to_owned(),
+            columns: vec![new_column("amount", "int", true, DefaultSpec::Literal("abc".to_owned()))],
+            options: TableOptions::default(),
+        });
+        assert!(planned.steps.is_empty() && planned.blocked.iter().any(|item| item.contains("不是数字")), "{engine:?}: {:?}", planned.blocked);
+        let planned = plan(&fresh(engine), &Action::CreateTable {
+            name: "audit".to_owned(),
+            columns: vec![new_column("note", "int", true, DefaultSpec::Expression("now() + 1".to_owned()))],
+            options: TableOptions::default(),
+        });
+        assert!(planned.steps.is_empty(), "{engine:?}: 白名单外的表达式不生成：{:?}", planned.steps);
+    }
+}
+
+/// 读入列的默认值原文按方言解析成四态；没改动时不产生变更，改动后 ALTER 路径与建表同一写法。
+#[test]
+fn existing_defaults_parse_per_dialect_and_alter_paths_match_create() {
+    use crate::ddl::sql::existing_default;
+    let literal = |text: &str| DefaultSpec::Literal(text.to_owned());
+    let expression = |text: &str| DefaultSpec::Expression(text.to_owned());
+    for (engine, raw, expected) in [
+        (Engine::Mysql, Some("active"), literal("active")),
+        (Engine::Mysql, Some("0"), literal("0")),
+        (Engine::Mysql, Some("CURRENT_TIMESTAMP"), expression("CURRENT_TIMESTAMP")),
+        (Engine::Mariadb, Some("'active'"), literal("active")),
+        (Engine::Mariadb, Some("NULL"), DefaultSpec::Null),
+        (Engine::Mariadb, Some("current_timestamp()"), expression("current_timestamp()")),
+        (Engine::Postgres, Some("'paid'::text"), literal("paid")),
+        (Engine::Postgres, Some("'it''s'::character varying"), literal("it's")),
+        (Engine::Postgres, Some("NULL::character varying"), DefaultSpec::Null),
+        (Engine::Postgres, Some("nextval('orders_id_seq'::regclass)"), expression("nextval('orders_id_seq'::regclass)")),
+        (Engine::Postgres, Some("CURRENT_TIMESTAMP"), expression("CURRENT_TIMESTAMP")),
+        (Engine::Postgres, None, DefaultSpec::None),
+        (Engine::Sqlite, Some("'x'"), literal("x")),
+        (Engine::Sqlite, Some("NULL"), DefaultSpec::Null),
+        (Engine::Sqlite, Some("CURRENT_TIMESTAMP"), expression("CURRENT_TIMESTAMP")),
+        (Engine::Sqlserver, Some("((0))"), literal("0")),
+        (Engine::Sqlserver, Some("(N'open')"), literal("open")),
+        (Engine::Sqlserver, Some("(getdate())"), expression("getdate()")),
+        (Engine::Sqlserver, Some("(NULL)"), DefaultSpec::Null),
+    ] {
+        assert_eq!(existing_default(engine, raw), expected, "{engine:?} {raw:?}");
+    }
+
+    // PostgreSQL：没动的 'paid'::text 不产生变更；改成 NULL / 字面量 / 无默认值分别生成 SET DEFAULT NULL / SET DEFAULT '…' / DROP DEFAULT。
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "orders");
+    let mut status = column("status", "text", true, false);
+    status.default_sql = Some("'paid'::text".to_owned());
+    snapshot.columns = vec![column("id", "bigint", false, true), status];
+    snapshot.row_count = Some(0);
+    let drafts = |default: DefaultSpec| -> Vec<ColumnDraft> {
+        let mut drafts: Vec<ColumnDraft> = snapshot.columns.iter().map(|item| draft_for(Engine::Postgres, item)).collect();
+        drafts[1].default = default;
+        drafts
+    };
+    let unchanged = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts(literal("paid")) });
+    assert_eq!(unchanged.blocked, vec!["没有字段变更。".to_owned()]);
+    let to_null = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts(DefaultSpec::Null) });
+    assert!(to_null.steps.iter().any(|step| step.sql.ends_with("ALTER COLUMN status SET DEFAULT NULL;")), "{:?}", to_null.steps);
+    let to_literal = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts(literal("it's")) });
+    assert!(to_literal.steps.iter().any(|step| step.sql.ends_with("ALTER COLUMN status SET DEFAULT 'it''s';")), "{:?}", to_literal.steps);
+    let dropped = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts(DefaultSpec::None) });
+    assert!(dropped.steps.iter().any(|step| step.sql.ends_with("ALTER COLUMN status DROP DEFAULT;")), "{:?}", dropped.steps);
+
+    // MySQL：CHANGE COLUMN 带完整定义，读入的不带引号字面量重新按字符串写出。
+    let mut mysql = Snapshot::bare(Engine::Mysql, "shop", "", "orders");
+    let mut state = column("state", "varchar(16)", false, false);
+    state.default_sql = Some("active".to_owned());
+    mysql.columns = vec![column("id", "bigint", false, true), state];
+    mysql.row_count = Some(0);
+    let mut renamed: Vec<ColumnDraft> = mysql.columns.iter().map(|item| draft_for(Engine::Mysql, item)).collect();
+    renamed[1].name = "status".to_owned();
+    let planned = plan(&mysql, &Action::AlterColumns { table: "orders".to_owned(), columns: renamed });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("CHANGE COLUMN state status varchar(16) NOT NULL DEFAULT 'active';")), "{:?}", planned.steps);
+    let mut emptied: Vec<ColumnDraft> = mysql.columns.iter().map(|item| draft_for(Engine::Mysql, item)).collect();
+    emptied[1].nullable = true;
+    emptied[1].default = DefaultSpec::Null;
+    let planned = plan(&mysql, &Action::AlterColumns { table: "orders".to_owned(), columns: emptied });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("CHANGE COLUMN state state varchar(16) DEFAULT NULL;")), "{:?}", planned.steps);
+
+    // SQL Server：改成 NULL 走具名默认约束 DEFAULT NULL；SQLite：改默认值走重建，新定义里是 DEFAULT NULL。
+    let mut tsql = Snapshot::bare(Engine::Sqlserver, "rillsql", "dbo", "notes");
+    let mut note = column("note", "nvarchar(20)", true, false);
+    note.default_sql = Some("(N'x')".to_owned());
+    note.default_constraint = Some("DF_notes_note".to_owned());
+    tsql.columns = vec![column("id", "int", false, true), note];
+    tsql.row_count = Some(0);
+    let mut nulled: Vec<ColumnDraft> = tsql.columns.iter().map(|item| draft_for(Engine::Sqlserver, item)).collect();
+    nulled[1].default = DefaultSpec::Null;
+    let planned = plan(&tsql, &Action::AlterColumns { table: "notes".to_owned(), columns: nulled });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ADD CONSTRAINT DF_notes_note DEFAULT NULL FOR note;")), "{:?}", planned.steps);
+    let untouched: Vec<ColumnDraft> = tsql.columns.iter().map(|item| draft_for(Engine::Sqlserver, item)).collect();
+    let planned = plan(&tsql, &Action::AlterColumns { table: "notes".to_owned(), columns: untouched });
+    assert_eq!(planned.blocked, vec!["没有字段变更。".to_owned()], "(N'x') 读入后不算改动");
+
+    let sqlite = notes("3.45.0");
+    let mut defaulted: Vec<ColumnDraft> = sqlite.columns.iter().map(|item| draft_for(Engine::Sqlite, item)).collect();
+    defaulted[1].default = DefaultSpec::Literal("hello".to_owned());
+    let planned = plan(&sqlite, &Action::AlterColumns { table: "notes".to_owned(), columns: defaulted });
+    assert!(planned.rebuild && planned.steps.iter().any(|step| step.sql.contains("note TEXT DEFAULT 'hello'")), "{:?}", planned.steps);
+}
+
+/// 表级选项与注释按方言写出：MySQL 内联 ENGINE/CHARSET/COLLATE/COMMENT，PostgreSQL 另写 COMMENT ON，SQLite WITHOUT ROWID / STRICT。
+#[test]
+fn create_table_options_and_comments_follow_the_dialect() {
+    let mut id = new_column("id", "bigint", false, DefaultSpec::None);
+    id.primary = true;
+    id.auto = true;
+    let mut note = new_column("note", "varchar(64)", true, DefaultSpec::None);
+    note.comment = "备注 'x'".to_owned();
+    let options = TableOptions { engine: "MyISAM".into(), charset: "latin1".into(), collation: "latin1_bin".into(), comment: "审计".into(), ..TableOptions::default() };
+    let sql = create_sql(Engine::Mysql, vec![id.clone(), note.clone()], options);
+    assert_eq!(sql.len(), 1, "{sql:?}");
+    assert!(sql[0].ends_with(") ENGINE=MyISAM DEFAULT CHARSET=latin1 COLLATE=latin1_bin COMMENT='审计';"), "{}", sql[0]);
+    assert!(sql[0].contains("note varchar(64) COMMENT '备注 ''x'''"), "{}", sql[0]);
+    let defaults = create_sql(Engine::Mysql, vec![id.clone()], TableOptions::default());
+    assert!(defaults[0].ends_with(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"), "没选表选项时保持原来的默认写法：{}", defaults[0]);
+
+    let mut pg_id = id.clone();
+    pg_id.type_name = "bigint".into();
+    let sql = create_sql(Engine::Postgres, vec![pg_id, note.clone()], TableOptions { comment: "审计".into(), ..TableOptions::default() });
+    assert_eq!(sql.len(), 3, "建表 + 表注释 + 字段注释：{sql:?}");
+    assert!(sql[1].starts_with("COMMENT ON TABLE") && sql[1].ends_with("IS '审计';"), "{sql:?}");
+    assert!(sql[2].starts_with("COMMENT ON COLUMN") && sql[2].ends_with("IS '备注 ''x''';"), "{sql:?}");
+
+    let mut sqlite_id = new_column("id", "INTEGER", false, DefaultSpec::None);
+    sqlite_id.primary = true;
+    let sql = create_sql(Engine::Sqlite, vec![sqlite_id], TableOptions { without_rowid: true, strict: true, ..TableOptions::default() });
+    assert!(sql[0].ends_with(") WITHOUT ROWID, STRICT;"), "{}", sql[0]);
+
+    let planned = plan(&fresh(Engine::Mysql), &Action::CreateTable {
+        name: "audit".into(),
+        columns: vec![id],
+        options: TableOptions { engine: "InnoDB; DROP TABLE x".into(), ..TableOptions::default() },
+    });
+    assert!(planned.steps.is_empty() && planned.blocked.iter().any(|item| item.contains("表选项")), "{:?}", planned.blocked);
+}
+
+/// R19：常用字段模板的增删改排、内置隐藏、适用引擎与套用时跳过重名。
+#[test]
+fn column_templates_are_editable_ordered_engine_scoped_and_skip_duplicates() {
+    use crate::ddl::templates::{apply_template, ColumnTemplate, TemplateColumn, TemplateProblem, TemplateStore, BUILTIN_TIMESTAMPS, BUILTIN_UUID};
+    let audit = ColumnTemplate {
+        id: "custom:audit".into(),
+        name: "审计字段".into(),
+        engines: Vec::new(),
+        columns: vec![
+            TemplateColumn { name: "created_user_id".into(), type_name: "bigint".into(), nullable: true, ..TemplateColumn::default() },
+            TemplateColumn { name: "modified_user_id".into(), type_name: "bigint".into(), nullable: true, ..TemplateColumn::default() },
+        ],
+    };
+    let mut store = TemplateStore::default();
+    store.upsert(audit.clone()).expect("保存审计字段模板");
+    let pg_only = ColumnTemplate { id: "custom:pg".into(), name: "PG 专用".into(), engines: vec!["postgres".into()], columns: vec![TemplateColumn { name: "doc".into(), type_name: "jsonb".into(), nullable: true, ..TemplateColumn::default() }] };
+    store.upsert(pg_only).unwrap();
+
+    // 新建与修改表共用的菜单：内置四个（含 UUID）+ 适用的用户模板。
+    let ids_of = |store: &TemplateStore, engine: &str| store.applicable(engine).into_iter().map(|template| template.id).collect::<Vec<_>>();
+    assert!(ids_of(&store, "mysql").contains(&BUILTIN_UUID.to_owned()), "UUID 不再遗漏");
+    assert!(ids_of(&store, "mysql").contains(&"custom:audit".to_owned()) && !ids_of(&store, "mysql").contains(&"custom:pg".to_owned()), "{:?}", ids_of(&store, "mysql"));
+    assert!(ids_of(&store, "postgres").contains(&"custom:pg".to_owned()));
+
+    // 内置可隐藏、再显示。
+    store.set_hidden(BUILTIN_TIMESTAMPS, true);
+    assert!(!ids_of(&store, "mysql").contains(&BUILTIN_TIMESTAMPS.to_owned()));
+    store.set_hidden(BUILTIN_TIMESTAMPS, false);
+    assert!(ids_of(&store, "mysql").contains(&BUILTIN_TIMESTAMPS.to_owned()));
+
+    // 排序与删除。
+    assert!(store.move_by("custom:pg", -1));
+    assert_eq!(store.custom.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), vec!["custom:pg", "custom:audit"]);
+    assert!(!store.move_by("custom:pg", -1), "越界不动");
+    assert!(store.remove("custom:pg"));
+    assert_eq!(store.custom.len(), 1);
+
+    // 校验：空名、重名、无字段、空字段名、重名字段、空类型。
+    let mut bad = audit.clone();
+    bad.id = "custom:other".into();
+    assert_eq!(store.upsert(bad.clone()), Err(TemplateProblem::DuplicateName));
+    bad.name = "  ".into();
+    assert_eq!(store.problem(&bad), Some(TemplateProblem::EmptyName));
+    bad.name = "其它".into();
+    bad.columns.clear();
+    assert_eq!(store.problem(&bad), Some(TemplateProblem::NoColumns));
+    bad.columns = vec![TemplateColumn { name: "a".into(), type_name: "int".into(), ..TemplateColumn::default() }, TemplateColumn { name: "A".into(), type_name: "int".into(), ..TemplateColumn::default() }];
+    assert_eq!(store.problem(&bad), Some(TemplateProblem::DuplicateColumn));
+    bad.columns[1].name = String::new();
+    assert_eq!(store.problem(&bad), Some(TemplateProblem::EmptyColumn));
+    bad.columns[1].name = "b".into();
+    bad.columns[1].type_name = " ".into();
+    assert_eq!(store.problem(&bad), Some(TemplateProblem::EmptyType));
+
+    // 套用：两字段加入；再次套用全部跳过、不重复添加。
+    let mut drafts = vec![new_column("id", "bigint", false, DefaultSpec::None)];
+    let (added, skipped) = apply_template(&mut drafts, &audit);
+    assert_eq!(added, vec!["created_user_id".to_owned(), "modified_user_id".to_owned()]);
+    assert!(skipped.is_empty());
+    let (added, skipped) = apply_template(&mut drafts, &audit);
+    assert!(added.is_empty());
+    assert_eq!(skipped.len(), 2);
+    assert_eq!(drafts.len(), 3);
+    let sql = create_sql(Engine::Mysql, drafts, TableOptions::default()).join("\n");
+    assert!(sql.contains("created_user_id bigint") && sql.contains("modified_user_id bigint"), "{sql}");
 }

@@ -4,7 +4,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const APP_STATE_VERSION: u32 = 1;
+use crate::ddl::templates::TemplateStore;
+
+/// 2：新增 `columnTemplates`（常用字段模板）。版本 1 的文件读入时迁移为 2（没有模板）。
+pub const APP_STATE_VERSION: u32 = 2;
+/// 仍能读入并迁移的旧版本。
+const MIGRATABLE_VERSIONS: &[u64] = &[1];
 pub const APP_STATE_FILE: &str = "app-state.json";
 
 const TAB_KINDS: &[&str] = &["query", "table", "structure", "definition", "diagram", "keys", "docs", "database"];
@@ -144,21 +149,31 @@ pub struct AppState {
     pub version: u32,
     pub shell: ShellSettings,
     pub session: SessionState,
+    /// 用户自定义的常用字段模板与被隐藏的内置模板。
+    #[serde(default)]
+    pub column_templates: TemplateStore,
 }
 
 impl AppState {
     pub fn new(shell: ShellSettings, session: SessionState) -> Self {
-        Self { version: APP_STATE_VERSION, shell, session }
+        Self { version: APP_STATE_VERSION, shell, session, column_templates: TemplateStore::default() }
+    }
+
+    pub fn with_templates(mut self, templates: TemplateStore) -> Self {
+        self.column_templates = templates;
+        self
     }
 }
 
 pub fn parse_stored(bytes: &[u8]) -> Result<AppState, StateError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| StateError::Malformed)?;
     let version = value.get("version").and_then(Value::as_u64).ok_or(StateError::Malformed)?;
-    if version != u64::from(APP_STATE_VERSION) {
+    if version != u64::from(APP_STATE_VERSION) && !MIGRATABLE_VERSIONS.contains(&version) {
         return Err(StateError::UnknownVersion(version));
     }
-    let state: AppState = serde_json::from_value(value).map_err(|_| StateError::Malformed)?;
+    let mut state: AppState = serde_json::from_value(value).map_err(|_| StateError::Malformed)?;
+    // 版本 1 没有模板字段（按空模板读入），升到当前版本；下次写盘即为新版本。
+    state.version = APP_STATE_VERSION;
     reject_forbidden(&state)?;
     Ok(state)
 }

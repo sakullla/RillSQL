@@ -551,3 +551,45 @@ async fn installed_webview_store_is_readable_when_the_root_is_provided() {
     assert!(session_ok, "session 键缺少标签结构");
     assert!(shell_ok, "shell 键缺少主题结构");
 }
+
+/// R19：常用字段模板随应用状态保存。版本 1 的文件读入时迁移为当前版本（没有模板）；
+/// 保存后重新读入（模拟重启）模板仍在。
+#[tokio::test]
+async fn column_templates_migrate_from_v1_and_survive_a_restart() {
+    use crate::ddl::templates::{ColumnTemplate, TemplateColumn, TemplateStore};
+    use crate::ddl::DefaultSpec;
+    assert_eq!(APP_STATE_VERSION, 2);
+    let v1 = json!({
+        "version": 1,
+        "shell": serde_json::to_value(ShellSettings::default()).unwrap(),
+        "session": { "tabs": [], "activeId": null }
+    });
+    let migrated = parse_stored(&serde_json::to_vec(&v1).unwrap()).expect("版本 1 可以迁移");
+    assert_eq!(migrated.version, APP_STATE_VERSION, "读入即升到当前版本");
+    assert_eq!(migrated.column_templates, TemplateStore::default(), "版本 1 没有模板");
+    assert!(to_bytes(&migrated).is_ok(), "迁移后的状态可以按新版本写回");
+    assert!(parse_stored(br#"{"version":3,"shell":{},"session":{"tabs":[]}}"#).is_err(), "更新的未知版本仍然拒绝");
+
+    let dir = temp_dir("templates");
+    let store = StateStore::new(&dir);
+    let mut templates = TemplateStore::default();
+    templates.hidden.push("builtin:softDelete".into());
+    templates
+        .upsert(ColumnTemplate {
+            id: "custom:audit".into(),
+            name: "审计字段".into(),
+            engines: vec!["mysql".into()],
+            columns: vec![
+                TemplateColumn { name: "created_user_id".into(), type_name: "bigint".into(), nullable: false, default: DefaultSpec::Literal("0".into()), comment: "创建人".into() },
+                TemplateColumn { name: "modified_user_id".into(), type_name: "bigint".into(), nullable: true, default: DefaultSpec::Null, comment: String::new() },
+            ],
+        })
+        .unwrap();
+    let state = AppState::new(ShellSettings::default(), SessionState::default()).with_templates(templates.clone());
+    store.save(&state).await.expect("save");
+    let text = fs::read_to_string(store.path()).unwrap();
+    assert!(text.contains("\"version\": 2") && text.contains("columnTemplates") && text.contains("created_user_id"), "{text}");
+    let reloaded = StateStore::new(&dir).load().await.expect("重启后读入");
+    assert_eq!(reloaded.column_templates, templates, "重启后模板仍在");
+    let _ = fs::remove_dir_all(&dir);
+}

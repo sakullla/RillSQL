@@ -435,7 +435,7 @@ async fn typed_service_queries(dir: &std::path::Path, service: Arc<Service>, app
     assert!(!skipped.imported && !skipped.wrote_state);
     assert!(!app.state.path().exists());
     app.save_state(&AppState::new(ShellSettings::default(), SessionState::default())).await.expect("save state");
-    assert_eq!(app.load_state().await.expect("load").version, 1);
+    assert_eq!(app.load_state().await.expect("load").version, crate::state::AppState::new(ShellSettings::default(), SessionState::default()).version);
     let bytes = std::fs::read(app.state.path()).expect("state file");
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(!text.contains("password"));

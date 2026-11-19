@@ -256,6 +256,15 @@ impl Workbench {
                     });
                 }
             }));
+            let templates_owner = struct_nav_owner.clone();
+            pane.set_templates_sink(Arc::new(move |templates: crate::ddl::templates::TemplateStore, cx: &mut App| {
+                if let Some(owner) = templates_owner.upgrade() {
+                    owner.update(cx, |view, cx| {
+                        view.model.column_templates = templates;
+                        view.persist_if_needed(cx);
+                    });
+                }
+            }));
             pane.set_structure_nav_sink(Arc::new(move |target: GridTarget, cx: &mut App| {
                 if let Some(owner) = struct_nav_owner.upgrade() {
                     owner.update(cx, |view, cx| {
@@ -2357,6 +2366,9 @@ impl Workbench {
                             // 启动时的自动更新检查只走这个开关；关闭时不发起检查。
                             this.schedule_auto_update(cx);
                             this.model.restore_session(&startup.state.session);
+                            this.model.column_templates = startup.state.column_templates.clone();
+                            let templates = startup.state.column_templates.clone();
+                            this.structure.update(cx, |pane, _| pane.set_templates(templates));
                             if let Some(key) = startup.warning_key {
                                 this.model.notice_key = Some(key);
                                 this.model.startup_warning = Some(startup.warning_detail);

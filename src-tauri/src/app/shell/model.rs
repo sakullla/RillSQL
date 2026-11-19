@@ -386,6 +386,8 @@ pub struct ClosePrompt {
 #[derive(Clone)]
 pub struct WorkbenchModel {
     pub shell: Shell,
+    /// 常用字段模板（R19）：随应用状态保存，重启后恢复并下发给结构页。
+    pub column_templates: crate::ddl::templates::TemplateStore,
     pub settings: SettingsForm,
     /// 设置页左侧分区导航当前高亮的分区。
     pub settings_section: SettingsSection,
@@ -570,6 +572,7 @@ impl WorkbenchModel {
         settings.capture_shell(&shell);
         Self {
             shell,
+            column_templates: crate::ddl::templates::TemplateStore::default(),
             settings,
             settings_section: SettingsSection::Appearance,
             settings_save: SaveState::Idle,
@@ -5956,7 +5959,7 @@ impl WorkbenchModel {
             active_id: self.active_tab.clone(),
             tabs: self.tabs.iter().map(tab_to_session).collect(),
         };
-        AppState::new(self.settings.to_settings(), session)
+        AppState::new(self.settings.to_settings(), session).with_templates(self.column_templates.clone())
     }
 
     pub fn restore_session(&mut self, session: &SessionState) {

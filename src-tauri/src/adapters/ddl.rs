@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
-use crate::ddl::model::{Action, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, StepReceipt};
+use crate::ddl::model::{Action, ColumnDraft, DefaultSpec, ForeignKey, Plan, Request, Risk, Snapshot, StepReceipt, TableOptions};
 use crate::ddl::plan::{Change, Tok};
 
 use super::{adapter, quote_ident, registry};
@@ -46,6 +46,57 @@ pub struct PresetTypes {
 pub const GENERIC_PRESET_TYPES: PresetTypes =
     PresetTypes { timestamp: "TEXT", timestamp_default: "CURRENT_TIMESTAMP", short_text: "TEXT", note: "TEXT", uuid: "TEXT" };
 
+/// 带参数的类型片段：菜单里显示 `label`（如 `varchar(n)`），选中后写入 `insert`（如 `varchar(255)`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParamType {
+    pub label: &'static str,
+    pub insert: &'static str,
+}
+
+/// 通用的带参数类型片段。
+pub const GENERIC_PARAM_TYPES: &[ParamType] = &[
+    ParamType { label: "varchar(n)", insert: "varchar(255)" },
+    ParamType { label: "char(n)", insert: "char(36)" },
+    ParamType { label: "decimal(p,s)", insert: "decimal(10,2)" },
+];
+
+/// 通用的数值类型名（小写、去掉参数）。数值列的字面量默认值必须是数字，按原样写出。
+const NUMERIC_TYPES: &[&str] = &[
+    "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric", "float", "double", "double precision", "real",
+    "int2", "int4", "int8", "float4", "float8", "serial", "bigserial", "smallserial", "money", "smallmoney",
+];
+
+/// 数字写成字面量时仍要加引号的类型（文本、日期时间、JSON、UUID、二进制等）。
+const QUOTED_FAMILIES: &[&str] = &["char", "text", "clob", "string", "json", "uuid", "uniqueidentifier", "date", "time", "enum", "set", "binary", "blob", "xml", "bytea"];
+
+/// 类型名的基名：小写、去掉括号参数与首尾空白。
+pub fn type_base(type_name: &str) -> String {
+    type_name.split('(').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// 通用的读入默认值解析：空→无默认，NULL→NULL，数字与单引号字符串→字面量，其余→表达式。
+pub fn generic_parse_default(raw: &str) -> DefaultSpec {
+    let text = raw.trim();
+    if text.is_empty() {
+        return DefaultSpec::None;
+    }
+    if text.eq_ignore_ascii_case("null") {
+        return DefaultSpec::Null;
+    }
+    if crate::ddl::sql::is_number(text) {
+        return DefaultSpec::Literal(text.to_owned());
+    }
+    if crate::ddl::sql::is_quoted(text) {
+        return DefaultSpec::Literal(text[1..text.len() - 1].replace("''", "'"));
+    }
+    DefaultSpec::Expression(text.to_owned())
+}
+
+/// 通用的字符串字面量：单引号翻倍。
+pub fn quote_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// 类型规则：类型候选与校验、默认值候选与校验、FK 动作、常用字段类型映射。
 /// 默认实现是通用写法（未知引擎的结构页候选也按它给出）。
 pub trait TypeRules: Sync {
@@ -69,9 +120,43 @@ pub trait TypeRules: Sync {
         &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"]
     }
 
-    /// 默认值下拉候选（不含 NULL；可空字段由调用方补在最前）。
-    fn default_choices(&self) -> &'static [&'static str] {
-        &["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]
+    /// 带参数的类型片段（类型组合框的第二组）。
+    fn param_types(&self) -> &'static [ParamType] {
+        GENERIC_PARAM_TYPES
+    }
+
+    /// “表达式”模式下的白名单候选（当前时间函数等）。
+    fn expression_choices(&self) -> &'static [&'static str] {
+        &["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"]
+    }
+
+    /// 数值类型（`base` 是小写、去掉参数的类型名）。
+    fn numeric_type(&self, base: &str) -> bool {
+        NUMERIC_TYPES.contains(&base)
+    }
+
+    /// 读入列的默认值原文 → 四态。各方言去掉自己的包装（类型转换、括号、N 前缀）。
+    fn parse_default(&self, raw: &str) -> DefaultSpec {
+        generic_parse_default(raw)
+    }
+
+    /// 字符串字面量的写法（引号与转义）。`type_name` 是列类型，方言可按它选前缀。
+    fn text_default(&self, _type_name: &str, value: &str) -> String {
+        quote_text(value)
+    }
+
+    /// 字面量默认值按列类型写成 SQL：数字写在非文本列上原样写出，布尔列的 true/false 写成关键字，
+    /// 其余按字符串加引号并转义。
+    fn literal_default(&self, type_name: &str, value: &str) -> String {
+        let base = type_base(type_name);
+        let quoted_family = QUOTED_FAMILIES.iter().any(|family| base.contains(family));
+        if crate::ddl::sql::is_number(value.trim()) && !quoted_family {
+            return value.trim().to_owned();
+        }
+        if matches!(base.as_str(), "boolean" | "bool") && matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "false") {
+            return value.trim().to_ascii_uppercase();
+        }
+        self.text_default(type_name, value)
     }
 
     /// 新字段的默认类型。
@@ -87,6 +172,29 @@ pub trait TypeRules: Sync {
     /// 常用字段模板的类型。
     fn preset_types(&self) -> PresetTypes {
         GENERIC_PRESET_TYPES
+    }
+}
+
+/// 建表页表级选项的方言描述：哪些选项显示，以及可选值。空列表表示不显示该选项。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableOptionSpec {
+    pub engines: &'static [&'static str],
+    pub charsets: &'static [&'static str],
+    pub collations: &'static [&'static str],
+    /// 表注释。
+    pub comment: bool,
+    /// 字段注释。
+    pub column_comments: bool,
+    /// 不建 rowid 的表选项；值是界面上显示的关键字。
+    pub without_rowid: Option<&'static str>,
+    /// 严格类型的表选项；值是界面上显示的关键字。
+    pub strict: Option<&'static str>,
+}
+
+impl TableOptionSpec {
+    /// 有任何表级选项要显示。
+    pub fn any(&self) -> bool {
+        !self.engines.is_empty() || !self.charsets.is_empty() || !self.collations.is_empty() || self.comment || self.without_rowid.is_some() || self.strict.is_some()
     }
 }
 
@@ -152,8 +260,18 @@ pub trait DdlDialect: Sync {
     fn finish_inline_autoincrement(&self, _sql: &mut String) {}
 
     /// 建表语句右括号之后的表选项。
-    fn create_table_suffix(&self, _without_rowid: bool, _strict: bool) -> String {
+    fn create_table_suffix(&self, _options: &TableOptions) -> String {
         String::new()
+    }
+
+    /// 建表页显示哪些表级选项。
+    fn table_option_spec(&self) -> TableOptionSpec {
+        TableOptionSpec::default()
+    }
+
+    /// 字段定义末尾内联的注释子句；不支持内联注释的方言返回 None（注释经 `comment_statements` 另写）。
+    fn inline_column_comment(&self, _comment: &str) -> Option<String> {
+        None
     }
 
     /// 字段定义里写在 NOT NULL 之前的自增子句。
