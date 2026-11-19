@@ -44,11 +44,13 @@ pub struct TabSpec {
     pub context: Option<SharedString>,
     /// 状态短标签（已翻译，例如“未保存”）：进入 tooltip，状态不只靠颜色表达。
     pub status: Option<SharedString>,
+    /// 预览标签（单击对象树打开、会被下一次单击就地替换）：标题用斜体区分，双击或操作后转为固定标签。
+    pub preview: bool,
 }
 
 impl TabSpec {
     pub fn new(id: impl Into<SharedString>, icon: IconName, title: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), icon, title: title.into(), active: false, running: false, dirty: false, prod: false, context: None, status: None }
+        Self { id: id.into(), icon, title: title.into(), active: false, running: false, dirty: false, prod: false, context: None, status: None, preview: false }
     }
 
     pub fn active(mut self, active: bool) -> Self {
@@ -69,6 +71,11 @@ impl TabSpec {
 
     pub fn context(mut self, context: Option<SharedString>) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn preview(mut self, preview: bool) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -171,6 +178,7 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
+                .when(spec.preview, |this| this.italic())
                 .test_support(),
         )
         .when(spec.dirty, |this| this.child(kit::status_dot(p.warn)))

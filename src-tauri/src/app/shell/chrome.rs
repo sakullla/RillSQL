@@ -1370,9 +1370,11 @@ impl Workbench {
         self.model.connections.selected = Some(id.to_owned());
         self.model.shell.focus = FocusTarget::Sidebar;
         let status = self.model.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected);
+        // 关系型连接单击打开（或就地替换）概览预览标签，双击固定；未连接的先按需连接再读。
+        self.model.overview_click_connection(id, double);
         match status {
             LinkStatus::Connected => {
-                // 单击只选中这一行；双击在树上展开/折叠，Redis/MongoDB 连接双击直接开浏览器。
+                // 单击选中这一行并打开概览；双击在树上展开/折叠，Redis/MongoDB 连接双击直接开浏览器。
                 // chevron 单击是展开/折叠的另一条鼠标路径，和双击、键盘右/左键走同一份状态。
                 if double {
                     let specialized = self
@@ -1693,10 +1695,14 @@ impl Workbench {
                         this.perform(&format!("nav-toggle:{click_id}"), cx);
                     }
                 } else if event.click_count() >= 2 {
-                    // 双击容器在树上展开/折叠，对象打开自己的数据或文档页。
+                    // 双击容器在树上展开/折叠，对象打开自己的数据或文档页；库/模式的概览预览转为固定标签。
+                    this.model.overview_click_node(&click_id, true);
                     if let Some(command) = this.model.nav_toggle_command(&click_id) {
                         this.perform(&command, cx);
                     }
+                } else {
+                    // 单击库/模式：主区打开（或就地替换）概览预览标签。
+                    this.model.overview_click_node(&click_id, false);
                 }
                 cx.notify();
             }))
@@ -1711,7 +1717,8 @@ impl Workbench {
         let table_view = page == AppPage::Workspace && tool == WorkTool::Table;
         let redis_view = page == AppPage::Workspace && tool == WorkTool::Redis;
         let mongo_view = page == AppPage::Workspace && tool == WorkTool::Mongo;
-        let tool_view = table_view || redis_view || mongo_view || matches!(page, AppPage::Structure | AppPage::Compare | AppPage::Diagram);
+        let overview_view = page == AppPage::Workspace && tool == WorkTool::Overview;
+        let tool_view = table_view || redis_view || mongo_view || overview_view || matches!(page, AppPage::Structure | AppPage::Compare | AppPage::Diagram);
         let welcome = self.model.show_welcome() && !tool_view;
         // 结构页的字段表按内容区真实宽度排版。这个宽度只有布局知道（视口减活动栏、
         // 停靠侧栏和根内边距），不能由面板拿视口宽冒充：900 开着侧栏只剩 614。
@@ -1737,6 +1744,8 @@ impl Workbench {
             self.redis.clone().into_any_element()
         } else if mongo_view {
             self.mongo.clone().into_any_element()
+        } else if overview_view {
+            self.overview_page(window, cx)
         } else if table_view {
             let entity = cx.entity();
             div()
@@ -1853,6 +1862,7 @@ impl Workbench {
             let close_id = tab.id.clone();
             let menu_id = tab.id.clone();
             let middle_id = tab.id.clone();
+            let preview = self.model.is_preview_tab(&tab.id);
             let close_label = self.t("common.close");
             let chip = tabs::tab(
                 tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
@@ -1860,6 +1870,7 @@ impl Workbench {
                     .running(tab.running)
                     .prod(is_prod)
                     .context(context_hint)
+                    .preview(preview)
                     .dirty(dirty, Some(dirty_text.clone())),
                 &p,
             )
@@ -1887,8 +1898,12 @@ impl Workbench {
                 this.persist_if_needed(cx);
                 cx.notify();
             }))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 let _ = this.model.activate_item(&id);
+                // 双击预览标签把它转为固定标签。
+                if event.click_count() >= 2 {
+                    this.model.pin_overview();
+                }
                 if this.model.tool == WorkTool::Query {
                     this.query.update(cx, |pane, _| pane.request_focus());
                 }
@@ -7078,6 +7093,7 @@ fn item_icon(kind: WorkItemKind) -> IconName {
         WorkItemKind::Admin => IconName::Gauge,
         WorkItemKind::Redis => IconName::Key,
         WorkItemKind::Mongo => IconName::Braces,
+        WorkItemKind::Overview => IconName::LayoutDashboard,
     }
 }
 

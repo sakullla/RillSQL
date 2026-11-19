@@ -11,6 +11,7 @@ pub(crate) mod layout;
 mod menus;
 mod model;
 pub(crate) mod nav;
+mod overview;
 mod update;
 mod view;
 
@@ -20,3 +21,5 @@ pub use view::Workbench;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod overview_tests;

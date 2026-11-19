@@ -8,6 +8,7 @@ pub mod model;
 pub mod nav_read;
 pub(crate) mod objects;
 pub mod read;
+pub mod stats;
 pub mod tree;
 
 pub use model::{
@@ -23,6 +24,7 @@ pub use commands::{catalog_definition, catalog_page, catalog_refresh, catalog_se
 pub use detail::read_object_details;
 pub use hierarchy::{NavAction, NavConnection};
 pub use nav_read::read_navigation;
+pub use stats::{read_object_stats, stats_level, StatRow, StatsBody, StatsLevel};
 pub use tree::{
     direct_objects, object_path, reconcile_objects, refresh_connection, refresh_schema,
     search_objects, take_page, visible_database_names, visible_schema_names,
@@ -75,3 +77,5 @@ pub fn module_id() -> &'static str {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod stats_tests;

@@ -115,6 +115,20 @@ impl CatalogDialect for SqliteCatalog {
         Some(format!("PRAGMA table_info({})", quote(table)))
     }
 
+    fn default_database(&self) -> Option<&'static str> {
+        Some("main")
+    }
+
+    /// 表与视图：SQLite 没有行数估算、注释与更新时间；大小来自 dbstat 虚表（表自己与它的索引的页）。
+    /// 没有编译 dbstat 时整条查询失败，概览退回名称清单并标注统计缺失。
+    fn object_stats_sql(&self, database: &str, _schema: &str) -> Option<String> {
+        let schema = quote_sqlite(database);
+        let name = crate::adapters::catalog::literal(database);
+        Some(format!(
+            "SELECT m.name, m.type, NULL, CASE WHEN m.type = 'table' THEN (SELECT SUM(d.pgsize) FROM dbstat({name}) d WHERE d.name IN (SELECT i.name FROM {schema}.sqlite_master i WHERE i.tbl_name = m.name AND i.type IN ('table', 'index'))) END, '', '' FROM {schema}.sqlite_master m WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name"
+        ))
+    }
+
     fn indexes_sql(&self, _database: &str, _schema: &str, table: &str) -> Option<String> {
         Some(format!("PRAGMA index_list({})", quote(table)))
     }

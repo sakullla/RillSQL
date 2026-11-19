@@ -149,6 +149,22 @@ impl CatalogDialect for MysqlCatalog {
         Some(information_schema_primary_key_sql(&literal(database), table))
     }
 
+    /// 库清单：每个库的基表数量与数据+索引大小（information_schema.tables 的统计值）。
+    fn database_stats_sql(&self) -> Option<String> {
+        Some(
+            "SELECT s.schema_name, CAST(COUNT(t.table_name) AS CHAR), CAST(SUM(COALESCE(t.data_length, 0) + COALESCE(t.index_length, 0)) AS CHAR) FROM information_schema.schemata s LEFT JOIN information_schema.tables t ON t.table_schema = s.schema_name AND t.table_type = 'BASE TABLE' WHERE s.schema_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') GROUP BY s.schema_name ORDER BY s.schema_name"
+                .to_owned(),
+        )
+    }
+
+    /// 表与视图：table_rows 是估算；视图的 table_comment 固定是 VIEW，不当注释。
+    fn object_stats_sql(&self, database: &str, _schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT table_name, CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END, CAST(table_rows AS CHAR), CAST(data_length + index_length AS CHAR), CASE WHEN table_type = 'VIEW' THEN '' ELSE table_comment END, DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s') FROM information_schema.tables WHERE table_schema = {} AND table_type IN ('BASE TABLE', 'VIEW', 'SYSTEM VERSIONED') ORDER BY table_name",
+            literal(database)
+        ))
+    }
+
     /// MySQL 用 SHOW INDEX。
     fn indexes_sql(&self, database: &str, _schema: &str, table: &str) -> Option<String> {
         Some(format!("SHOW INDEX FROM {}", crate::adapters::qualified(self.engine, &[database, table])))

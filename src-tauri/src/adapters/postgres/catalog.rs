@@ -137,6 +137,30 @@ impl CatalogDialect for PostgresCatalog {
         "t.relname"
     }
 
+    /// 库清单：表数量要连到那个库才读得到（留空）；大小只对有 CONNECT 权限的库读，避免整条查询因权限失败。
+    fn database_stats_sql(&self) -> Option<String> {
+        Some(
+            "SELECT d.datname::text, NULL::text, CASE WHEN has_database_privilege(d.datname, 'CONNECT') THEN pg_database_size(d.datname)::text END FROM pg_database d WHERE d.datallowconn AND NOT d.datistemplate ORDER BY d.datname"
+                .to_owned(),
+        )
+    }
+
+    /// 模式清单（会话已连在目标库）：普通表与分区父表的数量，表与物化视图的总大小（含索引与 TOAST）。
+    fn schema_stats_sql(&self, _database: &str) -> Option<String> {
+        Some(
+            "SELECT n.nspname::text, COUNT(c.oid) FILTER (WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition)::text, COALESCE(SUM(pg_total_relation_size(c.oid)) FILTER (WHERE c.relkind IN ('r', 'm')), 0)::text FROM pg_namespace n LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'm') WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg_%' GROUP BY n.nspname ORDER BY n.nspname"
+                .to_owned(),
+        )
+    }
+
+    /// 表与视图：reltuples 是估算（从未 ANALYZE 时为 -1，留空）；大小含索引与 TOAST；PostgreSQL 不记录数据更新时间。
+    fn object_stats_sql(&self, _database: &str, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT c.relname::text, CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END, CASE WHEN c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0 THEN c.reltuples::bigint::text END, CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_total_relation_size(c.oid)::text END, COALESCE(obj_description(c.oid, 'pg_class'), ''), NULL::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = {} AND c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition ORDER BY c.relname",
+            literal(schema)
+        ))
+    }
+
     fn primary_key_sql(&self, _database: &str, schema: &str, table: &str) -> Option<String> {
         Some(information_schema_primary_key_sql(&literal(schema), table))
     }

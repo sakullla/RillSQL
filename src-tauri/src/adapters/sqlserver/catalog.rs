@@ -132,6 +132,31 @@ impl CatalogDialect for SqlserverCatalog {
         "o.name"
     }
 
+    /// 库清单：表数量要进到那个库才读得到（留空）；大小按数据文件页数（8 KB/页）。
+    fn database_stats_sql(&self) -> Option<String> {
+        Some(
+            "SELECT d.name, CAST(NULL AS nvarchar(32)), CAST(SUM(CAST(f.size AS bigint)) * 8192 AS nvarchar(32)) FROM sys.databases d LEFT JOIN sys.master_files f ON f.database_id = d.database_id WHERE d.state = 0 AND d.name NOT IN ('master', 'tempdb', 'model', 'msdb') GROUP BY d.name ORDER BY d.name"
+                .to_owned(),
+        )
+    }
+
+    /// 模式清单：用户表数量与已用页大小（sys.dm_db_partition_stats，含索引）。读非当前库时由 scope_sql 加三段名。
+    fn schema_stats_sql(&self, _database: &str) -> Option<String> {
+        Some(
+            "SELECT s.name, CAST(COUNT(DISTINCT t.object_id) AS nvarchar(32)), CAST(SUM(CAST(ps.used_page_count AS bigint)) * 8192 AS nvarchar(32)) FROM sys.schemas s LEFT JOIN sys.tables t ON t.schema_id = s.schema_id LEFT JOIN sys.dm_db_partition_stats ps ON ps.object_id = t.object_id WHERE s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys') AND s.name NOT LIKE 'db[_]%' GROUP BY s.name ORDER BY s.name"
+                .to_owned(),
+        )
+    }
+
+    /// 表与视图：行数取堆/聚集索引分区行数，大小取全部分区已用页；注释是 MS_Description 扩展属性。
+    /// SQL Server 不记录数据更新时间（modify_date 是结构变更时间），留空。
+    fn object_stats_sql(&self, _database: &str, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT o.name, CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END, CAST((SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = o.object_id AND p.index_id IN (0, 1)) AS nvarchar(32)), CAST((SELECT SUM(CAST(p.used_page_count AS bigint)) * 8192 FROM sys.dm_db_partition_stats p WHERE p.object_id = o.object_id) AS nvarchar(32)), CAST(ep.value AS nvarchar(4000)), CAST(NULL AS nvarchar(32)) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' WHERE s.name = {} AND o.type IN ('U', 'V') ORDER BY o.name",
+            literal(schema)
+        ))
+    }
+
     fn primary_key_sql(&self, _database: &str, schema: &str, table: &str) -> Option<String> {
         Some(information_schema_primary_key_sql(&literal(schema), table))
     }

@@ -42,6 +42,8 @@ pub enum WorkTool {
     Admin,
     Redis,
     Mongo,
+    /// 连接/库对象概览（R3）。
+    Overview,
 }
 
 /// 一个可切换、可关闭、可恢复的工作项类型。持久化字符串沿用旧标签 kind，
@@ -54,6 +56,8 @@ pub enum WorkItemKind {
     Admin,
     Redis,
     Mongo,
+    /// 连接/库对象概览：单击对象树里的连接、库或模式打开（R3）。
+    Overview,
 }
 
 impl WorkItemKind {
@@ -65,6 +69,7 @@ impl WorkItemKind {
             Self::Admin => "database",
             Self::Redis => "keys",
             Self::Mongo => "docs",
+            Self::Overview => "overview",
         }
     }
 
@@ -76,6 +81,7 @@ impl WorkItemKind {
             "database" => Some(Self::Admin),
             "keys" => Some(Self::Redis),
             "docs" => Some(Self::Mongo),
+            "overview" => Some(Self::Overview),
             // 旧版本按引擎名保存专项工作台标签。
             other => match crate::adapters::workbench_loose(other)? {
                 crate::adapters::Workbench::Redis => Some(Self::Redis),
@@ -93,13 +99,14 @@ impl WorkItemKind {
             Self::Admin => WorkTool::Admin,
             Self::Redis => WorkTool::Redis,
             Self::Mongo => WorkTool::Mongo,
+            Self::Overview => WorkTool::Overview,
         }
     }
 
     pub fn page(self) -> AppPage {
         match self {
             Self::Structure | Self::Admin => AppPage::Structure,
-            Self::Query | Self::Table | Self::Redis | Self::Mongo => AppPage::Workspace,
+            Self::Query | Self::Table | Self::Redis | Self::Mongo | Self::Overview => AppPage::Workspace,
         }
     }
 
@@ -114,7 +121,7 @@ impl WorkItemKind {
             Self::Query => FocusTarget::Editor,
             Self::Table => FocusTarget::Grid,
             Self::Structure | Self::Admin => FocusTarget::Editor,
-            Self::Redis | Self::Mongo => FocusTarget::Sidebar,
+            Self::Redis | Self::Mongo | Self::Overview => FocusTarget::Sidebar,
         }
     }
 }
@@ -195,6 +202,8 @@ pub enum DraftField {
     PaletteQuery,
     /// 快捷键面板的搜索框。
     HelpQuery,
+    /// 对象概览的关键字过滤（名称或注释）。
+    OverviewFilter,
     BundlePassphrase,
     /// 危险操作确认层：生产环境要求输入的对象名。
     DangerConfirm,
@@ -471,6 +480,12 @@ pub struct WorkbenchModel {
     pub redis_spec: Option<String>,
     /// `connection|name|database|collection`。文档浏览只对已打开的 MongoDB 会话发命令。
     pub mongo_spec: Option<String>,
+    /// 活动概览标签的范围规格（`connection|name|database|schema||engine|env`）。
+    pub overview_spec: Option<String>,
+    /// 当前的概览预览标签：单击对象树打开，下一次单击就地替换；双击或在其中操作后转为固定标签。
+    pub preview_tab: Option<String>,
+    /// 每个概览标签（按范围规格）的读取结果、过滤、排序与选择。
+    pub overviews: std::collections::BTreeMap<String, crate::app::views::overview::OverviewState>,
     /// Redis 键浏览或命令还在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub redis_running: bool,
     /// MongoDB 文档读取或写入还在跑。关闭守卫把它和网格暂存、查询草稿分开。
@@ -618,6 +633,9 @@ impl WorkbenchModel {
             diagram_spec: None,
             redis_spec: None,
             mongo_spec: None,
+            overview_spec: None,
+            preview_tab: None,
+            overviews: std::collections::BTreeMap::new(),
             redis_running: false,
             mongo_running: false,
             update_checks: 0,
@@ -827,6 +845,9 @@ impl WorkbenchModel {
         }
         if id.starts_with("welcome-run-") {
             return self.welcome_run_command(id);
+        }
+        if id.starts_with("overview-") {
+            return self.overview_command(id);
         }
         if (id.starts_with("group-") || id.starts_with("conn-move-group")) && self.group_command(id) {
             return true;
@@ -2943,7 +2964,7 @@ impl WorkbenchModel {
             .filter(|database| !database.is_empty())
     }
 
-    fn nav_environment(&self, connection_id: &str) -> String {
+    pub(super) fn nav_environment(&self, connection_id: &str) -> String {
         self.connections
             .rows
             .iter()
@@ -4884,6 +4905,7 @@ impl WorkbenchModel {
             }
             WorkItemKind::Redis => self.redis_spec.is_some() && self.redis_spec == item.spec,
             WorkItemKind::Mongo => self.mongo_spec.is_some() && self.mongo_spec == item.spec,
+            WorkItemKind::Overview => self.overview_spec.is_some() && self.overview_spec == item.spec,
             WorkItemKind::Query => false,
         }
     }
@@ -4910,6 +4932,7 @@ impl WorkbenchModel {
         self.table_spec = None;
         self.redis_spec = None;
         self.mongo_spec = None;
+        self.overview_spec = None;
         self.shell.focus = FocusTarget::Editor;
     }
 
@@ -5049,6 +5072,7 @@ impl WorkbenchModel {
             WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin => self.table_spec = spec,
             WorkItemKind::Redis => self.redis_spec = spec,
             WorkItemKind::Mongo => self.mongo_spec = spec,
+            WorkItemKind::Overview => self.overview_spec = spec,
             WorkItemKind::Query => {
                 // 查询项不继承上一个表/专用页面的目标，避免 open-admin、导出等消费者取到旧目标。
                 self.table_spec = None;
@@ -5107,6 +5131,9 @@ impl WorkbenchModel {
                 }
             }
             WorkItemKind::Mongo => field(1),
+            WorkItemKind::Overview => crate::app::views::overview::OverviewTarget::parse(spec)
+                .map(|target| target.title())
+                .unwrap_or_else(|| field(1)),
         }
     }
 
@@ -5643,6 +5670,7 @@ impl WorkbenchModel {
             DraftField::RenameName => self.history.rename_text = value,
             DraftField::PaletteQuery => self.palette_query = value,
             DraftField::HelpQuery => self.help_query = value,
+            DraftField::OverviewFilter => self.set_overview_filter(value),
             DraftField::GroupName => {
                 if let Some(prompt) = self.group_prompt.as_mut() {
                     prompt.text = value;
@@ -5725,6 +5753,7 @@ impl WorkbenchModel {
             DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
             DraftField::HelpQuery => self.help_query.clone(),
+            DraftField::OverviewFilter => self.active_overview().map(|state| state.filter.clone()).unwrap_or_default(),
             DraftField::GroupName => self.group_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
             DraftField::TagLabel => self.tag_manager.as_ref().and_then(|manager| manager.editing.as_ref()).map(|draft| draft.label.clone()).unwrap_or_default(),
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
@@ -5937,6 +5966,8 @@ impl WorkbenchModel {
         self.table_spec = None;
         self.redis_spec = None;
         self.mongo_spec = None;
+        self.overview_spec = None;
+        self.preview_tab = None;
         let active = session
             .active_id
             .clone()

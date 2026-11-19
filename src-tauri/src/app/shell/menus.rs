@@ -523,6 +523,29 @@ fn targeted(id: &'static str, label_key: &'static str, action: String) -> MenuIt
     MenuItem { action: Some(action), ..leaf(id, label_key, false, true, None) }
 }
 
+/// 对象概览里一行的菜单（这一行还没读进对象树时用；读进来了就用对象树同一册菜单）。
+/// 表/视图：打开数据、查看结构、新建查询、复制名称；库/模式：打开概览、新建查询、复制名称。
+pub fn overview_menu_items(name: &str, object: bool, relational: bool) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    if object {
+        items.push(with_icon(targeted("overview-open-data", "catalog.tree.openData", format!("overview-open-data:{name}")), IconName::Table));
+        items.push(with_icon(
+            targeted("overview-open-structure", "catalog.tree.viewStructure", format!("overview-open-structure:{name}")),
+            IconName::TableProperties,
+        ));
+    } else {
+        items.push(with_icon(targeted("overview-open-child", "catalog.overview.open", format!("overview-open-child:{name}")), IconName::LayoutDashboard));
+    }
+    if relational {
+        items.push(sep(with_icon(
+            targeted("overview-new-query", "catalog.tree.newQueryHere", format!("overview-new-query:{name}")),
+            IconName::SquareTerminal,
+        )));
+    }
+    items.push(with_icon(targeted("overview-copy-name", "catalog.tree.copyFullName", format!("overview-copy-name:{name}")), IconName::Copy));
+    items
+}
+
 /// 资源管理器分组标题的菜单：新建、折叠/展开、重命名、删除（连接保留）。
 pub fn group_menu_items(group_id: &str, collapsed: bool) -> Vec<MenuItem> {
     let toggle_key = if collapsed { "ui.group.expand" } else { "ui.group.collapse" };

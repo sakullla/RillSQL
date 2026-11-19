@@ -163,6 +163,28 @@ pub trait CatalogDialect: Sync {
         None
     }
 
+    // ---- 概览统计（R3） ----
+
+    /// 没有库层的引擎在连接级读对象时用的库名（单文件引擎的主库）。
+    fn default_database(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 连接级概览：库清单，行形状 name, tables, size（字节）。None 表示不提供统计。
+    fn database_stats_sql(&self) -> Option<String> {
+        None
+    }
+
+    /// 库级概览（有模式层的引擎）：模式清单，行形状 name, tables, size（字节）。
+    fn schema_stats_sql(&self, _database: &str) -> Option<String> {
+        None
+    }
+
+    /// 库/模式级概览：表与视图，行形状 name, kind（table/view）, rows（估计）, size（数据+索引字节）, comment, updated。
+    fn object_stats_sql(&self, _database: &str, _schema: &str) -> Option<String> {
+        None
+    }
+
     /// 读非当前库时把目录查询限定到目标库（同一条会话、不发 USE）。默认原样。
     fn scope_sql(&self, _database: &str, sql: &str) -> String {
         sql.to_owned()

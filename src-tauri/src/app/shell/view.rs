@@ -1080,7 +1080,7 @@ impl Workbench {
                     pane.bind_item(target, &item);
                 });
             }
-            WorkTool::Query | WorkTool::Redis | WorkTool::Mongo => {}
+            WorkTool::Query | WorkTool::Redis | WorkTool::Mongo | WorkTool::Overview => {}
         }
     }
 
@@ -1096,6 +1096,57 @@ impl Workbench {
         }
         self.applied_redis = Some(spec.clone());
         self.redis.update(cx, |pane, cx| pane.open_spec(&spec, cx));
+    }
+
+    /// 活动概览标签：已连接且待读时在后台读取统计；未连接的先按需连接（连上后下一帧再读）。
+    fn ensure_overview(&mut self, cx: &mut Context<Self>) {
+        self.model.sync_overviews();
+        if self.model.tool != WorkTool::Overview {
+            return;
+        }
+        let pending_before = self.model.pending.len();
+        let Some((target, generation)) = self.model.overview_read_request() else {
+            if self.model.pending.len() != pending_before {
+                cx.notify();
+            }
+            return;
+        };
+        let spec = target.spec();
+        let services = Arc::clone(&self.services);
+        let gate = Arc::clone(&self.nav_gate);
+        let current = self.model.nav_connection_database(&target.connection_id);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            // 统计与名称退回都在同一个超时里：慢库不会让概览一直转圈。
+            let result = match nav_read_session(&services, target.engine, &target.connection_id, &target.database, current.as_deref()).await {
+                Ok((session, held)) => {
+                    let body = crate::catalog::nav_read::limited_metadata(
+                        gate,
+                        &target.connection_id,
+                        crate::catalog::read_object_stats(target.engine, &session, &target.database, &target.schema),
+                    )
+                    .await
+                    .unwrap_or_else(Err);
+                    drop(held);
+                    body
+                }
+                Err(message) => Err(message),
+            };
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(result) = rx.await else { return };
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    if this.model.finish_overview_read(&spec, generation, result) {
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
     }
 
     fn ensure_mongo(&mut self, cx: &mut Context<Self>) {
@@ -3078,6 +3129,7 @@ impl Render for Workbench {
         self.ensure_tool(cx);
         self.ensure_redis(cx);
         self.ensure_mongo(cx);
+        self.ensure_overview(cx);
         self.model.redis_running = self.redis.read(cx).running();
         self.model.mongo_running = self.mongo.read(cx).running();
         self.ensure_diagram(cx);
