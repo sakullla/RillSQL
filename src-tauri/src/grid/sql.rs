@@ -1,21 +1,7 @@
 use super::store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
-pub fn quote_ident(engine: Engine, name: &str) -> String {
-    match engine {
-        Engine::Mysql | Engine::Mariadb => {
-            let quote = '`';
-            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
-        }
-        Engine::Postgres | Engine::Sqlite => {
-            let quote = '"';
-            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
-        }
-        // T-SQL 的括号标识符转义是 ]]。
-        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
-        // Redis 没有 SQL 表网格；TableSchema 不会带这个引擎（live::describe 已拒绝）。
-        Engine::Redis | Engine::Mongodb => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
-}
+/// 按方言最小引号，统一由 sql_ident 判定。
+pub use crate::sql_ident::quote_ident;
 
 pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -185,12 +171,7 @@ pub fn filter_clause(engine: Engine, column: &Column, filter: &Filter) -> String
 }
 
 pub fn qualified_name(schema: &TableSchema) -> String {
-    let table = quote_ident(schema.engine, &schema.name);
-    if schema.schema.is_empty() {
-        table
-    } else {
-        format!("{}.{}", quote_ident(schema.engine, &schema.schema), table)
-    }
+    crate::sql_ident::qualified(schema.engine, &[&schema.schema, &schema.name])
 }
 
 pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String, String> {

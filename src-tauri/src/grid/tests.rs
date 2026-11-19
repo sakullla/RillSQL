@@ -236,22 +236,22 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
 
     let keyed_text = schema(Engine::Postgres, "table", &["token"], vec![col("token", "text"), col("note", "text"), col("payload", "bytea")]);
     let text_sql = sql::select_list(&keyed_text, false);
-    assert!(text_sql.starts_with("\"token\"::text,"), "{text_sql}");
-    assert!(!text_sql.contains("left(\"token\"::text"), "{text_sql}");
+    assert!(text_sql.starts_with("token::text,"), "{text_sql}");
+    assert!(!text_sql.contains("left(token::text"), "{text_sql}");
     assert!(text_sql.contains("chr(1)"), "{text_sql}");
     let keyed_blob = schema(Engine::Postgres, "table", &["payload"], vec![col("payload", "bytea"), col("blob", "bytea")]);
     let blob_sql = sql::select_list(&keyed_blob, false);
-    assert!(blob_sql.starts_with("CASE WHEN \"payload\" IS NULL THEN NULL ELSE encode(\"payload\", 'hex') END"), "{blob_sql}");
-    assert!(!blob_sql.contains("octet_length(\"payload\")"), "{blob_sql}");
+    assert!(blob_sql.starts_with("CASE WHEN payload IS NULL THEN NULL ELSE encode(payload, 'hex') END"), "{blob_sql}");
+    assert!(!blob_sql.contains("octet_length(payload)"), "{blob_sql}");
     assert!(blob_sql.contains("chr(1)"), "{blob_sql}");
     let mysql_key = schema(Engine::Mysql, "table", &["token"], vec![col("token", "varchar"), col("note", "text")]);
     let mysql_key_sql = sql::select_list(&mysql_key, false);
-    assert!(mysql_key_sql.starts_with("CAST(`token` AS CHAR),"), "{mysql_key_sql}");
-    assert!(!mysql_key_sql.contains("LEFT(CAST(`token` AS CHAR)"), "{mysql_key_sql}");
+    assert!(mysql_key_sql.starts_with("CAST(token AS CHAR),"), "{mysql_key_sql}");
+    assert!(!mysql_key_sql.contains("LEFT(CAST(token AS CHAR)"), "{mysql_key_sql}");
     let sqlite_key = schema(Engine::Sqlite, "table", &["token"], vec![col("token", "text"), col("note", "text")]);
     let sqlite_key_sql = sql::select_list(&sqlite_key, false);
-    assert!(sqlite_key_sql.starts_with("CAST(\"token\" AS TEXT),"), "{sqlite_key_sql}");
-    assert!(!sqlite_key_sql.contains("substr(CAST(\"token\" AS TEXT)"), "{sqlite_key_sql}");
+    assert!(sqlite_key_sql.starts_with("CAST(token AS TEXT),"), "{sqlite_key_sql}");
+    assert!(!sqlite_key_sql.contains("substr(CAST(token AS TEXT)"), "{sqlite_key_sql}");
 
     let flag = col("flag", "bool");
     assert_eq!(sql::sql_cell(Engine::Postgres, Some(&flag), &Cell::Text("t".to_owned())), "TRUE");
@@ -586,7 +586,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     let inserted_file = live::run_export(&session, &insert_spec).await;
     assert!(inserted_file.success);
     let insert_body = fs::read_to_string(inserted_file.path.unwrap()).unwrap();
-    assert!(insert_body.contains("INSERT INTO \"customers\""));
+    assert!(insert_body.contains("INSERT INTO customers"));
     assert!(insert_body.contains("NULL"));
     assert!(!insert_body.contains("CREATE TABLE"));
     let kept = dir.join("kept.json");
@@ -840,8 +840,8 @@ async fn key_columns_keep_full_text_and_hex_for_locator_reads() {
     let session = service.catalog_session("keys").expect("已打开会话");
 
     let blobs = live::query_page(&session, "main", "", "blob_keys", "sqlite", &[], None, 0, 10).await.unwrap();
-    assert!(blobs.sql.contains("lower(hex(\"id\"))"), "{}", blobs.sql);
-    assert!(!blobs.sql.contains("length(\"id\")"), "{}", blobs.sql);
+    assert!(blobs.sql.contains("lower(hex(id))"), "{}", blobs.sql);
+    assert!(!blobs.sql.contains("length(id)"), "{}", blobs.sql);
     assert!(blobs.sql.contains("char(1)"), "{}", blobs.sql);
     assert_eq!(blobs.rows.len(), 2);
     assert_ne!(blobs.rows[0].id, blobs.rows[1].id);
@@ -861,8 +861,8 @@ async fn key_columns_keep_full_text_and_hex_for_locator_reads() {
     assert_eq!(opened.rows[0].cells.get("extra"), Some(&Cell::Text("ffff".to_owned())));
 
     let texts = live::query_page(&session, "main", "", "text_keys", "sqlite", &[], None, 0, 10).await.unwrap();
-    assert!(texts.sql.starts_with("SELECT CAST(\"id\" AS TEXT),"), "{}", texts.sql);
-    assert!(!texts.sql.contains("substr(CAST(\"id\" AS TEXT)"), "{}", texts.sql);
+    assert!(texts.sql.starts_with("SELECT CAST(id AS TEXT),"), "{}", texts.sql);
+    assert!(!texts.sql.contains("substr(CAST(id AS TEXT)"), "{}", texts.sql);
     let wide = texts.rows.iter().find(|row| row.cells.get("note") == Some(&Cell::Text("x".to_owned()))).unwrap();
     let shaped = texts.rows.iter().find(|row| row.cells.get("note") == Some(&Cell::Text("y".to_owned()))).unwrap();
     assert_eq!(wide.cells.get("id"), Some(&Cell::Text(long.clone())));

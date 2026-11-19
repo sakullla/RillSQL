@@ -722,29 +722,9 @@ pub fn identifiers(sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn plain_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
-}
-
-/// PostgreSQL 会把没加引号的标识符折叠成小写，CamelCase 名字必须引用才指得回原对象。
-fn folds_case(engine: &str, name: &str) -> bool {
-    engine == "postgres" && name.chars().any(|ch| ch.is_uppercase())
-}
-
-/// 需要引号时才加引号，保留原大小写；引擎决定引号字符。
+/// 需要引号时才加引号，保留原大小写；判定（保留字、PG 大小写、特殊字符）统一由 sql_ident 负责。
 pub fn ident(engine: &str, name: &str) -> String {
-    if plain_ident(name) && !folds_case(engine, name) {
-        name.to_owned()
-    } else {
-        quote_ident(engine, name)
-    }
+    quote_ident(engine, name)
 }
 
 fn qualified_ident(engine: &str, schema: &str, name: &str) -> String {

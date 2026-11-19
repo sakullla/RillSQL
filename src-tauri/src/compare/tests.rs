@@ -124,9 +124,9 @@ fn drops_views_and_referencing_tables_before_referenced_tables() {
     let tickets = table_with_fk("tickets", foreign_key("tickets_note", "note_id", "notes"));
     let view = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes AS SELECT id FROM notes");
     let cases = [
-        ("postgres", "app", "public", "DROP VIEW \"public\".\"v_notes\"", "DROP TABLE \"public\".\"tickets\"", "DROP TABLE \"public\".\"notes\"", "DROP CONSTRAINT \"tickets_note\""),
-        ("mysql", "app", "", "DROP VIEW `app`.`v_notes`", "DROP TABLE `app`.`tickets`", "DROP TABLE `app`.`notes`", "DROP FOREIGN KEY `tickets_note`"),
-        ("sqlite", "main", "", "DROP VIEW \"v_notes\"", "DROP TABLE \"tickets\"", "DROP TABLE \"notes\"", ""),
+        ("postgres", "app", "public", "DROP VIEW public.v_notes", "DROP TABLE public.tickets", "DROP TABLE public.notes", "DROP CONSTRAINT tickets_note"),
+        ("mysql", "app", "", "DROP VIEW app.v_notes", "DROP TABLE app.tickets", "DROP TABLE app.notes", "DROP FOREIGN KEY tickets_note"),
+        ("sqlite", "main", "", "DROP VIEW v_notes", "DROP TABLE tickets", "DROP TABLE notes", ""),
     ];
     for (engine, database, schema, drop_view, drop_child, drop_parent, drop_fk) in cases {
         let report = diff_structure(
@@ -150,7 +150,7 @@ fn drops_a_view_before_the_view_it_selects() {
     let base = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT 1");
     let top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT * FROM v_base");
     let report = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![base, top]));
-    assert!(at(&report.script, "DROP VIEW \"public\".\"v_top\"") < at(&report.script, "DROP VIEW \"public\".\"v_base\""), "{}", report.script);
+    assert!(at(&report.script, "DROP VIEW public.v_top") < at(&report.script, "DROP VIEW public.v_base"), "{}", report.script);
 }
 
 #[test]
@@ -158,9 +158,9 @@ fn creates_foreign_keys_after_every_new_table() {
     let users = ObjectDef::table("users", shape(vec![column("id", "integer", false, true)], vec![]));
     let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
     let cases = [
-        ("postgres", "public", "CREATE TABLE \"public\".\"orders\"", "CREATE TABLE \"public\".\"users\""),
-        ("mysql", "", "CREATE TABLE `app`.`orders`", "CREATE TABLE `app`.`users`"),
-        ("mariadb", "", "CREATE TABLE `app`.`orders`", "CREATE TABLE `app`.`users`"),
+        ("postgres", "public", "CREATE TABLE public.orders", "CREATE TABLE public.users"),
+        ("mysql", "", "CREATE TABLE app.orders", "CREATE TABLE app.users"),
+        ("mariadb", "", "CREATE TABLE app.orders", "CREATE TABLE app.users"),
     ];
     for (engine, schema, create_orders, create_users) in cases {
         let report = diff_structure(
@@ -183,9 +183,9 @@ fn replaced_view_stops_using_a_table_before_that_table_is_dropped() {
     let current = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id) AS SELECT id FROM notes");
     let wanted = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id) AS SELECT 1 AS id");
     let cases = [
-        ("postgres", "app", "public", "CREATE OR REPLACE VIEW \"public\".\"v_notes\"", "DROP TABLE \"public\".\"notes\""),
-        ("mysql", "app", "", "CREATE OR REPLACE VIEW `app`.`v_notes`", "DROP TABLE `app`.`notes`"),
-        ("mariadb", "app", "", "CREATE OR REPLACE VIEW `app`.`v_notes`", "DROP TABLE `app`.`notes`"),
+        ("postgres", "app", "public", "CREATE OR REPLACE VIEW public.v_notes", "DROP TABLE public.notes"),
+        ("mysql", "app", "", "CREATE OR REPLACE VIEW app.v_notes", "DROP TABLE app.notes"),
+        ("mariadb", "app", "", "CREATE OR REPLACE VIEW app.v_notes", "DROP TABLE app.notes"),
     ];
     for (engine, database, schema, replace_view, drop_table) in cases {
         let report = diff_structure(
@@ -201,8 +201,8 @@ fn replaced_view_stops_using_a_table_before_that_table_is_dropped() {
         &Side::ready("sqlite", "main", "", vec![notes, current]),
     );
     let script = &sqlite.script;
-    assert!(at(script, "DROP VIEW \"v_notes\"") < at(script, "DROP TABLE \"notes\""), "{script}");
-    assert!(at(script, "DROP TABLE \"notes\"") < at(script, "CREATE VIEW \"v_notes\""), "{script}");
+    assert!(at(script, "DROP VIEW v_notes") < at(script, "DROP TABLE notes"), "{script}");
+    assert!(at(script, "DROP TABLE notes") < at(script, "CREATE VIEW v_notes"), "{script}");
 }
 
 #[test]
@@ -211,9 +211,9 @@ fn replaced_view_that_reads_a_dropped_view_is_recreated_after_the_drop() {
     let current = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM v_base");
     let wanted = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT 1 AS id");
     let cases = [
-        ("postgres", "app", "public", "\"public\".\"v_top\"", "\"public\".\"v_base\""),
-        ("mysql", "app", "", "`app`.`v_top`", "`app`.`v_base`"),
-        ("mariadb", "app", "", "`app`.`v_top`", "`app`.`v_base`"),
+        ("postgres", "app", "public", "public.v_top", "public.v_base"),
+        ("mysql", "app", "", "app.v_top", "app.v_base"),
+        ("mariadb", "app", "", "app.v_top", "app.v_base"),
     ];
     for (engine, database, schema, top, base_name) in cases {
         let report = diff_structure(
@@ -248,9 +248,9 @@ fn view_retargeted_onto_a_dropped_view_is_dropped_before_rebuild() {
     let current_mid = ObjectDef::defined(Kind::View, "v_mid", "CREATE VIEW v_mid (id) AS SELECT id FROM v_base");
     let wanted_mid = ObjectDef::defined(Kind::View, "v_mid", "CREATE VIEW v_mid (id) AS SELECT 2 AS id");
     let cases = [
-        ("postgres", "app", "public", "\"public\".\"v_top\"", "\"public\".\"v_mid\"", "\"public\".\"v_base\"", "\"public\".\"notes\""),
-        ("mysql", "app", "", "`app`.`v_top`", "`app`.`v_mid`", "`app`.`v_base`", "`app`.`notes`"),
-        ("mariadb", "app", "", "`app`.`v_top`", "`app`.`v_mid`", "`app`.`v_base`", "`app`.`notes`"),
+        ("postgres", "app", "public", "public.v_top", "public.v_mid", "public.v_base", "public.notes"),
+        ("mysql", "app", "", "app.v_top", "app.v_mid", "app.v_base", "app.notes"),
+        ("mariadb", "app", "", "app.v_top", "app.v_mid", "app.v_base", "app.notes"),
     ];
     for (engine, database, schema, top, mid, base_name, notes_name) in cases {
         let current_top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM notes");
@@ -283,10 +283,10 @@ fn view_retargeted_onto_a_dropped_view_is_dropped_before_rebuild() {
         ),
     );
     let script = &routine.script;
-    let create_top = view_create_at(script, "\"public\".\"v_top\"");
-    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP FUNCTION \"public\".\"old_fn\""), "{script}");
-    assert!(at(script, "DROP VIEW \"public\".\"v_mid\"") < create_top, "{script}");
-    assert!(view_create_at(script, "\"public\".\"v_mid\"") < create_top, "{script}");
+    let create_top = view_create_at(script, "public.v_top");
+    assert!(at(script, "DROP VIEW public.v_top") < at(script, "DROP FUNCTION public.old_fn"), "{script}");
+    assert!(at(script, "DROP VIEW public.v_mid") < create_top, "{script}");
+    assert!(view_create_at(script, "public.v_mid") < create_top, "{script}");
 
     let baseline_orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true)], vec![]));
     let target_orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], vec![]));
@@ -305,10 +305,10 @@ fn view_retargeted_onto_a_dropped_view_is_dropped_before_rebuild() {
         ),
     );
     let script = &column.script;
-    let create_top = view_create_at(script, "\"public\".\"v_top\"");
-    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP COLUMN \"note\""), "{script}");
-    assert!(at(script, "DROP VIEW \"public\".\"v_mid\"") < create_top, "{script}");
-    assert!(view_create_at(script, "\"public\".\"v_mid\"") < create_top, "{script}");
+    let create_top = view_create_at(script, "public.v_top");
+    assert!(at(script, "DROP VIEW public.v_top") < at(script, "DROP COLUMN note"), "{script}");
+    assert!(at(script, "DROP VIEW public.v_mid") < create_top, "{script}");
+    assert!(view_create_at(script, "public.v_mid") < create_top, "{script}");
 }
 
 #[test]
@@ -321,9 +321,9 @@ fn routine_that_reads_a_dropped_table_is_dropped_first() {
         &Side::ready("postgres", "app", "public", vec![notes, function, procedure]),
     );
     let script = &report.script;
-    let drop_table = at(script, "DROP TABLE \"public\".\"notes\"");
-    assert!(at(script, "DROP FUNCTION \"public\".\"read_notes\"") < drop_table, "{script}");
-    assert!(at(script, "DROP PROCEDURE \"public\".\"load_notes\"") < drop_table, "{script}");
+    let drop_table = at(script, "DROP TABLE public.notes");
+    assert!(at(script, "DROP FUNCTION public.read_notes") < drop_table, "{script}");
+    assert!(at(script, "DROP PROCEDURE public.load_notes") < drop_table, "{script}");
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn sqlite_new_table_keeps_the_foreign_key_inside_create_table() {
     let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
     let report = diff_structure(&Side::ready("sqlite", "main", "", vec![orders]), &Side::ready("sqlite", "main", "", vec![]));
     let script = &report.script;
-    let create_at = at(script, "CREATE TABLE \"orders\"");
+    let create_at = at(script, "CREATE TABLE orders");
     let body_end = create_at + script[create_at..].find(';').expect("statement");
     assert!(script[create_at..=body_end].contains("FOREIGN KEY"), "{script}");
     assert!(!script.to_ascii_uppercase().contains("ALTER TABLE"), "{script}");
@@ -345,20 +345,20 @@ fn types_and_routines_follow_the_columns_that_use_them() {
     let plain = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("status", "integer", true, false), column("code", "integer", true, false)], vec![]));
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![typed.clone(), enum_type.clone(), domain.clone()]));
     let script = &dropped.script;
-    assert!(at(script, "DROP TABLE \"public\".\"orders\"") < at(script, "DROP DOMAIN \"public\".\"order_code\""), "{script}");
-    assert!(at(script, "DROP TABLE \"public\".\"orders\"") < at(script, "DROP TYPE \"public\".\"order_status\""), "{script}");
-    assert!(at(script, "DROP DOMAIN \"public\".\"order_code\"") < at(script, "DROP TYPE \"public\".\"order_status\""), "{script}");
+    assert!(at(script, "DROP TABLE public.orders") < at(script, "DROP DOMAIN public.order_code"), "{script}");
+    assert!(at(script, "DROP TABLE public.orders") < at(script, "DROP TYPE public.order_status"), "{script}");
+    assert!(at(script, "DROP DOMAIN public.order_code") < at(script, "DROP TYPE public.order_status"), "{script}");
 
     let altered = diff_structure(&Side::ready("postgres", "app", "public", vec![plain.clone()]), &Side::ready("postgres", "app", "public", vec![typed.clone(), enum_type.clone(), domain.clone()]));
     let script = &altered.script;
-    assert!(at(script, "ALTER COLUMN \"status\" TYPE integer") < at(script, "DROP TYPE \"public\".\"order_status\""), "{script}");
-    assert!(at(script, "ALTER COLUMN \"code\" TYPE integer") < at(script, "DROP DOMAIN \"public\".\"order_code\""), "{script}");
+    assert!(at(script, "ALTER COLUMN status TYPE integer") < at(script, "DROP TYPE public.order_status"), "{script}");
+    assert!(at(script, "ALTER COLUMN code TYPE integer") < at(script, "DROP DOMAIN public.order_code"), "{script}");
 
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![typed, enum_type, domain]), &Side::ready("postgres", "app", "public", vec![plain]));
     let script = &created.script;
-    assert!(at(script, "CREATE TYPE \"public\".\"order_status\"") < at(script, "ALTER COLUMN \"status\" TYPE order_status"), "{script}");
-    assert!(at(script, "CREATE DOMAIN \"public\".\"order_code\"") < at(script, "ALTER COLUMN \"code\" TYPE order_code"), "{script}");
-    assert!(at(script, "CREATE TYPE \"public\".\"order_status\"") < at(script, "CREATE DOMAIN \"public\".\"order_code\""), "{script}");
+    assert!(at(script, "CREATE TYPE public.order_status") < at(script, "ALTER COLUMN status TYPE order_status"), "{script}");
+    assert!(at(script, "CREATE DOMAIN public.order_code") < at(script, "ALTER COLUMN code TYPE order_code"), "{script}");
+    assert!(at(script, "CREATE TYPE public.order_status") < at(script, "CREATE DOMAIN public.order_code"), "{script}");
 }
 
 #[test]
@@ -366,9 +366,9 @@ fn nested_domains_follow_their_base_type() {
     let base = ObjectDef::defined(Kind::Domain, "z_code", "CREATE DOMAIN z_code AS integer");
     let child = ObjectDef::defined(Kind::Domain, "a_code", "CREATE DOMAIN a_code AS z_code");
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![child.clone(), base.clone()]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(at(&created.script, "CREATE DOMAIN \"public\".\"z_code\"") < at(&created.script, "CREATE DOMAIN \"public\".\"a_code\""), "{}", created.script);
+    assert!(at(&created.script, "CREATE DOMAIN public.z_code") < at(&created.script, "CREATE DOMAIN public.a_code"), "{}", created.script);
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![child, base]));
-    assert!(at(&dropped.script, "DROP DOMAIN \"public\".\"a_code\"") < at(&dropped.script, "DROP DOMAIN \"public\".\"z_code\""), "{}", dropped.script);
+    assert!(at(&dropped.script, "DROP DOMAIN public.a_code") < at(&dropped.script, "DROP DOMAIN public.z_code"), "{}", dropped.script);
 }
 
 #[test]
@@ -376,7 +376,7 @@ fn new_table_waits_for_the_enum_it_uses() {
     let enum_type = ObjectDef::defined(Kind::Enum, "order_status", "CREATE TYPE order_status AS ENUM ('open')");
     let orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("status", "order_status", true, false)], vec![]));
     let report = diff_structure(&Side::ready("postgres", "app", "public", vec![orders, enum_type]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(at(&report.script, "CREATE TYPE \"public\".\"order_status\"") < at(&report.script, "CREATE TABLE \"public\".\"orders\""), "{}", report.script);
+    assert!(at(&report.script, "CREATE TYPE public.order_status") < at(&report.script, "CREATE TABLE public.orders"), "{}", report.script);
 }
 
 #[test]
@@ -387,17 +387,17 @@ fn owned_sequence_is_not_dropped_again_after_its_table() {
     column_id.default_sql = "nextval('orders_id_seq'::regclass)".to_owned();
     let orders = ObjectDef::table("orders", shape(vec![column_id], vec![]));
     let owned = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![orders.clone(), sequence]));
-    assert!(owned.script.contains("DROP TABLE \"public\".\"orders\""));
+    assert!(owned.script.contains("DROP TABLE public.orders"));
     assert!(!owned.script.to_ascii_uppercase().contains("DROP SEQUENCE"), "{}", owned.script);
 
     let serial = ObjectDef::defined(Kind::Sequence, "orders_id_seq", "CREATE SEQUENCE orders_id_seq");
     let implied = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![orders, serial]));
-    assert!(at(&implied.script, "DROP TABLE \"public\".\"orders\"") < at(&implied.script, "DROP SEQUENCE IF EXISTS \"public\".\"orders_id_seq\""), "{}", implied.script);
-    assert!(!implied.script.contains("DROP SEQUENCE \"public\".\"orders_id_seq\""), "{}", implied.script);
+    assert!(at(&implied.script, "DROP TABLE public.orders") < at(&implied.script, "DROP SEQUENCE IF EXISTS public.orders_id_seq"), "{}", implied.script);
+    assert!(!implied.script.contains("DROP SEQUENCE public.orders_id_seq"), "{}", implied.script);
 
     let loose = ObjectDef::defined(Kind::Sequence, "spare_seq", "CREATE SEQUENCE spare_seq");
     let alone = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![loose]));
-    assert!(alone.script.contains("DROP SEQUENCE \"public\".\"spare_seq\""), "{}", alone.script);
+    assert!(alone.script.contains("DROP SEQUENCE public.spare_seq"), "{}", alone.script);
 }
 
 #[test]
@@ -415,8 +415,8 @@ fn sequence_and_function_are_created_before_defaults_and_dropped_after_tables() 
         &Side::ready("postgres", "app", "public", vec![target_orders.clone()]),
     );
     let script = &created.script;
-    assert!(at(script, "CREATE SEQUENCE \"public\".\"orders_id_seq\"") < at(script, "SET DEFAULT nextval('orders_id_seq'::regclass)"), "{script}");
-    assert!(at(script, "CREATE FUNCTION \"public\".\"label\"") < at(script, "SET DEFAULT label()"), "{script}");
+    assert!(at(script, "CREATE SEQUENCE public.orders_id_seq") < at(script, "SET DEFAULT nextval('orders_id_seq'::regclass)"), "{script}");
+    assert!(at(script, "CREATE FUNCTION public.label") < at(script, "SET DEFAULT label()"), "{script}");
 
     let mut target_id = column("id", "integer", false, true);
     target_id.default_sql = "nextval('orders_id_seq'::regclass)".to_owned();
@@ -427,9 +427,9 @@ fn sequence_and_function_are_created_before_defaults_and_dropped_after_tables() 
         &Side::ready("postgres", "app", "public", vec![ObjectDef::table("orders", shape(vec![target_id, target_note], vec![])), sequence, function]),
     );
     let script = &dropped.script;
-    assert!(at(script, "DROP TABLE \"public\".\"orders\"") < at(script, "DROP FUNCTION \"public\".\"label\""), "{script}");
-    assert!(at(script, "DROP TABLE \"public\".\"orders\"") < at(script, "DROP SEQUENCE IF EXISTS \"public\".\"orders_id_seq\""), "{script}");
-    assert!(!script.contains("DROP SEQUENCE \"public\".\"orders_id_seq\""), "{script}");
+    assert!(at(script, "DROP TABLE public.orders") < at(script, "DROP FUNCTION public.label"), "{script}");
+    assert!(at(script, "DROP TABLE public.orders") < at(script, "DROP SEQUENCE IF EXISTS public.orders_id_seq"), "{script}");
+    assert!(!script.contains("DROP SEQUENCE public.orders_id_seq"), "{script}");
 }
 
 #[test]
@@ -438,9 +438,9 @@ fn trigger_on_a_view_is_dropped_before_the_view_and_created_after_it() {
     let mut trigger = ObjectDef::defined(Kind::Trigger, "v_touch", "CREATE TRIGGER v_touch INSTEAD OF UPDATE ON v_notes FOR EACH ROW EXECUTE FUNCTION touch()");
     trigger.relation = "v_notes".to_owned();
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![view.clone(), trigger.clone()]));
-    assert!(at(&dropped.script, "DROP TRIGGER \"v_touch\" ON \"public\".\"v_notes\"") < at(&dropped.script, "DROP VIEW \"public\".\"v_notes\""), "{}", dropped.script);
+    assert!(at(&dropped.script, "DROP TRIGGER v_touch ON public.v_notes") < at(&dropped.script, "DROP VIEW public.v_notes"), "{}", dropped.script);
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![view, trigger]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(at(&created.script, "CREATE VIEW \"public\".\"v_notes\"") < at(&created.script, "CREATE TRIGGER \"v_touch\""), "{}", created.script);
+    assert!(at(&created.script, "CREATE VIEW public.v_notes") < at(&created.script, "CREATE TRIGGER v_touch"), "{}", created.script);
 }
 
 #[test]
@@ -448,15 +448,15 @@ fn views_are_created_and_dropped_by_real_references_not_aliases() {
     let source = ObjectDef::defined(Kind::View, "v_source", "CREATE VIEW v_source AS SELECT 1");
     let report_view = ObjectDef::defined(Kind::View, "v_report", "CREATE VIEW v_report AS SELECT * FROM v_source");
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![report_view.clone(), source.clone()]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(at(&created.script, "CREATE VIEW \"public\".\"v_source\"") < at(&created.script, "CREATE VIEW \"public\".\"v_report\""), "{}", created.script);
+    assert!(at(&created.script, "CREATE VIEW public.v_source") < at(&created.script, "CREATE VIEW public.v_report"), "{}", created.script);
 
     let alias = ObjectDef::defined(Kind::View, "v_a", "CREATE VIEW v_a AS SELECT 'v_b' AS label /* FROM v_c */");
     let real = ObjectDef::defined(Kind::View, "v_b", "CREATE VIEW v_b AS SELECT * FROM v_a");
     let commented = ObjectDef::defined(Kind::View, "v_c", "CREATE VIEW v_c AS SELECT * FROM v_a -- v_b\n");
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![alias, real, commented]));
     let script = &dropped.script;
-    assert!(at(script, "DROP VIEW \"public\".\"v_b\"") < at(script, "DROP VIEW \"public\".\"v_a\""), "{script}");
-    assert!(at(script, "DROP VIEW \"public\".\"v_c\"") < at(script, "DROP VIEW \"public\".\"v_a\""), "{script}");
+    assert!(at(script, "DROP VIEW public.v_b") < at(script, "DROP VIEW public.v_a"), "{script}");
+    assert!(at(script, "DROP VIEW public.v_c") < at(script, "DROP VIEW public.v_a"), "{script}");
 }
 
 #[test]
@@ -469,8 +469,8 @@ fn owned_sequence_on_a_remaining_column_is_detached_before_it_is_dropped() {
     let target = ObjectDef::table("orders", shape(vec![id], vec![]));
     let report = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline]), &Side::ready("postgres", "app", "public", vec![target, sequence]));
     let script = &report.script;
-    assert!(at(script, "DROP DEFAULT") < at(script, "ALTER SEQUENCE \"public\".\"orders_id_seq\" OWNED BY NONE"), "{script}");
-    assert!(at(script, "OWNED BY NONE") < at(script, "DROP SEQUENCE \"public\".\"orders_id_seq\""), "{script}");
+    assert!(at(script, "DROP DEFAULT") < at(script, "ALTER SEQUENCE public.orders_id_seq OWNED BY NONE"), "{script}");
+    assert!(at(script, "OWNED BY NONE") < at(script, "DROP SEQUENCE public.orders_id_seq"), "{script}");
 }
 
 #[test]
@@ -479,18 +479,18 @@ fn cyclic_foreign_keys_are_not_inlined_and_drop_before_either_table() {
     let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![users.clone(), orders.clone()]), &Side::ready("postgres", "app", "public", vec![]));
     let script = &created.script;
-    for marker in ["CREATE TABLE \"public\".\"orders\"", "CREATE TABLE \"public\".\"users\""] {
+    for marker in ["CREATE TABLE public.orders", "CREATE TABLE public.users"] {
         let start = at(script, marker);
         let end = start + script[start..].find(';').expect("statement");
         assert!(!script[start..=end].contains("FOREIGN KEY"), "{script}");
-        assert!(start < at(script, "CONSTRAINT \"orders_user\""), "{script}");
-        assert!(start < at(script, "CONSTRAINT \"users_order\""), "{script}");
+        assert!(start < at(script, "CONSTRAINT orders_user"), "{script}");
+        assert!(start < at(script, "CONSTRAINT users_order"), "{script}");
     }
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![users, orders]));
     let script = &dropped.script;
     let first_drop = at(script, "DROP TABLE");
-    assert!(at(script, "DROP CONSTRAINT \"orders_user\"") < first_drop, "{script}");
-    assert!(at(script, "DROP CONSTRAINT \"users_order\"") < first_drop, "{script}");
+    assert!(at(script, "DROP CONSTRAINT orders_user") < first_drop, "{script}");
+    assert!(at(script, "DROP CONSTRAINT users_order") < first_drop, "{script}");
 }
 
 #[test]
@@ -704,7 +704,7 @@ fn orders_shape(primary: bool) -> ObjectDef {
 fn primary_key_script_drops_the_target_key_before_adding_the_baseline_key() {
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![orders_shape(false)]), &Side::ready("postgres", "app", "public", vec![orders_shape(true)]));
     assert!(dropped.changed.iter().any(|item| item.detail.contains("主键")));
-    assert!(dropped.script.contains("DROP CONSTRAINT \"orders_pkey\""));
+    assert!(dropped.script.contains("DROP CONSTRAINT orders_pkey"));
     assert!(!dropped.script.contains("ADD PRIMARY KEY"));
     assert!(!dropped.script.contains("没有结构差异"));
 
@@ -713,7 +713,7 @@ fn primary_key_script_drops_the_target_key_before_adding_the_baseline_key() {
     let target = ObjectDef::table("orders", shape(columns, vec![pk_index(&[("id", false)])]));
     let changed = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline]), &Side::ready("postgres", "app", "public", vec![target]));
     let drop_at = changed.script.find("DROP CONSTRAINT").expect("drop");
-    let add_at = changed.script.find("ADD PRIMARY KEY (\"id\", \"note\")").expect("add");
+    let add_at = changed.script.find("ADD PRIMARY KEY (id, note)").expect("add");
     assert!(drop_at < add_at);
 
     let with_pk = orders_shape(true);
@@ -814,16 +814,16 @@ fn create_statements_are_qualified_on_the_target_side() {
     let target_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"sales\".\"v_orders\" AS SELECT 2");
     let views = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_view]), &Side::ready("postgres", "app", "sales", vec![target_view]));
     // 两侧都没有列清单，不能证明 OR REPLACE 合法，所以先删对照上的视图再按对照 schema 建回。
-    assert!(views.script.contains("DROP VIEW \"sales\".\"v_orders\""));
-    assert!(at(&views.script, "DROP VIEW \"sales\".\"v_orders\"") < at(&views.script, "VIEW \"sales\".\"v_orders\" AS SELECT 1"));
-    assert!(views.script.contains("VIEW \"sales\".\"v_orders\" AS SELECT 1"));
-    assert!(!views.script.contains("\"public\".\"v_orders\""));
+    assert!(views.script.contains("DROP VIEW sales.v_orders"));
+    assert!(at(&views.script, "DROP VIEW sales.v_orders") < at(&views.script, "VIEW sales.v_orders AS SELECT 1"));
+    assert!(views.script.contains("VIEW sales.v_orders AS SELECT 1"));
+    assert!(!views.script.contains("public.v_orders"));
 
     let baseline_fn = ObjectDef::defined(Kind::Function, "add_customer", "CREATE FUNCTION public.add_customer() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
     let target_fn = ObjectDef::defined(Kind::Function, "add_customer", "CREATE FUNCTION sales.add_customer() RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$");
     let functions = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_fn]), &Side::ready("postgres", "app", "sales", vec![target_fn]));
     assert!(!functions.script.contains("DROP FUNCTION"));
-    assert!(functions.script.contains("CREATE OR REPLACE FUNCTION \"sales\".\"add_customer\"()"));
+    assert!(functions.script.contains("CREATE OR REPLACE FUNCTION sales.add_customer()"));
     assert!(functions.script.contains("SELECT 1"));
     assert!(!functions.script.contains("public.add_customer"));
 
@@ -832,10 +832,10 @@ fn create_statements_are_qualified_on_the_target_side() {
     let mut target_trigger = ObjectDef::defined(Kind::Trigger, "touch", "CREATE TRIGGER touch BEFORE UPDATE ON sales.orders FOR EACH ROW EXECUTE FUNCTION sales.touch()");
     target_trigger.relation = "orders".to_owned();
     let triggers = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_trigger]), &Side::ready("postgres", "app", "sales", vec![target_trigger]));
-    assert!(triggers.script.contains("DROP TRIGGER \"touch\" ON \"sales\".\"orders\""));
-    assert!(triggers.script.contains("CREATE TRIGGER \"touch\" BEFORE UPDATE ON \"sales\".\"orders\""));
-    assert!(!triggers.script.contains("CREATE TRIGGER \"sales\".\"touch\""));
-    assert!(!triggers.script.contains("\"sales\".\"touch\""));
+    assert!(triggers.script.contains("DROP TRIGGER touch ON sales.orders"));
+    assert!(triggers.script.contains("CREATE TRIGGER touch BEFORE UPDATE ON sales.orders"));
+    assert!(!triggers.script.contains("CREATE TRIGGER sales.touch"));
+    assert!(!triggers.script.contains("sales.touch"));
     assert!(!triggers.script.contains("ON public.orders"));
 
     let baseline_mysql = ObjectDef::defined(
@@ -847,8 +847,8 @@ fn create_statements_are_qualified_on_the_target_side() {
     let mysql = diff_structure(&Side::ready("mysql", "shop", "", vec![baseline_mysql]), &Side::ready("mysql", "other", "", vec![target_mysql]));
     assert!(!mysql.script.contains("DROP VIEW"));
     assert!(mysql.script.contains("CREATE OR REPLACE ALGORITHM=UNDEFINED"));
-    assert!(mysql.script.contains("VIEW `other`.`v_orders` AS select 1"));
-    assert!(!mysql.script.contains("`shop`.`v_orders`"));
+    assert!(mysql.script.contains("VIEW other.v_orders AS select 1"));
+    assert!(!mysql.script.contains("shop.v_orders"));
 
     let mut partial = index("orders_note", false, &[("note", false)]);
     partial.partial = true;
@@ -856,7 +856,7 @@ fn create_statements_are_qualified_on_the_target_side() {
     let indexed = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], vec![partial]));
     let plain = orders("integer");
     let indexes = diff_structure(&Side::ready("postgres", "app", "public", vec![indexed]), &Side::ready("postgres", "app", "sales", vec![plain]));
-    assert!(indexes.script.contains("ON \"sales\".\"orders\""));
+    assert!(indexes.script.contains("ON sales.orders"));
     assert!(!indexes.script.contains("ON public.orders"));
 }
 
@@ -1034,11 +1034,11 @@ fn changed_views_and_functions_are_replaced_without_dropping_dependents() {
         &Side::ready("postgres", "app", "public", vec![current, top, trigger]),
     );
     let script = &views.script;
-    assert!(at(script, "DROP TRIGGER \"v_touch\" ON \"public\".\"v_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(at(script, "CREATE VIEW \"public\".\"v_base\" AS SELECT id FROM notes") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_top\""), "{script}");
-    assert!(at(script, "CREATE VIEW \"public\".\"v_base\" AS SELECT id FROM notes") < at(script, "CREATE TRIGGER \"v_touch\""), "{script}");
-    assert!(!script.contains("CREATE OR REPLACE VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "DROP TRIGGER v_touch ON public.v_base") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(at(script, "DROP VIEW public.v_top") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(at(script, "CREATE VIEW public.v_base AS SELECT id FROM notes") < at(script, "CREATE OR REPLACE VIEW public.v_top"), "{script}");
+    assert!(at(script, "CREATE VIEW public.v_base AS SELECT id FROM notes") < at(script, "CREATE TRIGGER v_touch"), "{script}");
+    assert!(!script.contains("CREATE OR REPLACE VIEW public.v_base"), "{script}");
 
     let listed_wanted = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base (id) AS SELECT id FROM notes");
     let listed_current = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base (id) AS SELECT 1 AS id");
@@ -1047,7 +1047,7 @@ fn changed_views_and_functions_are_replaced_without_dropping_dependents() {
         &Side::ready("postgres", "app", "public", vec![listed_wanted, listed_top.clone()]),
         &Side::ready("postgres", "app", "public", vec![listed_current, listed_top]),
     );
-    assert!(listed.script.contains("CREATE OR REPLACE VIEW \"public\".\"v_base\" (id) AS SELECT id FROM notes"), "{}", listed.script);
+    assert!(listed.script.contains("CREATE OR REPLACE VIEW public.v_base (id) AS SELECT id FROM notes"), "{}", listed.script);
     assert!(!listed.script.contains("DROP VIEW"), "{}", listed.script);
 
     let mut note = column("note", "text", true, false);
@@ -1062,7 +1062,7 @@ fn changed_views_and_functions_are_replaced_without_dropping_dependents() {
         &Side::ready("postgres", "app", "public", vec![orders, current_fn, touch]),
     );
     let script = &functions.script;
-    assert!(script.contains("CREATE OR REPLACE FUNCTION \"public\".\"label\""), "{script}");
+    assert!(script.contains("CREATE OR REPLACE FUNCTION public.label"), "{script}");
     assert!(script.contains("SELECT 'b'"), "{script}");
     assert!(!script.contains("DROP FUNCTION"), "{script}");
     assert!(!script.contains("DROP TRIGGER"), "{script}");
@@ -1104,9 +1104,9 @@ fn enums_and_sequences_still_used_by_columns_are_not_dropped_first() {
         ),
     );
     let script = &removed.script;
-    assert!(at(script, "TYPE text") < at(script, "DROP TYPE \"public\".\"order_status\""), "{script}");
-    assert!(at(script, "DROP TYPE \"public\".\"order_status\"") < at(script, "CREATE TYPE \"public\".\"order_status\" AS ENUM ('open')"), "{script}");
-    assert!(at(script, "CREATE TYPE \"public\".\"order_status\" AS ENUM ('open')") < at(script, "ALTER COLUMN \"status\" TYPE \"public\".\"order_status\""), "{script}");
+    assert!(at(script, "TYPE text") < at(script, "DROP TYPE public.order_status"), "{script}");
+    assert!(at(script, "DROP TYPE public.order_status") < at(script, "CREATE TYPE public.order_status AS ENUM ('open')"), "{script}");
+    assert!(at(script, "CREATE TYPE public.order_status AS ENUM ('open')") < at(script, "ALTER COLUMN status TYPE public.order_status"), "{script}");
 
     let mut id = column("id", "integer", false, true);
     id.default_sql = "nextval('orders_id_seq'::regclass)".to_owned();
@@ -1117,7 +1117,7 @@ fn enums_and_sequences_still_used_by_columns_are_not_dropped_first() {
         &Side::ready("postgres", "app", "public", vec![table.clone(), wanted_seq]),
         &Side::ready("postgres", "app", "public", vec![table, current_seq]),
     );
-    assert!(sequences.script.contains("ALTER SEQUENCE \"public\".\"orders_id_seq\" INCREMENT BY 2"), "{}", sequences.script);
+    assert!(sequences.script.contains("ALTER SEQUENCE public.orders_id_seq INCREMENT BY 2"), "{}", sequences.script);
     assert!(!sequences.script.contains("DROP SEQUENCE"), "{}", sequences.script);
     assert!(!sequences.script.contains("OWNED BY NONE"), "{}", sequences.script);
 
@@ -1140,8 +1140,8 @@ fn enums_and_sequences_still_used_by_columns_are_not_dropped_first() {
         ),
     );
     let script = &moved.script;
-    assert!(at(script, "CREATE TYPE \"public\".\"new_status\"") < at(script, "ALTER COLUMN \"status\" TYPE new_status USING \"status\"::text::new_status"), "{script}");
-    assert!(at(script, "ALTER COLUMN \"status\" TYPE new_status USING \"status\"::text::new_status") < at(script, "DROP TYPE \"public\".\"old_status\""), "{script}");
+    assert!(at(script, "CREATE TYPE public.new_status") < at(script, "ALTER COLUMN status TYPE new_status USING status::text::new_status"), "{script}");
+    assert!(at(script, "ALTER COLUMN status TYPE new_status USING status::text::new_status") < at(script, "DROP TYPE public.old_status"), "{script}");
 
     let coded = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("code", "order_code", true, false)], vec![]));
     let domains = diff_structure(
@@ -1154,9 +1154,9 @@ fn enums_and_sequences_still_used_by_columns_are_not_dropped_first() {
         &Side::ready("postgres", "app", "public", vec![coded, ObjectDef::defined(Kind::Domain, "order_code", "CREATE DOMAIN order_code AS integer")]),
     );
     let script = &domains.script;
-    assert!(at(script, "TYPE text") < at(script, "DROP DOMAIN \"public\".\"order_code\""), "{script}");
-    assert!(at(script, "DROP DOMAIN \"public\".\"order_code\"") < at(script, "CREATE DOMAIN \"public\".\"order_code\""), "{script}");
-    assert!(at(script, "CREATE DOMAIN \"public\".\"order_code\"") < at(script, "TYPE \"public\".\"order_code\""), "{script}");
+    assert!(at(script, "TYPE text") < at(script, "DROP DOMAIN public.order_code"), "{script}");
+    assert!(at(script, "DROP DOMAIN public.order_code") < at(script, "CREATE DOMAIN public.order_code"), "{script}");
+    assert!(at(script, "CREATE DOMAIN public.order_code") < at(script, "TYPE public.order_code"), "{script}");
 }
 
 #[test]
@@ -1173,10 +1173,10 @@ fn function_return_type_change_detaches_triggers_and_defaults_first() {
         &Side::ready("postgres", "app", "public", vec![orders, current, touch]),
     );
     let script = &report.script;
-    assert!(at(script, "DROP TRIGGER \"touch\" ON \"public\".\"orders\"") < at(script, "DROP FUNCTION \"public\".\"label\""), "{script}");
-    assert!(at(script, "DROP DEFAULT") < at(script, "DROP FUNCTION \"public\".\"label\""), "{script}");
-    assert!(at(script, "CREATE FUNCTION \"public\".\"label\"") < at(script, "SET DEFAULT label()"), "{script}");
-    assert!(at(script, "CREATE FUNCTION \"public\".\"label\"") < at(script, "CREATE TRIGGER \"touch\""), "{script}");
+    assert!(at(script, "DROP TRIGGER touch ON public.orders") < at(script, "DROP FUNCTION public.label"), "{script}");
+    assert!(at(script, "DROP DEFAULT") < at(script, "DROP FUNCTION public.label"), "{script}");
+    assert!(at(script, "CREATE FUNCTION public.label") < at(script, "SET DEFAULT label()"), "{script}");
+    assert!(at(script, "CREATE FUNCTION public.label") < at(script, "CREATE TRIGGER touch"), "{script}");
 }
 
 #[test]
@@ -1190,18 +1190,18 @@ fn sql_routines_that_read_a_view_wait_for_that_view() {
         &Side::ready("postgres", "app", "public", vec![current.clone(), function.clone(), procedure.clone()]),
     );
     let script = &changed.script;
-    assert!(at(script, "DROP FUNCTION \"public\".\"read_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(at(script, "DROP PROCEDURE \"public\".\"load_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(function_create_at(script, "\"public\".\"read_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
-    assert!(function_create_at(script, "\"public\".\"load_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "DROP FUNCTION public.read_base") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(at(script, "DROP PROCEDURE public.load_base") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(function_create_at(script, "public.read_base") > at(script, "CREATE VIEW public.v_base"), "{script}");
+    assert!(function_create_at(script, "public.load_base") > at(script, "CREATE VIEW public.v_base"), "{script}");
 
     let created = diff_structure(
         &Side::ready("postgres", "app", "public", vec![wanted.clone(), function.clone(), procedure.clone()]),
         &Side::ready("postgres", "app", "public", vec![]),
     );
     let script = &created.script;
-    assert!(function_create_at(script, "\"public\".\"read_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
-    assert!(function_create_at(script, "\"public\".\"load_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+    assert!(function_create_at(script, "public.read_base") > at(script, "CREATE VIEW public.v_base"), "{script}");
+    assert!(function_create_at(script, "public.load_base") > at(script, "CREATE VIEW public.v_base"), "{script}");
 
     let top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT read_base() AS n");
     let chained = diff_structure(
@@ -1209,19 +1209,19 @@ fn sql_routines_that_read_a_view_wait_for_that_view() {
         &Side::ready("postgres", "app", "public", vec![current, function, top]),
     );
     let script = &chained.script;
-    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP FUNCTION \"public\".\"read_base\""), "{script}");
-    assert!(at(script, "DROP FUNCTION \"public\".\"read_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(at(script, "CREATE VIEW \"public\".\"v_base\"") < function_create_at(script, "\"public\".\"read_base\""), "{script}");
-    let top_create = script.find("CREATE OR REPLACE VIEW \"public\".\"v_top\"").or_else(|| script.find("CREATE VIEW \"public\".\"v_top\"")).expect("v_top");
-    assert!(function_create_at(script, "\"public\".\"read_base\"") < top_create, "{script}");
+    assert!(at(script, "DROP VIEW public.v_top") < at(script, "DROP FUNCTION public.read_base"), "{script}");
+    assert!(at(script, "DROP FUNCTION public.read_base") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(at(script, "CREATE VIEW public.v_base") < function_create_at(script, "public.read_base"), "{script}");
+    let top_create = script.find("CREATE OR REPLACE VIEW public.v_top").or_else(|| script.find("CREATE VIEW public.v_top")).expect("v_top");
+    assert!(function_create_at(script, "public.read_base") < top_create, "{script}");
 
     // 视图调用例程、例程不查询视图时，例程仍然先建后删。
     let label = ObjectDef::defined(Kind::Function, "label", "CREATE FUNCTION label() RETURNS text LANGUAGE sql AS $$ SELECT 'a' $$");
     let view = ObjectDef::defined(Kind::View, "v_label", "CREATE VIEW v_label AS SELECT label() AS name");
     let kept = diff_structure(&Side::ready("postgres", "app", "public", vec![view.clone(), label.clone()]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(function_create_at(&kept.script, "\"public\".\"label\"") < at(&kept.script, "CREATE VIEW \"public\".\"v_label\""), "{}", kept.script);
+    assert!(function_create_at(&kept.script, "public.label") < at(&kept.script, "CREATE VIEW public.v_label"), "{}", kept.script);
     let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![view, label]));
-    assert!(at(&removed.script, "DROP VIEW \"public\".\"v_label\"") < at(&removed.script, "DROP FUNCTION \"public\".\"label\""), "{}", removed.script);
+    assert!(at(&removed.script, "DROP VIEW public.v_label") < at(&removed.script, "DROP FUNCTION public.label"), "{}", removed.script);
 }
 
 #[test]
@@ -1230,11 +1230,11 @@ fn column_name_is_not_a_routine_call_and_real_cycles_are_broken() {
     let note = ObjectDef::defined(Kind::Function, "note", "CREATE FUNCTION note() RETURNS integer LANGUAGE sql AS $$ SELECT 1 FROM v_notes $$");
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![notes.clone(), note.clone()]), &Side::ready("postgres", "app", "public", vec![]));
     let script = &created.script;
-    assert!(at(script, "CREATE VIEW \"public\".\"v_notes\"") < function_create_at(script, "\"public\".\"note\""), "{script}");
+    assert!(at(script, "CREATE VIEW public.v_notes") < function_create_at(script, "public.note"), "{script}");
     assert!(!script.contains("NULL::integer"), "{script}");
     let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![notes, note]));
     let script = &removed.script;
-    assert!(at(script, "DROP FUNCTION \"public\".\"note\"") < at(script, "DROP VIEW \"public\".\"v_notes\""), "{script}");
+    assert!(at(script, "DROP FUNCTION public.note") < at(script, "DROP VIEW public.v_notes"), "{script}");
     assert!(!script.contains("CREATE OR REPLACE FUNCTION"), "{script}");
 
     let cycle_view = ObjectDef::defined(Kind::View, "v_cycle", "CREATE VIEW v_cycle AS SELECT cycle_fn()");
@@ -1245,15 +1245,15 @@ fn column_name_is_not_a_routine_call_and_real_cycles_are_broken() {
     );
     let script = &created.script;
     let stub = at(script, "SELECT NULL::integer");
-    let view_at = at(script, "CREATE VIEW \"public\".\"v_cycle\"");
+    let view_at = at(script, "CREATE VIEW public.v_cycle");
     let body = at(script, "FROM v_cycle");
     assert!(stub < view_at && view_at < body, "{script}");
     assert!(!script[..view_at].contains("v_cycle"), "{script}");
     let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![cycle_view, cycle_fn]));
     let script = &removed.script;
-    let stub = at(script, "CREATE OR REPLACE FUNCTION \"public\".\"cycle_fn\"");
-    assert!(stub < at(script, "DROP VIEW \"public\".\"v_cycle\""), "{script}");
-    assert!(at(script, "DROP VIEW \"public\".\"v_cycle\"") < at(script, "DROP FUNCTION \"public\".\"cycle_fn\""), "{script}");
+    let stub = at(script, "CREATE OR REPLACE FUNCTION public.cycle_fn");
+    assert!(stub < at(script, "DROP VIEW public.v_cycle"), "{script}");
+    assert!(at(script, "DROP VIEW public.v_cycle") < at(script, "DROP FUNCTION public.cycle_fn"), "{script}");
     let stub_end = stub + script[stub..].find(';').expect("stub");
     assert!(!script[stub..stub_end].contains("v_cycle"), "{script}");
 }
@@ -1269,16 +1269,16 @@ fn insert_and_update_targets_wait_for_the_view() {
         &Side::ready("postgres", "app", "public", vec![]),
     );
     let script = &created.script;
-    let view_at = at(script, "CREATE VIEW \"public\".\"v_base\"");
-    assert!(view_at < function_create_at(script, "\"public\".\"ins\""), "{script}");
-    assert!(view_at < function_create_at(script, "\"public\".\"upd\""), "{script}");
-    assert!(view_at < function_create_at(script, "\"public\".\"del\""), "{script}");
+    let view_at = at(script, "CREATE VIEW public.v_base");
+    assert!(view_at < function_create_at(script, "public.ins"), "{script}");
+    assert!(view_at < function_create_at(script, "public.upd"), "{script}");
+    assert!(view_at < function_create_at(script, "public.del"), "{script}");
     let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![view, ins, upd, del]));
     let script = &removed.script;
-    let view_at = at(script, "DROP VIEW \"public\".\"v_base\"");
-    assert!(at(script, "DROP FUNCTION \"public\".\"ins\"") < view_at, "{script}");
-    assert!(at(script, "DROP FUNCTION \"public\".\"upd\"") < view_at, "{script}");
-    assert!(at(script, "DROP FUNCTION \"public\".\"del\"") < view_at, "{script}");
+    let view_at = at(script, "DROP VIEW public.v_base");
+    assert!(at(script, "DROP FUNCTION public.ins") < view_at, "{script}");
+    assert!(at(script, "DROP FUNCTION public.upd") < view_at, "{script}");
+    assert!(at(script, "DROP FUNCTION public.del") < view_at, "{script}");
 }
 
 fn function_create_at(script: &str, name: &str) -> usize {
@@ -1291,9 +1291,9 @@ fn view_cte_names_and_function_bodies_do_not_use_name_order() {
     let alias = ObjectDef::defined(Kind::View, "v_a", "CREATE VIEW v_a AS SELECT * FROM v_b");
     let cte = ObjectDef::defined(Kind::View, "v_b", "CREATE VIEW v_b AS WITH v_a AS (SELECT 1) SELECT * FROM v_a");
     let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![alias.clone(), cte.clone()]));
-    assert!(at(&dropped.script, "DROP VIEW \"public\".\"v_a\"") < at(&dropped.script, "DROP VIEW \"public\".\"v_b\""), "{}", dropped.script);
+    assert!(at(&dropped.script, "DROP VIEW public.v_a") < at(&dropped.script, "DROP VIEW public.v_b"), "{}", dropped.script);
     let created = diff_structure(&Side::ready("postgres", "app", "public", vec![alias, cte]), &Side::ready("postgres", "app", "public", vec![]));
-    assert!(at(&created.script, "CREATE VIEW \"public\".\"v_b\"") < at(&created.script, "CREATE VIEW \"public\".\"v_a\""), "{}", created.script);
+    assert!(at(&created.script, "CREATE VIEW public.v_b") < at(&created.script, "CREATE VIEW public.v_a"), "{}", created.script);
 
     let caller = ObjectDef::defined(Kind::Function, "caller", "CREATE FUNCTION caller() RETURNS integer LANGUAGE sql AS $$ SELECT callee() $$");
     let callee = ObjectDef::defined(Kind::Function, "callee", "CREATE FUNCTION callee() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
@@ -1301,7 +1301,7 @@ fn view_cte_names_and_function_bodies_do_not_use_name_order() {
         &Side::ready("postgres", "app", "public", vec![caller, callee]),
         &Side::ready("postgres", "app", "public", vec![]),
     );
-    assert!(at(&functions.script, "CREATE FUNCTION \"public\".\"callee\"") < at(&functions.script, "CREATE FUNCTION \"public\".\"caller\""), "{}", functions.script);
+    assert!(at(&functions.script, "CREATE FUNCTION public.callee") < at(&functions.script, "CREATE FUNCTION public.caller"), "{}", functions.script);
 }
 
 #[test]
@@ -1317,8 +1317,8 @@ fn unchanged_view_is_removed_before_function_or_column_type_changes() {
         &Side::ready("postgres", "app", "public", vec![orders, view, current]),
     );
     let script = &report.script;
-    assert!(at(script, "DROP VIEW \"public\".\"v_label\"") < at(script, "DROP FUNCTION \"public\".\"label\""), "{script}");
-    assert!(at(script, "CREATE FUNCTION \"public\".\"label\"") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_label\""), "{script}");
+    assert!(at(script, "DROP VIEW public.v_label") < at(script, "DROP FUNCTION public.label"), "{script}");
+    assert!(at(script, "CREATE FUNCTION public.label") < at(script, "CREATE OR REPLACE VIEW public.v_label"), "{script}");
 
     let status_view = ObjectDef::defined(Kind::View, "v_status", "CREATE VIEW v_status AS SELECT status FROM orders");
     let typed = |labels: &str| {
@@ -1333,8 +1333,8 @@ fn unchanged_view_is_removed_before_function_or_column_type_changes() {
         &Side::ready("postgres", "app", "public", typed("'open', 'shut'")),
     );
     let script = &enums.script;
-    assert!(at(script, "DROP VIEW \"public\".\"v_status\"") < at(script, "ALTER COLUMN \"status\" TYPE text"), "{script}");
-    assert!(at(script, "ALTER COLUMN \"status\" TYPE \"public\".\"order_status\"") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_status\""), "{script}");
+    assert!(at(script, "DROP VIEW public.v_status") < at(script, "ALTER COLUMN status TYPE text"), "{script}");
+    assert!(at(script, "ALTER COLUMN status TYPE public.order_status") < at(script, "CREATE OR REPLACE VIEW public.v_status"), "{script}");
 }
 
 #[test]
@@ -1348,9 +1348,9 @@ fn compatible_view_replace_runs_before_a_column_it_stops_using() {
         &Side::ready("postgres", "app", "public", vec![target, current]),
     );
     let script = &report.script;
-    assert!(script.contains("CREATE OR REPLACE VIEW \"public\".\"v_notes\""), "{script}");
+    assert!(script.contains("CREATE OR REPLACE VIEW public.v_notes"), "{script}");
     assert!(!script.contains("DROP VIEW"), "{script}");
-    assert!(at(script, "CREATE OR REPLACE VIEW \"public\".\"v_notes\"") < at(script, "DROP COLUMN \"note\""), "{script}");
+    assert!(at(script, "CREATE OR REPLACE VIEW public.v_notes") < at(script, "DROP COLUMN note"), "{script}");
 }
 
 #[test]
@@ -1363,8 +1363,8 @@ fn view_column_list_change_drops_dependents_before_the_view() {
         &Side::ready("postgres", "app", "public", vec![current, top]),
     );
     let script = &report.script;
-    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
-    assert!(at(script, "CREATE VIEW \"public\".\"v_base\"") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_top\""), "{script}");
+    assert!(at(script, "DROP VIEW public.v_top") < at(script, "DROP VIEW public.v_base"), "{script}");
+    assert!(at(script, "CREATE VIEW public.v_base") < at(script, "CREATE OR REPLACE VIEW public.v_top"), "{script}");
 }
 
 #[tokio::test]
@@ -1532,21 +1532,21 @@ fn sqlserver_alter_emits_constraint_based_default_changes() {
     let target = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "DF_notes_status", "nvarchar(20)")]);
     let report = diff_structure(&baseline, &target);
     let script = &report.script;
-    assert!(script.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status]"), "{script}");
-    assert!(script.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status]"), "{script}");
-    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN [STATUS] SET DEFAULT"), "T-SQL 没有 ALTER COLUMN SET DEFAULT：{script}");
-    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN [STATUS] DROP DEFAULT"), "T-SQL 没有 ALTER COLUMN DROP DEFAULT：{script}");
+    assert!(script.contains("ALTER TABLE dbo.notes DROP CONSTRAINT DF_notes_status"), "{script}");
+    assert!(script.contains("ALTER TABLE dbo.notes ADD CONSTRAINT DF_notes_status DEFAULT N'done' FOR status"), "{script}");
+    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN STATUS SET DEFAULT"), "T-SQL 没有 ALTER COLUMN SET DEFAULT：{script}");
+    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN STATUS DROP DEFAULT"), "T-SQL 没有 ALTER COLUMN DROP DEFAULT：{script}");
 
     // 目标侧没有读到约束名时按 sys.default_constraints 动态查找。
     let target_unnamed = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "", "nvarchar(20)")]);
     let report = diff_structure(&baseline, &target_unnamed);
     assert!(report.script.contains("sys.default_constraints"), "{}", report.script);
-    assert!(report.script.contains("OBJECT_ID(N'[dbo].[notes]')"), "{}", report.script);
+    assert!(report.script.contains("OBJECT_ID(N'dbo.notes')"), "{}", report.script);
 
     // 类型变化走 ALTER COLUMN，且不含内联 DEFAULT。
     let baseline_retyped = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "DF_notes_status", "nvarchar(40)")]);
     let report = diff_structure(&baseline_retyped, &target);
-    assert!(report.script.contains("ALTER TABLE [dbo].[notes] ALTER COLUMN [status] nvarchar(40) NOT NULL"), "{}", report.script);
-    let alter_column_line = report.script.lines().find(|line| line.contains("ALTER COLUMN [status]")).expect("ALTER COLUMN 语句");
+    assert!(report.script.contains("ALTER TABLE dbo.notes ALTER COLUMN status nvarchar(40) NOT NULL"), "{}", report.script);
+    let alter_column_line = report.script.lines().find(|line| line.contains("ALTER COLUMN status")).expect("ALTER COLUMN 语句");
     assert!(!alter_column_line.to_ascii_uppercase().contains("DEFAULT"), "ALTER COLUMN 不能内联 DEFAULT：{alter_column_line}");
 }

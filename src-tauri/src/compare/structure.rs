@@ -9,6 +9,7 @@ use crate::dump::order::{
     qualified_relation, referenced_relations, skip_block_comment, skip_delimited, skip_dollar, skip_quoted, sql_tokens, statement_mentions, unquote,
     DepNode,
 };
+use crate::sql_ident::quote_ident as quote;
 
 pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     if let Some(message) = refuse_pair(baseline, target) {
@@ -454,23 +455,6 @@ fn skip_index(index: &IndexShape, shape: &TableShape) -> bool {
     }
     let pk = primary_columns(shape);
     !pk.is_empty() && index.columns.iter().map(|(name, _)| name.as_str()).eq(pk.iter().map(String::as_str))
-}
-
-fn quote(engine: Engine, name: &str) -> String {
-    match engine {
-        Engine::Mysql | Engine::Mariadb => {
-            let mark = '`';
-            format!("{mark}{}{mark}", name.replace(mark, &format!("{mark}{mark}")))
-        }
-        Engine::Postgres | Engine::Sqlite => {
-            let mark = '"';
-            format!("{mark}{}{mark}", name.replace(mark, &format!("{mark}{mark}")))
-        }
-        // T-SQL 的括号标识符转义是 ]]。
-        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
-        // Redis 不进对比（capability 门控）；占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
 }
 
 fn qualify(engine: Engine, side: &Side, name: &str) -> String {

@@ -1,20 +1,8 @@
 use super::model::Engine;
 
-pub fn quote_ident(engine: Engine, name: &str) -> String {
-    match engine {
-        Engine::Mysql | Engine::Mariadb => {
-            let quote = '`';
-            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
-        }
-        Engine::Postgres | Engine::Sqlite => {
-            let quote = '"';
-            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
-        }
-        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
-        // Redis 没有结构编辑（capability 门控），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
-}
+/// 按方言最小引号，统一由 sql_ident 判定。
+pub use crate::sql_ident::quote_ident;
+use crate::sql_ident::qualified;
 
 pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str) -> Result<String, String> {
     match engine {
@@ -31,19 +19,19 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
             if database.is_empty() {
                 return Err("需要数据库名，没有另开连接。".to_owned());
             }
-            Ok(format!("{}.{}", quote_ident(engine, database), quote_ident(engine, table)))
+            Ok(qualified(engine, &[database, table]))
         }
         Engine::Postgres => {
             if schema.is_empty() {
                 return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
             }
-            Ok(format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, table)))
+            Ok(qualified(engine, &[schema, table]))
         }
         Engine::Sqlserver => {
             if schema.is_empty() {
                 return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
             }
-            Ok(format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, table)))
+            Ok(qualified(engine, &[schema, table]))
         }
     }
 }
@@ -54,7 +42,7 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
 pub fn sqlserver_drop_default_sql(table: &str, column: &str, constraint: &str) -> String {
     let name = constraint.trim();
     if !name.is_empty() {
-        return format!("ALTER TABLE {table} DROP CONSTRAINT [{}]", name.replace(']', "]]"));
+        return format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote_ident(Engine::Sqlserver, name));
     }
     let column_escaped = column.replace('\'', "''");
     let table_escaped = table.replace('\'', "''");
@@ -67,9 +55,9 @@ pub fn sqlserver_drop_default_sql(table: &str, column: &str, constraint: &str) -
 pub fn sqlserver_add_default_sql(table: &str, table_name: &str, column: &str, expression: &str) -> String {
     let constraint = format!("DF_{table_name}_{column}");
     format!(
-        "ALTER TABLE {table} ADD CONSTRAINT [{}] DEFAULT {expression} FOR [{}]",
-        constraint.replace(']', "]]"),
-        column.replace(']', "]]")
+        "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT {expression} FOR {}",
+        quote_ident(Engine::Sqlserver, &constraint),
+        quote_ident(Engine::Sqlserver, column)
     )
 }
 

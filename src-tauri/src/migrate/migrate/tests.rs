@@ -367,10 +367,10 @@ fn batch_insert_uses_the_target_engine_and_column_types() {
         vec![Cell::Text("2".to_owned()), Cell::Null],
     ];
     let mysql = batch_insert(Engine::Mysql, "`app`.`docs`", &columns, &rows);
-    assert_eq!(mysql, "INSERT INTO `app`.`docs` (`id`, `body`) VALUES (1, X'0aff'), (2, NULL)");
+    assert_eq!(mysql, "INSERT INTO `app`.`docs` (id, body) VALUES (1, X'0aff'), (2, NULL)");
     let postgres = batch_insert(Engine::Postgres, "\"public\".\"docs\"", &columns, &rows);
-    assert_eq!(postgres, "INSERT INTO \"public\".\"docs\" (\"id\", \"body\") VALUES (1, '\\x0aff'), (2, NULL)");
-    assert_eq!(batch_insert(Engine::Sqlite, "\"docs\"", &columns, &[]), "");
+    assert_eq!(postgres, "INSERT INTO \"public\".\"docs\" (id, body) VALUES (1, '\\x0aff'), (2, NULL)");
+    assert_eq!(batch_insert(Engine::Sqlite, "docs", &columns, &[]), "");
 }
 
 #[test]

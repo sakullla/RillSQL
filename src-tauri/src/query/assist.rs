@@ -490,13 +490,8 @@ pub fn fold_line_ranges(sql: &str, engine: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-pub fn quote_ident(engine: &str, name: &str) -> String {
-    if engine == "sqlserver" {
-        return format!("[{}]", name.replace(']', "]]"));
-    }
-    let quote = if engine == "mysql" || engine == "mariadb" { '`' } else { '"' };
-    format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
-}
+/// 按方言最小引号，统一由 sql_ident 判定。
+pub use crate::sql_ident::quote_ident_named as quote_ident;
 
 pub fn qualified_name(engine: &str, schema: &str, name: &str) -> String {
     let table = quote_ident(engine, name);

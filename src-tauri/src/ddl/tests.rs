@@ -82,7 +82,7 @@ fn sqlite_353_not_null_is_a_direct_alter() {
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert!(!planned.rebuild);
     assert_eq!(planned.steps.len(), 1);
-    assert_eq!(planned.steps[0].sql, "ALTER TABLE \"notes\" ALTER COLUMN \"note\" SET NOT NULL;");
+    assert_eq!(planned.steps[0].sql, "ALTER TABLE notes ALTER COLUMN note SET NOT NULL;");
     let joined = planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>().join("\n");
     assert!(!joined.contains("PRAGMA"));
     assert!(!joined.contains("CREATE TABLE"));
@@ -97,17 +97,17 @@ fn sqlite_351_not_null_previews_the_official_rebuild() {
     let sql: Vec<&str> = planned.steps.iter().map(|step| step.sql.as_str()).collect();
     let off = sql.iter().position(|item| item.contains("PRAGMA foreign_keys = OFF")).expect("关闭外键");
     let begin = sql.iter().position(|item| item.starts_with("BEGIN")).expect("BEGIN");
-    let create = sql.iter().position(|item| item.contains("CREATE TABLE \"_rill_new_notes\"")).expect("新表");
-    let copy = sql.iter().position(|item| item.contains("INSERT INTO \"_rill_new_notes\"") && item.contains("FROM \"notes\"")).expect("复制");
-    let drop = sql.iter().position(|item| *item == "DROP TABLE \"notes\";").expect("删除旧表");
-    let rename = sql.iter().position(|item| item.contains("ALTER TABLE \"_rill_new_notes\" RENAME TO \"notes\"")).expect("改回原名");
+    let create = sql.iter().position(|item| item.contains("CREATE TABLE _rill_new_notes")).expect("新表");
+    let copy = sql.iter().position(|item| item.contains("INSERT INTO _rill_new_notes") && item.contains("FROM notes")).expect("复制");
+    let drop = sql.iter().position(|item| *item == "DROP TABLE notes;").expect("删除旧表");
+    let rename = sql.iter().position(|item| item.contains("ALTER TABLE _rill_new_notes RENAME TO notes")).expect("改回原名");
     let check = sql.iter().position(|item| item.contains("foreign_key_check")).expect("检查");
     let commit = sql.iter().position(|item| item.starts_with("COMMIT")).expect("COMMIT");
     let restore = sql.iter().position(|item| item.contains("PRAGMA foreign_keys = OFF")).unwrap();
     assert!(off < begin && begin < create && create < copy && copy < drop && drop < rename && rename < check && check < commit);
     assert!(commit < sql.iter().rposition(|item| item.contains("PRAGMA foreign_keys = OFF")).unwrap_or(0) || restore == off);
     assert!(sql.iter().any(|item| item.contains("PRAGMA foreign_keys = OFF") && sql.iter().position(|step| step.contains("COMMIT")).unwrap() < sql.iter().rposition(|step| *step == "PRAGMA foreign_keys = OFF;").unwrap()));
-    assert!(sql.iter().all(|item| !item.contains("ALTER TABLE \"notes\" RENAME")));
+    assert!(sql.iter().all(|item| !item.contains("ALTER TABLE notes RENAME")));
 }
 
 #[test]
@@ -180,8 +180,8 @@ fn replacing_a_view_lists_every_statement_and_refuses_unsafe_cases() {
     );
     assert!(changed.blocked.is_empty(), "{:?}", changed.blocked);
     assert_eq!(changed.steps.len(), 2);
-    assert_eq!(changed.steps[0].sql, "DROP VIEW \"v_notes\";");
-    assert!(changed.steps[1].sql.contains("CREATE VIEW \"v_notes\""));
+    assert_eq!(changed.steps[0].sql, "DROP VIEW v_notes;");
+    assert!(changed.steps[1].sql.contains("CREATE VIEW v_notes"));
     assert!(changed.steps.iter().all(|step| !step.sql.to_ascii_uppercase().contains("CASCADE")));
     assert!(changed.steps[0].sql.to_ascii_uppercase().contains("DROP"));
     assert!(changed.steps.iter().position(|step| step.sql.contains("DROP")).unwrap() < changed.steps.iter().position(|step| step.sql.contains("CREATE VIEW")).unwrap());
@@ -229,8 +229,8 @@ fn replacing_a_view_lists_every_statement_and_refuses_unsafe_cases() {
     assert!(mysql_plan.blocked.is_empty(), "{:?}", mysql_plan.blocked);
     assert_eq!(mysql_plan.steps.len(), 1);
     assert!(mysql_plan.steps[0].sql.to_ascii_uppercase().contains("CREATE OR REPLACE"));
-    assert!(mysql_plan.steps[0].sql.contains("`app`.`v_notes`"));
-    assert!(!mysql_plan.steps[0].sql.contains("VIEW `v_notes`"));
+    assert!(mysql_plan.steps[0].sql.contains("app.v_notes"));
+    assert!(!mysql_plan.steps[0].sql.contains("VIEW v_notes"));
     assert!(!mysql_plan.steps[0].sql.to_ascii_uppercase().contains("DROP"));
 
     let multi = plan(
@@ -261,7 +261,7 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
     assert!(with_table_word.blocked.is_empty(), "{:?}", with_table_word.blocked);
     assert_eq!(with_table_word.steps.len(), 1);
     assert!(with_table_word.steps[0].sql.contains("CREATE OR REPLACE VIEW"));
-    assert!(with_table_word.steps[0].sql.contains("\"v_notes\""));
+    assert!(with_table_word.steps[0].sql.contains("v_notes"));
     assert!(with_table_word.steps[0].sql.contains("table_id"));
     assert!(with_table_word.steps[0].sql.contains("tableoid"));
     assert!(!with_table_word.steps[0].sql.to_ascii_uppercase().contains("DROP"));
@@ -271,7 +271,7 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "SELECT table_id, tableoid FROM notes".to_owned() },
     );
     assert!(query_with_table_word.blocked.is_empty(), "{:?}", query_with_table_word.blocked);
-    assert!(query_with_table_word.steps[0].sql.starts_with("CREATE OR REPLACE VIEW \"public\".\"v_notes\""));
+    assert!(query_with_table_word.steps[0].sql.starts_with("CREATE OR REPLACE VIEW public.v_notes"));
 
     let other = plan(
         &postgres,
@@ -305,7 +305,7 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW V_Notes AS SELECT table_id FROM notes".to_owned() },
     );
     assert!(unquoted_same.blocked.is_empty(), "{:?}", unquoted_same.blocked);
-    assert!(unquoted_same.steps[0].sql.contains("CREATE OR REPLACE VIEW \"public\".\"v_notes\""));
+    assert!(unquoted_same.steps[0].sql.contains("CREATE OR REPLACE VIEW public.v_notes"));
     assert!(!unquoted_same.steps[0].sql.contains("V_Notes"));
 
     let materialized_text = plan(
@@ -337,8 +337,8 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
     assert_eq!(mysql_show.steps.len(), 1);
     assert!(mysql_show.steps[0].sql.starts_with("CREATE OR REPLACE ALGORITHM=UNDEFINED"));
     assert!(mysql_show.steps[0].sql.contains("DEFINER=`root`@`localhost`"));
-    assert!(mysql_show.steps[0].sql.contains("VIEW `app`.`v_notes`"));
-    assert!(!mysql_show.steps[0].sql.contains("VIEW `v_notes`"));
+    assert!(mysql_show.steps[0].sql.contains("VIEW app.v_notes"));
+    assert!(!mysql_show.steps[0].sql.contains("VIEW v_notes"));
     assert!(mysql_show.steps[0].sql.contains("table_id"));
     assert!(!mysql_show.steps[0].sql.to_ascii_uppercase().contains("DROP"));
 
@@ -347,7 +347,7 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW `app`.`v_notes` AS select `table_id` from `notes`".to_owned() },
     );
     assert!(mysql_same_db.blocked.is_empty(), "{:?}", mysql_same_db.blocked);
-    assert!(mysql_same_db.steps[0].sql.contains("`app`.`v_notes`"));
+    assert!(mysql_same_db.steps[0].sql.contains("app.v_notes"));
 
     let mysql_other_db = plan(
         &mysql,
@@ -386,7 +386,7 @@ fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
     assert!(unqualified.blocked.is_empty(), "{:?}", unqualified.blocked);
     assert_eq!(
         unqualified.steps[0].sql,
-        "CREATE OR REPLACE VIEW \"analytics\".\"v_notes\" (id) AS SELECT id FROM notes;"
+        "CREATE OR REPLACE VIEW analytics.v_notes (id) AS SELECT id FROM notes;"
     );
     assert!(!unqualified.steps[0].sql.contains("VIEW v_notes"));
 
@@ -402,7 +402,7 @@ fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
     assert!(show.blocked.is_empty(), "{:?}", show.blocked);
     assert_eq!(
         show.steps[0].sql,
-        "CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `shop`.`v_notes` AS select `id` from `notes`;"
+        "CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW shop.v_notes AS select `id` from `notes`;"
     );
     assert!(!show.steps[0].sql.contains("VIEW `v_notes`"));
 
@@ -411,7 +411,7 @@ fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW V_Notes AS SELECT 1".to_owned() },
     );
     assert!(different_case.blocked.is_empty(), "{:?}", different_case.blocked);
-    assert_eq!(different_case.steps[0].sql, "CREATE OR REPLACE VIEW `shop`.`v_notes` AS SELECT 1;");
+    assert_eq!(different_case.steps[0].sql, "CREATE OR REPLACE VIEW shop.v_notes AS SELECT 1;");
     assert!(!different_case.steps[0].sql.contains("V_Notes"));
 
     let qualified_case = plan(
@@ -419,7 +419,7 @@ fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW shop.V_Notes AS SELECT note FROM notes".to_owned() },
     );
     assert!(qualified_case.blocked.is_empty(), "{:?}", qualified_case.blocked);
-    assert_eq!(qualified_case.steps[0].sql, "CREATE OR REPLACE VIEW `shop`.`v_notes` AS SELECT note FROM notes;");
+    assert_eq!(qualified_case.steps[0].sql, "CREATE OR REPLACE VIEW shop.v_notes AS SELECT note FROM notes;");
     assert!(!qualified_case.steps[0].sql.contains("V_Notes"));
 
     let quoted_case = plan(
@@ -435,7 +435,7 @@ fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW v_notes AS select 2".to_owned() },
     );
     assert!(maria_plan.blocked.is_empty(), "{:?}", maria_plan.blocked);
-    assert!(maria_plan.steps[0].sql.contains("VIEW `app`.`v_notes`"));
+    assert!(maria_plan.steps[0].sql.contains("VIEW app.v_notes"));
     assert!(!maria_plan.steps[0].sql.contains("VIEW v_notes"));
 }
 
@@ -445,7 +445,7 @@ fn drop_table_sql_contains_only_the_previewed_object() {
     let planned = plan(&snapshot, &Action::DropTable { table: "notes".to_owned() });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert_eq!(planned.steps.len(), 1);
-    assert_eq!(planned.steps[0].sql, "DROP TABLE \"notes\";");
+    assert_eq!(planned.steps[0].sql, "DROP TABLE notes;");
     assert!(!planned.steps[0].sql.to_ascii_uppercase().contains("CASCADE"));
 }
 
@@ -470,6 +470,36 @@ fn mysql_and_postgres_alters_are_not_wrapped_in_a_transaction() {
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert!(planned.steps.iter().all(|step| !step.sql.to_ascii_uppercase().contains("BEGIN")));
     assert!(planned.rule.contains("不能据此认为所有数据库都会回滚"));
+}
+
+#[test]
+fn alter_previews_leave_safe_identifiers_bare_and_quote_reserved_or_cased_names() {
+    let mut mysql = Snapshot::bare(Engine::Mysql, "e6yun3_etoe_business", "", "etoe_alarm_rule_set");
+    mysql.columns = vec![column("id", "bigint", false, true), column("content", "varchar(1000)", false, false), column("order", "int", true, false)];
+    mysql.row_count = Some(0);
+    let mut drafts = mysql.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drafts.iter_mut().find(|column| column.name == "content").unwrap().type_name = "varchar(2000)".to_owned();
+    let planned = plan(&mysql, &Action::AlterColumns { table: "etoe_alarm_rule_set".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(
+        planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(),
+        vec!["ALTER TABLE e6yun3_etoe_business.etoe_alarm_rule_set CHANGE COLUMN content content varchar(2000) NOT NULL;"]
+    );
+
+    let mut drafts = mysql.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drafts.iter_mut().find(|column| column.name == "order").unwrap().type_name = "bigint".to_owned();
+    let reserved = plan(&mysql, &Action::AlterColumns { table: "etoe_alarm_rule_set".to_owned(), columns: drafts });
+    assert!(reserved.blocked.is_empty(), "{:?}", reserved.blocked);
+    assert_eq!(reserved.steps[0].sql, "ALTER TABLE e6yun3_etoe_business.etoe_alarm_rule_set CHANGE COLUMN `order` `order` bigint;");
+
+    let mut postgres = Snapshot::bare(Engine::Postgres, "app", "public", "accounts");
+    postgres.columns = vec![column("id", "integer", false, true), column("User", "text", true, false)];
+    postgres.row_count = Some(0);
+    let mut drafts = postgres.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drafts.iter_mut().find(|column| column.name == "User").unwrap().type_name = "varchar(40)".to_owned();
+    let cased = plan(&postgres, &Action::AlterColumns { table: "accounts".to_owned(), columns: drafts });
+    assert!(cased.blocked.is_empty(), "{:?}", cased.blocked);
+    assert!(cased.steps.iter().any(|step| step.sql.starts_with("ALTER TABLE public.accounts ALTER COLUMN \"User\" TYPE varchar(40)")), "{:?}", cased.steps);
 }
 
 #[test]
@@ -542,7 +572,7 @@ async fn preview_cancel_does_not_submit() {
     .await
     .unwrap();
     assert_eq!(loaded.steps.len(), 1);
-    assert_eq!(loaded.steps[0].sql, "DROP TABLE \"notes\";");
+    assert_eq!(loaded.steps[0].sql, "DROP TABLE notes;");
     assert_eq!(master_sql(&session, "notes").await, before);
     assert!(table_exists(&session, "notes").await);
     let _ = fs::remove_dir_all(dir);
@@ -683,7 +713,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                 },
             ],
         }),
-        &["ALTER TABLE \"notes\" RENAME TO \"old_notes\";".to_owned()],
+        &["ALTER TABLE notes RENAME TO old_notes;".to_owned()],
     )
     .await
     .unwrap();
@@ -694,7 +724,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
 
     let drop_plan = exec::preview(&session, &request(Action::DropTable { table: "notes".to_owned() })).await.unwrap();
     assert_eq!(drop_plan.steps.len(), 1);
-    assert_eq!(drop_plan.steps[0].sql, "DROP TABLE \"notes\";");
+    assert_eq!(drop_plan.steps[0].sql, "DROP TABLE notes;");
     assert!(!drop_plan.steps[0].sql.contains("child"));
     let confirmed = vec![drop_plan.steps[0].sql.clone()];
     let dropped = exec::execute(&session, &request(Action::DropTable { table: "notes".to_owned() }), &confirmed).await.unwrap();
@@ -786,15 +816,15 @@ fn postgres_create_index_name_is_not_schema_qualified() {
     );
     assert!(plain.blocked.is_empty(), "{:?}", plain.blocked);
     assert_eq!(plain.steps.len(), 1);
-    assert_eq!(plain.steps[0].sql, "CREATE INDEX \"idx\" ON \"public\".\"notes\" (\"note\" ASC);");
-    assert!(!plain.steps[0].sql.contains("\"public\".\"idx\""));
+    assert_eq!(plain.steps[0].sql, "CREATE INDEX idx ON public.notes (note ASC);");
+    assert!(!plain.steps[0].sql.contains("public.idx"));
     let unique = plan(
         &snapshot,
         &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: true, columns },
     );
     assert!(unique.blocked.is_empty(), "{:?}", unique.blocked);
-    assert_eq!(unique.steps[0].sql, "CREATE UNIQUE INDEX \"idx\" ON \"public\".\"notes\" (\"note\" ASC);");
-    assert!(!unique.steps[0].sql.contains("\"public\".\"idx\""));
+    assert_eq!(unique.steps[0].sql, "CREATE UNIQUE INDEX idx ON public.notes (note ASC);");
+    assert!(!unique.steps[0].sql.contains("public.idx"));
 }
 
 #[test]
@@ -919,7 +949,7 @@ fn sqlserver_foreign_key_qualifies_a_non_default_schema() {
     );
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     let sql = planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>().join("\n");
-    assert!(sql.contains("ALTER TABLE [dbo].[orders] ADD CONSTRAINT [fk_orders_customer] FOREIGN KEY ([customer_id]) REFERENCES [sales].[customers] ([id])"), "{sql}");
+    assert!(sql.contains("ALTER TABLE dbo.orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES sales.customers (id)"), "{sql}");
 }
 
 #[test]
@@ -937,7 +967,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     drafts.iter_mut().find(|column| column.name == "status").unwrap().type_name = "nvarchar(40)".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drafts });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
-    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ALTER COLUMN [status] nvarchar(40) NOT NULL;")), "{:?}", planned.steps);
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE dbo.notes ALTER COLUMN status nvarchar(40) NOT NULL;")), "{:?}", planned.steps);
     assert!(!planned.steps.iter().any(|step| step.sql.contains("CHANGE COLUMN")), "T-SQL 没有 CHANGE COLUMN：{:?}", planned.steps);
     assert!(!planned.steps.iter().any(|step| {
         let upper = step.sql.to_ascii_uppercase();
@@ -948,7 +978,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     let mut drop_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
     drop_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = String::new();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_default });
-    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status];")), "{:?}", planned.steps);
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE dbo.notes DROP CONSTRAINT DF_notes_status;")), "{:?}", planned.steps);
 
     // 约束名缺失时按 sys.default_constraints 动态查找，不猜 DF_ 前缀名。
     let mut unnamed = snapshot.clone();
@@ -958,14 +988,14 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     let planned = plan(&unnamed, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_unnamed });
     let dynamic = planned.steps.iter().find(|step| step.sql.contains("DROP CONSTRAINT")).expect("应当生成删除默认值的语句");
     assert!(dynamic.sql.contains("sys.default_constraints"), "{:?}", planned.steps);
-    assert!(dynamic.sql.contains("OBJECT_ID(N'[dbo].[notes]')"), "{:?}", planned.steps);
+    assert!(dynamic.sql.contains("OBJECT_ID(N'dbo.notes')"), "{:?}", planned.steps);
 
     // 改默认值：先摘既有约束再 ADD（同名 2714 / 不同名 1781 都会失败），ADD 用 DF_<表>_<列> 名。
     let mut change_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
     change_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = "N'done'".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: change_default });
-    let drop_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status];"));
-    let add_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status];"));
+    let drop_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE dbo.notes DROP CONSTRAINT DF_notes_status;"));
+    let add_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE dbo.notes ADD CONSTRAINT DF_notes_status DEFAULT N'done' FOR status;"));
     let (Some(drop), Some(add)) = (drop_at, add_at) else {
         panic!("改默认值应先 DROP 再 ADD：{:?}", planned.steps);
     };
@@ -981,7 +1011,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     let mut add = snapshot.columns.clone();
     add.push(column("extra", "int", true, false));
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: add.iter().map(draft_of).collect() });
-    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD [extra] int;")), "{:?}", planned.steps);
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE dbo.notes ADD extra int;")), "{:?}", planned.steps);
     assert!(!planned.steps.iter().any(|step| step.sql.contains("ADD COLUMN")), "{:?}", planned.steps);
 
     // 新建表的自增列是 IDENTITY(1, 1)（快照是已存在的表：建表动作按“新表”生成创建语句）。
@@ -1003,7 +1033,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
             }],
         },
     );
-    assert!(create.steps.iter().any(|step| step.sql.contains("[id] int NOT NULL IDENTITY(1, 1)")), "{:?}", create.steps);
+    assert!(create.steps.iter().any(|step| step.sql.contains("id int NOT NULL IDENTITY(1, 1)")), "{:?}", create.steps);
 }
 
 
@@ -1030,7 +1060,7 @@ fn postgres_sequence_alter_only_emits_changed_clauses() {
     );
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert_eq!(planned.steps.len(), 1);
-    assert_eq!(planned.steps[0].sql, "ALTER SEQUENCE \"public\".\"orders_id_seq\" INCREMENT BY 5 CYCLE;");
+    assert_eq!(planned.steps[0].sql, "ALTER SEQUENCE public.orders_id_seq INCREMENT BY 5 CYCLE;");
     assert!(planned.risks.iter().any(|risk| risk.text.contains("序列参数改完立即生效")));
 
     // 和现值完全一致时不给执行入口。
@@ -1092,10 +1122,10 @@ fn postgres_enum_add_value_previews_placement_and_blocks_duplicates() {
 
     let planned = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "great".to_owned(), before: Some("ok".to_owned()) });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
-    assert_eq!(planned.steps[0].sql, "ALTER TYPE \"public\".\"mood\" ADD VALUE 'great' BEFORE 'ok';");
+    assert_eq!(planned.steps[0].sql, "ALTER TYPE public.mood ADD VALUE 'great' BEFORE 'ok';");
 
     let escaped = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "it's".to_owned(), before: None });
-    assert_eq!(escaped.steps[0].sql, "ALTER TYPE \"public\".\"mood\" ADD VALUE 'it''s';");
+    assert_eq!(escaped.steps[0].sql, "ALTER TYPE public.mood ADD VALUE 'it''s';");
 
     let duplicate = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "ok".to_owned(), before: None });
     assert!(duplicate.steps.is_empty());
@@ -1133,12 +1163,12 @@ fn postgres_domain_alter_previews_default_and_not_null() {
     let sql: Vec<&str> = planned.steps.iter().map(|step| step.sql.as_str()).collect();
     assert_eq!(
         sql,
-        vec!["ALTER DOMAIN \"public\".\"email\" SET DEFAULT 'na@example.com';", "ALTER DOMAIN \"public\".\"email\" SET NOT NULL;"]
+        vec!["ALTER DOMAIN public.email SET DEFAULT 'na@example.com';", "ALTER DOMAIN public.email SET NOT NULL;"]
     );
     assert!(planned.risks.iter().any(|risk| risk.level == "warn" && risk.text.contains("SET NOT NULL 会先检查已有数据")));
 
     let drop_default = plan(&snapshot, &Action::AlterDomain { domain: "email".to_owned(), default_sql: Some(String::new()), not_null: None });
-    assert_eq!(drop_default.steps[0].sql, "ALTER DOMAIN \"public\".\"email\" DROP DEFAULT;");
+    assert_eq!(drop_default.steps[0].sql, "ALTER DOMAIN public.email DROP DEFAULT;");
 
     let unchanged = plan(
         &snapshot,
@@ -1164,7 +1194,7 @@ fn mysql_event_toggle_previews_and_blocks_noop() {
 
     let planned = plan(&snapshot, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: false });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
-    assert_eq!(planned.steps[0].sql, "ALTER EVENT `shop`.`nightly` DISABLE;");
+    assert_eq!(planned.steps[0].sql, "ALTER EVENT shop.nightly DISABLE;");
     assert!(planned.risks.iter().any(|risk| risk.text.contains("event_scheduler")));
 
     let noop = plan(&snapshot, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: true });
@@ -1174,7 +1204,7 @@ fn mysql_event_toggle_previews_and_blocks_noop() {
     let mut maria = snapshot.clone();
     maria.engine = Engine::Mariadb;
     let planned = plan(&maria, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: false });
-    assert_eq!(planned.steps[0].sql, "ALTER EVENT `shop`.`nightly` DISABLE;");
+    assert_eq!(planned.steps[0].sql, "ALTER EVENT shop.nightly DISABLE;");
 
     let mut missing = snapshot.clone();
     missing.event_enabled = None;
@@ -1233,10 +1263,10 @@ fn sqlite_attach_plan_blocks_duplicate_and_reserved_names() {
 
     let planned = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/other.db".to_owned(), name: "other".to_owned() });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
-    assert_eq!(planned.steps[0].sql, "ATTACH DATABASE '/tmp/other.db' AS \"other\";");
+    assert_eq!(planned.steps[0].sql, "ATTACH DATABASE '/tmp/other.db' AS other;");
 
     let quoted = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/it's.db".to_owned(), name: "extra".to_owned() });
-    assert_eq!(quoted.steps[0].sql, "ATTACH DATABASE '/tmp/it''s.db' AS \"extra\";");
+    assert_eq!(quoted.steps[0].sql, "ATTACH DATABASE '/tmp/it''s.db' AS extra;");
 
     let duplicate = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/x.db".to_owned(), name: "AUX".to_owned() });
     assert!(duplicate.steps.is_empty());
@@ -1264,7 +1294,7 @@ fn sqlite_maintenance_plans_cover_vacuum_and_reindex() {
     let reindex = plan(&snapshot, &Action::Reindex { target: None });
     assert_eq!(reindex.steps[0].sql, "REINDEX;");
     let indexed = plan(&snapshot, &Action::Reindex { target: Some("orders".to_owned()) });
-    assert_eq!(indexed.steps[0].sql, "REINDEX \"orders\";");
+    assert_eq!(indexed.steps[0].sql, "REINDEX orders;");
 
     let postgres = Snapshot::bare(Engine::Postgres, "app", "public", "");
     let planned = plan(&postgres, &Action::Vacuum);
@@ -1370,7 +1400,7 @@ async fn sqlite_maintenance_reports_result_and_writes_only_when_executed() {
 
     let reindex = Action::Reindex { target: Some("notes_note".to_owned()) };
     let planned = exec::preview(&session, &request(reindex.clone())).await.unwrap();
-    assert_eq!(planned.steps[0].sql, "REINDEX \"notes_note\";");
+    assert_eq!(planned.steps[0].sql, "REINDEX notes_note;");
     let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
     let receipt = exec::execute(&session, &request(reindex), &confirmed).await.unwrap();
     assert_eq!(receipt.steps[0].status, StepStatus::Ok, "{:?}", receipt.steps);
@@ -1414,11 +1444,11 @@ fn has_danger(planned: &super::model::Plan) -> bool {
 fn object_actions_emit_engine_specific_sql_with_a_danger_risk() {
     let truncate = Action::TruncateTable { table: "orders".to_owned() };
     let expected_truncate = [
-        (Engine::Sqlite, "DELETE FROM \"orders\";"),
-        (Engine::Mysql, "TRUNCATE TABLE `app`.`orders`;"),
-        (Engine::Mariadb, "TRUNCATE TABLE `app`.`orders`;"),
-        (Engine::Postgres, "TRUNCATE TABLE \"public\".\"orders\";"),
-        (Engine::Sqlserver, "TRUNCATE TABLE [dbo].[orders];"),
+        (Engine::Sqlite, "DELETE FROM orders;"),
+        (Engine::Mysql, "TRUNCATE TABLE app.orders;"),
+        (Engine::Mariadb, "TRUNCATE TABLE app.orders;"),
+        (Engine::Postgres, "TRUNCATE TABLE public.orders;"),
+        (Engine::Sqlserver, "TRUNCATE TABLE dbo.orders;"),
     ];
     for (engine, sql) in expected_truncate {
         let planned = plan(&table_of_engine(engine), &truncate);
@@ -1431,11 +1461,11 @@ fn object_actions_emit_engine_specific_sql_with_a_danger_risk() {
 
     let rename = Action::RenameTable { table: "orders".to_owned(), new_name: "orders_old".to_owned() };
     let expected_rename = [
-        (Engine::Sqlite, "ALTER TABLE \"orders\" RENAME TO \"orders_old\";"),
-        (Engine::Postgres, "ALTER TABLE \"public\".\"orders\" RENAME TO \"orders_old\";"),
-        (Engine::Mysql, "RENAME TABLE `app`.`orders` TO `app`.`orders_old`;"),
-        (Engine::Mariadb, "RENAME TABLE `app`.`orders` TO `app`.`orders_old`;"),
-        (Engine::Sqlserver, "EXEC sp_rename N'[dbo].[orders]', N'orders_old';"),
+        (Engine::Sqlite, "ALTER TABLE orders RENAME TO orders_old;"),
+        (Engine::Postgres, "ALTER TABLE public.orders RENAME TO orders_old;"),
+        (Engine::Mysql, "RENAME TABLE app.orders TO app.orders_old;"),
+        (Engine::Mariadb, "RENAME TABLE app.orders TO app.orders_old;"),
+        (Engine::Sqlserver, "EXEC sp_rename N'dbo.orders', N'orders_old';"),
     ];
     for (engine, sql) in expected_rename {
         let mut snapshot = table_of_engine(engine);
@@ -1449,11 +1479,11 @@ fn object_actions_emit_engine_specific_sql_with_a_danger_risk() {
 
     let drop_view = Action::DropView { view: "v_orders".to_owned() };
     let expected_drop = [
-        (Engine::Sqlite, "DROP VIEW \"v_orders\";"),
-        (Engine::Postgres, "DROP VIEW \"public\".\"v_orders\";"),
-        (Engine::Mysql, "DROP VIEW `app`.`v_orders`;"),
-        (Engine::Mariadb, "DROP VIEW `app`.`v_orders`;"),
-        (Engine::Sqlserver, "DROP VIEW [dbo].[v_orders];"),
+        (Engine::Sqlite, "DROP VIEW v_orders;"),
+        (Engine::Postgres, "DROP VIEW public.v_orders;"),
+        (Engine::Mysql, "DROP VIEW app.v_orders;"),
+        (Engine::Mariadb, "DROP VIEW app.v_orders;"),
+        (Engine::Sqlserver, "DROP VIEW dbo.v_orders;"),
     ];
     for (engine, sql) in expected_drop {
         let planned = plan(&view_snapshot(engine), &drop_view);
@@ -1465,7 +1495,7 @@ fn object_actions_emit_engine_specific_sql_with_a_danger_risk() {
     let mut materialized = view_snapshot(Engine::Postgres);
     materialized.materialized = true;
     let planned = plan(&materialized, &drop_view);
-    assert_eq!(planned.steps[0].sql, "DROP MATERIALIZED VIEW \"public\".\"v_orders\";");
+    assert_eq!(planned.steps[0].sql, "DROP MATERIALIZED VIEW public.v_orders;");
 }
 
 #[test]
@@ -1474,7 +1504,7 @@ fn sqlserver_rename_escapes_quotes_and_keeps_the_new_name_bare() {
     snapshot.name_taken = Some(false);
     let planned = plan(&snapshot, &Action::RenameTable { table: "orders".to_owned(), new_name: "o'rders]".to_owned() });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
-    assert_eq!(planned.steps[0].sql, "EXEC sp_rename N'[dbo].[orders]', N'o''rders]';");
+    assert_eq!(planned.steps[0].sql, "EXEC sp_rename N'dbo.orders', N'o''rders]';");
 }
 
 #[test]
@@ -1561,14 +1591,14 @@ fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
     postgres.table_comment = Some("订单".to_owned());
     postgres.column_comments.insert("customer_note".to_owned(), "客户's 备注".to_owned());
     let (text, missing) = super::plan::rebuilt_definition(&postgres);
-    assert!(text.contains("CREATE TABLE \"public\".\"orders\""), "{text}");
-    assert!(text.contains("\"id\" integer NOT NULL"), "{text}");
-    assert!(text.contains("\"customer_note\" character varying(40)"), "{text}");
-    assert!(text.contains("CONSTRAINT \"orders_pkey\" PRIMARY KEY (\"id\")"), "{text}");
+    assert!(text.contains("CREATE TABLE public.orders"), "{text}");
+    assert!(text.contains("id integer NOT NULL"), "{text}");
+    assert!(text.contains("customer_note character varying(40)"), "{text}");
+    assert!(text.contains("CONSTRAINT orders_pkey PRIMARY KEY (id)"), "{text}");
     assert!(text.contains("CREATE INDEX orders_note_idx ON public.orders USING btree (customer_note);"), "{text}");
     assert!(!text.contains("CREATE UNIQUE INDEX orders_pkey"), "{text}");
-    assert!(text.contains("COMMENT ON TABLE \"public\".\"orders\" IS '订单';"), "{text}");
-    assert!(text.contains("COMMENT ON COLUMN \"public\".\"orders\".\"customer_note\" IS '客户''s 备注';"), "{text}");
+    assert!(text.contains("COMMENT ON TABLE public.orders IS '订单';"), "{text}");
+    assert!(text.contains("COMMENT ON COLUMN public.orders.customer_note IS '客户''s 备注';"), "{text}");
     assert!(text.starts_with("-- "), "{text}");
     assert!(missing.iter().any(|item| item.contains("CHECK")), "{missing:?}");
     assert!(missing.iter().any(|item| item.contains("分区")), "{missing:?}");
@@ -1579,11 +1609,11 @@ fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
     sqlserver.indexes = vec![index("PK_orders", "id", true, false, None), index("IX_orders_total", "total", false, true, None)];
     sqlserver.column_comments.insert("total".to_owned(), "金额".to_owned());
     let (text, missing) = super::plan::rebuilt_definition(&sqlserver);
-    assert!(text.contains("CREATE TABLE [dbo].[orders]"), "{text}");
-    assert!(text.contains("[id] int IDENTITY(1, 1) NOT NULL"), "{text}");
-    assert!(text.contains("[total] decimal(10,2)"), "{text}");
-    assert!(text.contains("CONSTRAINT [PK_orders] PRIMARY KEY ([id])"), "{text}");
-    assert!(text.contains("CREATE INDEX [IX_orders_total] ON [dbo].[orders] ([total] DESC);"), "{text}");
+    assert!(text.contains("CREATE TABLE dbo.orders"), "{text}");
+    assert!(text.contains("id int IDENTITY(1, 1) NOT NULL"), "{text}");
+    assert!(text.contains("total decimal(10,2)"), "{text}");
+    assert!(text.contains("CONSTRAINT PK_orders PRIMARY KEY (id)"), "{text}");
+    assert!(text.contains("CREATE INDEX IX_orders_total ON dbo.orders (total DESC);"), "{text}");
     assert!(text.contains("@value = N'金额'") && text.contains("@level2name = N'total'"), "{text}");
     assert!(missing.iter().any(|item| item.contains("CHECK")), "{missing:?}");
     assert!(missing.iter().any(|item| item.contains("IDENTITY")), "{missing:?}");
@@ -1606,19 +1636,19 @@ fn sqlserver_index_sql_keeps_include_columns_out_of_the_key_and_writes_clusterin
         filter: Some("([status]<>(0))".to_owned()),
     };
     assert_eq!(
-        sqlserver_index_sql("[dbo].[orders]", &covering, &extra),
-        "CREATE NONCLUSTERED INDEX [IX_orders_customer] ON [dbo].[orders] ([customer_id], [created_at] DESC) INCLUDE ([total], [status]) WHERE ([status]<>(0));"
+        sqlserver_index_sql("dbo.orders", &covering, &extra),
+        "CREATE NONCLUSTERED INDEX IX_orders_customer ON dbo.orders (customer_id, created_at DESC) INCLUDE (total, status) WHERE ([status]<>(0));"
     );
 
     let mut clustered = index("CIX_orders_created", "created_at", false, false, None);
     clustered.unique = true;
     let extra = SqlserverIndexExtra { name: clustered.name.clone(), type_desc: "CLUSTERED".to_owned(), ..Default::default() };
-    assert_eq!(sqlserver_index_sql("[dbo].[orders]", &clustered, &extra), "CREATE UNIQUE CLUSTERED INDEX [CIX_orders_created] ON [dbo].[orders] ([created_at]);");
+    assert_eq!(sqlserver_index_sql("dbo.orders", &clustered, &extra), "CREATE UNIQUE CLUSTERED INDEX CIX_orders_created ON dbo.orders (created_at);");
 
     let mut columnstore = index("NCCI_orders", "total", false, false, None);
     columnstore.columns.clear();
     let extra = SqlserverIndexExtra { name: columnstore.name.clone(), type_desc: "NONCLUSTERED COLUMNSTORE".to_owned(), include: vec!["total".to_owned(), "status".to_owned()], filter: None };
-    assert_eq!(sqlserver_index_sql("[dbo].[orders]", &columnstore, &extra), "CREATE NONCLUSTERED COLUMNSTORE INDEX [NCCI_orders] ON [dbo].[orders] ([total], [status]);");
+    assert_eq!(sqlserver_index_sql("dbo.orders", &columnstore, &extra), "CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_orders ON dbo.orders (total, status);");
 
     let xml = index("XML_orders_doc", "doc", false, false, None);
     let extra = SqlserverIndexExtra { name: xml.name.clone(), type_desc: "XML".to_owned(), ..Default::default() };
@@ -1689,9 +1719,9 @@ async fn object_actions_refuse_sql_that_differs_from_the_preview() {
     ])
     .await;
     let actions = [
-        (Action::DropView { view: "v_notes".to_owned() }, "DROP VIEW \"v_notes\";"),
-        (Action::TruncateTable { table: "notes".to_owned() }, "DELETE FROM \"notes\";"),
-        (Action::RenameTable { table: "notes".to_owned(), new_name: "notes_old".to_owned() }, "ALTER TABLE \"notes\" RENAME TO \"notes_old\";"),
+        (Action::DropView { view: "v_notes".to_owned() }, "DROP VIEW v_notes;"),
+        (Action::TruncateTable { table: "notes".to_owned() }, "DELETE FROM notes;"),
+        (Action::RenameTable { table: "notes".to_owned(), new_name: "notes_old".to_owned() }, "ALTER TABLE notes RENAME TO notes_old;"),
     ];
     for (action, sql) in &actions {
         let previewed = exec::preview(&session, &request(action.clone())).await.unwrap();
@@ -1747,7 +1777,7 @@ fn untouched_postgres_defaults_do_not_block_other_column_changes() {
     let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: renamed });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert_eq!(planned.steps.len(), 1);
-    assert!(planned.steps[0].sql.contains("RENAME COLUMN \"amount\" TO \"total\""), "{}", planned.steps[0].sql);
+    assert!(planned.steps[0].sql.contains("RENAME COLUMN amount TO total"), "{}", planned.steps[0].sql);
     let mut typed = unchanged;
     typed[2].default_sql = "nextval('other_seq'::regclass)".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: typed });

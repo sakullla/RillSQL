@@ -549,13 +549,13 @@ fn render_formats_keep_nulls_quotes_and_column_order_byte_for_byte() {
     let mysql = render_insert_for(Engine::Mysql, "", "people", &columns, &table);
     assert_eq!(
         mysql,
-        "INSERT INTO `people` (`name`, `id`, `note`) VALUES ('甲', 1, NULL);\r\nINSERT INTO `people` (`name`, `id`, `note`) VALUES ('a,\"b\"', 2, 'NULL');"
+        "INSERT INTO people (name, id, note) VALUES ('甲', 1, NULL);\r\nINSERT INTO people (name, id, note) VALUES ('a,\"b\"', 2, 'NULL');"
     );
     let sqlserver = render_insert_for(Engine::Sqlserver, "dbo", "people", &columns, &table);
-    assert!(sqlserver.starts_with("INSERT INTO [dbo].[people] ([name], [id], [note]) VALUES (N'甲', 1, NULL);"), "{sqlserver}");
+    assert!(sqlserver.starts_with("INSERT INTO dbo.people (name, id, note) VALUES (N'甲', 1, NULL);"), "{sqlserver}");
     // 文件导出的 INSERT 仍是原来的 SQLite 写法。
     let exported = String::from_utf8(render("insert", &table, ',', "NULL", false, "", "people").unwrap()).unwrap();
-    assert!(exported.starts_with("INSERT INTO \"people\" (\"name\", \"id\", \"note\") VALUES ('甲', '1', NULL);"), "{exported}");
+    assert!(exported.starts_with("INSERT INTO people (name, id, note) VALUES ('甲', '1', NULL);"), "{exported}");
 }
 
 #[test]

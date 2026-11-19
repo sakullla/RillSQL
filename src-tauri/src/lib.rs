@@ -18,6 +18,7 @@ mod product;
 mod query;
 pub mod release;
 mod redis;
+mod sql_ident;
 mod state;
 mod ui;
 

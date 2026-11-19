@@ -1195,8 +1195,8 @@ mod tests {
         let parent = DumpTable { columns: vec![column("id", "integer", false), column("name", "text", false)], indexes: vec![pk_index(&["id"])], foreign_keys: vec![], source_sql: String::new() };
         let objects = vec![table_object("public", "orders", child), table_object("public", "customers", parent)];
         let entries = plan_sections(Engine::Postgres, &postgres_scope(), &objects, true, &[]);
-        let parent_at = entry_at(&entries, "CREATE TABLE \"public\".\"customers\"");
-        let child_at = entry_at(&entries, "CREATE TABLE \"public\".\"orders\"");
+        let parent_at = entry_at(&entries, "CREATE TABLE public.customers");
+        let child_at = entry_at(&entries, "CREATE TABLE public.orders");
         let child_data = entries
             .iter()
             .position(|entry| matches!(entry, DumpEntry::Data { table, .. } if table == "orders"))
@@ -1248,8 +1248,8 @@ mod tests {
         ];
         let entries = plan_sections(Engine::Postgres, &postgres_scope(), &objects, false, &[]);
         let table_at = entry_at(&entries, "CREATE TABLE");
-        let base_at = entry_at(&entries, "CREATE VIEW \"public\".\"v_base\" AS SELECT id FROM orders");
-        let top_at = entry_at(&entries, "CREATE VIEW \"public\".\"v_top\" AS SELECT * FROM v_base");
+        let base_at = entry_at(&entries, "CREATE VIEW public.v_base AS SELECT id FROM orders");
+        let top_at = entry_at(&entries, "CREATE VIEW public.v_top AS SELECT * FROM v_base");
         assert!(table_at < base_at, "{entries:?}");
         assert!(base_at < top_at, "{entries:?}");
     }
@@ -1282,8 +1282,8 @@ mod tests {
             },
         ];
         let entries = plan_sections(Engine::Postgres, &postgres_scope(), &objects, false, &[]);
-        let raw = entry_at(&entries, "CREATE VIEW \"public\".\"v_raw\" AS SELECT 1 AS one");
-        let mat = entry_at(&entries, "CREATE MATERIALIZED VIEW \"public\".\"v_mat\" AS SELECT id FROM orders");
+        let raw = entry_at(&entries, "CREATE VIEW public.v_raw AS SELECT 1 AS one");
+        let mat = entry_at(&entries, "CREATE MATERIALIZED VIEW public.v_mat AS SELECT id FROM orders");
         assert!(entries.iter().all(|entry| !matches!(entry, DumpEntry::Ddl { sql, .. } if sql.contains("v_broken"))));
         assert!(raw < mat || mat < raw);
     }
@@ -1321,10 +1321,10 @@ mod tests {
         let names: Vec<String> = schema.columns.iter().map(|column| column.name.clone()).collect();
         let cells = vec![Cell::Text("7".to_owned()), Cell::Text("0AFF".to_owned()), Cell::Text("它说'引号'".to_owned())];
         let line = insert_line(Engine::Postgres, &schema.schema, &schema.name, &schema.columns, &names, &cells);
-        assert_eq!(line, "INSERT INTO \"public\".\"docs\" (\"id\", \"body\", \"note\") VALUES (7, '\\x0aff', '它说''引号''');");
+        assert_eq!(line, "INSERT INTO public.docs (id, body, note) VALUES (7, '\\x0aff', '它说''引号''');");
         let mysql_line = insert_line(Engine::Mysql, "app", "docs", &schema.columns, &names, &cells);
         assert!(mysql_line.contains("X'0aff'"), "{mysql_line}");
-        assert!(mysql_line.contains("`app`.`docs`"), "{mysql_line}");
+        assert!(mysql_line.contains("app.docs"), "{mysql_line}");
     }
 
     #[test]
@@ -1337,7 +1337,7 @@ mod tests {
             columns: vec![],
             key: vec!["id".to_owned(), "seq".to_owned()],
         };
-        assert_eq!(data_order_clause(&schema), " ORDER BY \"id\" ASC, \"seq\" ASC");
+        assert_eq!(data_order_clause(&schema), " ORDER BY id ASC, seq ASC");
         let sqlite = grid::TableSchema { engine: Engine::Sqlite, schema: String::new(), name: "notes".to_owned(), kind: "table", columns: vec![], key: vec![] };
         assert_eq!(data_order_clause(&sqlite), " ORDER BY rowid");
         let loose = grid::TableSchema { engine: Engine::Mysql, schema: "app".to_owned(), name: "logs".to_owned(), kind: "table", columns: vec![], key: vec![] };

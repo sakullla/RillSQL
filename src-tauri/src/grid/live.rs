@@ -2054,15 +2054,15 @@ mod order_tests {
         // PostgreSQL 的 `"id"::text` 输出列仍叫 id；ORDER BY "id" 会按文本排出 1、10、100……
         let pg = schema(Engine::Postgres, "shop");
         let default = page_sql(&pg, &[], None, None, None, 100, 0, 1024).unwrap();
-        assert!(default.contains("\"id\"::text"), "{default}");
-        assert!(default.contains(" ORDER BY \"shop\".\"customers\".\"id\" ASC LIMIT 100"), "{default}");
+        assert!(default.contains("id::text"), "{default}");
+        assert!(default.contains(" ORDER BY shop.customers.id ASC LIMIT 100"), "{default}");
         let sorted = page_sql(&pg, &[], None, None, Some(&Sort { column: "amount".to_owned(), descending: true }), 100, 0, 1024).unwrap();
-        assert!(sorted.contains(" ORDER BY \"shop\".\"customers\".\"amount\" DESC"), "{sorted}");
+        assert!(sorted.contains(" ORDER BY shop.customers.amount DESC"), "{sorted}");
         let full = page_sql_full(&pg, &[], None, None, None, 10).unwrap();
-        assert!(full.contains(" ORDER BY \"shop\".\"customers\".\"id\" ASC LIMIT 10"), "{full}");
+        assert!(full.contains(" ORDER BY shop.customers.id ASC LIMIT 10"), "{full}");
         let mysql = page_sql(&schema(Engine::Mysql, "app"), &[], None, None, None, 5, 0, 1024).unwrap();
-        assert!(mysql.contains(" ORDER BY `app`.`customers`.`id` ASC LIMIT 5"), "{mysql}");
+        assert!(mysql.contains(" ORDER BY app.customers.id ASC LIMIT 5"), "{mysql}");
         let mssql = page_sql(&schema(Engine::Sqlserver, "dbo"), &[], None, None, None, 5, 10, 1024).unwrap();
-        assert!(mssql.contains(" ORDER BY [dbo].[customers].[id] ASC OFFSET 10 ROWS"), "{mssql}");
+        assert!(mssql.contains(" ORDER BY dbo.customers.id ASC OFFSET 10 ROWS"), "{mssql}");
     }
 }

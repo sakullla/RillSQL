@@ -1092,7 +1092,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
     let same: Option<Option<String>> = again.query_first("SELECT CONNECTION_ID()").await.unwrap();
     let queries = stub.queries.lock().expect("queries").clone();
     let failures = stub.failures.lock().expect("failures").clone();
-    assert!(queries.iter().any(|sql| sql == "USE `app`"), "{queries:?}");
+    assert!(queries.iter().any(|sql| sql == "USE app"), "{queries:?}");
     assert_eq!(stub.resets.load(Ordering::SeqCst), 0, "归还连接时执行了 COM_RESET_CONNECTION queries={queries:?} failures={failures:?}");
     assert_eq!(stub.accepts.load(Ordering::SeqCst), 1, "执行为同一批另开了连接 queries={queries:?} failures={failures:?}");
     assert_eq!(kept.as_ref().map(Option::as_deref), Some(Some("stay")), "queries={queries:?} failures={failures:?}");
