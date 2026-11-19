@@ -13,7 +13,7 @@ mod english;
 pub(crate) mod exec;
 pub(crate) mod keys;
 
-use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FieldHint, FormField, UrlScheme, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {

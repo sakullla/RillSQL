@@ -16,7 +16,7 @@ mod syntax;
 pub(in crate::adapters) mod transfer;
 mod types;
 
-use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, FieldHint, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct PostgresAdapter;

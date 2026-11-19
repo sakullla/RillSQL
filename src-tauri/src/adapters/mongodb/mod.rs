@@ -10,7 +10,7 @@ pub(crate) mod connect;
 pub(crate) mod docs;
 mod english;
 
-use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FieldHint, FormField, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {

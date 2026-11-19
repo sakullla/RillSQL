@@ -7884,6 +7884,131 @@ fn query_editor_runs_mysql_and_redis_fixtures(cx: &mut gpui_kit::TestAppContext)
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A6 适配器收口冒烟：MySQL / PostgreSQL / SQLite / Redis 各自经工作台完成连接、对象树浏览与查询。
+/// 需要 docker/compose.yaml 的 mysql、postgres、redis 服务；SQLite 使用 docker/sqlite/notes.sqlite 的副本。
+#[gpui_kit::test]
+#[ignore = "requires the MySQL, PostgreSQL and Redis development fixtures"]
+fn adapter_smoke_connects_browses_and_queries_fixture_engines(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::{database_node_id, group_node_id, schema_node_id, NavKind};
+    use crate::catalog::model::ObjectKind;
+    use crate::connections::model::{ConnectionDraft, Secret, SecretInput, TlsMode};
+    use gpui_kit::SharedString;
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-adapter-smoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let notes = dir.join("notes.sqlite");
+    std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker/sqlite/notes.sqlite"), &notes).unwrap();
+    let services = services_at(&dir);
+    let rows = jobs::runtime().block_on(async {
+        for (engine, port, user, database, password) in [
+            (Engine::Mysql, "3306", "rillsql", "rillsql", "rillsql"),
+            (Engine::Postgres, "5432", "postgres", "rillsql", "postgres"),
+            (Engine::Redis, "6379", "", "0", "rillsql-redis"),
+        ] {
+            let id = engine.as_str();
+            let mut draft = ConnectionDraft::blank(engine);
+            draft.id = Some(id.into());
+            draft.name = id.into();
+            draft.host = "127.0.0.1".into();
+            draft.port = port.into();
+            draft.username = user.into();
+            draft.database = database.into();
+            draft.tls_mode = TlsMode::Off;
+            draft.save_password = false;
+            services.connections.save(draft, SecretInput::default()).await.unwrap();
+            let opened = services.connections.open(id, SecretInput { password: Some(Secret::new(password)), ..Default::default() }).await.unwrap();
+            assert!(opened.connected, "{id}: {:?}", opened.report);
+        }
+        let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+        draft.id = Some("sqlite".into());
+        draft.name = "sqlite".into();
+        draft.file_path = notes.display().to_string();
+        services.connections.save(draft, SecretInput::default()).await.unwrap();
+        let opened = services.connections.open("sqlite", SecretInput::default()).await.unwrap();
+        assert!(opened.connected, "sqlite: {:?}", opened.report);
+        services.list_connections().await.unwrap()
+    });
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.connections.rows = rows;
+            for id in ["mysql", "postgres", "sqlite", "redis"] {
+                view.model.connections.status.insert(id.into(), LinkStatus::Connected);
+            }
+        });
+        window.render_frame(cx);
+    }).unwrap();
+    // 浏览：逐级展开到表分组，等对象页读回种子表。
+    let paths: [(&str, Vec<String>, String, &str); 3] = [
+        ("mysql", vec![database_node_id("mysql", "rillsql")], group_node_id("mysql", "rillsql", "", ObjectKind::Table), "customers"),
+        (
+            "postgres",
+            vec![database_node_id("postgres", "rillsql"), schema_node_id("postgres", "rillsql", "public")],
+            group_node_id("postgres", "rillsql", "public", ObjectKind::Table),
+            "customers",
+        ),
+        ("sqlite", Vec::new(), group_node_id("sqlite", "main", "", ObjectKind::Table), "notes"),
+    ];
+    for (id, parents, group, table) in &paths {
+        for node in parents.iter().chain(std::iter::once(group)) {
+            assert!(pump_until(cx, window, &view, |view, _| view.model.nav.node(node).is_some_and(|node| !node.loading)), "{id}: node {node} appears");
+            let expanded = cx.update(|cx| view.read(cx).model.nav.is_expanded(node));
+            if !expanded {
+                cx.update_window(window, |_, window, cx| {
+                    window.click(SharedString::from(format!("nav-chevron-{node}")), cx);
+                    window.render_frame(cx);
+                }).unwrap();
+            }
+        }
+        assert!(
+            pump_until(cx, window, &view, |view, _| view.model.nav.nodes().any(|node| node.kind == NavKind::Object && node.connection_id == *id && node.name == *table)),
+            "{id}: table {table} browsed"
+        );
+    }
+    // 查询：每个关系型引擎在绑定连接的查询页执行一条读语句。
+    for (id, database, sql, expected) in [
+        ("mysql", "rillsql", "SELECT COUNT(*) FROM customers", "2"),
+        ("postgres", "rillsql", "SELECT COUNT(*) FROM customers", "2"),
+        ("sqlite", "main", "SELECT COUNT(*) FROM notes", "2"),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, _| {
+                view.model.open_bound_query(sql.into(), Some(id.into()), Some(id.into()), Some(database.into()), Some(id.into()));
+            });
+            window.render_frame(cx);
+            window.click("query-act-execute-query", cx);
+        }).unwrap();
+        assert!(
+            pump_until(cx, window, &view, |view, cx| view.query_cell(0, 0, cx) == expected && !view.model.active_tab().unwrap().running),
+            "{id}: {sql}"
+        );
+    }
+    // Redis：打开键空间浏览种子键，再在查询页执行命令。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("nav-open-keyspace:redis\u{1}0", cx));
+        window.render_frame(cx);
+    }).unwrap();
+    assert!(pump_until(cx, window, &view, |view, cx| {
+        let redis = view.redis.read(cx);
+        !redis.running() && redis.keys().iter().any(|key| key.name == "rillsql:string:welcome")
+    }), "redis keys browsed");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.open_bound_query("GET rillsql:string:welcome".into(), Some("redis".into()), Some("redis".into()), Some("0".into()), Some("redis".into()));
+        });
+        window.render_frame(cx);
+        window.click("query-act-execute-query", cx);
+    }).unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.query_cell(0, 0, cx).contains("Redis 夹具") && !view.model.active_tab().unwrap().running),
+        "redis GET"
+    );
+    for id in ["mysql", "postgres", "sqlite", "redis"] {
+        services.connections.disconnect(id);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[gpui_kit::test]
 #[ignore = "requires scripts/verify-catalog-mysql.py on loopback port 33067"]
 fn mysql_lazy_navigation_latency_fixture(cx: &mut gpui_kit::TestAppContext) {

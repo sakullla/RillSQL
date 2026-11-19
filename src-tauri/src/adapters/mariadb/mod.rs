@@ -1,8 +1,8 @@
 //! MariaDB 适配器：独立入口，内部复用 MySQL 家族的共享实现。
 
 use crate::adapters::mysql;
-use crate::adapters::{FieldHint, 
-    Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench,
+use crate::adapters::{
+    Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, FieldHint, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench,
 };
 use crate::connections::model::{Engine, TlsMode};
 
