@@ -14,6 +14,9 @@ pub const ENGINES: [Engine; 7] = [
     Engine::Mongodb,
 ];
 
+/// 目录树节点挂到连接之前的占位引擎（建好节点后立即改成所属连接的引擎）。
+pub const PLACEHOLDER: Engine = Engine::Sqlite;
+
 /// 取得引擎的适配器。
 pub fn adapter(engine: Engine) -> &'static dyn EngineAdapter {
     match engine {

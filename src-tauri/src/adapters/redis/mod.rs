@@ -4,13 +4,14 @@
 //! 键空间浏览一律走 SCAN 游标（禁 KEYS）；写删类操作由前端确认后携带 confirmed 标记执行。
 //! 会话经 `Session::as_redis()` 专属接口取得。
 
+pub(crate) mod catalog;
 pub mod commands;
 pub(crate) mod complete;
 pub(crate) mod connect;
 pub(crate) mod exec;
 pub(crate) mod keys;
 
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {
@@ -113,7 +114,18 @@ impl EngineAdapter for RedisAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: false, sql_syntax_group: false, connector_group: true, ..Capabilities::default() }
+        Capabilities {
+            relational: false,
+            sql_syntax_group: false,
+            connector_group: true,
+            catalog_group: true,
+            shows_databases: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&catalog::RedisCatalog)
     }
 
     fn connector(&self) -> Option<&dyn Connector> {

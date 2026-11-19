@@ -112,8 +112,7 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("app/model.rs", 3, A6),
     ("app/shell/chrome.rs", 32, A6),
     ("app/shell/model.rs", 19, A6),
-    ("app/shell/nav.rs", 7, A2),
-    ("app/shell/view.rs", 9, A6),
+    ("app/shell/view.rs", 8, A6),
     ("app/views/admin/mod.rs", 8, A3),
     ("app/views/compare/live.rs", 31, A5),
     ("app/views/compare/mod.rs", 15, A5),
@@ -122,15 +121,6 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("app/views/query/mod.rs", 9, A4),
     ("app/views/structure/mod.rs", 47, A3),
     ("application/grid.rs", 14, A4),
-    ("catalog/definition.rs", 9, A2),
-    ("catalog/detail.rs", 90, A2),
-    ("catalog/hierarchy.rs", 7, A2),
-    ("catalog/mod.rs", 1, A2),
-    ("catalog/model.rs", 154, A2),
-    ("catalog/nav_read.rs", 8, A2),
-    ("catalog/objects.rs", 33, A2),
-    ("catalog/read.rs", 149, A2),
-    ("catalog/sqlite.rs", 3, A2),
     ("compare/model.rs", 1, A5),
     ("compare/read.rs", 60, A5),
     ("compare/structure.rs", 85, A5),
@@ -140,8 +130,6 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("ddl/model.rs", 14, A3),
     ("ddl/plan.rs", 152, A3),
     ("ddl/sql.rs", 27, A3),
-    ("diagram/read.rs", 14, A2),
-    ("diagram/sql.rs", 46, A2),
     ("dump/dump.rs", 66, A5),
     ("dump/order.rs", 2, A5),
     ("export/write.rs", 1, A5),
@@ -444,7 +432,7 @@ fn production_code_respects_the_adapter_boundary() {
         assert!(*count > 0 && !reason.is_empty(), "{file}");
     }
     // 已完成迁移的领域不得再出现在白名单里。
-    let done: &[&str] = &[A1];
+    let done: &[&str] = &[A1, A2];
     assert!(
         ALLOWLIST.iter().all(|(_, _, reason)| !done.contains(reason)),
         "{done:?} 已迁移完毕，白名单不应再有它们的条目"

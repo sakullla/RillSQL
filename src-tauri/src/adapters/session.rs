@@ -34,6 +34,28 @@ pub enum CatalogSession {
     Scripted,
 }
 
+impl CatalogSession {
+    /// 探针驱动的测试连接：没有可查询的数据库。
+    pub fn is_scripted(&self) -> bool {
+        matches!(self, Self::Scripted)
+    }
+
+    /// 执行一条只读语句，把每格转成文本。对象详情（列/索引/主键/注释）与补全外键读取共用，
+    /// 各引擎的取值规则在各自适配器里。
+    pub async fn text_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        use crate::catalog::detail::failure;
+        match self {
+            Self::Scripted => Err(failure("这个连接没有连着可查询的数据库")),
+            Self::Redis(_) => Err(failure("Redis 没有列或索引")),
+            Self::Mongo(_) => Err(failure("MongoDB 没有 SQL 列或索引")),
+            Self::Sqlite { pool, .. } => super::sqlite::catalog_read::text_rows(pool, sql).await,
+            Self::Mysql(pool) => super::mysql::catalog_read::text_rows(pool, sql).await,
+            Self::Postgres(client) => super::postgres::catalog_read::text_rows(client, sql).await,
+            Self::Sqlserver(client) => super::sqlserver::catalog_read::text_rows(client, sql).await,
+        }
+    }
+}
+
 /// 一条已打开的会话。由适配器的 [`Connector`] 产出，连接服务按连接 id 持有 `Arc<dyn Session>`。
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {

@@ -992,23 +992,27 @@ mod tests {
         .into_iter()
         .map(|(file, source)| (file.to_owned(), non_test(source)))
         .collect();
-        // 定义读取：入口、各引擎的定义读取与它们用到的取值/包装函数。
-        for name in [
-            "read_failure",
-            "definition_failure",
-            "read_definition",
-            "read_sqlite_definition",
-            "read_mysql_definition",
-            "mysql_create_sql",
-            "mysql_show_create_at",
-            "mysql_string",
-            "read_postgres_definition",
-            "read_postgres_text",
-            "pg_string",
-            "tds_query_rows",
-            "read_sqlserver_definition",
+        // 定义读取：入口、各引擎的定义读取与它们用到的取值/包装函数（A2 起各引擎读取在适配器里）。
+        const MYSQL_READ: &str = include_str!("../adapters/mysql/catalog_read.rs");
+        const POSTGRES_READ: &str = include_str!("../adapters/postgres/catalog_read.rs");
+        const SQLITE_READ: &str = include_str!("../adapters/sqlite/catalog_read.rs");
+        const SQLSERVER_READ: &str = include_str!("../adapters/sqlserver/catalog_read.rs");
+        for (file, source, name) in [
+            ("catalog/read.rs", READ, "read_failure"),
+            ("catalog/read.rs", READ, "definition_failure"),
+            ("catalog/read.rs", READ, "read_definition"),
+            ("adapters/sqlite/catalog_read.rs", SQLITE_READ, "read_sqlite_definition"),
+            ("adapters/mysql/catalog_read.rs", MYSQL_READ, "read_mysql_definition"),
+            ("adapters/mysql/catalog_read.rs", MYSQL_READ, "mysql_create_sql"),
+            ("adapters/mysql/catalog_read.rs", MYSQL_READ, "mysql_show_create_at"),
+            ("adapters/mysql/catalog_read.rs", MYSQL_READ, "mysql_string"),
+            ("adapters/postgres/catalog_read.rs", POSTGRES_READ, "read_postgres_definition"),
+            ("adapters/postgres/catalog_read.rs", POSTGRES_READ, "read_postgres_text"),
+            ("adapters/postgres/catalog_read.rs", POSTGRES_READ, "pg_string"),
+            ("adapters/sqlserver/catalog_read.rs", SQLSERVER_READ, "tds_query_rows"),
+            ("adapters/sqlserver/catalog_read.rs", SQLSERVER_READ, "read_sqlserver_definition"),
         ] {
-            sources.push((format!("catalog/read.rs::{name}"), function_source(READ, name)));
+            sources.push((format!("{file}::{name}"), function_source(source, name)));
         }
         // 外壳：查看器与确认层的读取回调、状态更新和渲染。
         for (file, source, name) in [
@@ -1035,7 +1039,7 @@ mod tests {
             }
         }
         assert!(seen.len() > 200, "扫描没有读到源码字面量：{}", seen.len());
-        for file in ["catalog/definition.rs", "catalog/read.rs::read_sqlserver_definition", "app/shell/danger.rs"] {
+        for file in ["catalog/definition.rs", "adapters/sqlserver/catalog_read.rs::read_sqlserver_definition", "app/shell/danger.rs"] {
             let (_, code) = sources.iter().find(|(name, _)| name == file).unwrap();
             assert!(!chinese_literals(code).is_empty(), "{file} 没有读到中文字面量，扫描范围可能失效");
         }

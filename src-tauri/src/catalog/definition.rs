@@ -31,20 +31,12 @@ pub struct ObjectDdl {
 
 /// 这个引擎的这种对象能不能读到定义。纯函数：菜单用它决定“查看 DDL”是否可点。
 pub fn ddl_available(engine: Engine, kind: ObjectKind) -> bool {
-    use ObjectKind::*;
-    match engine {
-        Engine::Sqlite => matches!(kind, Table | View | Trigger),
-        Engine::Mysql => matches!(kind, Table | View | Function | Procedure | Trigger | Event),
-        Engine::Mariadb => matches!(kind, Table | View | Function | Procedure | Trigger | Event | Sequence),
-        Engine::Postgres => matches!(kind, Table | View | Function | Procedure | Trigger | Sequence | Enum | Domain),
-        Engine::Sqlserver => matches!(kind, Table | View | Function | Procedure | Trigger | Sequence),
-        Engine::Redis | Engine::Mongodb => false,
-    }
+    crate::adapters::catalog_of(engine).definition_available(kind)
 }
 
 /// 这个引擎的表定义是不是按元数据重建的（没有数据库保存的建表原文）。
 pub fn table_is_rebuilt(engine: Engine) -> bool {
-    matches!(engine, Engine::Postgres | Engine::Sqlserver)
+    crate::adapters::catalog_of(engine).table_is_rebuilt()
 }
 
 /// 读对象定义。不可用的种类直接返回原因，不发查询。

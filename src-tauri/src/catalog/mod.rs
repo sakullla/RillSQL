@@ -1,4 +1,4 @@
-//! 按引擎读取库表：PostgreSQL 有 schema，MySQL / MariaDB 只有库，SQLite 直接列对象。
+//! 读取库表：树的层级（库 / 模式 / 对象）与各引擎的目录 SQL 由适配器的 Capabilities 与 CatalogDialect 给出。
 
 pub mod commands;
 pub mod definition;
@@ -6,9 +6,8 @@ pub mod detail;
 pub mod hierarchy;
 pub mod model;
 pub mod nav_read;
-mod objects;
+pub(crate) mod objects;
 pub mod read;
-mod sqlite;
 pub mod tree;
 
 pub use model::{
@@ -19,7 +18,7 @@ pub(crate) use model::{DatabaseNode, ObjectKind, ObjectRow};
 #[allow(unused_imports)]
 pub use objects::{read_extras, ExtrasBody, ExtrasScope};
 pub(crate) use read::{read_database_outline, read_definition, read_object_page, ConnectionBody};
-pub use sqlite::{read_sqlite_file, read_sqlite_pool};
+pub(crate) use crate::adapters::sqlite::file_page::{read_sqlite_file, read_sqlite_pool};
 pub use commands::{catalog_definition, catalog_page, catalog_refresh, catalog_sessions};
 pub use detail::read_object_details;
 pub use hierarchy::{NavAction, NavConnection};
@@ -65,7 +64,6 @@ pub fn module_id() -> &'static str {
     );
     let _ = (
         DEFAULT_OBJECT_PAGE,
-        Engine::Sqlite,
         SchemaStatus::Ready,
         model::ConnStatus::Connecting,
         model::ConnStatus::Error,

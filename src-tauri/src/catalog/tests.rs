@@ -7,7 +7,7 @@ use super::model::{
 };
 use super::objects::{read_extras, ExtrasScope};
 use super::read::{assemble_postgres, read_catalog_session, read_definition, read_limit, ObjectWindow};
-use super::sqlite::{read_sqlite_file, read_sqlite_pool};
+use super::{read_sqlite_file, read_sqlite_pool};
 use super::tree::{
     direct_objects, object_path, refresh_connection, refresh_schema, search_objects, take_page,
     visible_database_names, visible_schema_names,
@@ -387,7 +387,11 @@ fn catalog_commands_use_the_open_session_reader() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let compare = std::fs::read_to_string(root.join("src/app/views/compare/mod.rs")).unwrap();
     assert!(compare.contains("application::work::catalog_refresh("));
-    let reader = std::fs::read_to_string(root.join("src/catalog/read.rs")).unwrap();
+    // 读取门面与各适配器的会话读取（A2 起引擎读取迁入 adapters/<engine>/catalog_read.rs）。
+    let mut reader = std::fs::read_to_string(root.join("src/catalog/read.rs")).unwrap();
+    for engine in ["mysql", "postgres", "sqlite", "sqlserver"] {
+        reader.push_str(&std::fs::read_to_string(root.join(format!("src/adapters/{engine}/catalog_read.rs"))).unwrap());
+    }
     assert!(reader.contains("metadata_sql"));
     assert!(!reader.contains("PRAGMA foreign_keys"));
     assert!(!reader.contains("read_sqlite_file"));
@@ -667,7 +671,7 @@ fn sqlserver_shows_databases_and_schemas_layers() {
 #[test]
 fn sqlserver_sequence_definition_projects_sql_variant_columns() {
     // sql_variant 与位类型列必须先投影成文本：读不到时报错，而不是编造 START 1 / NO CYCLE。
-    let sql = super::read::SQLSERVER_SEQUENCE_SQL;
+    let sql = crate::adapters::sqlserver::catalog_read::SQLSERVER_SEQUENCE_SQL;
     for column in ["start_value", "increment", "minimum_value", "maximum_value", "cache_size"] {
         let cast = format!("CAST(q.{column} AS NVARCHAR(40))");
         assert!(sql.contains(&cast), "{column} 需要 CAST 投影：{sql}");

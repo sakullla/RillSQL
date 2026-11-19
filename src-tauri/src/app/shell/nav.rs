@@ -4,7 +4,6 @@
 use crate::app::model::ObjectTarget;
 use crate::catalog::hierarchy::{NavNode, ObjectKey};
 use crate::catalog::model::Engine;
-use crate::query::assist::quote_ident;
 
 /// 节点 -> 完整对象目标。环境只用于展示，不参与身份。
 pub fn target_for(node: &NavNode, environment: &str) -> Option<ObjectTarget> {
@@ -30,24 +29,9 @@ pub fn qualified_name(object: &ObjectKey) -> String {
     object.qualified_name()
 }
 
+/// 按引擎层级（库或模式作容器段）与方言引号写对象名。
 fn quoted(engine: Engine, database: &str, schema: &str, name: &str) -> String {
-    match engine {
-        Engine::Sqlite => quote_ident("sqlite", name),
-        Engine::Mysql | Engine::Mariadb => {
-            if database.is_empty() {
-                quote_ident("mysql", name)
-            } else {
-                format!("{}.{}", quote_ident("mysql", database), quote_ident("mysql", name))
-            }
-        }
-        engine => {
-            if schema.is_empty() {
-                quote_ident(engine.as_str(), name)
-            } else {
-                format!("{}.{}", quote_ident(engine.as_str(), schema), quote_ident(engine.as_str(), name))
-            }
-        }
-    }
+    crate::adapters::qualified_object(engine, database, schema, name)
 }
 
 /// 对象名插入文本：同一引擎的引用规则。
@@ -63,7 +47,7 @@ pub fn insert_column_text(column: &str) -> String {
 /// 生成 SELECT 的插入文本：只写草稿，永不执行。
 pub fn select_text(object: &ObjectKey) -> String {
     let name = quoted(object.engine, &object.database, &object.schema, &object.name);
-    format!("SELECT *\nFROM {name}\nLIMIT 100;")
+    crate::adapters::sample_select(object.engine, &name, 100)
 }
 
 /// 对象树“生成 INSERT / UPDATE / DELETE 模板”的种类。
@@ -94,7 +78,7 @@ impl TemplateKind {
 }
 
 fn quoted_column(engine: Engine, column: &str) -> String {
-    quote_ident(engine.as_str(), column)
+    crate::adapters::quote_ident(engine, column)
 }
 
 /// SQL 模板：表名与列名按引擎引用，值用 `?` 占位。只写草稿，永不执行。

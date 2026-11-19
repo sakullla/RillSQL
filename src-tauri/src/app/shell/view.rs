@@ -153,9 +153,9 @@ impl Drop for Workbench {
     }
 }
 
-/// 读一个节点所属库的会话。PostgreSQL 的会话只连着自己的库：读别的库时另开一个连到
+/// 读一个节点所属库的会话。会话绑定到单个库的引擎（PostgreSQL）读别的库时另开一个连到
 /// 那个库的临时会话（和比较页同一条路，读完随返回值一起断开），当前库仍用原会话。
-/// SQL Server 的读取在 catalog::read 里用三段名限定，同一个会话就够，不发 USE。
+/// 能跨库读目录的引擎（SQL Server 三段名）同一个会话就够，不发 USE。
 async fn nav_read_session(
     services: &AppServices,
     engine: Engine,
@@ -163,7 +163,7 @@ async fn nav_read_session(
     database: &str,
     current: Option<&str>,
 ) -> Result<(crate::connections::CatalogSession, Option<crate::connections::EphemeralRead>), String> {
-    if engine == Engine::Postgres && !database.is_empty() && current != Some(database) {
+    if crate::adapters::adapter(engine).capabilities().database_scoped_session && !database.is_empty() && current != Some(database) {
         let read = services.connections.open_ephemeral_postgres(connection_id, database).await?;
         let session = read.catalog();
         return Ok((session, Some(read)));

@@ -1,9 +1,13 @@
 //! MySQL 适配器。共享实现（语法等）以 `pub(in crate::adapters)` 暴露给 MariaDB 复用。
 
+pub(crate) mod catalog;
+pub(crate) mod catalog_read;
 pub(crate) mod connect;
+pub(crate) mod diagram;
+pub(crate) mod extras;
 pub(in crate::adapters) mod syntax;
 
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
 use crate::connections::model::{Engine, TlsMode};
 
 pub(in crate::adapters) struct MysqlAdapter;
@@ -49,14 +53,31 @@ impl EngineAdapter for MysqlAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: true, sql_syntax_group: true, connector_group: true, ..Capabilities::default() }
+        family_capabilities()
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::MysqlSyntax)
     }
 
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&catalog::MYSQL_CATALOG)
+    }
+
     fn connector(&self) -> Option<&dyn Connector> {
         Some(&connect::MysqlConnector)
+    }
+}
+
+/// MySQL 家族共用的能力声明：按库分的对象树，先读库名、对象按分组分页。
+pub(in crate::adapters) fn family_capabilities() -> Capabilities {
+    Capabilities {
+        relational: true,
+        sql_syntax_group: true,
+        connector_group: true,
+        catalog_group: true,
+        shows_databases: true,
+        outline_navigation: true,
+        ..Capabilities::default()
     }
 }

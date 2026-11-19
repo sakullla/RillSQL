@@ -8,7 +8,11 @@ use crate::diagram::model::{
     empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, OutgoingKey, RangeScope, TableAttempt,
 };
 use crate::diagram::read::read_diagram;
-use crate::diagram::sql::{diagram_statements, MYSQL_TABLES, POSTGRES_TABLES, SQLITE_TABLES, SQLSERVER_TABLES};
+use crate::adapters::mysql::diagram::MYSQL_TABLES;
+use crate::adapters::postgres::diagram::POSTGRES_TABLES;
+use crate::adapters::sqlite::diagram::SQLITE_TABLES;
+use crate::adapters::sqlserver::diagram::SQLSERVER_TABLES;
+use crate::diagram::read::diagram_statements;
 
 fn key(name: &str, columns: &[&str], ref_schema: &str, ref_table: &str, ref_columns: &[&str]) -> OutgoingKey {
     OutgoingKey {
@@ -137,7 +141,8 @@ fn diagram_range_refuses_an_empty_postgres_schema_and_another_database() {
 
 #[test]
 fn diagram_statements_are_a_dedicated_read_of_base_tables() {
-    let statements = diagram_statements();
+    let statements = &diagram_statements();
+    assert_eq!(statements.len(), 13, "四类关系型引擎的关系图语句都登记了");
     for statement in statements {
         let lowered = statement.to_ascii_lowercase();
         assert!(lowered.trim_start().starts_with("select "), "{statement}");
@@ -192,8 +197,19 @@ fn diagram_statements_are_a_dedicated_read_of_base_tables() {
 
 #[test]
 fn diagram_source_does_not_reuse_catalog_paging_or_structure_describe() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/diagram");
-    for name in ["assemble.rs", "commands.rs", "model.rs", "read.rs", "sql.rs", "mod.rs"] {
+    // 关系图的语句与各引擎读取在 A2 迁入 adapters/<engine>/diagram.rs，一并检查。
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for name in [
+        "diagram/assemble.rs",
+        "diagram/commands.rs",
+        "diagram/model.rs",
+        "diagram/read.rs",
+        "diagram/mod.rs",
+        "adapters/mysql/diagram.rs",
+        "adapters/postgres/diagram.rs",
+        "adapters/sqlite/diagram.rs",
+        "adapters/sqlserver/diagram.rs",
+    ] {
         let text = std::fs::read_to_string(root.join(name)).unwrap_or_else(|_| panic!("missing {name}"));
         for needle in ["metadata_sql", "kind_sql", "ddl_describe", "ddl::", "catalog::read", "connections_open", "connections_focus", "ATTACH", "USE "] {
             assert!(!text.contains(needle), "{name} contains {needle}");

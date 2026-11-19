@@ -1,198 +1,56 @@
 //! 表/视图的按需列与索引读取。只在已经打开的 catalog 会话上发查询，
 //! 不新开连接；失败只影响这一个对象，不碰同级的其它节点。
+//!
+//! 列/索引/主键/注释查询与结果行形状由各适配器的目录方言给出（见 `adapters/<engine>/catalog.rs`）。
 
-use mysql_async::prelude::Queryable;
-use sqlx::Row as _;
-
+use crate::adapters::catalog_of;
 use crate::catalog::hierarchy::{ColumnInfo, IndexInfo};
 use crate::catalog::model::Engine;
 use crate::connections::CatalogSession;
-use crate::query::assist::{quote_ident, ColumnMeta};
+use crate::query::assist::ColumnMeta;
 
-/// SQL 字面量：单引号翻倍。目录读取只接受已读到的名字，这里仍然转义，
-/// 避免对象名里的引号跑出语句。
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
-}
-
-fn qualified(engine: Engine, database: &str, schema: &str, table: &str) -> String {
-    let name = quote_ident(engine.as_str(), table);
-    match engine {
-        Engine::Sqlite => name,
-        Engine::Mysql | Engine::Mariadb => {
-            if database.is_empty() {
-                name
-            } else {
-                format!("{}.{}", quote_ident("mysql", database), name)
-            }
-        }
-        _ => {
-            if schema.is_empty() {
-                name
-            } else {
-                format!("{}.{}", quote_ident(engine.as_str(), schema), name)
-            }
-        }
-    }
-}
-
-/// 列查询。SQLite 走 PRAGMA，其余引擎走 information_schema 的位置列：
-/// name, type, nullable, default, comment。注释用左连接读，读不到就是 NULL，不影响列本身。
+/// 列查询：name, type, nullable, default, comment；注释用左连接读，读不到就是 NULL，不影响列本身。
 pub fn columns_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
-    match engine {
-        Engine::Redis | Engine::Mongodb => None,
-        Engine::Sqlite => Some(format!("PRAGMA table_info({})", quote_ident("sqlite", table))),
-        Engine::Postgres => Some(format!(
-            "SELECT c.column_name, COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), c.data_type), c.is_nullable, c.column_default, d.description FROM information_schema.columns c LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema LEFT JOIN pg_catalog.pg_class t ON t.relnamespace = n.oid AND t.relname = c.table_name LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = c.ordinal_position::int AND NOT a.attisdropped LEFT JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = c.ordinal_position::int WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
-            literal(schema),
-            literal(table)
-        )),
-        Engine::Sqlserver => Some(format!(
-            "SELECT c.column_name, CASE WHEN c.data_type IN ('varchar','nvarchar','char','nchar','varbinary','binary') AND c.character_maximum_length IS NOT NULL THEN c.data_type + '(' + CASE WHEN c.character_maximum_length = -1 THEN 'MAX' ELSE CAST(c.character_maximum_length AS varchar(16)) END + ')' WHEN c.data_type IN ('decimal','numeric') AND c.numeric_precision IS NOT NULL THEN c.data_type + '(' + CAST(c.numeric_precision AS varchar(16)) + ',' + CAST(ISNULL(c.numeric_scale, 0) AS varchar(16)) + ')' ELSE c.data_type END, c.is_nullable, c.column_default, CAST(ep.value AS nvarchar(4000)) FROM information_schema.columns c LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.name = 'MS_Description' AND ep.major_id = OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)) AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)), c.column_name, 'ColumnId') WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
-            literal(schema),
-            literal(table)
-        )),
-        Engine::Mysql | Engine::Mariadb => Some(format!(
-            "SELECT column_name, column_type, is_nullable, column_default, column_comment FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
-            literal(database),
-            literal(table)
-        )),
-    }
+    catalog_of(engine).columns_sql(database, schema, table)
 }
 
-/// 一个库/模式里表和视图的注释：(name, comment)，只列有注释的对象。SQLite 和非关系引擎没有注释。
-/// MySQL 视图的 table_comment 固定是 VIEW，不是注释，排除掉。
+/// 一个库/模式里表和视图的注释：(name, comment)，只列有注释的对象。没有注释来源的引擎为 None。
 pub fn table_comments_sql(engine: Engine, database: &str, schema: &str) -> Option<String> {
-    match engine {
-        Engine::Redis | Engine::Mongodb | Engine::Sqlite => None,
-        Engine::Postgres => Some(format!(
-            "SELECT t.relname, d.description FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = 0 WHERE n.nspname = {} AND t.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY t.relname",
-            literal(schema)
-        )),
-        Engine::Sqlserver => Some(format!(
-            "SELECT o.name, CAST(ep.value AS nvarchar(4000)) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.extended_properties ep ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' WHERE s.name = {} AND o.type IN ('U', 'V') ORDER BY o.name",
-            literal(schema)
-        )),
-        Engine::Mysql | Engine::Mariadb => Some(format!(
-            "SELECT table_name, table_comment FROM information_schema.tables WHERE table_schema = {} AND table_type <> 'VIEW' AND table_comment <> '' ORDER BY table_name",
-            literal(database)
-        )),
-    }
+    catalog_of(engine).table_comments_sql(database, schema)
 }
 
 /// SQL 补全只读取当前涉及对象的注释，不预读整个库。
 pub fn table_comment_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
-    let sql = table_comments_sql(engine, database, schema)?;
+    let dialect = catalog_of(engine);
+    let sql = dialect.table_comments_sql(database, schema)?;
     let (select, order) = sql.rsplit_once(" ORDER BY ")?;
-    let column = match engine { Engine::Postgres => "t.relname", Engine::Sqlserver => "o.name", _ => "table_name" };
-    Some(format!("{select} AND {column} = {} ORDER BY {order}", literal(table)))
+    let column = dialect.table_comment_name_column();
+    Some(format!("{select} AND {column} = {} ORDER BY {order}", crate::adapters::catalog::literal(table)))
 }
 
 /// 主键列查询。没有主键就是空集，不是失败。
 pub fn primary_key_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
-    let scope = match engine {
-        Engine::Postgres | Engine::Sqlserver => literal(schema),
-        Engine::Mysql | Engine::Mariadb => literal(database),
-        _ => return None,
-    };
-    Some(format!(
-        "SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = {scope} AND tc.table_name = {}",
-        literal(table)
-    ))
+    catalog_of(engine).primary_key_sql(database, schema, table)
 }
 
-/// 索引查询。SQLite 先列再逐个读列；MySQL 用 SHOW INDEX。
+/// 索引查询。
 pub fn indexes_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
-    match engine {
-        Engine::Redis | Engine::Mongodb => None,
-        Engine::Sqlite => Some(format!("PRAGMA index_list({})", quote_ident("sqlite", table))),
-        Engine::Mysql | Engine::Mariadb => Some(format!("SHOW INDEX FROM {}", qualified(engine, database, schema, table))),
-        Engine::Postgres => Some(format!(
-            "SELECT i.relname, a.attname, ix.indisunique::text, ix.indisprimary::text, k.ord::text FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace LEFT JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum WHERE n.nspname = {} AND t.relname = {} ORDER BY i.relname, k.ord",
-            literal(schema),
-            literal(table)
-        )),
-        Engine::Sqlserver => Some(format!(
-            "SELECT i.name, c.name, i.is_unique, i.is_primary_key FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id JOIN sys.tables t ON t.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = {} AND t.name = {} AND i.name IS NOT NULL ORDER BY i.name, ic.key_ordinal",
-            literal(schema),
-            literal(table)
-        )),
-    }
-}
-
-pub fn sqlite_index_info_sql(index: &str) -> String {
-    format!("PRAGMA index_info({})", quote_ident("sqlite", index))
+    catalog_of(engine).indexes_sql(database, schema, table)
 }
 
 fn cell(rows: &[Vec<Option<String>>], row: usize, column: usize) -> String {
-    rows.get(row)
-        .and_then(|row| row.get(column))
-        .and_then(|cell| cell.clone())
-        .unwrap_or_default()
+    crate::adapters::catalog::cell(rows, row, column)
 }
 
-fn yes(text: &str) -> bool {
-    matches!(text.trim().to_ascii_uppercase().as_str(), "YES" | "TRUE" | "1" | "T")
-}
-
-/// information_schema 的位置列：name, type, nullable, default；
-/// SQLite 的 PRAGMA table_info 是 cid, name, type, notnull, default, pk。
+/// 列查询结果收成列（按引擎的行形状）。
 pub fn columns_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<ColumnInfo> {
-    let mut columns = Vec::new();
-    for index in 0..rows.len() {
-        let (name, data_type, nullable, primary) = match engine {
-            Engine::Sqlite => {
-                let notnull = cell(rows, index, 3).trim() == "1";
-                let pk = {
-                    let value = cell(rows, index, 5);
-                    !value.is_empty() && value.trim() != "0"
-                };
-                (cell(rows, index, 1), cell(rows, index, 2), !notnull, pk)
-            }
-            _ => (cell(rows, index, 0), cell(rows, index, 1), yes(&cell(rows, index, 2)), false),
-        };
-        if name.is_empty() {
-            continue;
-        }
-        columns.push(ColumnInfo {
-            name,
-            data_type,
-            nullable,
-            primary,
-        });
-    }
-    columns
+    catalog_of(engine).columns_from_rows(rows)
 }
 
-/// 补全和悬停用的列元数据：在 columns_from_rows 的位置约定上再取注释（第 5 列）。
-/// SQLite 没有列注释，主键在 PRAGMA 的 pk 列；其它引擎的主键由 apply_primary_to_meta 另查。
-/// 读不到的类型和注释留空，不编造。
+/// 补全和悬停用的列元数据：在列查询的位置约定上再取注释。
+/// 主键由行本身给出的引擎直接标上，其它引擎的主键由 apply_primary_to_meta 另查。读不到的类型和注释留空，不编造。
 pub fn column_meta_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
-    let mut columns = Vec::new();
-    for index in 0..rows.len() {
-        let (name, type_name, nullable, comment, primary) = match engine {
-            Engine::Sqlite => {
-                let notnull = cell(rows, index, 3);
-                let nullable = match notnull.trim() {
-                    "" => None,
-                    flag => Some(flag != "1"),
-                };
-                let pk = cell(rows, index, 5);
-                let primary = !pk.trim().is_empty() && pk.trim() != "0";
-                (cell(rows, index, 1), cell(rows, index, 2), nullable, String::new(), primary)
-            }
-            _ => {
-                let flag = cell(rows, index, 2);
-                let nullable = if flag.trim().is_empty() { None } else { Some(yes(&flag)) };
-                (cell(rows, index, 0), cell(rows, index, 1), nullable, cell(rows, index, 4), false)
-            }
-        };
-        if name.is_empty() {
-            continue;
-        }
-        columns.push(ColumnMeta { name, type_name, nullable, comment, primary, foreign_key: false });
-    }
-    columns
+    catalog_of(engine).column_meta_from_rows(rows)
 }
 
 /// 主键查询的列名行标到已读列上。对不上的名字不编造列。
@@ -229,176 +87,20 @@ pub fn apply_primary_key(columns: &mut [ColumnInfo], rows: &[Vec<Option<String>>
     }
 }
 
-/// 索引行收成索引：兼容 SQLite/MySQL/PG/SQLServer 的列顺序。
-/// (name, column, unique, primary, ordinal)
+/// 索引行收成索引（按引擎的行形状），列按序号排好。
 pub fn indexes_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<IndexInfo> {
-    let mut indexes: Vec<IndexInfo> = Vec::new();
-    let mut positions: Vec<Vec<(i64, String)>> = Vec::new();
-    for index in 0..rows.len() {
-        let (name, column, unique, primary, ordinal) = match engine {
-            Engine::Sqlite => (cell(rows, index, 1), String::new(), yes(&cell(rows, index, 2)), false, 0),
-            Engine::Mysql | Engine::Mariadb => (
-                cell(rows, index, 2),
-                cell(rows, index, 4),
-                cell(rows, index, 1).trim() == "0",
-                cell(rows, index, 2).eq_ignore_ascii_case("PRIMARY"),
-                cell(rows, index, 3).parse::<i64>().unwrap_or(0),
-            ),
-            // PostgreSQL / SQL Server: name, column, unique, primary, ordinal
-            _ => (
-                cell(rows, index, 0),
-                cell(rows, index, 1),
-                yes(&cell(rows, index, 2)),
-                yes(&cell(rows, index, 3)),
-                cell(rows, index, 4).parse::<i64>().unwrap_or(0),
-            ),
-        };
-        if name.is_empty() {
-            continue;
-        }
-        match indexes.iter().position(|item| item.name == name) {
-            Some(at) => {
-                if !column.is_empty() {
-                    positions[at].push((ordinal, column));
-                }
-                indexes[at].unique |= unique;
-                indexes[at].primary |= primary;
-            }
-            None => {
-                indexes.push(IndexInfo {
-                    name,
-                    columns: Vec::new(),
-                    unique,
-                    primary,
-                });
-                positions.push(if column.is_empty() { Vec::new() } else { vec![(ordinal, column)] });
-            }
-        }
-    }
-    for (at, mut items) in positions.into_iter().enumerate() {
-        items.sort_by_key(|(ordinal, _)| *ordinal);
-        indexes[at].columns = items.into_iter().map(|(_, column)| column).collect();
-    }
-    indexes
+    catalog_of(engine).indexes_from_rows(rows)
 }
 
-fn failure(err: impl Into<crate::error_text::Reason>) -> String {
+pub(crate) fn failure(err: impl Into<crate::error_text::Reason>) -> String {
     let err = err.into();
     format!("读取对象详情失败：{err}")
 }
 
-fn mysql_cell(value: Option<&mysql_async::Value>) -> Option<String> {
-    match value? {
-        mysql_async::Value::NULL => None,
-        mysql_async::Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        mysql_async::Value::Int(number) => Some(number.to_string()),
-        mysql_async::Value::UInt(number) => Some(number.to_string()),
-        mysql_async::Value::Float(number) => Some(number.to_string()),
-        mysql_async::Value::Double(number) => Some(number.to_string()),
-        other => Some(format!("{other:?}")),
-    }
-}
-
-fn mysql_row(row: &mysql_async::Row, index: usize) -> Option<String> {
-    match row.as_ref(index) {
-        Some(mysql_async::Value::NULL) | None => None,
-        Some(mysql_async::Value::Int(number)) => Some(number.to_string()),
-        Some(mysql_async::Value::UInt(number)) => Some(number.to_string()),
-        Some(value) => mysql_cell(Some(value)),
-    }
-}
-
-fn sqlite_row(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
-    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return value;
-    }
-    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-        return value.map(|number| number.to_string());
-    }
-    None
-}
-
 /// 在一个已经打开的目录会话上执行一条只读语句，把每格转成文本。
-/// 同模块的按需读取和查询补全的外键读取共用它，不再各写一份引擎分支。
+/// 同模块的按需读取和查询补全的外键读取共用它；各引擎的取值规则在适配器里。
 pub(crate) async fn rows_for(session: &CatalogSession, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
-    match session {
-        CatalogSession::Scripted => Err(failure("这个连接没有连着可查询的数据库")),
-        CatalogSession::Redis(_) => Err(failure("Redis 没有列或索引")),
-        CatalogSession::Mongo(_) => Err(failure("MongoDB 没有 SQL 列或索引")),
-        CatalogSession::Sqlite { pool, .. } => {
-            let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
-                .fetch_all(pool)
-                .await
-                .map_err(failure)?;
-            Ok(rows
-                .into_iter()
-                .map(|row| {
-                    let width = row.columns().len();
-                    (0..width).map(|index| sqlite_row(&row, index)).collect()
-                })
-                .collect())
-        }
-        CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(failure)?;
-            let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(failure)?;
-            Ok(rows
-                .into_iter()
-                .map(|row| {
-                    let width = row.columns_ref().len().max(row.len());
-                    (0..width).map(|index| mysql_row(&row, index)).collect()
-                })
-                .collect())
-        }
-        CatalogSession::Postgres(client) => {
-            let rows = client.query(sql, &[]).await.map_err(failure)?;
-            Ok(rows
-                .into_iter()
-                .map(|row| {
-                    let width = row.len();
-                    (0..width)
-                        .map(|index| match row.try_get::<_, Option<String>>(index) {
-                            Ok(value) => value,
-                            Err(_) => row
-                                .try_get::<_, Option<i64>>(index)
-                                .ok()
-                                .flatten()
-                                .map(|value| value.to_string()),
-                        })
-                        .collect()
-                })
-                .collect())
-        }
-        CatalogSession::Sqlserver(client) => {
-            use futures::TryStreamExt;
-            let mut client = client.lock().await;
-            let mut stream = client.query(sql, &[]).await.map_err(failure)?;
-            let mut rows = Vec::new();
-            while let Some(item) = stream.try_next().await.map_err(|err| failure(err.to_string()))? {
-                let Some(row) = item.into_row() else { continue };
-                let width = row.columns().len();
-                rows.push(
-                    (0..width)
-                        .map(|index| {
-                            if let Ok(value) = row.try_get::<&str, _>(index) {
-                                return value.map(str::to_owned);
-                            }
-                            if let Ok(value) = row.try_get::<i32, _>(index) {
-                                return value.map(|number| number.to_string());
-                            }
-                            if let Ok(value) = row.try_get::<bool, _>(index) {
-                                return value.map(|flag| if flag { "1".to_owned() } else { "0".to_owned() });
-                            }
-                            None
-                        })
-                        .collect::<Vec<Option<String>>>(),
-                );
-            }
-            Ok(rows)
-        }
-    }
+    session.text_rows(sql).await
 }
 
 /// 读一个表的列元数据（名字、类型、可空、注释），供补全详情、悬停和对象信息使用。
@@ -409,14 +111,14 @@ pub async fn read_column_meta(
     schema: &str,
     table: &str,
 ) -> Result<Vec<ColumnMeta>, String> {
-    // MongoDB / Redis 没有列清单：只是没有列元数据，不是读取失败（与注释同一处理）。
+    // 没有列清单的引擎：只是没有列元数据，不是读取失败（与注释同一处理）。
     // 当成失败会让对象树顶端常驻“读取对象失败”。
     let Some(sql) = columns_sql(engine, database, schema, table) else {
         return Ok(Vec::new());
     };
     let rows = rows_for(session, &sql).await?;
     let mut meta = column_meta_from_rows(engine, &rows);
-    // 主键读不到不算列失败：列已经读到了，只是没有主键标记。SQLite 的 pk 已在 PRAGMA 行里。
+    // 主键读不到不算列失败：列已经读到了，只是没有主键标记。行本身带主键的引擎没有另查。
     if let Some(pk_sql) = primary_key_sql(engine, database, schema, table) {
         if let Ok(pk_rows) = rows_for(session, &pk_sql).await {
             apply_primary_to_meta(&mut meta, &pk_rows);
@@ -440,18 +142,8 @@ pub async fn read_table_comment(session: &CatalogSession, engine: Engine, databa
     Ok(comments_from_rows(&rows).into_iter().next().map(|(_, comment)| comment))
 }
 
-/// SQL Server 的列/索引/主键查询里既有目录视图也有只在当前库生效的函数：
-/// 读非当前库时按目标库三段名限定，同一条会话、不发 USE。
-fn scoped_sql(engine: Engine, database: &str, sql: &str) -> String {
-    if engine == Engine::Sqlserver {
-        crate::catalog::read::sqlserver_qualified(sql, database)
-    } else {
-        sql.to_owned()
-    }
-}
-
 /// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；两者都不碰同级的其它节点。
-/// database 是节点自己的库：SQL Server 用它限定三段名；PostgreSQL 非当前库要用连到该库的会话。
+/// database 是节点自己的库：能跨库读目录的引擎用它限定到目标库；会话只连一个库的引擎非当前库要用连到该库的会话。
 pub async fn read_object_details(
     session: &CatalogSession,
     engine: Engine,
@@ -459,13 +151,14 @@ pub async fn read_object_details(
     schema: &str,
     table: &str,
 ) -> (Result<Vec<ColumnInfo>, String>, Result<Vec<IndexInfo>, String>) {
-    let columns = match columns_sql(engine, database, schema, table) {
+    let dialect = catalog_of(engine);
+    let columns = match dialect.columns_sql(database, schema, table) {
         None => Err("这个引擎没有列清单".to_owned()),
-        Some(sql) => match rows_for(session, &scoped_sql(engine, database, &sql)).await {
+        Some(sql) => match rows_for(session, &dialect.scope_sql(database, &sql)).await {
             Ok(rows) => {
                 let mut items = columns_from_rows(engine, &rows);
-                if let Some(pk_sql) = primary_key_sql(engine, database, schema, table) {
-                    let pk_sql = scoped_sql(engine, database, &pk_sql);
+                if let Some(pk_sql) = dialect.primary_key_sql(database, schema, table) {
+                    let pk_sql = dialect.scope_sql(database, &pk_sql);
                     // 主键读不到不算列失败：列已经读到了，只是没有主键标记。
                     if let Ok(pk_rows) = rows_for(session, &pk_sql).await {
                         apply_primary_key(&mut items, &pk_rows);
@@ -478,17 +171,14 @@ pub async fn read_object_details(
     };
     let indexes = match indexes_sql(engine, database, schema, table) {
         None => Err("这个引擎没有索引清单".to_owned()),
-        Some(sql) => match rows_for(session, &scoped_sql(engine, database, &sql)).await {
+        Some(sql) => match rows_for(session, &dialect.scope_sql(database, &sql)).await {
             Ok(rows) => {
                 let mut items = indexes_from_rows(engine, &rows);
-                if engine == Engine::Sqlite {
-                    for item in items.iter_mut() {
-                        if let Ok(rows) = rows_for(session, &sqlite_index_info_sql(&item.name)).await {
-                            item.columns = (0..rows.len())
-                                .map(|index| cell(&rows, index, 2))
-                                .filter(|name| !name.is_empty())
-                                .collect();
-                        }
+                // 索引清单不带列的引擎：逐个索引读列。
+                for item in items.iter_mut() {
+                    let Some(sql) = dialect.index_columns_sql(&item.name) else { continue };
+                    if let Ok(rows) = rows_for(session, &sql).await {
+                        item.columns = (0..rows.len()).map(|index| cell(&rows, index, 2)).filter(|name| !name.is_empty()).collect();
                     }
                 }
                 Ok(items)

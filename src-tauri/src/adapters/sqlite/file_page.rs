@@ -1,3 +1,5 @@
+//! SQLite 文件的对象分页读取（由 catalog/sqlite.rs 迁入）：只读打开文件，读外键开关、对象总数与一页对象。
+
 use std::path::Path;
 
 use crate::catalog::model::{parse_kind, ObjectRow, DEFAULT_OBJECT_PAGE};

@@ -101,22 +101,11 @@ pub struct ObjectKey {
 impl ObjectKey {
     /// 复制用的限定名：按引擎的层级写，不把展示用的连接名带进去。
     pub fn qualified_name(&self) -> String {
-        match self.engine {
-            Engine::Sqlite => self.name.clone(),
-            Engine::Mysql | Engine::Mariadb => {
-                if self.database.is_empty() {
-                    self.name.clone()
-                } else {
-                    format!("{}.{}", self.database, self.name)
-                }
-            }
-            _ => {
-                if self.schema.is_empty() {
-                    self.name.clone()
-                } else {
-                    format!("{}.{}", self.schema, self.name)
-                }
-            }
+        let qualifier = crate::adapters::catalog_of(self.engine).name_qualifier(&self.database, &self.schema);
+        if qualifier.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{qualifier}.{}", self.name)
         }
     }
 
@@ -210,7 +199,7 @@ impl NavNode {
             path: String::new(),
             connection_id: String::new(),
             connection_name: String::new(),
-            engine: Engine::Sqlite,
+            engine: crate::adapters::registry::PLACEHOLDER,
             database: String::new(),
             schema: String::new(),
             name: String::new(),
@@ -510,9 +499,9 @@ impl NavTree {
         if connection.status != ConnStatus::Connected {
             return;
         }
-        match connection.engine {
-            // Redis 没有库/schema 层级：键空间就是 SELECT 的库号。
-            Engine::Redis => self.push_keyspaces(connection, root_id),
+        match crate::adapters::adapter(connection.engine).meta().workbench() {
+            // 键值工作台没有库/schema 层级：键空间就是 SELECT 的库号。
+            crate::adapters::Workbench::Redis => self.push_keyspaces(connection, root_id),
             _ => self.push_databases(connection, root_id, previous),
         }
     }
@@ -569,7 +558,7 @@ impl NavTree {
             if database.error.is_some() {
                 continue;
             }
-            if connection.engine == Engine::Mongodb {
+            if crate::adapters::adapter(connection.engine).meta().workbench() == crate::adapters::Workbench::Mongo {
                 // MongoDB 没有对象种类层：库下面直接是集合，集合打开文档页。
                 let schema = database
                     .schemas
@@ -1659,7 +1648,7 @@ impl NavTree {
             },
             NavKind::Object => {
                 let Some(object) = node.object() else { return NavAction::None };
-                if node.engine == Engine::Mongodb {
+                if crate::adapters::adapter(node.engine).meta().workbench() == crate::adapters::Workbench::Mongo {
                     return NavAction::OpenDocuments(node.id.clone());
                 }
                 if object.opens_data() {

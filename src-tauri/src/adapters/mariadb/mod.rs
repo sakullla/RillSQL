@@ -1,7 +1,7 @@
 //! MariaDB 适配器：独立入口，内部复用 MySQL 家族的共享实现。
 
 use crate::adapters::mysql;
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
 use crate::connections::model::{Engine, TlsMode};
 
 pub(in crate::adapters) struct MariadbAdapter;
@@ -47,11 +47,15 @@ impl EngineAdapter for MariadbAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: true, sql_syntax_group: true, connector_group: true, ..Capabilities::default() }
+        mysql::family_capabilities()
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&mysql::syntax::MysqlSyntax)
+    }
+
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&mysql::catalog::MARIADB_CATALOG)
     }
 
     fn connector(&self) -> Option<&dyn Connector> {

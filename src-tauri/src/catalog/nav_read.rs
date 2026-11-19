@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use futures::{stream, StreamExt};
 use crate::catalog::hierarchy::NavConnection;
-use crate::catalog::model::{ConnStatus, Engine};
+use crate::catalog::model::ConnStatus;
 use crate::catalog::read::{read_catalog_outline, read_catalog_session};
 use crate::connections::{Service, SessionCondition};
 
@@ -68,7 +68,7 @@ pub async fn stream_navigation(service: &Service, page: usize, connection_id: Op
         };
         let mut root = NavConnection::new(record.saved.id.clone(), record.saved.name.clone(), record.saved.engine, status);
         root.default_database = record.saved.database.clone();
-        root.outline_only = matches!(record.saved.engine, Engine::Mysql | Engine::Mariadb | Engine::Postgres | Engine::Sqlserver);
+        root.outline_only = crate::adapters::adapter(record.saved.engine).capabilities().outline_navigation;
         root
     }).collect();
     if sender.send(NavigationEvent::Started(roots)).await.is_err() { return; }
@@ -83,7 +83,7 @@ pub async fn stream_navigation(service: &Service, page: usize, connection_id: Op
         let mut connection = NavConnection::new(record.saved.id.clone(), record.saved.name, engine, status);
         connection.error = error;
         connection.default_database = record.saved.database;
-        connection.outline_only = matches!(engine, Engine::Mysql | Engine::Mariadb | Engine::Postgres | Engine::Sqlserver);
+        connection.outline_only = crate::adapters::adapter(engine).capabilities().outline_navigation;
         if let Some(session) = service.catalog_session(&record.saved.id) {
             let result = limited_metadata(gate, &record.saved.id, async {
                 if connection.outline_only { read_catalog_outline(engine, &session).await }
@@ -150,6 +150,7 @@ pub async fn limited_metadata<T>(gate: Arc<MetadataGate>, connection: &str, read
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::model::Engine;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]

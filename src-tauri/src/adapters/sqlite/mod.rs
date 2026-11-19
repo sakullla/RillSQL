@@ -1,9 +1,14 @@
 //! SQLite 适配器（文件型）。
 
+pub(crate) mod catalog;
+pub(crate) mod catalog_read;
 pub(crate) mod connect;
+pub(crate) mod diagram;
+pub(crate) mod extras;
+pub(crate) mod file_page;
 mod syntax;
 
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqliteAdapter;
@@ -57,11 +62,22 @@ impl EngineAdapter for SqliteAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: true, sql_syntax_group: true, connector_group: true, ..Capabilities::default() }
+        Capabilities {
+            relational: true,
+            sql_syntax_group: true,
+            connector_group: true,
+            catalog_group: true,
+            shows_foreign_keys: true,
+            ..Capabilities::default()
+        }
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::SqliteSyntax)
+    }
+
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&catalog::SqliteCatalog)
     }
 
     fn connector(&self) -> Option<&dyn Connector> {

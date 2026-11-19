@@ -1,9 +1,13 @@
 //! PostgreSQL 适配器。
 
+pub(crate) mod catalog;
+pub(crate) mod catalog_read;
 pub(crate) mod connect;
+pub(crate) mod diagram;
+pub(crate) mod extras;
 mod syntax;
 
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct PostgresAdapter;
@@ -50,12 +54,20 @@ impl EngineAdapter for PostgresAdapter {
             sql_syntax_group: true,
             connector_group: true,
             database_scoped_session: true,
+            catalog_group: true,
+            shows_databases: true,
+            shows_schemas: true,
+            outline_navigation: true,
             ..Capabilities::default()
         }
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::PostgresSyntax)
+    }
+
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&catalog::PostgresCatalog)
     }
 
     fn connector(&self) -> Option<&dyn Connector> {

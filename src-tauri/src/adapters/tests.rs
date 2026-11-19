@@ -290,3 +290,63 @@ async fn cancel_transport_delegates_to_the_adapter_canceller() {
     assert_eq!(local.deliver().await, Ok(false), "本地中断不另开传输");
     assert!(flag.load(Ordering::SeqCst));
 }
+
+#[test]
+fn catalog_shape_keeps_the_previous_rules() {
+    use super::{catalog_of, qualified_object, sample_select};
+    for engine in ENGINES {
+        let caps = adapter(engine).capabilities();
+        assert!(caps.catalog_group, "{engine:?} 每个引擎都有目录方言");
+        assert_eq!(caps.shows_databases, engine != Engine::Sqlite, "{engine:?}");
+        assert_eq!(caps.shows_schemas, matches!(engine, Engine::Postgres | Engine::Sqlserver), "{engine:?}");
+        assert_eq!(caps.shows_foreign_keys, engine == Engine::Sqlite, "{engine:?}");
+        assert_eq!(
+            caps.outline_navigation,
+            matches!(engine, Engine::Mysql | Engine::Mariadb | Engine::Postgres | Engine::Sqlserver),
+            "{engine:?}"
+        );
+        let catalog = catalog_of(engine);
+        assert_eq!(catalog.diagram_statements().is_empty(), !caps.relational, "{engine:?} 关系型引擎才有关系图");
+        assert_eq!(catalog.table_is_rebuilt(), matches!(engine, Engine::Postgres | Engine::Sqlserver), "{engine:?}");
+        assert_eq!(catalog.listed_kinds().is_empty(), engine == Engine::Redis, "{engine:?}");
+        assert_eq!(catalog.metadata_sql().objects.is_empty(), !caps.relational, "{engine:?}");
+    }
+    // 限定名的容器段：MySQL 家族用库，单文件引擎没有，其余用模式。
+    assert_eq!(qualified_object(Engine::Mysql, "shop", "ignored", "orders"), "shop.orders");
+    assert_eq!(qualified_object(Engine::Mariadb, "shop", "", "order"), "shop.`order`");
+    assert_eq!(qualified_object(Engine::Sqlite, "main", "x", "notes"), "notes");
+    assert_eq!(qualified_object(Engine::Postgres, "shop", "public", "User"), "public.\"User\"");
+    assert_eq!(qualified_object(Engine::Sqlserver, "shop", "", "orders"), "orders");
+    assert_eq!(sample_select(Engine::Postgres, "public.orders", 100), "SELECT *\nFROM public.orders\nLIMIT 100;");
+    assert_eq!(sample_select(Engine::Redis, "k", 5), "SELECT *\nFROM k\nLIMIT 5;");
+}
+
+/// 会话与引擎对不上时，各目录读取给出同一句原因，不按会话类型猜引擎。
+#[tokio::test]
+async fn catalog_reads_refuse_a_session_of_another_engine() {
+    use crate::catalog::model::ObjectKind;
+    use crate::catalog::read::{read_catalog_outline, read_catalog_session, read_definition, read_object_kind_page, read_object_page};
+    use crate::connections::CatalogSession;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().in_memory(true))
+        .await
+        .unwrap();
+    let session = CatalogSession::Sqlite { pool, foreign_keys: None };
+    for engine in [Engine::Mysql, Engine::Postgres, Engine::Sqlserver, Engine::Mongodb, Engine::Redis] {
+        let body = read_catalog_session(engine, &session, 100, &[]).await;
+        assert_eq!(body.error.as_deref(), Some("读取库表失败：连接类型和引擎不一致"), "{engine:?}");
+        let page = read_object_page(&session, engine, "main", "", 0, 10).await;
+        assert_eq!(page.error.as_deref(), Some("读取库表失败：连接类型和引擎不一致"), "{engine:?}");
+        let kind = read_object_kind_page(&session, engine, "main", "", ObjectKind::Table, 0, 10).await;
+        assert_eq!(kind.error.as_deref(), Some("读取库表失败：连接类型和引擎不一致"), "{engine:?}");
+        let definition = read_definition(&session, engine, "main", "", "t", "table", "", "").await.unwrap_err();
+        assert_eq!(definition, "读取定义失败：连接类型和引擎不一致", "{engine:?}");
+    }
+    // Redis 本来就没有库层级的概览读取：和迁移前一样按不一致报出。
+    let outline = read_catalog_outline(Engine::Redis, &session).await;
+    assert_eq!(outline.error.as_deref(), Some("读取库表失败：连接类型和引擎不一致"));
+    let sqlite = read_catalog_outline(Engine::Sqlite, &session).await;
+    assert!(sqlite.error.is_none(), "{:?}", sqlite.error);
+    assert_eq!(sqlite.databases.first().map(|db| db.name.as_str()), Some("main"));
+}

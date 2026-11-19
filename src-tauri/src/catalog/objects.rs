@@ -1,8 +1,7 @@
 //! 连接级对象详情（R5）：扩展、序列参数、事件、分区、PRAGMA 与附加库。
 //!
 //! 每节独立读取、独立报错：一节失败只让该节为空并带上原因，之前读到的树照原样保留。
-
-use mysql_async::prelude::Queryable;
+//! 各引擎的读取与 SQL 在 `adapters/<engine>/extras.rs`；这里是数据形状、引擎无关的整理规则与门面。
 
 use crate::catalog::model::Engine;
 use crate::connections::CatalogSession;
@@ -128,16 +127,6 @@ pub struct ExtrasScope {
     pub schema: String,
 }
 
-const POSTGRES_EXTENSIONS: &str = "SELECT a.name, a.default_version, a.installed_version, a.comment FROM pg_catalog.pg_available_extensions a ORDER BY a.name";
-
-const POSTGRES_SEQUENCES: &str = "SELECT s.schemaname, s.sequencename, s.data_type::text, s.start_value, s.min_value, s.max_value, s.increment_by, s.cache_size, s.cycle, s.last_value FROM pg_catalog.pg_sequences s WHERE s.schemaname = $1 ORDER BY s.sequencename";
-
-const POSTGRES_SEQUENCES_ALL: &str = "SELECT s.schemaname, s.sequencename, s.data_type::text, s.start_value, s.min_value, s.max_value, s.increment_by, s.cache_size, s.cycle, s.last_value FROM pg_catalog.pg_sequences s WHERE s.schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY s.schemaname, s.sequencename";
-
-const MYSQL_EVENTS: &str = "SELECT EVENT_SCHEMA, EVENT_NAME, STATUS, DEFINER, CAST(EXECUTE_AT AS CHAR), INTERVAL_VALUE, INTERVAL_FIELD, ON_COMPLETION, CAST(LAST_EXECUTED AS CHAR), EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME";
-
-const MYSQL_PARTITIONS: &str = "SELECT TABLE_SCHEMA, TABLE_NAME, PARTITION_NAME, PARTITION_METHOD, PARTITION_EXPRESSION, PARTITION_DESCRIPTION, TABLE_ROWS FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = ? AND PARTITION_NAME IS NOT NULL ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION";
-
 /// 一个原始分区行；分组后才会变成一张表的一条记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PartitionRaw {
@@ -150,7 +139,7 @@ pub(crate) struct PartitionRaw {
     pub rows: Option<i64>,
 }
 
-fn extras_failure(what: &str, err: impl Into<crate::error_text::Reason>) -> String {
+pub(crate) fn extras_failure(what: &str, err: impl Into<crate::error_text::Reason>) -> String {
     let err = err.into();
     format!("读取{what}失败：{err}")
 }
@@ -242,10 +231,10 @@ pub(crate) fn merge_pragmas(
     }
 }
 
-/// 读取一个连接上指定库/schema 的对象详情。不适用这一节的引擎返回空清单且不报错。
+/// 读取一个连接上指定库/schema 的对象详情。不适用这一节的引擎返回空清单且不报错，不编造。
 pub async fn read_extras(session: &CatalogSession, engine: Engine, database: &str, schema: &str) -> ExtrasBody {
-    match session {
-        CatalogSession::Scripted => ExtrasBody {
+    if session.is_scripted() {
+        return ExtrasBody {
             extensions: ExtrasList::failed(scripted_failure()),
             sequences: ExtrasList::failed(scripted_failure()),
             events: ExtrasList::failed(scripted_failure()),
@@ -255,203 +244,16 @@ pub async fn read_extras(session: &CatalogSession, engine: Engine, database: &st
                 error: Some(scripted_failure()),
             },
             attached: ExtrasList::failed(scripted_failure()),
-        },
-        CatalogSession::Sqlite { pool, .. } => read_sqlite_extras(pool).await,
-        CatalogSession::Mysql(pool) => match engine {
-            Engine::Mysql | Engine::Mariadb => read_mysql_extras(pool, database).await,
-            _ => engine_without_extras(),
-        },
-        CatalogSession::Postgres(client) => match engine {
-            Engine::Postgres => read_postgres_extras(client, schema).await,
-            _ => engine_without_extras(),
-        },
-        CatalogSession::Sqlserver(_) | CatalogSession::Redis(_) | CatalogSession::Mongo(_) => engine_without_extras(),
+        };
     }
-}
-
-/// 这些引擎还没有对象详情读取：各节空清单，不报错也不编造。
-fn engine_without_extras() -> ExtrasBody {
-    ExtrasBody::default()
-}
-
-async fn read_postgres_extras(client: &tokio_postgres::Client, schema: &str) -> ExtrasBody {
-    let mut body = ExtrasBody::default();
-    match client.query(POSTGRES_EXTENSIONS, &[]).await {
-        Ok(rows) => {
-            body.extensions.items = rows
-                .iter()
-                .map(|row| ExtensionRow {
-                    name: pg_text(row, 0),
-                    default_version: pg_text(row, 1),
-                    installed_version: pg_text_opt(row, 2),
-                    comment: pg_text(row, 3),
-                })
-                .collect();
-        }
-        Err(err) => body.extensions.error = Some(extras_failure("扩展", err)),
-    }
-    let result = if schema.is_empty() {
-        client.query(POSTGRES_SEQUENCES_ALL, &[]).await
-    } else {
-        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&schema];
-        client.query(POSTGRES_SEQUENCES, &params).await
-    };
-    match result {
-        Ok(rows) => {
-            body.sequences.items = rows
-                .iter()
-                .map(|row| SequenceRow {
-                    schema: pg_text(row, 0),
-                    name: pg_text(row, 1),
-                    data_type: pg_text(row, 2),
-                    start_value: row.try_get::<_, i64>(3).unwrap_or_default(),
-                    min_value: row.try_get::<_, i64>(4).unwrap_or_default(),
-                    max_value: row.try_get::<_, i64>(5).unwrap_or_default(),
-                    increment: row.try_get::<_, i64>(6).unwrap_or_default(),
-                    cache_size: row.try_get::<_, i64>(7).unwrap_or_default(),
-                    cycle: row.try_get::<_, bool>(8).unwrap_or(false),
-                    last_value: row.try_get::<_, Option<i64>>(9).unwrap_or(None),
-                })
-                .collect();
-        }
-        Err(err) => body.sequences.error = Some(extras_failure("序列", err)),
-    }
-    body
-}
-
-async fn read_mysql_extras(pool: &mysql_async::Pool, database: &str) -> ExtrasBody {
-    let mut body = ExtrasBody::default();
-    if database.is_empty() {
-        let message = "需要数据库名才能读取事件与分区".to_owned();
-        body.events.error = Some(message.clone());
-        body.partitions.error = Some(message);
-        return body;
-    }
-    let mut conn = match pool.get_conn().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            let message = extras_failure("事件与分区", err);
-            body.events.error = Some(message.clone());
-            body.partitions.error = Some(message);
-            return body;
-        }
-    };
-    let events: Result<Vec<mysql_async::Row>, mysql_async::Error> =
-        conn.exec(MYSQL_EVENTS, (database.to_owned(),)).await;
-    match events {
-        Ok(rows) => {
-            body.events.items = rows
-                .iter()
-                .map(|row| {
-                    let execute_at = mysql_text(row, 4);
-                    let last_executed = mysql_text(row, 8);
-                    EventRow {
-                        database: mysql_text(row, 0),
-                        name: mysql_text(row, 1),
-                        status: mysql_text(row, 2).to_ascii_lowercase(),
-                        definer: mysql_text(row, 3),
-                        schedule: event_schedule(&mysql_text(row, 5), &mysql_text(row, 6), &execute_at),
-                        on_completion: mysql_text(row, 7),
-                        last_executed: if last_executed.is_empty() { None } else { Some(last_executed) },
-                        definition: mysql_text(row, 9),
-                    }
-                })
-                .collect();
-        }
-        Err(err) => body.events.error = Some(extras_failure("事件", err)),
-    }
-    let partitions: Result<Vec<mysql_async::Row>, mysql_async::Error> =
-        conn.exec(MYSQL_PARTITIONS, (database.to_owned(),)).await;
-    match partitions {
-        Ok(rows) => {
-            let raw = rows
-                .iter()
-                .map(|row| PartitionRaw {
-                    database: mysql_text(row, 0),
-                    table: mysql_text(row, 1),
-                    name: mysql_text(row, 2),
-                    method: mysql_text(row, 3),
-                    expression: mysql_text(row, 4),
-                    description: mysql_text(row, 5),
-                    rows: mysql_i64(row, 6),
-                })
-                .collect();
-            body.partitions.items = group_partitions(raw);
-        }
-        Err(err) => body.partitions.error = Some(extras_failure("分区", err)),
-    }
-    body
-}
-
-async fn read_sqlite_extras(pool: &sqlx::SqlitePool) -> ExtrasBody {
-    let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| extras_failure("journal_mode", err))
-        .and_then(|value| value.ok_or_else(|| extras_failure("journal_mode", "没有返回值")));
-    let user_version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| extras_failure("user_version", err))
-        .and_then(|value| value.ok_or_else(|| extras_failure("user_version", "没有返回值")));
-    let foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| extras_failure("foreign_keys", err))
-        .and_then(|value| value.ok_or_else(|| extras_failure("foreign_keys", "没有返回值")));
-    let mut body = ExtrasBody {
-        pragmas: merge_pragmas(journal_mode, user_version, foreign_keys),
-        ..ExtrasBody::default()
-    };
-    let attached: Result<Vec<(i64, String, String)>, sqlx::Error> =
-        sqlx::query_as("PRAGMA database_list").fetch_all(pool).await;
-    match attached {
-        Ok(rows) => {
-            body.attached.items = rows
-                .into_iter()
-                .map(|(_, name, file)| AttachedRow { name, file })
-                .collect();
-        }
-        Err(err) => body.attached.error = Some(extras_failure("附加库", err)),
-    }
-    body
-}
-
-fn pg_text(row: &tokio_postgres::Row, index: usize) -> String {
-    row.try_get::<_, String>(index)
-        .or_else(|_| row.try_get::<_, Option<String>>(index).map(|value| value.unwrap_or_default()))
-        .unwrap_or_default()
-}
-
-fn pg_text_opt(row: &tokio_postgres::Row, index: usize) -> Option<String> {
-    row.try_get::<_, Option<String>>(index).ok().flatten()
-}
-
-fn mysql_value(row: &mysql_async::Row, index: usize) -> mysql_async::Value {
-    row.as_ref(index).cloned().unwrap_or(mysql_async::Value::NULL)
-}
-
-fn mysql_text(row: &mysql_async::Row, index: usize) -> String {
-    match mysql_value(row, index) {
-        mysql_async::Value::Bytes(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-        mysql_async::Value::NULL => String::new(),
-        other => other.as_sql(true),
-    }
-}
-
-fn mysql_i64(row: &mysql_async::Row, index: usize) -> Option<i64> {
-    match mysql_value(row, index) {
-        mysql_async::Value::Int(value) => Some(value),
-        mysql_async::Value::UInt(value) => i64::try_from(value).ok(),
-        mysql_async::Value::Bytes(bytes) => std::str::from_utf8(&bytes).ok().and_then(|text| text.trim().parse().ok()),
-        _ => None,
-    }
+    crate::adapters::catalog_of(engine).read_extras(session, database, schema).await
 }
 
 #[cfg(test)]
 mod extras_sql_tests {
     use super::{event_schedule, group_partitions, merge_pragmas, PartitionRaw};
-    use super::{MYSQL_EVENTS, MYSQL_PARTITIONS, POSTGRES_EXTENSIONS, POSTGRES_SEQUENCES, POSTGRES_SEQUENCES_ALL};
+    use crate::adapters::mysql::extras::{MYSQL_EVENTS, MYSQL_PARTITIONS};
+    use crate::adapters::postgres::extras::{POSTGRES_EXTENSIONS, POSTGRES_SEQUENCES, POSTGRES_SEQUENCES_ALL};
 
     #[test]
     fn postgres_extras_read_available_extensions_and_sequence_parameters() {

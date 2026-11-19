@@ -1,8 +1,7 @@
-mod assemble;
+pub(crate) mod assemble;
 pub mod commands;
-mod model;
-mod read;
-mod sql;
+pub(crate) mod model;
+pub(crate) mod read;
 
 pub use commands::diagram_read;
 #[cfg(test)]
@@ -15,7 +14,7 @@ pub fn module_id() -> &'static str {
         std::any::type_name::<Diagram>(),
         std::any::type_name_of_val(&diagram_read),
         std::any::type_name_of_val(&read::read_diagram),
-        std::any::type_name_of_val(&sql::diagram_statements),
+        std::any::type_name_of_val(&read::diagram_statements),
     );
     let _ = _linked;
     "diagram"

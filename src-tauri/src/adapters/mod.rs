@@ -8,6 +8,7 @@
 //! A6 UI 元数据与收尾）。尚无实现的能力组在这里先定义接口骨架，由对应迁移任务填充；
 //! 适配器在 [`Capabilities`] 里如实声明当前提供了哪些组，注册表完整性测试校验两者一致。
 
+pub mod catalog;
 pub mod registry;
 pub mod session;
 
@@ -26,6 +27,7 @@ mod tests;
 
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
+pub use catalog::{catalog_of, CatalogDialect};
 pub use registry::adapter;
 pub use session::Connector;
 
@@ -52,6 +54,14 @@ pub struct Capabilities {
     pub connector_group: bool,
     /// 会话绑定到单个库：切换库要改连，跨库读取要另开临时会话（不替换当前会话）。
     pub database_scoped_session: bool,
+    /// 对象树有“库”这一层（单文件引擎没有，对象直接挂在连接下）。
+    pub shows_databases: bool,
+    /// 对象树在库下还有“模式”这一层。
+    pub shows_schemas: bool,
+    /// 连接级显示外键约束开关（文件型引擎在连接阶段读到）。
+    pub shows_foreign_keys: bool,
+    /// 导航先只读库名（与当前库的模式名），对象按分组展开时再分页读取。
+    pub outline_navigation: bool,
 }
 
 /// 连接表单“常规”分栏里远程引擎的字段，顺序即绘制与 Tab 顺序。
@@ -205,6 +215,11 @@ pub trait SqlSyntax: Sync {
         false
     }
 
+    /// 对象树“生成 SELECT”插入的取样语句（只写草稿，不执行）。`table` 已按方言引用。
+    fn sample_select(&self, table: &str, limit: usize) -> String {
+        default_sample_select(table, limit)
+    }
+
     /// 该方言的保留字（大小写不敏感）。
     fn is_reserved(&self, name: &str) -> bool {
         let upper = name.to_ascii_uppercase();
@@ -259,9 +274,6 @@ pub trait TypeRules: Sync {}
 /// DDL 方言：create/alter/drop/rename/truncate/索引/外键/视图/重建、注释、序列与枚举生成及动作门控。（A3 填充）
 pub trait DdlDialect: Sync {}
 
-/// 目录方言：元数据/对象列表/搜索/定义/结构内省/外键/关系图/统计 SQL 与结果解析。（A2 填充）
-pub trait CatalogDialect: Sync {}
-
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A1/A4 填充）
 pub trait ErrorRules: Sync {}
 
@@ -280,7 +292,6 @@ pub trait EngineAdapter: Sync {
     fn ddl(&self) -> Option<&dyn DdlDialect> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))] // A2 填充并接入
     fn catalog(&self) -> Option<&dyn CatalogDialect> {
         None
     }
@@ -326,6 +337,23 @@ pub fn qualified(engine: Engine, parts: &[&str]) -> String {
         Some(syntax) => syntax.qualified(parts),
         None => parts.iter().filter(|part| !part.is_empty()).map(|part| standard_quote(part)).collect::<Vec<_>>().join("."),
     }
+}
+
+fn default_sample_select(table: &str, limit: usize) -> String {
+    format!("SELECT *\nFROM {table}\nLIMIT {limit};")
+}
+
+/// 门面：对象树“生成 SELECT”的取样语句。没有 SQL 语法组的引擎按通用写法。
+pub fn sample_select(engine: Engine, table: &str, limit: usize) -> String {
+    match adapter(engine).syntax() {
+        Some(syntax) => syntax.sample_select(table, limit),
+        None => default_sample_select(table, limit),
+    }
+}
+
+/// 门面：对象的限定名（按引擎层级取库或模式作容器段，每段按需引号）。
+pub fn qualified_object(engine: Engine, database: &str, schema: &str, name: &str) -> String {
+    qualified(engine, &[catalog_of(engine).name_qualifier(database, schema), name])
 }
 
 /// 门面：引擎以字符串给出时的按需引号；未知引擎按标准 SQL 双引号总是引用。

@@ -4,11 +4,12 @@
 //! 不做聚合管道构建器、GridFS 与索引管理 UI；JSON 编辑一律先校验后落库。
 //! 会话经 `Session::as_mongo()` 专属接口取得。
 
+pub(crate) mod catalog;
 pub mod commands;
 pub(crate) mod connect;
 pub(crate) mod docs;
 
-use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {
@@ -121,7 +122,18 @@ impl EngineAdapter for MongodbAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: false, sql_syntax_group: false, connector_group: true, ..Capabilities::default() }
+        Capabilities {
+            relational: false,
+            sql_syntax_group: false,
+            connector_group: true,
+            catalog_group: true,
+            shows_databases: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn catalog(&self) -> Option<&dyn CatalogDialect> {
+        Some(&catalog::MongoCatalog)
     }
 
     fn connector(&self) -> Option<&dyn Connector> {
