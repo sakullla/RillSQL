@@ -154,9 +154,12 @@ impl CatalogDialect for PostgresCatalog {
     }
 
     /// 表与视图：reltuples 是估算（从未 ANALYZE 时为 -1，留空）；大小含索引与 TOAST；PostgreSQL 不记录数据更新时间。
+    ///
+    /// 分区不单列，分区父表（relkind 'p'）自身没有存储：它的大小与估计行数按 pg_inherits 递归汇总全部叶子分区
+    /// （与模式级合计一致；递归 CTE 兼容 PG10/11，不依赖 PG12 的 pg_partition_tree）。任一叶子没有估算时行数留空，不拿 0 冒充。
     fn object_stats_sql(&self, _database: &str, schema: &str) -> Option<String> {
         Some(format!(
-            "SELECT c.relname::text, CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END, CASE WHEN c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0 THEN c.reltuples::bigint::text END, CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_total_relation_size(c.oid)::text END, COALESCE(obj_description(c.oid, 'pg_class'), ''), NULL::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = {} AND c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition ORDER BY c.relname",
+            "SELECT c.relname::text, CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END, CASE WHEN c.relkind = 'p' THEN part.estimate::text WHEN c.relkind IN ('r', 'm') AND c.reltuples >= 0 THEN c.reltuples::bigint::text END, CASE WHEN c.relkind = 'p' THEN part.bytes::text WHEN c.relkind IN ('r', 'm') THEN pg_total_relation_size(c.oid)::text END, COALESCE(obj_description(c.oid, 'pg_class'), ''), NULL::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN LATERAL (WITH RECURSIVE tree(relid) AS (SELECT c.oid UNION ALL SELECT i.inhrelid FROM pg_inherits i JOIN tree ON i.inhparent = tree.relid) SELECT COALESCE(SUM(pg_total_relation_size(l.oid)), 0) AS bytes, CASE WHEN COUNT(l.oid) = 0 THEN 0 WHEN bool_and(l.reltuples >= 0) THEN SUM(l.reltuples)::bigint END AS estimate FROM tree JOIN pg_class l ON l.oid = tree.relid AND l.relkind NOT IN ('p', 'I')) part ON c.relkind = 'p' WHERE n.nspname = {} AND c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition ORDER BY c.relname",
             literal(schema)
         ))
     }

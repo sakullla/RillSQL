@@ -54,6 +54,15 @@ fn postgres_stats_use_pg_class_total_size_and_obj_description() {
         assert!(objects.contains(part), "{part}: {objects}");
     }
     assert!(objects.contains("c.reltuples >= 0"), "从未 ANALYZE 的 -1 不当行数");
+    // 分区父表没有自身存储：大小与行数汇总叶子分区，而不是对父表本身取 pg_total_relation_size（恒为 0）。
+    assert!(objects.contains("NOT c.relispartition"), "分区不单列：{objects}");
+    assert!(objects.contains("WITH RECURSIVE tree(relid)") && objects.contains("pg_inherits"), "{objects}");
+    assert!(objects.contains("SUM(pg_total_relation_size(l.oid))"), "{objects}");
+    assert!(objects.contains("WHEN c.relkind = 'p' THEN part.bytes"), "{objects}");
+    assert!(objects.contains("WHEN c.relkind = 'p' THEN part.estimate"), "{objects}");
+    assert!(objects.contains("bool_and(l.reltuples >= 0)"), "有叶子没估算时行数留空：{objects}");
+    assert!(!objects.contains("c.relkind IN ('r', 'p', 'm') THEN pg_total_relation_size(c.oid)"), "父表自身大小恒为 0：{objects}");
+    assert!(!objects.contains("pg_partition_tree"), "兼容 PG10/11：{objects}");
 }
 
 #[test]
@@ -271,7 +280,70 @@ async fn live_check(fixture: &LiveFixture, session: &CatalogSession) -> Result<S
     if customers.rows != Some(2) || orders.rows != Some(3) {
         return Err(format!("估计行数与种子不符（ANALYZE 之后应为 2 / 3）：{:?} {:?}", customers.rows, orders.rows));
     }
-    Ok(format!("{:?}: customers {:?} 行 {:?} 字节，orders {:?} 行 {:?} 字节", fixture.engine, customers.rows, customers.size, orders.rows, orders.size))
+    let mut line = format!("{:?}: customers {:?} 行 {:?} 字节，orders {:?} 行 {:?} 字节", fixture.engine, customers.rows, customers.size, orders.rows, orders.size);
+    if fixture.engine == Engine::Postgres {
+        line.push_str(&live_check_pg_partitions(session).await?);
+    }
+    Ok(line)
+}
+
+/// 分区父表的大小与估计行数要等于全部叶子分区之和（含二级分区），分区本身不单列；用临时模式，读完即删。
+async fn live_check_pg_partitions(session: &CatalogSession) -> Result<String, String> {
+    const SCHEMA: &str = "rillsql_overview_parts";
+    let setup = [
+        format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"),
+        format!("CREATE SCHEMA {SCHEMA}"),
+        format!("CREATE TABLE {SCHEMA}.m (id int, d date) PARTITION BY RANGE (d)"),
+        format!("CREATE TABLE {SCHEMA}.m_2025 PARTITION OF {SCHEMA}.m FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')"),
+        format!("CREATE TABLE {SCHEMA}.m_2026 PARTITION OF {SCHEMA}.m FOR VALUES FROM ('2026-01-01') TO ('2027-01-01') PARTITION BY LIST (id)"),
+        format!("CREATE TABLE {SCHEMA}.m_2026_a PARTITION OF {SCHEMA}.m_2026 FOR VALUES IN (1, 2, 3)"),
+        format!("CREATE TABLE {SCHEMA}.m_2026_b PARTITION OF {SCHEMA}.m_2026 DEFAULT"),
+        format!("CREATE INDEX ON {SCHEMA}.m (id)"),
+        format!("CREATE TABLE {SCHEMA}.empty_parent (id int) PARTITION BY RANGE (id)"),
+        format!("INSERT INTO {SCHEMA}.m SELECT g, DATE '2025-03-01' FROM generate_series(1, 500) g"),
+        format!("INSERT INTO {SCHEMA}.m SELECT g % 7, DATE '2026-03-01' FROM generate_series(1, 700) g"),
+        format!("ANALYZE {SCHEMA}.m"),
+    ];
+    let outcome = async {
+        for sql in &setup {
+            session.text_rows(sql).await?;
+        }
+        let expected = session
+            .text_rows(&format!("SELECT SUM(pg_total_relation_size(c.oid))::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{SCHEMA}' AND c.relkind = 'r'"))
+            .await?
+            .first()
+            .and_then(|row| row.first().cloned().flatten())
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or_else(|| "读不到叶子分区大小之和".to_owned())?;
+        let body = read_object_stats(Engine::Postgres, session, "rillsql", SCHEMA).await?;
+        if let Some(missing) = &body.missing {
+            return Err(format!("分区模式统计缺失：{missing}"));
+        }
+        let names: Vec<_> = body.rows.iter().map(|row| row.name.as_str()).collect();
+        if names != ["empty_parent", "m"] {
+            return Err(format!("分区不该单列：{names:?}"));
+        }
+        let empty = &body.rows[0];
+        let parent = &body.rows[1];
+        if parent.size != Some(expected) || expected == 0 {
+            return Err(format!("分区父表大小应为叶子之和 {expected}：{parent:?}"));
+        }
+        if parent.rows != Some(1200) {
+            return Err(format!("分区父表估计行数应为叶子之和 1200：{parent:?}"));
+        }
+        if empty.size != Some(0) || empty.rows != Some(0) {
+            return Err(format!("没有分区的父表应为 0：{empty:?}"));
+        }
+        let schemas = read_object_stats(Engine::Postgres, session, "rillsql", "").await?;
+        let total = schemas.rows.iter().find(|row| row.name == SCHEMA).and_then(|row| row.size);
+        if total != Some(expected) {
+            return Err(format!("模式级合计 {total:?} 与对象级 {expected} 不一致"));
+        }
+        Ok(format!("；分区父表 m {:?} 行 {:?} 字节", parent.rows, parent.size))
+    }
+    .await;
+    let _ = session.text_rows(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")).await;
+    outcome
 }
 
 #[tokio::test]

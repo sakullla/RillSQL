@@ -404,6 +404,12 @@ impl Workbench {
             )
         };
         let size_text = state.total_size().map(|size| format!(" · {}", format_size(Some(size)))).unwrap_or_default();
+        // 统计值来自引擎缓存（如 MySQL 8 的 information_schema_stats_expiry、PG 的 ANALYZE 估算），如实提示可能滞后。
+        let cached_text = if level == StatsLevel::Objects && state.missing.is_none() {
+            format!(" · {}", self.model.text("catalog.overview.statsCached"))
+        } else {
+            String::new()
+        };
         let filter = self.input_for(DraftField::OverviewFilter, &self.model.text("catalog.overview.filter"), false, window, cx);
         let header = div()
             .flex_none()
@@ -437,7 +443,7 @@ impl Workbench {
                             .test_support()
                             .text_size(px(TypeScale::XS))
                             .text_color(p.text_muted)
-                            .child(SharedString::from(format!("{} · {count_text}{size_text}", self.model.text(heading_key)))),
+                            .child(SharedString::from(format!("{} · {count_text}{size_text}{cached_text}", self.model.text(heading_key)))),
                     ),
             )
             .child(div().w(px(220.)).flex_none().child(filter))

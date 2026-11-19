@@ -158,6 +158,9 @@ impl CatalogDialect for MysqlCatalog {
     }
 
     /// 表与视图：table_rows 是估算；视图的 table_comment 固定是 VIEW，不当注释。
+    ///
+    /// MySQL 8 按 information_schema_stats_expiry（默认 86400 秒）缓存 table_rows/data_length/index_length/update_time，
+    /// 所以行数、大小与更新时间都可能滞后至多一天；概览摘要行如实提示统计可能滞后。
     fn object_stats_sql(&self, database: &str, _schema: &str) -> Option<String> {
         Some(format!(
             "SELECT table_name, CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END, CAST(table_rows AS CHAR), CAST(data_length + index_length AS CHAR), CASE WHEN table_type = 'VIEW' THEN '' ELSE table_comment END, DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s') FROM information_schema.tables WHERE table_schema = {} AND table_type IN ('BASE TABLE', 'VIEW', 'SYSTEM VERSIONED') ORDER BY table_name",

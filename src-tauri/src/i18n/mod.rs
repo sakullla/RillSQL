@@ -321,6 +321,7 @@ dict! {
     "catalog.overview.filtered" => "{shown} / {count} 项", "{shown} of {count} items";
     "catalog.overview.filter" => "按名称或注释过滤", "Filter by name or comment";
     "catalog.overview.refresh" => "刷新概览", "Refresh overview";
+    "catalog.overview.statsCached" => "行数、大小与更新时间取自数据库统计，可能滞后", "Rows, sizes and update times come from database statistics and may lag";
     "catalog.overview.statsMissing" => "统计缺失，只显示名称", "Statistics unavailable, showing names only";
     "catalog.overview.statsUnsupported" => "这个引擎不提供这一层的统计", "This engine has no statistics for this level";
     "catalog.overview.loading" => "正在读取概览…", "Loading overview…";
