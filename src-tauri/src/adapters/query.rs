@@ -165,3 +165,67 @@ pub fn backslash_ambiguous_in(lexis: Lexis, quote: u8) -> bool {
 pub fn is_identifier_quote(ch: char) -> bool {
     identifier_quote_chars().contains(&ch)
 }
+
+/// 驱动错误原文里的错误码。各驱动写法不同，这里认常见的几种：
+/// `ERROR 1064 (42000)` / `1064 (42000):`（数字码 + SQLSTATE）、`SQLSTATE 42601` / `SQLSTATE[42S02]`、
+/// `code: 2627` / `(code 1)`。认不出时返回 None，不猜。
+pub fn error_code(message: &str) -> Option<String> {
+    let bytes = message.as_bytes();
+    // 数字码紧跟括号里的五位 SQLSTATE。
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_digit() && (at == 0 || !bytes[at - 1].is_ascii_alphanumeric()) {
+            let start = at;
+            while at < bytes.len() && bytes[at].is_ascii_digit() {
+                at += 1;
+            }
+            let digits = &message[start..at];
+            let rest = &message[at..];
+            if (3..=6).contains(&digits.len()) {
+                if let Some(state) = rest.strip_prefix(" (").and_then(|tail| tail.get(..6)) {
+                    if state.ends_with(')') && state[..5].bytes().all(|b| b.is_ascii_alphanumeric()) {
+                        return Some(digits.to_owned());
+                    }
+                }
+            }
+            continue;
+        }
+        at += 1;
+    }
+    let lower = message.to_ascii_lowercase();
+    for marker in ["sqlstate", "error code", "code"] {
+        let mut from = 0usize;
+        while let Some(found) = lower[from..].find(marker) {
+            let begin = from + found;
+            from = begin + marker.len();
+            if begin > 0 && lower.as_bytes()[begin - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let tail = &message[from..];
+            let trimmed = tail.trim_start_matches([' ', ':', '=', '[', '#']);
+            let code: String = trimmed.chars().take_while(|ch| ch.is_ascii_alphanumeric()).collect();
+            let valid = if marker == "sqlstate" { code.len() == 5 } else { !code.is_empty() && code.len() <= 6 && code.bytes().all(|b| b.is_ascii_digit()) };
+            if valid {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::error_code;
+
+    #[test]
+    fn error_codes_are_read_from_common_driver_messages() {
+        assert_eq!(error_code("ERROR 1064 (42000): You have an error in your SQL syntax").as_deref(), Some("1064"));
+        assert_eq!(error_code("Server error: `ERROR 42S02 (1146): Table 'x' doesn't exist'").as_deref(), None);
+        assert_eq!(error_code("1146 (42S02): Table 'shop.x' doesn't exist").as_deref(), Some("1146"));
+        assert_eq!(error_code("db error: ERROR: syntax error at or near \"form\" (SQLSTATE 42601)").as_deref(), Some("42601"));
+        assert_eq!(error_code("SQLSTATE[42S02]: Base table not found").as_deref(), Some("42S02"));
+        assert_eq!(error_code("Token error: 'Invalid object name' on server x executing  on line 1 (code: 208, state: 1, class: 16)").as_deref(), Some("208"));
+        assert_eq!(error_code("near \"selec\": syntax error").as_deref(), None);
+        assert_eq!(error_code("barcode 12 is wrong").as_deref(), None);
+    }
+}

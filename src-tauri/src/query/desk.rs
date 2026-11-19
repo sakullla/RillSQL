@@ -1110,7 +1110,7 @@ impl Desk {
 
     pub fn format_active(&mut self) -> TextResult {
         let Some(tab) = self.active_tab() else {
-            return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget") };
+            return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget"), position: None };
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
         if let Some(blocked) = assist::guard_rewrite(engine, true, &tab.draft) {
@@ -1126,7 +1126,7 @@ impl Desk {
 
     pub fn expand_active(&mut self) -> TextResult {
         let Some(tab) = self.active_tab() else {
-            return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget") };
+            return TextResult { ok: false, sql: String::new(), reason_key: Some("query.errors.needTarget"), position: None };
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
         let sources = self.sources_for(tab.target.as_ref());

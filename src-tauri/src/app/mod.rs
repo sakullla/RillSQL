@@ -53,6 +53,7 @@ actions!(
         RequestCancel,
         ShowAutocomplete,
         ToggleComment,
+        ToggleBlockComment,
         ToggleResults,
         FormatSql,
         ExplainSql,
@@ -240,6 +241,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
+    bind!(ToggleBlockComment, "toggle-block-comment");
     bind!(ToggleResults, "toggle-results");
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");
@@ -323,6 +325,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
+    bind!(ToggleBlockComment, "toggle-block-comment");
     bind!(ToggleResults, "toggle-results");
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");

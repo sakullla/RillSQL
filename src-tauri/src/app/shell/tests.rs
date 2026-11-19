@@ -12681,7 +12681,7 @@ fn help_panel_searches_names_and_keys_and_preselects_the_focused_group() {
     // 搜索动作名：跨分组查找，不受预选分组限制。
     model.set_field(DraftField::HelpQuery, "注释".into());
     let ids: Vec<&str> = model.help_sections().iter().flat_map(|(_, items)| items.iter().map(|item| item.id)).collect();
-    assert_eq!(ids, ["toggle-comment"]);
+    assert_eq!(ids, ["toggle-comment", "toggle-block-comment"]);
     // 搜索按键：符号或文字都可以。
     for query in ["Mod+/", "ctrl+/", "⌘/"] {
         model.set_field(DraftField::HelpQuery, query.into());

@@ -42,6 +42,35 @@ pub struct TextResult {
     pub ok: bool,
     pub sql: String,
     pub reason_key: Option<&'static str>,
+    /// 失败时出问题的位置（原文字节偏移）；界面据此显示“第 N 行第 M 列”并可跳转。
+    pub position: Option<usize>,
+}
+
+impl TextResult {
+    fn refused(sql: &str, reason_key: &'static str) -> Self {
+        Self { ok: false, sql: sql.to_owned(), reason_key: Some(reason_key), position: None }
+    }
+
+    fn done(sql: String) -> Self {
+        Self { ok: true, sql, reason_key: None, position: None }
+    }
+
+    fn at(mut self, position: Option<usize>) -> Self {
+        self.position = position;
+        self
+    }
+}
+
+/// 字节偏移换成从 1 开始的行列（列按字符计）。
+pub fn line_col(sql: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(sql.len());
+    while offset > 0 && !sql.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &sql[..offset];
+    let line = before.matches('\n').count() + 1;
+    let start = before.rfind('\n').map_or(0, |at| at + 1);
+    (line, before[start..].chars().count() + 1)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,14 +272,19 @@ fn key_text(key: &str) -> String {
 }
 
 pub fn format_sql(sql: &str) -> TextResult {
-    if let Some(open) = open_delimiter(sql) {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some(open_key(open)) };
+    if let Some((open, at)) = open_delimiter(sql) {
+        return TextResult::refused(sql, open_key(open)).at(Some(at));
     }
-    let laid = layout(&tokenize(sql));
-    if !laid.0 || !keeps_adjacent(sql, &laid.1) {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.format.adjacent") };
+    let tokens = tokenize(sql);
+    let laid = match layout(&tokens) {
+        Ok(laid) => laid,
+        Err(at) => return TextResult::refused(sql, "query.format.adjacent").at(Some(at)),
+    };
+    // 语义不变的判据：格式化前后的记号序列（种类 + 文本，关键字按大写比较）完全一致，只有记号之间的空白不同。
+    if let Some(at) = token_mismatch(&tokens, &laid) {
+        return TextResult::refused(sql, "query.format.adjacent").at(Some(at));
     }
-    TextResult { ok: true, sql: laid.1, reason_key: None }
+    TextResult::done(laid)
 }
 
 pub fn format_document(sql: &str, from: usize, to: usize) -> TextResult {
@@ -258,27 +292,27 @@ pub fn format_document(sql: &str, from: usize, to: usize) -> TextResult {
     let (from, to) = ordered(sql, from, to);
     let formatted = format_sql(sql.get(from..to).unwrap_or(""));
     if !formatted.ok {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: formatted.reason_key };
+        return TextResult { ok: false, sql: sql.to_owned(), reason_key: formatted.reason_key, position: formatted.position.map(|at| from + at) };
     }
     if !selected && from == 0 && to == sql.len() {
         return formatted;
     }
     let next = format!("{}{}{}", sql.get(..from).unwrap_or(""), formatted.sql, sql.get(to..).unwrap_or(""));
     if line_comment_broken(sql, &next) {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.format.commentBreak") };
+        return TextResult::refused(sql, "query.format.commentBreak");
     }
     if edge_whitespace_removed(sql, from, to, &formatted.sql) {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.format.edgeGlue") };
+        return TextResult::refused(sql, "query.format.edgeGlue");
     }
-    TextResult { ok: true, sql: next, reason_key: None }
+    TextResult::done(next)
 }
 
 pub fn guard_rewrite(engine: &str, provider: bool, sql: &str) -> Option<TextResult> {
     if !known_sql_engine(engine) {
-        return Some(TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.unknownDialect") });
+        return Some(TextResult::refused(sql, "query.errors.unknownDialect"));
     }
     if !provider {
-        return Some(TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.noProvider") });
+        return Some(TextResult::refused(sql, "query.errors.noProvider"));
     }
     None
 }
@@ -507,15 +541,15 @@ pub fn expand_star(engine: &str, sql: &str, sources: &[CompletionSource], provid
         return blocked;
     }
     if sources.iter().all(|source| source.columns.is_empty()) {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.noProvider") };
+        return TextResult::refused(sql, "query.errors.noProvider");
     }
     let Some(rewritten) = rewrite_stars(sql, sources) else {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.noProvider") };
+        return TextResult::refused(sql, "query.errors.noProvider");
     };
     if rewritten == sql {
-        return TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.noProvider") };
+        return TextResult::refused(sql, "query.errors.noProvider");
     }
-    TextResult { ok: true, sql: rewritten, reason_key: None }
+    TextResult::done(rewritten)
 }
 
 /// 编辑器补全用的元数据快照：方言、当前库对象与列、库/模式、词频、状态与外键。
@@ -882,11 +916,13 @@ fn open_key(kind: OpenKind) -> &'static str {
     }
 }
 
-fn open_delimiter(sql: &str) -> Option<OpenKind> {
+/// 没有闭合的引号、块注释或 dollar-quote，以及它开始的位置。
+fn open_delimiter(sql: &str) -> Option<(OpenKind, usize)> {
     let mut i = 0usize;
     let mut quote: Option<char> = None;
     let mut dollar: Option<String> = None;
     let mut comment = false;
+    let mut opened = 0usize;
     while i < sql.len() {
         if let Some(tag) = dollar.clone() {
             let marker = format!("${tag}$");
@@ -928,17 +964,20 @@ fn open_delimiter(sql: &str) -> Option<OpenKind> {
         }
         if sql[i..].starts_with("/*") {
             comment = true;
+            opened = i;
             i += 2;
             continue;
         }
         if ch_at(sql, i).is_some_and(is_quote_char) {
             quote = ch_at(sql, i);
+            opened = i;
             i = step(sql, i);
             continue;
         }
         if ch_at(sql, i) == Some('$') {
             if let Some(tag) = dollar_tag(sql, i) {
                 dollar = Some(tag.clone());
+                opened = i;
                 i += tag.len() + 2;
                 continue;
             }
@@ -946,11 +985,11 @@ fn open_delimiter(sql: &str) -> Option<OpenKind> {
         i = step(sql, i);
     }
     if quote.is_some() {
-        Some(OpenKind::Quote)
+        Some((OpenKind::Quote, opened))
     } else if comment {
-        Some(OpenKind::Comment)
+        Some((OpenKind::Comment, opened))
     } else if dollar.is_some() {
-        Some(OpenKind::Dollar)
+        Some((OpenKind::Dollar, opened))
     } else {
         None
     }
@@ -971,6 +1010,8 @@ struct Tok {
     text: String,
     gap: String,
     upper: Option<String>,
+    /// 记号在源文本里的字节偏移；格式化失败时据此给出行列。
+    start: usize,
 }
 
 fn tokenize(sql: &str) -> Vec<Tok> {
@@ -989,13 +1030,13 @@ fn tokenize(sql: &str) -> Vec<Tok> {
         if sql[i..].starts_with("--") || ch == '#' {
             let mut j = if ch == '#' { step(sql, i) } else { i + 2 };
             j = eol(sql, j);
-            push(&mut tokens, TokKind::Comment, &sql[i..j], gap, None);
+            push(&mut tokens, i, TokKind::Comment, &sql[i..j], gap, None);
             i = j;
             continue;
         }
         if sql[i..].starts_with("/*") {
             let j = sql[i + 2..].find("*/").map(|at| i + 2 + at + 2).unwrap_or(sql.len());
-            push(&mut tokens, TokKind::Comment, &sql[i..j], gap, None);
+            push(&mut tokens, i, TokKind::Comment, &sql[i..j], gap, None);
             i = j;
             continue;
         }
@@ -1012,7 +1053,7 @@ fn tokenize(sql: &str) -> Vec<Tok> {
                 }
                 j = step(sql, j);
             }
-            push(&mut tokens, TokKind::String, &sql[i..j], gap, None);
+            push(&mut tokens, i, TokKind::String, &sql[i..j], gap, None);
             i = j;
             continue;
         }
@@ -1020,7 +1061,7 @@ fn tokenize(sql: &str) -> Vec<Tok> {
             if let Some(tag) = dollar_tag(sql, i) {
                 let marker = format!("${tag}$");
                 let j = sql[i + marker.len()..].find(&marker).map(|at| i + marker.len() + at + marker.len()).unwrap_or(sql.len());
-                push(&mut tokens, TokKind::Dollar, &sql[i..j], gap, None);
+                push(&mut tokens, i, TokKind::Dollar, &sql[i..j], gap, None);
                 i = j;
                 continue;
             }
@@ -1029,55 +1070,55 @@ fn tokenize(sql: &str) -> Vec<Tok> {
                 while ch_at(sql, j).is_some_and(|next| next.is_ascii_digit()) {
                     j = step(sql, j);
                 }
-                push(&mut tokens, TokKind::Word, &sql[i..j], gap, None);
+                push(&mut tokens, i, TokKind::Word, &sql[i..j], gap, None);
                 i = j;
                 continue;
             }
         }
         if matches!(ch, 'x' | 'X' | 'b' | 'B') && ch_at(sql, step(sql, i)) == Some('\'') {
             let j = skip_quoted(sql, step(sql, i));
-            push(&mut tokens, TokKind::Number, &sql[i..j], gap, None);
+            push(&mut tokens, i, TokKind::Number, &sql[i..j], gap, None);
             i = j;
             continue;
         }
         if let Some(number_end) = scan_number(sql, i) {
-            push(&mut tokens, TokKind::Number, &sql[i..number_end], gap, None);
+            push(&mut tokens, i, TokKind::Number, &sql[i..number_end], gap, None);
             i = number_end;
             continue;
         }
         if let Some((text, end)) = sql_word_at(sql, i) {
             let upper = text.to_uppercase();
-            push(&mut tokens, TokKind::Word, &text, gap, Some(upper));
+            push(&mut tokens, i, TokKind::Word, &text, gap, Some(upper));
             i = end;
             continue;
         }
         if sql[i..].starts_with("->>") {
-            push(&mut tokens, TokKind::Punct, "->>", gap, None);
+            push(&mut tokens, i, TokKind::Punct, "->>", gap, None);
             i += 3;
             continue;
         }
         let two = sql.get(i..i + 2).unwrap_or("");
         if matches!(two, "::" | "->" | "<>" | "<=" | ">=" | "!=" | "||") {
-            push(&mut tokens, TokKind::Punct, two, gap, None);
+            push(&mut tokens, i, TokKind::Punct, two, gap, None);
             i += 2;
             continue;
         }
         if (ch == ':' || ch == '@') && two != "::" {
             if let Some((_, end)) = sql_word_at(sql, step(sql, i)) {
-                push(&mut tokens, TokKind::Word, &sql[i..end], gap, None);
+                push(&mut tokens, i, TokKind::Word, &sql[i..end], gap, None);
                 i = end;
                 continue;
             }
         }
         let next = step(sql, i);
-        push(&mut tokens, TokKind::Punct, &sql[i..next], gap, None);
+        push(&mut tokens, i, TokKind::Punct, &sql[i..next], gap, None);
         i = next;
     }
     tokens
 }
 
-fn push(tokens: &mut Vec<Tok>, kind: TokKind, text: &str, gap: String, upper: Option<String>) {
-    tokens.push(Tok { kind, text: text.to_owned(), gap, upper });
+fn push(tokens: &mut Vec<Tok>, start: usize, kind: TokKind, text: &str, gap: String, upper: Option<String>) {
+    tokens.push(Tok { kind, text: text.to_owned(), gap, upper, start });
 }
 
 fn holds(prev: &Tok, tok: &Tok) -> bool {
@@ -1130,11 +1171,31 @@ fn render_tok(tok: &Tok) -> String {
     tok.text.clone()
 }
 
-fn layout(tokens: &[Tok]) -> (bool, String) {
+/// 两个在源文本里紧挨着的记号之间能不能插入空白/换行而不改变意思：两侧是彼此独立的记号
+/// （逗号后、关键字边界、括号后关键字）时可以；`.` 限定名、`N'…'` 这类前缀字面量、`@x`/`:x`
+/// 参数、相邻的运算符字符则不行。
+fn separable(prev: &Tok, tok: &Tok) -> bool {
+    if prev.text == "." || tok.text == "." {
+        return false;
+    }
+    if prev.kind == TokKind::Word && matches!(tok.kind, TokKind::String | TokKind::Number) {
+        return false;
+    }
+    if prev.kind == TokKind::Punct && tok.kind == TokKind::Punct {
+        let joins = |text: &str| !matches!(text, "," | ";" | "(" | ")");
+        return !(joins(&prev.text) && joins(&tok.text));
+    }
+    true
+}
+
+/// 排版。成功时返回新文本；需要换行但两侧记号不能分开时返回那个记号在源文本里的偏移。
+fn layout(tokens: &[Tok]) -> Result<String, usize> {
     let mut out = String::new();
     let mut depth = 0i32;
     let mut break_body = false;
     let mut prev: Option<&Tok> = None;
+    // 开头连续的行注释留在第 0 层，不缩进。
+    let mut seen_code = false;
     for tok in tokens {
         let kind = break_kind(tok, prev);
         let line_comment = prev.is_some_and(|prev| prev.kind == TokKind::Comment && (prev.text.starts_with("--") || prev.text.starts_with('#')));
@@ -1154,7 +1215,7 @@ fn layout(tokens: &[Tok]) -> (bool, String) {
             }
         } else if line_comment && !out.trim().is_empty() {
             placed = "newline";
-            level = 1 + depth as usize;
+            level = if seen_code { 1 + depth as usize } else { 0 };
             next_break = false;
         } else if break_body && depth == 0 && !prev.is_some_and(|prev| holds(prev, tok)) {
             placed = "newline";
@@ -1167,12 +1228,15 @@ fn layout(tokens: &[Tok]) -> (bool, String) {
             placed = "space";
         }
         if placed == "newline" {
-            if tok.gap.is_empty() {
-                return (false, String::new());
+            if tok.gap.is_empty() && !prev.is_some_and(|prev| separable(prev, tok)) {
+                return Err(tok.start);
             }
             newline(&mut out, level);
         } else if placed == "space" && !tok.gap.is_empty() {
             space(&mut out);
+        }
+        if tok.kind != TokKind::Comment {
+            seen_code = true;
         }
         out.push_str(&render_tok(tok));
         if tok.kind == TokKind::Punct && tok.text == "(" {
@@ -1184,7 +1248,7 @@ fn layout(tokens: &[Tok]) -> (bool, String) {
         break_body = next_break;
         prev = Some(tok);
     }
-    (true, out.trim_end_matches([' ', '\t']).to_owned())
+    Ok(out.trim_end_matches([' ', '\t']).to_owned())
 }
 
 fn newline(out: &mut String, level: usize) {
@@ -1228,43 +1292,22 @@ fn tight(tok: &Tok, prev: Option<&Tok>) -> bool {
     prev.is_some_and(|prev| prev.kind == TokKind::Punct && (prev.text == "(" || prev.text == "."))
 }
 
-fn keeps_adjacent(source: &str, formatted: &str) -> bool {
-    let left: Vec<char> = source.chars().collect();
-    let right: Vec<char> = formatted.chars().collect();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < left.len() && j < right.len() {
-        if left[i].is_whitespace() && right[j].is_whitespace() {
-            while i < left.len() && left[i].is_whitespace() {
-                i += 1;
-            }
-            while j < right.len() && right[j].is_whitespace() {
-                j += 1;
-            }
-            continue;
+/// 格式化前后的记号序列是否一致：种类与文本逐个相同（关键字按渲染后的大写比较），
+/// 只允许记号之间的空白不同。返回第一个对不上的记号在源文本里的偏移。
+fn token_mismatch(source: &[Tok], formatted: &str) -> Option<usize> {
+    let after = tokenize(formatted);
+    for (index, tok) in source.iter().enumerate() {
+        let Some(other) = after.get(index) else {
+            return Some(tok.start);
+        };
+        if other.kind != tok.kind || other.text != render_tok(tok) {
+            return Some(tok.start);
         }
-        if left[i].is_whitespace() {
-            while i < left.len() && left[i].is_whitespace() {
-                i += 1;
-            }
-            continue;
-        }
-        if right[j].is_whitespace() {
-            return false;
-        }
-        if left[i].to_uppercase().to_string() != right[j].to_uppercase().to_string() {
-            return false;
-        }
-        i += 1;
-        j += 1;
     }
-    while i < left.len() && left[i].is_whitespace() {
-        i += 1;
+    if after.len() > source.len() {
+        return Some(source.last().map_or(0, |tok| tok.start + tok.text.len()));
     }
-    while j < right.len() && right[j].is_whitespace() {
-        j += 1;
-    }
-    i == left.len() && j == right.len()
+    None
 }
 
 fn line_comment_broken(source: &str, formatted: &str) -> bool {
@@ -1567,6 +1610,61 @@ mod tests {
             assert!(!result.ok);
             assert_eq!(result.sql, sql);
         }
+    }
+
+    /// 码里只留记号本身（去掉空白），用来确认格式化前后语义不变。
+    fn token_texts(sql: &str) -> Vec<String> {
+        tokenize(sql).iter().map(render_tok).collect()
+    }
+
+    /// 附图类脚本：多行 -- 注释开头、INSERT INTO t(a,b,...) SELECT ...、无空格逗号、中文字符串。
+    #[test]
+    fn scripts_with_glued_commas_comments_and_chinese_strings_format_without_changing_tokens() {
+        let script = "-- 每日轨迹汇总\n-- 作者：运营组\n-- 注意：只统计有效点\nINSERT INTO track_daily(vehicle_id,begin_time,end_time,mileage,remark)\nSELECT vehicle_id,min(gps_time),max(gps_time),sum(mileage),'自动汇总,不含停车'\nFROM track_point WHERE status='有效' GROUP BY vehicle_id;";
+        let formatted = format_sql(script);
+        assert!(formatted.ok, "{formatted:?}");
+        assert_eq!(formatted.position, None);
+        assert_eq!(token_texts(&formatted.sql), token_texts(script), "记号序列不变");
+        assert!(formatted.sql.starts_with("-- 每日轨迹汇总\n-- 作者：运营组\n-- 注意：只统计有效点\nINSERT INTO"), "{}", formatted.sql);
+        assert!(formatted.sql.contains("'自动汇总,不含停车'"), "字符串里的逗号不动");
+        assert!(formatted.sql.contains("(vehicle_id,begin_time,end_time,mileage,remark)"), "括号里的列清单保持原样");
+        assert!(formatted.sql.contains("\n  min(gps_time),"), "顶层逗号后换行：{}", formatted.sql);
+        assert_eq!(format_sql(&formatted.sql).sql, formatted.sql, "再格式化一次不变");
+
+        // 源间隔为空但两侧是独立记号：逗号后、关键字边界、括号后关键字。
+        for sql in ["SELECT a,b FROM t", "INSERT INTO t VALUES (1,2),(3,4)", "SELECT 1;SELECT 2", "SELECT *FROM t", "INSERT INTO t VALUES(1)", "SELECT 1 FROM t WHERE(a=1)", "/*hint*/SELECT 1"] {
+            let formatted = format_sql(sql);
+            assert!(formatted.ok, "{sql}: {formatted:?}");
+            assert_eq!(token_texts(&formatted.sql), token_texts(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn format_failures_report_line_and_column_and_leave_the_text_alone() {
+        let open = "SELECT 1;\nSELECT '未闭合";
+        let result = format_sql(open);
+        assert!(!result.ok);
+        assert_eq!(result.sql, open, "编辑器内容不变");
+        assert_eq!(result.reason_key, Some("query.format.quote"));
+        let at = result.position.expect("带位置");
+        assert_eq!(line_col(open, at), (2, 8));
+
+        // 限定名里的 `.` 不能拆开：需要换行的地方没有安全间隔时拒绝，并指出位置。
+        let glued = "SELECT a\nFROM s.\nt WHERE x.FROM = 1";
+        let result = format_sql(glued);
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(result.sql, glued);
+        assert_eq!(result.reason_key, Some("query.format.adjacent"));
+        assert_eq!(line_col(glued, result.position.expect("带位置")), (3, 11));
+
+        // 选区格式化失败时位置换算回整篇文档。
+        let doc = "SELECT 1;\nSELECT 'x";
+        let from = doc.find("SELECT 'x").unwrap();
+        let result = format_document(doc, from, doc.len());
+        assert!(!result.ok);
+        assert_eq!(result.sql, doc);
+        assert_eq!(result.position, Some(from + 7));
+        assert_eq!(line_col("中文\n表名", "中文\n表".len()), (2, 2), "列按字符计");
     }
 
     #[test]

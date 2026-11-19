@@ -20,7 +20,7 @@ pub use commands::{
 };
 pub(crate) use history::{HistoryEntry, HistoryStore};
 pub(crate) use saved::{RenameRequest, SaveRequest, SavedQuery, SavedWrite};
-pub use split::{first_keyword, normalize_sql_code, split_sql, toggle_line_comment};
+pub use split::{first_keyword, normalize_sql_code, split_sql, toggle_block_comment, toggle_statement_comment};
 
 pub fn module_id() -> &'static str {
     let _linked = (

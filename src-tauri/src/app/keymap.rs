@@ -9,7 +9,7 @@ use gpui_kit::KeyBinding;
 
 use super::{
     CloseTab, CommandPalette, CommitEdit, Dismiss, ExecuteCurrent, ExecuteQuery, ExecuteScript, ExplainSql, FormatSql, NewQuery,
-    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, ShowAutocomplete, ShowHelp, ToggleComment, ToggleResults,
+    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, ShowAutocomplete, ShowHelp, ToggleBlockComment, ToggleComment, ToggleResults,
     ToggleSidebar,
 };
 
@@ -113,6 +113,10 @@ pub const SHORTCUTS: &[Shortcut] = &[
         .command("autocomplete")
         .binds(&[global!(ShowAutocomplete)]),
     Shortcut::new("toggle-comment", "editor", "Mod+/", "shell.shortcuts.toggleComment").command("toggle-comment").binds(&[global!(ToggleComment)]),
+    // ⌘⇧/：有的键盘布局把 Shift+/ 报成 ?，两种按键串都绑上。
+    Shortcut::new("toggle-block-comment", "editor", "Mod+Shift+/", "shell.shortcuts.toggleBlockComment")
+        .command("toggle-block-comment")
+        .binds(&[global!(ToggleBlockComment), |_, mac| Some(KeyBinding::new(if mac { "cmd-?" } else { "ctrl-?" }, ToggleBlockComment, None))]),
     Shortcut::new("toggle-results", "editor", "Mod+J", "shell.shortcuts.toggleResults").command("toggle-results").binds(&[global!(ToggleResults)]),
     // 同一上下文里后注册的绑定优先：macOS 编辑器里再绑一次，把 ⌘⇧F 从内建的“替换”还给格式化。
     Shortcut::new("format", "editor", "Mod+Shift+F", "shell.shortcuts.format")

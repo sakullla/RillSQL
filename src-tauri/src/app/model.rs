@@ -509,7 +509,7 @@ impl Shell {
                 Effect::None
             }
             "autocomplete" => Effect::ShowCompletions,
-            "toggle-comment" => Effect::ToggleComment,
+            "toggle-comment" | "toggle-block-comment" => Effect::ToggleComment,
             "toggle-results" => {
                 self.results_open = !self.results_open;
                 Effect::None
@@ -645,6 +645,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.shortcuts.requestCancel" => "请求取消执行",
         "shell.shortcuts.autocomplete" => "补全",
         "shell.shortcuts.toggleComment" => "注释 / 取消注释",
+        "shell.shortcuts.toggleBlockComment" => "块注释 / 取消块注释",
         "shell.shortcuts.toggleResults" => "显示 / 隐藏查询结果区",
         "shell.shortcuts.format" => "格式化选中的 SQL；无选中时格式化全部",
         "shell.shortcuts.explain" => "查看当前语句的执行计划",
@@ -722,6 +723,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.shortcuts.requestCancel" => "Request cancellation",
         "shell.shortcuts.autocomplete" => "Autocomplete",
         "shell.shortcuts.toggleComment" => "Comment / uncomment",
+        "shell.shortcuts.toggleBlockComment" => "Block comment / uncomment",
         "shell.shortcuts.toggleResults" => "Show / hide the query results pane",
         "shell.shortcuts.format" => "Format selected SQL; with nothing selected, format everything",
         "shell.shortcuts.explain" => "Show the execution plan of the current statement",

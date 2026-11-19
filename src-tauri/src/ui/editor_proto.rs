@@ -9,14 +9,15 @@ use std::rc::Rc;
 
 use gpui_kit::base::input::{Diagnostic, DiagnosticSeverity};
 use gpui_kit::component::input::{
-    CompletionProvider, DefinitionProvider, Editor, EditorState, FoldRange, GutterDecoration, GutterDecorationCollection, HoverProvider,
-    InputEvent, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Rope,
+    BufferPoint, CompletionProvider, DefinitionProvider, Editor, EditorState, FoldRange, GutterDecoration, GutterDecorationCollection,
+    HoverProvider, InputEvent, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Rope, RopeExt as _,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    anchored, deferred, point, Anchor, App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Task, Window, div, px, rgb,
+    deferred, point, AnyElement, App, AppContext as _, AvailableSpace, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
+    EntityInputHandler as _, Focusable as _, FontWeight, GlobalElementId, InspectorElementId, InteractiveElement as _, IntoElement,
+    LayoutId, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px, rgb,
 };
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Documentation, Hover, HoverContents,
@@ -332,9 +333,15 @@ pub struct SqlEditor {
     caret: Caret,
     statement_marks: RangeDecorationCollection,
     error_marks: RangeDecorationCollection,
+    /// 出错语句的整段底色（比错误位置本身浅一档）。
+    error_statements: RangeDecorationCollection,
     error_gutter: GutterDecorationCollection,
     /// 当前错误标记的范围；下一次编辑或重新执行时清除。
     errors: Vec<Range<usize>>,
+    /// 当前执行错误（行尾标记与错误弹层读取）；与 errors 同时清除。
+    exec_errors: Vec<ExecError>,
+    /// 鼠标停在第几个行尾错误标记上（展开错误弹层）。
+    lens_open: Option<usize>,
     /// 执行错误和静态 lint 的原文，悬停与诊断共用。
     facts: Rc<RefCell<HoverFacts>>,
     stale_lint: u32,
@@ -351,6 +358,41 @@ pub struct SqlEditor {
     /// 光标移动后重算当前语句高亮和签名提示。
     _track: gpui_kit::Subscription,
 }
+
+/// 一条执行错误：标记位置、所在语句、错误码与服务器原文。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecError {
+    /// 错误位置（驱动给的偏移/行；没有时是整条语句）。
+    pub range: Range<usize>,
+    /// 出错语句在草稿里的范围；铺语句底色用。
+    pub statement: Option<Range<usize>>,
+    /// 驱动给出的错误码（如 1064 / 42601）；认不出时为 None。
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl ExecError {
+    /// 复制按钮写入剪贴板的完整文本：错误码 + 原文。
+    pub fn copy_text(&self) -> String {
+        match self.code.as_deref() {
+            Some(code) if !self.message.contains(code) => format!("[{code}] {}", self.message),
+            _ => self.message.clone(),
+        }
+    }
+
+    /// 行尾标记里的简短说明：原文第一行，过长时截断。
+    pub fn short(&self) -> String {
+        let first = self.message.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+        let mut out: String = first.chars().take(SHORT_CHARS).collect();
+        if first.chars().count() > SHORT_CHARS {
+            out.push('…');
+        }
+        out
+    }
+}
+
+/// 行尾错误标记最多显示的字符数。
+const SHORT_CHARS: usize = 48;
 
 /// 悬停要优先展示的诊断：执行错误和静态 lint，都带着原文。
 #[derive(Default)]
@@ -383,6 +425,27 @@ fn diagnostic_at(facts: &HoverFacts, offset: usize) -> Option<(Range<usize>, Str
 
 fn diagnostic_markdown(message: &str, locale: Locale) -> String {
     format!("**{}**\n\n{}", i18n::text(locale, "query.log.error"), escape_markdown(message))
+}
+
+/// 执行错误在诊断弹层里的说明：标题带错误码，正文是服务器原文。
+fn exec_error_markdown(error: &ExecError, locale: Locale) -> String {
+    let title = i18n::text(locale, "query.log.error");
+    let title = match error.code.as_deref() {
+        Some(code) => format!("{title} · {}", code_span(code)),
+        None => title,
+    };
+    let body = if error.message.trim().is_empty() { String::new() } else { escape_markdown(&error.message) };
+    format!("**{title}**\n\n{body}")
+}
+
+/// LSP 悬停的内容。诊断（执行错误、静态 lint）只经编辑器的诊断弹层展示：
+/// 悬停在诊断范围里时这里不再给第二个弹层，两个弹层叠在一起、此起彼伏正是闪烁的来源。
+fn hover_markdown(scope: Option<&CompletionScope>, facts: &HoverFacts, text: &str, offset: usize, locale: Locale) -> Option<(Range<usize>, String)> {
+    if diagnostic_at(facts, offset).is_some() {
+        return None;
+    }
+    let (span, info) = hover_info(scope?, text, offset)?;
+    Some((span, info_markdown(&info, locale)))
 }
 
 struct SqlDefinition {
@@ -433,8 +496,9 @@ impl SqlEditor {
             state
         });
         // 装饰集合一开始就建好：槽位常驻，出现错误标记时文本不会横移。
-        let (statement_marks, error_marks, error_gutter) = state.update(cx, |state, cx| {
+        let (statement_marks, error_statements, error_marks, error_gutter) = state.update(cx, |state, cx| {
             (
+                state.create_range_decorations_collection(Vec::new(), cx),
                 state.create_range_decorations_collection(Vec::new(), cx),
                 state.create_range_decorations_collection(Vec::new(), cx),
                 state.create_gutter_decorations_collection(Vec::new(), cx),
@@ -505,8 +569,11 @@ impl SqlEditor {
             caret: Caret::default(),
             statement_marks,
             error_marks,
+            error_statements,
             error_gutter,
             errors: Vec::new(),
+            exec_errors: Vec::new(),
+            lens_open: None,
             facts,
             stale_lint: 0,
             stale_completion: 0,
@@ -595,18 +662,37 @@ impl SqlEditor {
         self.mark_error_messages(ranges.into_iter().map(|range| (range, String::new())).collect(), cx);
     }
 
-    /// 执行失败的位置和错误原文。悬停命中范围时展示这段原文。
+    /// 执行失败的位置和错误原文（没有错误码与语句范围的旧入口）。
     pub fn mark_error_messages(&mut self, marked: Vec<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        let errors = marked.into_iter().map(|(range, message)| ExecError { range, message, ..ExecError::default() }).collect();
+        self.mark_exec_errors(errors, cx);
+    }
+
+    /// 执行错误的呈现：行号侧标记 + 出错语句底色 + 错误位置底色与波浪线 + 行尾简短标记。
+    /// 原文只经编辑器的诊断弹层展示（与静态 lint 同一个弹层），行尾标记展开后可以复制。
+    pub fn mark_exec_errors(&mut self, errors: Vec<ExecError>, cx: &mut Context<Self>) {
         let palette = Palette::of(cx);
         let mut fill = palette.danger;
-        fill.a = 0.16;
-        let ranges: Vec<Range<usize>> = marked.iter().map(|(range, _)| range.clone()).collect();
+        fill.a = 0.18;
+        let mut soft = palette.danger;
+        soft.a = 0.07;
+        let ranges: Vec<Range<usize>> = errors.iter().map(|error| error.range.clone()).collect();
         let gutter = ranges.iter().cloned().map(|range| GutterDecoration::new(range).with_color(palette.danger)).collect();
         let marks = ranges.iter().cloned().map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(fill)).collect();
+        let statements = errors
+            .iter()
+            .filter_map(|error| error.statement.clone().filter(|statement| !statement.is_empty()))
+            .map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(soft))
+            .collect();
         self.error_gutter.set(gutter, cx);
         self.error_marks.set(marks, cx);
+        self.error_statements.set(statements, cx);
         self.errors = ranges;
-        self.facts.borrow_mut().errors = marked;
+        let locale = self.locale.get();
+        self.facts.borrow_mut().errors = errors.iter().map(|error| (error.range.clone(), exec_error_markdown(error, locale))).collect();
+        self.exec_errors = errors;
+        self.lens_open = None;
+        self.sync_diagnostics(cx);
         cx.notify();
     }
 
@@ -615,10 +701,47 @@ impl SqlEditor {
             return;
         }
         self.errors.clear();
+        self.exec_errors.clear();
+        self.lens_open = None;
         self.facts.borrow_mut().errors.clear();
         self.error_gutter.clear(cx);
         self.error_marks.clear(cx);
+        self.error_statements.clear(cx);
+        self.sync_diagnostics(cx);
         cx.notify();
+    }
+
+    /// 当前执行错误（行尾标记、错误弹层与复制读取同一份）。
+    pub fn exec_errors(&self) -> &[ExecError] {
+        &self.exec_errors
+    }
+
+    /// 诊断弹层的唯一来源：执行错误在前、静态 lint 在后，一起写进编辑器的诊断集合。
+    fn sync_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let facts = self.facts.borrow();
+        let locale = self.locale.get();
+        let entries: Vec<(Range<usize>, String)> = facts
+            .errors
+            .iter()
+            .cloned()
+            .chain(facts.lint.iter().map(|(range, message)| (range.clone(), diagnostic_markdown(message, locale))))
+            .collect();
+        drop(facts);
+        self.state.update(cx, |state, _| {
+            let text = state.text().clone();
+            let Some(set) = state.diagnostics_mut() else {
+                return;
+            };
+            set.reset(&text);
+            for (range, message) in entries {
+                if range.is_empty() || message.is_empty() {
+                    continue;
+                }
+                let start = offset_to_position(&text, range.start);
+                let end = offset_to_position(&text, range.end.min(text.len()));
+                set.push(Diagnostic::new(start..end, message).with_severity(DiagnosticSeverity::Error));
+            }
+        });
     }
 
     /// 当前的错误标记范围（随编辑跟踪）。
@@ -659,13 +782,24 @@ impl SqlEditor {
     /// 悬停在偏移处会显示的说明（与悬停提供者同一份数据）；没有时为 None。
     /// 执行错误和静态 lint 优先于表、列、函数文档。
     pub fn hover_text(&self, offset: usize, cx: &App) -> Option<String> {
-        if let Some((_, message)) = diagnostic_at(&self.facts.borrow(), offset) {
-            return Some(diagnostic_markdown(&message, self.locale.get()));
+        if diagnostic_at(&self.facts.borrow(), offset).is_some() {
+            return self.diagnostic_text(offset, cx);
         }
+        self.lsp_hover_text(offset, cx)
+    }
+
+    /// LSP 悬停提供者在偏移处给出的内容（诊断范围里为 None：诊断只走诊断弹层）。
+    pub fn lsp_hover_text(&self, offset: usize, cx: &App) -> Option<String> {
         let text = self.value(cx);
         let scope = self.scope.borrow();
-        let (_, info) = hover_info(scope.as_ref()?, &text, offset)?;
-        Some(info_markdown(&info, self.locale.get()))
+        hover_markdown(scope.as_ref(), &self.facts.borrow(), &text, offset, self.locale.get()).map(|(_, markdown)| markdown)
+    }
+
+    /// 诊断弹层在偏移处显示的内容（编辑器诊断集合里的那一条）。
+    pub fn diagnostic_text(&self, offset: usize, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        let set = state.diagnostics()?;
+        set.for_offset(offset).map(|entry| entry.diagnostic.message.to_string())
     }
 
     /// 设置里的查询编辑器字号；渲染时作为 Editor 的文本尺寸。
@@ -776,21 +910,37 @@ impl SqlEditor {
         applied
     }
 
-    /// Ctrl/⌘+/：切换当前行或选区触及行的行注释。
+    /// Ctrl/⌘+/：切换选区触及行的行注释；没有选区时作用于光标所在语句的全部逻辑行。
     /// 整段连续行只替换一次（一次撤销即可还原），不执行查询；输入法组合输入期间不动作。
     pub fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let composing = self
-            .state
-            .update(cx, |state, cx| state.marked_text_range(window, cx).is_some());
-        if composing {
+        if self.composing(window, cx) {
             return false;
         }
         let value = self.value(cx);
         let selection = self.selected_range(cx);
-        let Some(edit) = crate::query::toggle_line_comment(&value, selection) else {
+        let engine = crate::adapters::query::sql_dialect_id(&self.engine());
+        let Some(edit) = crate::query::toggle_statement_comment(engine, &value, selection) else {
             return false;
         };
         self.replace_bytes(edit.range, &edit.text, edit.selection, window, cx)
+    }
+
+    /// Ctrl/⌘+Shift+/：切换块注释。有选区时包裹/去掉选区，没有选区时作用于光标所在的块注释或语句。
+    pub fn toggle_block_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.composing(window, cx) {
+            return false;
+        }
+        let value = self.value(cx);
+        let selection = self.selected_range(cx);
+        let engine = crate::adapters::query::sql_dialect_id(&self.engine());
+        let Some(edit) = crate::query::toggle_block_comment(engine, &value, selection) else {
+            return false;
+        };
+        self.replace_bytes(edit.range, &edit.text, edit.selection, window, cx)
+    }
+
+    fn composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.state.update(cx, |state, cx| state.marked_text_range(window, cx).is_some())
     }
 
     /// 在当前光标或选区插入文本。`None` 表示用当前选区（字节偏移），
@@ -825,18 +975,7 @@ impl SqlEditor {
             return false;
         }
         self.facts.borrow_mut().lint = findings.to_vec();
-        self.state.update(cx, |state, _| {
-            let text = state.text().clone();
-            let Some(set) = state.diagnostics_mut() else {
-                return;
-            };
-            set.reset(&text);
-            for (range, message) in findings {
-                let start = offset_to_position(&text, range.start);
-                let end = offset_to_position(&text, range.end.min(text.len()));
-                set.push(Diagnostic::new(start..end, message.clone()).with_severity(DiagnosticSeverity::Error));
-            }
-        });
+        self.sync_diagnostics(cx);
         true
     }
 
@@ -845,10 +984,11 @@ impl SqlEditor {
         self.facts.borrow().lint.iter().map(|(_, message)| message.clone()).collect()
     }
 
+    /// 第一条静态诊断的原文；只有它确实写进了编辑器的诊断集合时才算数。
     pub fn lint_message(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).diagnostics().and_then(|set| {
-            set.iter().next().map(|entry| entry.diagnostic.message.to_string())
-        })
+        let first = self.facts.borrow().lint.first().map(|(_, message)| message.clone())?;
+        let written = self.state.read(cx).diagnostics().is_some_and(|set| !set.is_empty());
+        written.then_some(first)
     }
 
     pub fn show_completions(&self, window: &mut Window, cx: &mut App) {
@@ -945,12 +1085,7 @@ impl SqlEditor {
             return false;
         }
         self.facts.borrow_mut().lint.clear();
-        self.state.update(cx, |state, _| {
-            let text = state.text().clone();
-            if let Some(set) = state.diagnostics_mut() {
-                set.reset(&text);
-            }
-        });
+        self.sync_diagnostics(cx);
         true
     }
 
@@ -984,6 +1119,7 @@ impl Render for SqlEditor {
         let (background, foreground) = self.theme_colors(cx.theme().is_dark());
         let focused = self.is_focused(window, cx);
         let popup = self.signature.clone().filter(|_| focused).map(|hint| self.signature_popup(&hint, cx));
+        let lenses = self.error_lenses(cx);
         let status = self.caret_status(cx);
         div()
             .id("sql-editor")
@@ -1005,8 +1141,131 @@ impl Render for SqlEditor {
                 ),
             )
             .child(status)
+            .children(lenses)
             .children(popup)
     }
+}
+
+/// 贴着编辑器文本定位的浮层。位置在本帧编辑器 prepaint 之后计算（作为 deferred 子元素，
+/// 它的 prepaint 排在编辑器之后），读到的是本帧的光标几何与滚动偏移，不用上一帧的布局：
+/// 滚动时不会先跳到旧位置再跳回来。几何缺失或目标不在可见区时整块不画（不回退到固定位置）。
+/// 给定浮层尺寸，返回它的左上角（窗口坐标）；None 表示这一帧不显示。
+type Placer = Box<dyn Fn(&EditorState, gpui_kit::Size<Pixels>) -> Option<gpui_kit::Point<Pixels>>>;
+
+struct Floating {
+    id: ElementId,
+    state: Entity<EditorState>,
+    place: Placer,
+    child: Option<AnyElement>,
+}
+
+impl Floating {
+    fn new(
+        id: impl Into<ElementId>,
+        state: Entity<EditorState>,
+        child: impl IntoElement,
+        place: impl Fn(&EditorState, gpui_kit::Size<Pixels>) -> Option<gpui_kit::Point<Pixels>> + 'static,
+    ) -> Self {
+        Self { id: id.into(), state, place: Box::new(place), child: Some(child.into_any_element()) }
+    }
+}
+
+impl IntoElement for Floating {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Floating {
+    type RequestLayoutState = ();
+    type PrepaintState = bool;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+        let mut empty = div().into_any_element();
+        (empty.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        let size = child.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let Some(origin) = (self.place)(self.state.read(cx), size) else {
+            return false;
+        };
+        window.with_absolute_element_offset(origin, |window| child.prepaint(window, cx));
+        true
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        visible: &mut bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if *visible {
+            if let Some(child) = self.child.as_mut() {
+                child.paint(window, cx);
+            }
+        }
+    }
+}
+
+/// 字节偏移在本帧的显示行顶边（窗口坐标）与行高。以本帧光标为基准按显示行差推算，
+/// 软换行与折叠都由编辑器自己的显示映射换算。光标几何还没有、或这一行被折叠隐藏时为 None。
+fn row_top(state: &EditorState, offset: usize) -> Option<(Pixels, Pixels)> {
+    let geometry = state.prepaint_caret_geometry()?;
+    let text = state.text();
+    let map = state.display_map();
+    let display_row = |at: usize| {
+        let at = at.min(text.len());
+        let point = text.offset_to_point(at);
+        map.buffer_pos_to_display_pos(BufferPoint::new(point.row, point.column)).row
+    };
+    let line = text.offset_to_point(offset.min(text.len())).row;
+    if map.is_buffer_line_hidden(line) {
+        return None;
+    }
+    let caret_row = display_row(state.cursor()) as f32;
+    let target_row = display_row(offset) as f32;
+    let line_height = geometry.line_height();
+    let caret_top = geometry.cursor_bounds().origin.y;
+    Some((caret_top + line_height * (target_row - caret_row), line_height))
+}
+
+/// 浮层能放在编辑器可见区里（上下都不越界）。
+fn inside_input(state: &EditorState, top: Pixels, height: Pixels) -> bool {
+    let Some(geometry) = state.prepaint_caret_geometry() else {
+        return false;
+    };
+    let input = geometry.input_bounds();
+    top >= input.origin.y && top + height <= input.origin.y + input.size.height
+}
+
+fn kit_icon_alert(color: gpui_kit::Hsla) -> AnyElement {
+    crate::ui::kit::icon(gpui_kit::assets::IconName::TriangleAlert, 11., color).into_any_element()
 }
 
 /// 编辑器底部状态行要显示的光标位置与选区大小。行列从 1 开始，列按字符数计。
@@ -1078,7 +1337,112 @@ impl SqlEditor {
 }
 
 impl SqlEditor {
-    /// 签名提示浮层：贴在光标上方，不压住下方的补全弹层；还没有光标几何时停在编辑器右上角。
+    /// 行尾错误标记：出错行右侧一个简短标记（错误码 + 原文首行）。鼠标移上去展开错误弹层：
+    /// 错误码、完整信息和复制按钮。弹层向下展开、贴着编辑器右缘，不压住出错的那一行。
+    fn error_lenses(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.exec_errors.is_empty() {
+            return Vec::new();
+        }
+        let p = Palette::of(cx);
+        let locale = self.locale.get();
+        let mut seen_lines: Vec<usize> = Vec::new();
+        let text = self.state.read(cx).text().clone();
+        let mut out = Vec::new();
+        for (index, error) in self.exec_errors.iter().enumerate() {
+            let line = text.offset_to_point(error.range.start.min(text.len())).row;
+            if seen_lines.contains(&line) {
+                continue;
+            }
+            seen_lines.push(line);
+            let open = self.lens_open == Some(index);
+            let label = match error.code.as_deref() {
+                Some(code) => format!("{code} · {}", error.short()),
+                None => error.short(),
+            };
+            let chip = div()
+                .id(("sql-error-lens-chip", index))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(6.))
+                .h(px(18.))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.danger_soft)
+                .text_color(p.danger)
+                .text_size(px(TypeScale::XS))
+                .child(kit_icon_alert(p.danger))
+                .child(SharedString::from(label));
+            let mut lens = div()
+                .id(("sql-error-lens", index))
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(4.))
+                .occlude()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let next = if *hovered { Some(index) } else { None };
+                    if this.lens_open != next && (*hovered || this.lens_open == Some(index)) {
+                        this.lens_open = next;
+                        cx.notify();
+                    }
+                }))
+                .child(chip);
+            if open {
+                lens = lens.child(self.error_popover(index, error, locale, cx));
+            }
+            let offset = error.range.start;
+            let floating = Floating::new(("sql-error-lens-anchor", index), self.state.clone(), lens, move |state, size| {
+                let (top, line_height) = row_top(state, offset)?;
+                let geometry = state.prepaint_caret_geometry()?;
+                let input = geometry.input_bounds();
+                let chip_top = top + (line_height - px(18.)).max(px(0.)) / 2.;
+                if !inside_input(state, chip_top, px(18.)) {
+                    return None;
+                }
+                // 右缘留出纵向滚动条的位置。
+                let x = (input.origin.x + input.size.width - size.width - px(14.)).max(input.origin.x);
+                Some(point(x, chip_top))
+            });
+            out.push(deferred(floating).with_priority(1).into_any_element());
+        }
+        out
+    }
+
+    fn error_popover(&self, index: usize, error: &ExecError, locale: Locale, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let copy_text = error.copy_text();
+        let title = match error.code.as_deref() {
+            Some(code) => i18n::fill(&i18n::text(locale, "query.errors.codeTitle"), &[("code", code)]),
+            None => i18n::text(locale, "query.log.error"),
+        };
+        div()
+            .id(("sql-error-popover", index))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .max_w(px(460.))
+            .p(px(8.))
+            .rounded(px(Radius::PANEL))
+            .border_1()
+            .border_color(p.danger)
+            .bg(p.raised)
+            .shadow_md()
+            .text_size(px(TypeScale::SM))
+            .text_color(p.text)
+            .child(div().id(("sql-error-popover-title", index)).font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(SharedString::from(title)))
+            .child(div().id(("sql-error-popover-message", index)).child(SharedString::from(error.message.clone())))
+            .child(
+                div().flex().justify_end().child(crate::ui::kit::secondary_button(
+                    ("sql-error-popover-copy", index),
+                    Some(gpui_kit::assets::IconName::Copy),
+                    i18n::text(locale, "query.errors.copy"),
+                    move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
+                )),
+            )
+            .into_any_element()
+    }
+
+    /// 签名提示浮层：贴在光标上方，不压住下方的补全弹层；还没有光标几何时不显示。
     fn signature_popup(&self, hint: &SignatureHint, cx: &App) -> gpui_kit::AnyElement {
         let p = Palette::of(cx);
         let mut row = div()
@@ -1113,14 +1477,22 @@ impl SqlEditor {
             row = row.child(SharedString::from(", …"));
         }
         row = row.child(SharedString::from(format!(") → {}", hint.returns)));
-        match self.state.read(cx).prepaint_caret_geometry() {
-            Some(geometry) => {
-                let caret = geometry.cursor_bounds();
-                let at = point(caret.origin.x - px(4.), caret.origin.y + geometry.scroll_offset().y - px(4.));
-                deferred(anchored().position(at).anchor(Anchor::BottomLeft).snap_to_window().child(row)).with_priority(1).into_any_element()
+        // 位置在本帧编辑器 prepaint 之后算：光标几何已经是本帧的（含滚动），不再额外叠加滚动偏移；
+        // 几何缺失时不画，不跳到固定位置。
+        let floating = Floating::new("sql-signature-anchor", self.state.clone(), row, |state, size| {
+            let geometry = state.prepaint_caret_geometry()?;
+            let caret = geometry.cursor_bounds();
+            let input = geometry.input_bounds();
+            if caret.origin.y < input.origin.y || caret.origin.y > input.origin.y + input.size.height {
+                return None;
             }
-            None => div().absolute().top(px(4.)).right(px(8.)).child(row).into_any_element(),
-        }
+            let x = (caret.origin.x - px(4.)).max(input.origin.x).min((input.origin.x + input.size.width - size.width).max(input.origin.x));
+            let above = caret.origin.y - px(4.) - size.height;
+            // 上方放不下时放到光标行下方，仍然不压住光标所在行。
+            let y = if above >= px(0.) { above } else { caret.origin.y + geometry.line_height() + px(4.) };
+            Some(point(x, y))
+        });
+        deferred(floating).with_priority(1).into_any_element()
     }
 }
 
@@ -1370,20 +1742,11 @@ impl CompletionProvider for SqlSuggest {
 impl HoverProvider for SqlHover {
     fn hover(&self, text: &Rope, offset: usize, _window: &mut Window, _cx: &mut App) -> Task<gpui_kit::Result<Option<Hover>>> {
         let locale = self.locale.get();
-        if let Some((span, message)) = diagnostic_at(&self.facts.borrow(), offset) {
-            return Task::ready(Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: diagnostic_markdown(&message, locale) }),
-                range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
-            })));
-        }
         let scope = self.scope.borrow();
-        let Some(scope) = scope.as_ref() else {
-            return Task::ready(Ok(None));
-        };
         let value = text.to_string();
-        // 认不出的名字没有悬停，不弹空气泡。
-        let hover = hover_info(scope, &value, offset).map(|(span, info)| Hover {
-            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(&info, locale) }),
+        // 诊断范围里没有悬停（诊断弹层已经在显示）；认不出的名字也没有，不弹空气泡。
+        let hover = hover_markdown(scope.as_ref(), &self.facts.borrow(), &value, offset, locale).map(|(span, markdown)| Hover {
+            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: markdown }),
             range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
         });
         Task::ready(Ok(hover))
@@ -2138,6 +2501,11 @@ select 1;";
             assert!(hover.contains(&i18n::text(Locale::ZhCn, "query.log.error")), "{hover}");
             let lint = editor.read(cx).hover_text(orders, cx).expect("第二条静态诊断也要能悬停");
             assert!(lint.contains("块注释没有闭合。"), "{lint}");
+            // 单一诊断弹层：执行错误与 lint 都在编辑器诊断集合里，LSP 悬停在诊断范围内不再给第二个弹层。
+            assert_eq!(editor.read(cx).diagnostic_text(bad, cx).as_deref(), Some(hover.as_str()));
+            assert_eq!(editor.read(cx).diagnostic_text(orders, cx).as_deref(), Some(lint.as_str()));
+            assert!(editor.read(cx).lsp_hover_text(bad, cx).is_none(), "执行错误不再走悬停弹层");
+            assert!(editor.read(cx).lsp_hover_text(orders, cx).is_none(), "lint 不再走悬停弹层");
             assert_eq!(editor.read(cx).lint_messages(), vec!["引号没有闭合。".to_owned(), "块注释没有闭合。".to_owned()]);
             assert_eq!(editor.read(cx).lint_message(cx).as_deref(), Some("引号没有闭合。"));
             editor.update(cx, |editor, cx| {
@@ -2156,6 +2524,75 @@ select 1;";
             let value = editor.read(cx).value(cx);
             assert!(!value.contains("/*x*/"), "插入走编辑器撤销栈：{value}");
             assert!(value.starts_with("select"), "{value}");
+        })
+        .unwrap();
+    }
+
+    /// 执行错误：错误码进诊断弹层标题，语句铺底色，行尾标记展开后可复制；光标移动不重建诊断。
+    #[gpui_kit::test]
+    fn exec_errors_carry_code_statement_and_copy_text(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            let sql = "select 1;\nselect bad\n  from orders;";
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+            });
+            window.render_frame(cx);
+            let bad = sql.find("bad").unwrap();
+            let statement = sql.find("select bad").unwrap()..sql.len();
+            let error = ExecError { range: bad..bad + 3, statement: Some(statement), code: Some("1054".to_owned()), message: "Unknown column 'bad' in 'field list'".to_owned() };
+            assert_eq!(error.copy_text(), "[1054] Unknown column 'bad' in 'field list'");
+            assert_eq!(error.short(), "Unknown column 'bad' in 'field list'");
+            editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_ranges(cx), vec![bad..bad + 3]);
+            assert_eq!(editor.read(cx).exec_errors(), &[error]);
+            let shown = editor.read(cx).diagnostic_text(bad, cx).expect("诊断弹层内容");
+            assert!(shown.contains("1054") && shown.contains("Unknown column"), "{shown}");
+            // 光标在错误行上来回移动、重绘：诊断与标记保持不变（不会被清掉再画回来）。
+            for at in [bad, bad + 1, sql.len(), 0] {
+                editor.update(cx, |editor, cx| editor.select_range(at..at, cx));
+                window.render_frame(cx);
+                assert_eq!(editor.read(cx).error_ranges(cx), vec![bad..bad + 3]);
+                assert!(editor.read(cx).diagnostic_text(bad, cx).is_some());
+            }
+            let long = ExecError { message: "x".repeat(80), ..ExecError::default() };
+            assert_eq!(long.short().chars().count(), SHORT_CHARS + 1, "行尾标记截断并带省略号");
+            editor.update(cx, |editor, cx| editor.clear_errors(cx));
+            assert!(editor.read(cx).diagnostic_text(bad, cx).is_none(), "清除后诊断一起清掉");
+        })
+        .unwrap();
+    }
+
+    /// 无选区的 ⌘/ 作用于光标所在语句的全部逻辑行；⌘⇧/ 切换块注释；各自一次撤销还原。
+    #[gpui_kit::test]
+    fn caret_statement_comments_and_block_comments_undo_in_one_step(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let sql = "SELECT 1;\nINSERT INTO t(a,b)\nSELECT a,b FROM s;\nSELECT 3;";
+        let caret = sql.find("FROM s").unwrap();
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+                editor.select_range(caret..caret, cx);
+            });
+            window.render_frame(cx);
+            assert!(editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)));
+            assert_eq!(editor.read(cx).value(cx), "SELECT 1;\n-- INSERT INTO t(a,b)\n-- SELECT a,b FROM s;\nSELECT 3;");
+            window.press("secondary-z", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(editor.read(cx).value(cx), sql, "一次撤销还原整条语句");
+            editor.update(cx, |editor, cx| editor.select_range(caret..caret, cx));
+            assert!(editor.update(cx, |editor, cx| editor.toggle_block_comment(window, cx)));
+            assert_eq!(editor.read(cx).value(cx), "SELECT 1;\n/* INSERT INTO t(a,b)\nSELECT a,b FROM s; */\nSELECT 3;");
+            window.press("secondary-z", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, _window, cx| {
+            assert_eq!(editor.read(cx).value(cx), sql, "块注释也是一次撤销");
         })
         .unwrap();
     }

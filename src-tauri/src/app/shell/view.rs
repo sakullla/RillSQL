@@ -3228,6 +3228,7 @@ fn query_command(id: &str) -> bool {
             | "run-script"
             | "request-cancel"
             | "toggle-comment"
+            | "toggle-block-comment"
             | "format"
             | "autocomplete"
             | "explain"

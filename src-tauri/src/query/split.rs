@@ -1147,6 +1147,197 @@ pub fn toggle_line_comment(sql: &str, selection: Range<usize>) -> Option<Comment
     Some(CommentEdit { range: region_start..region_end, text: rebuilt, selection, commented })
 }
 
+/// 一行（去掉缩进后）是不是行注释。
+fn is_comment_line(line: &str) -> bool {
+    body_of(line).1.starts_with(MARK)
+}
+
+/// 光标所在语句覆盖的字节范围（含结束符）。光标不在任何语句里时为 None。
+fn statement_span(engine: &str, sql: &str, cursor: usize) -> Option<Range<usize>> {
+    let report = split_sql(engine, sql);
+    let piece = report.pieces.iter().find(|piece| piece.start <= cursor && cursor <= piece.end)?;
+    // 语句结束符紧跟在后面时一并算进来。
+    let mut end = piece.end;
+    if sql[end..].starts_with(';') {
+        end += 1;
+    }
+    Some(piece.start..end)
+}
+
+/// 没有选区时行注释的作用范围：
+/// - 光标所在行已是注释：向上下扩展到连续的注释行（空行为界），第二次按下就能整段恢复；
+/// - 否则是光标所在完整语句的全部逻辑行；光标不在语句里时就是光标所在行。
+fn caret_region(engine: &str, sql: &str, cursor: usize) -> Range<usize> {
+    let cursor = floor_boundary(sql, cursor);
+    let first = line_start(sql, cursor);
+    let last = line_end(sql, cursor);
+    let blank = |range: Range<usize>| body_of(&sql[range]).1.is_empty();
+    if is_comment_line(&sql[first..last]) {
+        // 连续注释行；夹在注释行之间的空行不断开（语句中间的空行注释时保持原样）。
+        let mut start = first;
+        let mut probe = first;
+        while probe > 0 {
+            let above = line_start(sql, probe - 1);
+            let line = above..probe - 1;
+            if is_comment_line(&sql[line.clone()]) {
+                start = above;
+            } else if !blank(line) {
+                break;
+            }
+            probe = above;
+        }
+        let mut end = last;
+        let mut probe = last;
+        while probe < sql.len() {
+            let below = line_end(sql, probe + 1);
+            let line = probe + 1..below;
+            if is_comment_line(&sql[line.clone()]) {
+                end = below;
+            } else if !blank(line) {
+                break;
+            }
+            probe = below;
+        }
+        return start..end;
+    }
+    match statement_span(engine, sql, cursor) {
+        Some(span) => {
+            // 语句正上方紧贴的注释行属于这条语句：一起加一层，去掉时也能整段原样恢复。
+            let mut start = line_start(sql, span.start);
+            while start > 0 {
+                let above = line_start(sql, start - 1);
+                if !is_comment_line(&sql[above..start - 1]) {
+                    break;
+                }
+                start = above;
+            }
+            start..line_end(sql, span.end.saturating_sub(1).max(span.start))
+        }
+        None => first..last,
+    }
+}
+
+/// ⌘/ 的语句级行注释：有选区时作用于选区触及的逻辑行；没有选区时作用于光标所在语句的全部逻辑行
+/// （光标在注释行上时作用于连续的注释行）。判断“全部已注释”忽略空行；`-- ` 直接加在每个逻辑行行首，
+/// 不引入换行，软换行显示时注释前缀与内容在同一视觉行起始。整段只替换一次，一次撤销即可还原。
+pub fn toggle_statement_comment(engine: &str, sql: &str, selection: Range<usize>) -> Option<CommentEdit> {
+    if !selection.is_empty() || sql.is_empty() {
+        return toggle_line_comment(sql, selection);
+    }
+    let cursor = floor_boundary(sql, selection.start);
+    let region = caret_region(engine, sql, cursor);
+    let mut edit = toggle_line_comment(sql, region.start..region.end.max(region.start))?;
+    // 光标跟着原字符移动：算出它在第几行、行内第几字节，再映射到改写后的同一行。
+    let old = &sql[edit.range.clone()];
+    let mut old_at = 0usize;
+    let mut new_at = 0usize;
+    let mut new_lines = edit.text.split('\n');
+    let mut caret = edit.range.start + edit.text.len();
+    for line in old.split('\n') {
+        let rewritten = new_lines.next().unwrap_or(line);
+        let rel = cursor.saturating_sub(edit.range.start);
+        if rel <= old_at + line.len() {
+            let col = rel.saturating_sub(old_at);
+            let indent = body_of(line).0.len();
+            // 光标在缩进里时不动；在正文里时随正文平移，且不落在去掉的标记里。
+            let moved = if col <= indent {
+                col
+            } else {
+                (col as isize + rewritten.len() as isize - line.len() as isize).max(indent as isize) as usize
+            };
+            caret = edit.range.start + new_at + moved.min(rewritten.len());
+            break;
+        }
+        old_at += line.len() + 1;
+        new_at += rewritten.len() + 1;
+    }
+    edit.selection = caret..caret;
+    Some(edit)
+}
+
+/// 一次块注释切换带来的编辑。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEdit {
+    pub range: Range<usize>,
+    pub text: String,
+    pub selection: Range<usize>,
+    /// 加上块注释（true）还是去掉（false）。
+    pub commented: bool,
+}
+
+/// 光标所在的块注释 `/* … */`（含定界符）。字符串与行注释里的 `/*` 不算。
+fn enclosing_block(sql: &str, cursor: usize) -> Option<Range<usize>> {
+    let bytes = sql.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' | b'"' => {
+                let quote = bytes[at];
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    at += 1;
+                }
+                at += 1;
+            }
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                at = sql[at..].find('\n').map(|found| at + found + 1).unwrap_or(bytes.len());
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                let end = sql[at + 2..].find("*/").map(|found| at + 2 + found + 2).unwrap_or(bytes.len());
+                if at <= cursor && cursor <= end {
+                    return (end <= bytes.len() && sql[..end].ends_with("*/")).then_some(at..end);
+                }
+                at = end;
+            }
+            _ => at += 1,
+        }
+        if at > cursor {
+            return None;
+        }
+    }
+    None
+}
+
+/// ⌘⇧/ 块注释切换。有选区时作用于选区；没有选区时作用于光标所在的块注释（去掉）或光标所在语句（加上）。
+/// 选区本身就是一段 `/* … */` 时去掉一层；正文里已有 `*/` 时无法安全包裹，不动作。
+pub fn toggle_block_comment(engine: &str, sql: &str, selection: Range<usize>) -> Option<BlockEdit> {
+    let mut start = floor_boundary(sql, selection.start.min(selection.end));
+    let mut end = ceil_boundary(sql, selection.start.max(selection.end));
+    if start == end {
+        if let Some(block) = enclosing_block(sql, start) {
+            start = block.start;
+            end = block.end;
+        } else {
+            let span = statement_span(engine, sql, start)?;
+            start = span.start;
+            end = span.end;
+        }
+    }
+    let picked = &sql[start..end];
+    let lead = picked.len() - picked.trim_start().len();
+    let trail = picked.len() - picked.trim_end().len();
+    let inner_start = start + lead;
+    let inner_end = end - trail;
+    if inner_start >= inner_end {
+        return None;
+    }
+    let inner = &sql[inner_start..inner_end];
+    if inner.len() >= 4 && inner.starts_with("/*") && inner.ends_with("*/") && !inner[2..inner.len() - 2].contains("*/") {
+        let body = &inner[2..inner.len() - 2];
+        let body = body.strip_prefix(' ').unwrap_or(body);
+        let body = body.strip_suffix(' ').unwrap_or(body);
+        let text = body.to_owned();
+        let selection = inner_start..inner_start + text.len();
+        return Some(BlockEdit { range: inner_start..inner_end, text, selection, commented: false });
+    }
+    if inner.contains("*/") {
+        return None;
+    }
+    let text = format!("/* {inner} */");
+    let selection = inner_start..inner_start + text.len();
+    Some(BlockEdit { range: inner_start..inner_end, text, selection, commented: true })
+}
+
 #[cfg(test)]
 mod comment_tests {
     use super::*;
@@ -1159,6 +1350,85 @@ mod comment_tests {
         next.push_str(&edit.text);
         next.push_str(&sql[edit.range.end..]);
         (next, edit.selection, edit.commented)
+    }
+
+    fn apply_statement(sql: &str, selection: Range<usize>) -> (String, Range<usize>, bool) {
+        let edit = toggle_statement_comment("mysql", sql, selection).expect("应当发生的注释切换");
+        let mut next = sql.to_owned();
+        next.replace_range(edit.range.clone(), &edit.text);
+        (next, edit.selection, edit.commented)
+    }
+
+    fn apply_block(sql: &str, selection: Range<usize>) -> (String, Range<usize>, bool) {
+        let edit = toggle_block_comment("mysql", sql, selection).expect("应当发生的块注释切换");
+        let mut next = sql.to_owned();
+        next.replace_range(edit.range.clone(), &edit.text);
+        (next, edit.selection, edit.commented)
+    }
+
+    /// 附图类脚本：多个逻辑行、长行（编辑器里会软换行）、无空格逗号与中文字符串。
+    const LONG_INSERT: &str = "-- 同步车辆轨迹\nINSERT INTO track_daily(vehicle_id,begin_time,end_time,mileage,remark,created_at,updated_at,driver_name,plate_no)\nSELECT vehicle_id,min(gps_time),max(gps_time),sum(mileage),'自动汇总，不含停车段的里程数据',now(),now(),driver_name,plate_no\n  FROM track_point\n\n  WHERE gps_time >= '2026-01-01' GROUP BY vehicle_id,driver_name,plate_no;\nSELECT 1;";
+
+    #[test]
+    fn a_selected_multi_line_insert_round_trips_line_by_line() {
+        let sql = LONG_INSERT;
+        let start = sql.find("INSERT").unwrap();
+        let end = sql.find("plate_no;").unwrap() + "plate_no;".len();
+        let (commented, selection, added) = apply_statement(sql, start..end);
+        assert!(added);
+        for line in commented[selection.clone()].split('\n') {
+            assert!(line.trim().is_empty() || line.trim_start().starts_with("-- "), "每个逻辑行都加上前缀：{line:?}");
+            assert!(!line.trim_start().starts_with("-- \n"), "前缀与内容之间不引入换行");
+        }
+        assert_eq!(commented.matches('\n').count(), sql.matches('\n').count(), "不引入换行");
+        let (restored, _, added) = apply_statement(&commented, selection);
+        assert!(!added);
+        assert_eq!(restored, sql, "再按一次全部移除，恢复原样");
+    }
+
+    #[test]
+    fn a_caret_comments_its_whole_statement_and_the_next_press_restores_it() {
+        let sql = LONG_INSERT;
+        let caret = sql.find("FROM track_point").unwrap() + 3;
+        let (commented, selection, added) = apply_statement(sql, caret..caret);
+        assert!(added);
+        assert!(commented.starts_with("-- -- 同步车辆轨迹\n-- INSERT INTO"), "紧贴语句的注释行一起加一层：{commented}");
+        assert!(commented.contains("\n  -- FROM track_point\n\n  -- WHERE"), "空行保持原样：{commented}");
+        assert!(commented.ends_with("\nSELECT 1;"), "下一条语句不动：{commented}");
+        assert!(commented[selection.start..].starts_with(&sql[caret..caret + 8]), "光标跟着原字符");
+        let (restored, back, added) = apply_statement(&commented, selection);
+        assert!(!added);
+        assert_eq!(restored, sql, "光标在注释行上时整段连续注释行一起恢复");
+        assert_eq!(back, caret..caret);
+
+        // 只有一条语句占一行时与行注释一致。
+        let (single, _, _) = apply_statement("SELECT 1;\nSELECT 2;", 12..12);
+        assert_eq!(single, "SELECT 1;\n-- SELECT 2;");
+    }
+
+    #[test]
+    fn block_comments_toggle_for_a_selection_and_for_the_caret_statement() {
+        let sql = "SELECT 1;\nSELECT a,\n  b FROM t;";
+        let start = sql.find("SELECT a").unwrap();
+        let (wrapped, selection, added) = apply_block(sql, start..sql.len());
+        assert!(added);
+        assert_eq!(wrapped, "SELECT 1;\n/* SELECT a,\n  b FROM t; */");
+        let (restored, _, added) = apply_block(&wrapped, selection);
+        assert!(!added);
+        assert_eq!(restored, sql);
+
+        // 无选区：光标所在语句加块注释，光标在块注释里时去掉。
+        let caret = sql.find("b FROM").unwrap();
+        let (wrapped, _, added) = apply_block(sql, caret..caret);
+        assert!(added);
+        assert_eq!(wrapped, "SELECT 1;\n/* SELECT a,\n  b FROM t; */");
+        let inside = wrapped.find("b FROM").unwrap();
+        let (restored, _, added) = apply_block(&wrapped, inside..inside);
+        assert!(!added);
+        assert_eq!(restored, sql);
+
+        // 正文里已有 */ 时不能安全包裹。
+        assert!(toggle_block_comment("mysql", "SELECT '*/' x;", 0..14).is_none());
     }
 
     #[test]

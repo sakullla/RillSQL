@@ -33,6 +33,8 @@ pub enum Clause {
     Set,
     Values,
     Use,
+    /// `INSERT INTO t (` 的列清单。
+    Insert,
 }
 
 impl Clause {
@@ -58,8 +60,26 @@ impl Clause {
     }
 
     fn needs_columns(self) -> bool {
-        self.field_first() || matches!(self, Clause::On | Clause::Set | Clause::Values)
+        self.field_first() || matches!(self, Clause::On | Clause::Set | Clause::Values | Clause::Insert)
     }
+}
+
+/// 光标所在的语法位置：决定给哪些候选、各组怎么排。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Position {
+    /// 语句开头：只给语句起始关键字与片段；没有关键字命中时才给对象。
+    Start,
+    /// FROM/JOIN/INTO/UPDATE/TABLE 之后：对象优先。
+    Object,
+    /// SELECT 列表、WHERE/ON/HAVING、GROUP/ORDER BY：列 > 函数 > 关键字。
+    Expression,
+    /// INSERT 列表、VALUES、SET：目标表的列。
+    Target,
+    /// USE 之后：只给库。
+    Database,
+    /// 认不出的位置：给全部候选。
+    #[default]
+    Other,
 }
 
 /// FROM/JOIN/UPDATE/INSERT 里的一处来源。alias 是语句里实际使用的名字。
@@ -108,6 +128,7 @@ pub struct Plan {
     pub note: Option<String>,
     pub span: Span,
     pub clause: Option<Clause>,
+    pub position: Position,
 }
 
 impl Plan {
@@ -137,6 +158,19 @@ mod group {
     pub const FUNCTION: u8 = 6;
     pub const KEYWORD: u8 = 7;
     pub const SNIPPET: u8 = 8;
+
+    use super::Position;
+
+    /// 按语法位置决定的组顺序：语句开头关键字/片段在前；表达式位置列 > 函数 > 关键字；
+    /// 其余位置沿用组编号本身的顺序（条件 < 列 < 对象 < … < 关键字 < 片段）。
+    pub fn rank(position: Position, group: u8) -> u8 {
+        let order: &[u8] = match position {
+            Position::Start => &[KEYWORD, SNIPPET, OBJECT, CTE, DATABASE, SCHEMA, FUNCTION, COLUMN, CONDITION],
+            Position::Expression => &[CONDITION, COLUMN, FUNCTION, KEYWORD, CTE, OBJECT, DATABASE, SCHEMA, SNIPPET],
+            _ => return group,
+        };
+        order.iter().position(|have| *have == group).map(|at| at as u8).unwrap_or(group)
+    }
 }
 
 /// 词法记号。text 是引用标识符去掉引号后的名字；start/end 是原文里的字节范围（含引号）。
@@ -353,31 +387,69 @@ fn reserved(word: &str) -> bool {
 }
 
 /// 解析当前语句：子句、FROM/JOIN 来源与别名、WITH 定义的 CTE、UPDATE/INSERT 目标。
+///
+/// 子句按括号深度计算：子查询里的 FROM/WHERE 只影响子查询本身，括号闭合后回到外层子句；
+/// 已闭合子查询里的来源也不再算作当前来源。
 pub fn parse_scope(statement: &str) -> StatementScope {
-    let (mut scope, depth) = scan_scope(statement);
-    scope.tables.retain(|table| table.depth <= depth);
+    let scan = scan_scope(statement);
+    let mut scope = scan.scope;
+    let mut live = scan.live.into_iter();
+    scope.tables.retain(|_| live.next().unwrap_or(false));
     scope
 }
 
-/// 与 parse_scope 相同，但保留所有括号层的来源，并返回文本末尾所在的括号深度。
-fn scan_scope(statement: &str) -> (StatementScope, usize) {
+/// 一次扫描的结果：全部来源（含已闭合子查询里的），
+/// 以及每个来源在文本末尾是否仍然可见（所在括号未闭合）。
+struct Scan {
+    scope: StatementScope,
+    live: Vec<bool>,
+}
+
+/// 与 parse_scope 相同，但保留所有括号层的来源。
+fn scan_scope(statement: &str) -> Scan {
     let (tokens, _) = lex(statement);
     let mut scope = StatementScope::default();
+    // 每层括号各自的子句；新开的括号继承外层子句（函数参数、VALUES (、IN (），里面出现子句关键字时再覆盖。
+    let mut clauses: Vec<Option<Clause>> = vec![None];
+    let mut live: Vec<bool> = Vec::new();
     let mut depth = 0usize;
     let mut here = 0usize;
     let mut index = 0usize;
+    // 刚读完 INSERT 目标表：紧跟的左括号是列清单。
+    let mut insert_list = false;
+    let set_clause = |clauses: &mut Vec<Option<Clause>>, clause: Clause| {
+        if let Some(slot) = clauses.last_mut() {
+            *slot = Some(clause);
+        }
+    };
     while index < tokens.len() {
         let token = &tokens[index];
         if !token.word {
             match token.text.as_str() {
-                "(" => depth += 1,
-                ")" => depth = depth.saturating_sub(1),
+                "(" => {
+                    depth += 1;
+                    let inherited = if insert_list { Some(Clause::Insert) } else { clauses.last().copied().flatten() };
+                    clauses.push(inherited);
+                }
+                ")" => {
+                    depth = depth.saturating_sub(1);
+                    if clauses.len() > 1 {
+                        clauses.pop();
+                    }
+                    for (alive, table) in live.iter_mut().zip(scope.tables.iter()) {
+                        if table.depth > depth {
+                            *alive = false;
+                        }
+                    }
+                }
                 _ => {}
             }
+            insert_list = false;
             here = depth;
             index += 1;
             continue;
         }
+        insert_list = false;
         let upper = token.text.to_ascii_uppercase();
         if upper == "WITH" {
             index = read_ctes(&tokens, index + 1, &mut scope.ctes);
@@ -387,25 +459,34 @@ fn scan_scope(statement: &str) -> (StatementScope, usize) {
             let (table, next) = read_target(&tokens, index + 1, here);
             if table.is_some() {
                 scope.target = table;
+                insert_list = upper == "INTO";
             }
             index = next;
             continue;
         }
         if upper == "FROM" || upper == "JOIN" {
-            scope.clause = Some(if upper == "FROM" { Clause::From } else { Clause::Join });
+            set_clause(&mut clauses, if upper == "FROM" { Clause::From } else { Clause::Join });
             let next = read_tables(&tokens, index + 1, &mut scope.tables, here);
+            live.resize(scope.tables.len(), true);
             if upper == "JOIN" {
-                scope.on_tables = scope.tables.iter().map(|table| table.alias.clone()).collect();
+                scope.on_tables = scope
+                    .tables
+                    .iter()
+                    .zip(live.iter())
+                    .filter(|(_, alive)| **alive)
+                    .map(|(table, _)| table.alias.clone())
+                    .collect();
             }
             index = next;
             continue;
         }
         if let Some(clause) = Clause::of(&upper) {
-            scope.clause = Some(clause);
+            set_clause(&mut clauses, clause);
         }
         index += 1;
     }
-    (scope, depth)
+    scope.clause = clauses.last().copied().flatten();
+    Scan { scope, live }
 }
 
 /// 词法记号和“光标落在未闭合的字符串/引用/注释里”标志；签名提示等纯计算复用同一套词法。
@@ -451,8 +532,8 @@ fn tail_tables(tail: &str) -> Vec<TableRef> {
             _ => {}
         }
     }
-    let (scope, _) = scan_scope(&tail[..cut]);
-    scope.tables.into_iter().filter(|table| table.depth == 0).collect()
+    let scan = scan_scope(&tail[..cut]);
+    scan.scope.tables.into_iter().filter(|table| table.depth == 0).collect()
 }
 
 fn read_target(tokens: &[Tok], start: usize, depth: usize) -> (Option<TableRef>, usize) {
@@ -782,17 +863,24 @@ const FROM_CLAUSE_KEYWORDS: &[&str] = &[
     "LIMIT", "OFFSET", "UNION", "ALL", "LATERAL", "SELECT",
 ];
 
+/// 语句开头能出现的关键字（通用 SQL 语句起始词）。常用词在前。
+const START_KEYWORDS: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "CREATE", "ALTER", "DROP", "TRUNCATE", "SET", "USE", "SHOW", "EXPLAIN",
+    "DESCRIBE", "BEGIN", "COMMIT", "ROLLBACK", "GRANT", "REVOKE", "CALL", "EXECUTE", "MERGE", "REPLACE", "VALUES",
+];
+
 struct Gather<'a> {
     engine: &'a str,
     prefix: &'a str,
     locale: Locale,
     items: Vec<(usize, Candidate)>,
     order: usize,
+    position: Position,
 }
 
 impl<'a> Gather<'a> {
     fn new(engine: &'a str, prefix: &'a str, locale: Locale) -> Self {
-        Self { engine, prefix, locale, items: Vec::new(), order: 0 }
+        Self { engine, prefix, locale, items: Vec::new(), order: 0, position: Position::Other }
     }
 
     fn push(&mut self, label: String, insert: String, kind: &'static str, detail: String, group: u8, keyword: bool) {
@@ -907,6 +995,11 @@ impl<'a> Gather<'a> {
         self.push_keyword_list(&words);
     }
 
+    fn push_start_keywords(&mut self) {
+        let words: Vec<String> = START_KEYWORDS.iter().map(|word| (*word).to_owned()).collect();
+        self.push_keyword_list(&words);
+    }
+
     fn push_from_keywords(&mut self) {
         let mut words: Vec<String> = FROM_CLAUSE_KEYWORDS.iter().map(|word| (*word).to_owned()).collect();
         for word in dialect_words(self.engine) {
@@ -1007,12 +1100,13 @@ fn internal_rank(label: &str, group: u8) -> u8 {
 
 fn finalize(mut gather: Gather<'_>, frequency: &HashMap<String, u32>) -> Vec<Candidate> {
     let prefix = gather.prefix.to_owned();
+    let position = gather.position;
     gather.items.sort_by(|left, right| {
-        // 顺序：子句分组 → 匹配精度 → 对象类型 → 用户表先于内部表 → 本地词频 → 出现顺序。
+        // 顺序：位置决定的分组 → 匹配精度 → 对象类型 → 用户表先于内部表 → 本地词频 → 出现顺序。
         // 词频只在同一分组、同一精度、同一类型之间才起作用。
         let key = |(order, item): &(usize, Candidate)| {
             (
-                item.group,
+                group::rank(position, item.group),
                 match_tier(&item.label, &prefix, item.keyword).unwrap_or(9),
                 type_rank(item.kind),
                 internal_rank(&item.label, item.group),
@@ -1215,6 +1309,7 @@ fn redis_plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale
         note: None,
         span: Span { start, end },
         clause: None,
+        position: Position::Other,
     }
 }
 
@@ -1269,6 +1364,8 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     }
     plan.clause = statement.clause;
     let clause = statement.clause;
+    let position = position_of(&local[..word_start], clause);
+    plan.position = position;
     let sources = resolve_sources(scope, &statement.tables);
     let metadata_ok = !matches!(
         scope.state,
@@ -1276,6 +1373,7 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     );
     let frequency: HashMap<String, u32> = scope.frequency.iter().cloned().collect();
     let mut gather = Gather::new(&scope.engine, &prefix, locale);
+    gather.position = position;
 
     // 限定符：别名/表名只出该来源的列；模式只出该模式的对象；都不是就不回退无关列。
     if let Some((name, _)) = qualifier {
@@ -1317,6 +1415,31 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     // 需要列的来源确实没有任何列时的说明范围；只由来源本身决定，不看被前缀过滤后的候选。
     // 回退候选（对象/关键字）不受它限制：前缀没命中列时也要有正常候选。
     let mut column_gap: Option<String> = None;
+    match position {
+        Position::Start => {
+            gather.push_start_keywords();
+            gather.push_snippets();
+            // 语句开头不给表名，除非没有任何关键字命中（例如直接敲表名查对象）。
+            if !gather.has_group(group::KEYWORD) && metadata_ok {
+                gather.push_objects(scope);
+            }
+            plan.candidates = finalize(gather, &frequency);
+            plan.note = state_note(&scope.state, locale);
+            return plan;
+        }
+        Position::Object if !matches!(clause, Some(Clause::From) | Some(Clause::Join)) => {
+            // INTO / UPDATE / TABLE 之后：只要对象。
+            if metadata_ok {
+                gather.push_objects(scope);
+                gather.push_schemas(scope);
+            }
+            gather.push_ctes(&statement);
+            plan.candidates = finalize(gather, &frequency);
+            plan.note = state_note(&scope.state, locale);
+            return plan;
+        }
+        _ => {}
+    }
     match clause {
         Some(Clause::Use) => gather.push_databases(scope),
         Some(Clause::On) => {
@@ -1361,7 +1484,7 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 fallback_objects(&mut gather, scope, &statement, metadata_ok);
             }
         }
-        Some(Clause::Set) | Some(Clause::Values) => {
+        Some(Clause::Set) | Some(Clause::Values) | Some(Clause::Insert) => {
             let mut picked: Vec<Source> = Vec::new();
             if metadata_ok {
                 picked = match target {
@@ -1442,6 +1565,25 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     plan
 }
 
+/// 光标所在的语法位置。`head` 是当前语句里光标所在词之前的文本。
+fn position_of(head: &str, clause: Option<Clause>) -> Position {
+    let (tokens, _) = lex(head);
+    let Some(prev) = tokens.last() else {
+        return Position::Start;
+    };
+    if prev.word && !prev.quoted && matches!(prev.text.to_ascii_uppercase().as_str(), "INTO" | "UPDATE" | "TABLE") {
+        return Position::Object;
+    }
+    match clause {
+        Some(Clause::From) | Some(Clause::Join) => Position::Object,
+        Some(Clause::Use) => Position::Database,
+        Some(Clause::Set) | Some(Clause::Values) | Some(Clause::Insert) => Position::Target,
+        Some(Clause::On) => Position::Expression,
+        Some(clause) if clause.field_first() => Position::Expression,
+        _ => Position::Other,
+    }
+}
+
 /// 光标处标识符解析出的目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolved {
@@ -1516,7 +1658,7 @@ pub fn resolve(scope: &CompletionScope, text: &str, offset: usize) -> Option<Res
         parts.drain(..skip);
         pos -= skip;
     }
-    let (parsed, _) = scan_scope(statement);
+    let parsed = scan_scope(statement).scope;
     let mut refs = parsed.tables;
     if let Some(target) = parsed.target {
         refs.push(target);
@@ -1788,6 +1930,99 @@ mod tests {
     fn ranking_keeps_keywords_ahead_of_objects_and_uses_frequency_on_ties() {
         let planned = at("SEL");
         assert_eq!(planned.candidates.first().map(|item| item.label.as_str()), Some("SELECT"));
+    }
+
+    #[test]
+    fn statement_start_offers_select_first_and_no_tables_before_keywords() {
+        // 库里有一张 sessions 表也能被 se 命中：语句开头只给起始关键字与片段。
+        let mut busy = scope("postgres");
+        busy.objects.push(object("sessions", "public", "table"));
+        busy.objects.push(object("settings", "public", "table"));
+        let planned = plan(&busy, "se", 2, Locale::ZhCn);
+        assert_eq!(planned.position, Position::Start);
+        let names = labels(&planned);
+        assert_eq!(names.first().map(String::as_str), Some("SELECT"), "{names:?}");
+        assert!(!planned.candidates.iter().any(|item| item.kind == "table"), "语句开头有关键字命中时不给表：{names:?}");
+        assert!(!names.contains(&"WHERE".to_owned()), "只给语句起始关键字：{names:?}");
+
+        // 第二条语句开头同样处理。
+        let sql = "select 1;\nse";
+        let planned = plan(&busy, sql, sql.len(), Locale::ZhCn);
+        assert_eq!(labels(&planned).first().map(String::as_str), Some("SELECT"));
+
+        // 没有任何关键字命中时才给对象。
+        let planned = plan(&busy, "sess", 4, Locale::ZhCn);
+        assert!(labels(&planned).contains(&"public.sessions".to_owned()), "{:?}", labels(&planned));
+    }
+
+    #[test]
+    fn from_position_offers_current_tables_and_views_first() {
+        let mut mixed = scope("postgres");
+        mixed.objects.push(object("daily", "public", "view"));
+        let planned = plan(&mixed, "SELECT * FROM ", 14, Locale::ZhCn);
+        assert_eq!(planned.position, Position::Object);
+        let kinds: Vec<&str> = planned.candidates.iter().map(|item| item.kind).collect();
+        let first_other = kinds.iter().position(|kind| !matches!(*kind, "table" | "view")).unwrap_or(kinds.len());
+        assert_eq!(first_other, 3, "表/视图在最前：{:?}", labels(&planned));
+        assert!(!planned.candidates.iter().any(|item| item.kind == "column" || item.kind == "function"));
+
+        // INSERT INTO / UPDATE 后同样只给对象。
+        for sql in ["INSERT INTO ", "UPDATE "] {
+            let planned = plan(&mixed, sql, sql.len(), Locale::ZhCn);
+            assert_eq!(planned.position, Position::Object, "{sql}");
+            assert!(planned.candidates.iter().all(|item| matches!(item.kind, "table" | "view" | "schema")), "{sql}: {:?}", labels(&planned));
+        }
+    }
+
+    #[test]
+    fn alias_qualifier_before_from_offers_only_that_table() {
+        let sql = "SELECT a. FROM orders a";
+        let cursor = "SELECT a.".len();
+        let planned = plan(&scope("postgres"), sql, cursor, Locale::ZhCn);
+        let names = labels(&planned);
+        assert_eq!(names, vec!["id".to_owned(), "customer_id".to_owned(), "status".to_owned()]);
+        assert!(planned.candidates.iter().all(|item| item.kind == "column"));
+    }
+
+    #[test]
+    fn subquery_from_does_not_change_the_outer_clause() {
+        let sql = "SELECT * FROM orders o WHERE o.customer_id IN (SELECT id FROM customers) AND st";
+        let planned = at(sql);
+        assert_eq!(planned.clause, Some(Clause::Where));
+        assert_eq!(planned.position, Position::Expression);
+        assert_eq!(labels(&planned).first().map(String::as_str), Some("status"), "{:?}", labels(&planned));
+        assert!(!labels(&planned).contains(&"name".to_owned()), "已闭合子查询的 customers 不再是来源");
+
+        // SELECT 列表里的标量子查询闭合后仍是 SELECT 列表。
+        let scalar = parse_scope("SELECT (SELECT max(id) FROM customers), ");
+        assert_eq!(scalar.clause, Some(Clause::Select));
+        assert!(scalar.tables.is_empty(), "{:?}", scalar.tables);
+        // 未闭合的子查询里按子查询自己的子句。
+        assert_eq!(parse_scope("SELECT * FROM t WHERE x IN (SELECT a FROM ").clause, Some(Clause::From));
+        assert_eq!(parse_scope("SELECT * FROM t WHERE x IN (SELECT a FROM u WHERE ").clause, Some(Clause::Where));
+        // 函数参数继承外层子句。
+        assert_eq!(parse_scope("SELECT count(").clause, Some(Clause::Select));
+        // INSERT 列清单给目标表的列。
+        assert_eq!(parse_scope("INSERT INTO orders (").clause, Some(Clause::Insert));
+        let insert = at("INSERT INTO orders (id, ");
+        assert_eq!(insert.position, Position::Target);
+        assert!(insert.candidates.iter().all(|item| item.kind == "column"), "{:?}", labels(&insert));
+        assert!(labels(&insert).contains(&"status".to_owned()));
+        assert_eq!(parse_scope("INSERT INTO orders (id) SELECT ").clause, Some(Clause::Select));
+    }
+
+    #[test]
+    fn expression_positions_rank_columns_then_functions_then_keywords() {
+        let sql = "SELECT * FROM orders o WHERE c";
+        let planned = at(sql);
+        let first = |kind: &str| planned.candidates.iter().position(|item| item.kind == kind);
+        let column = first("column").expect("column");
+        let function = first("function").expect("function");
+        let keyword = first("keyword").expect("keyword");
+        assert!(column < function && function < keyword, "{:?}", labels(&planned));
+        if let Some(table) = first("table") {
+            assert!(keyword < table, "{:?}", labels(&planned));
+        }
     }
 
     #[test]

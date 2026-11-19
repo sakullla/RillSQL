@@ -181,6 +181,10 @@ pub struct QueryPane {
     /// 存的是按下快捷键时活动查询标签的 id；那时不是查询工作项就不挂起，
     /// 之后切了工作项或标签，请求按 id 对不上作废，不落在别的页面或别的标签上。
     pending_comment: Option<String>,
+    /// 挂起的注释请求是块注释（⌘⇧/）而不是行注释（⌘/）。
+    pending_block_comment: bool,
+    /// 最近一次格式化失败的位置：(查询标签, 原文字节偏移, 当时的草稿)。草稿改过后不再跳转。
+    format_failure: Option<(String, usize, String)>,
     /// 结果页签条的滚动句柄：跨帧保存，不能每帧新建。
     result_scroll: gpui_kit::ScrollHandle,
     /// 上一次已经滚过的（当前页签下标，页签数量）。
@@ -260,6 +264,19 @@ pub fn error_marks(draft: &str, results: &[desk::StatementView]) -> Vec<(Range<u
         }
     }
     marks
+}
+
+/// 编辑器要呈现的执行错误：错误位置、出错语句范围（语句底色）、错误码与原文。
+pub fn exec_errors(draft: &str, results: &[desk::StatementView]) -> Vec<crate::ui::ExecError> {
+    results
+        .iter()
+        .filter_map(|view| {
+            let (range, message) = error_marks(draft, std::slice::from_ref(view)).into_iter().next()?;
+            let statement = view.range.map(|(start, end)| start..end).filter(|range| range.start < range.end && range.end <= draft.len());
+            let code = crate::adapters::query::error_code(&view.message);
+            Some(crate::ui::ExecError { range, statement, code, message })
+        })
+        .collect()
 }
 
 /// 偏移所在的整行（不含换行和行尾 \r）。
@@ -566,6 +583,8 @@ impl QueryPane {
             target_picker: target::TargetPicker::default(),
             connect_request: None,
             pending_comment: None,
+            pending_block_comment: false,
+            format_failure: None,
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
@@ -960,8 +979,9 @@ impl QueryPane {
         // 行注释：命令层没有窗口，先挂起，下一帧只对真正有焦点的 SQL 编辑器执行。
         // 只有当前活动工作项就是这次请求的查询标签时才挂起；表格/结构/设置等页面
         // 按同一条快捷键什么都不排，回到查询时也不会执行这次残留的请求。
-        if id == "toggle-comment" {
+        if id == "toggle-comment" || id == "toggle-block-comment" {
             self.pending_comment = if self.context_active { self.desk.active_id().map(str::to_owned) } else { None };
+            self.pending_block_comment = id == "toggle-block-comment";
             cx.notify();
             return;
         }
@@ -1033,6 +1053,13 @@ impl QueryPane {
                     self.desk.set_active_note(&i18n::text(self.locale, "query.errors.copied"));
                 }
                 None => self.desk.set_active_note(&i18n::text(self.locale, "query.log.noPosition")),
+            }
+            cx.notify();
+            return;
+        }
+        if id == "jump-format-error" {
+            if !self.jump_to_format_failure(cx) {
+                self.desk.set_active_note(&i18n::text(self.locale, "query.log.noPosition"));
             }
             cx.notify();
             return;
@@ -1555,9 +1582,9 @@ impl QueryPane {
         if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
             return;
         }
-        let marked = error_marks(&text, self.desk.results());
-        if !marked.is_empty() {
-            editor.update(cx, |editor, cx| editor.mark_error_messages(marked, cx));
+        let errors = exec_errors(&text, self.desk.results());
+        if !errors.is_empty() {
+            editor.update(cx, |editor, cx| editor.mark_exec_errors(errors, cx));
         }
     }
 
@@ -1565,6 +1592,7 @@ impl QueryPane {
         if self.refuse_missing_target(cx) {
             return;
         }
+        self.format_failure = None;
         // 重新执行：上一次的错误标记不再成立。
         if let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() {
             editor.update(cx, |editor, cx| editor.clear_errors(cx));
@@ -1846,14 +1874,48 @@ impl QueryPane {
     }
 
     fn format(&mut self, cx: &mut Context<Self>) {
+        let draft = self.desk.draft();
         let formatted = self.desk.format_active();
+        self.format_failure = None;
         if formatted.ok {
             self.pending_text = Some(formatted.sql);
             self.desk.set_active_note("");
         } else if let Some(key) = formatted.reason_key {
-            self.desk.set_active_note(&i18n::text(self.locale, key));
+            // 编辑器内容不变；说明里带上行列，旁边给一个“定位”按钮。
+            let mut note = i18n::text(self.locale, key);
+            if let (Some(at), Some(id)) = (formatted.position, self.desk.active_id().map(str::to_owned)) {
+                let (line, col) = crate::query::assist::line_col(&draft, at);
+                note.push_str(&i18n::fill(&i18n::text(self.locale, "query.format.at"), &[("line", &line.to_string()), ("col", &col.to_string())]));
+                self.format_failure = Some((id, at, draft));
+            }
+            self.desk.set_active_note(&note);
         }
         cx.notify();
+    }
+
+    /// 把光标放到格式化失败的位置。草稿在失败之后改过时不跳，免得落到别的字符上。
+    fn jump_to_format_failure(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((id, at, draft)) = self.format_failure.clone() else {
+            return false;
+        };
+        if self.desk.active_id() != Some(id.as_str()) {
+            return false;
+        }
+        let Some(editor) = self.editors.get(&id).cloned() else {
+            return false;
+        };
+        if editor.read(cx).value(cx) != draft {
+            return false;
+        }
+        let end = draft[at..].chars().next().map_or(at, |ch| at + ch.len_utf8());
+        editor.update(cx, |editor, cx| editor.select_range(at..end, cx));
+        self.focus_editor = true;
+        true
+    }
+
+    /// 最近一次格式化失败的位置（测试读取）。
+    pub fn format_failure_at(&self) -> Option<usize> {
+        self.format_failure.as_ref().map(|(_, at, _)| *at)
     }
 
     fn expand(&mut self, cx: &mut Context<Self>) {
@@ -2644,7 +2706,9 @@ impl QueryPane {
         if !editor.read(cx).is_focused(window, cx) {
             return;
         }
-        if !editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)) {
+        let block = std::mem::take(&mut self.pending_block_comment);
+        let changed = editor.update(cx, |editor, cx| if block { editor.toggle_block_comment(window, cx) } else { editor.toggle_comment(window, cx) });
+        if !changed {
             return;
         }
         self.capture(cx);
@@ -3244,6 +3308,19 @@ impl QueryPane {
                     .child(SharedString::from(note))
                     .into_any_element(),
             );
+            let draft_unchanged = self
+                .format_failure
+                .as_ref()
+                .is_some_and(|(id, _, draft)| self.desk.active_id() == Some(id.as_str()) && self.desk.draft() == *draft);
+            if draft_unchanged {
+                let entity = entity.clone();
+                items.push(
+                    kit::secondary_button("query-format-jump", Some(IconName::Crosshair), i18n::text(locale, "query.errors.locate"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("jump-format-error", cx));
+                    })
+                    .into_any_element(),
+                );
+            }
         }
         if let Some(summary) = summary {
             items.push(self.render_row_summary(summary, running, p, metrics, entity));
@@ -3860,6 +3937,7 @@ pub fn requires_active_query(id: &str) -> bool {
             | "pin-result"
             | "toggle-side"
             | "jump-error"
+            | "jump-format-error"
             | "copy-error"
     ) || id.starts_with("statement:")
         || id.starts_with("outline:")
@@ -4833,6 +4911,14 @@ mod tests {
         // 没有位置（SQLite）：整条失败语句。
         let whole = error_ranges(draft, &[failed(ErrorMark::Statement)]);
         assert_eq!(whole, vec![second..end]);
+        // 编辑器呈现用的执行错误：位置、出错语句（铺底色）与从原文读出的错误码。
+        let coded = desk::StatementView { message: "1146 (42S02): Table 'shop.missing' doesn't exist".to_owned(), ..failed(ErrorMark::Offset(at)) };
+        let errors = exec_errors(draft, &[coded]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(&draft[errors[0].range.clone()], "missing");
+        assert_eq!(errors[0].statement, Some(second..end));
+        assert_eq!(errors[0].code.as_deref(), Some("1146"));
+        assert!(errors[0].message.contains("doesn't exist"));
         // 成功的语句没有标记。
         assert!(error_ranges(draft, &[sheet("select 1", false, "ok")]).is_empty());
         // “at end of input”：偏移在语句末尾（全文末尾或换行上）不能得到空范围，改标前一个非空白字符。

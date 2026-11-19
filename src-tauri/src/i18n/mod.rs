@@ -117,6 +117,7 @@ dict! {
     "shell.shortcuts.requestCancel" => "请求取消执行", "Request cancellation";
     "shell.shortcuts.autocomplete" => "补全", "Autocomplete";
     "shell.shortcuts.toggleComment" => "注释 / 取消注释", "Comment / uncomment";
+    "shell.shortcuts.toggleBlockComment" => "块注释 / 取消块注释", "Block comment / uncomment";
     "shell.shortcuts.toggleResults" => "显示 / 隐藏查询结果区", "Show / hide the query results pane";
     "shell.shortcuts.format" => "格式化选中的 SQL；无选中时格式化全部", "Format selected SQL; with nothing selected, format everything";
     "shell.shortcuts.explain" => "查看当前语句的执行计划", "Show the execution plan of the current statement";
@@ -539,6 +540,7 @@ dict! {
     "query.format.comment" => "无法格式化：注释未闭合。", "Cannot format: a comment is unclosed.";
     "query.format.dollar" => "无法格式化：dollar-quote 未闭合。", "Cannot format: a dollar quote is unclosed.";
     "query.format.adjacent" => "无法格式化：会把原本相连的字符拆开。", "Cannot format: that would split characters that were adjacent.";
+    "query.format.at" => "（第 {line} 行第 {col} 列）", " (line {line}, column {col})";
     "query.format.commentBreak" => "无法格式化：会把行注释断开，后面的文本会变成 SQL。", "Cannot format: that would break a line comment and turn the rest into SQL.";
     "query.format.edgeGlue" => "无法格式化：会去掉选区边缘的空白，使两边的字符粘在一起。", "Cannot format: that would remove whitespace at the selection edge and glue the sides together.";
     "conn.page.open" => "打开", "Open";
@@ -1357,6 +1359,7 @@ dict! {
     "grid.status.readonlyReason" => "只读：{reason}", "Read-only: {reason}";
     "query.errors.locate" => "定位到出错位置", "Jump to error";
     "query.errors.copy" => "复制错误", "Copy error";
+    "query.errors.codeTitle" => "执行失败 · 错误码 {code}", "Failed · error code {code}";
     "query.errors.copied" => "已复制错误信息", "Error message copied";
     "query.outline.run" => "运行此语句", "Run this statement";
     "query.results.rename" => "重命名固定结果", "Rename pinned result";

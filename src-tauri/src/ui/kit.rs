@@ -192,15 +192,126 @@ fn paint_editor_surface(dark: bool, cx: &mut App) {
     let name = cx.try_global::<EditorSurface>().map(|current| current.0).unwrap_or("auto");
     let (background, _) = crate::app::views::settings::editor_theme_colors(name, dark);
     let background = hex(background);
-    if cx.theme().highlight_theme.style.editor_background == Some(background) {
+    let theme_name = sql_theme_name(name, dark);
+    let current = &cx.theme().highlight_theme;
+    if current.style.editor_background == Some(background) && current.name == theme_name {
         return;
     }
     Theme::update(cx, |theme| {
         let mut highlight = (*theme.highlight_theme).clone();
+        highlight.name = theme_name;
         highlight.style.editor_background = Some(background);
         highlight.style.editor_gutter_background = Some(background);
+        apply_sql_syntax(&mut highlight.style.syntax, dark);
         theme.highlight_theme = Arc::new(highlight);
     });
+}
+
+fn sql_theme_name(editor_theme: &str, dark: bool) -> String {
+    format!("rillsql-sql-{editor_theme}-{}", if dark { "dark" } else { "light" })
+}
+
+/// SQL 语法里要彼此区分的记号种类，以及它们在浅/深两套配色里的颜色。
+/// 颜色按 WCAG AA（正文 4.5:1）对每一档编辑器底色（auto/contrast/warm/cool/mono）校验，见单测。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlTokenColor {
+    /// 高亮主题里的记号名（tree-sitter 捕获名的前缀）。
+    pub scope: &'static str,
+    pub light: u32,
+    pub dark: u32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// RillSQL 自有 SQL 配色。标识符（variable）用接近正文的颜色，其余各类都换色相，
+/// 关键字另外加粗、注释斜体，色觉差异的人也能靠字形区分。
+pub const SQL_TOKEN_COLORS: &[SqlTokenColor] = &[
+    SqlTokenColor { scope: "keyword", light: 0x0b4fb3, dark: 0x79b8ff, bold: true, italic: false },
+    SqlTokenColor { scope: "function", light: 0x6a2bb8, dark: 0xd2a8ff, bold: false, italic: false },
+    SqlTokenColor { scope: "type", light: 0x8a4600, dark: 0xf0b46a, bold: false, italic: false },
+    SqlTokenColor { scope: "string", light: 0x0a6636, dark: 0x7ee787, bold: false, italic: false },
+    SqlTokenColor { scope: "number", light: 0xa33200, dark: 0xffab70, bold: false, italic: false },
+    SqlTokenColor { scope: "boolean", light: 0xa33200, dark: 0xffab70, bold: false, italic: false },
+    SqlTokenColor { scope: "comment", light: 0x5a6470, dark: 0x96a0ab, bold: false, italic: true },
+    SqlTokenColor { scope: "operator", light: 0x3b4350, dark: 0xc3cad3, bold: false, italic: false },
+    SqlTokenColor { scope: "punctuation", light: 0x4b5563, dark: 0xb4bcc6, bold: false, italic: false },
+    SqlTokenColor { scope: "variable", light: 0x1f2937, dark: 0xe6edf3, bold: false, italic: false },
+    SqlTokenColor { scope: "property", light: 0x1f2937, dark: 0xe6edf3, bold: false, italic: false },
+    SqlTokenColor { scope: "attribute", light: 0x8a4600, dark: 0xf0b46a, bold: false, italic: false },
+    SqlTokenColor { scope: "variable.special", light: 0x9c1d6b, dark: 0xff8fc8, bold: false, italic: false },
+];
+
+/// 一种记号在当前明暗下的颜色。
+#[cfg(test)]
+pub fn sql_token_color(scope: &str, dark: bool) -> Option<u32> {
+    SQL_TOKEN_COLORS.iter().find(|token| token.scope == scope).map(|token| if dark { token.dark } else { token.light })
+}
+
+fn theme_style(color: u32, bold: bool, italic: bool) -> Option<gpui_kit::component::highlighter::ThemeStyle> {
+    let mut value = serde_json::json!({ "color": format!("#{color:06x}") });
+    if bold {
+        value["font_weight"] = serde_json::json!(700);
+    }
+    if italic {
+        value["font_style"] = serde_json::json!("italic");
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// 把 RillSQL 的 SQL 配色写进高亮主题的语法颜色。
+fn apply_sql_syntax(syntax: &mut gpui_kit::component::highlighter::SyntaxColors, dark: bool) {
+    for token in SQL_TOKEN_COLORS {
+        let style = theme_style(if dark { token.dark } else { token.light }, token.bold, token.italic);
+        let slot = match token.scope {
+            "keyword" => &mut syntax.keyword,
+            "function" => &mut syntax.function,
+            "type" => &mut syntax.type_,
+            "string" => &mut syntax.string,
+            "number" => &mut syntax.number,
+            "boolean" => &mut syntax.boolean,
+            "comment" => &mut syntax.comment,
+            "operator" => &mut syntax.operator,
+            "punctuation" => &mut syntax.punctuation,
+            "variable" => &mut syntax.variable,
+            "property" => &mut syntax.property,
+            "attribute" => &mut syntax.attribute,
+            "variable.special" => &mut syntax.variable_special,
+            _ => continue,
+        };
+        *slot = style;
+    }
+    // 子类回退到父类时不能被组件库默认主题里的同名子项截走。
+    syntax.punctuation_bracket = None;
+    syntax.punctuation_delimiter = None;
+    syntax.punctuation_special = None;
+    syntax.comment_doc = None;
+    syntax.string_escape = None;
+    syntax.string_special = None;
+}
+
+/// WCAG 2.x 相对亮度。
+#[cfg(test)]
+pub fn relative_luminance(color: u32) -> f64 {
+    let channel = |shift: u32| {
+        let value = ((color >> shift) & 0xff) as f64 / 255.0;
+        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// WCAG 2.x 对比度（1..=21）。
+#[cfg(test)]
+pub fn contrast_ratio(foreground: u32, background: u32) -> f64 {
+    let (a, b) = (relative_luminance(foreground), relative_luminance(background));
+    let (light, dark) = if a > b { (a, b) } else { (b, a) };
+    (light + 0.05) / (dark + 0.05)
+}
+
+/// 当前高亮主题里某个记号的颜色（测试用）。
+#[cfg(test)]
+pub fn syntax_color(cx: &App, scope: &str) -> Option<Hsla> {
+    use gpui_kit::component::input::HighlightStyleResolver as _;
+    cx.theme().highlight_theme.style(scope).and_then(|style| style.color)
 }
 
 /// 行号栏当前的底色（测试用）：与编辑器正文的配色底色应当一致。
@@ -2991,6 +3102,65 @@ mod control_tests {
             assert_eq!(editor_gutter_background(cx), Some(hex(crate::app::views::settings::editor_theme_colors("warm", true).0)));
             apply_theme(false, cx);
             assert_eq!(editor_gutter_background(cx), Some(hex(crate::app::views::settings::editor_theme_colors("warm", false).0)), "切明暗后沿用当前配色");
+        });
+    }
+
+    /// 自有 SQL 配色：每种记号在每一档编辑器底色（浅/深）上都满足 WCAG AA 正文对比度 4.5:1。
+    #[test]
+    fn sql_token_colors_meet_wcag_aa_on_every_editor_background() {
+        assert!((contrast_ratio(0x000000, 0xffffff) - 21.0).abs() < 1e-9);
+        assert!((contrast_ratio(0x777777, 0x777777) - 1.0).abs() < 1e-9);
+        for editor_theme in ["auto", "contrast", "warm", "cool", "mono"] {
+            for dark in [false, true] {
+                let (background, _) = crate::app::views::settings::editor_theme_colors(editor_theme, dark);
+                for token in SQL_TOKEN_COLORS {
+                    let color = if dark { token.dark } else { token.light };
+                    let ratio = contrast_ratio(color, background);
+                    assert!(ratio >= 4.5, "{} 在 {editor_theme}/{dark} 底色 #{background:06x} 上只有 {ratio:.2}:1", token.scope);
+                }
+            }
+        }
+    }
+
+    /// 关键字、字符串、注释、标识符、函数、数字彼此可区分：颜色两两不同且色差足够大。
+    #[test]
+    fn sql_token_kinds_are_distinguishable() {
+        let kinds = ["keyword", "string", "comment", "variable", "function", "number"];
+        for dark in [false, true] {
+            let colors: Vec<(&str, u32)> = kinds.iter().map(|kind| (*kind, sql_token_color(kind, dark).expect(kind))).collect();
+            for (index, (left, a)) in colors.iter().enumerate() {
+                for (right, b) in colors.iter().skip(index + 1) {
+                    let distance = [16u32, 8, 0]
+                        .iter()
+                        .map(|shift| ((*a >> shift) & 0xff) as i32 - ((*b >> shift) & 0xff) as i32)
+                        .map(|delta| (delta * delta) as f64)
+                        .sum::<f64>()
+                        .sqrt();
+                    assert!(distance >= 60.0, "{left} 与 {right} 太接近（dark={dark}，距离 {distance:.0}）");
+                }
+            }
+        }
+        for token in SQL_TOKEN_COLORS {
+            assert!(theme_style(token.light, token.bold, token.italic).is_some(), "{} 的样式要能写进高亮主题", token.scope);
+        }
+    }
+
+    /// 切换明暗与编辑器配色后，高亮主题里用的是 RillSQL 自己的语法颜色，子类记号回退到父类。
+    #[gpui_kit::test]
+    fn the_highlight_theme_uses_rillsql_sql_colors(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for dark in [false, true] {
+                apply_theme(dark, cx);
+                for scope in ["keyword", "string", "comment", "variable", "function", "number"] {
+                    assert_eq!(syntax_color(cx, scope), sql_token_color(scope, dark).map(hex), "{scope} dark={dark}");
+                }
+                assert_eq!(syntax_color(cx, "function.call"), sql_token_color("function", dark).map(hex), "function.call 回退到 function");
+                assert_eq!(syntax_color(cx, "keyword.operator"), sql_token_color("keyword", dark).map(hex));
+                set_editor_surface("warm", cx);
+                assert_eq!(syntax_color(cx, "keyword"), sql_token_color("keyword", dark).map(hex), "换配色不丢语法颜色");
+                set_editor_surface("auto", cx);
+            }
         });
     }
 
