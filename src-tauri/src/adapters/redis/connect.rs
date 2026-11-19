@@ -6,7 +6,7 @@ use std::time::Duration;
 use redis::ConnectionAddr;
 
 use super::cluster;
-use super::conn::{NodeFactory, RedisConn, RedisHandle, Topology};
+use super::conn::{ClusterFallback, NodeFactory, RedisConn, RedisHandle, Topology};
 use crate::adapters::session::{CatalogSession, Connector, NoCancel, Opened, RedisAccess, Session};
 use crate::connections::model::{SavedConnection, TlsMode};
 use crate::connections::route::{self, Route};
@@ -83,22 +83,66 @@ pub(crate) fn cluster_enabled(info: &str) -> bool {
     info.lines().any(|line| line.trim() == "cluster_enabled:1")
 }
 
+type ClusterOpen = (redis::cluster_async::ClusterConnection, redis::cluster::ClusterClient, Vec<cluster::ClusterNode>);
+
+/// 建集群连接时单个节点的连接超时。种子节点已经连上，公告的节点连不上多半是地址不可达，不必久等。
+const CLUSTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 当前已建好的单节点连接与集群尝试的结果如何落地：
+/// 不是集群 → 单机；经 SSH 隧道 → 不尝试，退回单节点；尝试成功 → 集群；尝试失败 → 退回单节点并记下原因。
+/// 连接不会因为集群连接建不起来而整个打开失败。
+pub(crate) enum ClusterSettle<T> {
+    Single,
+    Cluster(T),
+    Fallback(ClusterFallback),
+}
+
+pub(crate) fn settle_cluster<T>(cluster_enabled: bool, tunneled: bool, attempt: Option<Result<T, StageError>>) -> ClusterSettle<T> {
+    if !cluster_enabled {
+        return ClusterSettle::Single;
+    }
+    if tunneled {
+        return ClusterSettle::Fallback(ClusterFallback::Tunnel);
+    }
+    match attempt {
+        Some(Ok(opened)) => ClusterSettle::Cluster(opened),
+        Some(Err(StageError::Fail { message, .. })) => ClusterSettle::Fallback(ClusterFallback::Unreachable(message)),
+        Some(Err(_)) => ClusterSettle::Fallback(ClusterFallback::Unreachable(String::new())),
+        None => ClusterSettle::Fallback(ClusterFallback::Unreachable(String::new())),
+    }
+}
+
+/// 测试用：这些连接 id 建集群连接时把节点公告的地址换成不可达的本机端口，模拟 NAT / 容器内地址。
+#[cfg(test)]
+pub(crate) static UNREACHABLE_ANNOUNCE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn announced(config: &SavedConnection, node: &cluster::ClusterNode) -> (String, u16) {
+    #[cfg(test)]
+    if UNREACHABLE_ANNOUNCE.lock().map(|ids| ids.contains(&config.id)).unwrap_or(false) {
+        return ("127.0.0.1".to_owned(), 1);
+    }
+    let _ = config;
+    (node.host.clone(), node.port)
+}
+
 /// 集群会话：从种子节点读节点表，再以全部主节点为初始节点建立自动路由的集群连接。
-/// 经 SSH 隧道时节点公告的地址在本机不可达，只能按单节点会话浏览（只看到该节点的槽）。
-async fn open_cluster(
-    seed: &mut redis::aio::MultiplexedConnection,
-    factory: &NodeFactory,
-    route: &Route,
-) -> Result<(redis::cluster_async::ClusterConnection, redis::cluster::ClusterClient, Vec<cluster::ClusterNode>), StageError> {
+/// 失败由调用方退回单节点会话（见 [`settle_cluster`]）。
+async fn open_cluster(seed: &mut redis::aio::MultiplexedConnection, factory: &NodeFactory, route: &Route) -> Result<ClusterOpen, StageError> {
     let text: String = redis::cmd("CLUSTER").arg("NODES").query_async(seed).await.map_err(|err| redis_stage(route.tls_mode, &err))?;
     let nodes = cluster::parse_cluster_nodes(&text);
-    let mut initial: Vec<redis::ConnectionInfo> =
-        nodes.iter().filter(|node| node.master).map(|node| factory.info(&node.host, node.port, 0)).collect();
+    let mut initial: Vec<redis::ConnectionInfo> = nodes
+        .iter()
+        .filter(|node| node.master)
+        .map(|node| {
+            let (host, port) = announced(&factory.config, node);
+            factory.info(&host, port, 0)
+        })
+        .collect();
     if initial.is_empty() {
         initial.push(factory.info(&route.transport_host, route.transport_port, 0));
     }
     let mut builder = redis::cluster::ClusterClientBuilder::new(initial)
-        .connection_timeout(Duration::from_secs(15))
+        .connection_timeout(CLUSTER_CONNECT_TIMEOUT)
         .response_timeout(Duration::from_secs(60));
     if let Some(certs) = tls_certificates(&factory.config).map_err(|err| redis_stage(route.tls_mode, &err))? {
         builder = builder.certs(certs);
@@ -226,12 +270,17 @@ impl Connector for RedisConnector {
         let factory = NodeFactory { config: config.clone(), password: password.to_owned(), tls_mode: route.tls_mode };
         let addr = format!("{}:{}", config.host.clone().unwrap_or_default(), config.port.unwrap_or(6379));
         let tunneled = config.ssh.is_some();
-        let (conn, cluster_client, topology, version) = if opened.cluster_enabled && !tunneled {
-            let (conn, client, nodes) = open_cluster(&mut opened.conn, &factory, route).await?;
-            let version = format!("{} · Cluster", opened.version);
-            (RedisConn::Cluster(conn), Some(client), Topology { cluster: true, nodes, addr }, version)
-        } else {
-            (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr }, opened.version)
+        let attempt = if opened.cluster_enabled && !tunneled { Some(open_cluster(&mut opened.conn, &factory, route).await) } else { None };
+        let (conn, cluster_client, topology, version) = match settle_cluster(opened.cluster_enabled, tunneled, attempt) {
+            ClusterSettle::Cluster((conn, client, nodes)) => {
+                let version = format!("{} · Cluster", opened.version);
+                (RedisConn::Cluster(conn), Some(client), Topology { cluster: true, nodes, addr, fallback: None }, version)
+            }
+            ClusterSettle::Single => (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr, fallback: None }, opened.version),
+            ClusterSettle::Fallback(reason) => {
+                let version = format!("{} · Cluster（集群连接未建立，按单节点浏览）", opened.version);
+                (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr, fallback: Some(reason) }, version)
+            }
         };
         let handle = RedisHandle {
             conn: conn.clone(),

@@ -823,7 +823,7 @@ fn live_scan_reads_2500_keys_cancels_resumes_caps_and_batch_deletes() {
     let progress = block(async move {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let steps = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = crate::application::redis::batch(services_batch.connections.as_ref(), "live-scan", names, crate::adapters::redis::batch::BatchOp::Unlink, true, cancel, |_| {
+        let outcome = crate::application::redis::batch(services_batch.connections.as_ref(), "live-scan", crate::application::redis::BatchRequest { db: 9, keys: names, op: crate::adapters::redis::batch::BatchOp::Unlink }, true, cancel, |_| {
             steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             true
         })
@@ -905,10 +905,133 @@ fn live_cluster_scans_every_primary_explains_crossslot_and_batches_by_slot() {
 
     let services_batch = Arc::clone(&services);
     let outcome = block(async move {
-        crate::application::redis::batch(services_batch.connections.as_ref(), "live-cluster", names, crate::adapters::redis::batch::BatchOp::Unlink, true, Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| true).await
+        crate::application::redis::batch(services_batch.connections.as_ref(), "live-cluster", crate::application::redis::BatchRequest { db: 0, keys: names, op: crate::adapters::redis::batch::BatchOp::Unlink }, true, Arc::new(std::sync::atomic::AtomicBool::new(false)), |_| true).await
     })
     .expect("batch");
     assert_eq!((outcome.done, outcome.failed), (300, 0), "按槽分组的 UNLINK 不触发 CROSSSLOT");
     services.connections.disconnect("live-cluster");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 批量操作绑定发起时的逻辑库：主连接（多路复用，同一条 socket）上随后发生的 SELECT 不会让剩余批次落到别的库。
+/// 回归：以前批量操作共用主连接，切库后同名键在新库被删。
+#[test]
+fn live_batch_stays_on_its_db_after_the_shared_connection_selects_another() {
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-batch-db-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    if let Err(err) = block(open_redis_at(Arc::clone(&services), "live-batch-db", 6379, "10")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过：Redis 夹具没有连上：{err}");
+            return;
+        }
+        panic!("Redis 夹具没有连上：{err}");
+    }
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let names: Vec<String> = (0..1200).map(|index| format!("rillsql:t9db:{suffix}:{index}")).collect();
+    let (handle, _) = services.connections.redis_handle("live-batch-db").expect("handle");
+    let count_in = |db: i64, names: Vec<String>| {
+        let handle = handle.clone();
+        block(async move {
+            let mut conn = handle.pinned(db).await.expect("pinned");
+            let mut cmd = redis::cmd("EXISTS");
+            for name in &names {
+                cmd.arg(name);
+            }
+            cmd.query_async::<i64>(&mut conn).await.expect("EXISTS")
+        })
+    };
+    {
+        let names = names.clone();
+        let handle = handle.clone();
+        block(async move {
+            for db in [10, 11] {
+                let mut conn = handle.pinned(db).await.expect("pinned");
+                for chunk in names.chunks(500) {
+                    let mut cmd = redis::cmd("MSET");
+                    for name in chunk {
+                        cmd.arg(name).arg("v");
+                    }
+                    let _: () = cmd.query_async(&mut conn).await.expect("MSET");
+                }
+            }
+            // 共用的主连接切到 11 号库（相当于界面切库或控制台 SELECT）。
+            let mut shared = handle.conn();
+            let _: () = redis::cmd("SELECT").arg(11).query_async(&mut shared).await.expect("SELECT");
+        });
+    }
+    assert_eq!(count_in(10, names.clone()), 1200);
+    assert_eq!(count_in(11, names.clone()), 1200);
+
+    let services_batch = Arc::clone(&services);
+    let batch_names = names.clone();
+    let outcome = block(async move {
+        crate::application::redis::batch(
+            services_batch.connections.as_ref(),
+            "live-batch-db",
+            crate::application::redis::BatchRequest { db: 10, keys: batch_names, op: crate::adapters::redis::batch::BatchOp::Unlink },
+            true,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| true,
+        )
+        .await
+    })
+    .expect("batch");
+    assert_eq!((outcome.done, outcome.failed), (1200, 0));
+    assert_eq!(count_in(10, names.clone()), 0, "发起时的 10 号库被删完");
+    assert_eq!(count_in(11, names.clone()), 1200, "主连接所在的 11 号库同名键不受影响");
+
+    let cleanup = names.clone();
+    let handle_cleanup = handle.clone();
+    block(async move {
+        let mut conn = handle_cleanup.pinned(11).await.expect("pinned");
+        for chunk in cleanup.chunks(500) {
+            let mut cmd = redis::cmd("UNLINK");
+            for name in chunk {
+                cmd.arg(name);
+            }
+            let _: i64 = cmd.query_async(&mut conn).await.expect("UNLINK");
+        }
+    });
+    services.connections.disconnect("live-batch-db");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 集群节点公告的地址不可达（模拟 NAT / 容器内地址）：连接照常打开，退回种子节点上的单节点会话并说明原因。
+#[test]
+fn live_cluster_with_unreachable_announced_nodes_falls_back_to_the_seed() {
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-cluster-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    let id = format!("live-cluster-fallback-{}", uuid::Uuid::new_v4().simple());
+    crate::adapters::redis::connect::UNREACHABLE_ANNOUNCE.lock().unwrap().push(id.clone());
+    let id_open = id.clone();
+    let services_open = Arc::clone(&services);
+    let opened = block(async move { open_redis_at(services_open, &id_open, 7001, "0").await });
+    crate::adapters::redis::connect::UNREACHABLE_ANNOUNCE.lock().unwrap().retain(|item| item != &id);
+    if let Err(err) = opened {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过：Redis Cluster 夹具没有连上：{err}");
+            return;
+        }
+        panic!("集群建连失败时应退回单节点会话，而不是打开失败：{err}");
+    }
+    let (handle, _) = services.connections.redis_handle(&id).expect("handle");
+    assert!(!handle.is_cluster(), "退回单节点会话");
+    let topology = handle.topology();
+    assert!(
+        matches!(&topology.fallback, Some(crate::adapters::redis::conn::ClusterFallback::Unreachable(reason)) if !reason.is_empty()),
+        "{topology:?}"
+    );
+    let services_read = Arc::clone(&services);
+    let id_read = id.clone();
+    let pong = block(async move {
+        crate::application::redis::exec(services_read.connections.as_ref(), &id_read, "PING".into(), Vec::new(), false).await
+    })
+    .expect("单节点会话可用");
+    assert_eq!(pong.command, "PING");
+    services.connections.disconnect(&id);
     let _ = std::fs::remove_dir_all(&dir);
 }

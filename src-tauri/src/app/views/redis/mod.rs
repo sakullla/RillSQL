@@ -27,7 +27,7 @@ use crate::adapters::redis::complete::{self, RedisCompletion};
 use crate::adapters::redis::exec::{self, CommandRisk, RespReply};
 use crate::adapters::redis::batch::{self as batch_ops, BatchOp, BatchPreview, BatchProgress};
 use crate::adapters::redis::cluster::{self, KeyPlacement};
-use crate::adapters::redis::conn::Topology;
+use crate::adapters::redis::conn::{ClusterFallback, Topology};
 use crate::adapters::redis::diag::{BigKey, BigKeyEvent, ClientInfo, InfoSection, PubSubMessage, SlowEntry, SlowSort};
 use crate::adapters::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ValuePage};
 use crate::adapters::redis::keyspace::{self, KeyspacePrefs, TemplateGroup, TreeRow};
@@ -76,7 +76,8 @@ enum Confirm {
     Ttl { key: String, seconds: Option<i64> },
     Mutation { mutation: RedisMutation, key: String },
     /// 模板批量操作：预览（数量与样例）就是确认框的内容。
-    Batch { template: String, keys: Vec<String>, op: BatchOp, preview: BatchPreview },
+    /// db：发起时的逻辑库，批量操作只在这个库上执行。
+    Batch { template: String, keys: Vec<String>, op: BatchOp, preview: BatchPreview, db: u8 },
     SlowlogReset { node: String },
     ClientKill { node: String, id: String, addr: String },
     Publish { channel: String, message: String },
@@ -772,6 +773,9 @@ impl RedisPane {
         if self.topology.cluster {
             self.database = "0".into();
         }
+        if let Some(text) = self.fallback_text() {
+            self.note = text;
+        }
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         self.scan.running = true;
@@ -871,6 +875,14 @@ impl RedisPane {
         }
     }
 
+    /// 集群退回单节点会话时的说明。
+    pub(super) fn fallback_text(&self) -> Option<String> {
+        match self.topology.fallback.as_ref()? {
+            ClusterFallback::Tunnel => Some(self.text("redis.cluster.fallbackTunnel")),
+            ClusterFallback::Unreachable(reason) => Some(i18n::fill(&self.text("redis.cluster.fallbackUnreachable"), &[("reason", reason)])),
+        }
+    }
+
     fn refresh_keyspace_counts(&mut self, cx: &mut Context<Self>) {
         if self.connection_id.is_empty() {
             return;
@@ -898,6 +910,11 @@ impl RedisPane {
         }
         if self.topology.cluster && db != 0 {
             self.show_error_from(ErrorSource::Scan, self.text("redis.cluster.dbOnlyZero"));
+            return;
+        }
+        // 批量操作结束后要按发起库更新键索引；进行中不切库（可先取消）。
+        if self.batch_running() {
+            self.show_error_from(ErrorSource::Scan, self.text("redis.batch.switchBlocked"));
             return;
         }
         self.scan.cancel.store(true, Ordering::SeqCst);
@@ -1683,7 +1700,7 @@ impl RedisPane {
         self.confirm_typed.clear();
         self.confirm_typed_error = false;
         match action {
-            Some(Confirm::Batch { template, keys, op, .. }) => self.run_batch(template, keys, op, cx),
+            Some(Confirm::Batch { template, keys, op, db, .. }) => self.run_batch(template, keys, op, db, cx),
             Some(Confirm::SlowlogReset { node }) => self.run_slowlog_reset(node, cx),
             Some(Confirm::ClientKill { node, id, .. }) => self.run_client_kill(node, id, cx),
             Some(Confirm::Publish { channel, message }) => self.run_publish(channel, message, cx),
@@ -1824,6 +1841,10 @@ impl RedisPane {
             return;
         }
         if command.eq_ignore_ascii_case("SELECT") {
+            if self.batch_running() {
+                self.show_error(self.text("redis.batch.switchBlocked"));
+                return;
+            }
             if let Some(arg) = args.first() {
                 if let Ok(db) = arg.parse::<u8>() {
                     self.database = db.to_string();

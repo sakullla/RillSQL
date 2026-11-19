@@ -114,6 +114,7 @@ services:
 
   # Redis Cluster 夹具（R4）：一个容器里起 3 个主节点（7001-7003，无副本），节点公告 127.0.0.1，
   # 宿主机经映射端口直连每个节点；密码与单机夹具相同。live 测试按约定可选运行，连不上时跳过。
+  # 容器重启时节点从 nodes.conf 恢复，已经互相认识（known_nodes:3）就不再 create（否则报 not empty 退出）。
   redis-cluster:
     image: redis:7
     ports:
@@ -128,7 +129,7 @@ services:
         --appendonly no --save '' --dir /data/$$port --daemonize yes;
         done &&
         sleep 1 &&
-        (redis-cli --no-auth-warning -a rillsql-redis -p 7001 cluster info | grep -q 'cluster_state:ok'
+        (redis-cli --no-auth-warning -a rillsql-redis -p 7001 cluster info | grep -q 'cluster_known_nodes:3'
         || redis-cli --no-auth-warning -a rillsql-redis --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 0 --cluster-yes) &&
         tail -f /dev/null
     healthcheck:

@@ -1750,6 +1750,8 @@ dict! {
     "redis.batch.ttlPrompt" => "将分批修改模板 {template} 下已读取的 {n} 个键的过期时间。", "The expiry of {n} keys read under template {template} will be changed in batches.";
     "redis.batch.empty" => "这个模板下没有已读取的键。", "No keys have been read under this template.";
     "redis.batch.busy" => "上一个批量操作还在进行。", "The previous bulk operation is still running.";
+    "redis.batch.switchBlocked" => "批量操作进行中，暂不能切换逻辑库。可先取消或等它完成。", "A bulk operation is running, so the logical DB cannot be switched. Cancel it or wait for it to finish.";
+    "redis.batch.dbChanged" => "逻辑库已切换，这次批量操作没有执行。请在当前库重新发起。", "The logical DB changed, so this bulk operation was not run. Start it again in the current DB.";
     "redis.batch.progress" => "{op}：{state} {done}/{total}，失败 {failed}", "{op}: {state} {done}/{total}, {failed} failed";
     "redis.batch.running" => "进行中", "running";
     "redis.batch.cancelled" => "已取消", "cancelled";
@@ -1761,6 +1763,9 @@ dict! {
     "redis.value.json" => "JSON 文档（RedisJSON）", "JSON document (RedisJSON)";
     "redis.cluster.chip" => "集群 · {n} 个主节点", "Cluster · {n} primaries";
     "redis.cluster.dbOnlyZero" => "集群只有 0 号库。", "A cluster has only database 0.";
+    "redis.cluster.fallbackChip" => "集群 · 单节点浏览", "Cluster · single node";
+    "redis.cluster.fallbackTunnel" => "这是集群节点，但经 SSH 隧道连接，节点公告的地址在本机不可达，只按单节点浏览：只看得到这个节点的槽，其他槽的键会返回 MOVED。", "This is a cluster node reached through an SSH tunnel. The addresses the nodes announce cannot be reached from here, so it is browsed as a single node: only this node's slots are visible, and keys in other slots return MOVED.";
+    "redis.cluster.fallbackUnreachable" => "这是集群节点，但集群连接没有建立（{reason}），已改为单节点浏览：只看得到这个节点的槽。节点公告的地址可能在本机不可达（NAT、容器内地址）。", "This is a cluster node, but the cluster connection could not be set up ({reason}). It is browsed as a single node, so only this node's slots are visible. The addresses the nodes announce may be unreachable from here (NAT, container addresses).";
     "redis.cluster.slot" => "槽 {n}", "Slot {n}";
     "redis.cluster.node" => "节点 {addr}", "Node {addr}";
     "redis.cluster.hashTag" => "hash tag {{tag}}", "hash tag {{tag}}";

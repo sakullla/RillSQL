@@ -103,6 +103,9 @@ impl RedisPane {
             .bg(p.chrome)
             .child(identity)
             .child(scope)
+            .when(self.topology.fallback.is_some(), |this| {
+                this.child(div().id("redis-cluster-fallback").test_support().child(kit::pill(SharedString::from(self.text("redis.cluster.fallbackChip")), p.warn, p.warn_soft)))
+            })
             .child(tabs)
             .into_any_element()
     }

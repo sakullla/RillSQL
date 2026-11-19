@@ -271,7 +271,7 @@ fn cluster_topology() -> Topology {
         slots,
         myself: false,
     };
-    Topology { cluster: true, nodes: vec![node(7001, vec![(0, 5460)]), node(7002, vec![(5461, 10922)]), node(7003, vec![(10923, 16383)])], addr: "127.0.0.1:7001".into() }
+    Topology { cluster: true, nodes: vec![node(7001, vec![(0, 5460)]), node(7002, vec![(5461, 10922)]), node(7003, vec![(10923, 16383)])], addr: "127.0.0.1:7001".into(), fallback: None }
 }
 
 /// 集群：多键命令跨槽在发送前就给出 CROSSSLOT 说明；同 hash tag 照常；键详情显示槽、节点与 hash tag。
@@ -461,5 +461,62 @@ fn paged_values_show_total_and_json_writes_use_json_set() {
     pane.stage_if_key(RedisMutation::JsonSet { key: "h".into(), value: "{\"a\":1}".into() });
     assert!(pane.confirm_open());
     assert_eq!(pane.confirm_preview(), "JSON.SET h $ {\"a\":1}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 批量操作绑定发起时的逻辑库：进行中不能切库、控制台 SELECT 被拒；确认框开着时库变了，确认后不在新库上执行。
+#[gpui_kit::test]
+fn running_batch_pins_its_db_and_blocks_db_switches(cx: &mut gpui_kit::TestAppContext) {
+    let (pane, dir) = pane("batch-db");
+    let view = cx.update(|cx| cx.new(|_| pane));
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.database = "3".into();
+            pane.set_keys(vec![key("order:1001", "hash"), key("order:1002", "hash")]);
+            pane.batch = Some(BatchRun {
+                template: "order:*".into(),
+                op: BatchOp::Unlink,
+                progress: BatchProgress { total: 2, ..BatchProgress::default() },
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            pane.command("redis-db-pick:4", cx);
+            assert_eq!(pane.database, "3", "批量操作进行中不切库");
+            assert!(pane.error().contains("批量操作进行中"), "{}", pane.error());
+            assert_eq!(pane.keys().len(), 2, "索引保留");
+
+            pane.error.clear();
+            pane.exec_command("SELECT".into(), vec!["5".into()], true, "SELECT 5".into(), cx);
+            assert_eq!(pane.database, "3", "控制台 SELECT 被拒");
+            assert!(pane.error().contains("批量操作进行中"), "{}", pane.error());
+
+            // 批量操作结束后，确认框记下的是发起时的库；库变了就不执行。
+            pane.batch.as_mut().unwrap().progress.finished = true;
+            pane.command("redis-tpl-delete:order:*", cx);
+            assert!(matches!(pane.confirm, Some(Confirm::Batch { db: 3, .. })), "确认框记下发起时的库");
+            pane.database = "6".into();
+            pane.error.clear();
+            pane.command("redis-confirm", cx);
+            assert!(pane.batch.as_ref().is_some_and(|batch| batch.progress.finished), "没有开始新的批量操作");
+            assert!(pane.error().contains("逻辑库已切换"), "{}", pane.error());
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 集群退回单节点：顶栏显示单节点浏览标记，说明里带原因。
+#[gpui_kit::test]
+fn cluster_fallback_is_explained(cx: &mut gpui_kit::TestAppContext) {
+    let (pane, dir) = pane("fallback");
+    let view = cx.update(|cx| cx.new(|_| pane));
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            assert!(pane.fallback_text().is_none());
+            pane.topology = Topology { cluster: false, nodes: Vec::new(), addr: "10.0.0.5:7001".into(), fallback: Some(ClusterFallback::Unreachable("connection refused".into())) };
+            let text = pane.fallback_text().expect("说明");
+            assert!(text.contains("connection refused") && text.contains("单节点"), "{text}");
+            pane.topology.fallback = Some(ClusterFallback::Tunnel);
+            assert!(pane.fallback_text().unwrap().contains("SSH"));
+        });
+    });
     let _ = std::fs::remove_dir_all(dir);
 }

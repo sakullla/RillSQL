@@ -284,19 +284,34 @@ pub async fn memory_samples(service: &Service, connection_id: &str, keys: Vec<St
     Ok(diag::memory_usage(&mut handle.conn(), &keys).await)
 }
 
+/// 一次模板批量操作：发起时的逻辑库、键与操作。
+#[derive(Debug, Clone)]
+pub struct BatchRequest {
+    pub db: u8,
+    pub keys: Vec<String>,
+    pub op: BatchOp,
+}
+
 /// 模板批量操作（UNLINK / EXPIRE / PERSIST）。未确认时在取会话之前拒绝。
+///
+/// `db` 是发起时的逻辑库：批量操作在一条固定于该库的独占连接上执行，
+/// 不受主连接上随后发生的 SELECT（切库、控制台）影响。
 pub async fn batch(
     service: &Service,
     connection_id: &str,
-    keys: Vec<String>,
-    op: BatchOp,
+    request: BatchRequest,
     confirmed: bool,
     cancel: Arc<AtomicBool>,
     send: impl Fn(BatchProgress) -> bool,
 ) -> Result<BatchProgress, String> {
+    let BatchRequest { db, keys, op } = request;
     batch::require_batch(&keys, op, confirmed)?;
-    let (handle, _) = handle(service, connection_id)?;
-    batch::run_batch(handle.conn(), keys, op, confirmed, cancel, send).await
+    let (handle, health) = handle(service, connection_id)?;
+    let conn = handle.pinned(i64::from(db)).await.map_err(|err| {
+        note_io(&health, &err);
+        crate::error_text::chain(&err)
+    })?;
+    batch::run_batch(conn, keys, op, confirmed, cancel, send).await
 }
 
 // ------------------------------------------------------------------ 诊断

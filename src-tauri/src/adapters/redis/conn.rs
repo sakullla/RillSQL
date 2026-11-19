@@ -58,6 +58,20 @@ pub struct Topology {
     pub nodes: Vec<ClusterNode>,
     /// 单机时的服务地址（展示用）。
     pub addr: String,
+    /// 服务端是集群，但集群连接建不起来（节点公告的地址不可达、经 SSH 隧道），
+    /// 退回种子节点上的单节点会话：只看得到该节点的槽。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<ClusterFallback>,
+}
+
+/// 集群退回单节点会话的原因。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum ClusterFallback {
+    /// 经 SSH 隧道：节点公告的地址在本机不可达，不尝试。
+    Tunnel,
+    /// 尝试建立集群连接失败（原文）。
+    Unreachable(String),
 }
 
 impl Topology {
@@ -175,6 +189,28 @@ impl RedisHandle {
             .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "节点地址无效", addr.to_owned())))?;
         let conn = self.factory.connect(&host, port).await?;
         Ok(NodeTarget { addr: addr.to_owned(), conn: RedisConn::Single(conn) })
+    }
+
+    /// 固定在指定逻辑库上的独占连接（批量操作用）。
+    ///
+    /// 单机下主连接是多路复用的同一条 socket，SELECT 作用于整条 socket；批量操作若共用它，
+    /// 中途切库（界面切库或控制台 SELECT）会让剩余批次落到别的库。所以另开一条连接并显式 SELECT 目标库。
+    /// 集群只有 0 号库且按键路由，直接用集群连接（db 只能是 0）。
+    pub async fn pinned(&self, db: i64) -> redis::RedisResult<RedisConn> {
+        if self.is_cluster() {
+            if db != 0 {
+                return Err(redis::RedisError::from((redis::ErrorKind::ClientError, "集群只有 0 号库")));
+            }
+            return Ok(self.conn());
+        }
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::ClientError, "单机会话缺少建连客户端")))?;
+        let config = redis::AsyncConnectionConfig::new().set_connection_timeout(Duration::from_secs(15));
+        let mut conn = client.get_multiplexed_async_connection_with_config(&config).await?;
+        let _: () = redis::cmd("SELECT").arg(db).query_async(&mut conn).await?;
+        Ok(RedisConn::Single(conn))
     }
 
     /// Pub/Sub 专用连接：订阅态的连接不能再发普通命令，所以每次另开。

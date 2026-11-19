@@ -505,12 +505,32 @@ impl RedisPane {
             BatchOp::Ttl(_) => "redis.batch.ttlPrompt",
         };
         self.confirm_prompt = i18n::fill(&self.text(key), &[("n", &preview.count.to_string()), ("template", &template)]);
-        self.confirm = Some(Confirm::Batch { template, keys, op, preview });
+        let db = self.current_db();
+        self.confirm = Some(Confirm::Batch { template, keys, op, preview, db });
         self.note.clear();
         self.error.clear();
     }
 
-    pub(super) fn run_batch(&mut self, template: String, keys: Vec<String>, op: BatchOp, cx: &mut Context<Self>) {
+    /// 批量操作是否还在进行。
+    pub(super) fn batch_running(&self) -> bool {
+        self.batch.as_ref().is_some_and(|batch| !batch.progress.finished)
+    }
+
+    /// 当前逻辑库号（解析不了按 0）。
+    pub(super) fn current_db(&self) -> u8 {
+        self.database.trim().parse::<u8>().unwrap_or(0)
+    }
+
+    pub(super) fn run_batch(&mut self, template: String, keys: Vec<String>, op: BatchOp, db: u8, cx: &mut Context<Self>) {
+        if self.batch_running() {
+            self.show_error(self.text("redis.batch.busy"));
+            return;
+        }
+        // 确认框开着时库已经换了（比如控制台 SELECT）：键名来自旧库的索引，不在新库上执行。
+        if db != self.current_db() {
+            self.show_error(self.text("redis.batch.dbChanged"));
+            return;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.batch = Some(BatchRun { template, op, progress: BatchProgress { total: keys.len(), ..BatchProgress::default() }, cancel: Arc::clone(&cancel) });
         let connections = Arc::clone(&self.services.connections);
@@ -520,7 +540,7 @@ impl RedisPane {
             cx,
             move |send| {
                 Box::pin(async move {
-                    let outcome = crate::application::redis::batch(connections.as_ref(), &connection_id, keys, op, true, cancel, |progress| send(Ok(progress))).await;
+                    let outcome = crate::application::redis::batch(connections.as_ref(), &connection_id, crate::application::redis::BatchRequest { db, keys, op }, true, cancel, |progress| send(Ok(progress))).await;
                     if let Err(message) = outcome {
                         send(Err(message));
                     }

@@ -478,3 +478,22 @@ fn batch_plans_preview_and_require_confirmation() {
     let tagged: Vec<String> = (0..10).map(|index| format!("{{cart}}:{index}")).collect();
     assert_eq!(batch::plan_chunks(&tagged, true, 500).len(), 1, "同 hash tag 一批发完");
 }
+
+/// 集群建连失败不让整个连接失败：退回种子节点上的单节点会话并带原因；经 SSH 隧道不尝试，直接退回。
+#[test]
+fn cluster_setup_failure_falls_back_to_the_seed_node() {
+    use super::conn::ClusterFallback;
+    use super::connect::{settle_cluster, ClusterSettle};
+    let failed: Option<Result<(), crate::connections::stages::StageError>> = Some(Err(crate::connections::stages::fail_code(
+        crate::connections::error_codes::CONN_NETWORK_FAILED,
+        "Connection refused (os error 61)",
+        "",
+    )));
+    assert!(matches!(
+        settle_cluster(true, false, failed),
+        ClusterSettle::Fallback(ClusterFallback::Unreachable(reason)) if reason.contains("refused")
+    ));
+    assert!(matches!(settle_cluster(true, false, Some(Ok(7))), ClusterSettle::Cluster(7)));
+    assert!(matches!(settle_cluster::<()>(true, true, None), ClusterSettle::Fallback(ClusterFallback::Tunnel)));
+    assert!(matches!(settle_cluster::<()>(false, false, None), ClusterSettle::Single));
+}
