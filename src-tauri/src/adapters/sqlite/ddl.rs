@@ -159,6 +159,17 @@ impl DdlDialect for SqliteDdl {
         AdminSections { settings: true, attached: true, maintenance: true, ..AdminSections::default() }
     }
 
+    fn table_option_labels(&self, snapshot: &Snapshot) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if snapshot.strict {
+            labels.push("STRICT");
+        }
+        if snapshot.without_rowid {
+            labels.push("WITHOUT ROWID");
+        }
+        labels
+    }
+
     fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
         MESSAGES_EN
     }
@@ -237,6 +248,10 @@ fn object_action(snapshot: &Snapshot, action: &Action, supported: bool) -> Optio
 
 /// SQLite 专属计划文字的英文。
 const MESSAGES_EN: &[(&str, &str)] = &[
+    (
+        "WITHOUT ROWID 表必须保留主键，重建不能可靠保留行标识，因此阻止执行。",
+        "A WITHOUT ROWID table must keep its primary key and a rebuild can't keep the row identity reliably, so it is blocked.",
+    ),
     ("只有 SQLite 用 PRAGMA 改这些开关，这里不生成语句。", "Only SQLite changes these settings with PRAGMA, so no statement is generated here."),
     (
         "foreign_keys 走外键开关动作（SetForeignKeys），这里不重复生成同一条 PRAGMA。",

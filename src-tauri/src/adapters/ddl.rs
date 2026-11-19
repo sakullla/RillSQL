@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::model::{Action, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, StepReceipt};
-use crate::ddl::plan::Change;
+use crate::ddl::plan::{Change, Tok};
 
 use super::{adapter, quote_ident, registry};
 
@@ -94,6 +94,15 @@ pub trait TypeRules: Sync {
 struct GenericTypes;
 
 impl TypeRules for GenericTypes {}
+
+/// 视图语句头 CREATE 与 VIEW 之间一个方言专属修饰读完后的结果（值是修饰之后的记号位置）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewModifier {
+    /// 不影响替换的修饰（例如定义者、算法）。
+    Skip(usize),
+    /// 物化视图：不能在保留数据的前提下替换。
+    Materialized(usize),
+}
 
 /// 表与列的注释：(表注释, 列名 → 注释)。
 pub type Comments = (Option<String>, BTreeMap<String, String>);
@@ -193,6 +202,11 @@ pub trait DdlDialect: Sync {
         true
     }
 
+    /// 方言本身不允许给这张表加外键（例如存储引擎不支持）。返回阻断原因。
+    fn foreign_key_blocker(&self, _snapshot: &Snapshot, _table: &str) -> Option<String> {
+        None
+    }
+
     /// 方言不能直接增删外键时的说明（`adding` 区分新增与删除）。
     fn foreign_key_change_risk(&self, _adding: bool) -> Option<&'static str> {
         None
@@ -256,6 +270,12 @@ pub trait DdlDialect: Sync {
         false
     }
 
+    /// 视图语句头 CREATE 与 VIEW 之间、通用写法（OR REPLACE、TEMP、RECURSIVE）之外的修饰：从 `index` 读一个。
+    /// 不认识或写法不对返回 None（整段定义按不能安全替换处理）。
+    fn view_modifier(&self, _tokens: &[Tok], _index: usize) -> Option<ViewModifier> {
+        None
+    }
+
     /// 视图名前面的限定段可以是哪些名字。
     fn view_qualifiers<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a str> {
         vec![snapshot.schema.as_str()]
@@ -290,6 +310,11 @@ pub trait DdlDialect: Sync {
 
     /// 重建定义末尾的表/列注释语句。
     fn comment_statements(&self, _snapshot: &Snapshot, _qualified: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 结构页表头显示的表选项标签（读自快照里方言专属的表选项）。
+    fn table_option_labels(&self, _snapshot: &Snapshot) -> Vec<&'static str> {
         Vec::new()
     }
 

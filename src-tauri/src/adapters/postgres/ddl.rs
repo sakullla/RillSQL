@@ -1,12 +1,12 @@
 //! PostgreSQL 的 DDL 方言：按模式限定、标识列、就地替换视图、注释语句，以及序列/枚举/域的库级动作。
 
-use crate::adapters::ddl::{AdminSections, Comments, DdlDialect};
+use crate::adapters::ddl::{AdminSections, Comments, DdlDialect, ViewModifier};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{Action, Column, ColumnDraft, Plan, Request, Risk, SequenceState, Snapshot, Step};
-use crate::ddl::plan::{finish, normalize_default, same_type, statement_alter_plan, target_label, Change};
+use crate::ddl::plan::{finish, normalize_default, same_type, statement_alter_plan, target_label, word_is, Change, Tok};
 use crate::ddl::sql::{qualified_table, valid_default, valid_name};
 
 use super::ddl_read;
@@ -66,6 +66,11 @@ impl DdlDialect for PostgresDdl {
         } else {
             "DROP VIEW"
         }
+    }
+
+    /// CREATE MATERIALIZED VIEW：替换会丢弃物化数据。
+    fn view_modifier(&self, tokens: &[Tok], index: usize) -> Option<ViewModifier> {
+        tokens.get(index).filter(|token| word_is(token, "materialized")).map(|_| ViewModifier::Materialized(index + 1))
     }
 
     fn replaces_view_in_place(&self) -> bool {

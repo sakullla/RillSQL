@@ -1,7 +1,7 @@
 //! 结构变更计划。这里只写引擎无关的流程与校验；方言差异（语句形状、限定名、重建、库级动作）经
 //! [`DdlDialect`](crate::adapters::ddl::DdlDialect) 取得。
 
-use crate::adapters::ddl::{ddl_of, no_structure_editing, DdlDialect};
+use crate::adapters::ddl::{ddl_of, no_structure_editing, DdlDialect, ViewModifier};
 use crate::adapters::adapter;
 
 use super::model::{fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, Snapshot, Step};
@@ -257,8 +257,8 @@ fn plan_create_fk(snapshot: &Snapshot, table: &str, foreign_key: &ForeignKeyDraf
         return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
     }
     let mut blocked = validate_fk(snapshot, foreign_key);
-    if snapshot.storage.as_deref().is_some_and(|storage| storage.eq_ignore_ascii_case("MyISAM")) {
-        blocked.push(format!("表 {table} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。"));
+    if let Some(message) = ddl_of(snapshot.engine).and_then(|dialect| dialect.foreign_key_blocker(snapshot, table)) {
+        blocked.push(message);
     }
     let mut risks = vec![Risk {
         level: "info".to_owned(),
@@ -1111,7 +1111,7 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
     }
     // 只看语句开头是不是物化视图。查询正文里的 table_id、tableoid 或 “MATERIALIZED VIEW” 文本不是物化视图。
     let head = match statements.as_slice() {
-        [statement] => classify_view_statement(statement),
+        [statement] => classify_view_statement(snapshot.engine, statement),
         _ => ViewHead::Other,
     };
     if snapshot.materialized || matches!(&head, ViewHead::Materialized) {
@@ -1298,24 +1298,27 @@ struct SqlIdent {
     quoted: bool,
 }
 
-struct Tok {
+/// 视图语句头的记号（方言读自己的修饰时也用它）。
+pub(crate) struct Tok {
     start: usize,
     end: usize,
-    kind: TokKind,
+    pub(crate) kind: TokKind,
 }
 
-enum TokKind {
+pub(crate) enum TokKind {
     Word(String),
     Ident(String),
     Lit,
     Symbol(char),
 }
 
-fn classify_view_statement(sql: &str) -> ViewHead {
-    parse_view_head(sql).unwrap_or(ViewHead::Other)
+fn classify_view_statement(engine: Engine, sql: &str) -> ViewHead {
+    parse_view_head(engine, sql).unwrap_or(ViewHead::Other)
 }
 
-fn parse_view_head(sql: &str) -> Option<ViewHead> {
+/// 通用的 CREATE [OR REPLACE] [TEMP] [RECURSIVE] VIEW 语句头；CREATE 与 VIEW 之间方言专属的修饰交给方言读。
+fn parse_view_head(engine: Engine, sql: &str) -> Option<ViewHead> {
+    let dialect = ddl_of(engine)?;
     let tokens = tokenize_sql(sql);
     let mut index = 0;
     let first = tokens.get(index)?;
@@ -1334,11 +1337,6 @@ fn parse_view_head(sql: &str) -> Option<ViewHead> {
             index += 1;
             break;
         }
-        if word_is(token, "materialized") {
-            materialized = true;
-            index += 1;
-            continue;
-        }
         if word_is(token, "temp") || word_is(token, "temporary") {
             temporary = true;
             index += 1;
@@ -1356,39 +1354,15 @@ fn parse_view_head(sql: &str) -> Option<ViewHead> {
             index += 1;
             continue;
         }
-        if word_is(token, "algorithm") {
-            index += 1;
-            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
-                index += 1;
+        // 方言不认识或写法不对的修饰：不当作可安全替换的视图语句。
+        match dialect.view_modifier(&tokens, index)? {
+            ViewModifier::Skip(next) => index = next,
+            ViewModifier::Materialized(next) => {
+                materialized = true;
+                index = next;
             }
-            if !tokens.get(index).is_some_and(is_word) {
-                return None;
-            }
-            index += 1;
-            continue;
         }
-        if word_is(token, "definer") {
-            index += 1;
-            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
-                index += 1;
-            }
-            index = skip_definer(&tokens, index)?;
-            continue;
-        }
-        if word_is(token, "sql") {
-            index += 1;
-            if !tokens.get(index).is_some_and(|item| word_is(item, "security")) {
-                return None;
-            }
-            index += 1;
-            let security = tokens.get(index)?;
-            if !(word_is(security, "definer") || word_is(security, "invoker")) {
-                return None;
-            }
-            index += 1;
-            continue;
-        }
-        return None;
+        continue;
     }
     if materialized {
         return Some(ViewHead::Materialized);
@@ -1412,32 +1386,6 @@ fn bind_view_name(sql: &str, target: &ViewTarget, qualified: &str) -> String {
     bound.push_str(qualified);
     bound.push_str(&sql[target.end..]);
     bound
-}
-
-fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {
-    if tokens.get(index).is_some_and(|token| word_is(token, "current_user")) {
-        index += 1;
-        if tokens.get(index).is_some_and(|token| symbol_is(token, '(')) {
-            index += 1;
-            if !tokens.get(index).is_some_and(|token| symbol_is(token, ')')) {
-                return None;
-            }
-            index += 1;
-        }
-        return Some(index);
-    }
-    if !tokens.get(index).is_some_and(is_definer_atom) {
-        return None;
-    }
-    index += 1;
-    if tokens.get(index).is_some_and(|token| symbol_is(token, '@')) {
-        index += 1;
-        if !tokens.get(index).is_some_and(is_definer_atom) {
-            return None;
-        }
-        index += 1;
-    }
-    Some(index)
 }
 
 fn read_view_name(tokens: &[Tok], index: usize) -> Option<(SqlIdent, Option<SqlIdent>, usize, usize)> {
@@ -1487,20 +1435,16 @@ fn ident_matches(engine: Engine, ident: &SqlIdent, catalog: &str) -> bool {
     ident.text.eq_ignore_ascii_case(catalog)
 }
 
-fn word_is(token: &Tok, expected: &str) -> bool {
+pub(crate) fn word_is(token: &Tok, expected: &str) -> bool {
     matches!(&token.kind, TokKind::Word(text) if text.eq_ignore_ascii_case(expected))
 }
 
-fn symbol_is(token: &Tok, expected: char) -> bool {
+pub(crate) fn symbol_is(token: &Tok, expected: char) -> bool {
     matches!(token.kind, TokKind::Symbol(ch) if ch == expected)
 }
 
-fn is_word(token: &Tok) -> bool {
+pub(crate) fn is_word(token: &Tok) -> bool {
     matches!(token.kind, TokKind::Word(_))
-}
-
-fn is_definer_atom(token: &Tok) -> bool {
-    matches!(token.kind, TokKind::Word(_) | TokKind::Ident(_) | TokKind::Lit)
 }
 
 fn tokenize_sql(sql: &str) -> Vec<Tok> {

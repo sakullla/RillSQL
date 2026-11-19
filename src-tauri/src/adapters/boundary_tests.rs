@@ -59,6 +59,13 @@ const DIALECT_FRAGMENTS: &[&str] = &[
     "auto_increment",
     "IDENTITY",
     "sp_rename",
+    "MyISAM",
+    "InnoDB",
+    "ALGORITHM",
+    "SQL SECURITY",
+    "\"algorithm\"",
+    "\"definer\"",
+    "WITHOUT ROWID",
 ];
 
 const A1: &str = "A1 连接与会话";
@@ -451,6 +458,9 @@ fn boundary_scan_rejects_injected_violations() {
         "\nconst INJECTED: &str = \"SELECT name FROM sqlite_master\";\n",
         "\nfn injected(session: &CatalogSession) -> bool { matches!(session, CatalogSession::Redis(_)) }\n",
         "\nfn injected(name: &str) -> String { format!(\"`{}`\", name) }\n",
+        "\nfn injected(storage: &str) -> bool { storage.eq_ignore_ascii_case(\"MyISAM\") }\n",
+        "\nfn injected(word: &str) -> bool { word.eq_ignore_ascii_case(\"definer\") }\n",
+        "\nconst INJECTED: &str = \"CREATE ALGORITHM=MERGE VIEW v AS SELECT 1\";\n",
     ];
     // 一个白名单内文件（若有）与一个白名单外新文件都要被抓到。
     let mut targets = vec!["app/injected_view.rs".to_owned()];

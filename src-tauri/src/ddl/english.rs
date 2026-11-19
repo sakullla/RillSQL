@@ -248,10 +248,6 @@ const PATTERNS: &[(&str, &str)] = &[
     ("只删除这个索引，不删除表或记录。", "Only this index is dropped; the table and its rows stay."),
     ("删除索引 {}", "Drop index {0}"),
     (
-        "表 {} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。",
-        "Table {0} uses MyISAM, which doesn't support foreign keys. Checks are not turned off to pretend the creation succeeded.",
-    ),
-    (
         "数据库会检查已有数据。存在无法匹配的值时创建失败。不会关闭约束检查，也不会清理数据。",
         "The database checks the existing data. Creation fails if values don't match. Constraint checks are not turned off and no data is cleaned up.",
     ),
@@ -356,10 +352,6 @@ const PATTERNS: &[(&str, &str)] = &[
     ("表含生成列，重建不能可靠保留这些列，因此阻止执行。", "The table has generated columns that a rebuild can't keep reliably, so it is blocked."),
     ("表含 CHECK 约束，重建不能可靠保留该约束，因此阻止执行。", "The table has a CHECK constraint that a rebuild can't keep reliably, so it is blocked."),
     ("表含排序规则，重建不能可靠保留该规则，因此阻止执行。", "The table has a collation that a rebuild can't keep reliably, so it is blocked."),
-    (
-        "WITHOUT ROWID 表必须保留主键，重建不能可靠保留行标识，因此阻止执行。",
-        "A WITHOUT ROWID table must keep its primary key and a rebuild can't keep the row identity reliably, so it is blocked.",
-    ),
     ("触发器 {} 引用了将改变的列，无法可靠改写，因此阻止重建。", "Trigger {0} uses columns that will change and can't be rewritten reliably, so the rebuild is blocked."),
     ("读不到触发器 {} 的定义，不能可靠重建。", "The definition of trigger {0} couldn't be read, so it can't be rebuilt reliably."),
     ("视图 {} 引用了将改变的结构，无法可靠改写，因此阻止重建。", "View {0} uses structure that will change and can't be rewritten reliably, so the rebuild is blocked."),

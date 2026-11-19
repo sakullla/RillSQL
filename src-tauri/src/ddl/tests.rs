@@ -966,6 +966,64 @@ fn sqlserver_foreign_key_qualifies_a_non_default_schema() {
     assert!(sql.contains("ALTER TABLE dbo.orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES sales.customers (id)"), "{sql}");
 }
 
+/// 引擎专属的规则由方言给出：MyISAM 外键阻断、视图语句头修饰、表选项标签。
+#[test]
+fn dialect_owned_rules_apply_only_to_their_engine() {
+    let fk = |engine: Engine| {
+        let mut child = Snapshot::bare(engine, "app", "public", "orders");
+        child.columns = vec![column("id", "int", false, true), column("customer_id", "int", true, false)];
+        child.storage = Some("MyISAM".to_owned());
+        let mut parent = Snapshot::bare(engine, "app", "public", "customers");
+        parent.columns = vec![column("id", "int", false, true)];
+        child.reference = Some(Box::new(parent));
+        plan(
+            &child,
+            &Action::CreateForeignKey {
+                table: "orders".to_owned(),
+                foreign_key: ForeignKeyDraft {
+                    name: "fk_orders_customer".to_owned(),
+                    columns: vec!["customer_id".to_owned()],
+                    ref_schema: "public".to_owned(),
+                    ref_table: "customers".to_owned(),
+                    ref_columns: vec!["id".to_owned()],
+                    on_delete: "NO ACTION".to_owned(),
+                    on_update: "NO ACTION".to_owned(),
+                },
+            },
+        )
+    };
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let blocked = fk(engine);
+        assert!(blocked.steps.is_empty());
+        assert!(blocked.blocked.iter().any(|item| item.contains("MyISAM")), "{:?}", blocked.blocked);
+        assert!(blocked.blocked.iter().any(|item| super::english::english(item).contains("uses MyISAM")));
+    }
+    let postgres = fk(Engine::Postgres);
+    assert!(postgres.blocked.iter().all(|item| !item.contains("MyISAM")), "{:?}", postgres.blocked);
+
+    let show = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW v_notes AS SELECT 2";
+    let materialized = "CREATE MATERIALIZED VIEW v_notes AS SELECT 2";
+    let replace = |engine: Engine, definition: &str| {
+        plan(&view_of(engine, "CREATE VIEW v_notes AS SELECT 1"), &Action::ReplaceView { table: "v_notes".to_owned(), definition: definition.to_owned() })
+    };
+    assert!(replace(Engine::Mysql, show).blocked.is_empty());
+    let foreign = replace(Engine::Postgres, show);
+    assert!(foreign.steps.is_empty() && foreign.blocked.iter().any(|item| item.contains("不能安全地替换")), "{:?}", foreign.blocked);
+    let pg_materialized = replace(Engine::Postgres, materialized);
+    assert!(pg_materialized.blocked.iter().any(|item| item.contains("物化数据")), "{:?}", pg_materialized.blocked);
+    let mysql_materialized = replace(Engine::Mysql, materialized);
+    assert!(mysql_materialized.steps.is_empty() && mysql_materialized.blocked.iter().all(|item| !item.contains("物化数据")));
+
+    let mut sqlite = notes("3.45.0");
+    sqlite.strict = true;
+    sqlite.without_rowid = true;
+    let labels = |snapshot: &Snapshot| crate::adapters::ddl::ddl_of(snapshot.engine).unwrap().table_option_labels(snapshot);
+    assert_eq!(labels(&sqlite), vec!["STRICT", "WITHOUT ROWID"]);
+    let mut mysql = Snapshot::bare(Engine::Mysql, "app", "", "notes");
+    mysql.strict = true;
+    assert!(labels(&mysql).is_empty());
+}
+
 #[test]
 fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     // 快照带 IDENTITY 主键、有具名默认约束的列。

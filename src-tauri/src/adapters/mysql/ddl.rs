@@ -1,13 +1,13 @@
 //! MySQL 家族（MySQL / MariaDB）的 DDL 方言：按库限定、CHANGE COLUMN 改字段、AUTO_INCREMENT、InnoDB 表选项、
 //! RENAME TABLE，以及事件启停的库级动作。MariaDB 复用同一实现，按 `engine` 区分。
 
-use crate::adapters::ddl::{AdminSections, DdlDialect};
+use crate::adapters::ddl::{AdminSections, DdlDialect, ViewModifier};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{Action, ColumnDraft, Plan, Request, Risk, Snapshot, Step};
-use crate::ddl::plan::{column_sql, finish, statement_alter_plan, target_label, Change};
+use crate::ddl::plan::{column_sql, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
 use crate::ddl::sql::{qualified_table, valid_name};
 
 use super::ddl_read;
@@ -73,6 +73,14 @@ impl DdlDialect for MysqlDdl {
         self.qualified_table(&snapshot.database, "", ref_table)
     }
 
+    fn foreign_key_blocker(&self, snapshot: &Snapshot, table: &str) -> Option<String> {
+        snapshot
+            .storage
+            .as_deref()
+            .is_some_and(|storage| storage.eq_ignore_ascii_case("MyISAM"))
+            .then(|| format!("表 {table} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。"))
+    }
+
     fn truncate_note(&self) -> &'static str {
         "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。"
     }
@@ -85,6 +93,38 @@ impl DdlDialect for MysqlDdl {
 
     fn replaces_view_in_place(&self) -> bool {
         true
+    }
+
+    /// ALGORITHM=…、DEFINER=…、SQL SECURITY DEFINER|INVOKER（SHOW CREATE VIEW 原样带出）。
+    fn view_modifier(&self, tokens: &[Tok], index: usize) -> Option<ViewModifier> {
+        let token = tokens.get(index)?;
+        let mut index = index + 1;
+        if word_is(token, "algorithm") {
+            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
+                index += 1;
+            }
+            if !tokens.get(index).is_some_and(is_word) {
+                return None;
+            }
+            return Some(ViewModifier::Skip(index + 1));
+        }
+        if word_is(token, "definer") {
+            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
+                index += 1;
+            }
+            return skip_definer(tokens, index).map(ViewModifier::Skip);
+        }
+        if word_is(token, "sql") {
+            if !tokens.get(index).is_some_and(|item| word_is(item, "security")) {
+                return None;
+            }
+            let security = tokens.get(index + 1)?;
+            if !(word_is(security, "definer") || word_is(security, "invoker")) {
+                return None;
+            }
+            return Some(ViewModifier::Skip(index + 2));
+        }
+        None
     }
 
     fn view_qualifiers<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a str> {
@@ -108,10 +148,16 @@ impl DdlDialect for MysqlDdl {
     }
 
     fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[(
-            "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。",
-            "TRUNCATE TABLE commits immediately and resets AUTO_INCREMENT to its initial value; DELETE triggers don't fire.",
-        )]
+        &[
+            (
+                "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。",
+                "TRUNCATE TABLE commits immediately and resets AUTO_INCREMENT to its initial value; DELETE triggers don't fire.",
+            ),
+            (
+                "表 {} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。",
+                "Table {0} uses MyISAM, which doesn't support foreign keys. Checks are not turned off to pretend the creation succeeded.",
+            ),
+        ]
     }
 
     fn matches_session(&self, session: &CatalogSession) -> bool {
@@ -200,3 +246,34 @@ fn plan_set_event_enabled(snapshot: &Snapshot, event: &str, enabled: bool, suppo
     }
 }
 
+
+/// DEFINER 的值：CURRENT_USER[()] 或 user[@host]（各段可带引号）。
+fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {
+    if tokens.get(index).is_some_and(|token| word_is(token, "current_user")) {
+        index += 1;
+        if tokens.get(index).is_some_and(|token| symbol_is(token, '(')) {
+            index += 1;
+            if !tokens.get(index).is_some_and(|token| symbol_is(token, ')')) {
+                return None;
+            }
+            index += 1;
+        }
+        return Some(index);
+    }
+    if !tokens.get(index).is_some_and(is_definer_atom) {
+        return None;
+    }
+    index += 1;
+    if tokens.get(index).is_some_and(|token| symbol_is(token, '@')) {
+        index += 1;
+        if !tokens.get(index).is_some_and(is_definer_atom) {
+            return None;
+        }
+        index += 1;
+    }
+    Some(index)
+}
+
+fn is_definer_atom(token: &Tok) -> bool {
+    matches!(token.kind, TokKind::Word(_) | TokKind::Ident(_) | TokKind::Lit)
+}

@@ -4608,11 +4608,10 @@ impl StructurePane {
                     if let Some(storage) = snap.storage.as_deref().filter(|s| !s.is_empty()) {
                         pills.push(kit::pill(SharedString::from(storage.to_owned()), p.text_muted, p.hover));
                     }
-                    if snap.strict {
-                        pills.push(kit::pill("STRICT", p.text_muted, p.hover));
-                    }
-                    if snap.without_rowid {
-                        pills.push(kit::pill("WITHOUT ROWID", p.text_muted, p.hover));
+                    if let Some(dialect) = crate::adapters::ddl::ddl_of(snap.engine) {
+                        for label in dialect.table_option_labels(snap) {
+                            pills.push(kit::pill(label, p.text_muted, p.hover));
+                        }
                     }
                     if let Some(rows) = snap.row_count {
                         let label = i18n::fill(&i18n::text(locale, "structure.meta.rows"), &[("count", &group_digits(rows))]);
