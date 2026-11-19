@@ -212,7 +212,7 @@ impl CatalogDialect for SqlserverCatalog {
     }
 
     async fn read_diagram(&self, session: &CatalogSession, database: &str, schema: &str) -> Result<Diagram, String> {
-        if let Some(message) = crate::diagram::model::empty_sqlserver_schema(schema) {
+        if let Some(message) = super::diagram::empty_sqlserver_schema(schema) {
             return Err(message);
         }
         let CatalogSession::Sqlserver(client) = session else {

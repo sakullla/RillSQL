@@ -129,3 +129,11 @@ fn mysql_i64(row: &mysql_async::Row, index: usize) -> Option<i64> {
         _ => None,
     }
 }
+
+pub(crate) fn empty_mysql_database(database: &str) -> Option<String> {
+    if database.trim().is_empty() {
+        Some("MySQL 和 MariaDB 的关系图需要一个数据库。".to_owned())
+    } else {
+        None
+    }
+}

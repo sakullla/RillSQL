@@ -120,17 +120,6 @@ impl DdlDialect for SqlserverDdl {
         statements
     }
 
-    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("TRUNCATE TABLE 会重置 IDENTITY 计数，不触发 DELETE 触发器。", "TRUNCATE TABLE resets the IDENTITY counter; DELETE triggers don't fire."),
-            ("sp_rename 不会改写引用旧名的存储过程、函数和视图。", "sp_rename doesn't update stored procedures, functions or views that use the old name."),
-        ]
-    }
-
-    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[("IDENTITY 的起点与步长（统一写成 1, 1）", "the IDENTITY seed and increment (written as 1, 1)")]
-    }
-
     fn matches_session(&self, session: &CatalogSession) -> bool {
         matches!(session, CatalogSession::Sqlserver(_))
     }
@@ -248,4 +237,3 @@ pub(crate) fn sqlserver_bare_table_name(qualified: &str) -> String {
         .trim_end_matches(']')
         .to_owned()
 }
-

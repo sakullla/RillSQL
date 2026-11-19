@@ -31,6 +31,7 @@ use gpui_kit::base::FocusTrapElement as _;
 use super::conn_modal;
 use super::model::{ConnFilterMenu, DraftField, PaletteScope, WorkItemKind, WorkTool};
 use super::view::Workbench;
+use crate::adapters::Workbench as WorkbenchKind;
 
 use crate::ui::kit::stack_frame;
 
@@ -702,7 +703,8 @@ impl Workbench {
         // 固定活动栏只留工作台、连接、历史与底部设置；对比、导入导出和帮助
         // 走命令面板与对象/结果上下文菜单，不再占固定位置。
         let mut top = div().flex().flex_col().items_center().gap(px(4.));
-        for id in crate::app::model::RAIL_TOP {
+        let rail = crate::app::model::RAIL_TOP;
+        for id in rail {
             if let Some((icon, key, active)) = rail_entry(id, page) {
                 top = top.child(rail_item(id, icon, self.t(key), active, &p, cx));
             }
@@ -1155,7 +1157,7 @@ impl Workbench {
         let chevron_id = id.clone();
         let query_id = id.clone();
         let group = SharedString::from(format!("side-conn-group-{id}"));
-        let supports_query = row.saved.engine != Engine::Mongodb;
+        let supports_query = row.saved.engine.workbench().has_query_editor();
         kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
             .group(group.clone())
@@ -1222,7 +1224,7 @@ impl Workbench {
             })
             .when_some(browser_command(row), |this, (command, key, element_id)| {
                 let label = format!("{} {}", self.model.text(key), row.saved.name);
-                let icon = if row.saved.engine == Engine::Redis { IconName::Key } else { IconName::Braces };
+                let icon = if row.saved.engine.workbench() == WorkbenchKind::Redis { IconName::Key } else { IconName::Braces };
                 this.child(kit::icon_button(SharedString::from(element_id), icon, SharedString::from(label), act(command, cx)).xsmall())
             })
             .child({
@@ -1358,7 +1360,7 @@ impl Workbench {
                         .connections
                         .rows
                         .iter()
-                        .any(|row| row.saved.id == id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb));
+                        .any(|row| row.saved.id == id && !row.saved.engine.is_relational());
                     if specialized {
                         if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(browser_command) {
                             self.perform(&command, cx);
@@ -2628,7 +2630,7 @@ impl Workbench {
         self.modal_actions.clear();
         let existing = draft.id.is_some();
         let engine = draft.engine;
-        let file_based = engine == Engine::Sqlite;
+        let file_based = crate::adapters::adapter(engine).meta().file_based();
         let narrow = self.model.viewport_width <= 720;
         let view_w = self.model.viewport_width.max(240) as f32;
         let view_h = self.model.viewport_height.max(240) as f32;
@@ -2924,7 +2926,8 @@ impl Workbench {
                     };
 
                     let mut section = div().flex().flex_col().gap(px(12.));
-                    if engine == Engine::Redis {
+                    // 库索引是一个短数字：和端口排在同一行，用户名退到密码之后（可选的 ACL 用户）。
+                    if crate::adapters::adapter(engine).meta().database_is_index() {
                         let (db_hint, db_masked) = self.field_hint(DraftField::Database);
                         let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
                         let (password_hint, password_masked) = self.field_hint(DraftField::Password);
@@ -2963,7 +2966,7 @@ impl Workbench {
                             .flex_wrap()
                             .gap(px(10.))
                             .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.defaultDatabase"), "database", database, &p)));
-                        if engine == Engine::Mongodb {
+                        if crate::adapters::adapter(engine).meta().uses_replica_set() {
                             let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
                             let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
                             db_row = db_row.child(div().w(px(164.)).child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p)));
@@ -4042,20 +4045,13 @@ impl Workbench {
     fn field_hint(&self, field: DraftField) -> (String, bool) {
         let existing = self.model.connections.editor.as_ref().is_some_and(|draft| draft.id.is_some());
         let engine = self.model.connections.editor.as_ref().map(|draft| draft.engine);
-        let redis = engine == Some(Engine::Redis);
+        let meta = engine.map(|engine| crate::adapters::adapter(engine).meta());
+        let username_hint = meta.map_or(crate::adapters::FieldHint::None, |meta| meta.username_hint());
         let key = match field {
             DraftField::Url => "ui.conn.urlHint",
             DraftField::Name => "ui.conn.namePlaceholder",
             DraftField::File => "connections.validate.chooseFile",
-            DraftField::Database if redis => "ui.conn.redisDb",
-            DraftField::Database => match engine {
-                Some(Engine::Postgres) => "ui.conn.dbPlaceholderPg",
-                Some(Engine::Mysql | Engine::Mariadb) => "ui.conn.dbPlaceholderMysql",
-                Some(Engine::Sqlserver) => "ui.conn.dbPlaceholderMssql",
-                Some(Engine::Mongodb) => "ui.conn.dbPlaceholderMongo",
-                _ => "ui.conn.optional",
-            },
-            DraftField::Username if redis => "ui.conn.redisAclHint",
+            DraftField::Database => meta.map_or("ui.conn.optional", |meta| meta.database_hint_key()),
             DraftField::CaFile => "",
             DraftField::ClientCert | DraftField::ClientKey => "",
             DraftField::Passphrase => "ui.conn.optional",
@@ -4065,12 +4061,10 @@ impl Workbench {
             DraftField::Host => "127.0.0.1".to_owned(),
             // 端口清空后仍看得到这种数据库的默认端口。
             DraftField::Port => engine.map(|engine| crate::app::views::connections::default_port(engine).to_owned()).unwrap_or_default(),
-            DraftField::Username if !redis => match engine {
-                Some(Engine::Postgres) => "postgres".to_owned(),
-                Some(Engine::Mysql | Engine::Mariadb) => "root".to_owned(),
-                Some(Engine::Sqlserver) => "sa".to_owned(),
-                Some(Engine::Mongodb) => self.model.text("ui.conn.optional"),
-                _ => String::new(),
+            DraftField::Username => match username_hint {
+                crate::adapters::FieldHint::Text(text) => text.to_owned(),
+                crate::adapters::FieldHint::Key(key) => self.model.text(key),
+                crate::adapters::FieldHint::None => String::new(),
             },
             DraftField::Replica => "rs0".to_owned(),
             DraftField::SshHost => "bastion.example.com".to_owned(),
@@ -4086,7 +4080,7 @@ impl Workbench {
                 None => self.model.text(key),
             },
             // 示例跟着当前引擎走：选了 SQLite 不再提示一个 postgres 连接串。
-            DraftField::Url => format!("{} {}", self.model.text(key), url_example(engine.unwrap_or(Engine::Postgres))),
+            DraftField::Url => format!("{} {}", self.model.text(key), crate::adapters::adapter(engine.unwrap_or(crate::adapters::registry::DEFAULT_ENGINE)).meta().url_example()),
             _ if key.is_empty() => String::new(),
             _ => self.model.text(key),
         };
@@ -4333,7 +4327,7 @@ impl Workbench {
                                 Ok(path) => {
                                     if let Some(editor) = view.model.connections.editor.as_mut() {
                                         if editor.name.trim().is_empty() {
-                                            editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
+                                            editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or(editor.engine.as_str()).to_owned();
                                         }
                                     }
                                     view.model.set_field(DraftField::File, path.display().to_string());
@@ -7235,29 +7229,17 @@ fn palette_icon(id: &str) -> IconName {
     }
 }
 
-/// Redis 与 MongoDB 连接对应的浏览器命令、文案键和元素 id。
+/// 专项工作台（键值、文档）连接对应的浏览器命令、文案键和元素 id；关系型连接没有。
 pub(super) fn browser_command(row: &crate::connections::ConnectionRecord) -> Option<(String, &'static str, String)> {
     let name = row.saved.name.replace('|', " ");
-    match row.saved.engine {
-        Engine::Redis => {
-            let database = row.saved.database.clone().unwrap_or_else(|| "0".into());
+    match row.saved.engine.workbench() {
+        WorkbenchKind::Redis => {
+            let default_database = crate::adapters::adapter(row.saved.engine).meta().default_database();
+            let database = row.saved.database.clone().unwrap_or_else(|| default_database.to_owned());
             Some((format!("open-redis:{}|{name}|{database}", row.saved.id), "redis.open", format!("side-open-redis-{}", row.saved.id)))
         }
-        Engine::Mongodb => Some((format!("open-mongo:{}|{name}", row.saved.id), "mongo.open", format!("side-open-mongo-{}", row.saved.id))),
-        _ => None,
-    }
-}
-
-/// 连接串占位示例：与解析器支持的写法一致。
-fn url_example(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "postgres://user@host:5432/db",
-        Engine::Mysql => "mysql://user@host:3306/db",
-        Engine::Mariadb => "mariadb://user@host:3306/db",
-        Engine::Sqlserver => "sqlserver://user@host:1433/db",
-        Engine::Sqlite => "sqlite:///path/to/file.db",
-        Engine::Redis => "redis://host:6379/0",
-        Engine::Mongodb => "mongodb://user@host:27017/db",
+        WorkbenchKind::Mongo => Some((format!("open-mongo:{}|{name}", row.saved.id), "mongo.open", format!("side-open-mongo-{}", row.saved.id))),
+        WorkbenchKind::Relational => None,
     }
 }
 
@@ -7380,7 +7362,7 @@ pub(super) fn env_tone<'a>(env: &'a str, tags: &'a [EnvTag]) -> &'a str {
 
 /// 名称留空时保存所用的名字：与连接配置保存时的取名规则一致（文件库取文件名，其余取主机）。
 fn default_connection_name(draft: &crate::connections::model::ConnectionDraft) -> Option<String> {
-    let name = if draft.engine == Engine::Sqlite {
+    let name = if crate::adapters::adapter(draft.engine).meta().file_based() {
         let path = draft.file_path.trim();
         std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_owned()
     } else {

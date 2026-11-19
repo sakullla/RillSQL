@@ -687,3 +687,117 @@ async fn sessions_are_matched_to_engines_and_sqlite_scopes_stay_on_main() {
     assert_eq!(rows[0][0].as_deref(), Some("2"), "失败的批次整批回滚");
     assert!(CatalogSession::Scripted.insert_in_transaction("SELECT 1").await.is_err());
 }
+
+#[test]
+fn ui_metadata_comes_from_every_adapter() {
+    let mut marks = Vec::new();
+    for engine in ENGINES {
+        let meta = adapter(engine).meta();
+        let (abbr, color) = meta.mark();
+        assert_eq!(abbr.chars().count(), 2, "{engine:?} 徽标缩写为两个字母");
+        assert!(color <= 0xff_ffff, "{engine:?} 品牌色是 0xRRGGBB");
+        marks.push(abbr);
+        // 连接串示例必须能被本引擎的 scheme 认出。
+        let scheme = meta.url_example().split(':').next().unwrap();
+        assert_eq!(registry::by_url_scheme(scheme).map(|(found, _)| found), Some(engine), "{engine:?} 连接串示例");
+        // 别名与扩展名只给显示层/文件识别用，必须小写且能解析回本引擎。
+        for alias in meta.aliases() {
+            assert_eq!(*alias, alias.to_ascii_lowercase());
+            assert_eq!(registry::parse_loose(alias), Some(engine), "{engine:?} 别名 {alias}");
+        }
+        assert_eq!(registry::parse_loose(&meta.id().to_ascii_uppercase()), Some(engine), "宽松解析不区分大小写");
+        assert_eq!(meta.file_based(), !meta.file_extensions().is_empty(), "{engine:?} 只有文件型引擎有扩展名");
+        for ext in meta.file_extensions() {
+            assert_eq!(super::engine_for_file_extension(&ext.to_ascii_uppercase()), Some(engine));
+        }
+        assert!(!meta.database_hint_key().is_empty());
+        assert_eq!(super::is_relational_named(meta.id()), adapter(engine).capabilities().relational);
+        assert_eq!(engine.workbench(), meta.workbench());
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    assert_eq!(marks.len(), ENGINES.len(), "徽标缩写互不相同");
+    assert!(adapter(registry::LOCAL_FILE).meta().file_based(), "打开数据库文件建立的是文件型连接");
+    assert!(adapter(registry::DEFAULT_ENGINE).capabilities().relational, "新建连接默认关系型引擎");
+    assert_eq!(registry::parse_loose("unknown"), None);
+    assert!(super::is_relational_named("unknown"), "认不出的名字按关系型处理");
+    assert_eq!(super::engine_for_file_extension("txt"), None);
+}
+
+#[test]
+fn ui_metadata_matches_the_previous_tables() {
+    use super::FieldHint;
+    let expected = [
+        (Engine::Postgres, ("PG", 0x3b6ea5), "postgres://user@host:5432/db", "ui.conn.dbPlaceholderPg", FieldHint::Text("postgres")),
+        (Engine::Mysql, ("MY", 0x0284a8), "mysql://user@host:3306/db", "ui.conn.dbPlaceholderMysql", FieldHint::Text("root")),
+        (Engine::Mariadb, ("MA", 0xb46346), "mariadb://user@host:3306/db", "ui.conn.dbPlaceholderMysql", FieldHint::Text("root")),
+        (Engine::Sqlite, ("SL", 0x1d82d6), "sqlite:///path/to/file.db", "ui.conn.optional", FieldHint::None),
+        (Engine::Sqlserver, ("MS", 0xd63636), "sqlserver://user@host:1433/db", "ui.conn.dbPlaceholderMssql", FieldHint::Text("sa")),
+        (Engine::Redis, ("RD", 0xdc3d35), "redis://host:6379/0", "ui.conn.redisDb", FieldHint::Key("ui.conn.redisAclHint")),
+        (Engine::Mongodb, ("MG", 0x10a356), "mongodb://user@host:27017/db", "ui.conn.dbPlaceholderMongo", FieldHint::Key("ui.conn.optional")),
+    ];
+    for (engine, mark, url, db_key, user) in expected {
+        let meta = adapter(engine).meta();
+        assert_eq!(meta.mark(), mark, "{engine:?}");
+        assert_eq!(meta.url_example(), url, "{engine:?}");
+        assert_eq!(meta.database_hint_key(), db_key, "{engine:?}");
+        assert_eq!(meta.username_hint(), user, "{engine:?}");
+    }
+    for (alias, engine) in [("postgresql", Engine::Postgres), ("mssql", Engine::Sqlserver), ("mongo", Engine::Mongodb), ("MongoDB", Engine::Mongodb)] {
+        assert_eq!(registry::parse_loose(alias), Some(engine), "{alias}");
+    }
+    for ext in ["sqlite", "sqlite3", "db", "db3", "s3db", "DB"] {
+        assert_eq!(super::engine_for_file_extension(ext), Some(Engine::Sqlite), "{ext}");
+    }
+    assert!(!Workbench::Mongo.has_query_editor());
+    assert!(Workbench::Redis.has_query_editor() && Workbench::Relational.has_query_editor());
+}
+
+#[test]
+fn ui_kit_badges_and_labels_read_engine_meta() {
+    use crate::ui::kit::{engine_label, engine_mark};
+    for engine in ENGINES {
+        let meta = adapter(engine).meta();
+        assert_eq!(engine_mark(meta.id()), meta.mark());
+        assert_eq!(engine_label(meta.id()), meta.label());
+    }
+    assert_eq!(engine_label("postgresql"), "PostgreSQL");
+    assert_eq!(engine_label("mssql"), "SQL Server");
+    assert_eq!(engine_mark("mongo"), ("MG", 0x10a356));
+    assert_eq!(engine_mark("oracle"), ("DB", 0x64748b));
+    assert_eq!(engine_label("oracle"), "Database");
+}
+
+#[test]
+fn capability_notes_list_engines_from_the_registry() {
+    assert_eq!(super::transfer::schema_engines_note(), "只有 PostgreSQL 和 SQL Server 需要选择 schema");
+    assert_eq!(super::labels_with(|caps| caps.database_scoped_session, " 和 "), "PostgreSQL");
+    assert_eq!(super::labels_with(|caps| caps.relational && !caps.shows_databases, "、"), "SQLite");
+}
+
+#[test]
+fn engine_specific_english_lives_in_the_adapters() {
+    // 引擎专属句子由适配器给出英文：经 ddl::english 的通用查找仍能翻译。
+    for (zh, en) in [
+        ("SQLite 没有 TRUNCATE，这里用 DELETE FROM 逐行删除；AUTOINCREMENT 的计数不会重置，删除触发器会触发。", "SQLite has no TRUNCATE"),
+        ("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。", "PostgreSQL needs a schema"),
+        ("只有 MySQL 与 MariaDB 有事件（event）对象，这里不生成语句。", "Only MySQL and MariaDB have event objects"),
+        ("Redis 没有对象定义", "Redis has no object definitions"),
+        ("Redis 没有结构编辑。", "Redis has no structure editing."),
+    ] {
+        assert!(crate::ddl::english::english(zh).starts_with(en), "{zh}");
+    }
+    let mut owners = 0;
+    for engine in ENGINES {
+        let meta = adapter(engine).meta();
+        owners += usize::from(!meta.messages_en().is_empty());
+        for (zh, en) in meta.messages_en().iter().chain(meta.missing_items_en()) {
+            assert!(crate::ddl::english::has_cjk(zh) && !crate::ddl::english::has_cjk(en), "{engine:?}: {zh}");
+        }
+    }
+    assert_eq!(owners, ENGINES.len(), "每个引擎都有自己的专属句子");
+    assert_eq!(
+        crate::ddl::english::localize_missing_item("主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）", crate::i18n::Locale::En),
+        "the primary key's CLUSTERED / NONCLUSTERED option (SQL Server's default is assumed)"
+    );
+}

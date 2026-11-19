@@ -168,7 +168,7 @@ pub(crate) fn pair_note(source_type: &str, target_type: &str) -> Option<String> 
         (F::Decimal | F::Float, F::Integer) => "小数进整数列会被拒绝或截断，不会静默截断。".to_owned(),
         (F::Decimal, F::Float) | (F::Float, F::Decimal) => "定点与浮点互换有精度损失。".to_owned(),
         (F::Decimal | F::Float, F::Bool) => "小数转布尔不可靠，这些行通常会计入失败。".to_owned(),
-        (F::Bool, F::Integer | F::Decimal | F::Float) => "布尔写数值列在部分引擎（如 PostgreSQL）会被拒绝。".to_owned(),
+        (F::Bool, F::Integer | F::Decimal | F::Float) => crate::adapters::transfer::BOOL_TO_NUMBER_NOTE.to_owned(),
         (F::Date, F::Datetime) => return length_note(target_type),
         (F::Datetime, F::Date) => "日期时间进日期列会丢失时间部分。".to_owned(),
         (F::Date, F::Time) | (F::Time, F::Date) => "日期与时刻语义不同，值可能被拒绝。".to_owned(),
@@ -204,7 +204,6 @@ fn length_note(target_type: &str) -> Option<String> {
 pub(crate) fn is_conflict_error(message: &str) -> bool {
     crate::adapters::is_conflict_error(message)
 }
-
 
 /// 先精确匹配再忽略大小写，与前端 suggestMapping 的列名匹配同规则。
 fn find_column<'a>(columns: &'a [Column], name: &str) -> Option<&'a Column> {

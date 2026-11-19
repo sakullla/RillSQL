@@ -86,3 +86,18 @@ pub fn url_schemes() -> impl Iterator<Item = super::UrlScheme> {
 pub fn workbench_engine(workbench: super::Workbench) -> Option<Engine> {
     ENGINES.into_iter().find(|engine| adapter(*engine).meta().workbench() == workbench)
 }
+
+/// 新建连接、以及无从推断引擎时的默认引擎。
+pub const DEFAULT_ENGINE: Engine = Engine::Postgres;
+
+/// “打开数据库文件”所建连接的引擎（本地文件即数据库）。注册表完整性测试校验它是文件型。
+pub const LOCAL_FILE: Engine = Engine::Sqlite;
+
+/// 宽松解析：id 或别名，大小写不敏感（显示层与旧数据用）。
+pub fn parse_loose(name: &str) -> Option<Engine> {
+    let lower = name.trim().to_ascii_lowercase();
+    ENGINES.into_iter().find(|engine| {
+        let meta = adapter(*engine).meta();
+        meta.id() == lower || meta.aliases().contains(&lower.as_str())
+    })
+}

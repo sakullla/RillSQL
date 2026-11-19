@@ -15,6 +15,14 @@ pub fn text(locale: Locale, key: &str) -> String {
     value.unwrap_or(key).to_owned()
 }
 
+/// 字典里的原文（静态字符串）；没有这个键时为 None。
+pub fn static_text(locale: Locale, key: &str) -> Option<&'static str> {
+    match locale {
+        Locale::ZhCn => zh(key),
+        Locale::En => en(key),
+    }
+}
+
 pub fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
     let mut text = template.to_owned();
     for (key, value) in pairs {
@@ -635,8 +643,8 @@ dict! {
     "query.rewrite.sent" => "实际执行的语句", "Statement actually executed";
     "query.rewrite.limitAppend" => "追加 LIMIT {value}", "appended LIMIT {value}";
     "query.rewrite.limitReplace" => "把 LIMIT 改成 {value}", "changed LIMIT to {value}";
-    "query.rewrite.topAppend" => "加上 TOP ({value})", "added TOP ({value})";
-    "query.rewrite.topReplace" => "把 TOP 改成 {value}", "changed TOP to {value}";
+    "query.rewrite.topAppend" => "加上 {keyword} ({value})", "added {keyword} ({value})";
+    "query.rewrite.topReplace" => "把 {keyword} 改成 {value}", "changed {keyword} to {value}";
     "query.rewrite.fetchReplace" => "把 FETCH 行数改成 {value}", "changed FETCH rows to {value}";
     "query.side.toggle" => "显示 / 隐藏右侧面板", "Show / hide the side panel";
     "query.side.close" => "收起右侧面板", "Collapse the side panel";
@@ -1396,7 +1404,7 @@ dict! {
     "admin.probe.loading" => "正在读取清单…", "Reading inventory…";
     "admin.probe.refreshing" => "正在重新读取清单…", "Reloading inventory…";
     "admin.offline.heading" => "这个目标还没有连接", "This target is not connected";
-    "admin.offline.detail" => "下方的操作仍可预览生成的 SQL，但确认也不会执行；连接后这里会列出 PRAGMA、附加库、序列等清单。", "The actions below still preview their SQL but nothing runs, not even after confirming; once connected, PRAGMA values, attached databases, sequences, and the rest appear here.";
+    "admin.offline.detail" => "下方的操作仍可预览生成的 SQL，但确认也不会执行；连接后这里会列出引擎设置项、附加库、序列等清单。", "The actions below still preview their SQL but nothing runs, not even after confirming; once connected, engine settings, attached databases, sequences, and the rest appear here.";
     "admin.section.extras" => "扩展与分区", "Extensions and partitions";
     "admin.section.noneHint" => "切换到 SQLite、PostgreSQL 或 MySQL 目标后，这里会列出对应的数据库级操作。", "Switch to a SQLite, PostgreSQL, or MySQL target to see its database-level actions.";
     "admin.empty.attached" => "还没有附加数据库", "No attached databases yet";

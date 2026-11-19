@@ -243,7 +243,7 @@ impl CatalogDialect for MysqlCatalog {
     }
 
     async fn read_diagram(&self, session: &CatalogSession, database: &str, _schema: &str) -> Result<Diagram, String> {
-        if let Some(message) = crate::diagram::model::empty_mysql_database(database) {
+        if let Some(message) = super::diagram::empty_mysql_database(database) {
             return Err(message);
         }
         let CatalogSession::Mysql(pool) = session else {

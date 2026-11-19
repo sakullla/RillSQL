@@ -1,11 +1,13 @@
 //! 适配器边界扫描（ADR-0 / R22）。
 //!
 //! 扫描 `src/` 下除 `adapters/` 与测试代码（`tests.rs`、`*_tests.rs`、`#[cfg(test)]` 项）以外的生产源码，
-//! 禁止出现：具体 `Engine::<变体>`、具体会话变体（`CatalogSession::X` 等）、引擎名字符串字面量与方言标志性 SQL 片段。
+//! 禁止出现：具体 `Engine::<变体>`、具体会话变体（`CatalogSession::X` 等）、引擎名字符串字面量、方言标志性 SQL 片段，
+//! 以及字符串字面量里写死的引擎显示名（引擎专属的说明句与其英文由适配器提供，主代码只做通用拼装）。
+//! 界面文案目录（[`LOCALIZATION_CATALOGS`]，按 key 查的中英译文）不查显示名：功能介绍里列出支持的引擎属于产品文案。
 //!
 //! 迁移期间 [`ALLOWLIST`] 按文件记录尚未迁移的现存命中数，理由是负责迁移它的任务领域。
 //! 计数只减不增：命中数超过记录、或白名单外文件出现命中都会失败；命中减少时也会失败并提示把记录下调
-//! （棘轮），清零的条目必须删除。最后一个迁移任务（A6）完成时白名单为空。
+//! （棘轮），清零的条目必须删除。最后一个迁移任务（A6）已完成：白名单为空，任何命中都直接失败。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +40,12 @@ const ENGINE_NAMES: &[&str] = &[
     "mongodb",
     "mongo",
 ];
+
+/// 引擎显示名：出现在字符串字面量里即视为引擎专属文案（大小写敏感）。
+const ENGINE_DISPLAY_NAMES: &[&str] = &["PostgreSQL", "MySQL", "MariaDB", "SQLite", "SQL Server", "Redis", "MongoDB"];
+
+/// 界面文案目录：只按 key 存放中英译文，不含方言逻辑；不检查引擎显示名（其余规则照常检查）。
+const LOCALIZATION_CATALOGS: &[&str] = &["i18n/mod.rs"];
 
 /// 方言标志性 SQL 片段（大小写敏感）。
 const DIALECT_FRAGMENTS: &[&str] = &[
@@ -115,15 +123,8 @@ fn domain_of(file: &str) -> &'static str {
 }
 
 /// 尚未迁移的文件与现存命中数（只减不增）。理由为负责迁移的任务领域。
-const ALLOWLIST: &[(&str, usize, &str)] = &[
-    ("app/model.rs", 3, A6),
-    ("app/shell/chrome.rs", 32, A6),
-    ("app/shell/model.rs", 19, A6),
-    ("app/shell/view.rs", 8, A6),
-    ("i18n/mod.rs", 6, A6),
-    ("ui/format_viewer.rs", 1, A6),
-    ("ui/kit.rs", 27, A6),
-];
+/// A1–A6 全部完成后为空（R22）：生产代码不再有任何违规，新增违规不得再登记到这里。
+const ALLOWLIST: &[(&str, usize, &str)] = &[];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -306,8 +307,27 @@ fn product_code(text: &str) -> String {
     chars.into_iter().collect()
 }
 
-/// 一份产品代码中各禁止模式的命中数。
-fn hits(code: &str) -> BTreeMap<String, usize> {
+/// 产品代码里全部字符串字面量的内容（含原始字符串；字符字面量不算）。
+fn string_literals(code: &str) -> Vec<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match literal_end(&chars, i) {
+            Some(end) => {
+                if chars[i] != '\'' {
+                    out.push(chars[i..end].iter().collect());
+                }
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// 一份产品代码中各禁止模式的命中数。`catalog` 为界面文案目录时不检查引擎显示名。
+fn hits(code: &str, catalog: bool) -> BTreeMap<String, usize> {
     let mut found = BTreeMap::new();
     let mut add = |pattern: &str, count: usize| {
         if count > 0 {
@@ -329,6 +349,13 @@ fn hits(code: &str) -> BTreeMap<String, usize> {
         let literal = format!("\"{name}\"");
         add(&literal, lower.matches(&literal).count());
     }
+    if !catalog {
+        let literals = string_literals(code);
+        for name in ENGINE_DISPLAY_NAMES {
+            let count = literals.iter().map(|literal| literal.matches(name).count()).sum();
+            add(&format!("字面量里的 {name}"), count);
+        }
+    }
     found
 }
 
@@ -338,7 +365,7 @@ fn scan(files: &[(String, String)]) -> BTreeMap<String, (usize, BTreeMap<String,
         .iter()
         .filter(|(name, _)| !exempt(name))
         .filter_map(|(name, text)| {
-            let detail = hits(&product_code(text));
+            let detail = hits(&product_code(text), LOCALIZATION_CATALOGS.contains(&name.as_str()));
             let total: usize = detail.values().sum();
             (total > 0).then(|| (name.clone(), (total, detail)))
         })
@@ -405,11 +432,12 @@ fn production_code_respects_the_adapter_boundary() {
         assert!(*count > 0 && !reason.is_empty(), "{file}");
     }
     // 已完成迁移的领域不得再出现在白名单里。
-    let done: &[&str] = &[A1, A2, A3, A4, A5];
+    let done: &[&str] = &[A1, A2, A3, A4, A5, A6];
     assert!(
         ALLOWLIST.iter().all(|(_, _, reason)| !done.contains(reason)),
         "{done:?} 已迁移完毕，白名单不应再有它们的条目"
     );
+    assert!(ALLOWLIST.is_empty(), "R22：适配器迁移已收尾，白名单必须为空");
 }
 
 /// 自测：在现存源码上人为加入一处新违规，扫描必须失败；测试代码、注释与 adapters/ 不受约束。
@@ -435,6 +463,9 @@ fn boundary_scan_rejects_injected_violations() {
         "\nfn injected(storage: &str) -> bool { storage.eq_ignore_ascii_case(\"MyISAM\") }\n",
         "\nfn injected(word: &str) -> bool { word.eq_ignore_ascii_case(\"definer\") }\n",
         "\nconst INJECTED: &str = \"CREATE ALGORITHM=MERGE VIEW v AS SELECT 1\";\n",
+        "\nfn injected() -> String { \"SQLite 没有 TRUNCATE，这里用 DELETE FROM 逐行删除。\".to_owned() }\n",
+        "\nconst INJECTED: &[(&str, &str)] = &[(\"PostgreSQL 需要指定 schema。\", \"PostgreSQL needs a schema.\")];\n",
+        "\nfn injected(x: &str) -> String { format!(r#\"{x} 是 MySQL 与 MariaDB 的\"#) }\n",
     ];
     // 一个白名单内文件（若有）与一个白名单外新文件都要被抓到。
     let mut targets = vec!["app/injected_view.rs".to_owned()];
@@ -455,6 +486,8 @@ fn boundary_scan_rejects_injected_violations() {
         ("adapters/mysql/injected.rs", "\nfn f() { let _ = (Engine::Mysql, \"mysql\", \"PRAGMA\"); }\n"),
         ("app/injected_tests.rs", "\nfn f() { let _ = Engine::Postgres; }\n"),
         ("app/views/tests.rs", "\nfn f() { let _ = \"information_schema\"; }\n"),
+        ("app/injected_view.rs", "\n// SQLite 只出现在注释里\nfn sqlite_rows(redis_db: u8) -> u8 { redis_db }\n"),
+        ("i18n/mod.rs", "\nconst INJECTED: &str = \"支持 PostgreSQL、MySQL、SQLite\";\n"),
     ];
     for (file, extra) in tolerated {
         let problems = check(&inject(file, extra), ALLOWLIST);

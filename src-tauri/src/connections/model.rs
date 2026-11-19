@@ -47,6 +47,11 @@ impl Engine {
         crate::adapters::adapter(self).meta().label()
     }
 
+    /// 打开连接后主区用哪种工作台，由适配器 EngineMeta 提供。
+    pub fn workbench(self) -> crate::adapters::Workbench {
+        crate::adapters::adapter(self).meta().workbench()
+    }
+
 }
 
 pub const ENV_NONE: &str = "none";
@@ -411,7 +416,7 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         if !draft.database.trim().chars().all(|ch| ch.is_ascii_digit()) {
             errors.push(FieldError {
                 field: "database".to_owned(),
-                message: "Redis 库索引应为 0 起的非负整数".to_owned(),
+                message: format!("{} 库索引应为 0 起的非负整数", meta.label()),
             });
         }
     }

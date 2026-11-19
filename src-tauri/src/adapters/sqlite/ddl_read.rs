@@ -416,7 +416,6 @@ fn sqlite_i64(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<i64> {
     None
 }
 
-
 pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Step], restore: Option<bool>) -> Result<Vec<StepReceipt>, String> {
     let mut conn = pool.acquire().await.map_err(|err| crate::error_text::chain(&err))?;
     let mut results = Vec::new();
@@ -598,4 +597,3 @@ fn sqlite_unknown(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
     text.contains("pool closed") || text.contains("connection closed") || text.contains("broken pipe")
 }
-

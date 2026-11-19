@@ -335,18 +335,6 @@ pub trait DdlDialect: Sync {
         AdminSections::default()
     }
 
-    // ---- 英文 ----
-
-    /// 方言专属计划文字的英文（整句，不含可变部分）。
-    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    /// 方言专属的重建定义“未包含”项的英文。
-    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
     // ---- 会话：内省与执行 ----
 
     /// 会话句柄属于这个方言的引擎。

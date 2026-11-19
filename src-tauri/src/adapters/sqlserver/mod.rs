@@ -6,6 +6,7 @@ pub(crate) mod connect;
 pub(crate) mod diagram;
 pub(crate) mod ddl;
 pub(crate) mod ddl_read;
+mod english;
 pub(crate) mod exec;
 mod functions;
 pub(crate) mod grid_read;
@@ -14,7 +15,7 @@ mod syntax;
 pub(in crate::adapters) mod transfer;
 mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqlserverAdapter;
@@ -42,6 +43,34 @@ impl EngineMeta for SqlserverAdapter {
 
     fn workbench(&self) -> Workbench {
         Workbench::Relational
+    }
+
+    fn mark(&self) -> (&'static str, u32) {
+        ("MS", 0xd63636)
+    }
+
+    fn url_example(&self) -> &'static str {
+        "sqlserver://user@host:1433/db"
+    }
+
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MESSAGES_EN
+    }
+
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MISSING_ITEMS_EN
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["mssql"]
+    }
+
+    fn database_hint_key(&self) -> &'static str {
+        "ui.conn.dbPlaceholderMssql"
+    }
+
+    fn username_hint(&self) -> FieldHint {
+        FieldHint::Text("sa")
     }
 
     fn url_schemes(&self) -> &'static [UrlScheme] {

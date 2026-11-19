@@ -15,12 +15,9 @@ use super::store::{Applied, Cell, Column, CommitReport, Engine, Failed, Filter, 
 
 const MAX_PAGE: u64 = 10_000;
 
-
-
 fn no_channel() -> String {
     "这个连接没有连着可查询的数据库".to_owned()
 }
-
 
 pub struct LiveRow {
     pub id: String,
@@ -393,7 +390,6 @@ fn finish_job(id: &str) {
     jobs().lock().expect("exports").remove(id);
 }
 
-
 fn export_format(spec: &ExportSpec) -> Result<&'static str, ExportOutcome> {
     match spec.format.as_str() {
         "" | "csv" => Ok("csv"),
@@ -550,7 +546,6 @@ impl ExportSink for FileSink<'_> {
         }
     }
 }
-
 
 struct CsvFile {
     file: Option<File>,
@@ -1061,25 +1056,6 @@ async fn execute_sql(session: &CatalogSession, sql: &str) -> Result<u64, String>
     session.grid_execute(sql).await
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignKey {
     pub name: String,
@@ -1088,7 +1064,6 @@ pub struct ForeignKey {
     pub ref_table: String,
     pub ref_columns: Vec<String>,
 }
-
 
 /// 把目录行收成表级外键。空名、空列和缺引用目标的行跳过；同名约束按行序合并成复合键。
 pub(crate) fn assemble_foreign_keys(rows: &[Vec<Cell>]) -> Vec<ForeignKey> {

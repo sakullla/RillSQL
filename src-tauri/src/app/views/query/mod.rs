@@ -304,7 +304,9 @@ pub fn rewrite_clause(locale: Locale, rewrite: &AutoRewrite) -> String {
         ("top", _) => "query.rewrite.topReplace",
         _ => "query.rewrite.fetchReplace",
     };
-    i18n::fill(&i18n::text(locale, key), &[("value", &rewrite_value(&rewrite.added))])
+    // 方言的行数上限关键字就是改写种类本身（大写），文案里不写死某个方言。
+    let keyword = rewrite.kind.to_ascii_uppercase();
+    i18n::fill(&i18n::text(locale, key), &[("value", &rewrite_value(&rewrite.added)), ("keyword", &keyword)])
 }
 
 /// “这条语句被执行前改写过”的完整说明；手写 LIMIT 且没被改写时不产生说明。

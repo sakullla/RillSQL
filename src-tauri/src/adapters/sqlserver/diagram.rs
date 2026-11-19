@@ -139,3 +139,11 @@ fn cell_string(cell: Option<&Cell>) -> String {
 fn tsql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
+
+pub(crate) fn empty_sqlserver_schema(schema: &str) -> Option<String> {
+    if schema.trim().is_empty() {
+        Some("SQL Server 关系图需要一个 schema。".to_owned())
+    } else {
+        None
+    }
+}

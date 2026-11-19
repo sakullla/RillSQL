@@ -6,6 +6,7 @@ pub(crate) mod connect;
 mod ddl;
 pub(in crate::adapters) mod ddl_read;
 pub(crate) mod diagram;
+mod english;
 pub(crate) mod extras;
 pub(crate) mod exec;
 mod functions;
@@ -44,6 +45,26 @@ impl EngineMeta for SqliteAdapter {
 
     fn workbench(&self) -> Workbench {
         Workbench::Relational
+    }
+
+    fn mark(&self) -> (&'static str, u32) {
+        ("SL", 0x1d82d6)
+    }
+
+    fn url_example(&self) -> &'static str {
+        "sqlite:///path/to/file.db"
+    }
+
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MESSAGES_EN
+    }
+
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MISSING_ITEMS_EN
+    }
+
+    fn file_extensions(&self) -> &'static [&'static str] {
+        &["sqlite", "sqlite3", "db", "db3", "s3db"]
     }
 
     fn defaults_to_local(&self) -> bool {

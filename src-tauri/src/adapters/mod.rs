@@ -88,6 +88,21 @@ pub enum FormField {
     SavePassword,
 }
 
+/// 表单字段占位：原样示例文字、i18n 键或不显示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldHint {
+    None,
+    Text(&'static str),
+    Key(&'static str),
+}
+
+impl Workbench {
+    /// 有文本查询编辑器（SQL 编辑器或命令控制台）；文档工作台没有。
+    pub fn has_query_editor(self) -> bool {
+        !matches!(self, Workbench::Mongo)
+    }
+}
+
 /// 关系型远程引擎的默认字段顺序。
 pub const DEFAULT_GENERAL_FIELDS: &[FormField] =
     &[FormField::Host, FormField::Port, FormField::Username, FormField::Password, FormField::Database, FormField::SavePassword];
@@ -137,6 +152,43 @@ pub trait EngineMeta: Sync {
     /// 文件型（本地文件即数据库，没有主机/端口）。
     fn file_based(&self) -> bool;
     fn workbench(&self) -> Workbench;
+
+    /// 徽标：两字母缩写与品牌色（0xRRGGBB）。只做识别，不做商标。
+    fn mark(&self) -> (&'static str, u32);
+
+    /// 显示层可识别的别名（小写，不含 id 本身），如旧数据或连接串里的另一种写法。
+    fn aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 本地数据库文件的扩展名（小写、不含点）；只有文件型引擎有。
+    fn file_extensions(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 连接表单“连接串”占位示例。
+    fn url_example(&self) -> &'static str;
+
+    /// 连接表单“数据库”字段占位文案的 i18n 键。
+    fn database_hint_key(&self) -> &'static str {
+        "ui.conn.optional"
+    }
+
+    /// 连接表单“用户名”字段的占位。
+    fn username_hint(&self) -> FieldHint {
+        FieldHint::None
+    }
+
+    /// 只由这个引擎生成的说明句（计划风险/阻断/步骤、读取与执行错误、对象定义提示）的英文句型，
+    /// 规则见 `ddl/english.rs`。共用句型不放这里。
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// 这个引擎专属的重建定义“未包含”项的英文。
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
 
     /// 新建连接默认按本地开发处理：环境标签 local、TLS 关闭。
     fn defaults_to_local(&self) -> bool {
@@ -617,4 +669,41 @@ pub fn quote_ident_named(engine: &str, name: &str) -> String {
 /// 专项工作台（Redis / Mongo）顶栏徽标使用的引擎 id。
 pub fn workbench_badge_id(workbench: Workbench) -> &'static str {
     registry::workbench_engine(workbench).map(|engine| adapter(engine).meta().id()).unwrap_or_default()
+}
+
+/// 门面：按引擎名（id 或别名，大小写不敏感）判断是否关系型；认不出的名字按关系型处理。
+pub fn is_relational_named(engine: &str) -> bool {
+    registry::parse_loose(engine).is_none_or(|engine| adapter(engine).capabilities().relational)
+}
+
+/// 门面：按引擎名（id 或别名）取工作台类型；认不出时为 None。
+pub fn workbench_loose(engine: &str) -> Option<Workbench> {
+    registry::parse_loose(engine).map(|engine| adapter(engine).meta().workbench())
+}
+
+/// 门面：扩展名（不含点，大小写不敏感）属于哪种文件型引擎。
+pub fn engine_for_file_extension(ext: &str) -> Option<Engine> {
+    let ext = ext.to_ascii_lowercase();
+    registry::ENGINES.into_iter().find(|engine| adapter(*engine).meta().file_extensions().contains(&ext.as_str()))
+}
+
+/// 门面：具备某项能力的引擎显示名（注册表顺序），用 `separator` 连接。用于“只有 X 需要…”一类说明，
+/// 说明里不写死引擎名。
+pub fn labels_with(capability: impl Fn(Capabilities) -> bool, separator: &str) -> String {
+    registry::ENGINES
+        .into_iter()
+        .filter(|engine| capability(adapter(*engine).capabilities()))
+        .map(|engine| adapter(engine).meta().label())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+/// 门面：各引擎专属说明句的英文句型表（注册表顺序）。
+pub fn engine_messages_en() -> impl Iterator<Item = &'static [(&'static str, &'static str)]> {
+    registry::ENGINES.into_iter().map(|engine| adapter(engine).meta().messages_en())
+}
+
+/// 门面：各引擎专属的重建定义“未包含”项英文表（注册表顺序）。
+pub fn engine_missing_items_en() -> impl Iterator<Item = &'static [(&'static str, &'static str)]> {
+    registry::ENGINES.into_iter().map(|engine| adapter(engine).meta().missing_items_en())
 }

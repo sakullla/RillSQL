@@ -42,7 +42,7 @@ pub enum Retry {
 pub fn resolve_route(config: &SavedConnection, forwarder_port: Option<u16>) -> Result<Route, String> {
     if crate::adapters::adapter(config.engine).meta().file_based() {
         if config.tls.is_some() || config.ssh.is_some() {
-            return Err("SQLite 没有 TLS 或 SSH".to_owned());
+            return Err(format!("{} 没有 TLS 或 SSH", crate::adapters::adapter(config.engine).meta().label()));
         }
         return Ok(Route {
             transport_host: String::new(),

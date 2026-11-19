@@ -9,7 +9,7 @@ use super::model::{DataDiff, DataInput, DataKey, DataReport, DataTable, Engine};
 pub fn diff_data(input: &DataInput) -> DataReport {
     if Engine::parse(&input.baseline_engine).ok() != Engine::parse(&input.target_engine).ok() || Engine::parse(&input.target_engine).is_err() {
         return DataReport {
-            refused: Some("两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。".to_owned()),
+            refused: Some(crate::adapters::transfer::ENGINE_MISMATCH.to_owned()),
             script: String::new(),
             incomplete: false,
             notes: Vec::new(),

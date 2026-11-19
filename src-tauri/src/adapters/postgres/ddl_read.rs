@@ -376,7 +376,6 @@ fn clause_action(definition: &str, clause: &str) -> Option<String> {
     }
 }
 
-
 pub(in crate::adapters) async fn run_steps(client: &tokio_postgres::Client, steps: &[Step]) -> Result<Vec<StepReceipt>, String> {
     let mut results = Vec::new();
     let mut stop = false;
@@ -399,4 +398,3 @@ pub(in crate::adapters) async fn run_steps(client: &tokio_postgres::Client, step
     }
     Ok(results)
 }
-

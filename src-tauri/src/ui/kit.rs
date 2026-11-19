@@ -681,31 +681,16 @@ impl gpui_kit::Global for DensityMetrics {}
 
 // ---------------------------------------------------------------- 引擎与环境
 
-/// 引擎缩写与品牌色。只做识别，不做商标。
+/// 引擎缩写与品牌色（由适配器 EngineMeta 提供）。只做识别，不做商标；认不出的名字用通用灰色 DB。
 pub fn engine_mark(engine: &str) -> (&'static str, u32) {
-    match engine {
-        "postgres" | "postgresql" => ("PG", 0x3b6ea5),
-        "mysql" => ("MY", 0x0284a8),
-        "mariadb" => ("MA", 0xb46346),
-        "sqlite" => ("SL", 0x1d82d6),
-        "sqlserver" | "mssql" => ("MS", 0xd63636),
-        "redis" => ("RD", 0xdc3d35),
-        "mongodb" | "mongo" => ("MG", 0x10a356),
-        _ => ("DB", 0x64748b),
-    }
+    crate::adapters::registry::parse_loose(engine)
+        .map(|engine| crate::adapters::adapter(engine).meta().mark())
+        .unwrap_or(("DB", 0x64748b))
 }
 
+/// 引擎显示名（由适配器 EngineMeta 提供）；认不出的名字显示 Database。
 pub fn engine_label(engine: &str) -> &'static str {
-    match engine {
-        "postgres" | "postgresql" => "PostgreSQL",
-        "mysql" => "MySQL",
-        "mariadb" => "MariaDB",
-        "sqlite" => "SQLite",
-        "sqlserver" | "mssql" => "SQL Server",
-        "redis" => "Redis",
-        "mongodb" | "mongo" => "MongoDB",
-        _ => "Database",
-    }
+    crate::adapters::registry::parse_loose(engine).map(|engine| crate::adapters::adapter(engine).meta().label()).unwrap_or("Database")
 }
 
 /// 圆角方块里的两字母引擎徽标：柔和微透底 + 清晰品牌描边与色相，比纯色大红大绿块更精致现代。

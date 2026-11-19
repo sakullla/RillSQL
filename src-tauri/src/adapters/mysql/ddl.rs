@@ -147,19 +147,6 @@ impl DdlDialect for MysqlDdl {
         AdminSections { events: true, partitions: true, ..AdminSections::default() }
     }
 
-    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。",
-                "TRUNCATE TABLE commits immediately and resets AUTO_INCREMENT to its initial value; DELETE triggers don't fire.",
-            ),
-            (
-                "表 {} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。",
-                "Table {0} uses MyISAM, which doesn't support foreign keys. Checks are not turned off to pretend the creation succeeded.",
-            ),
-        ]
-    }
-
     fn matches_session(&self, session: &CatalogSession) -> bool {
         matches!(session, CatalogSession::Mysql(_))
     }
@@ -245,7 +232,6 @@ fn plan_set_event_enabled(snapshot: &Snapshot, event: &str, enabled: bool, suppo
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
 }
-
 
 /// DEFINER 的值：CURRENT_USER[()] 或 user[@host]（各段可带引号）。
 fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {

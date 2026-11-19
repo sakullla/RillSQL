@@ -170,10 +170,6 @@ impl DdlDialect for SqliteDdl {
         labels
     }
 
-    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
-        MESSAGES_EN
-    }
-
     fn matches_session(&self, session: &CatalogSession) -> bool {
         matches!(session, CatalogSession::Sqlite { .. })
     }
@@ -245,20 +241,6 @@ fn object_action(snapshot: &Snapshot, action: &Action, supported: bool) -> Optio
         _ => return None,
     })
 }
-
-/// SQLite 专属计划文字的英文。
-const MESSAGES_EN: &[(&str, &str)] = &[
-    (
-        "WITHOUT ROWID 表必须保留主键，重建不能可靠保留行标识，因此阻止执行。",
-        "A WITHOUT ROWID table must keep its primary key and a rebuild can't keep the row identity reliably, so it is blocked.",
-    ),
-    ("只有 SQLite 用 PRAGMA 改这些开关，这里不生成语句。", "Only SQLite changes these settings with PRAGMA, so no statement is generated here."),
-    (
-        "foreign_keys 走外键开关动作（SetForeignKeys），这里不重复生成同一条 PRAGMA。",
-        "foreign_keys has its own action (SetForeignKeys), so the same PRAGMA is not generated here again.",
-    ),
-    ("这里只改 journal_mode 与 user_version，其它 PRAGMA 不放行。", "Only journal_mode and user_version can be changed here; other PRAGMAs are not allowed."),
-];
 
 fn plan_set_fk(snapshot: &Snapshot, enabled: bool, supported: bool) -> Plan {
     let target = "sqlite / foreign_keys".to_owned();
@@ -718,4 +700,3 @@ fn nullability_is_direct(snapshot: &Snapshot, column: &Column) -> bool {
 }
 
 const DIRECT_NOT_NULL_VERSION: (u64, u64, u64) = (3, 53, 0);
-

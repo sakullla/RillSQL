@@ -1459,7 +1459,7 @@ fn sql_tokens(input: &str) -> Vec<String> {
             tokens.push(chars[start..index].iter().collect());
             continue;
         }
-        if ch == '\'' || ch == '"' || ch == '`' {
+        if ch == '\'' || crate::adapters::is_symmetric_identifier_quote(ch) {
             let start = index;
             index += 1;
             while index < chars.len() {

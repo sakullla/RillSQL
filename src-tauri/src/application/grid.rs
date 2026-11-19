@@ -229,7 +229,6 @@ fn sort_of(sort: Option<&SortArg>) -> Option<Sort> {
     sort.map(|sort| Sort { column: sort.column.clone(), descending: sort.direction == "desc" })
 }
 
-
 fn schema_dto(schema: &TableSchema, database: &str, foreign_keys: Option<Vec<ForeignKey>>) -> SchemaDto {
     SchemaDto {
         engine: schema.engine.as_str().to_owned(),

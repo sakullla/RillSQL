@@ -172,7 +172,7 @@ impl ObjectTarget {
     }
 
     pub fn is_relational(&self) -> bool {
-        !matches!(self.engine.to_ascii_lowercase().as_str(), "redis" | "mongodb" | "mongo")
+        crate::adapters::is_relational_named(&self.engine)
     }
 
     /// 库.模式.对象 · 连接：菜单、命令面板和对比入口共用同一段展示文本。
@@ -618,6 +618,14 @@ pub fn translate(locale: Locale, key: &'static str) -> &'static str {
         Locale::ZhCn => zh(key),
         Locale::En => en(key),
     }
+    // 外壳表里没有的键（如“打开 SQLite 文件”）沿用共用字典。
+    .or_else(|| {
+        let locale = match locale {
+            Locale::ZhCn => crate::i18n::Locale::ZhCn,
+            Locale::En => crate::i18n::Locale::En,
+        };
+        crate::i18n::static_text(locale, key)
+    })
     .unwrap_or(key)
 }
 
@@ -630,7 +638,6 @@ fn zh(key: &str) -> Option<&'static str> {
         "ui.tool.admin" => "数据库管理",
         "shell.command.openExchange" => "导入 / 导出",
         "shell.command.newConnection" => "新建连接",
-        "shell.command.openSqlite" => "打开 SQLite 文件",
         "shell.command.history" => "查询历史",
         "shell.command.saveQuery" => "保存当前查询",
         "shell.command.savedQueries" => "保存的查询",
@@ -708,7 +715,6 @@ fn en(key: &str) -> Option<&'static str> {
         "ui.tool.admin" => "Database admin",
         "shell.command.openExchange" => "Import / export",
         "shell.command.newConnection" => "New connection",
-        "shell.command.openSqlite" => "Open SQLite file",
         "shell.command.history" => "Query history",
         "shell.command.saveQuery" => "Save current query",
         "shell.command.savedQueries" => "Saved queries",

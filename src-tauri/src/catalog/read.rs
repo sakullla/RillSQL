@@ -282,4 +282,3 @@ impl KindRank for ObjectRow {
         }
     }
 }
-

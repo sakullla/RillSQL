@@ -279,7 +279,6 @@ fn mysql_i64(row: &mysql_async::Row, index: usize) -> i64 {
     mysql_string(row, index).parse().unwrap_or(0)
 }
 
-
 pub(in crate::adapters) async fn run_steps(pool: &mysql_async::Pool, steps: &[Step]) -> Result<Vec<StepReceipt>, String> {
     let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
     let mut results = Vec::new();
@@ -303,4 +302,3 @@ pub(in crate::adapters) async fn run_steps(pool: &mysql_async::Pool, steps: &[St
     }
     Ok(results)
 }
-

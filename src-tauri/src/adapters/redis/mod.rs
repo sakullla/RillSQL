@@ -9,10 +9,11 @@ pub mod commands;
 pub(crate) mod complete;
 pub(crate) mod connect;
 pub(crate) mod console;
+mod english;
 pub(crate) mod exec;
 pub(crate) mod keys;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, Workbench};
+use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {
@@ -50,6 +51,30 @@ impl EngineMeta for RedisAdapter {
 
     fn workbench(&self) -> Workbench {
         Workbench::Redis
+    }
+
+    fn mark(&self) -> (&'static str, u32) {
+        ("RD", 0xdc3d35)
+    }
+
+    fn url_example(&self) -> &'static str {
+        "redis://host:6379/0"
+    }
+
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MESSAGES_EN
+    }
+
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MISSING_ITEMS_EN
+    }
+
+    fn database_hint_key(&self) -> &'static str {
+        "ui.conn.redisDb"
+    }
+
+    fn username_hint(&self) -> FieldHint {
+        FieldHint::Key("ui.conn.redisAclHint")
     }
 
     fn defaults_to_local(&self) -> bool {

@@ -424,4 +424,3 @@ fn plan_alter_domain(snapshot: &Snapshot, domain: &str, default_sql: Option<&str
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
 }
-

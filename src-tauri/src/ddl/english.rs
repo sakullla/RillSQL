@@ -3,8 +3,9 @@
 //! 计划由执行层按中文生成，确认执行时还要和同一份计划逐条比对 SQL，所以不在生成端分语言；
 //! 英文界面在显示时按这里的句型表换成英文。句型里的 `{}` 是对象名、行数等可变部分，
 //! 英文句子用 `{0}`、`{1}` 按位置取回（可变部分本身是已知句型时也一起换）。
-//! 覆盖范围：`ddl/`、`application/ddl.rs` 与适配器结构方言（`adapters/ddl.rs`、`adapters/*/ddl*.rs`；方言专属的句子由各方言的
-//! `messages_en`/`missing_items_en` 给出英文）非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
+//! 这里只放各引擎共用的句型；只由某个引擎生成的句子（含引擎名或方言专属说明）由该引擎适配器的
+//! `EngineMeta::messages_en`/`missing_items_en`（`adapters/<engine>/english.rs`）给出英文，这里只做通用查找与拼装。
+//! 覆盖范围：`ddl/`、`application/ddl.rs` 与适配器结构方言（`adapters/ddl.rs`、`adapters/*/ddl*.rs`）非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
 //! 执行结果），以及确认层、对象定义查看器（`catalog/definition.rs` 与 `catalog/read.rs` 的定义读取函数）和结构页
 //! 路径上的中文，由源码扫描测试 `every_chinese_literal_on_ddl_paths_has_an_english_form` 守住；只用于匹配的片段与
 //! 写进生成 SQL 注释的文字列在测试白名单里并写明原因。查不到句型的原样返回（数据库原文不翻译）。
@@ -24,21 +25,13 @@ const PATTERNS: &[(&str, &str)] = &[
         "当前连接 foreign_keys = {p}。不会为了让这次操作看起来成功而静默打开或关闭它。",
         "This connection has foreign_keys = {0}. It is never switched on or off silently to make this operation look successful.",
     ),
-    ("Redis 没有结构编辑。", "Redis has no structure editing."),
-    ("MongoDB 没有结构编辑。", "MongoDB has no structure editing."),
     ("{} 没有结构编辑。", "{0} has no structure editing."),
     ("当前连接打开的是 {}，没有另开连接修改 {}", "This connection has {0} open; no other connection was opened to change {1}"),
     ("需要数据库名，没有另开连接。", "A database name is required; no other connection was opened."),
-    ("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。", "PostgreSQL needs a schema (the group the table is in); no other connection was opened."),
-    ("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。", "SQL Server needs a schema (the group the table is in); no other connection was opened."),
     ("被这些外键引用：{l}。{p}", "Referenced by these foreign keys: {0}. {1}"),
     // 删除表
     ("将永久删除 {} 的结构和{p}。这不是备份。", "This permanently deletes the structure of {0} and {1}. This is not a backup."),
     ("只删除预览中的这一张表，不隐式级联删除其他业务对象。", "Only this previewed table is dropped; no other object is removed by an implicit cascade."),
-    (
-        "不会添加 CASCADE。当前 foreign_keys = OFF 时 SQLite 仍可能删除这张表，引用方会留下无效引用。",
-        "CASCADE is not added. With foreign_keys = OFF, SQLite may still drop this table and leave dangling references behind.",
-    ),
     ("不会添加 CASCADE。被引用时数据库会拒绝删除。", "CASCADE is not added. The database refuses the drop while the table is referenced."),
     ("删除视图 {}", "Drop view {0}"),
     ("删除 {}", "Drop {0}"),
@@ -55,29 +48,12 @@ const PATTERNS: &[(&str, &str)] = &[
         "将永久删除 {} 里的{p}数据，只保留表结构。这不是备份，也不能撤销。",
         "This permanently deletes {1} of the data in {0} and keeps only the table structure. This is not a backup and can't be undone.",
     ),
-    (
-        "SQLite 没有 TRUNCATE，这里用 DELETE FROM 逐行删除；AUTOINCREMENT 的计数不会重置，删除触发器会触发。",
-        "SQLite has no TRUNCATE, so DELETE FROM removes the rows one by one; the AUTOINCREMENT counter is not reset and delete triggers fire.",
-    ),
-    (
-        "TRUNCATE TABLE 不触发逐行的 DELETE 触发器，不重置关联序列，也不加 CASCADE。",
-        "TRUNCATE TABLE doesn't fire row-level DELETE triggers, doesn't reset owned sequences and doesn't add CASCADE.",
-    ),
-    (
-        "当前 foreign_keys = ON：引用方还有数据时删除可能被拒绝，或按外键规则级联。",
-        "foreign_keys is ON: while referencing rows exist, the delete may be refused or cascade by the foreign-key rules.",
-    ),
-    ("当前 foreign_keys 未开启：删除会成功，引用方会留下无效引用。", "foreign_keys is off: the delete succeeds and the referencing rows are left with dangling references."),
     ("被外键引用的表，数据库可能拒绝 TRUNCATE。不会添加 CASCADE。", "The database may refuse TRUNCATE on a table referenced by foreign keys. CASCADE is not added."),
     ("清空 {}", "Empty {0}"),
     // 改名
     ("新表名不能为空。", "The new table name can't be empty."),
     ("新表名无效。", "The new table name is not valid."),
     ("新表名和原名相同，没有生成语句。", "The new name is the same as the current one, so no statement was generated."),
-    (
-        "SQLite 不能只改表名的大小写（{} → {}）。可以先改成另一个临时名，再改成 {}。",
-        "SQLite can't change only the letter case of a table name ({0} → {1}). Rename it to a temporary name first, then to {2}.",
-    ),
     ("名字 {} 已经被其它对象占用，不会覆盖它。", "The name {0} is already used by another object; it won't be overwritten."),
     ("没有确认名字 {} 是否已被占用，没有生成语句。", "It couldn't be confirmed whether the name {0} is free, so no statement was generated."),
     (
@@ -86,140 +62,27 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("这些视图或触发器引用了它：{l}。数据库不一定会同步改写它们。", "These views or triggers reference it: {0}. The database won't necessarily update them."),
     ("把 {} 改名为 {}", "Rename {0} to {1}"),
-    // 外键开关
-    (
-        "只改变本次已打开连接的 foreign_keys。不会清理已有数据，也不会把外键说成已经验证成功。",
-        "Only changes foreign_keys on this open connection. Existing data is not cleaned up, and the foreign keys are not reported as verified.",
-    ),
-    ("只有 SQLite 用连接上的 foreign_keys 控制外键是否生效。", "Only SQLite uses the connection's foreign_keys setting to enforce foreign keys."),
-    ("没有读到 foreign_keys，没有生成语句。", "foreign_keys could not be read, so no statement was generated."),
-    ("当前连接 foreign_keys 已经是 {}。", "foreign_keys is already {0} on this connection."),
-    ("设置 foreign_keys = {}", "Set foreign_keys = {0}"),
-    // PRAGMA（方言专属的句子在适配器的 messages_en 里）
-    ("journal_mode 只能是 delete、truncate、persist、memory、wal 或 off。", "journal_mode must be delete, truncate, persist, memory, wal or off."),
-    ("journal_mode 写进数据库文件头，重新打开这个文件后仍然是这个模式。", "journal_mode is written to the database file header and stays in effect when the file is reopened."),
-    (
-        "WAL 会在库文件旁边多出 -wal 与 -shm 文件，需要文件系统支持共享内存。",
-        "WAL adds -wal and -shm files next to the database file and needs a file system that supports shared memory.",
-    ),
-    ("关掉日志后崩溃时无法回滚未完成的事务。", "With the journal off, unfinished transactions can't be rolled back after a crash."),
-    ("user_version 只接受 0 到 2147483647 的整数。", "user_version only accepts an integer from 0 to 2147483647."),
-    ("{} 已经是 {} 的值，没有生成语句。", "{0} is already a value of {1}, so no statement was generated."),
+    // 引擎设置与库级动作的共用句型（各引擎专属的句子在适配器 `<engine>/english.rs` 里）
     ("{} 已经是 {}，没有生成语句。", "{0} is already {1}, so no statement was generated."),
     ("设置 {} = {}", "Set {0} = {1}"),
-    // ATTACH
-    ("只有 SQLite 用 ATTACH 附加数据库文件，这里不生成语句。", "Only SQLite attaches database files with ATTACH, so no statement is generated here."),
-    ("要附加的数据库文件路径不能为空。", "The path of the database file to attach can't be empty."),
-    ("文件路径里不能有控制字符。", "The file path can't contain control characters."),
-    ("文件路径太长。", "The file path is too long."),
-    ("附加库的名字无效。", "The name for the attached database is not valid."),
-    ("{} 是 SQLite 保留的库名，不能用来附加。", "{0} is a database name reserved by SQLite and can't be used for an attachment."),
-    ("{} 已经附加在这个连接上，没有生成语句。", "{0} is already attached on this connection, so no statement was generated."),
-    (
-        "路径上没有库文件时 SQLite 会新建一个空库；这里不检查文件是否已经存在。",
-        "If there is no database file at the path, SQLite creates an empty one; whether the file exists is not checked here.",
-    ),
-    ("ATTACH 只对当前连接生效，断开连接后不保留。", "ATTACH only applies to this connection and is gone after disconnecting."),
-    ("同一个文件已经作为 {} 附加过；再加一次会在写入时互相干扰。", "The same file is already attached as {0}; attaching it again makes writes interfere with each other."),
     ("附加 {}", "Attach {0}"),
-    // VACUUM / REINDEX
-    (
-        "VACUUM 会重写整个数据库文件，需要额外的临时磁盘空间；不确认执行就不会写入。",
-        "VACUUM rewrites the whole database file and needs extra temporary disk space; nothing is written until you confirm.",
-    ),
-    (
-        "VACUUM 不能在事务里执行，这里单条执行，不改表结构也不改数据。",
-        "VACUUM can't run inside a transaction, so it runs on its own; it changes neither the structure nor the data.",
-    ),
-    ("维护动作只对 SQLite 提供；其它引擎请在查询里自己写 VACUUM。", "Maintenance actions are only offered for SQLite; for other engines, write VACUUM in a query."),
     ("整理数据库文件", "Compact the database file"),
-    ("REINDEX 只重建索引，不改表里的数据。", "REINDEX only rebuilds indexes; table data is not changed."),
-    ("大表重建索引期间会占用写锁，其它写入要等它结束。", "Rebuilding the indexes of a large table holds a write lock; other writes wait until it finishes."),
-    ("维护动作只对 SQLite 提供；其它引擎请在查询里自己写 REINDEX。", "Maintenance actions are only offered for SQLite; for other engines, write REINDEX in a query."),
-    ("要重建的索引或表名无效。", "The index or table name to rebuild is not valid."),
-    ("重建当前库的索引", "Rebuild the indexes of the current database"),
     ("重建 {} 的索引", "Rebuild the indexes of {0}"),
-    // 序列
-    (
-        "序列参数改完立即生效，之后取号按新参数生成。已有数据里的号不会因此改变。",
-        "Sequence settings take effect immediately and new values follow them. Values already in the data don't change.",
-    ),
-    (
-        "只有 PostgreSQL 的序列参数由这里修改；其它引擎请在查询里自己写 ALTER SEQUENCE。",
-        "Only PostgreSQL sequence settings are changed here; for other engines, write ALTER SEQUENCE in a query.",
-    ),
-    ("序列名无效。", "The sequence name is not valid."),
-    ("没有读到序列 {} 的参数，没有生成语句。", "The settings of sequence {0} could not be read, so no statement was generated."),
-    (
-        "序列 {} 的参数读不到（可能是权限不足），没有生成语句。",
-        "The settings of sequence {0} can't be read (possibly a missing privilege), so no statement was generated.",
-    ),
-    ("步长不能是 0。", "The increment can't be 0."),
-    ("最小值必须小于最大值。", "The minimum must be less than the maximum."),
-    (
-        "START WITH 只改以后 RESTART 用的起点，不会移动已经取到的号；要移动当前号得另外 RESTART。",
-        "START WITH only changes the starting point used by a later RESTART and doesn't move the current value; moving it needs a separate RESTART.",
-    ),
-    (
-        "调小上界或调大下界可能让之后的取号失败；这里不检查已经用掉的号。",
-        "Lowering the maximum or raising the minimum may make later values fail; values already used are not checked here.",
-    ),
-    ("序列 {} 的参数没有变化。", "The settings of sequence {0} have not changed."),
-    ("修改序列 {}", "Alter sequence {0}"),
-    // 执行规则（管理页预览里显示）
-    (
-        "这些语句逐条执行，失败即停。MySQL 与 MariaDB 会立即提交每条结构变更语句，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。",
-        "These statements run one at a time and stop at the first failure. MySQL and MariaDB commit each structure change immediately, so a failure midway doesn't undo the statements that already succeeded; nothing can be claimed as fully rolled back.",
-    ),
-    (
-        "这些语句逐条执行，失败即停。已经成功的语句不撤销。PostgreSQL 虽然可以把结构变更放进事务，这里也不包成一个大事务，不能据此认为所有数据库都会回滚。",
-        "These statements run one at a time and stop at the first failure. Statements that already succeeded are not undone. PostgreSQL could put structure changes in a transaction, but they are not wrapped in one here, so don't assume every database rolls back.",
-    ),
-    ("这些语句逐条执行，失败即停。已经成功的语句不撤销，后面的语句不执行。", "These statements run one at a time and stop at the first failure. Statements that already succeeded are not undone, and the rest don't run."),
-    (
-        "这些语句逐条执行，失败即停。已成功的语句不撤销；这里也不把整批包进一个事务，不能据此声称可以整体回滚。",
-        "These statements run one at a time and stop at the first failure. Statements that already succeeded are not undone, and the batch is not wrapped in one transaction, so it can't be claimed to roll back as a whole.",
-    ),
-    // 事件
-    ("只改事件的启停状态，不改它的事件体。", "Only the event's enabled state changes; its body stays the same."),
-    ("只有 MySQL 与 MariaDB 有事件（event）对象，这里不生成语句。", "Only MySQL and MariaDB have event objects, so no statement is generated here."),
-    ("事件名无效。", "The event name is not valid."),
     ("没有读到事件 {}，没有生成语句。", "Event {0} could not be read, so no statement was generated."),
     ("事件 {} 已经是 {}。", "Event {0} is already {1}."),
-    ("event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。", "Events still don't run while event_scheduler is off; the scheduler state is not changed here."),
-    ("启用事件 {}", "Enable event {0}"),
-    ("停用事件 {}", "Disable event {0}"),
     // 结构读取（introspect）：读不到、找不到对象与读取结果。
     ("找不到表或视图 {}", "Table or view {0} was not found"),
     ("表名无效。", "The table name is not valid."),
     ("没有目标表", "There is no target table"),
     ("这个动作需要指定表，不是数据库级动作。", "This action needs a table; it is not a database-level action."),
     ("目标 {} 不是基础表。", "The target {0} is not a base table."),
-    ("读不到序列 {}：{}", "Sequence {0} could not be read: {1}"),
-    ("找不到序列 {}。", "Sequence {0} was not found."),
-    ("读不到类型 {}：{}", "Type {0} could not be read: {1}"),
-    ("找不到类型 {}。", "Type {0} was not found."),
-    ("{} 不是枚举类型，枚举值只能加在枚举上。", "{0} is not an enum type; enum values can only be added to an enum."),
-    ("读不到枚举 {} 的取值：{}", "The values of enum {0} could not be read: {1}"),
-    ("{} 不是域（domain）。", "{0} is not a domain."),
-    ("读不到域 {} 的定义：{}", "The definition of domain {0} could not be read: {1}"),
-    ("找不到域 {}。", "Domain {0} was not found."),
-    ("读不到事件 {}：{}", "Event {0} could not be read: {1}"),
-    ("找不到事件 {}。", "Event {0} was not found."),
     ("没有读到 NULL 计数", "The NULL count could not be read"),
     ("没有读到行数", "The row count could not be read"),
     ("没有读到视图定义", "The view definition could not be read"),
-    ("没有读到建表语句", "The CREATE TABLE statement could not be read"),
     ("不是整数 {}", "Not an integer: {0}"),
-    ("元数据是空的", "The metadata is empty"),
     ("读不到第 {} 列", "Column {0} could not be read"),
     ("由主键约束维护", "Maintained by the primary key constraint"),
-    ("由唯一约束维护", "Maintained by a unique constraint"),
-    ("由唯一约束 {} 维护", "Maintained by unique constraint {0}"),
     ("外键 {} 依赖此索引", "Foreign key {0} depends on this index"),
-    ("VACUUM 已完成：数据库现在有 {} 页，其中空闲 {} 页。", "VACUUM finished: the database now has {0} pages, {1} of them free."),
-    ("VACUUM 已完成。", "VACUUM finished."),
-    ("REINDEX 已完成：索引已按当前的表结构重建。", "REINDEX finished: the indexes were rebuilt for the current table structure."),
     // 结构编辑：建表、字段、索引、外键。
     ("至少需要一个字段。", "At least one column is needed."),
     ("表 {} 已经存在。不会覆盖已有表或数据。", "Table {0} already exists. Existing tables and data are not overwritten."),
@@ -252,11 +115,9 @@ const PATTERNS: &[(&str, &str)] = &[
         "The database checks the existing data. Creation fails if values don't match. Constraint checks are not turned off and no data is cleaned up.",
     ),
     ("CASCADE 会在父表变更时连带修改或删除本表中引用它的行。", "CASCADE changes or deletes the rows in this table that reference the parent table when the parent changes."),
-    ("SQLite 不能直接 ALTER TABLE 添加外键，需要按官方步骤重建表。", "SQLite can't add a foreign key with ALTER TABLE; the table has to be rebuilt by the official steps."),
     ("创建外键 {}", "Create foreign key {0}"),
     ("找不到外键 {}", "Foreign key {0} was not found"),
     ("只删除这条外键，不删除父表、子表或记录。", "Only this foreign key is dropped; the parent table, child table and rows stay."),
-    ("SQLite 需要重建表才能移除外键。", "SQLite has to rebuild the table to remove a foreign key."),
     ("删除外键 {}", "Drop foreign key {0}"),
     ("外键名称无效。", "The foreign key name is not valid."),
     ("外键 {} 已经存在，不会覆盖。", "Foreign key {0} already exists; it won't be overwritten."),
@@ -284,7 +145,6 @@ const PATTERNS: &[(&str, &str)] = &[
     ("外键引用列 {}，删除它不能保留该约束。", "A foreign key uses column {0}; dropping it can't keep that constraint."),
     ("其他表的外键引用列 {}，删除它不能保留该约束。", "A foreign key in another table references column {0}; dropping it can't keep that constraint."),
     ("不能给已有表追加主键列 {}。", "Primary key column {0} can't be added to an existing table."),
-    ("SQLite 新增非空字段 {} 必须有非 NULL 默认值。", "In SQLite, the new NOT NULL column {0} needs a non-NULL default."),
     ("新增非空字段 {} 没有默认值，已有行无法满足 NOT NULL。", "The new NOT NULL column {0} has no default, so existing rows can't satisfy NOT NULL."),
     (
         "没能确认表 {} 是否已有数据，不能新增没有默认值的非空字段 {}。",
@@ -309,97 +169,14 @@ const PATTERNS: &[(&str, &str)] = &[
     ("重命名 {} → {}", "Rename {0} → {1}"),
     ("新增字段 {}", "Add column {0}"),
     ("删除字段 {}", "Drop column {0}"),
-    ("修改类型 {}", "Change type of {0}"),
     ("修改默认值 {}", "Change default of {0}"),
-    ("删除默认值 {}", "Drop default of {0}"),
-    ("删除原默认值 {}", "Drop the old default of {0}"),
     ("修改字段 {}", "Change column {0}"),
-    ("去掉 NOT NULL {}", "Drop NOT NULL on {0}"),
     ("设置 NOT NULL {}", "Set NOT NULL on {0}"),
-    ("允许 NULL {}", "Allow NULL on {0}"),
-    // SQLite 重建表
-    (
-        "需要重建表。SQLite 不能直接完成这项修改，将按官方 12 步新建表、复制数据并替换原表。",
-        "The table needs a rebuild. SQLite can't make this change directly, so the official 12 steps create a new table, copy the data and replace the original.",
-    ),
-    ("索引 {} 引用了被删除或无法原样保留的列，重建时不会保留它。", "Index {0} uses a column that is dropped or can't be kept as is, so the rebuild won't keep it."),
-    ("没有可以可靠复制的原有列，因此阻止重建。", "No original column can be copied reliably, so the rebuild is blocked."),
+    // 重建表
     ("复制 {} 行", "Copy {0} rows"),
-    ("复制保留列的数据", "Copy the data of the kept columns"),
-    (
-        "不知道本次会话原来的 foreign_keys 设置，不能在重建后恢复，因此没有执行。",
-        "The session's original foreign_keys setting is unknown and couldn't be restored after the rebuild, so nothing was run.",
-    ),
-    ("在事务外关闭外键检查", "Turn off foreign key checks outside the transaction"),
-    ("开始重建事务", "Begin the rebuild transaction"),
-    ("按新定义创建新表", "Create the new table from the new definition"),
-    ("删除旧表", "Drop the old table"),
-    ("新表改回原名", "Rename the new table to the original name"),
-    ("重建索引 {}", "Rebuild index {0}"),
-    ("重建触发器 {}", "Rebuild trigger {0}"),
-    ("检查外键；有违规则停止并回滚这次重建", "Check foreign keys; stop and roll back this rebuild on a violation"),
-    ("提交重建事务", "Commit the rebuild transaction"),
-    ("恢复会话原来的 foreign_keys = {}", "Restore the session's original foreign_keys = {0}"),
-    ("恢复会话原来的 foreign_keys", "Restore the session's original foreign_keys"),
-    (
-        "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成强制检查。",
-        "This connection has foreign_keys = OFF. It is set back to OFF after the rebuild, so the foreign key definitions are not enforced because of it.",
-    ),
-    (
-        "读不到原来的建表语句，不能确认索引和约束能否保留，因此阻止重建。",
-        "The original CREATE TABLE statement couldn't be read, so it can't be confirmed that indexes and constraints are kept; the rebuild is blocked.",
-    ),
-    ("表含生成列，重建不能可靠保留这些列，因此阻止执行。", "The table has generated columns that a rebuild can't keep reliably, so it is blocked."),
-    ("表含 CHECK 约束，重建不能可靠保留该约束，因此阻止执行。", "The table has a CHECK constraint that a rebuild can't keep reliably, so it is blocked."),
-    ("表含排序规则，重建不能可靠保留该规则，因此阻止执行。", "The table has a collation that a rebuild can't keep reliably, so it is blocked."),
-    ("触发器 {} 引用了将改变的列，无法可靠改写，因此阻止重建。", "Trigger {0} uses columns that will change and can't be rewritten reliably, so the rebuild is blocked."),
-    ("读不到触发器 {} 的定义，不能可靠重建。", "The definition of trigger {0} couldn't be read, so it can't be rebuilt reliably."),
-    ("视图 {} 引用了将改变的结构，无法可靠改写，因此阻止重建。", "View {0} uses structure that will change and can't be rewritten reliably, so the rebuild is blocked."),
-    ("外键 {} 引用了将改变的列，重建不能可靠保留该约束。", "Foreign key {0} uses columns that will change, so the rebuild can't keep that constraint reliably."),
-    ("索引 {} 含表达式或部分条件，列被重命名后无法可靠改写。", "Index {0} has an expression or partial condition and can't be rewritten reliably after a column rename."),
-    ("读不到索引 {} 的原始语句，不能可靠保留。", "The original statement of index {0} couldn't be read, so it can't be kept reliably."),
     ("读不到索引 {} 的原始语句。", "The original statement of index {0} couldn't be read."),
-    ("表达式索引 {} 在列重命名后无法可靠改写。", "Expression index {0} can't be rewritten reliably after a column rename."),
-    (
-        "SQLite 按官方步骤重建：先在事务外关闭外键检查，再在一个事务里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。这只属于这次重建，不是所有数据库都能回滚。事务内失败会回滚这次重建；事务外改过的 foreign_keys 会恢复为会话原来的值。",
-        "SQLite rebuilds by the official steps: foreign key checks are turned off outside the transaction, then one transaction creates the new table, copies the data, drops the old table and renames the new one back, followed by foreign_key_check (a foreign key integrity check). This applies to this rebuild only; not every database can roll back. A failure inside the transaction rolls this rebuild back; foreign_keys changed outside the transaction is restored to the session's original value.",
-    ),
-    ("重建事务已回滚，这条语句没有保留。", "The rebuild transaction was rolled back, so this statement was not kept."),
-    ("回滚重建事务失败，结果未知：{}", "Rolling back the rebuild transaction failed, so the result is unknown: {0}"),
-    ("已恢复会话原来的 foreign_keys。", "The session's original foreign_keys was restored."),
-    ("恢复 foreign_keys 失败，结果未知：{}", "Restoring foreign_keys failed, so the result is unknown: {0}"),
-    ("数据库返回：{}", "The database returned: {0}"),
-    // 枚举与域（PostgreSQL）
-    ("枚举值只能追加，不能删除或调整顺序；已有的行不会被改写。", "Enum values can only be appended, not removed or reordered; existing rows are not rewritten."),
-    ("只有 PostgreSQL 有枚举类型，这里不生成语句。", "Only PostgreSQL has enum types, so no statement is generated here."),
-    ("枚举名无效。", "The enum name is not valid."),
-    ("枚举值不能为空。", "The enum value can't be empty."),
-    ("枚举值里不能有控制字符。", "The enum value can't contain control characters."),
-    ("PostgreSQL 的枚举值最长 63 字节。", "PostgreSQL enum values are at most 63 bytes long."),
-    (
-        "没有读到枚举 {} 的现有取值（可能不是枚举或权限不足），没有生成语句。",
-        "The existing values of enum {0} could not be read (it may not be an enum, or a privilege is missing), so no statement was generated.",
-    ),
+    // 枚举与域
     ("找不到枚举值 {}，没有生成语句。", "Enum value {0} was not found, so no statement was generated."),
-    ("不能把新值放在它自己前面。", "The new value can't be placed before itself."),
-    (
-        "新值要在这条语句执行完之后才能被使用；这里单条执行，不把追加值和使用它的语句放进同一个事务。",
-        "The new value can only be used after this statement finishes; it runs on its own and is not put in one transaction with statements that use it.",
-    ),
-    ("给 {} 追加值 {}", "Add value {1} to {0}"),
-    ("域的默认值只影响之后插入的行，不改已有数据。", "A domain default only affects rows inserted later; existing data is not changed."),
-    ("只有 PostgreSQL 有域（domain）对象，这里不生成语句。", "Only PostgreSQL has domain objects, so no statement is generated here."),
-    ("域名无效。", "The domain name is not valid."),
-    ("没有读到域 {} 的定义，没有生成语句。", "The definition of domain {0} could not be read, so no statement was generated."),
-    ("删除域默认值", "Drop the domain default"),
-    ("默认值只接受字面量、TRUE/FALSE、now() 或 CURRENT_TIMESTAMP。", "The default only accepts a literal, TRUE/FALSE, now() or CURRENT_TIMESTAMP."),
-    ("修改域默认值", "Change the domain default"),
-    ("修改域 NOT NULL", "Change the domain NOT NULL"),
-    (
-        "SET NOT NULL 会先检查已有数据，存在空值时数据库会报错；这里不先改写数据。",
-        "SET NOT NULL checks the existing data first and the database reports an error if there are nulls; the data is not rewritten beforehand.",
-    ),
-    ("域 {} 的默认值与 NOT NULL 没有变化。", "The default and NOT NULL of domain {0} have not changed."),
     // 视图定义替换
     ("视图 {} 已失效，没有发送。", "View {0} is no longer valid, so nothing was sent."),
     ("目标视图和已读取的结构不一致，没有生成语句。", "The target view doesn't match the structure that was read, so no statement was generated."),
@@ -425,7 +202,6 @@ const PATTERNS: &[(&str, &str)] = &[
     ("结构变更需要先确认预览中的 SQL，未确认不会执行。", "Structure changes need the previewed SQL to be confirmed first; nothing runs without confirmation."),
     ("这个连接没有连着可查询的数据库。", "This connection isn't connected to a database that can be queried."),
     ("会话类型和目标数据库不一致，没有另开连接。", "The session type doesn't match the target database; no other connection was opened."),
-    ("foreign_key_check 发现 {} 处违规，不会把这次重建当成成功。", "foreign_key_check found {0} violations, so this rebuild is not treated as a success."),
     ("不支持的数据库 {}", "Unsupported database {0}"),
     ("没有执行任何语句", "No statement was run"),
     ("生成计划失败", "Generating the plan failed"),
@@ -438,37 +214,10 @@ const PATTERNS: &[(&str, &str)] = &[
     ("{} 不是基础表", "{0} is not a base table"),
     ("缺少对象名", "The object name is missing"),
     ("这个连接没有连着可查询的数据库", "This connection isn't connected to a database that can be queried"),
-    ("Redis 没有对象定义", "Redis has no object definitions"),
-    ("MongoDB 集合没有 SQL 定义；文档在集合浏览器查看", "MongoDB collections have no SQL definition; view the documents in the collection browser"),
-    ("SQLite 没有函数或存储过程", "SQLite has no functions or stored procedures"),
-    ("SQLite 没有序列、枚举或域", "SQLite has no sequences, enums or domains"),
-    ("只有表、视图和触发器可以读取只读定义", "Only tables, views and triggers have a read-only definition"),
     ("没有读到定义", "No definition was returned"),
-    ("MariaDB 没有独立的枚举或域", "MariaDB has no separate enums or domains"),
-    ("MySQL 没有独立的序列、枚举或域", "MySQL has no separate sequences, enums or domains"),
-    (
-        "只有表、视图、函数、存储过程、触发器和事件可以读取只读定义",
-        "Only tables, views, functions, stored procedures, triggers and events have a read-only definition",
-    ),
     ("需要数据库名", "A database name is required"),
-    ("PostgreSQL 需要 schema", "PostgreSQL needs a schema"),
-    ("有多个同名函数，需要用参数类型区分", "Several functions have this name; their argument types are needed to tell them apart"),
-    ("有多个同名触发器，需要所属的表才能区分", "Several triggers have this name; their table is needed to tell them apart"),
-    (
-        "只有视图、函数、存储过程、触发器、序列、枚举和域可以读取只读定义",
-        "Only views, functions, stored procedures, triggers, sequences, enums and domains have a read-only definition",
-    ),
-    ("SQL Server 需要 schema", "SQL Server needs a schema"),
-    ("有多个同名对象，需要更具体的名称", "Several objects have this name; a more specific name is needed"),
-    ("没有读到序列起点", "The sequence start value was not returned"),
-    ("没有读到序列步长", "The sequence increment was not returned"),
-    ("没有读到序列下限", "The sequence minimum was not returned"),
-    ("没有读到序列上限", "The sequence maximum was not returned"),
-    ("SQL Server 没有独立的枚举或域", "SQL Server has no separate enums or domains"),
-    ("只有函数、存储过程、触发器、视图和序列可以读取只读定义", "Only functions, stored procedures, triggers, views and sequences have a read-only definition"),
     ("读取库表失败：{p}", "Could not read the catalog: {0}"),
     ("读取{p}失败：{p}", "Could not read {0}: {1}"),
-    ("元数据列缺失", "A metadata column is missing"),
     ("元数据列是空值", "A metadata column is null"),
 ];
 
@@ -477,18 +226,8 @@ const PATTERNS: &[(&str, &str)] = &[
 const MISSING_ITEMS: &[(&str, &str)] = &[
     ("CHECK 约束", "CHECK constraints"),
     ("分区", "partitioning"),
-    ("存储参数与表空间", "storage parameters and tablespace"),
     ("权限", "privileges"),
     ("触发器", "triggers"),
-    ("计算列表达式", "computed column expressions"),
-    ("文件组与压缩选项", "filegroup and compression options"),
-    ("主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）", "the primary key's CLUSTERED / NONCLUSTERED option (SQL Server's default is assumed)"),
-    ("索引选项（FILLFACTOR、IGNORE_DUP_KEY 等）", "index options (FILLFACTOR, IGNORE_DUP_KEY and so on)"),
-    ("XML 与空间索引", "XML and spatial indexes"),
-    (
-        "标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）",
-        "the identity column's ALWAYS / BY DEFAULT mode and sequence options (written as BY DEFAULT)",
-    ),
     ("索引（读取失败：{p}）", "indexes (could not be read: {0})"),
     ("外键（读取失败：{p}）", "foreign keys (could not be read: {0})"),
     ("注释（读取失败：{p}）", "comments (could not be read: {0})"),
@@ -595,16 +334,16 @@ fn translate_with(table: &[(&str, &str)], text: &str) -> Option<String> {
     })
 }
 
-/// 先查各方言自己的整句（只在某个引擎出现的说明），再查共用句型表。
+/// 先查各引擎适配器自己的整句（只在某个引擎出现的说明），再查共用句型表。
 fn translate(text: &str) -> Option<String> {
-    crate::adapters::ddl::all_dialects()
-        .find_map(|dialect| translate_with(dialect.messages_en(), text))
+    crate::adapters::engine_messages_en()
+        .find_map(|table| translate_with(table, text))
         .or_else(|| translate_with(PATTERNS, text))
 }
 
-/// 重建定义“未包含”项：共用清单加各方言自己的项。
+/// 重建定义“未包含”项：共用清单加各引擎适配器自己的项。
 fn translate_missing_item(text: &str) -> Option<String> {
-    translate_with(MISSING_ITEMS, text).or_else(|| crate::adapters::ddl::all_dialects().find_map(|dialect| translate_with(dialect.missing_items_en(), text)))
+    translate_with(MISSING_ITEMS, text).or_else(|| crate::adapters::engine_missing_items_en().find_map(|table| translate_with(table, text)))
 }
 
 /// 计划文字的英文版；不是已知句型时原样返回。

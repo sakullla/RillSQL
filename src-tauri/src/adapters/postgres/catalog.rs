@@ -218,7 +218,7 @@ impl CatalogDialect for PostgresCatalog {
     }
 
     async fn read_diagram(&self, session: &CatalogSession, database: &str, schema: &str) -> Result<Diagram, String> {
-        if let Some(message) = crate::diagram::model::empty_postgres_schema(schema) {
+        if let Some(message) = super::diagram::empty_postgres_schema(schema) {
             return Err(message);
         }
         let CatalogSession::Postgres(client) = session else {

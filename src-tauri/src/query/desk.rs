@@ -2200,7 +2200,6 @@ impl StopText for super::exec::StatementStop {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

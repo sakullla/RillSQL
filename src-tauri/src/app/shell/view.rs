@@ -677,7 +677,7 @@ impl Workbench {
             return;
         };
         if let Some(database) = redis_database {
-            if let Some(tab) = self.model.active_mut().filter(|tab| tab.kind.is_query() && tab.engine.as_deref() == Some("redis")) {
+            if let Some(tab) = self.model.active_mut().filter(|tab| tab.kind.is_query() && tab.engine.as_deref().and_then(crate::adapters::query::workbench_named) == Some(crate::adapters::Workbench::Redis)) {
                 tab.database = Some(database);
             }
         }
@@ -1847,7 +1847,7 @@ impl Workbench {
                         .connections
                         .rows
                         .iter()
-                        .any(|row| row.saved.id == intent.connection_id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb))
+                        .any(|row| row.saved.id == intent.connection_id && !row.saved.engine.is_relational())
                     {
                         self.pending_browser = Some(intent.connection_id.clone());
                     }
@@ -2583,7 +2583,7 @@ impl Workbench {
                     // 直接打开 SQLite 连接表单并把光标放到文件路径框，让用户能继续。
                     let origin = self.model.shell.focus;
                     self.model.open_connection_modal(
-                        Some(crate::connections::model::Engine::Sqlite),
+                        Some(crate::adapters::registry::LOCAL_FILE),
                         origin,
                         None,
                         "open-sqlite",
@@ -2893,7 +2893,7 @@ impl Workbench {
     fn open_diagram_target(&mut self, open: DiagramOpen) {
         let row = self.model.connections.rows.iter().find(|row| row.saved.id == open.connection_id);
         let name = row.map(|row| row.saved.name.clone()).unwrap_or_else(|| open.connection_id.clone());
-        let engine = row.map(|row| row.saved.engine.as_str().to_owned()).unwrap_or_else(|| "postgres".into());
+        let engine = row.map(|row| row.saved.engine.as_str().to_owned()).unwrap_or_else(|| crate::adapters::registry::DEFAULT_ENGINE.as_str().to_owned());
         let env = row.map(|row| row.saved.env.clone()).unwrap_or_default();
         let spec = ObjectTarget::new(open.connection_id, name, open.database, open.schema, open.table, engine, env).spec();
         if open.structure {
@@ -2937,9 +2937,10 @@ impl Workbench {
 
     fn apply_sqlite_path(&mut self, path: std::path::PathBuf) {
         self.model.shell.note_opened(path.clone());
-        let mut draft = blank_draft(Engine::Sqlite);
+        let engine = crate::adapters::registry::LOCAL_FILE;
+        let mut draft = blank_draft(engine);
         draft.file_path = path.display().to_string();
-        draft.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
+        draft.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or(engine.as_str()).to_owned();
         self.model.connections.editor = Some(draft);
         self.model.connections.issues.clear();
         self.model.shell.page = AppPage::Connections;
@@ -3151,7 +3152,7 @@ pub(super) fn is_sql_extension(path: &std::path::Path) -> bool {
 pub(super) fn is_sqlite_extension(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "sqlite" | "sqlite3" | "db" | "db3" | "s3db"))
+        .is_some_and(|ext| crate::adapters::engine_for_file_extension(ext).is_some())
 }
 
 pub(super) fn nav_key(key: &str) -> Option<NavKey> {

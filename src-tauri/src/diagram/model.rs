@@ -106,35 +106,3 @@ pub struct Diagram {
     pub omitted: Vec<OmittedTable>,
     pub notice: Option<String>,
 }
-
-pub(crate) fn empty_postgres_schema(schema: &str) -> Option<String> {
-    if schema.trim().is_empty() {
-        Some("PostgreSQL 关系图需要一个 schema。".to_owned())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn empty_sqlserver_schema(schema: &str) -> Option<String> {
-    if schema.trim().is_empty() {
-        Some("SQL Server 关系图需要一个 schema。".to_owned())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn other_postgres_database(current: &str, database: &str) -> Option<String> {
-    if database == current {
-        None
-    } else {
-        Some(format!("当前会话连在 {current}，没有另开连接读取 {database}"))
-    }
-}
-
-pub(crate) fn empty_mysql_database(database: &str) -> Option<String> {
-    if database.trim().is_empty() {
-        Some("MySQL 和 MariaDB 的关系图需要一个数据库。".to_owned())
-    } else {
-        None
-    }
-}

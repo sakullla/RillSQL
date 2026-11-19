@@ -162,7 +162,7 @@ fn refuse_pair(baseline: &Side, target: &Side) -> Option<String> {
     let left = Engine::parse(&baseline.engine).ok();
     let right = Engine::parse(&target.engine).ok();
     if left.is_none() || right.is_none() || left != right {
-        return Some("两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。".to_owned());
+        return Some(crate::adapters::transfer::ENGINE_MISMATCH.to_owned());
     }
     if !baseline.connected || !target.connected {
         return Some("有一侧还没有打开，不生成脚本。".to_owned());

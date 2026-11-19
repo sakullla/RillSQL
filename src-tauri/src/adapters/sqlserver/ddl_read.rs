@@ -403,7 +403,6 @@ fn tsql_fk_action(value: &str) -> String {
     }
 }
 
-
 pub(in crate::adapters) async fn run_steps(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, steps: &[Step]) -> Result<Vec<StepReceipt>, String> {
     let mut locked = client.lock().await;
     let mut results = Vec::new();
@@ -427,4 +426,3 @@ pub(in crate::adapters) async fn run_steps(client: &std::sync::Arc<tokio::sync::
     }
     Ok(results)
 }
-

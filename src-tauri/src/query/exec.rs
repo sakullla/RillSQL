@@ -140,14 +140,6 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
     StatementStop::Error { message, at: None }
 }
 
-
-
-
-
-
-
-
-
 /// 执行前的改写只在一处插入或替换文本（行数上限）。把改写后文本里的字符偏移映射回原文：
 /// 落在公共前缀里原样保留，落在公共后缀里减去长度差，落在改写片段里就停在改写起点。
 pub fn map_rewritten_char(original: &str, rewritten: &str, offset: usize) -> usize {
@@ -547,10 +539,6 @@ pub(crate) async fn reveal_rows(
     }
 }
 
-
-
-
-
 /// 批处理进行中压住探活：正在跑的语句不该被空闲计时误判成断线（R4）。
 struct BusyGuard(Arc<crate::connections::SessionHealth>);
 
@@ -669,42 +657,6 @@ impl StatementDriver for LiveDriver {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub fn clamp_limit(limit: u64) -> usize {
     usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000)
 }
@@ -779,8 +731,6 @@ fn insert_text(body: &str, suffix: &str, at: usize, text: &str, kind: &str) -> C
     let rewrite = AutoRewrite { kind: kind.to_owned(), at, replaced: 0, added };
     CappedSql { sql, rewrite: Some(rewrite) }
 }
-
-
 
 pub(crate) struct CountSpan {
     pub(crate) value: u64,
@@ -1066,7 +1016,6 @@ fn utf8_len(first: u8) -> usize {
         4
     }
 }
-
 
 #[cfg(test)]
 mod buffer_ownership_tests {

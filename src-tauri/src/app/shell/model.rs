@@ -17,6 +17,7 @@ use crate::app::views::connections::LinkStatus;
 use crate::app::views::query::object_spec;
 use crate::catalog::hierarchy::{NavKind, NavNode, NavRow, NavTree, ObjectKey};
 use crate::catalog::{NavAction, NavConnection};
+use crate::adapters::Workbench;
 use crate::i18n;
 
 use super::danger::{DangerKind, DangerPrompt, DangerStep};
@@ -73,9 +74,14 @@ impl WorkItemKind {
             "table" => Some(Self::Table),
             "structure" | "definition" => Some(Self::Structure),
             "database" => Some(Self::Admin),
-            "keys" | "redis" => Some(Self::Redis),
-            "docs" | "mongo" => Some(Self::Mongo),
-            _ => None,
+            "keys" => Some(Self::Redis),
+            "docs" => Some(Self::Mongo),
+            // 旧版本按引擎名保存专项工作台标签。
+            other => match crate::adapters::workbench_loose(other)? {
+                crate::adapters::Workbench::Redis => Some(Self::Redis),
+                crate::adapters::Workbench::Mongo => Some(Self::Mongo),
+                crate::adapters::Workbench::Relational => None,
+            },
         }
     }
 
@@ -713,7 +719,7 @@ impl WorkbenchModel {
             }
             "new-connection" => {
                 // 命令搜索、菜单和快捷键都到这里：打开同一个全局模态，不导航到另一个编辑页。
-                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Connections, None, "new-connection");
+                self.open_connection_modal(Some(crate::adapters::registry::DEFAULT_ENGINE), FocusTarget::Connections, None, "new-connection");
             }
             "connections" => self.welcome.has_connections = !self.connections.rows.is_empty(),
             "history" => {
@@ -920,7 +926,7 @@ impl WorkbenchModel {
         }
         if let Some(group_id) = id.strip_prefix("conn-new-in-group:") {
             let origin = if self.shell.page == AppPage::Connections { FocusTarget::Connections } else { FocusTarget::Sidebar };
-            self.open_connection_modal(Some(Engine::Postgres), origin, None, id);
+            self.open_connection_modal(Some(crate::adapters::registry::DEFAULT_ENGINE), origin, None, id);
             if self.group(group_id).is_some() {
                 self.conn_modal.draft_group = Some(group_id.to_owned());
                 self.conn_modal.initial_group = Some(group_id.to_owned());
@@ -1638,7 +1644,7 @@ impl WorkbenchModel {
     pub fn open_connection_modal(&mut self, engine: Option<Engine>, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) {
         // 重新开表单就是新一次输入：上一次“保存并连接”留下的机密不再复用。
         self.pending_open_secrets = None;
-        self.connections.start_new(engine.unwrap_or(Engine::Postgres));
+        self.connections.start_new(engine.unwrap_or(crate::adapters::registry::DEFAULT_ENGINE));
         self.connections.issues.clear();
         self.focused_field = Some(DraftField::Name);
         // 上一次粘贴的连接串（可能带密码）不该出现在下一张表单里。
@@ -1748,10 +1754,10 @@ impl WorkbenchModel {
             }
             "conn-new-launcher" => {
                 self.shell.page = AppPage::Connections;
-                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Connections, Some(ModalControl::LauncherNew), id);
+                self.open_connection_modal(Some(crate::adapters::registry::DEFAULT_ENGINE), FocusTarget::Connections, Some(ModalControl::LauncherNew), id);
             }
             "conn-new-sidebar" => {
-                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Sidebar, Some(ModalControl::SidebarNew), id);
+                self.open_connection_modal(Some(crate::adapters::registry::DEFAULT_ENGINE), FocusTarget::Sidebar, Some(ModalControl::SidebarNew), id);
             }
             "conn-cancel" | "conn-modal-close" | "conn-escape" => {
                 if self.conn_modal.discard_armed {
@@ -2007,12 +2013,7 @@ impl WorkbenchModel {
         let relational = selected
             .as_deref()
             .and_then(|id| self.connections.rows.iter().find(|row| row.saved.id == id))
-            .is_some_and(|row| {
-                !matches!(
-                    row.saved.engine,
-                    crate::connections::model::Engine::Redis | crate::connections::model::Engine::Mongodb
-                )
-            });
+            .is_some_and(|row| row.saved.engine.is_relational());
         self.open_menu(MenuPlace::ObjectTree, MenuTarget::Connection);
         self.menu = Some(OpenMenu::with_items(
             MenuPlace::ObjectTree,
@@ -3563,7 +3564,7 @@ impl WorkbenchModel {
         // 定位要看得见：侧栏收起时打开，并让对象树把这一行滚进可见区。
         self.shell.sidebar_open = true;
         self.reveal_node = Some(node.id.clone());
-        let structure = node.engine != Engine::Mongodb && node.object().is_some_and(|object| object.opens_data());
+        let structure = node.engine.workbench() != Workbench::Mongo && node.object().is_some_and(|object| object.opens_data());
         if structure {
             let _ = self.nav_command(&format!("nav-open-structure:{}", node.id));
         }
@@ -3708,7 +3709,7 @@ impl WorkbenchModel {
                 self.notice_detail.clear();
                 return true;
             };
-            if node.engine == Engine::Mongodb {
+            if node.engine.workbench() == Workbench::Mongo {
                 // 集合是文档：走集合浏览器，绝不开关系型表格页。
                 let connection_name = self.nav_connection_name(&node.connection_id);
                 let spec = nav::mongo_spec(&node.connection_id, &connection_name, &node.database, &node.name);
@@ -3728,7 +3729,7 @@ impl WorkbenchModel {
         }
         if let Some(rest) = id.strip_prefix("nav-open-structure:") {
             if self.nav.node(rest).is_some_and(|node| {
-                node.engine == Engine::Mongodb || node.object().is_some_and(|object| !object.opens_data())
+                node.engine.workbench() == Workbench::Mongo || node.object().is_some_and(|object| !object.opens_data())
             }) {
                 // 集合、触发器、例程、序列等没有表结构页；菜单和双击/Enter 走同一门控。
                 self.notice_key = Some("catalog.tree.noStructure");
@@ -5062,7 +5063,7 @@ impl WorkbenchModel {
             let id = tab.connection_id.clone()?;
             let row = self.connections.rows.iter().find(|row| row.saved.id == id)?;
             let engine = tab.engine.clone().unwrap_or_else(|| row.saved.engine.as_str().to_owned());
-            if row.saved.engine == Engine::Mongodb {
+            if !row.saved.engine.workbench().has_query_editor() {
                 return None;
             }
             let database = tab.database.clone().filter(|db| !db.is_empty()).or_else(|| self.default_query_database(&row.saved));
@@ -5070,7 +5071,7 @@ impl WorkbenchModel {
         }
         let mut connected = self.connections.rows.iter().filter(|row| {
             self.connections.row_status(&row.saved.id) == LinkStatus::Connected
-                && row.saved.engine != Engine::Mongodb
+                && row.saved.engine.workbench().has_query_editor()
         });
         let row = connected.next()?;
         if connected.next().is_some() {
@@ -5082,7 +5083,7 @@ impl WorkbenchModel {
 
     fn default_query_database(&self, saved: &SavedConnection) -> Option<String> {
         saved.database.clone().filter(|db| !db.is_empty())
-            .or_else(|| (saved.engine == Engine::Redis).then(|| "0".to_owned()))
+            .or_else(|| Some(crate::adapters::adapter(saved.engine).meta().default_database().to_owned()).filter(|db| !db.is_empty()))
             .or_else(|| self.only_database(&saved.id))
     }
 
@@ -5860,7 +5861,7 @@ fn tree_menu_target(node: &NavNode) -> MenuTarget {
     match node.kind {
         NavKind::Column | NavKind::Index => MenuTarget::Column,
         NavKind::Object => match node.object() {
-            Some(object) if object.engine == Engine::Mongodb => MenuTarget::DocumentObject,
+            Some(object) if object.engine.workbench() == Workbench::Mongo => MenuTarget::DocumentObject,
             Some(object) if object.opens_data() => MenuTarget::Object,
             Some(_) => MenuTarget::NonDataObject,
             None => MenuTarget::Scope,
@@ -5877,9 +5878,9 @@ pub struct ObjectGroup {
     pub objects: Vec<TreeObject>,
 }
 
-/// Redis / MongoDB 的对象不是关系型表，不能参与表层级或“打开表”。
+/// 专项引擎（键值、文档）的对象不是关系型表，不能参与表层级或“打开表”。由适配器能力决定。
 pub fn relational_engine(engine: &str) -> bool {
-    !matches!(engine.to_ascii_lowercase().as_str(), "redis" | "mongodb" | "mongo")
+    crate::adapters::is_relational_named(engine)
 }
 
 /// 只有真实表 / 视图才进入对象索引。

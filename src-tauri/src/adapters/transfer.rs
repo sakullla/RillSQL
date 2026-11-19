@@ -13,6 +13,17 @@ use crate::connections::CatalogSession;
 
 use super::{adapter, mysql, postgres, qualified_object, quote_ident, sqlite, sqlserver};
 
+/// 两侧引擎不同（同一家族也算不同）时对比拒绝生成脚本的说明。
+pub const ENGINE_MISMATCH: &str = "两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。";
+
+/// 迁移预检：布尔写进数值列的提示（举出会拒绝的引擎）。
+pub const BOOL_TO_NUMBER_NOTE: &str = "布尔写数值列在部分引擎（如 PostgreSQL）会被拒绝。";
+
+/// 对比选择 schema：只有库下还有“模式”一层的引擎需要（按注册表列出显示名）。
+pub fn schema_engines_note() -> String {
+    format!("只有 {} 需要选择 schema", super::labels_with(|caps| caps.shows_schemas, " 和 "))
+}
+
 /// 把对照上的一张表改成基准的结构。
 pub struct TableAlter<'a> {
     /// 脚本执行的一侧（对照）。

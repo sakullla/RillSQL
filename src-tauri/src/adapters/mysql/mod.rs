@@ -6,6 +6,7 @@ pub(crate) mod connect;
 pub(in crate::adapters) mod ddl;
 pub(in crate::adapters) mod ddl_read;
 pub(crate) mod diagram;
+pub(in crate::adapters) mod english;
 pub(crate) mod extras;
 pub(crate) mod exec;
 mod functions;
@@ -15,7 +16,7 @@ pub(in crate::adapters) mod syntax;
 pub(in crate::adapters) mod transfer;
 pub(in crate::adapters) mod types;
 
-use crate::adapters::{
+use crate::adapters::{FieldHint, 
     Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench,
 };
 use crate::connections::model::{Engine, TlsMode};
@@ -45,6 +46,30 @@ impl EngineMeta for MysqlAdapter {
 
     fn workbench(&self) -> Workbench {
         Workbench::Relational
+    }
+
+    fn mark(&self) -> (&'static str, u32) {
+        ("MY", 0x0284a8)
+    }
+
+    fn url_example(&self) -> &'static str {
+        "mysql://user@host:3306/db"
+    }
+
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MESSAGES_EN
+    }
+
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MISSING_ITEMS_EN
+    }
+
+    fn database_hint_key(&self) -> &'static str {
+        "ui.conn.dbPlaceholderMysql"
+    }
+
+    fn username_hint(&self) -> FieldHint {
+        FieldHint::Text("root")
     }
 
     fn url_schemes(&self) -> &'static [UrlScheme] {

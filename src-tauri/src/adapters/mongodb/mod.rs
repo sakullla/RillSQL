@@ -8,8 +8,9 @@ pub(crate) mod catalog;
 pub mod commands;
 pub(crate) mod connect;
 pub(crate) mod docs;
+mod english;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{FieldHint, Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, FormField, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub fn module_id() -> &'static str {
@@ -48,6 +49,34 @@ impl EngineMeta for MongodbAdapter {
 
     fn workbench(&self) -> Workbench {
         Workbench::Mongo
+    }
+
+    fn mark(&self) -> (&'static str, u32) {
+        ("MG", 0x10a356)
+    }
+
+    fn url_example(&self) -> &'static str {
+        "mongodb://user@host:27017/db"
+    }
+
+    fn messages_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MESSAGES_EN
+    }
+
+    fn missing_items_en(&self) -> &'static [(&'static str, &'static str)] {
+        english::MISSING_ITEMS_EN
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["mongo"]
+    }
+
+    fn database_hint_key(&self) -> &'static str {
+        "ui.conn.dbPlaceholderMongo"
+    }
+
+    fn username_hint(&self) -> FieldHint {
+        FieldHint::Key("ui.conn.optional")
     }
 
     fn defaults_to_local(&self) -> bool {

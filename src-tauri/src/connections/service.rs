@@ -577,7 +577,7 @@ impl Service {
         let store = self.store().await?;
         let config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
         if !adapter(config.engine).capabilities().database_scoped_session {
-            return Err("只有 PostgreSQL 需要改连到另一个库。".to_owned());
+            return Err(format!("只有 {} 需要改连到另一个库。", crate::adapters::labels_with(|caps| caps.database_scoped_session, " 和 ")));
         }
         if !self.sessions.lock().expect("sessions").contains_key(id) {
             return Err("这条连接还没有打开。".to_owned());
@@ -600,7 +600,7 @@ impl Service {
         let store = self.store().await?;
         let saved = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
         if !adapter(saved.engine).capabilities().database_scoped_session {
-            return Err("只有 PostgreSQL 需要临时读取会话。".to_owned());
+            return Err(format!("只有 {} 需要临时读取会话。", crate::adapters::labels_with(|caps| caps.database_scoped_session, " 和 ")));
         }
         if !self.sessions.lock().expect("sessions").contains_key(id) {
             return Err("这条连接还没有打开。".to_owned());

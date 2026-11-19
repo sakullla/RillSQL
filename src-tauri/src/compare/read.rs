@@ -86,7 +86,7 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
 
 fn refuse_loaded(baseline: &Side, target: &Side) -> Option<String> {
     if super::model::Engine::parse(&baseline.engine).ok() != super::model::Engine::parse(&target.engine).ok() {
-        return Some("两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。".to_owned());
+        return Some(crate::adapters::transfer::ENGINE_MISMATCH.to_owned());
     }
     baseline.fatal.clone().or(target.fatal.clone()).map(|message| format!("{message} 不生成脚本。"))
 }
@@ -530,7 +530,7 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
         return Err("这一侧还没有打开".to_owned());
     };
     let Some(engine) = engine_of_session(&existing).filter(|engine| adapter(*engine).capabilities().shows_schemas) else {
-        return Err("只有 PostgreSQL 和 SQL Server 需要选择 schema".to_owned());
+        return Err(crate::adapters::transfer::schema_engines_note());
     };
     let request = SideRequest {
         connection_id: connection_id.to_owned(),

@@ -4,9 +4,10 @@ use crate::catalog::{kind_sql, metadata_sql, Engine as CatalogEngine, ObjectKind
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::diagram::assemble::assemble_diagram;
-use crate::diagram::model::{
-    empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, OutgoingKey, RangeScope, TableAttempt,
-};
+use crate::adapters::mysql::diagram::empty_mysql_database;
+use crate::adapters::postgres::diagram::{empty_postgres_schema, other_postgres_database};
+use crate::adapters::sqlserver::diagram::empty_sqlserver_schema;
+use crate::diagram::model::{OutgoingKey, RangeScope, TableAttempt};
 use crate::diagram::read::read_diagram;
 use crate::adapters::mysql::diagram::MYSQL_TABLES;
 use crate::adapters::postgres::diagram::POSTGRES_TABLES;

@@ -1,7 +1,7 @@
 //! PostgreSQL 的关系图读取：一个 schema 的基表、列与外键。会话只连着自己的库，别的库直接报原因。
 
 use crate::diagram::assemble::{assemble_diagram, group_key_parts};
-use crate::diagram::model::{other_postgres_database, Diagram, DiagramColumn, KeyPart, OutgoingKey, RangeScope, ReadColumns, TableAttempt};
+use crate::diagram::model::{Diagram, DiagramColumn, KeyPart, OutgoingKey, RangeScope, ReadColumns, TableAttempt};
 
 pub(crate) const POSTGRES_CURRENT_DATABASE: &str = "SELECT current_database()::text";
 
@@ -133,4 +133,20 @@ fn postgres_keys(rows: &[tokio_postgres::Row]) -> Result<Vec<OutgoingKey>, Strin
         });
     }
     Ok(group_key_parts(parts))
+}
+
+pub(crate) fn empty_postgres_schema(schema: &str) -> Option<String> {
+    if schema.trim().is_empty() {
+        Some("PostgreSQL 关系图需要一个 schema。".to_owned())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn other_postgres_database(current: &str, database: &str) -> Option<String> {
+    if database == current {
+        None
+    } else {
+        Some(format!("当前会话连在 {current}，没有另开连接读取 {database}"))
+    }
 }

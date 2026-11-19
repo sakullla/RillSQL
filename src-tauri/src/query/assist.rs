@@ -173,7 +173,6 @@ pub struct FileLoad {
     pub execute: bool,
 }
 
-
 pub fn locate_statement(engine: &str, sql: &str, cursor: usize) -> Located {
     let report = split::split_sql(engine, sql);
     if let Some(found) = report.pieces.iter().find(|piece| cursor >= piece.start && cursor <= piece.end) {
