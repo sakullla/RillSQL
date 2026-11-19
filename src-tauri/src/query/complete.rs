@@ -722,7 +722,7 @@ pub fn identifiers(sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// 需要引号时才加引号，保留原大小写；判定（保留字、PG 大小写、特殊字符）统一由 sql_ident 负责。
+/// 需要引号时才加引号，保留原大小写；判定（保留字、PG 大小写、特殊字符）统一由适配器 SqlSyntax 负责。
 pub fn ident(engine: &str, name: &str) -> String {
     quote_ident(engine, name)
 }

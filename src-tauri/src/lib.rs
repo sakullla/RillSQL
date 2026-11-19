@@ -1,4 +1,5 @@
 pub mod app;
+mod adapters;
 mod application;
 mod catalog;
 mod compare;
@@ -18,7 +19,6 @@ mod product;
 mod query;
 pub mod release;
 mod redis;
-mod sql_ident;
 mod state;
 mod ui;
 

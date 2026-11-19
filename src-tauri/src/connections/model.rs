@@ -18,63 +18,33 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// 持久化/DTO 用的稳定 id，由适配器 EngineMeta 提供。
     pub fn as_str(self) -> &'static str {
-        match self {
-            Engine::Mysql => "mysql",
-            Engine::Mariadb => "mariadb",
-            Engine::Postgres => "postgres",
-            Engine::Sqlite => "sqlite",
-            Engine::Sqlserver => "sqlserver",
-            Engine::Redis => "redis",
-            Engine::Mongodb => "mongodb",
-        }
+        crate::adapters::adapter(self).meta().id()
     }
 
+    /// 按稳定 id 解析，经适配器注册表。
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "mysql" => Ok(Engine::Mysql),
-            "mariadb" => Ok(Engine::Mariadb),
-            "postgres" => Ok(Engine::Postgres),
-            "sqlite" => Ok(Engine::Sqlite),
-            "sqlserver" => Ok(Engine::Sqlserver),
-            "redis" => Ok(Engine::Redis),
-            "mongodb" => Ok(Engine::Mongodb),
-            other => Err(format!("不支持的数据库 {other}")),
-        }
+        crate::adapters::registry::parse(value).ok_or_else(|| format!("不支持的数据库 {value}"))
     }
 
     #[cfg(test)]
     pub fn default_port(self) -> Option<u16> {
-        match self {
-            Engine::Mysql | Engine::Mariadb => Some(3306),
-            Engine::Postgres => Some(5432),
-            Engine::Sqlserver => Some(1433),
-            Engine::Redis => Some(6379),
-            Engine::Mongodb => Some(27017),
-            Engine::Sqlite => None,
-        }
+        crate::adapters::adapter(self).meta().default_port()
     }
 
     #[cfg(test)]
     pub fn is_remote(self) -> bool {
-        !matches!(self, Engine::Sqlite)
+        !crate::adapters::adapter(self).meta().file_based()
     }
 
     /// Redis 与 MongoDB 是专项引擎：没有 SQL 执行、表网格、结构编辑、对比或导出等关系面。
     pub fn is_relational(self) -> bool {
-        !matches!(self, Engine::Redis | Engine::Mongodb)
+        crate::adapters::adapter(self).capabilities().relational
     }
 
     pub fn label_zh(self) -> &'static str {
-        match self {
-            Engine::Mysql => "MySQL",
-            Engine::Mariadb => "MariaDB",
-            Engine::Postgres => "PostgreSQL",
-            Engine::Sqlite => "SQLite",
-            Engine::Sqlserver => "SQL Server",
-            Engine::Redis => "Redis",
-            Engine::Mongodb => "MongoDB",
-        }
+        crate::adapters::adapter(self).meta().label()
     }
 
     /// MongoDB 的主机字段也可以直接填 mongodb:// / mongodb+srv:// 连接串；此时端口字段不参与。

@@ -9,7 +9,7 @@ use crate::dump::order::{
     qualified_relation, referenced_relations, skip_block_comment, skip_delimited, skip_dollar, skip_quoted, sql_tokens, statement_mentions, unquote,
     DepNode,
 };
-use crate::sql_ident::quote_ident as quote;
+use crate::adapters::quote_ident as quote;
 
 pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     if let Some(message) = refuse_pair(baseline, target) {

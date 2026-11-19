@@ -1,8 +1,8 @@
 use super::model::Engine;
 
-/// 按方言最小引号，统一由 sql_ident 判定。
-pub use crate::sql_ident::quote_ident;
-use crate::sql_ident::qualified;
+/// 按方言最小引号，统一由适配器 SqlSyntax 判定。
+pub use crate::adapters::quote_ident;
+use crate::adapters::qualified;
 
 pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str) -> Result<String, String> {
     match engine {

@@ -1353,7 +1353,7 @@ pub fn tds_type_name(kind: tiberius::ColumnType) -> &'static str {
 }
 
 fn quote_mysql(name: &str) -> String {
-    crate::sql_ident::quote_ident(crate::connections::model::Engine::Mysql, name)
+    crate::adapters::quote_ident(crate::connections::model::Engine::Mysql, name)
 }
 
 async fn sqlite_run(

@@ -1,7 +1,7 @@
 use super::store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
-/// 按方言最小引号，统一由 sql_ident 判定。
-pub use crate::sql_ident::quote_ident;
+/// 按方言最小引号，统一由适配器 SqlSyntax 判定。
+pub use crate::adapters::quote_ident;
 
 pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -171,7 +171,7 @@ pub fn filter_clause(engine: Engine, column: &Column, filter: &Filter) -> String
 }
 
 pub fn qualified_name(schema: &TableSchema) -> String {
-    crate::sql_ident::qualified(schema.engine, &[&schema.schema, &schema.name])
+    crate::adapters::qualified(schema.engine, &[&schema.schema, &schema.name])
 }
 
 pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String, String> {
