@@ -767,11 +767,10 @@ dict! {
     "compare.dialog.dataScript" => "数据脚本", "Data script";
     "compare.dialog.dataDisclosure" => "数据脚本，可放入新查询", "Data script, place into a new query";
     "compare.gates.schemaStillLoading" => "PostgreSQL 的 schema 还在读取，选定前不生成脚本。", "PostgreSQL schemas are still loading; no script is generated until one is picked.";
-    "compare.gates.schemaBothNeeded" => "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。", "PostgreSQL needs a schema picked for both the baseline and the target; no script is generated.";
+    "compare.gates.schemaNeeded" => "{engine} 需要为基准和对照各选一个 schema，不生成脚本。", "{engine} needs a schema picked for both the baseline and the target; no script is generated.";
     "compare.gates.engineMismatch" => "两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。", "The two sides use different engines. MySQL and MariaDB are different engines; no script is generated.";
     "compare.gates.sideNotOpen" => "有一侧还没有打开，不生成脚本。", "One side is not open; no script is generated.";
     "compare.gates.databasesNeeded" => "需要为两侧选择数据库，不生成脚本。", "Databases must be chosen for both sides; no script is generated.";
-    "compare.gates.sqlserverSchemaNeeded" => "SQL Server 需要为基准和对照各选一个 schema，不生成脚本。", "SQL Server needs a schema picked for both the baseline and the target; no script is generated.";
     "compare.gates.schemaNotInCatalog" => "目录里没有这个库的 schema，填写已有名称。不会改连当前会话。", "The catalog has no schema for this database; enter an existing name. The current session is not re-pointed.";
     "compare.gates.schemaNoteSuffix" => " 仍可填写已有 schema，不会改连当前会话。", " An existing schema can still be entered; the current session is not re-pointed.";
     "compare.gates.chooseBoth" => "请选择已打开的基准和对照。", "Choose an open baseline and target.";

@@ -50,6 +50,10 @@ fn every_engine_has_a_consistent_adapter() {
         assert_eq!(caps.catalog_group, adapter.catalog().is_some(), "{engine:?} CatalogDialect 声明与提供不一致");
         assert_eq!(caps.error_rules_group, adapter.errors().is_some(), "{engine:?} ErrorRules 声明与提供不一致");
         assert_eq!(caps.connector_group, adapter.connector().is_some(), "{engine:?} Connector 声明与提供不一致");
+        assert_eq!(caps.transfer_group, adapter.transfer().is_some(), "{engine:?} TransferDialect 声明与提供不一致");
+        // 关系型引擎有对比/导出方言与冲突识别；专项引擎没有。
+        assert_eq!(caps.relational, caps.transfer_group, "{engine:?} 关系面与对比/导出组应一致");
+        assert_eq!(caps.relational, caps.error_rules_group, "{engine:?} 关系面与错误规则组应一致");
 
         // 关系型引擎一定有 SQL 语法，并使用关系型工作台；非关系型反之。
         assert_eq!(caps.relational, caps.sql_syntax_group, "{engine:?} 关系面与 SQL 语法组应一致");
@@ -529,4 +533,157 @@ fn grid_projection_follows_the_dialect() {
     assert_eq!(sql_syntax(Engine::Mariadb).timeout_statements(1500), vec!["SET SESSION max_statement_time = 1.5".to_owned()]);
     assert_eq!(sql_syntax(Engine::Mysql).explain("SELECT 1"), "EXPLAIN FORMAT=TREE SELECT 1");
     assert_eq!(sql_syntax(Engine::Mariadb).explain("SELECT 1"), "EXPLAIN FORMAT=JSON SELECT 1");
+}
+
+// ---------------------------------------------------------------- A5：对比/导出/迁移方言
+
+#[test]
+fn conflict_wording_comes_from_each_engine_and_the_union_is_unchanged() {
+    use super::is_conflict_error;
+    let errors = |engine: Engine| adapter(engine).errors().expect("关系型引擎有错误规则");
+    assert!(errors(Engine::Sqlite).is_conflict("unique constraint failed: items.id"));
+    assert!(errors(Engine::Mysql).is_conflict("duplicate entry '1' for key 'items.primary'"));
+    assert!(errors(Engine::Mariadb).is_conflict("duplicate entry '1' for key 'primary'"));
+    assert!(errors(Engine::Postgres).is_conflict("duplicate key value violates unique constraint \"items_pkey\""));
+    assert!(errors(Engine::Sqlserver).is_conflict("violation of primary key constraint 'pk_items'."));
+    assert!(errors(Engine::Sqlserver).is_conflict("violation of unique key constraint 'uq_items'."));
+    assert!(errors(Engine::Sqlserver).is_conflict("cannot insert duplicate key row in object 'dbo.items'"));
+    // 措辞属于各自引擎：别的引擎不认。
+    assert!(!errors(Engine::Sqlite).is_conflict("duplicate entry '1' for key 'primary'"));
+    assert!(!errors(Engine::Mysql).is_conflict("unique constraint failed: items.id"));
+    // 门面认任一引擎的措辞（迁移目标的报错由它所属的引擎给出），大小写不敏感。
+    for message in [
+        "UNIQUE constraint failed: items.id",
+        "Duplicate entry '1' for key 'items.PRIMARY'",
+        r#"duplicate key value violates unique constraint "items_pkey""#,
+        "Violation of PRIMARY KEY constraint 'PK_items'.",
+        "Violation of UNIQUE KEY constraint 'UQ_items'.",
+    ] {
+        assert!(is_conflict_error(message), "{message}");
+    }
+    for message in ["no such table: items", "FOREIGN KEY constraint failed", "CHECK constraint failed: length(code) <= 3"] {
+        assert!(!is_conflict_error(message), "{message}");
+    }
+}
+
+#[test]
+fn transfer_facades_follow_capabilities() {
+    use super::transfer::relational_engine;
+    use super::{fixed_database_named, label_named, shows_schemas_named};
+    assert_eq!(fixed_database_named("sqlite"), Some("main"));
+    for engine in ["mysql", "mariadb", "postgres", "sqlserver", "redis", "mongodb", "unknown"] {
+        assert_eq!(fixed_database_named(engine), None, "{engine}");
+    }
+    assert!(shows_schemas_named("postgres") && shows_schemas_named("sqlserver"));
+    for engine in ["mysql", "mariadb", "sqlite", "redis", "unknown"] {
+        assert!(!shows_schemas_named(engine), "{engine}");
+    }
+    assert_eq!(label_named("sqlserver"), "SQL Server");
+    assert_eq!(label_named("postgres"), "PostgreSQL");
+    assert_eq!(label_named("whatever"), "whatever");
+    assert_eq!(relational_engine("mariadb"), Ok(Engine::Mariadb));
+    assert_eq!(relational_engine("redis"), Err("不支持的数据库 redis".to_owned()));
+    assert_eq!(relational_engine("x"), Err("不支持的数据库 x".to_owned()));
+    assert_eq!(registry::file_engine(), Some(Engine::Sqlite));
+    assert!(adapter(registry::FILE_EXPORT_DIALECT).capabilities().relational);
+}
+
+#[test]
+fn identifier_quote_helpers_cover_every_dialect() {
+    use super::{identifier_quote_close, is_symmetric_identifier_quote};
+    assert_eq!(identifier_quote_close('"'), Some('"'));
+    assert_eq!(identifier_quote_close('`'), Some('`'));
+    assert_eq!(identifier_quote_close('['), Some(']'));
+    assert_eq!(identifier_quote_close('\''), None);
+    assert!(is_symmetric_identifier_quote('"') && is_symmetric_identifier_quote('`'));
+    assert!(!is_symmetric_identifier_quote('[') && !is_symmetric_identifier_quote('\''));
+}
+
+#[test]
+fn compare_statements_are_written_by_each_dialect() {
+    use super::transfer::{transfer_of, ViewReplace};
+    use crate::compare::model::{Kind, ObjectDef, Side};
+    let side = |engine: &str, database: &str, schema: &str| Side::ready(engine, database, schema, Vec::new());
+    let mut trigger = ObjectDef::defined(Kind::Trigger, "touch", "");
+    trigger.relation = "notes".to_owned();
+    let mut function = ObjectDef::defined(Kind::Function, "total", "");
+    function.signature = "integer".to_owned();
+
+    let pg = side("postgres", "app", "public");
+    assert_eq!(transfer_of(Engine::Postgres).drop_index(&pg, "notes", "notes_idx"), "DROP INDEX public.notes_idx");
+    assert_eq!(transfer_of(Engine::Postgres).drop_trigger(&pg, &trigger), "DROP TRIGGER touch ON public.notes");
+    assert_eq!(transfer_of(Engine::Postgres).drop_routine(&pg, "FUNCTION", &function), "DROP FUNCTION public.total(integer)");
+    assert_eq!(transfer_of(Engine::Postgres).drop_default("public.notes", "Body"), r#"ALTER TABLE public.notes ALTER COLUMN "Body" DROP DEFAULT"#);
+    assert_eq!(transfer_of(Engine::Postgres).view_replace(), ViewReplace::MatchingColumns);
+    assert!(transfer_of(Engine::Postgres).in_place_types().is_some() && transfer_of(Engine::Postgres).breaks_view_routine_cycles());
+
+    let my = side("mysql", "shop", "");
+    assert_eq!(transfer_of(Engine::Mysql).drop_index(&my, "notes", "notes_idx"), "DROP INDEX notes_idx ON shop.notes");
+    assert_eq!(transfer_of(Engine::Mysql).drop_trigger(&my, &trigger), "DROP TRIGGER shop.touch");
+    assert_eq!(transfer_of(Engine::Mysql).set_default("shop.notes", "body", "'x'"), "ALTER TABLE shop.notes ALTER body SET DEFAULT 'x'");
+    assert_eq!(transfer_of(Engine::Mysql).dump_auto_clause(), " AUTO_INCREMENT");
+    assert!(!transfer_of(Engine::Mysql).replaces_routine_in_place());
+    assert!(transfer_of(Engine::Mariadb).replaces_routine_in_place());
+
+    let lite = side("sqlite", "main", "");
+    assert_eq!(transfer_of(Engine::Sqlite).drop_index(&lite, "notes", "notes_idx"), "DROP INDEX notes_idx");
+    assert!(transfer_of(Engine::Sqlite).inline_foreign_keys() && transfer_of(Engine::Sqlite).keeps_table_source());
+    assert_eq!(transfer_of(Engine::Sqlite).view_replace(), ViewReplace::Never);
+
+    let ms = side("sqlserver", "rillsql", "dbo");
+    assert_eq!(transfer_of(Engine::Sqlserver).drop_index(&ms, "notes", "notes_idx"), "DROP INDEX notes_idx ON dbo.notes");
+    assert_eq!(transfer_of(Engine::Sqlserver).drop_trigger(&ms, &trigger), "DROP TRIGGER touch");
+    assert!(transfer_of(Engine::Sqlserver).drop_default("dbo.notes", "status").contains("sys.default_constraints"));
+
+    // 专项引擎没有对比面：兜底按标准写法，读取拒绝。
+    assert!(adapter(Engine::Redis).transfer().is_none());
+    assert_eq!(transfer_of(Engine::Redis).drop_index(&side("redis", "", ""), "k", "i"), r#"DROP INDEX "i""#);
+}
+
+#[test]
+fn compare_scope_refusals_belong_to_the_dialect() {
+    use super::transfer::transfer_of;
+    use crate::compare::model::Side;
+    let side = |engine: &str, database: &str, schema: &str| Side::ready(engine, database, schema, Vec::new());
+    assert_eq!(
+        transfer_of(Engine::Postgres).compare_scope_refusal(&side("postgres", "app", "public"), &side("postgres", "app", " ")).as_deref(),
+        Some("PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。")
+    );
+    assert_eq!(transfer_of(Engine::Postgres).compare_scope_refusal(&side("postgres", "app", "public"), &side("postgres", "app", "public")), None);
+    assert_eq!(
+        transfer_of(Engine::Sqlite).compare_scope_refusal(&side("sqlite", "main", ""), &side("sqlite", "aux", "")).as_deref(),
+        Some("SQLite 只对比该连接的 main，不附加其他文件，不生成脚本。")
+    );
+    assert_eq!(transfer_of(Engine::Sqlite).compare_scope_refusal(&side("sqlite", "", ""), &side("sqlite", "main", "")), None);
+    assert_eq!(transfer_of(Engine::Mysql).compare_scope_refusal(&side("mysql", "a", ""), &side("mysql", "b", "")), None);
+}
+
+#[tokio::test]
+async fn sessions_are_matched_to_engines_and_sqlite_scopes_stay_on_main() {
+    use super::transfer::transfer_of;
+    use super::{engine_of_session, session_matches};
+    use crate::connections::CatalogSession;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+    let session = CatalogSession::Sqlite { pool, foreign_keys: None };
+    assert!(session_matches(Engine::Sqlite, &session));
+    for engine in [Engine::Mysql, Engine::Mariadb, Engine::Postgres, Engine::Sqlserver, Engine::Redis, Engine::Mongodb] {
+        assert!(!session_matches(engine, &session), "{engine:?}");
+    }
+    assert_eq!(engine_of_session(&session), Some(Engine::Sqlite));
+    assert_eq!(engine_of_session(&CatalogSession::Scripted), None);
+
+    let dialect = transfer_of(Engine::Sqlite);
+    assert_eq!(dialect.dump_scope(&session, "", &[]).await, Ok((String::new(), vec![String::new()])));
+    assert!(dialect.dump_scope(&session, "aux", &[]).await.unwrap_err().contains("当前连接打开的是 main，没有另开连接读取 aux"));
+    assert_eq!(dialect.compare_scope(&session, "main", "").await, Ok(()));
+    assert_eq!(dialect.compare_scope(&session, "aux", "").await, Err("SQLite 只对比该连接的 main，不附加其他文件".to_owned()));
+
+    // 迁移写入：事务批量与自动提交单条都落在同一条连接上。
+    session.execute_autocommit("CREATE TABLE items (id INTEGER PRIMARY KEY)").await.unwrap();
+    session.insert_in_transaction("INSERT INTO items (id) VALUES (1), (2)").await.unwrap();
+    let clash = session.insert_in_transaction("INSERT INTO items (id) VALUES (3), (1)").await.unwrap_err();
+    assert!(super::is_conflict_error(&clash), "{clash}");
+    let rows = session.text_rows("SELECT COUNT(*) FROM items").await.unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("2"), "失败的批次整批回滚");
+    assert!(CatalogSession::Scripted.insert_in_transaction("SELECT 1").await.is_err());
 }

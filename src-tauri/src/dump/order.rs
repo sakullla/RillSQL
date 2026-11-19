@@ -426,7 +426,8 @@ pub(crate) fn sql_tokens(sql: &str) -> Vec<SqlToken> {
         }
         if let Some(next) = skip_delimited(sql, index) {
             let ch = sql[index..].chars().next().unwrap();
-            if ch == '"' || ch == '`' || ch == '[' {
+            // 各方言的标识符引号（双引号、反引号、方括号）里是名字，不是字符串、注释或美元引号正文。
+            if crate::adapters::identifier_quote_close(ch).is_some() {
                 tokens.push(SqlToken { text: unquote(&sql[index..next]), quoted: true });
             }
             index = next;
@@ -492,7 +493,7 @@ pub(crate) fn skip_delimited(sql: &str, index: usize) -> Option<usize> {
         return Some(skip_block_comment(sql, index));
     }
     let ch = rest.chars().next()?;
-    if ch == '\'' || ch == '"' || ch == '`' {
+    if ch == '\'' || crate::adapters::is_symmetric_identifier_quote(ch) {
         return skip_quoted(sql, index, ch);
     }
     if ch == '$' {

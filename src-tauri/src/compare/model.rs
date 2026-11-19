@@ -330,7 +330,8 @@ pub struct SchemaListRequest {
     pub database: String,
 }
 
-/// PostgreSQL 只有在要读的库不是当前会话库时才另开会话。
+/// 会话绑定单库的引擎（PostgreSQL）只有在要读的库不是当前会话库时才另开会话。
 pub fn needs_ephemeral_postgres(engine: &str, current_database: &str, requested: &str) -> bool {
-    engine == "postgres" && !requested.is_empty() && current_database != requested
+    let scoped = crate::adapters::registry::parse(engine).is_some_and(|engine| crate::adapters::adapter(engine).capabilities().database_scoped_session);
+    scoped && !requested.is_empty() && current_database != requested
 }

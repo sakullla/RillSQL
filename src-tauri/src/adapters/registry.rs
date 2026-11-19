@@ -23,6 +23,14 @@ pub const UNBOUND_DIALECT: Engine = Engine::Postgres;
 /// 网格/编辑器目标的引擎字符串解析不出时按这个引擎生成 SQL 与折叠。
 pub const UNBOUND_GRID: Engine = Engine::Sqlite;
 
+/// 文件导出（INSERT 格式）没有目标库，语句按这个方言写（标识符引号与字面量）。
+pub const FILE_EXPORT_DIALECT: Engine = Engine::Sqlite;
+
+/// 本地文件即数据库的引擎（导出页“迁移到新文件”的目标）。
+pub fn file_engine() -> Option<Engine> {
+    ENGINES.into_iter().find(|engine| adapter(*engine).meta().file_based())
+}
+
 /// 有 SQL 语法组的引擎原样返回；未知或非 SQL 引擎按 [`UNBOUND_DIALECT`]。
 pub fn sql_engine(id: &str) -> Engine {
     parse(id).filter(|engine| adapter(*engine).syntax().is_some()).unwrap_or(UNBOUND_DIALECT)

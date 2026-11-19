@@ -15,6 +15,7 @@ pub mod grid;
 pub mod query;
 pub mod registry;
 pub mod session;
+pub mod transfer;
 
 mod mariadb;
 pub(crate) mod mongodb;
@@ -38,6 +39,7 @@ pub use catalog::{catalog_of, CatalogDialect};
 pub use ddl::{DdlDialect, TypeRules};
 pub use registry::adapter;
 pub use session::Connector;
+pub use transfer::TransferDialect;
 
 /// 工作台类型：决定打开连接后主区用哪种 UI。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,8 @@ pub struct Capabilities {
     pub catalog_group: bool,
     pub error_rules_group: bool,
     pub connector_group: bool,
+    /// 对比、全库导出、迁移与导出的方言组（A5）。
+    pub transfer_group: bool,
     /// 会话绑定到单个库：切换库要改连，跨库读取要另开临时会话（不替换当前会话）。
     pub database_scoped_session: bool,
     /// 对象树有“库”这一层（单文件引擎没有，对象直接挂在连接下）。
@@ -443,8 +447,11 @@ impl Lexis {
     pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true };
 }
 
-/// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A1/A4 填充）
-pub trait ErrorRules: Sync {}
+/// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A5 起提供冲突识别）
+pub trait ErrorRules: Sync {
+    /// 写入失败是主键/唯一键冲突（迁移按“跳过”计，而不是失败）。各引擎措辞不同，`lower` 已转成小写。
+    fn is_conflict(&self, lower: &str) -> bool;
+}
 
 /// 一个引擎的适配器：汇总各能力组。不支持的组返回 `None`，并在 [`Capabilities`] 里声明为 `false`。
 pub trait EngineAdapter: Sync {
@@ -462,13 +469,50 @@ pub trait EngineAdapter: Sync {
     fn catalog(&self) -> Option<&dyn CatalogDialect> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))] // A1/A4 填充并接入
     fn errors(&self) -> Option<&dyn ErrorRules> {
         None
     }
     fn connector(&self) -> Option<&dyn Connector> {
         None
     }
+    fn transfer(&self) -> Option<&'static dyn TransferDialect> {
+        None
+    }
+}
+
+/// 门面：主键/唯一键冲突的识别。任一已注册引擎的错误规则认出即算（写入目标的措辞由各自适配器给出）。
+pub fn is_conflict_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    registry::ENGINES.into_iter().filter_map(|engine| adapter(engine).errors()).any(|rules| rules.is_conflict(&lower))
+}
+
+/// 门面：会话句柄属于这个引擎（取引擎的结构方言判断；没有结构方言的引擎不匹配任何关系会话）。
+pub fn session_matches(engine: Engine, session: &crate::connections::CatalogSession) -> bool {
+    adapter(engine).ddl().is_some_and(|dialect| dialect.matches_session(session))
+}
+
+/// 门面：会话句柄所属的第一个引擎（共用会话形态的引擎取注册表顺序里靠前者）。
+pub fn engine_of_session(session: &crate::connections::CatalogSession) -> Option<Engine> {
+    registry::ENGINES.into_iter().find(|engine| session_matches(*engine, session))
+}
+
+/// 门面：单文件引擎唯一的库名（没有“库”这一层的引擎）；按引擎 id 查，解析不出或有库层时为 None。
+pub fn fixed_database_named(engine: &str) -> Option<&'static str> {
+    let engine = registry::parse(engine)?;
+    if adapter(engine).capabilities().shows_databases {
+        return None;
+    }
+    adapter(engine).syntax().and_then(|syntax| syntax.fixed_database())
+}
+
+/// 门面：引擎在库下还有“模式”一层（对比、导出要先选模式）。按引擎 id 查。
+pub fn shows_schemas_named(engine: &str) -> bool {
+    registry::parse(engine).is_some_and(|engine| adapter(engine).capabilities().shows_schemas)
+}
+
+/// 门面：引擎显示名；解析不出时原样返回 id。
+pub fn label_named(engine: &str) -> String {
+    registry::parse(engine).map(|engine| adapter(engine).meta().label().to_owned()).unwrap_or_else(|| engine.to_owned())
 }
 
 /// 主机字段是不是整串连接串（按引擎规则）。
@@ -516,6 +560,22 @@ pub fn sample_select(engine: Engine, table: &str, limit: usize) -> String {
         Some(syntax) => syntax.sample_select(table, limit),
         None => default_sample_select(table, limit),
     }
+}
+
+/// 各方言的标识符引号（开、闭）的缓存。词法扫描在热循环里逐字符判断，不能每次重新收集。
+fn cached_identifier_quotes() -> &'static [(char, char)] {
+    static QUOTES: std::sync::OnceLock<Vec<(char, char)>> = std::sync::OnceLock::new();
+    QUOTES.get_or_init(identifier_quotes)
+}
+
+/// 这个字符开始一个被引号引起来的标识符时，返回它的闭合字符。
+pub fn identifier_quote_close(open: char) -> Option<char> {
+    cached_identifier_quotes().iter().find(|(start, _)| *start == open).map(|(_, close)| *close)
+}
+
+/// 开闭相同的标识符引号（双引号、反引号）：按“同字符加倍转义”扫描。
+pub fn is_symmetric_identifier_quote(ch: char) -> bool {
+    cached_identifier_quotes().iter().any(|(open, close)| *open == ch && *close == ch)
 }
 
 /// 各方言的标识符引号（开、闭），去重。SQL 文本的通用词法（切语句、读视图头）据此认出被引起来的名字。

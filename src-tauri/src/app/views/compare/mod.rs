@@ -483,10 +483,10 @@ impl ComparePane {
             self.notify(self.text("compare.gates.sideNotOpen"));
             return;
         };
-        let database = if choice.engine == "sqlite" {
-            "main".to_owned()
-        } else {
-            choice.databases.first().cloned().unwrap_or_default()
+        // 没有“库”这一层的单文件引擎只有一个固定库。
+        let database = match crate::adapters::fixed_database_named(&choice.engine) {
+            Some(fixed) => fixed.to_owned(),
+            None => choice.databases.first().cloned().unwrap_or_default(),
         };
         let slot = if baseline { &mut self.baseline } else { &mut self.target };
         // 重新选连接会清掉 schema，这也是新目标。
@@ -588,7 +588,7 @@ impl ComparePane {
         let Some(engine) = self.engine_of(&slot.connection_id) else {
             return;
         };
-        if engine != "postgres" && engine != "sqlserver" {
+        if !crate::adapters::shows_schemas_named(&engine) {
             return;
         }
         let connection_id = slot.connection_id.clone();
@@ -786,8 +786,8 @@ impl ComparePane {
 
     fn side_request(&self, side: &SidePick) -> Option<SideRequest> {
         let choice = self.choices.iter().find(|choice| choice.id == side.connection_id)?;
-        let database = if choice.engine == "sqlite" { "main".to_owned() } else { side.database.trim().to_owned() };
-        let schema = if choice.engine == "postgres" || choice.engine == "sqlserver" { side.schema.trim().to_owned() } else { String::new() };
+        let database = crate::adapters::fixed_database_named(&choice.engine).map(str::to_owned).unwrap_or_else(|| side.database.trim().to_owned());
+        let schema = if crate::adapters::shows_schemas_named(&choice.engine) { side.schema.trim().to_owned() } else { String::new() };
         Some(SideRequest { connection_id: choice.id.clone(), database, schema, engine: choice.engine.clone() })
     }
 
@@ -803,7 +803,7 @@ impl ComparePane {
         if left.engine != right.engine {
             return Some(self.text("compare.gates.engineMismatch"));
         }
-        if left.engine != "sqlite" && (self.baseline.database.trim().is_empty() || self.target.database.trim().is_empty()) {
+        if crate::adapters::fixed_database_named(&left.engine).is_none() && (self.baseline.database.trim().is_empty() || self.target.database.trim().is_empty()) {
             return Some(self.text("compare.gates.databasesNeeded"));
         }
         if let Some(message) = self.schema_block(&self.baseline).or_else(|| self.schema_block(&self.target)) {
@@ -814,9 +814,10 @@ impl ComparePane {
 
     fn schema_block(&self, side: &SidePick) -> Option<String> {
         let engine = self.engine_of(&side.connection_id)?;
-        if engine != "postgres" && engine != "sqlserver" {
+        if !crate::adapters::shows_schemas_named(&engine) {
             return None;
         }
+        let needed = || i18n::fill(&self.text("compare.gates.schemaNeeded"), &[("engine", &crate::adapters::label_named(&engine))]);
         if side.database.trim().is_empty() {
             return None;
         }
@@ -825,14 +826,14 @@ impl ComparePane {
             Some(SchemaState::Ready(names)) => {
                 let value = side.schema.trim();
                 if value.is_empty() || !names.iter().any(|name| name == value) {
-                    Some(if engine == "sqlserver" { self.text("compare.gates.sqlserverSchemaNeeded") } else { self.text("compare.gates.schemaBothNeeded") })
+                    Some(needed())
                 } else {
                     None
                 }
             }
             Some(SchemaState::Manual(_)) => {
                 if side.schema.trim().is_empty() {
-                    Some(if engine == "sqlserver" { self.text("compare.gates.sqlserverSchemaNeeded") } else { self.text("compare.gates.schemaBothNeeded") })
+                    Some(needed())
                 } else {
                     None
                 }
@@ -1127,7 +1128,7 @@ impl ComparePane {
         let Some(engine) = self.engine_of(&side.connection_id) else {
             return;
         };
-        if engine != "postgres" && engine != "sqlserver" {
+        if !crate::adapters::shows_schemas_named(&engine) {
             return;
         }
         match self.schemas.get(&schema_key(&side.connection_id, &side.database)) {
@@ -1754,7 +1755,7 @@ impl ComparePane {
                 }
                 card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(SharedString::from(database_label), &p)).child(list));
             }
-            if choice.engine == "postgres" || choice.engine == "sqlserver" {
+            if crate::adapters::shows_schemas_named(&choice.engine) {
                 let schema_label = self.text("compare.dialog.chooseSchema");
                 match self.schemas.get(&schema_key(&side_connection, &side_database)).cloned() {
                     Some(SchemaState::Ready(names)) => {
@@ -2836,4 +2837,4 @@ mod workbench {
 }
 
 #[cfg(test)]
-mod live;
+mod live_tests;

@@ -12,9 +12,12 @@ mod functions;
 pub(crate) mod grid_read;
 mod plan;
 pub(in crate::adapters) mod syntax;
+pub(in crate::adapters) mod transfer;
 pub(in crate::adapters) mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, Workbench};
+use crate::adapters::{
+    Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench,
+};
 use crate::connections::model::{Engine, TlsMode};
 
 pub(in crate::adapters) struct MysqlAdapter;
@@ -82,6 +85,14 @@ impl EngineAdapter for MysqlAdapter {
     fn connector(&self) -> Option<&dyn Connector> {
         Some(&connect::MysqlConnector)
     }
+
+    fn errors(&self) -> Option<&dyn ErrorRules> {
+        Some(&transfer::MysqlErrors)
+    }
+
+    fn transfer(&self) -> Option<&'static dyn TransferDialect> {
+        Some(&transfer::MYSQL_TRANSFER)
+    }
 }
 
 /// MySQL 家族共用的能力声明：按库分的对象树，先读库名、对象按分组分页。
@@ -93,6 +104,8 @@ pub(in crate::adapters) fn family_capabilities() -> Capabilities {
         catalog_group: true,
         type_rules_group: true,
         ddl_group: true,
+        error_rules_group: true,
+        transfer_group: true,
         shows_databases: true,
         outline_navigation: true,
         ..Capabilities::default()

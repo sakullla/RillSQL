@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{metadata_sql, read_definition, read_object_page, Engine, ObjectKind, ObjectRow};
+use crate::adapters::transfer::transfer_of;
+use crate::adapters::{adapter, qualified_object, session_matches};
+use crate::catalog::{read_definition, read_object_page, Engine, ObjectKind, ObjectRow};
 use crate::connections::CatalogSession;
 use crate::ddl::{load_partial, Action, Request as DdlRequest};
 use crate::dump::order::{self, DepNode};
@@ -252,161 +254,13 @@ struct DumpScope {
 }
 
 impl DumpScope {
+    /// 按引擎层级取库或模式作容器段（单文件引擎不限定）。
     fn qualify(&self, engine: Engine, schema: &str, name: &str) -> String {
-        match engine {
-            Engine::Sqlite => quote_ident(engine, name),
-            Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote_ident(engine, &self.database), quote_ident(engine, name)),
-            Engine::Postgres => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
-            Engine::Sqlserver => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
-            // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
-            Engine::Redis | Engine::Mongodb => quote_ident(engine, name),
-        }
+        qualified_object(engine, &self.database, schema, name)
     }
 }
 
 // ---------------------------------------------------------------- 对象枚举与定义读取
-
-fn read_failure(err: impl Into<crate::error_text::Reason>) -> String {
-    let err = err.into();
-    format!("读取失败：{err}")
-}
-
-fn engine_matches(session: &CatalogSession, engine: Engine) -> bool {
-    matches!(
-        (engine, session),
-        (Engine::Sqlite, CatalogSession::Sqlite { .. })
-            | (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(_))
-            | (Engine::Postgres, CatalogSession::Postgres(_))
-            | (Engine::Sqlserver, CatalogSession::Sqlserver(_))
-    )
-}
-
-pub fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "postgres",
-        Engine::Mysql => "mysql",
-        Engine::Mariadb => "mariadb",
-        Engine::Sqlite => "sqlite",
-        Engine::Sqlserver => "sqlserver",
-        Engine::Redis => "redis",
-        Engine::Mongodb => "mongodb",
-    }
-}
-
-async fn postgres_text_column(session: &CatalogSession, sql: &str) -> Result<Vec<String>, String> {
-    let CatalogSession::Postgres(client) = session else {
-        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
-    };
-    let rows = client.query(sql, &[]).await.map_err(read_failure)?;
-    rows.iter()
-        .map(|row| {
-            if let Ok(value) = row.try_get::<_, String>(0) {
-                return Ok(value);
-            }
-            match row.try_get::<_, Option<String>>(0) {
-                Ok(Some(value)) => Ok(value),
-                Ok(None) => Err(read_failure("元数据列是空值")),
-                Err(err) => Err(read_failure(err)),
-            }
-        })
-        .collect()
-}
-
-async fn current_postgres_database(session: &CatalogSession) -> Result<String, String> {
-    postgres_text_column(session, "SELECT current_database()").await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| read_failure("没有当前数据库"))
-}
-
-/// 解析要导出的范围：库与 schema 列表。PostgreSQL 限定当前连接的库，schema 缺省全部。
-async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str, schemas: &[String]) -> Result<(String, Vec<String>), String> {
-    match engine {
-        // Redis 不在全库导出面（capability 门控）。
-        Engine::Redis => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "Redis 没有整库导出；键空间经键浏览器访问。")),
-        Engine::Mongodb => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "MongoDB 没有整库导出；集合文档经文档浏览器访问。")),
-        Engine::Sqlite => {
-            if !database.is_empty() && database != "main" {
-                return Err(crate::connections::error_codes::coded_string_params(
-                    crate::connections::error_codes::DUMP_SESSION_GAP_MAIN,
-                    &[("database", database)],
-                    format!("当前连接打开的是 main，没有另开连接读取 {database}"),
-                ));
-            }
-            Ok((String::new(), vec![String::new()]))
-        }
-        Engine::Mysql | Engine::Mariadb => {
-            if database.trim().is_empty() {
-                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_DATABASE_REQUIRED, "需要数据库名，没有另开连接。"));
-            }
-            Ok((database.to_owned(), vec![String::new()]))
-        }
-        Engine::Postgres => {
-            let current = current_postgres_database(session).await?;
-            if !database.is_empty() && database != current {
-                return Err(crate::connections::error_codes::coded_string_params(
-                    crate::connections::error_codes::DUMP_SESSION_GAP,
-                    &[("current", &current), ("database", database)],
-                    format!("当前连接打开的是 {current}，没有另开连接读取 {database}"),
-                ));
-            }
-            if schemas.is_empty() {
-                let sql = metadata_sql(Engine::Postgres).schemas.ok_or_else(|| read_failure("PostgreSQL 缺少 schema 查询"))?;
-                let all = postgres_text_column(session, sql).await?;
-                if all.is_empty() {
-                    return Err(read_failure("没有读到 schema"));
-                }
-                Ok((current, all))
-            } else {
-                Ok((current, schemas.to_vec()))
-            }
-        }
-        Engine::Sqlserver => {
-            let current = sqlserver_current_database(session).await?;
-            if !database.is_empty() && database != current {
-                return Err(crate::connections::error_codes::coded_string_params(
-                    crate::connections::error_codes::DUMP_SESSION_GAP,
-                    &[("current", &current), ("database", database)],
-                    format!("当前连接打开的是 {current}，没有另开连接读取 {database}"),
-                ));
-            }
-            if schemas.is_empty() {
-                let sql = metadata_sql(Engine::Sqlserver).schemas.ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
-                let all = sqlserver_text_column(session, sql).await?;
-                if all.is_empty() {
-                    return Err(read_failure("没有读到 schema"));
-                }
-                Ok((current, all))
-            } else {
-                Ok((current, schemas.to_vec()))
-            }
-        }
-    }
-}
-
-async fn sqlserver_current_database(session: &CatalogSession) -> Result<String, String> {
-    let CatalogSession::Sqlserver(client) = session else {
-        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
-    };
-    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(read_failure)?;
-    match rows.first().and_then(|row| row.first()) {
-        Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
-        _ => Err(read_failure("没有当前数据库")),
-    }
-}
-
-async fn sqlserver_text_column(session: &CatalogSession, sql: &str) -> Result<Vec<String>, String> {
-    let CatalogSession::Sqlserver(client) = session else {
-        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
-    };
-    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await.map_err(read_failure)?;
-    rows.iter()
-        .map(|row| match row.first() {
-            Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
-            _ => Err(read_failure("元数据列是空值")),
-        })
-        .collect()
-}
 
 async fn enumerate_objects(engine: Engine, session: &CatalogSession, scope: &DumpScope, flag: &AtomicBool) -> Result<Vec<DumpObject>, String> {
     let mut objects = Vec::new();
@@ -531,8 +385,8 @@ fn absorb_snapshot(object: &mut DumpObject, snapshot: &crate::ddl::Snapshot, not
         table.foreign_keys.clear();
     }
     let source = snapshot.table_sql.trim();
-    // SQLite 的 CREATE TABLE 原文带内联外键；其余引擎没有原文，只有 "-- 库.表" 占位。
-    if snapshot.engine == Engine::Sqlite && !source.is_empty() && !source.starts_with("--") {
+    // 保留建表原文的方言（SQLite）原文带内联外键；其余引擎没有原文，只有 "-- 库.表" 占位。
+    if transfer_of(snapshot.engine).keeps_table_source() && !source.is_empty() && !source.starts_with("--") {
         table.source_sql = source.to_owned();
     }
     object.table = Some(table);
@@ -572,8 +426,8 @@ fn column_clause(engine: Engine, column: &DumpColumn) -> String {
         line.push_str(" DEFAULT ");
         line.push_str(column.default_sql.trim());
     }
-    if column.auto && matches!(engine, Engine::Mysql | Engine::Mariadb) {
-        line.push_str(" AUTO_INCREMENT");
+    if column.auto {
+        line.push_str(transfer_of(engine).dump_auto_clause());
     }
     line
 }
@@ -715,7 +569,7 @@ fn plan_sections(engine: Engine, scope: &DumpScope, objects: &[DumpObject], incl
     for object in &ordered_tables {
         let table = object.table.as_ref().expect("table shape");
         let qualified = scope.qualify(engine, &object.schema, &object.name);
-        let inline_fk = engine == Engine::Sqlite;
+        let inline_fk = transfer_of(engine).inline_foreign_keys();
         let create = if !table.source_sql.is_empty() {
             table.source_sql.trim_end_matches(';').to_owned()
         } else {
@@ -776,8 +630,8 @@ fn plan_sections(engine: Engine, scope: &DumpScope, objects: &[DumpObject], incl
         }
     }
 
-    // 5. 非 SQLite 的外键在全部数据行之后补挂，插入顺序就不再受约束检查牵制。
-    if engine != Engine::Sqlite {
+    // 5. 外键不必内联的方言（SQLite 以外）在全部数据行之后补挂，插入顺序就不再受约束检查牵制。
+    if !transfer_of(engine).inline_foreign_keys() {
         for object in &ordered_tables {
             let Some(table) = object.table.as_ref() else { continue };
             let qualified = scope.qualify(engine, &object.schema, &object.name);
@@ -848,7 +702,7 @@ enum DumpStop {
     Failed(String),
 }
 
-/// 数据段的稳定排序：键列优先，SQLite 无键表按 rowid。迁移（R8）的流式分页读沿用同一规则。
+/// 数据段的稳定排序：键列优先，无键时按方言的隐式行序（SQLite 表的 rowid）。迁移（R8）的流式分页读沿用同一规则。
 pub(crate) fn data_order_clause(schema: &grid::TableSchema) -> String {
     if !schema.key.is_empty() {
         let columns = schema
@@ -859,10 +713,10 @@ pub(crate) fn data_order_clause(schema: &grid::TableSchema) -> String {
             .join(", ");
         return format!(" ORDER BY {columns}");
     }
-    if schema.engine == Engine::Sqlite && schema.kind == "table" {
-        return " ORDER BY rowid".to_owned();
+    match crate::adapters::query::sql_syntax(schema.engine).implicit_order(schema.kind) {
+        Some(order) => format!(" ORDER BY {order}"),
+        None => String::new(),
     }
-    String::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -894,7 +748,8 @@ async fn write_table_data(
         if flag.load(Ordering::Relaxed) {
             return Err(DumpStop::Cancelled);
         }
-        let sql = format!("SELECT {list} FROM {}{order} LIMIT {DATA_PAGE} OFFSET {offset}", qualified_name(&schema));
+        let tail = crate::adapters::query::sql_syntax(engine).page_tail(DATA_PAGE, offset, !order.is_empty());
+        let sql = format!("SELECT {list} FROM {}{order}{tail}", qualified_name(&schema));
         let rows = match fetch_cells(session, &sql, width).await {
             Ok(rows) => rows,
             Err(message) => return Err(DumpStop::Failed(format!("表 {} 读取失败：{message}", table))),
@@ -975,14 +830,15 @@ pub(crate) async fn run_dump(session: &CatalogSession, request: &DumpRequest, pr
 }
 
 async fn dump_body(session: &CatalogSession, request: &DumpRequest, flag: &AtomicBool, progress: &(dyn Fn(DumpProgress) + Send + Sync)) -> DumpDto {
-    if matches!(session, CatalogSession::Scripted) {
+    if session.is_scripted() {
         return failed_dto("这个连接没有连着可查询的数据库".to_owned(), None, 0, 0);
     }
     let engine = match Engine::parse(&request.engine) {
-        Ok(engine) if engine_matches(session, engine) => engine,
+        Ok(engine) if session_matches(engine, session) => engine,
         Ok(_) | Err(_) => return failed_dto("会话类型和目标引擎不一致".to_owned(), None, 0, 0),
     };
-    let (database, schemas) = match resolve_scope(engine, session, &request.database, &request.schemas).await {
+    // 范围解析（PostgreSQL / SQL Server 限定当前连接的库，schema 缺省全部）由各方言给出。
+    let (database, schemas) = match transfer_of(engine).dump_scope(session, &request.database, &request.schemas).await {
         Ok(scope) => scope,
         Err(message) => return failed_dto(message, None, 0, 0),
     };
@@ -1049,7 +905,7 @@ async fn dump_body(session: &CatalogSession, request: &DumpRequest, flag: &Atomi
                     return residual_outcome(&staging, crate::error_text::chain(&err), written_objects, written_rows);
                 }
                 let mut table_rows = |rows: u64| progress(DumpProgress::data(&request.id, table, rows));
-                match write_table_data(&mut out, session, &scope.database, schema, table, engine_name(engine), flag, &mut table_rows).await {
+                match write_table_data(&mut out, session, &scope.database, schema, table, engine.as_str(), flag, &mut table_rows).await {
                     Ok(count) => written_rows += count,
                     Err(DumpStop::Cancelled) => {
                         let _ = out.flush();
@@ -1081,18 +937,9 @@ fn residual_outcome(staging: &Path, message: String, objects: usize, rows: u64) 
 }
 
 fn write_header(out: &mut BufWriter<File>, engine: Engine, scope: &DumpScope, request: &DumpRequest, notes: &[String]) -> io::Result<()> {
-    let engine_label = match engine {
-        Engine::Postgres => "PostgreSQL",
-        Engine::Mysql => "MySQL",
-        Engine::Mariadb => "MariaDB",
-        Engine::Sqlite => "SQLite",
-        Engine::Sqlserver => "SQL Server",
-        // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
-        Engine::Redis => "Redis",
-        Engine::Mongodb => "MongoDB",
-    };
+    let engine_label = adapter(engine).meta().label();
     let database = if scope.database.is_empty() { "main".to_owned() } else { scope.database.clone() };
-    let schemas = if matches!(engine, Engine::Postgres | Engine::Sqlserver) { scope.schemas.join(", ") } else { String::new() };
+    let schemas = if adapter(engine).capabilities().shows_schemas { scope.schemas.join(", ") } else { String::new() };
     writeln!(out, "-- RillSQL 全库导出：只读生成，未执行任何语句。")?;
     writeln!(out, "-- 引擎：{engine_label}；库：{database}{}", if schemas.is_empty() { String::new() } else { format!("；schema：{schemas}") })?;
     writeln!(out, "-- 生成时间：{}；{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), if request.include_data { "含结构与数据。" } else { "仅结构，不含数据。" })?;

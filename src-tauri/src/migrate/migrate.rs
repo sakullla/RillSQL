@@ -200,25 +200,11 @@ fn length_note(target_type: &str) -> Option<String> {
     }
 }
 
-/// 主键/唯一键冲突的识别：三族引擎对同一错误的措辞不同。
+/// 主键/唯一键冲突的识别：各引擎对同一错误的措辞不同，措辞由各适配器的错误规则给出。
 pub(crate) fn is_conflict_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("duplicate entry")
-        || lower.contains("duplicate key")
-        || lower.contains("unique constraint")
-        || lower.contains("violation of primary key constraint")
-        || lower.contains("violation of unique key constraint")
+    crate::adapters::is_conflict_error(message)
 }
 
-fn engine_matches(session: &CatalogSession, engine: Engine) -> bool {
-    matches!(
-        (engine, session),
-        (Engine::Sqlite, CatalogSession::Sqlite { .. })
-            | (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(_))
-            | (Engine::Postgres, CatalogSession::Postgres(_))
-            | (Engine::Sqlserver, CatalogSession::Sqlserver(_))
-    )
-}
 
 /// 先精确匹配再忽略大小写，与前端 suggestMapping 的列名匹配同规则。
 fn find_column<'a>(columns: &'a [Column], name: &str) -> Option<&'a Column> {
@@ -271,92 +257,14 @@ fn row_identity(key_positions: &[usize], ordinal: u64, cells: &[Cell]) -> String
 
 // ---------------------------------------------------------------- 目标端执行
 
-/// 一批放进一个事务：整批成功才提交。失败即回滚并返回错误，由调用方降级逐行重放。
+/// 一批放进一个事务：整批成功才提交。失败即回滚并返回错误，由调用方降级逐行重放。各引擎的事务写法在适配器里。
 async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), String> {
-    match target {
-        CatalogSession::Scripted => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_NOT_QUERYABLE, "这个连接没有连着可查询的数据库")),
-        // Redis 不在迁移目标面（capability 门控）；误入时拒绝写入。
-        CatalogSession::Redis(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_REDIS_NOT_TARGET, "Redis 不是迁移目标；数据经键命令写入。")),
-        CatalogSession::Mongo(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_MONGO_NOT_TARGET, "MongoDB 不是迁移目标；文档经集合浏览器写入。")),
-        // SQLite 会话的池固定单连接，BEGIN/COMMIT 语句与数据语句落在同一条连接上。
-        CatalogSession::Sqlite { pool, .. } => {
-            exec_sqlite(pool, "BEGIN").await?;
-            match exec_sqlite(pool, statement).await {
-                Ok(()) => exec_sqlite(pool, "COMMIT").await,
-                Err(error) => {
-                    let _ = exec_sqlite(pool, "ROLLBACK").await;
-                    Err(error)
-                }
-            }
-        }
-        CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
-            mysql_async::prelude::Queryable::query_drop(&mut conn, "BEGIN".to_owned())
-                .await
-                .map_err(|err| crate::error_text::chain(&err))?;
-            match mysql_async::prelude::Queryable::query_drop(&mut conn, statement.to_owned()).await {
-                Ok(()) => mysql_async::prelude::Queryable::query_drop(&mut conn, "COMMIT".to_owned())
-                    .await
-                    .map_err(|err| crate::error_text::chain(&err)),
-                Err(error) => {
-                    let _ = mysql_async::prelude::Queryable::query_drop(&mut conn, "ROLLBACK".to_owned()).await;
-                    Err(error.to_string())
-                }
-            }
-        }
-        // Arc<Client> 不支持 transaction()，同一条连接上的显式 BEGIN/COMMIT 等价。
-        CatalogSession::Postgres(client) => {
-            client.execute("BEGIN", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-            match client.execute(statement, &[]).await {
-                Ok(_) => client.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
-                Err(error) => {
-                    let _ = client.execute("ROLLBACK", &[]).await;
-                    Err(error.to_string())
-                }
-            }
-        }
-        // 同一条 TDS 连接上的显式事务；失败回滚后由调用方降级逐行重放。
-        CatalogSession::Sqlserver(client) => {
-            let mut locked = client.lock().await;
-            locked.execute("BEGIN TRANSACTION", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-            match locked.execute(statement.to_owned(), &[]).await {
-                Ok(_) => locked.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
-                Err(error) => {
-                    let _ = locked.execute("ROLLBACK", &[]).await;
-                    Err(error.to_string())
-                }
-            }
-        }
-    }
+    target.insert_in_transaction(statement).await
 }
 
 /// 逐行重放的单条自动提交语句（降级路径专用）。
 async fn exec_one(target: &CatalogSession, statement: &str) -> Result<(), String> {
-    match target {
-        CatalogSession::Scripted => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_NOT_QUERYABLE, "这个连接没有连着可查询的数据库")),
-        CatalogSession::Redis(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_REDIS_NOT_TARGET, "Redis 不是迁移目标；数据经键命令写入。")),
-        CatalogSession::Mongo(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_MONGO_NOT_TARGET, "MongoDB 不是迁移目标；文档经集合浏览器写入。")),
-        CatalogSession::Sqlite { pool, .. } => exec_sqlite(pool, statement).await,
-        CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
-            mysql_async::prelude::Queryable::query_drop(&mut conn, statement.to_owned())
-                .await
-                .map_err(|err| crate::error_text::chain(&err))
-        }
-        CatalogSession::Postgres(client) => client.execute(statement, &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err)),
-        CatalogSession::Sqlserver(client) => {
-            let mut locked = client.lock().await;
-            locked.execute(statement.to_owned(), &[]).await.map(|_| ()).map_err(|err| crate::error_text::chain(&err))
-        }
-    }
-}
-
-async fn exec_sqlite(pool: &sqlx::SqlitePool, statement: &str) -> Result<(), String> {
-    sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()))
-        .execute(pool)
-        .await
-        .map(|_| ())
-        .map_err(|err| crate::error_text::chain(&err))
+    target.execute_autocommit(statement).await
 }
 
 /// 逐行连续失败后的探活：区分"这行数据有问题"和"连接已经断开"。
@@ -378,6 +286,7 @@ struct Plan {
     /// 投影里的源列（与 target_columns 一一对应）。
     source_columns: Vec<Column>,
     target_columns: Vec<Column>,
+    source_engine: Engine,
     target_engine: Engine,
     target_qualified: String,
     /// 主键列在投影中的位置（按源表键序）；源表无键时失败行用行号标识。
@@ -396,11 +305,11 @@ async fn build_plan(
 ) -> Result<Plan, String> {
     let source_engine = Engine::parse(&source_ref.engine)
         .ok()
-        .filter(|engine| engine_matches(source, *engine))
+        .filter(|engine| crate::adapters::session_matches(*engine, source))
         .ok_or_else(|| "源连接的会话类型和引擎不一致".to_owned())?;
     let target_engine = Engine::parse(&target_ref.engine)
         .ok()
-        .filter(|engine| engine_matches(target, *engine))
+        .filter(|engine| crate::adapters::session_matches(*engine, target))
         .ok_or_else(|| "目标连接的会话类型和引擎不一致".to_owned())?;
     let source_schema =
         describe(source, &source_ref.database, &source_ref.schema, &source_ref.table, &source_ref.engine)
@@ -494,6 +403,7 @@ async fn build_plan(
         source_projection,
         source_columns,
         target_columns,
+        source_engine,
         target_engine,
         target_qualified,
         key_positions,
@@ -573,7 +483,7 @@ async fn migrate_body(
     flag: &AtomicBool,
     progress: &(dyn Fn(MigrateProgress) + Send + Sync),
 ) -> MigrateDto {
-    if matches!(source, CatalogSession::Scripted) || matches!(target, CatalogSession::Scripted) {
+    if source.is_scripted() || target.is_scripted() {
         return blocked("这个连接没有连着可查询的数据库".to_owned());
     }
     let options = request.effective_options();
@@ -609,10 +519,8 @@ async fn migrate_body(
         if flag.load(Ordering::Relaxed) {
             return cancelled(&tally, warnings);
         }
-        let sql = format!(
-            "SELECT {} FROM {}{} LIMIT {} OFFSET {}",
-            plan.source_projection, plan.source_qualified, plan.order_clause, plan.batch_rows, offset
-        );
+        let tail = crate::adapters::query::sql_syntax(plan.source_engine).page_tail(plan.batch_rows, offset, !plan.order_clause.is_empty());
+        let sql = format!("SELECT {} FROM {}{}{tail}", plan.source_projection, plan.source_qualified, plan.order_clause);
         let rows = match fetch_cells(source, &sql, plan.source_columns.len()).await {
             Ok(rows) => rows,
             Err(message) => {

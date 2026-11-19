@@ -12,9 +12,10 @@ mod functions;
 pub(crate) mod grid_read;
 mod plan;
 mod syntax;
+pub(in crate::adapters) mod transfer;
 mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct PostgresAdapter;
@@ -64,6 +65,8 @@ impl EngineAdapter for PostgresAdapter {
             catalog_group: true,
             type_rules_group: true,
             ddl_group: true,
+            error_rules_group: true,
+            transfer_group: true,
             shows_databases: true,
             shows_schemas: true,
             outline_navigation: true,
@@ -89,5 +92,13 @@ impl EngineAdapter for PostgresAdapter {
 
     fn connector(&self) -> Option<&dyn Connector> {
         Some(&connect::PostgresConnector)
+    }
+
+    fn errors(&self) -> Option<&dyn ErrorRules> {
+        Some(&transfer::PostgresErrors)
+    }
+
+    fn transfer(&self) -> Option<&'static dyn TransferDialect> {
+        Some(&transfer::PostgresTransfer)
     }
 }

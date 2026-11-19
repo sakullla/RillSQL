@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use mysql_async::prelude::Queryable;
-
-use crate::catalog::{read_definition, read_object_page, Engine as CatalogEngine, ObjectKind, ObjectRow};
+use crate::adapters::transfer::{relational_engine, transfer_of};
+use crate::adapters::{adapter, catalog_of, engine_of_session, fixed_database_named, session_matches};
+use crate::catalog::{read_definition, read_object_page, ObjectKind, ObjectRow};
 use crate::connections::{CatalogSession, Service};
 use crate::ddl::{load_partial, Action, DdlEngine, Request, Snapshot};
-use crate::grid::{describe, qualified_name, quote_ident, select_list, Cell, TableSchema};
+use crate::grid::{describe, fetch_cells, qualified_name, quote_ident, select_list, Cell, TableSchema};
 
 use super::data::diff_data;
 use super::model::{
@@ -92,7 +92,11 @@ fn refuse_loaded(baseline: &Side, target: &Side) -> Option<String> {
 }
 
 async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) -> Side {
-    let database = if request.engine == "sqlite" && request.database.is_empty() { "main".to_owned() } else { request.database.clone() };
+    let fixed = fixed_database_named(&request.engine);
+    let database = match fixed {
+        Some(fixed) if request.database.is_empty() => fixed.to_owned(),
+        _ => request.database.clone(),
+    };
     let mut side = Side {
         engine: request.engine.clone(),
         database: database.clone(),
@@ -104,11 +108,11 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
         cancelled: false,
         listing_complete: false,
     };
-    if super::model::Engine::parse(&request.engine).is_err() {
+    let Ok(engine) = super::model::Engine::parse(&request.engine) else {
         side.fatal = Some(format!("不支持的数据库 {}", request.engine));
         return side;
-    }
-    if request.engine != "sqlite" && database.trim().is_empty() {
+    };
+    if fixed.is_none() && database.trim().is_empty() {
         side.fatal = Some("需要数据库名".to_owned());
         return side;
     }
@@ -116,7 +120,7 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
         side.fatal = Some("这一侧还没有打开".to_owned());
         return side;
     };
-    if !session_matches(&existing, &request.engine) {
+    if !session_matches(engine, &existing) {
         side.fatal = Some("会话类型和目标引擎不一致".to_owned());
         return side;
     }
@@ -128,14 +132,10 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
             return side;
         }
     };
-    if let Err(message) = ensure_scope(&held.session, &request.engine, &database, &request.schema).await {
+    if let Err(message) = transfer_of(engine).compare_scope(&held.session, &database, &request.schema).await {
         side.fatal = Some(message);
         return side;
     }
-    let Ok(catalog_engine) = catalog_engine(&request.engine) else {
-        side.fatal = Some(format!("不支持的数据库 {}", request.engine));
-        return side;
-    };
     let mut offset = 0usize;
     let mut seen = 0usize;
     loop {
@@ -144,7 +144,7 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
             side.listing_complete = false;
             break;
         }
-        let page = read_object_page(&held.session, catalog_engine, &database, &request.schema, offset, 200).await;
+        let page = read_object_page(&held.session, engine, &database, &request.schema, offset, 200).await;
         if let Some(message) = page.error {
             side.fatal = Some(message);
             return side;
@@ -230,8 +230,9 @@ async fn load_data_table(
     let Some(target_session) = service.catalog_session(&target_request.connection_id) else {
         return failed_table(name, chosen_key, "对照连接还没有打开".to_owned());
     };
-    let base_database = if baseline_request.engine == "sqlite" { "main".to_owned() } else { baseline_request.database.clone() };
-    let target_database = if target_request.engine == "sqlite" { "main".to_owned() } else { target_request.database.clone() };
+    let side_database = |request: &SideRequest| fixed_database_named(&request.engine).map(str::to_owned).unwrap_or_else(|| request.database.clone());
+    let base_database = side_database(baseline_request);
+    let target_database = side_database(target_request);
     let base_held = match hold_session(service, &base_session, baseline_request, &base_database).await {
         Ok(held) => held,
         Err(message) => return failed_table(name, chosen_key, message),
@@ -329,18 +330,10 @@ async fn fetch_page(session: &CatalogSession, schema: &TableSchema, offset: u64,
         let columns = schema.key.iter().map(|name| format!("{} ASC", quote_ident(schema.engine, name))).collect::<Vec<_>>().join(", ");
         format!(" ORDER BY {columns}")
     };
-    let sql = format!("SELECT {list} FROM {}{order} LIMIT {limit} OFFSET {offset}", qualified_name(schema));
-    let width = schema.columns.len();
-    let matrix = match session {
-        CatalogSession::Scripted => return Err("这个连接没有连着可查询的数据库".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => fetch_sqlite(pool, &sql, width).await?,
-        CatalogSession::Mysql(pool) => fetch_mysql(pool, &sql).await?,
-        CatalogSession::Postgres(client) => fetch_postgres(client, &sql, width).await?,
-        CatalogSession::Sqlserver(client) => fetch_sqlserver(client, &sql).await?,
-        // Redis 没有关系型表读取：对比入口对 kv 引擎不可达（capability 门控）。
-        CatalogSession::Redis(_) => return Err("Redis 没有表数据对比；键值引擎不进对比。".to_owned()),
-        CatalogSession::Mongo(_) => return Err("MongoDB 没有表数据对比；文档引擎不进对比。".to_owned()),
-    };
+    let tail = crate::adapters::query::sql_syntax(schema.engine).page_tail(limit, offset, !order.is_empty());
+    let sql = format!("SELECT {list} FROM {}{order}{tail}", qualified_name(schema));
+    // 与网格、导出同一套逐格读取（各引擎的取值规则在适配器里）。
+    let matrix = fetch_cells(session, &sql, schema.columns.len()).await?;
     let mut rows = Vec::new();
     for cells in matrix {
         let mut map = BTreeMap::new();
@@ -350,85 +343,6 @@ async fn fetch_page(session: &CatalogSession, schema: &TableSchema, offset: u64,
         rows.push(map);
     }
     Ok(rows)
-}
-
-async fn fetch_sqlite(pool: &sqlx::SqlitePool, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())).fetch_all(pool).await.map_err(|err| crate::error_text::chain(&err))?;
-    rows.iter().map(|row| read_sqlite_row(row, width)).collect()
-}
-
-fn read_sqlite_row(row: &sqlx::sqlite::SqliteRow, width: usize) -> Result<Vec<Cell>, String> {
-    use sqlx::Row;
-    let mut cells = Vec::new();
-    for index in 0..width {
-        if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-            cells.push(cell_text(value));
-            continue;
-        }
-        if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-            cells.push(cell_text(value.map(|number| number.to_string())));
-            continue;
-        }
-        if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-            cells.push(cell_text(value.map(|number| number.to_string())));
-            continue;
-        }
-        return Err(format!("读不到第 {index} 列"));
-    }
-    Ok(cells)
-}
-
-async fn fetch_postgres(client: &tokio_postgres::Client, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    let rows = client.query(sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-    let mut matrix = Vec::new();
-    for row in &rows {
-        let mut cells = Vec::new();
-        for index in 0..width {
-            let value = row.try_get::<_, Option<String>>(index).map_err(|err| crate::error_text::chain(&err))?;
-            cells.push(cell_text(value));
-        }
-        matrix.push(cells);
-    }
-    Ok(matrix)
-}
-
-async fn fetch_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
-    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await?;
-    Ok(rows)
-}
-
-async fn fetch_mysql(pool: &mysql_async::Pool, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
-    let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
-    let mut result = conn.query_iter(sql).await.map_err(|err| crate::error_text::chain(&err))?;
-    let width = result.columns_ref().len();
-    let mut matrix = Vec::new();
-    while let Some(row) = result.next().await.map_err(|err| crate::error_text::chain(&err))? {
-        let cells = (0..width).map(|index| mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL))).collect();
-        matrix.push(cells);
-    }
-    Ok(matrix)
-}
-
-fn mysql_cell(value: &mysql_async::Value) -> Cell {
-    match value {
-        mysql_async::Value::NULL => Cell::Null,
-        mysql_async::Value::Bytes(bytes) => Cell::Text(String::from_utf8_lossy(bytes).into_owned()),
-        mysql_async::Value::Int(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::UInt(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Float(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Double(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Date(year, month, day, hour, minute, second, micros) => Cell::Text(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}")),
-        mysql_async::Value::Time(negative, days, hour, minute, second, micros) => {
-            Cell::Text(format!("{}{days} {hour:02}:{minute:02}:{second:02}.{micros:06}", if *negative { "-" } else { "" }))
-        }
-    }
-}
-
-fn cell_text(value: Option<String>) -> Cell {
-    match value {
-        Some(text) => Cell::Text(text),
-        None => Cell::Null,
-    }
 }
 
 async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str, object: &mut ObjectDef) -> Vec<(Category, String)> {
@@ -451,15 +365,16 @@ async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str,
             }
         }
         _ => {
-            let Ok(engine) = catalog_engine(&request.engine) else {
+            let Ok(engine) = relational_engine(&request.engine) else {
                 object.read_error = Some("引擎不一致".to_owned());
                 return Vec::new();
             };
             match read_definition(session, engine, database, &request.schema, &object.name, kind_str(object.kind), &object.signature, &object.relation).await {
                 Ok(sql) => {
                     object.definition = sql;
-                    if object.kind == Kind::Sequence && request.engine == "postgres" {
-                        if let Some(owner) = postgres_sequence_owner(session, &request.schema, &object.name).await {
+                    // serial / identity 的序列由列拥有：relation 记成 `表\u{1}列`，结构脚本不再无条件 DROP SEQUENCE。
+                    if object.kind == Kind::Sequence {
+                        if let Some(owner) = transfer_of(engine).sequence_owner(session, &request.schema, &object.name).await {
                             object.relation = owner;
                         }
                     }
@@ -469,31 +384,6 @@ async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str,
             Vec::new()
         }
     }
-}
-
-/// serial / identity 的序列由列拥有。relation 记成 `表\u{1}列`，结构脚本不再无条件 DROP SEQUENCE。
-async fn postgres_sequence_owner(session: &CatalogSession, schema: &str, name: &str) -> Option<String> {
-    let CatalogSession::Postgres(client) = session else {
-        return None;
-    };
-    let sql = "SELECT tab.relname, att.attname FROM pg_class seq \
-        JOIN pg_namespace ns ON ns.oid = seq.relnamespace \
-        JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i') AND dep.classid = 'pg_class'::regclass AND dep.refclassid = 'pg_class'::regclass AND dep.refobjsubid > 0 \
-        JOIN pg_class tab ON tab.oid = dep.refobjid \
-        JOIN pg_attribute att ON att.attrelid = tab.oid AND att.attnum = dep.refobjsubid AND NOT att.attisdropped \
-        WHERE ns.nspname = $1 AND seq.relname = $2 AND seq.relkind = 'S' \
-        LIMIT 1";
-    let rows = client.query(sql, &[&schema, &name]).await.ok()?;
-    let row = rows.first()?;
-    let table: String = row.try_get(0).ok()?;
-    let column: String = row.try_get(1).ok()?;
-    if table.is_empty() {
-        return None;
-    }
-    if column.is_empty() {
-        return Some(table);
-    }
-    Some(format!("{table}\u{1}{column}"))
 }
 
 pub(super) fn absorb_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) -> Vec<(Category, String)> {
@@ -613,116 +503,21 @@ fn kind_str(kind: Kind) -> &'static str {
     }
 }
 
-fn catalog_engine(value: &str) -> Result<CatalogEngine, String> {
-    match value {
-        "postgres" => Ok(CatalogEngine::Postgres),
-        "mysql" => Ok(CatalogEngine::Mysql),
-        "mariadb" => Ok(CatalogEngine::Mariadb),
-        "sqlite" => Ok(CatalogEngine::Sqlite),
-        "sqlserver" => Ok(CatalogEngine::Sqlserver),
-        other => Err(format!("不支持的数据库 {other}")),
-    }
-}
-
-fn session_matches(session: &CatalogSession, engine: &str) -> bool {
-    matches!(
-        (session, engine),
-        (CatalogSession::Sqlite { .. }, "sqlite")
-            | (CatalogSession::Mysql(_), "mysql" | "mariadb")
-            | (CatalogSession::Postgres(_), "postgres")
-            | (CatalogSession::Sqlserver(_), "sqlserver")
-    )
-}
-
+/// 会话绑定单库的引擎（PostgreSQL）要读的库不是当前库时另开临时会话，不改连、不写配置。
 async fn hold_session(service: &Service, existing: &CatalogSession, request: &SideRequest, database: &str) -> Result<Held, String> {
-    if request.engine != "postgres" {
+    let Ok(engine) = relational_engine(&request.engine) else {
+        return Ok(Held { _ephemeral: None, session: existing.clone() });
+    };
+    if !adapter(engine).capabilities().database_scoped_session {
         return Ok(Held { _ephemeral: None, session: existing.clone() });
     }
-    let current = postgres_current(existing).await?;
+    let current = transfer_of(engine).session_database(existing).await?;
     if !needs_ephemeral_postgres(&request.engine, &current, database.trim()) {
         return Ok(Held { _ephemeral: None, session: existing.clone() });
     }
     let ephemeral = service.open_ephemeral_postgres(&request.connection_id, database.trim()).await?;
     let session = ephemeral.catalog();
     Ok(Held { _ephemeral: Some(ephemeral), session })
-}
-
-async fn postgres_current(session: &CatalogSession) -> Result<String, String> {
-    let CatalogSession::Postgres(client) = session else {
-        return Ok(String::new());
-    };
-    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-    let name: Option<String> = row.try_get(0).map_err(|err| crate::error_text::chain(&err))?;
-    Ok(name.unwrap_or_default())
-}
-
-async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, schema: &str) -> Result<(), String> {
-    match engine {
-        "sqlite" => {
-            if !database.is_empty() && database != "main" {
-                return Err("SQLite 只对比该连接的 main，不附加其他文件".to_owned());
-            }
-            Ok(())
-        }
-        "postgres" => {
-            if schema.trim().is_empty() {
-                return Err("PostgreSQL 需要指定 schema".to_owned());
-            }
-            let CatalogSession::Postgres(client) = session else {
-                return Err("会话类型和目标引擎不一致".to_owned());
-            };
-            let rows = client.query("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema]).await.map_err(|err| crate::error_text::chain(&err))?;
-            if rows.is_empty() {
-                return Err(format!("schema {schema} 不存在"));
-            }
-            Ok(())
-        }
-        "mysql" | "mariadb" => {
-            let CatalogSession::Mysql(pool) = session else {
-                return Err("会话类型和目标引擎不一致".to_owned());
-            };
-            let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
-            let row: Option<mysql_async::Row> = conn
-                .exec_first("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?", (database.to_owned(),))
-                .await
-                .map_err(|err| crate::error_text::chain(&err))?;
-            if row.is_none() {
-                return Err(format!("数据库 {database} 不存在"));
-            }
-            Ok(())
-        }
-        "sqlserver" => {
-            let CatalogSession::Sqlserver(client) = session else {
-                return Err("会话类型和目标引擎不一致".to_owned());
-            };
-            // SQL Server 不改连也不开临时会话：对比只落在当前连接的库上，点名其他库直接说明。
-            let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(|err| err.to_string())?;
-            let current = match rows.first().and_then(|row| row.first()) {
-                Some(crate::grid::Cell::Text(text)) => text.clone(),
-                _ => String::new(),
-            };
-            if current != database {
-                return Err(format!("当前连接打开的是 {current}，没有另开连接读取 {database}"));
-            }
-            if schema.trim().is_empty() {
-                return Err("SQL Server 需要指定 schema".to_owned());
-            }
-            let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(
-                client,
-                &format!(
-                    "SELECT name FROM sys.schemas WHERE name = N'{}'",
-                    schema.trim().replace('\'', "''")
-                ),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-            if rows.is_empty() {
-                return Err(format!("schema {schema} 不存在"));
-            }
-            Ok(())
-        }
-        _ => Err(format!("不支持的数据库 {engine}")),
-    }
 }
 
 /// 列出所选 PostgreSQL / SQL Server 库的 schema。PostgreSQL 的另一个库走临时会话，不改连、不写配置。
@@ -734,64 +529,19 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
     let Some(existing) = service.catalog_session(connection_id) else {
         return Err("这一侧还没有打开".to_owned());
     };
-    let engine = match &existing {
-        CatalogSession::Postgres(_) => "postgres",
-        CatalogSession::Sqlserver(_) => "sqlserver",
-        _ => {
-            return Err("只有 PostgreSQL 和 SQL Server 需要选择 schema".to_owned());
-        }
-    };
-    if !session_matches(&existing, engine) {
+    let Some(engine) = engine_of_session(&existing).filter(|engine| adapter(*engine).capabilities().shows_schemas) else {
         return Err("只有 PostgreSQL 和 SQL Server 需要选择 schema".to_owned());
-    }
+    };
     let request = SideRequest {
         connection_id: connection_id.to_owned(),
         database: database.to_owned(),
         schema: String::new(),
-        engine: engine.to_owned(),
+        engine: adapter(engine).meta().id().to_owned(),
     };
     let held = hold_session(service, &existing, &request, database).await?;
-    if let CatalogSession::Sqlserver(client) = &held.session {
-        let sql = crate::catalog::metadata_sql(CatalogEngine::Sqlserver)
-            .schemas
-            .ok_or_else(|| "SQL Server 缺少 schema 查询".to_owned())?;
-        let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await.map_err(|err| err.to_string())?;
-        let mut names = Vec::new();
-        for row in &rows {
-            if let Some(crate::grid::Cell::Text(name)) = row.first() {
-                if !name.is_empty() {
-                    names.push(name.clone());
-                }
-            }
-        }
-        return Ok(names);
-    }
-    let CatalogSession::Postgres(client) = &held.session else {
-        return Err("会话类型和目标引擎不一致".to_owned());
-    };
-    let sql = crate::catalog::metadata_sql(CatalogEngine::Postgres)
+    let sql = catalog_of(engine)
+        .metadata_sql()
         .schemas
-        .ok_or_else(|| "PostgreSQL 缺少 schema 查询".to_owned())?;
-    let rows = client.query(sql, &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-    let mut names = Vec::new();
-    for row in &rows {
-        let name = schema_name(row)?;
-        if !name.is_empty() {
-            names.push(name);
-        }
-    }
-    Ok(names)
+        .ok_or_else(|| format!("{} 缺少 schema 查询", adapter(engine).meta().label()))?;
+    transfer_of(engine).schema_names(&held.session, sql).await
 }
-
-fn schema_name(row: &tokio_postgres::Row) -> Result<String, String> {
-    if let Ok(value) = row.try_get::<_, String>(0) {
-        return Ok(value);
-    }
-    match row.try_get::<_, Option<String>>(0) {
-        Ok(Some(value)) => Ok(value),
-        Ok(None) => Err("schema 名是空值".to_owned()),
-        Err(err) => Err(crate::error_text::chain(&err)),
-    }
-}
-
-

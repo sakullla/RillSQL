@@ -225,7 +225,7 @@ fn render_text(writer: &mut impl Write, columns: &[String], rows: &[Vec<Option<S
             "insert" => {
                 if row_index > 0 { writer.write_all(b"\r\n")?; }
                 let cells = (0..columns.len()).map(|index| match row.get(index).and_then(Option::as_ref) { Some(text) => Cell::Text(text.clone()), None => Cell::Null }).collect::<Vec<_>>();
-                writer.write_all(insert_line(Engine::Sqlite, options.schema, options.table, &sql_columns, columns, &cells).as_bytes())?;
+                writer.write_all(insert_line(crate::adapters::registry::FILE_EXPORT_DIALECT, options.schema, options.table, &sql_columns, columns, &cells).as_bytes())?;
             }
             _ => unreachable!(),
         }

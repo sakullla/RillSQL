@@ -10,6 +10,7 @@ use crate::dump::order::{
     DepNode,
 };
 use crate::adapters::quote_ident as quote;
+use crate::adapters::transfer::{qualify as qualify_on, transfer_of, InPlaceTypes, SequenceSpec, TableAlter, ViewReplace};
 
 pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     if let Some(message) = refuse_pair(baseline, target) {
@@ -68,7 +69,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
             (None, Some(other)) => {
                 only_target.push(item(other, "仅对照拥有"));
                 if allow_ddl && readable(other) && !blocked(baseline, target, Category::from_kind(other.kind)) {
-                    let drop_owned_fk = engine != Engine::Sqlite && !blocked(baseline, target, Category::ForeignKey);
+                    let drop_owned_fk = !transfer_of(engine).inline_foreign_keys() && !blocked(baseline, target, Category::ForeignKey);
                     push_drop(engine, target, other, &mut drop_object, &mut drop_fk, drop_owned_fk);
                 } else if other.read_error.is_some() {
                     incomplete = true;
@@ -169,13 +170,7 @@ fn refuse_pair(baseline: &Side, target: &Side) -> Option<String> {
     if let Some(message) = baseline.fatal.clone().or(target.fatal.clone()) {
         return Some(format!("{message} 不生成脚本。"));
     }
-    if left == Some(Engine::Postgres) && (baseline.schema.trim().is_empty() || target.schema.trim().is_empty()) {
-        return Some("PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。".to_owned());
-    }
-    if left == Some(Engine::Sqlite) && ((!baseline.database.is_empty() && baseline.database != "main") || (!target.database.is_empty() && target.database != "main")) {
-        return Some("SQLite 只对比该连接的 main，不附加其他文件，不生成脚本。".to_owned());
-    }
-    None
+    left.and_then(|engine| transfer_of(engine).compare_scope_refusal(baseline, target))
 }
 
 fn identity(object: &ObjectDef) -> String {
@@ -229,9 +224,10 @@ fn push_create(
             // SQLite 不能事后加外键，只能写在 CREATE TABLE 里，而且允许被引用表尚未存在。
             // PostgreSQL 与 MySQL 在 CREATE TABLE 里引用还没建的表会失败，所以外键一律留到全部建表之后。
             let include_fk = !blocked(baseline, other, Category::ForeignKey);
-            let inline_fk = engine == Engine::Sqlite && include_fk;
+            let inline = transfer_of(engine).inline_foreign_keys();
+            let inline_fk = inline && include_fk;
             objects.push(plan_create(object, create_table(engine, target, &object.name, shape, inline_fk)));
-            if include_fk && engine != Engine::Sqlite {
+            if include_fk && !inline {
                 foreign_keys.extend(shape.foreign_keys.iter().map(|key| add_foreign_key(engine, target, &object.name, key)));
             }
             if !blocked(baseline, other, Category::Index) {
@@ -305,25 +301,27 @@ fn compare_pair(
         changed.push(item(base, "没有读到表结构"));
         return;
     };
+    let dialect = transfer_of(engine);
     let column_diff = columns_differ(left, right);
-    // SQLite 的主键来自列信息；其他引擎的主键来自索引查询。
-    let pk_trusted = engine == Engine::Sqlite || (left.indexes_read && right.indexes_read);
+    // 主键来自列信息的方言（SQLite）不依赖索引读取；其他引擎的主键来自索引查询。
+    let pk_trusted = dialect.primary_key_from_columns() || (left.indexes_read && right.indexes_read);
     let pk_diff = pk_trusted && primary_columns(left) != primary_columns(right);
     let fk_known = left.foreign_keys_read && right.foreign_keys_read;
     let fk_diff = fk_known && foreign_keys_differ(left, right);
     let fk_blocked = !fk_known || blocked(baseline, target_side, Category::ForeignKey);
     let with_fk = !fk_blocked;
     let index_blocked = blocked(baseline, target_side, Category::Index) || !left.indexes_read || !right.indexes_read;
-    let sqlite_fk_only = engine == Engine::Sqlite && fk_diff && !column_diff && !pk_diff;
-    let structural = engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
-    // 外键没读全时不能把空列表当成没有外键。SQLite 重建会在新表里丢掉它们。
-    let rebuild_drops_unknown_fk = engine == Engine::Sqlite && fk_blocked && sqlite_needs_rebuild(left, right, false);
-    // 仅外键不同时 SQLite 只能重建。索引没读全时重建会连带丢掉索引，因此不生成这类语句。
+    let inline_fk = dialect.inline_foreign_keys();
+    let fk_only_rebuild = inline_fk && fk_diff && !column_diff && !pk_diff;
+    let structural = dialect.needs_rebuild(left, right, with_fk);
+    // 外键没读全时不能把空列表当成没有外键。重建（SQLite）会在新表里丢掉它们。
+    let rebuild_drops_unknown_fk = fk_blocked && dialect.needs_rebuild(left, right, false);
+    // 外键只能内联的方言（SQLite）仅外键不同时只能重建。索引没读全时重建会连带丢掉索引，因此不生成这类语句。
     let emit_alter = allow_ddl
         && !blocked(baseline, target_side, Category::Table)
         && !(structural && index_blocked)
         && !rebuild_drops_unknown_fk
-        && (column_diff || pk_diff || (sqlite_fk_only && with_fk && !index_blocked));
+        && (column_diff || pk_diff || (fk_only_rebuild && with_fk && !index_blocked));
     if rebuild_drops_unknown_fk && allow_ddl && !blocked(baseline, target_side, Category::Table) && (column_diff || pk_diff) {
         *incomplete = true;
         notes.push(format!("表 {} 的外键没有读全，不生成会丢掉外键的重建。", base.name));
@@ -334,7 +332,7 @@ fn compare_pair(
     if emit_alter {
         alters.extend(alter_table(engine, target, baseline, &base.name, left, right, with_fk, pk_trusted));
     }
-    let rebuilt = emit_alter && engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
+    let rebuilt = emit_alter && dialect.needs_rebuild(left, right, with_fk);
     if left.indexes_read && right.indexes_read {
         compare_indexes(
             engine,
@@ -353,7 +351,7 @@ fn compare_pair(
     }
     if fk_diff {
         changed.push(DiffItem { kind: "外键".to_owned(), name: base.name.clone(), detail: "外键不同".to_owned() });
-        if allow_ddl && with_fk && engine != Engine::Sqlite {
+        if allow_ddl && with_fk && !inline_fk {
             for key in &right.foreign_keys {
                 if !left.foreign_keys.iter().any(|item| item.name == key.name && item == key) {
                     drop_fk.push(drop_foreign_key(engine, target, &base.name, key));
@@ -385,14 +383,14 @@ fn columns_differ(left: &TableShape, right: &TableShape) -> bool {
     false
 }
 
-fn primary_columns(shape: &TableShape) -> Vec<String> {
+pub(crate) fn primary_columns(shape: &TableShape) -> Vec<String> {
     if let Some(index) = shape.indexes.iter().find(|index| index.reason.contains("主键")) {
         return index.columns.iter().map(|(name, _)| name.clone()).collect();
     }
     shape.columns.iter().filter(|column| column.primary).map(|column| column.name.clone()).collect()
 }
 
-fn foreign_keys_differ(left: &TableShape, right: &TableShape) -> bool {
+pub(crate) fn foreign_keys_differ(left: &TableShape, right: &TableShape) -> bool {
     let normalize = |keys: &[ForeignKeyShape]| {
         let mut items = keys.to_vec();
         items.sort_by(|left, right| left.name.cmp(&right.name));
@@ -458,16 +456,10 @@ fn skip_index(index: &IndexShape, shape: &TableShape) -> bool {
 }
 
 fn qualify(engine: Engine, side: &Side, name: &str) -> String {
-    match engine {
-        Engine::Sqlite => quote(engine, name),
-        Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote(engine, &side.database), quote(engine, name)),
-        Engine::Postgres | Engine::Sqlserver => format!("{}.{}", quote(engine, &side.schema), quote(engine, name)),
-        // Redis 不进对比（capability 门控）；占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => quote(engine, name),
-    }
+    qualify_on(engine, side, name)
 }
 
-fn column_clause(engine: Engine, column: &ColumnShape) -> String {
+pub(crate) fn column_clause(engine: Engine, column: &ColumnShape) -> String {
     let mut line = format!("{} {}", quote(engine, &column.name), column.type_name.trim());
     if !column.nullable {
         line.push_str(" NOT NULL");
@@ -479,7 +471,7 @@ fn column_clause(engine: Engine, column: &ColumnShape) -> String {
     line
 }
 
-fn create_table(engine: Engine, side: &Side, name: &str, shape: &TableShape, with_fk: bool) -> String {
+pub(crate) fn create_table(engine: Engine, side: &Side, name: &str, shape: &TableShape, with_fk: bool) -> String {
     let mut lines = Vec::new();
     for column in &shape.columns {
         lines.push(column_clause(engine, column));
@@ -540,13 +532,7 @@ fn create_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) ->
 }
 
 fn drop_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) -> String {
-    match engine {
-        Engine::Mysql | Engine::Mariadb | Engine::Sqlserver => format!("DROP INDEX {} ON {}", quote(engine, &index.name), qualify(engine, side, table)),
-        Engine::Postgres => format!("DROP INDEX {}.{}", quote(engine, &side.schema), quote(engine, &index.name)),
-        Engine::Sqlite => format!("DROP INDEX {}", quote(engine, &index.name)),
-        // Redis 不进对比（capability 门控）；占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("DROP INDEX {}", quote(engine, &index.name)),
-    }
+    transfer_of(engine).drop_index(side, table, &index.name)
 }
 
 fn add_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeyShape) -> String {
@@ -554,10 +540,8 @@ fn add_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeySha
 }
 
 fn drop_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeyShape) -> String {
-    match engine {
-        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {} DROP FOREIGN KEY {}", qualify(engine, side, table), quote(engine, &key.name)),
-        _ => format!("ALTER TABLE {} DROP CONSTRAINT {}", qualify(engine, side, table), quote(engine, &key.name)),
-    }
+    let clause = crate::adapters::ddl::ddl_of(engine).map(|dialect| dialect.drop_foreign_key_clause()).unwrap_or("DROP CONSTRAINT");
+    format!("ALTER TABLE {} {clause} {}", qualify(engine, side, table), quote(engine, &key.name))
 }
 
 #[derive(Clone)]
@@ -623,7 +607,7 @@ fn referenced_tables(engine: Engine, side: &Side, object: &ObjectDef) -> Vec<Str
         if key.ref_table.is_empty() {
             continue;
         }
-        if engine == Engine::Postgres && !key.ref_schema.is_empty() && key.ref_schema != side.schema {
+        if transfer_of(engine).drop_order_same_schema_only() && !key.ref_schema.is_empty() && key.ref_schema != side.schema {
             continue;
         }
         names.push(key.ref_table.clone());
@@ -949,7 +933,7 @@ fn link_view_routine_references(items: &mut [PlannedDrop]) {
 
 /// 没有视图和例程互相引用的环时，沿用标识拓扑。有环则先把例程换成不引用对方的正文，再删或建真正对象，最后写回原定义。
 fn order_linked(engine: Engine, side: &Side, items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<String> {
-    if engine == Engine::Postgres && mixed_view_routine_cycle(&items) {
+    if transfer_of(engine).breaks_view_routine_cycles() && mixed_view_routine_cycle(&items) {
         emit_breaking_cycles(engine, side, items, dependents_first)
     } else {
         order_planned(items, dependents_first).into_iter().map(|item| item.statement).collect()
@@ -1130,7 +1114,7 @@ fn break_view_routine_cycle(
         statements.extend(routines.iter().map(|routine| routine.statement.clone()));
     } else {
         for routine in &routines {
-            if let Some(stub) = stub_new_routine(&routine.statement) {
+            if let Some(stub) = stub_new_routine(engine, &routine.statement) {
                 statements.push(stub);
             }
         }
@@ -1147,11 +1131,11 @@ fn stub_existing_routine(engine: Engine, side: &Side, routine: &PlannedDrop) -> 
         return None;
     }
     let qualified = replace_name_after(source, keyword, &qualify(engine, side, &routine.name))?;
-    Some(ensure_or_replace(&stub_routine(&qualified)?))
+    Some(ensure_or_replace(&stub_routine(engine, &qualified)?))
 }
 
-fn stub_new_routine(statement: &str) -> Option<String> {
-    let stub = stub_routine(statement)?;
+fn stub_new_routine(engine: Engine, statement: &str) -> Option<String> {
+    let stub = stub_routine(engine, statement)?;
     if has_or_replace(statement) { Some(ensure_or_replace(&stub)) } else { Some(stub) }
 }
 
@@ -1165,7 +1149,7 @@ fn has_or_replace(sql: &str) -> bool {
 }
 
 /// 保留签名和返回类型，正文不再引用视图或其它例程。
-fn stub_routine(sql: &str) -> Option<String> {
+fn stub_routine(engine: Engine, sql: &str) -> Option<String> {
     let function_at = find_keyword_end(sql, "FUNCTION");
     let procedure_at = find_keyword_end(sql, "PROCEDURE");
     let (keyword_end, procedure) = match (function_at, procedure_at) {
@@ -1188,19 +1172,7 @@ fn stub_routine(sql: &str) -> Option<String> {
         returns = sql[start..index].trim().to_owned();
     }
     let header = sql[..index].trim_end();
-    Some(stub_with_header(header, procedure, &returns))
-}
-
-fn stub_with_header(header: &str, procedure: bool, returns: &str) -> String {
-    if procedure {
-        return format!("{header} LANGUAGE plpgsql AS $$ BEGIN NULL; END $$");
-    }
-    let upper = returns.to_ascii_uppercase();
-    if returns.is_empty() || upper.contains("SETOF") || upper.contains("TABLE") || upper == "VOID" {
-        format!("{header} LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$")
-    } else {
-        format!("{header} LANGUAGE sql AS $$ SELECT NULL::{returns} $$")
-    }
+    transfer_of(engine).routine_stub(header, procedure, &returns)
 }
 
 fn skip_returns_type(sql: &str, mut index: usize) -> usize {
@@ -1458,8 +1430,10 @@ fn column_is_dropped(alters: &[String], table: &str, column: &str) -> bool {
 
 fn expand_sequence_drop(engine: Engine, side: &Side, drop: PlannedDrop) -> Vec<String> {
     let mut statements = Vec::new();
-    if engine == Engine::Postgres && drop.kind == Kind::Sequence && explicit_sequence_owner(&drop).0.is_some() {
-        statements.push(format!("ALTER SEQUENCE {} OWNED BY NONE", qualify(engine, side, &drop.name)));
+    if let Some(types) = transfer_of(engine).in_place_types() {
+        if drop.kind == Kind::Sequence && explicit_sequence_owner(&drop).0.is_some() {
+            statements.push(types.sequence_disown(&qualify(engine, side, &drop.name)));
+        }
     }
     statements.push(drop.statement);
     statements
@@ -1559,17 +1533,16 @@ fn order_named(items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDr
 }
 
 fn replaces_in_place(engine: Engine, base: &ObjectDef, other: &ObjectDef) -> bool {
+    let dialect = transfer_of(engine);
     match base.kind {
-        Kind::View => match engine {
-            Engine::Mysql | Engine::Mariadb => !base.materialized && !other.materialized,
-            Engine::Postgres => !base.materialized && !other.materialized && view_columns_compatible(&base.definition, &other.definition),
-            // T-SQL 没有 CREATE OR REPLACE VIEW，只能先摘依赖再删除重建。
-            Engine::Sqlite | Engine::Sqlserver => false,
-            // Redis 不进对比（capability 门控）。
-            Engine::Redis | Engine::Mongodb => false,
+        // 没有 CREATE OR REPLACE VIEW 的方言（T-SQL、SQLite）只能先摘依赖再删除重建。
+        Kind::View => match dialect.view_replace() {
+            ViewReplace::Never => false,
+            ViewReplace::Plain => !base.materialized && !other.materialized,
+            ViewReplace::MatchingColumns => !base.materialized && !other.materialized && view_columns_compatible(&base.definition, &other.definition),
         },
         // 返回类型变了时 CREATE OR REPLACE FUNCTION 会被拒绝，只能先摘依赖再删。
-        Kind::Function | Kind::Procedure => matches!(engine, Engine::Postgres | Engine::Mariadb) && return_types_compatible(&base.definition, &other.definition),
+        Kind::Function | Kind::Procedure => dialect.replaces_routine_in_place() && return_types_compatible(&base.definition, &other.definition),
         _ => false,
     }
 }
@@ -1723,9 +1696,9 @@ fn rewrite_kept_types(
     detach: &mut Vec<String>,
     restore: &mut Vec<String>,
 ) {
-    if engine != Engine::Postgres {
+    let Some(types) = transfer_of(engine).in_place_types() else {
         return;
-    }
+    };
     let paired = drops
         .iter()
         .filter(|drop| matches!(drop.kind, Kind::Enum | Kind::Domain) && creates.iter().any(|create| create.key == drop.key))
@@ -1742,7 +1715,7 @@ fn rewrite_kept_types(
                     if let Some(adds) = enum_additions(&current_labels, &wanted_labels) {
                         remove_planned(&key, drops, creates);
                         for (label, before) in adds {
-                            in_place.push(enum_add_sql(engine, target, &name, &label, before.as_deref()));
+                            in_place.push(types.enum_add_value(&qualify(engine, target, &name), &label, before.as_deref()));
                         }
                         continue;
                     }
@@ -1751,20 +1724,9 @@ fn rewrite_kept_types(
         }
         let baseline_cols = columns_of_type(baseline, &name);
         for (table, column) in &target_cols {
-            detach.push(format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE text USING {}::text",
-                qualify(engine, target, table),
-                quote(engine, column),
-                quote(engine, column)
-            ));
+            detach.push(types.detach_column_type(&qualify(engine, target, table), column));
             if baseline_cols.iter().any(|(base_table, base_column)| base_table == table && base_column == column) {
-                let type_name = qualify(engine, target, &name);
-                restore.push(format!(
-                    "ALTER TABLE {} ALTER COLUMN {} TYPE {type_name} USING {}::{type_name}",
-                    qualify(engine, target, table),
-                    quote(engine, column),
-                    quote(engine, column)
-                ));
+                restore.push(types.restore_column_type(&qualify(engine, target, table), column, &qualify(engine, target, &name)));
             }
         }
     }
@@ -1782,9 +1744,9 @@ fn rewrite_kept_sequences(
     detach: &mut Vec<String>,
     restore: &mut Vec<String>,
 ) {
-    if engine != Engine::Postgres {
+    let Some(types) = transfer_of(engine).in_place_types() else {
         return;
-    }
+    };
     let paired = drops
         .iter()
         .filter(|drop| drop.kind == Kind::Sequence && creates.iter().any(|create| create.key == drop.key))
@@ -1798,16 +1760,17 @@ fn rewrite_kept_sequences(
                 let same_type = wanted_spec.data_type.is_empty() || current_spec.data_type.is_empty() || wanted_spec.data_type.eq_ignore_ascii_case(&current_spec.data_type);
                 if same_type {
                     remove_planned(&key, drops, creates);
-                    in_place.push(sequence_alter_sql(engine, target, &name, &wanted_spec));
+                    in_place.push(types.sequence_alter(&qualify(engine, target, &name), &wanted_spec));
                     continue;
                 }
             }
         }
-        detach_sequence_use(engine, target, baseline, &name, alters, detach, restore);
+        detach_sequence_use(engine, types, target, baseline, &name, alters, detach, restore);
     }
 }
 
-fn detach_sequence_use(engine: Engine, target: &Side, baseline: &Side, name: &str, alters: &[String], detach: &mut Vec<String>, restore: &mut Vec<String>) {
+#[allow(clippy::too_many_arguments)]
+fn detach_sequence_use(engine: Engine, types: &dyn InPlaceTypes, target: &Side, baseline: &Side, name: &str, alters: &[String], detach: &mut Vec<String>, restore: &mut Vec<String>) {
     for object in target.objects.iter().filter(|object| object.kind == Kind::Table) {
         let Some(shape) = object.table.as_ref() else { continue };
         for column in &shape.columns {
@@ -1827,7 +1790,7 @@ fn detach_sequence_use(engine: Engine, target: &Side, baseline: &Side, name: &st
     if let Some(sequence) = baseline.objects.iter().find(|object| object.kind == Kind::Sequence && object.name.eq_ignore_ascii_case(name)) {
         let (owner_table, owner_column) = object_sequence_owner(sequence);
         if let (Some(table), Some(column)) = (owner_table, owner_column) {
-            restore.push(format!("ALTER SEQUENCE {} OWNED BY {}.{}", qualify(engine, target, name), qualify(engine, target, &table), quote(engine, &column)));
+            restore.push(types.sequence_owned_by(&qualify(engine, target, name), &qualify(engine, target, &table), &column));
         }
     }
 }
@@ -2144,7 +2107,7 @@ fn columns_of_type<'a>(side: &'a Side, type_name: &str) -> Vec<(&'a str, &'a str
     found
 }
 
-fn type_mentions(type_name: &str, object_name: &str) -> bool {
+pub(crate) fn type_mentions(type_name: &str, object_name: &str) -> bool {
     if object_name.is_empty() || type_name.trim().is_empty() {
         return false;
     }
@@ -2152,7 +2115,7 @@ fn type_mentions(type_name: &str, object_name: &str) -> bool {
     if let Some(end) = bare.find('(') {
         bare = bare[..end].trim();
     }
-    let last = bare.rsplit(['.', '"', '`']).find(|part| !part.is_empty()).unwrap_or(bare);
+    let last = bare.rsplit(|ch: char| ch == '.' || crate::adapters::is_symmetric_identifier_quote(ch)).find(|part| !part.is_empty()).unwrap_or(bare);
     last.eq_ignore_ascii_case(object_name)
 }
 
@@ -2167,22 +2130,11 @@ fn changes_default(statements: &[String], table: &str, column: &str, drop: bool)
 }
 
 fn drop_default_sql(engine: Engine, side: &Side, table: &str, column: &str) -> String {
-    let table = qualify(engine, side, table);
-    match engine {
-        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {} DROP DEFAULT", quote(engine, column)),
-        // T-SQL 的默认值是具名约束：名字未知时按 sys.default_constraints 动态查找。
-        Engine::Sqlserver => tsql_drop_default(engine, &table, column, ""),
-        _ => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote(engine, column)),
-    }
+    transfer_of(engine).drop_default(&qualify(engine, side, table), column)
 }
 
 fn set_default_sql(engine: Engine, side: &Side, table: &str, column: &str, expression: &str) -> String {
-    let table = qualify(engine, side, table);
-    match engine {
-        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {} SET DEFAULT {expression}", quote(engine, column)),
-        Engine::Sqlserver => tsql_add_default(engine, &table, &crate::adapters::sqlserver::ddl::sqlserver_bare_table_name(&table), column, expression),
-        _ => format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {expression}", quote(engine, column)),
-    }
+    transfer_of(engine).set_default(&qualify(engine, side, table), column, expression)
 }
 
 fn object_sequence_owner(object: &ObjectDef) -> (Option<String>, Option<String>) {
@@ -2256,29 +2208,6 @@ fn enum_additions(current: &[String], wanted: &[String]) -> Option<Vec<(String, 
     }
 }
 
-fn enum_add_sql(engine: Engine, side: &Side, name: &str, label: &str, before: Option<&str>) -> String {
-    let mut sql = format!("ALTER TYPE {} ADD VALUE IF NOT EXISTS {}", qualify(engine, side, name), quote_literal(label));
-    if let Some(before) = before {
-        sql.push_str(" BEFORE ");
-        sql.push_str(&quote_literal(before));
-    }
-    sql
-}
-
-fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-struct SequenceSpec {
-    data_type: String,
-    increment: String,
-    min_value: String,
-    max_value: String,
-    start: String,
-    cache: String,
-    cycle: bool,
-}
-
 fn parse_sequence(definition: &str) -> Option<SequenceSpec> {
     let tokens = loose_tokens(definition);
     let seq_at = tokens.iter().position(|token| token.eq_ignore_ascii_case("SEQUENCE"))?;
@@ -2286,15 +2215,7 @@ fn parse_sequence(definition: &str) -> Option<SequenceSpec> {
     while index < tokens.len() && !is_sequence_keyword(&tokens[index]) {
         index += 1;
     }
-    let mut spec = SequenceSpec {
-        data_type: String::new(),
-        increment: String::new(),
-        min_value: String::new(),
-        max_value: String::new(),
-        start: String::new(),
-        cache: String::new(),
-        cycle: false,
-    };
+    let mut spec = SequenceSpec::default();
     while index < tokens.len() {
         let word = tokens[index].as_str();
         if word.eq_ignore_ascii_case("AS") {
@@ -2395,19 +2316,6 @@ fn loose_tokens(sql: &str) -> Vec<String> {
     tokens
 }
 
-fn sequence_alter_sql(engine: Engine, side: &Side, name: &str, spec: &SequenceSpec) -> String {
-    let min_value = if spec.min_value.is_empty() { "NO MINVALUE".to_owned() } else { format!("MINVALUE {}", spec.min_value) };
-    let max_value = if spec.max_value.is_empty() { "NO MAXVALUE".to_owned() } else { format!("MAXVALUE {}", spec.max_value) };
-    let start = if spec.start.is_empty() { "1" } else { spec.start.as_str() };
-    let cache = if spec.cache.is_empty() { "1" } else { spec.cache.as_str() };
-    let cycle = if spec.cycle { "CYCLE" } else { "NO CYCLE" };
-    format!(
-        "ALTER SEQUENCE {} INCREMENT BY {} {min_value} {max_value} START WITH {start} CACHE {cache} {cycle}",
-        qualify(engine, side, name),
-        spec.increment
-    )
-}
-
 fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {
     let name = qualify(engine, side, &object.name);
     match object.kind {
@@ -2419,27 +2327,12 @@ fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {
         Kind::Domain => format!("DROP DOMAIN {name}"),
         Kind::Function => drop_routine(engine, side, "FUNCTION", object),
         Kind::Procedure => drop_routine(engine, side, "PROCEDURE", object),
-        Kind::Trigger => match engine {
-            Engine::Postgres => format!("DROP TRIGGER {} ON {}", quote(engine, &object.name), qualify(engine, side, &object.relation)),
-            Engine::Mysql | Engine::Mariadb => format!("DROP TRIGGER {}", qualify(engine, side, &object.name)),
-            // T-SQL 的 DDL 触发器之外，DML 触发器名挂在表上。
-            Engine::Sqlite | Engine::Sqlserver => format!("DROP TRIGGER {}", quote(engine, &object.name)),
-            // Redis 不进对比（capability 门控）；占位保持穷尽。
-            Engine::Redis | Engine::Mongodb => format!("DROP TRIGGER {}", quote(engine, &object.name)),
-        },
+        Kind::Trigger => transfer_of(engine).drop_trigger(side, object),
     }
 }
 
 fn drop_routine(engine: Engine, side: &Side, word: &str, object: &ObjectDef) -> String {
-    match engine {
-        Engine::Postgres if !object.signature.is_empty() => format!("DROP {word} {}.{}({})", quote(engine, &side.schema), quote(engine, &object.name), object.signature),
-        Engine::Postgres => format!("DROP {word} {}.{}", quote(engine, &side.schema), quote(engine, &object.name)),
-        Engine::Sqlite => format!("DROP {word} {}", quote(engine, &object.name)),
-        Engine::Mysql | Engine::Mariadb => format!("DROP {word} {}", qualify(engine, side, &object.name)),
-        Engine::Sqlserver => format!("DROP {word} {}", qualify(engine, side, &object.name)),
-        // Redis 不进对比（capability 门控）；占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("DROP {word} {}", quote(engine, &object.name)),
-    }
+    transfer_of(engine).drop_routine(side, word, object)
 }
 
 fn retarget_create(engine: Engine, side: &Side, object: &ObjectDef, definition: &str) -> String {
@@ -2453,8 +2346,8 @@ fn retarget_create(engine: Engine, side: &Side, object: &ObjectDef, definition: 
         Kind::Trigger => "TRIGGER",
         Kind::Table => return definition.to_owned(),
     };
-    // PostgreSQL 的触发器名不能带 schema，schema 只写在 ON 后面的表上。
-    let name = if object.kind == Kind::Trigger && engine == Engine::Postgres {
+    // 有的方言（PostgreSQL）触发器名不能带 schema，schema 只写在 ON 后面的表上。
+    let name = if object.kind == Kind::Trigger && transfer_of(engine).trigger_name_unqualified() {
         quote(engine, &object.name)
     } else {
         qualify(engine, side, &object.name)
@@ -2533,8 +2426,7 @@ fn ident_end(sql: &str, start: usize) -> Option<usize> {
         return None;
     }
     let ch = sql[start..].chars().next()?;
-    if ch == '"' || ch == '`' || ch == '[' {
-        let closer = if ch == '[' { ']' } else { ch };
+    if let Some(closer) = crate::adapters::identifier_quote_close(ch) {
         return skip_quoted(sql, start, closer);
     }
     if !is_ident_start(ch) {
@@ -2603,235 +2495,11 @@ fn alter_table(
     with_fk: bool,
     with_pk: bool,
 ) -> Vec<String> {
-    match engine {
-        Engine::Sqlite => sqlite_alter(side, name, baseline, target, with_fk),
-        Engine::Postgres => postgres_alter(side, baseline_side, name, baseline, target, with_pk),
-        Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target, with_pk),
-        Engine::Sqlserver => sqlserver_alter(side, name, baseline, target, with_pk),
-        // Redis 不进对比（capability 门控）；空差异保持穷尽。
-        Engine::Redis | Engine::Mongodb => Vec::new(),
-    }
+    transfer_of(engine).alter_table(&TableAlter { side, baseline_side, name, baseline, target, with_fk, with_pk })
 }
 
-/// T-SQL 的表差异：ADD/DROP COLUMN，改类型或可空性用 ALTER COLUMN <def>，主键按约束增删。
-fn sqlserver_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
-    let engine = Engine::Sqlserver;
-    let table = qualify(engine, side, name);
-    let mut statements = Vec::new();
-    for column in &target.columns {
-        if !baseline.columns.iter().any(|item| item.name == column.name) {
-            statements.push(format!("ALTER TABLE {table} DROP COLUMN {}", quote(engine, &column.name)));
-        }
-    }
-    for column in &baseline.columns {
-        match target.columns.iter().find(|item| item.name == column.name) {
-            None => statements.push(format!("ALTER TABLE {table} ADD {}", column_clause(engine, column))),
-            Some(other) if !column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable => {
-                // T-SQL 的 ALTER COLUMN 只接受列名/类型/NULL 性；默认值不能内联，走下面的约束分支。
-                statements.push(format!("ALTER TABLE {table} ALTER COLUMN {}", tsql_alter_column_clause(column)));
-            }
-            Some(other) if column.default_sql.trim() != other.default_sql.trim() => {
-                statements.extend(tsql_default_change(engine, &table, name, column, other));
-            }
-            Some(_) => {}
-        }
-    }
-    if with_pk {
-        push_primary_key(engine, &table, name, baseline, target, &mut statements);
-    }
-    statements
-}
-
-/// T-SQL 的 ALTER COLUMN 列定义：不含默认值（内联 DEFAULT 在 ALTER COLUMN 里非法）。
-fn tsql_alter_column_clause(column: &ColumnShape) -> String {
-    let mut line = format!("{} {}", quote(Engine::Sqlserver, &column.name), column.type_name.trim());
-    if !column.nullable {
-        line.push_str(" NOT NULL");
-    }
-    line
-}
-
-/// T-SQL 的默认值变更：具名约束的 DROP CONSTRAINT / ADD CONSTRAINT ... DEFAULT ... FOR。
-/// 删除时优先用从 sys.default_constraints 读到的约束名；名字缺失时动态查找，不猜 DF_ 前缀名。
-/// 新增用生成的 DF_<表>_<列> 名（与 SQL Server 自动命名习惯一致，重名冲突由执行报错暴露）。
-fn tsql_default_change(engine: Engine, table: &str, table_name: &str, wanted: &ColumnShape, current: &ColumnShape) -> Vec<String> {
-    let mut statements = Vec::new();
-    let wanted_default = wanted.default_sql.trim();
-    let current_default = current.default_sql.trim();
-    if wanted_default.is_empty() && current_default.is_empty() {
-        return statements;
-    }
-    if !current_default.is_empty() {
-        statements.push(tsql_drop_default(engine, table, &wanted.name, &current.default_constraint));
-    }
-    if !wanted_default.is_empty() {
-        statements.push(tsql_add_default(engine, table, table_name, &wanted.name, wanted_default));
-    }
-    statements
-}
-
-fn tsql_drop_default(_engine: Engine, table: &str, column: &str, constraint: &str) -> String {
-    crate::adapters::sqlserver::ddl::sqlserver_drop_default_sql(table, column, constraint)
-}
-
-fn tsql_add_default(_engine: Engine, table: &str, table_name: &str, column: &str, expression: &str) -> String {
-    crate::adapters::sqlserver::ddl::sqlserver_add_default_sql(table, table_name, column, expression)
-}
-
-fn postgres_alter(side: &Side, baseline_side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
-    let engine = Engine::Postgres;
-    let table = qualify(engine, side, name);
-    let mut statements = Vec::new();
-    for column in &target.columns {
-        if !baseline.columns.iter().any(|item| item.name == column.name) {
-            statements.push(format!("ALTER TABLE {table} DROP COLUMN {}", quote(engine, &column.name)));
-        }
-    }
-    for column in &baseline.columns {
-        match target.columns.iter().find(|item| item.name == column.name) {
-            None => statements.push(format!("ALTER TABLE {table} ADD COLUMN {}", column_clause(engine, column))),
-            Some(other) => {
-                if !column.type_name.eq_ignore_ascii_case(&other.type_name) {
-                    let using = enum_using(baseline_side, side, &other.type_name, &column.type_name, &column.name);
-                    statements.push(format!(
-                        "ALTER TABLE {table} ALTER COLUMN {} TYPE {}{using}",
-                        quote(engine, &column.name),
-                        column.type_name.trim()
-                    ));
-                }
-                if column.nullable != other.nullable {
-                    let verb = if column.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
-                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} {verb}", quote(engine, &column.name)));
-                }
-                if column.default_sql.trim() != other.default_sql.trim() {
-                    if column.default_sql.trim().is_empty() {
-                        statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote(engine, &column.name)));
-                    } else {
-                        statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {}", quote(engine, &column.name), column.default_sql.trim()));
-                    }
-                }
-            }
-        }
-    }
-    if with_pk {
-        push_primary_key(engine, &table, name, baseline, target, &mut statements);
-    }
-    statements
-}
-
-/// 两个枚举之间没有自动转型。经 text 转一次，标签对不上现有数据时由执行失败，而不是省略 USING。
-fn enum_using(baseline: &Side, target: &Side, from_type: &str, to_type: &str, column: &str) -> String {
-    if is_enum_type(target, from_type) && is_enum_type(baseline, to_type) {
-        format!(" USING {}::text::{}", quote(Engine::Postgres, column), to_type.trim())
-    } else {
-        String::new()
-    }
-}
-
-fn is_enum_type(side: &Side, type_name: &str) -> bool {
-    side.objects.iter().any(|object| object.kind == Kind::Enum && type_mentions(type_name, &object.name))
-}
-
-fn push_primary_key(engine: Engine, table: &str, name: &str, baseline: &TableShape, target: &TableShape, statements: &mut Vec<String>) {
-    let wanted = primary_columns(baseline);
-    let current = primary_columns(target);
-    if wanted == current {
-        return;
-    }
-    match engine {
-        Engine::Postgres | Engine::Sqlserver => {
-            if !current.is_empty() {
-                let constraint = primary_key_name(target).unwrap_or_else(|| format!("{name}_pkey"));
-                statements.push(format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote(engine, &constraint)));
-            }
-            if !wanted.is_empty() {
-                let names = wanted.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
-                statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({names})"));
-            }
-        }
-        Engine::Mysql | Engine::Mariadb => {
-            let names = wanted.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
-            match (!current.is_empty(), !wanted.is_empty()) {
-                (true, true) => statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY, ADD PRIMARY KEY ({names})")),
-                (true, false) => statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY")),
-                (false, true) => statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({names})")),
-                (false, false) => {}
-            }
-        }
-        Engine::Sqlite => {}
-        // Redis 不进对比（capability 门控）。
-        Engine::Redis | Engine::Mongodb => {}
-    }
-}
-
-fn primary_key_name(shape: &TableShape) -> Option<String> {
+pub(crate) fn primary_key_name(shape: &TableShape) -> Option<String> {
     shape.indexes.iter().find(|index| index.reason.contains("主键")).map(|index| index.name.clone())
-}
-
-fn mysql_alter(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
-    let table = qualify(engine, side, name);
-    let mut statements = Vec::new();
-    for column in &target.columns {
-        if !baseline.columns.iter().any(|item| item.name == column.name) {
-            statements.push(format!("ALTER TABLE {table} DROP COLUMN {}", quote(engine, &column.name)));
-        }
-    }
-    for column in &baseline.columns {
-        match target.columns.iter().find(|item| item.name == column.name) {
-            None => statements.push(format!("ALTER TABLE {table} ADD COLUMN {}", column_clause(engine, column))),
-            Some(other) if !column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable || column.default_sql.trim() != other.default_sql.trim() => {
-                statements.push(format!("ALTER TABLE {table} MODIFY COLUMN {}", column_clause(engine, column)));
-            }
-            _ => {}
-        }
-    }
-    if with_pk {
-        push_primary_key(engine, &table, name, baseline, target, &mut statements);
-    }
-    statements
-}
-
-fn sqlite_needs_rebuild(baseline: &TableShape, target: &TableShape, with_fk: bool) -> bool {
-    primary_columns(baseline) != primary_columns(target)
-        || baseline.columns.iter().any(|column| {
-            target.columns.iter().any(|other| other.name == column.name && (!column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable || column.default_sql.trim() != other.default_sql.trim()))
-        })
-        || (with_fk && foreign_keys_differ(baseline, target))
-}
-
-fn sqlite_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool) -> Vec<String> {
-    let engine = Engine::Sqlite;
-    let structural = sqlite_needs_rebuild(baseline, target, with_fk);
-    if !structural {
-        let table = qualify(engine, side, name);
-        let mut statements = Vec::new();
-        for column in &target.columns {
-            if !baseline.columns.iter().any(|item| item.name == column.name) {
-                statements.push(format!("ALTER TABLE {table} DROP COLUMN {}", quote(engine, &column.name)));
-            }
-        }
-        for column in &baseline.columns {
-            if !target.columns.iter().any(|item| item.name == column.name) {
-                statements.push(format!("ALTER TABLE {table} ADD COLUMN {}", column_clause(engine, column)));
-            }
-        }
-        return statements;
-    }
-    let fresh = format!("{name}__rillsql_new");
-    let shared = baseline
-        .columns
-        .iter()
-        .filter(|column| target.columns.iter().any(|other| other.name == column.name))
-        .map(|column| quote(engine, &column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut statements = vec![create_table(engine, side, &fresh, baseline, with_fk)];
-    if !shared.is_empty() {
-        statements.push(format!("INSERT INTO {} ({shared}) SELECT {shared} FROM {}", quote(engine, &fresh), quote(engine, name)));
-    }
-    statements.push(format!("DROP TABLE {}", quote(engine, name)));
-    statements.push(format!("ALTER TABLE {} RENAME TO {}", quote(engine, &fresh), quote(engine, name)));
-    statements
 }
 
 fn table_choices(engine: Engine, baseline: &[ObjectDef], target: &[ObjectDef]) -> Vec<TableChoice> {
@@ -2873,7 +2541,7 @@ pub fn table_data_keys(engine: Engine, left: Option<&TableShape>, right: Option<
             continue;
         }
         let column_primary = shape.columns.iter().any(|column| column.primary);
-        if engine != Engine::Sqlite || !column_primary {
+        if !transfer_of(engine).primary_key_from_columns() || !column_primary {
             return Err(KeysUnread);
         }
     }

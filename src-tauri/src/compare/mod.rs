@@ -2,9 +2,9 @@
 
 pub mod commands;
 mod data;
-mod model;
+pub(crate) mod model;
 mod read;
-mod structure;
+pub(crate) mod structure;
 
 pub use data::diff_data;
 pub use structure::diff_structure;

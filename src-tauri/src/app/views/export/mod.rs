@@ -878,8 +878,8 @@ impl ExchangePane {
                         source: migrate_ref(&source.connection_id, &source.table),
                         target: MigrateTableRef {
                             connection_id: target_id,
-                            engine: "sqlite".to_owned(),
-                            database: "main".to_owned(),
+                            engine: file_engine_id().to_owned(),
+                            database: file_engine_database().to_owned(),
                             schema: source.schema.clone(),
                             table: source.table.clone(),
                         },
@@ -1762,7 +1762,8 @@ fn extension_of(format: &str) -> &'static str {
 }
 
 async fn open_sqlite_target(service: &crate::connections::Service, path: &std::path::Path, locale: Locale) -> Result<String, String> {
-    let mut draft = crate::app::views::connections::blank_draft(crate::connections::model::Engine::Sqlite);
+    let engine = crate::adapters::registry::file_engine().ok_or_else(|| i18n::text(locale, "ui.exchange.migrateTargetClosed"))?;
+    let mut draft = crate::app::views::connections::blank_draft(engine);
     draft.id = Some("exchange-migrate-target".to_owned());
     draft.name = i18n::text(locale, "ui.exchange.migrateTarget");
     draft.file_path = path.display().to_string();
@@ -1785,11 +1786,21 @@ fn copy_table(table: &TableRef) -> TableRef {
     }
 }
 
+/// 迁移到新文件时目标的引擎 id（文件型引擎）。
+fn file_engine_id() -> &'static str {
+    crate::adapters::registry::file_engine().map(|engine| crate::adapters::adapter(engine).meta().id()).unwrap_or_default()
+}
+
+/// 文件型引擎唯一的库名。
+fn file_engine_database() -> &'static str {
+    crate::adapters::fixed_database_named(file_engine_id()).unwrap_or_default()
+}
+
 pub fn migrate_ref(connection_id: &str, table: &str) -> MigrateTableRef {
     MigrateTableRef {
         connection_id: connection_id.to_owned(),
-        engine: "sqlite".to_owned(),
-        database: "main".to_owned(),
+        engine: file_engine_id().to_owned(),
+        database: file_engine_database().to_owned(),
         schema: String::new(),
         table: table.to_owned(),
     }

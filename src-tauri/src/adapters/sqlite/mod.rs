@@ -13,9 +13,10 @@ pub(crate) mod grid_read;
 mod plan;
 pub(crate) mod file_page;
 mod syntax;
+pub(in crate::adapters) mod transfer;
 mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, ErrorRules, SqlSyntax, TransferDialect, TypeRules, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqliteAdapter;
@@ -76,6 +77,8 @@ impl EngineAdapter for SqliteAdapter {
             catalog_group: true,
             type_rules_group: true,
             ddl_group: true,
+            error_rules_group: true,
+            transfer_group: true,
             shows_foreign_keys: true,
             ..Capabilities::default()
         }
@@ -99,5 +102,13 @@ impl EngineAdapter for SqliteAdapter {
 
     fn connector(&self) -> Option<&dyn Connector> {
         Some(&connect::SqliteConnector)
+    }
+
+    fn errors(&self) -> Option<&dyn ErrorRules> {
+        Some(&transfer::SqliteErrors)
+    }
+
+    fn transfer(&self) -> Option<&'static dyn TransferDialect> {
+        Some(&transfer::SqliteTransfer)
     }
 }
