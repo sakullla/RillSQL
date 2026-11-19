@@ -56,6 +56,10 @@ pub fn is_bare(engine: Engine, name: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
+    // MySQL 词法把 `_binary`、`_utf8mb4` 等读作字符集引导符；下划线开头一律加引号。
+    if mysql && first == '_' {
+        return false;
+    }
     if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || (mysql && ch == '$')) {
         return false;
     }
@@ -189,7 +193,20 @@ mod tests {
             assert_eq!(quote_ident(engine, "content"), "content");
             assert_eq!(quote_ident(engine, "etoe_alarm_rule_set"), "etoe_alarm_rule_set");
             assert_eq!(quote_ident(engine, "e6yun3_etoe_business"), "e6yun3_etoe_business");
+        }
+        for engine in [Engine::Postgres, Engine::Sqlite, Engine::Sqlserver] {
             assert_eq!(quote_ident(engine, "_tmp1"), "_tmp1");
+        }
+    }
+
+    #[test]
+    fn mysql_family_quotes_leading_underscore_to_avoid_charset_introducers() {
+        for engine in [Engine::Mysql, Engine::Mariadb] {
+            for name in ["_binary", "_utf8mb4", "_latin1", "_tmp1", "_"] {
+                assert_eq!(quote_ident(engine, name), format!("`{name}`"));
+            }
+            assert_eq!(quote_ident(engine, "tmp_1"), "tmp_1");
+            assert_eq!(qualified(engine, &["db", "_binary"]), "db.`_binary`");
         }
     }
 
