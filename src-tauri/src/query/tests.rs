@@ -55,6 +55,40 @@ fn split_keeps_quotes_comments_and_current_statement() {
     assert!(!split::is_write("SELECT 1"));
 }
 
+/// 启动页“再次执行”的门：只有每条语句都明显只读才自动重放，其余一律按写入。
+#[test]
+fn clearly_read_only_is_conservative_about_hidden_writes() {
+    for (engine, sql) in [
+        ("postgres", "SELECT 1"),
+        ("postgres", "select * from orders where note = 'delete me';"),
+        ("postgres", "WITH a AS (SELECT 1 AS n) SELECT n FROM a"),
+        ("postgres", "SELECT \"update\" FROM t -- insert later"),
+        ("mysql", "SHOW TABLES; DESCRIBE t; EXPLAIN SELECT 1;"),
+        ("sqlserver", "SELECT [delete] FROM t ORDER BY id DESC"),
+    ] {
+        assert!(split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当是只读");
+    }
+    for (engine, sql) in [
+        ("postgres", "WITH d AS (DELETE FROM orders WHERE id = 9 RETURNING *) SELECT * FROM d"),
+        ("postgres", "WITH u AS (UPDATE t SET n = 1 RETURNING *) SELECT count(*) FROM u"),
+        ("mysql", "WITH c AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM c)"),
+        ("sqlserver", "EXEC dbo.purge_orders"),
+        ("sqlserver", "EXECUTE dbo.purge_orders @days = 3"),
+        ("sqlserver", "SELECT * INTO new_table FROM orders"),
+        ("mysql", "RENAME TABLE a TO b"),
+        ("postgres", "COMMENT ON TABLE t IS 'x'"),
+        ("postgres", "EXPLAIN ANALYZE DELETE FROM t"),
+        ("sqlite", "PRAGMA journal_mode = WAL"),
+        ("mysql", "SET @x = 1"),
+        ("postgres", "SELECT 1; DELETE FROM t;"),
+        ("postgres", "SELECT * FROM t FOR UPDATE"),
+        ("postgres", "SELECT 'unterminated"),
+        ("postgres", "   -- only a comment"),
+    ] {
+        assert!(!split::is_clearly_read_only(engine, sql), "{engine}: {sql} 应当按写入处理");
+    }
+}
+
 #[test]
 fn engine_boundaries_keep_routine_bodies_and_hash_rules() {
     let mysql = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\nEND$$\nDELIMITER ;\nSELECT 1;";

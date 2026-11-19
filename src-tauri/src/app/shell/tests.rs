@@ -10122,6 +10122,9 @@ fn changing_a_tag_tone_updates_production_judgement() {
 
     model.finish_tag_job(&TagJob::Untag { connection: "c1".into() }, Ok(vec![live("prod")]));
     assert!(!model.connection_is_prod("c1"), "移出生产标签后不再按生产处理");
+    let prompt = model.danger.as_ref().unwrap();
+    assert!(!prompt.prod, "已打开的危险确认按连接当前的标签重算，不沿用打开时的标签");
+    assert_eq!(prompt.env, crate::connections::model::ENV_NONE);
 }
 
 /// R14 启动页右键：连接行出现与连接管理一致的菜单，新建查询绑定该连接；最近执行行提供
@@ -10133,10 +10136,18 @@ fn welcome_rows_open_context_menus_and_dispatch_their_actions(cx: &mut gpui_kit:
     let (window, view) = open_workbench(cx, services_at(&dir), false);
     let read_sql = "-- 最近订单\nselect *\nfrom orders\nwhere id = 1";
     let write_sql = "delete from orders where id = 9";
+    // 首词不是写入关键字、但会改数据的语句：同样只载入，不自动执行。
+    let cte_write_sql = "WITH d AS (DELETE FROM orders WHERE id = 9 RETURNING *) SELECT * FROM d";
+    let exec_sql = "EXEC dbo.purge_orders";
     cx.update(|cx| {
         view.update(cx, |view, cx| {
             view.model.connections.rows = vec![record_for("pg", "Atlas", Engine::Postgres)];
-            view.model.history.runs = vec![history_run("r1", read_sql, "pg", "ok"), history_run("r2", write_sql, "pg", "ok")];
+            view.model.history.runs = vec![
+                history_run("r1", read_sql, "pg", "ok"),
+                history_run("r2", write_sql, "pg", "ok"),
+                history_run("r3", cte_write_sql, "pg", "ok"),
+                history_run("r4", exec_sql, "pg", "ok"),
+            ];
             cx.notify();
         });
     });
@@ -10209,6 +10220,22 @@ fn welcome_rows_open_context_menus_and_dispatch_their_actions(cx: &mut gpui_kit:
         assert!(!model.rerun_pending);
     });
     clear_tabs(cx);
+    for (row, sql) in [("welcome-run-r3", cte_write_sql), ("welcome-run-r4", exec_sql)] {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.right_click(row, cx);
+            window.click("ctx-welcome-run-again", cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let model = &view.read(cx).model;
+            assert_eq!(model.active_tab().map(|tab| tab.draft.as_str()), Some(sql));
+            assert_eq!(model.notice_key, Some("ui.welcome.runWriteLoaded"), "{sql} 按写入处理");
+            assert!(!model.connect_intents.iter().any(|intent| intent.replay.is_some()), "{sql} 不自动执行");
+            assert!(!model.rerun_pending);
+        });
+        clear_tabs(cx);
+    }
 
     // 4. 再次执行只读语句：走普通执行命令，连接未打开时先连上再重放这次执行。
     cx.update_window(window, |_, window, cx| {
@@ -10221,7 +10248,8 @@ fn welcome_rows_open_context_menus_and_dispatch_their_actions(cx: &mut gpui_kit:
         let model = &view.read(cx).model;
         assert_eq!(model.active_tab().map(|tab| tab.draft.as_str()), Some(read_sql));
         let replays: Vec<&str> = model.connect_intents.iter().filter_map(|intent| intent.replay.as_deref()).collect();
-        assert_eq!(replays, ["execute-query"], "按需连接后重放执行");
+        // 按整段脚本重放：记录里的多条语句都会再执行，不只光标所在的第一条。
+        assert_eq!(replays, ["run-script"], "按需连接后按整段脚本重放执行");
     });
     clear_tabs(cx);
     cx.update(|cx| view.update(cx, |view, _| view.model.connect_intents.clear()));

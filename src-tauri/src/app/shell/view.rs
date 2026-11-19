@@ -514,13 +514,14 @@ impl Workbench {
             }
             return;
         }
-        // 启动页“再次执行”：先像“在新查询中打开”一样载入，只读语句再走普通执行命令
-        // （同一条按需连接与执行路径）；写入语句只载入，等用户确认后自己执行。
+        // 启动页“再次执行”：先像“在新查询中打开”一样载入，只读语句再按整段脚本执行
+        // （重放历史里记录的全部语句，不受光标位置影响；同一条按需连接与执行路径）；
+        // 写入语句只载入，等用户确认后自己执行。
         if id == "welcome-run-again" {
             let _ = self.model.dispatch(id);
             self.adopt_shell(Effect::None, cx);
             if std::mem::take(&mut self.model.rerun_pending) {
-                self.perform("execute-query", cx);
+                self.perform("run-script", cx);
             }
             self.persist_if_needed(cx);
             cx.notify();

@@ -2162,7 +2162,8 @@ impl WorkbenchModel {
             }
             "welcome-run-again" => {
                 let Some(plan) = self.history.plan_run(&self.known_ids()) else { return true };
-                let write = crate::query::split::is_write(&plan.sql);
+                // 保守判定：只有每条语句都明显只读时才自动重放，其余一律按写入只载入。
+                let write = !crate::query::split::is_clearly_read_only(&plan.engine, &plan.sql);
                 let bound = !plan.needs_target;
                 self.apply_load(plan);
                 if write {
@@ -3294,6 +3295,17 @@ impl WorkbenchModel {
         self.env_tags = tags;
         self.env_tags_revision = self.env_tags_revision.wrapping_add(1);
         if let Some(prompt) = self.danger.as_mut() {
+            // 按连接此刻的标签重算：确认框打开后连接被移出/换到别的标签时不再沿用旧标签。
+            let current = self
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == prompt.object.connection_id)
+                .map(|row| row.saved.env.clone());
+            if let Some(env) = current.filter(|env| *env != prompt.env) {
+                prompt.env_label = env.clone();
+                prompt.env = env;
+            }
             prompt.apply_tags(Some(&self.env_tags));
         }
     }

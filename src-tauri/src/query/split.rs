@@ -132,8 +132,41 @@ pub fn is_write(sql: &str) -> bool {
     )
 }
 
+/// 只读语句允许的开头关键字。其余开头（SET、PRAGMA、EXEC、RENAME、COMMENT 等）一律按可能写入处理。
+const READ_ONLY_LEADS: &[&str] = &["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH"];
+
+/// 出现在语句任意位置（含括号内的 CTE 体）即视为可能写入的代码词。
+/// INTO 覆盖 SELECT ... INTO 新表/文件；UPDATE 同时让 FOR UPDATE 锁行查询走确认。
+/// 其他写入语句的开头（COMMENT/VACUUM/COPY 等）不在 READ_ONLY_LEADS 里，已经按写入处理。
+const WRITE_WORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "INTO", "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME",
+    "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL",
+];
+
+/// 保守的只读判定：整段 SQL 能切分且每一条语句都明显只读时才为 true。
+/// 只读 = 以 SELECT/SHOW/EXPLAIN/DESCRIBE/DESC/WITH 开头，且字符串与注释以外的任何层级
+/// 都没有写入类关键字（覆盖 WITH d AS (DELETE ...) SELECT、EXPLAIN ANALYZE DELETE、SELECT ... INTO）。
+/// 切分被拒绝、没有语句或任何一条不确定时都返回 false：调用方应当把它当作写入。
+pub fn is_clearly_read_only(engine: &str, sql: &str) -> bool {
+    let report = split_sql(engine, sql);
+    if report.refusal.is_some() || report.pieces.is_empty() {
+        return false;
+    }
+    report.pieces.iter().all(|piece| {
+        let (words, _) = code_words(engine, &piece.text, false);
+        let Some((lead, _, _)) = words.first() else { return false };
+        READ_ONLY_LEADS.contains(&lead.as_str()) && !words.iter().any(|(word, _, _)| WRITE_WORDS.contains(&word.as_str()))
+    })
+}
+
 /// 顶层代码词及其字节区间。字符串、注释、dollar-quote 和括号内的词不出现。
 pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>, usize) {
+    code_words(engine, sql, true)
+}
+
+/// 代码词及其字节区间：字符串、注释、dollar-quote 与方括号标识符里的词不出现；
+/// top_only 时只收括号外的词。
+fn code_words(engine: &str, sql: &str, top_only: bool) -> (Vec<(String, usize, usize)>, usize) {
     let bytes = sql.as_bytes();
     let lexis = crate::adapters::query::lexis_named(engine);
     let hash = lexis.hash_comments;
@@ -246,7 +279,7 @@ pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>,
             end_of_code = i;
             continue;
         }
-        if depth == 0 && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        if (depth == 0 || !top_only) && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
             let start = i;
             i += 1;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
