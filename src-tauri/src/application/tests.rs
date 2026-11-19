@@ -14,7 +14,7 @@ use crate::query::commands::StartRequest;
 use crate::query::{RenameRequest, SaveRequest};
 use crate::state::{AppState, Platform, SessionState, ShellSettings};
 use crate::grid::commands::{ChangeArg, CommitRequest, CountRequest, ExportRequest, FilterArg, PageRequest, TableRef, ValueArg};
-use crate::mongo::docs;
+use crate::adapters::mongodb::docs;
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("rillsql-app-{name}-{}", uuid::Uuid::new_v4()));

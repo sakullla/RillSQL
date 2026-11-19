@@ -1,5 +1,7 @@
 pub mod app;
 mod adapters;
+// Redis / MongoDB 后端已迁入各自适配器；目录（A2）与补全（A4）迁移前仍经这两个路径访问。
+pub(crate) use adapters::{mongodb as mongo, redis};
 mod application;
 mod catalog;
 mod compare;
@@ -12,13 +14,11 @@ mod error_text;
 mod export;
 mod grid;
 mod migrate;
-mod mongo;
 mod native_export;
 mod i18n;
 mod product;
 mod query;
 pub mod release;
-mod redis;
 mod state;
 mod ui;
 

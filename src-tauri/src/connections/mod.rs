@@ -13,7 +13,7 @@ pub(crate) mod secrets;
 mod service;
 pub(crate) mod stages;
 pub(crate) mod store;
-mod verify;
+pub(crate) mod verify;
 
 pub use service::{report_failure_text, CancelTransport, CatalogSession, EphemeralRead, Service, SessionCondition, SessionHealth, SessionStatus};
 pub(crate) use service::{ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, ServiceError};

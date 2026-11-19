@@ -1,7 +1,7 @@
 //! Redis 命令与键名自动补全：提供常用命令签名、中英文说明、读写风险标记及上下文键名补全。
 
 use crate::i18n::Locale;
-use crate::redis::exec::{command_risk, CommandRisk};
+use super::exec::{command_risk, CommandRisk};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedisCommandSpec {

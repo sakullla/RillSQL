@@ -6,7 +6,7 @@ use mongodb::bson::{Bson, Document};
 use serde::Serialize;
 
 use crate::connections::{Service, SessionHealth};
-use crate::mongo::docs::{self, CollectionSummary, DatabaseSummary, DocumentsPage};
+use crate::adapters::mongodb::docs::{self, CollectionSummary, DatabaseSummary, DocumentsPage};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

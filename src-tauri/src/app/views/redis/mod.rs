@@ -19,9 +19,9 @@ use gpui_kit::{
 use crate::application::redis::{DeleteOutcome, ExecOutcome, KeyspaceDb, RenameOutcome, TtlOutcome};
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
-use crate::redis::complete::{self, RedisCompletion};
-use crate::redis::exec::{self, CommandRisk, RespReply};
-use crate::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ScanPage};
+use crate::adapters::redis::complete::{self, RedisCompletion};
+use crate::adapters::redis::exec::{self, CommandRisk, RespReply};
+use crate::adapters::redis::keys::{self, RedisInitialValue, RedisKeyDetail, RedisKeyInfo, RedisMutation, RedisValue, ScanPage};
 
 const SIDEBAR_DEFAULT_W: f32 = 304.;
 const SIDEBAR_MIN_W: f32 = 220.;
@@ -2347,7 +2347,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live;
+mod live_tests;
 
 #[cfg(test)]
 mod states;

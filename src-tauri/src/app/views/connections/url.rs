@@ -1,5 +1,6 @@
 //! 连接串解析。语义对齐现有 `src/connections/url.ts`，失败原因用既有字典键。
 
+use crate::adapters::{adapter, registry, UrlStyle};
 use crate::connections::model::{Engine, TlsMode};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,20 +16,25 @@ pub struct ParsedUrl {
     pub original_host: Option<String>,
 }
 
+/// scheme 映射、默认端口、参数写法与 TLS 参数都来自各引擎适配器的 EngineMeta。
 pub fn parse_connection_url(text: &str) -> Result<ParsedUrl, &'static str> {
     let trimmed = text.trim();
     let Some((scheme, rest)) = split_scheme(trimmed) else {
         return Err("connections.url.unsupported");
     };
-    let engine = engine_of(scheme);
-    if engine == Engine::Sqlite {
-        return parse_sqlite(rest);
+    let Some((engine, scheme)) = registry::by_url_scheme(scheme) else {
+        return Err("connections.url.unsupported");
+    };
+    let style = adapter(engine).meta().url_style();
+    if style == UrlStyle::FilePath {
+        return parse_file(engine, rest);
     }
     if !rest.starts_with("//") {
         return Err("connections.url.parseFailed");
     }
-    let normalized = if engine == Engine::Sqlserver {
-        normalize_sqlserver(rest)
+    let jdbc = style == UrlStyle::Jdbc;
+    let normalized = if jdbc {
+        normalize_jdbc_params(rest)
     } else {
         rest.to_owned()
     };
@@ -45,37 +51,36 @@ pub fn parse_connection_url(text: &str) -> Result<ParsedUrl, &'static str> {
     }
     let pairs = query_pairs(query);
     let mut database = path.trim_matches('/').to_owned();
-    if engine == Engine::Sqlserver {
+    if jdbc {
         if let Some(name) = param(&pairs, "databasename") {
             if !name.trim().is_empty() {
                 database = name.trim().to_owned();
             }
         }
     }
-    let username = if username.is_empty() && engine == Engine::Sqlserver {
+    let username = if username.is_empty() && jdbc {
         param(&pairs, "user").unwrap_or("").to_owned()
     } else {
         username
     };
-    let password = if password.is_empty() && engine == Engine::Sqlserver {
+    let password = if password.is_empty() && jdbc {
         param(&pairs, "password").unwrap_or("").to_owned()
     } else {
         password
     };
-    let default_port = default_port(engine);
-    let port = if scheme == "mongodb+srv" {
+    let port = if scheme.discovered_port {
         String::new()
     } else if port.is_empty() {
-        default_port.to_owned()
+        default_port(engine)
     } else {
         port
     };
-    let tls_mode = if scheme == "rediss" || scheme == "mongodb+srv" {
+    let tls_mode = if scheme.implies_tls {
         Some(TlsMode::Require)
     } else {
         tls_from(engine, &pairs)
     };
-    if engine == Engine::Mongodb {
+    if style == UrlStyle::FullUri {
         return Ok(ParsedUrl {
             engine,
             host: trimmed.to_owned(),
@@ -101,7 +106,7 @@ pub fn parse_connection_url(text: &str) -> Result<ParsedUrl, &'static str> {
     })
 }
 
-fn parse_sqlite(rest: &str) -> Result<ParsedUrl, &'static str> {
+fn parse_file(engine: Engine, rest: &str) -> Result<ParsedUrl, &'static str> {
     let mut path = rest.trim_start_matches("//").to_owned();
     if let Some(query) = path.find('?') {
         path.truncate(query);
@@ -114,7 +119,7 @@ fn parse_sqlite(rest: &str) -> Result<ParsedUrl, &'static str> {
         return Err("connections.url.noHost");
     }
     Ok(ParsedUrl {
-        engine: Engine::Sqlite,
+        engine,
         host: String::new(),
         port: String::new(),
         database: String::new(),
@@ -126,59 +131,29 @@ fn parse_sqlite(rest: &str) -> Result<ParsedUrl, &'static str> {
     })
 }
 
-fn split_scheme(text: &str) -> Option<(&str, &str)> {
+fn split_scheme(text: &str) -> Option<(&'static str, &str)> {
     let lower = text.to_ascii_lowercase();
     let (body, lower_body) = if let Some(stripped) = lower.strip_prefix("jdbc:") {
         (&text[5..], stripped)
     } else {
         (text, lower.as_str())
     };
-    const SCHEMES: &[&str] = &[
-        "mongodb+srv",
-        "postgresql",
-        "postgres",
-        "mariadb",
-        "sqlserver",
-        "mongodb",
-        "sqlite",
-        "rediss",
-        "mysql",
-        "mssql",
-        "redis",
-    ];
-    for scheme in SCHEMES {
-        let prefix = format!("{scheme}:");
+    for scheme in registry::url_schemes() {
+        let prefix = format!("{}:", scheme.name);
         if lower_body.starts_with(&prefix) {
-            return Some((*scheme, &body[prefix.len()..]));
+            return Some((scheme.name, &body[prefix.len()..]));
         }
     }
     None
 }
 
-fn engine_of(scheme: &str) -> Engine {
-    match scheme {
-        "mysql" => Engine::Mysql,
-        "mariadb" => Engine::Mariadb,
-        "sqlserver" | "mssql" => Engine::Sqlserver,
-        "sqlite" => Engine::Sqlite,
-        "redis" | "rediss" => Engine::Redis,
-        "mongodb" | "mongodb+srv" => Engine::Mongodb,
-        _ => Engine::Postgres,
-    }
+/// 引擎的默认端口文本；文件型引擎为空。
+pub fn default_port(engine: Engine) -> String {
+    adapter(engine).meta().default_port().map(|port| port.to_string()).unwrap_or_default()
 }
 
-pub fn default_port(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Mysql | Engine::Mariadb => "3306",
-        Engine::Postgres => "5432",
-        Engine::Sqlserver => "1433",
-        Engine::Redis => "6379",
-        Engine::Mongodb => "27017",
-        Engine::Sqlite => "",
-    }
-}
-
-fn normalize_sqlserver(rest: &str) -> String {
+/// JDBC 风格 `host:port;k=v;k2=v2` 改写成 `host:port?k=v&k2=v2`。
+fn normalize_jdbc_params(rest: &str) -> String {
     match rest.find(';') {
         Some(at) => {
             let (head, tail) = rest.split_at(at);
@@ -281,28 +256,8 @@ fn tls_from(engine: Engine, pairs: &[(String, String)]) -> Option<TlsMode> {
             return Some(TlsMode::Verify);
         }
     }
-    if matches!(engine, Engine::Mysql | Engine::Mariadb) {
-        if let Some(mode) = param(pairs, "ssl-mode").or_else(|| param(pairs, "sslmode")).map(|value| value.to_ascii_lowercase()) {
-            if mode == "disabled" || mode == "disable" {
-                return Some(TlsMode::Off);
-            }
-            if mode == "verify_ca" || mode == "verify_identity" {
-                return Some(TlsMode::Verify);
-            }
-            if mode == "required" || mode == "preferred" {
-                return Some(TlsMode::Require);
-            }
-        }
-        if let Some(flag) = param(pairs, "usessl").map(|value| value.to_ascii_lowercase()) {
-            return Some(if flag == "false" || flag == "no" { TlsMode::Off } else { TlsMode::Require });
-        }
-    }
-    if matches!(engine, Engine::Mongodb | Engine::Redis) {
-        if let Some(flag) = param(pairs, "tls").or_else(|| param(pairs, "ssl")).map(|value| value.to_ascii_lowercase()) {
-            return Some(if matches!(flag.as_str(), "true" | "yes" | "1") { TlsMode::Require } else { TlsMode::Off });
-        }
-    }
-    None
+    let lookup = |name: &str| param(pairs, name).map(str::to_owned);
+    adapter(engine).meta().url_tls(&lookup)
 }
 
 fn decode_loose(value: &str) -> String {

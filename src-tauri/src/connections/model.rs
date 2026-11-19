@@ -47,11 +47,6 @@ impl Engine {
         crate::adapters::adapter(self).meta().label()
     }
 
-    /// MongoDB 的主机字段也可以直接填 mongodb:// / mongodb+srv:// 连接串；此时端口字段不参与。
-    pub fn host_is_mongo_uri(host: &str) -> bool {
-        let lowered = host.trim().to_ascii_lowercase();
-        lowered.starts_with("mongodb://") || lowered.starts_with("mongodb+srv://")
-    }
 }
 
 pub const ENV_NONE: &str = "none";
@@ -297,7 +292,7 @@ pub struct ConnectionDraft {
 impl ConnectionDraft {
     #[cfg(test)]
     pub fn blank(engine: Engine) -> Self {
-        let env = if engine == Engine::Sqlite {
+        let env = if !engine.is_remote() {
             "local".to_owned()
         } else {
             "dev".to_owned()
@@ -343,14 +338,15 @@ pub struct FieldError {
     pub message: String,
 }
 
+/// 规则（文件型、用户名可空、库索引、整串 URI、副本集）来自引擎适配器的 EngineMeta。
 pub fn normalize(draft: &ConnectionDraft, id: String) -> Result<SavedConnection, Vec<FieldError>> {
-    if draft.engine == Engine::Sqlite {
-        return normalize_sqlite(draft, id);
+    if crate::adapters::adapter(draft.engine).meta().file_based() {
+        return normalize_file(draft, id);
     }
     normalize_remote(draft, id)
 }
 
-fn normalize_sqlite(draft: &ConnectionDraft, id: String) -> Result<SavedConnection, Vec<FieldError>> {
+fn normalize_file(draft: &ConnectionDraft, id: String) -> Result<SavedConnection, Vec<FieldError>> {
     let file_path = draft.file_path.trim();
     if file_path.is_empty() {
         return Err(vec![FieldError {
@@ -362,7 +358,7 @@ fn normalize_sqlite(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
     Ok(SavedConnection {
         id,
         name,
-        engine: Engine::Sqlite,
+        engine: draft.engine,
         env: normalize_env_id(&draft.env),
         host: None,
         port: None,
@@ -378,6 +374,7 @@ fn normalize_sqlite(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
 }
 
 fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnection, Vec<FieldError>> {
+    let meta = crate::adapters::adapter(draft.engine).meta();
     let mut errors = Vec::new();
     let host = draft.host.trim();
     if host.is_empty() {
@@ -386,10 +383,10 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
             message: "请填写主机".to_owned(),
         });
     }
-    // MongoDB 的主机字段可以是完整 mongodb:// 连接串：地址和端口都在串里，端口字段不再必填。
-    let mongo_uri = draft.engine == Engine::Mongodb && Engine::host_is_mongo_uri(host);
-    let port = if mongo_uri {
-        draft.port.trim().parse::<u16>().ok().filter(|port| *port != 0).or(Some(27017))
+    // 主机字段可以是完整连接串（如 mongodb://）：地址和端口都在串里，端口字段不再必填。
+    let uri_host = meta.host_is_uri(host);
+    let port = if uri_host {
+        draft.port.trim().parse::<u16>().ok().filter(|port| *port != 0).or(meta.default_port())
     } else {
         match parse_port(&draft.port) {
             Some(port) => Some(port),
@@ -403,14 +400,14 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         }
     };
     let username = draft.username.trim();
-    if username.is_empty() && !matches!(draft.engine, Engine::Redis | Engine::Mongodb) {
+    if username.is_empty() && !meta.username_optional() {
         errors.push(FieldError {
             field: "username".to_owned(),
             message: "请填写用户名".to_owned(),
         });
     }
-    if draft.engine == Engine::Redis && !draft.database.trim().is_empty() {
-        // Redis 的“数据库”字段是库索引（SELECT），只接受非负整数。
+    if meta.database_is_index() && !draft.database.trim().is_empty() {
+        // 库索引（Redis 的“数据库”字段，SELECT）只接受非负整数。
         if !draft.database.trim().chars().all(|ch| ch.is_ascii_digit()) {
             errors.push(FieldError {
                 field: "database".to_owned(),
@@ -418,9 +415,9 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
             });
         }
     }
-    // MongoDB 整串 URI 与 SSH 隧道互斥：URI 的地址直接进驱动 hosts，转发器地址没有入口，
+    // 整串 URI 与 SSH 隧道互斥：URI 的地址直接进驱动 hosts，转发器地址没有入口，
     // 组合会静默绕过隧道。保存阶段就拒绝，不留到连接阶段（届时隧道可能已建立）。
-    if draft.engine == Engine::Mongodb && Engine::host_is_mongo_uri(host) && draft.ssh_on {
+    if uri_host && draft.ssh_on {
         errors.push(FieldError {
             field: "ssh_host".to_owned(),
             message: "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单".to_owned(),
@@ -493,7 +490,7 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         // Redis 允许无 ACL 用户名（密码认证）；MongoDB 允许无认证直连（本地开发）；关系引擎已在上面的校验里要求非空。
         username: if username.is_empty() { None } else { Some(username.to_owned()) },
         file_path: None,
-        replica_set: if draft.engine == Engine::Mongodb { nonempty(&draft.replica_set) } else { None },
+        replica_set: if meta.uses_replica_set() { nonempty(&draft.replica_set) } else { None },
         tls,
         ssh,
         password_saved: false,

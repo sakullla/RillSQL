@@ -530,7 +530,7 @@ impl Store {
     }
 
     async fn checkpoint(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        sqlx::query(crate::adapters::sqlite::connect::LOCAL_STORE_CHECKPOINT).execute(&self.pool).await?;
         Ok(())
     }
 }

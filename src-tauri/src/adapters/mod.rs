@@ -9,27 +9,28 @@
 //! 适配器在 [`Capabilities`] 里如实声明当前提供了哪些组，注册表完整性测试校验两者一致。
 
 pub mod registry;
+pub mod session;
 
 mod mariadb;
-mod mongodb;
-mod mysql;
-mod postgres;
-mod redis;
-mod sqlite;
-mod sqlserver;
+pub(crate) mod mongodb;
+pub(crate) mod mysql;
+pub(crate) mod postgres;
+pub(crate) mod redis;
+pub(crate) mod sqlite;
+pub(crate) mod sqlserver;
 
 #[cfg(test)]
 mod boundary_tests;
 #[cfg(test)]
 mod tests;
 
-use crate::connections::model::Engine;
+use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub use registry::adapter;
+pub use session::Connector;
 
 /// 工作台类型：决定打开连接后主区用哪种 UI。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // A6 起由壳层按它选择工作台
 pub enum Workbench {
     /// 关系型：SQL 编辑器 + 表网格 + 结构编辑。
     Relational,
@@ -49,6 +50,54 @@ pub struct Capabilities {
     pub catalog_group: bool,
     pub error_rules_group: bool,
     pub connector_group: bool,
+    /// 会话绑定到单个库：切换库要改连，跨库读取要另开临时会话（不替换当前会话）。
+    pub database_scoped_session: bool,
+}
+
+/// 连接表单“常规”分栏里远程引擎的字段，顺序即绘制与 Tab 顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormField {
+    Host,
+    Port,
+    Username,
+    Password,
+    Database,
+    ReplicaSet,
+    SavePassword,
+}
+
+/// 关系型远程引擎的默认字段顺序。
+pub const DEFAULT_GENERAL_FIELDS: &[FormField] =
+    &[FormField::Host, FormField::Port, FormField::Username, FormField::Password, FormField::Database, FormField::SavePassword];
+
+/// 连接串的整体形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlStyle {
+    /// `scheme://user:pass@host:port/db?k=v`。
+    Authority,
+    /// 同上，另接受 JDBC 风格 `;k=v` 参数，库名/用户/密码可写在参数里。
+    Jdbc,
+    /// 主机字段保存整串连接串（驱动自己解析），另记下原始主机名。
+    FullUri,
+    /// `scheme:path` 或 `scheme:///path`：本地文件路径。
+    FilePath,
+}
+
+/// 一个连接串 scheme。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UrlScheme {
+    /// 小写 scheme（不含冒号）。
+    pub name: &'static str,
+    /// 这个 scheme 本身就意味着加密（rediss、mongodb+srv）。
+    pub implies_tls: bool,
+    /// 端口由服务发现决定（mongodb+srv），不填默认端口。
+    pub discovered_port: bool,
+}
+
+impl UrlScheme {
+    pub const fn plain(name: &'static str) -> Self {
+        Self { name, implies_tls: false, discovered_port: false }
+    }
 }
 
 /// 引擎元数据：标识、显示名、默认端口、是否文件型、工作台类型。
@@ -62,13 +111,72 @@ pub trait EngineMeta: Sync {
     /// 显示名。
     fn label(&self) -> &'static str;
     /// 默认端口；文件型引擎没有。
-    #[cfg_attr(not(test), allow(dead_code))] // A1 迁入连接表单默认值
     fn default_port(&self) -> Option<u16>;
     /// 文件型（本地文件即数据库，没有主机/端口）。
-    #[cfg_attr(not(test), allow(dead_code))] // A1/A6 迁入连接表单与壳层判断
     fn file_based(&self) -> bool;
-    #[cfg_attr(not(test), allow(dead_code))] // A6 起由壳层按它选择工作台
     fn workbench(&self) -> Workbench;
+
+    /// 新建连接默认按本地开发处理：环境标签 local、TLS 关闭。
+    fn defaults_to_local(&self) -> bool {
+        false
+    }
+
+    /// 新建连接的默认库。
+    fn default_database(&self) -> &'static str {
+        ""
+    }
+
+    /// 用户名可以留空（密码认证或无认证直连）。
+    fn username_optional(&self) -> bool {
+        false
+    }
+
+    /// “数据库”字段是 0 起的库索引，不是库名（换引擎时两边不互相沿用）。
+    fn database_is_index(&self) -> bool {
+        false
+    }
+
+    /// 主机字段是不是整串连接串（此时端口不参与，也不能走 SSH 隧道）。
+    fn host_is_uri(&self, _host: &str) -> bool {
+        false
+    }
+
+    /// 连接表单有副本集字段。
+    fn uses_replica_set(&self) -> bool {
+        false
+    }
+
+    /// 远程引擎“常规”分栏的字段顺序。
+    fn general_fields(&self) -> &'static [FormField] {
+        DEFAULT_GENERAL_FIELDS
+    }
+
+    /// 没有密码时仍可建连（空密码不算凭据缺失）。
+    fn password_optional(&self, _username: &str) -> bool {
+        false
+    }
+
+    /// 自动重连要求凭据库里有保存的密码。
+    fn reconnect_needs_saved_password(&self) -> bool {
+        true
+    }
+
+    /// 数据库认证阶段成功时的说明。
+    fn auth_stage_note(&self, config: &SavedConnection) -> String {
+        format!("用户 {}", config.username.clone().unwrap_or_default())
+    }
+
+    /// 这个引擎认的连接串 scheme。
+    fn url_schemes(&self) -> &'static [UrlScheme];
+
+    fn url_style(&self) -> UrlStyle {
+        UrlStyle::Authority
+    }
+
+    /// 通用参数（encrypt / sslmode）之外、该引擎专有的连接串 TLS 参数。`param` 按名（大小写不敏感）取值。
+    fn url_tls(&self, _param: &dyn Fn(&str) -> Option<String>) -> Option<TlsMode> {
+        None
+    }
 }
 
 /// SQL 语法：标识符引号、保留字与限定名。A4 起补充字面量、分页、计数、超时、词法与 EXPLAIN。
@@ -157,17 +265,6 @@ pub trait CatalogDialect: Sync {}
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A1/A4 填充）
 pub trait ErrorRules: Sync {}
 
-/// 已打开的会话：执行语句与取行、探活、切换库。取代 `CatalogSession`/`Attached`/`SessionKind` 上的分支。（A1 填充）
-#[allow(dead_code)] // 接口骨架：A1 起由 Connector 产出并取代会话枚举
-pub trait Session: Send + Sync {}
-
-/// 打开连接并产出 [`Session`]。（A1 填充）
-pub trait Connector: Sync {}
-
-/// 取消进行中的语句。取代 `CancelTransport` 上的分支。（A1 填充）
-#[allow(dead_code)] // 接口骨架：A1 起由 Session 提供并取代 CancelTransport
-pub trait Canceller: Send + Sync {}
-
 /// 一个引擎的适配器：汇总各能力组。不支持的组返回 `None`，并在 [`Capabilities`] 里声明为 `false`。
 pub trait EngineAdapter: Sync {
     fn meta(&self) -> &dyn EngineMeta;
@@ -191,10 +288,14 @@ pub trait EngineAdapter: Sync {
     fn errors(&self) -> Option<&dyn ErrorRules> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))] // A1 填充并接入
     fn connector(&self) -> Option<&dyn Connector> {
         None
     }
+}
+
+/// 主机字段是不是整串连接串（按引擎规则）。
+pub fn host_is_uri(engine: Engine, host: &str) -> bool {
+    adapter(engine).meta().host_is_uri(host)
 }
 
 /// 没有 SQL 语法组的引擎（Redis/MongoDB）没有 SQL 生成面；万一被调用，按标准 SQL 双引号总是引用。
@@ -233,4 +334,9 @@ pub fn quote_ident_named(engine: &str, name: &str) -> String {
         Some(engine) => quote_ident(engine, name),
         None => standard_quote(name),
     }
+}
+
+/// 专项工作台（Redis / Mongo）顶栏徽标使用的引擎 id。
+pub fn workbench_badge_id(workbench: Workbench) -> &'static str {
+    registry::workbench_engine(workbench).map(|engine| adapter(engine).meta().id()).unwrap_or_default()
 }

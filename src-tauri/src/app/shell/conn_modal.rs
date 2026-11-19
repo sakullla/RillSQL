@@ -5,7 +5,8 @@
 //! 启动台、命令面板、对象树空态和连接行操作都调用同一入口，因此不存在第二个编辑面。
 
 use crate::app::model::FocusTarget;
-use crate::app::views::connections::{engines, ConnectionPage};
+use crate::adapters::FormField;
+use crate::app::views::connections::{engines, file_based, ConnectionPage};
 use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 
 use super::model::DraftField;
@@ -315,7 +316,7 @@ impl ConnectionModal {
     }
 
     pub fn effective_tab(&self, engine: Engine) -> ModalTab {
-        if engine == Engine::Sqlite {
+        if file_based(engine) {
             ModalTab::General
         } else {
             self.tab
@@ -356,7 +357,7 @@ impl ConnectionModal {
         for engine in engines() {
             stops.push(ModalStop::Control(engine_control_id(engine)));
         }
-        if draft.engine != Engine::Sqlite {
+        if !file_based(draft.engine) {
             for tab in [ModalTab::General, ModalTab::Ssh, ModalTab::Tls] {
                 stops.push(ModalStop::Control(tab.control_id().to_owned()));
             }
@@ -376,7 +377,7 @@ impl ConnectionModal {
             }
         };
 
-        if draft.engine == Engine::Sqlite {
+        if file_based(draft.engine) {
             stops.push(ModalStop::Field(DraftField::File));
             stops.push(ModalStop::Control(BROWSE_FILE.to_owned()));
             stops.push(ModalStop::Field(DraftField::Name));
@@ -387,21 +388,17 @@ impl ConnectionModal {
         } else {
             match self.effective_tab(draft.engine) {
                 ModalTab::General => {
-                    stops.push(ModalStop::Field(DraftField::Host));
-                    stops.push(ModalStop::Field(DraftField::Port));
-                    if draft.engine == Engine::Redis {
-                        stops.push(ModalStop::Field(DraftField::Database));
-                        stops.push(ModalStop::Field(DraftField::Password));
-                        stops.push(ModalStop::Field(DraftField::Username));
-                        stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
-                    } else {
-                        stops.push(ModalStop::Field(DraftField::Username));
-                        stops.push(ModalStop::Field(DraftField::Password));
-                        stops.push(ModalStop::Field(DraftField::Database));
-                        if draft.engine == Engine::Mongodb {
-                            stops.push(ModalStop::Field(DraftField::Replica));
-                        }
-                        stops.push(ModalStop::Control(SAVE_PASSWORD.to_owned()));
+                    // 字段顺序来自引擎适配器（EngineMeta::general_fields）。
+                    for field in crate::adapters::adapter(draft.engine).meta().general_fields() {
+                        stops.push(match field {
+                            FormField::Host => ModalStop::Field(DraftField::Host),
+                            FormField::Port => ModalStop::Field(DraftField::Port),
+                            FormField::Username => ModalStop::Field(DraftField::Username),
+                            FormField::Password => ModalStop::Field(DraftField::Password),
+                            FormField::Database => ModalStop::Field(DraftField::Database),
+                            FormField::ReplicaSet => ModalStop::Field(DraftField::Replica),
+                            FormField::SavePassword => ModalStop::Control(SAVE_PASSWORD.to_owned()),
+                        });
                     }
                     stops.push(ModalStop::Field(DraftField::Name));
                     for env in envs {

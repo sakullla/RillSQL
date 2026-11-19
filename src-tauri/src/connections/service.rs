@@ -1,23 +1,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use futures::{stream, StreamExt};
 
-use crate::connections::drivers::{self, TunnelFault, TdsClient};
+use crate::adapters::adapter;
+use crate::adapters::session::{Opened, ScriptedSession, Session as LiveSession};
+use crate::connections::drivers::{self, TunnelFault};
 use crate::connections::groups::{validate_group_name, ConnectionGroup};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
 use crate::connections::model::{
-    password_account, ssh_password_account, validate_tag_label, ConnectionDraft, Engine, EnvTag, FieldError, SavedConnection, Secret, SecretInput,
+    password_account, ssh_password_account, validate_tag_label, ConnectionDraft, EnvTag, FieldError, SavedConnection, Secret, SecretInput,
     SshAuthKind, SshSettings, TlsMode, ENV_NONE,
 };
 use crate::connections::route::{self, Route};
 use crate::connections::secrets::SecretStore;
 use crate::connections::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestReport, TestStatus};
 use crate::connections::store::{self, Store};
+
+pub use crate::adapters::session::{CancelTransport, CatalogSession};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,7 +98,7 @@ pub struct Probes {
     pub ssh: Option<Arc<dyn SshProbe>>,
     pub database: Option<Arc<dyn DatabaseProbe>>,
     pub sqlite: Option<Arc<dyn SqliteProbe>>,
-    /// 探活探针。None 时用真实探针（PG SELECT 1 / MySQL ping；SQLite 免）。
+    /// 探活探针。None 时用会话自己的探活（各适配器的 `Session::ping`；本地文件免）。
     pub health: Option<Arc<dyn HealthProbe>>,
 }
 
@@ -102,60 +106,6 @@ pub struct Probes {
 #[async_trait::async_trait]
 pub trait HealthProbe: Send + Sync {
     async fn check(&self, session: &CatalogSession) -> Result<(), String>;
-}
-
-struct SelectOneProbe;
-
-#[async_trait::async_trait]
-impl HealthProbe for SelectOneProbe {
-    async fn check(&self, session: &CatalogSession) -> Result<(), String> {
-        use mysql_async::prelude::Queryable;
-        match session {
-            // SQLite 是本地文件，没有“断线”可言，免探活（这里到不了，防御返回成功）。
-            CatalogSession::Sqlite { .. } | CatalogSession::Scripted => Ok(()),
-            CatalogSession::Mysql(pool) => {
-                let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
-                conn.ping().await.map_err(|err| crate::error_text::chain(&err))
-            }
-            CatalogSession::Postgres(client) => client
-                .simple_query("SELECT 1")
-                .await
-                .map(|_| ())
-                .map_err(|err| crate::error_text::chain(&err)),
-            CatalogSession::Sqlserver(client) => {
-                let mut client = client.lock().await;
-                use futures::TryStreamExt;
-                let mut stream = client.simple_query("SELECT 1").await.map_err(|err| crate::error_text::chain(&err))?;
-                while let Some(item) = stream.try_next().await.map_err(|err| crate::error_text::chain(&err))? {
-                    if item.into_row().is_some() {
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            }
-            CatalogSession::Redis(conn) => {
-                let mut conn = conn.lock().await;
-                let pong: String = redis::cmd("PING").query_async(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
-                if pong.eq_ignore_ascii_case("pong") {
-                    Ok(())
-                } else {
-                    Err(format!("PING 返回了 {pong}"))
-                }
-            }
-            CatalogSession::Mongo(client) => {
-                let reply = client
-                    .database("admin")
-                    .run_command(mongodb::bson::doc! { "ping": 1 })
-                    .await
-                    .map_err(|err| crate::error_text::chain(&err))?;
-                if reply.get_f64("ok") == Ok(1.0) || reply.get_i32("ok") == Ok(1) {
-                    Ok(())
-                } else {
-                    Err(format!("ping 返回了 {reply:?}"))
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -166,20 +116,9 @@ struct PendingHostKey {
     fingerprint: String,
 }
 
-enum SessionKind {
-    Sqlite(sqlx::SqlitePool),
-    /// exec 只给 SQL 执行（单连接，会话状态跨执行保留）；meta 给目录、结构、表浏览与补全。
-    Mysql { exec: mysql_async::Pool, meta: mysql_async::Pool },
-    Postgres(Arc<tokio_postgres::Client>),
-    Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
-    Redis { browser: Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>, client: redis::Client },
-    /// mongodb::Client 内部共享连接池，克隆廉价；库/集合/文档操作共用这一个句柄。
-    Mongo(mongodb::Client),
-    Scripted,
-}
-
-struct Session {
-    kind: SessionKind,
+/// 会话表里的一条已打开会话。
+struct LiveEntry {
+    session: Arc<dyn LiveSession>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
@@ -287,96 +226,7 @@ impl SessionHealth {
     }
 }
 
-/// 取消正在执行的语句。查询本身仍走已打开的会话，不从这里再拨一条执行连接。
-#[derive(Clone)]
-pub enum CancelTransport {
-    Sqlite(Arc<AtomicBool>, Arc<SessionHealth>),
-    Mysql {
-        connection_id: Arc<AtomicU64>,
-        opts: mysql_async::Opts,
-        via_ssh: bool,
-        health: Arc<SessionHealth>,
-    },
-    Postgres {
-        token: tokio_postgres::CancelToken,
-        tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
-        via_ssh: bool,
-        health: Arc<SessionHealth>,
-    },
-    Sqlserver {
-        spid: Arc<AtomicU32>,
-        config: tiberius::Config,
-        via_ssh: bool,
-        health: Arc<SessionHealth>,
-    },
-    /// Redis 命令没有服务端取消通道；这里只承载共享健康句柄（活动/断线报告）。
-    Redis {
-        health: Arc<SessionHealth>,
-    },
-    /// MongoDB 文档操作同样没有会话级取消通道；只承载共享健康句柄（R4 探活消费）。
-    Mongo {
-        health: Arc<SessionHealth>,
-    },
-    None,
-}
-
-impl CancelTransport {
-    pub fn via_ssh(&self) -> bool {
-        match self {
-            Self::Mysql { via_ssh, .. } | Self::Postgres { via_ssh, .. } | Self::Sqlserver { via_ssh, .. } => *via_ssh,
-            _ => false,
-        }
-    }
-
-    pub fn sqlite_flag(&self) -> Option<Arc<AtomicBool>> {
-        match self {
-            Self::Sqlite(flag, _) => Some(Arc::clone(flag)),
-            _ => None,
-        }
-    }
-
-    pub fn set_mysql_connection_id(&self, id: u64) {
-        if let Self::Mysql { connection_id, .. } = self {
-            connection_id.store(id, Ordering::SeqCst);
-        }
-    }
-
-    pub fn health(&self) -> Option<&Arc<SessionHealth>> {
-        match self {
-            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } | Self::Redis { health } | Self::Mongo { health } => {
-                Some(health)
-            }
-            Self::None => None,
-        }
-    }
-
-    /// 会话入表时把执行共享的健康句柄接到取消通道上，执行路径据此报告断线。
-    pub fn attach_health(&mut self, health: Arc<SessionHealth>) {
-        match self {
-            Self::Sqlite(_, slot) => *slot = health,
-            Self::Mysql { health: slot, .. } => *slot = health,
-            Self::Postgres { health: slot, .. } => *slot = health,
-            Self::Sqlserver { health: slot, .. } => *slot = health,
-            Self::Redis { health: slot } => *slot = health,
-            Self::Mongo { health: slot } => *slot = health,
-            Self::None => {}
-        }
-    }
-
-    pub fn note_activity(&self) {
-        if let Some(health) = self.health() {
-            health.note_activity();
-        }
-    }
-
-    pub fn note_disconnect(&self) {
-        if let Some(health) = self.health() {
-            health.note_disconnect();
-        }
-    }
-}
-
-/// 一次对比用的临时 PostgreSQL 会话。丢弃时关闭它自己的通道，不动用户正在使用的会话。
+/// 一次对比用的临时读取会话（会话绑定单库的引擎）。丢弃时关闭它自己的通道，不动用户正在使用的会话。
 pub struct EphemeralRead {
     catalog: CatalogSession,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -396,31 +246,13 @@ impl Drop for EphemeralRead {
     }
 }
 
-/// 已打开会话的查询句柄。调用方只能拿去查元数据，不能据此再拨一条数据库连接。
-#[derive(Clone)]
-pub enum CatalogSession {
-    Sqlite {
-        pool: sqlx::SqlitePool,
-        foreign_keys: Option<bool>,
-    },
-    Mysql(mysql_async::Pool),
-    Postgres(Arc<tokio_postgres::Client>),
-    /// tiberius 句柄不可共享借用，目录/查询/网格/对比都经这一把互斥锁串行使用同一条连接。
-    Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
-    /// Redis 单条多路复用连接：键浏览、值读取与命令行共用，经互斥锁串行。
-    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
-    /// MongoDB 客户端：库/集合目录与文档 CRUD 共用（驱动内部自带连接池）。
-    Mongo(mongodb::Client),
-    Scripted,
-}
-
 pub struct Service {
     path: PathBuf,
     secrets: Arc<dyn SecretStore>,
     #[cfg(test)]
     logs: Mutex<Vec<String>>,
     cell: tokio::sync::OnceCell<Store>,
-    sessions: Mutex<HashMap<String, Session>>,
+    sessions: Mutex<HashMap<String, LiveEntry>>,
     operation_sequence: AtomicU64,
     operation_epochs: Mutex<HashMap<String, u64>>,
     pending: Mutex<HashMap<String, PendingHostKey>>,
@@ -620,7 +452,7 @@ impl Service {
             saved.env = ENV_NONE.to_owned();
         }
         let mut notes = Vec::new();
-        if saved.engine == Engine::Sqlite {
+        if adapter(saved.engine).meta().file_based() {
             saved.password_saved = false;
             saved.ssh_password_saved = false;
         } else if draft.save_password {
@@ -735,7 +567,7 @@ impl Service {
         self.exercise(id, input, true).await
     }
 
-    /// 把已经打开的 PostgreSQL 会话改连到同一个服务器上的另一个库。
+    /// 把已经打开的会话改连到同一个服务器上的另一个库（会话绑定单库的引擎，如 PostgreSQL）。
     /// 不改已保存的配置。连不上时保留原来的会话。
     pub async fn focus_database(&self, id: &str, database: &str) -> Result<(), String> {
         let database = database.trim();
@@ -744,7 +576,7 @@ impl Service {
         }
         let store = self.store().await?;
         let config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
-        if config.engine != Engine::Postgres {
+        if !adapter(config.engine).capabilities().database_scoped_session {
             return Err("只有 PostgreSQL 需要改连到另一个库。".to_owned());
         }
         if !self.sessions.lock().expect("sessions").contains_key(id) {
@@ -759,7 +591,7 @@ impl Service {
         Err(focus_failure(&outcome.report))
     }
 
-    /// 为这一次读取另开 PostgreSQL 会话。不替换当前会话，不调用改连，也不写已保存的配置。
+    /// 为这一次读取另开会话（会话绑定单库的引擎，如 PostgreSQL）。不替换当前会话，不调用改连，也不写已保存的配置。
     pub async fn open_ephemeral_postgres(&self, id: &str, database: &str) -> Result<EphemeralRead, String> {
         let database = database.trim();
         if database.is_empty() {
@@ -767,7 +599,7 @@ impl Service {
         }
         let store = self.store().await?;
         let saved = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
-        if saved.engine != Engine::Postgres {
+        if !adapter(saved.engine).capabilities().database_scoped_session {
             return Err("只有 PostgreSQL 需要临时读取会话。".to_owned());
         }
         if !self.sessions.lock().expect("sessions").contains_key(id) {
@@ -796,15 +628,9 @@ impl Service {
             forwarder_port: None,
             shutdown: None,
             remote: Remote::Fresh,
-            sqlite_pool: None,
-            mysql_pool: None,
-            postgres: None,
-            sqlserver: None,
-            redis: None,
-            mongo: None,
+            opened: None,
             schema_note: None,
             foreign_keys: None,
-            cancel: CancelTransport::None,
         };
         let report = stages::execute_stages(&stages, &mut attempt).await;
         let persisted = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
@@ -817,10 +643,10 @@ impl Service {
         if report.status != TestStatus::Ok {
             return Err(ephemeral_failure(&report));
         }
-        let Some(client) = attempt.postgres.take() else {
+        let Some(opened) = attempt.opened.take() else {
             return Err("没有打开临时读取会话。".to_owned());
         };
-        Ok(EphemeralRead { catalog: CatalogSession::Postgres(Arc::new(client)), shutdown: attempt.shutdown.take() })
+        Ok(EphemeralRead { catalog: opened.session.catalog(None), shutdown: attempt.shutdown.take() })
     }
 
     pub fn disconnect(&self, id: &str) {
@@ -835,7 +661,7 @@ impl Service {
             if let Some(shutdown) = session.shutdown {
                 let _ = shutdown.send(());
             }
-            drop(session.kind);
+            drop(session.session);
             self.log(format!("已断开会话 {id}，隧道和通道已关闭。数据库文件未删除。"));
         }
     }
@@ -1054,15 +880,9 @@ impl Service {
             forwarder_port: None,
             shutdown: None,
             remote: Remote::Fresh,
-            sqlite_pool: None,
-            mysql_pool: None,
-            postgres: None,
-            sqlserver: None,
-            redis: None,
-            mongo: None,
+            opened: None,
             schema_note: None,
             foreign_keys: None,
-            cancel: CancelTransport::None,
         };
         let report = stages::execute_stages(&stages, &mut attempt).await;
         if report.status == TestStatus::Wait {
@@ -1088,28 +908,16 @@ impl Service {
             // 提交会话与断开操作使用同一把短锁；迟到握手不能恢复已断开/被更新的会话。
             let epochs = self.operation_epochs.lock().expect("connection epochs");
             if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
-            let kind = if let Some(pool) = attempt.sqlite_pool.take() {
-                SessionKind::Sqlite(pool)
-            } else if let Some((exec, meta)) = attempt.mysql_pool.take() {
-                SessionKind::Mysql { exec, meta }
-            } else if let Some(client) = attempt.postgres.take() {
-                SessionKind::Postgres(Arc::new(client))
-            } else if let Some(client) = attempt.sqlserver.take() {
-                SessionKind::Sqlserver(Arc::new(tokio::sync::Mutex::new(client)))
-            } else if let Some((client, conn)) = attempt.redis.take() {
-                SessionKind::Redis { browser: Arc::new(tokio::sync::Mutex::new(conn)), client }
-            } else if let Some(client) = attempt.mongo.take() {
-                SessionKind::Mongo(client)
-            } else {
-                SessionKind::Scripted
-            };
             let health = Arc::new(SessionHealth::default());
-            let mut cancel = attempt.cancel.clone();
-            cancel.attach_health(Arc::clone(&health));
+            // 探针驱动的测试连接没有真实驱动句柄，也没有取消通道。
+            let (session, cancel): (Arc<dyn LiveSession>, CancelTransport) = match attempt.opened.take() {
+                Some(opened) => (opened.session, CancelTransport::new(opened.canceller, Arc::clone(&health))),
+                None => (Arc::new(ScriptedSession), CancelTransport::default()),
+            };
             self.sessions.lock().expect("sessions").insert(
                 session_id.to_owned(),
-                Session {
-                    kind,
+                LiveEntry {
+                    session,
                     shutdown: attempt.shutdown.take(),
                     foreign_keys,
                     cancel,
@@ -1212,23 +1020,17 @@ impl Service {
         Some(clone_catalog_handle(session))
     }
 
-    /// Redis 的 SELECT 作用于整个网络连接。查询批次独占命令连接，避免和键浏览器互相切库。
+    /// 查询批次使用的句柄：需要独占执行连接的引擎（MySQL 执行池、Redis 独占命令连接）由适配器另给。
     pub async fn query_session(&self, id: &str) -> Result<Option<CatalogSession>, String> {
-        let client = {
+        let (session, foreign_keys) = {
             let sessions = self.sessions.lock().expect("sessions");
-            let Some(session) = sessions.get(id).filter(|session| !session.health.is_lost()) else {
+            let Some(entry) = sessions.get(id).filter(|entry| !entry.health.is_lost()) else {
                 return Ok(None);
             };
-            session.health.note_activity();
-            match &session.kind {
-                SessionKind::Mysql { exec, .. } => return Ok(Some(CatalogSession::Mysql(exec.clone()))),
-                SessionKind::Redis { client, .. } => client.clone(),
-                _ => return Ok(Some(clone_catalog_handle(session))),
-            }
+            entry.health.note_activity();
+            (Arc::clone(&entry.session), entry.foreign_keys)
         };
-        let config = redis::AsyncConnectionConfig::new().set_connection_timeout(Duration::from_secs(15));
-        let conn = client.get_multiplexed_async_connection_with_config(&config).await.map_err(|err| err.to_string())?;
-        Ok(Some(CatalogSession::Redis(Arc::new(tokio::sync::Mutex::new(conn)))))
+        session.query(foreign_keys).await.map(Some)
     }
 
     /// MySQL / MariaDB 已认证的目录连接池：当独立执行连接受限于 max_user_connections、
@@ -1239,10 +1041,7 @@ impl Service {
         if session.health.is_lost() {
             return None;
         }
-        match &session.kind {
-            SessionKind::Mysql { meta, .. } => Some(meta.clone()),
-            _ => None,
-        }
+        session.session.shared_pool()
     }
 
     /// Redis 会话句柄：键浏览、值读取与命令行共用同一条多路复用连接（互斥锁串行）。
@@ -1257,10 +1056,8 @@ impl Service {
             return None;
         }
         session.health.note_activity();
-        match &session.kind {
-            SessionKind::Redis { browser, .. } => Some((Arc::clone(browser), Arc::clone(&session.health))),
-            _ => None,
-        }
+        let browser = session.session.as_redis()?.browser();
+        Some((browser, Arc::clone(&session.health)))
     }
 
     /// MongoDB 会话句柄：库/集合浏览与文档 CRUD 共用这一个客户端（驱动内部连接池）。
@@ -1272,10 +1069,8 @@ impl Service {
             return None;
         }
         session.health.note_activity();
-        match &session.kind {
-            SessionKind::Mongo(client) => Some((client.clone(), Arc::clone(&session.health))),
-            _ => None,
-        }
+        let client = session.session.as_mongo()?.client();
+        Some((client, Arc::clone(&session.health)))
     }
 
     /// 前端 1s 轮询的落点：返回全部会话状态，并按需探活、驱动有限次退避重连（R4）。
@@ -1284,12 +1079,12 @@ impl Service {
             let epochs = self.operation_epochs.lock().expect("connection epochs");
             let sessions = self.sessions.lock().expect("sessions");
             sessions.iter().map(|(id, session)| SessionHealthProbe {
-                id: id.clone(), sqlite: matches!(session.kind, SessionKind::Sqlite(_)),
+                id: id.clone(), local_file: session.session.local_file(),
                 health: Arc::clone(&session.health), epoch: epochs.get(id).copied(),
             }).collect()
         };
         stream::iter(targets).map(|target| async move {
-            if !target.health.is_lost() && target.health.needs_probe(target.sqlite) { self.probe_session(&target).await; }
+            if !target.health.is_lost() && target.health.needs_probe(target.local_file) { self.probe_session(&target).await; }
             let condition = self.session_condition(&target.id)?;
             if matches!(condition, SessionCondition::Lost { .. }) { self.run_reconnect_if_due(&target.id).await; }
             match self.session_condition(&target.id)? {
@@ -1312,13 +1107,15 @@ impl Service {
             if epochs.get(&target.id).copied() != target.epoch { return; }
             let sessions = self.sessions.lock().expect("sessions");
             match sessions.get(&target.id) {
-                Some(session) if !session.health.is_lost() => Some(clone_catalog_handle(session)),
+                Some(entry) if !entry.health.is_lost() => Some((Arc::clone(&entry.session), entry.foreign_keys)),
                 _ => None,
             }
         };
-        let Some(session) = session else { return };
-        let probe = self.probes.health.as_deref().unwrap_or(&SelectOneProbe);
-        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe.check(&session)).await;
+        let Some((session, foreign_keys)) = session else { return };
+        let outcome = match self.probes.health.as_deref() {
+            Some(probe) => tokio::time::timeout(PROBE_TIMEOUT, probe.check(&session.catalog(foreign_keys))).await,
+            None => tokio::time::timeout(PROBE_TIMEOUT, session.ping()).await,
+        };
         let epochs = self.operation_epochs.lock().expect("connection epochs");
         if epochs.get(&target.id).copied() != target.epoch { return; }
         let current = self.sessions.lock().expect("sessions").get(&target.id).is_some_and(|session| Arc::ptr_eq(&session.health, &target.health));
@@ -1379,8 +1176,8 @@ impl Service {
             );
             return;
         };
-        // Redis / MongoDB 都可以无认证直连（本地开发常见）：没有保存密码不阻止自动重连；其余远程引擎仍要求已保存密码。
-        let passwordless_ok = matches!(config.engine, Engine::Sqlite | Engine::Redis | Engine::Mongodb);
+        // 文件型与可无认证直连的引擎（本地开发常见）：没有保存密码不阻止自动重连；其余远程引擎仍要求已保存密码。
+        let passwordless_ok = !adapter(config.engine).meta().reconnect_needs_saved_password();
         if !passwordless_ok && !config.password_saved {
             self.finish_reconnect(
                 id, epoch,
@@ -1470,7 +1267,7 @@ impl Service {
 
     #[cfg(test)]
     pub async fn open_sqlite_for_test(&self, id: &str, name: &str, path: &Path) -> Result<(), String> {
-        let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+        let mut draft = ConnectionDraft::blank(crate::connections::model::Engine::Sqlite);
         draft.id = Some(id.to_owned());
         draft.name = name.to_owned();
         draft.file_path = path.display().to_string();
@@ -1529,23 +1326,12 @@ impl Drop for ProbeGuard {
 struct SessionHealthProbe {
     id: String,
     epoch: Option<u64>,
-    sqlite: bool,
+    local_file: bool,
     health: Arc<SessionHealth>,
 }
 
-fn clone_catalog_handle(session: &Session) -> CatalogSession {
-    match &session.kind {
-        SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
-            pool: pool.clone(),
-            foreign_keys: session.foreign_keys,
-        },
-        SessionKind::Mysql { meta, .. } => CatalogSession::Mysql(meta.clone()),
-        SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
-        SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
-        SessionKind::Redis { browser, .. } => CatalogSession::Redis(Arc::clone(browser)),
-        SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
-        SessionKind::Scripted => CatalogSession::Scripted,
-    }
+fn clone_catalog_handle(entry: &LiveEntry) -> CatalogSession {
+    entry.session.catalog(entry.foreign_keys)
 }
 
 #[derive(Default)]
@@ -1705,16 +1491,10 @@ struct Attempt {
     forwarder_port: Option<u16>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     remote: Remote,
-    sqlite_pool: Option<sqlx::SqlitePool>,
-    /// (执行池, 元数据池)。
-    mysql_pool: Option<(mysql_async::Pool, mysql_async::Pool)>,
-    postgres: Option<tokio_postgres::Client>,
-    sqlserver: Option<TdsClient>,
-    redis: Option<(redis::Client, redis::aio::MultiplexedConnection)>,
-    mongo: Option<mongodb::Client>,
+    /// 适配器打开的会话与取消通道（探针驱动的测试连接没有）。
+    opened: Option<Opened>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
-    cancel: CancelTransport,
 }
 
 impl Attempt {
@@ -1818,16 +1598,13 @@ impl Attempt {
             return;
         }
         let tls_mode = self.tls_mode();
-        // Redis 允许无密码直连（本地开发常见）：空密码不是“凭据缺失”，照常建连。
-        // MongoDB 无用户名时同样是无认证直连；有用户名而没有密码仍按凭据缺失报错。
+        let adapter = adapter(self.config.engine);
+        // 可无密码直连的引擎（本地开发常见）：空密码不是“凭据缺失”，照常建连。
+        // 是否允许由适配器按用户名判断（如无用户名即无认证直连）；不允许时仍按凭据缺失报错。
         let empty_password;
         let password = match self.password.as_ref() {
             Some(secret) => secret,
-            None if self.config.engine == Engine::Redis => {
-                empty_password = Secret::new("");
-                &empty_password
-            }
-            None if self.config.engine == Engine::Mongodb && self.config.username.as_deref().unwrap_or("").trim().is_empty() => {
+            None if adapter.meta().password_optional(self.config.username.as_deref().unwrap_or("")) => {
                 empty_password = Secret::new("");
                 &empty_password
             }
@@ -1858,55 +1635,13 @@ impl Attempt {
             return;
         }
         let password = password.expose().to_owned();
-        let opened = match self.config.engine {
-            Engine::Mysql | Engine::Mariadb => drivers::open_mysql(&self.config, &route, &password).await.map(|opened| {
-                let via_ssh = self.config.ssh.is_some();
-                self.cancel = CancelTransport::Mysql {
-                    connection_id: Arc::new(AtomicU64::new(opened.connection_id)),
-                    opts: opened.kill_opts,
-                    via_ssh,
-                    health: Arc::new(SessionHealth::default()),
-                };
-                self.mysql_pool = Some((opened.pool, opened.meta_pool));
-                opened.version
+        let opened = match adapter.connector() {
+            Some(connector) => connector.open_remote(&self.config, &route, &password).await.map(|opened| {
+                let version = opened.version.clone();
+                self.opened = Some(opened);
+                version
             }),
-            Engine::Postgres => drivers::open_postgres(&self.config, &route, &password).await.map(|opened| {
-                let via_ssh = self.config.ssh.is_some();
-                self.cancel = CancelTransport::Postgres {
-                    token: opened.cancel,
-                    tls: opened.tls,
-                    via_ssh,
-                    health: Arc::new(SessionHealth::default()),
-                };
-                self.postgres = Some(opened.client);
-                opened.version
-            }),
-            Engine::Sqlserver => drivers::open_sqlserver(&self.config, &route, &password).await.map(|opened| {
-                let via_ssh = self.config.ssh.is_some();
-                self.cancel = CancelTransport::Sqlserver {
-                    spid: Arc::new(AtomicU32::new(opened.spid)),
-                    config: opened.kill_config,
-                    via_ssh,
-                    health: Arc::new(SessionHealth::default()),
-                };
-                self.sqlserver = Some(opened.client);
-                opened.version
-            }),
-            Engine::Redis => drivers::open_redis(&self.config, &route, &password).await.map(|opened| {
-                self.cancel = CancelTransport::Redis {
-                    health: Arc::new(SessionHealth::default()),
-                };
-                self.redis = Some((opened.client, opened.conn));
-                opened.version
-            }),
-            Engine::Mongodb => drivers::open_mongo(&self.config, &route, &password).await.map(|opened| {
-                self.cancel = CancelTransport::Mongo {
-                    health: Arc::new(SessionHealth::default()),
-                };
-                self.mongo = Some(opened.client);
-                opened.version
-            }),
-            Engine::Sqlite => Err(stages::fail_code(crate::connections::error_codes::CONN_SQLITE_NOT_REMOTE, "SQLite 不走远程连接", "未执行")),
+            None => Err(stages::fail_code(crate::connections::error_codes::CONN_NOT_STARTED, "这个引擎没有连接器", "未执行")),
         };
         match opened {
             Ok(version) => self.remote = Remote::Done { version },
@@ -1993,30 +1728,8 @@ impl Attempt {
             return probe.authenticate(&self.config, &route, password.expose()).await;
         }
         self.ensure_remote().await;
-        let user = self.config.username.clone().unwrap_or_default();
-        if self.config.engine == Engine::Redis {
-            let note = if user.is_empty() {
-                "密码认证".to_owned()
-            } else {
-                format!("ACL 用户 {user}")
-            };
-            return self.finish_stage(StageKind::DatabaseAuthentication, || note);
-        }
-        if self.config.engine == Engine::Mongodb {
-            let source = self
-                .config
-                .database
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "admin".to_owned());
-            let note = if user.is_empty() {
-                "无认证直连".to_owned()
-            } else {
-                format!("SCRAM 用户 {user}（认证库 {source}）")
-            };
-            return self.finish_stage(StageKind::DatabaseAuthentication, || note);
-        }
-        self.finish_stage(StageKind::DatabaseAuthentication, || format!("用户 {user}"))
+        let note = adapter(self.config.engine).meta().auth_stage_note(&self.config);
+        self.finish_stage(StageKind::DatabaseAuthentication, || note)
     }
 
     async fn server_version(&mut self) -> Result<String, StageError> {
@@ -2033,11 +1746,13 @@ impl Attempt {
         if let Some(probe) = self.probes.sqlite.clone() {
             return probe.open_file(&path).await;
         }
-        let opened = drivers::open_sqlite(Path::new(&path)).await?;
-        self.schema_note = Some(format!("SQLite {} · 读取到 {} 个表或视图", opened.version, opened.schema_objects));
-        self.foreign_keys = Some(opened.foreign_keys);
-        self.sqlite_pool = Some(opened.pool);
-        self.cancel = CancelTransport::Sqlite(Arc::new(AtomicBool::new(false)), Arc::new(SessionHealth::default()));
+        let connector = adapter(self.config.engine)
+            .connector()
+            .ok_or_else(|| stages::fail_code(crate::connections::error_codes::CONN_NOT_STARTED, "这个引擎没有连接器", "未执行"))?;
+        let opened = connector.open_file(Path::new(&path)).await?;
+        self.schema_note = opened.schema_note.clone();
+        self.foreign_keys = opened.foreign_keys;
+        self.opened = Some(opened);
         Ok(path)
     }
 
@@ -2197,15 +1912,9 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         forwarder_port: None,
         shutdown: None,
         remote,
-        sqlite_pool: None,
-        mysql_pool: None,
-        postgres: None,
-        sqlserver: None,
-        redis: None,
-        mongo: None,
+        opened: None,
         schema_note: None,
         foreign_keys: None,
-        cancel: CancelTransport::None,
     };
     stages::execute_stages(&stages::planned_stages(&config), &mut attempt).await
 }
@@ -2280,7 +1989,8 @@ mod health_tests {
     fn transport_notes_disconnect_on_the_shared_health_handle() {
         let shared = Arc::new(SessionHealth::default());
         let placeholder = Arc::new(SessionHealth::default());
-        let mut transport = CancelTransport::Sqlite(Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::clone(&placeholder));
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut transport = CancelTransport::new(Arc::new(crate::adapters::sqlite::connect::InterruptFlag(flag)), Arc::clone(&placeholder));
         transport.note_disconnect();
         assert!(placeholder.is_suspect(), "断线报告落在当前挂着的句柄上");
         transport.attach_health(Arc::clone(&shared));

@@ -3,7 +3,7 @@
 use super::keys::ScanPage;
 use crate::application::redis::{self, DeleteOutcome, ExecOutcome, RenameOutcome, TtlOutcome};
 use crate::connections::commands::ConnectionsState;
-use crate::redis::keys::RedisKeyDetail;
+use super::keys::RedisKeyDetail;
 
 pub async fn redis_scan_keys(
     state: &ConnectionsState,

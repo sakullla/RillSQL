@@ -214,3 +214,79 @@ fn named_engines_follow_the_same_rules() {
     assert_eq!(quote_ident_named("sqlserver", "order"), "[order]");
     assert_eq!(quote_ident_named("unknown", "content"), "\"content\"");
 }
+
+#[test]
+fn every_engine_has_a_connector_and_url_schemes() {
+    let mut schemes = Vec::new();
+    for engine in ENGINES {
+        let adapter = adapter(engine);
+        assert!(adapter.connector().is_some(), "{engine:?} 需要连接器");
+        let own = adapter.meta().url_schemes();
+        assert!(!own.is_empty(), "{engine:?} 至少认一个连接串 scheme");
+        for scheme in own {
+            assert_eq!(scheme.name, scheme.name.to_ascii_lowercase());
+            assert_eq!(registry::by_url_scheme(scheme.name).map(|(found, _)| found), Some(engine));
+            schemes.push(scheme.name);
+        }
+    }
+    let total = schemes.len();
+    schemes.sort_unstable();
+    schemes.dedup();
+    assert_eq!(schemes.len(), total, "scheme 不能被两个引擎同时认领");
+    assert_eq!(registry::url_schemes().count(), total);
+    assert!(registry::by_url_scheme("oracle").is_none());
+}
+
+#[test]
+fn connection_form_metadata_keeps_the_previous_rules() {
+    use super::{FormField, UrlStyle, DEFAULT_GENERAL_FIELDS};
+    let mut order = registry::CONNECTION_FORM_ORDER.to_vec();
+    order.sort_by_key(|engine| variant_index(*engine));
+    assert_eq!(order, ENGINES.to_vec(), "表单顺序覆盖每个引擎一次");
+    for engine in ENGINES {
+        let meta = adapter(engine).meta();
+        let local = matches!(engine, Engine::Sqlite | Engine::Redis | Engine::Mongodb);
+        assert_eq!(meta.defaults_to_local(), local, "{engine:?}");
+        assert_eq!(meta.reconnect_needs_saved_password(), !local, "{engine:?}");
+        assert_eq!(meta.username_optional(), matches!(engine, Engine::Redis | Engine::Mongodb), "{engine:?}");
+        assert_eq!(meta.database_is_index(), engine == Engine::Redis, "{engine:?}");
+        assert_eq!(meta.uses_replica_set(), engine == Engine::Mongodb, "{engine:?}");
+        assert_eq!(adapter(engine).capabilities().database_scoped_session, engine == Engine::Postgres, "{engine:?}");
+        assert_eq!(meta.url_style() == UrlStyle::FilePath, meta.file_based(), "{engine:?}");
+    }
+    assert_eq!(adapter(Engine::Redis).meta().default_database(), "0");
+    assert_eq!(
+        adapter(Engine::Redis).meta().general_fields(),
+        &[FormField::Host, FormField::Port, FormField::Database, FormField::Password, FormField::Username, FormField::SavePassword]
+    );
+    assert!(adapter(Engine::Mongodb).meta().general_fields().contains(&FormField::ReplicaSet));
+    assert_eq!(adapter(Engine::Postgres).meta().general_fields(), DEFAULT_GENERAL_FIELDS);
+    assert!(adapter(Engine::Redis).meta().password_optional("acl-user"));
+    assert!(adapter(Engine::Mongodb).meta().password_optional("  "));
+    assert!(!adapter(Engine::Mongodb).meta().password_optional("root"));
+    assert!(!adapter(Engine::Mysql).meta().password_optional(""));
+    assert_eq!(super::workbench_badge_id(Workbench::Redis), "redis");
+    assert_eq!(super::workbench_badge_id(Workbench::Mongo), "mongodb");
+}
+
+#[tokio::test]
+async fn cancel_transport_delegates_to_the_adapter_canceller() {
+    use super::session::{CancelTransport, NoCancel};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let none = CancelTransport::default();
+    assert!(none.health().is_none() && !none.via_ssh() && none.sqlite_flag().is_none());
+    assert!(none.deliver().await.unwrap_err().contains("没有可用来取消的数据库通道"));
+
+    let health = Arc::new(crate::connections::SessionHealth::default());
+    let silent = CancelTransport::new(Arc::new(NoCancel), Arc::clone(&health));
+    assert!(silent.health().is_some(), "没有取消通道的会话仍带健康句柄");
+    assert!(silent.deliver().await.is_err());
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let local = CancelTransport::new(Arc::new(super::sqlite::connect::InterruptFlag(Arc::clone(&flag))), health);
+    assert!(Arc::ptr_eq(&local.sqlite_flag().unwrap(), &flag));
+    assert_eq!(local.deliver().await, Ok(false), "本地中断不另开传输");
+    assert!(flag.load(Ordering::SeqCst));
+}

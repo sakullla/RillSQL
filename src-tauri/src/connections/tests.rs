@@ -357,8 +357,8 @@ fn sqlite_has_no_tls_and_mysql_stays_distinct_from_mariadb() {
     assert_ne!(mysql.engine, maria.engine);
     assert_eq!(mysql.engine, Engine::Mysql);
     assert_eq!(maria.engine, Engine::Mariadb);
-    assert!(super::drivers::version_note(Engine::Mysql, "10.11.6-MariaDB").contains("仍保持为 MySQL"));
-    assert!(super::drivers::version_note(Engine::Mariadb, "8.4.3").contains("仍保持为 MariaDB"));
+    assert!(crate::adapters::mysql::connect::version_note(Engine::Mysql, "10.11.6-MariaDB").contains("仍保持为 MySQL"));
+    assert!(crate::adapters::mysql::connect::version_note(Engine::Mariadb, "8.4.3").contains("仍保持为 MariaDB"));
 }
 
 #[tokio::test]
@@ -921,7 +921,7 @@ async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
             draft.ca_mode = CaMode::System;
             let saved = model::normalize(&draft, "system".to_owned()).unwrap();
             let route = route::resolve_route(&saved, None).unwrap();
-            let ssl = super::drivers::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
+            let ssl = crate::adapters::mysql::connect::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
             assert!(ssl.disable_built_in_roots(), "{engine:?} {mode:?} 仍会装入 webpki Mozilla 根");
             let mut actual = Vec::new();
             for cert in ssl.root_certs() {
@@ -938,7 +938,7 @@ async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
     file_draft.ca_file = ca.display().to_string();
     let saved = model::normalize(&file_draft, "file".to_owned()).unwrap();
     let route = route::resolve_route(&saved, None).unwrap();
-    let ssl = super::drivers::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
+    let ssl = crate::adapters::mysql::connect::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
     assert!(ssl.disable_built_in_roots());
     let roots = ssl.root_certs();
     assert_eq!(roots.len(), 1);
@@ -1240,7 +1240,7 @@ async fn transient_failures_back_off_then_give_up_after_limited_attempts() {
 
 #[test]
 fn sqlserver_version_banner_parsing_maps_years_to_engine_majors() {
-    use super::drivers::{sqlserver_product_major, SQLSERVER_MIN_MAJOR};
+    use crate::adapters::sqlserver::connect::{sqlserver_product_major, SQLSERVER_MIN_MAJOR};
     assert_eq!(sqlserver_product_major("Microsoft SQL Server 2022 (RTM) - 16.0.1000.6 (X64)"), Some(16));
     assert_eq!(sqlserver_product_major("Microsoft SQL Server 2019 (RTM) - 15.0.2000.5"), Some(15));
     assert_eq!(sqlserver_product_major("Microsoft SQL Server 2012 (SP4) - 11.0.7001.08"), Some(11));
@@ -1618,7 +1618,7 @@ async fn mysql_large_catalog_fast_path_fixture() {
     use crate::catalog::ObjectKind;
     use crate::connections::CatalogSession;
     use std::time::Instant;
-    use crate::connections::{drivers, model::{ConnectionDraft, TlsMode}, route::resolve_route};
+    use crate::connections::{model::{ConnectionDraft, TlsMode}, route::resolve_route};
     let mut draft = ConnectionDraft::blank(Engine::Mysql);
     draft.name = "fixture".into();
     draft.host = "127.0.0.1".into();
@@ -1629,7 +1629,7 @@ async fn mysql_large_catalog_fast_path_fixture() {
     let saved = crate::connections::model::normalize(&draft, "fixture".into()).unwrap();
     let route = resolve_route(&saved, None).unwrap();
     let started = Instant::now();
-    let opened = drivers::open_mysql(&saved, &route, "fixture").await.unwrap();
+    let opened = crate::adapters::mysql::connect::open_mysql(&saved, &route, "fixture").await.unwrap();
     eprintln!("connect: {:?}", started.elapsed());
     assert_eq!(opened.connection_id, 0, "取消不能误杀目录连接");
     let session = CatalogSession::Mysql(opened.meta_pool.clone());

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connections::error_codes;
-use crate::connections::model::{Engine, SavedConnection, TlsMode};
+use crate::connections::model::{SavedConnection, TlsMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -192,7 +192,7 @@ pub enum StageError {
 }
 
 pub fn planned_stages(config: &SavedConnection) -> Vec<StageKind> {
-    if config.engine == Engine::Sqlite {
+    if crate::adapters::adapter(config.engine).meta().file_based() {
         return vec![StageKind::OpenFile, StageKind::ReadSchema, StageKind::ForeignKeys];
     }
     let mut stages = Vec::new();

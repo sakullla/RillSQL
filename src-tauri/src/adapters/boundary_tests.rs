@@ -111,23 +111,15 @@ fn domain_of(file: &str) -> &'static str {
 const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("app/model.rs", 3, A6),
     ("app/shell/chrome.rs", 32, A6),
-    ("app/shell/conn_modal.rs", 5, A1),
-    ("app/shell/conn_page.rs", 2, A1),
     ("app/shell/model.rs", 19, A6),
     ("app/shell/nav.rs", 7, A2),
     ("app/shell/view.rs", 9, A6),
     ("app/views/admin/mod.rs", 8, A3),
     ("app/views/compare/live.rs", 31, A5),
     ("app/views/compare/mod.rs", 15, A5),
-    ("app/views/connections/mod.rs", 35, A1),
-    ("app/views/connections/url.rs", 41, A1),
     ("app/views/export/mod.rs", 3, A5),
     ("app/views/grid/session.rs", 8, A4),
-    ("app/views/mongo/live.rs", 2, A1),
-    ("app/views/mongo/mod.rs", 1, A1),
     ("app/views/query/mod.rs", 9, A4),
-    ("app/views/redis/live.rs", 2, A1),
-    ("app/views/redis/view.rs", 1, A1),
     ("app/views/structure/mod.rs", 47, A3),
     ("application/grid.rs", 14, A4),
     ("catalog/definition.rs", 9, A2),
@@ -142,12 +134,6 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("compare/model.rs", 1, A5),
     ("compare/read.rs", 60, A5),
     ("compare/structure.rs", 85, A5),
-    ("connections/drivers.rs", 6, A1),
-    ("connections/model.rs", 8, A1),
-    ("connections/route.rs", 1, A1),
-    ("connections/service.rs", 62, A1),
-    ("connections/stages.rs", 1, A1),
-    ("connections/store.rs", 1, A1),
     ("ddl/english.rs", 14, A3),
     ("ddl/exec.rs", 12, A3),
     ("ddl/introspect.rs", 186, A3),
@@ -164,9 +150,7 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("grid/store.rs", 7, A4),
     ("i18n/mod.rs", 6, A6),
     ("migrate/migrate.rs", 25, A5),
-    ("mongo/mod.rs", 1, A1),
     ("query/assist.rs", 26, A4),
-    ("query/cancel.rs", 7, A1),
     ("query/commands.rs", 3, A4),
     ("query/complete.rs", 2, A4),
     ("query/desk.rs", 25, A4),
@@ -175,7 +159,6 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("query/meta.rs", 15, A4),
     ("query/plan.rs", 12, A4),
     ("query/split.rs", 20, A4),
-    ("redis/mod.rs", 1, A1),
     ("ui/editor_proto.rs", 5, A4),
     ("ui/format_viewer.rs", 1, A6),
     ("ui/kit.rs", 27, A6),
@@ -460,6 +443,12 @@ fn production_code_respects_the_adapter_boundary() {
     for (file, count, reason) in ALLOWLIST {
         assert!(*count > 0 && !reason.is_empty(), "{file}");
     }
+    // 已完成迁移的领域不得再出现在白名单里。
+    let done: &[&str] = &[A1];
+    assert!(
+        ALLOWLIST.iter().all(|(_, _, reason)| !done.contains(reason)),
+        "{done:?} 已迁移完毕，白名单不应再有它们的条目"
+    );
 }
 
 /// 自测：在现存源码上人为加入一处新违规，扫描必须失败；测试代码、注释与 adapters/ 不受约束。

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use crate::connections::model::{Engine, SavedConnection, TlsMode};
+use crate::connections::model::{SavedConnection, TlsMode};
 
 /// 传输地址和 TLS 身份分开。回环地址只表示转发器接入点。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum Retry {
 }
 
 pub fn resolve_route(config: &SavedConnection, forwarder_port: Option<u16>) -> Result<Route, String> {
-    if config.engine == Engine::Sqlite {
+    if crate::adapters::adapter(config.engine).meta().file_based() {
         if config.tls.is_some() || config.ssh.is_some() {
             return Err("SQLite 没有 TLS 或 SSH".to_owned());
         }

@@ -5,10 +5,11 @@ mod url;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::adapters::{adapter, host_is_uri};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard, TaskOutcome};
 use crate::connections::model::{
-    CaMode, ConnectionDraft, Engine, FieldError, Secret, SecretInput, SshAuthKind, TlsMode, TlsSettings, SshSettings,
+    CaMode, ConnectionDraft, Engine, FieldError, Secret, SecretInput, SshAuthKind, TlsMode,
 };
 use crate::connections::{ConnectionRecord, OpenOutcome, SaveOutcome};
 use crate::connections::stages::{StageKind, StageStatus, TestReport, TestStatus};
@@ -187,19 +188,21 @@ impl ConnectionPage {
         if draft.engine == engine {
             return;
         }
-        if draft.engine == Engine::Sqlite {
+        let was_file = file_based(draft.engine);
+        let to_file = file_based(engine);
+        if was_file {
             if !draft.file_path.trim().is_empty() {
                 self.editor_file_stash = Some(draft.file_path.clone());
             }
         } else {
             self.editor_network_stash = Some(draft.clone());
         }
-        let mut next = if draft.engine == Engine::Sqlite && engine != Engine::Sqlite {
+        let mut next = if was_file && !to_file {
             if let Some(mut stashed) = self.editor_network_stash.clone() {
                 stashed.id = draft.id.clone();
                 stashed.name = draft.name.clone();
-                let sqlite_blank = blank_draft(Engine::Sqlite);
-                if draft.env != sqlite_blank.env {
+                let file_blank = blank_draft(draft.engine);
+                if draft.env != file_blank.env {
                     stashed.env = draft.env.clone();
                 }
                 switch_engine(&stashed, engine)
@@ -209,7 +212,7 @@ impl ConnectionPage {
         } else {
             switch_engine(&draft, engine)
         };
-        if engine == Engine::Sqlite && next.file_path.is_empty() {
+        if to_file && next.file_path.is_empty() {
             if let Some(file_path) = &self.editor_file_stash {
                 next.file_path = file_path.clone();
             }
@@ -245,8 +248,7 @@ impl ConnectionPage {
         if let Some(mode) = parsed.tls_mode {
             draft.tls_mode = mode;
         }
-        if (parsed.engine == Engine::Sqlite || parsed.engine == Engine::Redis || parsed.engine == Engine::Mongodb)
-            && draft.env == "dev" {
+        if adapter(parsed.engine).meta().defaults_to_local() && draft.env == "dev" {
                 draft.env = "local".into();
             }
         self.secrets.password = parsed.password;
@@ -510,16 +512,18 @@ fn failure_reason(report: &TestReport) -> String {
     }
 }
 
+/// 新建草稿。默认端口、默认库、是否按本地开发处理都来自引擎适配器的 EngineMeta。
 pub fn blank_draft(engine: Engine) -> ConnectionDraft {
-    let local = matches!(engine, Engine::Sqlite | Engine::Redis | Engine::Mongodb);
+    let meta = adapter(engine).meta();
+    let local = meta.defaults_to_local();
     ConnectionDraft {
         id: None,
         name: String::new(),
         engine,
         env: if local { "local".into() } else { "dev".into() },
         host: String::new(),
-        port: default_port(engine).to_owned(),
-        database: if engine == Engine::Redis { "0".into() } else { String::new() },
+        port: default_port(engine),
+        database: meta.default_database().into(),
         username: String::new(),
         file_path: String::new(),
         replica_set: String::new(),
@@ -534,8 +538,13 @@ pub fn blank_draft(engine: Engine) -> ConnectionDraft {
         ssh_user: String::new(),
         ssh_auth: SshAuthKind::Key,
         ssh_key: String::new(),
-        save_password: engine != Engine::Sqlite,
+        save_password: !meta.file_based(),
     }
+}
+
+/// 文件型引擎（本地文件即数据库，没有主机/端口/TLS/SSH）。
+pub fn file_based(engine: Engine) -> bool {
+    adapter(engine).meta().file_based()
 }
 
 /// 表单里换数据库类型时的新草稿。
@@ -555,11 +564,12 @@ pub fn switch_engine(current: &ConnectionDraft, engine: Engine) -> ConnectionDra
     if current.env != before.env {
         next.env = current.env.clone();
     }
-    if current.engine == Engine::Sqlite || engine == Engine::Sqlite {
+    if file_based(current.engine) || file_based(engine) {
         return next;
     }
-    // 整串 mongodb:// URI 只有 MongoDB 认；换到别的引擎时它不是一个主机名。
-    if engine == Engine::Mongodb || !Engine::host_is_mongo_uri(&current.host) {
+    // 整串连接串（如 mongodb://）只有认它的引擎才当主机；换到别的引擎时它不是一个主机名。
+    let uri_host = crate::adapters::registry::ENGINES.into_iter().any(|other| host_is_uri(other, &current.host));
+    if !uri_host || host_is_uri(engine, &current.host) {
         next.host = current.host.clone();
     }
     let port = current.port.trim();
@@ -567,8 +577,8 @@ pub fn switch_engine(current: &ConnectionDraft, engine: Engine) -> ConnectionDra
         next.port = current.port.clone();
     }
     next.username = current.username.clone();
-    // Redis 的“库”是 0 起的索引，不是库名：两边不互相沿用。
-    if current.engine != Engine::Redis && engine != Engine::Redis {
+    // 库索引（Redis 的“库”从 0 起）不是库名：两边不互相沿用。
+    if !adapter(current.engine).meta().database_is_index() && !adapter(engine).meta().database_is_index() {
         next.database = current.database.clone();
     }
     if current.tls_mode != before.tls_mode {
@@ -629,7 +639,8 @@ pub fn validate_draft(draft: &ConnectionDraft) -> Vec<FieldIssue> {
     let push = |issues: &mut Vec<FieldIssue>, field: &str, key: &'static str| {
         issues.push(FieldIssue::new(field, key));
     };
-    if draft.engine == Engine::Sqlite {
+    let meta = adapter(draft.engine).meta();
+    if meta.file_based() {
         if draft.file_path.trim().is_empty() {
             push(&mut issues, "file_path", "connections.validate.chooseFile");
         }
@@ -638,20 +649,20 @@ pub fn validate_draft(draft: &ConnectionDraft) -> Vec<FieldIssue> {
     if draft.host.trim().is_empty() {
         push(&mut issues, "host", "connections.validate.hostRequired");
     }
-    let mongo_uri = draft.engine == Engine::Mongodb && Engine::host_is_mongo_uri(&draft.host);
-    if !mongo_uri {
+    let uri_host = meta.host_is_uri(&draft.host);
+    if !uri_host {
         let port = draft.port.trim().parse::<u16>().ok();
         if port.is_none_or(|port| port == 0) {
             push(&mut issues, "port", "connections.validate.portRange");
         }
     }
-    if draft.username.trim().is_empty() && !matches!(draft.engine, Engine::Redis | Engine::Mongodb) {
+    if draft.username.trim().is_empty() && !meta.username_optional() {
         push(&mut issues, "username", "connections.validate.userRequired");
     }
-    if draft.engine == Engine::Redis && !draft.database.trim().is_empty() && !draft.database.trim().chars().all(|ch| ch.is_ascii_digit()) {
+    if meta.database_is_index() && !draft.database.trim().is_empty() && !draft.database.trim().chars().all(|ch| ch.is_ascii_digit()) {
         push(&mut issues, "database", "connections.validate.redisDbIndex");
     }
-    if mongo_uri && draft.ssh_on {
+    if uri_host && draft.ssh_on {
         push(&mut issues, "ssh_host", "connections.validate.mongoUriSsh");
     }
     if draft.ssh_on && draft.ssh_host.trim().is_empty() {
@@ -670,7 +681,7 @@ pub fn validate_draft(draft: &ConnectionDraft) -> Vec<FieldIssue> {
 }
 
 pub fn transport_key(draft: &ConnectionDraft) -> &'static str {
-    if draft.engine == Engine::Sqlite {
+    if file_based(draft.engine) {
         return "connections.page.localFile";
     }
     match draft.tls_mode {
@@ -818,10 +829,11 @@ fn none_if_empty(value: &str) -> Option<String> {
 }
 
 pub fn engines() -> [Engine; 7] {
-    [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlserver, Engine::Sqlite, Engine::Redis, Engine::Mongodb]
+    crate::adapters::registry::CONNECTION_FORM_ORDER
 }
 
 /// 给领域校验用的最小合法草稿。TLS/SSH 材料留在草稿里，密码不进这个结构。
+#[cfg(test)]
 pub fn sample_draft(engine: Engine) -> ConnectionDraft {
     let mut draft = blank_draft(engine);
     draft.name = format!("sample-{}", engine.as_str());
@@ -844,6 +856,7 @@ pub fn sample_draft(engine: Engine) -> ConnectionDraft {
     draft
 }
 
+#[cfg(test)]
 pub fn with_tls_ssh(engine: Engine) -> ConnectionDraft {
     let mut draft = sample_draft(engine);
     if engine == Engine::Sqlite {
@@ -860,7 +873,7 @@ pub fn with_tls_ssh(engine: Engine) -> ConnectionDraft {
     draft.ssh_user = "jump".into();
     draft.ssh_auth = SshAuthKind::Key;
     draft.ssh_key = "id_ed25519".into();
-    let _ = TlsSettings {
+    let _ = crate::connections::model::TlsSettings {
         mode: draft.tls_mode,
         server_name: draft.host.clone(),
         ca_mode: draft.ca_mode,
@@ -868,7 +881,7 @@ pub fn with_tls_ssh(engine: Engine) -> ConnectionDraft {
         client_cert: Some(draft.client_cert.clone()),
         client_key: Some(draft.client_key.clone()),
     };
-    let _ = SshSettings {
+    let _ = crate::connections::model::SshSettings {
         host: draft.ssh_host.clone(),
         port: 22,
         username: draft.ssh_user.clone(),

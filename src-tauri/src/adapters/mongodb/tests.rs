@@ -1,10 +1,10 @@
 //! Mongo 模块测试：ClientOptions 装配（URI/host+port、凭据/认证库/副本集/TLS 三档）、
 //! JSON 过滤错误定位、CRUD 守卫（确认强制/校验前置）与计数策略。
 
-use crate::connections::drivers::mongo_client_options;
+use super::connect::mongo_client_options;
 use crate::connections::model::{CaMode, ConnectionDraft, Engine, SavedConnection, TlsMode};
 use crate::connections::route::{self, Route};
-use crate::mongo::docs::{self, CountMode};
+use super::docs::{self, CountMode};
 
 fn route_for(host: &str, port: u16) -> Route {
     Route {
@@ -274,9 +274,9 @@ fn mongo_engine_is_document_only() {
     assert_eq!(serde_json::to_string(&Engine::Mongodb).unwrap(), "\"mongodb\"");
     assert_eq!(Engine::parse("mongodb").unwrap(), Engine::Mongodb);
     assert!(!Engine::Mongodb.is_relational(), "MongoDB 没有 SQL 面/结构编辑/对比/导出");
-    assert!(Engine::host_is_mongo_uri("MongoDB://host"));
-    assert!(Engine::host_is_mongo_uri("mongodb+srv://cluster"));
-    assert!(!Engine::host_is_mongo_uri("mongo.example.test"));
+    assert!(crate::adapters::host_is_uri(Engine::Mongodb, "MongoDB://host"));
+    assert!(crate::adapters::host_is_uri(Engine::Mongodb, "mongodb+srv://cluster"));
+    assert!(!crate::adapters::host_is_uri(Engine::Mongodb, "mongo.example.test"));
 }
 
 #[test]

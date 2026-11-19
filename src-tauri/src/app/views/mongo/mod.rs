@@ -18,7 +18,7 @@ use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, View
 use crate::application::mongo::{DeleteOutcome, InsertOutcome, ReplaceOutcome};
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
-use crate::mongo::docs::{CollectionSummary, DatabaseSummary, DocumentsPage, MongoDoc};
+use crate::adapters::mongodb::docs::{CollectionSummary, DatabaseSummary, DocumentsPage, MongoDoc};
 
 const PAGE_LIMIT: u64 = 20;
 /// 文档表每列的最小宽度：窄窗口靠横向滚动，不把列压到只剩省略号。
@@ -1118,7 +1118,7 @@ impl Render for MongoPane {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(p.line)
-                    .child(kit::engine_badge("mongodb", 20.))
+                    .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Mongo), 20.))
                     .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
                     .child(mongo_icon("mongo-refresh-db", IconName::RefreshCw, &self.text("mongo.tab.databases"), &entity)),
             )
@@ -2427,4 +2427,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live;
+mod live_tests;

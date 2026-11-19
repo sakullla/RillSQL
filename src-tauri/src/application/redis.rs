@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::connections::{Service, SessionHealth};
 use serde::Serialize;
 
-use crate::redis::exec::{self, RespReply};
-use crate::redis::keys::{self, RedisKeyDetail, RedisMutation, ScanPage};
+use crate::adapters::redis::exec::{self, RespReply};
+use crate::adapters::redis::keys::{self, RedisKeyDetail, RedisMutation, ScanPage};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

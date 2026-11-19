@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 
 use crate::app::views::connections::LinkStatus;
-use crate::connections::model::{Engine, TlsMode};
+use crate::connections::model::TlsMode;
 use crate::connections::ConnectionRecord;
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
 
@@ -603,7 +603,7 @@ impl Workbench {
                 .into_any_element()
         };
 
-        let is_mongo = row.saved.engine == Engine::Mongodb;
+        let is_mongo = crate::adapters::adapter(row.saved.engine).meta().workbench() == crate::adapters::Workbench::Mongo;
         let secondary_btn = if is_mongo {
             let browse_id = query_id.clone();
             kit::tool_button(
@@ -924,7 +924,7 @@ impl Workbench {
         } else {
             kit::primary_button("conn-detail-open", Some(IconName::Plug), self.t("connections.page.connect"), cx.listener(move |this, _: &ClickEvent, _, cx| this.perform(&format!("connection:{open_id}"), cx)))
         };
-        let secondary_action = if saved.engine == Engine::Mongodb {
+        let secondary_action = if crate::adapters::adapter(saved.engine).meta().workbench() == crate::adapters::Workbench::Mongo {
             let mongo_id = id.clone();
             kit::secondary_button(
                 "conn-detail-query",

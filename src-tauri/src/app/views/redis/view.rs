@@ -436,7 +436,7 @@ impl RedisPane {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(kit::engine_badge("redis", 22.))
+            .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Redis), 22.))
             .child(
                 div()
                     .flex_1()

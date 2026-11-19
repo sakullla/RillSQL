@@ -1,8 +1,9 @@
 //! SQL Server 适配器。
 
+pub(crate) mod connect;
 mod syntax;
 
-use crate::adapters::{Capabilities, EngineAdapter, EngineMeta, SqlSyntax, Workbench};
+use crate::adapters::{Capabilities, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqlserverAdapter;
@@ -31,6 +32,15 @@ impl EngineMeta for SqlserverAdapter {
     fn workbench(&self) -> Workbench {
         Workbench::Relational
     }
+
+    fn url_schemes(&self) -> &'static [UrlScheme] {
+        const SCHEMES: &[UrlScheme] = &[UrlScheme::plain("sqlserver"), UrlScheme::plain("mssql")];
+        SCHEMES
+    }
+
+    fn url_style(&self) -> UrlStyle {
+        UrlStyle::Jdbc
+    }
 }
 
 impl EngineAdapter for SqlserverAdapter {
@@ -39,10 +49,14 @@ impl EngineAdapter for SqlserverAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { relational: true, sql_syntax_group: true, ..Capabilities::default() }
+        Capabilities { relational: true, sql_syntax_group: true, connector_group: true, ..Capabilities::default() }
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::SqlserverSyntax)
+    }
+
+    fn connector(&self) -> Option<&dyn Connector> {
+        Some(&connect::SqlserverConnector)
     }
 }
