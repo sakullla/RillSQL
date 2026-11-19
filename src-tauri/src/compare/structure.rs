@@ -2180,7 +2180,7 @@ fn set_default_sql(engine: Engine, side: &Side, table: &str, column: &str, expre
     let table = qualify(engine, side, table);
     match engine {
         Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {} SET DEFAULT {expression}", quote(engine, column)),
-        Engine::Sqlserver => tsql_add_default(engine, &table, &crate::ddl::sql::sqlserver_bare_table_name(&table), column, expression),
+        Engine::Sqlserver => tsql_add_default(engine, &table, &crate::adapters::sqlserver::ddl::sqlserver_bare_table_name(&table), column, expression),
         _ => format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {expression}", quote(engine, column)),
     }
 }
@@ -2671,11 +2671,11 @@ fn tsql_default_change(engine: Engine, table: &str, table_name: &str, wanted: &C
 }
 
 fn tsql_drop_default(_engine: Engine, table: &str, column: &str, constraint: &str) -> String {
-    crate::ddl::sql::sqlserver_drop_default_sql(table, column, constraint)
+    crate::adapters::sqlserver::ddl::sqlserver_drop_default_sql(table, column, constraint)
 }
 
 fn tsql_add_default(_engine: Engine, table: &str, table_name: &str, column: &str, expression: &str) -> String {
-    crate::ddl::sql::sqlserver_add_default_sql(table, table_name, column, expression)
+    crate::adapters::sqlserver::ddl::sqlserver_add_default_sql(table, table_name, column, expression)
 }
 
 fn postgres_alter(side: &Side, baseline_side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {

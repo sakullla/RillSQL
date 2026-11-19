@@ -13,6 +13,11 @@ impl SqlSyntax for SqlserverSyntax {
     fn reserved_words(&self) -> &'static [&'static str] {
         RESERVED
     }
+
+    /// T-SQL 没有 LIMIT，取前几行用 TOP。
+    fn select_first_rows(&self, table: &str, limit: usize) -> String {
+        format!("SELECT TOP {limit} * FROM {table};")
+    }
 }
 
 /// SQL Server 保留关键字。按字母序。

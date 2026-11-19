@@ -518,6 +518,20 @@ fn ddl_commands_stay_registered_beside_existing_commands() {
     for name in ["sql.rs", "model.rs", "plan.rs", "introspect.rs", "exec.rs", "commands.rs", "mod.rs"] {
         sources.push_str(&fs::read_to_string(root.join("src/ddl").join(name)).unwrap());
     }
+    // A3 起各引擎的结构计划、内省与执行在适配器里。
+    for name in [
+        "ddl.rs",
+        "mysql/ddl.rs",
+        "mysql/ddl_read.rs",
+        "postgres/ddl.rs",
+        "postgres/ddl_read.rs",
+        "sqlite/ddl.rs",
+        "sqlite/ddl_read.rs",
+        "sqlserver/ddl.rs",
+        "sqlserver/ddl_read.rs",
+    ] {
+        sources.push_str(&fs::read_to_string(root.join("src/adapters").join(name)).unwrap());
+    }
     for forbidden in ["open_sqlite", "open_mysql", "open_postgres", "reset_connection", "danger_accept_invalid", "skip_domain"] {
         assert!(!sources.contains(forbidden), "{forbidden}");
     }
@@ -1626,7 +1640,7 @@ fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
 
 #[test]
 fn sqlserver_index_sql_keeps_include_columns_out_of_the_key_and_writes_clustering_and_filter() {
-    use super::introspect::{sqlserver_index_sql, SqlserverIndexExtra};
+    use crate::adapters::sqlserver::ddl_read::{sqlserver_index_sql, SqlserverIndexExtra};
     let mut covering = index("IX_orders_customer", "customer_id", false, false, None);
     covering.columns.push(IndexColumn { name: "created_at".to_owned(), descending: true });
     let extra = SqlserverIndexExtra {

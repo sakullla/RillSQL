@@ -9,6 +9,7 @@
 //! 适配器在 [`Capabilities`] 里如实声明当前提供了哪些组，注册表完整性测试校验两者一致。
 
 pub mod catalog;
+pub mod ddl;
 pub mod registry;
 pub mod session;
 
@@ -28,6 +29,7 @@ mod tests;
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
 
 pub use catalog::{catalog_of, CatalogDialect};
+pub use ddl::{DdlDialect, TypeRules};
 pub use registry::adapter;
 pub use session::Connector;
 
@@ -220,6 +222,11 @@ pub trait SqlSyntax: Sync {
         default_sample_select(table, limit)
     }
 
+    /// 结构页“查看数据”复制的单行取样语句：取前 `limit` 行。`table` 已按方言引用。
+    fn select_first_rows(&self, table: &str, limit: usize) -> String {
+        format!("SELECT * FROM {table} LIMIT {limit};")
+    }
+
     /// 该方言的保留字（大小写不敏感）。
     fn is_reserved(&self, name: &str) -> bool {
         let upper = name.to_ascii_uppercase();
@@ -268,12 +275,6 @@ pub trait SqlSyntax: Sync {
     }
 }
 
-/// 类型规则：类型候选与校验、默认值候选与校验、默认值字面量、自增表达、FK 动作、常用字段类型映射。（A3 填充）
-pub trait TypeRules: Sync {}
-
-/// DDL 方言：create/alter/drop/rename/truncate/索引/外键/视图/重建、注释、序列与枚举生成及动作门控。（A3 填充）
-pub trait DdlDialect: Sync {}
-
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A1/A4 填充）
 pub trait ErrorRules: Sync {}
 
@@ -284,12 +285,10 @@ pub trait EngineAdapter: Sync {
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))] // A3 填充并接入
-    fn types(&self) -> Option<&dyn TypeRules> {
+    fn types(&self) -> Option<&'static dyn TypeRules> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))] // A3 填充并接入
-    fn ddl(&self) -> Option<&dyn DdlDialect> {
+    fn ddl(&self) -> Option<&'static dyn DdlDialect> {
         None
     }
     fn catalog(&self) -> Option<&dyn CatalogDialect> {
@@ -348,6 +347,29 @@ pub fn sample_select(engine: Engine, table: &str, limit: usize) -> String {
     match adapter(engine).syntax() {
         Some(syntax) => syntax.sample_select(table, limit),
         None => default_sample_select(table, limit),
+    }
+}
+
+/// 各方言的标识符引号（开、闭），去重。SQL 文本的通用词法（切语句、读视图头）据此认出被引起来的名字。
+pub fn identifier_quotes() -> Vec<(char, char)> {
+    let mut quotes = Vec::new();
+    for syntax in registry::ENGINES.into_iter().filter_map(|engine| adapter(engine).syntax()) {
+        let empty = syntax.quote_always("");
+        let mut chars = empty.chars();
+        if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
+            if !quotes.contains(&(open, close)) {
+                quotes.push((open, close));
+            }
+        }
+    }
+    quotes
+}
+
+/// 门面：结构页“查看数据”的取样语句。没有 SQL 语法组的引擎按通用写法。
+pub fn first_rows_select(engine: Engine, table: &str, limit: usize) -> String {
+    match adapter(engine).syntax() {
+        Some(syntax) => syntax.select_first_rows(table, limit),
+        None => format!("SELECT * FROM {table} LIMIT {limit};"),
     }
 }
 

@@ -12,6 +12,7 @@ use crate::connections::model::SavedConnection;
 use crate::connections::route::Route;
 use crate::connections::SessionHealth;
 use crate::connections::stages::{self, StageError};
+use crate::ddl::model::{Step, StepReceipt};
 
 /// tiberius 的连接句柄。futures-io 与 tokio 之间经 compat 桥接（tiberius 只发 futures 生态的流）。
 pub type TdsClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -52,6 +53,20 @@ impl CatalogSession {
             Self::Mysql(pool) => super::mysql::catalog_read::text_rows(pool, sql).await,
             Self::Postgres(client) => super::postgres::catalog_read::text_rows(client, sql).await,
             Self::Sqlserver(client) => super::sqlserver::catalog_read::text_rows(client, sql).await,
+        }
+    }
+
+    /// 逐条执行结构变更，失败即停。由会话所属引擎的适配器执行（重建事务回滚、外键开关恢复各按方言）。
+    pub async fn run_ddl_steps(&self, steps: &[Step], restore_foreign_keys: Option<bool>) -> Result<Vec<StepReceipt>, String> {
+        match self {
+            // 专项引擎没有结构编辑：误入时拒绝执行而不是生成无意义语句。
+            Self::Redis(_) => Err("Redis 没有结构编辑。".to_owned()),
+            Self::Mongo(_) => Err("MongoDB 没有结构编辑。".to_owned()),
+            Self::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
+            Self::Sqlite { pool, .. } => super::sqlite::ddl_read::run_steps(pool, steps, restore_foreign_keys).await,
+            Self::Mysql(pool) => super::mysql::ddl_read::run_steps(pool, steps).await,
+            Self::Postgres(client) => super::postgres::ddl_read::run_steps(client, steps).await,
+            Self::Sqlserver(client) => super::sqlserver::ddl_read::run_steps(client, steps).await,
         }
     }
 }

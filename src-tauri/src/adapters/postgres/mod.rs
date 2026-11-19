@@ -4,10 +4,13 @@ pub(crate) mod catalog;
 pub(crate) mod catalog_read;
 pub(crate) mod connect;
 pub(crate) mod diagram;
+mod ddl;
+pub(in crate::adapters) mod ddl_read;
 pub(crate) mod extras;
 mod syntax;
+mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct PostgresAdapter;
@@ -55,6 +58,8 @@ impl EngineAdapter for PostgresAdapter {
             connector_group: true,
             database_scoped_session: true,
             catalog_group: true,
+            type_rules_group: true,
+            ddl_group: true,
             shows_databases: true,
             shows_schemas: true,
             outline_navigation: true,
@@ -64,6 +69,14 @@ impl EngineAdapter for PostgresAdapter {
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::PostgresSyntax)
+    }
+
+    fn types(&self) -> Option<&'static dyn TypeRules> {
+        Some(&types::PostgresTypes)
+    }
+
+    fn ddl(&self) -> Option<&'static dyn DdlDialect> {
+        Some(&ddl::PostgresDdl)
     }
 
     fn catalog(&self) -> Option<&dyn CatalogDialect> {

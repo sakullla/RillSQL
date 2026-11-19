@@ -4,9 +4,12 @@ pub(crate) mod catalog;
 pub(crate) mod catalog_read;
 pub(crate) mod connect;
 pub(crate) mod diagram;
+pub(crate) mod ddl;
+pub(crate) mod ddl_read;
 mod syntax;
+mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqlserverAdapter;
@@ -57,6 +60,8 @@ impl EngineAdapter for SqlserverAdapter {
             sql_syntax_group: true,
             connector_group: true,
             catalog_group: true,
+            type_rules_group: true,
+            ddl_group: true,
             shows_databases: true,
             shows_schemas: true,
             outline_navigation: true,
@@ -66,6 +71,14 @@ impl EngineAdapter for SqlserverAdapter {
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::SqlserverSyntax)
+    }
+
+    fn types(&self) -> Option<&'static dyn TypeRules> {
+        Some(&types::SqlserverTypes)
+    }
+
+    fn ddl(&self) -> Option<&'static dyn DdlDialect> {
+        Some(&ddl::SqlserverDdl)
     }
 
     fn catalog(&self) -> Option<&dyn CatalogDialect> {

@@ -18,34 +18,12 @@ use crate::ddl::english::localize;
 use crate::ddl::{preview_plan, Action, Plan, Request, Snapshot};
 use crate::i18n::{self, Locale};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdminSections {
-    pub pragma: bool,
-    pub attached: bool,
-    pub maintenance: bool,
-    pub extensions: bool,
-    pub sequences: bool,
-    pub events: bool,
-    pub partitions: bool,
-    pub enums: bool,
-    pub domains: bool,
-}
+/// 管理页分区门控由适配器的 DDL 方言声明。
+pub use crate::adapters::ddl::AdminSections;
 
+/// 引擎字符串解析不出或没有结构编辑时没有管理分区。
 pub fn sections_for(engine: &str) -> AdminSections {
-    let sqlite = engine == "sqlite";
-    let postgres = engine == "postgres";
-    let mysql = engine == "mysql" || engine == "mariadb";
-    AdminSections {
-        pragma: sqlite,
-        attached: sqlite,
-        maintenance: sqlite,
-        extensions: postgres,
-        sequences: postgres,
-        events: mysql,
-        partitions: mysql,
-        enums: postgres,
-        domains: postgres,
-    }
+    crate::adapters::ddl::ddl_named(engine).map(|dialect| dialect.admin_sections()).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -660,7 +638,7 @@ impl AdminSections {
     fn allows(self, operation: &AdminOp) -> bool {
         match operation {
             AdminOp::Vacuum | AdminOp::Reindex { .. } => self.maintenance,
-            AdminOp::SetForeignKeys { .. } | AdminOp::SetPragma { .. } => self.pragma,
+            AdminOp::SetForeignKeys { .. } | AdminOp::SetPragma { .. } => self.settings,
             AdminOp::Attach { .. } => self.attached,
             AdminOp::SetEvent { .. } => self.events,
             AdminOp::AlterSequence { .. } => self.sequences,
@@ -812,7 +790,7 @@ impl Render for AdminPane {
             let target = self.admin_field("reindex", &i18n::text(locale, "ui.conn.optional"), window, cx);
             cards = cards.child(op_card("admin-reindex", "reindex", IconName::ListRestart, t("admin.action.reindex"), vec![target], Vec::new(), None, &entity, locale, &p));
         }
-        if sections.pragma {
+        if sections.settings {
             let mut pragma_bits = Vec::new();
             if !inventory.journal_mode.is_empty() {
                 pragma_bits.push(format!("journal_mode {}", inventory.journal_mode));
@@ -980,7 +958,7 @@ impl Render for AdminPane {
             }
             cards = cards.child(card);
         }
-        if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached && !sections.enums && !sections.domains {
+        if sections == AdminSections::default() {
             // 没有数据库级操作也是一句"下一步"：换成能出现的引擎，而不是一块空白。
             cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.noneHint"), &p));
         }
@@ -1178,7 +1156,7 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
         inventory.probed = true;
         return inventory;
     };
-    if matches!(session, crate::connections::CatalogSession::Scripted) {
+    if session.is_scripted() {
         let mut inventory = AdminInventory::offline(target);
         inventory.probed = true;
         return inventory;
@@ -1190,8 +1168,9 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
     };
     let extras = crate::catalog::read_extras(&session, engine, &target.database, &target.schema).await;
     let mut inventory = inventory_from_extras(target, &extras);
-    if engine == crate::connections::model::Engine::Postgres {
-        load_postgres_types(&session, engine, target, &mut inventory).await;
+    let sections = sections_for(&target.engine);
+    if sections.enums || sections.domains {
+        load_types(&session, engine, target, &mut inventory).await;
     }
     inventory.connected = true;
     inventory.probed = true;
@@ -1252,7 +1231,8 @@ fn push_fault(faults: &mut Vec<SectionFault>, title_key: &'static str, error: &O
     }
 }
 
-async fn load_postgres_types(session: &crate::connections::CatalogSession, engine: crate::connections::model::Engine, target: &GridTarget, inventory: &mut AdminInventory) {
+/// 枚举与域清单（有这两类对象的引擎）。
+async fn load_types(session: &crate::connections::CatalogSession, engine: crate::connections::model::Engine, target: &GridTarget, inventory: &mut AdminInventory) {
     let enums = crate::catalog::read::read_object_kind_page(session, engine, &target.database, &target.schema, crate::catalog::model::ObjectKind::Enum, 0, 200).await;
     if let Some(message) = enums.error {
         inventory.faults.push(SectionFault { title_key: "catalog.kind.enum", message });
@@ -1325,7 +1305,7 @@ mod tests {
     #[test]
     fn remote_admin_fixtures_stay_unconnected_and_sqlserver_has_no_section() {
         let sqlserver = sections_for("sqlserver");
-        assert!(!sqlserver.pragma && !sqlserver.maintenance && !sqlserver.sequences && !sqlserver.events && !sqlserver.extensions && !sqlserver.partitions && !sqlserver.attached);
+        assert!(!sqlserver.settings && !sqlserver.maintenance && !sqlserver.sequences && !sqlserver.events && !sqlserver.extensions && !sqlserver.partitions && !sqlserver.attached);
 
         let mut postgres = AdminSession::new(target("postgres"));
         postgres.operation = AdminOp::AlterSequence {
@@ -1499,7 +1479,7 @@ mod tests {
             engine: "sqlite".into(),
             environment: "dev".into(),
         });
-        assert!(session.sections().pragma && session.sections().maintenance);
+        assert!(session.sections().settings && session.sections().maintenance);
         session.operation = AdminOp::SetPragma { pragma: "user_version".into(), value: "7".into() };
         let request = session.request().unwrap();
         let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();

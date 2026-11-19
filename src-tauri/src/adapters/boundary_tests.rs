@@ -113,23 +113,15 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("app/shell/chrome.rs", 32, A6),
     ("app/shell/model.rs", 19, A6),
     ("app/shell/view.rs", 8, A6),
-    ("app/views/admin/mod.rs", 8, A3),
     ("app/views/compare/live.rs", 31, A5),
     ("app/views/compare/mod.rs", 15, A5),
     ("app/views/export/mod.rs", 3, A5),
     ("app/views/grid/session.rs", 8, A4),
     ("app/views/query/mod.rs", 9, A4),
-    ("app/views/structure/mod.rs", 47, A3),
     ("application/grid.rs", 14, A4),
     ("compare/model.rs", 1, A5),
     ("compare/read.rs", 60, A5),
     ("compare/structure.rs", 85, A5),
-    ("ddl/english.rs", 14, A3),
-    ("ddl/exec.rs", 12, A3),
-    ("ddl/introspect.rs", 186, A3),
-    ("ddl/model.rs", 14, A3),
-    ("ddl/plan.rs", 152, A3),
-    ("ddl/sql.rs", 27, A3),
     ("dump/dump.rs", 66, A5),
     ("dump/order.rs", 2, A5),
     ("export/write.rs", 1, A5),
@@ -432,7 +424,7 @@ fn production_code_respects_the_adapter_boundary() {
         assert!(*count > 0 && !reason.is_empty(), "{file}");
     }
     // 已完成迁移的领域不得再出现在白名单里。
-    let done: &[&str] = &[A1, A2];
+    let done: &[&str] = &[A1, A2, A3];
     assert!(
         ALLOWLIST.iter().all(|(_, _, reason)| !done.contains(reason)),
         "{done:?} 已迁移完毕，白名单不应再有它们的条目"

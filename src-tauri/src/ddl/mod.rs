@@ -2,10 +2,10 @@
 
 pub mod commands;
 pub(crate) mod english;
-mod exec;
-mod introspect;
-mod model;
-mod plan;
+pub(crate) mod exec;
+pub(crate) mod introspect;
+pub(crate) mod model;
+pub(crate) mod plan;
 pub(crate) mod sql;
 
 pub(crate) use exec::{preview, Receipt};

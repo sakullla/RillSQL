@@ -350,3 +350,104 @@ async fn catalog_reads_refuse_a_session_of_another_engine() {
     assert!(sqlite.error.is_none(), "{:?}", sqlite.error);
     assert_eq!(sqlite.databases.first().map(|db| db.name.as_str()), Some("main"));
 }
+
+// ---- A3：类型规则与 DDL 方言 ----
+
+/// 关系型引擎都有类型规则与 DDL 方言，专项引擎都没有（结构编辑经能力组门控）。
+#[test]
+fn structure_editing_follows_the_relational_capability() {
+    for engine in ENGINES {
+        let adapter = adapter(engine);
+        let relational = adapter.capabilities().relational;
+        assert_eq!(adapter.types().is_some(), relational, "{engine:?} 类型规则");
+        assert_eq!(adapter.ddl().is_some(), relational, "{engine:?} DDL 方言");
+    }
+    assert_eq!(super::ddl::no_structure_editing(Engine::Redis), "Redis 没有结构编辑。");
+    assert_eq!(super::ddl::no_structure_editing(Engine::Mongodb), "MongoDB 没有结构编辑。");
+}
+
+/// 每个引擎专属的库级动作只由所属方言给计划；其它引擎请求时由所属方言给出拒绝原因，不生成语句。
+/// 管理页分区与方言实际提供的动作一致。
+#[test]
+fn object_actions_have_one_owning_dialect_and_admin_sections_agree() {
+    use crate::ddl::model::{Action, Snapshot};
+    let actions = [
+        ("settings", Action::SetForeignKeys { enabled: true }),
+        ("settings", Action::SetPragma { pragma: "user_version".into(), value: "1".into() }),
+        ("attached", Action::AttachDatabase { path: "/tmp/x.sqlite".into(), name: "x".into() }),
+        ("maintenance", Action::Vacuum),
+        ("maintenance", Action::Reindex { target: None }),
+        ("sequences", Action::AlterSequence { sequence: "s".into(), start: None, increment: Some(2), min_value: None, max_value: None, cycle: None }),
+        ("enums", Action::AddEnumValue { enum_name: "e".into(), value: "v".into(), before: None }),
+        ("domains", Action::AlterDomain { domain: "d".into(), default_sql: None, not_null: Some(true) }),
+        ("events", Action::SetEventEnabled { event: "ev".into(), enabled: true }),
+    ];
+    for (section, action) in &actions {
+        let mut owners = 0;
+        for engine in SQL_ENGINES {
+            let dialect = super::ddl::ddl_of(engine).unwrap();
+            let snapshot = Snapshot::bare(engine, "app", "public", "t");
+            let owned = dialect.plan_object_action(&snapshot, action).is_some();
+            assert_eq!(owned, dialect.refuse_object_action(&snapshot, action).is_some(), "{engine:?} {action:?}");
+            let sections = dialect.admin_sections();
+            let shown = match *section {
+                "settings" => sections.settings,
+                "attached" => sections.attached,
+                "maintenance" => sections.maintenance,
+                "sequences" => sections.sequences,
+                "enums" => sections.enums,
+                "domains" => sections.domains,
+                _ => sections.events,
+            };
+            assert_eq!(owned, shown, "{engine:?} 管理分区 {section} 与 {action:?} 的归属不一致");
+            if owned {
+                owners += 1;
+            } else {
+                let refused = crate::ddl::preview_plan(&snapshot, action);
+                assert!(!refused.blocked.is_empty() && refused.steps.is_empty(), "{engine:?} {action:?} 应被拒绝：{refused:?}");
+            }
+        }
+        // MySQL 与 MariaDB 共用事件动作，其它动作只有一个引擎。
+        let expected = if matches!(action, Action::SetEventEnabled { .. }) { 2 } else { 1 };
+        assert_eq!(owners, expected, "{action:?} 的所属方言数");
+    }
+}
+
+/// 结构页按引擎字符串取候选：解析不出的按通用写法，专项引擎没有外键动作；与按 Engine 取的一致。
+#[test]
+fn named_type_rules_fall_back_to_the_generic_rules() {
+    use super::ddl::{fk_actions, fk_actions_named, types_named, FULL_FK_ACTIONS};
+    assert_eq!(types_named("oracle").type_choices(), types_named("sqlite").type_choices());
+    assert_eq!(types_named("redis").default_column_type(), "TEXT");
+    assert_eq!(fk_actions_named("oracle"), FULL_FK_ACTIONS);
+    assert!(fk_actions_named("redis").is_empty() && fk_actions_named("mongodb").is_empty());
+    for engine in ENGINES {
+        assert_eq!(fk_actions_named(adapter(engine).meta().id()), fk_actions(engine), "{engine:?}");
+    }
+    assert_eq!(types_named("mariadb").preset_types(), types_named("mysql").preset_types());
+}
+
+/// 通用词法认的标识符引号来自各方言：双引号、反引号与方括号各一次。
+#[test]
+fn identifier_quotes_are_collected_from_every_dialect() {
+    let quotes = super::identifier_quotes();
+    assert_eq!(quotes.len(), 3, "{quotes:?}");
+    for pair in [('"', '"'), ('`', '`'), ('[', ']')] {
+        assert!(quotes.contains(&pair), "{pair:?} 不在 {quotes:?}");
+    }
+    use crate::ddl::sql::mentions;
+    assert!(mentions("CREATE VIEW v AS SELECT \"Total\" FROM t", "Total"));
+    assert!(mentions("CREATE VIEW v AS SELECT `Total` FROM t", "Total"));
+    assert!(mentions("CREATE VIEW v AS SELECT [Total] FROM t", "Total"));
+    assert!(!mentions("CREATE VIEW v AS SELECT total_count FROM t", "total"));
+}
+
+/// 结构页“查看数据”的取样语句：按引擎层级限定，T-SQL 用 TOP。
+#[test]
+fn first_rows_select_follows_the_dialect() {
+    let sample = |engine: Engine| super::first_rows_select(engine, &super::qualified_object(engine, "shop", "dbo", "orders"), 100);
+    assert_eq!(sample(Engine::Sqlserver), "SELECT TOP 100 * FROM dbo.orders;");
+    assert_eq!(sample(Engine::Mysql), "SELECT * FROM shop.orders LIMIT 100;");
+    assert_eq!(sample(Engine::Sqlite), "SELECT * FROM orders LIMIT 100;");
+    assert_eq!(sample(Engine::Postgres), "SELECT * FROM dbo.orders LIMIT 100;");
+}

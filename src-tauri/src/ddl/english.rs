@@ -3,7 +3,8 @@
 //! 计划由执行层按中文生成，确认执行时还要和同一份计划逐条比对 SQL，所以不在生成端分语言；
 //! 英文界面在显示时按这里的句型表换成英文。句型里的 `{}` 是对象名、行数等可变部分，
 //! 英文句子用 `{0}`、`{1}` 按位置取回（可变部分本身是已知句型时也一起换）。
-//! 覆盖范围：`ddl/` 与 `application/ddl.rs` 非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
+//! 覆盖范围：`ddl/`、`application/ddl.rs` 与适配器结构方言（`adapters/ddl.rs`、`adapters/*/ddl*.rs`；方言专属的句子由各方言的
+//! `messages_en`/`missing_items_en` 给出英文）非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
 //! 执行结果），以及确认层、对象定义查看器（`catalog/definition.rs` 与 `catalog/read.rs` 的定义读取函数）和结构页
 //! 路径上的中文，由源码扫描测试 `every_chinese_literal_on_ddl_paths_has_an_english_form` 守住；只用于匹配的片段与
 //! 写进生成 SQL 注释的文字列在测试白名单里并写明原因。查不到句型的原样返回（数据库原文不翻译）。
@@ -25,6 +26,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("Redis 没有结构编辑。", "Redis has no structure editing."),
     ("MongoDB 没有结构编辑。", "MongoDB has no structure editing."),
+    ("{} 没有结构编辑。", "{0} has no structure editing."),
     ("当前连接打开的是 {}，没有另开连接修改 {}", "This connection has {0} open; no other connection was opened to change {1}"),
     ("需要数据库名，没有另开连接。", "A database name is required; no other connection was opened."),
     ("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。", "PostgreSQL needs a schema (the group the table is in); no other connection was opened."),
@@ -58,14 +60,9 @@ const PATTERNS: &[(&str, &str)] = &[
         "SQLite has no TRUNCATE, so DELETE FROM removes the rows one by one; the AUTOINCREMENT counter is not reset and delete triggers fire.",
     ),
     (
-        "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。",
-        "TRUNCATE TABLE commits immediately and resets AUTO_INCREMENT to its initial value; DELETE triggers don't fire.",
-    ),
-    (
         "TRUNCATE TABLE 不触发逐行的 DELETE 触发器，不重置关联序列，也不加 CASCADE。",
         "TRUNCATE TABLE doesn't fire row-level DELETE triggers, doesn't reset owned sequences and doesn't add CASCADE.",
     ),
-    ("TRUNCATE TABLE 会重置 IDENTITY 计数，不触发 DELETE 触发器。", "TRUNCATE TABLE resets the IDENTITY counter; DELETE triggers don't fire."),
     (
         "当前 foreign_keys = ON：引用方还有数据时删除可能被拒绝，或按外键规则级联。",
         "foreign_keys is ON: while referencing rows exist, the delete may be refused or cascade by the foreign-key rules.",
@@ -88,7 +85,6 @@ const PATTERNS: &[(&str, &str)] = &[
         "This renames {0} to {1}. Queries, views, stored procedures and application code that use the old name may fail.",
     ),
     ("这些视图或触发器引用了它：{l}。数据库不一定会同步改写它们。", "These views or triggers reference it: {0}. The database won't necessarily update them."),
-    ("sp_rename 不会改写引用旧名的存储过程、函数和视图。", "sp_rename doesn't update stored procedures, functions or views that use the old name."),
     ("把 {} 改名为 {}", "Rename {0} to {1}"),
     // 外键开关
     (
@@ -99,12 +95,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("没有读到 foreign_keys，没有生成语句。", "foreign_keys could not be read, so no statement was generated."),
     ("当前连接 foreign_keys 已经是 {}。", "foreign_keys is already {0} on this connection."),
     ("设置 foreign_keys = {}", "Set foreign_keys = {0}"),
-    // PRAGMA
-    ("只有 SQLite 用 PRAGMA 改这些开关，这里不生成语句。", "Only SQLite changes these settings with PRAGMA, so no statement is generated here."),
-    (
-        "foreign_keys 走外键开关动作（SetForeignKeys），这里不重复生成同一条 PRAGMA。",
-        "foreign_keys has its own action (SetForeignKeys), so the same PRAGMA is not generated here again.",
-    ),
+    // PRAGMA（方言专属的句子在适配器的 messages_en 里）
     ("journal_mode 只能是 delete、truncate、persist、memory、wal 或 off。", "journal_mode must be delete, truncate, persist, memory, wal or off."),
     ("journal_mode 写进数据库文件头，重新打开这个文件后仍然是这个模式。", "journal_mode is written to the database file header and stays in effect when the file is reopened."),
     (
@@ -113,7 +104,6 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("关掉日志后崩溃时无法回滚未完成的事务。", "With the journal off, unfinished transactions can't be rolled back after a crash."),
     ("user_version 只接受 0 到 2147483647 的整数。", "user_version only accepts an integer from 0 to 2147483647."),
-    ("这里只改 journal_mode 与 user_version，其它 PRAGMA 不放行。", "Only journal_mode and user_version can be changed here; other PRAGMAs are not allowed."),
     ("{} 已经是 {} 的值，没有生成语句。", "{0} is already a value of {1}, so no statement was generated."),
     ("{} 已经是 {}，没有生成语句。", "{0} is already {1}, so no statement was generated."),
     ("设置 {} = {}", "Set {0} = {1}"),
@@ -507,7 +497,6 @@ const MISSING_ITEMS: &[(&str, &str)] = &[
         "标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）",
         "the identity column's ALWAYS / BY DEFAULT mode and sequence options (written as BY DEFAULT)",
     ),
-    ("IDENTITY 的起点与步长（统一写成 1, 1）", "the IDENTITY seed and increment (written as 1, 1)"),
     ("索引（读取失败：{p}）", "indexes (could not be read: {0})"),
     ("外键（读取失败：{p}）", "foreign keys (could not be read: {0})"),
     ("注释（读取失败：{p}）", "comments (could not be read: {0})"),
@@ -614,8 +603,16 @@ fn translate_with(table: &[(&str, &str)], text: &str) -> Option<String> {
     })
 }
 
+/// 先查各方言自己的整句（只在某个引擎出现的说明），再查共用句型表。
 fn translate(text: &str) -> Option<String> {
-    translate_with(PATTERNS, text)
+    crate::adapters::ddl::all_dialects()
+        .find_map(|dialect| translate_with(dialect.messages_en(), text))
+        .or_else(|| translate_with(PATTERNS, text))
+}
+
+/// 重建定义“未包含”项：共用清单加各方言自己的项。
+fn translate_missing_item(text: &str) -> Option<String> {
+    translate_with(MISSING_ITEMS, text).or_else(|| crate::adapters::ddl::all_dialects().find_map(|dialect| translate_with(dialect.missing_items_en(), text)))
 }
 
 /// 计划文字的英文版；不是已知句型时原样返回。
@@ -637,7 +634,7 @@ pub fn localize(text: &str, locale: crate::i18n::Locale) -> String {
 /// 按界面语言给出重建定义“未包含”清单里的一项；不是已知项时按整句再查一次，仍查不到原样返回。
 pub fn localize_missing_item(item: &str, locale: crate::i18n::Locale) -> String {
     match locale {
-        crate::i18n::Locale::En if has_cjk(item) => translate_with(MISSING_ITEMS, item).unwrap_or_else(|| english(item)),
+        crate::i18n::Locale::En if has_cjk(item) => translate_missing_item(item).unwrap_or_else(|| english(item)),
         _ => item.to_owned(),
     }
 }
@@ -901,9 +898,9 @@ mod tests {
     /// 不是给人看的整句：只用来匹配/拼接的片段，或写进生成 SQL 注释里的文字。每条写明原因。
     const NOT_MESSAGES: &[(&str, &str)] = &[
         ("找不到表或视图", "exec.rs 用 starts_with 识别读取层“找不到表或视图 {}”错误的前缀，本身不显示"),
-        ("需要", "plan.rs 用 contains 识别 sql.rs 返回的限定名错误，本身不显示"),
-        ("没有另开", "plan.rs 用 contains 识别 sql.rs 返回的限定名错误，本身不显示"),
-        ("主键", "introspect.rs 用 contains 在索引原因里认出主键索引，本身不显示"),
+        ("需要", "plan.rs 用 contains 识别适配器限定名返回的错误，本身不显示"),
+        ("没有另开", "plan.rs 用 contains 识别适配器限定名返回的错误，本身不显示"),
+        ("主键", "适配器的结构读取与重建用 contains 在索引原因里认出主键索引，本身不显示"),
         ("、", "名字列表的分隔符，英文句型的 {l} 位置把它换成逗号"),
         (
             "-- 由元数据重建，不是数据库保存的原文。未包含：{}。\\nCREATE TABLE {qualified} (\\n  {}\\n);",
@@ -938,7 +935,7 @@ mod tests {
         }
         let candidates = [
             translate_with(PHRASES, sample),
-            translate_with(MISSING_ITEMS, sample),
+            translate_missing_item(sample),
             Some(localize_missing_item(sample, crate::i18n::Locale::En)),
             Some(crate::catalog::definition::error_text(sample, crate::i18n::Locale::En)),
         ];
@@ -992,6 +989,22 @@ mod tests {
         .into_iter()
         .map(|(file, source)| (file.to_owned(), non_test(source)))
         .collect();
+        // A3 起各引擎的结构计划、内省与执行在适配器里：整个文件扫描。
+        for (file, source) in [
+            ("adapters/ddl.rs", include_str!("../adapters/ddl.rs")),
+            ("adapters/mysql/ddl.rs", include_str!("../adapters/mysql/ddl.rs")),
+            ("adapters/mysql/ddl_read.rs", include_str!("../adapters/mysql/ddl_read.rs")),
+            ("adapters/postgres/ddl.rs", include_str!("../adapters/postgres/ddl.rs")),
+            ("adapters/postgres/ddl_read.rs", include_str!("../adapters/postgres/ddl_read.rs")),
+            ("adapters/sqlite/ddl.rs", include_str!("../adapters/sqlite/ddl.rs")),
+            ("adapters/sqlite/ddl_read.rs", include_str!("../adapters/sqlite/ddl_read.rs")),
+            ("adapters/sqlserver/ddl.rs", include_str!("../adapters/sqlserver/ddl.rs")),
+            ("adapters/sqlserver/ddl_read.rs", include_str!("../adapters/sqlserver/ddl_read.rs")),
+        ] {
+            sources.push((file.to_owned(), non_test(source)));
+        }
+        const SESSION: &str = include_str!("../adapters/session.rs");
+        sources.push(("adapters/session.rs::run_ddl_steps".to_owned(), function_source(SESSION, "run_ddl_steps")));
         // 定义读取：入口、各引擎的定义读取与它们用到的取值/包装函数（A2 起各引擎读取在适配器里）。
         const MYSQL_READ: &str = include_str!("../adapters/mysql/catalog_read.rs");
         const POSTGRES_READ: &str = include_str!("../adapters/postgres/catalog_read.rs");

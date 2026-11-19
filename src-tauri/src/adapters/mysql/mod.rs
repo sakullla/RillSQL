@@ -3,11 +3,14 @@
 pub(crate) mod catalog;
 pub(crate) mod catalog_read;
 pub(crate) mod connect;
+pub(in crate::adapters) mod ddl;
+pub(in crate::adapters) mod ddl_read;
 pub(crate) mod diagram;
 pub(crate) mod extras;
 pub(in crate::adapters) mod syntax;
+pub(in crate::adapters) mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, Workbench};
 use crate::connections::model::{Engine, TlsMode};
 
 pub(in crate::adapters) struct MysqlAdapter;
@@ -60,6 +63,14 @@ impl EngineAdapter for MysqlAdapter {
         Some(&syntax::MysqlSyntax)
     }
 
+    fn types(&self) -> Option<&'static dyn TypeRules> {
+        Some(&types::MysqlTypes)
+    }
+
+    fn ddl(&self) -> Option<&'static dyn DdlDialect> {
+        Some(&ddl::MYSQL_DDL)
+    }
+
     fn catalog(&self) -> Option<&dyn CatalogDialect> {
         Some(&catalog::MYSQL_CATALOG)
     }
@@ -76,6 +87,8 @@ pub(in crate::adapters) fn family_capabilities() -> Capabilities {
         sql_syntax_group: true,
         connector_group: true,
         catalog_group: true,
+        type_rules_group: true,
+        ddl_group: true,
         shows_databases: true,
         outline_navigation: true,
         ..Capabilities::default()

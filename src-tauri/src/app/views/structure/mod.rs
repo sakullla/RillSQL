@@ -20,7 +20,8 @@ use gpui_kit::{
 use crate::app::views::grid::{GridTarget, group_digits, operation_banner};
 use crate::application::AppServices;
 use crate::ddl::english::{localize, localize_missing_item};
-use crate::ddl::sql::{non_null_default, quote_ident, valid_default, valid_name, valid_type};
+use crate::adapters::ddl::types_named;
+use crate::ddl::sql::{non_null_default, valid_default, valid_name, valid_type};
 use crate::ddl::{
     Action, ColumnDraft, DdlEngine, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot,
     fk_sql_for_display, index_sql_for_display, preview_plan,
@@ -29,64 +30,13 @@ use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
 use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
 
-/// 与 `ddl::model::fk_actions` 相同的级联动作。结构页按引擎原样列出。
+/// 与 `ddl::model::fk_actions` 相同的级联动作。结构页按引擎原样列出（由适配器的类型规则给出）。
 fn fk_action_choices(engine: &str) -> &'static [&'static str] {
-    match engine {
-        "mysql" | "mariadb" => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
-        "redis" | "mongodb" => &[],
-        _ => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
-    }
+    crate::adapters::ddl::fk_actions_named(engine)
 }
 
 fn type_choices(engine: &str) -> &'static [&'static str] {
-    match engine {
-        "postgres" => &[
-            "bigint",
-            "integer",
-            "smallint",
-            "bigserial",
-            "serial",
-            "varchar(255)",
-            "text",
-            "boolean",
-            "numeric(10,2)",
-            "timestamptz",
-            "timestamp",
-            "date",
-            "jsonb",
-            "uuid",
-            "bytea",
-        ],
-        "mysql" | "mariadb" => &[
-            "bigint",
-            "int",
-            "tinyint(1)",
-            "varchar(255)",
-            "varchar(64)",
-            "text",
-            "decimal(10,2)",
-            "datetime",
-            "timestamp",
-            "date",
-            "json",
-            "blob",
-        ],
-        "sqlserver" => &[
-            "bigint",
-            "int",
-            "smallint",
-            "tinyint",
-            "bit",
-            "nvarchar(255)",
-            "varchar(255)",
-            "decimal(18,2)",
-            "datetime2",
-            "date",
-            "uniqueidentifier",
-            "varbinary(max)",
-        ],
-        _ => &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"],
-    }
+    types_named(engine).type_choices()
 }
 
 fn default_choices(engine: &str, nullable: bool) -> Vec<&'static str> {
@@ -94,33 +44,19 @@ fn default_choices(engine: &str, nullable: bool) -> Vec<&'static str> {
     if nullable {
         items.push("NULL");
     }
-    match engine {
-        "postgres" => items.extend(["0", "''", "TRUE", "FALSE", "CURRENT_TIMESTAMP", "NOW()"]),
-        "mysql" | "mariadb" => items.extend(["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]),
-        "sqlserver" => items.extend(["0", "''", "N''", "GETDATE()", "SYSDATETIME()", "GETUTCDATE()"]),
-        _ => items.extend(["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]),
-    }
+    items.extend(types_named(engine).default_choices());
     items
 }
 
 fn default_column_type(engine: &str) -> &'static str {
-    match engine {
-        "postgres" => "text",
-        "mysql" | "mariadb" => "varchar(255)",
-        "sqlserver" => "nvarchar(255)",
-        _ => "TEXT",
-    }
+    types_named(engine).default_column_type()
 }
 
 fn default_id(engine: &str) -> ColumnDraft {
-    let type_name = match engine {
-        "postgres" | "mysql" | "mariadb" | "sqlserver" => "bigint",
-        _ => "INTEGER",
-    };
     ColumnDraft {
         original: None,
         name: "id".into(),
-        type_name: type_name.into(),
+        type_name: types_named(engine).id_column_type().into(),
         nullable: false,
         default_sql: String::new(),
         primary: true,
@@ -138,34 +74,8 @@ pub enum ColumnPreset {
 }
 
 fn preset_columns(engine: &str, preset: ColumnPreset) -> Vec<ColumnDraft> {
-    let ts_type = match engine {
-        "postgres" => "timestamptz",
-        "mysql" | "mariadb" => "datetime",
-        "sqlserver" => "datetime2",
-        _ => "TEXT",
-    };
-    let ts_default = match engine {
-        "sqlserver" => "SYSDATETIME()",
-        _ => "CURRENT_TIMESTAMP",
-    };
-    let str_short = match engine {
-        "postgres" => "varchar(32)",
-        "mysql" | "mariadb" => "varchar(32)",
-        "sqlserver" => "nvarchar(32)",
-        _ => "TEXT",
-    };
-    let str_note = match engine {
-        "postgres" => "text",
-        "mysql" | "mariadb" => "varchar(255)",
-        "sqlserver" => "nvarchar(255)",
-        _ => "TEXT",
-    };
-    let uuid_type = match engine {
-        "postgres" => "uuid",
-        "sqlserver" => "uniqueidentifier",
-        "mysql" | "mariadb" => "char(36)",
-        _ => "TEXT",
-    };
+    let types = types_named(engine).preset_types();
+    let (ts_type, ts_default, str_short, str_note, uuid_type) = (types.timestamp, types.timestamp_default, types.short_text, types.note, types.uuid);
     let col = |name: &str, kind: &str, nullable: bool, default_sql: &str| ColumnDraft {
         original: None,
         name: name.into(),
@@ -207,8 +117,9 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
         .collect()
 }
 
+/// 外键可以引用另一个模式里的表时，结构页显示目标模式。
 fn shows_ref_schema(engine: &str) -> bool {
-    matches!(engine, "postgres" | "sqlserver")
+    crate::adapters::ddl::ddl_named(engine).is_some_and(|dialect| dialect.references_cross_schema())
 }
 
 fn definition_text(snapshot: &Snapshot) -> (String, Vec<String>) {
@@ -255,21 +166,8 @@ fn select_sample_sql(target: &GridTarget) -> String {
     let Ok(engine) = DdlEngine::parse(&target.engine) else {
         return format!("SELECT * FROM {} LIMIT 100;", target.table);
     };
-    let qualified = match engine {
-        DdlEngine::Sqlite => quote_ident(engine, &target.table),
-        DdlEngine::Mysql | DdlEngine::Mariadb if !target.database.is_empty() => {
-            format!("{}.{}", quote_ident(engine, &target.database), quote_ident(engine, &target.table))
-        }
-        DdlEngine::Postgres | DdlEngine::Sqlserver if !target.schema.is_empty() => {
-            format!("{}.{}", quote_ident(engine, &target.schema), quote_ident(engine, &target.table))
-        }
-        _ => quote_ident(engine, &target.table),
-    };
-    if engine == DdlEngine::Sqlserver {
-        format!("SELECT TOP 100 * FROM {qualified};")
-    } else {
-        format!("SELECT * FROM {qualified} LIMIT 100;")
-    }
+    let qualified = crate::adapters::qualified_object(engine, &target.database, &target.schema, &target.table);
+    crate::adapters::first_rows_select(engine, &qualified, 100)
 }
 
 /// 从 `CREATE INDEX ... ON tbl (expr)` 里取出括号段，供表达式索引没有普通列名时展示。
@@ -2358,7 +2256,8 @@ impl StructurePane {
                 && col.original.is_none()
                 && !col.nullable
                 && !non_null_default(&col.default_sql)
-                && (self.snapshot.as_ref().and_then(|snap| snap.row_count).unwrap_or(0) > 0 || engine == Some(DdlEngine::Sqlite))
+                && (self.snapshot.as_ref().and_then(|snap| snap.row_count).unwrap_or(0) > 0
+                    || engine.and_then(crate::adapters::ddl::ddl_of).is_some_and(|dialect| dialect.add_not_null_without_default(trimmed).is_some()))
             {
                 return Some(i18n::fill(&i18n::text(locale, "structure.diag.notNullNeedsDefault"), &[("name", trimmed)]));
             }

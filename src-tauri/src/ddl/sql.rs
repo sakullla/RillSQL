@@ -1,89 +1,23 @@
+//! 结构变更用到的命名与校验门面：限定名、类型与默认值校验经适配器的 DDL 方言与类型规则；
+//! 名字合法性与字面量识别是引擎无关的。
+
+use crate::adapters::ddl::{ddl_of, no_structure_editing, types_of};
+use crate::adapters::{registry, adapter};
+
 use super::model::Engine;
 
 /// 按方言最小引号，统一由适配器 SqlSyntax 判定。
 pub use crate::adapters::quote_ident;
-use crate::adapters::qualified;
 
+/// 结构变更目标的限定名。没有结构编辑的引擎、缺库/模式或不是当前库时给出原因。
 pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str) -> Result<String, String> {
-    match engine {
-        // Redis 没有结构编辑（capability 门控）。
-        Engine::Redis => Err("Redis 没有结构编辑。".to_owned()),
-        Engine::Mongodb => Err("MongoDB 没有结构编辑。".to_owned()),
-        Engine::Sqlite => {
-            if !database.is_empty() && database != "main" {
-                return Err(format!("当前连接打开的是 main，没有另开连接修改 {database}"));
-            }
-            Ok(quote_ident(engine, table))
-        }
-        Engine::Mysql | Engine::Mariadb => {
-            if database.is_empty() {
-                return Err("需要数据库名，没有另开连接。".to_owned());
-            }
-            Ok(qualified(engine, &[database, table]))
-        }
-        Engine::Postgres => {
-            if schema.is_empty() {
-                return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
-            }
-            Ok(qualified(engine, &[schema, table]))
-        }
-        Engine::Sqlserver => {
-            if schema.is_empty() {
-                return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
-            }
-            Ok(qualified(engine, &[schema, table]))
-        }
+    match ddl_of(engine) {
+        Some(dialect) => dialect.qualified_table(database, schema, table),
+        None => Err(no_structure_editing(engine)),
     }
 }
 
-/// SQL Server 的默认值是具名约束。删除时优先用读到的 sys.default_constraints 约束名；
-/// 名字缺失时按系统视图动态查找后删除，找不到就不发语句（不猜 DF_ 前缀名）。
-/// `table` 是已加引号的限定名（如 [dbo].[orders]），`column` 是裸列名。
-pub fn sqlserver_drop_default_sql(table: &str, column: &str, constraint: &str) -> String {
-    let name = constraint.trim();
-    if !name.is_empty() {
-        return format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote_ident(Engine::Sqlserver, name));
-    }
-    let column_escaped = column.replace('\'', "''");
-    let table_escaped = table.replace('\'', "''");
-    format!(
-        "DECLARE @dc sysname = (SELECT dc.name FROM sys.default_constraints dc JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id WHERE dc.parent_object_id = OBJECT_ID(N'{table_escaped}') AND c.name = N'{column_escaped}'); IF @dc IS NOT NULL EXEC(N'ALTER TABLE {table_escaped} DROP CONSTRAINT ' + QUOTENAME(@dc))"
-    )
-}
-
-/// 新增默认值：生成 DF_<表>_<列> 约束名（与 SQL Server 自动命名习惯一致，重名冲突由执行报错暴露）。
-pub fn sqlserver_add_default_sql(table: &str, table_name: &str, column: &str, expression: &str) -> String {
-    let constraint = format!("DF_{table_name}_{column}");
-    format!(
-        "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT {expression} FOR {}",
-        quote_ident(Engine::Sqlserver, &constraint),
-        quote_ident(Engine::Sqlserver, column)
-    )
-}
-
-/// 从限定名 [dbo].[orders] 取末段裸表名，用于生成 DF_<表>_<列> 约束名。
-pub fn sqlserver_bare_table_name(qualified: &str) -> String {
-    qualified
-        .rsplit('.')
-        .next()
-        .unwrap_or(qualified)
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_owned()
-}
-
-pub fn sqlite_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
-    let mut parts = version.split(['.', '-', ' ']);
-    let got = [
-        parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0),
-        parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0),
-        parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0),
-    ];
-    got >= [major, minor, patch]
-}
-
-/// 默认值只接受字面量和少量当前时间函数，避免把用户输入拼成任意语句。
+/// 默认值只接受字面量和少量当前时间函数，避免把用户输入拼成任意语句。各方言额外接受的写法见类型规则。
 pub fn valid_default(engine: Engine, raw: &str) -> bool {
     let text = raw.trim();
     if text.is_empty() || text.eq_ignore_ascii_case("null") {
@@ -92,28 +26,11 @@ pub fn valid_default(engine: Engine, raw: &str) -> bool {
     if is_number(text) || is_quoted(text) {
         return true;
     }
-    // T-SQL 的 Unicode 字符串默认值 N'...'。
-    if engine == Engine::Sqlserver
-        && (text.starts_with("N'") || text.starts_with("n'"))
-        && is_quoted(&text[1..])
-    {
-        return true;
-    }
     let upper = text.to_ascii_uppercase();
     if matches!(upper.as_str(), "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "(CURRENT_TIMESTAMP)") {
         return true;
     }
-    if engine == Engine::Postgres && matches!(upper.as_str(), "TRUE" | "FALSE" | "NOW()") {
-        return true;
-    }
-    if matches!(engine, Engine::Mysql | Engine::Mariadb) && upper == "CURRENT_TIMESTAMP()" {
-        return true;
-    }
-    // T-SQL 的 GETDATE()/SYSDATETIME() 是常见默认值；GETUTCDATE() 同属当前时间函数。
-    if engine == Engine::Sqlserver && matches!(upper.as_str(), "GETDATE()" | "GETDATE" | "SYSDATETIME()" | "GETUTCDATE()" | "SYSUTCDATETIME()") {
-        return true;
-    }
-    false
+    types_of(engine).is_some_and(|types| types.extra_default(text, &upper))
 }
 
 pub fn non_null_default(raw: &str) -> bool {
@@ -131,22 +48,9 @@ pub fn valid_type(engine: Engine, raw: &str) -> bool {
         return false;
     }
     let base = lower.split('(').next().unwrap_or("").trim();
-    match engine {
-        Engine::Sqlite => !base.is_empty() && base.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()),
-        Engine::Postgres => POSTGRES_TYPES.contains(&base),
-        Engine::Mysql | Engine::Mariadb => MYSQL_TYPES.contains(&base),
-        Engine::Sqlserver => SQLSERVER_TYPES.contains(&base),
-        // Redis 没有列类型（不进结构编辑）。
-        Engine::Redis | Engine::Mongodb => false,
-    }
+    // 没有结构编辑的引擎没有列类型。
+    types_of(engine).is_some_and(|types| types.valid_type_base(base))
 }
-
-const SQLSERVER_TYPES: &[&str] = &[
-    "bigint", "int", "smallint", "tinyint", "bit", "decimal", "numeric", "money", "smallmoney",
-    "float", "real", "date", "datetime", "datetime2", "datetimeoffset", "smalldatetime", "time",
-    "char", "varchar", "text", "nchar", "nvarchar", "ntext", "binary", "varbinary", "image",
-    "uniqueidentifier", "xml",
-];
 
 pub fn valid_name(name: &str) -> bool {
     let text = name.trim();
@@ -158,11 +62,9 @@ pub fn mentions(sql: &str, name: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let quoted = [
-        format!("\"{}\"", needle.replace('"', "\"\"")),
-        format!("`{}`", needle.replace('`', "``")),
-        format!("[{needle}]"),
-    ];
+    // 各方言的引号写法都算提到（双引号、反引号、方括号）；方括号另认不转义 `]` 的写法。
+    let mut quoted: Vec<String> = registry::ENGINES.into_iter().filter_map(|engine| adapter(engine).syntax()).map(|syntax| syntax.quote_always(needle)).collect();
+    quoted.push(format!("[{needle}]"));
     if quoted.iter().any(|item| sql.contains(item)) {
         return true;
     }
@@ -191,7 +93,8 @@ fn is_number(value: &str) -> bool {
     digits > 0
 }
 
-fn is_quoted(value: &str) -> bool {
+/// 单引号字符串字面量（内部单引号已加倍）。
+pub(crate) fn is_quoted(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'\'' || bytes[bytes.len() - 1] != b'\'' {
         return false;
@@ -206,73 +109,3 @@ fn is_quoted(value: &str) -> bool {
     }
     true
 }
-
-const POSTGRES_TYPES: &[&str] = &[
-    "smallint",
-    "integer",
-    "bigint",
-    "int",
-    "int2",
-    "int4",
-    "int8",
-    "real",
-    "double precision",
-    "numeric",
-    "decimal",
-    "text",
-    "varchar",
-    "character varying",
-    "char",
-    "character",
-    "boolean",
-    "bool",
-    "date",
-    "timestamp",
-    "timestamptz",
-    "timestamp with time zone",
-    "timestamp without time zone",
-    "time",
-    "time with time zone",
-    "time without time zone",
-    "json",
-    "jsonb",
-    "uuid",
-    "bytea",
-    "serial",
-    "bigserial",
-];
-
-const MYSQL_TYPES: &[&str] = &[
-    "tinyint",
-    "smallint",
-    "mediumint",
-    "int",
-    "integer",
-    "bigint",
-    "decimal",
-    "numeric",
-    "float",
-    "double",
-    "real",
-    "bit",
-    "char",
-    "varchar",
-    "binary",
-    "varbinary",
-    "tinytext",
-    "text",
-    "mediumtext",
-    "longtext",
-    "tinyblob",
-    "blob",
-    "mediumblob",
-    "longblob",
-    "date",
-    "datetime",
-    "timestamp",
-    "time",
-    "year",
-    "json",
-    "boolean",
-    "bool",
-];

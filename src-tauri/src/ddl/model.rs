@@ -13,7 +13,7 @@ pub struct Column {
     pub primary: bool,
     pub auto: bool,
     pub generated: bool,
-    /// SQL Server 的默认值是具名约束（sys.default_constraints）；改/删默认值需要这个名字。其余引擎为 None。
+    /// 默认值是具名约束的引擎（SQL Server）记下约束名；改/删默认值需要这个名字。其余引擎为 None。
     pub default_constraint: Option<String>,
 }
 
@@ -326,26 +326,14 @@ pub struct StepReceipt {
     pub message: String,
 }
 
-pub fn fk_actions(engine: Engine) -> &'static [&'static str] {
-    match engine {
-        // Redis 没有结构编辑（capability 门控），空清单保持穷尽。
-        Engine::Redis | Engine::Mongodb => &[],
-        Engine::Mysql | Engine::Mariadb => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
-        Engine::Postgres | Engine::Sqlite | Engine::Sqlserver => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
-    }
-}
+/// 引擎的外键引用动作（由适配器的类型规则给出；没有结构编辑的引擎为空）。
+pub use crate::adapters::ddl::fk_actions;
 
+/// 执行语义说明。`rebuild` 为真时按重建方式说明；没有结构编辑的引擎说明这一点。
 pub fn rule_text(engine: Engine, rebuild: bool) -> String {
-    if rebuild {
-        return "SQLite 按官方步骤重建：先在事务外关闭外键检查，再在一个事务里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。这只属于这次重建，不是所有数据库都能回滚。事务内失败会回滚这次重建；事务外改过的 foreign_keys 会恢复为会话原来的值。".to_owned();
-    }
-    match engine {
-        Engine::Mysql | Engine::Mariadb => "这些语句逐条执行，失败即停。MySQL 与 MariaDB 会立即提交每条结构变更语句，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。".to_owned(),
-        Engine::Postgres => "这些语句逐条执行，失败即停。已经成功的语句不撤销。PostgreSQL 虽然可以把结构变更放进事务，这里也不包成一个大事务，不能据此认为所有数据库都会回滚。".to_owned(),
-        Engine::Sqlite => "这些语句逐条执行，失败即停。已经成功的语句不撤销，后面的语句不执行。".to_owned(),
-        Engine::Sqlserver => "这些语句逐条执行，失败即停。已成功的语句不撤销；这里也不把整批包进一个事务，不能据此声称可以整体回滚。".to_owned(),
-        // Redis 没有结构编辑（capability 门控）。
-        Engine::Redis => "Redis 没有结构编辑。".to_owned(),
-        Engine::Mongodb => "MongoDB 没有结构编辑。".to_owned(),
+    match crate::adapters::ddl::ddl_of(engine) {
+        Some(dialect) if rebuild => dialect.rebuild_rule_text().to_owned(),
+        Some(dialect) => dialect.rule_text().to_owned(),
+        None => crate::adapters::ddl::no_structure_editing(engine),
     }
 }

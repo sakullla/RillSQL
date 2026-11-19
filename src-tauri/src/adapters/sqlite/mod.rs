@@ -3,12 +3,15 @@
 pub(crate) mod catalog;
 pub(crate) mod catalog_read;
 pub(crate) mod connect;
+mod ddl;
+pub(in crate::adapters) mod ddl_read;
 pub(crate) mod diagram;
 pub(crate) mod extras;
 pub(crate) mod file_page;
 mod syntax;
+mod types;
 
-use crate::adapters::{Capabilities, CatalogDialect, Connector, EngineAdapter, EngineMeta, SqlSyntax, UrlScheme, UrlStyle, Workbench};
+use crate::adapters::{Capabilities, CatalogDialect, Connector, DdlDialect, EngineAdapter, EngineMeta, SqlSyntax, TypeRules, UrlScheme, UrlStyle, Workbench};
 use crate::connections::model::Engine;
 
 pub(in crate::adapters) struct SqliteAdapter;
@@ -67,6 +70,8 @@ impl EngineAdapter for SqliteAdapter {
             sql_syntax_group: true,
             connector_group: true,
             catalog_group: true,
+            type_rules_group: true,
+            ddl_group: true,
             shows_foreign_keys: true,
             ..Capabilities::default()
         }
@@ -74,6 +79,14 @@ impl EngineAdapter for SqliteAdapter {
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
         Some(&syntax::SqliteSyntax)
+    }
+
+    fn types(&self) -> Option<&'static dyn TypeRules> {
+        Some(&types::SqliteTypes)
+    }
+
+    fn ddl(&self) -> Option<&'static dyn DdlDialect> {
+        Some(&ddl::SqliteDdl)
     }
 
     fn catalog(&self) -> Option<&dyn CatalogDialect> {
