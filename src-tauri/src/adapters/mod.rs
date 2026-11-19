@@ -498,19 +498,21 @@ pub struct Lexis {
     pub delimiter_command: bool,
     /// `/*! ... */`（及 MariaDB `/*M! ... */`）是服务器会执行的代码，不是注释（MySQL 家族）。
     pub executable_comments: bool,
+    /// 字符串里的反斜杠转义下一个字符（MySQL 家族默认 sql_mode）：`'a\'b'` 是一个字符串。
+    pub backslash_escapes: bool,
 }
 
 impl Default for Lexis {
     /// 标准 SQL：没有 `#` 注释与 T-SQL 写法，也不认 DELIMITER。
     fn default() -> Self {
-        Self { hash_comments: false, transact: false, delimiter_command: false, executable_comments: false }
+        Self { hash_comments: false, transact: false, delimiter_command: false, executable_comments: false, backslash_escapes: false }
     }
 }
 
 impl Lexis {
     /// 引擎未知（或不是 SQL 引擎）时：保守地照常处理 DELIMITER。
     /// 可执行注释也按代码检查，只读判定因此更保守。
-    pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true, executable_comments: true };
+    pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true, executable_comments: true, backslash_escapes: false };
 }
 
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A5 起提供冲突识别）

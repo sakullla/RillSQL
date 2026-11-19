@@ -130,6 +130,12 @@ pub trait TypeRules: Sync {
         &["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"]
     }
 
+    /// 以整数存放、按惯例当作开关的类型（如 MySQL 的 `tinyint(1)`，即 BOOLEAN 的落地形式）。
+    /// 网格为它画开关并写 1/0；`type_name` 是列的完整类型原文。真正的布尔类型不在这里。
+    fn flag_type(&self, _type_name: &str) -> bool {
+        false
+    }
+
     /// 数值类型（`base` 是小写、去掉参数的类型名）。
     fn numeric_type(&self, base: &str) -> bool {
         NUMERIC_TYPES.contains(&base)

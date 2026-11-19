@@ -2318,3 +2318,51 @@ fn redis_query_desk_completion_plans_commands_and_keys() {
     assert_eq!(key_plan.candidates.len(), 1);
     assert_eq!(key_plan.candidates[0].insert, "workshop:ranking:1");
 }
+
+#[test]
+fn comment_stripping_follows_each_dialect_lexis_for_quotes() {
+    // PG dollar-quote 里的 -- 与 /* 是字符串内容，不是注释：后面的代码不能被吞掉。
+    assert_eq!(
+        split::strip_sql_comments("postgres", "SELECT $$a -- b$$ AS x FROM t -- tail"),
+        "SELECT $$a -- b$$ AS x FROM t  "
+    );
+    assert_eq!(
+        split::strip_sql_comments("postgres", "SELECT $q$/* x */$q$ FROM t /* c */ WHERE 1"),
+        "SELECT $q$/* x */$q$ FROM t   WHERE 1"
+    );
+    // MySQL 字符串里的反斜杠转义引号：'a\' -- b' 是一个字符串，不会从中间开出注释。
+    assert_eq!(
+        split::strip_sql_comments("mysql", "SELECT 'a\\' -- b' FROM t # tail"),
+        "SELECT 'a\\' -- b' FROM t  "
+    );
+    // PG 不认反斜杠转义：'a\' 在这里已经闭合，后面的 -- 才是注释。
+    assert_eq!(split::strip_sql_comments("postgres", "SELECT 'a\\' -- b"), "SELECT 'a\\'  ");
+    // T-SQL 方括号标识符里的 -- 是名字的一部分。
+    assert_eq!(split::strip_sql_comments("sqlserver", "SELECT [a--b] FROM t"), "SELECT [a--b] FROM t");
+    // 规整：引号外的空白与注释折成一个空格，引号里的空白原样保留。
+    assert_eq!(
+        split::normalize_sql_code("postgres", "SELECT  id,\n  \"full  name\" -- 说明\nFROM   \"my  table\"\n"),
+        "SELECT id, \"full  name\" FROM \"my  table\""
+    );
+    assert_eq!(split::normalize_sql_code("mysql", "SELECT 'x  y'\t/* a */\n FROM t"), "SELECT 'x  y' FROM t");
+}
+
+#[test]
+fn single_table_proof_reads_quoted_names_and_dialect_strings() {
+    use crate::app::views::grid::prove_single_table;
+    // 引号标识符可以带空格：整体读入，不在空白处截断成另一个名字。
+    let proof = prove_single_table("postgres", "SELECT * FROM \"my  table\" -- 注释\nWHERE id = 1").unwrap();
+    assert_eq!(proof.table, "my  table");
+    let proof = prove_single_table("postgres", "SELECT * FROM \"sales\".\"Order Items\"").unwrap();
+    assert_eq!((proof.schema.as_deref(), proof.table.as_str()), (Some("sales"), "Order Items"));
+    let proof = prove_single_table("sqlserver", "SELECT * FROM [dbo].[a]]b]").unwrap();
+    assert_eq!((proof.schema.as_deref(), proof.table.as_str()), (Some("dbo"), "a]b"));
+    // dollar-quote 里的注释标记不能把后面的 JOIN 藏起来。
+    assert_eq!(prove_single_table("postgres", "SELECT $$ -- $$ AS x FROM a JOIN b ON true"), Err("grid.readonly.join"));
+    // MySQL 反斜杠转义的引号同理。
+    assert_eq!(prove_single_table("mysql", "SELECT 'it\\'s -- ' AS x FROM a JOIN b ON 1"), Err("grid.readonly.join"));
+    assert!(prove_single_table("mysql", "SELECT 'it\\'s' AS x FROM orders").is_ok());
+    // 切分同样按 MySQL 的反斜杠转义：字符串里的分号不切开语句；PG 不认反斜杠转义。
+    assert_eq!(split::split_sql("mysql", "SELECT 'a\\'; b' FROM t; SELECT 2").pieces.len(), 2);
+    assert_eq!(split::split_sql("postgres", "SELECT 'a\\'; SELECT 2").pieces.len(), 2);
+}

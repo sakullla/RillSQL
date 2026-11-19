@@ -158,6 +158,8 @@ pub struct GridPane {
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
     fetching: bool,
     schema_cache: Option<(GridTarget, Option<Arc<crate::connections::SessionHealth>>, SchemaDto)>,
+    /// 本面板里用户解锁过的查询结果（目标 + 语句）：切换结果页签再切回时保持解锁。
+    unlocked_sheets: std::collections::HashSet<String>,
     next_offset: u64,
     counting: Option<u64>,
     count_sequence: u64,
@@ -353,6 +355,7 @@ impl GridPane {
             focus_inside: false,
             fetching: false,
             schema_cache: None,
+            unlocked_sheets: std::collections::HashSet::new(),
             next_offset: 0,
             counting: None,
             count_sequence: 0,
@@ -660,10 +663,18 @@ impl GridPane {
         self.press = None;
         self.pending_page = None;
         let QuerySheet { sql, columns, rows, truncated, full_count } = sheet;
-        // 查询结果默认只读：不再自动读主键，由“解锁编辑”按需发起（R17）。
-        let _token = self.session.show_query_sheet_typed(&sql, columns, column_types, rows, truncated, full_count);
+        let key = unlock_key(&self.session.target, &sql);
+        // 查询结果默认只读（R17）。唯一键仍在后台读一次：行定位后外键导航与完整值读取照常可用，
+        // 写入要等用户点“解锁编辑”。同一条语句在本面板里解锁过（切结果页签再切回）则保持解锁。
+        let token = self.session.show_query_sheet_typed(&sql, columns, column_types, rows, truncated, full_count);
         self.edit_error = None;
+        self.scheduled = 0;
+        if self.unlocked_sheets.contains(&key) {
+            let live = self.live_target();
+            let _ = self.session.begin_unlock(live);
+        }
         self.sync_table(cx);
+        self.schedule_locate(token, cx);
     }
 
     /// “解锁编辑”：对这份结果自己的语句（去注释）证明单表并读主键；通过后可编辑，不通过把原因留在标签旁。
@@ -672,18 +683,40 @@ impl GridPane {
         match self.session.begin_unlock(live) {
             Ok(_) => {
                 self.notice.clear();
-                // 同一份结果可以重试：上一次读取失败后仍允许再发一次。
-                self.scheduled = 0;
-                let token = self.session.token;
-                self.schedule_locate(token, cx);
+                if self.session.complete_unlock() {
+                    // 后台已经读到唯一键：直接打开编辑。
+                    self.remember_unlock();
+                    self.sync_table(cx);
+                } else {
+                    // 后台读取还在路上就等它（schedule_locate 会跳过）；失败过的已经清了代次，这里重新发一次。
+                    let token = self.session.token;
+                    self.schedule_locate(token, cx);
+                }
             }
             Err(reason) => self.notice = i18n::text(self.locale, reason),
         }
         cx.notify();
     }
 
+    /// 这份查询结果已经解锁：记下它的语句与目标，切页签重新显示时不再锁回去。
+    fn remember_unlock(&mut self) {
+        let key = unlock_key(&self.session.target, self.session.sql_text());
+        self.unlocked_sheets.insert(key);
+    }
+
+    /// 查找栏展开前先结束正在进行的单元格编辑：输入按 Enter 的语义提交，
+    /// 否则焦点在查找框里时 Esc 会被当成“取消编辑”。输入不合法时编辑框留着并说明原因。
+    fn settle_edit_for_find(&mut self, cx: &mut Context<Self>) {
+        if self.edit_target.is_some() {
+            self.finish_edit(cx);
+        }
+    }
+
     /// 打开查找栏并把焦点交给输入框；再按一次（栏已展开且焦点在里面）收起。
     pub fn toggle_find(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            self.settle_edit_for_find(cx);
+        }
         self.find_open = !self.find_open;
         if self.find_open {
             self.focus_find = true;
@@ -694,6 +727,7 @@ impl GridPane {
     }
 
     pub fn open_find(&mut self, cx: &mut Context<Self>) {
+        self.settle_edit_for_find(cx);
         self.find_open = true;
         self.focus_find = true;
         cx.notify();
@@ -2168,6 +2202,13 @@ impl GridPane {
     }
 
     /// 编辑面板上点选的值（布尔、枚举、日历之外的 NULL 等）：直接作为这一格的新值暂存并结束编辑。
+    /// 这一列是方言约定的整数开关（如 MySQL tinyint(1)）：编辑面板给开关而不是只给数字输入。
+    fn edit_flag_column(&self, column: usize) -> bool {
+        self.session
+            .column_type(column)
+            .is_some_and(|type_name| crate::adapters::ddl::types_named(&self.session.target.engine).flag_type(type_name))
+    }
+
     fn pick_edit_value(&mut self, value: Option<String>, cx: &mut Context<Self>) {
         let Some(target) = self.edit_target.take().filter(|target| target.cells.is_empty()) else {
             return;
@@ -2676,28 +2717,52 @@ impl GridPane {
             let result = rx.await;
             cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
-                    view.update(cx, |this, cx| match result {
-                        Ok(Ok(dto)) => {
-                            this.session.set_foreign_keys(foreign_keys_of(&dto));
-                            if let Ok(schema) = schema_from_dto(&dto) {
-                                if this.session.finish_locate(token, schema) {
-                                    this.sync_table(cx);
-                                }
-                            }
-                            cx.notify();
-                        }
-                        // 读结构失败：回到可解锁状态并说明原因，用户可以再点一次。
-                        Ok(Err(message)) if this.session.token == token => {
-                            this.session.relock();
-                            this.notice = message;
-                            cx.notify();
-                        }
-                        _ => {}
-                    });
+                    view.update(cx, |this, cx| this.finish_schedule_locate(token, result, cx));
                 }
             });
         })
         .detach();
+    }
+
+    /// 后台读结构的每种结局都有去处：成功则定位（用户已点解锁时同时打开编辑）；
+    /// 读取报错、结构解析不了或任务被丢弃，都回到可解锁并允许重试，不会停在“正在确认”。
+    fn finish_schedule_locate(
+        &mut self,
+        token: u64,
+        result: Result<Result<SchemaDto, String>, tokio::sync::oneshot::error::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.token != token || self.session.mode != GridMode::Query {
+            return;
+        }
+        if self.scheduled == token {
+            // 这一次读取已经结束：之后再点“解锁编辑”可以重新发起。
+            self.scheduled = 0;
+        }
+        let failure = match result {
+            Ok(Ok(dto)) => {
+                self.session.set_foreign_keys(foreign_keys_of(&dto));
+                match schema_from_dto(&dto) {
+                    Ok(schema) => {
+                        if self.session.finish_locate(token, schema) {
+                            self.remember_unlock();
+                        }
+                        None
+                    }
+                    Err(message) => Some(message),
+                }
+            }
+            Ok(Err(message)) => Some(message),
+            Err(_) => Some(i18n::text(self.locale, "grid.unlock.interrupted")),
+        };
+        if let Some(message) = failure {
+            // 只有用户在等解锁时才提示；后台预读失败不打扰，点解锁时会再读一次。
+            if self.session.relock() {
+                self.notice = message;
+            }
+        }
+        self.sync_table(cx);
+        cx.notify();
     }
 
     fn sync_table(&mut self, cx: &mut App) {
@@ -2835,6 +2900,12 @@ fn row_is_dirty(grid: &SharedGrid, row: usize) -> bool {
 }
 
 /// 结构里带回来的真实外键；没有读到时给空表，界面因此不会显示不适用的入口。
+/// 查询结果“解锁过”的身份：连接、库与语句原文。换库或改语句都算另一份结果。
+/// 不含模式与表名：定位成功后会话会把它们补成实际表，重新显示时还没有。
+fn unlock_key(target: &GridTarget, sql: &str) -> String {
+    format!("{}\u{1f}{}\u{1f}{}", target.connection_id, target.database, sql)
+}
+
 fn foreign_keys_of(dto: &SchemaDto) -> Vec<ForeignKeyInfo> {
     dto.foreign_keys
         .as_ref()
@@ -4261,7 +4332,10 @@ impl GridPane {
         let family = self.session.column_type(column).map(crate::grid::value_family);
         let temporal_kind = self.edit_temporal_kind(column);
         let choices = self.session.column_choices(column).to_vec();
-        let boolean = family == Some(crate::grid::ValueFamily::Bool);
+        // 开关：真正的布尔类型写 true/false；以整数存放的开关（方言决定，如 MySQL tinyint(1)）写 1/0。
+        let flag = self.edit_flag_column(column);
+        let boolean = family == Some(crate::grid::ValueFamily::Bool) || flag;
+        let (on_value, off_value) = if flag && family != Some(crate::grid::ValueFamily::Bool) { ("1", "0") } else { ("true", "false") };
         let error = self.edit_error.clone();
         if temporal_kind.is_none() && choices.is_empty() && !boolean && error.is_none() {
             return None;
@@ -4329,8 +4403,8 @@ impl GridPane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .child(pick("grid-edit-true".into(), t("grid.bool.true"), Some("true".to_owned()), on))
-                    .child(pick("grid-edit-false".into(), t("grid.bool.false"), Some("false".to_owned()), off)),
+                    .child(pick("grid-edit-true".into(), t("grid.bool.true"), Some(on_value.to_owned()), on))
+                    .child(pick("grid-edit-false".into(), t("grid.bool.false"), Some(off_value.to_owned()), off)),
             );
         }
         if let Some(kind) = temporal_kind {
@@ -6126,6 +6200,172 @@ mod pane_tests {
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let started = std::time::Instant::now();
+        while !done(cx) && started.elapsed() < std::time::Duration::from_secs(5) {
+            cx.run_until_parked();
+            std::thread::park_timeout(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// R17 与既有行为：结果一出现就在后台读唯一键，行定位后外键与完整值读取照常可用，但写入仍锁着；
+    /// 点“解锁编辑”时已读到的结构直接生效。切换结果页签后同一语句保持解锁，换了语句则重新锁上。
+    #[gpui_kit::test]
+    fn query_results_locate_in_background_but_stay_locked_until_unlocked(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services(
+            "prelocate",
+            &["CREATE TABLE keyed (id INTEGER PRIMARY KEY, name TEXT)".to_owned(), "INSERT INTO keyed VALUES (1, '甲')".to_owned()],
+        );
+        let (window, pane) = open_with(cx, services);
+        let sql = "SELECT id, name FROM keyed";
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.show_query(table_target("keyed"), query_sheet(sql, &["id", "name"], vec![vec![Some("1"), Some("甲")]], false), cx));
+        })
+        .unwrap();
+        wait_until(cx, |cx| cx.update(|cx| pane.read(cx).session.schema().is_some()));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).session.schema().is_some(), "后台读到了唯一键");
+            assert!(!pane.read(cx).writable(), "读到唯一键也不自动解锁");
+            assert!(window.find("grid-unlock").visible());
+            window.click("grid-unlock", cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).writable(), "结构已在手：点了立即可编辑");
+            // 切到另一个结果页签再切回来：同一语句保持解锁。
+            pane.update(cx, |pane, cx| {
+                pane.show_query(table_target("keyed"), query_sheet("SELECT name FROM keyed k JOIN keyed j ON j.id = k.id", &["name"], vec![vec![Some("甲")]], false), cx);
+                pane.show_query(table_target("keyed"), query_sheet(sql, &["id", "name"], vec![vec![Some("1"), Some("甲")]], false), cx);
+            });
+        })
+        .unwrap();
+        wait_until(cx, |cx| cx.update(|cx| pane.read(cx).writable()));
+        cx.update_window(window, |_, _, cx| {
+            assert!(pane.read(cx).writable(), "同一语句切回后仍是解锁状态");
+            pane.update(cx, |pane, cx| pane.show_query(table_target("keyed"), query_sheet("SELECT id FROM keyed", &["id"], vec![vec![Some("1")]], false), cx));
+            assert!(!pane.read(cx).writable(), "另一条语句默认只读");
+            assert!(pane.read(cx).session.unlockable());
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读结构失败不会卡在“正在确认…”：回到可解锁并说明原因，可以再点；连接没打开时只提示，不把结果锁死。
+    #[gpui_kit::test]
+    fn failed_or_offline_unlock_returns_to_unlockable(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services("unlock-fail", &["CREATE TABLE keyed (id INTEGER PRIMARY KEY, name TEXT)".to_owned()]);
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.show_query(table_target("missing"), query_sheet("SELECT id FROM missing", &["id"], vec![vec![Some("1")]], false), cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 后台预读失败不打扰：仍是可解锁，没有提示。
+        wait_until(cx, |cx| cx.update(|cx| pane.read(cx).scheduled == 0));
+        cx.update_window(window, |_, window, cx| {
+            assert!(pane.read(cx).session.unlockable());
+            assert!(pane.read(cx).notice.is_empty(), "{}", pane.read(cx).notice);
+            window.click("grid-unlock", cx);
+            assert_eq!(pane.read(cx).session.readonly_reason(), "grid.readonly.locatePending");
+        })
+        .unwrap();
+        wait_until(cx, |cx| cx.update(|cx| !pane.read(cx).session.unlock_pending()));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).session.unlockable(), "失败后回到可解锁，可再试");
+            assert!(!pane.read(cx).notice.is_empty(), "说明失败原因");
+            assert!(window.find("grid-unlock").visible());
+            // 连接不在：只提示原因，结果仍可解锁（重新连接后再点即可）。
+            pane.update(cx, |pane, cx| {
+                let offline = GridTarget { connection_id: "gone".to_owned(), ..table_target("keyed") };
+                pane.show_query(offline, query_sheet("SELECT id FROM keyed", &["id"], vec![vec![Some("1")]], false), cx);
+                pane.unlock(cx);
+            });
+            assert_eq!(pane.read(cx).notice, i18n::text(pane.read(cx).locale, "grid.readonly.offline"));
+            assert!(pane.read(cx).session.unlockable());
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 编辑单元格时按 ⌘F：先按 Enter 的语义提交这一格，再展开查找栏；查找框里的 Esc 收起查找栏而不是取消编辑。
+    #[gpui_kit::test]
+    fn find_opened_while_editing_commits_the_cell_and_esc_closes_find(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.choose_cell(0, 1);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).editing());
+            window.press("secondary-a", cx);
+            window.input("丙", cx);
+            window.press("secondary-f", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!pane.read(cx).editing(), "展开查找前结束编辑");
+            assert_eq!(pane.read(cx).cell(0, 1), "丙", "输入按 Enter 语义暂存");
+            assert!(pane.read(cx).find_open());
+            let focused = pane.read(cx).search.as_ref().is_some_and(|search| search.read(cx).focus_handle(cx).is_focused(window));
+            assert!(focused, "光标在查找输入框里");
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(!pane.read(cx).find_open(), "Esc 收起查找栏");
+            assert_eq!(pane.read(cx).cell(0, 1), "丙", "暂存不受影响");
+        });
+    }
+
+    /// MySQL 的 BOOLEAN 落地为 tinyint(1)：编辑面板给开关，点“是”写 1。
+    #[gpui_kit::test]
+    fn mysql_tinyint_one_gets_a_switch_that_writes_one(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    GridTarget { engine: "mysql".to_owned(), database: "shop".to_owned(), ..target() },
+                    vec![("id", "int"), ("active", "tinyint(1)"), ("qty", "tinyint(4)")],
+                    vec![vec![Some("1"), Some("0"), Some("3")]],
+                    "id",
+                    cx,
+                );
+                pane.choose_cell(0, 2);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).editing());
+            assert!(window.try_find("grid-edit-bool").is_none(), "普通 tinyint 不是开关");
+            window.press("escape", cx);
+            pane.update(cx, |pane, cx| {
+                pane.choose_cell(0, 1);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(window.find("grid-edit-bool").visible(), "tinyint(1) 给出开关");
+            window.click("grid-edit-true", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(!pane.read(cx).editing());
+            assert_eq!(pane.read(cx).cell(0, 1), "1", "开关按整数写 1");
+        });
     }
 
     #[gpui_kit::test]

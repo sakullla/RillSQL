@@ -67,7 +67,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
             i = skip_break(sql, line_end);
             continue;
         }
-        let scanned = scan_statement(sql, begin, &delimiter, hash, lexis.transact);
+        let scanned = scan_statement(sql, begin, &delimiter, hash, lexis);
         if let Some(piece) = scanned.piece {
             pieces.push(piece);
         }
@@ -346,7 +346,9 @@ struct Scanned {
     refusal: Option<String>,
 }
 
-fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blocks: bool) -> Scanned {
+/// 字符串里的反斜杠是否转义按词法（MySQL 家族是），`'it\'s; x'` 不在分号处切开。
+fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, lexis: crate::adapters::Lexis) -> Scanned {
+    let tsql_blocks = lexis.transact;
     let bytes = sql.as_bytes();
     let mut i = start;
     let mut quote: Option<u8> = None;
@@ -376,6 +378,10 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             continue;
         }
         if let Some(q) = quote {
+            if crate::adapters::query::backslash_escapes_in(lexis, q) && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 1 + utf8_len(bytes[i + 1]);
+                continue;
+            }
             if bytes[i] == q {
                 if q == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                     i += 2;
@@ -755,20 +761,69 @@ fn meaningful(text: &str, hash: bool) -> bool {
 }
 
 /// 去掉注释后的语句文本（字符串与引号标识符里的内容原样保留，注释换成一个空格）。
-/// 按引擎决定 `#` 是否是注释；多字节字符按字符整体保留。
+/// 按引擎的词法决定 `#` 是否是注释、反斜杠是否转义、`[name]` 是否是标识符；
+/// dollar-quote（`$$…$$`、`$tag$…$tag$`）与语句切分同样整体当作字符串。多字节字符按字符整体保留。
+#[cfg(test)]
 pub fn strip_sql_comments(engine: &str, sql: &str) -> String {
-    let hash = crate::adapters::query::lexis_named(engine).hash_comments;
+    scan_code(engine, sql, false)
+}
+
+/// 只看代码的规整文本：去注释，并把引号外的连续空白折成一个空格；
+/// 字符串、引号标识符与 dollar-quote 里的空白原样保留。
+pub fn normalize_sql_code(engine: &str, sql: &str) -> String {
+    scan_code(engine, sql, true).trim().to_owned()
+}
+
+fn scan_code(engine: &str, sql: &str, collapse: bool) -> String {
+    let lexis = crate::adapters::query::lexis_named(engine);
+    let hash = lexis.hash_comments;
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0usize;
-    let mut quote: Option<u8> = None;
+    // 原样复制的起点：引号内或普通代码字符都先不复制，遇到注释或（折叠时）空白再整段写出。
     let mut copied = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut dollar: Option<String> = None;
+    let mut bracket = false;
+    // 折叠模式下刚写出过一个空格：连续的空白与注释只留一个。
+    let mut spaced = false;
+    let flush = |out: &mut String, from: usize, to: usize, spaced: &mut bool| {
+        if from < to {
+            out.push_str(&sql[from..to]);
+            *spaced = false;
+        }
+    };
     while i < bytes.len() {
+        if let Some(tag) = dollar.as_deref() {
+            let marker = format!("${tag}$");
+            if sql[i..].starts_with(&marker) {
+                i += marker.len();
+                dollar = None;
+                continue;
+            }
+            i += utf8_len(bytes[i]);
+            continue;
+        }
         if let Some(q) = quote {
+            if crate::adapters::query::backslash_escapes_in(lexis, q) && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 1 + utf8_len(bytes[i + 1]);
+                continue;
+            }
             if bytes[i] == q {
                 quote = None;
             }
             i += 1;
+            continue;
+        }
+        if bracket {
+            if bytes[i] == b']' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                    continue;
+                }
+                bracket = false;
+            }
+            i += utf8_len(bytes[i]);
             continue;
         }
         let comment_end = if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
@@ -785,18 +840,45 @@ pub fn strip_sql_comments(engine: &str, sql: &str) -> String {
             None
         };
         if let Some(end) = comment_end {
-            out.push_str(&sql[copied..i]);
-            out.push(' ');
+            flush(&mut out, copied, i, &mut spaced);
+            if !(collapse && spaced) {
+                out.push(' ');
+                spaced = true;
+            }
             i = end;
             copied = end;
             continue;
         }
+        if collapse && bytes[i].is_ascii_whitespace() {
+            flush(&mut out, copied, i, &mut spaced);
+            if !spaced {
+                out.push(' ');
+                spaced = true;
+            }
+            i += 1;
+            copied = i;
+            continue;
+        }
+        if lexis.transact && bytes[i] == b'[' {
+            bracket = true;
+            i += 1;
+            continue;
+        }
         if crate::adapters::query::is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
+            i += 1;
+            continue;
         }
-        i += 1;
+        if bytes[i] == b'$' {
+            if let Some(tag) = dollar_tag(sql, i) {
+                i += tag.len() + 2;
+                dollar = Some(tag);
+                continue;
+            }
+        }
+        i += utf8_len(bytes[i]);
     }
-    out.push_str(&sql[copied.min(sql.len())..]);
+    flush(&mut out, copied.min(sql.len()), sql.len(), &mut spaced);
     out
 }
 

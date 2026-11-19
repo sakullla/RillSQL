@@ -18,6 +18,14 @@ impl TypeRules for MysqlTypes {
         upper == "CURRENT_TIMESTAMP()"
     }
 
+    /// MySQL/MariaDB 的 BOOLEAN 落地为 `tinyint(1)`（可带 unsigned/zerofill）；其他宽度的 tinyint 是普通整数。
+    fn flag_type(&self, type_name: &str) -> bool {
+        let compact: String = type_name.chars().filter(|ch| !ch.is_whitespace()).collect::<String>().to_ascii_lowercase();
+        compact.strip_prefix("tinyint(1)").is_some_and(|rest| rest.is_empty() || rest == "unsigned" || rest == "zerofill" || rest == "unsignedzerofill")
+            || compact == "bool"
+            || compact == "boolean"
+    }
+
     fn type_choices(&self) -> &'static [&'static str] {
         &[
             "bigint",
@@ -116,3 +124,25 @@ const MYSQL_TYPES: &[&str] = &[
     "boolean",
     "bool",
 ];
+
+#[cfg(test)]
+mod flag_type_tests {
+    use crate::adapters::ddl::types_named;
+
+    /// MySQL/MariaDB 的 BOOLEAN 落地为 tinyint(1)：网格为它给开关；其他宽度和其他引擎不算。
+    #[test]
+    fn tinyint_one_is_a_flag_only_in_the_mysql_family() {
+        for engine in ["mysql", "mariadb"] {
+            let types = types_named(engine);
+            for name in ["tinyint(1)", "TINYINT(1)", "tinyint(1) unsigned", "tinyint( 1 )", "boolean"] {
+                assert!(types.flag_type(name), "{engine}: {name}");
+            }
+            for name in ["tinyint", "tinyint(4)", "int(1)", "tinyint(10)", "bit(1)", "varchar(1)"] {
+                assert!(!types.flag_type(name), "{engine}: {name}");
+            }
+        }
+        for engine in ["postgres", "sqlite", "sqlserver"] {
+            assert!(!types_named(engine).flag_type("tinyint(1)"), "{engine}");
+        }
+    }
+}

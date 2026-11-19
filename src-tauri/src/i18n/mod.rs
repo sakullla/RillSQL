@@ -700,6 +700,7 @@ dict! {
     "grid.unlock.action" => "解锁编辑", "Unlock editing";
     "grid.unlock.hint" => "确认这条语句只读一张有主键的表，然后允许编辑并预览提交", "Check that this statement reads one keyed table, then allow editing with a preview before saving";
     "grid.unlock.checking" => "正在确认…", "Checking…";
+    "grid.unlock.interrupted" => "读取表结构时被中断，请再点一次“解锁编辑”", "Reading the table structure was interrupted. Click Unlock editing again";
     "grid.find.toggle" => "查找与筛选", "Find and filter";
     "grid.find.active" => "有生效的查找或筛选：显示的不是全部行", "A find or filter is active: not all rows are shown";
     "grid.numeric.invalid" => "“{value}”不是{kind}，没有暂存。", "\"{value}\" is not {kind}; nothing was staged.";

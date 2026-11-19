@@ -591,6 +591,9 @@ pub struct SharedGrid {
     /// 新增行里仍交给数据库给值的格子（行 id、列名）：有默认值、自增或生成列，且用户还没动过。
     /// 它们显示“默认 / 自动生成”，INSERT 里不写；用户改过或明确设为 NULL 后移出，“恢复默认”再放回。
     pristine: HashSet<(String, String)>,
+    /// 查询结果的唯一键已在后台读到并定位了行（外键与完整值读取因此可用），但写入仍锁着，
+    /// 直到用户点“解锁编辑”；点了以后不必再读一次结构。
+    query_located: bool,
 }
 
 impl Default for SharedGrid {
@@ -662,6 +665,7 @@ impl SharedGrid {
             batches: Vec::new(),
             cloned: Vec::new(),
             pristine: HashSet::new(),
+            query_located: false,
             empty_hint: true,
         }
     }
@@ -740,6 +744,7 @@ impl SharedGrid {
         self.sql = sql.to_owned();
         self.token = self.token.saturating_add(1);
         self.schema = None;
+        self.query_located = false;
         // 查询结果默认只读（R17）。结构上像单表 SELECT 的给出“解锁编辑”，由用户点按后再读主键；
         // 联接、聚合等从一开始就说明原因。每个结果页签只看它自己的语句。
         self.readonly_reason = match prove_single_table(&self.target.engine, sql) {
@@ -812,11 +817,14 @@ impl SharedGrid {
         self.token
     }
 
-    /// 迟到的表结构只有代次仍是当前结果时才打开编辑。
+    /// 迟到的表结构只有代次仍是当前结果时才生效。结果出现时就在后台读一次：行据此定位，
+    /// 外键导航与完整值读取照常可用，但写入保持锁定；只有用户已经点了“解锁编辑”（正在确认）时才打开编辑。
+    /// 返回值表示这次是否真的解锁了。
     pub fn finish_locate(&mut self, token: u64, schema: TableSchema) -> bool {
         if token != self.token || self.mode != GridMode::Query {
             return false;
         }
+        let unlock = self.readonly_reason == "grid.readonly.locatePending";
         let proof = match prove_single_table(&self.target.engine, &self.sql) {
             Ok(proof) => proof,
             Err(reason) => {
@@ -879,9 +887,26 @@ impl SharedGrid {
             self.target.schema = schema.schema.clone();
         }
         self.schema = Some(schema);
-        self.readonly_reason.clear();
+        self.query_located = true;
         self.rows = self.source.clone();
-        true
+        if unlock {
+            self.readonly_reason.clear();
+        }
+        unlock
+    }
+
+    /// 点了“解锁编辑”且唯一键已在后台读到：直接打开编辑，不再读结构。
+    pub fn complete_unlock(&mut self) -> bool {
+        if self.mode == GridMode::Query && self.query_located && self.readonly_reason == "grid.readonly.locatePending" {
+            self.readonly_reason.clear();
+            return true;
+        }
+        false
+    }
+
+    /// 正在等唯一键的结果（用户点了“解锁编辑”）。
+    pub fn unlock_pending(&self) -> bool {
+        self.mode == GridMode::Query && self.readonly_reason == "grid.readonly.locatePending"
     }
 
     /// 查询结果能否点“解锁编辑”：结构证明已通过、还没开始读主键。
@@ -903,18 +928,20 @@ impl SharedGrid {
             }
         };
         if !live {
-            self.readonly_reason = "grid.readonly.offline".to_owned();
+            // 连接没打开：只说明原因，结果仍可解锁；重新连接后再点一次即可，不必重跑查询。
             return Err("grid.readonly.offline");
         }
         self.readonly_reason = "grid.readonly.locatePending".to_owned();
         Ok(proof)
     }
 
-    /// 解锁时读主键失败：回到“可解锁”，原因由界面另行提示。
-    pub fn relock(&mut self) {
-        if self.mode == GridMode::Query && self.readonly_reason == "grid.readonly.locatePending" {
+    /// 解锁时读主键失败：回到“可解锁”，原因由界面另行提示。返回 true 表示确实是在等解锁时失败的。
+    pub fn relock(&mut self) -> bool {
+        if self.unlock_pending() {
             self.readonly_reason = "grid.readonly.locked".to_owned();
+            return true;
         }
+        false
     }
 
     pub fn writable(&self) -> bool {
@@ -3732,6 +3759,11 @@ impl SharedGrid {
     }
 
     fn tsv_field(&self, row: usize, column: usize) -> String {
+        // 新增行里仍交给数据库给值的格子（默认/自动生成）还没有值：复制为空文本，
+        // 既不写成 NULL（它提交后未必是 NULL），也不写“默认”这类界面标签。
+        if self.pristine_cell(row, column).is_some() {
+            return String::new();
+        }
         match self.original(row, column) {
             Some(Some(text)) if text == "NULL" => quote_tsv(&text, true),
             Some(Some(text)) => quote_tsv(&text, false),
@@ -4804,11 +4836,12 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
         return Err("grid.readonly.unparsed");
     }
     // 证明只看代码：注释（行尾 `-- a, b`、`/* (x) */`）里的逗号、括号和关键字不算，
-    // 换行与多个空白折成一个空格，`SELECT id\nFROM t` 与单行写法同样能证明。
+    // 引号外的换行与多个空白折成一个空格，`SELECT id\nFROM t` 与单行写法同样能证明；
+    // 引号标识符与字符串里的空白原样保留，注释的词法（`#`、反斜杠、dollar-quote）按引擎。
     let pieces = report
         .pieces
         .into_iter()
-        .map(|piece| crate::query::strip_sql_comments(engine, &piece.text).split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|piece| crate::query::normalize_sql_code(engine, &piece.text))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
     if pieces.len() != 1 {
@@ -4854,7 +4887,24 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
     let after = statement[marker + " FROM ".len()..].trim_start();
     let mut parts = Vec::new();
     let mut current = String::new();
-    for ch in after.chars() {
+    // 引号标识符整体读入（可含空格、点与逗号），`""`、`]]` 这类双写还原成一个；引号外遇到空白或逗号即结束。
+    let mut chars = after.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if crate::adapters::query::is_identifier_quote(ch) {
+            let close = if ch == '[' { ']' } else { ch };
+            while let Some(inner) = chars.next() {
+                if inner == close {
+                    if chars.peek() == Some(&close) {
+                        chars.next();
+                        current.push(close);
+                        continue;
+                    }
+                    break;
+                }
+                current.push(inner);
+            }
+            continue;
+        }
         if ch.is_whitespace() || ch == ',' {
             break;
         }
@@ -4862,9 +4912,6 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
             if !current.is_empty() {
                 parts.push(std::mem::take(&mut current));
             }
-            continue;
-        }
-        if crate::adapters::query::is_identifier_quote(ch) {
             continue;
         }
         current.push(ch);
@@ -5694,7 +5741,15 @@ mod tests {
         grid.show_query_sheet("select count(*)", vec!["n".into()], vec![vec![Some("1".into())]], false, Some(1));
         assert!(!grid.finish_locate(stale, schema()) || !grid.writable());
         let current = grid.show_query_sheet("select id, name from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]], false, Some(1));
-        assert!(grid.finish_locate(current, schema()));
+        // 后台读到唯一键：行已定位，但写入仍锁着（R17）。
+        assert!(!grid.finish_locate(current, schema()));
+        assert!(!grid.writable());
+        assert!(grid.unlockable());
+        assert!(grid.rows.iter().all(|row| row.located), "外键与完整值读取靠定位，不必等解锁");
+        assert_eq!(grid.stage_text(0, 1, Some("乙".into())), Gate::Readonly);
+        // 点“解锁编辑”：已读到的结构直接生效。
+        assert!(grid.begin_unlock(true).is_ok());
+        assert!(grid.complete_unlock());
         assert!(grid.writable());
         assert!(grid.banner().contains("笔记"), "{}", grid.banner());
         assert!(grid.banner().contains("dev"), "{}", grid.banner());
@@ -7076,12 +7131,17 @@ mod tests {
         assert_eq!(pending.readonly_reason(), "grid.readonly.locked");
         assert!(pending.unlockable());
         assert_eq!(pending.begin_unlock(false), Err("grid.readonly.offline"), "连接没打开时说明原因");
-        pending.show_query_sheet("select name from keyed", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        // 离线时只提示，不把结果卡在不可解锁：重新连接后直接再点，无须重跑查询。
+        assert!(pending.unlockable());
+        assert_eq!(pending.readonly_reason(), "grid.readonly.locked");
         assert!(pending.begin_unlock(true).is_ok());
         assert_eq!(pending.readonly_reason(), "grid.readonly.locatePending");
+        assert!(pending.unlock_pending());
         assert!(!pending.unlockable(), "正在确认时不再给第二个解锁入口");
-        pending.relock();
+        assert!(!pending.complete_unlock(), "还没读到结构时不能直接解锁");
+        assert!(pending.relock());
         assert!(pending.unlockable(), "读主键失败后可以再试");
+        assert!(!pending.relock(), "不在等解锁时不算失败");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7109,6 +7169,27 @@ mod tests {
         let count = rows.len() as i64;
         grid.load_local(columns_from_schema(&schema, true), rows, Some(count), Some(schema));
         grid
+    }
+
+    /// 新增行里还交给数据库的格子没有值：复制为空文本，不是 NULL 文本，也不是界面上的“默认/自动生成”标签。
+    #[test]
+    fn copying_pending_default_cells_gives_empty_text() {
+        let mut grid = defaults_grid(Vec::new());
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        let (id, created, note) = (0, 1, 3);
+        for column in [id, created] {
+            grid.select(0, column, false);
+            assert_eq!(grid.tsv(), "", "列 {column}");
+            assert_eq!(grid.copy_text(), "", "列 {column}");
+        }
+        // 没有默认值的可空列确实是 NULL，照旧复制 NULL 文本。
+        grid.select(0, note, false);
+        assert_eq!(grid.tsv(), "NULL");
+        // 用户改过以后就是普通值。
+        let row_id = grid.row_id(0).unwrap().to_owned();
+        assert_eq!(grid.stage_text_by_id(&row_id, created, Some("2026-01-02 03:04:05".into())), Gate::Writable);
+        grid.select(0, created, false);
+        assert_eq!(grid.tsv(), "2026-01-02 03:04:05");
     }
 
     fn insert_statement(grid: &mut SharedGrid) -> String {

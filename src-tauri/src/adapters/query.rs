@@ -150,6 +150,11 @@ pub fn is_quote_byte(byte: u8) -> bool {
     byte.is_ascii() && is_quote_char(byte as char)
 }
 
+/// 在这种引号里反斜杠是否转义下一个字符：MySQL 家族的字符串（'…'、"…"）是，反引号标识符不是。
+pub fn backslash_escapes_in(lexis: Lexis, quote: u8) -> bool {
+    lexis.backslash_escapes && quote != b'`'
+}
+
 /// 这个字符是某个方言的标识符引号（开或闭）。
 pub fn is_identifier_quote(ch: char) -> bool {
     identifier_quote_chars().contains(&ch)

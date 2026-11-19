@@ -67,7 +67,7 @@ impl SqlSyntax for SqlserverSyntax {
     }
 
     fn lexis(&self) -> Lexis {
-        Lexis { hash_comments: false, transact: true, delimiter_command: false, executable_comments: false }
+        Lexis { hash_comments: false, transact: true, delimiter_command: false, executable_comments: false, backslash_escapes: false }
     }
 
     fn cap_rows(&self, sql: &str, cap: usize) -> Option<CappedSql> {
