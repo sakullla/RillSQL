@@ -1921,7 +1921,8 @@ impl QueryPane {
         let mut databases = Vec::new();
         let links = connections.iter().filter(|connection| connection.status == crate::catalog::model::ConnStatus::Connected).map(|connection| {
             let mut names: Vec<String> = connection.databases.iter().map(|database| database.name.clone()).collect();
-            if connection.engine == crate::connections::model::Engine::Redis {
+            // 库号型引擎（Redis 0–15）：没读到的库号也列出来，可以直接切换。
+            if crate::adapters::adapter(connection.engine).meta().database_is_index() {
                 for db in 0..16u8 {
                     let item = db.to_string();
                     if !names.contains(&item) {
@@ -2187,9 +2188,8 @@ impl QueryPane {
         if !engine.is_relational() {
             return;
         }
-        let schema = match engine {
-            crate::catalog::Engine::Postgres if target.schema.is_empty() => "public".to_owned(),
-            crate::catalog::Engine::Sqlserver if target.schema.is_empty() => "dbo".to_owned(),
+        let schema = match crate::adapters::catalog_of(engine).default_schema() {
+            Some(default) if target.schema.is_empty() => default.to_owned(),
             _ => target.schema.clone(),
         };
         let (handle, abort) = futures::future::AbortHandle::new_pair();
@@ -2201,8 +2201,8 @@ impl QueryPane {
         runtime().spawn(futures::future::Abortable::new(async move {
             let result = crate::catalog::nav_read::limited_metadata(gate, &read_target.connection_id, async {
                 let session = services.connections.catalog_session(&read_target.connection_id).ok_or_else(|| "连接没有打开".to_owned())?;
-                if let crate::connections::CatalogSession::Mysql(pool) = &session {
-                    return crate::catalog::read::read_mysql_completion_objects(pool, &read_target.database).await.map(|objects| (schema, objects));
+                if let Some(objects) = crate::adapters::catalog_of(engine).read_completion_objects(&session, &read_target.database).await {
+                    return objects.map(|objects| (schema, objects));
                 }
                 let page = crate::catalog::read_object_page(&session, engine, &read_target.database, &schema, 0, FULL_LIST).await;
                 match page.error {
@@ -2263,10 +2263,11 @@ impl QueryPane {
         let mut requests = Vec::new();
         for table in parsed.tables.into_iter().chain(parsed.target) {
             if parsed.ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&table.name)) { continue; }
-            let mysql = matches!(engine, crate::catalog::Engine::Mysql | crate::catalog::Engine::Mariadb);
+            // 名字第一段是库（而不是模式）的引擎：`库.表` 指向另一个库。
+            let mysql = crate::adapters::catalog_of(engine).qualifier_is_database();
             let database = if mysql && !table.schema.is_empty() { table.schema.clone() } else { target.database.clone() };
             let mut schema = if mysql { String::new() } else if table.schema.is_empty() { target.schema.clone() } else { table.schema };
-            if schema.is_empty() && matches!(engine, crate::catalog::Engine::Postgres | crate::catalog::Engine::Sqlserver) {
+            if schema.is_empty() && crate::adapters::adapter(engine).capabilities().shows_schemas {
                 let candidates: Vec<_> = self.desk.objects().iter().filter(|object| object.connection_id == target.connection_id && object.database == database && object.name.eq_ignore_ascii_case(&table.name)).collect();
                 if candidates.len() == 1 { schema = candidates[0].schema.clone(); }
             }
@@ -2666,7 +2667,12 @@ impl QueryPane {
         }
         self.fold_key = Some(key);
         self.fold_wait = None;
-        let engine = self.desk.target().map(|target| target.engine).filter(|engine| !engine.is_empty()).unwrap_or_else(|| "sqlite".to_owned());
+        let engine = self
+            .desk
+            .target()
+            .map(|target| target.engine)
+            .filter(|engine| !engine.is_empty())
+            .unwrap_or_else(|| crate::adapters::registry::UNBOUND_GRID.as_str().to_owned());
         let ranges = assist::fold_line_ranges(&sql, &engine);
         editor.update(cx, |editor, cx| {
             let _ = editor.apply_folds(&ranges, cx);

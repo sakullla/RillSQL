@@ -258,7 +258,7 @@ fn mysql_column_index(row: &mysql_async::Row, label: &str) -> Option<usize> {
 
 fn quote_mysql(name: &str) -> String {
     use crate::adapters::SqlSyntax;
-    super::syntax::MysqlSyntax.quote_always(name)
+    super::syntax::MYSQL_SYNTAX.quote_always(name)
 }
 
 fn mysql_create_sql(row: &mysql_async::Row, index: usize) -> Result<String, String> {

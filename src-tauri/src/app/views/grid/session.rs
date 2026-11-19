@@ -1166,7 +1166,7 @@ impl SharedGrid {
 
     fn engine_name(&self) -> String {
         match &self.schema {
-            Some(schema) => crate::grid::engine_key(schema.engine).to_owned(),
+            Some(schema) => schema.engine.as_str().to_owned(),
             None => self.target.engine.clone(),
         }
     }
@@ -2184,7 +2184,7 @@ impl SharedGrid {
         if points.is_empty() {
             return String::new();
         }
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         let mut lines: Vec<Vec<String>> = Vec::new();
         let mut current = usize::MAX;
         for (row, column) in points.iter().copied() {
@@ -2627,7 +2627,7 @@ impl SharedGrid {
         if key.ref_columns.len() != key.columns.len() || key.ref_table.is_empty() {
             return Err("grid.fk.missingColumn");
         }
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         // 与网格读取同样的限定方式：会话已经绑定库，引用部分只带模式（模式为空就只带表）。
         let table = if key.ref_schema.is_empty() {
             quote_ident(engine, &key.ref_table)
@@ -3337,7 +3337,7 @@ impl SharedGrid {
 
     /// 条件里的列名带表名前缀（有结构证明时），并按目标引擎引用。
     fn ident(&self, name: &str) -> String {
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         match &self.schema {
             Some(schema) => format!("{}.{}", qualified_name(schema), quote_ident(engine, name)),
             None => quote_ident(engine, name),
@@ -3345,7 +3345,7 @@ impl SharedGrid {
     }
 
     fn literal(&self, column: Option<&GridColumn>, value: Option<String>) -> String {
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         sql_cell(engine, column.map(domain_column).as_ref(), &cell_of(value))
     }
 
@@ -3934,7 +3934,7 @@ impl SharedGrid {
             CopyFormat::Json => render("json", ""),
             CopyFormat::Markdown => render("markdown", "NULL"),
             CopyFormat::Insert => {
-                let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+                let engine = crate::adapters::registry::grid_engine(&self.target.engine);
                 let (schema, table_name) = match (&self.schema, self.mode) {
                     (_, GridMode::Table) if !self.target.table.is_empty() => (self.target.schema.clone(), self.target.table.clone()),
                     // 查询结果只有在证明是单表并读到结构后才用真实表名。
@@ -4264,7 +4264,7 @@ impl SharedGrid {
             return String::new();
         }
         let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         let mut sets = Vec::new();
         for item in &self.overlays {
             if item.kind != "update" || item.row_id != row_id || item.gate != Gate::Writable || item.column_name.is_empty() {
@@ -4296,7 +4296,7 @@ impl SharedGrid {
         if let Some(schema) = &self.schema {
             return qualified_name(schema);
         }
-        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let engine = crate::adapters::registry::grid_engine(&self.target.engine);
         if self.target.table.is_empty() {
             quote_ident(engine, PLACEHOLDER_TABLE)
         } else if self.target.schema.is_empty() {
@@ -4609,7 +4609,7 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
             }
             continue;
         }
-        if matches!(ch, '"' | '`' | '[' | ']') {
+        if crate::adapters::query::is_identifier_quote(ch) {
             continue;
         }
         current.push(ch);

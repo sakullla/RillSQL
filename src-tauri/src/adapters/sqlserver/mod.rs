@@ -6,6 +6,10 @@ pub(crate) mod connect;
 pub(crate) mod diagram;
 pub(crate) mod ddl;
 pub(crate) mod ddl_read;
+pub(crate) mod exec;
+mod functions;
+pub(crate) mod grid_read;
+mod plan;
 mod syntax;
 mod types;
 

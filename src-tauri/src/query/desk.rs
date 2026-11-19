@@ -8,7 +8,7 @@ use crate::application::tasks::{TaskBoard, TaskOutcome, TaskToken};
 use crate::i18n::Locale;
 use crate::catalog::{ConnectionBody, ObjectKind};
 use crate::connections::model::Engine;
-use crate::connections::{CatalogSession, Service};
+use crate::connections::Service;
 
 use super::assist::{
     self, CatalogObject, ColumnMeta, CompletionEntry, CompletionSource, LintFinding, MetadataState, OutlineItem, RunPick, RunScope, TextResult,
@@ -577,7 +577,7 @@ impl Desk {
             .iter()
             .find(|name| !name.is_empty())
             .cloned()
-            .unwrap_or_else(|| if link.engine == "sqlite" { "main".to_owned() } else { String::new() });
+            .unwrap_or_else(|| crate::adapters::query::syntax_named(&link.engine).and_then(|syntax| syntax.fixed_database()).unwrap_or_default().to_owned());
         if database.is_empty() {
             return false;
         }
@@ -1153,8 +1153,7 @@ impl Desk {
     pub fn refresh_outline(&mut self) {
         let view_gen = self.view_gen;
         let Some(tab) = self.active_mut() else { return };
-        let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("postgres");
-        let engine = if assist::known_engine(engine) { engine } else { "postgres" };
+        let engine = crate::adapters::query::sql_dialect_id(tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or_default());
         let stamp = (tab.version, view_gen, engine.to_owned());
         if tab.outline_stamp.as_ref() == Some(&stamp) { return; }
         let list = assist::outline_statements(&tab.draft, engine);
@@ -1309,7 +1308,8 @@ impl Desk {
                 return BeginRun::Rejected(reason);
             }
         }
-        if override_sql.is_none() && target.engine != "redis" {
+        // Redis 查询台执行的是命令，不做 SQL 变量替换。
+        if override_sql.is_none() && crate::adapters::query::workbench_named(&target.engine) != Some(crate::adapters::Workbench::Redis) {
             let variables = assist::find_variables(&pick.sql);
             if !variables.is_empty() {
                 if let Some(tab) = self.active_mut() {
@@ -1857,77 +1857,20 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
         if let Some(name) = record.saved.database.clone().filter(|name| !name.is_empty()) {
             db_names.push(name);
         }
-        if engine != "sqlite" {
-            if let Ok(parsed) = Engine::parse(&engine) {
-                let body = crate::catalog::nav_read::metadata_read(crate::catalog::read::read_catalog_outline(parsed, &session)).await?;
-                let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
-                // 目录只给对象名；列和外键按对象按需再读，单个对象失败只记原因，不清空兄弟节点。
-                for object in &listing.objects {
-                    match crate::catalog::detail::read_column_meta(&session, parsed, &object.database, &object.schema, &object.name).await {
-                        Ok(meta) if !meta.is_empty() => {
-                            columns.insert(
-                                column_key(&object.connection_id, &object.database, &object.schema, &object.name),
-                                meta,
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => failures.push(format!("{}: {error}", object_label(object))),
-                    }
-                }
-                // 对象注释按库/模式读一次；读不到只是没有注释，不记成失败，也不编造。
-                let mut scopes: Vec<(String, String)> = Vec::new();
-                for object in &listing.objects {
-                    let scope = (object.database.clone(), object.schema.clone());
-                    if !scopes.contains(&scope) {
-                        scopes.push(scope);
-                    }
-                }
-                for (database, schema) in &scopes {
-                    if let Ok(found) = crate::catalog::detail::read_table_comments(&session, parsed, database, schema).await {
-                        for (name, comment) in found {
-                            comments.insert(column_key(&record.saved.id, database, schema, &name), comment);
-                        }
-                    }
-                }
-                for object in listing.objects.iter().filter(|object| object.kind == "table") {
-                    let Ok(keys) = super::meta::read_table_keys(&session, parsed, &object.database, &object.schema, &object.name).await else {
-                        continue;
-                    };
-                    collect_keys(
-                        &mut foreign_keys,
-                        &object.connection_id,
-                        &object.database,
-                        &object.schema,
-                        &object.name,
-                        keys,
-                    );
-                }
-                objects.extend(listing.objects);
-                failures.extend(listing.failures);
-                for name in listing.databases {
-                    if !name.is_empty() && !db_names.iter().any(|have| have == &name) {
-                        db_names.push(name);
-                    }
-                }
+        // 经执行通道列对象的引擎（单文件引擎）不走目录读取。
+        let listing = crate::adapters::query::syntax_named(&engine).and_then(|syntax| syntax.editor_object_listing());
+        if let Some(listing_sql) = listing {
+            let parsed = crate::adapters::registry::sql_engine(&engine);
+            let main = crate::adapters::query::sql_syntax(parsed).fixed_database().unwrap_or_default();
+            if !db_names.iter().any(|name| name == main) {
+                db_names.push(main.to_owned());
             }
-        } else {
-            if !db_names.iter().any(|name| name == "main") {
-                db_names.push("main".to_owned());
-            }
-            let transport = service.cancel_transport(&record.saved.id).unwrap_or(crate::connections::CancelTransport::None);
+            let transport = service.cancel_transport(&record.saved.id).unwrap_or_default();
             // 外键读取要另外借用同一个会话，执行器拿走它之前先留一份句柄。
             let key_session = session.clone();
-            let driver = LiveDriver::attach(session, &engine, "main", transport, None).await?;
+            let driver = LiveDriver::attach(session, &engine, main, transport, None).await?;
             let flag = Arc::new(AtomicBool::new(false));
-            let listed = driver
-                .run(
-                    "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                    page,
-                    &flag,
-                )
-                .await
-                .outcome
-                .map_err(|err| err.to_string())?;
+            let listed = driver.run(listing_sql, page, &flag).await.outcome.map_err(|err| err.to_string())?;
             let _ = driver.finish().await;
             for row in listed.rows {
                 let Some(name) = row.first().and_then(|cell| cell.clone()) else {
@@ -1938,16 +1881,67 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
                     connection_id: record.saved.id.clone(),
                     connection_name: record.saved.name.clone(),
                     engine: engine.clone(),
-                    database: "main".to_owned(),
+                    database: main.to_owned(),
                     schema: String::new(),
                     name: name.clone(),
                     kind,
                 });
-                if let Ok(info) = read_columns(service, &record.saved.id, &name).await {
-                    columns.insert(column_key(&record.saved.id, "main", "", &name), info);
+                if let Ok(info) = read_columns(service, &record.saved.id, &engine, main, &name).await {
+                    columns.insert(column_key(&record.saved.id, main, "", &name), info);
                 }
-                if let Ok(keys) = super::meta::read_table_keys(&key_session, Engine::Sqlite, "main", "", &name).await {
-                    collect_keys(&mut foreign_keys, &record.saved.id, "main", "", &name, keys);
+                if let Ok(keys) = super::meta::read_table_keys(&key_session, parsed, main, "", &name).await {
+                    collect_keys(&mut foreign_keys, &record.saved.id, main, "", &name, keys);
+                }
+            }
+        } else if let Ok(parsed) = Engine::parse(&engine) {
+            let body = crate::catalog::nav_read::metadata_read(crate::catalog::read::read_catalog_outline(parsed, &session)).await?;
+            let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
+            // 目录只给对象名；列和外键按对象按需再读，单个对象失败只记原因，不清空兄弟节点。
+            for object in &listing.objects {
+                match crate::catalog::detail::read_column_meta(&session, parsed, &object.database, &object.schema, &object.name).await {
+                    Ok(meta) if !meta.is_empty() => {
+                        columns.insert(
+                            column_key(&object.connection_id, &object.database, &object.schema, &object.name),
+                            meta,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.push(format!("{}: {error}", object_label(object))),
+                }
+            }
+            // 对象注释按库/模式读一次；读不到只是没有注释，不记成失败，也不编造。
+            let mut scopes: Vec<(String, String)> = Vec::new();
+            for object in &listing.objects {
+                let scope = (object.database.clone(), object.schema.clone());
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+            for (database, schema) in &scopes {
+                if let Ok(found) = crate::catalog::detail::read_table_comments(&session, parsed, database, schema).await {
+                    for (name, comment) in found {
+                        comments.insert(column_key(&record.saved.id, database, schema, &name), comment);
+                    }
+                }
+            }
+            for object in listing.objects.iter().filter(|object| object.kind == "table") {
+                let Ok(keys) = super::meta::read_table_keys(&session, parsed, &object.database, &object.schema, &object.name).await else {
+                    continue;
+                };
+                collect_keys(
+                    &mut foreign_keys,
+                    &object.connection_id,
+                    &object.database,
+                    &object.schema,
+                    &object.name,
+                    keys,
+                );
+            }
+            objects.extend(listing.objects);
+            failures.extend(listing.failures);
+            for name in listing.databases {
+                if !name.is_empty() && !db_names.iter().any(|have| have == &name) {
+                    db_names.push(name);
                 }
             }
         }
@@ -1967,11 +1961,13 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
     Ok(TreeLoad { objects, databases, columns, comments, foreign_keys, links, failures })
 }
 
-async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<ColumnMeta>, String> {
+async fn read_columns(service: &Arc<Service>, connection_id: &str, engine: &str, database: &str, table: &str) -> Result<Vec<ColumnMeta>, String> {
     let session = service.catalog_session(connection_id).ok_or_else(|| "连接没有打开".to_owned())?;
-    let transport = service.cancel_transport(connection_id).unwrap_or(crate::connections::CancelTransport::None);
-    let driver = LiveDriver::attach(session, "sqlite", "main", transport, None).await?;
-    let sql = format!("PRAGMA table_info({})", assist::quote_ident("sqlite", table));
+    let sql = crate::adapters::query::syntax_named(engine)
+        .and_then(|syntax| syntax.editor_column_listing(table))
+        .ok_or_else(|| "这个引擎不经执行通道读列".to_owned())?;
+    let transport = service.cancel_transport(connection_id).unwrap_or_default();
+    let driver = LiveDriver::attach(session, engine, database, transport, None).await?;
     let flag = Arc::new(AtomicBool::new(false));
     let info = driver.run(&sql, 200, &flag).await.outcome.map_err(|stop| match stop {
         super::exec::StatementStop::Error { message, .. } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message,
@@ -1980,7 +1976,7 @@ async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) 
     Ok(sqlite_column_meta(&info.columns, &info.rows))
 }
 
-/// PRAGMA table_info 的结果按列名取 name / type / notnull / pk；SQLite 没有列注释。
+/// 列清单结果按列名取 name / type / notnull / pk；这类引擎没有列注释。
 fn sqlite_column_meta(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
     let find = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
     let name_at = find("name").unwrap_or(1);
@@ -2204,18 +2200,6 @@ impl StopText for super::exec::StatementStop {
     }
 }
 
-#[allow(dead_code)]
-fn _session_kind(session: &CatalogSession) -> &'static str {
-    match session {
-        CatalogSession::Sqlite { .. } => "sqlite",
-        CatalogSession::Postgres(_) => "postgres",
-        CatalogSession::Mysql(_) => "mysql",
-        CatalogSession::Sqlserver(_) => "sqlserver",
-        CatalogSession::Redis(_) => "redis",
-        CatalogSession::Mongo(_) => "mongo",
-        CatalogSession::Scripted => "scripted",
-    }
-}
 
 #[cfg(test)]
 mod tests {

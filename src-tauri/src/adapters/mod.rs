@@ -10,6 +10,9 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod exec;
+pub mod grid;
+pub mod query;
 pub mod registry;
 pub mod session;
 
@@ -27,6 +30,9 @@ mod boundary_tests;
 mod tests;
 
 use crate::connections::model::{Engine, SavedConnection, TlsMode};
+use crate::query::exec::{CappedSql, DatabaseGate};
+use crate::query::functions::FunctionSig;
+use crate::query::plan::PlanNode;
 
 pub use catalog::{catalog_of, CatalogDialect};
 pub use ddl::{DdlDialect, TypeRules};
@@ -191,7 +197,8 @@ pub trait EngineMeta: Sync {
     }
 }
 
-/// SQL 语法：标识符引号、保留字与限定名。A4 起补充字面量、分页、计数、超时、词法与 EXPLAIN。
+/// SQL 语法：标识符引号、保留字与限定名；网格的字面量、分页、计数与投影；查询的词法、库切换、超时、
+/// 行数上限、执行计划与函数表（A4）。主代码经 [`query`] 门面按引擎取用。
 ///
 /// 按需引号判定（保守：任何不确定都加引号）：仅 `[A-Za-z_][A-Za-z0-9_]*`（`allows_dollar` 时另允许 `$`），
 /// 不是保留字，`bare_leading_underscore` 为假时下划线开头一律加引号，`folds_to_lowercase` 时要求全小写。
@@ -273,6 +280,167 @@ pub trait SqlSyntax: Sync {
             .collect::<Vec<_>>()
             .join(".")
     }
+
+    // ---- A4 网格：字面量、匹配、分页与投影 ----
+
+    /// Unicode 字符串字面量的前缀（T-SQL 的 `N`）；字面量与 LIKE 模式共用。
+    fn national_prefix(&self) -> &'static str {
+        ""
+    }
+
+    /// 文本字面量：单引号翻倍。
+    fn text_literal(&self, value: &str) -> String {
+        format!("{}'{}'", self.national_prefix(), value.replace('\'', "''"))
+    }
+
+    /// 筛选“包含”与整表关键字搜索使用的匹配运算符（不区分大小写的方言给出专用运算符）。
+    fn contains_operator(&self) -> &'static str {
+        "LIKE"
+    }
+
+    /// 分页尾段。`ordered` 表示语句已有 ORDER BY。
+    fn page_tail(&self, limit: u64, offset: u64, _ordered: bool) -> String {
+        if offset == 0 {
+            format!(" LIMIT {limit}")
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        }
+    }
+
+    /// 没有任何列值的插入。`table` 已按方言引用。
+    fn insert_defaults(&self, table: &str) -> String {
+        format!("INSERT INTO {table} DEFAULT VALUES")
+    }
+
+    /// 计数投影（结果读成 64 位整数）。
+    fn count_expression(&self) -> &'static str {
+        "COUNT(*)"
+    }
+
+    /// 既没有排序也没有主键时，这种对象（`table` / `view`）的稳定行序列。
+    fn implicit_order(&self, _kind: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// 把列转成文本形态（网格投影与关键字匹配）。`ident` 已引用。
+    fn text_cast(&self, ident: &str) -> String;
+
+    /// 超过 `cap` 字节的文本投影成预览信封 `\u{1}t:字节数:预览`。`plain` 是 `text_cast` 的结果。
+    fn text_preview(&self, plain: &str, cap: usize) -> String;
+
+    /// 二进制列投影成长度信封 `\u{1}b:字节数`。
+    fn binary_length(&self, ident: &str) -> String;
+
+    /// 二进制列投影成不带前缀的小写十六进制（外层 NULL 判断由调用方包）。
+    fn binary_hex(&self, ident: &str) -> String;
+
+    /// 十六进制文本写成二进制字面量。
+    fn binary_literal(&self, hex: &str) -> String {
+        format!("X'{hex}'")
+    }
+
+    // ---- A4 查询：词法、库切换、超时、行数上限、执行计划 ----
+
+    /// 语句切分与词法扫描需要知道的方言特征。
+    fn lexis(&self) -> Lexis {
+        Lexis::default()
+    }
+
+    /// 单文件引擎唯一的库名；其余引擎没有。
+    fn fixed_database(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 请求的库与会话当前库不同（且不为空）时的处理。
+    fn database_gate(&self, requested: &str) -> DatabaseGate {
+        if self.fixed_database() == Some(requested) {
+            DatabaseGate::Ready
+        } else {
+            DatabaseGate::Refuse
+        }
+    }
+
+    /// 本批要下发的会话级语句超时设置（毫秒，大于 0）。
+    fn timeout_statements(&self, _ms: u64) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 整批结束后复位会话级超时的语句。
+    fn timeout_reset_statements(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 行数上限改写：返回 None 表示走通用的 LIMIT 改写；方言自有写法（TOP）时给出结果。
+    fn cap_rows(&self, _sql: &str, _cap: usize) -> Option<CappedSql> {
+        None
+    }
+
+    /// 补全里该方言独有的关键字。
+    fn dialect_words(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 把一条（已去掉末尾分号、非 ANALYZE 的）语句包成只看执行计划的语句。
+    fn explain(&self, body: &str) -> String {
+        if body.to_ascii_uppercase().starts_with("EXPLAIN") {
+            body.to_owned()
+        } else {
+            format!("EXPLAIN {body}")
+        }
+    }
+
+    /// 解析执行计划结果；`explained` 表示语句以 EXPLAIN / SET SHOWPLAN 开头。认不出返回 None。
+    fn parse_plan(&self, _sql: &str, _explained: bool, _columns: &[String], _rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
+        None
+    }
+
+    /// 常用内置函数的签名表。
+    fn functions(&self) -> &'static [FunctionSig] {
+        &[]
+    }
+
+    /// 方言专有、不属于标准 SQL 的语句关键字（大写）。
+    fn statement_keywords(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 系统内部对象的名字前缀（补全里排在业务表之后）。
+    fn system_object_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// 查询编辑器经执行通道列出对象（名字、类型两列）的语句；None 表示走目录读取。
+    fn editor_object_listing(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 查询编辑器经执行通道读一张表的列（name/type/notnull/pk 列）的语句。`table` 未引用。
+    fn editor_column_listing(&self, _table: &str) -> Option<String> {
+        None
+    }
+}
+
+/// 语句切分与词法扫描的方言特征。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lexis {
+    /// `#` 起行注释（MySQL 家族）。
+    pub hash_comments: bool,
+    /// T-SQL：`[name]` 括号标识符、独占一行的 GO 批次分隔与 BEGIN…END 块。
+    pub transact: bool,
+    /// 认 `DELIMITER` 客户端指令；不认的方言跳过它并提示。
+    pub delimiter_command: bool,
+}
+
+impl Default for Lexis {
+    /// 标准 SQL：没有 `#` 注释与 T-SQL 写法，也不认 DELIMITER。
+    fn default() -> Self {
+        Self { hash_comments: false, transact: false, delimiter_command: false }
+    }
+}
+
+impl Lexis {
+    /// 引擎未知（或不是 SQL 引擎）时：保守地照常处理 DELIMITER。
+    pub const UNKNOWN: Lexis = Lexis { hash_comments: false, transact: false, delimiter_command: true };
 }
 
 /// 错误规则：错误码/位置解析、冲突错误识别、连接失败分类。（A1/A4 填充）

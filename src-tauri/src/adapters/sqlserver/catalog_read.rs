@@ -216,7 +216,7 @@ pub(super) async fn search(client: &TdsHandle, pattern: &str) -> Vec<(String, St
            AND LOWER(o.name) LIKE LOWER(N'{escaped}') ESCAPE '\\' \
          ORDER BY s.name, o.name"
     );
-    let Ok((_, rows)) = crate::grid::sqlserver_rows(client, &sql).await else {
+    let Ok((_, rows)) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, &sql).await else {
         return Vec::new();
     };
     rows.into_iter()

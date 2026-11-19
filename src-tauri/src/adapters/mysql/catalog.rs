@@ -101,6 +101,17 @@ impl CatalogDialect for MysqlCatalog {
         database
     }
 
+    fn qualifier_is_database(&self) -> bool {
+        true
+    }
+
+    async fn read_completion_objects(&self, session: &CatalogSession, database: &str) -> Option<Result<Vec<ObjectRow>, String>> {
+        match session {
+            CatalogSession::Mysql(pool) => Some(super::catalog_read::read_completion_objects(pool, database).await),
+            _ => None,
+        }
+    }
+
     fn definition_available(&self, kind: ObjectKind) -> bool {
         use ObjectKind::*;
         matches!(kind, Table | View | Function | Procedure | Trigger | Event) || (self.engine == Engine::Mariadb && kind == Sequence)

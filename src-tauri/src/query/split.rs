@@ -23,7 +23,8 @@ pub struct SplitReport {
 const FULLWIDTH_SEMICOLON: &str = "\u{ff1b}";
 
 pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
-    let hash = hash_comments(engine);
+    let lexis = crate::adapters::query::lexis_named(engine);
+    let hash = lexis.hash_comments;
     let mut notices = Vec::new();
     let mut pieces = Vec::new();
     let mut delimiter = ";".to_owned();
@@ -35,7 +36,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
             break;
         }
         // T-SQL 的 GO 是客户端批次分隔，不是发往服务器的语句，整行跳过。
-        if engine == "sqlserver" && is_go_line(sql, begin) {
+        if lexis.transact && is_go_line(sql, begin) {
             let line_end = eol_at(sql, begin);
             i = skip_break(sql, line_end);
             continue;
@@ -43,11 +44,11 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
         if is_delimiter_command(sql, begin) {
             let line_end = eol_at(sql, begin);
             let arg = delimiter_argument(&sql[begin..line_end]);
-            if engine == "postgres" || engine == "sqlite" || engine == "sqlserver" {
+            if !lexis.delimiter_command {
                 if !noticed {
                     notices.push(format!(
                         "{} 不使用 DELIMITER 这条客户端指令，已跳过。其余语句仍按该引擎执行。",
-                        engine_label(engine)
+                        crate::adapters::query::label_named(engine)
                     ));
                     noticed = true;
                 }
@@ -66,7 +67,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
             i = skip_break(sql, line_end);
             continue;
         }
-        let scanned = scan_statement(sql, begin, &delimiter, hash, engine == "sqlserver");
+        let scanned = scan_statement(sql, begin, &delimiter, hash, lexis.transact);
         if let Some(piece) = scanned.piece {
             pieces.push(piece);
         }
@@ -134,7 +135,8 @@ pub fn is_write(sql: &str) -> bool {
 /// 顶层代码词及其字节区间。字符串、注释、dollar-quote 和括号内的词不出现。
 pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>, usize) {
     let bytes = sql.as_bytes();
-    let hash = hash_comments(engine);
+    let lexis = crate::adapters::query::lexis_named(engine);
+    let hash = lexis.hash_comments;
     let mut i = 0usize;
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;
@@ -201,14 +203,14 @@ pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>,
             i = (i + 2).min(bytes.len());
             continue;
         }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+        if crate::adapters::query::is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
             i += 1;
             end_of_code = i;
             continue;
         }
         // T-SQL 的 [name] 标识符：]] 转义；其中的词不参与顶层关键字判断（[top] 不是 TOP）。
-        if engine == "sqlserver" && bytes[i] == b'[' {
+        if lexis.transact && bytes[i] == b'[' {
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b']' {
@@ -364,7 +366,7 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             i += 1;
             continue;
         }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+        if crate::adapters::query::is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
             i += 1;
             continue;
@@ -622,16 +624,6 @@ fn delimiter_argument(command: &str) -> Option<String> {
     if arg.is_empty() { None } else { Some(arg.to_owned()) }
 }
 
-fn engine_label(engine: &str) -> &'static str {
-    match engine {
-        "sqlite" => "SQLite",
-        "mysql" => "MySQL",
-        "mariadb" => "MariaDB",
-        "sqlserver" => "SQL Server",
-        _ => "PostgreSQL",
-    }
-}
-
 /// T-SQL 的 BEGIN 后面跟 TRAN/TRANSACTION/DISTRIBUTED 时是事务语句，不进入块计数。
 fn begins_transaction(sql: &str, index: usize, hash: bool) -> bool {
     matches!(peek_word(sql, index, hash).as_deref(), Some("TRAN") | Some("TRANSACTION") | Some("DISTRIBUTED"))
@@ -662,10 +654,6 @@ fn is_go_line(sql: &str, word_start: usize) -> bool {
     let rest = rest.split_once("--").map(|(code, _)| code).unwrap_or(rest).trim();
     let rest = rest.strip_suffix(';').unwrap_or(rest).trim();
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn hash_comments(engine: &str) -> bool {
-    engine == "mysql" || engine == "mariadb"
 }
 
 fn skip_noise(sql: &str, mut i: usize, hash: bool) -> usize {
@@ -737,7 +725,7 @@ fn strip_comments(sql: &str, hash: bool) -> String {
             i = (i + 2).min(bytes.len());
             continue;
         }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+        if crate::adapters::query::is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
         }
         out.push(bytes[i] as char);

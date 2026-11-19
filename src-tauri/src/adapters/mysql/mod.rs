@@ -7,6 +7,10 @@ pub(in crate::adapters) mod ddl;
 pub(in crate::adapters) mod ddl_read;
 pub(crate) mod diagram;
 pub(crate) mod extras;
+pub(crate) mod exec;
+mod functions;
+pub(crate) mod grid_read;
+mod plan;
 pub(in crate::adapters) mod syntax;
 pub(in crate::adapters) mod types;
 
@@ -60,7 +64,7 @@ impl EngineAdapter for MysqlAdapter {
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
-        Some(&syntax::MysqlSyntax)
+        Some(&syntax::MYSQL_SYNTAX)
     }
 
     fn types(&self) -> Option<&'static dyn TypeRules> {

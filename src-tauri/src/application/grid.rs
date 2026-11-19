@@ -6,7 +6,7 @@ use crate::grid::commands::{
     TableRef,
 };
 use crate::grid::{
-    commit_mutations_with_preview, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, Engine, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
+    commit_mutations_with_preview, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
     Mutation, MutationKind, Sort, TableSchema,
 };
 
@@ -229,21 +229,10 @@ fn sort_of(sort: Option<&SortArg>) -> Option<Sort> {
     sort.map(|sort| Sort { column: sort.column.clone(), descending: sort.direction == "desc" })
 }
 
-fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "postgres",
-        Engine::Mysql => "mysql",
-        Engine::Mariadb => "mariadb",
-        Engine::Sqlite => "sqlite",
-        Engine::Sqlserver => "sqlserver",
-        Engine::Redis => "redis",
-        Engine::Mongodb => "mongodb",
-    }
-}
 
 fn schema_dto(schema: &TableSchema, database: &str, foreign_keys: Option<Vec<ForeignKey>>) -> SchemaDto {
     SchemaDto {
-        engine: engine_name(schema.engine).to_owned(),
+        engine: schema.engine.as_str().to_owned(),
         database: database.to_owned(),
         schema: schema.schema.clone(),
         name: schema.name.clone(),

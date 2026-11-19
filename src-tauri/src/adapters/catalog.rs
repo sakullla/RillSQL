@@ -99,6 +99,16 @@ pub trait CatalogDialect: Sync {
         schema
     }
 
+    /// 名字的第一段是库（而不是模式）：`库.表` 指向另一个库。
+    fn qualifier_is_database(&self) -> bool {
+        false
+    }
+
+    /// 没有指定模式时对象所在的默认模式。
+    fn default_schema(&self) -> Option<&'static str> {
+        None
+    }
+
     /// 这种对象能不能读到定义（菜单据此决定“查看 DDL”是否可点）。
     fn definition_available(&self, _kind: ObjectKind) -> bool {
         false
@@ -255,6 +265,11 @@ pub trait CatalogDialect: Sync {
     /// 一个库/模式的对象一页（各类合并排序）。`limit` 已按默认页大小补齐。
     async fn read_object_page(&self, _session: &CatalogSession, _database: &str, _schema: &str, _offset: usize, _limit: usize) -> ObjectPageBody {
         empty_page(mismatch())
+    }
+
+    /// 补全用的轻量对象名单（一次读完整个库）。None 表示这个引擎按对象分页读取。
+    async fn read_completion_objects(&self, _session: &CatalogSession, _database: &str) -> Option<Result<Vec<ObjectRow>, String>> {
+        None
     }
 
     /// 全局搜索：`pattern` 是已转义、两端带 `%` 的 LIKE 模式。返回 (库, 模式, 对象)。

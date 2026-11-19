@@ -182,7 +182,12 @@ fn grid_commands_are_registered_beside_catalog() {
     let open = open.split("pub(in crate::adapters) struct SqliteConnector").next().unwrap();
     assert!(open.contains("read_only(false)"));
     assert!(!open.contains("read_only(true)"));
-    let live = fs::read_to_string(root.join("src/grid/live.rs")).unwrap();
+    // 网格读写的驱动一侧在各适配器的 grid_read.rs（A4）：同样只用已打开的会话。
+    let live = ["src/grid/live.rs", "src/adapters/grid.rs", "src/adapters/sqlite/grid_read.rs", "src/adapters/mysql/grid_read.rs", "src/adapters/postgres/grid_read.rs", "src/adapters/sqlserver/grid_read.rs"]
+        .iter()
+        .map(|path| fs::read_to_string(root.join(path)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(!live.contains("open_sqlite"));
     assert!(!live.contains("open_mysql"));
     assert!(!live.contains("open_postgres"));
@@ -1137,14 +1142,14 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
 
 #[test]
 fn sqlserver_foreign_keys_reuse_the_query_meta_catalog_query() {
-    let sql = super::live::sqlserver_foreign_key_sql("dbo", "orders");
+    let sql = crate::adapters::sqlserver::grid_read::foreign_key_sql("dbo", "orders");
     assert!(sql.contains("sys.foreign_key_columns"), "{sql}");
     assert!(sql.contains("pt.name = N'orders'"), "{sql}");
     assert!(sql.contains("ps.name = N'dbo'"), "{sql}");
-    let quoted = super::live::sqlserver_foreign_key_sql("db'o", "o'rders");
+    let quoted = crate::adapters::sqlserver::grid_read::foreign_key_sql("db'o", "o'rders");
     assert!(quoted.contains("N'db''o'"), "{quoted}");
     assert!(quoted.contains("N'o''rders'"), "{quoted}");
-    assert!(!super::live::sqlserver_foreign_key_sql("", "orders").contains("ps.name = "));
+    assert!(!crate::adapters::sqlserver::grid_read::foreign_key_sql("", "orders").contains("ps.name = "));
     let rows = vec![
         vec![text("fk_orders"), text("customer_id"), text("dbo"), text("customers"), text("id")],
         vec![text("fk_pair"), text("a"), text("dbo"), text("pairs"), text("a")],

@@ -51,7 +51,7 @@ impl EngineAdapter for MariadbAdapter {
     }
 
     fn syntax(&self) -> Option<&dyn SqlSyntax> {
-        Some(&mysql::syntax::MysqlSyntax)
+        Some(&mysql::syntax::MARIADB_SYNTAX)
     }
 
     fn types(&self) -> Option<&'static dyn TypeRules> {

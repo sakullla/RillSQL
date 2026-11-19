@@ -364,7 +364,7 @@ async fn scalar(session: &CatalogSession, sql: &str) -> Result<String, String> {
         }
         CatalogSession::Mysql(pool) => mysql_scalar(pool, sql).await,
         CatalogSession::Sqlserver(client) => {
-            let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+            let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await?;
             match rows.first().and_then(|row| row.first()) {
                 Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
                 _ => Err("没有计数".to_owned()),
@@ -384,7 +384,7 @@ async fn exec(session: &CatalogSession, sql: &str) -> Result<(), String> {
             conn.query_drop(sql).await.map_err(|err| crate::error_text::chain(&err))
         }
         // CREATE SCHEMA 不能包进 sp_executesql。simple_query 单独成批。
-        CatalogSession::Sqlserver(client) => crate::grid::sqlserver_rows(client, sql).await.map(|_| ()),
+        CatalogSession::Sqlserver(client) => crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await.map(|_| ()),
         _ => Err("这不是已打开的关系库会话".to_owned()),
     }
 }

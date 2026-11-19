@@ -1,6 +1,8 @@
-//! PostgreSQL 的 SQL 语法：标识符引号与保留字。
+//! PostgreSQL 的 SQL 语法：标识符引号、保留字、网格投影、语句超时与执行计划。
 
 use crate::adapters::SqlSyntax;
+use crate::query::functions::FunctionSig;
+use crate::query::plan::PlanNode;
 
 pub(super) struct PostgresSyntax;
 
@@ -16,6 +18,70 @@ impl SqlSyntax for PostgresSyntax {
     /// 未加引号的名字被折叠成小写；含大写的名字必须加引号。
     fn folds_to_lowercase(&self) -> bool {
         true
+    }
+
+    fn contains_operator(&self) -> &'static str {
+        "ILIKE"
+    }
+
+    fn count_expression(&self) -> &'static str {
+        "COUNT(*)::bigint"
+    }
+
+    fn text_cast(&self, ident: &str) -> String {
+        format!("{ident}::text")
+    }
+
+    fn text_preview(&self, plain: &str, cap: usize) -> String {
+        format!("CASE WHEN octet_length({plain}) > {cap} THEN chr(1) || 't:' || octet_length({plain})::text || ':' || left({plain}, {cap}) ELSE {plain} END")
+    }
+
+    fn binary_length(&self, ident: &str) -> String {
+        format!("CASE WHEN {ident} IS NULL THEN NULL ELSE chr(1) || 'b:' || octet_length({ident})::text END")
+    }
+
+    fn binary_hex(&self, ident: &str) -> String {
+        format!("encode({ident}, 'hex')")
+    }
+
+    fn binary_literal(&self, hex: &str) -> String {
+        format!("'\\x{hex}'")
+    }
+
+    fn timeout_statements(&self, ms: u64) -> Vec<String> {
+        vec![format!("SET statement_timeout = {ms}")]
+    }
+
+    fn timeout_reset_statements(&self) -> Vec<String> {
+        vec!["SET statement_timeout = 0".to_owned()]
+    }
+
+    fn dialect_words(&self) -> &'static [&'static str] {
+        &["ILIKE", "RETURNING", "LATERAL", "SIMILAR", "TABLESAMPLE", "STRING_AGG"]
+    }
+
+    /// JSON 格式带结构化的代价、行数与条件，计划视图据此画树。
+    fn explain(&self, body: &str) -> String {
+        if body.to_ascii_uppercase().starts_with("EXPLAIN") {
+            body.to_owned()
+        } else {
+            format!("EXPLAIN (FORMAT JSON) {body}")
+        }
+    }
+
+    fn parse_plan(&self, _sql: &str, explained: bool, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
+        if !explained {
+            return None;
+        }
+        super::plan::parse_postgres(columns, rows)
+    }
+
+    fn functions(&self) -> &'static [FunctionSig] {
+        super::functions::POSTGRES
+    }
+
+    fn system_object_prefixes(&self) -> &'static [&'static str] {
+        &["pg_"]
     }
 }
 

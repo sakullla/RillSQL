@@ -7,6 +7,10 @@ pub(crate) mod diagram;
 mod ddl;
 pub(in crate::adapters) mod ddl_read;
 pub(crate) mod extras;
+pub(crate) mod exec;
+mod functions;
+pub(crate) mod grid_read;
+mod plan;
 mod syntax;
 mod types;
 

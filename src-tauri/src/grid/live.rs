@@ -7,13 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use futures::TryStreamExt;
-use sqlx::Column as _;
-use sqlx::Row as _;
-use sqlx::Executor;
-use sqlx::SqlSafeStr;
-use sqlx::Statement as _;
-
+use crate::adapters::grid::ExportSink;
 use crate::connections::CatalogSession;
 
 use super::sql;
@@ -21,23 +15,12 @@ use super::store::{Applied, Cell, Column, CommitReport, Engine, Failed, Filter, 
 
 const MAX_PAGE: u64 = 10_000;
 
-fn db_err(err: impl Into<crate::error_text::Reason>) -> String {
-    let err = err.into();
-    err.to_string()
-}
 
-/// 标识符已由结构化编译器加引号，字面量也已转义。这里只执行那条 SQL，不接收手写片段。
-fn audited(statement: &str) -> sqlx::AssertSqlSafe<String> {
-    sqlx::AssertSqlSafe(statement.to_owned())
-}
 
 fn no_channel() -> String {
     "这个连接没有连着可查询的数据库".to_owned()
 }
 
-fn other_database(current: &str, name: &str) -> String {
-    format!("当前连接打开的是 {current}，没有另开连接读取 {name}")
-}
 
 pub struct LiveRow {
     pub id: String,
@@ -116,42 +99,7 @@ pub async fn describe(session: &CatalogSession, database: &str, schema: &str, ta
     if table.is_empty() {
         return Err("没有表名".to_owned());
     }
-    match session {
-        CatalogSession::Scripted => Err(no_channel()),
-        // Redis 是键值专项引擎（R11）：不经 TableTarget→grid_describe 的 SQL 通路。
-        CatalogSession::Redis(_) => Err("Redis 没有表数据网格；请使用键浏览器。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 没有表数据网格；请使用集合文档浏览器。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => {
-            if !database.is_empty() && database != "main" {
-                return Err(other_database("main", database));
-            }
-            describe_sqlite(pool, table).await
-        }
-        CatalogSession::Mysql(pool) => {
-            if database.is_empty() {
-                return Err("需要数据库名，没有另开连接。".to_owned());
-            }
-            let engine = if engine_hint == "mariadb" { Engine::Mariadb } else { Engine::Mysql };
-            describe_mysql(pool, engine, database, table).await
-        }
-        CatalogSession::Postgres(client) => {
-            ensure_postgres_database(client, database).await?;
-            if schema.is_empty() {
-                return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
-            }
-            describe_postgres(client, schema, table).await
-        }
-        CatalogSession::Sqlserver(client) => {
-            if database.is_empty() {
-                return Err("需要数据库名，没有另开连接。".to_owned());
-            }
-            ensure_sqlserver_database(client, database).await?;
-            if schema.is_empty() {
-                return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
-            }
-            describe_sqlserver(client, schema, table).await
-        }
-    }
+    session.grid_describe(database, schema, table, engine_hint).await
 }
 
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -445,15 +393,6 @@ fn finish_job(id: &str) {
     jobs().lock().expect("exports").remove(id);
 }
 
-fn engine_from(hint: &str) -> Engine {
-    match hint {
-        "mysql" => Engine::Mysql,
-        "mariadb" => Engine::Mariadb,
-        "sqlite" => Engine::Sqlite,
-        "sqlserver" => Engine::Sqlserver,
-        _ => Engine::Postgres,
-    }
-}
 
 fn export_format(spec: &ExportSpec) -> Result<&'static str, ExportOutcome> {
     match spec.format.as_str() {
@@ -476,7 +415,7 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
     if let Err(outcome) = export_format(spec) {
         return outcome;
     }
-    if matches!(session, CatalogSession::Scripted) {
+    if session.is_scripted() {
         return failed_message(no_channel());
     }
     match spec.mode {
@@ -488,7 +427,7 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             if !spec.acknowledged {
                 return blocked("执行前需说明会重新执行这条 SELECT".to_owned());
             }
-            stream_statement(session, &statement, spec, flag, false, None, engine_from(&spec.engine_hint), &[]).await
+            stream_statement(session, &statement, spec, flag, false, None, crate::adapters::registry::sql_engine(&spec.engine_hint), &[]).await
         }
         ExportMode::TableLoaded | ExportMode::TableFull => {
             let schema = match describe(session, &spec.database, &spec.schema, &spec.table, &spec.engine_hint).await {
@@ -538,211 +477,80 @@ async fn stream_statement(
     engine: Engine,
     columns: &[Column],
 ) -> ExportOutcome {
-    match session {
-        CatalogSession::Scripted => failed_message(no_channel()),
-        // Redis 不参与五格式导出（capability 门控）；误入时明确拒绝。
-        CatalogSession::Redis(_) => failed_message("Redis 没有表数据导出；请使用键浏览器。".to_owned()),
-        CatalogSession::Mongo(_) => failed_message("MongoDB 没有表数据导出；请使用集合文档浏览器。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => {
-            let names = match known_names {
-                Some(names) => names,
-                None => {
-                    let mut conn = match pool.acquire().await {
-                        Ok(conn) => conn,
-                        Err(err) => return failed_message(crate::error_text::chain(&err)),
-                    };
-                    let statement = match conn.prepare(audited(sql).into_sql_str()).await {
-                        Ok(statement) => statement,
-                        Err(err) => return failed_message(crate::error_text::chain(&err)),
-                    };
-                    statement.columns().iter().map(|column| column.name().to_owned()).collect()
-                }
-            };
-            let typed = plain_columns(&names, columns);
-            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
-                Ok(csv) => csv,
-                Err(outcome) => return outcome,
-            };
-            csv.set_names(&names);
-            if let Some(outcome) = csv.control(flag, spec) {
-                return outcome;
-            }
-            if spec.header {
-                if let Some(outcome) = csv.write_header(&names) {
-                    return outcome;
-                }
-            }
-            let mut stream = sqlx::query(audited(sql)).fetch(pool);
-            loop {
-                if let Some(outcome) = csv.control(flag, spec) {
-                    return outcome;
-                }
-                match stream.try_next().await {
-                    Ok(Some(row)) => {
-                        let cells = match read_width(&row, names.len(), sqlite_cell) {
-                            Ok(cells) => cells,
-                            Err(message) => return csv.fail(&message),
-                        };
-                        if let Some(outcome) = csv.write_cells(&cells) {
-                            return outcome;
-                        }
-                    }
-                    Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
-                }
+    let mut sink = FileSink { spec, flag, partial, engine, columns, csv: None, outcome: None };
+    session.grid_export(sql, known_names, &mut sink).await;
+    sink.outcome.unwrap_or_else(|| failed_message("导出没有完成"))
+}
+
+/// 导出文件一侧：读到列名才建文件写表头；之后每行先查取消/注入失败，再写。
+struct FileSink<'a> {
+    spec: &'a ExportSpec,
+    flag: &'a AtomicBool,
+    partial: bool,
+    engine: Engine,
+    columns: &'a [Column],
+    csv: Option<CsvFile>,
+    outcome: Option<ExportOutcome>,
+}
+
+impl FileSink<'_> {
+    fn stop(&mut self, outcome: ExportOutcome) -> bool {
+        self.outcome = Some(outcome);
+        false
+    }
+}
+
+impl ExportSink for FileSink<'_> {
+    fn start(&mut self, names: &[String]) -> bool {
+        let typed = plain_columns(names, self.columns);
+        let mut csv = match CsvFile::create(&self.spec.path, self.partial, self.spec, &typed, self.engine) {
+            Ok(csv) => csv,
+            Err(outcome) => return self.stop(outcome),
+        };
+        csv.set_names(names);
+        if let Some(outcome) = csv.control(self.flag, self.spec) {
+            return self.stop(outcome);
+        }
+        if self.spec.header {
+            if let Some(outcome) = csv.write_header(names) {
+                return self.stop(outcome);
             }
         }
-        CatalogSession::Mysql(pool) => {
-            let mut conn = match pool.get_conn().await {
-                Ok(conn) => conn,
-                Err(err) => return failed_message(crate::error_text::chain(&err)),
-            };
-            let mut result = match mysql_async::prelude::Queryable::query_iter(&mut conn, sql).await {
-                Ok(result) => result,
-                Err(err) => return failed_message(crate::error_text::chain(&err)),
-            };
-            let names = known_names.unwrap_or_else(|| result.columns_ref().iter().map(|column| column.name_str().into_owned()).collect());
-            let typed = plain_columns(&names, columns);
-            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
-                Ok(csv) => csv,
-                Err(outcome) => return outcome,
-            };
-            csv.set_names(&names);
-            if let Some(outcome) = csv.control(flag, spec) {
-                return outcome;
-            }
-            if spec.header {
-                if let Some(outcome) = csv.write_header(&names) {
-                    return outcome;
-                }
-            }
-            loop {
-                if let Some(outcome) = csv.control(flag, spec) {
-                    return outcome;
-                }
-                match result.next().await {
-                    Ok(Some(row)) => {
-                        let cells = (0..names.len()).map(|index| mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL))).collect::<Vec<_>>();
-                        if let Some(outcome) = csv.write_cells(&cells) {
-                            return outcome;
-                        }
-                    }
-                    Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
-                }
-            }
+        self.csv = Some(csv);
+        true
+    }
+
+    fn proceed(&mut self) -> bool {
+        let Some(csv) = self.csv.as_mut() else { return false };
+        match csv.control(self.flag, self.spec) {
+            Some(outcome) => self.stop(outcome),
+            None => true,
         }
-        CatalogSession::Postgres(client) => {
-            let names = match known_names {
-                Some(names) => names,
-                None => {
-                    let statement = match client.prepare(sql).await {
-                        Ok(statement) => statement,
-                        Err(err) => return failed_message(crate::error_text::chain(&err)),
-                    };
-                    statement.columns().iter().map(|column| column.name().to_owned()).collect()
-                }
-            };
-            let statement = match client.prepare(sql).await {
-                Ok(statement) => statement,
-                Err(err) => return failed_message(crate::error_text::chain(&err)),
-            };
-            let typed = plain_columns(&names, columns);
-            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
-                Ok(csv) => csv,
-                Err(outcome) => return outcome,
-            };
-            csv.set_names(&names);
-            if let Some(outcome) = csv.control(flag, spec) {
-                return outcome;
-            }
-            if spec.header {
-                if let Some(outcome) = csv.write_header(&names) {
-                    return outcome;
-                }
-            }
-            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
-            let stream = match client.query_raw(&statement, params).await {
-                Ok(stream) => stream,
-                Err(err) => return csv.fail(&crate::error_text::chain(&err)),
-            };
-            futures::pin_mut!(stream);
-            loop {
-                if let Some(outcome) = csv.control(flag, spec) {
-                    return outcome;
-                }
-                match stream.try_next().await {
-                    Ok(Some(row)) => {
-                        let cells = match (0..names.len()).map(|index| pg_cell(&row, index)).collect::<Result<Vec<_>, _>>() {
-                            Ok(cells) => cells,
-                            Err(message) => return csv.fail(&message),
-                        };
-                        if let Some(outcome) = csv.write_cells(&cells) {
-                            return outcome;
-                        }
-                    }
-                    Ok(None) => return csv.finish(),
-                    Err(err) => return csv.fail(&crate::error_text::chain(&err)),
-                }
-            }
+    }
+
+    fn row(&mut self, cells: &[Cell]) -> bool {
+        let Some(csv) = self.csv.as_mut() else { return false };
+        match csv.write_cells(cells) {
+            Some(outcome) => self.stop(outcome),
+            None => true,
         }
-        CatalogSession::Sqlserver(client) => {
-            let mut locked = client.lock().await;
-            let mut stream = match locked.simple_query(sql).await {
-                Ok(stream) => stream,
-                Err(err) => return failed_message(crate::error_text::chain(&err)),
-            };
-            let mut names = known_names;
-            let mut rows: Vec<tiberius::Row> = Vec::new();
-            {
-                use futures::TryStreamExt;
-                // QueryItem 不公开导出，经 as_metadata/into_row 取内容。
-                while let Ok(Some(item)) = stream.try_next().await {
-                    if let Some(meta) = item.as_metadata() {
-                        if names.is_none() {
-                            names = Some(meta.columns().iter().map(|column| column.name().to_owned()).collect());
-                        }
-                        continue;
-                    }
-                    if let Some(row) = item.into_row() {
-                        rows.push(row);
-                    }
-                }
-            }
-            drop(stream);
-            drop(locked);
-            let names = names.unwrap_or_default();
-            let typed = plain_columns(&names, columns);
-            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
-                Ok(csv) => csv,
-                Err(outcome) => return outcome,
-            };
-            csv.set_names(&names);
-            if let Some(outcome) = csv.control(flag, spec) {
-                return outcome;
-            }
-            if spec.header {
-                if let Some(outcome) = csv.write_header(&names) {
-                    return outcome;
-                }
-            }
-            for row in rows {
-                if let Some(outcome) = csv.control(flag, spec) {
-                    return outcome;
-                }
-                let cells = (0..names.len()).map(|index| tds_cell(&row, index)).collect::<Vec<_>>();
-                if let Some(outcome) = csv.write_cells(&cells) {
-                    return outcome;
-                }
-            }
-            csv.finish()
+    }
+
+    fn fail(&mut self, message: &str) {
+        let outcome = match self.csv.as_mut() {
+            Some(csv) => csv.fail(message),
+            None => failed_message(message.to_owned()),
+        };
+        self.outcome = Some(outcome);
+    }
+
+    fn finish(&mut self) {
+        if let Some(csv) = self.csv.take() {
+            self.outcome = Some(csv.finish());
         }
     }
 }
 
-fn read_width(row: &sqlx::sqlite::SqliteRow, width: usize, read: fn(&sqlx::sqlite::SqliteRow, usize) -> Result<Cell, String>) -> Result<Vec<Cell>, String> {
-    (0..width).map(|index| read(row, index)).collect()
-}
 
 struct CsvFile {
     file: Option<File>,
@@ -1122,11 +930,7 @@ fn page_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expr
 #[allow(clippy::too_many_arguments)]
 fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>, sort: Option<&Sort>, limit: u64) -> Result<String, String> {
     let (body, ordered) = page_body(schema, filters, search, expression, sort, true, 1024)?;
-    let tail = if schema.engine == Engine::Sqlserver {
-        sql::page_tail(schema.engine, limit, 0, ordered)
-    } else {
-        format!(" LIMIT {limit}")
-    };
+    let tail = sql::page_tail(schema.engine, limit, 0, ordered);
     Ok(format!("{body}{tail}"))
 }
 
@@ -1147,13 +951,7 @@ fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, exp
 fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>) -> Result<String, String> {
     let where_sql = sql::compile_where_with_condition(schema, filters, search, expression)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
-    let count = match schema.engine {
-        Engine::Postgres => "COUNT(*)::bigint",
-        Engine::Sqlite | Engine::Mysql | Engine::Mariadb => "COUNT(*)",
-        Engine::Sqlserver => "CAST(COUNT_BIG(*) AS BIGINT)",
-        // Redis 没有表网格；TableSchema 不会带这个引擎（describe 已拒绝）。
-        Engine::Redis | Engine::Mongodb => "COUNT(*)",
-    };
+    let count = crate::adapters::query::sql_syntax(schema.engine).count_expression();
     Ok(format!("SELECT {count} FROM {}{clause}", sql::qualified_name(schema)))
 }
 
@@ -1177,8 +975,8 @@ fn order_clause(schema: &TableSchema, sort: Option<&Sort>) -> String {
             .join(", ");
         return format!(" ORDER BY {columns}");
     }
-    if schema.engine == Engine::Sqlite && schema.kind == "table" {
-        return " ORDER BY rowid".to_owned();
+    if let Some(order) = crate::adapters::query::sql_syntax(schema.engine).implicit_order(schema.kind) {
+        return format!(" ORDER BY {order}");
     }
     String::new()
 }
@@ -1219,30 +1017,7 @@ fn live_row(schema: &TableSchema, cells: Vec<Cell>, offset: u64, index: usize) -
 
 /// 按列数把一页行读成 Cell 矩阵。全库导出（R7）的流式分页读走这里，与网格同一套单元转换。
 pub async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    match session {
-        CatalogSession::Scripted => Err(no_channel()),
-        CatalogSession::Redis(_) => Err("Redis 没有 SQL 行读取；数据经键浏览专项通路。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 没有 SQL 行读取；文档经集合浏览器分页。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => {
-            let rows = sqlx::query(audited(sql)).fetch_all(pool).await.map_err(db_err)?;
-            rows.iter().map(|row| read_width(row, width, sqlite_cell)).collect()
-        }
-        CatalogSession::Mysql(pool) => {
-            let (_names, rows) = mysql_rows(pool, sql).await?;
-            Ok(rows)
-        }
-        CatalogSession::Postgres(client) => {
-            let rows = client.query(sql, &[]).await.map_err(db_err)?;
-            rows.iter()
-                .map(|row| (0..width).map(|index| pg_cell(row, index)).collect::<Result<Vec<_>, _>>())
-                .collect()
-        }
-        CatalogSession::Sqlserver(client) => {
-            let (_names, rows) = sqlserver_rows(client, sql).await?;
-            let _ = width;
-            Ok(rows)
-        }
-    }
+    session.grid_fetch_cells(sql, width).await
 }
 
 /// 单格完整原值读取：查看、复制、编辑、导出和 WHERE 需要完整值时共用这一次定位读取。
@@ -1279,558 +1054,31 @@ pub async fn read_full_cell(session: &CatalogSession, schema: &TableSchema, loca
 }
 
 async fn fetch_count(session: &CatalogSession, sql: &str) -> Result<i64, String> {
-    match session {
-        CatalogSession::Scripted => Err(no_channel()),
-        CatalogSession::Redis(_) => Err("Redis 没有 SQL 计数；键空间计数走专项通路。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 没有 SQL 计数；文档计数走 estimatedDocumentCount。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => sqlx::query_scalar(audited(sql)).fetch_one(pool).await.map_err(db_err),
-        CatalogSession::Mysql(pool) => {
-            let (_names, rows) = mysql_rows(pool, sql).await?;
-            match rows.first().and_then(|row| row.first()) {
-                Some(Cell::Text(text)) => text.parse::<i64>().map_err(|_| format!("计数无效 {text}")),
-                _ => Err("没有计数".to_owned()),
-            }
-        }
-        CatalogSession::Postgres(client) => {
-            let row = client.query_one(sql, &[]).await.map_err(db_err)?;
-            row.try_get(0).map_err(db_err)
-        }
-        CatalogSession::Sqlserver(client) => {
-            let (_names, rows) = sqlserver_rows(client, sql).await?;
-            match rows.first().and_then(|row| row.first()) {
-                Some(Cell::Text(text)) => text.parse::<i64>().map_err(|_| format!("计数无效 {text}")),
-                _ => Err("没有计数".to_owned()),
-            }
-        }
-    }
+    session.grid_fetch_count(sql).await
 }
 
 async fn execute_sql(session: &CatalogSession, sql: &str) -> Result<u64, String> {
-    match session {
-        CatalogSession::Scripted => Err(no_channel()),
-        CatalogSession::Redis(_) => Err("Redis 不执行 SQL；命令经 redis_exec 专项通道。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 不执行 SQL；文档操作经 mongo_* 专项通道。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => sqlx::query(audited(sql)).execute(pool).await.map(|done| done.rows_affected()).map_err(db_err),
-        CatalogSession::Mysql(pool) => {
-            let mut conn = pool.get_conn().await.map_err(db_err)?;
-            let mut result = mysql_async::prelude::Queryable::query_iter(&mut conn, sql).await.map_err(db_err)?;
-            let affected = result.affected_rows();
-            while result.next().await.map_err(db_err)?.is_some() {}
-            Ok(affected)
-        }
-        CatalogSession::Postgres(client) => client.execute(sql, &[]).await.map_err(db_err),
-        // execute 走 sp_executesql，返回受影响行数；结果流在下一条语句前会被 tiberius 排空。
-        CatalogSession::Sqlserver(client) => {
-            let mut client = client.lock().await;
-            client.execute(sql, &[]).await.map(|done| done.total()).map_err(db_err)
-        }
-    }
+    session.grid_execute(sql).await
 }
 
-fn sqlite_cell(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Cell, String> {
-    use sqlx::Row;
-    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return Ok(cell_text(value));
-    }
-    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return Ok(cell_text(value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())));
-    }
-    Err(format!("读不到第 {index} 列"))
-}
 
-fn cell_text(value: Option<String>) -> Cell {
-    match value {
-        Some(text) => Cell::Text(text),
-        None => Cell::Null,
-    }
-}
 
-fn pg_cell(row: &tokio_postgres::Row, index: usize) -> Result<Cell, String> {
-    if let Ok(value) = row.try_get::<_, Option<String>>(index) {
-        return Ok(cell_text(value));
-    }
-    if let Ok(value) = row.try_get::<_, Option<i64>>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<_, Option<i32>>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<_, Option<i16>>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<_, Option<f64>>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<_, Option<bool>>(index) {
-        return Ok(cell_text(value.map(|number| number.to_string())));
-    }
-    if let Ok(value) = row.try_get::<_, Option<Vec<u8>>>(index) {
-        return Ok(cell_text(value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())));
-    }
-    Err(format!("读不到第 {index} 列"))
-}
 
-fn mysql_cell(value: &mysql_async::Value) -> Cell {
-    match value {
-        mysql_async::Value::NULL => Cell::Null,
-        mysql_async::Value::Bytes(bytes) => Cell::Text(String::from_utf8_lossy(bytes).into_owned()),
-        mysql_async::Value::Int(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::UInt(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Float(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Double(number) => Cell::Text(number.to_string()),
-        mysql_async::Value::Date(year, month, day, hour, minute, second, micros) => {
-            Cell::Text(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"))
-        }
-        mysql_async::Value::Time(negative, days, hour, minute, second, micros) => {
-            Cell::Text(format!("{}{days} {hour:02}:{minute:02}:{second:02}.{micros:06}", if *negative { "-" } else { "" }))
-        }
-    }
-}
 
-async fn mysql_rows(pool: &mysql_async::Pool, sql: &str) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
-    let mut conn = pool.get_conn().await.map_err(db_err)?;
-    let mut result = mysql_async::prelude::Queryable::query_iter(&mut conn, sql).await.map_err(db_err)?;
-    let names = result.columns_ref().iter().map(|column| column.name_str().into_owned()).collect::<Vec<_>>();
-    let mut rows = Vec::new();
-    while let Some(row) = result.next().await.map_err(db_err)? {
-        let cells = (0..names.len()).map(|index| mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL))).collect();
-        rows.push(cells);
-    }
-    Ok((names, rows))
-}
 
-async fn describe_sqlite(pool: &sqlx::SqlitePool, table: &str) -> Result<TableSchema, String> {
-    let kind: Option<String> = sqlx::query_scalar("SELECT type FROM sqlite_master WHERE name = ?1 AND type IN ('table', 'view')")
-        .bind(table)
-        .fetch_optional(pool)
-        .await
-        .map_err(db_err)?;
-    let kind = kind.ok_or_else(|| format!("找不到表或视图 {table}"))?;
-    let kind = if kind.eq_ignore_ascii_case("view") { "view" } else { "table" };
-    let quoted = sql::quote_ident(Engine::Sqlite, table);
-    let info = sqlx::query(audited(&format!("PRAGMA table_info({quoted})"))).fetch_all(pool).await.map_err(db_err)?;
-    if info.is_empty() {
-        return Err(format!("找不到表或视图 {table}"));
-    }
-    let mut pk_order: Vec<(i64, String)> = Vec::new();
-    let mut columns = Vec::new();
-    for row in &info {
-        let name = match sqlite_cell(row, 1)? {
-            Cell::Text(text) => text,
-            Cell::Null => return Err("列名是空的".to_owned()),
-        };
-        let type_name = match sqlite_cell(row, 2)? {
-            Cell::Text(text) => text,
-            Cell::Null => String::new(),
-        };
-        let not_null = sqlite_number(row, 3)? != 0;
-        let pk = sqlite_number(row, 5)?;
-        if pk > 0 {
-            pk_order.push((pk, name.clone()));
-        }
-        columns.push(Column {
-            name,
-            type_name,
-            nullable: !not_null,
-            primary: pk > 0,
-            unique: false,
-            auto: false,
-        });
-    }
-    pk_order.sort_by_key(|(order, _)| *order);
-    let mut key: Vec<String> = pk_order.into_iter().map(|(_, name)| name).collect();
-    let indexes = sqlx::query(audited(&format!("PRAGMA index_list({quoted})"))).fetch_all(pool).await.map_err(db_err)?;
-    let mut unique_columns: Vec<Vec<String>> = Vec::new();
-    for index in &indexes {
-        let unique = sqlite_number(index, 2)? != 0;
-        let partial = sqlite_number(index, 4).unwrap_or(0) != 0;
-        if !unique || partial {
-            continue;
-        }
-        let index_name = match sqlite_cell(index, 1)? {
-            Cell::Text(text) => text,
-            Cell::Null => continue,
-        };
-        let origin = match sqlite_cell(index, 3) {
-            Ok(Cell::Text(text)) => text,
-            _ => String::new(),
-        };
-        let index_rows = sqlx::query(audited(&format!("PRAGMA index_info({})", sql::quote_ident(Engine::Sqlite, &index_name))))
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-        let mut pairs = Vec::new();
-        for index_row in &index_rows {
-            let seq = sqlite_number(index_row, 0)?;
-            let name = match sqlite_cell(index_row, 2)? {
-                Cell::Text(text) => text,
-                Cell::Null => continue,
-            };
-            pairs.push((seq, name));
-        }
-        pairs.sort_by_key(|(seq, _)| *seq);
-        let names = pairs.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
-        if origin == "pk" && key.is_empty() {
-            key = names.clone();
-        }
-        unique_columns.push(names);
-    }
-    if key.is_empty() {
-        if let Some(first) = unique_columns.first() {
-            key = first.clone();
-        }
-    }
-    let single_unique = unique_columns.iter().filter(|group| group.len() == 1).map(|group| group[0].clone()).collect::<Vec<_>>();
-    let key_for_flags = key.clone();
-    for column in &mut columns {
-        column.unique = column.primary || single_unique.iter().any(|name| name == &column.name);
-        column.auto = column.primary && key_for_flags.len() == 1 && column.type_name.to_ascii_lowercase().contains("int");
-    }
-    Ok(TableSchema { engine: Engine::Sqlite, schema: String::new(), name: table.to_owned(), kind, columns, key })
-}
 
-fn sqlite_number(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<i64, String> {
-    match sqlite_cell(row, index)? {
-        Cell::Text(text) => text.parse::<i64>().map_err(|_| format!("不是整数 {text}")),
-        Cell::Null => Ok(0),
-    }
-}
 
-async fn ensure_postgres_database(client: &tokio_postgres::Client, database: &str) -> Result<(), String> {
-    if database.is_empty() {
-        return Ok(());
-    }
-    let row = client.query_one("SELECT current_database()", &[]).await.map_err(db_err)?;
-    let current: Option<String> = row.try_get(0).map_err(db_err)?;
-    let current = current.unwrap_or_default();
-    if current != database {
-        return Err(other_database(&current, database));
-    }
-    Ok(())
-}
 
-async fn describe_postgres(client: &tokio_postgres::Client, schema: &str, table: &str) -> Result<TableSchema, String> {
-    let kind_rows = client
-        .query(
-            "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','v','m')",
-            &[&schema, &table],
-        )
-        .await
-        .map_err(db_err)?;
-    let kind_text: String = kind_rows.first().ok_or_else(|| format!("找不到表或视图 {schema}.{table}"))?.get(0);
-    let kind = if kind_text == "r" || kind_text == "p" { "table" } else { "view" };
-    let columns_rows = client
-        .query(
-            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity::text, pg_get_expr(ad.adbin, ad.adrelid) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-            &[&schema, &table],
-        )
-        .await
-        .map_err(db_err)?;
-    let pk_rows = client
-        .query(
-            "SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey) WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
-            &[&schema, &table],
-        )
-        .await
-        .map_err(db_err)?;
-    let pk = pk_rows.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
-    let unique_rows = client
-        .query(
-            "SELECT i.indexrelid::text, a.attname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey) WHERE n.nspname = $1 AND c.relname = $2 AND i.indisunique AND NOT i.indisprimary AND i.indpred IS NULL AND i.indexprs IS NULL AND NOT (0 = ANY (i.indkey)) ORDER BY i.indexrelid, array_position(i.indkey, a.attnum)",
-            &[&schema, &table],
-        )
-        .await
-        .map_err(db_err)?;
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for row in &unique_rows {
-        let id: String = row.get(0);
-        let name: String = row.get(1);
-        if let Some(group) = groups.iter_mut().find(|group| group.0 == id) {
-            group.1.push(name);
-        } else {
-            groups.push((id, vec![name]));
-        }
-    }
-    let key = if !pk.is_empty() { pk.clone() } else { groups.first().map(|group| group.1.clone()).unwrap_or_default() };
-    let mut columns = Vec::new();
-    for row in &columns_rows {
-        let name: String = row.get(0);
-        let type_name: String = row.get(1);
-        let not_null: bool = row.get(2);
-        let identity: String = row.get(3);
-        let default: Option<String> = row.get(4);
-        let auto = identity == "a" || identity == "d" || default.as_deref().unwrap_or("").starts_with("nextval(");
-        let primary = pk.iter().any(|item| item == &name);
-        let unique = primary || groups.iter().any(|group| group.1.len() == 1 && group.1[0] == name);
-        columns.push(Column { name, type_name, nullable: !not_null, primary, unique, auto });
-    }
-    Ok(TableSchema { engine: Engine::Postgres, schema: schema.to_owned(), name: table.to_owned(), kind, columns, key })
-}
 
-async fn describe_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, table: &str) -> Result<TableSchema, String> {
-    let mut conn = pool.get_conn().await.map_err(db_err)?;
-    let kind_row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::exec_first(
-        &mut conn,
-        "SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(db_err)?;
-    let kind_text = mysql_text(kind_row.as_ref().ok_or_else(|| format!("找不到表或视图 {database}.{table}"))?, 0)?;
-    let kind = if kind_text.eq_ignore_ascii_case("VIEW") { "view" } else { "table" };
-    let column_rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-        &mut conn,
-        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(db_err)?;
-    let index_rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-        &mut conn,
-        "SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(db_err)?;
-    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
-    for row in &index_rows {
-        let name = mysql_text(row, 0)?;
-        let non_unique = mysql_text(row, 1)?;
-        let column = mysql_text(row, 3)?;
-        let unique = non_unique == "0";
-        if let Some(group) = groups.iter_mut().find(|group| group.0 == name) {
-            group.2.push(column);
-        } else {
-            groups.push((name, unique, vec![column]));
-        }
-    }
-    let pk = groups.iter().find(|group| group.0.eq_ignore_ascii_case("PRIMARY")).map(|group| group.2.clone()).unwrap_or_default();
-    let key = if !pk.is_empty() {
-        pk.clone()
-    } else {
-        groups.iter().find(|group| group.1).map(|group| group.2.clone()).unwrap_or_default()
-    };
-    let mut columns = Vec::new();
-    for row in &column_rows {
-        let name = mysql_text(row, 0)?;
-        let type_name = mysql_text(row, 1)?;
-        let nullable = mysql_text(row, 2)?.eq_ignore_ascii_case("YES");
-        let extra = mysql_text(row, 4)?;
-        let primary = pk.iter().any(|item| item == &name);
-        let unique = primary || groups.iter().any(|group| group.1 && group.2.len() == 1 && group.2[0] == name);
-        let auto = extra.to_ascii_lowercase().contains("auto_increment");
-        columns.push(Column { name, type_name, nullable, primary, unique, auto });
-    }
-    Ok(TableSchema { engine, schema: database.to_owned(), name: table.to_owned(), kind, columns, key })
-}
 
-fn mysql_text(row: &mysql_async::Row, index: usize) -> Result<String, String> {
-    match mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL)) {
-        Cell::Text(text) => Ok(text),
-        Cell::Null => Err("元数据列是空值".to_owned()),
-    }
-}
 
-fn tds_text_cell(row: &tiberius::Row, index: usize) -> Option<String> {
-    row.try_get::<&str, _>(index).ok().flatten().map(str::to_owned)
-}
 
-/// TDS 行到 Cell：文本优先，数字/浮点/布尔逐类兜底，二进制转十六进制（与前端投影协议一致）。
-fn tds_cell(row: &tiberius::Row, index: usize) -> Cell {
-    if let Some(text) = tds_text_cell(row, index) {
-        return Cell::Text(text);
-    }
-    if let Ok(Some(value)) = row.try_get::<i64, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<i32, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<i16, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<u8, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<f64, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<f32, _>(index) {
-        return Cell::Text(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<bool, _>(index) {
-        return Cell::Text(if value { "1" } else { "0" }.to_owned());
-    }
-    if let Ok(Some(value)) = row.try_get::<&[u8], _>(index) {
-        return Cell::Text(to_hex_text(value));
-    }
-    Cell::Null
-}
 
-fn to_hex_text(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
 
-type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
 
-pub(crate) async fn sqlserver_rows(client: &TdsHandle, sql: &str) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
-    let mut locked = client.lock().await;
-    let mut stream = locked.simple_query(sql).await.map_err(db_err)?;
-    let mut names: Vec<String> = Vec::new();
-    let mut rows = Vec::new();
-    {
-        use futures::TryStreamExt;
-        // QueryItem 不公开导出，经 as_metadata/into_row 取内容。
-        while let Some(item) = stream.try_next().await.map_err(|err| db_err(crate::error_text::chain(&err)))? {
-            if let Some(meta) = item.as_metadata() {
-                if names.is_empty() {
-                    names = meta.columns().iter().map(|column| column.name().to_owned()).collect();
-                }
-                continue;
-            }
-            if let Some(row) = item.into_row() {
-                if names.is_empty() {
-                    names = (0..row.len()).map(|index| format!("col{}", index + 1)).collect();
-                }
-                let cells = (0..names.len()).map(|index| tds_cell(&row, index)).collect();
-                rows.push(cells);
-            }
-        }
-    }
-    Ok((names, rows))
-}
 
-async fn ensure_sqlserver_database(client: &TdsHandle, database: &str) -> Result<(), String> {
-    let (_names, rows) = sqlserver_rows(client, "SELECT DB_NAME()").await?;
-    let current = match rows.first().and_then(|row| row.first()) {
-        Some(Cell::Text(text)) => text.clone(),
-        _ => String::new(),
-    };
-    if current != database {
-        return Err(other_database(&current, database));
-    }
-    Ok(())
-}
 
-async fn describe_sqlserver(client: &TdsHandle, schema: &str, table: &str) -> Result<TableSchema, String> {
-    let kind_rows = sqlserver_rows(
-        client,
-        &format!(
-            "SELECT CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}' AND o.type IN ('U', 'V')",
-            escape_tds_text(schema),
-            escape_tds_text(table)
-        ),
-    )
-    .await?;
-    let kind_text = match kind_rows.1.first().and_then(|row| row.first()) {
-        Some(Cell::Text(text)) => text.clone(),
-        _ => return Err(format!("找不到表或视图 {schema}.{table}")),
-    };
-    let kind = if kind_text.eq_ignore_ascii_case("VIEW") { "view" } else { "table" };
-    let column_rows = sqlserver_rows(
-        client,
-        &format!(
-            "SELECT c.name, TYPE_NAME(c.user_type_id), c.is_nullable, c.is_identity, dc.definition FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{}' AND o.name = N'{}' ORDER BY c.column_id",
-            escape_tds_text(schema),
-            escape_tds_text(table)
-        ),
-    )
-    .await?;
-    let pk_rows = sqlserver_rows(
-        client,
-        &format!(
-            "SELECT c.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' ORDER BY ic.key_ordinal",
-            escape_tds_text(schema),
-            escape_tds_text(table)
-        ),
-    )
-    .await?;
-    let unique_rows = sqlserver_rows(
-        client,
-        &format!(
-            "SELECT i.name, i.is_unique, ic.key_ordinal, c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.is_unique = 1 AND i.is_primary_key = 0 AND s.name = N'{}' AND o.name = N'{}' ORDER BY i.name, ic.key_ordinal",
-            escape_tds_text(schema),
-            escape_tds_text(table)
-        ),
-    )
-    .await?;
-    let pk: Vec<String> = pk_rows
-        .1
-        .iter()
-        .filter_map(|row| match row.first() {
-            Some(Cell::Text(text)) => Some(text.clone()),
-            _ => None,
-        })
-        .collect();
-    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
-    for row in &unique_rows.1 {
-        let cells: Vec<&Cell> = row.iter().collect();
-        let name = match cells.first().and_then(|cell| match cell {
-            Cell::Text(text) => Some(text.as_str()),
-            _ => None,
-        }) {
-            Some(name) => name.to_owned(),
-            None => continue,
-        };
-        let unique = cells.get(1).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
-        let column = cells
-            .get(3)
-            .and_then(|cell| match cell {
-                Cell::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        if let Some(group) = groups.iter_mut().find(|group| group.0 == name) {
-            group.2.push(column);
-        } else {
-            groups.push((name, unique, vec![column]));
-        }
-    }
-    let key = if !pk.is_empty() {
-        pk.clone()
-    } else {
-        groups.iter().find(|group| group.1).map(|group| group.2.clone()).unwrap_or_default()
-    };
-    let mut columns = Vec::new();
-    for row in &column_rows.1 {
-        let cells: Vec<&Cell> = row.iter().collect();
-        let name = match cells.first().and_then(|cell| match cell {
-            Cell::Text(text) => Some(text.clone()),
-            _ => None,
-        }) {
-            Some(name) => name,
-            None => return Err("列名是空的".to_owned()),
-        };
-        let type_name = cells.get(1).and_then(|cell| match cell {
-            Cell::Text(text) => Some(text.clone()),
-            _ => None,
-        }).unwrap_or_default();
-        let nullable = cells.get(2).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(true);
-        let identity = cells.get(3).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
-        let primary = pk.iter().any(|item| item == &name);
-        let unique = primary || groups.iter().any(|group| group.1 && group.2.len() == 1 && group.2[0] == name);
-        // IDENTITY 列即网格的自增列：插入时省略、UPDATE 不进 SET。
-        columns.push(Column { name, type_name, nullable, primary, unique, auto: identity });
-    }
-    Ok(TableSchema { engine: Engine::Sqlserver, schema: schema.to_owned(), name: table.to_owned(), kind, columns, key })
-}
 
-/// 元数据查询里内联的 N'...' 文本转义。标识符与表名来自用户输入。
-fn escape_tds_text(value: &str) -> String {
-    value.replace('\'', "''")
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignKey {
@@ -1841,28 +1089,6 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
 }
 
-/// SQL Server 出向外键查询。只读 sys 目录，标识符按 N'...' 转义。
-pub(crate) fn sqlserver_foreign_key_sql(schema: &str, table: &str) -> String {
-    let mut sql = String::from(
-        "SELECT fk.name, pc.name, rs.name, rt.name, rc.name \
-         FROM sys.foreign_key_columns fkc \
-         JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id \
-         JOIN sys.tables pt ON pt.object_id = fkc.parent_object_id \
-         JOIN sys.schemas ps ON ps.schema_id = pt.schema_id \
-         JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
-         JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id \
-         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
-         JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
-         WHERE pt.name = ",
-    );
-    sql.push_str(&format!("N'{}'", escape_tds_text(table)));
-    if !schema.is_empty() {
-        sql.push_str(" AND ps.name = ");
-        sql.push_str(&format!("N'{}'", escape_tds_text(schema)));
-    }
-    sql.push_str(" ORDER BY fk.name, fkc.constraint_column_id");
-    sql
-}
 
 /// 把目录行收成表级外键。空名、空列和缺引用目标的行跳过；同名约束按行序合并成复合键。
 pub(crate) fn assemble_foreign_keys(rows: &[Vec<Cell>]) -> Vec<ForeignKey> {
@@ -1883,12 +1109,12 @@ pub(crate) fn assemble_foreign_keys(rows: &[Vec<Cell>]) -> Vec<ForeignKey> {
         if ref_table.is_empty() || ref_column.is_empty() {
             continue;
         }
-        push_key(&mut list, &name, &column, &ref_schema, &ref_table, &ref_column);
+        push_foreign_key(&mut list, &name, &column, &ref_schema, &ref_table, &ref_column);
     }
     list
 }
 
-fn push_key(list: &mut Vec<ForeignKey>, name: &str, column: &str, ref_schema: &str, ref_table: &str, ref_column: &str) {
+pub(crate) fn push_foreign_key(list: &mut Vec<ForeignKey>, name: &str, column: &str, ref_schema: &str, ref_table: &str, ref_column: &str) {
     if let Some(existing) = list.iter_mut().find(|item| item.name == name) {
         existing.columns.push(column.to_owned());
         existing.ref_columns.push(ref_column.to_owned());
@@ -1904,132 +1130,11 @@ fn push_key(list: &mut Vec<ForeignKey>, name: &str, column: &str, ref_schema: &s
 }
 
 /// 表级出向外键；只读，失败不影响表结构本身的读取。
-pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name: &str, table: &str, engine_hint: &str) -> Result<Vec<ForeignKey>, String> {
+pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name: &str, table: &str, _engine_hint: &str) -> Result<Vec<ForeignKey>, String> {
     if table.is_empty() {
         return Ok(Vec::new());
     }
-    match session {
-        CatalogSession::Scripted => Ok(Vec::new()),
-        CatalogSession::Redis(_) | CatalogSession::Mongo(_) => Ok(Vec::new()),
-        CatalogSession::Sqlite { pool, .. } => {
-            if !database.is_empty() && database != "main" {
-                return Err(other_database("main", database));
-            }
-            let quoted = sql::quote_ident(Engine::Sqlite, table);
-            let rows = sqlx::query(audited(&format!("PRAGMA foreign_key_list({quoted})")))
-                .fetch_all(pool)
-                .await
-                .map_err(db_err)?;
-            let mut list: Vec<ForeignKey> = Vec::new();
-            let mut pk_cache: HashMap<String, Vec<String>> = HashMap::new();
-            for row in rows {
-                let id: i64 = row.try_get("id").map_err(db_err)?;
-                let seq: i64 = row.try_get("seq").unwrap_or(0);
-                let column: String = row.try_get("from").map_err(db_err)?;
-                let ref_table: String = row.try_get("table").map_err(db_err)?;
-                let explicit: Option<String> = row.try_get("to").ok().flatten();
-                let ref_column = match explicit {
-                    Some(name) if !name.is_empty() => name,
-                    // 引用父表主键时 PRAGMA 的 to 为 NULL：按 seq 取父表主键序号，找不到就跳过。
-                    _ => {
-                        if !pk_cache.contains_key(&ref_table) {
-                            let parent = sql::quote_ident(Engine::Sqlite, &ref_table);
-                            let info = sqlx::query(audited(&format!("PRAGMA table_info({parent})")))
-                                .fetch_all(pool)
-                                .await
-                                .map_err(db_err)?;
-                            let mut keys: Vec<(i64, String)> = info
-                                .iter()
-                                .filter_map(|item| {
-                                    let pk = item.try_get::<i64, _>("pk").unwrap_or(0);
-                                    if pk > 0 { item.try_get::<String, _>("name").ok().map(|name| (pk, name)) } else { None }
-                                })
-                                .collect();
-                            keys.sort_by_key(|(pk, _)| *pk);
-                            pk_cache.insert(ref_table.clone(), keys.into_iter().map(|(_, name)| name).collect());
-                        }
-                        match pk_cache.get(&ref_table).and_then(|keys| keys.get(seq as usize)) {
-                            Some(name) => name.clone(),
-                            None => continue,
-                        }
-                    }
-                };
-                push_key(&mut list, &format!("fk_{id}"), &column, "main", &ref_table, &ref_column);
-            }
-
-
-            Ok(list)
-        }
-        CatalogSession::Mysql(pool) => {
-            if database.is_empty() {
-                return Ok(Vec::new());
-            }
-            let _ = engine_hint;
-            let mut conn = pool.get_conn().await.map_err(db_err)?;
-            let rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-                &mut conn,
-                "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
-                (database.to_owned(), table.to_owned()),
-            )
-            .await
-            .map_err(db_err)?;
-            let mut list: Vec<ForeignKey> = Vec::new();
-            for row in &rows {
-                let name = mysql_text(row, 0)?;
-                let column = mysql_text(row, 1)?;
-                let ref_schema = mysql_text(row, 2)?;
-                let ref_table = mysql_text(row, 3)?;
-                let ref_column = mysql_text(row, 4)?;
-                let scope = if ref_schema.is_empty() { database.to_owned() } else { ref_schema };
-                push_key(&mut list, &name, &column, &scope, &ref_table, &ref_column);
-            }
-            Ok(list)
-        }
-
-        CatalogSession::Postgres(client) => {
-            ensure_postgres_database(client, database).await?;
-            if schema_name.is_empty() {
-                return Ok(Vec::new());
-            }
-            let rows = client
-                .query(
-                    "SELECT c.conname AS name, a.attname AS column_name, fs.nspname AS ref_schema, ft.relname AS ref_table, af.attname AS ref_column \
-                     FROM pg_constraint c \
-                     JOIN pg_class t ON t.oid = c.conrelid \
-                     JOIN pg_namespace s ON s.oid = t.relnamespace \
-                     JOIN pg_class ft ON ft.oid = c.confrelid \
-                     JOIN pg_namespace fs ON fs.oid = ft.relnamespace \
-                     JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord) ON true \
-                     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-                     JOIN pg_attribute af ON af.attrelid = ft.oid AND af.attnum = k.fattnum \
-                     WHERE s.nspname = $1 AND t.relname = $2 AND c.contype = 'f' \
-                     ORDER BY c.conname, k.ord",
-                    &[&schema_name, &table],
-                )
-                .await
-                .map_err(db_err)?;
-            let mut list: Vec<ForeignKey> = Vec::new();
-            for row in &rows {
-                let name: String = row.get("name");
-                let column: String = row.get("column_name");
-                let ref_schema: String = row.get("ref_schema");
-                let ref_table: String = row.get("ref_table");
-                let ref_column: String = row.get("ref_column");
-                push_key(&mut list, &name, &column, &ref_schema, &ref_table, &ref_column);
-            }
-            Ok(list)
-        }
-        CatalogSession::Sqlserver(client) => {
-            if database.is_empty() || table.is_empty() {
-                return Ok(Vec::new());
-            }
-            ensure_sqlserver_database(client, database).await?;
-            // 与查询补全同一条 sys 目录语句，避免网格和外键提示各写一套。
-            let sql = sqlserver_foreign_key_sql(schema_name, table);
-            let (_names, rows) = sqlserver_rows(client, &sql).await?;
-            Ok(assemble_foreign_keys(&rows))
-        }
-    }
+    session.grid_foreign_keys(database, schema_name, table).await
 }
 
 #[cfg(test)]

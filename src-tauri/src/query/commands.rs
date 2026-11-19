@@ -9,7 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
-use crate::connections::{CancelTransport, CatalogSession, Service, SessionCondition};
+use crate::connections::{Service, SessionCondition};
 
 use super::cancel::{self, CancelView};
 use super::exec::{self, RowSink, StatementReport, StatementValue};
@@ -151,7 +151,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     }
     let notices = report.notices;
     let parts = report.pieces;
-    let transport = service.cancel_transport(&request.connection_id).unwrap_or(CancelTransport::None);
+    let transport = service.cancel_transport(&request.connection_id).unwrap_or_default();
     let via_ssh = transport.via_ssh();
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -200,7 +200,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             "这条连接还没有打开，没有另开新的连接。".to_owned()
         }
     })?;
-    if matches!(session, CatalogSession::Scripted) {
+    if session.is_scripted() {
         return Err("这个连接没有连着可查询的数据库".to_owned());
     }
     let mut driver = match exec::LiveDriver::attach_with_fallback(
@@ -413,7 +413,7 @@ pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: 
     if !matches!(status.as_str(), "running" | "cancel-requested") {
         return Ok(slot.snapshot.lock().expect("snapshot").clone());
     }
-    let transport = service.cancel_transport(&connection_id).unwrap_or(CancelTransport::None);
+    let transport = service.cancel_transport(&connection_id).unwrap_or_default();
     let via_ssh = transport.via_ssh();
     {
         let mut snap = slot.snapshot.lock().expect("snapshot");

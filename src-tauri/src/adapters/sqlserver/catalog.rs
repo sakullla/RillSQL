@@ -88,6 +88,10 @@ impl CatalogDialect for SqlserverCatalog {
         LISTED
     }
 
+    fn default_schema(&self) -> Option<&'static str> {
+        Some("dbo")
+    }
+
     fn definition_available(&self, kind: ObjectKind) -> bool {
         use ObjectKind::*;
         matches!(kind, Table | View | Function | Procedure | Trigger | Sequence)

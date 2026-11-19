@@ -8,6 +8,7 @@ pub(crate) mod catalog;
 pub mod commands;
 pub(crate) mod complete;
 pub(crate) mod connect;
+pub(crate) mod console;
 pub(crate) mod exec;
 pub(crate) mod keys;
 

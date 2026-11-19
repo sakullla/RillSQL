@@ -393,7 +393,7 @@ async fn fetch_postgres(client: &tokio_postgres::Client, sql: &str, width: usize
 }
 
 async fn fetch_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
-    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await?;
     Ok(rows)
 }
 
@@ -696,7 +696,7 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
                 return Err("会话类型和目标引擎不一致".to_owned());
             };
             // SQL Server 不改连也不开临时会话：对比只落在当前连接的库上，点名其他库直接说明。
-            let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(|err| err.to_string())?;
+            let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(|err| err.to_string())?;
             let current = match rows.first().and_then(|row| row.first()) {
                 Some(crate::grid::Cell::Text(text)) => text.clone(),
                 _ => String::new(),
@@ -707,7 +707,7 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
             if schema.trim().is_empty() {
                 return Err("SQL Server 需要指定 schema".to_owned());
             }
-            let (_names, rows) = crate::grid::sqlserver_rows(
+            let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(
                 client,
                 &format!(
                     "SELECT name FROM sys.schemas WHERE name = N'{}'",
@@ -755,7 +755,7 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
         let sql = crate::catalog::metadata_sql(CatalogEngine::Sqlserver)
             .schemas
             .ok_or_else(|| "SQL Server 缺少 schema 查询".to_owned())?;
-        let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await.map_err(|err| err.to_string())?;
+        let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await.map_err(|err| err.to_string())?;
         let mut names = Vec::new();
         for row in &rows {
             if let Some(crate::grid::Cell::Text(name)) = row.first() {

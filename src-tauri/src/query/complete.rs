@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::i18n::{self, Locale};
 
 use super::assist::{
-    dialect_words, known_engine, quote_ident, CatalogObject, ColumnMeta, CompletionEntry, CompletionScope, CompletionSource, EntryInfo,
+    dialect_words, quote_ident, CatalogObject, ColumnMeta, CompletionEntry, CompletionScope, CompletionSource, EntryInfo,
     MetadataState,
 };
 use super::functions;
@@ -998,7 +998,7 @@ fn internal_rank(label: &str, group: u8) -> u8 {
     }
     let bare = label.rsplit_once('.').map(|(_, tail)| tail).unwrap_or(label);
     let lower = bare.to_ascii_lowercase();
-    if bare.starts_with('_') || lower.starts_with("sqlite_") || lower.starts_with("pg_") {
+    if bare.starts_with('_') || crate::adapters::query::system_object_prefixes().any(|prefix| lower.starts_with(prefix)) {
         1
     } else {
         0
@@ -1222,14 +1222,14 @@ fn redis_plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale
 pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) -> Plan {
     let end = floor_boundary(text, cursor);
     let mut plan = Plan { span: Span { start: end, end }, ..Default::default() };
-    if scope.engine == "redis" {
+    if crate::adapters::query::workbench_named(&scope.engine) == Some(crate::adapters::Workbench::Redis) {
         if !scope.provider {
             plan.note = Some(i18n::text(locale, "query.complete.state.noProvider"));
             return plan;
         }
         return redis_plan(scope, text, end, locale);
     }
-    if !scope.provider || !known_engine(&scope.engine) {
+    if !scope.provider || !crate::adapters::query::known_sql_engine(&scope.engine) {
         plan.note = Some(i18n::text(locale, "query.complete.state.noProvider"));
         return plan;
     }
@@ -1477,7 +1477,7 @@ pub struct Resolution {
 /// 把全文里的一个字节偏移解析成对象或列。别名、表名、`模式.表`、`别名.列`、`模式.表.列` 都认；
 /// 解析依据只有当前语句和已读到的元数据。认不出、有歧义、落在字符串或注释里时返回 None，不猜。
 pub fn resolve(scope: &CompletionScope, text: &str, offset: usize) -> Option<Resolution> {
-    if !known_engine(&scope.engine) {
+    if !crate::adapters::query::known_sql_engine(&scope.engine) {
         return None;
     }
     let offset = floor_boundary(text, offset);

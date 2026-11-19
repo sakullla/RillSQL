@@ -338,7 +338,12 @@ fn cancel_code_does_not_reuse_the_executing_stream() {
     // MySQL 与 PostgreSQL 的取消实现位于各自适配器的 Canceller。
     let mysql_cancel = std::fs::read_to_string(root.join("src/adapters/mysql/connect.rs")).unwrap();
     let postgres_cancel = std::fs::read_to_string(root.join("src/adapters/postgres/connect.rs")).unwrap();
-    let exec = std::fs::read_to_string(root.join("src/query/exec.rs")).unwrap();
+    // 执行器与各引擎的执行驱动（A4 起在适配器里）都只用已打开的会话。
+    let exec = ["src/query/exec.rs", "src/adapters/exec.rs", "src/adapters/sqlite/exec.rs", "src/adapters/mysql/exec.rs", "src/adapters/postgres/exec.rs", "src/adapters/sqlserver/exec.rs"]
+        .iter()
+        .map(|path| std::fs::read_to_string(root.join(path)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(mysql_cancel.contains("Pool::new"));
     assert!(postgres_cancel.contains("cancel_query"));
     assert!(!postgres_cancel.contains("cancel_query_raw"));
@@ -804,11 +809,11 @@ fn sqlserver_result_cap_uses_top_without_touching_with_statements() {
 #[test]
 fn sqlserver_set_and_showplan_statements_route_through_the_row_path() {
     // sp_executesql（execute 路径）里的 SET 只作用于内层批次；SET 语句必须走 simple_query 才会留在会话上。
-    assert!(exec::is_showplan_statement("SET SHOWPLAN_ALL ON"));
-    assert!(exec::is_showplan_statement("set showplan_all off"));
-    assert!(exec::is_showplan_statement("  SET SHOWPLAN_ALL ON;\nSELECT 1;\nSET SHOWPLAN_ALL OFF"));
-    assert!(!exec::is_showplan_statement("SELECT 1"));
-    assert!(!exec::is_showplan_statement("SET NOCOUNT ON"));
+    assert!(crate::adapters::sqlserver::exec::is_showplan_statement("SET SHOWPLAN_ALL ON"));
+    assert!(crate::adapters::sqlserver::exec::is_showplan_statement("set showplan_all off"));
+    assert!(crate::adapters::sqlserver::exec::is_showplan_statement("  SET SHOWPLAN_ALL ON;\nSELECT 1;\nSET SHOWPLAN_ALL OFF"));
+    assert!(!crate::adapters::sqlserver::exec::is_showplan_statement("SELECT 1"));
+    assert!(!crate::adapters::sqlserver::exec::is_showplan_statement("SET NOCOUNT ON"));
     // 路由口径：SET 开头（会话设置）与 SELECT 族都走收行路径，写语句走 execute 拿受影响行数。
     assert_eq!(split::first_keyword("SET NOCOUNT ON"), "SET");
     assert_eq!(split::first_keyword("SET SHOWPLAN_ALL ON"), "SET");
@@ -820,7 +825,7 @@ fn sqlserver_set_and_showplan_statements_route_through_the_row_path() {
 fn sqlserver_showplan_batch_survives_the_real_split_and_routes_each_piece() {
     // 真实批次（不经 synthetic 拦截）：整批按分号切成三条语句，每条都走收行路径，
     // 中间的 SELECT 在 SHOWPLAN_ALL 下返回计划行集而不是执行语句。
-    let batch = exec::showplan_batch("SELECT * FROM [dbo].[orders]");
+    let batch = crate::adapters::sqlserver::exec::showplan_batch("SELECT * FROM [dbo].[orders]");
     let report = split::split_sql("sqlserver", &batch);
     assert_eq!(report.pieces.len(), 3, "{report:?}");
     assert_eq!(report.pieces[0].text.trim_end_matches(';'), "SET SHOWPLAN_ALL ON");
@@ -845,12 +850,12 @@ fn sqlserver_showplan_result_rows_are_ordered_parents_first() {
         vec![Some("1".to_owned()), Some("3".to_owned()), Some("1".to_owned()), Some("Sort".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("3".to_owned())],
         vec![Some("1".to_owned()), Some("2".to_owned()), Some("1".to_owned()), Some("Clustered Index Scan".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("3".to_owned())],
     ];
-    let ordered = exec::order_showplan_results(&columns, rows);
+    let ordered = crate::adapters::sqlserver::exec::order_showplan_results(&columns, rows);
     let node_ids: Vec<&str> = ordered.iter().map(|row| row[1].as_deref().unwrap_or("")).collect();
     assert_eq!(node_ids, vec!["1", "2", "3", "4"]);
     // NodeId 非数字或父缺失（层次不完整）时按原序返回，不猜。
     let plain = vec![Some("a".to_owned()), Some("b".to_owned())];
-    let kept = exec::order_showplan_results(&columns, vec![plain.clone()]);
+    let kept = crate::adapters::sqlserver::exec::order_showplan_results(&columns, vec![plain.clone()]);
     assert_eq!(kept, vec![plain]);
     // 普通结果集恰好带 NodeId+Parent 数字列（无 SHOWPLAN 专属列）时不重排、保持原序。
     let ordinary_columns: Vec<String> = ["NodeId", "Parent", "value"].iter().map(|item| item.to_string()).collect();
@@ -858,17 +863,17 @@ fn sqlserver_showplan_result_rows_are_ordered_parents_first() {
         vec![Some("2".to_owned()), Some("1".to_owned()), Some("second".to_owned())],
         vec![Some("1".to_owned()), Some("0".to_owned()), Some("first".to_owned())],
     ];
-    let unchanged = exec::order_showplan_results(&ordinary_columns, ordinary.clone());
+    let unchanged = crate::adapters::sqlserver::exec::order_showplan_results(&ordinary_columns, ordinary.clone());
     assert_eq!(unchanged, ordinary, "非 SHOWPLAN 形状不得静默重排");
     let ordinary_columns: Vec<String> = ["id", "name"].iter().map(|item| item.to_string()).collect();
-    let untouched = exec::order_showplan_results(&ordinary_columns, vec![vec![Some("1".to_owned()), Some("x".to_owned())]]);
+    let untouched = crate::adapters::sqlserver::exec::order_showplan_results(&ordinary_columns, vec![vec![Some("1".to_owned()), Some("x".to_owned())]]);
     assert_eq!(untouched.len(), 1);
 }
 
 #[test]
 fn sqlserver_showplan_batch_wraps_the_statement_without_executing_it() {
     // SHOWPLAN 批次：SET 开、原语句、SET 关。原语句保持一行，不做改写。
-    let batch = super::exec::showplan_batch("SELECT * FROM [dbo].[orders]");
+    let batch = crate::adapters::sqlserver::exec::showplan_batch("SELECT * FROM [dbo].[orders]");
     assert_eq!(batch, "SET SHOWPLAN_ALL ON;\nSELECT * FROM [dbo].[orders];\nSET SHOWPLAN_ALL OFF");
     assert!(batch.starts_with("SET SHOWPLAN_ALL ON"));
     assert!(batch.ends_with("SET SHOWPLAN_ALL OFF"));
@@ -884,7 +889,7 @@ fn showplan_rows_build_an_outline_by_parent() {
         (3, 1, "Sort".to_owned(), "0.01".to_owned()),
         (4, 3, "Nested Loops".to_owned(), "0.005".to_owned()),
     ];
-    let outline = super::exec::showplan_outline(&rows);
+    let outline = crate::adapters::sqlserver::exec::showplan_outline(&rows);
     assert_eq!(outline.len(), 4);
     assert_eq!(outline[0], (0, "SELECT".to_owned(), "0.03".to_owned()));
     assert_eq!(outline[1], (1, "Clustered Index Scan".to_owned(), "0.02".to_owned()));
@@ -920,7 +925,12 @@ fn result_cap_limits_the_server_read_without_raising_a_smaller_limit() {
 
 #[test]
 fn mysql_batch_checks_out_once_and_does_not_reset_on_return() {
-    let exec = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/query/exec.rs")).unwrap();
+    // 执行器在 query/exec.rs，会话一侧与各引擎驱动在适配器里（A4）；按同一份源码文本检查。
+    let exec = ["src/query/exec.rs", "src/adapters/exec.rs", "src/adapters/mysql/exec.rs", "src/adapters/postgres/exec.rs"]
+        .iter()
+        .map(|path| std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     let mysql_run = exec.split("async fn mysql_run").nth(1).unwrap();
     let mysql_run = mysql_run.split("fn mysql_cell").next().unwrap();
     assert!(!mysql_run.contains("get_conn"), "每条语句不能重新借连接");
@@ -1334,7 +1344,7 @@ async fn wait_done(state: &super::commands::QueryState, id: &str) -> super::comm
 
 #[test]
 fn tds_value_formatters_cover_numeric_uuid_and_temporal_types() {
-    use super::exec::{tds_datetime_offset_text, tds_naive_date_text, tds_naive_datetime_text, tds_naive_time_text, tds_numeric_text, tds_uuid_text};
+    use crate::adapters::sqlserver::exec::{tds_datetime_offset_text, tds_naive_date_text, tds_naive_datetime_text, tds_naive_time_text, tds_numeric_text, tds_uuid_text};
     // decimal / money：定点文本保留小数位。
     let money = tiberius::numeric::Numeric::new_with_scale(12850, 2);
     assert_eq!(tds_numeric_text(money), "128.50");
@@ -1359,7 +1369,7 @@ fn tds_value_formatters_cover_numeric_uuid_and_temporal_types() {
 
 #[test]
 fn tds_type_names_map_temporal_numeric_and_xml_columns() {
-    use super::exec::tds_type_name;
+    use crate::adapters::sqlserver::exec::tds_type_name;
     use tiberius::ColumnType;
     assert_eq!(tds_type_name(ColumnType::Datetime2), "datetime");
     assert_eq!(tds_type_name(ColumnType::Daten), "date");
@@ -1469,24 +1479,24 @@ async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
 #[test]
 fn error_positions_are_parsed_per_driver() {
     // PostgreSQL：position 从 1 开始按字符计数，换成语句内的字符偏移；越界停在末尾。
-    assert_eq!(exec::pg_error_char(8, "SELECT nope FROM t"), Some(7));
-    assert_eq!(exec::pg_error_char(1, "SELECT"), Some(0));
-    assert_eq!(exec::pg_error_char(3, "选择 x"), Some(2), "按字符而不是字节");
-    assert_eq!(exec::pg_error_char(99, "SELECT"), Some(6));
-    assert_eq!(exec::pg_error_char(0, "SELECT"), None);
+    assert_eq!(crate::adapters::postgres::exec::pg_error_char(8, "SELECT nope FROM t"), Some(7));
+    assert_eq!(crate::adapters::postgres::exec::pg_error_char(1, "SELECT"), Some(0));
+    assert_eq!(crate::adapters::postgres::exec::pg_error_char(3, "选择 x"), Some(2), "按字符而不是字节");
+    assert_eq!(crate::adapters::postgres::exec::pg_error_char(99, "SELECT"), Some(6));
+    assert_eq!(crate::adapters::postgres::exec::pg_error_char(0, "SELECT"), None);
     // MySQL / MariaDB：从文本里取 "at line N"。
     let mysql = "ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'FORM t' at line 2";
-    assert_eq!(exec::mysql_error_line(mysql), Some(2));
-    assert_eq!(exec::mysql_error_line("Table 'shop.t' doesn't exist"), None);
-    assert_eq!(exec::mysql_error_line("near 'x' at line 0"), None);
+    assert_eq!(crate::adapters::mysql::exec::mysql_error_line(mysql), Some(2));
+    assert_eq!(crate::adapters::mysql::exec::mysql_error_line("Table 'shop.t' doesn't exist"), None);
+    assert_eq!(crate::adapters::mysql::exec::mysql_error_line("near 'x' at line 0"), None);
     // SQL Server：服务器错误的行号，0 表示没有。
-    assert_eq!(exec::sqlserver_error_line(3), Some(3));
-    assert_eq!(exec::sqlserver_error_line(0), None);
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_line(3), Some(3));
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_line(0), None);
     // 错误发生在存储过程/触发器/函数里时，行号属于模块定义，不给位置，退回整条语句标错。
-    assert_eq!(exec::sqlserver_error_at(3, ""), Some(exec::ErrorAt::Line(3)));
-    assert_eq!(exec::sqlserver_error_at(0, ""), None);
-    assert_eq!(exec::sqlserver_error_at(12, "dbo.audit_orders"), None, "模块内的行号不映射到用户语句");
-    assert_eq!(exec::sqlserver_error_at(1, "trg_orders"), None);
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_at(3, ""), Some(exec::ErrorAt::Line(3)));
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_at(0, ""), None);
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_at(12, "dbo.audit_orders"), None, "模块内的行号不映射到用户语句");
+    assert_eq!(crate::adapters::sqlserver::exec::sqlserver_error_at(1, "trg_orders"), None);
     // 执行前追加的 LIMIT 不影响原文里的位置。
     let original = "SELECT nope FROM t";
     let sent = "SELECT nope FROM t LIMIT 101";

@@ -7,12 +7,12 @@ mod sql;
 mod store;
 
 pub(crate) use live::{
-    commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview, query_page_with_schema,
-    read_full_cell, request_cancel as request_grid_export_cancel, run_export, sqlserver_rows, ExportMode, ExportSpec, ForeignKey, Mutation,
-    MutationKind, LivePage,
+    assemble_foreign_keys, commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, push_foreign_key,
+    query_page_search_preview, query_page_with_schema, read_full_cell, request_cancel as request_grid_export_cancel, run_export, ExportMode, ExportSpec, ForeignKey,
+    Mutation, MutationKind, LivePage,
 };
 pub(crate) use sql::{
-    compile_where, delete_sql, engine_key, gate_filter_expression, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal,
+    compile_where, delete_sql, gate_filter_expression, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal,
     reject_literal_with, select_list, sql_cell, update_sql, value_family, PreviewValue, ValueFamily, DEFAULT_PREVIEW_BYTES,
 };
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
@@ -74,8 +74,6 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&export::start_export),
         std::any::type_name_of_val(&commands::grid_page),
         std::any::type_name_of_val(&live::describe),
-        std::any::type_name_of_val(&store::customers_fixture),
-        std::any::type_name_of_val(&store::nokey_fixture),
         std::any::type_name_of_val(&store::touch_api),
     );
     let _ = store::touch_api();

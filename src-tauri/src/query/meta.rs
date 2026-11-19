@@ -1,7 +1,6 @@
 //! 表级外键读取：补全的 ON 条件只有实际读到外键时才标成外键。
 //!
-//! 关系型引擎复用目录/网格已有的按需读取（SQLite、MySQL/MariaDB、PostgreSQL），
-//! SQL Server 在这里补一条 sys 目录查询；键/文档引擎没有外键，空集不是失败。
+//! 读取由会话所属引擎的适配器完成（与网格同一套按需读取）；键/文档引擎没有外键，空集不是失败。
 
 use crate::catalog::Engine;
 use crate::connections::CatalogSession;
@@ -24,91 +23,25 @@ pub async fn read_table_keys(
     schema: &str,
     table: &str,
 ) -> Result<Vec<TableKey>, String> {
-    if table.is_empty() {
+    if table.is_empty() || !engine.is_relational() {
         return Ok(Vec::new());
     }
-    match engine {
-        Engine::Redis | Engine::Mongodb => Ok(Vec::new()),
-        Engine::Sqlserver => sqlserver_keys(session, schema, table).await,
-        Engine::Sqlite | Engine::Mysql | Engine::Mariadb | Engine::Postgres => {
-            let keys = crate::grid::foreign_keys(session, database, schema, table, engine.as_str()).await?;
-            Ok(keys
-                .into_iter()
-                .map(|key| TableKey {
-                    name: key.name,
-                    columns: key.columns,
-                    ref_schema: key.ref_schema,
-                    ref_table: key.ref_table,
-                    ref_columns: key.ref_columns,
-                })
-                .collect())
-        }
-    }
-}
-
-fn literal(text: &str) -> String {
-    format!("N'{}'", text.replace('\'', "''"))
-}
-
-/// SQL Server 的出向外键查询；只读 sys 目录，不碰用户表。
-pub fn sqlserver_keys_sql(schema: &str, table: &str) -> String {
-    let mut sql = String::from(
-        "SELECT fk.name, pc.name, rs.name, rt.name, rc.name \
-         FROM sys.foreign_key_columns fkc \
-         JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id \
-         JOIN sys.tables pt ON pt.object_id = fkc.parent_object_id \
-         JOIN sys.schemas ps ON ps.schema_id = pt.schema_id \
-         JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
-         JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id \
-         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
-         JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
-         WHERE pt.name = ",
-    );
-    sql.push_str(&literal(table));
-    if !schema.is_empty() {
-        sql.push_str(" AND ps.name = ");
-        sql.push_str(&literal(schema));
-    }
-    sql.push_str(" ORDER BY fk.name, fkc.constraint_column_id");
-    sql
-}
-
-async fn sqlserver_keys(session: &CatalogSession, schema: &str, table: &str) -> Result<Vec<TableKey>, String> {
-    let rows = crate::catalog::detail::rows_for(session, &sqlserver_keys_sql(schema, table)).await?;
-    let mut keys: Vec<TableKey> = Vec::new();
-    for row in rows {
-        let cell = |index: usize| row.get(index).and_then(|value| value.clone()).unwrap_or_default();
-        let name = cell(0);
-        let column = cell(1);
-        if name.is_empty() || column.is_empty() {
-            continue;
-        }
-        let ref_schema = cell(2);
-        let ref_table = cell(3);
-        let ref_column = cell(4);
-        if ref_table.is_empty() || ref_column.is_empty() {
-            continue;
-        }
-        match keys.iter_mut().find(|key| key.name == name) {
-            Some(existing) => {
-                existing.columns.push(column);
-                existing.ref_columns.push(ref_column);
-            }
-            None => keys.push(TableKey {
-                name,
-                columns: vec![column],
-                ref_schema,
-                ref_table,
-                ref_columns: vec![ref_column],
-            }),
-        }
-    }
-    Ok(keys)
+    let keys = session.completion_foreign_keys(database, schema, table).await?;
+    Ok(keys
+        .into_iter()
+        .map(|key| TableKey {
+            name: key.name,
+            columns: key.columns,
+            ref_schema: key.ref_schema,
+            ref_table: key.ref_table,
+            ref_columns: key.ref_columns,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::adapters::sqlserver::grid_read::foreign_key_sql as sqlserver_keys_sql;
 
     #[test]
     fn sqlserver_query_reads_the_sys_catalog_without_user_tables() {

@@ -1,10 +1,10 @@
 //! SQL 方言辅助。编辑器只负责文本和显示；切分、格式化、lint、补全、大纲和计划在这里。
 //! 失败时返回原 SQL，不在这里改写调用方的草稿。
 
+use crate::adapters::query::{is_quote_byte, is_quote_char, known_sql_engine};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::exec::showplan_batch;
 use super::split::{self, Piece, SplitReport};
 
 pub const MAX_SQL_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -173,9 +173,6 @@ pub struct FileLoad {
     pub execute: bool,
 }
 
-pub fn known_engine(engine: &str) -> bool {
-    matches!(engine, "postgres" | "mysql" | "mariadb" | "sqlite" | "sqlserver")
-}
 
 pub fn locate_statement(engine: &str, sql: &str, cursor: usize) -> Located {
     let report = split::split_sql(engine, sql);
@@ -278,7 +275,7 @@ pub fn format_document(sql: &str, from: usize, to: usize) -> TextResult {
 }
 
 pub fn guard_rewrite(engine: &str, provider: bool, sql: &str) -> Option<TextResult> {
-    if !known_engine(engine) {
+    if !known_sql_engine(engine) {
         return Some(TextResult { ok: false, sql: sql.to_owned(), reason_key: Some("query.errors.unknownDialect") });
     }
     if !provider {
@@ -288,7 +285,7 @@ pub fn guard_rewrite(engine: &str, provider: bool, sql: &str) -> Option<TextResu
 }
 
 pub fn lint_sql(sql: &str, engine: &str) -> Vec<LintFinding> {
-    let hash = engine == "mysql" || engine == "mariadb";
+    let hash = crate::adapters::query::lexis_named(engine).hash_comments;
     let mut findings = Vec::new();
     let mut parens = Vec::new();
     let mut i = 0usize;
@@ -345,7 +342,7 @@ pub fn lint_sql(sql: &str, engine: &str) -> Vec<LintFinding> {
             i += 2;
             continue;
         }
-        if matches!(ch_at(sql, i), Some('\'' | '"' | '`')) {
+        if ch_at(sql, i).is_some_and(is_quote_char) {
             quote = ch_at(sql, i);
             quote_at = i;
             i = step(sql, i);
@@ -550,7 +547,7 @@ impl CompletionScope {
 }
 
 pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &str) -> Result<(String, usize, usize), String> {
-    if !known_engine(engine) {
+    if !known_sql_engine(engine) {
         return Err(key_text("query.errors.unknownDialect"));
     }
     let pick = if from == to {
@@ -580,7 +577,7 @@ pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &s
 }
 
 pub fn explain_sql(engine: &str, statement: &str) -> Result<String, String> {
-    if !known_engine(engine) {
+    if !known_sql_engine(engine) {
         return Err(key_text("query.errors.unknownDialect"));
     }
     let body = statement.trim().trim_end_matches(';').trim();
@@ -590,27 +587,10 @@ pub fn explain_sql(engine: &str, statement: &str) -> Result<String, String> {
     if has_analyze(body, engine) {
         return Err(key_text("query.plan.noAnalyze"));
     }
-    if engine == "sqlserver" {
-        return Ok(showplan_batch(body));
-    }
-    let upper = body.to_ascii_uppercase();
-    if upper.starts_with("EXPLAIN") {
-        if engine == "sqlite" && !upper.starts_with("EXPLAIN QUERY PLAN") {
-            let rest = body.split_once(char::is_whitespace).map(|(_, rest)| rest).unwrap_or("");
-            return Ok(format!("EXPLAIN QUERY PLAN {rest}"));
-        }
-        return Ok(body.to_owned());
-    }
-    if engine == "sqlite" {
-        Ok(format!("EXPLAIN QUERY PLAN {body}"))
-    } else if engine == "mysql" {
-        Ok(format!("EXPLAIN FORMAT=TREE {body}"))
-    } else if engine == "mariadb" {
-        Ok(format!("EXPLAIN FORMAT=JSON {body}"))
-    } else {
-        // PostgreSQL：JSON 格式带结构化的代价、行数与条件，计划视图据此画树。
-        Ok(format!("EXPLAIN (FORMAT JSON) {body}"))
-    }
+    let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
+        return Err(key_text("query.errors.unknownDialect"));
+    };
+    Ok(syntax.explain(body))
 }
 
 pub fn sql_save_name() -> String {
@@ -664,7 +644,7 @@ fn rewrite_stars(sql: &str, sources: &[CompletionSource]) -> Option<String> {
             i += 1;
             continue;
         }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+        if is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
             out.push(bytes[i] as char);
             i += 1;
@@ -757,13 +737,7 @@ fn columns_for(sources: &[CompletionSource], alias: Option<&str>) -> Vec<String>
 }
 
 pub(crate) fn dialect_words(engine: &str) -> &'static [&'static str] {
-    match engine {
-        "postgres" => &["ILIKE", "RETURNING", "LATERAL", "SIMILAR", "TABLESAMPLE", "STRING_AGG"],
-        "mysql" | "mariadb" => &["REGEXP", "STRAIGHT_JOIN", "IFNULL", "GROUP_CONCAT", "UNSIGNED"],
-        "sqlite" => &["PRAGMA", "VACUUM", "WITHOUT", "ROWID", "AUTOINCREMENT", "IFNULL", "GLOB"],
-        "sqlserver" => &["TOP", "NOLOCK", "ISNULL", "OFFSET", "FETCH", "IDENTITY"],
-        _ => &[],
-    }
+    crate::adapters::query::syntax_named(engine).map(|syntax| syntax.dialect_words()).unwrap_or(&[])
 }
 
 fn has_analyze(sql: &str, engine: &str) -> bool {
@@ -826,7 +800,7 @@ fn scan_spots(sql: &str) -> Vec<Spot> {
             continue;
         }
         match ch_at(sql, i) {
-            Some('\'' | '"' | '`') => {
+            Some(ch) if is_quote_char(ch) => {
                 quote = ch_at(sql, i);
                 i = step(sql, i);
             }
@@ -958,7 +932,7 @@ fn open_delimiter(sql: &str) -> Option<OpenKind> {
             i += 2;
             continue;
         }
-        if matches!(ch_at(sql, i), Some('\'' | '"' | '`')) {
+        if ch_at(sql, i).is_some_and(is_quote_char) {
             quote = ch_at(sql, i);
             i = step(sql, i);
             continue;
@@ -1026,7 +1000,7 @@ fn tokenize(sql: &str) -> Vec<Tok> {
             i = j;
             continue;
         }
-        if ch == '\'' || ch == '"' || ch == '`' {
+        if is_quote_char(ch) {
             let mut j = step(sql, i);
             while j < sql.len() {
                 if ch_at(sql, j) == Some(ch) && ch_at(sql, step(sql, j)) == Some(ch) {
@@ -1399,7 +1373,7 @@ fn line_comment_marks(sql: &str) -> Vec<bool> {
             i += 2;
             continue;
         }
-        if matches!(chars[i], '\'' | '"' | '`') {
+        if is_quote_char(chars[i]) {
             quote = Some(chars[i]);
             i += 1;
             continue;

@@ -451,3 +451,82 @@ fn first_rows_select_follows_the_dialect() {
     assert_eq!(sample(Engine::Sqlite), "SELECT * FROM orders LIMIT 100;");
     assert_eq!(sample(Engine::Postgres), "SELECT * FROM dbo.orders LIMIT 100;");
 }
+
+/// A4：网格与查询的方言门面按引擎 id 解析，未知或非 SQL 引擎保持原来的回退。
+#[test]
+fn grid_and_query_facades_resolve_through_the_registry() {
+    use super::query::{
+        dialect_statement_keywords, is_identifier_quote, is_quote_byte, is_quote_char, known_sql_engine, label_named, lexis_named, sql_dialect_id,
+        sql_syntax, syntax_named, system_object_prefixes,
+    };
+    use super::Lexis;
+
+    for engine in SQL_ENGINES {
+        let id = engine.as_str();
+        assert!(known_sql_engine(id), "{id}");
+        assert_eq!(sql_dialect_id(id), id);
+        assert_eq!(registry::sql_engine(id), engine);
+        assert_eq!(registry::grid_engine(id), engine);
+        assert!(!syntax_named(id).unwrap().functions().is_empty(), "{id} 有函数签名表");
+        assert!(!syntax_named(id).unwrap().dialect_words().is_empty(), "{id} 有方言关键字");
+    }
+    for id in ["redis", "mongodb", "", "oracle"] {
+        assert!(!known_sql_engine(id), "{id}");
+        assert_eq!(sql_dialect_id(id), registry::UNBOUND_DIALECT.as_str());
+        assert_eq!(lexis_named(id), Lexis::UNKNOWN);
+    }
+    assert_eq!(registry::grid_engine("redis"), Engine::Redis);
+    assert_eq!(registry::grid_engine("oracle"), registry::UNBOUND_GRID);
+
+    // 词法：MySQL 家族认 # 注释与 DELIMITER；T-SQL 认括号标识符与 GO；其余标准写法。
+    assert!(lexis_named("mysql").hash_comments && lexis_named("mariadb").delimiter_command);
+    assert!(lexis_named("sqlserver").transact && !lexis_named("sqlserver").delimiter_command);
+    assert_eq!(lexis_named("postgres"), Lexis::default());
+    assert_eq!(label_named("sqlserver"), "SQL Server");
+    assert_eq!(label_named("oracle"), "");
+
+    // 通用词法的引号字符：字符串单引号与开闭相同的标识符引号；任一方言的标识符引号含 T-SQL 的方括号。
+    let quotes: Vec<char> = (0u8..128).map(char::from).filter(|ch| is_quote_char(*ch)).collect();
+    assert_eq!(quotes, vec!['"', '\'', '\u{60}']);
+    assert!(is_quote_byte(b'"') && !is_quote_byte(0xe4) && !is_quote_byte(b'['));
+    let identifier: Vec<char> = (0u8..128).map(char::from).filter(|ch| is_identifier_quote(*ch)).collect();
+    assert_eq!(identifier, vec!['"', '[', ']', '\u{60}']);
+
+    assert!(dialect_statement_keywords().any(|word| word == "PRAGMA"));
+    let prefixes: Vec<&str> = system_object_prefixes().collect();
+    assert!(prefixes.contains(&"pg_") && prefixes.contains(&"sqlite_"), "{prefixes:?}");
+
+    // 非 SQL 引擎落到占位语法：原样投影、标准双引号。
+    let none = sql_syntax(Engine::Redis);
+    assert_eq!(none.text_cast("x"), "x");
+    assert_eq!(none.quote_ident("order"), "\"order\"");
+    assert_eq!(none.page_tail(10, 0, false), " LIMIT 10");
+}
+
+/// A4：网格投影、分页与字面量按方言生成。
+#[test]
+fn grid_projection_follows_the_dialect() {
+    use super::query::sql_syntax;
+    let tail = |engine: Engine, offset: u64, ordered: bool| sql_syntax(engine).page_tail(5, offset, ordered);
+    assert_eq!(tail(Engine::Postgres, 0, false), " LIMIT 5");
+    assert_eq!(tail(Engine::Mysql, 10, true), " LIMIT 5 OFFSET 10");
+    assert_eq!(tail(Engine::Sqlserver, 10, true), " OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY");
+    assert_eq!(tail(Engine::Sqlserver, 0, false), " ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY");
+    assert_eq!(sql_syntax(Engine::Sqlserver).text_literal("it's"), "N'it''s'");
+    assert_eq!(sql_syntax(Engine::Mysql).text_literal("it's"), "'it''s'");
+    assert_eq!(sql_syntax(Engine::Postgres).contains_operator(), "ILIKE");
+    assert_eq!(sql_syntax(Engine::Sqlite).contains_operator(), "LIKE");
+    assert_eq!(sql_syntax(Engine::Mariadb).insert_defaults("t"), "INSERT INTO t () VALUES ()");
+    assert_eq!(sql_syntax(Engine::Postgres).insert_defaults("t"), "INSERT INTO t DEFAULT VALUES");
+    assert_eq!(sql_syntax(Engine::Sqlite).implicit_order("table"), Some("rowid"));
+    assert_eq!(sql_syntax(Engine::Sqlite).implicit_order("view"), None);
+    assert_eq!(sql_syntax(Engine::Postgres).binary_literal("ff"), "'\\xff'");
+    assert_eq!(sql_syntax(Engine::Sqlserver).binary_literal("ff"), "0xff");
+    assert_eq!(sql_syntax(Engine::Sqlite).binary_literal("ff"), "X'ff'");
+    assert_eq!(sql_syntax(Engine::Sqlserver).count_expression(), "CAST(COUNT_BIG(*) AS BIGINT)");
+    // MySQL 与 MariaDB 共用语法，只在超时变量和计划格式上不同。
+    assert_eq!(sql_syntax(Engine::Mysql).timeout_statements(1500), vec!["SET SESSION MAX_EXECUTION_TIME = 1500".to_owned()]);
+    assert_eq!(sql_syntax(Engine::Mariadb).timeout_statements(1500), vec!["SET SESSION max_statement_time = 1.5".to_owned()]);
+    assert_eq!(sql_syntax(Engine::Mysql).explain("SELECT 1"), "EXPLAIN FORMAT=TREE SELECT 1");
+    assert_eq!(sql_syntax(Engine::Mariadb).explain("SELECT 1"), "EXPLAIN FORMAT=JSON SELECT 1");
+}

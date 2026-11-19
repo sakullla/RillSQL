@@ -1,6 +1,10 @@
-//! SQL Server 的 SQL 语法：标识符引号与保留字。
+//! SQL Server 的 SQL 语法：标识符引号、保留字、Unicode 字面量、OFFSET/FETCH 分页、
+//! 网格投影、T-SQL 词法、TOP 行数上限与 SHOWPLAN 执行计划。
 
-use crate::adapters::SqlSyntax;
+use crate::adapters::{Lexis, SqlSyntax};
+use crate::query::exec::CappedSql;
+use crate::query::functions::FunctionSig;
+use crate::query::plan::PlanNode;
 
 pub(super) struct SqlserverSyntax;
 
@@ -17,6 +21,75 @@ impl SqlSyntax for SqlserverSyntax {
     /// T-SQL 没有 LIMIT，取前几行用 TOP。
     fn select_first_rows(&self, table: &str, limit: usize) -> String {
         format!("SELECT TOP {limit} * FROM {table};")
+    }
+
+    fn national_prefix(&self) -> &'static str {
+        "N"
+    }
+
+    /// T-SQL 的 OFFSET/FETCH 必须跟在 ORDER BY 后面，没有排序时补一个恒定序。
+    fn page_tail(&self, limit: u64, offset: u64, ordered: bool) -> String {
+        if ordered {
+            format!(" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+        } else {
+            format!(" ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+        }
+    }
+
+    fn count_expression(&self) -> &'static str {
+        "CAST(COUNT_BIG(*) AS BIGINT)"
+    }
+
+    /// NVARCHAR(MAX) 承接任意长度的文本形态，日期/数字等隐式转换后参与 LIKE 匹配。
+    fn text_cast(&self, ident: &str) -> String {
+        format!("CAST({ident} AS NVARCHAR(MAX))")
+    }
+
+    /// LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断按设置的字符数。
+    fn text_preview(&self, plain: &str, cap: usize) -> String {
+        format!("CASE WHEN LEN({plain}) > {cap} THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, {cap}) ELSE {plain} END")
+    }
+
+    fn binary_length(&self, ident: &str) -> String {
+        format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CHAR(1) + N'b:' + CAST(DATALENGTH({ident}) AS NVARCHAR(20)) END")
+    }
+
+    /// CONVERT 样式 2 输出不带 0x 前缀的小写十六进制。
+    fn binary_hex(&self, ident: &str) -> String {
+        format!("LOWER(CONVERT(VARCHAR(MAX), {ident}, 2))")
+    }
+
+    /// T-SQL 的二进制字面量是 0x 前缀（空二进制是 0x）。
+    fn binary_literal(&self, hex: &str) -> String {
+        format!("0x{hex}")
+    }
+
+    fn lexis(&self) -> Lexis {
+        Lexis { hash_comments: false, transact: true, delimiter_command: false }
+    }
+
+    fn cap_rows(&self, sql: &str, cap: usize) -> Option<CappedSql> {
+        Some(super::exec::cap_rows_with_top(sql, cap))
+    }
+
+    fn dialect_words(&self) -> &'static [&'static str] {
+        &["TOP", "NOLOCK", "ISNULL", "OFFSET", "FETCH", "IDENTITY"]
+    }
+
+    fn explain(&self, body: &str) -> String {
+        super::exec::showplan_batch(body)
+    }
+
+    fn parse_plan(&self, _sql: &str, _explained: bool, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
+        let column = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
+        if column("NodeId").is_none() || column("PhysicalOp").is_none() {
+            return None;
+        }
+        super::plan::parse_showplan_all(columns, rows)
+    }
+
+    fn functions(&self) -> &'static [FunctionSig] {
+        super::functions::SQLSERVER
     }
 }
 

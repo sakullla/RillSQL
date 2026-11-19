@@ -4,13 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::TryStreamExt;
-use mysql_async::prelude::Queryable;
-use sqlx::Column;
-use sqlx::Row;
-use sqlx::TypeInfo;
-use sqlx::ValueRef;
-
 use crate::connections::CancelTransport;
 use crate::connections::CatalogSession;
 
@@ -74,7 +67,7 @@ pub struct CappedSql {
 }
 
 impl CappedSql {
-    fn unchanged(sql: &str) -> Self {
+    pub(crate) fn unchanged(sql: &str) -> Self {
         Self { sql: sql.to_owned(), rewrite: None }
     }
 }
@@ -119,17 +112,9 @@ pub fn database_gate(engine: &str, current: &str, requested: &str) -> DatabaseGa
     if requested.is_empty() || requested == current {
         return DatabaseGate::Ready;
     }
-    match engine {
-        "mysql" | "mariadb" => DatabaseGate::Switch,
-        "postgres" | "sqlserver" => DatabaseGate::Refuse,
-        "sqlite" => {
-            if requested == "main" {
-                DatabaseGate::Ready
-            } else {
-                DatabaseGate::Refuse
-            }
-        }
-        _ => DatabaseGate::Refuse,
+    match crate::adapters::query::syntax_named(engine) {
+        Some(syntax) => syntax.database_gate(requested),
+        None => DatabaseGate::Refuse,
     }
 }
 
@@ -155,70 +140,13 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
     StatementStop::Error { message, at: None }
 }
 
-/// PostgreSQL 的 position 从 1 开始、按字符计数。换成语句内从 0 开始的字符偏移；
-/// 超出语句长度时落在语句末尾（执行时追加的 LIMIT 不在用户文本里）。
-pub fn pg_error_char(position: u32, statement: &str) -> Option<usize> {
-    if position == 0 {
-        return None;
-    }
-    let count = statement.chars().count();
-    Some(((position as usize) - 1).min(count))
-}
 
-/// MySQL / MariaDB 的语法错误写在文本里："... near 'x' at line N"。取最后一处，行号从 1 开始。
-pub fn mysql_error_line(message: &str) -> Option<usize> {
-    let lower = message.to_ascii_lowercase();
-    let at = lower.rfind("at line ")?;
-    let digits: String = lower[at + "at line ".len()..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    digits.parse::<usize>().ok().filter(|line| *line > 0)
-}
 
-/// SQL Server 的服务器错误带行号（批次内从 1 开始）；0 表示服务器没给行号。
-pub fn sqlserver_error_line(line: u32) -> Option<usize> {
-    if line == 0 {
-        None
-    } else {
-        Some(line as usize)
-    }
-}
 
-/// SQL Server 服务器错误的位置。错误发生在存储过程/触发器/函数里时（procedure 非空），
-/// 行号属于那个模块的定义，不对应用户写的语句，此时不给位置，由编辑器整条语句标错。
-pub fn sqlserver_error_at(line: u32, procedure: &str) -> Option<ErrorAt> {
-    if !procedure.trim().is_empty() {
-        return None;
-    }
-    sqlserver_error_line(line).map(ErrorAt::Line)
-}
 
-/// 从 tiberius 错误里取行号；不是服务器报错时没有位置。
-fn tds_error_at(err: &tiberius::error::Error) -> Option<ErrorAt> {
-    match err {
-        tiberius::error::Error::Server(token) => sqlserver_error_at(token.line(), token.procedure()),
-        _ => None,
-    }
-}
 
-/// 从 tokio-postgres 错误里取位置；只认原语句里的位置，内部生成语句的位置不对应用户文本。
-fn pg_error_at(err: &tokio_postgres::Error, statement: &str) -> Option<ErrorAt> {
-    match err.as_db_error()?.position()? {
-        tokio_postgres::error::ErrorPosition::Original(position) => pg_error_char(*position, statement).map(ErrorAt::Char),
-        tokio_postgres::error::ErrorPosition::Internal { .. } => None,
-    }
-}
 
-fn tds_failure(err: &tiberius::error::Error) -> Failure {
-    Failure { message: crate::error_text::chain(err), at: tds_error_at(err) }
-}
 
-/// sent 是实际发出的文本（可能加了行数上限），位置先在 sent 里换算，再映射回用户写的 statement。
-fn pg_failure(err: &tokio_postgres::Error, sent: &str, statement: &str) -> Failure {
-    let at = match pg_error_at(err, sent) {
-        Some(ErrorAt::Char(offset)) => Some(ErrorAt::Char(map_rewritten_char(statement, sent, offset))),
-        other => other,
-    };
-    Failure { message: crate::error_text::chain(err), at }
-}
 
 /// 执行前的改写只在一处插入或替换文本（行数上限）。把改写后文本里的字符偏移映射回原文：
 /// 落在公共前缀里原样保留，落在公共后缀里减去长度差，落在改写片段里就停在改写起点。
@@ -278,28 +206,18 @@ pub fn is_statement_timeout(message: &str) -> bool {
 }
 
 /// 生成本批要下发的会话级语句超时设置。目录连接是共享会话，整批结束由 `LiveDriver::finish` 复位。
-/// MySQL 的 MAX_EXECUTION_TIME 只对 SELECT 生效；MariaDB 的单位是秒。
+/// 写法与单位按方言（适配器 SqlSyntax）；不支持会话级超时的引擎没有设置。
 pub fn timeout_statements(engine: &str, timeout_ms: Option<u64>) -> Vec<String> {
     let ms = match timeout_ms {
         Some(ms) if ms > 0 => ms,
         _ => return Vec::new(),
     };
-    match engine {
-        "postgres" => vec![format!("SET statement_timeout = {ms}")],
-        "mysql" => vec![format!("SET SESSION MAX_EXECUTION_TIME = {ms}")],
-        "mariadb" => vec![format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)],
-        _ => Vec::new(),
-    }
+    crate::adapters::query::syntax_named(engine).map(|syntax| syntax.timeout_statements(ms)).unwrap_or_default()
 }
 
 /// 整批结束后把会话级超时设置复位，避免泄漏到目录连接。
 pub fn timeout_reset_statements(engine: &str) -> Vec<String> {
-    match engine {
-        "postgres" => vec!["SET statement_timeout = 0".to_owned()],
-        "mysql" => vec!["SET SESSION MAX_EXECUTION_TIME = 0".to_owned()],
-        "mariadb" => vec!["SET SESSION max_statement_time = 0".to_owned()],
-        _ => Vec::new(),
-    }
+    crate::adapters::query::syntax_named(engine).map(|syntax| syntax.timeout_reset_statements()).unwrap_or_default()
 }
 
 pub fn is_disconnect(message: &str) -> bool {
@@ -597,12 +515,12 @@ impl Pace {
     }
 }
 
-fn chunk_rows(limit: usize) -> usize {
+pub(crate) fn chunk_rows(limit: usize) -> usize {
     if limit <= 8 { limit.max(1) } else { (limit / 2).max(1) }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn reveal_rows(
+pub(crate) async fn reveal_rows(
     sink: &dyn RowSink,
     index: usize,
     columns: Vec<String>,
@@ -629,222 +547,9 @@ async fn reveal_rows(
     }
 }
 
-fn tokenize_redis_line(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    for ch in line.trim().trim_end_matches(';').trim().chars() {
-        match quote {
-            Some(mark) if ch == mark => quote = None,
-            Some(_) => current.push(ch),
-            None if ch == '"' || ch == '\'' => quote = Some(ch),
-            None if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            None => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
 
-fn redis_scalar_text(value: &redis::Value) -> Option<String> {
-    match value {
-        redis::Value::Nil => None,
-        redis::Value::Int(n) => Some(n.to_string()),
-        redis::Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        redis::Value::Okay => Some("OK".to_owned()),
-        redis::Value::Boolean(b) => Some(b.to_string()),
-        redis::Value::Double(f) => Some(f.to_string()),
-        other => Some(format!("{other:?}")),
-    }
-}
 
-async fn redis_query_run(
-    conn: &Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>,
-    script: &str,
-    limit: usize,
-    cancel: &AtomicBool,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, String> {
-    let cap = limit.max(1);
-    let lines: Vec<&str> = script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("--"))
-        .collect();
-    if lines.is_empty() {
-        return Err("请输入要执行的 Redis 命令。".to_owned());
-    }
 
-    let mut last_result: Option<StatementValue> = None;
-    for line in lines {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("已取消".to_owned());
-        }
-        let tokens = tokenize_redis_line(line);
-        if tokens.is_empty() {
-            continue;
-        }
-        let head_upper = tokens[0].to_ascii_uppercase();
-
-        // KEYS pattern 在查询台中自动转为安全的游标增量 SCAN（最多返回 cap 条，绝不阻塞服务端）。
-        if head_upper == "KEYS" {
-            let pattern = tokens.get(1).map(String::as_str).unwrap_or("*");
-            let mut cursor = 0u64;
-            let mut collected: Vec<String> = Vec::new();
-            let mut truncated = false;
-            let mut rounds = 0usize;
-            {
-                let mut guard = conn.lock().await;
-                loop {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Err("已取消".to_owned());
-                    }
-                    let mut cmd = redis::cmd("SCAN");
-                    cmd.arg(cursor);
-                    if !pattern.is_empty() && pattern != "*" {
-                        cmd.arg("MATCH").arg(pattern);
-                    }
-                    cmd.arg("COUNT").arg(200usize);
-                    let (next_cursor, batch): (u64, Vec<String>) = cmd
-                        .query_async(&mut *guard)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                    for key in batch {
-                        if collected.len() >= cap {
-                            truncated = true;
-                            break;
-                        }
-                        if !collected.contains(&key) {
-                            collected.push(key);
-                        }
-                    }
-                    cursor = next_cursor;
-                    rounds += 1;
-                    if cursor == 0 || truncated || rounds >= 50 {
-                        if cursor != 0 {
-                            truncated = true;
-                        }
-                        break;
-                    }
-                }
-            }
-            let rows: Vec<Vec<Option<String>>> = collected
-                .into_iter()
-                .enumerate()
-                .map(|(ix, key)| vec![Some((ix + 1).to_string()), Some(key)])
-                .collect();
-            last_result = Some(
-                reveal_rows(
-                    sink,
-                    index,
-                    vec!["#".to_owned(), "key".to_owned()],
-                    vec!["bigint".to_owned(), "varchar".to_owned()],
-                    rows,
-                    truncated,
-                    None,
-                    cap,
-                    cancel,
-                )
-                .await?,
-            );
-            continue;
-        }
-
-        let value: redis::Value = {
-            let mut guard = conn.lock().await;
-            let mut cmd = redis::cmd(&tokens[0]);
-            for arg in &tokens[1..] {
-                cmd.arg(arg);
-            }
-            cmd.query_async(&mut *guard).await.map_err(|err| err.to_string())?
-        };
-
-        let (columns, column_types, mut rows) = match (head_upper.as_str(), value) {
-            ("HGETALL", redis::Value::Array(items)) => {
-                let mut rows = Vec::new();
-                for pair in items.chunks(2) {
-                    let field = pair.first().and_then(redis_scalar_text);
-                    let val = pair.get(1).and_then(redis_scalar_text);
-                    rows.push(vec![field, val]);
-                }
-                (vec!["field".to_owned(), "value".to_owned()], vec!["varchar".to_owned(), "text".to_owned()], rows)
-            }
-            (_, redis::Value::Map(pairs)) => {
-                let rows = pairs
-                    .iter()
-                    .map(|(k, v)| vec![redis_scalar_text(k), redis_scalar_text(v)])
-                    .collect();
-                (vec!["field".to_owned(), "value".to_owned()], vec!["varchar".to_owned(), "text".to_owned()], rows)
-            }
-            ("INFO", redis::Value::BulkString(bytes)) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let mut section = "server".to_owned();
-                let mut rows = Vec::new();
-                for info_line in text.lines() {
-                    let trimmed = info_line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Some(sec) = trimmed.strip_prefix('#') {
-                        section = sec.trim().to_owned();
-                        continue;
-                    }
-                    if let Some((k, v)) = trimmed.split_once(':') {
-                        rows.push(vec![Some(section.clone()), Some(k.trim().to_owned()), Some(v.trim().to_owned())]);
-                    }
-                }
-                (
-                    vec!["section".to_owned(), "metric".to_owned(), "value".to_owned()],
-                    vec!["varchar".to_owned(), "varchar".to_owned(), "varchar".to_owned()],
-                    rows,
-                )
-            }
-            (_, redis::Value::Array(items)) | (_, redis::Value::Set(items)) => {
-                let rows = items
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, item)| vec![Some((ix + 1).to_string()), redis_scalar_text(item)])
-                    .collect();
-                (vec!["#".to_owned(), "value".to_owned()], vec!["bigint".to_owned(), "text".to_owned()], rows)
-            }
-            (_, redis::Value::Int(n)) => (
-                vec!["result".to_owned()],
-                vec!["bigint".to_owned()],
-                vec![vec![Some(n.to_string())]],
-            ),
-            (_, scalar) => (
-                vec!["result".to_owned()],
-                vec!["text".to_owned()],
-                vec![vec![redis_scalar_text(&scalar)]],
-            ),
-        };
-
-        let truncated = rows.len() > cap;
-        if truncated {
-            rows.truncate(cap);
-        }
-        last_result = Some(reveal_rows(sink, index, columns, column_types, rows, truncated, None, cap, cancel).await?);
-    }
-
-    last_result.ok_or_else(|| "请输入要执行的 Redis 命令。".to_owned())
-}
-
-enum Attached {
-    Sqlite(sqlx::SqlitePool),
-    Mysql(mysql_async::Conn),
-    Postgres(Arc<tokio_postgres::Client>),
-    Sqlserver(std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>),
-    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
-    Scripted,
-}
 
 /// 批处理进行中压住探活：正在跑的语句不该被空闲计时误判成断线（R4）。
 struct BusyGuard(Arc<crate::connections::SessionHealth>);
@@ -856,7 +561,7 @@ impl Drop for BusyGuard {
 }
 
 pub struct LiveDriver {
-    session: tokio::sync::Mutex<Attached>,
+    session: tokio::sync::Mutex<crate::adapters::exec::Attached>,
     transport: CancelTransport,
     engine: String,
     sink: Arc<dyn RowSink>,
@@ -869,7 +574,7 @@ pub struct LiveDriver {
 }
 
 /// attach 阶段的失败也走断线分类：池里借不出连接通常就是断线（R4）。
-fn attach_failure(transport: &CancelTransport, message: String) -> String {
+pub(crate) fn attach_failure(transport: &CancelTransport, message: String) -> String {
     if is_disconnect(&message) {
         transport.note_disconnect();
     }
@@ -896,78 +601,7 @@ impl LiveDriver {
             BusyGuard(Arc::clone(health))
         });
         let setup = timeout_statements(engine, timeout_ms);
-        let mut timeout_applied = !setup.is_empty();
-        let attached = match session {
-            CatalogSession::Scripted => Attached::Scripted,
-            CatalogSession::Redis(conn) => {
-                if !database.trim().is_empty() {
-                    let db = database.trim().strip_prefix("db").unwrap_or(database.trim()).parse::<u32>()
-                        .map_err(|_| format!("Redis 库号无效：{database}"))?;
-                    let mut guard = conn.lock().await;
-                    let _: () = redis::cmd("SELECT")
-                        .arg(db)
-                        .query_async(&mut *guard)
-                        .await
-                        .map_err(|err| attach_failure(&transport, err.to_string()))?;
-                }
-                timeout_applied = false;
-                Attached::Redis(conn)
-            }
-            // MongoDB 不做 SQL 面（R12）：文档在集合浏览器里查看与编辑。
-            CatalogSession::Mongo(_) => return Err("MongoDB 不执行 SQL；文档在集合浏览器里查看。".to_owned()),
-            CatalogSession::Sqlite { pool, .. } => match database_gate("sqlite", "main", database) {
-                DatabaseGate::Refuse => return Err(refuse_message("main", database)),
-                _ => Attached::Sqlite(pool),
-            },
-            CatalogSession::Mysql(pool) => {
-                let mut conn = acquire_mysql_conn(&pool, mysql_fallback.as_ref())
-                    .await
-                    .map_err(|err| attach_failure(&transport, err))?;
-                conn.reset_connection(false);
-                // 握手已经提供真实连接 id，无需再花一次网络往返查询。
-                transport.set_mysql_connection_id(u64::from(conn.id()));
-                match tokio::time::timeout(Duration::from_secs(12), align_mysql(&mut conn, engine, database)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(attach_failure(&transport, err)),
-                    Err(_) => return Err(attach_failure(&transport, "切换数据库响应超时，连接可能已中断。".to_owned())),
-                }
-                if !setup.is_empty() {
-                    match tokio::time::timeout(Duration::from_secs(8), run_mysql_statements(&mut conn, &setup)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) if is_unsupported_timeout_var(&err) => {
-                            // 旧版 MySQL / TiDB / OceanBase / 代理不支持会话级超时变量时不阻断 SQL 执行。
-                            timeout_applied = false;
-                        }
-                        Ok(Err(err)) => return Err(attach_failure(&transport, err)),
-                        Err(_) => return Err(attach_failure(&transport, "初始化查询会话超时。".to_owned())),
-                    }
-                }
-                Attached::Mysql(conn)
-            }
-            CatalogSession::Postgres(client) => {
-                let current = postgres_current(&client)
-                    .await
-                    .map_err(|err| attach_failure(&transport, err))?;
-                match database_gate("postgres", &current, database) {
-                    DatabaseGate::Refuse => return Err(refuse_message(&current, database)),
-                    _ => {
-                        if let Err(err) = run_postgres_statements(&client, &setup).await {
-                            return Err(attach_failure(&transport, err));
-                        }
-                        Attached::Postgres(client)
-                    }
-                }
-            }
-            CatalogSession::Sqlserver(client) => {
-                let current = sqlserver_current(&client)
-                    .await
-                    .map_err(|err| attach_failure(&transport, err))?;
-                match database_gate("sqlserver", &current, database) {
-                    DatabaseGate::Refuse => return Err(refuse_message(&current, database)),
-                    _ => Attached::Sqlserver(client),
-                }
-            }
-        };
+        let (attached, timeout_applied) = session.attach_query(mysql_fallback, engine, database, &transport, &setup).await?;
         Ok(Self {
             session: tokio::sync::Mutex::new(attached),
             transport,
@@ -989,12 +623,7 @@ impl LiveDriver {
         if statements.is_empty() {
             return Ok(());
         }
-        let mut attached = self.session.lock().await;
-        match &mut *attached {
-            Attached::Mysql(conn) => run_mysql_statements(conn, &statements).await,
-            Attached::Postgres(client) => run_postgres_statements(client, &statements).await,
-            _ => Ok(()),
-        }
+        self.session.lock().await.reset(&statements).await
     }
 
     pub fn set_sink(&mut self, sink: Arc<dyn RowSink>) {
@@ -1009,24 +638,15 @@ impl StatementDriver for LiveDriver {
         let mut attached = self.session.lock().await;
         // 没有可查询的会话时一条语句都不会发出去：报告里也就不能带改写后的文本，
         // 否则界面会给一条从未执行的语句显示"实际执行的语句"和追加的 LIMIT。
-        let capped = if matches!(&*attached, Attached::Scripted | Attached::Redis(_)) {
-            CappedSql::unchanged(sql)
-        } else {
+        let capped = if attached.sends_sql() {
             // 读取上限改写只在这里做一次：驱动收到的就是要发出去的文本，报告里也用它。
             cap_result_sql_detail(&self.engine, sql, limit)
+        } else {
+            CappedSql::unchanged(sql)
         };
         let sent = capped.sql.as_str();
         let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
-        let result: Result<StatementValue, Failure> = match &mut *attached {
-            Attached::Scripted => Err(Failure::from("这个连接没有连着可查询的数据库".to_owned())),
-            Attached::Sqlite(pool) => sqlite_run(pool, sent, limit, cancel, &sink, index).await.map_err(Failure::from),
-            Attached::Mysql(conn) => mysql_run(conn, &self.transport, sent, limit, cancel, &sink, index)
-                .await
-                .map_err(|message| Failure { at: mysql_error_line(&message).map(ErrorAt::Line), message }),
-            Attached::Postgres(client) => postgres_run(client, sent, sql, limit, cancel, &sink, index).await,
-            Attached::Sqlserver(client) => sqlserver_run(client, sent, limit, cancel, &sink, index).await,
-            Attached::Redis(conn) => redis_query_run(conn, sent, limit, cancel, &sink, index).await.map_err(Failure::from),
-        };
+        let result: Result<StatementValue, Failure> = attached.run(&self.transport, sent, sql, limit, cancel, &sink, index).await;
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。
         match &result {
@@ -1049,838 +669,48 @@ impl StatementDriver for LiveDriver {
     }
 }
 
-async fn checkout_mysql_pool(pool: &mysql_async::Pool, wait: Duration) -> Result<mysql_async::Conn, String> {
-    match tokio::time::timeout(wait, pool.get_conn()).await {
-        Ok(Ok(conn)) => Ok(conn),
-        Ok(Err(err)) => Err(crate::error_text::chain(&err)),
-        Err(_) => Err("建立查询执行连接超时".to_owned()),
-    }
-}
 
-async fn acquire_mysql_conn(
-    exec_pool: &mysql_async::Pool,
-    fallback_pool: Option<&mysql_async::Pool>,
-) -> Result<mysql_async::Conn, String> {
-    let primary_timeout = if fallback_pool.is_some() {
-        Duration::from_secs(4)
-    } else {
-        Duration::from_secs(12)
-    };
-    let primary_err = match checkout_mysql_pool(exec_pool, primary_timeout).await {
-        Ok(conn) => return Ok(conn),
-        Err(err) => err,
-    };
-    if let Some(meta_pool) = fallback_pool {
-        if let Ok(conn) = checkout_mysql_pool(meta_pool, Duration::from_secs(8)).await {
-            return Ok(conn);
-        }
-    }
-    Err(primary_err)
-}
 
-fn is_unsupported_timeout_var(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("unknown system variable")
-        || lower.contains("1193")
-        || lower.contains("max_execution_time")
-        || lower.contains("max_statement_time")
-}
 
-async fn align_mysql(conn: &mut mysql_async::Conn, engine: &str, database: &str) -> Result<(), String> {
-    // DATABASE() returns one row containing SQL NULL until a schema is selected.
-    let value: Option<Option<String>> = conn.query_first("SELECT DATABASE()").await.map_err(|err| crate::error_text::chain(&err))?;
-    let current = value.flatten().unwrap_or_default();
-    match database_gate(engine, &current, database) {
-        DatabaseGate::Refuse => Err(refuse_message(&current, database)),
-        DatabaseGate::Switch => {
-            let statement = format!("USE {}", quote_mysql(database));
-            conn.query_drop(statement).await.map_err(|err| crate::error_text::chain(&err))?;
-            Ok(())
-        }
-        DatabaseGate::Ready => Ok(()),
-    }
-}
 
-async fn run_mysql_statements(conn: &mut mysql_async::Conn, statements: &[String]) -> Result<(), String> {
-    for statement in statements {
-        conn.query_drop(statement).await.map_err(|err| crate::error_text::chain(&err))?;
-    }
-    Ok(())
-}
 
-async fn run_postgres_statements(client: &tokio_postgres::Client, statements: &[String]) -> Result<(), String> {
-    for statement in statements {
-        client.simple_query(statement).await.map_err(|err| crate::error_text::chain(&err))?;
-    }
-    Ok(())
-}
 
-async fn postgres_current(client: &tokio_postgres::Client) -> Result<String, String> {
-    let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| crate::error_text::chain(&err))?;
-    row.try_get(0).map_err(|err| crate::error_text::chain(&err))
-}
 
-async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>) -> Result<String, String> {
-    let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await?;
-    match rows.first().and_then(|row| row.first()) {
-        Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
-        _ => Err("没有当前数据库".to_owned()),
-    }
-}
 
-/// TDS 执行：会返回行的语句走 simple_query 收行集，其余走 execute 拿受影响行数。
-/// SET 类语句（含 SET SHOWPLAN_ALL）一律走 simple_query：execute 是 sp_executesql，
-/// 其中的 SET 只作用于内层批次、结束后即还原，外层会话上的 SHOWPLAN_ALL 不会生效。
-async fn sqlserver_run(
-    client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>,
-    bounded: &str,
-    limit: usize,
-    cancel: &Arc<AtomicBool>,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, Failure> {
-    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-    let mut locked = client.lock().await;
-    if !sqlserver_wants_rows(bounded) {
-        let done = locked.execute(bounded.to_owned(), &[]).await.map_err(|err| tds_failure(&err))?;
-        let value = StatementValue {
-            columns: Vec::new(),
-            column_types: Vec::new(),
-            rows: Vec::new(),
-            truncated: false,
-            affected: Some(done.total()),
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    let mut stream = locked.simple_query(bounded).await.map_err(|err| tds_failure(&err))?;
-    let mut columns: Vec<String> = Vec::new();
-    let mut column_types: Vec<String> = Vec::new();
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    let mut truncated = false;
-    {
-        use futures::TryStreamExt;
-        while let Some(item) = stream.try_next().await.map_err(|err| tds_failure(&err))? {
-            if let Some(meta) = item.as_metadata() {
-                if columns.is_empty() {
-                    columns = meta.columns().iter().map(|column| column.name().to_owned()).collect();
-                    column_types = meta.columns().iter().map(|column| tds_type_name(column.column_type()).to_owned()).collect();
-                }
-                continue;
-            }
-            if let Some(row) = item.into_row() {
-                if columns.is_empty() {
-                    columns = (0..row.len()).map(|column| format!("col{column}")).collect();
-                    column_types = vec!["类型未知".to_owned(); columns.len()];
-                }
-                if rows.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-                let cells = (0..columns.len()).map(|cell| tds_string_cell(&row, cell)).collect();
-                rows.push(cells);
-            }
-        }
-    }
-    drop(stream);
-    drop(locked);
-    // SHOWPLAN_ALL 行集按 NodeId 排成稳定的父先子后顺序（层次有效性经 showplan_outline 验证）。
-    let rows = order_showplan_results(&columns, rows);
-    if columns.is_empty() {
-        let value = StatementValue {
-            columns,
-            column_types,
-            rows,
-            truncated: false,
-            affected: None,
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    reveal_rows(sink, index, columns, column_types, rows, truncated, None, limit, cancel).await.map_err(Failure::from)
-}
 
-/// SHOWPLAN 批次判定：以 SET SHOWPLAN_ALL 开头的语句即使整批到达也按收行路径执行。
-pub fn is_showplan_statement(sql: &str) -> bool {
-    let mut words = sql.split_whitespace();
-    matches!(
-        (words.next(), words.next()),
-        (Some(first), Some(second)) if first.eq_ignore_ascii_case("SET") && second.eq_ignore_ascii_case("SHOWPLAN_ALL")
-    )
-}
 
-/// TDS 的收行路由：普通 SELECT 族、以及全部 SET 开头的会话设置语句。
-fn sqlserver_wants_rows(sql: &str) -> bool {
-    is_showplan_statement(sql) || split::first_keyword(sql) == "SET" || looks_like_rows(sql)
-}
 
-/// 把已收到的 SHOWPLAN_ALL 行集按 NodeId 升序排成父先子后。
-/// 先把行集还原成 (NodeId, Parent, 操作) 三元组走 showplan_outline 验证层次完整
-/// （父节点缺失或 NodeId 非数字时按原序返回，不猜）；有效层次才重排。
-pub fn order_showplan_results(columns: &[String], rows: Vec<Vec<Option<String>>>) -> Vec<Vec<Option<String>>> {
-    let names: Vec<String> = columns.iter().map(|column| column.trim().to_ascii_lowercase()).collect();
-    // 只对 SHOWPLAN_ALL 形状应用：除 NodeId/Parent 外还须有 PhysicalOp/LogicalOp/StmtId 等
-    // SHOWPLAN 专属列同现——普通查询恰好有 NodeId+Parent 数字列时不重排、保持原序。
-    if !names.iter().any(|name| matches!(name.as_str(), "physicalop" | "logicalop" | "stmtid" | "estimaterows" | "totalsubtreecost")) {
-        return rows;
-    }
-    let (Some(node_at), Some(parent_at)) = (names.iter().position(|name| name == "nodeid"), names.iter().position(|name| name == "parent")) else {
-        return rows;
-    };
-    let text = |row: &Vec<Option<String>>, index: usize| -> String {
-        row.get(index).and_then(|cell| cell.as_deref()).unwrap_or("").trim().to_owned()
-    };
-    let mut triples = Vec::with_capacity(rows.len());
-    for (position, row) in rows.iter().enumerate() {
-        let (Some(node), Some(parent)) = (text(row, node_at).parse::<i64>().ok(), text(row, parent_at).parse::<i64>().ok()) else {
-            return rows;
-        };
-        triples.push((node, parent, position));
-    }
-    if showplan_outline(&triples.iter().map(|(node, parent, _)| (*node, *parent, String::new(), String::new())).collect::<Vec<_>>()).len() != rows.len() {
-        return rows;
-    }
-    let mut indexed = triples;
-    indexed.sort_by_key(|(node, _, _)| *node);
-    indexed.into_iter().map(|(_, _, position)| rows[position].clone()).collect()
-}
 
-fn tds_string_cell(row: &tiberius::Row, index: usize) -> Option<String> {
-    if let Ok(Some(text)) = row.try_get::<&str, _>(index) {
-        return Some(text.to_owned());
-    }
-    if let Ok(Some(value)) = row.try_get::<i64, _>(index) {
-        return Some(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<i32, _>(index) {
-        return Some(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<i16, _>(index) {
-        return Some(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<u8, _>(index) {
-        return Some(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<f64, _>(index) {
-        return Some(value.to_string());
-    }
-    if let Ok(Some(value)) = row.try_get::<bool, _>(index) {
-        return Some(if value { "1" } else { "0" }.to_owned());
-    }
-    if let Ok(Some(bytes)) = row.try_get::<&[u8], _>(index) {
-        return Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect());
-    }
-    // decimal / numeric / money：Numeric 自带定点文本（含小数位）。
-    if let Ok(Some(value)) = row.try_get::<tiberius::numeric::Numeric, _>(index) {
-        return Some(tds_numeric_text(value));
-    }
-    // uniqueidentifier。
-    if let Ok(Some(value)) = row.try_get::<uuid::Uuid, _>(index) {
-        return Some(tds_uuid_text(value));
-    }
-    // xml（文档原文）：XmlData 只实现 FromSqlOwned，经 cells() 按 ColumnData 直接取。
-    if let Some((_, tiberius::ColumnData::Xml(Some(xml)))) = row.cells().nth(index) {
-        return Some(xml.to_string());
-    }
-    // datetime / datetime2 / smalldatetime → 本地日期时间文本。
-    if let Ok(Some(value)) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-        return Some(tds_naive_datetime_text(value));
-    }
-    // date。
-    if let Ok(Some(value)) = row.try_get::<chrono::NaiveDate, _>(index) {
-        return Some(tds_naive_date_text(value));
-    }
-    // time(n)。
-    if let Ok(Some(value)) = row.try_get::<chrono::NaiveTime, _>(index) {
-        return Some(tds_naive_time_text(value));
-    }
-    // datetimeoffset（带时区偏移）。
-    if let Ok(Some(value)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(index) {
-        return Some(tds_datetime_offset_text(value));
-    }
-    None
-}
 
-/// 以下格式化器把 TDS 专用类型落成与其它引擎一致的网格文本；
-/// 单独成函数是为了不经数据库就能单测格式口径。
-pub fn tds_numeric_text(value: tiberius::numeric::Numeric) -> String {
-    value.to_string()
-}
 
-pub fn tds_uuid_text(value: uuid::Uuid) -> String {
-    value.to_string()
-}
 
-pub fn tds_naive_datetime_text(value: chrono::NaiveDateTime) -> String {
-    // chrono Display：无小数 "2024-01-02 15:04:05"，有则补到 3/6/9 位。
-    value.to_string()
-}
 
-pub fn tds_naive_date_text(value: chrono::NaiveDate) -> String {
-    value.format("%Y-%m-%d").to_string()
-}
 
-pub fn tds_naive_time_text(value: chrono::NaiveTime) -> String {
-    value.to_string()
-}
 
-pub fn tds_datetime_offset_text(value: chrono::DateTime<chrono::Utc>) -> String {
-    value.to_rfc3339()
-}
 
-pub fn tds_type_name(kind: tiberius::ColumnType) -> &'static str {
-    use tiberius::ColumnType::*;
-    match kind {
-        Bit | Bitn => "bit",
-        Int1 => "tinyint",
-        Int2 => "smallint",
-        Int4 => "int",
-        Int8 | Intn => "bigint",
-        Datetime4 | Datetime | Datetimen | Datetime2 => "datetime",
-        DatetimeOffsetn => "datetimeoffset",
-        Daten => "date",
-        Timen => "time",
-        Float4 | Floatn => "real",
-        Float8 => "float",
-        Money | Money4 | Decimaln | Numericn => "decimal",
-        Guid => "uniqueidentifier",
-        BigVarBin | BigBinary | Image => "varbinary",
-        BigVarChar | BigChar | Text => "varchar",
-        NVarchar | NChar | NText => "nvarchar",
-        Xml => "xml",
-        Udt | SSVariant | Null => "类型未知",
-    }
-}
 
-fn quote_mysql(name: &str) -> String {
-    crate::adapters::quote_ident(crate::connections::model::Engine::Mysql, name)
-}
 
-async fn sqlite_run(
-    pool: &sqlx::SqlitePool,
-    sql: &str,
-    limit: usize,
-    cancel: &Arc<AtomicBool>,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, String> {
-    let mut conn = pool.acquire().await.map_err(|err| crate::error_text::chain(&err))?;
-    let watched = Arc::clone(cancel);
-    conn.lock_handle()
-        .await
-        .map_err(|err| crate::error_text::chain(&err))?
-        .set_progress_handler(64, move || !watched.load(Ordering::SeqCst));
-    let outcome = sqlite_dispatch(&mut conn, sql, limit, cancel, sink, index).await;
-    if let Ok(mut handle) = conn.lock_handle().await {
-        handle.remove_progress_handler();
-    }
-    outcome
-}
 
-async fn sqlite_dispatch(
-    conn: &mut sqlx::SqliteConnection,
-    sql: &str,
-    limit: usize,
-    cancel: &Arc<AtomicBool>,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, String> {
-    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-    let safe = sqlx::AssertSqlSafe(sql);
-    if looks_like_rows(sql) {
-        let mut stream = sqlx::query(safe).fetch(&mut *conn);
-        let mut columns = Vec::new();
-        let mut column_types = Vec::new();
-        let mut rows = Vec::new();
-        let mut truncated = false;
-        let mut pending: Option<sqlx::sqlite::SqliteRow> = None;
-        let step = chunk_rows(limit);
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                drop(stream);
-                return Err("已取消".to_owned());
-            }
-            let row = if let Some(row) = pending.take() {
-                row
-            } else {
-                match stream.try_next().await.map_err(|err| crate::error_text::chain(&err))? {
-                    Some(row) => row,
-                    None => break,
-                }
-            };
-            if columns.is_empty() {
-                columns = row.columns().iter().map(|column| column.name().to_owned()).collect();
-                column_types = sqlite_type_names(&row);
-            }
-            if rows.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let width = columns.len();
-            rows.push((0..width).map(|cell| sqlite_text(&row, cell)).collect());
-            if rows.len() < limit && rows.len() % step == 0 {
-                let peek = stream.try_next().await.map_err(|err| crate::error_text::chain(&err))?;
-                let partial = StatementValue {
-                    columns: columns.clone(),
-                    column_types: column_types.clone(),
-                    rows: std::mem::take(&mut rows),
-                    truncated: false,
-                    affected: None,
-                };
-                sink.publish(index, &partial).await;
-                match peek {
-                    None => {
-                        drop(stream);
-                        return Ok(partial);
-                    }
-                    Some(next) => {
-                        sink.pause(cancel).await?;
-                        rows = partial.rows;
-                        pending = Some(next);
-                    }
-                }
-            }
-        }
-        drop(stream);
-        let value = StatementValue {
-            columns,
-            column_types,
-            rows,
-            truncated,
-            affected: None,
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    let done = sqlx::query(safe).execute(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
-    let value = StatementValue {
-        columns: Vec::new(),
-        column_types: Vec::new(),
-        rows: Vec::new(),
-        truncated: false,
-        affected: Some(done.rows_affected()),
-    };
-    sink.publish(index, &value).await;
-    Ok(value)
-}
 
-fn looks_like_rows(sql: &str) -> bool {
-    matches!(
-        split::first_keyword(sql).as_str(),
-        "SELECT" | "WITH" | "SHOW" | "EXPLAIN" | "PRAGMA" | "VALUES" | "TABLE" | "DESC" | "DESCRIBE"
-    )
-}
 
-fn sqlite_type_names(row: &sqlx::sqlite::SqliteRow) -> Vec<String> {
-    row.columns()
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let declared = column.type_info().name();
-            if declared.is_empty() || declared == "NULL" {
-                sqlite_storage_name(row, index).unwrap_or_else(|| "类型未知".to_owned())
-            } else {
-                declared.to_owned()
-            }
-        })
-        .collect()
-}
 
-fn sqlite_storage_name(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
-    let raw = row.try_get_raw(index).ok()?;
-    let name = raw.type_info().name().to_owned();
-    drop(raw);
-    if name.is_empty() || name == "NULL" { None } else { Some(name) }
-}
 
-fn sqlite_text(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
-    let storage = {
-        let raw = row.try_get_raw(index).ok()?;
-        let name = raw.type_info().name().to_owned();
-        drop(raw);
-        name
-    };
-    match storage.as_str() {
-        "NULL" => None,
-        "INTEGER" | "INT4" | "BOOLEAN" => {
-            if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-                return value.map(|number| number.to_string());
-            }
-            row.try_get::<Option<String>, _>(index).ok().flatten()
-        }
-        // 浮点（含 avg()、带小数的表达式）：按 f64 读，不再落到文本解码而被当成 NULL。
-        "REAL" | "FLOAT" | "DOUBLE" => {
-            if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-                return value.map(|number| number.to_string());
-            }
-            row.try_get::<Option<String>, _>(index).ok().flatten()
-        }
-        "BLOB" => row.try_get::<Option<Vec<u8>>, _>(index).ok().flatten().map(to_hex),
-        _ => row
-            .try_get::<Option<String>, _>(index)
-            .ok()
-            .flatten()
-            // 声明类型与存储类不一致时（如 TEXT 列里存了数字），按实际值再读一次，不静默变成 NULL。
-            .or_else(|| row.try_get_unchecked::<Option<String>, _>(index).ok().flatten()),
-    }
-}
 
-fn to_hex(bytes: Vec<u8>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn mysql_run(
-    conn: &mut mysql_async::Conn,
-    transport: &CancelTransport,
-    bounded: &str,
-    limit: usize,
-    cancel: &Arc<AtomicBool>,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, String> {
-    // 握手包里的线程 id 就是 CONNECTION_ID()；不再为每条语句多走一次网络往返。
-    transport.set_mysql_connection_id(u64::from(conn.id()));
-    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-    let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
-    let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
-        .columns_ref()
-        .iter()
-        .map(|column| (column.name_str().into_owned(), column.column_type(), column.character_set()))
-        .collect();
-    let columns: Vec<String> = column_meta.iter().map(|column| column.0.clone()).collect();
-    let column_types: Vec<String> = column_meta.iter().map(|column| mysql_type_name(column.1, column.2).to_owned()).collect();
-    if columns.is_empty() {
-        let affected = result.affected_rows();
-        // OK 包没有行。收掉这个结果集，同一条连接才能执行下一条。
-        result.drop_result().await.map_err(|err| crate::error_text::chain(&err))?;
-        let value = StatementValue {
-            columns,
-            column_types,
-            rows: Vec::new(),
-            truncated: false,
-            affected: Some(affected),
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    let mut rows = Vec::new();
-    let mut truncated = false;
-    let mut pending: Option<mysql_async::Row> = None;
-    let step = chunk_rows(limit);
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            let _ = result.drop_result().await;
-            return Err("已取消".to_owned());
-        }
-        let row = if let Some(row) = pending.take() {
-            row
-        } else {
-            match result.next().await.map_err(|err| crate::error_text::chain(&err))? {
-                Some(row) => row,
-                None => break,
-            }
-        };
-        if rows.len() >= limit {
-            truncated = true;
-            break;
-        }
-        let cells = (0..columns.len())
-            .map(|cell| mysql_cell(row.as_ref(cell).unwrap_or(&mysql_async::Value::NULL), column_meta[cell].1, column_meta[cell].2))
-            .collect();
-        rows.push(cells);
-        if rows.len() < limit && rows.len() % step == 0 {
-            let peek = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
-            let partial = StatementValue {
-                columns: columns.clone(),
-                column_types: column_types.clone(),
-                rows: std::mem::take(&mut rows),
-                truncated: false,
-                affected: None,
-            };
-            sink.publish(index, &partial).await;
-            match peek {
-                None => {
-                    let _ = result.drop_result().await;
-                    return Ok(partial);
-                }
-                Some(next) => {
-                    sink.pause(cancel).await?;
-                    rows = partial.rows;
-                    pending = Some(next);
-                }
-            }
-        }
-    }
-    if truncated {
-        // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
-        let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
-    }
-    let _ = result.drop_result().await;
-    let value = StatementValue {
-        columns,
-        column_types,
-        rows,
-        truncated,
-        affected: None,
-    };
-    sink.publish(index, &value).await;
-    Ok(value)
-}
 
-const MYSQL_BINARY_CHARSET: u16 = 63;
 
-fn mysql_type_name(kind: mysql_async::consts::ColumnType, charset: u16) -> &'static str {
-    use mysql_async::consts::ColumnType::*;
-    let binary = charset == MYSQL_BINARY_CHARSET;
-    match kind {
-        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "DECIMAL",
-        MYSQL_TYPE_TINY => "TINYINT",
-        MYSQL_TYPE_SHORT => "SMALLINT",
-        MYSQL_TYPE_LONG => "INT",
-        MYSQL_TYPE_FLOAT => "FLOAT",
-        MYSQL_TYPE_DOUBLE => "DOUBLE",
-        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "TIMESTAMP",
-        MYSQL_TYPE_LONGLONG => "BIGINT",
-        MYSQL_TYPE_INT24 => "MEDIUMINT",
-        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "DATE",
-        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "TIME",
-        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "DATETIME",
-        MYSQL_TYPE_YEAR => "YEAR",
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => {
-            if binary {
-                "VARBINARY"
-            } else {
-                "VARCHAR"
-            }
-        }
-        MYSQL_TYPE_BIT => "BIT",
-        MYSQL_TYPE_JSON => "JSON",
-        MYSQL_TYPE_ENUM => "ENUM",
-        MYSQL_TYPE_SET => "SET",
-        MYSQL_TYPE_TINY_BLOB => {
-            if binary {
-                "TINYBLOB"
-            } else {
-                "TINYTEXT"
-            }
-        }
-        MYSQL_TYPE_BLOB => {
-            if binary {
-                "BLOB"
-            } else {
-                "TEXT"
-            }
-        }
-        MYSQL_TYPE_MEDIUM_BLOB => {
-            if binary {
-                "MEDIUMBLOB"
-            } else {
-                "MEDIUMTEXT"
-            }
-        }
-        MYSQL_TYPE_LONG_BLOB => {
-            if binary {
-                "LONGBLOB"
-            } else {
-                "LONGTEXT"
-            }
-        }
-        MYSQL_TYPE_STRING => {
-            if binary {
-                "BINARY"
-            } else {
-                "CHAR"
-            }
-        }
-        MYSQL_TYPE_GEOMETRY => "GEOMETRY",
-        MYSQL_TYPE_NULL => "NULL",
-        MYSQL_TYPE_VECTOR => "VECTOR",
-        MYSQL_TYPE_UNKNOWN | MYSQL_TYPE_TYPED_ARRAY => "类型未知",
-    }
-}
 
-fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType, charset: u16) -> Option<String> {
-    use mysql_async::consts::ColumnType::*;
-    if matches!(kind, MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL) {
-        return match value {
-            mysql_async::Value::NULL => None,
-            mysql_async::Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-            mysql_async::Value::Int(number) => Some(number.to_string()),
-            mysql_async::Value::UInt(number) => Some(number.to_string()),
-            mysql_async::Value::Float(_) | mysql_async::Value::Double(_) => None,
-            mysql_async::Value::Date(_, _, _, _, _, _, _) | mysql_async::Value::Time(_, _, _, _, _, _) => None,
-        };
-    }
-    let binary = charset == MYSQL_BINARY_CHARSET
-        && matches!(
-            kind,
-            MYSQL_TYPE_TINY_BLOB
-                | MYSQL_TYPE_BLOB
-                | MYSQL_TYPE_MEDIUM_BLOB
-                | MYSQL_TYPE_LONG_BLOB
-                | MYSQL_TYPE_STRING
-                | MYSQL_TYPE_VARCHAR
-                | MYSQL_TYPE_VAR_STRING
-        );
-    match value {
-        mysql_async::Value::NULL => None,
-        mysql_async::Value::Bytes(bytes) => {
-            if binary {
-                Some(to_hex(bytes.clone()))
-            } else {
-                Some(String::from_utf8_lossy(bytes).into_owned())
-            }
-        }
-        mysql_async::Value::Int(number) => Some(number.to_string()),
-        mysql_async::Value::UInt(number) => Some(number.to_string()),
-        mysql_async::Value::Float(number) => Some(number.to_string()),
-        mysql_async::Value::Double(number) => Some(number.to_string()),
-        mysql_async::Value::Date(year, month, day, hour, minute, second, micros) => Some(mysql_date_text(kind, *year, *month, *day, *hour, *minute, *second, *micros)),
-        mysql_async::Value::Time(negative, days, hour, minute, second, micros) => {
-            Some(format!("{}{days} {hour:02}:{minute:02}:{second:02}.{micros:06}", if *negative { "-" } else { "" }))
-        }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn mysql_date_text(kind: mysql_async::consts::ColumnType, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8, micros: u32) -> String {
-    use mysql_async::consts::ColumnType::*;
-    let date = format!("{year:04}-{month:02}-{day:02}");
-    let time = if micros == 0 {
-        format!("{hour:02}:{minute:02}:{second:02}")
-    } else {
-        format!("{hour:02}:{minute:02}:{second:02}.{micros:06}")
-    };
-    match kind {
-        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => date,
-        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => time,
-        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => format!("{date} {time}"),
-        _ if hour == 0 && minute == 0 && second == 0 && micros == 0 => date,
-        _ => format!("{date} {time}"),
-    }
-}
 
-/// sent 是实际发出的文本（可能带上读取上限），sql 是用户写的那条：错误位置先在 sent 里换算，
-/// 再映射回 sql，界面因此永远定位到草稿里自己的语句。
-async fn postgres_run(
-    client: &tokio_postgres::Client,
-    sent: &str,
-    sql: &str,
-    limit: usize,
-    cancel: &Arc<AtomicBool>,
-    sink: &dyn RowSink,
-    index: usize,
-) -> Result<StatementValue, Failure> {
-    let prepared = match client.prepare(sent).await {
-        Ok(statement) => {
-            let columns = statement.columns().iter().map(|column| column.name().to_owned()).collect::<Vec<_>>();
-            let types = statement.columns().iter().map(|column| column.type_().name().to_owned()).collect::<Vec<_>>();
-            drop(statement);
-            Some((columns, types))
-        }
-        Err(_) => None,
-    };
-    let messages = client.simple_query(sent).await.map_err(|err| pg_failure(&err, sent, sql))?;
-    let mut columns = prepared.as_ref().map(|item| item.0.clone()).unwrap_or_default();
-    let mut types = prepared.as_ref().map(|item| item.1.clone()).unwrap_or_default();
-    let mut rows = Vec::new();
-    let mut affected = None;
-    let mut truncated = false;
-    for message in messages {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(Failure::from("已取消".to_owned()));
-        }
-        match message {
-            tokio_postgres::SimpleQueryMessage::RowDescription(description) => {
-                if columns.is_empty() {
-                    columns = description.iter().map(|column| column.name().to_owned()).collect();
-                }
-            }
-            tokio_postgres::SimpleQueryMessage::Row(row) => {
-                if rows.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-                let width = row.len();
-                if columns.is_empty() {
-                    columns = (0..width).map(|column| format!("col{}", column + 1)).collect();
-                }
-                if types.is_empty() {
-                    types = vec!["类型未知".to_owned(); columns.len().max(width)];
-                } else if types.len() < width {
-                    types.resize(width, "类型未知".to_owned());
-                }
-                let cells = (0..width).map(|cell| row.get(cell).map(str::to_owned)).collect();
-                rows.push(cells);
-            }
-            tokio_postgres::SimpleQueryMessage::CommandComplete(count) => affected = Some(count),
-            _ => {}
-        }
-    }
-    if columns.is_empty() {
-        let value = StatementValue {
-            columns,
-            column_types: Vec::new(),
-            rows,
-            truncated: false,
-            affected,
-        };
-        sink.publish(index, &value).await;
-        return Ok(value);
-    }
-    if types.is_empty() {
-        types = vec!["类型未知".to_owned(); columns.len()];
-    }
-    reveal_rows(sink, index, columns, types, rows, truncated, None, limit, cancel).await.map_err(Failure::from)
-}
 
-/// SQL Server 的执行计划批次：SET SHOWPLAN_ALL ON 后服务器只编译不执行，读完行集再关掉。
-/// 与前端 src/query/plan.ts 的 sqlserver 形态互为镜像；这里钉住批次文本的契约。
-pub fn showplan_batch(statement: &str) -> String {
-    let body = statement.trim().trim_end_matches(';');
-    format!("SET SHOWPLAN_ALL ON;\n{body};\nSET SHOWPLAN_ALL OFF")
-}
 
-/// SHOWPLAN_ALL 行集的层次展开（纯函数）：(NodeId, Parent, 操作, 估算行数) 按父节点深度排成缩进大纲。
-/// 根节点的 Parent 不在结果里时深度为 0；父节点缺失按根处理，成环按根处理。
-pub fn showplan_outline(rows: &[(i64, i64, String, String)]) -> Vec<(usize, String, String)> {
-    let ids: Vec<i64> = rows.iter().map(|(node, _, _, _)| *node).collect();
-    let depth_of = |node: i64| -> usize {
-        let mut seen = std::collections::HashSet::new();
-        let mut depth = 0usize;
-        let mut current = node;
-        loop {
-            if !seen.insert(current) {
-                return depth;
-            }
-            let Some((_, parent, _, _)) = rows.iter().find(|(candidate, _, _, _)| *candidate == current) else {
-                return depth;
-            };
-            if *parent == current || !ids.contains(parent) {
-                return depth;
-            }
-            depth += 1;
-            current = *parent;
-        }
-    };
-    rows.iter()
-        .map(|(node, _, operation, est_rows)| (depth_of(*node), operation.clone(), est_rows.clone()))
-        .collect()
-}
 
 pub fn clamp_limit(limit: u64) -> usize {
     usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000)
 }
 
 /// 给会返回行的语句加上不超过 cap + 1 的 LIMIT。多出来的一行只用来判断截断。
-/// SQL Server 走 TOP：语句以 SELECT 开头时改写第一个 SELECT，其余（WITH、FETCH 已有）不改写或按计数改写。
+/// 方言自有写法（SQL Server 的 TOP）由适配器改写：语句以 SELECT 开头时改写第一个 SELECT，其余不改写或按计数改写。
 /// 只返回文本；改写规则的对照断言用它，运行路径统一走 cap_result_sql_detail。
 #[cfg(test)]
 pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
@@ -1889,8 +719,9 @@ pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
 
 /// 与 cap_result_sql 同一套规则，另外说明这句 SQL 被自动改写了哪一处（追加还是替换数字）。
 pub fn cap_result_sql_detail(engine: &str, sql: &str, cap: usize) -> CappedSql {
-    if engine == "sqlserver" {
-        return cap_result_sql_detail_sqlserver(sql, cap);
+    // 方言自有写法（T-SQL 的 TOP）由适配器改写。
+    if let Some(capped) = crate::adapters::query::syntax_named(engine).and_then(|syntax| syntax.cap_rows(sql, cap)) {
+        return capped;
     }
     let probe = cap.saturating_add(1);
     let (body, suffix) = peel_trailing_semi(sql);
@@ -1920,7 +751,7 @@ pub fn cap_result_sql_detail(engine: &str, sql: &str, cap: usize) -> CappedSql {
 }
 
 /// 把替换数字的改写落成文本和改写记录。
-fn replace_count(body: &str, suffix: &str, span: (usize, usize), probe: usize, kind: &str) -> CappedSql {
+pub(crate) fn replace_count(body: &str, suffix: &str, span: (usize, usize), probe: usize, kind: &str) -> CappedSql {
     let mut sql = String::new();
     sql.push_str(&body[..span.0]);
     sql.push_str(&probe.to_string());
@@ -1949,78 +780,20 @@ fn insert_text(body: &str, suffix: &str, at: usize, text: &str, kind: &str) -> C
     CappedSql { sql, rewrite: Some(rewrite) }
 }
 
-/// T-SQL 的行数上限：SELECT 直接改写为 SELECT TOP (n)；FETCH NEXT 已有时只改数字；
-/// TOP 已有时只改数字；WITH 开头的语句不改写（TOP 需要落在内层 SELECT，盲改会破坏语义）。
-fn cap_result_sql_detail_sqlserver(sql: &str, cap: usize) -> CappedSql {
-    let probe = cap.saturating_add(1);
-    let (body, suffix) = peel_trailing_semi(sql);
-    if !limit_target(body) {
-        return CappedSql::unchanged(sql);
-    }
-    let scan = scan_top("sqlserver", body);
-    if scan.has_into {
-        return CappedSql::unchanged(sql);
-    }
-    if let Some(fetch) = scan.fetch {
-        if fetch.value <= probe as u64 {
-            return CappedSql::unchanged(sql);
-        }
-        return replace_count(body, suffix, fetch.span, probe, "fetch");
-    }
-    if let Some(top) = scan_top_n(body) {
-        if top.value <= probe as u64 {
-            return CappedSql::unchanged(sql);
-        }
-        return replace_count(body, suffix, top.span, probe, "top");
-    }
-    if split::first_keyword(body) != "SELECT" {
-        return CappedSql::unchanged(sql);
-    }
-    // TOP 紧跟在第一个 SELECT 之后：插入点之前的文本原样保留，之后的全部后移。
-    let cut = body.to_ascii_uppercase().find("SELECT").unwrap_or(0) + "SELECT".len();
-    let mut added = String::from(" TOP (");
-    added.push_str(&probe.to_string());
-    added.push(')');
-    let mut rewritten = String::new();
-    rewritten.push_str(&body[..cut]);
-    rewritten.push_str(&added);
-    rewritten.push_str(&body[cut..]);
-    rewritten.push_str(suffix);
-    let rewrite = AutoRewrite { kind: "top".to_owned(), at: cut, replaced: 0, added };
-    CappedSql { sql: rewritten, rewrite: Some(rewrite) }
+
+
+pub(crate) struct CountSpan {
+    pub(crate) value: u64,
+    pub(crate) span: (usize, usize),
 }
 
-/// 顶层 TOP n 的数量区间。TOP 与数量之间允许括号。
-fn scan_top_n(sql: &str) -> Option<CountSpan> {
-    let (words, _) = split::top_level_words("sqlserver", sql);
-    let mut index = 0usize;
-    while index < words.len() {
-        if words[index].0 == "TOP" {
-            let mut at = skip_noise(sql, words[index].2);
-            let bytes = sql.as_bytes();
-            if at < bytes.len() && bytes[at] == b'(' {
-                at = skip_noise(sql, at + 1);
-            }
-            let (value, end) = read_u64(sql, at)?;
-            return Some(CountSpan { value, span: (at, end) });
-        }
-        index += 1;
-    }
-    None
-}
-
-struct CountSpan {
-    value: u64,
-    span: (usize, usize),
-}
-
-struct TopScan {
-    limit: Option<CountSpan>,
-    fetch: Option<CountSpan>,
+pub(crate) struct TopScan {
+    pub(crate) limit: Option<CountSpan>,
+    pub(crate) fetch: Option<CountSpan>,
     insert_at: Option<usize>,
     end_of_code: usize,
     unsafe_limit: bool,
-    has_into: bool,
+    pub(crate) has_into: bool,
 }
 
 fn ends_with_whitespace(text: &str) -> bool {
@@ -2031,11 +804,11 @@ fn starts_with_whitespace(text: &str) -> bool {
     text.chars().next().map(|ch| ch.is_whitespace()).unwrap_or(false)
 }
 
-fn limit_target(sql: &str) -> bool {
+pub(crate) fn limit_target(sql: &str) -> bool {
     matches!(split::first_keyword(sql).as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE")
 }
 
-fn peel_trailing_semi(sql: &str) -> (&str, &str) {
+pub(crate) fn peel_trailing_semi(sql: &str) -> (&str, &str) {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
     let mut depth = 0i32;
@@ -2089,7 +862,7 @@ fn peel_trailing_semi(sql: &str) -> (&str, &str) {
             i = (i + 2).min(bytes.len());
             continue;
         }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+        if crate::adapters::query::is_quote_byte(bytes[i]) {
             quote = Some(bytes[i]);
             semi_at = None;
             i += 1;
@@ -2121,7 +894,7 @@ fn peel_trailing_semi(sql: &str) -> (&str, &str) {
     }
 }
 
-fn scan_top(engine: &str, sql: &str) -> TopScan {
+pub(crate) fn scan_top(engine: &str, sql: &str) -> TopScan {
     let (words, end_of_code) = split::top_level_words(engine, sql);
     interpret_words(sql, words, end_of_code)
 }
@@ -2229,7 +1002,7 @@ fn ident_boundary(sql: &str, index: usize) -> bool {
     sql.as_bytes().get(index).map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_').unwrap_or(true)
 }
 
-fn read_u64(sql: &str, i: usize) -> Option<(u64, usize)> {
+pub(crate) fn read_u64(sql: &str, i: usize) -> Option<(u64, usize)> {
     let bytes = sql.as_bytes();
     if i >= bytes.len() || !bytes[i].is_ascii_digit() {
         return None;
@@ -2242,7 +1015,7 @@ fn read_u64(sql: &str, i: usize) -> Option<(u64, usize)> {
     Some((value, end))
 }
 
-fn skip_noise(sql: &str, mut i: usize) -> usize {
+pub(crate) fn skip_noise(sql: &str, mut i: usize) -> usize {
     let bytes = sql.as_bytes();
     loop {
         if i >= bytes.len() {
@@ -2294,37 +1067,6 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-#[cfg(test)]
-mod mysql_value_tests {
-    use super::{mysql_cell, mysql_type_name};
-    use mysql_async::consts::ColumnType::*;
-
-    #[test]
-    fn charset_splits_text_from_binary() {
-        let text = mysql_async::Value::Bytes("你好".as_bytes().to_vec());
-        let binary = mysql_async::Value::Bytes(vec![0xff, 0x00, 0x41]);
-        assert_eq!(mysql_type_name(MYSQL_TYPE_BLOB, 45), "TEXT");
-        assert_eq!(mysql_cell(&text, MYSQL_TYPE_BLOB, 45).as_deref(), Some("你好"));
-        assert_eq!(mysql_type_name(MYSQL_TYPE_TINY_BLOB, 33), "TINYTEXT");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_MEDIUM_BLOB, 45), "MEDIUMTEXT");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_LONG_BLOB, 45), "LONGTEXT");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_BLOB, 63), "BLOB");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_TINY_BLOB, 63), "TINYBLOB");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_MEDIUM_BLOB, 63), "MEDIUMBLOB");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_LONG_BLOB, 63), "LONGBLOB");
-        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_BLOB, 63).as_deref(), Some("ff0041"));
-        assert_eq!(mysql_type_name(MYSQL_TYPE_VAR_STRING, 63), "VARBINARY");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_VARCHAR, 63), "VARBINARY");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_STRING, 63), "BINARY");
-        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_VAR_STRING, 63).as_deref(), Some("ff0041"));
-        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_STRING, 63).as_deref(), Some("ff0041"));
-        assert_eq!(mysql_type_name(MYSQL_TYPE_VAR_STRING, 45), "VARCHAR");
-        assert_eq!(mysql_type_name(MYSQL_TYPE_STRING, 45), "CHAR");
-        assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"abc".to_vec()), MYSQL_TYPE_VAR_STRING, 45).as_deref(), Some("abc"));
-        assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"12.50".to_vec()), MYSQL_TYPE_NEWDECIMAL, 63).as_deref(), Some("12.50"));
-        assert_eq!(mysql_cell(&mysql_async::Value::Date(2024, 1, 2, 0, 0, 0, 0), MYSQL_TYPE_DATE, 63).as_deref(), Some("2024-01-02"));
-    }
-}
 
 #[cfg(test)]
 mod buffer_ownership_tests {

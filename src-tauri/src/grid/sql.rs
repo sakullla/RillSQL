@@ -1,19 +1,12 @@
 use super::store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
+use crate::adapters::query::sql_syntax;
 
 /// 按方言最小引号，统一由适配器 SqlSyntax 判定。
 pub use crate::adapters::quote_ident;
 
-pub fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-/// T-SQL 的 Unicode 字符串字面量。其余引擎与 quote_literal 相同。
+/// 文本字面量：单引号翻倍；方言有 Unicode 前缀（T-SQL 的 N）时带上。
 pub fn text_literal(engine: Engine, value: &str) -> String {
-    if engine == Engine::Sqlserver {
-        format!("N'{}'", value.replace('\'', "''"))
-    } else {
-        quote_literal(value)
-    }
+    sql_syntax(engine).text_literal(value)
 }
 
 fn is_numeric(type_name: &str) -> bool {
@@ -135,7 +128,7 @@ fn is_preview_envelope(value: &str) -> bool {
 
 fn like_literal(engine: Engine, value: &str, contains: bool) -> String {
     let escaped = value.replace('!', "!!").replace('%', "!%").replace('_', "!_").replace('\'', "''");
-    let prefix = if engine == Engine::Sqlserver { "N" } else { "" };
+    let prefix = sql_syntax(engine).national_prefix();
     if contains {
         format!("{prefix}'%{escaped}%'")
     } else {
@@ -150,7 +143,7 @@ pub fn filter_clause(engine: Engine, column: &Column, filter: &Filter) -> String
         FilterOp::Eq => format!("{ident} = {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Ne => format!("{ident} <> {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Contains => {
-            let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
+            let op = sql_syntax(engine).contains_operator();
             format!("{ident} {op} {} ESCAPE '!'", like_literal(engine, raw, true))
         }
         FilterOp::Starts => format!("{ident} LIKE {} ESCAPE '!'", like_literal(engine, raw, false)),
@@ -197,7 +190,7 @@ pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String,
 }
 
 /// 表数据网格的整表关键字搜索（R3）：跨可作为文本匹配的列生成 OR-LIKE。
-/// `%`/`_`/`!` 经现有 like_literal 的 ESCAPE '!' 字面转义；postgres 用 ILIKE、其余引擎 LIKE，与筛选 contains 同方言。
+/// `%`/`_`/`!` 经现有 like_literal 的 ESCAPE '!' 字面转义；匹配运算符由方言给出，与筛选 contains 同方言。
 /// 二进制、几何与类型未知的列不参与；全部列被排除时给出恒假子句，让“无匹配”空态仍然成立。
 /// 关键字去空白后为空时返回 None，表示没有搜索。
 pub fn search_clause(engine: Engine, columns: &[Column], keyword: &str) -> Option<String> {
@@ -205,7 +198,7 @@ pub fn search_clause(engine: Engine, columns: &[Column], keyword: &str) -> Optio
     if keyword.is_empty() {
         return None;
     }
-    let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
+    let op = sql_syntax(engine).contains_operator();
     let pattern = like_literal(engine, keyword, true);
     let parts = columns
         .iter()
@@ -238,7 +231,7 @@ pub fn compile_where_with_condition(
         where_sql = and_part(where_sql, clause);
     }
     if let Some(raw) = expression {
-        match gate_filter_expression(engine_key(schema.engine), raw) {
+        match gate_filter_expression(schema.engine.as_str(), raw) {
             // 表达式独占一行再包括号：用户末尾的行注释不会把括号和后面的子句吃掉。
             Ok(Some(text)) => where_sql = and_part(where_sql, format!("(\n{text}\n)")),
             Ok(None) => {}
@@ -253,19 +246,6 @@ fn and_part(left: String, right: String) -> String {
         right
     } else {
         format!("{left} AND {right}")
-    }
-}
-
-/// 引擎名：和连接、查询词法用的字符串保持一致。
-pub fn engine_key(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "postgres",
-        Engine::Mysql => "mysql",
-        Engine::Mariadb => "mariadb",
-        Engine::Sqlite => "sqlite",
-        Engine::Sqlserver => "sqlserver",
-        Engine::Redis => "redis",
-        Engine::Mongodb => "mongodb",
     }
 }
 
@@ -287,11 +267,16 @@ impl ExprRefusal {
 }
 
 /// 写、DDL、事务和客户端控制语句：它们不能出现在 WHERE 表达式里，任何括号层都不行。
-const EXPR_FORBIDDEN: [&str; 34] = [
+/// 方言专有的控制语句关键字（如 SQLite 的 PRAGMA）由适配器补充。
+const EXPR_FORBIDDEN: [&str; 33] = [
     "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "GRANT", "REVOKE",
     "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET", "RESET", "DECLARE", "PREPARE", "EXECUTE", "EXEC", "CALL", "DO", "VACUUM",
-    "ANALYZE", "PRAGMA", "ATTACH", "DETACH", "LOCK", "USE",
+    "ANALYZE", "ATTACH", "DETACH", "LOCK", "USE",
 ];
+
+fn forbidden_in_expression(word: &str) -> bool {
+    EXPR_FORBIDDEN.contains(&word) || crate::adapters::query::dialect_statement_keywords().any(|keyword| keyword == word)
+}
 
 /// 筛选表达式闸门：空表达式表示无条件；其余必须是一段可放进 WHERE 的布尔表达式。
 /// 这是命令边界上的词法检查：拒绝未闭合文本、客户端指令、多语句、分号分隔、
@@ -316,7 +301,7 @@ pub fn gate_filter_expression(engine: &str, raw: &str) -> Result<Option<String>,
         // 引用标识符里的词不是关键字，按原文放行。
         if token.word && !token.quoted {
             let upper = token.text.to_ascii_uppercase();
-            if EXPR_FORBIDDEN.contains(&upper.as_str()) {
+            if forbidden_in_expression(&upper) {
                 return Err(ExprRefusal::new("grid.filter.sqlWrite", upper));
             }
             if upper == "SELECT" && depth == 0 {
@@ -365,23 +350,13 @@ pub fn browse_sql_with_search(schema: &TableSchema, filters: &[Filter], search: 
     Ok(format!("SELECT * FROM {}{clause}{order}{tail}", qualified_name(schema)))
 }
 
-/// 分页尾段。T-SQL 的 OFFSET/FETCH 必须跟在 ORDER BY 后面，没有排序时补一个恒定序。
+/// 分页尾段（方言决定 LIMIT/OFFSET 还是 OFFSET/FETCH）。`ordered` 表示语句已有 ORDER BY。
 pub fn page_tail(engine: Engine, limit: u64, offset: u64, ordered: bool) -> String {
-    match engine {
-        Engine::Sqlserver => {
-            if ordered {
-                format!(" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
-            } else {
-                format!(" ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
-            }
-        }
-        _ if offset == 0 => format!(" LIMIT {limit}"),
-        _ => format!(" LIMIT {limit} OFFSET {offset}"),
-    }
+    sql_syntax(engine).page_tail(limit, offset, ordered)
 }
 
 pub fn select_export_gate(sql: &str) -> Result<String, String> {
-    select_export_gate_for("postgres", sql)
+    select_export_gate_for(crate::adapters::registry::UNBOUND_DIALECT.as_str(), sql)
 }
 
 /// 导出闸门走 query 的语句扫描，并带上引擎。
@@ -439,11 +414,7 @@ pub fn delete_sql(schema: &TableSchema, locator: &[(String, Cell)]) -> String {
 
 pub fn insert_sql(schema: &TableSchema, values: &[(String, Cell)]) -> String {
     if values.is_empty() {
-        return if matches!(schema.engine, Engine::Mysql | Engine::Mariadb) {
-            format!("INSERT INTO {} () VALUES ()", qualified_name(schema))
-        } else {
-            format!("INSERT INTO {} DEFAULT VALUES", qualified_name(schema))
-        };
+        return sql_syntax(schema.engine).insert_defaults(&qualified_name(schema));
     }
     let names = values.iter().map(|(name, _)| quote_ident(schema.engine, name)).collect::<Vec<_>>().join(", ");
     let literals = values
@@ -497,51 +468,19 @@ fn null_key_guard(schema: &TableSchema) -> String {
 }
 
 fn plain_cast(engine: Engine, ident: &str) -> String {
-    match engine {
-        Engine::Postgres => format!("{ident}::text"),
-        Engine::Mysql | Engine::Mariadb => format!("CAST({ident} AS CHAR)"),
-        Engine::Sqlite => format!("CAST({ident} AS TEXT)"),
-        // NVARCHAR(MAX) 承接任意长度的文本形态，日期/数字等隐式转换后参与 LIKE 匹配。
-        Engine::Sqlserver => format!("CAST({ident} AS NVARCHAR(MAX))"),
-        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => ident.to_owned(),
-    }
+    sql_syntax(engine).text_cast(ident)
 }
 
 fn text_preview(engine: Engine, plain: &str, preview_bytes: usize) -> String {
-    let cap = preview_bytes.max(1);
-    match engine {
-        Engine::Postgres => format!("CASE WHEN octet_length({plain}) > {cap} THEN chr(1) || 't:' || octet_length({plain})::text || ':' || left({plain}, {cap}) ELSE {plain} END"),
-        Engine::Mysql | Engine::Mariadb => format!("CASE WHEN LENGTH({plain}) > {cap} THEN CONCAT(CHAR(1), 't:', LENGTH({plain}), ':', LEFT({plain}, {cap})) ELSE {plain} END"),
-        Engine::Sqlite => format!("CASE WHEN length(CAST({plain} AS BLOB)) > {cap} THEN char(1) || 't:' || length(CAST({plain} AS BLOB)) || ':' || substr({plain}, 1, {cap}) ELSE {plain} END"),
-        // LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断按设置的字符数。
-        Engine::Sqlserver => format!("CASE WHEN LEN({plain}) > {cap} THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, {cap}) ELSE {plain} END"),
-        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => plain.to_owned(),
-    }
+    sql_syntax(engine).text_preview(plain, preview_bytes.max(1))
 }
 
 fn binary_length(engine: Engine, ident: &str) -> String {
-    match engine {
-        Engine::Postgres => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE chr(1) || 'b:' || octet_length({ident})::text END"),
-        Engine::Mysql | Engine::Mariadb => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CONCAT(CHAR(1), 'b:', LENGTH({ident})) END"),
-        Engine::Sqlite => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE char(1) || 'b:' || length({ident}) END"),
-        Engine::Sqlserver => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CHAR(1) + N'b:' + CAST(DATALENGTH({ident}) AS NVARCHAR(20)) END"),
-        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {ident} END"),
-    }
+    sql_syntax(engine).binary_length(ident)
 }
 
 fn binary_hex(engine: Engine, ident: &str) -> String {
-    let hex = match engine {
-        Engine::Postgres => format!("encode({ident}, 'hex')"),
-        Engine::Mysql | Engine::Mariadb => format!("LOWER(HEX({ident}))"),
-        Engine::Sqlite => format!("lower(hex({ident}))"),
-        // CONVERT 样式 2 输出不带 0x 前缀的小写十六进制。
-        Engine::Sqlserver => format!("LOWER(CONVERT(VARCHAR(MAX), {ident}, 2))"),
-        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => ident.to_owned(),
-    };
+    let hex = sql_syntax(engine).binary_hex(ident);
     format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {hex} END")
 }
 
@@ -661,14 +600,7 @@ fn parse_hex(value: &str) -> Option<String> {
 }
 
 fn binary_literal(engine: Engine, hex: &str) -> String {
-    match engine {
-        Engine::Postgres => format!("'\\x{hex}'"),
-        Engine::Mysql | Engine::Mariadb | Engine::Sqlite => format!("X'{hex}'"),
-        // T-SQL 的二进制字面量是 0x 前缀（空二进制是 0x）。
-        Engine::Sqlserver => format!("0x{hex}"),
-        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
-        Engine::Redis | Engine::Mongodb => format!("X'{hex}'"),
-    }
+    sql_syntax(engine).binary_literal(hex)
 }
 
 #[cfg(test)]

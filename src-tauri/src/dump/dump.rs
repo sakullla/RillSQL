@@ -388,7 +388,7 @@ async fn sqlserver_current_database(session: &CatalogSession) -> Result<String, 
     let CatalogSession::Sqlserver(client) = session else {
         return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
     };
-    let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(read_failure)?;
+    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(read_failure)?;
     match rows.first().and_then(|row| row.first()) {
         Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
         _ => Err(read_failure("没有当前数据库")),
@@ -399,7 +399,7 @@ async fn sqlserver_text_column(session: &CatalogSession, sql: &str) -> Result<Ve
     let CatalogSession::Sqlserver(client) = session else {
         return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
     };
-    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await.map_err(read_failure)?;
+    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await.map_err(read_failure)?;
     rows.iter()
         .map(|row| match row.first() {
             Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),

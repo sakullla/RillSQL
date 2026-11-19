@@ -27,7 +27,7 @@ pub(super) async fn name_taken(client: &TdsHandle, schema: &str, current: &str, 
 }
 
 pub(super) async fn count(client: &TdsHandle, sql: &str) -> Result<i64, String> {
-    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await?;
     let text = match rows.first().and_then(|row| row.first()) {
         Some(crate::grid::Cell::Text(text)) => text.clone(),
         _ => return Err("没有读到 NULL 计数".to_owned()),
@@ -65,7 +65,7 @@ pub(super) async fn sqlserver_comments(client: &TdsHandle, schema: &str, table: 
 type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
 
 async fn tds_strings(client: &TdsHandle, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+    let (_names, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, sql).await?;
     Ok(rows
         .into_iter()
         .map(|cells| {

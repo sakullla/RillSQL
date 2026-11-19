@@ -7,6 +7,7 @@ use crate::adapters::catalog_of;
 use crate::catalog::model::{DatabaseNode, Engine, KindReport, ObjectKind, ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE};
 use crate::connections::CatalogSession;
 
+#[cfg(test)]
 pub use crate::adapters::mysql::catalog_read::read_completion_objects as read_mysql_completion_objects;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

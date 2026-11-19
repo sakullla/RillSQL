@@ -2,7 +2,8 @@
 
 use crate::diagram::assemble::{assemble_diagram, group_key_parts};
 use crate::diagram::model::{Diagram, DiagramColumn, KeyPart, OutgoingKey, RangeScope, ReadColumns, TableAttempt};
-use crate::grid::{sqlserver_rows, Cell};
+use super::grid_read::sqlserver_rows;
+use crate::grid::Cell;
 
 type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
 

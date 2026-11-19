@@ -1,8 +1,17 @@
-//! MySQL 家族（MySQL 与 MariaDB 共用）的 SQL 语法：标识符引号与保留字。
+//! MySQL 家族（MySQL 与 MariaDB 共用）的 SQL 语法：标识符引号、保留字、网格投影、
+//! 词法、库切换、语句超时与执行计划。两者只在超时变量与计划格式上不同。
 
-use crate::adapters::SqlSyntax;
+use crate::adapters::{Lexis, SqlSyntax};
+use crate::query::exec::DatabaseGate;
+use crate::query::functions::FunctionSig;
+use crate::query::plan::PlanNode;
 
-pub(in crate::adapters) struct MysqlSyntax;
+pub(in crate::adapters) struct MysqlSyntax {
+    mariadb: bool,
+}
+
+pub(in crate::adapters) const MYSQL_SYNTAX: MysqlSyntax = MysqlSyntax { mariadb: false };
+pub(in crate::adapters) const MARIADB_SYNTAX: MysqlSyntax = MysqlSyntax { mariadb: true };
 
 impl SqlSyntax for MysqlSyntax {
     /// MySQL/MariaDB 用反引号，内部反引号加倍。
@@ -21,6 +30,78 @@ impl SqlSyntax for MysqlSyntax {
     /// MySQL 词法把 `_binary`、`_utf8mb4` 等读作字符集引导符；下划线开头一律加引号。
     fn bare_leading_underscore(&self) -> bool {
         false
+    }
+
+    fn insert_defaults(&self, table: &str) -> String {
+        format!("INSERT INTO {table} () VALUES ()")
+    }
+
+    fn text_cast(&self, ident: &str) -> String {
+        format!("CAST({ident} AS CHAR)")
+    }
+
+    fn text_preview(&self, plain: &str, cap: usize) -> String {
+        format!("CASE WHEN LENGTH({plain}) > {cap} THEN CONCAT(CHAR(1), 't:', LENGTH({plain}), ':', LEFT({plain}, {cap})) ELSE {plain} END")
+    }
+
+    fn binary_length(&self, ident: &str) -> String {
+        format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CONCAT(CHAR(1), 'b:', LENGTH({ident})) END")
+    }
+
+    fn binary_hex(&self, ident: &str) -> String {
+        format!("LOWER(HEX({ident}))")
+    }
+
+    fn lexis(&self) -> Lexis {
+        Lexis { hash_comments: true, transact: false, delimiter_command: true }
+    }
+
+    /// 同一条连接上用 USE 切到目标库。
+    fn database_gate(&self, _requested: &str) -> DatabaseGate {
+        DatabaseGate::Switch
+    }
+
+    /// MySQL 的 MAX_EXECUTION_TIME 只对 SELECT 生效；MariaDB 的单位是秒。
+    fn timeout_statements(&self, ms: u64) -> Vec<String> {
+        if self.mariadb {
+            vec![format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)]
+        } else {
+            vec![format!("SET SESSION MAX_EXECUTION_TIME = {ms}")]
+        }
+    }
+
+    fn timeout_reset_statements(&self) -> Vec<String> {
+        if self.mariadb {
+            vec!["SET SESSION max_statement_time = 0".to_owned()]
+        } else {
+            vec!["SET SESSION MAX_EXECUTION_TIME = 0".to_owned()]
+        }
+    }
+
+    fn dialect_words(&self) -> &'static [&'static str] {
+        &["REGEXP", "STRAIGHT_JOIN", "IFNULL", "GROUP_CONCAT", "UNSIGNED"]
+    }
+
+    /// MySQL 8 用 TREE 格式；MariaDB 没有 TREE，用 JSON。
+    fn explain(&self, body: &str) -> String {
+        if body.to_ascii_uppercase().starts_with("EXPLAIN") {
+            body.to_owned()
+        } else if self.mariadb {
+            format!("EXPLAIN FORMAT=JSON {body}")
+        } else {
+            format!("EXPLAIN FORMAT=TREE {body}")
+        }
+    }
+
+    fn parse_plan(&self, _sql: &str, explained: bool, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
+        if !explained {
+            return None;
+        }
+        super::plan::parse_mysql_family(columns, rows)
+    }
+
+    fn functions(&self) -> &'static [FunctionSig] {
+        super::functions::MYSQL
     }
 }
 

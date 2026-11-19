@@ -139,7 +139,7 @@ pub fn signature_at(engine: &str, text: &str, cursor: usize) -> Option<Signature
 /// 光标所在语句的范围。光标落在语句之间的空白里、或草稿只有一条语句时没有高亮。
 pub fn statement_at(engine: &str, text: &str, cursor: usize) -> Option<Range<usize>> {
     // 与大纲同一套切分：未绑定或未知引擎按 postgres 切。
-    let engine = if crate::query::assist::known_engine(engine) { engine } else { "postgres" };
+    let engine = crate::adapters::query::sql_dialect_id(engine);
     let pieces = crate::query::split_sql(engine, text).pieces;
     if pieces.len() < 2 {
         return None;
@@ -227,14 +227,17 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
     lines.join("\n\n")
 }
 
+/// Markdown 行内代码的反引号（不是 SQL 标识符引号）。
+const TICK: char = '\u{60}';
+
 fn code_span(text: &str) -> String {
-    format!("`{}`", text.replace('`', "'"))
+    format!("{TICK}{}{TICK}", text.replace(TICK, "'"))
 }
 
 fn escape_markdown(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|') {
+        if matches!(ch, '\\' | TICK | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|') {
             out.push('\\');
         }
         out.push(ch);

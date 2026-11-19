@@ -17,6 +17,22 @@ pub const ENGINES: [Engine; 7] = [
 /// 目录树节点挂到连接之前的占位引擎（建好节点后立即改成所属连接的引擎）。
 pub const PLACEHOLDER: Engine = Engine::Sqlite;
 
+/// 查询编辑器没有绑定连接（或绑定的不是 SQL 引擎）时，切分、大纲与导出按这个方言处理。
+pub const UNBOUND_DIALECT: Engine = Engine::Postgres;
+
+/// 网格/编辑器目标的引擎字符串解析不出时按这个引擎生成 SQL 与折叠。
+pub const UNBOUND_GRID: Engine = Engine::Sqlite;
+
+/// 有 SQL 语法组的引擎原样返回；未知或非 SQL 引擎按 [`UNBOUND_DIALECT`]。
+pub fn sql_engine(id: &str) -> Engine {
+    parse(id).filter(|engine| adapter(*engine).syntax().is_some()).unwrap_or(UNBOUND_DIALECT)
+}
+
+/// 网格目标的引擎：解析不出时按 [`UNBOUND_GRID`]。
+pub fn grid_engine(id: &str) -> Engine {
+    parse(id).unwrap_or(UNBOUND_GRID)
+}
+
 /// 取得引擎的适配器。
 pub fn adapter(engine: Engine) -> &'static dyn EngineAdapter {
     match engine {

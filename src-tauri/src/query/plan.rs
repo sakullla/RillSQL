@@ -76,7 +76,7 @@ pub struct PlanNode {
 }
 
 impl PlanNode {
-    fn new(op: impl Into<String>) -> Self {
+    pub(crate) fn new(op: impl Into<String>) -> Self {
         Self { op: op.into(), ..Self::default() }
     }
 
@@ -157,80 +157,28 @@ impl Plan {
     }
 }
 
-/// 这条语句的结果是不是执行计划；是就解析，不是或认不出返回 None。
+/// 这条语句的结果是不是执行计划；是就解析，不是或认不出返回 None。各引擎的结果形态由适配器认。
 pub fn parse(engine: &str, sql: &str, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Plan> {
     let upper = sql.trim_start().to_ascii_uppercase();
     let explained = upper.starts_with("EXPLAIN") || upper.starts_with("SET SHOWPLAN");
-    let column = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
-    let roots = match engine {
-        "sqlite" if column("detail").is_some() && column("parent").is_some() => parse_sqlite(columns, rows),
-        "sqlserver" if column("NodeId").is_some() && column("PhysicalOp").is_some() => parse_showplan_all(columns, rows),
-        _ if !explained => return None,
-        "postgres" => parse_postgres(columns, rows),
-        "mysql" | "mariadb" => parse_mysql_family(columns, rows),
-        _ => None,
-    }?;
-    let mut plan = Plan { engine: engine.to_owned(), roots };
+    let roots = crate::adapters::query::syntax_named(engine)?.parse_plan(sql, explained, columns, rows)?;
+    let plan = Plan { engine: engine.to_owned(), roots };
     if plan.roots.is_empty() {
         return None;
-    }
-    // SQLite 在计划里写的是别名（SCAN o）：从语句里把别名对回表名，写成 “o（orders）”。
-    if engine == "sqlite" {
-        let aliases = alias_map(sql);
-        fn rename(node: &mut PlanNode, aliases: &[(String, String)]) {
-            if let Some(object) = node.object.as_mut() {
-                if let Some((_, table)) = aliases.iter().find(|(alias, table)| alias.eq_ignore_ascii_case(object) && !table.eq_ignore_ascii_case(object)) {
-                    *object = format!("{object}（{table}）");
-                }
-            }
-            for child in &mut node.children {
-                rename(child, aliases);
-            }
-        }
-        for root in &mut plan.roots {
-            rename(root, &aliases);
-        }
     }
     Some(plan)
 }
 
-/// 语句里的 “表 [AS] 别名”（FROM / JOIN 之后）。只认简单形态，认不出就不改名。
-fn alias_map(sql: &str) -> Vec<(String, String)> {
-    const STOP: [&str; 16] = ["WHERE", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "USING", "NATURAL", "OUTER", "UNION", "HAVING"];
-    let tokens: Vec<String> = sql
-        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '(' || ch == ')' || ch == ';')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.trim_matches(['"', '`', '[', ']']).to_owned())
-        .collect();
-    let mut out = Vec::new();
-    for index in 0..tokens.len() {
-        let keyword = tokens[index].to_ascii_uppercase();
-        if keyword != "FROM" && keyword != "JOIN" {
-            continue;
-        }
-        let Some(table) = tokens.get(index + 1) else { continue };
-        let mut next = index + 2;
-        if tokens.get(next).is_some_and(|token| token.eq_ignore_ascii_case("AS")) {
-            next += 1;
-        }
-        if let Some(alias) = tokens.get(next).filter(|alias| !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
-            let table = table.rsplit('.').next().unwrap_or(table).to_owned();
-            out.push((alias.clone(), table));
-        }
-    }
-    out
-}
-
-fn cell(row: &[Option<String>], index: Option<usize>) -> Option<&str> {
+pub(crate) fn cell(row: &[Option<String>], index: Option<usize>) -> Option<&str> {
     index.and_then(|index| row.get(index)).and_then(|value| value.as_deref())
 }
 
-fn number(text: &str) -> Option<f64> {
+pub(crate) fn number(text: &str) -> Option<f64> {
     text.trim().parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 /// 多个节点挂成树：(id, parent, node)，parent 不在集合里的就是根。
-fn assemble(mut items: Vec<(i64, i64, PlanNode)>) -> Vec<PlanNode> {
+pub(crate) fn assemble(mut items: Vec<(i64, i64, PlanNode)>) -> Vec<PlanNode> {
     fn take_children(parent: i64, items: &mut Vec<(i64, i64, PlanNode)>, depth: usize) -> Vec<PlanNode> {
         if depth > 64 {
             return Vec::new();
@@ -265,116 +213,7 @@ fn assemble(mut items: Vec<(i64, i64, PlanNode)>) -> Vec<PlanNode> {
     roots
 }
 
-// ---------------------------------------------------------------- SQLite
-
-fn parse_sqlite(columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
-    let at = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
-    let (id_at, parent_at, detail_at) = (at("id"), at("parent"), at("detail"));
-    let items = rows
-        .iter()
-        .filter_map(|row| {
-            let id = number(cell(row, id_at)?)? as i64;
-            let parent = number(cell(row, parent_at).unwrap_or("0")).unwrap_or(0.) as i64;
-            let detail = cell(row, detail_at)?.trim().to_owned();
-            Some((id, parent, sqlite_node(&detail)))
-        })
-        .collect();
-    Some(assemble(items))
-}
-
-fn sqlite_node(detail: &str) -> PlanNode {
-    let upper = detail.to_ascii_uppercase();
-    let mut words = detail.split_whitespace();
-    let head = words.next().unwrap_or("").to_owned();
-    let mut node = PlanNode::new(head.clone());
-    node.props.push(("detail".into(), detail.to_owned()));
-    match head.to_ascii_uppercase().as_str() {
-        "SCAN" | "SEARCH" => {
-            // 旧版写 “SCAN TABLE t”，新版写 “SCAN t”。
-            let mut object = words.next().unwrap_or("").to_owned();
-            if object.eq_ignore_ascii_case("TABLE") {
-                object = words.next().unwrap_or("").to_owned();
-            }
-            let rest = detail.split_once(&object).map(|(_, rest)| rest.trim()).unwrap_or("");
-            node.object = (!object.is_empty()).then_some(object);
-            node.detail = rest.to_owned();
-            let uses_index = upper.contains("INDEX") || upper.contains("PRIMARY KEY");
-            let virtual_scan = upper.contains("SUBQUERY") || upper.contains("CONSTANT ROW") || upper.contains("CO-ROUTINE") || upper.contains("VIRTUAL TABLE");
-            if head.eq_ignore_ascii_case("SCAN") && !uses_index && !virtual_scan {
-                node.issues.push(Issue::FullScan);
-            }
-        }
-        "USE" if upper.contains("TEMP B-TREE") => {
-            node.op = "TEMP B-TREE".into();
-            node.detail = detail.split_once("FOR").map(|(_, rest)| format!("FOR{rest}")).unwrap_or_default();
-            node.issues.push(Issue::TempSort);
-        }
-        _ => {
-            node.op = detail.to_owned();
-        }
-    }
-    node
-}
-
-// ---------------------------------------------------------------- PostgreSQL
-
-fn parse_postgres(columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
-    let at = columns.iter().position(|column| column.eq_ignore_ascii_case("QUERY PLAN")).or(Some(0));
-    let text: Vec<&str> = rows.iter().filter_map(|row| cell(row, at)).collect();
-    let joined = text.join("\n");
-    let trimmed = joined.trim_start();
-    if trimmed.starts_with('[') || trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed).ok()?;
-        let plans: Vec<&Value> = match &value {
-            Value::Array(items) => items.iter().filter_map(|item| item.get("Plan")).collect(),
-            Value::Object(_) => value.get("Plan").into_iter().collect(),
-            _ => Vec::new(),
-        };
-        return Some(plans.into_iter().map(pg_json_node).collect());
-    }
-    Some(arrow_tree(&joined, pg_text_node))
-}
-
-fn pg_json_node(value: &Value) -> PlanNode {
-    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-    let op = match (text("Node Type"), text("Join Type")) {
-        (Some(kind), Some(join)) if kind.contains("Join") || kind == "Nested Loop" => format!("{kind} ({join})"),
-        (Some(kind), _) => kind,
-        _ => "Plan".into(),
-    };
-    let mut node = PlanNode::new(op.clone());
-    node.object = match (text("Relation Name"), text("Alias"), text("Index Name")) {
-        (Some(relation), Some(alias), _) if alias != relation => Some(format!("{relation} {alias}")),
-        (Some(relation), _, _) => Some(relation),
-        (None, _, Some(index)) => Some(index),
-        _ => None,
-    };
-    let index = text("Index Name").filter(|_| text("Relation Name").is_some()).map(|index| format!("using {index}"));
-    let condition = ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter", "Filter", "Recheck Cond", "Sort Key", "Group Key"]
-        .iter()
-        .find_map(|key| value.get(*key).map(|item| format!("{key}: {}", json_inline(item))));
-    node.detail = [index, condition].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-    node.cost = value.get("Total Cost").and_then(Value::as_f64);
-    node.rows = value.get("Plan Rows").and_then(Value::as_f64);
-    if let Some(map) = value.as_object() {
-        for (key, item) in map {
-            if key != "Plans" {
-                node.props.push((key.clone(), json_inline(item)));
-            }
-        }
-    }
-    let filtered = value.get("Filter").is_some();
-    if op == "Seq Scan" && (filtered || node.rows.unwrap_or(0.) >= 10_000.) {
-        node.issues.push(Issue::FullScan);
-    }
-    if value.get("Sort Space Type").and_then(Value::as_str) == Some("Disk") {
-        node.issues.push(Issue::TempSort);
-    }
-    node.children = value.get("Plans").and_then(Value::as_array).map(|plans| plans.iter().map(pg_json_node).collect()).unwrap_or_default();
-    node
-}
-
-fn json_inline(value: &Value) -> String {
+pub(crate) fn json_inline(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(items) => items.iter().map(json_inline).collect::<Vec<_>>().join(", "),
@@ -382,238 +221,10 @@ fn json_inline(value: &Value) -> String {
     }
 }
 
-/// PostgreSQL 文本计划的一行：`Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)`。
-fn pg_text_node(line: &str) -> PlanNode {
-    let (head, stats) = split_stats(line);
-    let mut node = PlanNode::new(head.split(" on ").next().unwrap_or(&head).trim().to_owned());
-    if let Some((_, object)) = head.split_once(" on ") {
-        let object = object.trim();
-        let (object, index) = match object.split_once(" using ") {
-            Some((table, index)) => (table.trim().to_owned(), format!("using {}", index.trim())),
-            None => (object.to_owned(), String::new()),
-        };
-        node.object = Some(object);
-        node.detail = index;
-    }
-    node.cost = stat(&stats, "cost").and_then(|cost| cost.rsplit("..").next().and_then(number));
-    node.rows = stat(&stats, "rows").and_then(|rows| number(&rows));
-    if node.op.starts_with("Using ") {
-        // “Index Scan using idx on t” 的另一种写法：操作在前、索引在后。
-        node.op = head.clone();
-    }
-    if !stats.is_empty() {
-        node.props.push(("estimate".into(), stats));
-    }
-    if node.op == "Seq Scan" && node.rows.unwrap_or(0.) >= 10_000. {
-        node.issues.push(Issue::FullScan);
-    }
-    node
-}
-
-// ---------------------------------------------------------------- MySQL / MariaDB
-
-fn parse_mysql_family(columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
-    // 传统表格格式：每张表一行（id, select_type, table, type, key, rows, Extra…）。
-    if columns.iter().any(|column| column.eq_ignore_ascii_case("select_type")) {
-        return Some(mysql_table_rows(columns, rows));
-    }
-    let text: Vec<&str> = rows.iter().filter_map(|row| row.first().and_then(|value| value.as_deref())).collect();
-    let joined = text.join("\n");
-    let trimmed = joined.trim_start();
-    if trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed).ok()?;
-        return Some(mariadb_json(&value));
-    }
-    if trimmed.starts_with("->") {
-        return Some(arrow_tree(&joined, mysql_tree_node));
-    }
-    None
-}
-
-/// MySQL 8 的 FORMAT=TREE：`-> Table scan on t  (cost=0.35 rows=1)`。
-fn mysql_tree_node(line: &str) -> PlanNode {
-    let (head, stats) = split_stats(line);
-    let mut node = PlanNode::new(head.clone());
-    let lower = head.to_ascii_lowercase();
-    for marker in [" on ", " using "] {
-        if let Some((op, rest)) = head.split_once(marker) {
-            if marker == " on " {
-                node.op = op.trim().to_owned();
-                let object = rest.split_whitespace().next().unwrap_or("").to_owned();
-                node.detail = rest.trim()[object.len()..].trim().to_owned();
-                node.object = (!object.is_empty()).then_some(object);
-                break;
-            }
-        }
-    }
-    node.cost = stat(&stats, "cost").and_then(|cost| cost.rsplit("..").next().and_then(number));
-    node.rows = stat(&stats, "rows").and_then(|rows| number(&rows));
-    if !stats.is_empty() {
-        node.props.push(("estimate".into(), stats));
-    }
-    if lower.starts_with("table scan on") {
-        node.issues.push(Issue::FullScan);
-    }
-    if lower.starts_with("sort:") || lower.contains("filesort") {
-        node.issues.push(Issue::TempSort);
-    }
-    if lower.contains("temporary table") || lower.starts_with("materialize") {
-        node.issues.push(Issue::TempTable);
-    }
-    node
-}
-
-fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<PlanNode> {
-    let at = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
-    rows.iter()
-        .map(|row| {
-            let access = cell(row, at("type")).unwrap_or("").to_owned();
-            let mut node = PlanNode::new(if access.is_empty() { cell(row, at("select_type")).unwrap_or("SELECT").to_owned() } else { access.clone() });
-            node.object = cell(row, at("table")).map(str::to_owned);
-            let key = cell(row, at("key")).map(|key| format!("key {key}"));
-            let extra = cell(row, at("Extra")).map(str::to_owned);
-            node.detail = [key, extra.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-            node.rows = cell(row, at("rows")).and_then(number);
-            for (index, column) in columns.iter().enumerate() {
-                if let Some(value) = cell(row, Some(index)) {
-                    node.props.push((column.clone(), value.to_owned()));
-                }
-            }
-            if access.eq_ignore_ascii_case("ALL") {
-                node.issues.push(Issue::FullScan);
-            }
-            let extra = extra.unwrap_or_default().to_ascii_lowercase();
-            if extra.contains("filesort") {
-                node.issues.push(Issue::TempSort);
-            }
-            if extra.contains("temporary") {
-                node.issues.push(Issue::TempTable);
-            }
-            node
-        })
-        .collect()
-}
-
-/// MariaDB 的 FORMAT=JSON：query_block 里嵌着 table / nested_loop / filesort / temporary_table。
-fn mariadb_json(value: &Value) -> Vec<PlanNode> {
-    fn walk(key: &str, value: &Value) -> Vec<PlanNode> {
-        match value {
-            Value::Array(items) => items.iter().flat_map(|item| walk(key, item)).collect(),
-            Value::Object(map) => {
-                let mut node = match key {
-                    "query_block" => PlanNode::new(format!("Query block #{}", map.get("select_id").map(json_inline).unwrap_or_default())),
-                    "table" => {
-                        let access = map.get("access_type").map(json_inline).unwrap_or_default();
-                        let mut node = PlanNode::new(if access.is_empty() { "table".to_owned() } else { access.clone() });
-                        node.object = map.get("table_name").map(json_inline);
-                        let key = map.get("key").map(|key| format!("key {}", json_inline(key)));
-                        let condition = map.get("attached_condition").map(json_inline);
-                        node.detail = [key, condition].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-                        node.rows = map.get("rows").and_then(Value::as_f64);
-                        if access == "ALL" {
-                            node.issues.push(Issue::FullScan);
-                        }
-                        node
-                    }
-                    "filesort" => {
-                        let mut node = PlanNode::new("filesort");
-                        node.detail = map.get("sort_key").map(json_inline).unwrap_or_default();
-                        node.issues.push(Issue::TempSort);
-                        node
-                    }
-                    "temporary_table" => {
-                        let mut node = PlanNode::new("temporary table");
-                        node.issues.push(Issue::TempTable);
-                        node
-                    }
-                    "nested_loop" => PlanNode::new("nested loop"),
-                    other => PlanNode::new(other),
-                };
-                node.cost = map.get("cost").and_then(Value::as_f64).or_else(|| map.get("query_cost").and_then(Value::as_f64));
-                for (child_key, child) in map {
-                    match child {
-                        Value::Object(_) | Value::Array(_) if child_key != "used_key_parts" && child_key != "possible_keys" && child_key != "ref" => {
-                            node.children.extend(walk(child_key, child));
-                        }
-                        Value::Object(_) | Value::Array(_) => node.props.push((child_key.clone(), json_inline(child))),
-                        scalar => node.props.push((child_key.clone(), json_inline(scalar))),
-                    }
-                }
-                // nested_loop 自己只是容器：直接用它的子节点，层级更浅。
-                if key == "nested_loop" {
-                    return std::mem::take(&mut node.children);
-                }
-                vec![node]
-            }
-            _ => Vec::new(),
-        }
-    }
-    match value.get("query_block") {
-        Some(block) => walk("query_block", block),
-        None => walk("plan", value),
-    }
-}
-
-// ---------------------------------------------------------------- SQL Server
-
-fn parse_showplan_all(columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
-    let at = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
-    let (node_at, parent_at, physical_at, logical_at, argument_at) = (at("NodeId"), at("Parent"), at("PhysicalOp"), at("LogicalOp"), at("Argument"));
-    let (rows_at, cost_at, warnings_at, type_at) = (at("EstimateRows"), at("TotalSubtreeCost"), at("Warnings"), at("Type"));
-    let items = rows
-        .iter()
-        .filter(|row| cell(row, type_at).is_none_or(|kind| kind.eq_ignore_ascii_case("PLAN_ROW")))
-        .filter_map(|row| {
-            let id = number(cell(row, node_at)?)? as i64;
-            let parent = number(cell(row, parent_at).unwrap_or("0")).unwrap_or(0.) as i64;
-            let physical = cell(row, physical_at)?.trim().to_owned();
-            let logical = cell(row, logical_at).unwrap_or("").trim().to_owned();
-            let mut node = PlanNode::new(if logical.is_empty() || logical == physical { physical.clone() } else { format!("{physical} ({logical})") });
-            let argument = cell(row, argument_at).unwrap_or("").to_owned();
-            node.object = showplan_object(&argument);
-            node.detail = argument.chars().take(160).collect();
-            node.rows = cell(row, rows_at).and_then(number);
-            node.cost = cell(row, cost_at).and_then(number);
-            for (index, column) in columns.iter().enumerate() {
-                if let Some(value) = cell(row, Some(index)).filter(|value| !value.is_empty()) {
-                    node.props.push((column.clone(), value.to_owned()));
-                }
-            }
-            if physical == "Table Scan" || physical == "Clustered Index Scan" || physical == "Index Scan" {
-                node.issues.push(Issue::FullScan);
-            }
-            if physical == "Sort" {
-                node.issues.push(Issue::TempSort);
-            }
-            if physical.contains("Spool") {
-                node.issues.push(Issue::TempTable);
-            }
-            if cell(row, warnings_at).is_some_and(|warnings| !warnings.trim().is_empty()) {
-                node.issues.push(Issue::EngineWarning);
-            }
-            Some((id, parent, node))
-        })
-        .collect();
-    Some(assemble(items))
-}
-
-/// `OBJECT:([db].[dbo].[orders].[ix_customer] AS [o])` → `orders.ix_customer`（去掉库与架构）。
-fn showplan_object(argument: &str) -> Option<String> {
-    let start = argument.find("OBJECT:(")? + "OBJECT:(".len();
-    let rest = &argument[start..];
-    let end = rest.find(')').unwrap_or(rest.len());
-    let parts: Vec<String> = rest[..end].split(" AS ").next()?.split('.').map(|part| part.trim().trim_matches(['[', ']']).to_owned()).filter(|part| !part.is_empty()).collect();
-    match parts.len() {
-        0 => None,
-        1 | 2 => parts.last().cloned(),
-        _ => Some(parts[2..].join(".")),
-    }
-}
-
 // ---------------------------------------------------------------- 共用：`->` 缩进树
 
 /// PostgreSQL 文本计划与 MySQL TREE 共用：`->` 开头、按缩进分层；不带 `->` 的行是上一节点的属性。
-fn arrow_tree(text: &str, node_of: fn(&str) -> PlanNode) -> Vec<PlanNode> {
+pub(crate) fn arrow_tree(text: &str, node_of: fn(&str) -> PlanNode) -> Vec<PlanNode> {
     let mut flat: Vec<(usize, PlanNode)> = Vec::new();
     for raw in text.lines() {
         if raw.trim().is_empty() {
@@ -668,7 +279,7 @@ fn arrow_tree(text: &str, node_of: fn(&str) -> PlanNode) -> Vec<PlanNode> {
 }
 
 /// `head  (cost=… rows=… width=…)` → (head, 括号里的统计)；没有统计时第二项为空。
-fn split_stats(line: &str) -> (String, String) {
+pub(crate) fn split_stats(line: &str) -> (String, String) {
     let line = line.trim();
     if let Some(open) = line.rfind("  (") {
         let stats = line[open + 3..].trim_end_matches(')').to_owned();
@@ -680,7 +291,7 @@ fn split_stats(line: &str) -> (String, String) {
 }
 
 /// 在 “cost=0.35 rows=1 width=4” 里取一个键的值（遇到第一个括号或空白结束）。
-fn stat(stats: &str, key: &str) -> Option<String> {
+pub(crate) fn stat(stats: &str, key: &str) -> Option<String> {
     stats
         .split(['(', ')', ' '])
         .find_map(|part| part.strip_prefix(&format!("{key}=")).map(str::to_owned))

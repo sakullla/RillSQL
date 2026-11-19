@@ -127,7 +127,10 @@ pub struct CommitReport {
 pub const COMMIT_RULE: &str = "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。";
 
 pub fn touch_api() -> usize {
-    let engines = [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite, Engine::Sqlserver];
+    let engines = crate::adapters::registry::ENGINES
+        .into_iter()
+        .filter(|engine| crate::adapters::adapter(*engine).syntax().is_some())
+        .collect::<Vec<_>>();
     let ops = [
         FilterOp::Eq,
         FilterOp::Ne,
@@ -168,14 +171,17 @@ pub fn touch_api() -> usize {
         + report.rule.len()
 }
 
+#[cfg(test)]
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool, unique: bool, auto: bool) -> Column {
     Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, primary, unique, auto }
 }
 
+#[cfg(test)]
 fn text_cell(value: &str) -> Cell {
     Cell::Text(value.to_owned())
 }
 
+#[cfg(test)]
 pub fn customers_fixture(count: usize) -> TableStore {
     let schema = TableSchema {
         engine: Engine::Postgres,
@@ -215,6 +221,7 @@ pub fn customers_fixture(count: usize) -> TableStore {
     TableStore { schema, rows, read_error: None }
 }
 
+#[cfg(test)]
 pub fn nokey_fixture() -> TableStore {
     let schema = TableSchema {
         engine: Engine::Sqlite,

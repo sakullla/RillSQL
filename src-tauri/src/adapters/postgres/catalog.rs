@@ -92,6 +92,10 @@ impl CatalogDialect for PostgresCatalog {
         LISTED
     }
 
+    fn default_schema(&self) -> Option<&'static str> {
+        Some("public")
+    }
+
     fn definition_available(&self, kind: ObjectKind) -> bool {
         use ObjectKind::*;
         matches!(kind, Table | View | Function | Procedure | Trigger | Sequence | Enum | Domain)
