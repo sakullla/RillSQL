@@ -654,8 +654,60 @@ fn resolve_sources(scope: &CompletionScope, tables: &[TableRef]) -> Vec<Source> 
         .collect()
 }
 
-fn matched(label: &str, prefix: &str) -> bool {
-    match_kind(label, prefix) >= 0
+fn subsequence_hit(haystack: &str, needle: &str) -> bool {
+    let chars: Vec<char> = needle.chars().collect();
+    if chars.is_empty() {
+        return true;
+    }
+    let mut index = 0usize;
+    for ch in haystack.chars() {
+        if index < chars.len() && ch == chars[index] {
+            index += 1;
+        }
+        if index == chars.len() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 精细匹配分档（越小越精准）：
+/// - 0：裸标识符前缀命中（如 `public.orders` 命中 `ord`、`logs` 命中 `l`）
+/// - 1：完整标签前缀命中（如 `public.orders` 命中 `pub`）
+/// - 2：下划线分段词首命中（非关键字，如 `order_logs` 命中 `log`、`_sqlx_migrations` 命中 `mig`）
+/// - 3：裸标识符连续子串命中（仅当输入 >= 2 个字符，避免单字母如 `l` 把 `SELECT`/`DELETE`/`VALUES` 全捞出来）
+/// - 4：裸标识符子序列命中（仅当输入 >= 2 个字符，如 `ors` 命中 `orders`、`st` 命中 `SELECT`）
+/// - 5：完整标签子序列命中（仅当输入 >= 2 个字符且前缀包含 `.`）
+fn match_tier(label: &str, prefix: &str, keyword: bool) -> Option<u8> {
+    if prefix.is_empty() {
+        return Some(0);
+    }
+    let needle = prefix.to_lowercase();
+    let full = label.to_lowercase();
+    let bare = full.rsplit_once('.').map(|(_, tail)| tail).unwrap_or(full.as_str());
+    if bare.starts_with(&needle) {
+        return Some(0);
+    }
+    if full.starts_with(&needle) {
+        return Some(1);
+    }
+    if !keyword && bare.split('_').skip(1).any(|seg| !seg.is_empty() && seg.starts_with(&needle)) {
+        return Some(2);
+    }
+    // 单字符输入只接受词首或下划线分词词首，避免输入 `l` 匹配到 `SELECT`、`NULL`、`VALUES`、`public.*` 等噪音。
+    if needle.chars().count() < 2 {
+        return None;
+    }
+    if bare.contains(&needle) {
+        return Some(3);
+    }
+    if subsequence_hit(bare, &needle) {
+        return Some(4);
+    }
+    if needle.contains('.') && subsequence_hit(&full, &needle) {
+        return Some(5);
+    }
+    None
 }
 
 /// 语句里可计数的标识符（小写）。关键字、字符串、引用符和注释都不计入。
@@ -668,29 +720,6 @@ pub fn identifiers(sql: &str) -> Vec<String> {
         .filter(|word| !word.is_empty() && !reserved(&word.to_ascii_uppercase()))
         .filter(|word| !BASE_KEYWORDS.contains(&word.to_ascii_uppercase().as_str()))
         .collect()
-}
-
-/// 0：前缀命中；1：子序列命中；-1：不命中。大小写不敏感。
-pub fn match_kind(label: &str, prefix: &str) -> i32 {
-    if prefix.is_empty() {
-        return 0;
-    }
-    let haystack = label.to_lowercase();
-    let needle = prefix.to_lowercase();
-    if haystack.starts_with(&needle) {
-        return 0;
-    }
-    let chars: Vec<char> = needle.chars().collect();
-    let mut index = 0usize;
-    for ch in haystack.chars() {
-        if index < chars.len() && ch == chars[index] {
-            index += 1;
-        }
-        if index == chars.len() {
-            return 1;
-        }
-    }
-    -1
 }
 
 fn plain_ident(name: &str) -> bool {
@@ -767,6 +796,12 @@ const BASE_KEYWORDS: &[&str] = &[
     "ELSE", "END", "WITH", "USING", "RETURNING", "ASC", "DESC", "NULLS", "FIRST", "LAST", "USE",
 ];
 
+/// FROM / JOIN 子句里真正合法的后续子句与表修饰词，过滤掉 DELETE / ALTER / DROP / VALUES / NULL 等无关干扰词。
+const FROM_CLAUSE_KEYWORDS: &[&str] = &[
+    "WHERE", "JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "OUTER", "ON", "USING", "AS", "GROUP", "BY", "ORDER", "HAVING",
+    "LIMIT", "OFFSET", "UNION", "ALL", "LATERAL", "SELECT",
+];
+
 struct Gather<'a> {
     engine: &'a str,
     prefix: &'a str,
@@ -804,7 +839,7 @@ impl<'a> Gather<'a> {
         if self.items.iter().filter(|(_, item)| item.group == group).count() >= cap {
             return;
         }
-        if !matched(&label, self.prefix) {
+        if match_tier(&label, self.prefix, keyword).is_none() {
             return;
         }
         self.order += 1;
@@ -821,8 +856,23 @@ impl<'a> Gather<'a> {
     }
 
     /// 一个对象只留一条候选：限定名就是身份，不再同时推裸名占限额。
-    fn push_object(&mut self, object: &CatalogObject, with_schema: bool) {
-        let detail = i18n::text(self.locale, kind_key(&object.kind));
+    fn push_object(&mut self, scope: &CompletionScope, object: &CatalogObject, with_schema: bool) {
+        let tref = TableRef {
+            alias: object.name.clone(),
+            schema: object.schema.clone(),
+            name: object.name.clone(),
+            depth: 0,
+        };
+        let columns = source_columns(scope, &tref).map(|src| src.columns.clone()).unwrap_or_default();
+        let kind_label = i18n::text(self.locale, kind_key(&object.kind));
+        let detail = if columns.is_empty() {
+            kind_label
+        } else {
+            i18n::fill(
+                &i18n::text(self.locale, "query.complete.detail.colsCount"),
+                &[("kind", &kind_label), ("count", &columns.len().to_string())],
+            )
+        };
         let schema = if with_schema { object.schema.as_str() } else { "" };
         let label = if schema.is_empty() { object.name.clone() } else { format!("{}.{}", schema, object.name) };
         let insert = qualified_ident(self.engine, schema, &object.name);
@@ -831,6 +881,7 @@ impl<'a> Gather<'a> {
             name: object.name.clone(),
             kind: object.kind.clone(),
             comment: object.comment.clone(),
+            columns,
         };
         self.push_info(label, insert, static_kind(&object.kind), detail, group::OBJECT, false, Some(info));
     }
@@ -838,11 +889,17 @@ impl<'a> Gather<'a> {
     fn push_columns(&mut self, sources: &[Source]) {
         for source in sources {
             for column in &source.columns {
+                let ty = column.type_name.trim();
+                let detail = match (column.primary, ty.is_empty()) {
+                    (_, true) => source.label.clone(),
+                    (true, false) => format!("PK {ty} · {}", source.label),
+                    (false, false) => format!("{ty} · {}", source.label),
+                };
                 self.push_info(
                     column.name.clone(),
                     ident(self.engine, &column.name),
                     "column",
-                    source.label.clone(),
+                    detail,
                     group::COLUMN,
                     false,
                     Some(EntryInfo::Column { source: source.label.clone(), column: column.clone() }),
@@ -867,6 +924,21 @@ impl<'a> Gather<'a> {
                 words.push(upper);
             }
         }
+        self.push_keyword_list(&words);
+    }
+
+    fn push_from_keywords(&mut self) {
+        let mut words: Vec<String> = FROM_CLAUSE_KEYWORDS.iter().map(|word| (*word).to_owned()).collect();
+        for word in dialect_words(self.engine) {
+            let upper = (*word).to_uppercase();
+            if matches!(upper.as_str(), "LATERAL" | "TABLESAMPLE" | "STRAIGHT_JOIN" | "NOLOCK" | "FINAL") && !words.contains(&upper) {
+                words.push(upper);
+            }
+        }
+        self.push_keyword_list(&words);
+    }
+
+    fn push_keyword_list(&mut self, words: &[String]) {
         let detail = self.note("query.complete.detail.keyword");
         for word in words {
             if word.eq_ignore_ascii_case(self.prefix) {
@@ -917,7 +989,7 @@ impl<'a> Gather<'a> {
 
     fn push_objects(&mut self, scope: &CompletionScope) {
         for object in &scope.objects {
-            self.push_object(object, true);
+            self.push_object(scope, object, true);
         }
     }
 }
@@ -939,16 +1011,31 @@ fn type_rank(kind: &str) -> u8 {
     }
 }
 
+/// 下划线开头的迁移/框架内部表（如 `_sqlx_migrations`、`__efmigrationshistory`）与系统内部表排在普通业务表之后。
+fn internal_rank(label: &str, group: u8) -> u8 {
+    if group != group::OBJECT {
+        return 0;
+    }
+    let bare = label.rsplit_once('.').map(|(_, tail)| tail).unwrap_or(label);
+    let lower = bare.to_ascii_lowercase();
+    if bare.starts_with('_') || lower.starts_with("sqlite_") || lower.starts_with("pg_") {
+        1
+    } else {
+        0
+    }
+}
+
 fn finalize(mut gather: Gather<'_>, frequency: &HashMap<String, u32>) -> Vec<Candidate> {
     let prefix = gather.prefix.to_owned();
     gather.items.sort_by(|left, right| {
-        // 顺序：子句分组 → 匹配精度 → 对象类型 → 本地词频 → 出现顺序。
+        // 顺序：子句分组 → 匹配精度 → 对象类型 → 用户表先于内部表 → 本地词频 → 出现顺序。
         // 词频只在同一分组、同一精度、同一类型之间才起作用。
         let key = |(order, item): &(usize, Candidate)| {
             (
                 item.group,
-                match_kind(&item.label, &prefix),
+                match_tier(&item.label, &prefix, item.keyword).unwrap_or(9),
                 type_rank(item.kind),
+                internal_rank(&item.label, item.group),
                 std::cmp::Reverse(weight(frequency, &item.label)),
                 *order,
             )
@@ -1225,7 +1312,7 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 scope.objects.iter().filter(|object| object.schema.eq_ignore_ascii_case(&name)).collect();
             if !schema_objects.is_empty() {
                 for object in schema_objects {
-                    gather.push_object(object, false);
+                    gather.push_object(scope, object, false);
                 }
                 plan.candidates = finalize(gather, &frequency);
                 return plan;
@@ -1319,9 +1406,13 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
         Some(Clause::From) | Some(Clause::Join) => {
             if metadata_ok {
                 gather.push_objects(scope);
+                gather.push_schemas(scope);
+                gather.push_ctes(&statement);
+                gather.push_from_keywords();
+            } else {
+                gather.push_ctes(&statement);
+                gather.push_keywords();
             }
-            gather.push_ctes(&statement);
-            gather.push_keywords();
         }
         Some(clause) if clause.field_first() => {
             if metadata_ok {
@@ -1384,11 +1475,12 @@ impl Resolved {
     /// 与补全详情相同的结构化说明；悬停和详情面板用同一份数据。
     pub fn info(&self) -> EntryInfo {
         match self {
-            Resolved::Object { schema, name, kind, comment, .. } => EntryInfo::Object {
+            Resolved::Object { schema, name, kind, comment, columns } => EntryInfo::Object {
                 schema: schema.clone(),
                 name: name.clone(),
                 kind: kind.clone(),
                 comment: comment.clone(),
+                columns: columns.clone(),
             },
             Resolved::Column { source, column, .. } => EntryInfo::Column { source: source.clone(), column: column.clone() },
         }

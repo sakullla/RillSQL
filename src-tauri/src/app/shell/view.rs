@@ -225,11 +225,48 @@ impl Workbench {
             }));
         });
         let data_owner = cx.entity().downgrade();
+        let struct_query_owner = cx.entity().downgrade();
+        let struct_nav_owner = cx.entity().downgrade();
         let structure = cx.new(|_| {
             let mut pane = StructurePane::new(Arc::clone(&services));
             pane.set_data_sink(Arc::new(move |cx: &mut App| {
                 if let Some(owner) = data_owner.upgrade() {
                     owner.update(cx, |view, cx| view.perform("switch-to-data", cx));
+                }
+            }));
+            pane.set_query_sink(Arc::new(move |target: GridTarget, sql: String, cx: &mut App| {
+                if let Some(owner) = struct_query_owner.upgrade() {
+                    owner.update(cx, |view, cx| {
+                        view.model.open_bound_query(
+                            sql,
+                            (!target.connection_id.is_empty()).then_some(target.connection_id),
+                            (!target.connection_name.is_empty()).then_some(target.connection_name),
+                            (!target.database.is_empty()).then_some(target.database),
+                            (!target.engine.is_empty()).then_some(target.engine),
+                        );
+                        view.model.shell.focus = crate::app::FocusTarget::Editor;
+                        view.adopt_shell(Effect::None, cx);
+                        view.query.update(cx, |q, _| q.request_focus());
+                        view.persist_if_needed(cx);
+                        cx.notify();
+                    });
+                }
+            }));
+            pane.set_structure_nav_sink(Arc::new(move |target: GridTarget, cx: &mut App| {
+                if let Some(owner) = struct_nav_owner.upgrade() {
+                    owner.update(cx, |view, cx| {
+                        let spec = ObjectTarget::new(
+                            target.connection_id,
+                            target.connection_name,
+                            target.database,
+                            target.schema,
+                            target.table,
+                            target.engine,
+                            target.environment,
+                        )
+                        .spec();
+                        view.perform(&format!("open-structure-for:{spec}"), cx);
+                    });
                 }
             }));
             pane
@@ -2930,13 +2967,33 @@ impl Render for Workbench {
         self.pump_update(cx);
         self.pump_tag_job(cx);
         self.flush_clipboard(cx);
-        // 结构页删除表成功后，对象树也要跟着变。
-        if let Some(target) = self.structure.update(cx, |pane, _| pane.take_dropped()) {
-            self.model.table_dropped(&target.connection_id, &target.database, &target.schema, &target.table);
+        // 结构页删除、改名或修改结构成功后，对象树、工作项与网格列结构缓存同步更新。
+        if let Some((target, is_view)) = self.structure.update(cx, |pane, _| pane.take_dropped_object()) {
+            let kind = if is_view { crate::catalog::model::ObjectKind::View } else { crate::catalog::model::ObjectKind::Table };
+            self.model.object_dropped(&target.connection_id, &target.database, &target.schema, &target.table, kind);
+            self.table.update(cx, |pane, _| pane.invalidate_schema_cache(&target));
+            self.applied_tool = None;
+            self.pump_nav(cx);
+        }
+        if let Some((old_target, new_name)) = self.structure.update(cx, |pane, _| pane.take_renamed()) {
+            self.model.table_renamed(&old_target.connection_id, &old_target.database, &old_target.schema, &old_target.table, &new_name);
+            self.table.update(cx, |pane, _| pane.invalidate_schema_cache(&old_target));
+            if !self.table.read(cx).uncommitted() {
+                self.table_view_spec = None;
+            }
+            self.applied_tool = None;
             self.pump_nav(cx);
         }
         if let Some(target) = self.structure.update(cx, |pane, _| pane.take_created()) {
             self.adopt_created_table(target);
+            self.pump_nav(cx);
+        }
+        if let Some((target, is_view)) = self.structure.update(cx, |pane, _| pane.take_modified()) {
+            self.model.table_structure_changed(&target.connection_id, &target.database, &target.schema, &target.table, is_view);
+            self.table.update(cx, |pane, _| pane.invalidate_schema_cache(&target));
+            if !self.table.read(cx).uncommitted() {
+                self.table_view_spec = None;
+            }
             self.pump_nav(cx);
         }
         self.sync_view_settings(cx);

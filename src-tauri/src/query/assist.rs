@@ -106,8 +106,8 @@ impl ColumnMeta {
 pub enum EntryInfo {
     /// 来源（表或视图，按语句里的写法）里的一列。
     Column { source: String, column: ColumnMeta },
-    /// 目录对象：模式、名字、类型和注释（读不到时为空）。
-    Object { schema: String, name: String, kind: String, comment: String },
+    /// 目录对象：模式、名字、类型、注释和已读到的字段清单（读不到时为空）。
+    Object { schema: String, name: String, kind: String, comment: String, columns: Vec<ColumnMeta> },
     /// 内置函数的一行签名。
     Function { signature: String },
 }

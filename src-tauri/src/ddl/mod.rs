@@ -11,10 +11,12 @@ pub(crate) mod sql;
 pub(crate) use exec::{preview, Receipt};
 pub(crate) use introspect::{load, load_comments, load_partial};
 #[allow(unused_imports)]
-pub(crate) use model::{Action, Column, ColumnDraft, Engine as DdlEngine, ForeignKeyDraft, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus};
+pub(crate) use model::{
+    Action, Column, ColumnDraft, DependentSql, Engine as DdlEngine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index,
+    IndexColumn, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus,
+};
 pub(crate) use plan::plan as preview_plan;
-pub(crate) use plan::is_no_change;
-pub(crate) use plan::rebuilt_definition;
+pub(crate) use plan::{fk_sql_for_display, index_sql_for_display, is_no_change, rebuilt_definition};
 
 pub fn module_id() -> &'static str {
     let _linked = (

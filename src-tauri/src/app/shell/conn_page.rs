@@ -2,15 +2,17 @@
 //! 窄窗口只留列表，操作跟在选中行上。标签由用户自己维护（新建、改名、换色、删除）。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, AnyElement, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
+    div, px, AnyElement, AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
 };
 
 use crate::app::views::connections::LinkStatus;
-use crate::connections::model::TlsMode;
+use crate::connections::model::{Engine, TlsMode};
 use crate::connections::ConnectionRecord;
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
 
@@ -136,24 +138,25 @@ impl Workbench {
                     .on_click(act("conn-layout-list", cx)),
             );
 
-        let secondary: Vec<AnyElement> = if wide_tools {
+        let mut secondary: Vec<AnyElement> = if wide_tools {
             vec![
                 kit::tool_button("launcher-group-new", Some(IconName::FolderPlus), self.t("ui.group.new"), act("group-new", cx)).small().into_any_element(),
                 kit::tool_button("launcher-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx)).small().into_any_element(),
-                icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx),
-                icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx),
-                icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx),
             ]
         } else {
             vec![
                 icon("launcher-group-new", IconName::FolderPlus, "ui.group.new", "group-new", cx),
-                icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx),
                 icon("launcher-sqlite", IconName::FolderOpen, "common.openSqlite", "open-sqlite", cx),
-                icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx),
-                icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx),
             ]
         };
+        if total == 0 {
+            secondary.push(icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx));
+        }
+        secondary.push(icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx));
+        secondary.push(icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx));
+
         let focus = self.conn_launcher_focus.clone();
+        let compact_search = self.model.viewport_width >= 820;
         div()
             .flex_none()
             .px(px(m.page_pad))
@@ -170,6 +173,10 @@ impl Workbench {
                     .flex_wrap()
                     .items_center()
                     .gap(px(8.))
+                    .when(!self.model.tabs.is_empty() && self.model.viewport_width >= 760, |this| {
+                        this.child(kit::tool_button("conn-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)).small())
+                            .child(kit::vline(&p))
+                    })
                     .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
                     .child(
                         div()
@@ -199,27 +206,33 @@ impl Workbench {
                         )
                     })
                     .child(div().flex_1())
-                    .when(!self.model.tabs.is_empty() && self.model.viewport_width >= 760, |this| {
-                        this.child(kit::tool_button("conn-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
-                            .child(kit::vline(&p))
-                    })
-                    .when(total > 0 && self.model.viewport_width >= 680, |this| this.child(layout_toggle))
                     .children(secondary)
                     .child(kit::vline(&p))
                     .child(self.launcher_action("conn-new", IconName::Plus, self.t("common.newConnection"), Some(&focus), "conn-new-launcher", true, &p, cx)),
             )
             .when(total > 0, |this| {
+                let search_box = if compact_search {
+                    div().w(px(280.)).min_w(px(200.))
+                } else {
+                    div().flex_1().min_w(px(180.))
+                }
+                .child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true));
                 this.child(
                     div()
                         .flex()
                         .flex_wrap()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w(px(180.)).child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                        .child(search_box)
                         .child(self.filter_button("conn-filter-engine", IconName::Database, SharedString::from(engine), engine_open, "conn-filter-engine", &p, cx))
-                        .when(filtering, |this| this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)))),
+                        .when(filtering, |this| {
+                            this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)).small())
+                        })
+                        .when(compact_search, |this| this.child(kit::vline(&p)))
+                        .child(self.tag_chips(&p, cx))
+                        .child(div().flex_1())
+                        .when(self.model.viewport_width >= 680, |this| this.child(layout_toggle)),
                 )
-                .child(self.tag_chips(&p, cx))
             })
             .into_any_element()
     }
@@ -412,7 +425,49 @@ impl Workbench {
                 continue;
             }
             if rows.is_empty() {
-                body = body.child(div().pl(px(32.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("connections.group.emptyHint")));
+                let empty_group_id = group.id.clone();
+                let drop_group_id = group.id.clone();
+                let drop_soft = p.accent_soft;
+                let drop_border = p.accent;
+                let entity = cx.entity().downgrade();
+                body = body.child(
+                    div()
+                        .id(SharedString::from(format!("launcher-group-empty-{}", group.id)))
+                        .test_support()
+                        .ml(px(22.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .max_w(px(520.))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(10.))
+                        .rounded(px(Radius::PANEL))
+                        .border_1()
+                        .border_color(p.line_soft)
+                        .bg(p.sunken.opacity(0.6))
+                        .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft).border_color(drop_border))
+                        .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
+                            let connection = drag.connection.clone();
+                            let gid = drop_group_id.clone();
+                            if let Some(entity) = entity.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.model.assign_connection_group(&connection, Some(&gid));
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .child(div().flex_1().min_w(px(180.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.t("conn.page.emptyGroupDrop")))
+                        .child(
+                            kit::tool_button(
+                                SharedString::from(format!("launcher-group-empty-add-{}", group.id)),
+                                Some(IconName::Plus),
+                                self.t("conn.page.newInGroup"),
+                                act(format!("conn-new-in-group:{empty_group_id}"), cx),
+                            )
+                            .xsmall(),
+                        ),
+                );
                 child_count += 1;
             } else if cards {
                 if rows.iter().any(|row| self.model.connections.selected.as_deref() == Some(row.saved.id.as_str())) {
@@ -432,7 +487,28 @@ impl Workbench {
         }
         let ungrouped: Vec<ConnectionRecord> = layout.ungrouped.iter().filter_map(|id| shown(id)).collect();
         if !ungrouped.is_empty() {
-            body = body.child(div().px(px(if cards { 0. } else { 6. })).child(super::chrome::section_label(self.t("connections.group.ungrouped"), &p)));
+            let drop_soft = p.accent_soft;
+            let entity = cx.entity().downgrade();
+            body = body.child(
+                div()
+                    .id("launcher-ungrouped-drop")
+                    .test_support()
+                    .mt(px(4.))
+                    .px(px(if cards { 4. } else { 6. }))
+                    .py(px(2.))
+                    .rounded(px(Radius::CONTROL))
+                    .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft))
+                    .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
+                        let connection = drag.connection.clone();
+                        if let Some(entity) = entity.upgrade() {
+                            entity.update(cx, |this, cx| {
+                                this.model.assign_connection_group(&connection, None);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(super::chrome::section_label(self.t("connections.group.ungrouped"), &p)),
+            );
             child_count += 1;
             if cards {
                 if ungrouped.iter().any(|row| self.model.connections.selected.as_deref() == Some(row.saved.id.as_str())) {
@@ -489,29 +565,67 @@ impl Workbench {
         let has_tls = row.saved.tls.as_ref().is_some_and(|tls| tls.mode != TlsMode::Off);
         let failed_reason = self.model.connections.failures.get(&id).and_then(|s| s.lines().next()).map(str::to_owned);
 
-        let status_badge = div()
-            .flex_none()
-            .px(px(6.))
-            .py(px(2.))
-            .rounded(px(Radius::TAG))
-            .bg(match status {
-                LinkStatus::Connected => p.ok_soft,
-                LinkStatus::Failed => p.danger_soft,
-                LinkStatus::Connecting => p.accent_soft,
-                LinkStatus::Disconnected => p.sunken,
-            })
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .text_size(px(TypeScale::XS))
-            .text_color(match status {
-                LinkStatus::Connected => p.ok,
-                LinkStatus::Failed => p.danger,
-                LinkStatus::Connecting => p.accent_text,
-                LinkStatus::Disconnected => p.text_muted,
-            })
-            .child(kit::status_dot(dot))
-            .child(self.model.text(state_key));
+        let status_badge: AnyElement = if status == LinkStatus::Disconnected {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_faint)
+                .child(kit::status_dot(dot))
+                .child(self.model.text(state_key))
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .py(px(2.))
+                .rounded(px(Radius::TAG))
+                .bg(match status {
+                    LinkStatus::Connected => p.ok_soft,
+                    LinkStatus::Failed => p.danger_soft,
+                    LinkStatus::Connecting => p.accent_soft,
+                    LinkStatus::Disconnected => p.sunken,
+                })
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(TypeScale::XS))
+                .text_color(match status {
+                    LinkStatus::Connected => p.ok,
+                    LinkStatus::Failed => p.danger,
+                    LinkStatus::Connecting => p.accent_text,
+                    LinkStatus::Disconnected => p.text_muted,
+                })
+                .child(kit::status_dot(dot))
+                .child(self.model.text(state_key))
+                .into_any_element()
+        };
+
+        let is_mongo = row.saved.engine == Engine::Mongodb;
+        let secondary_btn = if is_mongo {
+            let browse_id = query_id.clone();
+            kit::tool_button(
+                SharedString::from(format!("launcher-query-{prefix}-{id}")),
+                Some(IconName::Braces),
+                self.model.text("conn.page.openBrowserMongo"),
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.perform(&format!("open-mongo:{browse_id}"), cx);
+                }),
+            )
+            .xsmall()
+        } else {
+            kit::tool_button(
+                SharedString::from(format!("launcher-query-{prefix}-{id}")),
+                Some(IconName::SquareTerminal),
+                self.model.text("conn.page.newQuery"),
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.perform(&format!("connection-query:{query_id}"), cx);
+                }),
+            )
+            .xsmall()
+        };
 
         let actions = div()
             .pt(px(8.))
@@ -531,17 +645,7 @@ impl Workbench {
                 )
                 .xsmall(),
             )
-            .child(
-                kit::tool_button(
-                    SharedString::from(format!("launcher-query-{prefix}-{id}")),
-                    Some(IconName::SquareTerminal),
-                    self.model.text("conn.page.newQuery"),
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.perform(&format!("connection-query:{query_id}"), cx);
-                    }),
-                )
-                .xsmall(),
-            )
+            .child(secondary_btn)
             .child(div().flex_1())
             .child(
                 kit::icon_button(
@@ -680,6 +784,10 @@ impl Workbench {
                     this.perform("menu-connection", cx);
                 }),
             )
+            .on_drag(
+                super::explorer::ConnectionDrag { connection: id.clone() },
+                |_, _, _, cx| cx.new(|_| super::chrome::ConnectionDragGhost),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.model.connections.selected = Some(select_id.clone());
                 if event.click_count() >= 2 {
@@ -781,6 +889,10 @@ impl Workbench {
                 this.model.connections.selected = Some(menu_id.clone());
                 this.perform("menu-connection", cx);
             }))
+            .on_drag(
+                super::explorer::ConnectionDrag { connection: id.clone() },
+                |_, _, _, cx| cx.new(|_| super::chrome::ConnectionDragGhost),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.model.connections.selected = Some(select_id.clone());
                 if event.click_count() >= 2 {
@@ -792,9 +904,10 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 详情栏：所选连接的身份、状态、常用操作与配置摘要。
+    /// 详情栏：所选连接的身份、状态（含失败原因与一键重试）、常用操作、分组切换与配置摘要。
     fn connection_detail_panel(&mut self, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(DETAIL_W)).h_full().border_l_1().border_color(p.line).bg(p.chrome).overflow_y_scroll();
+        let detail_w = if self.model.viewport_width >= 1080 { 340. } else { DETAIL_W };
+        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(detail_w)).h_full().border_l_1().border_color(p.line).bg(p.chrome).overflow_y_scroll();
         let Some(row) = self.model.connections.selected.as_ref().and_then(|id| self.model.connections.rows.iter().find(|row| &row.saved.id == id)).cloned() else {
             return panel.child(div().p(px(20.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("conn.page.pickHint"))).into_any_element();
         };
@@ -803,30 +916,96 @@ impl Workbench {
         let status = self.model.connections.row_status(&id);
         let (dot, state_key) = status_parts(status, p);
         let connected = status == LinkStatus::Connected;
+        let failed = status == LinkStatus::Failed;
+        let failure_text = failed.then(|| self.model.connections.failures.get(&id).cloned()).flatten().filter(|s| !s.trim().is_empty());
         let open_id = id.clone();
         let primary = if connected {
             kit::primary_button("conn-detail-open", Some(IconName::SquareArrowOutUpRight), self.t("conn.page.open"), cx.listener(move |this, _: &ClickEvent, _, cx| this.perform(&format!("connection:{open_id}"), cx)))
         } else {
             kit::primary_button("conn-detail-open", Some(IconName::Plug), self.t("connections.page.connect"), cx.listener(move |this, _: &ClickEvent, _, cx| this.perform(&format!("connection:{open_id}"), cx)))
         };
+        let secondary_action = if saved.engine == Engine::Mongodb {
+            let mongo_id = id.clone();
+            kit::secondary_button(
+                "conn-detail-query",
+                Some(IconName::Braces),
+                self.t("conn.page.openBrowserMongo"),
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.perform(&format!("open-mongo:{mongo_id}"), cx)),
+            )
+            .small()
+        } else {
+            kit::secondary_button("conn-detail-query", Some(IconName::SquareTerminal), self.t("conn.page.newQuery"), act("conn-new-query", cx)).small()
+        };
         let mut actions = div()
             .flex()
             .flex_wrap()
             .gap(px(6.))
             .child(primary.small())
-            .child(kit::secondary_button("conn-detail-query", Some(IconName::SquareTerminal), self.t("conn.page.newQuery"), act("conn-new-query", cx)).small());
+            .child(secondary_action);
         if connected {
             actions = actions.child(kit::secondary_button("conn-detail-disconnect", Some(IconName::Unplug), self.t("conn.page.disconnect"), act("conn-disconnect", cx)).small());
         }
         let tools = div()
             .flex()
             .flex_wrap()
+            .items_center()
             .gap(px(2.))
             .child(kit::tool_button("conn-detail-edit", Some(IconName::Pencil), self.t("conn.page.edit"), act("conn-edit", cx)).xsmall())
             .child(kit::tool_button("conn-detail-test", Some(IconName::Zap), self.t("conn.page.test"), act("conn-test", cx)).xsmall())
             .child(kit::tool_button("conn-detail-duplicate", Some(IconName::Copy), self.t("conn.page.duplicate"), act("conn-duplicate", cx)).xsmall())
             .child(div().flex_1())
             .child(kit::icon_button("conn-detail-delete", IconName::Trash, self.t("conn.page.delete"), act("conn-delete", cx)).xsmall());
+
+        let failure_callout = failure_text.map(|reason| {
+            let retry_id = id.clone();
+            div()
+                .id("conn-detail-failure")
+                .test_support()
+                .p(px(9.))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.danger_soft)
+                .border_1()
+                .border_color(p.danger.opacity(0.28))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(6.))
+                        .child(div().pt(px(1.)).flex_none().child(kit::icon(IconName::CircleAlert, 13., p.danger)))
+                        .child(
+                            div()
+                                .id("conn-detail-failure-scroll")
+                                .flex_1()
+                                .min_w(px(0.))
+                                .max_h(px(88.))
+                                .overflow_y_scroll()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.danger)
+                                .child(SharedString::from(reason)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(4.))
+                        .child(
+                            kit::tool_button(
+                                "conn-detail-retry",
+                                Some(IconName::RefreshCw),
+                                self.t("common.retry"),
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.perform(&format!("connection:{retry_id}"), cx);
+                                }),
+                            )
+                            .xsmall(),
+                        )
+                        .child(kit::tool_button("conn-detail-failure-edit", Some(IconName::Pencil), self.t("conn.page.edit"), act("conn-edit", cx)).xsmall()),
+                )
+        });
 
         let none = self.model.text("conn.page.none");
         let mut facts: Vec<(&str, String)> = vec![("conn.page.engine", kit::engine_label(saved.engine.as_str()).to_owned())];
@@ -852,8 +1031,6 @@ impl Workbench {
                 facts.push(("conn.page.ssh", saved.ssh.as_ref().map(|ssh| format!("{}@{}:{}", ssh.username, ssh.host, ssh.port)).unwrap_or_else(|| none.clone())));
             }
         }
-        let group = self.model.group_of(&id).and_then(|group| self.model.groups.iter().find(|item| item.id == group)).map(|group| group.name.clone()).unwrap_or_else(|| none.clone());
-        facts.push(("conn.page.group", group));
         let mut table = div().flex().flex_col().gap(px(8.));
         for (key, value) in facts {
             let has_value = value != none;
@@ -909,6 +1086,110 @@ impl Workbench {
                     }),
             );
         }
+
+        let current_group_id = self.model.group_of(&id).map(str::to_owned);
+        let group_name = current_group_id
+            .as_deref()
+            .and_then(|gid| self.model.groups.iter().find(|item| item.id == gid))
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| none.clone());
+        let has_group = current_group_id.is_some();
+        let groups_for_menu = self.model.groups.clone();
+        let conn_for_group = id.clone();
+        let move_out_label = self.model.text("ui.group.moveOut");
+        let new_group_label = self.model.text("ui.group.new");
+        let workbench_entity = cx.entity().downgrade();
+        let group_action: AnyElement = if groups_for_menu.is_empty() {
+            kit::tool_button("conn-detail-group", Some(IconName::FolderPlus), self.t("ui.group.new"), act("group-new", cx))
+                .xsmall()
+                .into_any_element()
+        } else {
+            let current_for_menu = current_group_id.clone();
+            Button::new("conn-detail-group")
+                .ghost()
+                .xsmall()
+                .label(self.t("conn.page.changeGroup"))
+                .dropdown_menu(move |mut menu, _, _| {
+                    menu = menu.min_w(px(180.));
+                    for grp in &groups_for_menu {
+                        let gid = grp.id.clone();
+                        let gname = grp.name.clone();
+                        let selected = current_for_menu.as_deref() == Some(gid.as_str());
+                        let cid = conn_for_group.clone();
+                        let ent = workbench_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                kit::popup_menu_row(
+                                    Some(if selected { IconName::Check } else { IconName::Folder }),
+                                    gname.clone(),
+                                    None,
+                                    false,
+                                    &Palette::of(cx),
+                                )
+                            })
+                            .on_click(move |_, _, cx| {
+                                if let Some(ent) = ent.upgrade() {
+                                    ent.update(cx, |this, cx| {
+                                        this.perform(&format!("group-assign:{cid}\u{1}{gid}"), cx);
+                                    });
+                                }
+                            }),
+                        );
+                    }
+                    if current_for_menu.is_some() {
+                        let cid = conn_for_group.clone();
+                        let out_text = move_out_label.clone();
+                        let ent = workbench_entity.clone();
+                        menu = menu.separator().item(
+                            PopupMenuItem::element(move |_, cx| {
+                                kit::popup_menu_row(Some(IconName::X), out_text.clone(), None, false, &Palette::of(cx))
+                            })
+                            .on_click(move |_, _, cx| {
+                                if let Some(ent) = ent.upgrade() {
+                                    ent.update(cx, |this, cx| {
+                                        this.perform(&format!("group-assign:{cid}\u{1}"), cx);
+                                    });
+                                }
+                            }),
+                        );
+                    }
+                    let new_text = new_group_label.clone();
+                    let ent = workbench_entity.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::element(move |_, cx| {
+                            kit::popup_menu_row(Some(IconName::FolderPlus), new_text.clone(), None, false, &Palette::of(cx))
+                        })
+                        .on_click(move |_, _, cx| {
+                            if let Some(ent) = ent.upgrade() {
+                                ent.update(cx, |this, cx| {
+                                    this.perform("group-new", cx);
+                                });
+                            }
+                        }),
+                    );
+                    menu
+                })
+                .into_any_element()
+        };
+        table = table.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(TypeScale::SM))
+                .child(div().flex_none().w(px(72.)).text_color(p.text_muted).child(self.t("conn.page.group")))
+                .child(
+                    div()
+                        .id("conn-fact-conn.page.group")
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(if has_group { p.text } else { p.text_faint })
+                        .child(SharedString::from(group_name)),
+                )
+                .child(group_action),
+        );
+
         let tag = self.env_pill(&saved.env, p);
         table = table.child(
             div()
@@ -927,16 +1208,16 @@ impl Workbench {
 
         panel = panel.child(
             div()
-                .p(px(18.))
+                .p(px(16.))
                 .flex()
                 .flex_col()
-                .gap(px(14.))
+                .gap(px(12.))
                 .child(
                     kit::card(p)
                         .p(px(14.))
                         .flex()
                         .flex_col()
-                        .gap(px(12.))
+                        .gap(px(11.))
                         .child(
                             div()
                                 .flex()
@@ -965,12 +1246,13 @@ impl Workbench {
                                                 .items_center()
                                                 .gap(px(6.))
                                                 .text_size(px(TypeScale::XS))
-                                                .text_color(p.text_muted)
+                                                .text_color(if failed { p.danger } else { p.text_muted })
                                                 .child(kit::status_dot(dot))
                                                 .child(self.model.text(state_key)),
                                         ),
                                 ),
                         )
+                        .children(failure_callout)
                         .child(actions)
                         .child(div().pt(px(4.)).border_t_1().border_color(p.line_soft).child(tools)),
                 )

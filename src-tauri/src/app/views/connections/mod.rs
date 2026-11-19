@@ -93,6 +93,9 @@ pub struct ConnectionPage {
     /// 最近一次测试的完整结果（各阶段成败）。只属于屏幕上这份草稿：草稿一改就清掉，
     /// 表单不会在改了地址之后还挂着上一份配置的“连接成功”。
     pub test_report: Option<TestReport>,
+    /// 同一轮弹窗内跨文件型（SQLite）与联网引擎来回切换时暂存上次填好的字段，误点 SQLite 再切回不会冲掉主机/用户/TLS。
+    pub editor_network_stash: Option<ConnectionDraft>,
+    pub editor_file_stash: Option<String>,
 }
 
 /// 打开失败是不是缺密码或密码被拒：返回 Some(被拒绝)。服务端拒绝凭据的错误码随驱动不同
@@ -133,7 +136,7 @@ impl ConnectionPage {
                 if self.filter_engine.is_some_and(|engine| row.saved.engine != engine) {
                     return false;
                 }
-                if !self.filter_env.is_empty() && row.saved.env != self.filter_env {
+                if !self.filter_env.is_empty() && crate::connections::model::normalize_env_id(&row.saved.env) != self.filter_env {
                     return false;
                 }
                 if needle.is_empty() {
@@ -141,9 +144,10 @@ impl ConnectionPage {
                 }
                 let saved = &row.saved;
                 let haystack = format!(
-                    "{} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {}",
                     saved.name,
                     saved.host.as_deref().unwrap_or(""),
+                    saved.username.as_deref().unwrap_or(""),
                     saved.file_path.as_deref().unwrap_or(""),
                     saved.database.as_deref().unwrap_or(""),
                     saved.engine.as_str(),
@@ -157,6 +161,8 @@ impl ConnectionPage {
 
     pub fn start_new(&mut self, engine: Engine) {
         self.editor = Some(blank_draft(engine));
+        self.editor_network_stash = None;
+        self.editor_file_stash = None;
         self.secrets = Secrets::default();
         self.issues.clear();
         self.confirm_delete = false;
@@ -175,13 +181,40 @@ impl ConnectionPage {
         }
     }
 
-    /// 在表单里换数据库类型：能沿用的字段都留着（见 [`switch_engine`]）。
+    /// 在表单里换数据库类型：能沿用的字段都留着（见 [`switch_engine`]），跨 SQLite 来回切也恢复先前暂存的字段。
     pub fn change_engine(&mut self, engine: Engine) {
-        let Some(draft) = self.editor.as_ref() else { return };
+        let Some(draft) = self.editor.clone() else { return };
         if draft.engine == engine {
             return;
         }
-        self.editor = Some(switch_engine(draft, engine));
+        if draft.engine == Engine::Sqlite {
+            if !draft.file_path.trim().is_empty() {
+                self.editor_file_stash = Some(draft.file_path.clone());
+            }
+        } else {
+            self.editor_network_stash = Some(draft.clone());
+        }
+        let mut next = if draft.engine == Engine::Sqlite && engine != Engine::Sqlite {
+            if let Some(mut stashed) = self.editor_network_stash.clone() {
+                stashed.id = draft.id.clone();
+                stashed.name = draft.name.clone();
+                let sqlite_blank = blank_draft(Engine::Sqlite);
+                if draft.env != sqlite_blank.env {
+                    stashed.env = draft.env.clone();
+                }
+                switch_engine(&stashed, engine)
+            } else {
+                switch_engine(&draft, engine)
+            }
+        } else {
+            switch_engine(&draft, engine)
+        };
+        if engine == Engine::Sqlite && next.file_path.is_empty() {
+            if let Some(file_path) = &self.editor_file_stash {
+                next.file_path = file_path.clone();
+            }
+        }
+        self.editor = Some(next);
         self.issues.clear();
         self.draft_touched();
     }
@@ -190,6 +223,8 @@ impl ConnectionPage {
         let Some(id) = self.selected.clone() else { return };
         let Some(row) = self.rows.iter().find(|row| row.saved.id == id) else { return };
         self.editor = Some(draft_from_saved(&row.saved));
+        self.editor_network_stash = None;
+        self.editor_file_stash = None;
         self.secrets = Secrets::default();
         self.issues.clear();
         self.confirm_delete = false;
@@ -233,6 +268,8 @@ impl ConnectionPage {
         draft.name = format!("{} copy", draft.name.trim());
         draft.save_password = false;
         self.editor = Some(draft);
+        self.editor_network_stash = None;
+        self.editor_file_stash = None;
         self.secrets = Secrets::default();
         self.issues.clear();
         self.test_report = None;
@@ -572,7 +609,7 @@ pub fn draft_from_saved(saved: &crate::connections::model::SavedConnection) -> C
         username: saved.username.clone().unwrap_or_default(),
         file_path: saved.file_path.clone().unwrap_or_default(),
         replica_set: saved.replica_set.clone().unwrap_or_default(),
-        tls_mode: tls.as_ref().map(|item| item.mode).unwrap_or(if saved.engine == Engine::Sqlite { TlsMode::Off } else { TlsMode::Verify }),
+        tls_mode: tls.as_ref().map(|item| item.mode).unwrap_or(TlsMode::Off),
         ca_mode: tls.as_ref().map(|item| item.ca_mode).unwrap_or(CaMode::System),
         ca_file: tls.and_then(|item| item.ca_file).unwrap_or_default(),
         client_cert: saved.tls.as_ref().and_then(|item| item.client_cert.clone()).unwrap_or_default(),
@@ -1213,5 +1250,38 @@ mod tests {
         let typed = Secrets { password: "s3cret".into(), ..Secrets::default() };
         assert_ne!(base, draft_fingerprint(&Some(draft.clone()), &typed));
         assert_ne!(base, draft_fingerprint(&None, &secrets));
+    }
+
+    #[test]
+    fn round_tripping_through_sqlite_preserves_network_fields_and_unencrypted_tls() {
+        let mut draft = blank_draft(Engine::Mysql);
+        draft.name = "qsyn-uat".into();
+        draft.env = "test".into();
+        draft.host = "192.168.92.210".into();
+        draft.port = "3306".into();
+        draft.username = "qsyn3_user".into();
+        draft.tls_mode = TlsMode::Off;
+        let mut saved = normalize(&draft, "uat".into()).unwrap();
+        saved.password_saved = true;
+
+        let mut page = ConnectionPage {
+            rows: vec![ConnectionRecord { saved, ssh_host_key: None }],
+            selected: Some("uat".into()),
+            ..ConnectionPage::default()
+        };
+        page.edit_selected();
+        assert_eq!(page.editor.as_ref().unwrap().tls_mode, TlsMode::Off);
+
+        // 误点 SQLite 再点回 MySQL：不丢失主机、用户名、端口或未加密设置。
+        page.change_engine(Engine::Sqlite);
+        assert_eq!(page.editor.as_ref().unwrap().engine, Engine::Sqlite);
+        page.change_engine(Engine::Mysql);
+        let restored = page.editor.as_ref().unwrap();
+        assert_eq!(restored.host, "192.168.92.210");
+        assert_eq!(restored.port, "3306");
+        assert_eq!(restored.username, "qsyn3_user");
+        assert_eq!(restored.env, "test");
+        assert_eq!(restored.tls_mode, TlsMode::Off);
+        assert!(restored.save_password);
     }
 }

@@ -1037,6 +1037,43 @@ fn index_definition(snapshot: &Snapshot, index: &Index, qualified: &str) -> Opti
     Some(format!("CREATE {}INDEX {} ON {qualified} ({cols});", if index.unique { "UNIQUE " } else { "" }, quote_ident(engine, &index.name)))
 }
 
+/// 供结构页复制或展示单条索引的建索引 SQL。
+pub(crate) fn index_sql_for_display(snapshot: &Snapshot, index: &Index) -> Option<String> {
+    let engine = snapshot.engine;
+    let qualified = match engine {
+        Engine::Sqlite => quote_ident(engine, &snapshot.name),
+        _ => qualified_table(engine, &snapshot.database, &snapshot.schema, &snapshot.name)
+            .unwrap_or_else(|_| quote_ident(engine, &snapshot.name)),
+    };
+    if is_primary_index(index) {
+        let cols = index
+            .columns
+            .iter()
+            .map(|column| quote_ident(engine, &column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if cols.is_empty() {
+            return None;
+        }
+        return Some(format!("ALTER TABLE {qualified} ADD CONSTRAINT {} PRIMARY KEY ({cols});", quote_ident(engine, &index.name)));
+    }
+    index_definition(snapshot, index, &qualified)
+}
+
+/// 供结构页复制或展示单条外键的约束 SQL。
+pub(crate) fn fk_sql_for_display(snapshot: &Snapshot, key: &ForeignKey) -> Option<String> {
+    let draft = ForeignKeyDraft {
+        name: if key.name.is_empty() { format!("fk_{}", snapshot.name) } else { key.name.clone() },
+        columns: key.columns.clone(),
+        ref_schema: key.ref_schema.clone(),
+        ref_table: key.ref_table.clone(),
+        ref_columns: key.ref_columns.clone(),
+        on_delete: key.on_delete.clone(),
+        on_update: key.on_update.clone(),
+    };
+    add_fk_sql(snapshot, &snapshot.name, &draft).ok()
+}
+
 fn comment_statements(snapshot: &Snapshot, qualified: &str) -> Vec<String> {
     let engine = snapshot.engine;
     let literal = |text: &str| text.replace('\'', "''");

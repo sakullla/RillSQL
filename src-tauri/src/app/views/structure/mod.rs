@@ -1,28 +1,35 @@
-//! 对象结构。预览和执行只走 application::ddl，取消预览不执行。
+//! 对象结构工作台：字段设计器、索引管理、外键与被引用关系、视图与 DDL 定义、表级危险操作与安全变更预览。
+//! 预览和执行只走 `application::ddl`，取消预览不发送任何 SQL。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 
-use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
-use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale};
-
+use crate::app::views::grid::{GridTarget, group_digits, operation_banner};
 use crate::application::AppServices;
-use crate::app::views::grid::{operation_banner, GridTarget};
 use crate::ddl::english::{localize, localize_missing_item};
-use crate::ddl::{preview_plan, Action, ColumnDraft, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot};
+use crate::ddl::sql::{non_null_default, quote_ident, valid_default, valid_name, valid_type};
+use crate::ddl::{
+    Action, ColumnDraft, DdlEngine, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot,
+    fk_sql_for_display, index_sql_for_display, preview_plan,
+};
 use crate::i18n::{self, Locale};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
+use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
 
-/// 与 `ddl::model::fk_actions` 相同的级联动作。该函数在 ddl 私有模块里，结构页按引擎原样列出。
+/// 与 `ddl::model::fk_actions` 相同的级联动作。结构页按引擎原样列出。
 fn fk_action_choices(engine: &str) -> &'static [&'static str] {
     match engine {
         "mysql" | "mariadb" => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
@@ -33,10 +40,75 @@ fn fk_action_choices(engine: &str) -> &'static [&'static str] {
 
 fn type_choices(engine: &str) -> &'static [&'static str] {
     match engine {
-        "postgres" => &["bigint", "integer", "text", "boolean", "numeric", "timestamp", "jsonb", "uuid"],
-        "mysql" | "mariadb" => &["bigint", "int", "varchar(255)", "text", "datetime", "decimal(10,2)", "json"],
-        "sqlserver" => &["bigint", "int", "nvarchar(255)", "datetime2", "bit", "decimal(18,2)"],
-        _ => &["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"],
+        "postgres" => &[
+            "bigint",
+            "integer",
+            "smallint",
+            "bigserial",
+            "serial",
+            "varchar(255)",
+            "text",
+            "boolean",
+            "numeric(10,2)",
+            "timestamptz",
+            "timestamp",
+            "date",
+            "jsonb",
+            "uuid",
+            "bytea",
+        ],
+        "mysql" | "mariadb" => &[
+            "bigint",
+            "int",
+            "tinyint(1)",
+            "varchar(255)",
+            "varchar(64)",
+            "text",
+            "decimal(10,2)",
+            "datetime",
+            "timestamp",
+            "date",
+            "json",
+            "blob",
+        ],
+        "sqlserver" => &[
+            "bigint",
+            "int",
+            "smallint",
+            "tinyint",
+            "bit",
+            "nvarchar(255)",
+            "varchar(255)",
+            "decimal(18,2)",
+            "datetime2",
+            "date",
+            "uniqueidentifier",
+            "varbinary(max)",
+        ],
+        _ => &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"],
+    }
+}
+
+fn default_choices(engine: &str, nullable: bool) -> Vec<&'static str> {
+    let mut items = Vec::new();
+    if nullable {
+        items.push("NULL");
+    }
+    match engine {
+        "postgres" => items.extend(["0", "''", "TRUE", "FALSE", "CURRENT_TIMESTAMP", "NOW()"]),
+        "mysql" | "mariadb" => items.extend(["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]),
+        "sqlserver" => items.extend(["0", "''", "N''", "GETDATE()", "SYSDATETIME()", "GETUTCDATE()"]),
+        _ => items.extend(["0", "''", "CURRENT_TIMESTAMP", "CURRENT_DATE"]),
+    }
+    items
+}
+
+fn default_column_type(engine: &str) -> &'static str {
+    match engine {
+        "postgres" => "text",
+        "mysql" | "mariadb" => "varchar(255)",
+        "sqlserver" => "nvarchar(255)",
+        _ => "TEXT",
     }
 }
 
@@ -54,6 +126,67 @@ fn default_id(engine: &str) -> ColumnDraft {
         primary: true,
         auto: true,
         dropped: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnPreset {
+    Timestamps,
+    SoftDelete,
+    StatusRemark,
+    Uuid,
+}
+
+fn preset_columns(engine: &str, preset: ColumnPreset) -> Vec<ColumnDraft> {
+    let ts_type = match engine {
+        "postgres" => "timestamptz",
+        "mysql" | "mariadb" => "datetime",
+        "sqlserver" => "datetime2",
+        _ => "TEXT",
+    };
+    let ts_default = match engine {
+        "sqlserver" => "SYSDATETIME()",
+        _ => "CURRENT_TIMESTAMP",
+    };
+    let str_short = match engine {
+        "postgres" => "varchar(32)",
+        "mysql" | "mariadb" => "varchar(32)",
+        "sqlserver" => "nvarchar(32)",
+        _ => "TEXT",
+    };
+    let str_note = match engine {
+        "postgres" => "text",
+        "mysql" | "mariadb" => "varchar(255)",
+        "sqlserver" => "nvarchar(255)",
+        _ => "TEXT",
+    };
+    let uuid_type = match engine {
+        "postgres" => "uuid",
+        "sqlserver" => "uniqueidentifier",
+        "mysql" | "mariadb" => "char(36)",
+        _ => "TEXT",
+    };
+    let col = |name: &str, kind: &str, nullable: bool, default_sql: &str| ColumnDraft {
+        original: None,
+        name: name.into(),
+        type_name: kind.into(),
+        nullable,
+        default_sql: default_sql.into(),
+        primary: false,
+        auto: false,
+        dropped: false,
+    };
+    match preset {
+        ColumnPreset::Timestamps => vec![
+            col("created_at", ts_type, false, ts_default),
+            col("updated_at", ts_type, false, ts_default),
+        ],
+        ColumnPreset::SoftDelete => vec![col("deleted_at", ts_type, true, "")],
+        ColumnPreset::StatusRemark => vec![
+            col("status", str_short, false, "'active'"),
+            col("remark", str_note, true, ""),
+        ],
+        ColumnPreset::Uuid => vec![col("uuid", uuid_type, false, "")],
     }
 }
 
@@ -93,9 +226,65 @@ fn is_placeholder_definition(sql: &str) -> bool {
     sql.lines().map(str::trim).filter(|line| !line.is_empty()).all(|line| line.starts_with("--"))
 }
 
+fn suggested_index_name(table: &str, unique: bool, columns: &[IndexColumnDraft]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let prefix = if unique { "uk" } else { "idx" };
+    let base = if table.trim().is_empty() { "table" } else { table.trim() };
+    let cols = columns.iter().map(|col| col.name.trim()).filter(|name| !name.is_empty()).collect::<Vec<_>>().join("_");
+    if cols.is_empty() {
+        return String::new();
+    }
+    let candidate = format!("{prefix}_{base}_{cols}");
+    if candidate.len() <= 60 { candidate } else { candidate.chars().take(60).collect() }
+}
+
+fn suggested_fk_name(table: &str, column: &str, ref_table: &str) -> String {
+    let col = column.trim();
+    let target = ref_table.trim();
+    if col.is_empty() || target.is_empty() {
+        return String::new();
+    }
+    let base = if table.trim().is_empty() { "table" } else { table.trim() };
+    let candidate = format!("fk_{base}_{col}");
+    if candidate.len() <= 60 { candidate } else { candidate.chars().take(60).collect() }
+}
+
+fn select_sample_sql(target: &GridTarget) -> String {
+    let Ok(engine) = DdlEngine::parse(&target.engine) else {
+        return format!("SELECT * FROM {} LIMIT 100;", target.table);
+    };
+    let qualified = match engine {
+        DdlEngine::Sqlite => quote_ident(engine, &target.table),
+        DdlEngine::Mysql | DdlEngine::Mariadb if !target.database.is_empty() => {
+            format!("{}.{}", quote_ident(engine, &target.database), quote_ident(engine, &target.table))
+        }
+        DdlEngine::Postgres | DdlEngine::Sqlserver if !target.schema.is_empty() => {
+            format!("{}.{}", quote_ident(engine, &target.schema), quote_ident(engine, &target.table))
+        }
+        _ => quote_ident(engine, &target.table),
+    };
+    if engine == DdlEngine::Sqlserver {
+        format!("SELECT TOP 100 * FROM {qualified};")
+    } else {
+        format!("SELECT * FROM {qualified} LIMIT 100;")
+    }
+}
+
+/// 从 `CREATE INDEX ... ON tbl (expr)` 里取出括号段，供表达式索引没有普通列名时展示。
+fn extract_index_target_expr(sql: Option<&str>) -> String {
+    let Some(raw) = sql.map(str::trim).filter(|text| !text.is_empty() && !text.starts_with("--")) else {
+        return String::new();
+    };
+    let Some(open) = raw.find('(') else {
+        return raw.to_owned();
+    };
+    let end = raw.rfind(')').unwrap_or(raw.len());
+    if end > open + 1 { raw[open + 1..end].trim().to_owned() } else { raw.to_owned() }
+}
+
 /// 字段、索引、外键三张列表共用一份几何（S8.4：复用结果网格的表头、行高与列宽规范）。
-/// 行高与表头高都取 `Metrics::row_h`，随密度变化；左右内边距三张表相同，
-/// 不再各自拼 `row_h + 2` 与不同的 `px(14.)`。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TableSpec {
     header_h: f32,
@@ -119,9 +308,8 @@ struct ColumnSpec {
     min_w: f32,
 }
 
-/// 可直接编辑的字段表那一张的列宽。表头与行共用同一份：宽窗口用设计稿的固定档，
-/// 内容宽度放不下整行时按同一比例收窄，最后一列的"标记删除"不会被卡片裁掉（R6 / R7）。
-/// 之前这里两边各写一遍像素值，640 宽下多出来的主键/自增/上下移动把删除键挤到屏幕外。
+/// 可直接编辑的字段表列宽。表头与行共用同一份：宽窗口用宽档，窄内容列整体换紧凑档，
+/// 行尾动作在 640 宽侧栏开启时也不会被裁切（R6 / R7）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FieldWidths {
     name_min: f32,
@@ -135,24 +323,43 @@ struct FieldWidths {
 }
 
 impl FieldWidths {
-    /// 行内间距与左右内边距：表头与行共用，不再各写一遍 6 / 12 / 8。
     const GAP: f32 = 6.;
     const PAD_LEFT: f32 = 12.;
     const PAD_RIGHT: f32 = 8.;
 
     fn wide() -> Self {
-        Self { name_min: 140., kind: 170., nullable: 52., default: 150., primary: 44., auto: 44., moves: 52., drop: 28. }
+        Self {
+            name_min: 140.,
+            kind: 174.,
+            nullable: 52.,
+            default: 156.,
+            primary: 44.,
+            auto: 44.,
+            moves: 52.,
+            drop: 46.,
+        }
     }
 
-    /// 紧凑档要放进最窄的真实内容列：640 宽窗口开着侧栏时内容列只余 588
-    /// （640 - 52 活动栏），扣掉结构页左右内边距（标准 20 / 宽松 26）和卡片边线，
-    /// 可用约 534–548。列间距与行内边距占 62，固定列预算按 472 收，
-    /// 行尾动作才不会被 overflow_hidden 裁掉。
+    /// 紧凑档要放进最窄的真实内容列（640 - 52 活动栏 - 2 * 26 页边距 - 2 卡片边线 = 534）。
+    /// 新建表有 7 个间隙与主键/自增/移动列，行尾只放删除（24px）；已有表放还原+删除（44px）。
+    fn compact_for(create: bool) -> Self {
+        Self {
+            name_min: 96.,
+            kind: 108.,
+            nullable: 40.,
+            default: 84.,
+            primary: 36.,
+            auto: 36.,
+            moves: 40.,
+            drop: if create { 24. } else { 44. },
+        }
+    }
+
+    #[cfg(test)]
     fn compact() -> Self {
-        Self { name_min: 96., kind: 108., nullable: 40., default: 84., primary: 36., auto: 36., moves: 40., drop: 24. }
+        Self::compact_for(true)
     }
 
-    /// 整行在给定内容宽度里至少要多宽：固定列 + 名称最小宽 + 列间距 + 左右内边距。
     fn min_total(&self, create: bool) -> f32 {
         let mut total = self.name_min + self.kind + self.nullable + self.default + self.drop;
         let mut columns = 4;
@@ -163,17 +370,15 @@ impl FieldWidths {
         total + Self::GAP * columns as f32 + Self::PAD_LEFT + Self::PAD_RIGHT
     }
 
-    /// 宽档放得下就用宽档，否则整行换紧凑档；两档都放不下时仍用紧凑档（不再往回缩到点不中）。
-    /// `content_w` 是字段表真实可用的内容宽（外壳内容区宽减去 structure-body 左右内边距），
-    /// 不是窗口视口宽。
     fn of(content_w: f32, create: bool) -> Self {
         let mut wide = Self::wide();
+        if create {
+            wide.drop = 28.;
+        }
         let slack = content_w - wide.min_total(create);
         if slack < 0. {
-            return Self::compact();
+            return Self::compact_for(create);
         }
-        // 宽屏的余量不全给字段名：默认值常是表达式（nextval('…'::regclass)、CURRENT_TIMESTAMP），
-        // 分它四成（最多加 260），字段名仍拿剩下的大头。
         wide.default += (slack * 0.4).min(260.);
         wide
     }
@@ -187,15 +392,22 @@ const FIELDS_TABLE: [ColumnSpec; 4] = [
 ];
 
 const INDEXES_TABLE: [ColumnSpec; 3] = [
-    ColumnSpec { key: "structure.field.index", weight: 2., min_w: 96. },
-    ColumnSpec { key: "structure.section.columns", weight: 2., min_w: 96. },
-    ColumnSpec { key: "ui.structure.unique", weight: 0.6, min_w: 52. },
+    ColumnSpec { key: "structure.field.index", weight: 1.8, min_w: 96. },
+    ColumnSpec { key: "structure.section.columns", weight: 2.2, min_w: 104. },
+    ColumnSpec { key: "structure.index.kind", weight: 0.9, min_w: 68. },
 ];
 
-const FOREIGN_TABLE: [ColumnSpec; 3] = [
-    ColumnSpec { key: "structure.section.foreign", weight: 1.4, min_w: 84. },
-    ColumnSpec { key: "structure.section.columns", weight: 1.4, min_w: 84. },
-    ColumnSpec { key: "ui.structure.references", weight: 2., min_w: 108. },
+const FOREIGN_TABLE: [ColumnSpec; 4] = [
+    ColumnSpec { key: "structure.section.foreign", weight: 1.3, min_w: 84. },
+    ColumnSpec { key: "structure.section.columns", weight: 1.1, min_w: 72. },
+    ColumnSpec { key: "ui.structure.references", weight: 1.8, min_w: 108. },
+    ColumnSpec { key: "structure.fk.rules", weight: 1.3, min_w: 96. },
+];
+
+const INCOMING_FK_TABLE: [ColumnSpec; 3] = [
+    ColumnSpec { key: "structure.fk.incomingChild", weight: 1.8, min_w: 104. },
+    ColumnSpec { key: "structure.fk.incomingTarget", weight: 1.4, min_w: 88. },
+    ColumnSpec { key: "structure.section.foreign", weight: 1.4, min_w: 88. },
 ];
 
 fn table_columns(section: Section) -> &'static [ColumnSpec] {
@@ -206,7 +418,7 @@ fn table_columns(section: Section) -> &'static [ColumnSpec] {
     }
 }
 
-/// 列表三态与内容态的判定，供渲染与测试共用：加载优先于错误，错误优先于空态。
+/// 列表三态与内容态的判定：加载优先于错误，错误优先于空态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListState {
     Loading,
@@ -228,8 +440,6 @@ fn list_state(loading: bool, error: &str, rows: usize) -> ListState {
     ListState::Rows
 }
 
-/// 空态的列表不保留表头骨架：表头只属于有行的表。
-/// 判定与用例共用；渲染路径里"只有有行才画表头"由 `structure_table` 的调用点保证。
 #[allow(dead_code)]
 fn shows_table_header(state: ListState) -> bool {
     state == ListState::Rows
@@ -265,7 +475,7 @@ pub enum EditIntent {
     DropForeignKey { name: String },
 }
 
-/// 结构页提示。界面文字存 i18n 键，执行层/应用层的原文按条保存；显示时按当前语言给出，切换语言立即生效。
+/// 结构页提示。界面文字存 i18n 键，执行层/应用层的原文按条保存；显示时按当前语言给出。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Note {
     #[default]
@@ -334,6 +544,7 @@ pub struct StructureSession {
 
 impl StructureSession {
     pub fn new(target: GridTarget) -> Self {
+        let initial_type = default_column_type(&target.engine).to_owned();
         Self {
             target,
             mode: StructureMode::Existing,
@@ -341,7 +552,7 @@ impl StructureSession {
             object_kind: String::new(),
             table_name: String::new(),
             column_name: String::new(),
-            column_type: "TEXT".to_owned(),
+            column_type: initial_type,
             kept_columns: Vec::new(),
             index_name: String::new(),
             index_column: String::new(),
@@ -368,7 +579,6 @@ impl StructureSession {
         }
     }
 
-    /// 当前提示，按界面语言给出。
     pub fn note(&self) -> String {
         self.note.text(self.locale)
     }
@@ -403,8 +613,6 @@ impl StructureSession {
         !self.production() || self.danger_name.trim() == self.target.table
     }
 
-    /// 确认层按危险色呈现的条件：危险操作页签，或计划里本身有 danger 级风险。
-    /// 只影响配色与图标，二次确认仍由 `requires_second_confirm` 决定。
     pub fn preview_dangerous(&self) -> bool {
         self.section == Section::Danger
             || self
@@ -413,16 +621,13 @@ impl StructureSession {
                 .is_some_and(|plan| plan.risks.iter().any(|risk| risk.level == "danger"))
     }
 
-    /// 生产环境危险操作必须先输入对象名；未满足时确认按钮保持禁用。
     pub fn confirm_blocked(&self) -> bool {
         self.section == Section::Danger && !self.danger_name_ok()
     }
 
-    /// 确认层标题里的对象名：已有对象用表名，新建表用输入的表名。
     pub fn object_label(&self) -> String {
         if self.mode == StructureMode::Create { self.table_name.clone() } else { self.target.table.clone() }
     }
-
 
     fn column_drafts_for_action(&self) -> Vec<ColumnDraft> {
         let mut columns = self.kept_columns.clone();
@@ -457,6 +662,9 @@ impl StructureSession {
         if !self.index_columns.is_empty() {
             return self.index_columns.clone();
         }
+        if self.index_column.trim().is_empty() {
+            return Vec::new();
+        }
         vec![IndexColumnDraft { name: self.index_column.clone(), descending: false }]
     }
 
@@ -487,7 +695,9 @@ impl StructureSession {
     pub fn action(&self) -> Action {
         let table = self.target.table.clone();
         match self.section {
-            Section::Columns if self.mode == StructureMode::Create => Action::CreateTable { name: self.table_name.clone(), columns: self.column_drafts_for_action() },
+            Section::Columns if self.mode == StructureMode::Create => {
+                Action::CreateTable { name: self.table_name.clone(), columns: self.column_drafts_for_action() }
+            }
             Section::Columns | Section::Ddl => Action::AlterColumns { table, columns: self.column_drafts_for_action() },
             Section::Indexes => match &self.intent {
                 EditIntent::DropIndex { name } => Action::DropIndex { table, name: name.clone() },
@@ -523,7 +733,6 @@ impl StructureSession {
         self.open
     }
 
-    /// 危险计划在真正执行前还要再确认一次；预览关闭、重做或取消都会重置这个状态。
     pub fn requires_second_confirm(&self) -> bool {
         self.open
             && !self.armed
@@ -544,7 +753,6 @@ impl StructureSession {
         self.armed
     }
 
-    /// 预览被拦下的唯一原因是“什么都没改”：这是说明，不是错误。
     pub fn preview_unchanged(&self) -> bool {
         self.preview.as_ref().is_some_and(|plan| {
             plan.steps.is_empty() && !plan.blocked.is_empty() && plan.blocked.iter().all(|text| crate::ddl::is_no_change(text))
@@ -552,11 +760,26 @@ impl StructureSession {
     }
 
     pub fn blocked(&self) -> Vec<String> {
-        self.preview.as_ref().map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect()).unwrap_or_default()
+        self.preview
+            .as_ref()
+            .map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect())
+            .unwrap_or_default()
     }
 
     pub fn preview_sql(&self) -> Vec<String> {
         self.preview.as_ref().map(|plan| plan.steps.iter().map(|step| step.sql.clone()).collect()).unwrap_or_default()
+    }
+
+    pub fn preview_steps(&self) -> Vec<(String, String)> {
+        self.preview
+            .as_ref()
+            .map(|plan| {
+                plan.steps
+                    .iter()
+                    .map(|step| (localize(&step.label, self.locale), step.sql.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn preview_risks(&self) -> Vec<(String, String)> {
@@ -583,7 +806,6 @@ impl StructureSession {
         self.confirm_steps().map_err(|note| note.text(self.locale))
     }
 
-    /// 确认前的检查；不能执行时给出要显示的提示（保留原文，显示时再本地化）。
     fn confirm_steps(&self) -> Result<Vec<String>, Note> {
         if !self.open {
             return Err(Note::Key("structure.preview.need"));
@@ -602,63 +824,83 @@ impl StructureSession {
     }
 }
 
+type DataSink = Arc<dyn Fn(&mut App)>;
+type QuerySink = Arc<dyn Fn(GridTarget, String, &mut App)>;
+type StructureNavSink = Arc<dyn Fn(GridTarget, &mut App)>;
+
 pub struct StructurePane {
     pub session: StructureSession,
     services: Arc<AppServices>,
+    focus: Option<FocusHandle>,
     fields: Fields<&'static str>,
     draft_fields: Fields<u32>,
     snapshot: Option<Snapshot>,
     loaded_for: String,
-    /// 快照列已经写进 kept_columns。重置前不再覆盖用户草稿。
     drafts_ready: bool,
     loading: bool,
+    refreshing: bool,
+    previewing: bool,
+    executing: bool,
     load_error: String,
-    /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
     item_id: String,
-    /// 刚删除成功的表；外壳取走后让对象树跟着变。
-    dropped: Option<GridTarget>,
-    /// 建表成功后的新表。外壳取走后刷新对象树并切到这张表。
+    /// 刚删除成功的表或视图 `(target, is_view)`。
+    dropped: Option<(GridTarget, bool)>,
+    /// 建表成功后的新表。
     created: Option<GridTarget>,
+    /// 改表名成功后的 `(旧目标, 新表名)`。
+    renamed: Option<(GridTarget, String)>,
+    /// 结构修改（字段/索引/外键/视图定义）执行成功后的 `(target, is_view)`。
+    modified: Option<(GridTarget, bool)>,
     fk_tables: Vec<String>,
     fk_schemas: Vec<String>,
     fk_columns: Vec<String>,
     fk_key: String,
-    ddl_view: Option<gpui_kit::Entity<FormatViewer>>,
+    ddl_view: Option<Entity<FormatViewer>>,
     ddl_text: String,
-    /// DDL 已复制到剪贴板：按钮短暂显示“已复制”，换表或改定义后复位。
     ddl_copied: bool,
-    view_editor: Option<gpui_kit::Entity<EditorState>>,
+    preview_copied: bool,
+    view_editor: Option<Entity<EditorState>>,
     view_editor_sync: String,
     view_sub: Option<Subscription>,
-    /// 索引/外键页的“新建”表单是否展开：默认收起，列表是主角。
     composer_open: bool,
-    /// 读取失败是因为连接没打开时，“重试”先请外壳打开连接；连上后自动重读。
+    /// 字段筛选关键字（大表按列名或类型快速定位）。
+    column_filter: String,
+    /// 仅显示有未提交变更的字段行。
+    only_changed_columns: bool,
+    /// 新建索引名称是否跟随所选列自动生成（用户手动输入后转为 false，清空或点自动命名恢复 true）。
+    index_name_auto: bool,
+    /// 新建外键名称是否跟随所选列自动生成。
+    fk_name_auto: bool,
+    /// 下一帧要自动聚焦的 draft_fields 键（如建表时的表名框、刚新增的字段名框）。
+    pending_focus_draft: Option<u32>,
     connect_request: Option<String>,
-    /// 外壳同步来的真实可用内容宽（已扣活动栏与停靠侧栏）。
-    /// 字段表按它决定列宽，不能拿窗口视口宽冒充：900 的视口开着侧栏时只剩 614。
     content_width: f32,
     data_sink: Option<DataSink>,
+    query_sink: Option<QuerySink>,
+    structure_nav_sink: Option<StructureNavSink>,
 }
-
-type DataSink = Arc<dyn Fn(&mut App)>;
 
 impl StructurePane {
     pub fn new(services: Arc<AppServices>) -> Self {
         Self {
             session: StructureSession::new(GridTarget::default()),
             services,
+            focus: None,
             fields: Fields::default(),
-            connect_request: None,
-            composer_open: false,
             draft_fields: Fields::default(),
             snapshot: None,
             loaded_for: String::new(),
             drafts_ready: false,
             loading: false,
+            refreshing: false,
+            previewing: false,
+            executing: false,
             load_error: String::new(),
             item_id: String::new(),
             dropped: None,
             created: None,
+            renamed: None,
+            modified: None,
             fk_tables: Vec::new(),
             fk_schemas: Vec::new(),
             fk_columns: Vec::new(),
@@ -666,20 +908,36 @@ impl StructurePane {
             ddl_view: None,
             ddl_text: String::new(),
             ddl_copied: false,
+            preview_copied: false,
             view_editor: None,
             view_editor_sync: String::new(),
             view_sub: None,
+            composer_open: false,
+            column_filter: String::new(),
+            only_changed_columns: false,
+            index_name_auto: true,
+            fk_name_auto: true,
+            pending_focus_draft: None,
+            connect_request: None,
             content_width: 0.,
             data_sink: None,
+            query_sink: None,
+            structure_nav_sink: None,
         }
     }
 
-    pub fn set_data_sink(&mut self, sink: Arc<dyn Fn(&mut App)>) {
+    pub fn set_data_sink(&mut self, sink: DataSink) {
         self.data_sink = Some(sink);
     }
 
-    /// 外壳每帧下发内容区真实宽度；变了返回 true，调用方据此重绘。
-    /// 布局还没跑过（独立渲染面板的测试）时是 0，字段表退回紧凑档，而不是拿视口宽冒充。
+    pub fn set_query_sink(&mut self, sink: QuerySink) {
+        self.query_sink = Some(sink);
+    }
+
+    pub fn set_structure_nav_sink(&mut self, sink: StructureNavSink) {
+        self.structure_nav_sink = Some(sink);
+    }
+
     pub fn set_content_width(&mut self, width: f32) -> bool {
         if (self.content_width - width).abs() < 0.5 {
             return false;
@@ -688,13 +946,11 @@ impl StructurePane {
         true
     }
 
-    /// 字段表此刻依据的内容宽；测试用来核对它确实来自布局而不是视口。
     #[cfg(test)]
     pub(crate) fn content_width(&self) -> f32 {
         self.content_width
     }
 
-    /// 测试夹具：跳过 describe 直接装一份快照（目标没有连接 id，渲染时不会发起读取）。
     #[cfg(test)]
     pub(crate) fn install_snapshot_for_test(&mut self, columns: usize) {
         let mut snapshot = crate::ddl::Snapshot::bare(crate::ddl::DdlEngine::Postgres, "app", "public", "orders");
@@ -718,12 +974,26 @@ impl StructurePane {
         self.snapshot = Some(snapshot);
     }
 
-    /// 外壳取走“刚建好的表”。
     pub fn take_created(&mut self) -> Option<GridTarget> {
         self.created.take()
     }
 
-    /// 对象树“新建表”：表名留空，字段草稿从 id 开始。
+    pub fn take_dropped(&mut self) -> Option<GridTarget> {
+        self.dropped.take().map(|(target, _)| target)
+    }
+
+    pub fn take_dropped_object(&mut self) -> Option<(GridTarget, bool)> {
+        self.dropped.take()
+    }
+
+    pub fn take_renamed(&mut self) -> Option<(GridTarget, String)> {
+        self.renamed.take()
+    }
+
+    pub fn take_modified(&mut self) -> Option<(GridTarget, bool)> {
+        self.modified.take()
+    }
+
     pub fn begin_create(&mut self, mut target: GridTarget) {
         target.table.clear();
         let item = format!("create:{}", target.connection_id);
@@ -738,19 +1008,13 @@ impl StructurePane {
         self.session.table_name.clear();
         self.session.kept_columns = vec![default_id(&self.session.target.engine)];
         self.drafts_ready = true;
+        self.pending_focus_draft = Some(4);
     }
 
-    /// 外壳取走“刚删除成功的表”。
-    pub fn take_dropped(&mut self) -> Option<GridTarget> {
-        self.dropped.take()
-    }
-
-    /// 兼容调用：不区分工作项实例，只按目标绑定。
     pub fn bind(&mut self, target: GridTarget) {
         self.bind_item(target, "");
     }
 
-    /// 同一工作项切工具不丢草稿；关闭后重开（新 item id）或换目标才重建。
     pub fn bind_item(&mut self, target: GridTarget, item: &str) {
         if self.session.target == target && self.item_id == item {
             return;
@@ -766,15 +1030,26 @@ impl StructurePane {
         self.drafts_ready = false;
         self.load_error.clear();
         self.loading = false;
+        self.refreshing = false;
+        self.previewing = false;
+        self.executing = false;
         self.fk_tables.clear();
         self.fk_schemas.clear();
         self.fk_columns.clear();
         self.fk_key.clear();
         self.ddl_view = None;
         self.ddl_text.clear();
+        self.ddl_copied = false;
+        self.preview_copied = false;
         self.view_editor = None;
         self.view_editor_sync.clear();
         self.view_sub = None;
+        self.composer_open = false;
+        self.column_filter.clear();
+        self.only_changed_columns = false;
+        self.index_name_auto = true;
+        self.fk_name_auto = true;
+        self.pending_focus_draft = None;
         if target.table.is_empty() && !target.connection_id.is_empty() {
             self.enter_create();
         }
@@ -784,13 +1059,31 @@ impl StructurePane {
         self.session.locale = locale;
     }
 
-    /// 读取结构失败的原因，按当前界面语言给出（模型里留原文）。
     pub fn load_error_text(&self) -> String {
         localize(&self.load_error, self.session.locale)
     }
 
+    pub fn column_filter(&self) -> &str {
+        &self.column_filter
+    }
+
+    pub fn set_column_filter(&mut self, value: String) {
+        self.column_filter = value;
+    }
+
+    pub fn clear_column_filter(&mut self) {
+        self.column_filter.clear();
+        self.only_changed_columns = false;
+    }
+
     pub fn type_into(&mut self, field: &str, text: &str) {
         let keep_preview = field == "danger_name";
+        if field == "index_name" {
+            self.index_name_auto = false;
+        } else if field == "fk_name" {
+            self.fk_name_auto = false;
+        }
+        let default_kind = default_column_type(&self.session.target.engine);
         let slot = match field {
             "column_name" => &mut self.session.column_name,
             "column_type" => &mut self.session.column_type,
@@ -809,7 +1102,7 @@ impl StructurePane {
         };
         if text == "backspace" {
             slot.pop();
-        } else if field == "column_type" && slot.as_str() == "TEXT" {
+        } else if field == "column_type" && (slot.as_str() == "TEXT" || slot.as_str() == default_kind) {
             slot.clear();
             slot.push_str(text);
         } else {
@@ -824,11 +1117,17 @@ impl StructurePane {
     }
 
     pub fn preview(&mut self, cx: &mut Context<Self>) {
+        if self.previewing {
+            return;
+        }
         let Ok(request) = self.session.request() else {
             self.session.note = Note::Key("structure.preview.need");
             cx.notify();
             return;
         };
+        self.previewing = true;
+        self.preview_copied = false;
+        cx.notify();
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
@@ -843,6 +1142,7 @@ impl StructurePane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            this.previewing = false;
                             if this.session.target != target {
                                 this.session.note = Note::Key("structure.preview.stale");
                                 cx.notify();
@@ -862,6 +1162,9 @@ impl StructurePane {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.executing {
+            return;
+        }
         if self.session.section == Section::Danger && !self.session.danger_name_ok() {
             self.session.note = Note::Key("structure.danger.typeName");
             cx.notify();
@@ -883,11 +1186,22 @@ impl StructurePane {
         let Ok(request) = self.session.request() else {
             return;
         };
-        let drops_table = matches!(request.action, Action::DropTable { .. });
-        let created_name = match &request.action {
-            Action::CreateTable { name, .. } => Some(name.clone()),
+        let drop_kind = match &request.action {
+            Action::DropTable { .. } => Some(false),
+            Action::DropView { .. } => Some(true),
             _ => None,
         };
+        let created_name = match &request.action {
+            Action::CreateTable { name, .. } => Some(name.trim().to_owned()),
+            _ => None,
+        };
+        let renamed_to = match &request.action {
+            Action::RenameTable { new_name, .. } => Some(new_name.trim().to_owned()),
+            _ => None,
+        };
+        let is_view = self.session.object_kind == "view";
+        self.executing = true;
+        cx.notify();
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
@@ -902,6 +1216,7 @@ impl StructurePane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            this.executing = false;
                             if this.session.target != target {
                                 this.session.note = Note::Key("structure.execute.stale");
                                 cx.notify();
@@ -911,18 +1226,19 @@ impl StructurePane {
                                 Ok(receipt) if receipt.blocked.is_empty() => {
                                     this.session.open = false;
                                     this.session.armed = false;
-                                    // 删表成功：对象树也要去掉这张表。失败的语句不算成功。
                                     let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
-                                    if drops_table && all_ok && !receipt.steps.is_empty() {
-                                        this.dropped = Some(this.session.target.clone());
-                                    }
-                                    // 修改已有表全部成功：按数据库的新结构重读，草稿也从新结构重建。
-                                    // 否则旧快照还在，刚执行的改动会继续显示成“1 处修改未应用”。
-                                    if created_name.is_none() && !drops_table && all_ok && !receipt.steps.is_empty() {
-                                        this.reload_after_execute();
-                                    }
-                                    if let Some(name) = created_name.clone() {
-                                        if all_ok && !receipt.steps.is_empty() && !name.trim().is_empty() {
+                                    if all_ok && !receipt.steps.is_empty() {
+                                        if let Some(dropped_view) = drop_kind {
+                                            this.dropped = Some((this.session.target.clone(), dropped_view));
+                                        } else if let Some(new_name) = renamed_to.filter(|name| !name.is_empty()) {
+                                            let old = this.session.target.clone();
+                                            this.session.target.table = new_name.clone();
+                                            this.session.rename_to.clear();
+                                            this.session.danger_name.clear();
+                                            this.session.section = Section::Columns;
+                                            this.renamed = Some((old, new_name));
+                                            this.reload_after_execute();
+                                        } else if let Some(name) = created_name.filter(|name| !name.is_empty()) {
                                             let mut created = this.session.target.clone();
                                             created.table = name;
                                             this.created = Some(created.clone());
@@ -930,11 +1246,12 @@ impl StructurePane {
                                             this.session.target = created;
                                             this.session.object_kind = "table".into();
                                             this.session.table_name.clear();
-                                            this.drafts_ready = false;
-                                            this.loaded_for.clear();
-                                            this.snapshot = None;
-                                            this.ddl_view = None;
-                                            this.ddl_text.clear();
+                                            this.reload_after_execute();
+                                        } else {
+                                            this.modified = Some((this.session.target.clone(), is_view));
+                                            this.composer_open = false;
+                                            this.reset_composer_drafts();
+                                            this.reload_after_execute();
                                         }
                                     }
                                     Note::Key("structure.preview.done")
@@ -944,7 +1261,6 @@ impl StructurePane {
                                     Note::Raw(receipt.blocked)
                                 }
                                 Err(message) => {
-                                    // 执行失败留在预览里，原因和可重试的脚本都还在。
                                     this.session.armed = false;
                                     Note::raw(message)
                                 }
@@ -970,16 +1286,27 @@ impl StructurePane {
             return;
         }
         self.loaded_for = key.clone();
-        self.snapshot = None;
         self.load_error.clear();
-        self.loading = true;
+        if self.snapshot.is_some() {
+            self.refreshing = true;
+        } else {
+            self.loading = true;
+        }
         let services = Arc::clone(&self.services);
         let target = target.clone();
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
-                let result = crate::application::ddl::describe_saved(&services.connections, &target.connection_id, target.database.clone(), target.schema.clone(), &target.engine, &target.table).await;
+                let result = crate::application::ddl::describe_saved(
+                    &services.connections,
+                    &target.connection_id,
+                    target.database.clone(),
+                    target.schema.clone(),
+                    &target.engine,
+                    &target.table,
+                )
+                .await;
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
@@ -990,13 +1317,16 @@ impl StructurePane {
                                 return;
                             }
                             this.loading = false;
+                            this.refreshing = false;
                             match result {
                                 Ok(snapshot) => {
                                     this.adopt_snapshot(&snapshot);
                                     this.snapshot = Some(snapshot);
                                 }
-                                // 留原文，显示时按当前语言给出。
-                                Err(message) => this.load_error = message,
+                                Err(message) => {
+                                    this.snapshot = None;
+                                    this.load_error = message;
+                                }
                             }
                             cx.notify();
                         });
@@ -1026,7 +1356,60 @@ impl StructurePane {
         }
     }
 
+    /// 手动刷新结构：没有未应用的字段修改时同步重读最新列草稿；已有未保存编辑时只更新底层快照对照。
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.loading || self.refreshing || self.session.mode == StructureMode::Create {
+            return;
+        }
+        if self.pending_changes() == 0 {
+            self.drafts_ready = false;
+            self.session.view_sql.clear();
+        }
+        self.fk_key.clear();
+        self.ddl_view = None;
+        self.ddl_text.clear();
+        self.retry_load(cx);
+    }
+
+    fn reset_composer_drafts(&mut self) {
+        self.session.index_name.clear();
+        self.session.index_column.clear();
+        self.session.index_unique = false;
+        self.session.index_columns.clear();
+        self.index_name_auto = true;
+        self.session.fk_name.clear();
+        self.session.fk_column.clear();
+        self.session.fk_ref_table.clear();
+        self.session.fk_ref_column.clear();
+        self.session.fk_on_delete = "NO ACTION".to_owned();
+        self.session.fk_on_update = "NO ACTION".to_owned();
+        self.fk_name_auto = true;
+    }
+
     fn set_field(&mut self, field: &'static str, value: String) {
+        if field == "column_filter" {
+            self.column_filter = value;
+            return;
+        }
+        if field == "index_name" {
+            if value.trim().is_empty() {
+                self.index_name_auto = true;
+            } else {
+                let auto = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+                if value != auto {
+                    self.index_name_auto = false;
+                }
+            }
+        } else if field == "fk_name" {
+            if value.trim().is_empty() {
+                self.fk_name_auto = true;
+            } else {
+                let auto = suggested_fk_name(&self.session.target.table, &self.session.fk_column, &self.session.fk_ref_table);
+                if value != auto {
+                    self.fk_name_auto = false;
+                }
+            }
+        }
         let keep_preview = field == "danger_name";
         let slot = match field {
             "column_name" => &mut self.session.column_name,
@@ -1060,6 +1443,7 @@ impl StructurePane {
 
     fn field_value(&self, field: &'static str) -> String {
         match field {
+            "column_filter" => self.column_filter.clone(),
             "column_name" => self.session.column_name.clone(),
             "column_type" => self.session.column_type.clone(),
             "index_name" => self.session.index_name.clone(),
@@ -1104,8 +1488,40 @@ impl StructurePane {
         edit(column)
     }
 
+    pub fn revert_column(&mut self, index: usize) {
+        let Some(original_name) = self.session.kept_columns.get(index).and_then(|col| col.original.clone()) else {
+            return;
+        };
+        let Some(before) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.columns.iter().find(|col| col.name == original_name))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(draft) = self.session.kept_columns.get_mut(index) {
+            draft.name = before.name;
+            draft.type_name = before.type_name;
+            draft.nullable = before.nullable;
+            draft.default_sql = before.default_sql.unwrap_or_default();
+            draft.primary = before.primary;
+            draft.auto = before.auto;
+            draft.dropped = false;
+            self.session.cancel();
+        }
+    }
+
     fn toggle_column(&mut self, index: usize, which: &str) {
         let create = self.session.mode == StructureMode::Create;
+        if which == "drop" {
+            let is_unsaved_new = self.session.kept_columns.get(index).is_some_and(|col| col.original.is_none());
+            if is_unsaved_new && (!create || self.session.kept_columns.len() > 1) {
+                self.session.kept_columns.remove(index);
+                self.session.cancel();
+                return;
+            }
+        }
         let changed = self.edit_column(index, |column| match which {
             "null" => {
                 column.nullable = !column.nullable;
@@ -1120,6 +1536,9 @@ impl StructurePane {
             }
             "auto" if create => {
                 column.auto = !column.auto;
+                if column.auto {
+                    column.nullable = false;
+                }
                 true
             }
             "drop" => {
@@ -1145,19 +1564,27 @@ impl StructurePane {
         self.session.cancel();
     }
 
-    fn add_column(&mut self) {
+    pub fn add_column(&mut self) {
         let name = if self.session.column_name.trim().is_empty() {
-            format!("col_{}", self.session.kept_columns.len() + 1)
+            let mut seq = self.session.kept_columns.len() + 1;
+            loop {
+                let candidate = format!("col_{seq}");
+                if self.session.kept_columns.iter().all(|col| !col.name.eq_ignore_ascii_case(&candidate)) {
+                    break candidate;
+                }
+                seq += 1;
+            }
         } else {
             self.session.column_name.trim().to_owned()
         };
         if self.session.kept_columns.iter().any(|column| column.name == name) {
             return;
         }
+        let new_index = self.session.kept_columns.len();
         self.session.kept_columns.push(ColumnDraft {
             original: None,
             name,
-            type_name: self.session.column_type.clone(),
+            type_name: default_column_type(&self.session.target.engine).to_owned(),
             nullable: true,
             default_sql: String::new(),
             primary: false,
@@ -1165,18 +1592,32 @@ impl StructurePane {
             dropped: false,
         });
         self.session.column_name.clear();
+        self.only_changed_columns = false;
+        self.pending_focus_draft = Some(10_000 + new_index as u32);
         self.session.cancel();
+    }
+
+    pub fn apply_column_preset(&mut self, preset: ColumnPreset) {
+        let templates = preset_columns(&self.session.target.engine, preset);
+        let mut added = false;
+        for draft in templates {
+            if self.session.kept_columns.iter().all(|col| !col.name.eq_ignore_ascii_case(&draft.name)) {
+                self.session.kept_columns.push(draft);
+                added = true;
+            }
+        }
+        if added {
+            self.session.cancel();
+        }
     }
 
     fn reset_draft(&mut self) {
         self.session.cancel();
         self.session.column_name.clear();
-        self.session.column_type = "TEXT".into();
+        self.session.column_type = default_column_type(&self.session.target.engine).into();
         self.session.intent = EditIntent::Apply;
-        self.session.index_unique = false;
-        self.session.index_columns.clear();
-        self.session.index_name.clear();
-        self.session.index_column.clear();
+        self.reset_composer_drafts();
+        self.only_changed_columns = false;
         if self.session.mode == StructureMode::Create {
             self.session.table_name.clear();
             self.session.kept_columns = vec![default_id(&self.session.target.engine)];
@@ -1188,6 +1629,19 @@ impl StructurePane {
         }
     }
 
+    fn sync_auto_index_name(&mut self) {
+        if self.index_name_auto || self.session.index_name.trim().is_empty() {
+            self.session.index_name = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+            self.index_name_auto = true;
+        }
+    }
+
+    pub fn apply_auto_index_name(&mut self) {
+        self.index_name_auto = true;
+        self.session.index_name = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+        self.session.cancel();
+    }
+
     fn toggle_index_column(&mut self, name: &str) {
         if let Some(index) = self.session.index_columns.iter().position(|column| column.name == name) {
             self.session.index_columns.remove(index);
@@ -1195,6 +1649,19 @@ impl StructurePane {
             self.session.index_columns.push(IndexColumnDraft { name: name.to_owned(), descending: false });
         }
         self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
+        self.sync_auto_index_name();
+        self.session.intent = EditIntent::Apply;
+        self.session.cancel();
+    }
+
+    pub fn move_index_column(&mut self, index: usize, delta: isize) {
+        let next = index as isize + delta;
+        if next < 0 || next >= self.session.index_columns.len() as isize {
+            return;
+        }
+        self.session.index_columns.swap(index, next as usize);
+        self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
+        self.sync_auto_index_name();
         self.session.intent = EditIntent::Apply;
         self.session.cancel();
     }
@@ -1209,12 +1676,21 @@ impl StructurePane {
 
     fn choose_fk(&mut self, field: &'static str, value: String) {
         self.set_field(field, value);
+        if matches!(field, "fk_column" | "fk_ref_table") && (self.fk_name_auto || self.session.fk_name.trim().is_empty()) {
+            let suggested = suggested_fk_name(&self.session.target.table, &self.session.fk_column, &self.session.fk_ref_table);
+            if !suggested.is_empty() {
+                self.session.fk_name = suggested;
+                self.fk_name_auto = true;
+            }
+        }
     }
 
     fn field(&mut self, field: &'static str, key: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let value = self.field_value(field);
-        let state = self.fields.bind(field, &value, FieldSpec { placeholder, masked: false }, window, cx, |this: &mut Self, field, value, _| this.set_field(field, value));
+        let state = self.fields.bind(field, &value, FieldSpec { placeholder, masked: false }, window, cx, |this: &mut Self, field, value, _| {
+            this.set_field(field, value)
+        });
         kit::form_row(
             SharedString::from(i18n::text(self.session.locale, key)),
             kit::text_input(SharedString::from(format!("structure-field-{field}")), &state, i18n::text(self.session.locale, key)),
@@ -1259,6 +1735,16 @@ impl StructurePane {
                             }
                             this.fk_tables = loaded.tables;
                             this.fk_columns = loaded.columns;
+                            // 刚选定引用表且引用列为空时，优先预填主键或 id 列，省去再点一次下拉。
+                            if this.session.fk_ref_column.trim().is_empty() && !this.fk_columns.is_empty() {
+                                if let Some(pk) = loaded.primary_column.or_else(|| {
+                                    this.fk_columns.iter().find(|col| col.eq_ignore_ascii_case("id")).cloned().or_else(|| {
+                                        (this.fk_columns.len() == 1).then(|| this.fk_columns[0].clone())
+                                    })
+                                }) {
+                                    this.session.fk_ref_column = pk;
+                                }
+                            }
                             cx.notify();
                         });
                     }
@@ -1268,7 +1754,7 @@ impl StructurePane {
         .detach();
     }
 
-    fn ddl_viewer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::Entity<FormatViewer> {
+    fn ddl_viewer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<FormatViewer> {
         if let Some(view) = self.ddl_view.clone() {
             if self.ddl_text != text {
                 self.ddl_text = text.to_owned();
@@ -1323,10 +1809,6 @@ impl StructurePane {
         self.view_editor = Some(editor);
     }
 
-    /// “当前结构”卡片：列表走统一的加载/失败/空/有行四态；空列表不再画表头加破折号冒充空态。
-    /// “当前结构”卡片：加载 / 读取失败 / 空 / 有内容四态对**所有页签**同一套判定。
-    /// 列表页签的"空"看行数，定义类页签（视图 / DDL / 危险操作）的"空"看有没有 SQL 定义——
-    /// 读取失败不能退化成"这个对象没有可显示的 SQL 定义"，那样既没原因也没有重试入口。
     fn overview(&self, entity: &Entity<StructurePane>, p: &Palette, cx: &App) -> AnyElement {
         let locale = self.session.locale;
         let metrics = kit::Metrics::of(cx);
@@ -1338,7 +1820,7 @@ impl StructurePane {
             ListState::Loading => return kit::skeleton_state(6, &metrics, p).into_any_element(),
             ListState::Error => return self.load_error_state(entity, p, locale),
             ListState::Empty if !list => {
-                return kit::empty_state(IconName::Braces, t("ui.structure.none"), t("structure.empty.definition"), p).into_any_element()
+                return kit::empty_state(IconName::Braces, t("ui.structure.none"), t("structure.empty.definition"), p).into_any_element();
             }
             ListState::Empty => {
                 let (icon, heading, detail) = match section {
@@ -1346,6 +1828,18 @@ impl StructurePane {
                     Section::ForeignKeys => (IconName::Key, "structure.empty.foreignKeys", "structure.empty.foreignKeysHint"),
                     _ => (IconName::Table, "structure.empty.columns", "structure.empty.columnsHint"),
                 };
+                if matches!(section, Section::Indexes | Section::ForeignKeys) && !self.composer_open {
+                    let owner = entity.clone();
+                    let cta_label = if section == Section::Indexes { t("structure.index.new") } else { t("structure.fk.new") };
+                    let cta = kit::primary_button("structure-empty-create", Some(IconName::Plus), cta_label, move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.composer_open = true;
+                            pane.session.cancel();
+                            cx.notify();
+                        });
+                    });
+                    return kit::empty_state_with_action(icon, t(heading), t(detail), cta, p).into_any_element();
+                }
                 return kit::empty_state(icon, t(heading), t(detail), p).into_any_element();
             }
             ListState::Rows => {}
@@ -1353,7 +1847,6 @@ impl StructurePane {
         if list {
             return self.list_card(entity, section, p, cx);
         }
-        // 视图 / DDL / 危险操作页签：显示对象的 SQL 定义（重建定义与 DDL 页签一致）。
         let (sql, _missing) = self.snapshot.as_ref().map(definition_text).unwrap_or((String::new(), Vec::new()));
         div()
             .id("structure-definition")
@@ -1367,15 +1860,17 @@ impl StructurePane {
             .into_any_element()
     }
 
-    /// 读取失败的统一呈现：原因 + 重试（重试不清用户草稿）。所有页签共用同一块。
     fn load_error_state(&self, entity: &Entity<StructurePane>, p: &Palette, locale: Locale) -> AnyElement {
-        // 连接还没打开（恢复会话时标签先于连接出现）不是读取出错：和表数据页一样给中性说明
-        // 和“连接并读取”主按钮，不用红色错误态；连上后自动重读。
         if self.connection_closed() {
             let owner = entity.clone();
-            let connect = kit::primary_button("structure-retry", Some(IconName::Plug), SharedString::from(i18n::text(locale, "grid.action.connectRead")), move |_, _, cx| {
-                owner.update(cx, |pane, cx| pane.retry_load(cx));
-            })
+            let connect = kit::primary_button(
+                "structure-retry",
+                Some(IconName::Plug),
+                SharedString::from(i18n::text(locale, "grid.action.connectRead")),
+                move |_, _, cx| {
+                    owner.update(cx, |pane, cx| pane.retry_load(cx));
+                },
+            )
             .into_any_element();
             return kit::empty_state_with_action(
                 IconName::Plug,
@@ -1400,12 +1895,10 @@ impl StructurePane {
         .into_any_element()
     }
 
-    /// 定义类页签有没有可显示的定义（DDL 页签会用重建定义，所以与 table_sql 是否为空不完全一致）。
     fn has_definition(&self) -> bool {
         self.snapshot.as_ref().map(|snapshot| !definition_text(snapshot).0.trim().is_empty()).unwrap_or(false)
     }
 
-    /// 有行时的列表：表头与行共用 TableSpec；行带右键菜单，菜单项仍只改草稿，要预览确认才执行。
     fn list_card(&self, entity: &Entity<StructurePane>, section: Section, p: &Palette, cx: &App) -> AnyElement {
         let locale = self.session.locale;
         let spec = TableSpec::of(kit::Metrics::of(cx));
@@ -1426,6 +1919,22 @@ impl StructurePane {
                 .enumerate()
                 .map(|(index, column)| {
                     let dropped = self.session.kept_columns.get(index).is_some_and(|draft| draft.dropped);
+                    let mut menu = vec![MenuEntry {
+                        id: format!("copy-column-{index}"),
+                        label: text("structure.menu.copyName"),
+                        action: RowAction::Copy(column.name.clone()),
+                        disabled: false,
+                        reason: None,
+                    }];
+                    if self.session.object_kind != "view" {
+                        menu.push(MenuEntry {
+                            id: format!("drop-column-{index}"),
+                            label: text(if dropped { "structure.menu.restoreColumn" } else { "structure.menu.dropColumn" }),
+                            action: RowAction::ToggleColumnDrop(index),
+                            disabled: false,
+                            reason: None,
+                        });
+                    }
                     RowSpec {
                         id: format!("columns-{index}"),
                         dim: dropped,
@@ -1433,24 +1942,9 @@ impl StructurePane {
                             cell_main(column.name.clone(), column.primary.then_some(IconName::Key), p),
                             cell_mono(column.type_name.clone(), mono, p),
                             cell_text(if column.nullable { "✓".into() } else { "—".into() }, p),
-                            cell_mono(column.default_sql.clone().unwrap_or_default(), mono, p),
+                            cell_mono(column.default_sql.clone().unwrap_or_else(|| "—".into()), mono, p),
                         ],
-                        menu: vec![
-                            MenuEntry {
-                                id: format!("copy-column-{index}"),
-                                label: text("structure.menu.copyName"),
-                                action: RowAction::Copy(column.name.clone()),
-                                disabled: false,
-                                reason: None,
-                            },
-                            MenuEntry {
-                                id: format!("drop-column-{index}"),
-                                label: text(if dropped { "structure.menu.restoreColumn" } else { "structure.menu.dropColumn" }),
-                                action: RowAction::ToggleColumnDrop(index),
-                                disabled: false,
-                                reason: None,
-                            },
-                        ],
+                        menu,
                     }
                 })
                 .collect(),
@@ -1460,38 +1954,75 @@ impl StructurePane {
                 .enumerate()
                 .map(|(index, row)| {
                     let reason = localize(&row.reason, locale);
+                    let is_pk = row.protected && row.reason == "由主键约束维护";
+                    let cols_display = if !row.columns.is_empty() {
+                        row.columns
+                            .iter()
+                            .map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        extract_index_target_expr(row.sql.as_deref())
+                    };
+                    let mut kind_badges = div().flex().items_center().gap(px(4.)).min_w(px(0.));
+                    if is_pk {
+                        kind_badges = kind_badges.child(kit::pill(text("structure.index.primaryBadge"), p.warn, p.warn_soft));
+                    } else if row.unique {
+                        kind_badges = kind_badges.child(kit::pill(text("structure.index.uniqueBadge"), p.accent_text, p.accent_soft));
+                    } else {
+                        kind_badges = kind_badges.child(kit::pill(text("structure.index.normalBadge"), p.text_muted, p.hover));
+                    }
+                    if row.partial {
+                        kind_badges = kind_badges.child(kit::pill(text("structure.index.partialBadge"), p.info, p.accent_soft));
+                    } else if row.expression {
+                        kind_badges = kind_badges.child(kit::pill(text("structure.index.exprBadge"), p.info, p.accent_soft));
+                    }
+                    let name_cell = div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w(px(0.))
+                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.name.clone())))
+                        .when(row.protected, |this| {
+                            let tip = if reason.is_empty() { text("structure.index.primaryBadge") } else { reason.clone() };
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("structure-index-lock-{index}")))
+                                    .test_support()
+                                    .flex_none()
+                                    .tooltip_text(SharedString::from(tip))
+                                    .child(kit::icon(if is_pk { IconName::Key } else { IconName::Lock }, 12., if is_pk { p.warn } else { p.text_faint })),
+                            )
+                        })
+                        .into_any_element();
+                    let mut menu = vec![MenuEntry {
+                        id: format!("copy-index-{index}"),
+                        label: text("structure.menu.copyName"),
+                        action: RowAction::Copy(row.name.clone()),
+                        disabled: false,
+                        reason: None,
+                    }];
+                    if let Some(sql) = index_sql_for_display(snapshot, row) {
+                        menu.push(MenuEntry {
+                            id: format!("copy-index-sql-{index}"),
+                            label: text("structure.index.copySql"),
+                            action: RowAction::Copy(sql),
+                            disabled: false,
+                            reason: None,
+                        });
+                    }
+                    menu.push(MenuEntry {
+                        id: format!("drop-index-{index}"),
+                        label: text("structure.index.delete"),
+                        action: RowAction::DropIndex(row.name.clone()),
+                        disabled: row.protected,
+                        reason: (row.protected && !reason.is_empty()).then_some(reason),
+                    });
                     RowSpec {
                         id: format!("indexes-{index}"),
                         dim: false,
-                        cells: vec![
-                            cell_main(row.name.clone(), row.unique.then_some(IconName::Hash), p),
-                            cell_mono(
-                                row.columns
-                                    .iter()
-                                    .map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() })
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                mono,
-                                p,
-                            ),
-                            cell_text(if row.unique { "✓".into() } else { "—".into() }, p),
-                        ],
-                        menu: vec![
-                            MenuEntry {
-                                id: format!("copy-index-{index}"),
-                                label: text("structure.menu.copyName"),
-                                action: RowAction::Copy(row.name.clone()),
-                                disabled: false,
-                                reason: None,
-                            },
-                            MenuEntry {
-                                id: format!("drop-index-{index}"),
-                                label: text("structure.index.delete"),
-                                action: RowAction::DropIndex(row.name.clone()),
-                                disabled: row.protected,
-                                reason: (row.protected && !reason.is_empty()).then_some(reason),
-                            },
-                        ],
+                        cells: vec![name_cell, cell_mono(cols_display, mono, p), kind_badges.into_any_element()],
+                        menu,
                     }
                 })
                 .collect(),
@@ -1500,37 +2031,202 @@ impl StructurePane {
                 .iter()
                 .enumerate()
                 .map(|(index, key)| {
-                    let reference = if key.ref_schema.is_empty() { key.ref_table.clone() } else { format!("{}.{}", key.ref_schema, key.ref_table) };
+                    let reference = if key.ref_schema.is_empty() {
+                        key.ref_table.clone()
+                    } else {
+                        format!("{}.{}", key.ref_schema, key.ref_table)
+                    };
                     let name = if key.name.is_empty() { format!("fk_{index}") } else { key.name.clone() };
+                    let target_schema = if key.ref_schema.is_empty() { self.session.target.schema.clone() } else { key.ref_schema.clone() };
+                    let mut menu = vec![MenuEntry {
+                        id: format!("copy-fk-{index}"),
+                        label: text("structure.menu.copyName"),
+                        action: RowAction::Copy(name.clone()),
+                        disabled: false,
+                        reason: None,
+                    }];
+                    if !key.ref_table.is_empty() && self.structure_nav_sink.is_some() {
+                        menu.push(MenuEntry {
+                            id: format!("open-fk-ref-{index}"),
+                            label: text("structure.fk.openRef"),
+                            action: RowAction::OpenTable { schema: target_schema.clone(), table: key.ref_table.clone() },
+                            disabled: false,
+                            reason: None,
+                        });
+                    }
+                    if let Some(sql) = fk_sql_for_display(snapshot, key) {
+                        menu.push(MenuEntry {
+                            id: format!("copy-fk-sql-{index}"),
+                            label: text("structure.fk.copySql"),
+                            action: RowAction::Copy(sql),
+                            disabled: false,
+                            reason: None,
+                        });
+                    }
+                    menu.push(MenuEntry {
+                        id: format!("drop-fk-{index}"),
+                        label: text("structure.fk.delete"),
+                        action: RowAction::DropForeignKey(name.clone()),
+                        disabled: key.name.is_empty(),
+                        reason: None,
+                    });
+                    let ref_display = format!("{reference}({})", key.ref_columns.join(", "));
+                    let ref_cell = if !key.ref_table.is_empty() && self.structure_nav_sink.is_some() {
+                        let nav_sink = self.structure_nav_sink.clone();
+                        let mut ref_target = self.session.target.clone();
+                        ref_target.schema = target_schema;
+                        ref_target.table = key.ref_table.clone();
+                        kit::interactive(
+                            div().id(SharedString::from(format!("structure-fk-jump-{index}"))),
+                            p,
+                            false,
+                        )
+                        .test_support()
+                        .px(px(4.))
+                        .mx(px(-4.))
+                        .rounded(px(Radius::TAG))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .min_w(px(0.))
+                        .tooltip_text(SharedString::from(text("structure.fk.openRef")))
+                        .child(
+                            div()
+                                .truncate()
+                                .font_family(mono.clone())
+                                .text_size(px(TypeScale::SM))
+                                .text_color(p.accent_text)
+                                .child(SharedString::from(ref_display)),
+                        )
+                        .child(kit::icon(IconName::ArrowUpRight, 12., p.accent_text))
+                        .on_click(move |_, _, cx| {
+                            if let Some(sink) = &nav_sink {
+                                sink(ref_target.clone(), cx);
+                            }
+                        })
+                        .into_any_element()
+                    } else {
+                        cell_mono(ref_display, mono, p)
+                    };
                     RowSpec {
                         id: format!("foreign-{index}"),
                         dim: false,
                         cells: vec![
-                            cell_main(name.clone(), None, p),
+                            cell_main(name, Some(IconName::Key), p),
                             cell_mono(key.columns.join(", "), mono, p),
-                            cell_mono(format!("{reference}({})", key.ref_columns.join(", ")), mono, p),
+                            ref_cell,
+                            fk_rules_cell(&key.on_delete, &key.on_update, p),
                         ],
-                        menu: vec![
-                            MenuEntry {
-                                id: format!("copy-fk-{index}"),
-                                label: text("structure.menu.copyName"),
-                                action: RowAction::Copy(name.clone()),
-                                disabled: false,
-                                reason: None,
-                            },
-                            MenuEntry {
-                                id: format!("drop-fk-{index}"),
-                                label: text("structure.fk.delete"),
-                                action: RowAction::DropForeignKey(name),
-                                disabled: key.name.is_empty(),
-                                reason: None,
-                            },
-                        ],
+                        menu,
                     }
                 })
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    fn incoming_fk_card(&self, entity: &Entity<StructurePane>, p: &Palette, cx: &App) -> Option<AnyElement> {
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.incoming.is_empty() || self.loading || !self.load_error.is_empty() {
+            return None;
+        }
+        let locale = self.session.locale;
+        let text = |key: &str| i18n::text(locale, key);
+        let mono = cx.theme().mono_font_family.clone();
+        let spec = TableSpec::of(kit::Metrics::of(cx));
+        let rows: Vec<RowSpec> = snapshot
+            .incoming
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let child_qualified = if item.schema.is_empty() {
+                    item.table.clone()
+                } else {
+                    format!("{}.{}", item.schema, item.table)
+                };
+                let child_display = format!("{child_qualified}({})", item.columns.join(", "));
+                let child_schema = if item.schema.is_empty() { self.session.target.schema.clone() } else { item.schema.clone() };
+                let child_cell = if !item.table.is_empty() && self.structure_nav_sink.is_some() {
+                    let nav_sink = self.structure_nav_sink.clone();
+                    let mut child_target = self.session.target.clone();
+                    child_target.schema = child_schema.clone();
+                    child_target.table = item.table.clone();
+                    kit::interactive(
+                        div().id(SharedString::from(format!("structure-incoming-jump-{index}"))),
+                        p,
+                        false,
+                    )
+                    .test_support()
+                    .px(px(4.))
+                    .mx(px(-4.))
+                    .rounded(px(Radius::TAG))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .min_w(px(0.))
+                    .tooltip_text(SharedString::from(text("structure.fk.openChild")))
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.accent_text)
+                            .child(SharedString::from(child_display)),
+                    )
+                    .child(kit::icon(IconName::ArrowUpRight, 12., p.accent_text))
+                    .on_click(move |_, _, cx| {
+                        if let Some(sink) = &nav_sink {
+                            sink(child_target.clone(), cx);
+                        }
+                    })
+                    .into_any_element()
+                } else {
+                    cell_mono(child_display, &mono, p)
+                };
+                let fk_label = if item.name.is_empty() { format!("fk_in_{index}") } else { item.name.clone() };
+                let mut menu = vec![MenuEntry {
+                    id: format!("copy-incoming-{index}"),
+                    label: text("structure.menu.copyName"),
+                    action: RowAction::Copy(item.table.clone()),
+                    disabled: false,
+                    reason: None,
+                }];
+                if !item.table.is_empty() && self.structure_nav_sink.is_some() {
+                    menu.push(MenuEntry {
+                        id: format!("open-incoming-{index}"),
+                        label: text("structure.fk.openChild"),
+                        action: RowAction::OpenTable { schema: child_schema, table: item.table.clone() },
+                        disabled: false,
+                        reason: None,
+                    });
+                }
+                RowSpec {
+                    id: format!("incoming-{index}"),
+                    dim: false,
+                    cells: vec![
+                        child_cell,
+                        cell_mono(format!("{}({})", self.session.target.table, item.ref_columns.join(", ")), &mono, p),
+                        cell_text(fk_label, p),
+                    ],
+                    menu,
+                }
+            })
+            .collect();
+        let heading = SharedString::from(i18n::fill(
+            &i18n::text(locale, "structure.fk.incomingTitle"),
+            &[("count", &snapshot.incoming.len().to_string())],
+        ));
+        Some(
+            div()
+                .id("structure-incoming-fks")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(kit::eyebrow(heading, p))
+                .child(kit::card(p).overflow_hidden().child(structure_table(entity, &INCOMING_FK_TABLE, rows, spec, p, locale)))
+                .into_any_element(),
+        )
     }
 
     fn list_len(&self, section: Section) -> usize {
@@ -1545,13 +2241,11 @@ impl StructurePane {
         }
     }
 
-    /// 目标连接当前没有打开的会话。
     fn connection_closed(&self) -> bool {
         let connection = &self.session.target.connection_id;
         !connection.is_empty() && self.services.connections.catalog_session(connection).is_none()
     }
 
-    /// 结构变更执行成功后：丢掉旧快照与据它生成的草稿，下一帧从数据库重读。
     fn reload_after_execute(&mut self) {
         self.drafts_ready = false;
         self.loaded_for.clear();
@@ -1560,11 +2254,9 @@ impl StructurePane {
         self.ddl_text.clear();
     }
 
-    /// 读取失败后的重试：清掉失败原因与已读标记，下一帧重新读取（不清用户草稿）。
     pub fn retry_load(&mut self, cx: &mut Context<Self>) {
         let connection = self.session.target.connection_id.clone();
         if !connection.is_empty() && self.services.connections.catalog_session(&connection).is_none() {
-            // 连接没打开时重读只会再失败一次：先请外壳连接，连上后由 retry_after_connect 重读。
             self.connect_request = Some(connection);
             cx.notify();
             return;
@@ -1572,6 +2264,7 @@ impl StructurePane {
         self.load_error.clear();
         self.loaded_for.clear();
         self.loading = false;
+        self.refreshing = false;
         cx.notify();
     }
 
@@ -1579,53 +2272,225 @@ impl StructurePane {
         self.connect_request.take()
     }
 
-    /// 连接刚打开：此前因连接未打开而读取失败的结构页自动重读。
     pub fn retry_after_connect(&mut self, connection_id: &str, cx: &mut Context<Self>) {
         if self.session.target.connection_id == connection_id && !self.load_error.is_empty() {
             self.retry_load(cx);
         }
     }
 
-    /// 读取中或读取失败时不显示新增表单与主操作：先让用户看到加载/失败态与重试。
     fn form_visible(&self) -> bool {
         self.session.mode == StructureMode::Create || (!self.loading && self.load_error.is_empty())
     }
 
-    /// 主操作（预览 SQL）固定显示的条件。它与内容滚动分开，长字段列表下也始终可达。
     fn preview_action_visible(&self) -> bool {
         let section = self.session.section;
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
-        // 索引/外键页只有展开“新建”表单时才有东西可预览；平时列表是主角，不常驻一个预览按钮。
         let composing = !matches!(section, Section::Indexes | Section::ForeignKeys) || self.composer_open;
         self.form_visible() && composing && !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view)
     }
-
 
     fn apply_row_action(&mut self, action: RowAction, cx: &mut Context<Self>) {
         match action {
             RowAction::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             RowAction::ToggleColumnDrop(index) => self.toggle_column(index, "drop"),
+            RowAction::RevertColumn(index) => self.revert_column(index),
+            RowAction::AddColumn => self.add_column(),
             RowAction::DropIndex(name) => self.preview_drop_index(name, cx),
             RowAction::DropForeignKey(name) => self.preview_drop_fk(name, cx),
+            RowAction::OpenTable { schema, table } => {
+                if let Some(sink) = self.structure_nav_sink.clone() {
+                    let mut target = self.session.target.clone();
+                    target.schema = schema;
+                    target.table = table;
+                    sink(target, cx);
+                }
+            }
         }
     }
 
-    /// 主操作按钮：页签内容之外的一条固定动作栏，三档宽度都不被滚动吞掉。
+    /// 草稿前置诊断：在点击“预览 SQL”之前即时标出重名、空列名、非法类型/默认值或非空无默认值提示。
+    pub fn draft_diagnostic(&self) -> Option<String> {
+        let locale = self.session.locale;
+        if self.session.section != Section::Columns {
+            return None;
+        }
+        let engine = DdlEngine::parse(&self.session.target.engine).ok();
+        let active: Vec<(usize, &ColumnDraft)> = self
+            .session
+            .kept_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| !col.dropped)
+            .collect();
+        let mut seen = HashSet::new();
+        for (row_idx, col) in &active {
+            let trimmed = col.name.trim();
+            if trimmed.is_empty() {
+                return Some(i18n::fill(&i18n::text(locale, "structure.diag.emptyCol"), &[("index", &(row_idx + 1).to_string())]));
+            }
+            let lower = trimmed.to_lowercase();
+            if !seen.insert(lower) {
+                return Some(i18n::fill(&i18n::text(locale, "structure.diag.duplicateCol"), &[("name", trimmed)]));
+            }
+            if let Some(eng) = engine {
+                // 已有字段如果没动过类型，按原样放行（例如数据库读出的带显示宽度或自定义类型）。
+                let untouched_type = col
+                    .original
+                    .as_deref()
+                    .and_then(|orig| self.snapshot.as_ref().and_then(|snap| snap.columns.iter().find(|item| item.name == orig)))
+                    .is_some_and(|before| before.type_name.eq_ignore_ascii_case(col.type_name.trim()));
+                if !untouched_type && !valid_type(eng, &col.type_name) {
+                    return Some(i18n::fill(
+                        &i18n::text(locale, "structure.diag.invalidType"),
+                        &[("name", trimmed), ("kind", col.type_name.trim())],
+                    ));
+                }
+                let untouched_default = col
+                    .original
+                    .as_deref()
+                    .and_then(|orig| self.snapshot.as_ref().and_then(|snap| snap.columns.iter().find(|item| item.name == orig)))
+                    .is_some_and(|before| before.default_sql.as_deref().unwrap_or("") == col.default_sql.as_str());
+                if !untouched_default && !col.default_sql.trim().is_empty() && !valid_default(eng, &col.default_sql) {
+                    return Some(i18n::fill(&i18n::text(locale, "structure.diag.invalidDefault"), &[("name", trimmed)]));
+                }
+            }
+            if self.session.mode == StructureMode::Existing
+                && col.original.is_none()
+                && !col.nullable
+                && !non_null_default(&col.default_sql)
+                && (self.snapshot.as_ref().and_then(|snap| snap.row_count).unwrap_or(0) > 0 || engine == Some(DdlEngine::Sqlite))
+            {
+                return Some(i18n::fill(&i18n::text(locale, "structure.diag.notNullNeedsDefault"), &[("name", trimmed)]));
+            }
+        }
+        None
+    }
+
+    fn changes_breakdown_text(&self, locale: Locale) -> (usize, String) {
+        if self.session.mode == StructureMode::Create {
+            return (0, String::new());
+        }
+        let (mut added, mut modified, mut dropped) = (0usize, 0usize, 0usize);
+        for column in &self.session.kept_columns {
+            match self.column_change(column) {
+                ColumnChange::Added => added += 1,
+                ColumnChange::Modified => modified += 1,
+                ColumnChange::Dropped => dropped += 1,
+                ColumnChange::Clean => {}
+            }
+        }
+        let total = added + modified + dropped;
+        if total == 0 {
+            return (0, String::new());
+        }
+        let mut parts = Vec::new();
+        if added > 0 {
+            parts.push(i18n::fill(&i18n::text(locale, "structure.changes.added"), &[("n", &added.to_string())]));
+        }
+        if modified > 0 {
+            parts.push(i18n::fill(&i18n::text(locale, "structure.changes.modified"), &[("n", &modified.to_string())]));
+        }
+        if dropped > 0 {
+            parts.push(i18n::fill(&i18n::text(locale, "structure.changes.dropped"), &[("n", &dropped.to_string())]));
+        }
+        let sep = match locale {
+            Locale::ZhCn => " · ",
+            Locale::En => ", ",
+        };
+        let summary = i18n::fill(
+            &i18n::text(locale, "structure.changes.breakdown"),
+            &[("count", &total.to_string()), ("detail", &parts.join(sep))],
+        );
+        (total, summary)
+    }
+
     fn preview_footer(&self, entity: &Entity<StructurePane>, p: &Palette, locale: Locale, metrics: kit::Metrics) -> Option<AnyElement> {
         if !self.preview_action_visible() {
             return None;
         }
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
-        let pending = if section == Section::Columns { self.pending_changes() } else { 0 };
+        let (pending, breakdown) = if section == Section::Columns {
+            self.changes_breakdown_text(locale)
+        } else {
+            (0, String::new())
+        };
+        let diagnostic = self.draft_diagnostic();
+        let create_summary = (section == Section::Columns && self.session.mode == StructureMode::Create).then(|| {
+            let active: Vec<&ColumnDraft> = self.session.kept_columns.iter().filter(|col| !col.dropped).collect();
+            let pks: Vec<&str> = active.iter().filter(|col| col.primary).map(|col| col.name.trim()).filter(|n| !n.is_empty()).collect();
+            if pks.is_empty() {
+                (
+                    true,
+                    i18n::fill(&i18n::text(locale, "structure.create.noPkWarn"), &[("columns", &active.len().to_string())]),
+                )
+            } else {
+                (
+                    false,
+                    i18n::fill(
+                        &i18n::text(locale, "structure.create.summary"),
+                        &[("columns", &active.len().to_string()), ("pk", &pks.join(", "))],
+                    ),
+                )
+            }
+        });
         let owner = entity.clone();
         let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
             owner.update(cx, |pane, cx| pane.preview_current(cx));
         };
+        let tip = SharedString::from(format!("{} · {}", i18n::text(locale, "structure.action.preview"), kit::shortcut("Mod+Enter")));
         let button = if section == Section::Danger {
-            kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click).into_any_element()
+            kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click)
+                .loading(self.previewing)
+                .tooltip(tip)
+                .into_any_element()
         } else {
-            kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click).into_any_element()
+            kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click)
+                .loading(self.previewing)
+                .tooltip(tip)
+                .into_any_element()
+        };
+        let status_node: AnyElement = if let Some(diag) = diagnostic {
+            div()
+                .id("structure-draft-diagnostic")
+                .test_support()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(kit::icon(IconName::TriangleAlert, 13., p.warn))
+                .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.warn).font_weight(FontWeight::MEDIUM).child(SharedString::from(diag)))
+                .into_any_element()
+        } else if pending > 0 {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(kit::icon(IconName::CircleDot, 13., p.warn))
+                .child(div().truncate().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(breakdown)))
+                .into_any_element()
+        } else if let Some((no_pk, text)) = create_summary {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when(no_pk, |this| this.child(kit::icon(IconName::TriangleAlert, 13., p.warn)))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(TypeScale::SM))
+                        .text_color(if no_pk { p.warn } else { p.text_muted })
+                        .child(SharedString::from(text)),
+                )
+                .into_any_element()
+        } else {
+            div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p)).into_any_element()
         };
         Some(
             div()
@@ -1640,19 +2505,7 @@ impl StructurePane {
                 .border_t_1()
                 .border_color(p.line)
                 .bg(if pending > 0 { p.warn_soft } else { p.surface })
-                .child(if pending > 0 {
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(kit::icon(IconName::CircleDot, 13., p.warn))
-                        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(i18n::fill(&i18n::text(locale, "structure.changes.pending"), &[("count", &pending.to_string())]))))
-                        .child(kit::muted(t("structure.action.hint"), p))
-                } else {
-                    div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p))
-                })
+                .child(status_node)
                 .when(pending > 0, |this| {
                     let owner = entity.clone();
                     this.child(kit::tool_button("structure-reset-draft", Some(IconName::Undo2), t("structure.changes.discard"), move |_, _, cx| {
@@ -1668,7 +2521,6 @@ impl StructurePane {
     }
 }
 
-/// 一行字段相对快照的状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColumnChange {
     Clean,
@@ -1677,7 +2529,6 @@ enum ColumnChange {
     Dropped,
 }
 
-/// 小号勾选框（16px）：表格行里的布尔开关，比整块“可空”按钮更像一张表。
 fn check_box(id: SharedString, on: bool, enabled: bool, label: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
     kit::interactive_states(div().id(id), p, !enabled)
         .role(gpui_kit::Role::CheckBox)
@@ -1694,6 +2545,32 @@ fn check_box(id: SharedString, on: bool, enabled: bool, label: SharedString, p: 
         .when(!on, |this| this.border_color(p.line_strong).bg(p.surface))
 }
 
+fn fk_rules_cell(on_delete: &str, on_update: &str, p: &Palette) -> AnyElement {
+    let del = if on_delete.trim().is_empty() { "NO ACTION" } else { on_delete.trim() };
+    let upd = if on_update.trim().is_empty() { "NO ACTION" } else { on_update.trim() };
+    let badge = |prefix: &str, rule: &str| -> AnyElement {
+        let upper = rule.to_ascii_uppercase();
+        let (fg, bg) = if upper == "CASCADE" {
+            (p.warn, p.warn_soft)
+        } else if upper.starts_with("SET ") {
+            (p.accent_text, p.accent_soft)
+        } else {
+            (p.text_muted, p.hover)
+        };
+        kit::pill(SharedString::from(format!("{prefix}: {upper}")), fg, bg)
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .min_w(px(0.))
+        .overflow_hidden()
+        .child(badge("DEL", del))
+        .when(!upd.eq_ignore_ascii_case("NO ACTION") && !upd.eq_ignore_ascii_case("RESTRICT"), |this| {
+            this.child(badge("UPD", upd))
+        })
+        .into_any_element()
+}
 
 fn replace_text(slot: &mut String, value: String) -> bool {
     if *slot == value {
@@ -1711,14 +2588,21 @@ struct FkChoices {
     schemas: Option<Vec<String>>,
     tables: Vec<String>,
     columns: Vec<String>,
+    primary_column: Option<String>,
 }
 
-async fn load_fk_choices(service: &crate::connections::Service, target: &GridTarget, schema: &str, ref_table: &str, want_schemas: bool) -> FkChoices {
+async fn load_fk_choices(
+    service: &crate::connections::Service,
+    target: &GridTarget,
+    schema: &str,
+    ref_table: &str,
+    want_schemas: bool,
+) -> FkChoices {
     let Some(session) = service.catalog_session(&target.connection_id) else {
-        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new() };
+        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new(), primary_column: None };
     };
     let Ok(engine) = crate::connections::model::Engine::parse(&target.engine) else {
-        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new() };
+        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new(), primary_column: None };
     };
     let schemas = if want_schemas {
         let body = crate::catalog::read::read_catalog_outline(engine, &session).await;
@@ -1737,24 +2621,35 @@ async fn load_fk_choices(service: &crate::connections::Service, target: &GridTar
     tables.sort();
     tables.dedup();
     let mut columns = Vec::new();
+    let mut primary_column = None;
     if !ref_table.is_empty() {
-        if let Ok(snapshot) = crate::application::ddl::describe_saved(service, &target.connection_id, target.database.clone(), schema.to_owned(), &target.engine, ref_table).await {
+        if let Ok(snapshot) = crate::application::ddl::describe_saved(
+            service,
+            &target.connection_id,
+            target.database.clone(),
+            schema.to_owned(),
+            &target.engine,
+            ref_table,
+        )
+        .await
+        {
+            let pks: Vec<&str> = snapshot.columns.iter().filter(|col| col.primary).map(|col| col.name.as_str()).collect();
+            if pks.len() == 1 {
+                primary_column = Some(pks[0].to_owned());
+            }
             columns = snapshot.columns.into_iter().map(|column| column.name).collect();
         }
     }
-    FkChoices { schemas, tables, columns }
+    FkChoices { schemas, tables, columns, primary_column }
 }
 
-/// 列表一行：单元格、右键菜单与“已标记删除”的淡化状态。
 struct RowSpec {
-    /// 行 id 片段（`columns-0` 之类），行的元素 id 是 `structure-row-{id}`。
     id: String,
     dim: bool,
     cells: Vec<AnyElement>,
     menu: Vec<MenuEntry>,
 }
 
-/// 右键菜单项。动作只改草稿或发起预览，不直接执行 SQL。
 #[derive(Clone)]
 struct MenuEntry {
     id: String,
@@ -1768,11 +2663,13 @@ struct MenuEntry {
 enum RowAction {
     Copy(String),
     ToggleColumnDrop(usize),
+    RevertColumn(usize),
+    AddColumn,
     DropIndex(String),
     DropForeignKey(String),
+    OpenTable { schema: String, table: String },
 }
 
-/// 一张结构列表：表头与行共用一份 TableSpec（行高、表头高、左右内边距）。
 fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows: Vec<RowSpec>, spec: TableSpec, p: &Palette, locale: Locale) -> AnyElement {
     let mut head = div()
         .id("structure-table-head")
@@ -1786,12 +2683,17 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
         .border_b_1()
         .border_color(p.line)
         .text_size(px(TypeScale::XS))
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.text_faint);
     for column in columns {
         head = head.child(table_cell(*column, div().truncate().child(SharedString::from(i18n::text(locale, column.key)))));
     }
-    // 行尾的可见删除：索引/外键行把菜单里的删除项直接摆出来（受保护的保持禁用并说明原因）。
-    let quick_of = |entries: &[MenuEntry]| entries.iter().find(|entry| matches!(entry.action, RowAction::DropIndex(_) | RowAction::DropForeignKey(_))).cloned();
+    let quick_of = |entries: &[MenuEntry]| {
+        entries
+            .iter()
+            .find(|entry| matches!(entry.action, RowAction::DropIndex(_) | RowAction::DropForeignKey(_)))
+            .cloned()
+    };
     let has_quick = rows.iter().any(|row| quick_of(&row.menu).is_some());
     if has_quick {
         head = head.child(div().w(px(28.)).flex_none());
@@ -1801,7 +2703,6 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
         let owner = entity.clone();
         let quick = quick_of(&row.menu);
         let entries = row.menu;
-        // 每行一个稳定的元素 id：右键菜单的状态按元素 id 保存，共用同一处代码位置会让所有行共享一个菜单。
         let mut cells = div()
             .id(SharedString::from(format!("structure-row-cells-{}", row.id)))
             .flex()
@@ -1827,12 +2728,17 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
             .when_some(quick, |this, entry| {
                 let owner = entity.clone();
                 let action = entry.action.clone();
-                let button = kit::icon_button(SharedString::from(format!("structure-quick-{}", entry.id)), IconName::Trash, SharedString::from(entry.label.clone()), move |_, _, cx| {
-                    owner.update(cx, |pane, cx| {
-                        pane.apply_row_action(action.clone(), cx);
-                        cx.notify();
-                    });
-                })
+                let button = kit::icon_button(
+                    SharedString::from(format!("structure-quick-{}", entry.id)),
+                    IconName::Trash,
+                    SharedString::from(entry.label.clone()),
+                    move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.apply_row_action(action.clone(), cx);
+                            cx.notify();
+                        });
+                    },
+                )
                 .xsmall()
                 .disabled(entry.disabled);
                 let button = match entry.reason.clone() {
@@ -1856,14 +2762,10 @@ fn table_cell(cell: ColumnSpec, child: impl IntoElement) -> gpui_kit::Div {
         .child(child)
 }
 
-/// 长列表下拉按当前输入得到的结果。没有可选项与输入无命中是两种不同的结论，都不能点。
 #[derive(Debug, PartialEq, Eq)]
 enum ChoiceMatch<'a> {
-    /// 原始选项为空：没有可选的表、列、模式或类型。
     Unavailable,
-    /// 有选项但当前输入一项都不匹配：保留输入，提示修改或清空。
     NoMatch,
-    /// 要列出的选项：输入为空或已是精确值时为全部，否则为大小写不敏感的部分匹配。
     Items(Vec<&'a String>),
 }
 
@@ -1880,10 +2782,13 @@ fn match_choices<'a>(choices: &'a [String], current: &str) -> ChoiceMatch<'a> {
     if hits.is_empty() { ChoiceMatch::NoMatch } else { ChoiceMatch::Items(hits) }
 }
 
-/// 长列表下拉（表、列、模式、类型）：限高可滚动，标出当前值；输入框里已经填了一部分时只列匹配项，
-/// 几百张表时不再铺满整个窗口。没有匹配时给不可点的“无匹配选项”并保留输入，清空输入即恢复全部；
-/// 原本就没有选项时给“无可用选项”。两种提示都不触发选择、不改草稿。
-fn choice_menu(menu: PopupMenu, choices: &[String], current: &str, locale: Locale, pick: impl Fn(String, &mut App) + Clone + 'static) -> PopupMenu {
+fn choice_menu(
+    menu: PopupMenu,
+    choices: &[String],
+    current: &str,
+    locale: Locale,
+    pick: impl Fn(String, &mut App) + Clone + 'static,
+) -> PopupMenu {
     let mut menu = menu.min_w(px(220.)).max_w(px(420.)).max_h(px(360.)).scrollable(true);
     match match_choices(choices, current) {
         ChoiceMatch::Unavailable => menu.item(PopupMenuItem::label(i18n::text(locale, "structure.choice.empty"))),
@@ -1894,7 +2799,11 @@ fn choice_menu(menu: PopupMenu, choices: &[String], current: &str, locale: Local
             for choice in filtered {
                 let value = choice.clone();
                 let pick = pick.clone();
-                menu = menu.item(PopupMenuItem::new(choice.clone()).checked(choice == current.trim()).on_click(move |_, _, cx| pick(value.clone(), cx)));
+                menu = menu.item(
+                    PopupMenuItem::new(choice.clone())
+                        .checked(choice == current.trim())
+                        .on_click(move |_, _, cx| pick(value.clone(), cx)),
+                );
             }
             menu
         }
@@ -1908,7 +2817,6 @@ fn row_menu(entity: &Entity<StructurePane>, entries: &[MenuEntry], mut menu: Pop
     menu
 }
 
-/// 菜单项带稳定 id（`structure-menu-{id}`），禁用项留在菜单里并说明原因。
 fn menu_entry(entity: &Entity<StructurePane>, entry: &MenuEntry) -> PopupMenuItem {
     let owner = entity.downgrade();
     let element_id = SharedString::from(format!("structure-menu-{}", entry.id));
@@ -1954,7 +2862,13 @@ fn cell_main(text: String, icon: Option<IconName>, p: &Palette) -> AnyElement {
 }
 
 fn cell_mono(text: String, mono: &SharedString, p: &Palette) -> AnyElement {
-    div().truncate().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
+    div()
+        .truncate()
+        .font_family(mono.clone())
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .child(SharedString::from(text))
+        .into_any_element()
 }
 
 fn cell_text(text: String, p: &Palette) -> AnyElement {
@@ -1962,6 +2876,26 @@ fn cell_text(text: String, p: &Palette) -> AnyElement {
 }
 
 impl StructurePane {
+    pub fn handle_escape(&mut self) -> bool {
+        if self.session.preview_open() && !self.executing {
+            self.session.cancel();
+            return true;
+        }
+        if self.composer_open {
+            self.composer_open = false;
+            return true;
+        }
+        false
+    }
+
+    pub fn trigger_preview_shortcut(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.session.preview_open() && self.preview_action_visible() && !self.previewing {
+            self.preview_current(cx);
+            return true;
+        }
+        false
+    }
+
     fn preview_current(&mut self, cx: &mut Context<Self>) {
         self.session.intent = EditIntent::Apply;
         self.preview(cx);
@@ -1979,20 +2913,18 @@ impl StructurePane {
         self.preview(cx);
     }
 
-
     fn draft_input(&mut self, key: u32, value: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = self.draft_fields.bind(key, value, FieldSpec { placeholder, masked: false }, window, cx, on_draft);
         kit::text_input(SharedString::from(format!("structure-draft-{key}")), &state, placeholder.to_owned()).small().into_any_element()
     }
 
-    /// 一行字段与快照比，处于什么状态：新增 / 已修改 / 待删除 / 未改。
     fn column_change(&self, column: &ColumnDraft) -> ColumnChange {
+        let Some(original) = column.original.as_deref() else {
+            return if column.dropped { ColumnChange::Clean } else { ColumnChange::Added };
+        };
         if column.dropped {
             return ColumnChange::Dropped;
         }
-        let Some(original) = column.original.as_deref() else {
-            return ColumnChange::Added;
-        };
         let Some(before) = self.snapshot.as_ref().and_then(|snapshot| snapshot.columns.iter().find(|item| item.name == original)) else {
             return ColumnChange::Clean;
         };
@@ -2003,7 +2935,6 @@ impl StructurePane {
         if changed { ColumnChange::Modified } else { ColumnChange::Clean }
     }
 
-    /// 未应用的结构修改数（字段的增、改、删）。
     pub fn pending_changes(&self) -> usize {
         if self.session.mode == StructureMode::Create {
             return 0;
@@ -2011,9 +2942,63 @@ impl StructurePane {
         self.session.kept_columns.iter().filter(|column| self.column_change(column) != ColumnChange::Clean).count()
     }
 
-    /// 字段页：一张可直接编辑的结构表（设计表）。每行就是一列：名称、类型、可空、默认值；
-    /// 新建表时多出主键、自增与上下移动。改过的行左侧有色条（新增绿、修改黄、删除红并划线），
-    /// 最后一行“添加字段”。所有修改只改草稿，经“预览 SQL”确认后才执行。
+    fn column_matches_filter(&self, column: &ColumnDraft, change: ColumnChange) -> bool {
+        if self.only_changed_columns && change == ColumnChange::Clean {
+            return false;
+        }
+        let needle = self.column_filter.trim().to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        column.name.to_lowercase().contains(&needle)
+            || column.type_name.to_lowercase().contains(&needle)
+            || column.default_sql.to_lowercase().contains(&needle)
+            || column.original.as_deref().is_some_and(|orig| orig.to_lowercase().contains(&needle))
+    }
+
+    /// 实时生成建表、新建索引或新建外键的预览 SQL（纯内存推导，不发起网络请求）。
+    fn live_composer_sql(&self) -> Option<String> {
+        let engine = DdlEngine::parse(&self.session.target.engine).ok()?;
+        match (self.session.mode, self.session.section) {
+            (StructureMode::Create, Section::Columns) => {
+                if !valid_name(&self.session.table_name) {
+                    return None;
+                }
+                let mut snap = Snapshot::bare(engine, &self.session.target.database, &self.session.target.schema, &self.session.table_name);
+                snap.object_exists = false;
+                let plan = preview_plan(&snap, &self.session.action());
+                plan.steps.first().map(|step| step.sql.clone())
+            }
+            (StructureMode::Existing, Section::Indexes) => {
+                let snap = self.snapshot.as_ref()?;
+                let plan = preview_plan(snap, &self.session.action());
+                plan.steps.first().map(|step| step.sql.clone())
+            }
+            (StructureMode::Existing, Section::ForeignKeys) => {
+                let snap = self.snapshot.as_ref()?;
+                let draft = self.session.foreign_key_draft();
+                if !valid_name(&draft.name)
+                    || draft.columns.first().is_none_or(|c| c.trim().is_empty())
+                    || draft.ref_table.trim().is_empty()
+                    || draft.ref_columns.first().is_none_or(|c| c.trim().is_empty())
+                {
+                    return None;
+                }
+                let key = crate::ddl::ForeignKey {
+                    name: draft.name,
+                    columns: draft.columns,
+                    ref_schema: draft.ref_schema,
+                    ref_table: draft.ref_table,
+                    ref_columns: draft.ref_columns,
+                    on_delete: draft.on_delete,
+                    on_update: draft.on_update,
+                };
+                fk_sql_for_display(snap, &key)
+            }
+            _ => None,
+        }
+    }
+
     #[inline(never)]
     fn column_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
@@ -2024,20 +3009,183 @@ impl StructurePane {
         let create = self.session.mode == StructureMode::Create;
         let readonly_view = self.session.object_kind == "view" && !create;
         if readonly_view {
-            return kit::muted(t("structure.section.viewDef"), &p);
+            return div().into_any_element();
         }
         let engine = self.session.target.engine.clone();
         let row_h = metrics.row_h;
-        // 内容宽由外壳布局同步（活动栏、停靠侧栏和根内边距已经扣掉），
-        // 再扣掉 structure-body 真正应用的左右内边距，才是这一行能用的宽度。
         let content_w = (self.content_width - 2. * metrics.page_pad).max(0.);
         let widths = FieldWidths::of(content_w, create);
         let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
+
         if create {
-            let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
-            editor = editor.child(kit::form_row(t("structure.action.createTable"), div().max_w(px(360.)).child(name), &p));
+            let name_placeholder = i18n::text(locale, "structure.create.tableNamePlaceholder");
+            let name = self.draft_input(4, &self.session.table_name.clone(), &name_placeholder, window, cx);
+            let preset_entity = entity.clone();
+            let add_top_entity = entity.clone();
+            let presets_btn = Button::new("structure-column-presets")
+                .ghost()
+                .small()
+                .icon(IconName::Sparkles)
+                .label(t("structure.field.presets"))
+                .dropdown_menu(move |menu, _, _| {
+                    let items = [
+                        ("structure.preset.timestamps", ColumnPreset::Timestamps),
+                        ("structure.preset.softDelete", ColumnPreset::SoftDelete),
+                        ("structure.preset.statusRemark", ColumnPreset::StatusRemark),
+                        ("structure.preset.uuid", ColumnPreset::Uuid),
+                    ];
+                    let mut m = menu.min_w(px(220.));
+                    for (key, preset) in items {
+                        let owner = preset_entity.clone();
+                        m = m.item(PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                            owner.update(cx, |pane, cx| {
+                                pane.apply_column_preset(preset);
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    m
+                });
+            editor = editor.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_end()
+                    .gap(px(12.))
+                    .child(div().flex_1().min_w(px(200.)).max_w(px(380.)).child(kit::form_row(t("structure.action.createTable"), name, &p)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(presets_btn)
+                            .child(kit::secondary_button("structure-add-column-top", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
+                                add_top_entity.update(cx, |pane, cx| {
+                                    pane.add_column();
+                                    cx.notify();
+                                });
+                            })),
+                    ),
+            );
+        } else {
+            let total_cols = self.session.kept_columns.len();
+            let pending = self.pending_changes();
+            let filter_val = self.column_filter.clone();
+            let filter_placeholder = i18n::text(locale, "structure.columns.filter");
+            let filter_state = self.fields.bind(
+                "column_filter",
+                &filter_val,
+                FieldSpec { placeholder: &filter_placeholder, masked: false },
+                window,
+                cx,
+                |this: &mut Self, field, value, _| this.set_field(field, value),
+            );
+            let show_toolbar = total_cols >= 5 || !filter_val.is_empty() || self.only_changed_columns || pending > 0;
+            if show_toolbar {
+                let clear_entity = entity.clone();
+                let changed_entity = entity.clone();
+                let add_top_entity = entity.clone();
+                let preset_entity = entity.clone();
+                let visible_count = self
+                    .session
+                    .kept_columns
+                    .iter()
+                    .filter(|col| self.column_matches_filter(col, self.column_change(col)))
+                    .count();
+                let count_label = if !filter_val.trim().is_empty() || self.only_changed_columns {
+                    i18n::fill(
+                        &i18n::text(locale, "structure.columns.filteredCount"),
+                        &[("shown", &visible_count.to_string()), ("total", &total_cols.to_string())],
+                    )
+                } else {
+                    i18n::fill(&i18n::text(locale, "structure.columns.count"), &[("count", &total_cols.to_string())])
+                };
+                let presets_btn = Button::new("structure-column-presets")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Sparkles)
+                    .label(t("structure.field.presets"))
+                    .dropdown_menu(move |menu, _, _| {
+                        let items = [
+                            ("structure.preset.timestamps", ColumnPreset::Timestamps),
+                            ("structure.preset.softDelete", ColumnPreset::SoftDelete),
+                            ("structure.preset.statusRemark", ColumnPreset::StatusRemark),
+                        ];
+                        let mut m = menu.min_w(px(220.));
+                        for (key, preset) in items {
+                            let owner = preset_entity.clone();
+                            m = m.item(PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                                owner.update(cx, |pane, cx| {
+                                    pane.apply_column_preset(preset);
+                                    cx.notify();
+                                });
+                            }));
+                        }
+                        m
+                    });
+                editor = editor.child(
+                    div()
+                        .id("structure-columns-toolbar")
+                        .test_support()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.))
+                                .max_w(px(280.))
+                                .h(px(metrics.control_h))
+                                .px(px(8.))
+                                .rounded(px(Radius::CONTROL))
+                                .border_1()
+                                .border_color(if !filter_val.is_empty() { p.accent } else { p.line })
+                                .bg(p.surface)
+                                .flex()
+                                .items_center()
+                                .child(kit::input_prefix(IconName::Search, 13., p.text_faint))
+                                .child(div().flex_1().min_w(px(0.)).child(kit::borderless_input("structure-column-filter", &filter_state, filter_placeholder)))
+                                .when(!filter_val.is_empty(), |this| {
+                                    this.child(
+                                        kit::icon_button("structure-column-filter-clear", IconName::X, t("structure.columns.filterClear"), move |_, _, cx| {
+                                            clear_entity.update(cx, |pane, cx| {
+                                                pane.column_filter.clear();
+                                                cx.notify();
+                                            });
+                                        })
+                                        .xsmall(),
+                                    )
+                                }),
+                        )
+                        .when(pending > 0 || self.only_changed_columns, |this| {
+                            let label = SharedString::from(i18n::fill(
+                                &i18n::text(locale, "structure.columns.onlyChanged"),
+                                &[("count", &pending.to_string())],
+                            ));
+                            this.child(
+                                kit::tool_button("structure-only-changed", Some(IconName::CircleDot), label, move |_, _, cx| {
+                                    changed_entity.update(cx, |pane, cx| {
+                                        pane.only_changed_columns = !pane.only_changed_columns;
+                                        cx.notify();
+                                    });
+                                })
+                                .selected(self.only_changed_columns),
+                            )
+                        })
+                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(count_label)))
+                        .child(div().flex_1())
+                        .when(content_w >= 560., |this| this.child(presets_btn))
+                        .child(kit::secondary_button("structure-add-column-top", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
+                            add_top_entity.update(cx, |pane, cx| {
+                                pane.add_column();
+                                cx.notify();
+                            });
+                        })),
+                );
+            }
         }
-        // 表头：与行同一套列宽。
+
         let head = div()
             .id("structure-table-head")
             .test_support()
@@ -2052,8 +3200,8 @@ impl StructurePane {
             .border_b_1()
             .border_color(p.line)
             .text_size(px(TypeScale::XS))
+            .font_weight(FontWeight::SEMIBOLD)
             .text_color(p.text_faint)
-            // 名称列前有 12px 的主键图标槽和 4px 间距，表头文字与输入框左缘对齐。
             .child(div().flex_1().min_w(px(widths.name_min)).pl(px(16.)).child(t("structure.field.column")))
             .child(div().w(px(widths.kind)).flex_none().child(t("structure.field.type")))
             .child(div().w(px(widths.nullable)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
@@ -2064,11 +3212,42 @@ impl StructurePane {
                     .child(div().w(px(widths.moves)).flex_none())
             })
             .child(div().w(px(widths.drop)).flex_none());
-        let mut rows = div().flex().flex_col();
+
         let columns = self.session.kept_columns.clone();
-        for (index, column) in columns.iter().enumerate() {
-            let change = self.column_change(column);
-            rows = rows.child(stack_frame(|| self.column_row(index, column, change, create, &engine, row_h, widths, &p, &entity, window, cx)));
+        let visible_indices: Vec<(usize, ColumnDraft, ColumnChange)> = columns
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, column)| {
+                let change = self.column_change(&column);
+                self.column_matches_filter(&column, change).then_some((index, column, change))
+            })
+            .collect();
+
+        if visible_indices.is_empty() && (!self.column_filter.trim().is_empty() || self.only_changed_columns) {
+            let clear_owner = entity.clone();
+            let clear_btn = kit::secondary_button("structure-clear-col-filter", None, t("structure.columns.filterClear"), move |_, _, cx| {
+                clear_owner.update(cx, |pane, cx| {
+                    pane.clear_column_filter();
+                    cx.notify();
+                });
+            });
+            editor = editor.child(
+                kit::card(&p).overflow_hidden().child(kit::no_match_state_with_action(
+                    IconName::Search,
+                    t("structure.columns.noMatch"),
+                    t("structure.columns.noMatchHint"),
+                    clear_btn,
+                    &p,
+                )),
+            );
+            return editor.into_any_element();
+        }
+
+        let mut rows = div().flex().flex_col();
+        for (index, column, change) in &visible_indices {
+            rows = rows.child(stack_frame(|| {
+                self.column_row(*index, column, *change, create, &engine, row_h, widths, &p, &entity, window, cx)
+            }));
         }
         let add_entity = entity.clone();
         let add = div()
@@ -2077,15 +3256,41 @@ impl StructurePane {
             .items_center()
             .h(px(row_h + 4.))
             .px(px(6.))
+            .bg(p.surface)
             .child(kit::tool_button("structure-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
                 add_entity.update(cx, |pane, cx| {
                     pane.add_column();
                     cx.notify();
                 });
             }));
-        editor
-            .child(kit::card(&p).overflow_hidden().flex().flex_col().child(head).child(rows).child(add))
-            .into_any_element()
+        editor = editor.child(kit::card(&p).overflow_hidden().flex().flex_col().child(head).child(rows).child(add));
+
+        if create {
+            let live_sql = self.live_composer_sql();
+            let mono = cx.theme().mono_font_family.clone();
+            editor = editor.child(
+                div()
+                    .id("structure-create-live-sql")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(kit::eyebrow(t("structure.create.sqlPreview"), &p))
+                    .child(
+                        kit::sunken(&p)
+                            .id("structure-create-live-sql-scroll")
+                            .p(px(12.))
+                            .max_h(px(180.))
+                            .overflow_y_scroll()
+                            .font_family(mono)
+                            .text_size(px(TypeScale::SM))
+                            .text_color(if live_sql.is_some() { p.text } else { p.text_faint })
+                            .child(SharedString::from(live_sql.unwrap_or_else(|| i18n::text(locale, "structure.create.nameHint")))),
+                    ),
+            );
+        }
+
+        editor.into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2106,21 +3311,60 @@ impl StructurePane {
     ) -> AnyElement {
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
+
+        let snapshot_col = column
+            .original
+            .as_deref()
+            .and_then(|orig| self.snapshot.as_ref().and_then(|snap| snap.columns.iter().find(|c| c.name == orig)));
+        let orig_primary = !create && snapshot_col.is_some_and(|c| c.primary);
+        let orig_generated = !create && snapshot_col.is_some_and(|c| c.generated);
+        let orig_auto = !create && snapshot_col.is_some_and(|c| c.auto);
+        let col_comment = column
+            .original
+            .as_deref()
+            .and_then(|orig| self.snapshot.as_ref().and_then(|snap| snap.column_comments.get(orig)))
+            .cloned();
+        let fk_target = column.original.as_deref().and_then(|orig| {
+            self.snapshot.as_ref().and_then(|snap| {
+                snap.foreign_keys
+                    .iter()
+                    .find(|fk| fk.columns.iter().any(|c| c == orig))
+                    .map(|fk| format!("{}.{}", fk.ref_table, fk.ref_columns.join(",")))
+            })
+        });
+        let changed_detail = (change == ColumnChange::Modified).then(|| {
+            snapshot_col
+                .map(|before| {
+                    let null_str = if before.nullable { "NULL" } else { "NOT NULL" };
+                    let def_str = before.default_sql.as_deref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
+                    i18n::fill(
+                        &i18n::text(locale, "structure.field.changedFrom"),
+                        &[("detail", &format!("{} {} {null_str}{def_str}", before.name, before.type_name))],
+                    )
+                })
+                .unwrap_or_default()
+        });
+
         let name = self.draft_input(10_000 + index as u32, &column.name, "name", window, cx);
-        let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
+        let kind = self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
         let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "NULL", window, cx);
+
         let types = type_choices(engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
-        // 用列表里的原样拼写作当前值：既能勾出它，也让 choice_menu 按精确值列出全部类型，而不是把大小写不同的输入当筛选词。
-        let current_type = types.iter().find(|item| item.eq_ignore_ascii_case(column.type_name.trim())).cloned().unwrap_or_default();
+        let current_type = types
+            .iter()
+            .find(|item| item.eq_ignore_ascii_case(column.type_name.trim()))
+            .cloned()
+            .unwrap_or_default();
         let type_entity = entity.clone();
+        let type_locked = orig_primary || orig_generated;
         let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
             .ghost()
             .xsmall()
             .icon(IconName::ChevronDown)
+            .disabled(type_locked)
             .tooltip(t("structure.field.pickType"))
             .dropdown_menu(move |menu, _, _| {
                 let entity = type_entity.clone();
-                // 类型下拉列全部常用类型并勾出当前值，不按输入筛选：这里换类型，不是搜类型。
                 choice_menu(menu, &types, &current_type, locale, move |choice, cx| {
                     entity.update(cx, |pane, cx| {
                         pane.write_draft(20_000 + index as u32, choice);
@@ -2128,6 +3372,46 @@ impl StructurePane {
                     });
                 })
             });
+
+        let defaults = default_choices(engine, column.nullable);
+        let default_entity = entity.clone();
+        let cur_default = column.default_sql.trim().to_owned();
+        let clear_default_label = i18n::text(locale, "structure.field.defaultNone");
+        let default_menu = Button::new(SharedString::from(format!("structure-defaults-{index}")))
+            .ghost()
+            .xsmall()
+            .icon(IconName::ChevronDown)
+            .disabled(orig_generated || (create && column.auto))
+            .tooltip(t("structure.field.pickDefault"))
+            .dropdown_menu(move |mut menu, _, _| {
+                let owner_clear = default_entity.clone();
+                menu = menu.min_w(px(180.)).item(
+                    PopupMenuItem::new(clear_default_label.clone())
+                        .checked(cur_default.is_empty())
+                        .on_click(move |_, _, cx| {
+                            owner_clear.update(cx, |pane, cx| {
+                                pane.write_draft(30_000 + index as u32, String::new());
+                                cx.notify();
+                            });
+                        }),
+                );
+                for preset in &defaults {
+                    let value = (*preset).to_owned();
+                    let owner = default_entity.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(value.clone())
+                            .checked(cur_default.eq_ignore_ascii_case(&value))
+                            .on_click(move |_, _, cx| {
+                                owner.update(cx, |pane, cx| {
+                                    pane.write_draft(30_000 + index as u32, value.clone());
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+
         let toggle = |id: String, on: bool, which: &'static str, label: SharedString, enabled: bool| {
             let owner = entity.clone();
             check_box(SharedString::from(id), on, enabled, label, p).on_click(move |_, _, cx| {
@@ -2137,18 +3421,40 @@ impl StructurePane {
                 });
             })
         };
-        let bar = match change {
-            ColumnChange::Added => Some(p.ok),
-            ColumnChange::Modified => Some(p.warn),
-            ColumnChange::Dropped => Some(p.danger),
-            ColumnChange::Clean => None,
+        let (bar, row_tint) = match change {
+            ColumnChange::Added => (Some(p.ok), Some(p.ok_soft.opacity(0.45))),
+            ColumnChange::Modified => (Some(p.warn), Some(p.warn_soft.opacity(0.45))),
+            ColumnChange::Dropped => (Some(p.danger), Some(p.danger_soft.opacity(0.35))),
+            ColumnChange::Clean => (None, None),
         };
         let dropped = change == ColumnChange::Dropped;
+        let is_unsaved_new = column.original.is_none();
+        let drop_locked = orig_generated || (create && is_unsaved_new && self.session.kept_columns.len() <= 1);
+        let drop_label = if dropped {
+            t("structure.field.undoDelete")
+        } else if is_unsaved_new && !create {
+            t("structure.field.removeDraft")
+        } else {
+            t("structure.field.delete")
+        };
+        let drop_tip = if orig_primary {
+            Some(t("structure.field.pkLocked"))
+        } else if orig_generated {
+            Some(t("structure.field.genLocked"))
+        } else {
+            None
+        };
         let drop_entity = entity.clone();
-        let drop = kit::icon_button(
+        let drop_btn = kit::icon_button(
             SharedString::from(format!("structure-drop-col-{index}")),
-            if dropped { IconName::Undo2 } else { IconName::Trash },
-            if dropped { t("structure.field.undoDelete") } else { t("structure.field.delete") },
+            if dropped {
+                IconName::Undo2
+            } else if is_unsaved_new && !create {
+                IconName::X
+            } else {
+                IconName::Trash
+            },
+            drop_label.clone(),
             move |_, _, cx| {
                 drop_entity.update(cx, |pane, cx| {
                     pane.toggle_column(index, "drop");
@@ -2156,7 +3462,98 @@ impl StructurePane {
                 });
             },
         )
-        .xsmall();
+        .xsmall()
+        .disabled(drop_locked);
+        let drop_btn = match drop_tip {
+            Some(reason) => drop_btn.tooltip(reason),
+            None => drop_btn,
+        };
+
+        let revert_btn = (!create && change == ColumnChange::Modified).then(|| {
+            let revert_entity = entity.clone();
+            let tip = changed_detail
+                .clone()
+                .filter(|d| !d.is_empty())
+                .map(|d| SharedString::from(format!("{} · {d}", i18n::text(locale, "structure.field.revert"))))
+                .unwrap_or_else(|| t("structure.field.revert"));
+            kit::icon_button(
+                SharedString::from(format!("structure-revert-col-{index}")),
+                IconName::Undo2,
+                t("structure.field.revert"),
+                move |_, _, cx| {
+                    revert_entity.update(cx, |pane, cx| {
+                        pane.revert_column(index);
+                        cx.notify();
+                    });
+                },
+            )
+            .xsmall()
+            .tooltip(tip)
+        });
+
+        let mut row_menu_entries = vec![MenuEntry {
+            id: format!("edit-copy-col-{index}"),
+            label: i18n::text(locale, "structure.menu.copyName"),
+            action: RowAction::Copy(column.name.clone()),
+            disabled: column.name.trim().is_empty(),
+            reason: None,
+        }];
+        if !create && change == ColumnChange::Modified {
+            row_menu_entries.push(MenuEntry {
+                id: format!("edit-revert-col-{index}"),
+                label: i18n::text(locale, "structure.field.revert"),
+                action: RowAction::RevertColumn(index),
+                disabled: false,
+                reason: None,
+            });
+        }
+        row_menu_entries.push(MenuEntry {
+            id: format!("edit-add-col-{index}"),
+            label: i18n::text(locale, "structure.field.addColumn"),
+            action: RowAction::AddColumn,
+            disabled: false,
+            reason: None,
+        });
+        row_menu_entries.push(MenuEntry {
+            id: format!("edit-drop-col-{index}"),
+            label: drop_label.to_string(),
+            action: RowAction::ToggleColumnDrop(index),
+            disabled: drop_locked,
+            reason: if orig_primary {
+                Some(i18n::text(locale, "structure.field.pkLocked"))
+            } else if orig_generated {
+                Some(i18n::text(locale, "structure.field.genLocked"))
+            } else {
+                None
+            },
+        });
+
+        let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if column.primary {
+            let mut tip = i18n::text(locale, "structure.field.primary");
+            if orig_auto || (create && column.auto) {
+                tip = format!("{tip} · {}", i18n::text(locale, "structure.field.auto"));
+            }
+            if let Some(comment) = &col_comment {
+                tip = format!("{tip} — {comment}");
+            }
+            Some((IconName::Key, p.warn, tip))
+        } else if let Some(target) = &fk_target {
+            let mut tip = i18n::fill(&i18n::text(locale, "structure.field.badgeFk"), &[("target", target)]);
+            if let Some(comment) = &col_comment {
+                tip = format!("{tip} — {comment}");
+            }
+            Some((IconName::Key, p.info, tip))
+        } else if orig_generated {
+            Some((IconName::Lock, p.text_faint, i18n::text(locale, "structure.field.genLocked")))
+        } else {
+            col_comment
+                .as_ref()
+                .map(|comment| (IconName::Info, p.text_faint, format!("{}: {comment}", i18n::text(locale, "structure.field.comment"))))
+        };
+
+        let show_inline_badge = !create && widths.name_min >= 130. && (orig_auto || orig_generated);
+        let menu_owner = entity.clone();
+
         let mut row = div()
             .id(SharedString::from(format!("structure-row-columns-{index}")))
             .test_support()
@@ -2169,9 +3566,13 @@ impl StructurePane {
             .pr(px(FieldWidths::PAD_RIGHT))
             .border_b_1()
             .border_color(p.line_soft)
+            .when_some(row_tint, |this, tint| this.bg(tint))
             .hover(|style| style.bg(p.hover))
-            // 改动色条单独画在左侧，不染行的分隔线。
-            .when_some(bar, |this, color| this.child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(color)))
+            .context_menu(move |menu, _, _| row_menu(&menu_owner, &row_menu_entries, menu))
+            .when_some(bar, |this, color| {
+                let indicator = div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(color);
+                this.child(indicator)
+            })
             .child(
                 div()
                     .flex_1()
@@ -2179,48 +3580,137 @@ impl StructurePane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    // 主键图标占一个固定槽：每行的名称输入框左缘对齐，不因有没有钥匙错开。
-                    .child(div().w(px(12.)).flex_none().when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn))))
-                    .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name)),
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(slot_icon, |this, (ic, color, tip)| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!("structure-col-mark-{index}")))
+                                        .tooltip_text(SharedString::from(tip))
+                                        .child(kit::icon(ic, 12., color)),
+                                )
+                            }),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name))
+                    .when(show_inline_badge, |this| {
+                        let key = if orig_generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
+                        this.child(kit::pill(t(key), p.text_muted, p.hover))
+                    }),
             )
-            .child(div().w(px(widths.kind)).flex_none().flex().items_center().gap(px(2.)).when(dropped, |this| this.opacity(0.5)).child(div().flex_1().min_w(px(0.)).child(kind)).child(type_menu))
+            .child(
+                div()
+                    .w(px(widths.kind))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .when(dropped, |this| this.opacity(0.5))
+                    .child(div().flex_1().min_w(px(0.)).child(kind))
+                    .child(type_menu),
+            )
             .child(
                 div()
                     .w(px(widths.nullable))
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(toggle(format!("structure-null-{index}"), column.nullable, "null", t("ui.structure.nullable"), !dropped && !column.primary)),
+                    .child(toggle(
+                        format!("structure-null-{index}"),
+                        column.nullable,
+                        "null",
+                        t("ui.structure.nullable"),
+                        !dropped && !column.primary && !orig_generated,
+                    )),
             )
-            .child(div().w(px(widths.default)).flex_none().when(dropped, |this| this.opacity(0.5)).child(default_value));
+            .child(
+                div()
+                    .w(px(widths.default))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .when(dropped, |this| this.opacity(0.5))
+                    .child(div().flex_1().min_w(px(0.)).child(default_value))
+                    .child(default_menu),
+            );
+
         if create {
             let up_entity = entity.clone();
             let down_entity = entity.clone();
             let is_first = index == 0;
             let is_last = index + 1 >= self.session.kept_columns.len();
             row = row
-                .child(div().w(px(widths.primary)).flex_none().flex().justify_center().child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)))
-                .child(div().w(px(widths.auto)).flex_none().flex().justify_center().child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)))
+                .child(
+                    div()
+                        .w(px(widths.primary))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(toggle(format!("structure-pk-{index}"), column.primary, "primary", t("structure.field.primary"), true)),
+                )
+                .child(
+                    div()
+                        .w(px(widths.auto))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(toggle(format!("structure-auto-{index}"), column.auto, "auto", t("structure.field.auto"), true)),
+                )
                 .child(
                     div()
                         .w(px(widths.moves))
                         .flex_none()
                         .flex()
-                        .child(kit::icon_button(SharedString::from(format!("structure-up-{index}")), IconName::ChevronUp, t("structure.field.moveUp"), move |_, _, cx| {
-                            up_entity.update(cx, |pane, cx| {
-                                pane.move_column(index, -1);
-                                cx.notify();
-                            });
-                        }).xsmall().disabled(is_first))
-                        .child(kit::icon_button(SharedString::from(format!("structure-down-{index}")), IconName::ChevronDown, t("structure.field.moveDown"), move |_, _, cx| {
-                            down_entity.update(cx, |pane, cx| {
-                                pane.move_column(index, 1);
-                                cx.notify();
-                            });
-                        }).xsmall().disabled(is_last)),
+                        .justify_center()
+                        .child(
+                            kit::icon_button(
+                                SharedString::from(format!("structure-up-{index}")),
+                                IconName::ChevronUp,
+                                t("structure.field.moveUp"),
+                                move |_, _, cx| {
+                                    up_entity.update(cx, |pane, cx| {
+                                        pane.move_column(index, -1);
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .xsmall()
+                            .disabled(is_first),
+                        )
+                        .child(
+                            kit::icon_button(
+                                SharedString::from(format!("structure-down-{index}")),
+                                IconName::ChevronDown,
+                                t("structure.field.moveDown"),
+                                move |_, _, cx| {
+                                    down_entity.update(cx, |pane, cx| {
+                                        pane.move_column(index, 1);
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .xsmall()
+                            .disabled(is_last),
+                        ),
                 );
         }
-        row.child(div().w(px(widths.drop)).flex_none().flex().justify_center().child(drop)).into_any_element()
+        row.child(
+            div()
+                .w(px(widths.drop))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(2.))
+                .when_some(revert_btn, |this, btn| this.child(btn))
+                .child(drop_btn),
+        )
+        .into_any_element()
     }
 
     fn section_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2233,26 +3723,53 @@ impl StructurePane {
         let form = div().flex().flex_col().gap(px(metrics.section_gap()));
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
         let form = match section {
-            Section::Columns if readonly_view => form.child(kit::muted(t("structure.section.viewDef"), &p)),
+            Section::Columns if readonly_view => {
+                let edit_entity = entity.clone();
+                form.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.view.readonlyColumns"), &p)))
+                        .child(kit::secondary_button("structure-switch-view-def", Some(IconName::SquarePen), t("structure.view.editDef"), move |_, _, cx| {
+                            edit_entity.update(cx, |pane, cx| {
+                                pane.session.section = Section::View;
+                                pane.session.cancel();
+                                cx.notify();
+                            });
+                        })),
+                )
+            }
             Section::Columns => form.child(self.column_editor(window, cx)),
             Section::Indexes => stack_frame(|| {
-                // 新建索引：名称与“唯一”在一行；已选列按顺序排成标签（点标签切升/降序，× 移除），
-                // “添加列”下拉只列还没选的列。已有索引在上面的列表里，这里不再重复列一遍。
                 let mut form = form;
-                let names = self.snapshot.as_ref().map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>()).unwrap_or_else(|| {
-                    self.session.kept_columns.iter().filter(|column| !column.dropped).map(|column| column.name.clone()).collect()
-                });
+                let names = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>())
+                    .unwrap_or_else(|| {
+                        self.session.kept_columns.iter().filter(|column| !column.dropped).map(|column| column.name.clone()).collect()
+                    });
                 let selected = self.session.index_columns.clone();
                 let unique = self.session.index_unique;
-                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
+                let name = self.field("index_name", "structure.field.index", "idx_table_column", window, cx);
                 let unique_entity = entity.clone();
+                let auto_entity = entity.clone();
                 form = form.child(
                     div()
                         .flex()
                         .flex_wrap()
                         .items_end()
-                        .gap(px(16.))
+                        .gap(px(12.))
                         .child(div().flex_1().min_w(px(200.)).max_w(px(360.)).child(name))
+                        .when(!self.index_name_auto && !selected.is_empty(), |this| {
+                            this.child(kit::tool_button("structure-index-autoname", Some(IconName::Sparkles), t("structure.index.autoName"), move |_, _, cx| {
+                                auto_entity.update(cx, |pane, cx| {
+                                    pane.apply_auto_index_name();
+                                    cx.notify();
+                                });
+                            }))
+                        })
                         .child(
                             div()
                                 .id("structure-index-unique")
@@ -2266,6 +3783,7 @@ impl StructurePane {
                                 .on_click(move |_, _, cx| {
                                     unique_entity.update(cx, |pane, cx| {
                                         pane.session.index_unique = !pane.session.index_unique;
+                                        pane.sync_auto_index_name();
                                         pane.session.intent = EditIntent::Apply;
                                         pane.session.cancel();
                                         cx.notify();
@@ -2277,9 +3795,12 @@ impl StructurePane {
                 if selected.is_empty() {
                     chips = chips.child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("structure.index.pickHint")));
                 }
-                for column in &selected {
+                let selected_len = selected.len();
+                for (chip_idx, column) in selected.iter().enumerate() {
                     let order_entity = entity.clone();
                     let remove_entity = entity.clone();
+                    let left_entity = entity.clone();
+                    let right_entity = entity.clone();
                     let order_name = column.name.clone();
                     let remove_name = column.name.clone();
                     chips = chips.child(
@@ -2288,14 +3809,22 @@ impl StructurePane {
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .h(px(24.))
+                            .h(px(26.))
                             .pl(px(8.))
-                            .pr(px(2.))
+                            .pr(px(3.))
                             .rounded(px(Radius::CONTROL))
                             .bg(p.accent_soft)
                             .text_color(p.accent_text)
                             .text_size(px(TypeScale::SM))
                             .font_family(cx.theme().mono_font_family.clone())
+                            .when(selected_len > 1, |this| {
+                                this.child(
+                                    div()
+                                        .text_size(px(TypeScale::XS))
+                                        .text_color(p.text_faint)
+                                        .child(SharedString::from(format!("{}.", chip_idx + 1))),
+                                )
+                            })
                             .child(SharedString::from(column.name.clone()))
                             .child(
                                 div()
@@ -2314,13 +3843,53 @@ impl StructurePane {
                                         });
                                     }),
                             )
-                            .child(kit::icon_button(SharedString::from(format!("structure-index-remove-{}", column.name)), IconName::X, t("structure.index.removeColumn"), move |_, _, cx| {
-                                let name = remove_name.clone();
-                                remove_entity.update(cx, |pane, cx| {
-                                    pane.toggle_index_column(&name);
-                                    cx.notify();
-                                });
-                            }).xsmall()),
+                            .when(selected_len > 1 && chip_idx > 0, |this| {
+                                this.child(
+                                    kit::icon_button(
+                                        SharedString::from(format!("structure-index-left-{}", column.name)),
+                                        IconName::ChevronLeft,
+                                        t("structure.index.moveLeft"),
+                                        move |_, _, cx| {
+                                            left_entity.update(cx, |pane, cx| {
+                                                pane.move_index_column(chip_idx, -1);
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .xsmall(),
+                                )
+                            })
+                            .when(selected_len > 1 && chip_idx + 1 < selected_len, |this| {
+                                this.child(
+                                    kit::icon_button(
+                                        SharedString::from(format!("structure-index-right-{}", column.name)),
+                                        IconName::ChevronRight,
+                                        t("structure.index.moveRight"),
+                                        move |_, _, cx| {
+                                            right_entity.update(cx, |pane, cx| {
+                                                pane.move_index_column(chip_idx, 1);
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .xsmall(),
+                                )
+                            })
+                            .child(
+                                kit::icon_button(
+                                    SharedString::from(format!("structure-index-remove-{}", column.name)),
+                                    IconName::X,
+                                    t("structure.index.removeColumn"),
+                                    move |_, _, cx| {
+                                        let name = remove_name.clone();
+                                        remove_entity.update(cx, |pane, cx| {
+                                            pane.toggle_index_column(&name);
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .xsmall(),
+                            ),
                     );
                 }
                 let remaining: Vec<String> = names.into_iter().filter(|name| !selected.iter().any(|column| &column.name == name)).collect();
@@ -2342,13 +3911,24 @@ impl StructurePane {
                             })
                         }),
                 );
-                form.child(kit::form_row(t("structure.section.columns"), chips, &p))
+                form = form.child(kit::form_row(t("structure.section.columns"), chips, &p));
+                if let Some(sql) = self.live_composer_sql() {
+                    form = form.child(
+                        kit::sunken(&p)
+                            .px(px(10.))
+                            .py(px(8.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(sql)),
+                    );
+                }
+                form
             }),
             Section::ForeignKeys => stack_frame(|| {
                 let mut form = form;
                 self.ensure_references(cx);
-                // 已有外键在上面的列表里（行尾可删除），这里只放新建表单。
-                let name = self.field("fk_name", "structure.section.foreign", "fk_name", window, cx);
+                let name = self.field("fk_name", "structure.section.foreign", "fk_table_column", window, cx);
                 let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
                 let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
                 let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
@@ -2499,16 +4079,20 @@ impl StructurePane {
                 let update_now = self.session.fk_on_update.clone();
                 let delete_entity = entity.clone();
                 let update_entity = entity.clone();
+                let delete_checked = delete_now.clone();
+                let update_checked = update_now.clone();
                 let delete_button = stack_frame(|| {
                     Button::new("structure-fk-on-delete")
-                        .ghost()
+                        .outline()
                         .small()
-                        .label(SharedString::from(format!("{} {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
+                        .icon(IconName::ChevronDown)
+                        .label(SharedString::from(format!("{}: {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
                         .dropdown_menu(move |mut menu, _, _| {
                             for choice in actions {
                                 let delete_entity = delete_entity.clone();
                                 let choice = (*choice).to_owned();
-                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                let is_cur = delete_checked.eq_ignore_ascii_case(&choice);
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).checked(is_cur).on_click(move |_, _, cx| {
                                     let choice = choice.clone();
                                     delete_entity.update(cx, |pane, cx| {
                                         pane.session.fk_on_delete = choice;
@@ -2525,14 +4109,16 @@ impl StructurePane {
                 let update_button = stack_frame(|| {
                     let actions = fk_action_choices(&self.session.target.engine);
                     Button::new("structure-fk-on-update")
-                        .ghost()
+                        .outline()
                         .small()
-                        .label(SharedString::from(format!("{} {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
+                        .icon(IconName::ChevronDown)
+                        .label(SharedString::from(format!("{}: {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
                         .dropdown_menu(move |mut menu, _, _| {
                             for choice in actions {
                                 let update_entity = update_entity.clone();
                                 let choice = (*choice).to_owned();
-                                menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                let is_cur = update_checked.eq_ignore_ascii_case(&choice);
+                                menu = menu.item(PopupMenuItem::new(choice.clone()).checked(is_cur).on_click(move |_, _, cx| {
                                     let choice = choice.clone();
                                     update_entity.update(cx, |pane, cx| {
                                         pane.session.fk_on_update = choice;
@@ -2546,18 +4132,81 @@ impl StructurePane {
                         })
                         .into_any_element()
                 });
-                form = form.child(div().flex().gap(px(8.)).child(delete_button).child(update_button));
+                form = form.child(div().flex().flex_wrap().gap(px(8.)).child(delete_button).child(update_button));
+                if let Some(sql) = self.live_composer_sql() {
+                    form = form.child(
+                        kit::sunken(&p)
+                            .px(px(10.))
+                            .py(px(8.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(sql)),
+                    );
+                }
                 form
             }),
             Section::View => stack_frame(|| {
                 let mut form = form;
                 self.ensure_view_editor(window, cx);
+                let orig_sql = self.snapshot.as_ref().map(|s| s.table_sql.as_str()).unwrap_or("");
+                let view_dirty = !orig_sql.is_empty() && self.session.view_sql.trim() != orig_sql.trim();
+                let lines = self.session.view_sql.lines().count().max(1);
+                let available = (f32::from(window.viewport_size().height) - 340.).max(220.);
+                let copy_sql = self.session.view_sql.clone();
+                let open_sql = self.session.view_sql.clone();
+                let revert_owner = entity.clone();
+                let query_sink = self.query_sink.clone();
+                let target_for_query = self.session.target.clone();
+                let toolbar = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(format!(
+                                "{} · {}",
+                                i18n::text(locale, "structure.section.viewDef"),
+                                i18n::text(locale, "ui.structure.ddlLines").replace("{count}", &lines.to_string())
+                            )))
+                            .when(view_dirty, |this| this.child(kit::pill(t("structure.view.modified"), p.warn, p.warn_soft))),
+                    )
+                    .when(view_dirty, |this| {
+                        this.child(kit::tool_button("structure-view-revert", Some(IconName::Undo2), t("structure.view.revert"), move |_, _, cx| {
+                            revert_owner.update(cx, |pane, cx| {
+                                if let Some(snap) = &pane.snapshot {
+                                    pane.session.view_sql = snap.table_sql.clone();
+                                    pane.session.cancel();
+                                    cx.notify();
+                                }
+                            });
+                        }))
+                    })
+                    .when_some(query_sink, |this, sink| {
+                        this.child(kit::secondary_button("structure-view-open-query", Some(IconName::SquarePen), t("structure.ddl.openInQuery"), move |_, _, cx| {
+                            sink(target_for_query.clone(), open_sql.clone(), cx);
+                        }))
+                    })
+                    .child(kit::secondary_button("structure-view-copy", Some(IconName::Copy), t("common.copy"), move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_sql.clone()));
+                    }));
+                form = form.child(toolbar);
                 if let Some(editor) = self.view_editor.clone() {
                     kit::sync_editor(&editor, &mut self.view_editor_sync, &self.session.view_sql, window, cx);
                     form = form.child(
-                        div().h(px(220.)).child(
-                            Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(t("structure.section.viewDef")),
-                        ),
+                        div()
+                            .h(px(available))
+                            .rounded(px(Radius::CONTROL))
+                            .border_1()
+                            .border_color(if view_dirty { p.warn } else { p.line })
+                            .overflow_hidden()
+                            .child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(t("structure.section.viewDef"))),
                     );
                 }
                 form
@@ -2565,23 +4214,48 @@ impl StructurePane {
             Section::Ddl => stack_frame(|| {
                 let mut form = form;
                 let (sql, missing) = self.snapshot.as_ref().map(definition_text).unwrap_or_else(|| (String::new(), Vec::new()));
+                let rebuilt = !missing.is_empty();
                 let viewer = self.ddl_viewer(&sql, window, cx);
                 let copy_sql = sql.clone();
+                let open_sql = sql.clone();
                 let lines = sql.lines().count().max(1) as f32;
-                // 编辑器高度跟着定义行数走，最多铺满窗口可用高度；短定义不留大片空白。
                 let available = (f32::from(window.viewport_size().height) - 300.).max(240.);
                 let height = (lines * 20. + 24.).clamp(160., available);
                 let copied = self.ddl_copied;
                 let owner = cx.entity();
+                let query_sink = self.query_sink.clone();
+                let target_for_query = self.session.target.clone();
                 let toolbar = div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!(
-                        "{} · {}",
-                        i18n::text(locale, "structure.section.ddl"),
-                        i18n::text(locale, "ui.structure.ddlLines").replace("{count}", &(lines as usize).to_string())
-                    ))))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(140.))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(format!(
+                                "{} · {}",
+                                i18n::text(locale, "structure.section.ddl"),
+                                i18n::text(locale, "ui.structure.ddlLines").replace("{count}", &(lines as usize).to_string())
+                            )))
+                            .when(rebuilt, |this| this.child(kit::pill(t("structure.meta.rebuilt"), p.warn, p.warn_soft))),
+                    )
+                    .when_some(query_sink, |this, sink| {
+                        this.child(kit::secondary_button(
+                            "structure-open-ddl-query",
+                            Some(IconName::SquarePen),
+                            t("structure.ddl.openInQuery"),
+                            move |_, _, cx| {
+                                sink(target_for_query.clone(), open_sql.clone(), cx);
+                            },
+                        ))
+                    })
                     .child(kit::secondary_button(
                         "structure-copy-ddl",
                         Some(if copied { IconName::Check } else { IconName::Copy }),
@@ -2611,19 +4285,135 @@ impl StructurePane {
                     .child(toolbar)
                     .child(div().h(px(height)).rounded(px(Radius::CONTROL)).border_1().border_color(p.line).overflow_hidden().child(viewer));
                 if !missing.is_empty() {
-                    let mut notes = div().flex().flex_col().gap(px(4.));
-                    for item in missing {
-                        notes = notes.child(kit::muted(SharedString::from(localize_missing_item(&item, locale)), &p));
+                    let sep = match locale {
+                        Locale::ZhCn => "、",
+                        Locale::En => ", ",
+                    };
+                    let localized_items = missing.iter().map(|item| localize_missing_item(item, locale)).collect::<Vec<_>>().join(sep);
+                    let notice = i18n::fill(&i18n::text(locale, "structure.meta.rebuiltHint"), &[("items", &localized_items)]);
+                    form = form.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .px(px(12.))
+                            .py(px(8.))
+                            .rounded(px(Radius::PANEL))
+                            .bg(p.hover)
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                            .child(kit::icon(IconName::Info, 13., p.text_muted))
+                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(notice))),
+                    );
+                }
+                if let Some(snap) = &self.snapshot {
+                    let mono = cx.theme().mono_font_family.clone();
+                    if !snap.triggers.is_empty() {
+                        let heading = SharedString::from(i18n::fill(
+                            &i18n::text(locale, "structure.ddl.triggers"),
+                            &[("count", &snap.triggers.len().to_string())],
+                        ));
+                        let mut trig_list = div().flex().flex_col().gap(px(6.));
+                        for (idx, trig) in snap.triggers.iter().enumerate() {
+                            let trig_sql = trig.sql.clone();
+                            trig_list = trig_list.child(
+                                kit::card(&p)
+                                    .p(px(10.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(div().flex_1().font_weight(FontWeight::MEDIUM).text_size(px(TypeScale::SM)).child(SharedString::from(trig.name.clone())))
+                                            .when(!trig_sql.trim().is_empty(), |this| {
+                                                this.child(
+                                                    kit::icon_button(
+                                                        SharedString::from(format!("structure-copy-trigger-{idx}")),
+                                                        IconName::Copy,
+                                                        t("common.copy"),
+                                                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(trig_sql.clone())),
+                                                    )
+                                                    .xsmall(),
+                                                )
+                                            }),
+                                    )
+                                    .when(!trig.sql.trim().is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!("structure-trigger-sql-{idx}")))
+                                                .max_h(px(120.))
+                                                .overflow_y_scroll()
+                                                .font_family(mono.clone())
+                                                .text_size(px(TypeScale::XS))
+                                                .text_color(p.text_muted)
+                                                .child(SharedString::from(trig.sql.clone())),
+                                        )
+                                    }),
+                            );
+                        }
+                        form = form.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(heading, &p)).child(trig_list));
                     }
-                    form = form.child(notes);
+                    if !snap.views.is_empty() {
+                        let heading = SharedString::from(i18n::fill(
+                            &i18n::text(locale, "structure.ddl.dependentViews"),
+                            &[("count", &snap.views.len().to_string())],
+                        ));
+                        let mut view_chips = div().flex().flex_wrap().gap(px(6.));
+                        for dep in &snap.views {
+                            view_chips = view_chips.child(kit::pill(SharedString::from(dep.name.clone()), p.text, p.hover));
+                        }
+                        form = form.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(heading, &p)).child(view_chips));
+                    }
                 }
                 form
             }),
             Section::Danger => stack_frame(|| {
-                // 只摆用户从“更多”里选的那一项：标题与后果说明随操作变化，重命名才要新名字，
-                // 生产环境再要求输入表名；执行仍经底部“预览 SQL”和确认层。
                 let mut form = form;
                 let view = self.session.object_kind == "view";
+                let back_owner = entity.clone();
+                let mut mode_bar = div().flex().flex_wrap().items_center().gap(px(6.));
+                if !view {
+                    for (kind, key) in [
+                        (DangerKind::Rename, "catalog.tree.renameTable"),
+                        (DangerKind::Truncate, "catalog.tree.truncateTable"),
+                        (DangerKind::Drop, "catalog.tree.dropTable"),
+                    ] {
+                        let owner = entity.clone();
+                        let active = self.session.danger == kind;
+                        mode_bar = mode_bar.child(
+                            kit::tool_button(
+                                SharedString::from(format!("structure-danger-kind-{kind:?}")),
+                                None,
+                                t(key),
+                                move |_, _, cx| {
+                                    owner.update(cx, |pane, cx| {
+                                        pane.session.danger = kind;
+                                        pane.session.cancel();
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .selected(active),
+                        );
+                    }
+                }
+                mode_bar = mode_bar.child(div().flex_1()).child(kit::tool_button(
+                    "structure-danger-back",
+                    Some(IconName::ArrowLeft),
+                    t("structure.danger.backColumns"),
+                    move |_, _, cx| {
+                        back_owner.update(cx, |pane, cx| {
+                            pane.session.section = Section::Columns;
+                            pane.session.cancel();
+                            cx.notify();
+                        });
+                    },
+                ));
+                form = form.child(mode_bar);
+
                 let (title_key, detail_key) = match (self.session.danger, view) {
                     (_, true) => ("catalog.tree.dropView", "ui.structure.dropDetail"),
                     (DangerKind::Rename, false) => ("catalog.tree.renameTable", "structure.danger.renameDetail"),
@@ -2633,6 +4423,29 @@ impl StructurePane {
                 let rename = self.session.danger == DangerKind::Rename && !view;
                 let tone = if rename { p.warn } else { p.danger };
                 let tone_soft = if rename { p.warn_soft } else { p.danger_soft };
+                let impact_line = self.snapshot.as_ref().and_then(|snap| {
+                    let mut facts = Vec::new();
+                    if let Some(rows) = snap.row_count.filter(|_| !rename && !view) {
+                        facts.push(i18n::fill(&i18n::text(locale, "structure.meta.rows"), &[("count", &group_digits(rows))]));
+                    }
+                    if !snap.incoming.is_empty() {
+                        facts.push(i18n::fill(
+                            &i18n::text(locale, "structure.danger.incomingCount"),
+                            &[("count", &snap.incoming.len().to_string())],
+                        ));
+                    }
+                    let deps = snap.triggers.len() + snap.views.len();
+                    if deps > 0 {
+                        facts.push(i18n::fill(&i18n::text(locale, "structure.danger.dependentCount"), &[("count", &deps.to_string())]));
+                    }
+                    (!facts.is_empty()).then(|| {
+                        let sep = match locale {
+                            Locale::ZhCn => " · ",
+                            Locale::En => ", ",
+                        };
+                        i18n::fill(&i18n::text(locale, "structure.danger.impact"), &[("detail", &facts.join(sep))])
+                    })
+                });
                 form = form.child(
                     div()
                         .flex()
@@ -2644,11 +4457,20 @@ impl StructurePane {
                         .child(kit::icon(IconName::TriangleAlert, 16., tone))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .flex()
                                 .flex_col()
-                                .gap(px(2.))
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(format!("{} {}", i18n::text(locale, title_key), self.session.target.table))))
-                                .child(div().text_size(px(TypeScale::SM)).child(t(detail_key))),
+                                .gap(px(3.))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(SharedString::from(format!("{} {}", i18n::text(locale, title_key), self.session.target.table))),
+                                )
+                                .child(div().text_size(px(TypeScale::SM)).child(t(detail_key)))
+                                .when_some(impact_line, |this, line| {
+                                    this.child(div().pt(px(2.)).text_size(px(TypeScale::XS)).font_weight(FontWeight::MEDIUM).child(SharedString::from(line)))
+                                }),
                         ),
                 );
                 if rename {
@@ -2666,13 +4488,15 @@ impl StructurePane {
     }
 }
 
-use crate::ui::kit::stack_frame;
-
 impl Render for StructurePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_snapshot(cx);
-        // 表单、确认层、页面主体各用一帧。未优化构建不复用栈槽，叠在 Windows 主线程 1 MB 栈上会溢出。
         let form = if self.form_visible() { Some(self.section_form(window, cx)) } else { None };
+        if let Some(key) = self.pending_focus_draft.take() {
+            if self.draft_fields.contains(key) {
+                self.draft_fields.focus(key, window, cx);
+            }
+        }
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
         let section = self.session.section;
@@ -2683,7 +4507,6 @@ impl Render for StructurePane {
 }
 
 impl StructurePane {
-    /// 结构页主体。与确认层分属两个 `inline(never)` 帧，调用返回后槽位释放。
     #[inline(never)]
     fn render_page(
         &mut self,
@@ -2698,9 +4521,11 @@ impl StructurePane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
         let entity = cx.entity();
-        // 页签：左对齐、带数量的下划线页签（字段 7 · 索引 1 · 外键 0 · DDL）。危险操作不当页签，
-        // 收进右上角“更多”，进入后才在页签末尾显示一个红色的当前页签。
-        let counts = self.snapshot.as_ref().map(|snapshot| (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len()));
+
+        let counts = self.snapshot.as_ref().map(|snapshot| {
+            (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len())
+        });
+        let pending_cols = self.pending_changes();
         let mut tabs = div().id("structure-tabs").role(gpui_kit::Role::TabList).flex().items_end().gap(px(4.));
         for value in self.session.visible_sections() {
             if value == Section::Danger && section != Section::Danger {
@@ -2722,6 +4547,7 @@ impl StructurePane {
             };
             let selected = section == value;
             let danger = value == Section::Danger;
+            let dirty_dot = value == Section::Columns && pending_cols > 0;
             let owner = entity.clone();
             tabs = tabs.child(
                 kit::interactive_states(div().id(SharedString::from(key)), &p, false)
@@ -2741,19 +4567,24 @@ impl StructurePane {
                             .text_color(if danger { p.danger } else { p.text })
                             .font_weight(FontWeight::MEDIUM)
                     })
-                    .when(!selected, |this| this.border_color(gpui_kit::hsla(0., 0., 0., 0.)).text_color(p.text_muted).hover(|style| style.text_color(p.text)))
+                    .when(!selected, |this| {
+                        this.border_color(gpui_kit::hsla(0., 0., 0., 0.))
+                            .text_color(p.text_muted)
+                            .hover(|style| style.text_color(p.text))
+                    })
                     .child(t(key))
                     .when_some(count, |this, count| {
                         this.child(
                             div()
                                 .px(px(5.))
                                 .rounded(px(Radius::TAG))
-                                .bg(p.hover)
+                                .bg(if dirty_dot { p.warn_soft } else { p.hover })
                                 .text_size(px(TypeScale::XS))
-                                .text_color(p.text_muted)
+                                .text_color(if dirty_dot { p.warn } else { p.text_muted })
                                 .child(SharedString::from(count.to_string())),
                         )
                     })
+                    .when(dirty_dot, |this| this.child(kit::status_dot(p.warn)))
                     .on_click(move |_, _, cx| {
                         owner.update(cx, |pane, cx| {
                             pane.session.section = value;
@@ -2765,6 +4596,7 @@ impl StructurePane {
                     }),
             );
         }
+
         let title = if self.session.mode == StructureMode::Create {
             t("structure.action.createTable")
         } else if self.session.target.table.is_empty() {
@@ -2772,24 +4604,82 @@ impl StructurePane {
         } else {
             SharedString::from(self.session.target.table.clone())
         };
-        // “更多”：表级的重命名、清空、删除。只给已存在的表/视图，都先进入危险操作页、经预览确认。
+
+        let existing = self.session.mode != StructureMode::Create && !self.session.target.table.is_empty();
+        let qualified = {
+            let target = &self.session.target;
+            [target.database.as_str(), target.schema.as_str(), target.table.as_str()]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+
         let more = (self.session.mode != StructureMode::Create && self.session.visible_sections().contains(&Section::Danger)).then(|| {
             let owner = entity.clone();
             let view = self.session.object_kind == "view";
+            let query_sink = self.query_sink.clone();
+            let target_for_menu = self.session.target.clone();
+            let qualified_for_menu = qualified.clone();
+            let ddl_for_menu = self.snapshot.as_ref().map(|snap| definition_text(snap).0).unwrap_or_default();
             Button::new("structure-more")
                 .ghost()
                 .small()
                 .icon(IconName::Ellipsis)
                 .label(t("structure.action.more"))
-                .dropdown_menu(move |mut menu, _, _| {
-                    let entries: Vec<(&str, DangerKind)> = if view {
-                        vec![("catalog.tree.dropView", DangerKind::Drop)]
+                .dropdown_menu(move |mut menu, _, cx| {
+                    let pal = Palette::of(cx);
+                    menu = menu.min_w(px(200.));
+                    if let Some(sink) = query_sink.clone() {
+                        let tgt = target_for_menu.clone();
+                        let sql = select_sample_sql(&tgt);
+                        let label = i18n::text(locale, "structure.action.openQuery");
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                kit::popup_menu_row(Some(IconName::SquarePen), label.clone(), None, false, &Palette::of(cx))
+                            })
+                            .on_click(move |_, _, cx| sink(tgt.clone(), sql.clone(), cx)),
+                        );
+                    }
+                    if !qualified_for_menu.is_empty() {
+                        let q = qualified_for_menu.clone();
+                        let label = i18n::text(locale, "structure.action.copyQualified");
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                kit::popup_menu_row(Some(IconName::Copy), label.clone(), None, false, &Palette::of(cx))
+                            })
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(q.clone()))),
+                        );
+                    }
+                    if !ddl_for_menu.trim().is_empty() {
+                        let sql = ddl_for_menu.clone();
+                        let label = i18n::text(locale, "structure.action.copyDdl");
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                kit::popup_menu_row(Some(IconName::Code), label.clone(), None, false, &Palette::of(cx))
+                            })
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()))),
+                        );
+                    }
+                    menu = menu.separator();
+                    let entries: Vec<(&str, DangerKind, IconName, bool)> = if view {
+                        vec![("catalog.tree.dropView", DangerKind::Drop, IconName::Trash, true)]
                     } else {
-                        vec![("catalog.tree.renameTable", DangerKind::Rename), ("catalog.tree.truncateTable", DangerKind::Truncate), ("catalog.tree.dropTable", DangerKind::Drop)]
+                        vec![
+                            ("catalog.tree.renameTable", DangerKind::Rename, IconName::Pencil, false),
+                            ("catalog.tree.truncateTable", DangerKind::Truncate, IconName::Trash, true),
+                            ("catalog.tree.dropTable", DangerKind::Drop, IconName::Trash, true),
+                        ]
                     };
-                    for (key, kind) in entries {
+                    let _ = pal;
+                    for (key, kind, ic, is_danger) in entries {
                         let owner = owner.clone();
-                        let item = PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                        let label = i18n::text(locale, key);
+                        let item = PopupMenuItem::element(move |_, cx| {
+                            kit::popup_menu_row(Some(ic), label.clone(), None, is_danger, &Palette::of(cx))
+                        })
+                        .on_click(move |_, _, cx| {
                             owner.update(cx, |pane, cx| {
                                 pane.session.section = Section::Danger;
                                 pane.session.danger = kind;
@@ -2803,16 +4693,46 @@ impl StructurePane {
                     menu
                 })
         });
-        // 表名与完整路径都能点一下复制：写 SQL、贴工单时最常要的就是这两样。
-        let existing = self.session.mode != StructureMode::Create && !self.session.target.table.is_empty();
-        let qualified = {
-            let target = &self.session.target;
-            [target.database.as_str(), target.schema.as_str(), target.table.as_str()].iter().filter(|part| !part.is_empty()).copied().collect::<Vec<_>>().join(".")
+
+        let show_meta_pills = existing && (self.content_width == 0. || self.content_width >= 680.);
+        let meta_pills: Vec<AnyElement> = if show_meta_pills {
+            let mut pills = Vec::new();
+            let env = self.session.target.environment.trim();
+            if !env.is_empty() && env != "none" && env != "local" {
+                pills.push(kit::env_tag(env, SharedString::from(env.to_uppercase()), &p));
+            }
+            if let Some(snap) = &self.snapshot {
+                if snap.kind == "view" {
+                    let key = if snap.materialized { "structure.meta.materializedView" } else { "structure.meta.view" };
+                    pills.push(kit::pill(t(key), p.accent_text, p.accent_soft));
+                } else {
+                    if let Some(storage) = snap.storage.as_deref().filter(|s| !s.is_empty()) {
+                        pills.push(kit::pill(SharedString::from(storage.to_owned()), p.text_muted, p.hover));
+                    }
+                    if snap.strict {
+                        pills.push(kit::pill("STRICT", p.text_muted, p.hover));
+                    }
+                    if snap.without_rowid {
+                        pills.push(kit::pill("WITHOUT ROWID", p.text_muted, p.hover));
+                    }
+                    if let Some(rows) = snap.row_count {
+                        let label = i18n::fill(&i18n::text(locale, "structure.meta.rows"), &[("count", &group_digits(rows))]);
+                        pills.push(kit::pill(SharedString::from(label), p.text_muted, p.hover));
+                    }
+                }
+            }
+            pills
+        } else {
+            Vec::new()
         };
+
         let banner_text = SharedString::from(self.session.display_banner());
         let title_row: AnyElement = if existing {
             div()
                 .flex()
+                .items_center()
+                .gap(px(6.))
+                .min_w(px(0.))
                 .child(kit::copyable(
                     "structure-copy-name",
                     self.session.target.table.clone(),
@@ -2822,14 +4742,20 @@ impl StructurePane {
                     window,
                     cx,
                 ))
+                .children(meta_pills)
                 .into_any_element()
         } else {
             kit::title(title.clone(), TypeScale::LG, &p)
         };
+
+        let table_comment = self.snapshot.as_ref().and_then(|snap| snap.table_comment.clone()).filter(|c| !c.trim().is_empty());
         let banner_row: AnyElement = if existing {
             div()
                 .id("structure-banner")
                 .flex()
+                .items_center()
+                .gap(px(6.))
+                .min_w(px(0.))
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(kit::copyable(
@@ -2841,13 +4767,68 @@ impl StructurePane {
                     window,
                     cx,
                 ))
+                .when_some(table_comment, |this, comment| {
+                    this.child(div().text_color(p.text_faint).child("·")).child(
+                        div()
+                            .id("structure-table-comment")
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(p.text_faint)
+                            .tooltip_text(SharedString::from(comment.clone()))
+                            .child(SharedString::from(comment)),
+                    )
+                })
                 .into_any_element()
         } else {
-            div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(banner_text).into_any_element()
+            div()
+                .id("structure-banner")
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .truncate()
+                .child(banner_text)
+                .into_any_element()
         };
+
+        let refresh_btn = existing.then(|| {
+            let owner = entity.clone();
+            if self.refreshing {
+                div()
+                    .id("structure-refresh")
+                    .size(px(kit::HitArea::CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Spinner::new().xsmall().color(p.accent))
+                    .into_any_element()
+            } else {
+                kit::icon_button("structure-refresh", IconName::RefreshCw, t("structure.action.refresh"), move |_, _, cx| {
+                    owner.update(cx, |pane, cx| pane.refresh(cx));
+                })
+                .disabled(self.loading)
+                .into_any_element()
+            }
+        });
+
+        let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
         let mut column = div()
             .id("structure-pane")
             .test_support()
+            .key_context("Structure")
+            .track_focus(&focus)
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let key = event.keystroke.key.as_str();
+                if key == "escape" && this.handle_escape() {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if key == "enter"
+                    && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    && this.trigger_preview_shortcut(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -2866,17 +4847,10 @@ impl StructurePane {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(12.))
+                            .gap(px(10.))
                             .child(kit::engine_badge(&self.session.target.engine, 28.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(160.))
-                                    .flex()
-                                    .flex_col()
-                                    .child(title_row)
-                                    .child(banner_row),
-                            )
+                            .child(div().flex_1().min_w(px(120.)).flex().flex_col().child(title_row).child(banner_row))
+                            .children(refresh_btn)
                             .when_some(
                                 self.data_sink
                                     .clone()
@@ -2891,41 +4865,57 @@ impl StructurePane {
                     )
                     .child(tabs),
             );
-        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).flex().flex_col().gap(px(metrics.section_gap()));
-        let editing_columns = section == Section::Columns && self.form_visible() && !(self.session.object_kind == "view" && self.session.mode != StructureMode::Create);
+
+        let mut body = div()
+            .id("structure-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p(px(metrics.page_pad))
+            .flex()
+            .flex_col()
+            .gap(px(metrics.section_gap()));
+        let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
+        let editing_columns = section == Section::Columns && self.form_visible() && !readonly_view;
         let composer_section = matches!(section, Section::Indexes | Section::ForeignKeys);
         if editing_columns {
-            // 字段页：编辑表就是主体，不再先列一遍“当前结构”再列一遍“新增”。
             if let Some(form) = form {
                 body = body.child(form);
             }
         } else {
-            if composer_section && self.form_visible() {
+            if composer_section && self.form_visible() && (self.list_len(section) > 0 || self.composer_open) {
                 let owner = entity.clone();
                 let label = if section == Section::Indexes { t("structure.index.new") } else { t("structure.fk.new") };
                 body = body.child(
-                    div().flex().items_center().child(div().flex_1()).child(
-                        kit::secondary_button("structure-composer-toggle", Some(if self.composer_open { IconName::X } else { IconName::Plus }), if self.composer_open { t("common.cancel") } else { label }, move |_, _, cx| {
+                    div().flex().items_center().child(div().flex_1()).child(kit::secondary_button(
+                        "structure-composer-toggle",
+                        Some(if self.composer_open { IconName::X } else { IconName::Plus }),
+                        if self.composer_open { t("common.cancel") } else { label },
+                        move |_, _, cx| {
                             owner.update(cx, |pane, cx| {
                                 pane.composer_open = !pane.composer_open;
                                 pane.session.cancel();
                                 cx.notify();
                             });
-                        }),
-                    ),
+                        },
+                    )),
                 );
             }
-            // DDL 页签：定义本身就是主体，不再先摆一张只读预览卡再摆一遍编辑器。
             let ddl_direct = section == Section::Ddl && form.is_some() && self.has_definition();
+            let danger_direct = section == Section::Danger && form.is_some() && !self.loading && self.load_error.is_empty();
             let mut form = form;
-            if ddl_direct {
+            if ddl_direct || danger_direct {
                 if let Some(form) = form.take() {
                     body = body.child(div().id("structure-composer").test_support().child(form));
                 }
             } else {
                 body = body.child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx)));
             }
-            if let Some(form) = form.filter(|_| !composer_section || self.composer_open) {
+            if section == Section::Columns && readonly_view {
+                if let Some(form) = form.take() {
+                    body = body.child(form);
+                }
+            } else if let Some(form) = form.filter(|_| !composer_section || self.composer_open) {
                 let heading = match section {
                     Section::Indexes => t("structure.index.new"),
                     Section::ForeignKeys => t("structure.fk.new"),
@@ -2943,9 +4933,22 @@ impl StructurePane {
                         .child(kit::card(&p).p(px(metrics.card_pad())).child(form)),
                 );
             }
+            if section == Section::ForeignKeys {
+                if let Some(incoming) = self.incoming_fk_card(&entity, &p, cx) {
+                    body = body.child(incoming);
+                }
+            }
         }
         if !self.session.note.is_empty() {
-            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note())));
+            body = body.child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(Radius::PANEL))
+                    .bg(p.hover)
+                    .text_size(px(TypeScale::SM))
+                    .child(SharedString::from(self.session.note())),
+            );
         }
         column = column.child(body.test_support());
         if let Some(actions) = self.preview_footer(&entity, &p, locale, metrics) {
@@ -2974,1328 +4977,307 @@ impl StructurePane {
         }
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
-            // 危险操作确认层（S12.5）：标题行带对象名与危险图标，只有正文滚动，
-            // 页脚动作固定可见，640/900/1360 三档都能点到取消与确认。
-            let dangerous = self.session.preview_dangerous();
-            let armed = self.session.armed();
-            let confirm_blocked = self.session.confirm_blocked();
-            let object = SharedString::from(self.session.object_label());
-            let sql = self.session.preview_sql().join("\n");
-            let banner = SharedString::from(self.session.display_banner());
-            let target = SharedString::from(self.session.preview_target());
-            let rule = self.session.preview_rule();
-            let note_text = self.session.note();
-            let risks = self.session.preview_risks();
-            let blocked_text = self.session.blocked().join(" ");
-            // 没有语句可执行（什么都没改，或被规则拦下）时：不画空的 SQL 框，确认不可点。
-            // 只是“没有变更”时用中性色说明，不当成错误标红。
-            let nothing_to_run = sql.trim().is_empty();
-            let only_unchanged = nothing_to_run && self.session.preview_unchanged();
-            let preview_title = t("structure.preview.title");
-            let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
-            let cancel_label = t("structure.action.cancel");
-            let typed_hint =
-                (section == Section::Danger && self.session.production() && confirm_blocked).then(|| t("structure.danger.typeHint"));
-            let danger_field = if section == Section::Danger && self.session.production() {
-                Some(kit::form_row(
-                    t("structure.danger.typeName"),
-                    self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
-                    p,
-                ))
-            } else {
-                None
-            };
-            let confirm = {
-                let entity = entity.clone();
-                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
-            };
-            let cancel = {
-                let entity = entity.clone();
-                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
-                    entity.update(cx, |pane, cx| {
+        let dangerous = self.session.preview_dangerous();
+        let armed = self.session.armed();
+        let confirm_blocked = self.session.confirm_blocked();
+        let executing = self.executing;
+        let object = SharedString::from(self.session.object_label());
+        let steps = self.session.preview_steps();
+        let sql_raw = self.session.preview_sql().join("\n");
+        let sql_display = if steps.len() > 1 {
+            steps
+                .iter()
+                .enumerate()
+                .map(|(i, (label, sql))| format!("-- {}. {label}\n{sql}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            sql_raw.clone()
+        };
+        let banner = SharedString::from(self.session.display_banner());
+        let target = SharedString::from(self.session.preview_target());
+        let rule = self.session.preview_rule();
+        let note_text = self.session.note();
+        let risks = self.session.preview_risks();
+        let blocked_text = self.session.blocked().join(" ");
+        let nothing_to_run = sql_raw.trim().is_empty();
+        let only_unchanged = nothing_to_run && self.session.preview_unchanged();
+        let preview_title = t("structure.preview.title");
+        let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
+        let cancel_label = t("structure.action.cancel");
+        let typed_hint = (section == Section::Danger && self.session.production() && confirm_blocked).then(|| t("structure.danger.typeHint"));
+        let danger_field = if section == Section::Danger && self.session.production() {
+            Some(kit::form_row(
+                t("structure.danger.typeName"),
+                self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
+                p,
+            ))
+        } else {
+            None
+        };
+        let confirm = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
+        };
+        let cancel = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |pane, cx| {
+                    if !pane.executing {
                         pane.session.cancel();
                         cx.notify();
-                    })
-                }
-            };
-        let dialog = 
-                div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
-                    div()
-                        .id("structure-preview-dialog")
-                        .test_support()
-                        .role(gpui_kit::Role::Dialog)
-                        .aria_label(preview_title.clone())
-                        .occlude()
-                        .w(px(620.))
-                        .max_w(relative(0.92))
-                        .max_h(relative(0.92))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .bg(p.raised)
-                        .border_1()
-                        .border_color(p.line)
-                        .rounded(px(Radius::PANEL))
-                        .shadow_lg()
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .px(px(metrics.card_pad()))
-                                .pt(px(metrics.card_pad()))
-                                .pb(px(10.))
-                                .border_b_1()
-                                .border_color(p.line_soft)
-                                .when(dangerous, |this| this.child(kit::icon(IconName::TriangleAlert, 16., p.danger)))
-                                .child(kit::title(preview_title, TypeScale::LG, p))
-                                .child(div().flex_1().min_w(px(0.)))
-                                .child(
+                    }
+                })
+            }
+        };
+        let close_header = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |pane, cx| {
+                    if !pane.executing {
+                        pane.session.cancel();
+                        cx.notify();
+                    }
+                })
+            }
+        };
+        let scrim_entity = entity.clone();
+        let copy_entity = entity.clone();
+        let copy_sql_text = sql_raw.clone();
+        let copied = self.preview_copied;
+        let steps_heading = SharedString::from(i18n::fill(
+            &i18n::text(locale, "structure.preview.steps"),
+            &[("count", &steps.len().to_string())],
+        ));
+
+        let dialog = div()
+            .id("structure-preview-scrim")
+            .absolute()
+            .inset_0()
+            .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                scrim_entity.update(cx, |pane, cx| {
+                    if !pane.executing {
+                        pane.session.cancel();
+                        cx.notify();
+                    }
+                });
+            })
+            .child(
+                div()
+                    .id("structure-preview-dialog")
+                    .test_support()
+                    .role(gpui_kit::Role::Dialog)
+                    .aria_label(preview_title.clone())
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .w(px(640.))
+                    .max_w(relative(0.92))
+                    .max_h(relative(0.92))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.line)
+                    .rounded(px(Radius::PANEL))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(metrics.card_pad()))
+                            .pt(px(metrics.card_pad()))
+                            .pb(px(10.))
+                            .border_b_1()
+                            .border_color(p.line_soft)
+                            .when(dangerous, |this| this.child(kit::icon(IconName::TriangleAlert, 16., p.danger)))
+                            .when(!dangerous, |this| this.child(kit::icon(IconName::Code, 16., p.accent)))
+                            .child(kit::title(preview_title, TypeScale::LG, p))
+                            .child(div().flex_1().min_w(px(0.)))
+                            .child(
+                                div()
+                                    .id("structure-preview-object")
+                                    .test_support()
+                                    .min_w(px(0.))
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(TypeScale::SM))
+                                    .text_color(p.text_muted)
+                                    .truncate()
+                                    .child(object),
+                            )
+                            .child(kit::icon_button("structure-preview-close", IconName::X, t("common.close"), close_header).xsmall().disabled(executing)),
+                    )
+                    .child(
+                        div()
+                            .id("structure-preview-body")
+                            .test_support()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .px(px(metrics.card_pad()))
+                            .py(px(10.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(kit::muted(banner, p))
+                            .when(!nothing_to_run, |this| {
+                                this.child(
                                     div()
-                                        .id("structure-preview-object")
-                                        .test_support()
-                                        .min_w(px(0.))
-                                        .text_size(px(TypeScale::SM))
-                                        .text_color(p.text_muted)
-                                        .truncate()
-                                        .child(object),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("structure-preview-body")
-                                .test_support()
-                                .flex_1()
-                                .min_h(px(0.))
-                                .overflow_y_scroll()
-                                .px(px(metrics.card_pad()))
-                                .py(px(10.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(10.))
-                                .child(kit::muted(banner, p))
-                                .when(!nothing_to_run, |this| this.child(
-                                    div()
-                                        .id("structure-preview-sql")
-                                        .max_h(px(240.))
-                                        .overflow_y_scroll()
-                                        .p(px(12.))
-                                        .rounded(px(Radius::PANEL))
-                                        .bg(p.chrome)
-                                        .border_1()
-                                        .border_color(p.line)
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_size(px(TypeScale::SM))
-                                        .child(SharedString::from(sql)),
-                                ))
-                                .child(kit::muted(target, p))
-                                .when(!risks.is_empty(), |this| {
-                                    let mut list = div().flex().flex_col().gap(px(4.));
-                                    for (level, text) in risks {
-                                        let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                                        list = list.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text)));
-                                    }
-                                    this.child(list)
-                                })
-                                .when(!rule.is_empty() && !nothing_to_run, |this| this.child(kit::muted(SharedString::from(rule), p)))
-                                .when(!blocked_text.is_empty(), |this| {
-                                    let (fg, bg) = if only_unchanged { (p.text_muted, p.hover) } else { (p.danger, p.danger_soft) };
-                                    this.child(
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .child(div().flex_1().child(kit::eyebrow(steps_heading, p)))
+                                                .child(
+                                                    kit::tool_button(
+                                                        "structure-preview-copy",
+                                                        Some(if copied { IconName::Check } else { IconName::Copy }),
+                                                        if copied { t("ui.copied") } else { t("structure.preview.copySql") },
+                                                        move |_, _, cx| {
+                                                            cx.write_to_clipboard(ClipboardItem::new_string(copy_sql_text.clone()));
+                                                            let reset = copy_entity.downgrade();
+                                                            copy_entity.update(cx, |pane, cx| {
+                                                                pane.preview_copied = true;
+                                                                cx.notify();
+                                                                cx.spawn(async move |_, cx| {
+                                                                    cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                                                                    cx.update(|cx| {
+                                                                        if let Some(pane) = reset.upgrade() {
+                                                                            pane.update(cx, |pane, cx| {
+                                                                                pane.preview_copied = false;
+                                                                                cx.notify();
+                                                                            });
+                                                                        }
+                                                                    });
+                                                                })
+                                                                .detach();
+                                                            });
+                                                        },
+                                                    )
+                                                    .xsmall(),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("structure-preview-sql")
+                                                .max_h(px(240.))
+                                                .overflow_y_scroll()
+                                                .p(px(12.))
+                                                .rounded(px(Radius::PANEL))
+                                                .bg(p.sunken)
+                                                .border_1()
+                                                .border_color(p.line)
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_size(px(TypeScale::SM))
+                                                .child(SharedString::from(sql_display)),
+                                        ),
+                                )
+                            })
+                            .child(kit::muted(target, p))
+                            .when(!risks.is_empty(), |this| {
+                                let mut list = div().flex().flex_col().gap(px(4.));
+                                for (level, text) in risks {
+                                    let (fg, bg, ic) = if level == "danger" {
+                                        (p.danger, p.danger_soft, IconName::TriangleAlert)
+                                    } else if level == "warn" {
+                                        (p.warn, p.warn_soft, IconName::CircleAlert)
+                                    } else {
+                                        (p.text_muted, p.hover, IconName::Info)
+                                    };
+                                    list = list.child(
                                         div()
-                                            .id("structure-preview-blocked")
-                                            .px(px(12.))
-                                            .py(px(8.))
+                                            .flex()
+                                            .items_start()
+                                            .gap(px(8.))
+                                            .px(px(10.))
+                                            .py(px(6.))
                                             .rounded(px(Radius::PANEL))
                                             .bg(bg)
                                             .text_color(fg)
                                             .text_size(px(TypeScale::SM))
-                                            .child(SharedString::from(blocked_text.clone())),
+                                            .child(div().pt(px(2.)).flex_none().child(kit::icon(ic, 13., fg)))
+                                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text))),
+                                    );
+                                }
+                                this.child(list)
+                            })
+                            .when(!rule.is_empty() && !nothing_to_run, |this| this.child(kit::muted(SharedString::from(rule), p)))
+                            .when(!blocked_text.is_empty(), |this| {
+                                let (fg, bg) = if only_unchanged { (p.text_muted, p.hover) } else { (p.danger, p.danger_soft) };
+                                this.child(
+                                    div()
+                                        .id("structure-preview-blocked")
+                                        .px(px(12.))
+                                        .py(px(8.))
+                                        .rounded(px(Radius::PANEL))
+                                        .bg(bg)
+                                        .text_color(fg)
+                                        .text_size(px(TypeScale::SM))
+                                        .child(SharedString::from(blocked_text.clone())),
+                                )
+                            })
+                            .when(!note_text.is_empty(), |this| {
+                                if armed {
+                                    this.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .px(px(10.))
+                                            .py(px(8.))
+                                            .rounded(px(Radius::PANEL))
+                                            .bg(p.danger_soft)
+                                            .text_color(p.danger)
+                                            .text_size(px(TypeScale::SM))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(kit::icon(IconName::TriangleAlert, 14., p.danger))
+                                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(note_text))),
                                     )
-                                })
-                                .when(!note_text.is_empty(), |this| this.child(kit::muted(SharedString::from(note_text), p)))
-                                .when_some(danger_field, |this, field| this.child(field))
-                                .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap(px(8.))
-                                .px(px(metrics.card_pad()))
-                                .py(px(10.))
-                                .border_t_1()
-                                .border_color(p.line_soft)
-                                .child(kit::secondary_button("structure-cancel", None, cancel_label, cancel))
-                                .child(if dangerous || armed {
-                                    kit::danger_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(confirm_blocked || nothing_to_run).into_any_element()
                                 } else {
-                                    kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(nothing_to_run).into_any_element()
-                                }),
-                        ),
-                )
+                                    this.child(kit::muted(SharedString::from(note_text), p))
+                                }
+                            })
+                            .when_some(danger_field, |this, field| this.child(field))
+                            .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.))
+                            .px(px(metrics.card_pad()))
+                            .py(px(10.))
+                            .border_t_1()
+                            .border_color(p.line_soft)
+                            .child(kit::secondary_button("structure-cancel", None, cancel_label, cancel).disabled(executing))
+                            .child(if dangerous || armed {
+                                kit::danger_button("structure-confirm", Some(IconName::Check), confirm_label, confirm)
+                                    .disabled(confirm_blocked || nothing_to_run)
+                                    .loading(executing)
+                                    .into_any_element()
+                            } else {
+                                kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm)
+                                    .disabled(nothing_to_run)
+                                    .loading(executing)
+                                    .into_any_element()
+                            }),
+                    ),
+            )
             .into_any_element();
         Some(dialog)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ddl::{Column, ColumnDraft, DdlEngine, Snapshot};
-
-    fn column(name: &str, type_name: &str, primary: bool) -> Column {
-        Column {
-            name: name.to_owned(),
-            type_name: type_name.to_owned(),
-            nullable: !primary,
-            default_sql: None,
-            primary,
-            auto: false,
-            generated: false,
-            default_constraint: None,
-        }
-    }
-
-    #[test]
-    fn ddl_tab_never_shows_the_placeholder_comment_as_the_definition() {
-        let mut mysql = Snapshot::bare(DdlEngine::Mysql, "shop", "", "task_list_track_code");
-        mysql.columns = vec![column("id", "bigint(20) unsigned", true), column("track_code", "varchar(128)", false)];
-        // 读不到 SHOW CREATE TABLE 时只剩一行占位：DDL 页签要退回重建定义，而不是只显示这行注释。
-        mysql.table_sql = "-- shop.task_list_track_code".to_owned();
-        let (text, _) = definition_text(&mysql);
-        assert!(text.contains("CREATE TABLE"), "{text}");
-        assert!(text.contains("track_code"), "{text}");
-        // 读到了服务器原文就原样显示。
-        mysql.table_sql = "CREATE TABLE `task_list_track_code` (\n  `id` bigint unsigned NOT NULL\n);".to_owned();
-        assert_eq!(definition_text(&mysql).0, mysql.table_sql);
-        assert!(is_placeholder_definition("-- a.b\n\n-- c"));
-        assert!(!is_placeholder_definition("-- note\nCREATE TABLE t (id int)"));
-    }
-
-    fn target(engine: &str, table: &str) -> GridTarget {
-        GridTarget {
-            connection_id: "notes".into(),
-            connection_name: "笔记".into(),
-            database: "app".into(),
-            schema: "public".into(),
-            table: table.into(),
-            engine: engine.into(),
-            environment: "dev".into(),
-        }
-    }
-
-    /// 什么都没改就预览：没有语句、确认不可点；“没有字段变更”是中性说明，不是错误。
-    /// 带 nextval 默认值的主键原样保留，不再被当成非法默认值拦下。
-    #[test]
-    fn previewing_an_untouched_table_is_a_neutral_no_op() {
-        let mut session = StructureSession::new(target("postgres", "orders"));
-        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "shop", "orders");
-        let mut id = column("id", "bigint", true);
-        id.default_sql = Some("nextval('shop.orders_id_seq'::regclass)".to_owned());
-        snapshot.columns = vec![id, column("status", "text", false)];
-        session.kept_columns = column_drafts(&snapshot);
-        session.arm_fixture(&snapshot);
-        assert!(session.preview_sql().is_empty(), "{:?}", session.preview_sql());
-        assert!(session.preview_unchanged(), "{:?}", session.blocked());
-        session.kept_columns[1].name = "state".into();
-        session.arm_fixture(&snapshot);
-        assert!(!session.preview_unchanged());
-        assert!(session.blocked().is_empty(), "{:?}", session.blocked());
-        assert_eq!(session.preview_sql().len(), 1);
-    }
-
-    #[test]
-    fn fixtures_preview_columns_indexes_keys_views_and_danger_without_a_live_engine() {
-        let mut session = StructureSession::new(target("postgres", "orders"));
-        session.section = Section::Indexes;
-        session.index_name = "ix_note".into();
-        session.index_column = "note".into();
-        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
-        snapshot.columns.push(column("note", "text", false));
-        session.arm_fixture(&snapshot);
-        assert!(session.banner().contains("笔记") && session.banner().contains("dev") && session.banner().contains("orders"), "{}", session.banner());
-        assert!(session.preview_sql().iter().any(|sql| sql.to_ascii_uppercase().contains("INDEX")), "{:?}", session.preview_sql());
-        session.cancel();
-        assert!(session.confirm_sql().is_err());
-
-        session.section = Section::ForeignKeys;
-        session.fk_name = "orders_parent".into();
-        session.fk_column = "parent_id".into();
-        session.fk_ref_schema = "public".into();
-        session.fk_ref_table = "parents".into();
-        session.fk_ref_column = "id".into();
-        let mut child = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
-        child.columns.push(column("parent_id", "integer", false));
-        let mut parent = Snapshot::bare(DdlEngine::Postgres, "app", "public", "parents");
-        parent.columns.push(column("id", "integer", true));
-        child.reference = Some(Box::new(parent));
-        session.arm_fixture(&child);
-        assert!(session.blocked().is_empty(), "{:?}", session.blocked());
-        let foreign = session.preview_sql().join("\n").to_ascii_uppercase();
-        assert!(foreign.contains("FOREIGN") || foreign.contains("REFERENCES"), "{foreign}");
-        assert!(session.confirm_sql().unwrap_err().contains("没有连接"));
-
-        session.target = target("postgres", "v");
-        session.section = Section::View;
-        session.view_sql = "CREATE VIEW public.v AS SELECT 2".into();
-        let mut view = Snapshot::bare(DdlEngine::Postgres, "app", "public", "v");
-        view.kind = "view".into();
-        view.table_sql = "CREATE VIEW public.v AS SELECT 1".into();
-        session.arm_fixture(&view);
-        assert!(session.blocked().is_empty(), "{:?}", session.blocked());
-        assert!(session.preview_sql().join("\n").to_ascii_uppercase().contains("VIEW"), "{:?}", session.preview_sql());
-        assert!(session.confirm_sql().is_err());
-
-        session.target = target("sqlite", "customers");
-        session.target.database = "main".into();
-        session.target.schema.clear();
-        session.section = Section::Danger;
-        let danger = Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers");
-        session.arm_fixture(&danger);
-        assert!(session.banner().contains("customers") && session.banner().contains("sqlite") && session.banner().contains("dev"), "{}", session.banner());
-        assert!(session.preview_sql().iter().any(|sql| sql.to_ascii_uppercase().contains("DROP")), "{:?}", session.preview_sql());
-        session.cancel();
-        assert!(session.confirm_sql().is_err());
-    }
-
-    #[test]
-    fn dangerous_ddl_needs_a_second_confirm_and_target_change_drops_the_draft() {
-        let mut session = StructureSession::new(target("sqlite", "customers"));
-        session.target.database = "main".into();
-        session.target.schema.clear();
-        session.section = Section::Danger;
-        let snapshot = Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers");
-        session.arm_fixture(&snapshot);
-        assert!(session.requires_second_confirm(), "DROP 必须进入二次确认");
-        assert!(session.preview_risks().iter().any(|(level, _)| level == "danger"));
-        assert!(session.preview_rule().contains("逐条执行"));
-        assert!(session.preview_target().contains("customers"), "{}", session.preview_target());
-        session.arm_confirm();
-        assert!(session.armed());
-        assert!(!session.requires_second_confirm(), "第二次确认后不再拦");
-        session.cancel();
-        assert!(!session.armed(), "取消后必须重置二次确认");
-
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-reset-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
-        let mut pane = StructurePane::new(services);
-        pane.bind(target("sqlite", "customers"));
-        pane.type_into("column_name", "nickname");
-        pane.session.section = Section::Indexes;
-        pane.session.arm_fixture(&snapshot);
-        assert!(pane.session.preview_open());
-        pane.bind(target("sqlite", "orders"));
-        assert_eq!(pane.session.target.table, "orders");
-        assert!(pane.session.column_name.is_empty(), "换表不能带走上一张表的列名");
-        assert_eq!(pane.session.section, Section::Columns);
-        assert!(!pane.session.preview_open(), "换表不能带走上一张表的预览");
-        assert!(pane.session.note().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 提示与读取错误留原文，显示时按当前语言给出：错误出现后再切换语言，文字立即跟着变。
-    #[test]
-    fn notes_and_load_errors_follow_a_later_locale_switch() {
-        let cjk = crate::ddl::english::has_cjk;
-        let mut session = StructureSession::new(target("sqlite", "customers"));
-        session.note = Note::raw("这条连接还没有打开，没有另开新的连接。".to_owned());
-        assert!(session.note().contains("没有打开"), "{}", session.note());
-        session.locale = Locale::En;
-        assert!(session.note().contains("isn't open") && !cjk(&session.note()), "{}", session.note());
-        session.locale = Locale::ZhCn;
-        assert!(session.note().contains("没有打开"), "{}", session.note());
-
-        // 执行结果里的多条阻断逐条翻译后再连起来。
-        session.note = Note::Raw(vec!["生成计划失败".to_owned(), "找不到表或视图 orders".to_owned()]);
-        session.locale = Locale::En;
-        assert_eq!(session.note(), "Generating the plan failed Table or view orders was not found");
-
-        // 二次确认的提示与未连接提示也跟着语言变。
-        session.target.database = "main".into();
-        session.target.schema.clear();
-        session.section = Section::Danger;
-        session.locale = Locale::ZhCn;
-        session.arm_fixture(&Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers"));
-        assert_eq!(session.note(), i18n::text(Locale::ZhCn, "admin.preview.unconnected"));
-        session.arm_confirm();
-        assert!(session.note().contains("再次点击"), "{}", session.note());
-        session.locale = Locale::En;
-        assert!(session.note().contains("Confirm again") && !cjk(&session.note()), "{}", session.note());
-        assert!(!cjk(&session.confirm_sql().unwrap_err()), "未连接的拒绝原因按英文给出");
-
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-locale-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
-        let mut pane = StructurePane::new(services);
-        pane.bind(target("sqlite", "customers"));
-        pane.load_error = "找不到表或视图 customers".to_owned();
-        assert!(pane.load_error_text().contains("找不到"), "{}", pane.load_error_text());
-        pane.set_locale(Locale::En);
-        assert_eq!(pane.load_error_text(), "Table or view customers was not found");
-        pane.set_locale(Locale::ZhCn);
-        assert!(pane.load_error_text().contains("找不到"), "{}", pane.load_error_text());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn typed_structure_fields_are_the_preview_draft() {
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-draft-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
-        let mut pane = StructurePane::new(services);
-        pane.bind(target("sqlite", "customers"));
-        pane.type_into("column_name", "nickname");
-        match pane.session.action() {
-            crate::ddl::Action::AlterColumns { columns, .. } => assert_eq!(columns[0].name, "nickname"),
-            other => panic!("{other:?}"),
-        }
-        pane.session.section = Section::Indexes;
-        pane.type_into("index_name", "ix_nick");
-        pane.type_into("index_column", "nickname");
-        match pane.session.action() {
-            crate::ddl::Action::CreateIndex { name, columns, .. } => {
-                assert_eq!(name, "ix_nick");
-                assert_eq!(columns[0].name, "nickname");
-            }
-            other => panic!("{other:?}"),
-        }
-        pane.session.section = Section::ForeignKeys;
-        pane.type_into("fk_name", "fk_parent");
-        pane.type_into("fk_column", "parent_id");
-        pane.type_into("fk_ref_table", "parents");
-        pane.type_into("fk_ref_column", "id");
-        match pane.session.action() {
-            crate::ddl::Action::CreateForeignKey { foreign_key, .. } => {
-                assert_eq!(foreign_key.name, "fk_parent");
-                assert_eq!(foreign_key.columns, vec!["parent_id".to_owned()]);
-                assert_eq!(foreign_key.ref_table, "parents");
-            }
-            other => panic!("{other:?}"),
-        }
-        pane.session.section = Section::View;
-        pane.type_into("view_sql", "select 1");
-        match pane.session.action() {
-            crate::ddl::Action::ReplaceView { definition, .. } => assert_eq!(definition, "select 1"),
-            other => panic!("{other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview() {
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let database = dir.join("notes.sqlite");
-        let setup = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").execute(&setup).await.unwrap();
-        sqlx::query("CREATE TABLE scratch (id INTEGER PRIMARY KEY)").execute(&setup).await.unwrap();
-        setup.close().await;
-        let service = std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
-        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
-        let mut session = StructureSession::new(GridTarget {
-            connection_id: "notes".into(),
-            connection_name: "笔记".into(),
-            database: "main".into(),
-            schema: String::new(),
-            table: "customers".into(),
-            engine: "sqlite".into(),
-            environment: "dev".into(),
-        });
-        session.section = Section::Columns;
-        session.column_name = "extra".into();
-        session.column_type = "TEXT".into();
-        let blocked = crate::application::ddl::preview_request(&service, "notes", &session.request().unwrap()).await.unwrap();
-        assert!(!blocked.blocked.is_empty(), "缺字段的草稿必须停在预览");
-        session.arm_live(blocked);
-        assert!(session.banner().contains("笔记") && session.banner().contains("dev") && session.banner().contains("customers"), "{}", session.banner());
-        assert!(session.confirm_sql().is_err());
-        session.kept_columns = vec![
-            ColumnDraft { original: Some("id".into()), name: "id".into(), type_name: "INTEGER".into(), nullable: false, default_sql: String::new(), primary: true, auto: true, dropped: false },
-            ColumnDraft { original: Some("name".into()), name: "name".into(), type_name: "TEXT".into(), nullable: true, default_sql: String::new(), primary: false, auto: false, dropped: false },
-            ColumnDraft { original: None, name: "extra".into(), type_name: "TEXT".into(), nullable: true, default_sql: String::new(), primary: false, auto: false, dropped: false },
-        ];
-        let request = session.request().unwrap();
-        let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
-        assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
-        session.arm_live(plan);
-        let sql = session.confirm_sql().unwrap();
-        session.cancel();
-        assert!(session.confirm_sql().is_err());
-        let refused = match crate::application::ddl::execute_request(&service, "notes", &request, &sql, false).await {
-            Err(message) => message,
-            Ok(_) => panic!("未确认的结构变更应当被拒绝"),
-        };
-        assert!(refused.contains("确认"), "{refused}");
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let extra: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_table_info('customers') WHERE name = 'extra'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(extra, 0);
-        session.open = true;
-        let done = crate::application::ddl::execute_request(&service, "notes", &request, &sql, true).await.unwrap();
-        assert!(done.blocked.is_empty(), "{}", done.blocked.join("; "));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let extra: i64 = sqlx::query_scalar("SELECT count(*) FROM pragma_table_info('customers') WHERE name = 'extra'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(extra, 1);
-
-        session.section = Section::Indexes;
-        session.index_name = "ix_name".into();
-        session.index_column = "name".into();
-        let request = session.request().unwrap();
-        let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
-        assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
-        session.arm_live(plan);
-        let index_sql = session.confirm_sql().unwrap();
-        session.cancel();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'ix_name'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(indexes, 0);
-        session.open = true;
-        crate::application::ddl::execute_request(&service, "notes", &request, &index_sql, true).await.unwrap();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'ix_name'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(indexes, 1);
-
-        session.target.table = "scratch".into();
-        session.section = Section::Danger;
-        let request = session.request().unwrap();
-        let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
-        assert!(plan.steps.iter().any(|step| step.sql.to_ascii_uppercase().contains("DROP")), "{:?}", plan.blocked);
-        session.arm_live(plan);
-        let drop_sql = session.confirm_sql().unwrap();
-        session.cancel();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let present: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'scratch'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(present, 1);
-        session.open = true;
-        crate::application::ddl::execute_request(&service, "notes", &request, &drop_sql, true).await.unwrap();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
-            .await
-            .unwrap();
-        let present: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'scratch'").fetch_one(&pool).await.unwrap();
-        pool.close().await;
-        assert_eq!(present, 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tabs_follow_the_object_and_original_names_let_alter_precheck_proceed() {
-        let mut session = StructureSession::new(target("postgres", "orders"));
-        assert_eq!(
-            session.visible_sections(),
-            vec![Section::Columns, Section::Indexes, Section::ForeignKeys, Section::Ddl, Section::Danger]
-        );
-        session.object_kind = "view".into();
-        assert_eq!(session.visible_sections(), vec![Section::Columns, Section::View, Section::Danger]);
-        assert!(!session.visible_sections().contains(&Section::Ddl));
-        session.mode = StructureMode::Create;
-        assert_eq!(session.visible_sections(), vec![Section::Columns]);
-
-        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
-        snapshot.kind = "table".into();
-        snapshot.columns.push(column("name", "text", false));
-        let mut drafts = column_drafts(&snapshot);
-        assert_eq!(drafts[0].original.as_deref(), Some("name"));
-        drafts[0].name = "title".into();
-        let plan = preview_plan(&snapshot, &Action::AlterColumns { table: "orders".into(), columns: drafts });
-        assert!(!plan.blocked.iter().any(|item| item.contains("没有出现")), "{:?}", plan.blocked);
-
-        let mut created = StructureSession::new(target("sqlite", "ignored"));
-        created.mode = StructureMode::Create;
-        created.table_name = "notes".into();
-        created.kept_columns = vec![default_id("sqlite")];
-        match created.action() {
-            Action::CreateTable { name, columns } => {
-                assert_eq!(name, "notes");
-                assert_eq!(columns[0].name, "id");
-                assert!(columns[0].primary && columns[0].original.is_none());
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn indexes_and_foreign_keys_preview_drops_unique_order_and_actions() {
-        let mut session = StructureSession::new(target("postgres", "orders"));
-        session.section = Section::Indexes;
-        session.index_name = "ix_note".into();
-        session.index_unique = true;
-        session.index_columns = vec![
-            IndexColumnDraft { name: "note".into(), descending: false },
-            IndexColumnDraft { name: "id".into(), descending: true },
-        ];
-        match session.action() {
-            Action::CreateIndex { unique, columns, .. } => {
-                assert!(unique);
-                assert_eq!(columns.len(), 2);
-                assert!(columns[1].descending);
-            }
-            other => panic!("{other:?}"),
-        }
-        session.intent = EditIntent::DropIndex { name: "orders_pkey".into() };
-        assert!(matches!(session.action(), Action::DropIndex { name, .. } if name == "orders_pkey"));
-
-        session.section = Section::ForeignKeys;
-        session.intent = EditIntent::Apply;
-        session.fk_name = "orders_parent".into();
-        session.fk_column = "parent_id".into();
-        session.fk_ref_schema = "public".into();
-        session.fk_ref_table = "parents".into();
-        session.fk_ref_column = "id".into();
-        session.fk_on_delete = "CASCADE".into();
-        session.fk_on_update = "RESTRICT".into();
-        match session.action() {
-            Action::CreateForeignKey { foreign_key, .. } => {
-                assert_eq!(foreign_key.ref_schema, "public");
-                assert_eq!(foreign_key.on_delete, "CASCADE");
-                assert_eq!(foreign_key.on_update, "RESTRICT");
-            }
-            other => panic!("{other:?}"),
-        }
-        session.intent = EditIntent::DropForeignKey { name: "orders_parent".into() };
-        assert!(matches!(session.action(), Action::DropForeignKey { .. }));
-        assert!(fk_action_choices("postgres").contains(&"SET DEFAULT"));
-        assert!(!fk_action_choices("mysql").contains(&"SET DEFAULT"));
-        assert_eq!(fk_action_choices("mysql"), fk_action_choices("mariadb"));
-    }
-
-    #[test]
-    fn production_danger_needs_the_object_name_and_a_failed_note_keeps_the_draft() {
-        let mut session = StructureSession::new(target("sqlite", "customers"));
-        session.target.environment = "prod".into();
-        session.section = Section::Danger;
-        assert!(!session.danger_name_ok());
-        session.danger_name = "customers".into();
-        assert!(session.danger_name_ok());
-        session.danger_name = "other".into();
-        assert!(!session.danger_name_ok());
-
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-keep-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
-        let mut pane = StructurePane::new(services);
-        pane.begin_create(target("sqlite", "customers"));
-        assert_eq!(pane.session.mode, StructureMode::Create);
-        assert_eq!(pane.session.kept_columns[0].name, "id");
-        pane.type_into("table_name", "notes");
-        pane.type_into("column_name", "nickname");
-        pane.session.note = Note::raw("生成计划失败".into());
-        assert_eq!(pane.session.table_name, "notes");
-        assert_eq!(pane.session.column_name, "nickname");
-        assert_eq!(pane.session.kept_columns[0].name, "id");
-        match pane.session.action() {
-            Action::CreateTable { name, columns } => {
-                assert_eq!(name, "notes");
-                assert!(columns.iter().any(|column| column.name == "nickname"));
-            }
-            other => panic!("{other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn snapshot_with(columns: usize) -> Snapshot {
-        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
-        snapshot.kind = "table".into();
-        for index in 0..columns {
-            snapshot.columns.push(column(&format!("col_{index}"), if index == 0 { "bigint" } else { "integer" }, index == 0));
-        }
-        snapshot
-    }
-
-    /// 没有连接 id 的目标：渲染时不会发起读取，快照由用例直接注入。
-    fn offline_target(table: &str) -> GridTarget {
-        GridTarget {
-            connection_id: String::new(),
-            connection_name: String::new(),
-            database: "app".into(),
-            schema: "public".into(),
-            table: table.into(),
-            engine: "postgres".into(),
-            environment: "dev".into(),
-        }
-    }
-
-    fn pane_with_snapshot(services: std::sync::Arc<crate::application::AppServices>, columns: usize) -> StructurePane {
-        let mut pane = StructurePane::new(services);
-        pane.bind(offline_target("orders"));
-        let snapshot = snapshot_with(columns);
-        pane.session.object_kind = snapshot.kind.clone();
-        pane.session.kept_columns = column_drafts(&snapshot);
-        pane.session.index_columns.clear();
-        pane.drafts_ready = true;
-        pane.snapshot = Some(snapshot);
-        pane
-    }
-
-    fn offline_services(name: &str) -> (std::sync::Arc<crate::application::AppServices>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("rillsql-structure-{name}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
-            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
-        )));
-        (services, dir)
-    }
-
-    /// 字段、索引、外键三张列表共用一份行高、表头高与内边距，最小列宽在 640 宽窗口里放得下（S8.4 / R6）。
-    #[test]
-    fn structure_lists_share_one_row_height_and_fit_the_narrowest_window() {
-        for metrics in [kit::Metrics::compact(), kit::Metrics::standard(), kit::Metrics::relaxed()] {
-            let spec = TableSpec::of(metrics);
-            assert_eq!(spec.header_h, metrics.row_h, "表头高取 row_h");
-            assert_eq!(spec.row_h, metrics.row_h, "行高取 row_h，不再各表 +2");
-            assert_eq!(spec.pad_x, TableSpec::PAD_X, "三张表共用同一左右内边距");
-            for section in [Section::Columns, Section::Indexes, Section::ForeignKeys] {
-                let columns = table_columns(section);
-                assert!(columns.len() >= 3, "{section:?} 至少要能显示标识、内容与状态列");
-                let total: f32 = columns.iter().map(|column| column.min_w).sum();
-                let available = 640. - 2. * metrics.page_pad - 2. * spec.pad_x;
-                assert!(total <= available, "{section:?}: 最小列宽之和 {total} 超过 640 宽可用的 {available}");
-                assert!(columns.iter().all(|column| column.weight > 0.), "{section:?}: 每列都要能伸缩");
-            }
-        }
-        // 反向：行高不能是个与密度无关的常量。
-        assert_ne!(TableSpec::of(kit::Metrics::compact()).row_h, TableSpec::of(kit::Metrics::standard()).row_h);
-    }
-
-    /// 空列表不画表头冒充空态；加载优先于错误，错误优先于空态。
-    #[test]
-    fn empty_lists_have_no_header_and_loading_wins_over_error() {
-        assert_eq!(list_state(false, "", 0), ListState::Empty);
-        assert!(!shows_table_header(ListState::Empty), "空列表不能保留表头加破折号");
-        assert_eq!(list_state(false, "", 3), ListState::Rows);
-        assert!(shows_table_header(ListState::Rows));
-        assert_eq!(list_state(true, "", 0), ListState::Loading);
-        assert_eq!(list_state(true, "找不到表或视图 orders", 3), ListState::Loading, "加载优先于错误");
-        assert_eq!(list_state(false, "找不到表或视图 orders", 0), ListState::Error);
-    }
-
-    /// 生产环境的危险操作在输入对象名之前不能确认；图标/配色按危险呈现。
-    #[test]
-    fn production_warning_name_gates_the_confirm_button() {
-        let mut session = StructureSession::new(target("postgres", "orders"));
-        session.target.environment = "prod".into();
-        session.section = Section::Danger;
-        session.arm_fixture(&snapshot_with(1));
-        assert!(session.confirm_blocked(), "生产环境未输入对象名时确认必须禁用");
-        assert!(session.preview_dangerous());
-        session.danger_name = "orders".into();
-        assert!(!session.confirm_blocked());
-        session.section = Section::Columns;
-        assert!(!session.confirm_blocked(), "非危险页签不受对象名约束");
-        assert_eq!(session.object_label(), "orders");
-
-        session.mode = StructureMode::Create;
-        session.table_name = "notes".into();
-        assert_eq!(session.object_label(), "notes", "新建表确认层标题用输入的表名");
-    }
-
-    /// 主操作固定在滚动内容之外：字段很多、窗口只有 640 宽时也直接可见可点（R6）。
-    #[gpui_kit::test]
-    fn primary_action_stays_outside_the_scrolled_body_at_every_width(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("actions");
-        cx.update(gpui_kit::init);
-        for width in [1360., 900., 640.] {
-            let (window, _pane) = cx
-                .update(|cx| {
-                    let bounds = gpui_kit::Bounds {
-                        origin: gpui_kit::Point::default(),
-                        size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)),
-                    };
-                    let (window, pane) = gpui_kit::open_window(
-                        gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                        cx,
-                        |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 26)),
-                    )
-                    .expect("structure pane");
-                    (window, pane)
-                });
-            let (button, body, pane_bounds, row_h) = cx
-                .update_window(window, |_, window, cx| {
-                    window.render_frame(cx);
-                    (
-                        window.find("structure-preview").bounds(),
-                        window.find("structure-body").bounds(),
-                        window.find("structure-pane").bounds(),
-                        window.find("structure-row-columns-0").bounds(),
-                    )
-                })
-                .unwrap();
-            let bottom = f32::from(button.origin.y + button.size.height);
-            assert!(bottom <= f32::from(pane_bounds.size.height) + 0.5, "{width}: 主操作被裁在窗口外（底 {bottom}）");
-            assert!(
-                f32::from(button.origin.y) >= f32::from(body.origin.y + body.size.height) - 0.5,
-                "{width}: 主操作不能落在滚动内容里"
-            );
-            let expected = cx.update(|cx| kit::Metrics::of(cx).row_h);
-            assert!((f32::from(row_h.size.height) - expected).abs() < 0.5, "{width}: 行高应为 Metrics::row_h {expected}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 行右键菜单的语义：复制只写剪贴板，"标记删除"只改草稿，任何菜单动作都不执行 SQL。
-    ///
-    /// 说明：ContextMenu 弹层在 headless 测试窗口里不展开（它用 hitbox.is_hovered 判断按下是否属于自己，
-    /// 没有真实指针时恒为假），所以这里验证菜单项内容与它们触发的动作；行的渲染与行高由
-    /// primary_action_stays_outside_the_scrolled_body_at_every_width 覆盖。
-    #[gpui_kit::test]
-    fn row_menu_actions_only_edit_the_draft_and_never_execute(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("menu");
-        let pane = cx.update(|cx| cx.new(|_| pane_with_snapshot(services, 2)));
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| {
-                let mono = SharedString::from("mono");
-                let rows = pane.list_rows(Section::Columns, Locale::ZhCn, &mono, &Palette::light());
-                assert_eq!(rows.len(), 2, "两列就该有两个可右键的行");
-                let ids = rows[1].menu.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>();
-                assert_eq!(ids, vec!["copy-column-1", "drop-column-1"], "字段行菜单：复制名称 + 标记删除");
-                assert!(rows[1].menu.iter().all(|entry| !entry.disabled));
-
-                pane.apply_row_action(RowAction::Copy("col_1".into()), cx);
-                pane.apply_row_action(RowAction::ToggleColumnDrop(1), cx);
-                assert!(pane.session.kept_columns[1].dropped, "标记删除落在草稿上");
-                assert!(!pane.session.preview_open(), "菜单动作不能绕过预览");
-                assert!(!pane.session.armed(), "也不能把计划推到可执行状态");
-                // 同一个菜单项再点一次是取消标记。
-                pane.apply_row_action(RowAction::ToggleColumnDrop(1), cx);
-                assert!(!pane.session.kept_columns[1].dropped, "再点一次取消删除标记");
-            });
-        });
-        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
-        assert_eq!(copied.as_deref(), Some("col_1"), "复制名称进剪贴板");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 浅/深色 × 紧凑/标准：行高与表头高随密度取 `row_h`，主题只换配色，主操作与空态位置不变（S9 / S12.2）。
-    #[gpui_kit::test]
-    fn structure_lists_follow_density_in_both_themes(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("density");
-        for dark in [false, true] {
-            for metrics in [kit::Metrics::compact(), kit::Metrics::standard()] {
-                let expected = metrics.row_h;
-                cx.update(|cx| {
-                    gpui_kit::init(cx);
-                    kit::apply_theme(dark, cx);
-                    metrics.publish(cx);
-                });
-                let (window, _pane) = cx
-                    .update(|cx| {
-                        let bounds = gpui_kit::Bounds {
-                            origin: gpui_kit::Point::default(),
-                            size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
-                        };
-                        let (window, pane) = gpui_kit::open_window(
-                            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                            cx,
-                            |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 3)),
-                        )
-                        .expect("structure pane");
-                        (window, pane)
-                    });
-                let (row, head, action) = cx
-                    .update_window(window, |_, window, cx| {
-                        window.render_frame(cx);
-                        (
-                            window.find("structure-row-columns-0").bounds(),
-                            window.find("structure-table-head").bounds(),
-                            window.find("structure-preview").visible(),
-                        )
-                    })
-                    .unwrap();
-                let theme = if dark { "深色" } else { "浅色" };
-                assert!((f32::from(row.size.height) - expected).abs() < 0.5, "{theme}: 行高 {} 应为 {expected}", f32::from(row.size.height));
-                assert!((f32::from(head.size.height) - expected).abs() < 0.5, "{theme}: 表头高应为 {expected}");
-                assert!(action, "{theme}: 主操作在两种密度两种主题下都在位");
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 字段表的紧凑档要放进最窄的真实内容列：640 宽窗口开着侧栏时内容列 588，
-    /// 扣掉结构页左右内边距和卡片边线只剩 534（原先拿 640 视口宽去算，行尾动作被裁掉）。
-    /// 完整工作台里 900 / 640 的可见与可点由外壳用例
-    /// structure_row_actions_stay_inside_the_real_content_column 覆盖。
-    #[test]
-    fn compact_field_widths_fit_the_narrowest_content_column() {
-        let rail = crate::app::shell::layout::RAIL_WIDTH as f32;
-        for metrics in [kit::Metrics::compact(), kit::Metrics::standard(), kit::Metrics::relaxed()] {
-            // 640 - 活动栏 - 左右页边距 - 卡片左右边线。
-            let content_w = 640. - rail - 2. * metrics.page_pad - 2.;
-            let widths = FieldWidths::compact();
-            for create in [false, true] {
-                let needed = widths.min_total(create);
-                assert!(needed <= content_w, "{metrics:?} create={create}: 紧凑行需要 {needed}，640 开侧栏只有 {content_w}");
-            }
-            // 宽档放不下时必须整体换紧凑档，不能停在宽档把右边挤出去。
-            assert_eq!(FieldWidths::of(content_w, true).min_total(true), widths.min_total(true), "{metrics:?}: 窄内容列应取紧凑档");
-        }
-        // 反向：宽档确实更宽，档位不是摆设。
-        assert!(FieldWidths::wide().min_total(false) > FieldWidths::compact().min_total(false));
-        // 宽屏余量分一部分给默认值（表达式放得下），整行仍不超出内容宽。
-        for (content_w, create) in [(1040., false), (1040., true), (2400., false)] {
-            let widths = FieldWidths::of(content_w, create);
-            assert!(widths.default > FieldWidths::wide().default, "{content_w}: 默认值列应变宽");
-            assert!(widths.default <= FieldWidths::wide().default + 260.);
-            assert!(widths.min_total(create) <= content_w, "{content_w}: 行宽 {} 超出", widths.min_total(create));
-        }
-    }
-
-    /// 空索引列表整块换成空态：既没有表头，也没有"表头 + 破折号"的占位行。
-    #[gpui_kit::test]
-    fn empty_index_list_replaces_the_table_with_an_empty_state(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("empty-indexes");
-        cx.update(gpui_kit::init);
-        let (window, _pane) = cx.update(|cx| {
-            let bounds = gpui_kit::Bounds {
-                origin: gpui_kit::Point::default(),
-                size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
-            };
-            let (window, pane) = gpui_kit::open_window(
-                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                cx,
-                |_window, cx| {
-                    cx.new(|_| {
-                        let mut pane = pane_with_snapshot(services.clone(), 2);
-                        pane.session.section = Section::Indexes;
-                        pane
-                    })
-                },
-            )
-            .expect("structure pane");
-            (window, pane)
-        });
-        let (head, empty, dash_rows) = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                (
-                    window.try_find("structure-table-head").map(|head| head.visible()),
-                    window.try_find("empty-state").map(|block| block.visible()),
-                    window.find_all("structure-row-indexes-0").len(),
-                )
-            })
-            .unwrap();
-        assert!(head.is_none(), "空索引列表不能保留表头");
-        assert_eq!(empty, Some(true), "空索引列表要换成空态块");
-        assert_eq!(dash_rows, 0, "空列表不能留占位行");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 危险确认层在 640×640 里也放得下：只有正文滚动，取消与确认始终可见。
-    #[gpui_kit::test]
-    fn danger_dialog_keeps_its_actions_visible_in_a_short_narrow_window(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("dialog");
-        cx.update(gpui_kit::init);
-        let (window, _pane) = cx.update(|cx| {
-            let bounds = gpui_kit::Bounds {
-                origin: gpui_kit::Point::default(),
-                size: gpui_kit::size(gpui_kit::px(640.), gpui_kit::px(640.)),
-            };
-            let (window, pane) = gpui_kit::open_window(
-                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                cx,
-                |_window, cx| {
-                    cx.new(|_| {
-                        let mut pane = pane_with_snapshot(services.clone(), 8);
-                        pane.session.section = Section::Danger;
-                        let snapshot = snapshot_with(8);
-                        pane.session.arm_fixture(&snapshot);
-                        pane
-                    })
-                },
-            )
-            .expect("structure pane");
-            (window, pane)
-        });
-        let (dialog, body, confirm, cancel, window_size) = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                (
-                    window.find("structure-preview-dialog").bounds(),
-                    window.find("structure-preview-body").bounds(),
-                    window.find("structure-confirm").bounds(),
-                    window.find("structure-cancel").bounds(),
-                    window.find("structure-pane").bounds(),
-                )
-            })
-            .unwrap();
-        let limit = f32::from(window_size.size.height) * 0.92 + 1.;
-        assert!(f32::from(dialog.size.height) <= limit, "确认层高 {} 超出窗口可用高度 {limit}", f32::from(dialog.size.height));
-        assert!(f32::from(confirm.size.height) > 0., "确认按钮要真的画出来");
-        for (name, bounds) in [("确认", confirm), ("取消", cancel)] {
-            let bottom = f32::from(bounds.origin.y + bounds.size.height);
-            assert!(bottom <= f32::from(window_size.size.height) + 0.5, "{name}按钮被裁在窗口外（底 {bottom}）");
-        }
-        assert!(
-            f32::from(body.size.height) < f32::from(dialog.size.height),
-            "正文与页脚分工：正文滚动，页脚固定"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 源码里出现的每一个结构页文案键都要在字典里。
-    ///
-    /// \`i18n::text\` 对未知键原样返回键名（曾把 \`structure.error.retry\` 这个不存在的键直接显示到两种语言里），
-    /// 而 \`i18n\` 自己的测试只从"键→语言"方向检查，抓不到"用了不存在的键"。这里反向扫描本文件。
-    #[test]
-    fn every_structure_copy_key_used_in_the_source_exists_in_the_catalog() {
-        let catalog = i18n::catalog_keys();
-        let prefixes = ["structure.", "ui.structure.", "common.", "admin.", "catalog."];
-        let mut checked = 0;
-        for literal in string_literals(include_str!("mod.rs")) {
-            if prefixes.contains(&literal.as_str()) || !prefixes.iter().any(|prefix| literal.starts_with(prefix)) {
-                continue;
-            }
-            // 元素 id 用连字符（structure-row-…），键用点号；带占位符或空格的不是文案键。
-            if literal.contains('{') || literal.contains(' ') {
-                continue;
-            }
-            assert!(catalog.contains(&literal.as_str()), "{literal:?} 被当作文案键使用，但字典里没有它");
-            checked += 1;
-        }
-        assert!(checked >= 20, "只扫到 {checked} 个文案键，扫描本身可能失效了");
-    }
-
-    /// 取出源码里的所有双引号字符串字面量（跳过 \`\\"\` 转义）。
-    fn string_literals(source: &str) -> Vec<String> {
-        let mut literals = Vec::new();
-        let mut chars = source.chars();
-        while let Some(ch) = chars.next() {
-            if ch != '"' {
-                continue;
-            }
-            let mut literal = String::new();
-            let mut escaped = false;
-            for inner in chars.by_ref() {
-                if escaped {
-                    escaped = false;
-                    literal.push(inner);
-                    continue;
-                }
-                match inner {
-                    '\\' => escaped = true,
-                    '"' => break,
-                    _ => literal.push(inner),
-                }
-            }
-            literals.push(literal);
-        }
-        literals
-    }
-
-    /// 连接还没打开时，结构页和表数据页一样给中性的“连接未打开”和“连接并读取”主按钮，
-    /// 不是红色的“读取结构失败”；点它请外壳去连接，而不是再读一次必然失败的结构。
-    #[gpui_kit::test]
-    fn an_unopened_connection_offers_connect_instead_of_an_error(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("unopened");
-        cx.update(gpui_kit::init);
-        let (window, pane) = cx.update(|cx| {
-            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_window, cx| {
-                cx.new(|_| {
-                    let mut pane = pane_with_snapshot(services.clone(), 2);
-                    pane.session.target.connection_id = "closed-connection".into();
-                    pane.snapshot = None;
-                    pane.session.kept_columns.clear();
-                    pane.drafts_ready = false;
-                    // 已经读过一次（因连接未打开而失败），渲染时不再自动重读。
-                    pane.loaded_for = "closed-connection|app|public|orders".into();
-                    pane.load_error = "这条连接还没有打开，没有另开新的连接。".to_owned();
-                    pane
-                })
-            })
-            .expect("structure pane")
-        });
-        let (error, empty, label) = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                (window.try_find("error-state").is_some(), window.try_find("empty-state").is_some(), window.find("structure-retry").label().map(str::to_owned))
-            })
-            .unwrap();
-        assert!(!error, "连接没打开不是读取错误");
-        assert!(empty, "给中性的说明");
-        assert_eq!(label.as_deref(), Some(i18n::text(Locale::ZhCn, "grid.action.connectRead").as_str()));
-        cx.update_window(window, |_, window, cx| window.click("structure-retry", cx)).unwrap();
-        assert_eq!(cx.update(|cx| pane.update(cx, |pane, _| pane.take_connect_request())).as_deref(), Some("closed-connection"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 读取失败与读取中在定义类页签（DDL / 危险操作）也要给原因、重试与骨架，
-    /// 不能退化成"这个对象没有可显示的 SQL 定义"。
-    #[gpui_kit::test]
-    fn definition_tabs_share_the_loading_and_load_failure_states(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt;
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("definition-tabs");
-        cx.update(gpui_kit::init);
-        for section in [Section::Ddl, Section::Danger, Section::View] {
-            // 读取中：骨架，不是空态文案。
-            let (window, _pane) = cx.update(|cx| {
-                let bounds = gpui_kit::Bounds {
-                    origin: gpui_kit::Point::default(),
-                    size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
-                };
-                gpui_kit::open_window(
-                    gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                    cx,
-                    |_window, cx| {
-                        cx.new(|_| {
-                            let mut pane = pane_with_snapshot(services.clone(), 2);
-                            pane.session.section = section;
-                            pane.snapshot = None;
-                            pane.loading = true;
-                            pane
-                        })
-                    },
-                )
-                .expect("structure pane")
-            });
-            let (skeleton, empty) = cx
-                .update_window(window, |_, window, cx| {
-                    window.render_frame(cx);
-                    (window.try_find("skeleton-state").map(|block| block.visible()), window.try_find("empty-state").is_some())
-                })
-                .unwrap();
-            assert_eq!(skeleton, Some(true), "{section:?}: 读取中要给骨架");
-            assert!(!empty, "{section:?}: 读取中不能闪「没有可显示的 SQL 定义」");
-
-            // 读取失败：错误态 + 可点的重试，按钮文案是翻译过的（不是键名）。
-            let (window, pane) = cx.update(|cx| {
-                let bounds = gpui_kit::Bounds {
-                    origin: gpui_kit::Point::default(),
-                    size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
-                };
-                gpui_kit::open_window(
-                    gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                    cx,
-                    |_window, cx| {
-                        cx.new(|_| {
-                            let mut pane = pane_with_snapshot(services.clone(), 2);
-                            pane.session.section = section;
-                            pane.snapshot = None;
-                            pane.load_error = "找不到表或视图 orders".to_owned();
-                            pane
-                        })
-                    },
-                )
-                .expect("structure pane")
-            });
-            let (error, empty, label, detail) = cx
-                .update_window(window, |_, window, cx| {
-                    window.render_frame(cx);
-                    (
-                        window.try_find("error-state").map(|block| block.visible()),
-                        window.try_find("empty-state").is_some(),
-                        window.find("structure-retry").label().map(str::to_owned),
-                        window.find("error-state-detail").label().map(str::to_owned),
-                    )
-                })
-                .unwrap();
-            assert_eq!(error, Some(true), "{section:?}: 读取失败要给错误态");
-            assert!(!empty, "{section:?}: 读取失败不能退化成「没有可显示的 SQL 定义」");
-            assert_eq!(label.as_deref(), Some("重试"), "{section:?}: 重试按钮文案要翻译过，不能是键名");
-            assert!(detail.is_none() || detail.as_deref() != Some("structure.empty.definition"));
-            cx.update_window(window, |_, window, cx| window.click("structure-retry", cx)).unwrap();
-            assert!(cx.update(|cx| pane.read(cx).load_error_text().is_empty()), "{section:?}: 重试要清掉失败原因");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 长列表下拉的判定：空选项、空输入、精确值、大小写混合、部分命中、无命中与清空恢复各有确定结果，
-    /// 无命中不再无说明地退回完整列表（R5）。
-    #[test]
-    fn choice_matching_separates_no_options_from_no_match() {
-        let choices: Vec<String> = ["orders", "Order_Items", "customers", "products"].iter().map(|item| (*item).to_owned()).collect();
-        let all: Vec<&String> = choices.iter().collect();
-        assert_eq!(match_choices(&[], ""), ChoiceMatch::Unavailable, "没有选项");
-        assert_eq!(match_choices(&[], "orders"), ChoiceMatch::Unavailable, "有输入但原本没有选项，仍是无可用项而不是无命中");
-        assert_eq!(match_choices(&choices, ""), ChoiceMatch::Items(all.clone()), "空输入列全部");
-        assert_eq!(match_choices(&choices, "   "), ChoiceMatch::Items(all.clone()), "只有空白等同空输入");
-        assert_eq!(match_choices(&choices, "orders"), ChoiceMatch::Items(all.clone()), "已是精确值时列全部，便于换一个");
-        assert_eq!(match_choices(&choices, " orders "), ChoiceMatch::Items(all.clone()), "精确值忽略首尾空白");
-        assert_eq!(match_choices(&choices, "ORDER"), ChoiceMatch::Items(vec![&choices[0], &choices[1]]), "大小写不敏感的部分命中");
-        assert_eq!(match_choices(&choices, "omer"), ChoiceMatch::Items(vec![&choices[2]]));
-        assert_eq!(match_choices(&choices, "zzz"), ChoiceMatch::NoMatch, "无命中不能退回完整列表");
-        // 清空输入恢复全部。
-        assert_eq!(match_choices(&choices, ""), ChoiceMatch::Items(all));
-        // 两种提示文案不同，且两种语言都翻译过。
-        for locale in [Locale::ZhCn, Locale::En] {
-            let empty = i18n::text(locale, "structure.choice.empty");
-            let no_match = i18n::text(locale, "structure.choice.noMatch");
-            assert_ne!(empty, no_match, "{locale:?}: 无可用项与无命中要用不同说明");
-            assert_ne!(i18n::text(locale, "structure.choice.noMatchHint"), "structure.choice.noMatchHint");
-        }
-        assert_ne!(i18n::text(Locale::ZhCn, "structure.choice.noMatch"), i18n::text(Locale::En, "structure.choice.noMatch"));
-    }
-
-    /// 真实下拉路径：引用表输入无命中时菜单里没有可点项、输入与草稿不变；清空输入后重新打开列出全部，
-    /// 限高可滚动；部分匹配时点选写入正确的字段（R5 / R7）。
-    #[gpui_kit::test]
-    fn fk_table_menu_shows_no_match_keeps_input_and_recovers_after_clearing(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::{TestQueryExt as _, TestWindowExt};
-        use gpui_kit::AppContext as _;
-        let (services, dir) = offline_services("choice-menu");
-        cx.update(gpui_kit::init);
-        let tables: Vec<String> = (0..60).map(|index| format!("table_{index:02}")).collect();
-        let (window, pane) = cx.update(|cx| {
-            let bounds = gpui_kit::Bounds {
-                origin: gpui_kit::Point::default(),
-                size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)),
-            };
-            gpui_kit::open_window(
-                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
-                cx,
-                |_window, cx| {
-                    cx.new(|_| {
-                        let mut pane = pane_with_snapshot(services.clone(), 3);
-                        pane.session.section = Section::ForeignKeys;
-                        pane.composer_open = true;
-                        pane.fk_tables = tables.clone();
-                        pane.session.fk_ref_table = "zzz".into();
-                        pane.session.fk_column = "col_1".into();
-                        pane
-                    })
-                },
-            )
-            .expect("structure pane")
-        });
-        let menu_items = |window: &mut Window| {
-            window
-                .find_all_by_role(gpui_kit::Role::MenuItem)
-                .into_iter()
-                .map(|item| (item.label().unwrap_or_default().to_owned(), item.disabled().unwrap_or(false)))
-                .collect::<Vec<_>>()
-        };
-
-        // 无命中：只有两条不可点的说明，没有任何表名。
-        let items = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                window.click("structure-fk-tables", cx);
-                window.render_frame(cx);
-                menu_items(window)
-            })
-            .unwrap();
-        let no_match = i18n::text(Locale::ZhCn, "structure.choice.noMatch");
-        let hint = i18n::text(Locale::ZhCn, "structure.choice.noMatchHint");
-        assert_eq!(items.iter().map(|(label, _)| label.clone()).collect::<Vec<_>>(), vec![no_match.clone(), hint.clone()], "无命中不能退回完整列表: {items:?}");
-        // 说明行是 PopupMenu 的 Label：无点击处理、键盘也跳过。逐条点击并尝试键盘确认，草稿都不变。
-        cx.update_window(window, |_, window, cx| {
-            window.click(gpui_kit::ElementId::Integer(0), cx);
-            window.render_frame(cx);
-            window.click(gpui_kit::ElementId::Integer(1), cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-        let still_open = cx.update_window(window, |_, window, _| window.try_find("popup-menu").is_some()).unwrap();
-        assert!(still_open, "点说明行不算选择，菜单保持打开");
-        cx.update_window(window, |_, window, cx| {
-            window.press("down", cx);
-            window.press("enter", cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-        cx.update(|cx| {
-            let pane = pane.read(cx);
-            assert_eq!(pane.session.fk_ref_table, "zzz", "点无命中说明不改输入");
-            assert_eq!(pane.session.fk_column, "col_1", "也不改其它未提交草稿");
-            assert!(!pane.session.preview_open());
-        });
-        cx.update_window(window, |_, window, cx| {
-            window.press("escape", cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-
-        // 清空输入后重新打开：全部 60 张表，菜单限高滚动。
-        cx.update(|cx| pane.update(cx, |pane, cx| {
-            pane.set_field("fk_ref_table", String::new());
-            cx.notify();
-        }));
-        let (items, menu_h) = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                window.click("structure-fk-tables", cx);
-                window.render_frame(cx);
-                (menu_items(window), window.find("popup-menu").bounds().size.height)
-            })
-            .unwrap();
-        assert_eq!(items.len(), tables.len(), "清空输入恢复全部选项");
-        assert!(items.iter().all(|(_, disabled)| !*disabled));
-        assert!(f32::from(menu_h) <= 360. + 16., "长列表菜单仍限高（{}）", f32::from(menu_h));
-        cx.update_window(window, |_, window, cx| {
-            window.press("escape", cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-
-        // 部分匹配：只列命中的表，点选写入引用表字段，不碰本表列。
-        cx.update(|cx| pane.update(cx, |pane, cx| {
-            pane.set_field("fk_ref_table", "LE_4".into());
-            cx.notify();
-        }));
-        let items = cx
-            .update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                window.click("structure-fk-tables", cx);
-                window.render_frame(cx);
-                menu_items(window)
-            })
-            .unwrap();
-        let labels = items.iter().map(|(label, _)| label.clone()).collect::<Vec<_>>();
-        assert_eq!(labels, (40..50).map(|index| format!("table_{index}")).collect::<Vec<_>>(), "部分匹配只列命中项");
-        cx.update_window(window, |_, window, cx| {
-            let target = window.find_by_label("table_42");
-            window.click(target.path().last().unwrap().clone(), cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-        cx.update(|cx| {
-            let pane = pane.read(cx);
-            assert_eq!(pane.session.fk_ref_table, "table_42", "选中项写入引用表");
-            assert_eq!(pane.session.fk_column, "col_1", "本表列不被改写");
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod tests;

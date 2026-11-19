@@ -11728,3 +11728,118 @@ fn object_tree_keeps_one_tab_stop_and_keyboard_opens_data_and_structure(cx: &mut
     let _ = cx.update_window(window, |_, window, _| window.remove_window());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[gpui_kit::test]
+fn connections_page_renders_failure_callout_and_supports_group_drag_and_modal_group_picker(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-conn-ux-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1280., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let mut r1 = record_for("uat", "qsyn-uat", Engine::Mysql);
+            r1.saved.host = Some("192.168.92.210".into());
+            r1.saved.port = Some(3306);
+            r1.saved.username = Some("qsyn3_user".into());
+            r1.saved.env = "test".into();
+            let r2 = record_for("logs", "logs_2", Engine::Sqlite);
+            view.model.connections.rows = vec![r1, r2];
+            view.model.connections.selected = Some("uat".into());
+            view.model.connections.status.insert("uat".into(), LinkStatus::Failed);
+            view.model.connections.failures.insert("uat".into(), "Input/output error: invalid peer certificate: UnknownIssuer".into());
+            view.model.apply_groups(vec![group("g_qs", "青山", 0, false)], Default::default());
+            view.model.shell.page = AppPage::Connections;
+        });
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("conn-detail-failure").visible(), "右侧详情栏直接展示连接失败原因");
+        assert!(window.find("launcher-group-empty-g_qs").visible(), "空分组展示拖放区与快捷新建入口");
+
+        // 在空分组上点「在此分组新建连接」，模态打开且默认选中该分组，控件登记与 Tab 停靠点完全一致。
+        window.click("launcher-group-empty-add-g_qs", cx);
+        window.render_frame(cx);
+        {
+            let v = view.read(cx);
+            assert!(v.model.conn_modal.open);
+            assert_eq!(v.model.conn_modal.draft_group.as_deref(), Some("g_qs"));
+            let expected: Vec<String> = v.model.modal_stops().iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
+            assert_eq!(v.model.conn_modal.rendered.len(), expected.len(), "{:?} vs {:?}", v.model.conn_modal.rendered, expected);
+            assert!(v.model.conn_modal.rendered.iter().any(|id| id == "conn-group-opt-g_qs"));
+            assert!(v.model.conn_modal.rendered.iter().any(|id| id == "conn-env-none"));
+        }
+        window.click("conn-cancel", cx);
+        window.render_frame(cx);
+
+        // 将未分组连接卡片拖入空分组区，触发归组任务。
+        window.drag_to("conn-row-uat", "launcher-group-empty-g_qs", cx);
+    })
+    .unwrap();
+    let op = cx.update(|cx| view.update(cx, |view, _| view.model.take_pending_group_op()));
+    assert_eq!(
+        op,
+        Some(crate::app::shell::model::GroupOp::Assign {
+            connection: "uat".into(),
+            group: Some("g_qs".into()),
+        })
+    );
+    let _ = cx.update_window(window, |_, window, _| window.remove_window());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn table_rename_and_drop_sync_open_tabs_and_invalidate_tree_details() {
+    use crate::catalog::hierarchy::{column_group_id, connection_node_id, database_node_id, group_node_id, schema_node_id, ColumnInfo};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let orders_obj = ObjectRow::table("orders", Some(10));
+    let nav = nav_connection(Engine::Postgres, "pg", "Atlas", vec![nav_database("shop", vec![orders_obj.clone()])]);
+    model.apply_navigation(&[nav], false);
+    for id in [
+        connection_node_id("pg"),
+        database_node_id("pg", "shop"),
+        schema_node_id("pg", "shop", "public"),
+        group_node_id("pg", "shop", "public", ObjectKind::Table),
+    ] {
+        model.nav.expand(&id);
+    }
+    let table_node = crate::catalog::hierarchy::object_node_id("pg", "shop", "public", &orders_obj);
+    let cols_group = column_group_id(&table_node);
+    model.nav.expand(&table_node);
+    assert!(model.nav.set_details(
+        &table_node,
+        Ok(vec![ColumnInfo {
+            name: "old_col".into(),
+            data_type: "int4".into(),
+            nullable: false,
+            primary: true,
+        }]),
+        Ok(Vec::new()),
+    ));
+    model.nav.expand(&cols_group);
+    assert!(model.nav.visible().iter().any(|r| r.label == "old_col"));
+
+    let spec = "pg|Atlas|shop|public|orders|postgres|dev";
+    let _ = model.dispatch(&format!("open-table:{spec}"));
+    let _ = model.dispatch(&format!("open-structure-for:{spec}"));
+
+    // 表结构变更后清理旧字段缓存并排队重新加载详情。
+    model.table_structure_changed("pg", "shop", "public", "orders", false);
+    assert!(!model.nav.visible().iter().any(|r| r.label == "old_col"));
+
+    // 表重命名后已打开的数据与结构标签页同步跟随新表名。
+    model.table_renamed("pg", "shop", "public", "orders", "orders_v2");
+    for tab in &model.tabs {
+        if matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure) {
+            assert_eq!(tab.title, "orders_v2");
+            assert!(tab.spec.as_deref().unwrap_or_default().contains("|orders_v2|"));
+        }
+    }
+
+    // 删除表后自动收起已失效的干净数据与结构标签页。
+    model.object_dropped("pg", "shop", "public", "orders_v2", ObjectKind::Table);
+    assert!(model.tabs.iter().all(|tab| !matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure)));
+}

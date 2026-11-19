@@ -420,6 +420,18 @@ impl GridPane {
         self.structure_sink = Some(sink);
     }
 
+    /// 表结构在结构页刚执行变更后：丢掉列结构缓存，切回表数据时重新读取最新列清单。
+    pub fn invalidate_schema_cache(&mut self, target: &GridTarget) {
+        if self.schema_cache.as_ref().is_some_and(|(cached, _, _)| {
+            cached.connection_id == target.connection_id
+                && cached.database == target.database
+                && cached.schema == target.schema
+                && cached.table == target.table
+        }) {
+            self.schema_cache = None;
+        }
+    }
+
     pub fn menu_sink(&self) -> Option<MenuSink> {
         self.menu_sink.clone()
     }

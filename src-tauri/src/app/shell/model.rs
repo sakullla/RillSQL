@@ -918,6 +918,15 @@ impl WorkbenchModel {
             self.conn_command("conn-new-query");
             return true;
         }
+        if let Some(group_id) = id.strip_prefix("conn-new-in-group:") {
+            let origin = if self.shell.page == AppPage::Connections { FocusTarget::Connections } else { FocusTarget::Sidebar };
+            self.open_connection_modal(Some(Engine::Postgres), origin, None, id);
+            if self.group(group_id).is_some() {
+                self.conn_modal.draft_group = Some(group_id.to_owned());
+                self.conn_modal.initial_group = Some(group_id.to_owned());
+            }
+            return true;
+        }
         match id {
             "activity-workspace" => {
                 if self.shell.page == AppPage::Workspace {
@@ -1644,6 +1653,9 @@ impl WorkbenchModel {
         if !self.conn_modal.open {
             return false;
         }
+        if self.conn_modal.draft_group != self.conn_modal.initial_group {
+            return true;
+        }
         if draft_fingerprint(&self.connections.editor, &self.connections.secrets) == self.conn_modal.baseline {
             return false;
         }
@@ -1698,7 +1710,10 @@ impl WorkbenchModel {
         self.connections.message_detail.clear();
         self.focused_field = Some(DraftField::Name);
         self.url_buffer.clear();
+        let current_group = self.group_of(id).map(str::to_owned);
         self.conn_modal.open_from(origin, control, trigger);
+        self.conn_modal.draft_group = current_group.clone();
+        self.conn_modal.initial_group = current_group;
         // 没动过的副本关掉不用问：再复制一次就是同一份。
         self.conn_modal.baseline = draft_fingerprint(&self.connections.editor, &self.connections.secrets);
         true
@@ -1708,6 +1723,8 @@ impl WorkbenchModel {
     pub fn close_connection_modal(&mut self) -> Option<(FocusTarget, Option<ModalControl>)> {
         let restored = self.conn_modal.close()?;
         self.connections.editor = None;
+        self.connections.editor_network_stash = None;
+        self.connections.editor_file_stash = None;
         self.connections.secrets = Secrets::default();
         self.connections.issues.clear();
         self.connections.message_key = None;
@@ -1932,7 +1949,11 @@ impl WorkbenchModel {
 
     /// 模态里这一帧应该存在的全部 Tab 停靠点（真实 Tab 由 GPUI 的 focus trap 在容器内成环）。
     pub fn modal_stops(&self) -> Vec<super::conn_modal::ModalStop> {
-        self.conn_modal.stops_for(&self.connections, &super::conn_modal::env_ids(&self.env_tags))
+        self.conn_modal.stops_for_with_groups(
+            &self.connections,
+            &super::conn_modal::env_ids(&self.env_tags),
+            &super::conn_modal::group_ids(&self.groups),
+        )
     }
 
     pub fn open_menu(&mut self, place: MenuPlace, target: MenuTarget) {
@@ -4131,9 +4152,18 @@ impl WorkbenchModel {
             return false;
         }
         let prompt = self.danger.take().expect("prompt");
-        if matches!(prompt.kind, DangerKind::DropTable | DangerKind::DropView | DangerKind::Rename) {
-            self.forget_cached_object(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name, prompt.object.kind);
-            self.nav.forget(&prompt.node_id);
+        match prompt.kind {
+            DangerKind::DropTable | DangerKind::DropView => {
+                self.forget_cached_object(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name, prompt.object.kind);
+                self.nav.forget(&prompt.node_id);
+                self.close_tabs_for_dropped(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name);
+            }
+            DangerKind::Rename => {
+                self.forget_cached_object(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name, prompt.object.kind);
+                self.nav.forget(&prompt.node_id);
+                self.retarget_tabs_after_rename(&prompt.object.connection_id, &prompt.object.database, &prompt.object.schema, &prompt.object.name, prompt.new_name.trim());
+            }
+            DangerKind::Truncate => {}
         }
         self.request_nav_refresh(Some(prompt.object.connection_id.clone()));
         self.notice_key = Some("catalog.danger.done");
@@ -4144,7 +4174,6 @@ impl WorkbenchModel {
         true
     }
 
-    /// 结构页删除表成功：这张表立即离开树，再重读所属连接。
     pub fn adopt_created_table(&mut self, spec: String) {
         let connection = spec.split('|').next().unwrap_or("").to_owned();
         if let Some(tab) = self.active_mut() {
@@ -4156,6 +4185,60 @@ impl WorkbenchModel {
         self.table_spec = Some(spec);
         if !connection.is_empty() {
             self.request_nav_refresh(Some(connection));
+        }
+    }
+
+    fn close_tabs_for_dropped(&mut self, connection_id: &str, database: &str, schema: &str, name: &str) {
+        let doomed_ids: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                matches!(tab.kind, WorkItemKind::Structure | WorkItemKind::Table)
+                    && !tab.uncommitted_cells
+                    && tab
+                        .spec
+                        .as_deref()
+                        .and_then(ObjectTarget::parse)
+                        .is_some_and(|target| {
+                            target.connection_id == connection_id
+                                && target.database == database
+                                && target.schema == schema
+                                && target.name == name
+                        })
+            })
+            .map(|tab| tab.id.clone())
+            .collect();
+        for id in doomed_ids {
+            self.remove_tab(&id);
+        }
+    }
+
+    fn retarget_tabs_after_rename(&mut self, connection_id: &str, database: &str, schema: &str, old_name: &str, new_name: &str) {
+        if new_name.is_empty() {
+            return;
+        }
+        let rewrite = |spec: &str| -> Option<String> {
+            let mut target = ObjectTarget::parse(spec)?;
+            if target.connection_id == connection_id && target.database == database && target.schema == schema && target.name == old_name {
+                target.name = new_name.to_owned();
+                Some(target.spec())
+            } else {
+                None
+            }
+        };
+        for tab in &mut self.tabs {
+            if matches!(tab.kind, WorkItemKind::Structure | WorkItemKind::Table) {
+                if let Some(updated) = tab.spec.as_deref().and_then(rewrite) {
+                    tab.title = new_name.to_owned();
+                    tab.spec = Some(updated);
+                }
+            }
+        }
+        if let Some(updated) = self.table_spec.as_deref().and_then(rewrite) {
+            self.table_spec = Some(updated);
+        }
+        if let Some(updated) = self.object_spec.as_deref().and_then(rewrite) {
+            self.object_spec = Some(updated);
         }
     }
 
@@ -4176,15 +4259,57 @@ impl WorkbenchModel {
     }
 
     pub fn table_dropped(&mut self, connection_id: &str, database: &str, schema: &str, table: &str) {
-        self.forget_cached_object(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table);
+        self.object_dropped(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table);
+    }
+
+    pub fn object_dropped(&mut self, connection_id: &str, database: &str, schema: &str, name: &str, kind: crate::catalog::model::ObjectKind) {
+        self.forget_cached_object(connection_id, database, schema, name, kind);
         let id = self
             .nav
-            .object_by_key(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table)
+            .object_by_key(connection_id, database, schema, name, kind)
             .map(|node| node.id.clone());
         if let Some(id) = id {
             self.nav.forget(&id);
         }
-        self.request_nav_refresh(Some(connection_id.to_owned()));
+        self.close_tabs_for_dropped(connection_id, database, schema, name);
+        self.notice_key = Some("catalog.danger.done");
+        self.notice_detail = name.to_owned();
+        if !connection_id.is_empty() {
+            self.request_nav_refresh(Some(connection_id.to_owned()));
+        }
+    }
+
+    pub fn table_renamed(&mut self, connection_id: &str, database: &str, schema: &str, old_name: &str, new_name: &str) {
+        let kind = crate::catalog::model::ObjectKind::Table;
+        self.forget_cached_object(connection_id, database, schema, old_name, kind);
+        let id = self
+            .nav
+            .object_by_key(connection_id, database, schema, old_name, kind)
+            .map(|node| node.id.clone());
+        if let Some(id) = id {
+            self.nav.forget(&id);
+        }
+        self.retarget_tabs_after_rename(connection_id, database, schema, old_name, new_name);
+        if !connection_id.is_empty() {
+            self.request_nav_refresh(Some(connection_id.to_owned()));
+        }
+    }
+
+    pub fn table_structure_changed(&mut self, connection_id: &str, database: &str, schema: &str, name: &str, is_view: bool) {
+        let kind = if is_view { crate::catalog::model::ObjectKind::View } else { crate::catalog::model::ObjectKind::Table };
+        let id = self
+            .nav
+            .object_by_key(connection_id, database, schema, name, kind)
+            .map(|node| node.id.clone());
+        if let Some(id) = id {
+            self.nav.invalidate_details(&id);
+            if self.nav.is_expanded(&id) {
+                self.request_nav_details(&id);
+            }
+        }
+        if !connection_id.is_empty() {
+            self.request_nav_refresh(Some(connection_id.to_owned()));
+        }
     }
 
     /// 对象列表真正按页读取的范围：往上找到库/模式/连接节点。

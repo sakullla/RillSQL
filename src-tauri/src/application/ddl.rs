@@ -19,7 +19,11 @@ fn open_session(service: &Service, connection_id: &str) -> Result<crate::connect
 pub async fn describe_saved(service: &Service, connection_id: &str, database: String, schema: String, engine: &str, table: &str) -> Result<Snapshot, String> {
     let request = request(database, schema, engine, Action::DropTable { table: table.to_owned() })?;
     let session = open_session(service, connection_id)?;
-    crate::ddl::load(&session, &request, table).await
+    let mut snapshot = crate::ddl::load(&session, &request, table).await?;
+    if snapshot.kind == "table" {
+        crate::ddl::load_comments(&session, &mut snapshot).await;
+    }
+    Ok(snapshot)
 }
 
 /// 对象树“查看/复制 DDL”的读取入口。只在已打开的会话上读，不另开连接。

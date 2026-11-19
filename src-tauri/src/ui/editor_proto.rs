@@ -175,7 +175,7 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
                 lines.push(fill("query.info.comment", "comment", &column.comment));
             }
         }
-        EntryInfo::Object { schema, name, kind, comment } => {
+        EntryInfo::Object { schema, name, kind, comment, columns } => {
             let qualified = if schema.is_empty() { name.clone() } else { format!("{schema}.{name}") };
             let kind_key = match kind.to_ascii_lowercase().as_str() {
                 "table" => "query.complete.kind.table",
@@ -192,6 +192,34 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
             }
             if !comment.trim().is_empty() {
                 lines.push(fill("query.info.comment", "comment", comment));
+            }
+            if !columns.is_empty() {
+                const MAX_DOC_COLS: usize = 8;
+                let mut col_lines = vec![format!("**{}**", i18n::fill(&t("query.info.columnsHeader"), &[("count", &columns.len().to_string())]))];
+                for col in columns.iter().take(MAX_DOC_COLS) {
+                    let mut parts = vec![code_span(&col.name)];
+                    if !col.type_name.trim().is_empty() {
+                        parts.push(escape_markdown(col.type_name.trim()));
+                    }
+                    if col.primary {
+                        parts.push(t("query.side.primary"));
+                    }
+                    if col.foreign_key {
+                        parts.push(t("query.side.foreign"));
+                    }
+                    if col.nullable == Some(false) && !col.primary {
+                        parts.push(t("query.info.notNull"));
+                    }
+                    if !col.comment.trim().is_empty() {
+                        parts.push(format!("— {}", escape_markdown(col.comment.trim())));
+                    }
+                    col_lines.push(format!("- {}", parts.join(" · ")));
+                }
+                if columns.len() > MAX_DOC_COLS {
+                    let rest = columns.len() - MAX_DOC_COLS;
+                    col_lines.push(format!("_{}_", i18n::fill(&t("query.info.moreColumns"), &[("count", &rest.to_string())])));
+                }
+                lines.push(col_lines.join("\n"));
             }
         }
         EntryInfo::Function { signature } => lines.push(code_span(signature)),
@@ -385,6 +413,8 @@ impl SqlEditor {
                 .line_number(true)
                 .folding(true)
                 .default_value("select 1;\n");
+            state.lsp_mut().completion_menu.max_width = px(440.);
+            state.lsp_mut().set_completion_highlighter(Rc::new(highlight_sql_completion));
             state.lsp_mut().completion_provider = Some(Rc::new(SqlSuggest {
                 version: version.clone(),
                 extra: extra.clone(),
@@ -1120,16 +1150,26 @@ impl SqlSuggest {
                     let start = planned.span.start.min(offset);
                     let end = planned.span.end.min(text.len());
                     let range = offset_to_position(text, start)..offset_to_position(text, end);
+                    // 超过 8 条候选时弹层右侧会出现纵向滚动条；给右侧详情预留 1em 安全边距，防止滚动条压住文字。
+                    let scroll_gutter = planned.candidates.len() > 8;
                     for entry in &planned.candidates {
+                        let detail = if entry.detail.is_empty() {
+                            None
+                        } else if scroll_gutter {
+                            Some(format!("{}\u{2003}", entry.detail))
+                        } else {
+                            Some(entry.detail.clone())
+                        };
                         let mut item = completion_edit(
                             &entry.label,
                             &entry.insert,
                             completion_kind(entry.kind),
                             range.clone(),
-                            Some(entry.detail.clone()),
+                            detail,
                         );
-                        // 详情面板：列的类型/可空/注释、对象的种类与模式、函数签名。
-                        item.documentation = entry.info.as_ref().map(|info| {
+                        // 详情面板：仅当确实有列结构、注释、模式或函数签名等增值信息时才展开右侧卡片，
+                        // 避免没有任何附加元数据的表重复弹出仅写着 "`logs` · 表" 的冗余空气泡。
+                        item.documentation = entry.info.as_ref().filter(|info| has_meaningful_doc(info)).map(|info| {
                             Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(info, locale) })
                         });
                         items.push(item);
@@ -1186,6 +1226,105 @@ fn completion_kind(kind: &str) -> Option<CompletionItemKind> {
     })
 }
 
+fn has_meaningful_doc(info: &EntryInfo) -> bool {
+    match info {
+        EntryInfo::Column { .. } | EntryInfo::Function { .. } => true,
+        EntryInfo::Object { schema, comment, columns, .. } => {
+            !columns.is_empty() || !comment.trim().is_empty() || !schema.trim().is_empty()
+        }
+    }
+}
+
+/// SQL 补全项匹配高亮：优先在裸标识符（跳过 `schema.` 前缀）中寻找词首、下划线分段或连续子串命中，
+/// 退化为字符序列命中；绝不把未命中的整段标签全部染蓝。
+pub fn highlight_sql_completion(query: &str, item: &CompletionItem) -> Vec<Range<usize>> {
+    let raw = if !item.label.contains('.') {
+        query.rsplit_once('.').map(|(_, tail)| tail).unwrap_or(query)
+    } else {
+        query
+    };
+    let q = raw.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let (bare_offset, bare) = match item.label.rsplit_once('.') {
+        Some((head, tail)) if !q.contains('.') => (head.len() + 1, tail),
+        _ => (0, item.label.as_str()),
+    };
+    if let Some(span) = contiguous_match_in(bare, q) {
+        return std::iter::once((bare_offset + span.start)..(bare_offset + span.end)).collect();
+    }
+    if let Some(span) = contiguous_match_in(&item.label, q) {
+        return std::iter::once(span).collect();
+    }
+    let subseq = subseq_ranges_in(bare, q);
+    if !subseq.is_empty() {
+        return subseq.into_iter().map(|r| (bare_offset + r.start)..(bare_offset + r.end)).collect();
+    }
+    gpui_kit::base::input::highlight_characters(q, item)
+}
+
+fn contiguous_match_in(haystack: &str, needle: &str) -> Option<Range<usize>> {
+    let q_chars: Vec<char> = needle.chars().collect();
+    if q_chars.is_empty() {
+        return None;
+    }
+    let h_chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    let last_start = h_chars.len().checked_sub(q_chars.len())?;
+    let eq_at = |start: usize| {
+        q_chars
+            .iter()
+            .zip(h_chars[start..].iter())
+            .all(|(qc, (_, hc))| qc.eq_ignore_ascii_case(hc) || qc.to_lowercase().eq(hc.to_lowercase()))
+    };
+    let span_at = |start: usize| {
+        let byte_start = h_chars[start].0;
+        let (last_ix, last_ch) = h_chars[start + q_chars.len() - 1];
+        byte_start..(last_ix + last_ch.len_utf8())
+    };
+    if eq_at(0) {
+        return Some(span_at(0));
+    }
+    for start in 1..=last_start {
+        if h_chars[start - 1].1 == '_' && eq_at(start) {
+            return Some(span_at(start));
+        }
+    }
+    for start in 1..=last_start {
+        if eq_at(start) {
+            return Some(span_at(start));
+        }
+    }
+    None
+}
+
+fn subseq_ranges_in(haystack: &str, needle: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut rest = haystack;
+    let mut base = 0usize;
+    for qc in needle.chars() {
+        let Some((idx, matched)) = rest
+            .char_indices()
+            .find(|(_, hc)| qc.eq_ignore_ascii_case(hc) || qc.to_lowercase().eq(hc.to_lowercase()))
+        else {
+            return Vec::new();
+        };
+        let start = base + idx;
+        let end = start + matched.len_utf8();
+        let next = idx + matched.len_utf8();
+        base += next;
+        rest = &rest[next..];
+        if let Some(last) = ranges.last_mut() {
+            if last.end == start {
+                last.end = end;
+                continue;
+            }
+        }
+        ranges.push(start..end);
+    }
+    ranges
+}
+
 fn completion_edit(
     label: &str,
     insert: &str,
@@ -1198,7 +1337,7 @@ fn completion_edit(
         kind,
         detail,
         insert_text: Some(insert.to_string()),
-        filter_text: Some(insert.to_string()),
+        filter_text: None,
         text_edit: Some(CompletionTextEdit::Edit(TextEdit { range: lsp_types::Range { start: range.start, end: range.end }, new_text: insert.to_string() })),
         ..CompletionItem::default()
     }
@@ -1220,8 +1359,8 @@ impl CompletionProvider for SqlSuggest {
     }
 
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
-        // IME 组合和中文正文不触发弹层，避免打断输入。
-        new_text.chars().any(|ch| ch.is_ascii_alphabetic() || ch == '.')
+        // IME 组合和中文正文不触发弹层，避免打断输入；下划线和数字继续刷新当前标识符补全。
+        new_text.chars().any(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
     }
 }
 
@@ -2065,5 +2204,66 @@ select 1;";
             assert!(!editor.update(cx, |editor, cx| editor.toggle_comment(window, cx)), "组合输入期间不动作");
         })
         .unwrap();
+    }
+
+    #[test]
+    fn from_single_char_filters_noise_highlights_exact_match_and_formats_object_columns() {
+        use crate::query::assist::{CatalogObject, ColumnMeta, CompletionSource, MetadataState};
+        let scope = CompletionScope {
+            engine: "sqlite".to_owned(),
+            objects: vec![
+                CatalogObject { name: "_sqlx_migrations".into(), schema: String::new(), kind: "table".into(), comment: String::new() },
+                CatalogObject { name: "logs".into(), schema: String::new(), kind: "table".into(), comment: String::new() },
+                CatalogObject { name: "bare_empty".into(), schema: String::new(), kind: "table".into(), comment: String::new() },
+            ],
+            sources: vec![CompletionSource {
+                alias: String::new(),
+                label: "logs".into(),
+                columns: vec![
+                    ColumnMeta { name: "id".into(), type_name: "INTEGER".into(), nullable: Some(false), comment: String::new(), primary: true, foreign_key: false },
+                    ColumnMeta { name: "level".into(), type_name: "TEXT".into(), nullable: Some(false), comment: "日志级别".into(), primary: false, foreign_key: false },
+                ],
+            }],
+            provider: true,
+            databases: vec!["main".into()],
+            schemas: Vec::new(),
+            frequency: Vec::new(),
+            state: MetadataState::Ready,
+            foreign_keys: Vec::new(),
+        };
+        let provider = suggest(Some(scope), Vec::new());
+
+        // `SELECT * FROM l`：logs 排第一；不混入 SELECT / NULL / VALUES / DELETE / ALTER / TABLE 或内部迁移表。
+        let rope = Rope::from("SELECT * FROM l");
+        let items = provider.items(&rope, rope.len());
+        assert_eq!(items.first().map(|i| i.label.as_str()), Some("logs"));
+        for noise in ["SELECT", "NULL", "VALUES", "DELETE", "ALTER", "TABLE", "_sqlx_migrations"] {
+            assert!(!items.iter().any(|i| i.label == noise), "单字符 l 不应带出无关候选 {noise}: {:?}", items.iter().map(|i| &i.label).collect::<Vec<_>>());
+        }
+        // 高亮只染命中的 `l`（0..1），绝不把整个单词染蓝；filter_text 保持为 None。
+        let logs = &items[0];
+        assert!(logs.filter_text.is_none());
+        assert_eq!(highlight_sql_completion("l", logs).as_slice(), std::slice::from_ref(&(0..1)));
+        let doc = match logs.documentation.as_ref().expect("已读到列的表应展示字段卡片") {
+            Documentation::MarkupContent(mc) => &mc.value,
+            Documentation::String(s) => s,
+        };
+        assert!(doc.contains("`id`") && doc.contains("INTEGER") && doc.contains("`level`") && doc.contains("日志级别"), "{doc}");
+
+        // 没有任何列、模式与注释的对象不弹出重复右侧空卡片。
+        let rope_bare = Rope::from("SELECT * FROM bare_emp");
+        let bare_items = provider.items(&rope_bare, rope_bare.len());
+        let bare = bare_items.iter().find(|i| i.label == "bare_empty").expect("bare_empty");
+        assert!(bare.documentation.is_none(), "无附加元数据的表不重复弹冗余空气泡");
+
+        // 下划线分段输入 `mig` 仍能精准匹配 `_sqlx_migrations` 并高亮 `mig`。
+        let rope_mig = Rope::from("SELECT * FROM mig");
+        let mig_items = provider.items(&rope_mig, rope_mig.len());
+        let mig = mig_items.iter().find(|i| i.label == "_sqlx_migrations").expect("_sqlx_migrations");
+        assert_eq!(highlight_sql_completion("mig", mig).as_slice(), std::slice::from_ref(&(6..9)));
+
+        // 带 schema 前缀的对象在输入裸表名前缀时高亮表名段而非 schema 段。
+        let pg_item = CompletionItem { label: "public.orders".into(), ..Default::default() };
+        assert_eq!(highlight_sql_completion("ord", &pg_item).as_slice(), std::slice::from_ref(&(7..10)));
     }
 }

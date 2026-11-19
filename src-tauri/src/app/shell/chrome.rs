@@ -40,7 +40,7 @@ const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
 const RAIL_INDICATOR_RADIUS: f32 = 2.;
 
 /// 拖拽连接时的拖动图形：不画内容，避免挡住目标分组标题。
-struct ConnectionDragGhost;
+pub(super) struct ConnectionDragGhost;
 
 impl Render for ConnectionDragGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -381,6 +381,18 @@ impl Workbench {
             if self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
                 self.perform("ddl-close", cx);
                 self.restore_focus(window, cx);
+                return;
+            }
+            if self.model.shell.page == AppPage::Structure
+                && self.model.tool == WorkTool::Structure
+                && self.structure.update(cx, |pane, cx| {
+                    let closed = pane.handle_escape();
+                    if closed {
+                        cx.notify();
+                    }
+                    closed
+                })
+            {
                 return;
             }
         }
@@ -2475,24 +2487,75 @@ impl Workbench {
 
     /// 连接页与欢迎区共用的启动台：最近连接、全部连接、紧凑行与全部入口。
     /// 新建/编辑不再在页面里开第二块编辑区，而是打开同一个全局模态。
-    /// 启动台里的分组标题：折叠箭头、文件夹、组名、数量；单击折叠/展开，右键改名或删除。
+    /// 启动台里的分组标题：折叠箭头、文件夹、组名、数量；支持拖入归组、一键新建组内连接与更多菜单。
     pub(super) fn launcher_group_row(&self, id: &str, name: &str, members: usize, expanded: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let m = self.metrics();
         let menu_id = id.to_owned();
+        let more_menu_id = id.to_owned();
         let click_id = id.to_owned();
+        let add_id = id.to_owned();
+        let drop_id = id.to_owned();
+        let drop_soft = p.accent_soft;
+        let entity = cx.entity().downgrade();
+        let hover_group = SharedString::from(format!("launcher-group-hover-{id}"));
+        let quick_actions = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .opacity(0.)
+            .group_hover(hover_group.clone(), |style| style.opacity(1.))
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-group-new-conn-{id}")),
+                    IconName::Plus,
+                    self.t("conn.page.newInGroup"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.perform(&format!("conn-new-in-group:{add_id}"), cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-group-more-{id}")),
+                    IconName::Ellipsis,
+                    self.t("conn.page.more"),
+                    cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.menu_at = event.position();
+                        this.model.open_group_menu(&more_menu_id);
+                        cx.notify();
+                    }),
+                )
+                .xsmall(),
+            );
         kit::row_states(div().id(SharedString::from(format!("launcher-group-{id}"))), p)
             .test_support()
+            .group(hover_group)
             .role(gpui_kit::Role::Button)
             .aria_label(SharedString::from(name.to_owned()))
             .aria_expanded(expanded)
             .mt(px(6.))
-            .h(px(m.row_h))
+            .h(px(m.row_h + 2.))
             .px(px(6.))
             .flex()
             .items_center()
             .gap(px(6.))
             .rounded(px(Radius::CONTROL))
             .hover(|style| style.bg(p.hover))
+            .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft))
+            .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
+                let connection = drag.connection.clone();
+                let group = drop_id.clone();
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        this.model.assign_connection_group(&connection, Some(&group));
+                        cx.notify();
+                    });
+                }
+            })
             .child(kit::icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
             .child(kit::icon(if expanded { IconName::FolderOpen } else { IconName::Folder }, 14., p.text_muted))
             .child(div().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::SM)).child(SharedString::from(name.to_owned())))
@@ -2507,6 +2570,7 @@ impl Workbench {
                     .child(SharedString::from(members.to_string())),
             )
             .child(div().flex_1())
+            .child(quick_actions)
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.menu_at = event.position;
                 this.model.open_group_menu(&menu_id);
@@ -2646,12 +2710,20 @@ impl Workbench {
                         .min_w(px(0.))
                         .child(
                             div()
-                                .id("conn-form-title")
-                                .truncate()
-                                .tooltip_text(title.clone())
-                                .text_size(px(TypeScale::LG))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(title),
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .id("conn-form-title")
+                                        .truncate()
+                                        .tooltip_text(title.clone())
+                                        .text_size(px(TypeScale::LG))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .children(self.env_pill(&draft.env, &p)),
                         )
                         .child(
                             div()
@@ -2809,19 +2881,7 @@ impl Workbench {
                         .child(msg)
                         .into_any_element()
                 });
-                let (name_hint, name_masked) = self.field_hint(DraftField::Name);
-                let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
-                let mut env_items = segment_track(&p);
-                for env in &envs {
-                    env_items = env_items.child(self.modal_segment_item(
-                        conn_modal::env_control_id(env),
-                        self.env_text(env),
-                        draft.env == *env,
-                        conn_modal::ModalAction::Env(env.clone()),
-                        &p,
-                        cx,
-                    ));
-                }
+                let identity = self.modal_identity_section(&draft, &envs, &p, window, cx);
                 div()
                     .flex()
                     .flex_col()
@@ -2841,18 +2901,7 @@ impl Workbench {
                             )
                             .children(file_issue),
                     )
-                    .child(
-                        div()
-                            .pt(px(12.))
-                            .border_t_1()
-                            .border_color(p.line_soft)
-                            .flex()
-                            .flex_wrap()
-                            .items_start()
-                            .gap(px(12.))
-                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
-                            .child(kit::form_row(self.t("ui.conn.env"), env_items, &p)),
-                    )
+                    .child(identity)
                     .into_any_element()
             })
         } else {
@@ -2952,32 +3001,7 @@ impl Workbench {
                         &p,
                         cx,
                     ));
-
-                    let (name_hint, name_masked) = self.field_hint(DraftField::Name);
-                    let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
-                    let mut env_items = segment_track(&p);
-                    for env in &envs {
-                        env_items = env_items.child(self.modal_segment_item(
-                            conn_modal::env_control_id(env),
-                            self.env_text(env),
-                            draft.env == *env,
-                            conn_modal::ModalAction::Env(env.clone()),
-                            &p,
-                            cx,
-                        ));
-                    }
-                    section = section.child(
-                        div()
-                            .pt(px(12.))
-                            .border_t_1()
-                            .border_color(p.line_soft)
-                            .flex()
-                            .flex_wrap()
-                            .items_start()
-                            .gap(px(10.))
-                            .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
-                            .child(kit::form_row(self.t("ui.conn.env"), env_items, &p)),
-                    );
+                    section = section.child(self.modal_identity_section(&draft, &envs, &p, window, cx));
                     section.into_any_element()
                 }),
                 conn_modal::ModalTab::Ssh => stack_frame(|| {
@@ -3105,7 +3129,19 @@ impl Workbench {
                             cx,
                         ));
                     }
-                    security = security.child(kit::form_row(self.t("connections.editor.tls.title"), tls_items, &p));
+                    let tls_hint = match draft.tls_mode {
+                        TlsMode::Off => "ui.conn.tlsHintOff",
+                        TlsMode::Require => "ui.conn.tlsHintRequire",
+                        TlsMode::Verify => "ui.conn.tlsHintVerify",
+                    };
+                    security = security.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(5.))
+                            .child(kit::form_row(self.t("connections.editor.tls.title"), tls_items, &p))
+                            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.t(tls_hint))),
+                    );
                     if draft.tls_mode == TlsMode::Verify {
                         let mut ca_items = segment_track(&p);
                         for (mode, key) in [
@@ -3378,6 +3414,10 @@ impl Workbench {
                 // 环境只是标签，不影响连不连得上：测试结论留着，只收起放弃确认。
                 self.model.conn_modal.discard_armed = false;
             }
+            conn_modal::ModalAction::Group(group) => {
+                self.model.conn_modal.draft_group = group;
+                self.model.conn_modal.discard_armed = false;
+            }
             conn_modal::ModalAction::Tls(mode) => {
                 if let Some(editor) = self.model.connections.editor.as_mut() {
                     editor.tls_mode = mode;
@@ -3542,11 +3582,99 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// 名称、环境标签与所属分组：联网与文件型连接共用同一套身份组织区。
+    fn modal_identity_section(
+        &mut self,
+        draft: &crate::connections::model::ConnectionDraft,
+        envs: &[String],
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (name_hint, name_masked) = self.field_hint(DraftField::Name);
+        let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
+        let active_env = env_key(&draft.env);
+        let mut env_items = segment_track(p);
+        for env in envs {
+            let dot = env_shown(env).then(|| {
+                let tone = env_tone(env, &self.model.env_tags);
+                kit::env_colors(tone, p).0
+            });
+            env_items = env_items.child(self.modal_segment_item_with_dot(
+                conn_modal::env_control_id(env),
+                self.env_text(env),
+                dot,
+                active_env == env.as_str(),
+                conn_modal::ModalAction::Env(env.clone()),
+                p,
+                cx,
+            ));
+        }
+
+        let mut block = div()
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(p.line_soft)
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, p)))
+                    .child(kit::form_row(self.t("conn.page.tag"), env_items, p)),
+            );
+
+        if !self.model.groups.is_empty() {
+            let current_group = self.model.conn_modal.draft_group.clone();
+            let groups = self.model.groups.clone();
+            let mut group_items = segment_track(p);
+            group_items = group_items.child(self.modal_segment_item(
+                conn_modal::group_control_id(None),
+                self.t("ui.conn.groupNone"),
+                current_group.is_none(),
+                conn_modal::ModalAction::Group(None),
+                p,
+                cx,
+            ));
+            for group in groups {
+                let selected = current_group.as_deref() == Some(group.id.as_str());
+                group_items = group_items.child(self.modal_segment_item(
+                    conn_modal::group_control_id(Some(&group.id)),
+                    SharedString::from(group.name),
+                    selected,
+                    conn_modal::ModalAction::Group(Some(group.id)),
+                    p,
+                    cx,
+                ));
+            }
+            block = block.child(kit::form_row(self.t("ui.conn.group"), group_items, p));
+        }
+        block.into_any_element()
+    }
+
     /// 分段控件里的一项：与 kit::segmented_sized 同一套视觉，但每项都有自己的焦点句柄。
     fn modal_segment_item(
         &mut self,
         id: impl Into<String>,
         label: SharedString,
+        selected: bool,
+        action: conn_modal::ModalAction,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.modal_segment_item_with_dot(id, label, None, selected, action, p, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn modal_segment_item_with_dot(
+        &mut self,
+        id: impl Into<String>,
+        label: SharedString,
+        dot: Option<gpui_kit::Hsla>,
         selected: bool,
         action: conn_modal::ModalAction,
         p: &Palette,
@@ -3564,9 +3692,10 @@ impl Workbench {
             .aria_selected(selected)
             .track_focus(&handle)
             .h(px(height))
-            .px(px(10.))
+            .px(px(9.))
             .flex()
             .items_center()
+            .gap(px(5.))
             .rounded(px(Radius::CONTROL))
             .text_size(px(TypeScale::SM))
             .when(selected, |this| {
@@ -3576,6 +3705,7 @@ impl Workbench {
                     .shadow_sm()
             })
             .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
+            .when_some(dot, |this, color| this.child(kit::status_dot(color)))
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.activate_modal_control(&click_id, cx);
@@ -3788,14 +3918,19 @@ impl Workbench {
             .aria_description(detail.clone())
             .aria_selected(on)
             .track_focus(&handle)
-            .self_start()
-            .max_w_full()
+            .w_full()
+            .px(px(10.))
+            .py(px(8.))
             .flex()
             .flex_wrap()
             .items_center()
             .gap_x(px(10.))
             .gap_y(px(2.))
             .rounded(px(Radius::CONTROL))
+            .border_1()
+            .border_color(if on { p.accent.opacity(0.28) } else { p.line_soft })
+            .bg(if on { p.accent_soft.opacity(0.45) } else { p.sunken })
+            .hover(|style| style.border_color(if on { p.accent.opacity(0.48) } else { p.line }))
             .child(switch_visual(on, p))
             .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(label))
             .child(div().min_w(px(0.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(detail))
@@ -3913,7 +4048,13 @@ impl Workbench {
             DraftField::Name => "ui.conn.namePlaceholder",
             DraftField::File => "connections.validate.chooseFile",
             DraftField::Database if redis => "ui.conn.redisDb",
-            DraftField::Database => "ui.conn.optional",
+            DraftField::Database => match engine {
+                Some(Engine::Postgres) => "ui.conn.dbPlaceholderPg",
+                Some(Engine::Mysql | Engine::Mariadb) => "ui.conn.dbPlaceholderMysql",
+                Some(Engine::Sqlserver) => "ui.conn.dbPlaceholderMssql",
+                Some(Engine::Mongodb) => "ui.conn.dbPlaceholderMongo",
+                _ => "ui.conn.optional",
+            },
             DraftField::Username if redis => "ui.conn.redisAclHint",
             DraftField::CaFile => "",
             DraftField::ClientCert | DraftField::ClientKey => "",
@@ -3924,6 +4065,13 @@ impl Workbench {
             DraftField::Host => "127.0.0.1".to_owned(),
             // 端口清空后仍看得到这种数据库的默认端口。
             DraftField::Port => engine.map(|engine| crate::app::views::connections::default_port(engine).to_owned()).unwrap_or_default(),
+            DraftField::Username if !redis => match engine {
+                Some(Engine::Postgres) => "postgres".to_owned(),
+                Some(Engine::Mysql | Engine::Mariadb) => "root".to_owned(),
+                Some(Engine::Sqlserver) => "sa".to_owned(),
+                Some(Engine::Mongodb) => self.model.text("ui.conn.optional"),
+                _ => String::new(),
+            },
             DraftField::Replica => "rs0".to_owned(),
             DraftField::SshHost => "bastion.example.com".to_owned(),
             DraftField::SshPort => "22".to_owned(),
@@ -7204,15 +7352,19 @@ pub(super) fn env_key(env: &str) -> &str {
 }
 
 pub(super) fn env_label(text: impl Fn(&str) -> String, env: &str, tags: &[EnvTag]) -> String {
-    if let Some(tag) = tags.iter().find(|tag| tag.id == env) {
+    let trimmed = env.trim();
+    if trimmed.is_empty() || trimmed == crate::connections::model::ENV_NONE {
+        return text("ui.conn.env.none");
+    }
+    if let Some(tag) = tags.iter().find(|tag| tag.id == trimmed) {
         let label = tag.label.trim();
         if !label.is_empty() {
             return label.to_owned();
         }
     }
-    let key = format!("ui.conn.env.{env}");
+    let key = format!("ui.conn.env.{trimmed}");
     let value = text(&key);
-    if value == key { env.to_owned() } else { value }
+    if value == key { trimmed.to_owned() } else { value }
 }
 
 /// 色块用 `EnvTag.tone`。没有色调时退回环境 id，内置色仍按 dev/test/prod 取。

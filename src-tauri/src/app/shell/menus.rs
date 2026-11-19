@@ -522,7 +522,8 @@ fn targeted(id: &'static str, label_key: &'static str, action: String) -> MenuIt
 pub fn group_menu_items(group_id: &str, collapsed: bool) -> Vec<MenuItem> {
     let toggle_key = if collapsed { "ui.group.expand" } else { "ui.group.collapse" };
     vec![
-        with_icon(item("group-new", "ui.group.new"), IconName::Plus),
+        with_icon(targeted("conn-new-in-group", "conn.page.newInGroup", format!("conn-new-in-group:{group_id}")), IconName::Plus),
+        with_icon(item("group-new", "ui.group.new"), IconName::FolderPlus),
         with_icon(targeted("group-toggle", toggle_key, format!("group-toggle:{group_id}")), IconName::ChevronDown),
         with_icon(targeted("group-rename", "ui.group.rename", format!("group-rename:{group_id}")), IconName::SquarePen),
         MenuItem {

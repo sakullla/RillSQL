@@ -301,12 +301,17 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.connections.message_key = None;
                 model.notice_detail.clear();
                 let connect_after = model.conn_modal.save_and_connect;
+                let desired_group = model.conn_modal.draft_group.clone();
+                let modal_was_open = model.conn_modal.open;
                 // 关闭模态会清掉本次机密；“保存并连接”要带着刚输入的密码去连接，
                 // 否则没保存密码的配置（复制出来的、编辑过的）会在 OpenConnection 时拿空密码去认证。
                 let typed_secrets = model.connections.secrets.clone();
                 // 保存成功就关掉模态：普通保存到此为止，绝不因为保存过一次就去连接。
                 let _ = model.close_connection_modal();
                 model.connections.selected = Some(id.clone());
+                if modal_was_open && model.group_of(&id) != desired_group.as_deref() {
+                    let _ = model.assign_connection_group(&id, desired_group.as_deref());
+                }
                 if connect_after {
                     // 用刚才输入/存下的机密去连接，重试也带着它；配置已经落盘，失败不再存一次。
                     model.pending_open_secrets = Some((id.clone(), typed_secrets));

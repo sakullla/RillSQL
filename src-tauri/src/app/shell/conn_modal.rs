@@ -72,6 +72,17 @@ pub fn env_control_id(env: &str) -> String {
     format!("conn-env-{env}")
 }
 
+pub fn group_control_id(group: Option<&str>) -> String {
+    match group {
+        Some(id) => format!("conn-group-opt-{id}"),
+        None => "conn-group-opt-none".to_owned(),
+    }
+}
+
+pub fn group_ids(groups: &[crate::connections::groups::ConnectionGroup]) -> Vec<String> {
+    groups.iter().map(|g| g.id.clone()).collect()
+}
+
 pub fn tls_control_id(mode: TlsMode) -> &'static str {
     match mode {
         TlsMode::Off => "conn-tls-off",
@@ -94,13 +105,16 @@ pub fn ssh_auth_control_id(kind: SshAuthKind) -> &'static str {
     }
 }
 
-/// 环境选项：内置四个 + 自定义标签，表单与停靠点序列读同一份。
+/// 环境选项：内置四个 + 自定义标签 + 无标签（none），表单与停靠点序列读同一份。
 pub fn env_ids(tags: &[EnvTag]) -> Vec<String> {
     let mut ids = vec!["dev".to_owned(), "test".to_owned(), "prod".to_owned(), "local".to_owned()];
     for tag in tags {
         if !ids.iter().any(|id| id == &tag.id) {
             ids.push(tag.id.clone());
         }
+    }
+    if !ids.iter().any(|id| id == crate::connections::model::ENV_NONE) {
+        ids.push(crate::connections::model::ENV_NONE.to_owned());
     }
     ids
 }
@@ -127,6 +141,7 @@ pub enum ModalAction {
     Tab(ModalTab),
     ToggleUrl,
     Env(String),
+    Group(Option<String>),
     Tls(TlsMode),
     Ca(CaMode),
     SshAuth(SshAuthKind),
@@ -188,6 +203,10 @@ pub struct ConnectionModal {
     pub tab: ModalTab,
     /// 是否展开连接串快速解析栏。
     pub url_open: bool,
+    /// 表单中选择的所属分组（保存成功后同步落库；None 表示不归组）。
+    pub draft_group: Option<String>,
+    /// 打开模态时的初始所属分组，用于判断未保存修改。
+    pub initial_group: Option<String>,
 }
 
 impl Default for ConnectionModal {
@@ -211,6 +230,8 @@ impl Default for ConnectionModal {
             url_applied: false,
             tab: ModalTab::General,
             url_open: false,
+            draft_group: None,
+            initial_group: None,
         }
     }
 }
@@ -233,6 +254,8 @@ impl ConnectionModal {
         self.url_applied = false;
         self.tab = ModalTab::General;
         self.url_open = false;
+        self.draft_group = None;
+        self.initial_group = None;
     }
 
     /// 关闭并交还焦点归属；重复关闭不产生第二次还焦。
@@ -250,6 +273,8 @@ impl ConnectionModal {
         self.url_applied = false;
         self.tab = ModalTab::General;
         self.url_open = false;
+        self.draft_group = None;
+        self.initial_group = None;
         let origin = self.origin;
         let control = self.control.take();
         self.trigger = None;
@@ -320,6 +345,10 @@ impl ConnectionModal {
 
     /// 这一帧的完整停靠点：严格与 connection_modal_layer 当前分栏和展开态的绘制顺序一致。
     pub fn stops_for(&self, page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
+        self.stops_for_with_groups(page, envs, &[])
+    }
+
+    pub fn stops_for_with_groups(&self, page: &ConnectionPage, envs: &[String], groups: &[String]) -> Vec<ModalStop> {
         let Some(draft) = page.editor.as_ref() else {
             return Vec::new();
         };
@@ -338,6 +367,15 @@ impl ConnectionModal {
             stops.push(ModalStop::Control(APPLY_URL.to_owned()));
         }
 
+        let push_groups = |stops: &mut Vec<ModalStop>| {
+            if !groups.is_empty() {
+                stops.push(ModalStop::Control(group_control_id(None)));
+                for group in groups {
+                    stops.push(ModalStop::Control(group_control_id(Some(group))));
+                }
+            }
+        };
+
         if draft.engine == Engine::Sqlite {
             stops.push(ModalStop::Field(DraftField::File));
             stops.push(ModalStop::Control(BROWSE_FILE.to_owned()));
@@ -345,6 +383,7 @@ impl ConnectionModal {
             for env in envs {
                 stops.push(ModalStop::Control(env_control_id(env)));
             }
+            push_groups(&mut stops);
         } else {
             match self.effective_tab(draft.engine) {
                 ModalTab::General => {
@@ -368,6 +407,7 @@ impl ConnectionModal {
                     for env in envs {
                         stops.push(ModalStop::Control(env_control_id(env)));
                     }
+                    push_groups(&mut stops);
                 }
                 ModalTab::Ssh => {
                     stops.push(ModalStop::Control(SSH_TOGGLE.to_owned()));

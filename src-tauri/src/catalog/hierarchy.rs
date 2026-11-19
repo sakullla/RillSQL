@@ -1241,6 +1241,33 @@ impl NavTree {
         }
     }
 
+    /// 对象的字段或索引在结构页刚执行变更：清掉已缓存的列/索引子节点，保留展开状态以便立即按新结构重读。
+    pub fn invalidate_details(&mut self, id: &str) -> bool {
+        let Some(children) = self.nodes.get(id).filter(|node| node.kind == NavKind::Object).map(|node| node.children.clone()) else {
+            return false;
+        };
+        let col_group = column_group_id(id);
+        let idx_group = index_group_id(id);
+        let cols_expanded = self.expanded.contains(&col_group);
+        let idxs_expanded = self.expanded.contains(&idx_group);
+        for child in children {
+            self.remove_subtree(&child);
+        }
+        if cols_expanded {
+            self.expanded.insert(col_group);
+        }
+        if idxs_expanded {
+            self.expanded.insert(idx_group);
+        }
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.children.clear();
+            node.loaded = 0;
+            node.loading = false;
+            node.error = None;
+        }
+        true
+    }
+
     /// 已知被删掉或改名的对象（本应用刚执行成功）：直接从树上拿掉，不再经过 stale。
     pub fn forget(&mut self, id: &str) -> bool {
         if !self.nodes.contains_key(id) {
