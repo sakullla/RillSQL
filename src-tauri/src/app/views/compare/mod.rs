@@ -2300,7 +2300,7 @@ impl ComparePane {
     }
 
     fn diff_tree(&self, report: &StructureReport, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics) -> AnyElement {
-        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).flex().flex_col().gap(px(1.)).max_h(px(420.)).scroll_area_y();
+        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().gap(px(1.)).max_h(px(420.)).scroll_area_y();
         let visible = self.visible_entries(report);
         if visible.is_empty() {
             tree = tree.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.tree.empty")), p)));
@@ -2358,7 +2358,7 @@ impl ComparePane {
         };
         let mono = gpui_kit::component::ActiveTheme::theme(&**cx).mono_font_family.clone();
         let side = |label: String, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla, mine: &str, other: &str, missing: String| {
-            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).flex().flex_col().max_h(px(320.)).scroll_area_y().font_family(mono.clone()).text_size(px(TypeScale::XS));
+            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().max_h(px(320.)).scroll_area_y().font_family(mono.clone()).text_size(px(TypeScale::XS));
             if mine.trim().is_empty() {
                 block = block.child(div().px(px(4.)).text_color(p.text_faint).child(SharedString::from(missing)));
             } else {
@@ -2521,7 +2521,7 @@ impl ComparePane {
     fn data_rows(&self, report: &DataReport, table: &str, p: &Palette, cx: &App) -> AnyElement {
         let mono = gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.clone();
         let rows: Vec<_> = report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").collect();
-        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).flex().flex_col().gap(px(6.)).max_h(px(420.)).scroll_area_y();
+        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().gap(px(6.)).max_h(px(420.)).scroll_area_y();
         if rows.is_empty() {
             let reason = report.tables.iter().find(|item| item.table == table).and_then(|item| item.skipped.clone()).unwrap_or_else(|| self.text("compare.data.same"));
             return block.child(kit::muted(SharedString::from(reason), p)).into_any_element();

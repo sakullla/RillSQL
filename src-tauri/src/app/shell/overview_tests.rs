@@ -343,6 +343,10 @@ fn clicking_a_real_sqlite_connection_renders_its_overview_and_double_click_opens
             (window.try_find("overview-page").is_some(), window.try_find("overview-row-0").is_some(), window.try_find("overview-row-1").is_some())
         })
         .unwrap();
+    // 虚拟化的对象列表同样常驻可见滚动条（ADR-8 / R15），叠层铺满列表区域。
+    let bar = cx.update_window(window, |_, window, _| window.try_find("overview-list-bar").map(|found| found.bounds())).unwrap();
+    let bar = bar.expect("概览列表缺可见滚动条叠层");
+    assert!(bar.size.height > gpui_kit::px(0.) && bar.size.width > gpui_kit::px(0.), "滚动条叠层应铺在列表上：{bar:?}");
     assert_eq!(found, (true, true, true), "概览页与两行（表、视图）都画出来");
     cx.update(|cx| {
         let view = view.read(cx);

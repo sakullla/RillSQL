@@ -6,7 +6,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, relative, AnyElement, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement as _, MouseButton, MouseDownEvent,
+    div, px, relative, AnyElement, ClickEvent, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement as _, MouseButton, MouseDownEvent,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
 };
 
@@ -524,7 +524,10 @@ impl Workbench {
                 let selected = state.selected.clone();
                 let rows = std::rc::Rc::new(visible);
                 let list_rows = std::rc::Rc::clone(&rows);
-                gpui_kit::uniform_list("overview-list", rows.len(), move |range, _, cx| {
+                // 每个概览目标各记一份滚动位置；句柄同时喂给可见滚动条（ADR-8）。
+                let scroll_key = SharedString::from(format!("overview-list-scroll:{}:{}:{}", target.connection_id, target.database, target.schema));
+                let scroll = window.use_keyed_state(ElementId::Name(scroll_key), cx, |_, _| gpui_kit::UniformListScrollHandle::new()).read(cx).clone();
+                let list = gpui_kit::uniform_list("overview-list", rows.len(), move |range, _, cx| {
                     owner
                         .update(cx, |this, cx| {
                             range
@@ -533,8 +536,15 @@ impl Workbench {
                         })
                         .unwrap_or_default()
                 })
-                .flex_1()
-                .into_any_element()
+                .track_scroll(&scroll)
+                .size_full();
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .relative()
+                    .child(list)
+                    .child(kit::scrollbar_overlay("overview-list-bar", &scroll, kit::ScrollbarAxis::Vertical))
+                    .into_any_element()
             }
         };
         div()

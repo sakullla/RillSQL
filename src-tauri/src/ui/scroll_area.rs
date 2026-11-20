@@ -103,8 +103,21 @@ impl<E> StatefulInteractiveElement for ScrollArea<E> where E: StatefulInteractiv
 ///
 /// 滚动轴上的 `overflow: hidden` 放在包装上：flex 子项只有 overflow 不是 visible 时才会
 /// 把自动最小尺寸降到 0，否则内容会把包装撑开、把兄弟元素挤出去，而不是滚动。
+///
+/// 外投影也挪到包装上：包装的 `overflow: hidden` 会把子元素画出边界的投影裁掉，
+/// 浮动菜单因此失去层次。包装同时拿一份圆角，投影形状与原元素一致；内投影画在原元素里面，留在原处。
 pub(crate) fn split_outer_style(style: &mut StyleRefinement, axis: ScrollbarAxis) -> StyleRefinement {
+    let (drop_shadows, inset_shadows) = match style.box_shadow.take() {
+        Some(shadows) => {
+            let (inset, drop): (Vec<_>, Vec<_>) = shadows.into_iter().partition(|shadow| shadow.inset);
+            (Some(drop), (!inset.is_empty()).then_some(inset))
+        }
+        None => (None, None),
+    };
+    style.box_shadow = inset_shadows;
     let outer = StyleRefinement {
+        box_shadow: drop_shadows,
+        corner_radii: style.corner_radii.clone(),
         position: style.position.take(),
         inset: std::mem::take(&mut style.inset),
         size: std::mem::take(&mut style.size),
@@ -169,15 +182,22 @@ where
     }
 }
 
+/// 浮动滚动条拇指占视口右缘（下缘）往里 4–12px：内边距小的滚动区在这一侧补到这个宽度，
+/// 末列文字与长行不被拇指压住（ADR-8）。
+pub const SCROLLBAR_GUTTER: f32 = 12.;
+
 /// 给已有滚动句柄的虚拟列表（`uniform_list` 等）叠一条可见滚动条：
 /// 放进与列表同大小、`relative` 的父容器里，绝对定位铺满，只在条所在的边缘接收指针。
-pub fn scrollbar_overlay<H: ScrollbarHandle + Clone>(id: impl Into<ElementId>, handle: &H, axis: ScrollbarAxis) -> gpui_kit::Div {
-    div().absolute().inset_0().child(Scrollbar::new(handle).id(id).axis(axis).viewport_from_layout())
+/// 叠层本身带 `id`（测试可按它找到），里面的条为 `(id, "scrollbar")`。
+pub fn scrollbar_overlay<H: ScrollbarHandle + Clone>(id: impl Into<ElementId>, handle: &H, axis: ScrollbarAxis) -> impl IntoElement {
+    let id = id.into();
+    div().id(id.clone()).test_support().absolute().inset_0().child(Scrollbar::new(handle).id((id, "scrollbar")).axis(axis).viewport_from_layout())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::kit::Radius;
     use gpui_kit::px;
 
     #[test]
@@ -202,6 +222,26 @@ mod tests {
         assert_eq!(outer.overflow.x, Some(Overflow::Hidden));
         assert_eq!(style.overflow.x, Some(Overflow::Scroll));
         assert_eq!(style.overflow.y, None);
+    }
+
+    /// 浮动菜单常在同一元素上 `scroll_area_y().shadow_lg()`：外投影要画在不裁剪的包装上，
+    /// 否则包装的 overflow 遮罩把它整个裁掉；内投影留在视口里。
+    #[test]
+    fn drop_shadow_moves_to_unclipped_wrapper() {
+        let inset = gpui_kit::BoxShadow { color: gpui_kit::black(), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: true };
+        let mut style = StyleRefinement::default().rounded(px(Radius::PANEL)).shadow_lg();
+        let mut shadows = style.box_shadow.clone().unwrap();
+        let drop_count = shadows.len();
+        shadows.push(inset.clone());
+        style.box_shadow = Some(shadows);
+        let outer = split_outer_style(&mut style, ScrollbarAxis::Vertical);
+        let outer_shadows = outer.box_shadow.unwrap();
+        assert_eq!(outer_shadows.len(), drop_count);
+        assert!(outer_shadows.iter().all(|shadow| !shadow.inset));
+        assert_eq!(outer.corner_radii.top_left, style.corner_radii.top_left, "投影沿原元素的圆角");
+        assert!(outer.corner_radii.top_left.is_some());
+        assert_eq!(style.box_shadow, Some(vec![inset]), "内投影画在视口里面");
+        assert_eq!(outer.overflow.y, Some(Overflow::Hidden));
     }
 
     use gpui_kit::test::TestWindowExt;
@@ -299,5 +339,47 @@ mod tests {
             }
         }
         assert!(offenders.is_empty(), "改用 kit::ScrollAreaExt::scroll_area_y/x，或注明 `滚动条例外：原因`：{offenders:?}");
+    }
+
+    /// 虚拟列表自己滚动，不经过 `overflow_*_scroll`：每个 `uniform_list` 调用都要跟踪滚动句柄，
+    /// 并在紧随其后的代码里叠 `scrollbar_overlay`，或带 `滚动条例外：` 注释。
+    #[test]
+    fn every_virtual_list_has_visible_scrollbar() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        const WINDOW: usize = 40;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let needle = concat!("uniform_list", "(\"");
+        let mut offenders = Vec::new();
+        let mut seen = 0usize;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (ix, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                seen += 1;
+                let excused = line.contains("滚动条例外：") || ix.checked_sub(1).is_some_and(|prev| lines[prev].contains("滚动条例外："));
+                let after = &lines[ix..(ix + WINDOW).min(lines.len())];
+                let tracked = after.iter().any(|line| line.contains(".track_scroll("));
+                let overlaid = after.iter().any(|line| line.contains("scrollbar_overlay("));
+                if !excused && !(tracked && overlaid) {
+                    offenders.push(format!("{}:{}", file.strip_prefix(&root).unwrap().display(), ix + 1));
+                }
+            }
+        }
+        assert!(seen >= 3, "扫描应覆盖仓库里的虚拟列表（至少概览、命令面板、Redis 键列表），只找到 {seen} 处");
+        assert!(offenders.is_empty(), "虚拟列表缺可见滚动条：用 track_scroll + kit::scrollbar_overlay，或注明 `滚动条例外：原因`：{offenders:?}");
     }
 }
