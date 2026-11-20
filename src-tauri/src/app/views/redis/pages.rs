@@ -1,27 +1,9 @@
 //! 顶栏（连接/逻辑库或集群 + 页签）与诊断页：慢日志、信息、大键、客户端、Pub/Sub、节点。
 
 use super::view::{action, cmd_click, icon_btn, Kind};
-use crate::ui::kit::ScrollAreaExt as _;
+use crate::ui::kit::{ControlSize, IconSize, ScrollAreaExt as _, Space};
+use crate::ui::read_table::{ReadColumn, ReadTable};
 use super::*;
-use gpui_kit::Hsla;
-
-/// 诊断表的一列：标题与宽度（None 占满剩余）。
-struct Col {
-    label: String,
-    width: Option<f32>,
-    sort: Option<&'static str>,
-}
-
-fn col(label: String, width: Option<f32>) -> Col {
-    Col { label, width, sort: None }
-}
-
-fn cell(width: Option<f32>) -> gpui_kit::Div {
-    match width {
-        Some(w) => div().flex_none().w(px(w)).min_w(px(0.)).truncate(),
-        None => div().flex_1().min_w(px(0.)).truncate(),
-    }
-}
 
 impl RedisPane {
     // ------------------------------------------------------------------ 顶栏
@@ -116,16 +98,16 @@ impl RedisPane {
     pub(super) fn render_diag_page(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = cx.theme().mono_font_family.clone();
         let body = match self.page {
-            Page::Slowlog => self.render_slowlog(p, m, entity, &mono),
-            Page::Info => self.render_info(p, m, entity, &mono),
-            Page::BigKeys => self.render_big_keys(p, m, entity, &mono),
-            Page::Clients => self.render_clients(p, m, entity, &mono),
+            Page::Slowlog => self.render_slowlog(p, m, entity, window, cx),
+            Page::Info => self.render_info(p, m, entity, window, cx),
+            Page::BigKeys => self.render_big_keys(p, m, entity, window, cx),
+            Page::Clients => self.render_clients(p, m, entity, window, cx),
             Page::PubSub => self.render_pubsub(p, m, entity, &mono, window, cx),
-            Page::Nodes => self.render_nodes(p, m, entity, &mono),
+            Page::Nodes => self.render_nodes(p, m, entity, window, cx),
             Page::Keys => div().into_any_element(),
         };
         let error = (!self.diag.error.is_empty()).then(|| {
-            div().px(px(m.pane_pad())).pt(px(8.)).child(kit::banner(kit::BannerTone::Danger, IconName::CircleAlert, self.diag.error.clone(), None, p))
+            div().px(px(m.pane_pad())).pt(px(Space::MD)).child(kit::banner(kit::BannerTone::Danger, IconName::CircleAlert, self.diag.error.clone(), None, p))
         });
         div()
             .id(SharedString::from(format!("redis-diag-{}", self.page.id())))
@@ -143,7 +125,7 @@ impl RedisPane {
 
     /// 页内工具条：标题、集群节点选择、右侧操作。
     fn diag_toolbar(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, title_key: &str, node_all: bool, actions: Vec<AnyElement>) -> gpui_kit::Div {
-        let mut nodes = div().flex().items_center().gap(px(4.)).flex_wrap();
+        let mut nodes = div().flex().items_center().gap(px(Space::XS)).flex_wrap();
         if self.topology.cluster {
             if node_all {
                 nodes = nodes.child(kit::filter_chip(
@@ -167,10 +149,10 @@ impl RedisPane {
         let mut bar = div()
             .flex_none()
             .px(px(m.pane_pad()))
-            .py(px(8.))
+            .py(px(Space::MD))
             .flex()
             .items_center()
-            .gap(px(10.))
+            .gap(px(Space::MD))
             .border_b_1()
             .border_color(p.line_soft)
             .child(kit::title(SharedString::from(self.text(title_key)), TypeScale::MD, p))
@@ -182,84 +164,12 @@ impl RedisPane {
         bar
     }
 
-    fn table_header(&self, cols: &[Col], p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
-        let mut header = div()
-            .flex_none()
-            .h(px(m.row_h - 2.))
-            .px(px(m.pane_pad()))
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .bg(p.chrome)
-            .border_b_1()
-            .border_color(p.line)
-            .text_size(px(TypeScale::XS))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(p.text_muted);
-        for item in cols {
-            let label = cell(item.width).child(SharedString::from(item.label.clone()));
-            header = match item.sort {
-                Some(sort) => {
-                    let id = format!("redis-slow-sort:{sort}");
-                    header.child(
-                        div()
-                            .id(SharedString::from(id.clone()))
-                            .test_support()
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(SharedString::from(item.label.clone()))
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(p.text))
-                            .when_some(item.width, |this, w| this.flex_none().w(px(w)))
-                            .when(item.width.is_none(), |this| this.flex_1().min_w(px(0.)))
-                            .child(label)
-                            .on_click(cmd_click(entity, id)),
-                    )
-                }
-                None => header.child(label),
-            };
-        }
-        header.into_any_element()
+    /// 一张诊断表占满剩余高度。
+    fn table_area(id: &'static str, table: Entity<ReadTable>) -> AnyElement {
+        div().id(id).test_support().flex_1().min_h(px(0.)).child(table).into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn table_row(
-        &self,
-        id: String,
-        cells: Vec<(Option<f32>, String, Hsla)>,
-        p: &Palette,
-        m: &kit::Metrics,
-        mono: &SharedString,
-        tail: Option<AnyElement>,
-        click: Option<(&Entity<Self>, String)>,
-    ) -> AnyElement {
-        let mut row = div()
-            .id(SharedString::from(id))
-            .test_support()
-            .role(gpui_kit::Role::Row)
-            .flex_none()
-            .h(px(m.row_h))
-            .px(px(m.pane_pad()))
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .border_b_1()
-            .border_color(p.line_soft)
-            .hover(|s| s.bg(p.hover))
-            .font_family(mono.clone())
-            .text_size(px(TypeScale::SM));
-        for (width, text, color) in cells {
-            row = row.child(cell(width).text_color(color).child(SharedString::from(text)));
-        }
-        if let Some((entity, command)) = click {
-            row = row.cursor_pointer().on_click(cmd_click(entity, command));
-        }
-        row.children(tail).into_any_element()
-    }
-
-    fn render_slowlog(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString) -> AnyElement {
-        let reset = action("redis-slow-reset", Some(IconName::Trash), &self.text("redis.slowlog.reset"), Kind::DangerSoft, entity).small().into_any_element();
-        let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.slowlog", true, vec![refresh, reset]);
+    fn render_slowlog(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let arrow = |by_time: bool| {
             if self.diag.slow_by_time == by_time {
                 if self.diag.slow_asc { " ↑" } else { " ↓" }
@@ -267,85 +177,110 @@ impl RedisPane {
                 ""
             }
         };
-        let cols = vec![
-            col("#".into(), Some(56.)),
-            Col { label: format!("{}{}", self.text("redis.slowlog.time"), arrow(true)), width: Some(150.), sort: Some("time") },
-            Col { label: format!("{}{}", self.text("redis.slowlog.duration"), arrow(false)), width: Some(110.), sort: Some("duration") },
-            col(self.text("redis.slowlog.command"), None),
-            col(self.text("redis.slowlog.client"), Some(150.)),
-        ];
-        let mut body = div().id("redis-slowlog-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
-        if self.diag.slowlog.is_empty() && self.diag.slow_loaded {
-            body = body.child(kit::empty_state(IconName::Timer, SharedString::from(self.text("redis.slowlog.empty")), SharedString::from(""), p));
-        }
-        for (index, entry) in self.diag.slowlog.iter().enumerate() {
-            let at = chrono::DateTime::from_timestamp(entry.at, 0).map(|time| time.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
-            let ms = format!("{:.2} ms", entry.micros as f64 / 1000.);
-            let color = if entry.micros >= 100_000 { p.danger } else if entry.micros >= 10_000 { p.warn } else { p.text };
-            body = body.child(self.table_row(
-                format!("redis-slow-row:{index}"),
-                vec![
-                    (Some(56.), entry.id.to_string(), p.text_faint),
-                    (Some(150.), at, p.text_muted),
-                    (Some(110.), ms, color),
-                    (None, entry.command.clone(), p.text),
-                    (Some(150.), if self.topology.cluster { format!("{} · {}", entry.client, entry.node) } else { entry.client.clone() }, p.text_muted),
-                ],
-                p,
-                m,
-                mono,
-                None,
-                None,
-            ));
-        }
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(self.table_header(&cols, p, m, entity)).child(body).into_any_element()
+        let sort_time = action("redis-slow-sort:time", Some(IconName::Clock), &format!("{}{}", self.text("redis.slowlog.time"), arrow(true)), Kind::Tool, entity).small().into_any_element();
+        let sort_duration =
+            action("redis-slow-sort:duration", Some(IconName::Timer), &format!("{}{}", self.text("redis.slowlog.duration"), arrow(false)), Kind::Tool, entity).small().into_any_element();
+        let reset = action("redis-slow-reset", Some(IconName::Trash), &self.text("redis.slowlog.reset"), Kind::DangerSoft, entity).small().into_any_element();
+        let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
+        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.slowlog", true, vec![sort_time, sort_duration, refresh, reset]);
+        let cluster = self.topology.cluster;
+        let stamp = {
+            let rows: Vec<(i64, i64, i64, &str, &str, &str)> =
+                self.diag.slowlog.iter().map(|e| (e.id, e.at, e.micros, e.command.as_str(), e.client.as_str(), e.node.as_str())).collect();
+            hash_of(&(rows, cluster, self.diag.slow_loaded))
+        };
+        let empty = SharedString::from(if self.diag.slow_loaded { self.text("redis.slowlog.empty") } else { self.text("redis.diag.loading") });
+        let table = self.table_slot(
+            "slowlog",
+            stamp,
+            move |this| {
+                let columns = vec![
+                    ReadColumn::new("#").width(56.).right(),
+                    ReadColumn::new(this.text("redis.slowlog.time")).width(140.),
+                    ReadColumn::new(this.text("redis.slowlog.duration")).width(100.).right(),
+                    ReadColumn::new(this.text("redis.slowlog.command")).width(360.).mono(),
+                    ReadColumn::new(this.text("redis.slowlog.client")).width(170.),
+                ];
+                let rows = this
+                    .diag
+                    .slowlog
+                    .iter()
+                    .map(|entry| {
+                        let at = chrono::DateTime::from_timestamp(entry.at, 0).map(|time| time.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                        let client = if cluster { format!("{} · {}", entry.client, entry.node) } else { entry.client.clone() };
+                        vec![entry.id.to_string(), at, format!("{:.2} ms", entry.micros as f64 / 1000.), entry.command.clone(), client].into_iter().map(SharedString::from).collect()
+                    })
+                    .collect();
+                (columns, rows)
+            },
+            Some(empty),
+            window,
+            cx,
+        );
+        let hint = div().flex_none().px(px(m.pane_pad())).py(px(Space::XS)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.slowlog.hint")));
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(hint).child(Self::table_area("redis-slowlog-rows", table)).into_any_element()
     }
 
-    fn render_info(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString) -> AnyElement {
+    fn render_info(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
         let toolbar = self.diag_toolbar(p, m, entity, "redis.page.info", false, vec![refresh]);
         let metrics = crate::adapters::redis::diag::key_metrics(&self.diag.info);
-        let mut cards = div().flex().flex_wrap().gap(px(8.)).px(px(m.pane_pad())).py(px(10.));
+        // 顶部关键指标卡片。
+        let mut cards = div().flex().flex_wrap().gap(px(Space::MD)).px(px(m.pane_pad())).py(px(Space::MD));
         for (label, value) in metrics {
             cards = cards.child(
                 kit::card(p)
-                    .w(px(150.))
-                    .px(px(10.))
-                    .py(px(8.))
+                    .min_w(px(ControlSize::PICKER_MIN_W / 2.))
+                    .px(px(Space::MD))
+                    .py(px(Space::MD))
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(px(Space::XXS))
                     .child(kit::eyebrow(SharedString::from(self.text(label)), p))
                     .child(kit::metric_value(SharedString::from(value), p)),
             );
         }
-        let mut sections = div().flex().flex_col().gap(px(10.)).px(px(m.pane_pad())).pb(px(16.));
-        for section in &self.diag.info {
-            let mut table = kit::card(p).flex().flex_col().overflow_hidden();
-            for (key, value) in &section.items {
-                table = table.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .px(px(10.))
-                        .min_h(px(24.))
-                        .border_b_1()
-                        .border_color(p.line_soft)
-                        .font_family(mono.clone())
-                        .text_size(px(TypeScale::XS))
-                        .child(div().flex_none().w(px(260.)).truncate().text_color(p.text_muted).child(SharedString::from(key.clone())))
-                        .child(div().flex_1().min_w(px(0.)).truncate().text_color(p.text).child(SharedString::from(value.clone()))),
+        // 下方按 section 分组、可以折叠的只读表格。
+        let mut sections = div().flex().flex_col().gap(px(Space::MD)).px(px(m.pane_pad())).pb(px(Space::XL));
+        let info = self.diag.info.clone();
+        let header_h = m.table_row_h();
+        for (index, section) in info.iter().enumerate() {
+            let name = if section.name.is_empty() { "—".to_owned() } else { section.name.clone() };
+            let collapsed = self.info_collapsed.contains(&name);
+            let toggle_id = format!("redis-info-section:{name}");
+            let head = kit::interactive_states(div().id(SharedString::from(toggle_id.clone())), p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_expanded(!collapsed)
+                .aria_label(SharedString::from(name.clone()))
+                .flex()
+                .items_center()
+                .gap(px(Space::SM))
+                .h(px(m.row_h))
+                .child(kit::icon(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }, IconSize::INLINE, p.text_faint))
+                .child(kit::eyebrow(SharedString::from(name.clone()), p))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(section.items.len().to_string())))
+                .on_click(cmd_click(entity, toggle_id));
+            let mut block = div().flex().flex_col().gap(px(Space::XS)).child(head);
+            if !collapsed {
+                let items = section.items.clone();
+                let stamp = hash_of(&items);
+                let height = header_h * (items.len().max(1) + 1) as f32 + Space::XS;
+                let table = self.table_slot(
+                    &format!("info:{index}:{name}"),
+                    stamp,
+                    move |this| {
+                        let columns = vec![ReadColumn::new(this.text("redis.info.key")).width(260.).mono(), ReadColumn::new(this.text("redis.info.value")).width(360.).mono()];
+                        let rows = items.into_iter().map(|(key, value)| vec![SharedString::from(key), SharedString::from(value)]).collect();
+                        (columns, rows)
+                    },
+                    None,
+                    window,
+                    cx,
                 );
+                block = block.child(div().h(px(height)).border_1().border_color(p.line_soft).rounded(px(Radius::CONTROL)).overflow_hidden().child(table));
             }
-            sections = sections.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(kit::eyebrow(SharedString::from(if section.name.is_empty() { "—".to_owned() } else { section.name.clone() }), p))
-                    .child(table),
-            );
+            sections = sections.child(block);
         }
         div()
             .flex_1()
@@ -357,12 +292,12 @@ impl RedisPane {
             .into_any_element()
     }
 
-    fn render_big_keys(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString) -> AnyElement {
+    fn render_big_keys(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut actions = vec![
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .child(kit::switch_visual(self.diag.big_memory, p))
                 .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(self.text("redis.bigkeys.memory"))))
                 .id("redis-big-memory")
@@ -385,77 +320,98 @@ impl RedisPane {
                 None => i18n::fill(&self.text("redis.scan.read"), &[("n", &self.diag.big_scanned.to_string())]),
             };
             let ratio = self.diag.big_total.filter(|total| *total > 0).map(|total| (self.diag.big_scanned as f32 / total as f32).min(1.)).unwrap_or(0.);
-            div().px(px(m.pane_pad())).py(px(6.)).child(progress_bar(&text, ratio, self.diag.big_running, p))
+            div().px(px(m.pane_pad())).py(px(Space::SM)).child(progress_bar(&text, ratio, self.diag.big_running, p))
         });
-        let cols = vec![
-            col("#".into(), Some(40.)),
-            col(self.text("redis.key.name"), None),
-            col(self.text("redis.new.type"), Some(60.)),
-            col(self.text("redis.bigkeys.size"), Some(110.)),
-            col(self.text("redis.bigkeys.memoryCol"), Some(110.)),
-        ];
-        let mut body = div().id("redis-big-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         if self.diag.big.is_empty() && !self.diag.big_running {
-            body = body.child(kit::empty_state(IconName::ChartBar, SharedString::from(self.text("redis.bigkeys.empty")), SharedString::from(self.text("redis.bigkeys.hint")), p));
+            let empty = kit::empty_state(IconName::ChartBar, SharedString::from(self.text("redis.bigkeys.empty")), SharedString::from(self.text("redis.bigkeys.hint")), p);
+            return div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).children(progress).child(div().id("redis-big-rows").test_support().flex_1().child(empty)).into_any_element();
         }
-        for (index, item) in self.diag.big.iter().enumerate() {
-            let memory = item.memory.map(keyspace::human_bytes).unwrap_or_else(|| "—".to_owned());
-            body = body.child(
-                self.table_row(
-                    format!("redis-big-open:{index}"),
-                    vec![
-                        (Some(40.), (index + 1).to_string(), p.text_faint),
-                        (None, item.key.clone(), p.text),
-                        (Some(60.), item.key_type.clone(), super::view::type_colors(&item.key_type, p).0),
-                        (Some(110.), item.size.to_string(), p.text),
-                        (Some(110.), memory, p.text_muted),
-                    ],
-                    p,
-                    m,
-                    mono,
-                    None,
-                    Some((entity, format!("redis-big-open:{index}"))),
-                ),
-            );
-        }
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).children(progress).child(self.table_header(&cols, p, m, entity)).child(body).into_any_element()
+        let stamp = hash_of(&self.diag.big.iter().map(|item| (item.key.as_str(), item.key_type.as_str(), item.size, item.memory)).collect::<Vec<_>>());
+        let table = self.table_slot(
+            "bigkeys",
+            stamp,
+            |this| {
+                let columns = vec![
+                    ReadColumn::new("#").width(44.).right(),
+                    ReadColumn::new(this.text("redis.key.name")).width(320.),
+                    ReadColumn::new(this.text("redis.new.type")).width(70.),
+                    ReadColumn::new(this.text("redis.bigkeys.size")).width(100.).right(),
+                    ReadColumn::new(this.text("redis.bigkeys.memoryCol")).width(100.).right(),
+                ];
+                let rows = this
+                    .diag
+                    .big
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let memory = item.memory.map(keyspace::human_bytes).unwrap_or_else(|| "—".to_owned());
+                        vec![(index + 1).to_string(), item.key.clone(), item.key_type.clone(), item.size.to_string(), memory].into_iter().map(SharedString::from).collect()
+                    })
+                    .collect();
+                (columns, rows)
+            },
+            None,
+            window,
+            cx,
+        );
+        let hint = div().flex_none().px(px(m.pane_pad())).py(px(Space::XS)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.bigkeys.openHint")));
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).children(progress).child(hint).child(Self::table_area("redis-big-rows", table)).into_any_element()
     }
 
-    fn render_clients(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString) -> AnyElement {
+    fn render_clients(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.table_focus_row("clients", cx).filter(|row| *row < self.diag.clients.len());
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.clients", true, vec![refresh]);
-        let cols = vec![
-            col("id".into(), Some(64.)),
-            col(self.text("redis.clients.addr"), Some(170.)),
-            col(self.text("redis.clients.name"), Some(120.)),
-            col(self.text("redis.clients.age"), Some(70.)),
-            col(self.text("redis.clients.idle"), Some(70.)),
-            col("db".into(), Some(40.)),
-            col(self.text("redis.clients.cmd"), None),
-            col(String::new(), Some(28.)),
-        ];
-        let mut body = div().id("redis-client-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
-        for (index, client) in self.diag.clients.iter().enumerate() {
-            let kill = icon_btn(format!("redis-client-kill:{index}"), IconName::Unplug, &self.text("redis.clients.kill"), entity).xsmall().into_any_element();
-            body = body.child(self.table_row(
-                format!("redis-client-row:{index}"),
-                vec![
-                    (Some(64.), client.id.clone(), p.text_faint),
-                    (Some(170.), client.addr.clone(), p.text),
-                    (Some(120.), client.name.clone(), p.text_muted),
-                    (Some(70.), format!("{}s", client.age), p.text_muted),
-                    (Some(70.), format!("{}s", client.idle), p.text_muted),
-                    (Some(40.), client.db.clone(), p.text_muted),
-                    (None, if self.topology.cluster { format!("{} · {}", client.cmd, client.node) } else { client.cmd.clone() }, p.text),
-                ],
-                p,
-                m,
-                mono,
-                Some(div().flex_none().w(px(28.)).child(kill).into_any_element()),
-                None,
-            ));
-        }
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(self.table_header(&cols, p, m, entity)).child(body).into_any_element()
+        let kill = action(
+            match selected {
+                Some(row) => format!("redis-client-kill:{row}"),
+                None => "redis-client-kill-none".to_owned(),
+            },
+            Some(IconName::Unplug),
+            &self.text("redis.clients.kill"),
+            Kind::DangerSoft,
+            entity,
+        )
+        .small()
+        .disabled(selected.is_none())
+        .into_any_element();
+        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.clients", true, vec![refresh, kill]);
+        let cluster = self.topology.cluster;
+        let stamp = hash_of(&(
+            self.diag.clients.iter().map(|c| (c.id.as_str(), c.addr.as_str(), c.name.as_str(), c.age.as_str(), c.idle.as_str(), c.db.as_str(), c.cmd.as_str(), c.node.as_str())).collect::<Vec<_>>(),
+            cluster,
+        ));
+        let table = self.table_slot(
+            "clients",
+            stamp,
+            move |this| {
+                let columns = vec![
+                    ReadColumn::new("id").width(64.).right(),
+                    ReadColumn::new(this.text("redis.clients.addr")).width(170.).mono(),
+                    ReadColumn::new(this.text("redis.clients.name")).width(120.),
+                    ReadColumn::new(this.text("redis.clients.age")).width(70.).right(),
+                    ReadColumn::new(this.text("redis.clients.idle")).width(70.).right(),
+                    ReadColumn::new("db").width(44.).right(),
+                    ReadColumn::new(this.text("redis.clients.cmd")).width(200.).mono(),
+                ];
+                let rows = this
+                    .diag
+                    .clients
+                    .iter()
+                    .map(|client| {
+                        let cmd = if cluster { format!("{} · {}", client.cmd, client.node) } else { client.cmd.clone() };
+                        vec![client.id.clone(), client.addr.clone(), client.name.clone(), format!("{}s", client.age), format!("{}s", client.idle), client.db.clone(), cmd]
+                            .into_iter()
+                            .map(SharedString::from)
+                            .collect()
+                    })
+                    .collect();
+                (columns, rows)
+            },
+            None,
+            window,
+            cx,
+        );
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(Self::table_area("redis-client-rows", table)).into_any_element()
     }
 
     fn render_pubsub(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -517,46 +473,47 @@ impl RedisPane {
         div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(subscribe).child(status).child(list).child(publish).into_any_element()
     }
 
-    fn render_nodes(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString) -> AnyElement {
+    fn render_nodes(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
         let toolbar = self.diag_toolbar(p, m, entity, "redis.page.nodes", false, vec![refresh]);
-        let cols = vec![
-            col(self.text("redis.nodes.addr"), Some(170.)),
-            col(self.text("redis.nodes.role"), Some(80.)),
-            col(self.text("redis.nodes.status"), Some(100.)),
-            col(self.text("redis.nodes.slots"), None),
-            col(self.text("redis.nodes.slotCount"), Some(80.)),
-            col(self.text("redis.nodes.keys"), Some(90.)),
-        ];
-        let mut body = div().id("redis-node-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
-        for (index, node) in self.topology.nodes.iter().enumerate() {
-            let status = node.status();
-            let color = match status {
-                "ok" => p.ok,
-                "pfail" => p.warn,
-                _ => p.danger,
-            };
-            let keys = self.diag.node_sizes.iter().find(|(addr, _)| *addr == node.addr()).map(|(_, n)| n.to_string()).unwrap_or_else(|| "—".to_owned());
-            let role = if node.master { self.text("redis.nodes.master") } else { self.text("redis.nodes.replica") };
-            body = body.child(self.table_row(
-                format!("redis-node-row:{index}"),
-                vec![
-                    (Some(170.), node.addr(), p.text),
-                    (Some(80.), role, if node.master { p.accent_text } else { p.text_muted }),
-                    (Some(100.), status.to_owned(), color),
-                    (None, node.slot_text(), p.text_muted),
-                    (Some(80.), node.slot_total().to_string(), p.text),
-                    (Some(90.), keys, p.text),
-                ],
-                p,
-                m,
-                mono,
-                None,
-                None,
-            ));
-        }
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(self.table_header(&cols, p, m, entity)).child(body).into_any_element()
+        let rows: Vec<Vec<String>> = self
+            .topology
+            .nodes
+            .iter()
+            .map(|node| {
+                let keys = self.diag.node_sizes.iter().find(|(addr, _)| *addr == node.addr()).map(|(_, n)| n.to_string()).unwrap_or_else(|| "—".to_owned());
+                let role = if node.master { self.text("redis.nodes.master") } else { self.text("redis.nodes.replica") };
+                vec![node.addr(), role, node.status().to_owned(), node.slot_text(), node.slot_total().to_string(), keys]
+            })
+            .collect();
+        let stamp = hash_of(&rows);
+        let table = self.table_slot(
+            "nodes",
+            stamp,
+            move |this| {
+                let columns = vec![
+                    ReadColumn::new(this.text("redis.nodes.addr")).width(170.).mono(),
+                    ReadColumn::new(this.text("redis.nodes.role")).width(80.),
+                    ReadColumn::new(this.text("redis.nodes.status")).width(90.),
+                    ReadColumn::new(this.text("redis.nodes.slots")).width(240.).mono(),
+                    ReadColumn::new(this.text("redis.nodes.slotCount")).width(80.).right(),
+                    ReadColumn::new(this.text("redis.nodes.keys")).width(90.).right(),
+                ];
+                (columns, rows.into_iter().map(|row| row.into_iter().map(SharedString::from).collect()).collect())
+            },
+            None,
+            window,
+            cx,
+        );
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(Self::table_area("redis-node-rows", table)).into_any_element()
     }
+}
+
+fn hash_of<T: std::hash::Hash>(value: &T) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 进度条：说明文字 + 细条（未知总数时只显示文字）。

@@ -397,6 +397,34 @@ pub struct RedisPane {
     focus_request: Option<Field>,
     /// 键列表（虚拟列表）的滚动句柄：叠在列表右侧的可见滚动条与它同步。
     key_scroll: gpui_kit::UniformListScrollHandle,
+    /// 键列表的焦点（回车在新标签中打开选中的键）。
+    key_focus: Option<gpui_kit::FocusHandle>,
+    /// 正在读取选中的键（与写入的 busy 分开：读取中仍可切换到别的键）。
+    reading: bool,
+    /// 读取的代数：只有最后一次选键的结果落地，旧响应丢弃。
+    read_generation: u64,
+    /// `detail` 属于哪个键（换键时旧内容保留到新值到达）。
+    detail_key: String,
+    /// 读取时发现已不存在的键：列表里画删除线。
+    gone: std::collections::HashSet<String>,
+    /// 只读表格：条目表与诊断页。
+    tables: HashMap<String, tables::TableSlot>,
+    /// 条目表的行 → 条目下标（筛选、排序之后）。
+    entry_rows: Vec<usize>,
+    /// 条目表排序：0 原顺序，1 升序，2 降序（按主列）。
+    entry_sort: u8,
+    /// 值区分隔条拖动：(起点 x, 起始宽度)。
+    value_drag_start: Option<(f32, f32)>,
+    /// 写回前核对的代数：只认最后一次。
+    guard_generation: u64,
+    /// 上一次失败是「值已被别人修改」：错误条给出刷新。
+    stale_value: bool,
+    /// 键名截断缓存：(键名, 可用宽度) → 显示文本。
+    fit_cache: HashMap<(String, u32), String>,
+    /// 诊断信息页收起的分组。
+    info_collapsed: BTreeSet<String>,
+    /// 请求外壳在新标签中固定打开的键（规格 `连接|名称|库|键`）。
+    open_requests: Vec<String>,
 }
 
 impl RedisPane {
@@ -503,6 +531,20 @@ impl RedisPane {
             entry_viewer_sub: None,
             focus_request: None,
             key_scroll: gpui_kit::UniformListScrollHandle::new(),
+            key_focus: None,
+            reading: false,
+            read_generation: 0,
+            detail_key: String::new(),
+            gone: std::collections::HashSet::new(),
+            tables: HashMap::new(),
+            entry_rows: Vec::new(),
+            entry_sort: 0,
+            value_drag_start: None,
+            guard_generation: 0,
+            stale_value: false,
+            fit_cache: HashMap::new(),
+            info_collapsed: BTreeSet::new(),
+            open_requests: Vec::new(),
         }
     }
 
@@ -512,7 +554,22 @@ impl RedisPane {
 
     /// 有前台操作或后台扫描在进行。
     pub fn running(&self) -> bool {
-        self.busy || self.scan.running
+        self.busy || self.scan.running || self.reading
+    }
+
+    /// 正在读取选中的键。
+    pub fn reading(&self) -> bool {
+        self.reading
+    }
+
+    /// 读取时发现已不存在的键。
+    pub fn key_gone(&self, name: &str) -> bool {
+        self.gone.contains(name)
+    }
+
+    /// 外壳取走「在新标签中固定打开」的请求（规格 `连接|名称|库|键`）。
+    pub fn take_open_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.open_requests)
     }
 
     /// 外壳按环境标签告诉面板目标是不是生产库：生产库的每次写入确认都要输入连接名。
@@ -623,6 +680,7 @@ impl RedisPane {
         self.database = "0".into();
         self.set_keys(vec![RedisKeyInfo { name: name.into(), key_type: "string".into(), ttl_ms: Some(-1) }]);
         self.selected = name.into();
+        self.detail_key = name.into();
         self.detail = Some(Arc::new(RedisKeyDetail {
             key_type: "string".into(),
             ttl_ms: Some(-1),
@@ -733,6 +791,17 @@ impl RedisPane {
         self.entry_target = None;
         self.entry_viewer_sub = None;
         self.focus_request = None;
+        self.reading = false;
+        self.read_generation = self.read_generation.wrapping_add(1);
+        self.detail_key.clear();
+        self.gone.clear();
+        self.tables.clear();
+        self.entry_rows.clear();
+        self.entry_sort = 0;
+        self.value_drag_start = None;
+        self.guard_generation = self.guard_generation.wrapping_add(1);
+        self.stale_value = false;
+        self.info_collapsed.clear();
     }
 
     fn clear_entry_drafts(&mut self) {
@@ -760,6 +829,19 @@ impl RedisPane {
             self.database = "0".into();
         }
         self.load_context(cx);
+        // 带键的规格（新标签中固定打开某个键）：直接读这个键，不等扫描。
+        if let Some(key) = spec_key(spec) {
+            self.select_key(key, cx);
+        }
+    }
+
+    /// 在新标签中固定打开一个键：交给外壳（`take_open_requests`）。
+    fn request_open_tab(&mut self, name: &str) {
+        if self.connection_id.is_empty() || name.is_empty() {
+            return;
+        }
+        self.open_requests.push(format!("{}|{}|{}|{}", self.connection_id, self.connection_name, self.database, name));
+        self.note = i18n::fill(&self.text("redis.tab.openedInTab"), &[("key", name)]);
     }
 
     /// 打开目标时：先读本连接的键空间偏好与拓扑，再开始后台扫描（分隔符、上限都按偏好）。
@@ -932,9 +1014,11 @@ impl RedisPane {
         self.done = false;
         self.selected.clear();
         self.detail = None;
+        self.detail_key.clear();
+        self.reading = false;
+        self.read_generation = self.read_generation.wrapping_add(1);
         self.placement = None;
         self.entry_focus = None;
-        self.entry_viewer = None;
         self.entry_viewer_tag.clear();
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
@@ -1057,7 +1141,12 @@ impl RedisPane {
             || id.starts_with("redis-stream-copy-id:")
             || id.starts_with("redis-entry-inspect:")
             || id.starts_with("redis-complete-pick:")
-            || id.starts_with("redis-xopen:");
+            || id.starts_with("redis-xopen:")
+            // 读取中仍可切换到别的键：旧响应按读取代数丢弃。
+            || id.starts_with("redis-select:")
+            || id.starts_with("redis-open-tab:")
+            || id == "redis-entry-sort"
+            || id == "redis-open-tab";
 
         if self.busy && !local {
             self.show_error_from(ErrorSource::Command, self.text("redis.tab.busy"));
@@ -1278,9 +1367,27 @@ impl RedisPane {
             self.invalidate_rows();
         } else if let Some(kind) = id.strip_prefix("redis-type-") {
             self.type_filter = if kind == "all" { String::new() } else { kind.to_owned() };
+            self.invalidate_rows();
         } else if let Some(prefix) = id.strip_prefix("redis-folder:") {
             if !self.expanded.remove(prefix) {
                 self.expanded.insert(prefix.to_owned());
+            }
+            self.invalidate_rows();
+        } else if let Some(index) = id.strip_prefix("redis-open-tab:") {
+            if let Some(name) = index.parse::<usize>().ok().and_then(|index| self.keys.get(index)).map(|key| key.name.clone()) {
+                self.request_open_tab(&name);
+            }
+        } else if id == "redis-open-tab" {
+            let name = self.selected.clone();
+            self.request_open_tab(&name);
+        } else if id == "redis-entry-sort" {
+            self.entry_sort = (self.entry_sort + 1) % 3;
+        } else if id == "redis-stale-refresh" {
+            self.stale_value = false;
+            self.error.clear();
+            if !self.selected.is_empty() {
+                let name = self.selected.clone();
+                self.select_key(name, cx);
             }
         } else if let Some(prefix) = id.strip_prefix("redis-folder-filter:") {
             self.pattern = keyspace::folder_pattern(prefix, &self.prefs.separators);
@@ -1497,21 +1604,31 @@ impl RedisPane {
     fn set_keys(&mut self, keys: Vec<RedisKeyInfo>) {
         self.key_pos = keys.iter().enumerate().map(|(index, key)| (key.name.clone(), index)).collect();
         self.keys = keys;
+        self.gone.clear();
         self.invalidate_rows();
     }
 
-    /// 并入一批扫描结果：已有的键原位更新，新键追加。
+    /// 并入一批扫描结果：已有的键原位更新，新键追加。键集合（及类型、TTL）没变时不作废列表缓存。
     fn absorb_keys(&mut self, page: Vec<RedisKeyInfo>) {
+        let mut changed = false;
         for item in page {
             match self.key_pos.get(&item.name) {
-                Some(&index) => self.keys[index] = item,
+                Some(&index) => {
+                    if self.keys[index] != item {
+                        self.keys[index] = item;
+                        changed = true;
+                    }
+                }
                 None => {
                     self.key_pos.insert(item.name.clone(), self.keys.len());
                     self.keys.push(item);
+                    changed = true;
                 }
             }
         }
-        self.invalidate_rows();
+        if changed {
+            self.invalidate_rows();
+        }
     }
 
     /// 从索引里移除一批键（删除、批量删除之后）。
@@ -1535,6 +1652,8 @@ impl RedisPane {
         }
     }
 
+    /// 选键：旧内容保留到新值到达后整体替换（不清空、不出骨架），列表也不插加载行。
+    /// 读取有自己的代数：读取中可以再选别的键，旧响应直接丢弃；不占用写入的 busy。
     fn select_key(&mut self, name: String, cx: &mut Context<Self>) {
         if self.selected != name {
             // 换键时收起条目表单、清掉条目筛选：上一个键的草稿不能被误写到新键上。
@@ -1542,17 +1661,15 @@ impl RedisPane {
             self.clear_entry_drafts();
             self.hash_query.clear();
             self.set_query.clear();
+            self.entry_sort = 0;
+            self.ttl_open = false;
+            self.rename_open = false;
+            self.rename_to.clear();
         }
         self.selected = name.clone();
-        self.detail = None;
         self.value_loading = false;
         self.placement = self.topology.cluster.then(|| cluster::placement(&self.topology.nodes, &name));
         self.stream_focus = None;
-        self.entry_focus = None;
-        self.entry_viewer_tag.clear();
-        self.ttl_open = false;
-        self.rename_open = false;
-        self.rename_to.clear();
         if self.viewport_w < kit::NARROW_PAGE_WIDTH {
             self.nav_choice = Some(false);
         }
@@ -1560,43 +1677,90 @@ impl RedisPane {
             self.show_error_from(ErrorSource::Detail, self.text("redis.tab.needConnection"));
             return;
         }
+        if self.error_source == ErrorSource::Detail {
+            self.error.clear();
+        }
+        let generation = self.begin_read();
+        let epoch = self.epoch;
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
-        self.spawn(
-            cx,
-            false,
-            async move { crate::application::redis::read_key(connections.as_ref(), &connection_id, name).await },
-            Self::finish_read,
-        );
+        let view = cx.entity().downgrade();
+        let key = name.clone();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::app::views::grid::runtime_for_views().spawn(async move {
+                let _ = tx.send(crate::application::redis::read_key(connections.as_ref(), &connection_id, key).await);
+            });
+            if let Ok(result) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |pane, cx| {
+                            if pane.epoch == epoch && pane.deliver_read(generation, name, result, cx) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
-    fn finish_read(&mut self, result: Result<RedisKeyDetail, String>, _: &mut Context<Self>) {
+    /// 开始一次读取：代数加一，之前还没回来的读取全部作废。
+    fn begin_read(&mut self) -> u64 {
+        self.read_generation = self.read_generation.wrapping_add(1);
+        self.reading = true;
+        self.read_generation
+    }
+
+    /// 读取结果落地；不是最后一次选键的结果直接丢弃（返回 false）。
+    fn deliver_read(&mut self, generation: u64, name: String, result: Result<RedisKeyDetail, String>, cx: &mut Context<Self>) -> bool {
+        if self.read_generation != generation {
+            return false;
+        }
+        self.reading = false;
+        self.finish_read(name, result, cx);
+        true
+    }
+
+    fn finish_read(&mut self, name: String, result: Result<RedisKeyDetail, String>, _: &mut Context<Self>) {
         match result {
             Ok(detail) => {
-                // 顺带更新内存索引里这个键的类型与 TTL：键已不存在就移除，新建的键补进来。
-                let name = self.selected.clone();
+                let same_key = self.detail_key == name;
+                // 顺带更新内存索引里这个键的类型与 TTL；键已不存在时留在列表里画删除线，详情说明它已不存在。
                 if detail.key_type == "none" {
-                    let gone: std::collections::HashSet<String> = std::iter::once(name).collect();
-                    self.drop_keys(&gone);
+                    self.gone.insert(name.clone());
+                    self.invalidate_rows();
                 } else {
-                    self.absorb_keys(vec![RedisKeyInfo { name, key_type: detail.key_type.clone(), ttl_ms: detail.ttl_ms }]);
+                    if self.gone.remove(&name) {
+                        self.invalidate_rows();
+                    }
+                    self.absorb_keys(vec![RedisKeyInfo { name: name.clone(), key_type: detail.key_type.clone(), ttl_ms: detail.ttl_ms }]);
                 }
                 self.ttl_input = match detail.ttl_ms {
                     Some(ms) if ms >= 0 => (ms / 1000).to_string(),
                     _ => String::new(),
                 };
-                self.entry_focus = match &detail.value {
-                    RedisValue::Hash { entries } if !entries.is_empty() => Some(0),
-                    RedisValue::List { items } if !items.is_empty() => Some(0),
-                    RedisValue::Set { items } if !items.is_empty() => Some(0),
-                    RedisValue::ZSet { entries } if !entries.is_empty() => Some(0),
-                    RedisValue::Stream { messages } if !messages.is_empty() => Some(0),
+                let len = match &detail.value {
+                    RedisValue::Hash { entries } => entries.len(),
+                    RedisValue::List { items } | RedisValue::Set { items } => items.len(),
+                    RedisValue::ZSet { entries } => entries.len(),
+                    RedisValue::Stream { messages } => messages.len(),
+                    _ => 0,
+                };
+                // 同一个键重读（写入之后）：保留选中的条目；换了键：默认选中第一行。
+                self.entry_focus = match self.entry_focus {
+                    Some(index) if same_key && index < len => Some(index),
+                    _ if len > 0 => Some(0),
                     _ => None,
                 };
                 self.detail = Some(Arc::new(detail));
+                self.detail_key = name;
                 self.reload_viewer = true;
                 self.entry_viewer_tag.clear();
-                self.error.clear();
+                if self.error_source == ErrorSource::Detail {
+                    self.error.clear();
+                }
             }
             Err(message) => self.show_error_from(ErrorSource::Detail, message),
         }
@@ -1791,6 +1955,7 @@ impl RedisPane {
                 let gone: std::collections::HashSet<String> = std::iter::once(std::mem::take(&mut self.selected)).collect();
                 self.drop_keys(&gone);
                 self.detail = None;
+                self.detail_key.clear();
                 self.placement = None;
                 self.refresh_keyspace_counts(cx);
             }
@@ -1825,6 +1990,7 @@ impl RedisPane {
                 self.drop_keys(&gone);
                 self.rename_to.clear();
                 self.detail = None;
+                self.detail_key.clear();
                 self.after_write(cx);
             }
             Err(message) => {
@@ -2186,6 +2352,11 @@ impl RedisPane {
             self.show_error(self.text("redis.tab.needKey"));
             return;
         }
+        // 正在换键：界面上还是上一个键的内容，条目写入不能落到新键上。
+        if self.reading && self.detail_key != self.selected {
+            self.show_error(self.text("redis.value.reading"));
+            return;
+        }
         if let Err(message) = keys::prepare_mutation(&mutation, true) {
             self.show_error(message);
             return;
@@ -2379,6 +2550,7 @@ impl RedisPane {
             at,
             items: vec![
                 ContextItem { id: format!("redis-select:{index}"), icon: IconName::Eye, label: self.text("redis.menu.open"), danger: false },
+                ContextItem { id: format!("redis-open-tab:{index}"), icon: IconName::Pin, label: self.text("redis.menu.openInTab"), danger: false },
                 ContextItem { id: format!("redis-key-copy-name:{index}"), icon: IconName::Copy, label: self.text("redis.copy.keyName"), danger: false },
                 ContextItem { id: format!("redis-key-fill-cmd:{index}"), icon: IconName::SquareTerminal, label: self.text("redis.menu.fillCommand"), danger: false },
                 ContextItem { id: format!("redis-key-delete:{index}"), icon: IconName::Trash, label: self.text("redis.tab.remove"), danger: true },
@@ -2400,7 +2572,22 @@ impl RedisPane {
         cx.notify();
     }
 
-    fn open_entry_context_menu(&mut self, items: Vec<ContextItem>, at: Point<Pixels>, cx: &mut Context<Self>) {
+    /// 详情头部的「更多」：次要操作（窄窗口下放不下的主要操作也在这里）。
+    fn open_more_menu(&mut self, at: Point<Pixels>, overflow: bool, cx: &mut Context<Self>) {
+        if self.selected.is_empty() {
+            return;
+        }
+        let mut items = Vec::new();
+        if overflow {
+            items.push(ContextItem { id: "redis-ttl-toggle".into(), icon: IconName::Timer, label: self.text("redis.tab.setTtl"), danger: false });
+        }
+        items.push(ContextItem { id: "redis-rename-toggle".into(), icon: IconName::Pencil, label: self.text("redis.tab.rename"), danger: false });
+        items.push(ContextItem { id: "redis-copy".into(), icon: IconName::Copy, label: self.text("redis.copy.keyValue"), danger: false });
+        items.push(ContextItem { id: "redis-copy-key".into(), icon: IconName::Tag, label: self.text("redis.copy.keyName"), danger: false });
+        items.push(ContextItem { id: "redis-open-tab".into(), icon: IconName::Pin, label: self.text("redis.menu.openInTab"), danger: false });
+        if overflow {
+            items.push(ContextItem { id: "redis-delete".into(), icon: IconName::Trash, label: self.text("redis.tab.remove"), danger: true });
+        }
         self.context_menu = Some(ContextMenuState { at, items });
         cx.notify();
     }
@@ -2451,7 +2638,7 @@ pub fn parse_ttl(input: &str) -> Result<Option<i64>, ()> {
 }
 
 fn parse_spec(spec: &str) -> Option<(String, String, String)> {
-    let mut parts = spec.splitn(3, '|');
+    let mut parts = spec.splitn(4, '|');
     let id = parts.next()?.trim().to_owned();
     let name = parts.next().unwrap_or("").trim().to_owned();
     let database = parts.next().unwrap_or("0").trim().to_owned();
@@ -2459,6 +2646,12 @@ fn parse_spec(spec: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((id, name, if database.is_empty() { "0".into() } else { database }))
+}
+
+/// 规格里的第四段：要直接打开的键（`连接|名称|库|键`，键名里可以有 `|`）。
+fn spec_key(spec: &str) -> Option<String> {
+    let key = spec.splitn(4, '|').nth(3)?;
+    (!key.is_empty()).then(|| key.to_owned())
 }
 
 #[cfg(test)]
@@ -2664,42 +2857,6 @@ pub(crate) fn long_ttl(ms: i64) -> String {
     }
 }
 
-/// 宽度不足时把键名从中间省略：开头的前缀和结尾的 ID 都留着。
-/// Redis 键名的区分信息往往在末尾（`order:209831:1269…`），只在尾部截断会让一屏行长得一样。
-/// 宽度按等宽单位计：ASCII 算 1，其余（中文等）算 2。
-pub(crate) fn middle_ellipsis(text: &str, max_units: usize) -> String {
-    fn units(ch: char) -> usize {
-        if ch.is_ascii() { 1 } else { 2 }
-    }
-    let total: usize = text.chars().map(units).sum();
-    if total <= max_units || max_units < 8 {
-        return text.to_owned();
-    }
-    let budget = max_units - 1;
-    let head_budget = budget * 2 / 5;
-    let tail_budget = budget - head_budget;
-    let mut head = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        if used + units(ch) > head_budget {
-            break;
-        }
-        used += units(ch);
-        head.push(ch);
-    }
-    let mut tail: Vec<char> = Vec::new();
-    used = 0;
-    for ch in text.chars().rev() {
-        if used + units(ch) > tail_budget {
-            break;
-        }
-        used += units(ch);
-        tail.push(ch);
-    }
-    tail.reverse();
-    format!("{head}…{}", tail.into_iter().collect::<String>())
-}
-
 /// 列表单元格里的一行预览：换行、制表符折成空格，超长值只取开头，完整内容留给结构化查看器。
 pub(crate) fn one_line(text: &str) -> String {
     const MAX: usize = 240;
@@ -2716,6 +2873,7 @@ pub(crate) fn one_line(text: &str) -> String {
 
 mod actions;
 mod pages;
+mod tables;
 mod view;
 
 /// 确认门槛：非生产库直接可确认；生产库要求输入的文本（去首尾空白）与连接名完全一致。
@@ -2736,11 +2894,6 @@ mod tests {
         assert_eq!(short_ttl(3_600_000), "1h");
         assert_eq!(long_ttl(5_000_000), "1h 23m");
         assert_eq!(long_ttl(308_000), "5m 08s");
-        let name = "lastCustomArea209831:1269820826354053120";
-        let short = middle_ellipsis(name, 24);
-        assert!(short.starts_with("lastCust") && short.ends_with("4053120") && short.contains('…'), "{short}");
-        assert!(short.chars().count() <= 24, "{short}");
-        assert_eq!(middle_ellipsis("user:1", 24), "user:1");
         assert_eq!(one_line("a\nb\tc"), "a b c");
     }
 
@@ -2940,3 +3093,6 @@ mod states;
 
 #[cfg(test)]
 mod workbench_tests;
+
+#[cfg(test)]
+mod ux_tests;

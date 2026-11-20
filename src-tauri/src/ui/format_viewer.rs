@@ -2,19 +2,22 @@
 //! GPUI 面板只把这些结果画出来，供网格、记录视图、Mongo 和 Redis 挂载。
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use base64::Engine;
 use chrono::Datelike;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
+    anchored, deferred, Anchor, AnyElement, AppContext as _, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, Focusable as _,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, UniformListScrollHandle, Window, div, px, relative,
 };
 
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, Palette, Radius, TypeScale};
+use crate::ui::kit::{self, ControlSize, Palette, Radius, Space, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 
 /// 面板能切换的六种视图。手动选择不改原始文本。
@@ -146,6 +149,30 @@ pub enum FormatViewerEvent {
     Commit(String),
 }
 
+/// JSON 树的可见节点（或解析错误），按草稿哈希、折叠状态和过滤词缓存：render 不再每帧重新解析。
+type TreeNodes = Result<Rc<Vec<JsonTreeNode>>, JsonDiagnostic>;
+
+struct TreeCache {
+    key: (u64, u64, String),
+    nodes: TreeNodes,
+}
+
+struct TreeMenu {
+    at: Point<Pixels>,
+    menu: Entity<PopupMenu>,
+    _dismiss: Subscription,
+}
+
+/// JSON 树一行的高度。
+const TREE_ROW_H: f32 = 26.;
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// 可挂载的格式面板。树、校验和草稿都留在这里，调用方只订阅加载完整值和提交。
 pub struct FormatViewer {
     source: String,
@@ -163,11 +190,20 @@ pub struct FormatViewer {
     code_only: bool,
     wrap: bool,
     collapsed: BTreeSet<String>,
+    /// 折叠状态的版本：树缓存按它失效。
+    collapsed_rev: u64,
     filter: String,
     editor_sync: String,
     last_error: Option<JsonDiagnostic>,
     editor: Entity<EditorState>,
     filter_input: Entity<InputState>,
+    /// 嵌入方给的标题（Redis 右栏：当前字段名或成员名），与工具条合为一行。
+    title: Option<SharedString>,
+    tree_cache: Option<TreeCache>,
+    /// 解析 JSON 的次数（测试用：同一内容重复渲染不应再解析）。
+    tree_parses: usize,
+    tree_scroll: UniformListScrollHandle,
+    tree_menu: Option<TreeMenu>,
     _editor_sub: Subscription,
     _filter_sub: Subscription,
 }
@@ -218,11 +254,17 @@ impl FormatViewer {
             code_only: false,
             wrap: true,
             collapsed: BTreeSet::new(),
+            collapsed_rev: 0,
             filter: String::new(),
             editor_sync: draft,
             last_error: None,
             editor,
             filter_input,
+            title: None,
+            tree_cache: None,
+            tree_parses: 0,
+            tree_scroll: UniformListScrollHandle::new(),
+            tree_menu: None,
             _editor_sub: editor_sub,
             _filter_sub: filter_sub,
         };
@@ -236,6 +278,139 @@ impl FormatViewer {
 
     pub fn draft(&self) -> &str {
         &self.draft
+    }
+
+    /// 草稿与原值不同（有未应用的修改）。
+    pub fn dirty(&self) -> bool {
+        self.draft != self.source
+    }
+
+    #[cfg(test)]
+    pub fn title(&self) -> Option<&SharedString> {
+        self.title.as_ref()
+    }
+
+    /// 工具条左端的标题；None 时不画。
+    pub fn set_title(&mut self, title: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.title != title {
+            self.title = title;
+            cx.notify();
+        }
+    }
+
+    /// 原地换内容：复用同一个实体（编辑器、过滤框、滚动位置的句柄都不重建），
+    /// 手动格式、折叠、草稿和错误都按新值重来。切换 Redis 键、条目时用它，界面不闪。
+    pub fn set_content(&mut self, spec: ViewerSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let detected = detect_format(DetectInput {
+            column_hint: spec.column_hint.as_deref(),
+            type_hint: spec.type_hint.as_deref(),
+            bytes: spec.bytes.as_deref(),
+            text: &spec.text,
+        });
+        self.draft = spec.text.clone();
+        self.source = spec.text;
+        self.column_hint = spec.column_hint;
+        self.type_hint = spec.type_hint;
+        self.bytes = spec.bytes;
+        self.detected = detected;
+        self.manual = None;
+        self.truncation = spec.truncation;
+        self.mode = spec.mode;
+        if self.locale != spec.locale {
+            self.set_locale(spec.locale, window, cx);
+        }
+        self.code_view = detected != DataFormat::Json;
+        self.collapsed.clear();
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
+        self.tree_cache = None;
+        self.tree_menu = None;
+        self.last_error = None;
+        let language = editor_language(detected).to_owned();
+        self.editor.update(cx, |state, cx| state.set_highlighter(language, cx));
+        self.refresh_validation();
+        cx.notify();
+    }
+
+    /// 换截断状态（大值预览 → 加载中 → 失败）；完整值到达用 [`Self::replace_full`]。
+    pub fn set_truncation(&mut self, truncation: TruncationState, cx: &mut Context<Self>) {
+        self.truncation = truncation;
+        cx.notify();
+    }
+
+    /// 放弃未应用的修改：草稿回到原值。
+    pub fn discard(&mut self, cx: &mut Context<Self>) {
+        if self.draft == self.source {
+            return;
+        }
+        self.draft = self.source.clone();
+        self.refresh_validation();
+        cx.notify();
+    }
+
+    /// 当前可见的 JSON 树节点。按（草稿哈希、折叠版本、过滤词）缓存，同一内容反复渲染不再解析。
+    pub fn tree_nodes(&mut self) -> TreeNodes {
+        let key = (text_hash(&self.draft), self.collapsed_rev, self.filter.clone());
+        if let Some(cache) = &self.tree_cache {
+            if cache.key == key {
+                return cache.nodes.clone();
+            }
+        }
+        self.tree_parses += 1;
+        let nodes = parse_json(&self.draft).map(|value| Rc::new(visible_json_nodes(&value, &self.collapsed, &self.filter)));
+        self.tree_cache = Some(TreeCache { key, nodes: nodes.clone() });
+        nodes
+    }
+
+    /// 解析 JSON 的累计次数（测试断言缓存用）。
+    #[cfg(test)]
+    pub fn tree_parses(&self) -> usize {
+        self.tree_parses
+    }
+
+    #[cfg(test)]
+    pub fn tree_menu_open(&self) -> bool {
+        self.tree_menu.is_some()
+    }
+
+    /// 复制某个节点的值（标量原样、容器为 JSON）。
+    pub fn copy_node(&mut self, path: &str, cx: &mut Context<Self>) -> Option<String> {
+        let value = parse_json(&self.draft).ok()?;
+        let text = copy_node_value(&value, path)?;
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        Some(text)
+    }
+
+    /// 节点右键菜单：复制值、复制 JSONPath。
+    pub fn open_tree_menu(&mut self, path: String, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = cx.entity().downgrade();
+        let (value_label, path_label) = (self.text("format.action.copyValue"), self.text("format.action.copyPath"));
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let (value_owner, path_owner) = (owner.clone(), owner.clone());
+            let (value_path, copied_path) = (path.clone(), path.clone());
+            menu.item(PopupMenuItem::new(value_label.clone()).on_click(move |_, _, cx| {
+                value_owner
+                    .update(cx, |this, cx| {
+                        this.copy_node(&value_path, cx);
+                        this.close_tree_menu(cx);
+                    })
+                    .ok();
+            }))
+            .item(PopupMenuItem::new(path_label.clone()).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copied_path.clone()));
+                path_owner.update(cx, |this, cx| this.close_tree_menu(cx)).ok();
+            }))
+            .min_w(px(ControlSize::PICKER_MIN_W - 60.))
+        });
+        let dismiss = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| this.close_tree_menu(cx));
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.tree_menu = Some(TreeMenu { at, menu, _dismiss: dismiss });
+        cx.notify();
+    }
+
+    pub fn close_tree_menu(&mut self, cx: &mut Context<Self>) {
+        if self.tree_menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn format(&self) -> DataFormat {
@@ -294,6 +469,7 @@ impl FormatViewer {
         self.draft = text;
         self.truncation = TruncationState::Full;
         self.collapsed.clear();
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
         self.last_error = None;
         let language = editor_language(self.format()).to_owned();
         self.editor.update(cx, |state, cx| state.set_highlighter(language, cx));
@@ -345,11 +521,13 @@ impl FormatViewer {
         if !self.collapsed.remove(path) {
             self.collapsed.insert(path.to_owned());
         }
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
         cx.notify();
     }
 
     pub fn expand_all(&mut self, cx: &mut Context<Self>) {
         self.collapsed.clear();
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
         cx.notify();
     }
 
@@ -358,6 +536,7 @@ impl FormatViewer {
         if let Ok(value) = parse_json(&self.draft) {
             collect_containers(&value, "$", &mut self.collapsed);
         }
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
         cx.notify();
     }
 
@@ -402,10 +581,21 @@ impl Render for FormatViewer {
         let body = if format == DataFormat::Hex {
             hex_body(self, &p)
         } else if format == DataFormat::Json && !self.code_view {
-            tree_body(self, &entity, &p)
+            let nodes = self.tree_nodes();
+            tree_body(self, nodes, &p, cx)
         } else {
             code_body(self, &p, locked)
         };
+        let menu = self.tree_menu.as_ref().map(|open| {
+            deferred(
+                anchored()
+                    .position(open.at)
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(ControlSize::POPOVER_MARGIN))
+                    .child(div().id("format-tree-menu").test_support().child(open.menu.clone())),
+            )
+            .with_priority(3)
+        });
         div()
             .id("format-viewer")
             .size_full()
@@ -418,6 +608,7 @@ impl Render for FormatViewer {
             .children(banner)
             .children(hint)
             .child(body)
+            .children(menu)
     }
 }
 
@@ -507,6 +698,22 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
     }));
     let apply_locked = apply_block(viewer.format(), viewer.mode, &viewer.truncation, &viewer.draft).is_some();
     let dirty_ready = !apply_locked && viewer.draft != viewer.source;
+    // 有未应用的修改时：标记 + 「放弃」，和「应用」一起固定在工具条右端。
+    if viewer.mode == EditMode::Editable && viewer.dirty() {
+        actions = actions.child(
+            div()
+                .id("format-dirty")
+                .test_support()
+                .flex_none()
+                .px(px(Space::SM))
+                .rounded(px(Radius::TAG))
+                .bg(p.warn_soft)
+                .text_color(p.warn)
+                .text_size(px(TypeScale::XS))
+                .child(viewer.text("format.dirty")),
+        );
+        actions = actions.child(text_button(entity, "format-discard", Some(IconName::Undo2), viewer.text("format.action.discard"), false, |this, cx| this.discard(cx)));
+    }
     let apply_target = entity.clone();
     let apply_btn = if dirty_ready {
         kit::primary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), move |_, _, cx| {
@@ -523,18 +730,32 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
         .disabled(apply_locked)
     };
     actions = actions.child(apply_btn);
+    let title = viewer.title.clone().map(|title| {
+        div()
+            .id("format-title")
+            .test_support()
+            .flex_1()
+            .min_w(px(0.))
+            .truncate()
+            .text_size(px(TypeScale::SM))
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(p.text)
+            .child(title)
+    });
+    let has_title = title.is_some();
     div()
         .flex_none()
         .px(px(metrics.pane_pad()))
-        .py(px(6.))
+        .py(px(Space::SM))
         .flex()
         .flex_wrap()
         .items_center()
-        .justify_between()
-        .gap(px(8.))
+        .when(!has_title, |this| this.justify_between())
+        .gap(px(Space::MD))
         .border_b_1()
         .border_color(p.line)
         .bg(p.chrome)
+        .children(title)
         .when(choices.len() > 1, |this| this.child(formats))
         .when(choices.len() <= 1, |this| {
             // 只有一种视图时不给切换器，只标出这是什么：少一排没有意义的按钮。
@@ -759,39 +980,55 @@ fn hex_body(viewer: &FormatViewer, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
-fn tree_body(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette) -> AnyElement {
-    let parsed = parse_json(&viewer.draft);
+/// JSON 树：虚拟列表只画可见行；节点来自缓存，不在每帧重新解析。
+fn tree_body(viewer: &FormatViewer, nodes: TreeNodes, p: &Palette, cx: &mut Context<FormatViewer>) -> AnyElement {
     let mut column = div().flex_1().min_h(px(0.)).flex().flex_col().bg(p.surface);
     column = column.child(
         div()
             .flex_none()
-            .px(px(8.))
-            .py(px(6.))
+            .px(px(Space::MD))
+            .py(px(Space::SM))
             .child(kit::text_input("format-filter", &viewer.filter_input, viewer.text("format.filter.placeholder"))),
     );
-    match parsed {
-        Ok(value) => {
-            let nodes = visible_json_nodes(&value, &viewer.collapsed, &viewer.filter);
+    match nodes {
+        Ok(nodes) => {
             if nodes.is_empty() {
-                column = column.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(viewer.text("format.tree.empty")));
+                column = column.child(div().p(px(Space::LG)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(viewer.text("format.tree.empty")));
+                return column.into_any_element();
             }
-            let mut list = div().id("format-json-tree").flex_1().min_h(px(0.)).scroll_area_y();
-            for node in nodes {
-                list = list.child(tree_row(entity, viewer, p, &node));
-            }
-            column = column.child(list);
+            let count = nodes.len();
+            let list = gpui_kit::uniform_list("format-json-tree", count, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let entity = cx.entity();
+                let p = Palette::of(cx);
+                range.filter_map(|ix| nodes.get(ix).map(|node| tree_row(&entity, this, &p, node))).collect::<Vec<_>>()
+            }))
+            .track_scroll(&viewer.tree_scroll)
+            .flex_1();
+            column = column.child(
+                div()
+                    .id("format-json-tree-frame")
+                    .test_support()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(list)
+                    .child(kit::scrollbar_overlay("format-json-tree-bar", &viewer.tree_scroll, kit::ScrollbarAxis::Vertical)),
+            );
         }
         Err(error) => {
             let message = i18n::fill(
                 &i18n::text(viewer.locale, "format.error.json"),
                 &[("line", &error.line.to_string()), ("column", &error.column.to_string()), ("message", &error.message)],
             );
-            column = column.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(message)));
+            column = column.child(div().p(px(Space::LG)).text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(message)));
         }
     }
     column.into_any_element()
 }
 
+/// 树的一行。「复制值」「复制 JSONPath」只在悬停时出现，右键菜单里也有这两项。
 fn tree_row(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, node: &JsonTreeNode) -> AnyElement {
     let path = node.path.clone();
     let value_label = viewer.text("format.action.copyValue");
@@ -803,15 +1040,26 @@ fn tree_row(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, n
     let path_id = format!("format-copy-path-{copied_path}");
     let expandable = node.expandable;
     let toggle = entity.clone();
+    let menu_owner = entity.clone();
+    let menu_path = path.clone();
+    const ROW_GROUP: &str = "format-tree-row";
     div()
+        .id(SharedString::from(format!("format-row-{path}")))
+        .test_support()
+        .group(ROW_GROUP)
         .flex()
         .items_center()
-        .gap(px(6.))
-        .pl(px(8. + node.depth as f32 * 14.))
-        .pr(px(8.))
-        .h(px(26.))
+        .gap(px(Space::SM))
+        .pl(px(Space::MD + node.depth as f32 * 14.))
+        .pr(px(Space::MD))
+        .h(px(TREE_ROW_H))
         .min_w(px(0.))
         .hover(|style| style.bg(p.hover))
+        .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            let (path, at) = (menu_path.clone(), event.position);
+            menu_owner.update(cx, |this, cx| this.open_tree_menu(path, at, window, cx));
+        })
         .child(
             kit::interactive_states(div().id(SharedString::from(format!("format-toggle-{path}"))), p, !expandable)
                 .w(px(16.))
@@ -838,16 +1086,33 @@ fn tree_row(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, n
             let color = node.scalar_kind.map(|kind| scalar_color(kind, p)).unwrap_or(p.text);
             div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(color).child(SharedString::from(scalar))
         }))
-        .child(text_button(entity, value_id, None, value_label, false, move |this, cx| {
-            if let Ok(value) = parse_json(&this.draft) {
-                if let Some(text) = copy_node_value(&value, &value_path) {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-            }
-        }))
-        .child(text_button(entity, path_id, None, path_label, false, move |_, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(copied_path.clone()));
-        }))
+        .when(node.scalar.is_none(), |this| this.child(div().flex_1().min_w(px(0.))))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(Space::XXS))
+                .invisible()
+                .group_hover(ROW_GROUP, |style| style.visible())
+                .child(
+                    kit::icon_button(SharedString::from(value_id), IconName::Copy, value_label, {
+                        let target = entity.clone();
+                        move |_, _, cx| {
+                            target.update(cx, |this, cx| {
+                                this.copy_node(&value_path, cx);
+                            });
+                        }
+                    })
+                    .xsmall(),
+                )
+                .child(
+                    kit::icon_button(SharedString::from(path_id), IconName::Route, path_label, move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copied_path.clone()));
+                    })
+                    .xsmall(),
+                ),
+        )
         .into_any_element()
 }
 
@@ -1684,6 +1949,112 @@ mod tests {
         assert!(json_yaml.json_compatible);
         assert!(json_yaml.limitation_key.is_none());
         assert!(json_yaml.text.contains("name"));
+    }
+
+    fn open_viewer(cx: &mut gpui_kit::TestAppContext, text: String) -> (gpui_kit::AnyWindowHandle, Entity<FormatViewer>) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(px(900.), px(600.)) };
+            gpui_kit::open_window(gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+                cx.new(|cx| {
+                    FormatViewer::new(
+                        ViewerSpec {
+                            text,
+                            column_hint: None,
+                            type_hint: Some("json".into()),
+                            bytes: None,
+                            truncation: TruncationState::Full,
+                            mode: EditMode::Editable,
+                            locale: Locale::ZhCn,
+                        },
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("viewer window")
+        })
+    }
+
+    /// JSON 树：虚拟列表只画可见行；同一内容反复渲染不再解析；复制按钮平时隐藏，右键菜单里有复制值与 JSONPath。
+    #[gpui_kit::test]
+    fn json_tree_is_virtual_cached_and_copy_actions_wait_for_hover(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        let body = (0..2000).map(|ix| format!("\"k{ix}\":{ix}")).collect::<Vec<_>>().join(",");
+        let (window, viewer) = open_viewer(cx, format!("{{{body}}}"));
+        let (first, last, copy_visible) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+                (
+                    window.try_find("format-row-$.k0").is_some(),
+                    window.try_find("format-row-$.k1999").is_some(),
+                    window.try_find("format-copy-value-$.k0").map(|button| button.visible()),
+                )
+            })
+            .unwrap();
+        assert!(first, "首屏画出前几行");
+        assert!(!last, "2000 个节点只画可见行");
+        assert_ne!(copy_visible, Some(true), "复制按钮不常驻，悬停时才出现");
+        let parses = cx.update(|cx| viewer.read(cx).tree_parses());
+        cx.update_window(window, |_, window, cx| {
+            viewer.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|cx| viewer.read(cx).tree_parses()), parses, "内容没变就不重新解析");
+        let nodes = cx.update(|cx| viewer.update(cx, |viewer, _| viewer.tree_nodes()));
+        let again = cx.update(|cx| viewer.update(cx, |viewer, _| viewer.tree_nodes()));
+        assert!(Rc::ptr_eq(nodes.as_ref().unwrap(), again.as_ref().unwrap()), "按内容缓存");
+        cx.update(|cx| viewer.update(cx, |viewer, cx| viewer.toggle_node("$", cx)));
+        let collapsed = cx.update(|cx| viewer.update(cx, |viewer, _| viewer.tree_nodes()));
+        assert_eq!(collapsed.unwrap().len(), 1, "折叠后缓存失效");
+        cx.update_window(window, |_, window, cx| {
+            viewer.update(cx, |viewer, cx| viewer.open_tree_menu("$.k1".into(), gpui_kit::point(px(10.), px(10.)), window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(cx.update(|cx| viewer.read(cx).tree_menu_open()), "右键菜单打开");
+        let copied = cx.update(|cx| viewer.update(cx, |viewer, cx| viewer.copy_node("$.k7", cx)));
+        assert_eq!(copied.as_deref(), Some("7"));
+    }
+
+    /// 换内容复用同一个实体：草稿、手动格式、标题都按新值来；放弃修改回到原值。
+    #[gpui_kit::test]
+    fn set_content_reuses_the_viewer_and_discard_restores_the_source(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        let (window, viewer) = open_viewer(cx, "{\"a\":1}".into());
+        cx.update_window(window, |_, window, cx| {
+            viewer.update(cx, |viewer, cx| {
+                viewer.set_manual_format(Some(DataFormat::Text), window, cx);
+                viewer.draft = "edited".into();
+                assert!(viewer.dirty());
+                viewer.discard(cx);
+                assert!(!viewer.dirty());
+                viewer.set_content(
+                    ViewerSpec {
+                        text: "<root/>".into(),
+                        column_hint: Some("field".into()),
+                        type_hint: Some("text".into()),
+                        bytes: None,
+                        truncation: TruncationState::Full,
+                        mode: EditMode::ReadOnly,
+                        locale: Locale::ZhCn,
+                    },
+                    window,
+                    cx,
+                );
+                viewer.set_title(Some("field".into()), cx);
+                assert_eq!(viewer.source(), "<root/>");
+                assert_eq!(viewer.format(), DataFormat::Xml, "手动格式随新内容重置，按新值识别");
+                assert!(!viewer.edits_enabled(), "只读模式跟着新内容");
+                assert_eq!(viewer.title().map(|t| t.as_ref()), Some("field"));
+                viewer.set_truncation(TruncationState::Loading, cx);
+                assert!(!viewer.edits_enabled());
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 
     #[test]

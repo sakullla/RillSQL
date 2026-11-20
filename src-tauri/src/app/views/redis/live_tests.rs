@@ -24,10 +24,11 @@ fn rendered_controls_refuse_keys_and_keep_unconfirmed_input(cx: &mut TestAppCont
         assert_eq!(window.find("redis-refresh").label(), Some("刷新"));
         assert_eq!(window.find("redis-more").label(), Some("继续扫描"));
         assert_eq!(window.find("redis-ttl").label(), Some("设置 TTL"));
-        assert_eq!(window.find("redis-rename").label(), Some("重命名"));
         assert_eq!(window.find("redis-delete").label(), Some("删除"));
         assert_eq!(window.find("redis-exec").label(), Some("执行"));
-        assert_eq!(window.find("redis-copy").label(), Some("复制键值"));
+        // 重命名、复制值是次要操作，收在「更多」里。
+        assert_eq!(window.find("redis-more-actions").label(), Some("更多操作"));
+        assert!(window.try_find("redis-rename").is_none() && window.try_find("redis-copy").is_none());
         window.click("redis-pattern", cx);
         window.input("ab", cx);
         window.click("redis-command", cx);

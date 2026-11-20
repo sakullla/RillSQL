@@ -310,6 +310,10 @@ type TrackKey = (u64, usize, (usize, usize), usize, bool);
 
 pub struct SqlEditor {
     state: Entity<EditorState>,
+    /// 连接 Redis 时按 Redis 命令高亮；否则按 SQL。
+    redis: bool,
+    /// 已经装上带 Redis 分支的高亮工厂（第一次切到 Redis 时安装，之后一直沿用）。
+    redis_factory: bool,
     version: Rc<Cell<u64>>,
     extra: Rc<RefCell<Vec<(String, String)>>>,
     scope: Rc<RefCell<Option<CompletionScope>>>,
@@ -561,6 +565,8 @@ impl SqlEditor {
         });
         Self {
             state,
+            redis: false,
+            redis_factory: false,
             version,
             extra,
             scope,
@@ -594,6 +600,32 @@ impl SqlEditor {
             _dismiss_signature: dismiss_signature,
             _track: track,
         }
+    }
+
+    /// 按连接类型切换高亮语言：Redis 用命令词法高亮，其余回到 SQL。从未连过 Redis 的编辑器不动组件库的默认高亮。
+    pub fn set_redis(&mut self, redis: bool, cx: &mut Context<Self>) {
+        if self.redis == redis {
+            return;
+        }
+        self.redis = redis;
+        let install = redis && !self.redis_factory;
+        self.redis_factory |= install;
+        self.state.update(cx, |state, cx| {
+            if install {
+                state.set_highlighter_factory(super::redis_highlight::highlighter_factory(), cx);
+            }
+            state.set_highlighter(if redis { super::redis_highlight::REDIS_LANGUAGE } else { "sql" }, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn is_redis(&self) -> bool {
+        self.redis
+    }
+
+    /// 编辑器当前的高亮语言名（测试用）。
+    pub fn language(&self, cx: &App) -> SharedString {
+        self.state.read(cx).language_name()
     }
 
     fn engine(&self) -> String {
@@ -2024,6 +2056,31 @@ mod tests {
             .expect("editor window");
             (window, editor)
         })
+    }
+
+    /// R12：连接 Redis 时查询编辑器装上 Redis 高亮（语言名 redis），换回 SQL 连接时回到 sql；
+    /// 从没连过 Redis 的编辑器不动组件库默认的高亮工厂。
+    #[gpui_kit::test]
+    fn redis_targets_switch_the_editor_to_redis_highlighting(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| {
+                assert!(!editor.is_redis());
+                assert_eq!(editor.language(cx).as_ref(), "sql");
+                editor.set_sql("HGETALL user:1", window, cx);
+                editor.set_redis(true, cx);
+                assert!(editor.is_redis() && editor.redis_factory);
+                assert_eq!(editor.language(cx).as_ref(), super::super::redis_highlight::REDIS_LANGUAGE);
+            });
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| {
+                editor.set_redis(false, cx);
+                assert_eq!(editor.language(cx).as_ref(), "sql", "换回 SQL 连接");
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

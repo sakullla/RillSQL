@@ -95,6 +95,12 @@ impl RedisPane {
                 self.confirm_prompt = i18n::fill(&self.text("redis.confirm.pending"), &[("command", &format!("CLIENT KILL ID {}", client.id))]);
                 self.confirm = Some(Confirm::ClientKill { node: client.node.clone(), id: client.id.clone(), addr: client.addr.clone() });
             }
+        } else if let Some(name) = id.strip_prefix("redis-info-section:") {
+            if !self.info_collapsed.remove(name) {
+                self.info_collapsed.insert(name.to_owned());
+            }
+        } else if id == "redis-client-kill-none" {
+            self.diag.error = self.text("redis.clients.pickFirst");
         } else if id == "redis-big-start" {
             self.start_big_keys(cx);
         } else if id == "redis-big-cancel" {
@@ -624,6 +630,87 @@ impl RedisPane {
         items.push(ContextItem { id: format!("redis-tpl-delete:{template}"), icon: IconName::Trash, label: self.text("redis.tpl.batchDelete"), danger: true });
         self.context_menu = Some(ContextMenuState { at, items });
         cx.notify();
+    }
+
+    // ------------------------------------------------------------------ 写回核对
+
+    /// 应用修改前先读一次服务端当前值，与读取时的值比较指纹：一致才进确认框，不一致提示刷新（不写）。
+    pub(super) fn guarded_stage(&mut self, mutation: RedisMutation, probe: keys::ValueProbe, original: String, cx: &mut Context<Self>) {
+        if self.selected.is_empty() {
+            self.show_error(self.text("redis.tab.needKey"));
+            return;
+        }
+        if self.reading && self.detail_key != self.selected {
+            self.show_error(self.text("redis.value.reading"));
+            return;
+        }
+        if let Err(message) = keys::prepare_mutation(&mutation, true) {
+            self.show_error(message);
+            return;
+        }
+        let expected = keys::value_fingerprint(Some(&original));
+        self.guard_generation = self.guard_generation.wrapping_add(1);
+        let generation = self.guard_generation;
+        self.stale_value = false;
+        self.note = self.text("redis.value.checking");
+        let connections = Arc::clone(&self.services.connections);
+        let connection_id = self.connection_id.clone();
+        self.run_bg(
+            cx,
+            async move { crate::application::redis::probe_value(connections.as_ref(), &connection_id, probe).await },
+            move |pane, result, _| {
+                if pane.guard_generation == generation {
+                    pane.finish_guard(mutation, expected, result);
+                }
+            },
+        );
+    }
+
+    /// 核对结果：值没变 → 进确认框；变了 → 提示刷新，不进确认；读失败 → 报错。
+    pub(super) fn finish_guard(&mut self, mutation: RedisMutation, expected: u64, result: Result<Option<String>, String>) {
+        match result {
+            Ok(current) if keys::value_fingerprint(current.as_deref()) == expected => {
+                self.note.clear();
+                self.stage_if_key(mutation);
+            }
+            Ok(_) => {
+                self.stale_value = true;
+                self.show_error(self.text("redis.value.stale"));
+            }
+            Err(message) => self.show_error(message),
+        }
+    }
+
+    /// 大字符串「加载全部」：GET 整个值，到达后换掉预览（查看器解除只读）。
+    pub(super) fn load_full_string(&mut self, cx: &mut Context<Self>) {
+        let key = self.selected.clone();
+        if key.is_empty() {
+            return;
+        }
+        let connections = Arc::clone(&self.services.connections);
+        let connection_id = self.connection_id.clone();
+        self.run_bg(
+            cx,
+            async move { crate::application::redis::read_full_string(connections.as_ref(), &connection_id, key.clone()).await.map(|text| (key, text)) },
+            |pane, result: Result<(String, String), String>, cx| match result {
+                Ok((key, text)) if key == pane.selected && pane.detail_key == key => {
+                    if let Some(detail) = pane.detail.as_deref() {
+                        let mut next = detail.clone();
+                        next.total = Some(text.len() as u64);
+                        next.value = RedisValue::String { text };
+                        pane.detail = Some(Arc::new(next));
+                        pane.reload_viewer = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(message) => {
+                    if let Some(viewer) = pane.string_viewer.clone() {
+                        viewer.update(cx, |viewer, cx| viewer.set_truncation(crate::ui::TruncationState::Error(message.clone()), cx));
+                    }
+                    pane.show_error_from(ErrorSource::Detail, message);
+                }
+            },
+        );
     }
 
     // ------------------------------------------------------------------ 值分页与集群

@@ -5,6 +5,7 @@ mod grid_proto;
 pub mod kit;
 pub mod picker;
 pub mod read_table;
+pub mod redis_highlight;
 mod scroll_area;
 pub mod spinner_view;
 pub mod tabs;

@@ -215,7 +215,26 @@ pub async fn scan_keys(
     })
 }
 
-/// 读取单个键的类型、TTL、总数与第一页值。
+/// 字符串超过这个字节数时先读前缀预览（GETRANGE），「加载全部」再 GET 整个值。
+pub const STRING_PREVIEW_BYTES: u64 = 1024 * 1024;
+
+/// 读字符串的命令（纯函数）：长度未知或不超过预览上限时 GET，否则 GETRANGE 取前 1 MiB。
+pub fn string_read_command(key: &str, strlen: Option<u64>) -> Vec<String> {
+    match strlen {
+        Some(len) if len > STRING_PREVIEW_BYTES => vec!["GETRANGE".into(), key.into(), "0".into(), (STRING_PREVIEW_BYTES - 1).to_string()],
+        _ => vec!["GET".into(), key.into()],
+    }
+}
+
+/// 字符串只读了前缀预览：总字节数大于已读内容。
+pub fn string_is_preview(detail: &RedisKeyDetail) -> bool {
+    match (&detail.value, detail.total) {
+        (RedisValue::String { text }, Some(total)) => total > STRING_PREVIEW_BYTES && (text.len() as u64) < total,
+        _ => false,
+    }
+}
+
+/// 读取单个键的类型、TTL、总数与第一页值。大字符串只读前 1 MiB（`total` 仍是 STRLEN）。
 pub async fn read_key(conn: &mut super::conn::RedisConn, key: &str) -> Result<RedisKeyDetail, redis::RedisError> {
     let key_type: String = redis::cmd("TYPE").arg(key).query_async(conn).await?;
     let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(conn).await?;
@@ -223,8 +242,64 @@ pub async fn read_key(conn: &mut super::conn::RedisConn, key: &str) -> Result<Re
         Some(word) => redis::cmd(word).arg(key).query_async::<Option<u64>>(conn).await.ok().flatten(),
         None => None,
     };
+    if key_type == "string" && total.is_some_and(|len| len > STRING_PREVIEW_BYTES) {
+        let words = string_read_command(key, total);
+        let mut cmd = redis::cmd(words[0].as_str());
+        for arg in &words[1..] {
+            cmd.arg(arg);
+        }
+        let raw: redis::Value = cmd.query_async(conn).await?;
+        return Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: RedisValue::String { text: bulk_text(raw) }, total, next: None });
+    }
     let page = read_page(conn, key, &key_type, None, VALUE_PAGE_SIZE).await?;
     Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: page.value, total, next: page.next })
+}
+
+/// 写回前核对的那一个值：整个字符串 / JSON 文档、Hash 的一个字段、List 的一个下标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueProbe {
+    String { key: String },
+    Json { key: String },
+    HashField { key: String, field: String },
+    ListIndex { key: String, index: i64 },
+}
+
+/// 读当前值的命令（纯函数，只读）。
+pub fn probe_command(probe: &ValueProbe) -> Vec<String> {
+    match probe {
+        ValueProbe::String { key } => vec!["GET".into(), key.clone()],
+        ValueProbe::Json { key } => vec!["JSON.GET".into(), key.clone()],
+        ValueProbe::HashField { key, field } => vec!["HGET".into(), key.clone(), field.clone()],
+        ValueProbe::ListIndex { key, index } => vec!["LINDEX".into(), key.clone(), index.to_string()],
+    }
+}
+
+/// 值的指纹：读取时记下，写回前与服务端当前值比较。None 表示值不存在（字段被删、下标越界）。
+pub fn value_fingerprint(value: Option<&str>) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 读当前值；不存在时为 None。
+pub async fn probe_value(conn: &mut super::conn::RedisConn, probe: &ValueProbe) -> Result<Option<String>, redis::RedisError> {
+    let words = probe_command(probe);
+    let mut cmd = redis::cmd(words[0].as_str());
+    for arg in &words[1..] {
+        cmd.arg(arg);
+    }
+    let raw: redis::Value = cmd.query_async(conn).await?;
+    Ok(match raw {
+        redis::Value::Nil => None,
+        other => Some(bulk_text(other)),
+    })
+}
+
+/// 整个字符串（「加载全部」）。
+pub async fn read_full_string(conn: &mut super::conn::RedisConn, key: &str) -> Result<String, redis::RedisError> {
+    let raw: redis::Value = redis::cmd("GET").arg(key).query_async(conn).await?;
+    Ok(bulk_text(raw))
 }
 
 /// 读一页值。`token` 为上一页给出的 next。

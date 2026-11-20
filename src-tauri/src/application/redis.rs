@@ -270,6 +270,16 @@ pub async fn scan_keyspace(
     scan::scan_keyspace(targets, resume, options, cancel, send).await;
 }
 
+/// 读当前值（写回前核对是否被别人改过）。
+pub async fn probe_value(service: &Service, connection_id: &str, probe: keys::ValueProbe) -> Result<Option<String>, String> {
+    with_redis(service, connection_id, move |mut conn, _| async move { keys::probe_value(&mut conn, &probe).await }).await
+}
+
+/// 大字符串「加载全部」：GET 整个值。
+pub async fn read_full_string(service: &Service, connection_id: &str, key: String) -> Result<String, String> {
+    with_redis(service, connection_id, move |mut conn, _| async move { keys::read_full_string(&mut conn, &key).await }).await
+}
+
 /// 读下一页值。
 pub async fn read_page(service: &Service, connection_id: &str, key: String, key_type: String, token: Option<String>) -> Result<ValuePage, String> {
     with_redis(service, connection_id, move |mut conn, _| async move {

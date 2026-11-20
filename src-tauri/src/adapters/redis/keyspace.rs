@@ -26,6 +26,10 @@ pub struct TemplateRule {
     pub variable: bool,
 }
 
+/// 值区条目表宽度的保存范围（像素）。
+pub const VALUE_SPLIT_MIN: u32 = 200;
+pub const VALUE_SPLIT_MAX: u32 = 1600;
+
 /// 按连接保存的键空间偏好。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +39,8 @@ pub struct KeyspacePrefs {
     pub scan_count: usize,
     pub scan_cap: usize,
     pub memory_samples: usize,
+    /// 值区左栏（条目表）的宽度，像素；0 表示按默认比例。分隔条拖动后保存。
+    pub value_split: u32,
 }
 
 impl Default for KeyspacePrefs {
@@ -45,6 +51,7 @@ impl Default for KeyspacePrefs {
             scan_count: DEFAULT_SCAN_COUNT,
             scan_cap: DEFAULT_SCAN_CAP,
             memory_samples: DEFAULT_MEMORY_SAMPLES,
+            value_split: 0,
         }
     }
 }
@@ -73,6 +80,9 @@ impl KeyspacePrefs {
         self.scan_count = self.scan_count.clamp(10, 10_000);
         self.scan_cap = self.scan_cap.clamp(1_000, 5_000_000);
         self.memory_samples = self.memory_samples.clamp(1, 500);
+        if self.value_split != 0 {
+            self.value_split = self.value_split.clamp(VALUE_SPLIT_MIN, VALUE_SPLIT_MAX);
+        }
     }
 
     /// 分隔符输入框的文本：空格分开（`:` 与 `|` → `: |`）。

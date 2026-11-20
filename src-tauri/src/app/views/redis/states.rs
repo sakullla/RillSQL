@@ -210,13 +210,14 @@ fn key_list_states_render_with_a_next_step(cx: &mut gpui_kit::TestAppContext) {
         pane.plant_key("user:1");
         pane.busy = true;
     });
-    let (inline, row) = cx
+    let (inline, row, footer) = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            (window.try_find("inline-loading").is_some(), window.find("redis-select:0").visible())
+            (window.try_find("inline-loading").is_some(), window.find("redis-select:0").visible(), window.try_find("redis-scan-progress").is_some())
         })
         .unwrap();
-    assert!(inline, "读下一页时用一行增量指示");
+    assert!(!inline, "读取中列表里不再插加载行，已读到的键不被推着下移");
+    assert!(footer, "读取进度留在页脚");
     assert!(row, "增量读取不能盖住已读到的键");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -415,7 +416,8 @@ fn redis_pane_holds_both_themes_both_densities_and_three_widths(cx: &mut gpui_ki
                 if narrow {
                     assert!(value, "{theme} {width}: 窄窗口选中键后值区域要占满整列");
                 } else {
-                    let expected = metrics.tree_row_h + 2.;
+                    // 键行高与资源管理器的树行一致。
+                    let expected = metrics.tree_row_h;
                     let row_h = row_h.expect("宽窗口要有关键行");
                     assert!((row_h - expected).abs() < 0.5, "{theme} 行高 {row_h} 应为 {expected}");
                 }

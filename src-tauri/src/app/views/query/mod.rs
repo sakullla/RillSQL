@@ -2744,10 +2744,16 @@ impl QueryPane {
             self.completion_stamp = Some(stamp);
             let locale = self.locale;
             let link_target = self.desk.target().map(|target| (target.connection_id, target.database));
-            editor.update(cx, |editor, _| {
+            // 连接 Redis 时按 Redis 命令高亮，其余按 SQL。
+            let redis = self
+                .desk
+                .target()
+                .is_some_and(|target| crate::adapters::query::workbench_named(&target.engine) == Some(crate::adapters::Workbench::Redis));
+            editor.update(cx, |editor, cx| {
                 editor.set_locale(locale);
                 if let Some(scope) = scope { editor.set_completion_scope(scope); }
                 editor.set_link_target(link_target);
+                editor.set_redis(redis, cx);
             });
         }
         if let Some(sql) = self.pending_text.take() {

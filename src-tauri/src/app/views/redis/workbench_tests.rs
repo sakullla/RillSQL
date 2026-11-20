@@ -416,6 +416,15 @@ fn diagnostic_pages_sort_slowlog_and_confirm_resets_and_kills(cx: &mut gpui_kit:
             pane.command("redis-page:clients", cx);
         })
     });
+    // 客户端表：先在表里选中一行，工具条的「断开」才作用到它。
+    let disabled = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("redis-client-kill-none").is_some()
+        })
+        .unwrap();
+    assert!(disabled, "没选中客户端时断开按钮不可用");
+    cx.update(|cx| view.update(cx, |pane, cx| pane.select_table_row("clients", 0, cx)));
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window.click("redis-client-kill:0", cx);

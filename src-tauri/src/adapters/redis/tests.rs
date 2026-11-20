@@ -497,3 +497,20 @@ fn cluster_setup_failure_falls_back_to_the_seed_node() {
     assert!(matches!(settle_cluster::<()>(true, true, None), ClusterSettle::Fallback(ClusterFallback::Tunnel)));
     assert!(matches!(settle_cluster::<()>(false, false, None), ClusterSettle::Single));
 }
+
+#[test]
+fn large_strings_read_a_prefix_and_writes_probe_the_current_value() {
+    use super::keys::{probe_command, string_is_preview, string_read_command, value_fingerprint, RedisKeyDetail, ValueProbe, STRING_PREVIEW_BYTES};
+    assert_eq!(string_read_command("k", None), vec!["GET", "k"]);
+    assert_eq!(string_read_command("k", Some(STRING_PREVIEW_BYTES)), vec!["GET", "k"], "正好 1 MiB 仍整段读");
+    assert_eq!(string_read_command("k", Some(STRING_PREVIEW_BYTES + 1)), vec!["GETRANGE", "k", "0", "1048575"]);
+    let detail = |text: &str, total: u64| RedisKeyDetail { key_type: "string".into(), ttl_ms: None, value: RedisValue::String { text: text.into() }, total: Some(total), next: None };
+    assert!(string_is_preview(&detail("abc", STRING_PREVIEW_BYTES * 2)));
+    assert!(!string_is_preview(&detail("abc", 3)));
+    assert_eq!(probe_command(&ValueProbe::Json { key: "j".into() }), vec!["JSON.GET", "j"]);
+    for probe in [ValueProbe::String { key: "a".into() }, ValueProbe::HashField { key: "h".into(), field: "f".into() }, ValueProbe::ListIndex { key: "l".into(), index: -1 }] {
+        assert!(!probe_command(&probe).iter().any(|word| word.eq_ignore_ascii_case("KEYS")), "核对只读一个值");
+    }
+    assert_eq!(value_fingerprint(Some("x")), value_fingerprint(Some("x")));
+    assert_ne!(value_fingerprint(Some("x")), value_fingerprint(Some("y")));
+}
