@@ -155,9 +155,13 @@ fn mysql_column(row: &mysql_async::Row, at: usize) -> Column {
         name: mysql_string(row, at),
         type_name: mysql_string(row, at + 1),
         nullable: mysql_string(row, at + 2).eq_ignore_ascii_case("YES"),
+        // SQL NULL 是无默认值；空串是 DEFAULT ''。表达式、含引号文本规整见 reported_default。
         default_sql: {
-            let value = mysql_string(row, at + 3);
-            if value.is_empty() { None } else { Some(value) }
+            let raw = match row.as_ref(at + 3) {
+                None | Some(mysql_async::Value::NULL) => None,
+                Some(_) => Some(mysql_string(row, at + 3)),
+            };
+            super::types::reported_default(raw.as_deref(), &extra)
         },
         primary: false,
         auto: extra.contains("auto_increment"),

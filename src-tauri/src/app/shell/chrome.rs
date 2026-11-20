@@ -314,7 +314,7 @@ impl Workbench {
             covered = true;
             root = root.child(self.password_layer(window, cx));
         }
-        cx.set_global(crate::ui::ShellOverlayOpen(covered));
+        crate::ui::ShellOverlayOpen::set(window, covered, cx);
         root.into_any_element()
     }
 

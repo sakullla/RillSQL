@@ -15,8 +15,9 @@ impl TypeRules for MysqlTypes {
     }
 
     /// `CURRENT_TIMESTAMP(n)`（0–6 位小数秒，配 datetime(n)/timestamp(n)）与带括号的 `(CURRENT_DATE)`。
+    /// 读回时 MySQL 8 把 `(CURRENT_DATE)` 报成 `curdate()`，结构快照包成 `(curdate())`，同样接受。
     fn extra_default(&self, _text: &str, upper: &str) -> bool {
-        current_timestamp_fsp(upper).is_some() || upper == "(CURRENT_DATE)"
+        current_timestamp_fsp(upper).is_some() || upper == "(CURRENT_DATE)" || upper == "(CURDATE())"
     }
 
     /// MySQL 8 不接受裸写的 CURRENT_DATE / CURRENT_TIME（要写成带括号的表达式）；
@@ -114,6 +115,55 @@ impl TypeRules for MysqlTypes {
     }
 }
 
+/// information_schema.columns 的 COLUMN_DEFAULT（`raw`，SQL NULL 为 None）与 EXTRA → 结构快照里的默认值写法，
+/// 让对比与转储拼出的 `DEFAULT ...` 在 MySQL 8 与 MariaDB 上都能执行：
+/// - EXTRA 标 DEFAULT_GENERATED 的是 MySQL 8 表达式默认值，读回不带括号（`(CURRENT_DATE)` 读回 `curdate()`），
+///   除当前时间写法外补上外层括号；
+/// - 非 NULL 的空串是 `DEFAULT ''`，写成 `''`（不再与“无默认值”混同）；
+/// - 含单引号却不以引号开头、也不像函数调用或 `b'…'`/`x'…'` 的，是 MySQL 不带引号的文本字面量，补引号并翻倍内部引号。
+///
+/// 其余（MariaDB 已带引号的字面量、数字、NULL、当前时间、无标记的旧版写法）原样保留，交给方言的 parse_default。
+pub(in crate::adapters) fn reported_default(raw: Option<&str>, extra: &str) -> Option<String> {
+    let raw = raw?;
+    let text = raw.trim();
+    if extra.to_ascii_uppercase().contains("DEFAULT_GENERATED") && !text.is_empty() {
+        let upper = text.to_ascii_uppercase();
+        if current_timestamp_fsp(&upper).is_some() || wrapped_in_parens(text) {
+            return Some(text.to_owned());
+        }
+        return Some(format!("({text})"));
+    }
+    if raw.is_empty() {
+        return Some("''".to_owned());
+    }
+    let bit_or_hex = text.len() >= 2 && text.as_bytes()[1] == b'\'' && matches!(text.as_bytes()[0], b'b' | b'B' | b'x' | b'X');
+    if raw.contains('\'') && !text.starts_with('\'') && !text.contains('(') && !bit_or_hex {
+        return Some(crate::adapters::ddl::quote_text(raw));
+    }
+    Some(raw.to_owned())
+}
+
+/// 整段被一对外层括号包住（第一个左括号的配对右括号就是最后一个字符）。
+fn wrapped_in_parens(text: &str) -> bool {
+    if !text.starts_with('(') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (at, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1 == text.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `CURRENT_TIMESTAMP`、`CURRENT_TIMESTAMP()`、`CURRENT_TIMESTAMP(n)`（n 为 0–6）的小数秒位数；其他写法为 None。
 /// 带外层括号的 `(CURRENT_TIMESTAMP)` 是表达式默认值，不在此列。
 fn current_timestamp_fsp(upper: &str) -> Option<u8> {
@@ -193,6 +243,51 @@ mod default_expression_tests {
                 assert_ne!(*choice, "CURRENT_DATE", "{engine}: 裸写 CURRENT_DATE 会被 MySQL 8 拒绝");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reported_default_tests {
+    use super::reported_default;
+    use crate::adapters::ddl::types_named;
+    use crate::ddl::model::{DefaultSpec, Engine};
+    use crate::ddl::sql::{existing_default, existing_default_sql};
+
+    /// 读回的默认值经快照规整后，对比/转储拼出的 DEFAULT 子句都是 MySQL 8 能执行的写法。
+    #[test]
+    fn reported_defaults_become_executable_default_clauses() {
+        let clause = |raw: Option<&str>, extra: &str, type_name: &str| {
+            let snapshot = reported_default(raw, extra);
+            existing_default_sql(Engine::Mysql, type_name, snapshot.as_deref().unwrap_or_default())
+        };
+        // 表达式默认值：MySQL 8 读回不带括号，补括号；当前时间写法保持原样。
+        assert_eq!(clause(Some("curdate()"), "DEFAULT_GENERATED", "date"), "(curdate())");
+        assert_eq!(clause(Some("(rand() * 10)"), "DEFAULT_GENERATED", "double"), "(rand() * 10)");
+        assert_eq!(clause(Some("(1) + (2)"), "DEFAULT_GENERATED", "int"), "((1) + (2))");
+        assert_eq!(clause(Some("CURRENT_TIMESTAMP"), "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", "datetime"), "CURRENT_TIMESTAMP");
+        assert_eq!(clause(Some("CURRENT_TIMESTAMP(3)"), "DEFAULT_GENERATED", "datetime(3)"), "CURRENT_TIMESTAMP(3)");
+        // 空串默认值不再塌缩为“无默认值”；SQL NULL 才是无默认值。
+        assert_eq!(clause(Some(""), "", "varchar(10)"), "''");
+        assert_eq!(reported_default(None, ""), None);
+        // 含单引号的文本字面量补引号并翻倍。
+        assert_eq!(clause(Some("it's"), "", "varchar(10)"), "'it''s'");
+        // 不带引号的普通文本字面量、数字、MariaDB 已带引号的字面量与表达式维持原有处理。
+        assert_eq!(clause(Some("new"), "", "varchar(10)"), "'new'");
+        assert_eq!(clause(Some("0"), "", "int"), "0");
+        assert_eq!(clause(Some("'it''s'"), "", "varchar(10)"), "'it''s'");
+        assert_eq!(clause(Some("curdate()"), "", "date"), "curdate()");
+        assert_eq!(clause(Some("b'101'"), "", "bit(3)"), "b'101'");
+    }
+
+    /// 结构页读到的四态与规整一致：空串是空字面量，含引号文本是字面量，补括号的 curdate() 仍是可接受的表达式。
+    #[test]
+    fn reported_defaults_parse_into_the_structure_states() {
+        let parse = |raw: Option<&str>, extra: &str| existing_default(Engine::Mysql, reported_default(raw, extra).as_deref());
+        assert_eq!(parse(Some(""), ""), DefaultSpec::Literal(String::new()));
+        assert_eq!(parse(Some("it's"), ""), DefaultSpec::Literal("it's".to_owned()));
+        assert_eq!(parse(None, ""), DefaultSpec::None);
+        assert_eq!(parse(Some("curdate()"), "DEFAULT_GENERATED"), DefaultSpec::Expression("(curdate())".to_owned()));
+        assert!(types_named("mysql").extra_default("(curdate())", "(CURDATE())"));
     }
 }
 

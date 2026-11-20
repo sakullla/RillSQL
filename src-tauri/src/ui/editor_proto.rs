@@ -1163,13 +1163,37 @@ type Placer = Box<dyn Fn(&EditorState, gpui_kit::Size<Pixels>) -> Option<gpui_ki
 
 /// 外壳此刻有没有盖在工作区上的浮层（模态、命令面板、右键菜单……）。浮层是普通层，
 /// 编辑器的 [`Floating`] 是 deferred 绘制、会画在它们上面，所以有浮层时这一帧不画。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ShellOverlayOpen(pub bool);
+/// 按窗口记录：一个工作台窗口的浮层只影响该窗口里的编辑器，不会藏掉其他窗口的错误标记。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShellOverlayOpen {
+    covered: std::collections::HashSet<gpui::WindowId>,
+}
 
 impl gpui_kit::Global for ShellOverlayOpen {}
 
-fn shell_overlay_open(cx: &App) -> bool {
-    cx.try_global::<ShellOverlayOpen>().is_some_and(|open| open.0)
+impl ShellOverlayOpen {
+    /// 外壳每帧报告当前窗口是否有盖在工作区上的浮层。状态未变时不写全局，避免无谓的观察者通知。
+    pub fn set(window: &Window, covered: bool, cx: &mut App) {
+        let id = window.window_handle().window_id();
+        if cx.try_global::<Self>().is_some_and(|state| state.covered.contains(&id) == covered) {
+            return;
+        }
+        let state = cx.default_global::<Self>();
+        if covered {
+            state.covered.insert(id);
+        } else {
+            state.covered.remove(&id);
+        }
+    }
+
+    fn is_covered(window: &Window, cx: &App) -> bool {
+        let id = window.window_handle().window_id();
+        cx.try_global::<Self>().is_some_and(|state| state.covered.contains(&id))
+    }
+}
+
+fn shell_overlay_open(window: &Window, cx: &App) -> bool {
+    ShellOverlayOpen::is_covered(window, cx)
 }
 
 struct Floating {
@@ -1227,7 +1251,7 @@ impl Element for Floating {
         let Some(child) = self.child.as_mut() else {
             return false;
         };
-        if shell_overlay_open(cx) {
+        if shell_overlay_open(window, cx) {
             return false;
         }
         let size = child.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -2704,14 +2728,46 @@ select 1;";
             editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
             window.render_frame(cx);
             assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some(), "没有浮层时画出行尾标记");
-            cx.set_global(ShellOverlayOpen(true));
+            ShellOverlayOpen::set(window, true, cx);
             editor.update(cx, |_, cx| cx.notify());
             window.render_frame(cx);
             assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_none(), "浮层打开时标记不能压在上面");
-            cx.set_global(ShellOverlayOpen(false));
+            ShellOverlayOpen::set(window, false, cx);
             editor.update(cx, |_, cx| cx.notify());
             window.render_frame(cx);
             assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some());
+        })
+        .unwrap();
+    }
+
+    /// 浮层状态按窗口记录：一个窗口打开快捷键面板时，另一个窗口的行尾错误标记照常显示。
+    #[gpui_kit::test]
+    fn a_shell_overlay_hides_error_lenses_only_in_its_own_window(cx: &mut TestAppContext) {
+        let (first, first_editor) = open(cx);
+        let (second, second_editor) = open(cx);
+        let sql = "select * from missing_table;";
+        let error = ExecError { range: 14..27, statement: Some(0..28), code: Some("42P01".to_owned()), message: "relation \"missing_table\" does not exist".to_owned() };
+        for (window, editor) in [(first, &first_editor), (second, &second_editor)] {
+            cx.update_window(window, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.set_sql(sql, window, cx));
+                window.render_frame(cx);
+                editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
+                window.render_frame(cx);
+                assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some());
+            })
+            .unwrap();
+        }
+        cx.update_window(second, |_, window, cx| {
+            ShellOverlayOpen::set(window, true, cx);
+            second_editor.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_none(), "有浮层的窗口不画标记");
+        })
+        .unwrap();
+        cx.update_window(first, |_, window, cx| {
+            first_editor.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some(), "另一个窗口的浮层不能藏掉这里的标记");
         })
         .unwrap();
     }

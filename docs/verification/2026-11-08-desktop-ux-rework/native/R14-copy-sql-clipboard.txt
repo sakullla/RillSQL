@@ -1,0 +1,4 @@
+-- orders report
+SELECT id, title FROM shop.tickets WHERE status = 'open';
+SELECT * FROM shop.missing_table WHERE id = 1;
+SELECT count(*) FROM shop.wide_metrics;
