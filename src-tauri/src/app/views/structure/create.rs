@@ -317,6 +317,13 @@ impl StructurePane {
         };
         if *slot != value {
             *slot = value;
+            // 换了字符集：不适用于新字符集的排序规则清回默认。
+            if field == "charset" {
+                let spec = ddl_named(&self.session.target.engine).map(|dialect| dialect.table_option_spec()).unwrap_or_default();
+                if spec.collation_problem(&options.charset, &options.collation).is_some() {
+                    options.collation.clear();
+                }
+            }
             self.session.cancel();
         }
     }
@@ -381,7 +388,7 @@ impl StructurePane {
         for (field, key, choices, current) in [
             ("engine", "structure.options.engine", spec.engines, options.engine.clone()),
             ("charset", "structure.options.charset", spec.charsets, options.charset.clone()),
-            ("collation", "structure.options.collation", spec.collations, options.collation.clone()),
+            ("collation", "structure.options.collation", spec.collations_for(&options.charset), options.collation.clone()),
         ] {
             if choices.is_empty() {
                 continue;

@@ -1049,7 +1049,7 @@ dict! {
     "ui.help.explorer" => "对象树", "Explorer";
     "ui.help.keyspace" => "Redis 工作台", "Redis workbench";
     "ui.help.all" => "全部", "All";
-    "ui.help.search" => "搜索动作或按键，如“注释”或 ⌘/", "Search actions or keys, e.g. “comment” or Ctrl+/";
+    "ui.help.search" => "搜索动作或按键，如“注释”或 {chord}", "Search actions or keys, e.g. “comment” or {chord}";
     "ui.help.noMatch" => "没有匹配的快捷键，换个动作名或按键试试", "No matching shortcuts — try another action name or key";
     "ui.help.groups" => "快捷键分组", "Shortcut groups";
     "shell.command.openFile" => "打开文件…", "Open file…";

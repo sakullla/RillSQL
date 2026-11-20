@@ -6,7 +6,7 @@ pub mod kit;
 mod scroll_area;
 pub mod tabs;
 
-pub use editor_proto::{ExecError, ObjectHandler, ObjectLink, SqlEditor};
+pub use editor_proto::{ExecError, ObjectHandler, ObjectLink, ShellOverlayOpen, SqlEditor};
 #[allow(unused_imports)] // 后续任务的公开入口，本任务内尚无调用方。
 pub use format_viewer::{
     apply_block, commit_draft, copy_node_value, detect_format, editing_locked, editor_language, effective_format, format_key, format_sql,

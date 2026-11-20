@@ -3,6 +3,8 @@
 
 /// (中文句型, 英文句型)。同一前缀里更具体的句型排在前面。
 pub(in crate::adapters) const MESSAGES_EN: &[(&str, &str)] = &[
+    ("MySQL 要写成带括号的表达式 ({})。", "MySQL needs this written as a parenthesized expression ({0})."),
+    ("列类型 {} 的当前时间默认值要写 {}（小数秒位数必须一致）。", "The current-time default for column type {0} must be written {1} (the fractional-second precision must match)."),
     (
         "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。",
         "TRUNCATE TABLE commits immediately and resets AUTO_INCREMENT to its initial value; DELETE triggers don't fire.",

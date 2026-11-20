@@ -264,6 +264,8 @@ pub struct OverviewState {
     pub selected: Option<String>,
     /// 读取代数：刷新后迟到的旧结果丢弃。
     pub generation: u64,
+    /// 失败来自按需连接（不是统计读取）：连接之后从别处连上（密码框、对象树）时自动重读。
+    pub connect_failed: bool,
 }
 
 impl OverviewState {
@@ -278,6 +280,7 @@ impl OverviewState {
             descending: false,
             selected: None,
             generation: 0,
+            connect_failed: false,
         }
     }
 
@@ -319,6 +322,7 @@ impl OverviewState {
     pub fn reload(&mut self) {
         self.generation += 1;
         self.load = OverviewLoad::Pending;
+        self.connect_failed = false;
     }
 
     /// 点击列头：同一列切换升降序；换列时数字列先从大到小、文本列先从 A 到 Z。

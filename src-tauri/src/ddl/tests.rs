@@ -2156,3 +2156,65 @@ fn column_templates_are_editable_ordered_engine_scoped_and_skip_duplicates() {
     let sql = create_sql(Engine::Mysql, drafts, TableOptions::default()).join("\n");
     assert!(sql.contains("created_user_id bigint") && sql.contains("modified_user_id bigint"), "{sql}");
 }
+
+/// MySQL：datetime(n) 的当前时间默认值要带同样的小数秒位数；排序规则要属于所选字符集。两者都在提交前拦下。
+#[test]
+fn mysql_create_checks_fractional_seconds_and_charset_collation_before_submit() {
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let mut id = new_column("id", "bigint", false, DefaultSpec::None);
+        id.primary = true;
+        let created = new_column("created", "datetime(3)", false, DefaultSpec::Expression("CURRENT_TIMESTAMP(3)".into()));
+        let day = new_column("day", "date", true, DefaultSpec::Expression("(CURRENT_DATE)".into()));
+        let sql = create_sql(engine, vec![id.clone(), created, day], TableOptions::default()).join("\n");
+        assert!(sql.contains("created datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"), "{engine:?}: {sql}");
+        assert!(sql.contains("day date DEFAULT (CURRENT_DATE)"), "{engine:?}: {sql}");
+
+        for (column, needle) in [
+            (new_column("created", "datetime(3)", false, DefaultSpec::Expression("CURRENT_TIMESTAMP".into())), "CURRENT_TIMESTAMP(3)"),
+            (new_column("day", "date", true, DefaultSpec::Expression("CURRENT_DATE".into())), "(CURRENT_DATE)"),
+        ] {
+            let planned = plan(&fresh(engine), &Action::CreateTable { name: "audit".into(), columns: vec![id.clone(), column], options: TableOptions::default() });
+            assert!(planned.steps.is_empty() && planned.blocked.iter().any(|item| item.contains(needle)), "{engine:?}: {:?}", planned.blocked);
+        }
+
+        let mismatched = TableOptions { charset: "latin1".into(), collation: "utf8mb4_bin".into(), ..TableOptions::default() };
+        let planned = plan(&fresh(engine), &Action::CreateTable { name: "audit".into(), columns: vec![id.clone()], options: mismatched });
+        assert!(planned.steps.is_empty() && planned.blocked.iter().any(|item| item.contains("utf8mb4_bin") && item.contains("latin1")), "{engine:?}: {:?}", planned.blocked);
+        let spec = crate::adapters::ddl::ddl_of(engine).expect("mysql family").table_option_spec();
+        for charset in spec.charsets {
+            let collations = spec.collations_for(charset);
+            assert!(!collations.is_empty(), "{engine:?}: {charset}");
+            assert!(collations.iter().all(|collation| spec.collation_problem(charset, collation).is_none()), "{engine:?}: {charset}");
+        }
+        assert_eq!(spec.collations_for(""), spec.collations, "未选字符集时给默认列表");
+    }
+    // 英文界面：新增的阻断原因（含嵌套的方言说明）都有英文。
+    for text in [
+        "字段 created：列类型 datetime(3) 的当前时间默认值要写 CURRENT_TIMESTAMP(3)（小数秒位数必须一致）。",
+        "字段 day：MySQL 要写成带括号的表达式 (CURRENT_DATE)。",
+        "排序规则 utf8mb4_bin 不适用于字符集 latin1。",
+    ] {
+        let english = crate::ddl::english::english(text);
+        assert!(!crate::ddl::english::has_cjk(&english), "{text} -> {english}");
+    }
+}
+
+/// 读入的默认值原文拼回 DEFAULT 子句：MySQL information_schema 报回的文本字面量不带引号，要补上；
+/// 表达式、数字、NULL 与已带引号的写法原样保留（对比与转储的结构脚本都经这里）。
+#[test]
+fn existing_defaults_become_valid_default_clauses() {
+    use crate::ddl::sql::existing_default_sql;
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        assert_eq!(existing_default_sql(engine, "varchar(32)", "new"), "'new'", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "varchar(32)", "'new'"), "'new'", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "datetime(3)", "CURRENT_TIMESTAMP(3)"), "CURRENT_TIMESTAMP(3)", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "datetime", "CURRENT_TIMESTAMP"), "CURRENT_TIMESTAMP", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "date", "(curdate())"), "(curdate())", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "int", "0"), "0", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "int", "NULL"), "NULL", "{engine:?}");
+        assert_eq!(existing_default_sql(engine, "int", ""), "", "{engine:?}");
+    }
+    assert_eq!(existing_default_sql(Engine::Postgres, "character varying", "'new'::character varying"), "'new'::character varying");
+    assert_eq!(existing_default_sql(Engine::Postgres, "integer", "nextval('t_id_seq'::regclass)"), "nextval('t_id_seq'::regclass)");
+    assert_eq!(existing_default_sql(Engine::Sqlite, "TEXT", "'x'"), "'x'");
+}

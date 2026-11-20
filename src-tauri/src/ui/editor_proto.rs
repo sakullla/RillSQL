@@ -1161,6 +1161,17 @@ impl Render for SqlEditor {
 /// 给定浮层尺寸，返回它的左上角（窗口坐标）；None 表示这一帧不显示。
 type Placer = Box<dyn Fn(&EditorState, gpui_kit::Size<Pixels>) -> Option<gpui_kit::Point<Pixels>>>;
 
+/// 外壳此刻有没有盖在工作区上的浮层（模态、命令面板、右键菜单……）。浮层是普通层，
+/// 编辑器的 [`Floating`] 是 deferred 绘制、会画在它们上面，所以有浮层时这一帧不画。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShellOverlayOpen(pub bool);
+
+impl gpui_kit::Global for ShellOverlayOpen {}
+
+fn shell_overlay_open(cx: &App) -> bool {
+    cx.try_global::<ShellOverlayOpen>().is_some_and(|open| open.0)
+}
+
 struct Floating {
     id: ElementId,
     state: Entity<EditorState>,
@@ -1216,6 +1227,9 @@ impl Element for Floating {
         let Some(child) = self.child.as_mut() else {
             return false;
         };
+        if shell_overlay_open(cx) {
+            return false;
+        }
         let size = child.layout_as_root(AvailableSpace::min_size(), window, cx);
         let Some(origin) = (self.place)(self.state.read(cx), size) else {
             return false;
@@ -1389,6 +1403,9 @@ impl SqlEditor {
                 self.lens_open = Some(index);
                 cx.notify();
             }
+            // 标记与弹层遮住了编辑器的鼠标移动：鼠标从波浪线移到这里时，编辑器自己的诊断弹层收不到
+            // “离开”，会和错误弹层同时挂在屏上（原生截图里两个弹层并存）。同一时刻只留一个。
+            self.state.update(cx, |state, cx| state.clear_diagnostic_popover(cx));
             return;
         }
         if *slot == Some(index) {
@@ -1446,6 +1463,9 @@ impl SqlEditor {
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.lens_hover(index, false, *hovered, cx)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.lens_pinned = if this.lens_pinned == Some(index) { None } else { Some(index) };
+                    if this.lens_pinned.is_some() {
+                        this.state.update(cx, |state, cx| state.clear_diagnostic_popover(cx));
+                    }
                     if this.lens_pinned.is_none() && this.lens_open == Some(index) && this.lens_chip_hover != Some(index) {
                         this.lens_open = None;
                     }
@@ -2671,6 +2691,31 @@ select 1;";
         }
     }
 
+    /// 外壳有浮层（快捷键面板、模态……）时，行尾错误标记不画：它是 deferred 绘制，
+    /// 原生截图里曾压在快捷键面板上面。浮层关掉后照常显示。
+    #[gpui_kit::test]
+    fn error_lenses_stay_under_shell_overlays(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let sql = "select * from missing_table;";
+        let error = ExecError { range: 14..27, statement: Some(0..28), code: Some("42P01".to_owned()), message: "relation \"missing_table\" does not exist".to_owned() };
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_sql(sql, window, cx));
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
+            window.render_frame(cx);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some(), "没有浮层时画出行尾标记");
+            cx.set_global(ShellOverlayOpen(true));
+            editor.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_none(), "浮层打开时标记不能压在上面");
+            cx.set_global(ShellOverlayOpen(false));
+            editor.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some());
+        })
+        .unwrap();
+    }
+
     /// R9：悬停或点击行尾标记展开错误弹层；弹层不压住多行出错语句的任何一行；
     /// 鼠标从标记移到弹层（中间隔着语句）时弹层不消失，离开两者后才收起；点击标记后固定展开。
     #[gpui_kit::test]
@@ -2688,9 +2733,18 @@ select 1;";
             window.render_frame(cx);
             editor.update(cx, |editor, cx| editor.mark_exec_errors(vec![error.clone()], cx));
             window.render_frame(cx);
+            // 鼠标先停在波浪线上：编辑器自己的诊断弹层出现。
+            let squiggle = gpui_kit::base::input::DiagnosticEntry {
+                range: start..end,
+                diagnostic: Diagnostic::new(offset_to_position(&editor.read(cx).state.read(cx).text().clone(), start)..offset_to_position(&editor.read(cx).state.read(cx).text().clone(), end), "duplicate key"),
+            };
+            editor.update(cx, |editor, cx| editor.state.update(cx, |state, cx| state.present_diagnostic(squiggle, cx)));
+            assert!(editor.read(cx).state.read(cx).diagnostic_popover().is_some());
             window.hover(("sql-error-lens-chip", 0usize), cx);
             window.render_frame(cx);
             assert_eq!(editor.read(cx).error_popover_open(), Some(0), "悬停标记展开弹层");
+            // 标记遮住了编辑器的鼠标移动：诊断弹层收不到“离开”，由错误弹层收起它，屏上只留一个。
+            assert!(editor.read(cx).state.read(cx).diagnostic_popover().is_none(), "两个弹层不能同时挂着");
             window.render_frame(cx);
             let card = window.find(("sql-error-popover", 0usize)).bounds();
             let state = editor.read(cx).state.read(cx);

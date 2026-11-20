@@ -149,7 +149,8 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
 
 fn mysql_column(row: &mysql_async::Row, at: usize) -> Column {
     let extra = mysql_string(row, at + 4).to_ascii_lowercase();
-    let generated = !mysql_string(row, at + 5).is_empty() || extra.contains("generated");
+    // MySQL 8 给表达式默认值（CURRENT_TIMESTAMP 等）标 DEFAULT_GENERATED，那不是生成列。
+    let generated = !mysql_string(row, at + 5).is_empty() || super::grid_read::extra_marks_generated(&extra);
     Column {
         name: mysql_string(row, at),
         type_name: mysql_string(row, at + 1),

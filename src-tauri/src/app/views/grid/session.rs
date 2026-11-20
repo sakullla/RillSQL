@@ -3935,7 +3935,11 @@ impl SharedGrid {
         if origin.auto || origin.generated {
             return Some(ShownCell { kind: CellKind::Auto, label: i18n::text(self.locale, "grid.value.autoLabel"), body: String::new(), preview: false });
         }
-        let shown = self.default_text(origin).unwrap_or_default();
+        let shown = match self.default_spec(origin) {
+            // 空字符串默认值按 R20 写成“空”，不留一个像是缺字的“默认:”。
+            crate::ddl::DefaultSpec::Literal(value) if value.is_empty() => i18n::text(self.locale, "grid.value.emptyLabel"),
+            _ => self.default_text(origin).unwrap_or_default(),
+        };
         Some(ShownCell {
             kind: CellKind::Default,
             label: i18n::fill(&i18n::text(self.locale, "grid.value.defaultLabel"), &[("value", &shown)]),
@@ -7195,6 +7199,29 @@ mod tests {
         assert_eq!(grid.stage_text_by_id(&row_id, created, Some("2026-01-02 03:04:05".into())), Gate::Writable);
         grid.select(0, created, false);
         assert_eq!(grid.tsv(), "2026-01-02 03:04:05");
+    }
+
+    /// 默认值是空字符串的列，新增行里写“默认: 空”（R20 的空字符串标记），而不是只剩一个“默认:”。
+    #[test]
+    fn an_empty_string_default_reads_as_empty_in_new_rows() {
+        let col = |name: &str, type_name: &str, nullable: bool| Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, ..Column::default() };
+        let columns = vec![
+            Column { primary: true, unique: true, auto: true, ..col("id", "integer", false) },
+            Column { default: Some("''::text".to_owned()), ..col("note", "text", true) },
+            Column { default: Some("'open'::text".to_owned()), ..col("status", "text", false) },
+        ];
+        let schema = schema_from_parts("postgres", "app", "tickets", "table", columns, vec!["id".to_owned()]).unwrap();
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "postgres".into();
+        grid.target.connection_id = "app".into();
+        grid.target.database = "app".into();
+        grid.target.schema = "public".into();
+        grid.target.table = "tickets".into();
+        grid.load_local(columns_from_schema(&schema, true), Vec::new(), Some(0), Some(schema));
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        assert_eq!(grid.cell_kind_at(0, 1), CellKind::Default);
+        assert_eq!(grid.cell_label(0, 1), format!("默认: {}", i18n::text(Locale::ZhCn, "grid.value.emptyLabel")));
+        assert_eq!(grid.cell_label(0, 2), "默认: open");
     }
 
     fn insert_statement(grid: &mut SharedGrid) -> String {

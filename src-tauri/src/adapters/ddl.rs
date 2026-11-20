@@ -115,6 +115,12 @@ pub trait TypeRules: Sync {
         false
     }
 
+    /// 已通过白名单的表达式默认值放在这个列类型上，服务端仍会拒绝的原因（如时间精度不一致）。
+    /// `type_name` 是列的完整类型原文，`upper` 是表达式去掉首尾空白后的大写。
+    fn expression_default_problem(&self, _type_name: &str, _upper: &str) -> Option<String> {
+        None
+    }
+
     /// 字段类型下拉候选。
     fn type_choices(&self) -> &'static [&'static str] {
         &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"]
@@ -187,6 +193,8 @@ pub struct TableOptionSpec {
     pub engines: &'static [&'static str],
     pub charsets: &'static [&'static str],
     pub collations: &'static [&'static str],
+    /// 排序规则随字符集变化时，每个字符集可用的排序规则。空表示排序规则与字符集无关。
+    pub charset_collations: &'static [(&'static str, &'static [&'static str])],
     /// 表注释。
     pub comment: bool,
     /// 字段注释。
@@ -201,6 +209,30 @@ impl TableOptionSpec {
     /// 有任何表级选项要显示。
     pub fn any(&self) -> bool {
         !self.engines.is_empty() || !self.charsets.is_empty() || !self.collations.is_empty() || self.comment || self.without_rowid.is_some() || self.strict.is_some()
+    }
+
+    /// 选了字符集 `charset` 后可选的排序规则。未选字符集或排序规则与字符集无关时给默认列表；
+    /// 字符集没有登记时为空（不提供会被服务端拒绝的组合）。
+    pub fn collations_for(&self, charset: &str) -> &'static [&'static str] {
+        let charset = charset.trim();
+        if charset.is_empty() || self.charset_collations.is_empty() {
+            return self.collations;
+        }
+        self.charset_collations
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(charset))
+            .map(|(_, collations)| *collations)
+            .unwrap_or(&[])
+    }
+
+    /// 字符集与排序规则不配套时的原因（任一为空或方言没有登记配套关系时不检查）。
+    pub fn collation_problem(&self, charset: &str, collation: &str) -> Option<String> {
+        let (charset, collation) = (charset.trim(), collation.trim());
+        if charset.is_empty() || collation.is_empty() || self.charset_collations.is_empty() {
+            return None;
+        }
+        (!self.collations_for(charset).iter().any(|choice| choice.eq_ignore_ascii_case(collation)))
+            .then(|| format!("排序规则 {collation} 不适用于字符集 {charset}。"))
     }
 }
 

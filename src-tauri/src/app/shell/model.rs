@@ -3664,7 +3664,9 @@ impl WorkbenchModel {
 
     /// 回车：分组折叠/展开，连接按需连接并展开，树节点照原规则打开。
     pub fn explorer_enter(&mut self) -> Option<String> {
-        let Some(row) = self.explorer_current_row() else { return self.nav_key(NavKey::Enter) };
+        // 没有当前行（启动第一帧、树焦点指向已不可见的行）：回车不做事。
+        // 不能再转给 nav_key(Enter)——它又回到这里，死递归撑爆主线程栈。
+        let row = self.explorer_current_row()?;
         match row {
             ExplorerRow::Group(id) => {
                 self.toggle_group(&id);

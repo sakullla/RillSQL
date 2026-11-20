@@ -79,6 +79,9 @@ fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft], options
             blocked.push(format!("表选项 {label} 的值 {text} 无效。"));
         }
     }
+    if let Some(problem) = ddl_of(snapshot.engine).and_then(|dialect| dialect.table_option_spec().collation_problem(&options.charset, &options.collation)) {
+        blocked.push(problem);
+    }
     if snapshot.object_exists {
         blocked.push(format!("表 {name} 已经存在。不会覆盖已有表或数据。"));
     }

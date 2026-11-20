@@ -184,6 +184,19 @@ fn a_disconnected_connection_connects_on_demand_before_reading() {
     assert_eq!(model.active_overview().map(|state| state.load.clone()), Some(OverviewLoad::Failed("密码错误".to_owned())));
     model.dispatch("overview-connect");
     assert_eq!(model.active_overview().map(|state| state.load.clone()), Some(OverviewLoad::Connecting));
+
+    // 按需连接因缺密码失败，随后在密码框里连上：概览不停在失败说明上，下一帧直接读取。
+    let mut model = self::model();
+    model.connections.status.remove("my");
+    model.overview_click_connection("my", false);
+    let _ = model.overview_read_request();
+    model.connections.status.insert("my".to_owned(), LinkStatus::Failed);
+    model.connections.failures.insert("my".to_owned(), "请填写数据库密码".to_owned());
+    assert!(model.overview_read_request().is_none());
+    assert!(matches!(model.active_overview().map(|state| state.load.clone()), Some(OverviewLoad::Failed(_))));
+    model.connections.status.insert("my".to_owned(), LinkStatus::Connected);
+    assert!(model.overview_read_request().is_some(), "连上后自动重读");
+    assert_eq!(model.active_overview().map(|state| state.load.clone()), Some(OverviewLoad::Loading));
 }
 
 #[test]
@@ -348,6 +361,9 @@ fn clicking_a_real_sqlite_connection_renders_its_overview_and_double_click_opens
     let bar = bar.expect("概览列表缺可见滚动条叠层");
     assert!(bar.size.height > gpui_kit::px(0.) && bar.size.width > gpui_kit::px(0.), "滚动条叠层应铺在列表上：{bar:?}");
     assert_eq!(found, (true, true, true), "概览页与两行（表、视图）都画出来");
+    // 行铺满列表宽度，各列与列头对齐（原生截图里行曾按内容宽度挤在左边）。
+    let row = cx.update_window(window, |_, window, _| window.find("overview-row-0").bounds()).unwrap();
+    assert!(row.size.width >= bar.size.width - gpui_kit::px(1.), "行应铺满列表：{row:?} vs {bar:?}");
     cx.update(|cx| {
         let view = view.read(cx);
         let tab = view.model.active_tab().cloned().unwrap();

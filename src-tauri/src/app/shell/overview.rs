@@ -170,7 +170,13 @@ impl WorkbenchModel {
     /// 活动概览这一帧要不要发起读取：已连接且待读时返回目标与代数；未连接时按需排队连接。
     pub fn overview_read_request(&mut self) -> Option<(OverviewTarget, u64)> {
         let spec = self.active_overview_spec()?;
+        let connection_id = self.active_overview()?.target.connection_id.clone();
+        let connected = self.connections.row_status(&connection_id) == LinkStatus::Connected;
         let state = self.active_overview_mut()?;
+        if connected && state.connect_failed {
+            // 按需连接失败后，用户经密码框或对象树连上了：不必再点“重试”，直接重读。
+            state.reload();
+        }
         if !matches!(state.load, OverviewLoad::Pending | OverviewLoad::Connecting) {
             return None;
         }
@@ -199,6 +205,7 @@ impl WorkbenchModel {
                     let reason = self.connections.failures.get(&target.connection_id).cloned().unwrap_or_default();
                     if let Some(state) = self.overviews.get_mut(&spec) {
                         state.load = OverviewLoad::Failed(if reason.is_empty() { "catalog.overview.connectFailed".to_owned() } else { reason });
+                        state.connect_failed = true;
                     }
                     return None;
                 }
@@ -578,6 +585,8 @@ impl Workbench {
             .role(gpui_kit::Role::Row)
             .aria_label(SharedString::from(name.clone()))
             .aria_selected(selected)
+            // 虚拟列表的行按内容宽度布局：不写满宽时各列按百分比算不出宽度，整行挤在左边、与列头对不齐。
+            .w_full()
             .h(px(row_h))
             .px(px(m.pane_pad()))
             .flex()

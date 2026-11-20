@@ -206,6 +206,13 @@ pub(crate) struct ColumnTraits {
     pub choices: Vec<String>,
 }
 
+/// EXTRA 是否标明生成列（VIRTUAL/STORED/PERSISTENT GENERATED）。MySQL 8 给表达式默认值标的
+/// DEFAULT_GENERATED 不是生成列，列仍可写。
+pub(crate) fn extra_marks_generated(extra: &str) -> bool {
+    let extra = extra.to_ascii_uppercase();
+    ["VIRTUAL GENERATED", "STORED GENERATED", "PERSISTENT GENERATED"].iter().any(|flag| extra.contains(flag))
+}
+
 /// MySQL 8 的 COLUMN_DEFAULT 字面量不带引号、表达式默认在 EXTRA 里标 DEFAULT_GENERATED；
 /// MariaDB 的字面量带引号、没有默认值的可空列报回文本 NULL。两者都按类型规则解析成四态，
 /// 无默认值与默认 NULL 一律记为 None（新增行本来就是 NULL）。生成列（VIRTUAL/STORED/PERSISTENT GENERATED）
@@ -213,7 +220,7 @@ pub(crate) struct ColumnTraits {
 pub(crate) fn column_traits(engine: Engine, type_name: &str, raw_default: Option<&str>, extra: &str) -> ColumnTraits {
     let extra = extra.to_ascii_uppercase();
     let auto = extra.contains("AUTO_INCREMENT");
-    let generated = ["VIRTUAL GENERATED", "STORED GENERATED", "PERSISTENT GENERATED"].iter().any(|flag| extra.contains(flag));
+    let generated = extra_marks_generated(&extra);
     let default = if auto || generated {
         None
     } else {
@@ -272,6 +279,10 @@ mod column_trait_tests {
         let total = column_traits(Engine::Mysql, "int", None, "STORED GENERATED");
         assert!(total.generated && total.default.is_none());
         assert!(column_traits(Engine::Mariadb, "int", None, "VIRTUAL GENERATED").generated);
+        // 结构页读列也用同一判定：DEFAULT_GENERATED（表达式默认值）不是生成列。
+        assert!(!super::extra_marks_generated("DEFAULT_GENERATED"));
+        assert!(!super::extra_marks_generated("DEFAULT_GENERATED on update CURRENT_TIMESTAMP"));
+        assert!(super::extra_marks_generated("stored generated"));
         assert_eq!(
             column_traits(Engine::Mysql, "enum('draft','it''s','done')", Some("draft"), "").choices,
             vec!["draft".to_owned(), "it's".to_owned(), "done".to_owned()]

@@ -1770,3 +1770,13 @@ fn custom_templates_are_managed_saved_and_shared_by_create_and_alter_menus(cx: &
     assert!(alter.session.kept_columns.iter().any(|column| column.name == "created_user_id" && column.original.is_none()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// “在查询中打开”的取样语句按方言写；引擎识别不出来时不猜（不给出带 LIMIT 的通用语句）。
+#[test]
+fn sample_query_follows_the_dialect_and_skips_unknown_engines() {
+    let sql = select_sample_sql(&target("sqlserver", "orders")).expect("sqlserver");
+    assert!(sql.contains("TOP 100") && !sql.contains("LIMIT"), "{sql}");
+    let sql = select_sample_sql(&target("postgres", "orders")).expect("postgres");
+    assert!(sql.contains("LIMIT 100"), "{sql}");
+    assert_eq!(select_sample_sql(&target("unknown-engine", "orders")), None);
+}

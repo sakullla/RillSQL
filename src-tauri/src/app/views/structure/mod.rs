@@ -118,12 +118,11 @@ fn suggested_fk_name(table: &str, column: &str, ref_table: &str) -> String {
     if candidate.len() <= 60 { candidate } else { candidate.chars().take(60).collect() }
 }
 
-fn select_sample_sql(target: &GridTarget) -> String {
-    let Ok(engine) = DdlEngine::parse(&target.engine) else {
-        return format!("SELECT * FROM {} LIMIT 100;", target.table);
-    };
+/// “在查询中打开”的取样语句。引擎识别不出来时不猜方言，返回 None（菜单不提供这一项）。
+fn select_sample_sql(target: &GridTarget) -> Option<String> {
+    let engine = DdlEngine::parse(&target.engine).ok()?;
     let qualified = crate::adapters::qualified_object(engine, &target.database, &target.schema, &target.table);
-    crate::adapters::first_rows_select(engine, &qualified, 100)
+    Some(crate::adapters::first_rows_select(engine, &qualified, 100))
 }
 
 /// 从 `CREATE INDEX ... ON tbl (expr)` 里取出括号段，供表达式索引没有普通列名时展示。
@@ -4598,9 +4597,8 @@ impl StructurePane {
                 .dropdown_menu(move |mut menu, _, cx| {
                     let pal = Palette::of(cx);
                     menu = menu.min_w(px(200.));
-                    if let Some(sink) = query_sink.clone() {
+                    if let (Some(sink), Some(sql)) = (query_sink.clone(), select_sample_sql(&target_for_menu)) {
                         let tgt = target_for_menu.clone();
-                        let sql = select_sample_sql(&tgt);
                         let label = i18n::text(locale, "structure.action.openQuery");
                         menu = menu.item(
                             PopupMenuItem::element(move |_, cx| {

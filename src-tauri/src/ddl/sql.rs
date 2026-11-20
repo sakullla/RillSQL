@@ -33,6 +33,19 @@ pub fn valid_default(engine: Engine, raw: &str) -> bool {
     types_of(engine).is_some_and(|types| types.extra_default(text, &upper))
 }
 
+/// 读入列的默认值原文 → 可以直接拼进 `DEFAULT ...` 的 SQL。数据库报回的若是不带引号的文本字面量
+/// （information_schema.COLUMN_DEFAULT 的写法），按方言与列类型补上引号；已带引号、括号、数字、NULL 与表达式原样保留。
+pub fn existing_default_sql(engine: Engine, type_name: &str, raw: &str) -> String {
+    let text = raw.trim();
+    if text.is_empty() || text.starts_with('\'') || text.starts_with('(') || is_number(text) {
+        return text.to_owned();
+    }
+    match (existing_default(engine, Some(text)), types_of(engine)) {
+        (DefaultSpec::Literal(value), Some(types)) => types.literal_default(type_name, &value),
+        _ => text.to_owned(),
+    }
+}
+
 /// 读入列的默认值原文（数据库报回的写法）→ 四态。缺失为无默认值；解析由方言的类型规则完成。
 pub fn existing_default(engine: Engine, raw: Option<&str>) -> DefaultSpec {
     let Some(raw) = raw else {
@@ -75,7 +88,13 @@ pub fn default_problem(engine: Engine, draft: &ColumnDraft) -> Option<String> {
         }
         DefaultSpec::Expression(text) if text.trim().is_empty() => Some(format!("字段 {name} 的默认值表达式为空。")),
         DefaultSpec::Expression(text) => {
-            (!valid_default(engine, text)).then(|| format!("字段 {name} 的默认值不是允许的字面量或当前时间函数。"))
+            if !valid_default(engine, text) {
+                return Some(format!("字段 {name} 的默认值不是允许的字面量或当前时间函数。"));
+            }
+            let upper = text.trim().to_ascii_uppercase();
+            types_of(engine)
+                .and_then(|types| types.expression_default_problem(&draft.type_name, &upper))
+                .map(|reason| format!("字段 {name}：{reason}"))
         }
     }
 }

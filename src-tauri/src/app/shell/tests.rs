@@ -12882,3 +12882,16 @@ fn column_templates_restore_on_boot_and_persist_after_edit(cx: &mut gpui_kit::Te
     cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 资源管理器没有当前行（没有连接、或树焦点不在可见行上）时回车什么也不做；
+/// 原先转给 nav_key(Enter) 又回到 explorer_enter，原生应用里按回车直接栈溢出退出。
+#[test]
+fn enter_without_an_explorer_row_is_a_no_op_not_a_recursion() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.explorer_current_row().is_none());
+    assert_eq!(model.nav_key(NavKey::Enter), None);
+    let mut model = grouped_model(vec![record_for("pg", "Atlas", Engine::Postgres)], Vec::new(), &[]);
+    model.nav.set_focus("missing-node");
+    assert!(model.explorer_current_row().is_none());
+    assert_eq!(model.nav_key(NavKey::Enter), None);
+}

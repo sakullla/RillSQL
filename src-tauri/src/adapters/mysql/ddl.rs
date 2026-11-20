@@ -50,14 +50,26 @@ impl DdlDialect for MysqlDdl {
     }
 
     fn table_option_spec(&self) -> TableOptionSpec {
-        let collations: &'static [&'static str] = match self.engine {
-            Engine::Mariadb => &["utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_unicode_520_ci", "utf8mb4_bin"],
-            _ => &["utf8mb4_0900_ai_ci", "utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"],
+        // 排序规则属于字符集：选了字符集后只给它的排序规则，否则服务端报 COLLATION ... is not valid for CHARACTER SET。
+        const MARIADB_UTF8MB4: &[&str] = &["utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_unicode_520_ci", "utf8mb4_bin"];
+        const MYSQL_UTF8MB4: &[&str] = &["utf8mb4_0900_ai_ci", "utf8mb4_general_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"];
+        const OTHERS: [(&str, &[&str]); 4] = [
+            ("utf8mb3", &["utf8mb3_general_ci", "utf8mb3_unicode_ci", "utf8mb3_bin"]),
+            ("latin1", &["latin1_swedish_ci", "latin1_general_ci", "latin1_bin"]),
+            ("ascii", &["ascii_general_ci", "ascii_bin"]),
+            ("binary", &["binary"]),
+        ];
+        const MARIADB_BY_CHARSET: &[(&str, &[&str])] = &[("utf8mb4", MARIADB_UTF8MB4), OTHERS[0], OTHERS[1], OTHERS[2], OTHERS[3]];
+        const MYSQL_BY_CHARSET: &[(&str, &[&str])] = &[("utf8mb4", MYSQL_UTF8MB4), OTHERS[0], OTHERS[1], OTHERS[2], OTHERS[3]];
+        let (collations, charset_collations) = match self.engine {
+            Engine::Mariadb => (MARIADB_UTF8MB4, MARIADB_BY_CHARSET),
+            _ => (MYSQL_UTF8MB4, MYSQL_BY_CHARSET),
         };
         TableOptionSpec {
             engines: &["InnoDB", "MyISAM", "MEMORY", "ARCHIVE"],
             charsets: &["utf8mb4", "utf8mb3", "latin1", "ascii", "binary"],
             collations,
+            charset_collations,
             comment: true,
             column_comments: true,
             ..TableOptionSpec::default()

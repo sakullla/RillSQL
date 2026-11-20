@@ -250,52 +250,71 @@ impl Workbench {
             )
             .child(self.status_bar(cx));
 
+        // 盖在工作区上的浮层（模态、命令面板、右键菜单……）。编辑器贴着文本的浮层（行尾错误标记、错误弹层、
+        // 签名提示）是 deferred 绘制，会画在这些普通层之上；有浮层时让它们这一帧不画。
+        let mut covered = false;
         if self.model.exchange_open {
+            covered = true;
             root = root.child(self.exchange_layer(cx));
         }
         if palette_open || help_open {
+            covered = true;
             root = root.child(self.palette_layer(window, cx));
         }
         if self.model.conn_filter_menu.is_some() {
+            covered = true;
             root = root.child(self.conn_filter_layer(cx));
         }
         if self.model.menu.is_some() {
+            covered = true;
             root = root.child(self.context_layer(cx));
         }
         // 连接模态盖在最上层：backdrop 吞掉下面控件的点击，Esc 与 Tab 也归它。
         if self.model.conn_modal.open {
+            covered = true;
             root = root.child(self.connection_modal_layer(window, cx));
         }
         if let Some(layer) = self.tag_manager_layer(window, cx) {
+            covered = true;
             root = root.child(layer);
         }
         if self.model.close_prompt.is_some() {
+            covered = true;
             root = root.child(self.close_layer(cx));
         }
         if self.model.connections.confirm_delete {
+            covered = true;
             root = root.child(self.delete_layer(cx));
         }
         if self.model.group_delete.is_some() {
+            covered = true;
             root = root.child(self.group_delete_layer(cx));
         }
         if !self.model.open_choices.is_empty() {
+            covered = true;
             root = root.child(self.open_choice_layer(cx));
         }
         if self.model.history.confirm_clear {
+            covered = true;
             root = root.child(self.clear_history_layer(cx));
         }
         if self.model.history.confirm_delete {
+            covered = true;
             root = root.child(self.delete_saved_layer(cx));
         }
         if self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
+            covered = true;
             root = root.child(self.ddl_layer(window, cx));
         }
         if self.model.danger.is_some() {
+            covered = true;
             root = root.child(self.danger_layer(window, cx));
         }
         if self.model.password_prompt.is_some() {
+            covered = true;
             root = root.child(self.password_layer(window, cx));
         }
+        cx.set_global(crate::ui::ShellOverlayOpen(covered));
         root.into_any_element()
     }
 
@@ -5730,7 +5749,9 @@ impl Workbench {
             panel = stack_frame(|| {
             // 固定高度：左侧分组导航与右侧列表各自滚动，长列表能完整滚到底。
             let mut panel = panel.h(px(max_panel_h));
-            let input = self.input_for(DraftField::HelpQuery, &self.model.text("ui.help.search"), false, window, cx);
+            // 示例按键按本机平台写（macOS ⌘/，其他 Ctrl+/），与面板里列出的按键一致。
+            let placeholder = i18n::fill(&self.model.text("ui.help.search"), &[("chord", &crate::app::keymap::display_chord("Mod+/"))]);
+            let input = self.input_for(DraftField::HelpQuery, &placeholder, false, window, cx);
             if !self.help_focused {
                 self.help_focused = true;
                 self.fields.focus(DraftField::HelpQuery, window, cx);

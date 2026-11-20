@@ -74,6 +74,14 @@ const DIALECT_FRAGMENTS: &[&str] = &[
     "\"algorithm\"",
     "\"definer\"",
     "WITHOUT ROWID",
+    // 拼接语句时的分页、返回与自动更新写法（SQL Server 没有 LIMIT，MySQL 没有 RETURNING）。
+    // 扫描只认字面片段：关键字接在格式化占位前后才算，分句用的关键字表、界面文案不算；
+    // 写法换了（如另起变量拼接）仍可能漏检，评审时仍需人工核对。
+    "} LIMIT ",
+    "LIMIT {}",
+    "LIMIT {limit}",
+    " RETURNING ",
+    "ON UPDATE CURRENT_TIMESTAMP",
 ];
 
 const A1: &str = "A1 连接与会话";
@@ -466,6 +474,8 @@ fn boundary_scan_rejects_injected_violations() {
         "\nfn injected() -> String { \"SQLite 没有 TRUNCATE，这里用 DELETE FROM 逐行删除。\".to_owned() }\n",
         "\nconst INJECTED: &[(&str, &str)] = &[(\"PostgreSQL 需要指定 schema。\", \"PostgreSQL needs a schema.\")];\n",
         "\nfn injected(x: &str) -> String { format!(r#\"{x} 是 MySQL 与 MariaDB 的\"#) }\n",
+        "\nfn injected(table: &str) -> String { format!(\"SELECT * FROM {} LIMIT 100;\", table) }\n",
+        "\nfn injected(table: &str) -> String { format!(\"DELETE FROM {table} RETURNING *\") }\n",
     ];
     // 一个白名单内文件（若有）与一个白名单外新文件都要被抓到。
     let mut targets = vec!["app/injected_view.rs".to_owned()];

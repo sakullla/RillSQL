@@ -343,7 +343,7 @@ fn absorb_snapshot(object: &mut DumpObject, snapshot: &crate::ddl::Snapshot, not
                 name: column.name.clone(),
                 type_name: column.type_name.clone(),
                 nullable: column.nullable,
-                default_sql: column.default_sql.clone().unwrap_or_default(),
+                default_sql: crate::ddl::sql::existing_default_sql(snapshot.engine, &column.type_name, column.default_sql.as_deref().unwrap_or_default()),
                 primary: column.primary,
                 auto: column.auto,
             })
