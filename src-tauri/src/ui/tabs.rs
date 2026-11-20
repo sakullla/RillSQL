@@ -5,11 +5,9 @@
 //! 页面不再自绘第二套页签样式。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    AnyElement, AnyView, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div, px,
 };
 
@@ -29,7 +27,7 @@ pub const TAB_PAD_R: f32 = 5.;
 const TAB_MARK_H: f32 = 2.;
 
 /// 一个页签的表现数据。点击后做什么由调用方挂事件，组件不持有业务语义。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TabSpec {
     /// 元素 id，同时是测试与无障碍定位用的名字（例如 `tab-3`）。
     pub id: SharedString,
@@ -46,11 +44,41 @@ pub struct TabSpec {
     pub status: Option<SharedString>,
     /// 预览标签（单击对象树打开、会被下一次单击就地替换）：标题用斜体区分，双击或操作后转为固定标签。
     pub preview: bool,
+    /// 固定标签：标题后画一个小图钉，状态写进 tooltip。
+    pub pinned: Option<SharedString>,
+    /// 运行中的转圈：调用方持有的隔离实体（`ui::spinner_view`），动画帧只通知它自己。
+    /// 没给时运行态只把类型图标改成强调色，不在页签里直接画动画。
+    pub spinner: Option<AnyView>,
 }
 
 impl TabSpec {
     pub fn new(id: impl Into<SharedString>, icon: IconName, title: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), icon, title: title.into(), active: false, running: false, dirty: false, prod: false, context: None, status: None, preview: false }
+        Self {
+            id: id.into(),
+            icon,
+            title: title.into(),
+            active: false,
+            running: false,
+            dirty: false,
+            prod: false,
+            context: None,
+            status: None,
+            preview: false,
+            pinned: None,
+            spinner: None,
+        }
+    }
+
+    /// 运行中的转圈视图；只在 `running` 时画出来。
+    pub fn spinner(mut self, spinner: Option<AnyView>) -> Self {
+        self.spinner = spinner;
+        self
+    }
+
+    /// 固定标签；参数是 tooltip 里的状态文字（已翻译）。
+    pub fn pinned(mut self, label: Option<SharedString>) -> Self {
+        self.pinned = label;
+        self
     }
 
     pub fn active(mut self, active: bool) -> Self {
@@ -92,6 +120,9 @@ impl TabSpec {
         if let Some(ctx) = self.context.as_ref().filter(|ctx| !ctx.is_empty()) {
             parts.push(ctx.to_string());
         }
+        if let Some(pinned) = self.pinned.as_ref().filter(|label| !label.is_empty()) {
+            parts.push(pinned.to_string());
+        }
         if self.dirty {
             if let Some(status) = self.status.as_ref().filter(|s| !s.is_empty()) {
                 parts.push(status.to_string());
@@ -128,8 +159,10 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
             .child(child)
             .into_any_element()
     };
-    let leading = if spec.running {
-        slot(Spinner::new().xsmall().color(p.accent).into_any_element())
+    let leading = if let Some(spinner) = spec.spinner.clone().filter(|_| spec.running) {
+        slot(spinner.into_any_element())
+    } else if spec.running {
+        slot(kit::icon(spec.icon, IconSize::CONTROL, p.accent).into_any_element())
     } else {
         slot(kit::icon(spec.icon, IconSize::CONTROL, icon_tone).into_any_element())
     };
@@ -181,6 +214,15 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
                 .when(spec.preview, |this| this.italic())
                 .test_support(),
         )
+        .when(spec.pinned.is_some(), |this| {
+            this.child(
+                div()
+                    .id(ElementId::Name(SharedString::from(format!("{}-pinned", spec.id))))
+                    .test_support()
+                    .flex_none()
+                    .child(kit::icon(IconName::Pin, IconSize::INLINE, p.text_faint)),
+            )
+        })
         .when(spec.dirty, |this| this.child(kit::status_dot(p.warn)))
         .test_support()
 }

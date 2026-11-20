@@ -16,8 +16,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Sizable as _};
+use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Sizable as _, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, InteractiveElement as _, IntoElement, MouseButton,
@@ -221,6 +220,10 @@ pub struct QueryPane {
     result_scroll_seen: Option<(Option<usize>, usize)>,
     /// 还没确认进入视口的滚动请求。
     result_scroll_pending: Option<tabs::Reveal>,
+    /// 结果头、行数摘要与语句结果里的转圈：隔离实体，动画帧不通知查询页和工作台。
+    spinners: crate::ui::spinner_view::SpinnerPool,
+    /// 这一帧取好的转圈视图（结果头、行数摘要、语句进度）；只在运行时画出来。
+    frame_spinners: Option<[gpui_kit::AnyView; 3]>,
     _target_tab_sub: gpui_kit::Subscription,
 }
 
@@ -622,6 +625,8 @@ impl QueryPane {
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
+            spinners: crate::ui::spinner_view::SpinnerPool::new(),
+            frame_spinners: None,
             _target_tab_sub: target_tab_sub,
         }
     }
@@ -757,6 +762,17 @@ impl QueryPane {
 
     pub fn null_copy(&self) -> &str {
         &self.null_copy
+    }
+
+    /// 已经建好的 SqlEditor 个数（懒建：当前标签和访问过的标签才有）。
+    #[cfg(test)]
+    pub fn editor_count(&self) -> usize {
+        self.editors.len()
+    }
+
+    /// 这一帧取好的转圈（见 `frame_spinners`）。
+    fn frame_spinner(&self, slot: usize) -> Option<AnyElement> {
+        self.frame_spinners.as_ref().map(|views| views[slot].clone().into_any_element())
     }
 
     pub fn request_focus(&mut self) {
@@ -1261,12 +1277,16 @@ impl QueryPane {
     pub fn prepare(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, context: bool, cx: &App) -> SyncEffect {
         self.locale = locale;
         let next = active.map(str::to_owned);
+        // 只有正在编辑的标签（以及刚离开的那个）可能有还没收回的输入；其余标签的编辑器文本
+        // 在离开时已经收回，不再逐个读全文。
+        let previous = self.seen_active.clone();
         if next != self.seen_active {
             self.seen_active = next;
             if self.seen_active.is_some() {
                 self.focus_editor = true;
             }
         }
+        let live = |id: &str| active == Some(id) || previous.as_deref() == Some(id);
         let ids: Vec<String> = tabs.iter().map(|tab| tab.id.clone()).collect();
         for tab in tabs {
             self.desk.import_tab(&tab.id, &tab.draft, target_of(tab));
@@ -1276,7 +1296,7 @@ impl QueryPane {
                     DraftLink { applied: tab.draft.clone(), editor: tab.draft.clone(), dirty: false },
                 );
             }
-            if self.pending_text.is_none() {
+            if self.pending_text.is_none() && live(&tab.id) {
                 if let Some(editor) = self.editors.get(&tab.id) {
                     let text = editor.read(cx).value(cx);
                     if let Some(link) = self.links.get_mut(&tab.id) {
@@ -1291,7 +1311,13 @@ impl QueryPane {
             match action {
                 Some(DraftSync::Pull) => {
                     self.desk.replace_draft(&tab.id, &tab.draft, &self.services.tasks);
-                    self.pending_text = Some(tab.draft.clone());
+                    if active == Some(tab.id.as_str()) {
+                        self.pending_text = Some(tab.draft.clone());
+                    } else {
+                        // 后台标签的草稿被外壳改写：丢掉它的旧编辑器，下次切过去时按新草稿重建。
+                        self.editors.remove(&tab.id);
+                        self.editor_watch.remove(&tab.id);
+                    }
                 }
                 Some(DraftSync::Push(text)) => self.desk.set_tab_draft(&tab.id, &text),
                 Some(DraftSync::Same) | None => {}
@@ -1335,9 +1361,14 @@ impl QueryPane {
         }
     }
 
+    /// 懒建编辑器：只给当前标签建 `SqlEditor`。其余标签只存草稿文本，第一次切过去时再建；
+    /// 访问过的标签保留编辑器（撤销栈、光标、折叠都还在）。几百个标签时实体数不随标签数增长。
     pub fn ensure_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for id in self.desk.tab_ids() {
-            if self.editors.contains_key(&id) {
+        let Some(active) = self.desk.active_id().map(str::to_owned) else {
+            return;
+        };
+        for id in [active] {
+            if self.editors.contains_key(&id) || !self.desk.has_tab(&id) {
                 continue;
             }
             let sql = self.desk.tab_draft(&id).unwrap_or_default();
@@ -1361,10 +1392,14 @@ impl QueryPane {
                 }));
             });
             // 选区出现或消失时重绘工具条；光标在选区内外移动不打扰查询页。
+            // 文本改了也通知一次：外壳不再每帧轮询编辑器全文，靠这次通知把草稿收回标签。
             let selected = std::cell::Cell::new(false);
+            let version = std::cell::Cell::new(editor.read(cx).version());
             let watch = cx.observe(&editor, move |_, editor, cx| {
-                let has = editor.read(cx).caret().chars > 0;
-                if selected.replace(has) != has {
+                let editor = editor.read(cx);
+                let has = editor.caret().chars > 0;
+                let changed = version.replace(editor.version()) != editor.version();
+                if selected.replace(has) != has || changed {
                     cx.notify();
                 }
             });
@@ -2891,6 +2926,14 @@ impl QueryPane {
 
 impl Render for QueryPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 当前标签第一次画出来时才建它的编辑器。
+        self.ensure_editors(window, cx);
+        let accent = Palette::of(cx).accent;
+        self.frame_spinners = Some([
+            self.spinners.view("query-head", Size::XSmall, Some(accent), cx),
+            self.spinners.view("query-summary", Size::XSmall, Some(accent), cx),
+            self.spinners.view("query-outcome", Size::Small, Some(accent), cx),
+        ]);
         self.apply_pending(window, cx);
         self.sync_error_marks(cx);
         self.refresh_folds(cx);
@@ -3436,7 +3479,7 @@ impl QueryPane {
                     .gap(px(6.))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
-                    .child(Spinner::new().xsmall().color(p.accent))
+                    .children(self.frame_spinner(0))
                     .child(SharedString::from(self.running_text()))
                     .into_any_element(),
             );
@@ -3550,7 +3593,7 @@ impl QueryPane {
             .text_size(px(TypeScale::SM))
             .text_color(tone)
             .child(if running {
-                Spinner::new().xsmall().color(p.accent).into_any_element()
+                self.frame_spinner(1).unwrap_or_else(|| kit::icon(IconName::Sigma, 12., p.accent).into_any_element())
             } else {
                 kit::icon(IconName::Sigma, 12., tone).into_any_element()
             })
@@ -3712,7 +3755,7 @@ impl QueryPane {
             } else {
                 Progress::Done
             };
-            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity);
+            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity, self.frame_spinner(2));
         }
         // 结果是执行计划：画成计划视图（摘要、问题与建议、计划树、节点详情）；“原始结果”仍是网格。
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
@@ -3951,11 +3994,24 @@ fn error_copy_button(locale: Locale, _p: &Palette, _metrics: Metrics, entity: &E
 /// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn statement_outcome(result: &desk::StatementView, progress: Progress, note: &str, locale: Locale, mono: &SharedString, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+fn statement_outcome(
+    result: &desk::StatementView,
+    progress: Progress,
+    note: &str,
+    locale: Locale,
+    mono: &SharedString,
+    p: &Palette,
+    metrics: Metrics,
+    entity: &Entity<QueryPane>,
+    spinner: Option<AnyElement>,
+) -> AnyElement {
     if progress != Progress::Done {
         // 执行中：正在跑的这一条转圈，排在后面的写“等待执行”，都不能画成成功的对勾。
         let (text, indicator) = match progress {
-            Progress::Running => (i18n::text(locale, "query.status.running"), Spinner::new().small().color(p.accent).into_any_element()),
+            Progress::Running => (
+                i18n::text(locale, "query.status.running"),
+                spinner.unwrap_or_else(|| kit::icon(IconName::Clock, 16., p.accent).into_any_element()),
+            ),
             _ => (i18n::text(locale, "query.status.queued"), kit::icon(IconName::Clock, 16., p.text_faint).into_any_element()),
         };
         return div()
@@ -4645,7 +4701,10 @@ mod tests {
         .unwrap();
         let runs = cx.update(|cx| view.read(cx).query_runs(cx));
         cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 'only-draft'".into());
+            view.update(cx, |view, cx| {
+                view.model.tabs[0].draft = "SELECT 'only-draft'".into();
+                view.settle(cx);
+            });
             window.render_frame(cx);
             view.update(cx, |view, cx| {
                 assert!(!view.query_executed(cx));
@@ -4688,6 +4747,58 @@ mod tests {
             database: Some("main".to_owned()),
             engine: Some("sqlite".to_owned()),
         }
+    }
+
+    /// R5：几百个查询标签时只有当前标签和访问过的标签持有 SqlEditor；
+    /// 对齐时只读当前标签（和刚离开的那个）的编辑器全文，切换后各自的草稿完好。
+    #[gpui_kit::test]
+    fn three_hundred_tabs_create_editors_lazily_and_keep_drafts(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let mut snaps: Vec<TabSnap> = (0..300).map(|ix| bound(&format!("t{ix}"), &format!("select {ix}"))).collect();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("t0"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editors.len(), 1, "300 个标签只给当前标签建编辑器");
+            assert!(pane.read(cx).editors.contains_key("t0"));
+            assert_eq!(pane.read(cx).editor_text(cx), "select 0");
+            // 在当前标签里改一笔，然后切走：离开的标签的输入在切换这一次对齐里收回。
+            let editor = pane.read(cx).editors["t0"].clone();
+            editor.update(cx, |editor, cx| editor.set_sql("select 'edited'", window, cx));
+            let effect = pane.update(cx, |pane, cx| pane.sync(&snaps, Some("t150"), Locale::ZhCn, window, cx));
+            assert!(effect.drafts.iter().any(|(id, text)| id == "t0" && text == "select 'edited'"), "{:?}", effect.drafts);
+            for (id, text) in effect.drafts {
+                if let Some(snap) = snaps.iter_mut().find(|snap| snap.id == id) {
+                    snap.draft = text;
+                }
+            }
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editors.len(), 2, "访问过的标签保留编辑器，其余仍没有");
+            assert_eq!(pane.read(cx).editor_text(cx), "select 150");
+            assert!(!pane.read(cx).editors.contains_key("t299"));
+            // 切回来：草稿和编辑器文本都是改过的那一笔，没有被旧草稿覆盖。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("t0"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editors.len(), 2);
+            assert_eq!(pane.read(cx).editor_text(cx), "select 'edited'");
+            assert_eq!(pane.read(cx).desk.tab_draft("t150").as_deref(), Some("select 150"));
+            assert_eq!(pane.read(cx).desk.tab_draft("t299").as_deref(), Some("select 299"));
+            // 后台标签的草稿被外壳改写（例如会话替换）：丢掉旧编辑器，下次切过去按新草稿重建。
+            snaps[150].draft = "select 'replaced'".to_owned();
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("t0"), Locale::ZhCn, window, cx);
+            });
+            assert!(!pane.read(cx).editors.contains_key("t150"));
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("t150"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editor_text(cx), "select 'replaced'");
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
@@ -6135,13 +6246,22 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| view.perform("new-query", cx));
             window.render_frame(cx);
-            view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 1;".to_owned());
+            // 直接改模型不经过命令：按事件到来整理一次（生产里由通知触发）。
+            view.update(cx, |view, cx| {
+                view.model.tabs[0].draft = "SELECT 1;".to_owned();
+                view.settle(cx);
+            });
             window.render_frame(cx);
             assert!(view.read(cx).query_editor_focused(window, cx), "查询编辑器没有拿到焦点");
             assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;");
             window.press("secondary-/", cx);
             window.render_frame(cx);
             assert_eq!(view.read(cx).query_editor_text(cx), "-- SELECT 1;", "快捷键没有切换行注释");
+        })
+        .unwrap();
+        // 编辑器改动的通知在这一轮事件结束时到外壳，外壳据此把草稿收回标签（不靠每帧轮询）。
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
             assert_eq!(view.read(cx).query_draft(cx), "-- SELECT 1;", "草稿跟着编辑器同步");
             assert_eq!(view.read(cx).query_runs(cx), 0, "注释不是执行");
             assert!(!view.read(cx).query_executed(cx));
@@ -6175,11 +6295,18 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| view.perform("new-query", cx));
             window.render_frame(cx);
-            view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 1;\nSELECT a,\n  b FROM t;".to_owned());
+            view.update(cx, |view, cx| {
+                view.model.tabs[0].draft = "SELECT 1;\nSELECT a,\n  b FROM t;".to_owned();
+                view.settle(cx);
+            });
             window.render_frame(cx);
             assert!(view.read(cx).query_editor_focused(window, cx), "查询编辑器没有拿到焦点");
             assert_eq!(view.read(cx).query_editor_text(cx), "SELECT 1;\nSELECT a,\n  b FROM t;");
             window.press("secondary-shift-/", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             let text = view.read(cx).query_editor_text(cx);
             assert!(text.contains("/* ") && text.contains(" */"), "快捷键没有切换块注释：{text}");

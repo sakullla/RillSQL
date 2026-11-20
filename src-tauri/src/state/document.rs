@@ -140,6 +140,9 @@ pub struct SessionTab {
     pub admin_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_key: Option<TitleKey>,
+    /// 固定标签（排在左侧、批量关闭时跳过）。旧会话没有这一项时按未固定读取；未固定时不写出。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -330,6 +333,7 @@ fn tab_from_legacy(value: &Value) -> Result<SessionTab, String> {
         doc_collection: optional_text(tab, "docCollection")?,
         admin_schema: optional_text(tab, "adminSchema")?,
         title_key: title_key_from(tab.get("titleKey"))?,
+        pinned: tab.get("pinned").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 

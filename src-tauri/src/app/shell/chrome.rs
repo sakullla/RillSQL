@@ -2,10 +2,9 @@
 //! 状态与命令都在 `WorkbenchModel`；这里只把它画出来，并把点击交回 `perform`。
 
 use gpui_kit::component::input::Input;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
+use gpui_kit::component::{ActiveTheme as _, Size, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle, Focusable as _, FontWeight,
@@ -1251,7 +1250,7 @@ impl Workbench {
             )
             .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
             .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(name))
-            .when(status == LinkStatus::Connecting, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
+            .when(status == LinkStatus::Connecting, |this| this.child(self.spinners.element(format!("conn-{}", row.saved.id), Size::XSmall, Some(p.text_muted), cx)))
             .when(supports_query, |this| {
                 this.child(explorer_hover_icon(
                     SharedString::from(format!("side-query-{id}")),
@@ -1639,7 +1638,7 @@ impl Workbench {
             .when(row.stale, |this| {
                 this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(self.t("catalog.tree.stale")))
             })
-            .when(row.loading, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
+            .when(row.loading, |this| this.child(self.spinners.element(format!("nav-{}", row.id), Size::XSmall, Some(p.text_muted), cx)))
             .when_some(row.error.clone(), |this, error| {
                 let error = self.model.text(&error);
                 let full = format!("{}: {error}", self.t("catalog.tree.nodeError"));
@@ -1811,17 +1810,25 @@ impl Workbench {
                 .child(self.query.clone())
                 .into_any_element()
         };
+        // 页签条是缓存视图（见 `TabStripHost`）：光标闪烁等只标脏工作台的重绘不再重排几百个页签。
+        let tabs_h = self.metrics().tabs_h;
+        let strip = (!welcome || !self.model.tabs.is_empty()).then(|| {
+            gpui_kit::AnyView::from(self.tab_strip_host.clone())
+                .cached(gpui_kit::StyleRefinement::default().flex_none().w_full().h(px(tabs_h)))
+        });
         let _ = window;
         div()
             .flex()
             .flex_col()
             .size_full()
-            .when(!welcome || !self.model.tabs.is_empty(), |this| this.child(self.tab_strip(cx)))
+            .children(strip)
             .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(body))
             .into_any_element()
     }
 
-    fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn tab_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(test)]
+        self.strip_count.set(self.strip_count.get() + 1);
         let p = Palette::of(cx);
         let m = self.metrics();
         // 页签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达，
@@ -1857,6 +1864,7 @@ impl Workbench {
         }
         // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
         let dirty_text = self.t("ui.grid.pending");
+        let pinned_text = self.t("shell.tabs.pinned");
         for tab in self.model.tabs.clone() {
             // 只有工作页才把标签显示为选中；设置、对比、关系图页不伪装成某个工作项。
             let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
@@ -1897,10 +1905,14 @@ impl Workbench {
             let middle_id = tab.id.clone();
             let preview = self.model.is_preview_tab(&tab.id);
             let close_label = self.t("common.close");
+            // 运行中的转圈是独立小实体：动画帧不通知工作台，不触发工作台的整理。
+            let spinner = tab.running.then(|| self.spinners.view(format!("tab-{id}"), Size::XSmall, Some(p.accent), cx));
             let chip = tabs::tab(
                 tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
                     .active(active)
                     .running(tab.running)
+                    .spinner(spinner)
+                    .pinned(tab.pinned.then(|| pinned_text.clone()))
                     .prod(is_prod)
                     .context(context_hint)
                     .preview(preview)
@@ -1958,18 +1970,138 @@ impl Workbench {
             act("new-query", cx),
         )
         .into_any_element();
-        tabs::tab_strip_with_double_click(
+        // 标签列表：标签多到放不下时也一直在右侧，可按标题、连接、库搜索后切过去。
+        let anchor = self.tab_picker_anchor.clone();
+        let list_action = div()
+            .relative()
+            .flex_none()
+            .child(
+                kit::icon_action(
+                    "tab-picker",
+                    IconName::ChevronDown,
+                    self.t("shell.tabs.list"),
+                    kit::HitArea::CONTROL,
+                    p.text_muted,
+                    &p,
+                    self.model.tabs.is_empty(),
+                    self.tab_picker.is_some(),
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_tab_picker(window, cx)),
+                ),
+            )
+            .child(
+                gpui_kit::canvas(move |area, _, _| anchor.set(Some(area)), |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+            )
+            .into_any_element();
+        let strip = tabs::tab_strip_with_double_click(
             "tabs",
             self.t("shell.tabs.tablist"),
             "tab-list",
             items,
-            vec![new_action],
+            vec![list_action, new_action],
             &self.tab_scroll,
             reveal,
             &m,
             &p,
             Some(kit::click(act("new-query", cx))),
+        );
+        match self.render_tab_picker(window, cx) {
+            Some(overlay) => div().size_full().child(strip).child(overlay).into_any_element(),
+            None => strip,
+        }
+    }
+
+    /// 标签列表里的条目：标题；说明是连接 / 库，也参与搜索。固定标签在说明里注明。
+    pub(super) fn tab_picker_items(&self) -> Vec<crate::ui::picker::PickerItem> {
+        let pinned = self.t("shell.tabs.pinned");
+        self.model
+            .tabs
+            .iter()
+            .map(|tab| {
+                let mut detail: Vec<String> = Vec::new();
+                if let Some(name) = tab.connection_name.as_ref().filter(|name| !name.is_empty()) {
+                    detail.push(name.clone());
+                }
+                if let Some(db) = tab.database.as_ref().filter(|db| !db.is_empty()) {
+                    detail.push(db.clone());
+                }
+                let mut text = detail.join(" / ");
+                if tab.pinned {
+                    text = if text.is_empty() { pinned.to_string() } else { format!("{text} · {pinned}") };
+                }
+                let item = crate::ui::picker::PickerItem::new(tab.id.clone(), tab.title.clone());
+                if text.is_empty() { item } else { item.detail(text) }
+            })
+            .collect()
+    }
+
+    /// 打开或关闭标签列表；打开时搜索框拿到键盘焦点，当前标签预先高亮。
+    pub(super) fn toggle_tab_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_picker.is_some() {
+            self.close_tab_picker(cx);
+            return;
+        }
+        let items = self.tab_picker_items();
+        if items.is_empty() {
+            return;
+        }
+        let chosen: Vec<SharedString> = self.model.active_tab.clone().map(SharedString::from).into_iter().collect();
+        let locale = self.model.locale();
+        let picker = cx.new(|cx| crate::ui::picker::Picker::new(items, crate::ui::picker::PickerMode::Single, chosen, locale, window, cx));
+        let subscription = cx.subscribe_in(&picker, window, |this, _, event: &crate::ui::picker::PickerEvent, _, cx| match event {
+            crate::ui::picker::PickerEvent::Chosen(id) => {
+                let id = id.to_string();
+                this.close_tab_picker(cx);
+                this.pick_tab(&id, cx);
+            }
+            crate::ui::picker::PickerEvent::Dismissed => this.close_tab_picker(cx),
+            crate::ui::picker::PickerEvent::Toggled(_) => {}
+        });
+        picker.update(cx, |picker, cx| picker.focus_search(window, cx));
+        self.tab_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    pub(super) fn close_tab_picker(&mut self, cx: &mut Context<Self>) {
+        if self.tab_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 标签列表里选中一项：切到这个标签，查询标签把焦点交回编辑器。
+    pub(super) fn pick_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.model.activate_item(id) {
+            return;
+        }
+        if self.model.tool == WorkTool::Query {
+            self.query.update(cx, |pane, _| pane.request_focus());
+        }
+        self.persist_if_needed(cx);
+        cx.notify();
+    }
+
+    fn render_tab_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.tab_picker.as_ref()?.0.clone();
+        let anchor = self.tab_picker_anchor.get().unwrap_or_default();
+        let viewport = window.viewport_size();
+        // 遮罩铺满窗口、画在弹层下面：点弹层以外的地方只关闭它，不会顺手点到页签。
+        let backdrop = gpui_kit::deferred(
+            gpui_kit::anchored().position(gpui_kit::Point::default()).child(
+                div()
+                    .id("tab-picker-backdrop")
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_tab_picker(cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_tab_picker(cx))),
+            ),
         )
+        .with_priority(2);
+        let popover = crate::ui::picker::picker_popover(&picker, anchor, window, cx);
+        Some(div().child(backdrop).child(popover).into_any_element())
     }
 
     // ------------------------------------------------------------ 状态栏
@@ -2108,7 +2240,7 @@ impl Workbench {
                         .rounded(px(Radius::CONTROL))
                         .px(px(4.))
                         .hover(|style| style.bg(p.hover).text_color(p.text))
-                        .child(Spinner::new().xsmall().color(p.accent))
+                        .child(self.spinners.element("status-running", Size::XSmall, Some(p.accent), cx))
                         .child(self.t("query.status.running"))
                         .on_click(act("status-jobs", cx)),
                 )
@@ -3371,7 +3503,7 @@ impl Workbench {
                                     .id("conn-test-running")
                                     .test_support()
                                     .aria_label(self.t("connections.editor.test.running"))
-                                    .child(Spinner::new().xsmall().color(p.accent)),
+                                    .child(self.spinners.element("conn-test-running", Size::XSmall, Some(p.accent), cx)),
                             )
                         }),
                 )
@@ -3868,7 +4000,7 @@ impl Workbench {
             ModalTone::Danger => p.danger,
         };
         if busy == ModalBusy::Working {
-            button = button.child(Spinner::new().xsmall().color(icon_color));
+            button = button.child(self.spinners.element(format!("modal-{id}"), Size::XSmall, Some(icon_color), cx));
         } else if let Some(icon) = icon {
             button = button.child(kit::icon(icon, 13., icon_color));
         }

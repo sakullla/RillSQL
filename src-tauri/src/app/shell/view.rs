@@ -147,6 +147,26 @@ pub struct Workbench {
     admin_link: Option<(String, bool)>,
     /// 历史预览的只读 SQL 编辑器，按条目 id 与原文重建。
     pub(super) history_editor: Option<(String, Entity<gpui_kit::component::input::EditorState>)>,
+    /// 页签、资源树行、状态栏等位置的转圈：每个位置一个隔离实体，动画帧不通知工作台。
+    pub(super) spinners: crate::ui::spinner_view::SpinnerPool,
+    /// 页签条的缓存视图：编辑器光标闪烁、转圈动画只把工作台标脏，不通知它；
+    /// 页签条沿用上一帧的布局和绘制，几百个标签时空闲重绘不再逐个重排页签。
+    pub(super) tab_strip_host: Entity<TabStripHost>,
+    /// 页签条“标签列表”弹层（按标题、连接、库搜索打开的标签）。
+    pub(super) tab_picker: Option<(Entity<crate::ui::picker::Picker>, gpui_kit::Subscription)>,
+    /// 标签列表按钮上一帧的位置：弹层贴着它弹出。
+    pub(super) tab_picker_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    /// 这一波事件里已经连续整理了几遍；画完一帧或隔了一会儿归零。
+    settle_passes: u32,
+    settle_burst: std::time::Instant,
+    settling: bool,
+    /// 测试用：render 与 settle 各执行了多少次。
+    #[cfg(test)]
+    pub(super) render_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) settle_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) strip_count: std::cell::Cell<usize>,
     _child_subscriptions: Vec<gpui_kit::Subscription>,
 }
 
@@ -186,6 +206,15 @@ impl Workbench {
     }
 
     pub fn with_services(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
+        // 构造一结束就整理一次：第一帧画出来时状态已经就绪。
+        cx.defer_in(window, |this, window, cx| this.attach(window, cx));
+        let mut this = Self::build(window, cx, services, boot);
+        // 测试里窗口常在同一个闭包里直接绘制，延迟回调还没轮到；先把窗口量好。
+        this.measure(window);
+        this
+    }
+
+    fn build(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
         let metadata_gate = Arc::clone(&services.metadata_gate);
         let foundation = cx.new(|cx| Foundation::new(window, cx));
         let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
@@ -294,6 +323,7 @@ impl Workbench {
         let child_subscriptions = vec![
             cx.observe(&query, |_, _, cx| cx.notify()),
             cx.observe(&table, |_, _, cx| cx.notify()),
+            cx.observe(&admin, |_, _, cx| cx.notify()),
             cx.observe(&exchange, |_, _, cx| cx.notify()),
             cx.observe(&structure, |_, _, cx| cx.notify()),
             cx.observe(&compare, |_, _, cx| cx.notify()),
@@ -335,7 +365,20 @@ impl Workbench {
                     cx.notify();
                 }
             }),
+            // 事件驱动的整理：本视图被通知（命令、后台回执、子视图变化转来的通知）后、下一帧之前整理一次。
+            // Spinner 动画帧只通知它自己的小视图，不会走到这里。
+            cx.observe_self(|this, cx| {
+                this.settle_from_event(cx);
+                // 工作台真的被通知（状态可能变了）时，页签条才重画；只是被标脏时沿用缓存。
+                this.tab_strip_host.update(cx, |_, cx| cx.notify());
+            }),
+            // 窗口尺寸变化：重新量宽高（窄窗口收起侧栏、按宽度排版）。
+            cx.observe_window_bounds(window, |this, window, cx| {
+                this.measure(window);
+                cx.notify();
+            }),
         ];
+        let weak_self = cx.entity().downgrade();
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -422,15 +465,43 @@ impl Workbench {
             seen_page: AppPage::Workspace,
             admin_link: None,
             history_editor: None,
+            spinners: crate::ui::spinner_view::SpinnerPool::new(),
+            tab_strip_host: cx.new(|_| TabStripHost { workbench: weak_self }),
+            tab_picker: None,
+            tab_picker_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
+            settle_passes: 0,
+            settle_burst: std::time::Instant::now(),
+            settling: false,
+            #[cfg(test)]
+            render_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            settle_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            strip_count: std::cell::Cell::new(0),
             _child_subscriptions: child_subscriptions,
         }
+    }
+
+    /// 窗口里的第一次整理：量窗口、接上关窗钩子、启动状态读取。之后只由事件驱动。
+    /// 构造完成后由 `new` / `with_services` 的调用方触发（见 `attach`）。
+    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hook_close(window, cx);
+        self.measure(window);
+        self.settle(cx);
     }
 
     pub fn shell(&self) -> &Shell {
         &self.model.shell
     }
 
+    /// 命令的唯一入口。命令改完状态后立即整理一次（补拉作业、同步标签与工具页），
+    /// 这样同一个事件里紧接着画的那一帧看到的已经是整理后的状态。
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.perform_command(id, cx);
+        self.settle(cx);
+    }
+
+    fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
             let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
@@ -875,6 +946,9 @@ impl Workbench {
     }
 
     fn forward_query(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 先把编辑器里还没收回的输入对齐进标签：不再每帧同步，这一步不能丢掉回执，
+        // 否则下面按旧快照对齐会把外壳的旧草稿拉回编辑器。
+        self.sync_query(cx);
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
@@ -886,8 +960,6 @@ impl Workbench {
             if pane.set_density(density) {
                 cx.notify();
             }
-            let _ = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
-            pane.apply_grid_locale(locale, cx);
             // 外壳已经过按需连接这道门；这里直接执行，避免面板再回一次外壳。
             pane.forwarded_command(id, cx);
             let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
@@ -942,7 +1014,8 @@ impl Workbench {
         });
     }
 
-    fn sync_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 事件触发：把标签快照交给查询页对齐。编辑器不在这里建，查询页画当前标签时才懒建。
+    fn sync_query(&mut self, cx: &mut Context<Self>) {
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
@@ -965,7 +1038,6 @@ impl Workbench {
             }
             let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.apply_grid_locale(locale, cx);
-            pane.ensure_editors(window, cx);
             effect
         });
         self.apply_query_effect(effect);
@@ -1304,7 +1376,10 @@ impl Workbench {
 
     #[cfg(test)]
     pub fn mark_table_dirty(&mut self, cx: &mut Context<Self>) {
-        self.table.update(cx, |pane, _| pane.stage_sample_edit());
+        self.table.update(cx, |pane, cx| {
+            pane.stage_sample_edit();
+            cx.notify();
+        });
     }
 
     #[cfg(test)]
@@ -1435,7 +1510,12 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() {
+                        if this.drop_nav_read(&node_id, &cancelled) {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.nav_reads.remove(&node_id);
                     match result {
                         Ok((objects, total, error, kind_reports)) => {
@@ -1563,6 +1643,18 @@ impl Workbench {
         let cancelled = handle.clone();
         if let Some((_, old)) = self.nav_reads.insert(node.id.clone(), (node.connection_id.clone(), handle)) { old.abort(); }
         (registration, cancelled)
+    }
+
+    /// 作废的读取回来了（被取消、换了更新的读取、整条连接刷新过）：结果丢掉；这个节点上
+    /// 没有别的读取在途时收起加载态，否则转圈会一直转下去（空闲时也一直请求动画帧）。
+    /// 返回加载态是否真的变了（调用方据此重绘）。
+    fn drop_nav_read(&mut self, node_id: &str, ours: &futures::future::AbortHandle) -> bool {
+        let other_live = self.nav_reads.get(node_id).is_some_and(|(_, handle)| !handle.is_aborted());
+        if !nav_read_drop_clears(ours.is_aborted(), other_live) {
+            return false;
+        }
+        self.nav_reads.remove(node_id);
+        self.model.nav.end_loading(node_id)
     }
 
     fn finish_nav_refresh(&mut self, scope: &Option<String>) {
@@ -1713,7 +1805,12 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() {
+                        if this.drop_nav_read(&node_id, &cancelled) {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.nav_reads.remove(&node_id);
                     match result {
                         Ok(schemas) => { this.model.nav.set_database(&node_id, schemas); }
@@ -1754,7 +1851,12 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() {
+                        if this.drop_nav_read(&node_id, &cancelled) {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.nav_reads.remove(&node_id);
                     let (columns, indexes) = match result {
                         Ok(pair) => pair,
@@ -1808,7 +1910,12 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() {
+                        if this.drop_nav_read(&node_id, &cancelled) {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.nav_reads.remove(&node_id);
                     match result {
                         Ok((objects, total, error)) => {
@@ -1858,7 +1965,12 @@ impl Workbench {
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() { return; }
+                    if this.nav_revision.get(&connection_id).copied() != revision || cancelled.is_aborted() {
+                        if this.drop_nav_read(&group_id, &cancelled) {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     this.nav_reads.remove(&group_id);
                     match result {
                         Ok(Ok((body, total_known))) => {
@@ -2338,6 +2450,8 @@ impl Workbench {
             let slot = allow.clone();
             if let Some(view) = view.upgrade() {
                 view.update(cx, |this, cx| {
+                    // 关窗判断前先按最新的子页面状态整理一次（导出、对比、网格暂存都在里面）。
+                    this.settle(cx);
                     this.refresh_exchange(cx);
                     slot.set(this.model.allow_system_close());
                     cx.notify();
@@ -3096,9 +3210,53 @@ impl Focusable for Workbench {
 }
 
 impl Render for Workbench {
+    /// 只构建元素。同步、补拉、按需读取都在 `settle` 里，由事件（自身通知、子视图通知、
+    /// 窗口尺寸变化、后台回执）触发；Spinner 动画帧让本视图重绘时不再重复这些工作。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.hook_close(window, cx);
-        self.measure(window);
+        #[cfg(test)]
+        self.render_count.set(self.render_count.get() + 1);
+        // 一帧画完，下一批事件重新计数；见 `settle_from_event`。
+        self.settle_passes = 0;
+        self.render_root(window, cx)
+    }
+}
+
+/// 一次事件波及里最多连续整理几遍：整理本身改了状态会再通知自己，通常两遍内收敛；
+/// 超过就停，避免某个同步函数每次都通知自己时空转。下一帧或稍后的事件会重新计数。
+const SETTLE_PASSES: u32 = 4;
+
+impl Workbench {
+    /// 自身被通知（含子视图通知转来的）时整理一次状态。连续整理有上限，见 `SETTLE_PASSES`。
+    fn settle_from_event(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.settle_burst) > std::time::Duration::from_millis(50) {
+            self.settle_passes = 0;
+        }
+        if self.settle_passes == 0 {
+            self.settle_burst = now;
+        }
+        if self.settle_passes >= SETTLE_PASSES {
+            return;
+        }
+        self.settle_passes += 1;
+        self.settle(cx);
+    }
+
+    /// 原来每帧在 render 里做的整理：补拉后台回执、下发设置、同步查询标签与目录、按需打开工具页。
+    /// 现在只在事件到来时执行一次；render 只读这些结果构建元素。
+    pub(crate) fn settle(&mut self, cx: &mut Context<Self>) {
+        // 整理过程中派发的命令（例如连接建好后续接的动作）不再嵌套整理，外层这一遍做完即可。
+        if self.settling {
+            return;
+        }
+        self.settling = true;
+        self.settle_body(cx);
+        self.settling = false;
+    }
+
+    fn settle_body(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.settle_count.set(self.settle_count.get() + 1);
         self.boot_state(cx);
         self.monitor_connections(cx);
         self.pump_jobs(cx);
@@ -3139,7 +3297,7 @@ impl Render for Workbench {
         }
         self.sync_view_settings(cx);
         self.sync_density(cx);
-        self.sync_query(window, cx);
+        self.sync_query(cx);
         self.sync_catalog(cx);
         let locale = self.model.locale();
         if self.applied_locale != Some(locale) {
@@ -3185,8 +3343,31 @@ impl Render for Workbench {
         self.refresh_tree_on_connect(cx);
         self.run_connect_intents(cx);
         self.note_admin_link(cx);
-        self.render_root(window, cx)
     }
+}
+
+/// 作废的目录读取回来时要不要收起节点的加载态。
+/// `ours_aborted`：这次读取被取消了；`other_live`：节点上登记着一个仍在途的读取。
+/// 没被取消（只是连接版本变了）时节点登记的就是这次读取自己，收起；
+/// 被同一节点更新的读取顶掉时，新读取还在途，加载态留给它收尾。
+/// 页签条的缓存视图。内容仍由工作台构建（状态和命令都在工作台），这里只提供一个独立的实体边界：
+/// 用 `.cached()` 挂进工作台后，只有它自己被通知（工作台被通知时转告、悬停变化）才重建。
+/// 缓存视图在 prepaint 阶段才画，工作台的 render 已经结束，可以在这里借用工作台。
+pub(super) struct TabStripHost {
+    workbench: gpui_kit::WeakEntity<Workbench>,
+}
+
+impl Render for TabStripHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.workbench.upgrade() {
+            Some(workbench) => workbench.update(cx, |workbench, cx| workbench.tab_strip(window, cx)),
+            None => gpui_kit::div().into_any_element(),
+        }
+    }
+}
+
+pub(super) fn nav_read_drop_clears(ours_aborted: bool, other_live: bool) -> bool {
+    !ours_aborted || !other_live
 }
 
 /// 启动后多久做第一次自动更新检查。

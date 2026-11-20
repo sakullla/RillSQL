@@ -146,6 +146,8 @@ pub struct WorkItem {
     pub connection_name: Option<String>,
     pub database: Option<String>,
     pub engine: Option<String>,
+    /// 固定标签：排在最左侧，批量关闭时跳过；随会话保存。
+    pub pinned: bool,
 }
 
 impl WorkItem {
@@ -166,6 +168,7 @@ impl WorkItem {
             connection_name: None,
             database: None,
             engine: None,
+            pinned: false,
         }
     }
 }
@@ -1357,6 +1360,8 @@ impl WorkbenchModel {
             "tab-close-others" => self.close_others(),
             "tab-close-right" => self.close_right(),
             "tab-close-all" => self.request_close_all(),
+            "tab-close-unmodified" => self.close_unmodified(),
+            "tab-pin" => self.toggle_pin_active(),
             "editor-clear" => self.clear_editor(),
             "history-load" => self.load_selected_history(),
             "history-copy" => self.copy_selected_sql(),
@@ -2221,6 +2226,13 @@ impl WorkbenchModel {
 
     pub fn open_tab_menu(&mut self) {
         self.open_menu(MenuPlace::TabBar, MenuTarget::QueryTab);
+        let facts = super::menus::TabMenuFacts {
+            pinned: self.active_tab.as_deref().is_some_and(|id| self.is_pinned(id)),
+            unmodified: self.unmodified_tabs().len(),
+        };
+        if let Some(menu) = self.menu.as_mut() {
+            *menu = super::menus::OpenMenu::with_items(MenuPlace::TabBar, super::menus::tab_bar_items(&facts));
+        }
     }
 
     /// 标签右键：先激活目标项，再打开菜单；视图、目标与菜单基准保持一致。
@@ -4963,22 +4975,73 @@ impl WorkbenchModel {
         self.shell.focus = FocusTarget::Editor;
     }
 
+    // 批量关闭都跳过固定标签：固定就是“别被顺手关掉”。单个关闭（× 按钮、中键、Ctrl+W）不受影响。
     fn close_others(&mut self) {
         let Some(id) = self.active_tab.clone() else { return };
-        let others: Vec<String> = self.tabs.iter().filter(|tab| tab.id != id).map(|tab| tab.id.clone()).collect();
+        let others: Vec<String> = self.tabs.iter().filter(|tab| tab.id != id && !tab.pinned).map(|tab| tab.id.clone()).collect();
         self.close_sequence(others);
     }
 
     fn close_right(&mut self) {
         let Some(id) = self.active_tab.clone() else { return };
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
-        let right: Vec<String> = self.tabs.iter().skip(index + 1).map(|tab| tab.id.clone()).collect();
+        let right: Vec<String> = self.tabs.iter().skip(index + 1).filter(|tab| !tab.pinned).map(|tab| tab.id.clone()).collect();
         self.close_sequence(right);
     }
 
     fn request_close_all(&mut self) {
-        let ids: Vec<String> = self.tabs.iter().map(|tab| tab.id.clone()).collect();
+        let ids: Vec<String> = self.tabs.iter().filter(|tab| !tab.pinned).map(|tab| tab.id.clone()).collect();
         self.close_sequence(ids);
+    }
+
+    /// 不需要确认就能关的标签：没有未执行草稿、未提交修改，也没有正在执行，并且没有固定。
+    pub fn unmodified_tabs(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|tab| !tab.pinned && evaluate(self.tab_facts(&tab.id)) == CloseKind::Allow)
+            .map(|tab| tab.id.clone())
+            .collect()
+    }
+
+    /// “关闭全部未修改”：只关不需要确认的标签，有草稿、有修改、正在执行和固定的都留下，不弹确认。
+    pub fn close_unmodified(&mut self) {
+        for id in self.unmodified_tabs() {
+            self.remove_tab(&id);
+        }
+    }
+
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.pinned)
+    }
+
+    fn toggle_pin_active(&mut self) {
+        let Some(id) = self.active_tab.clone() else { return };
+        let pinned = !self.is_pinned(&id);
+        self.set_pinned(&id, pinned);
+    }
+
+    /// 固定或取消固定。固定标签排在最左侧（固定区内保持固定的先后），取消固定的放在固定区之后的第一个。
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return false };
+        if self.tabs[index].pinned == pinned {
+            return false;
+        }
+        let mut tab = self.tabs.remove(index);
+        tab.pinned = pinned;
+        if pinned && self.preview_tab.as_deref() == Some(id) {
+            // 固定的标签不再是会被替换的预览标签。
+            self.preview_tab = None;
+        }
+        let boundary = self.tabs.iter().take_while(|tab| tab.pinned).count();
+        self.tabs.insert(boundary, tab);
+        true
+    }
+
+    /// 会话恢复和外部插入之后把固定标签收拢到左侧，相对顺序不变。
+    fn group_pinned(&mut self) {
+        if self.tabs.iter().skip_while(|tab| tab.pinned).any(|tab| tab.pinned) {
+            self.tabs.sort_by_key(|tab| !tab.pinned);
+        }
     }
 
     /// 逐项关闭：需要确认时停下；确认后从断点继续，运行中的项保留在原位。
@@ -5051,6 +5114,7 @@ impl WorkbenchModel {
             connection_name,
             database,
             engine,
+            pinned: false,
         });
         let _ = self.activate_item(&id);
     }
@@ -5992,6 +6056,7 @@ impl WorkbenchModel {
 
     pub fn restore_session(&mut self, session: &SessionState) {
         self.tabs = session.tabs.iter().filter_map(session_to_item).collect();
+        self.group_pinned();
         self.relabel_query_tabs();
         self.tool = WorkTool::Query;
         self.table_spec = None;
@@ -6040,6 +6105,7 @@ fn tab_to_session(tab: &WorkItem) -> SessionTab {
         doc_collection: None,
         admin_schema: None,
         title_key: None,
+        pinned: tab.pinned,
     }
 }
 
@@ -6066,6 +6132,7 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
         connection_name: tab.connection_name.clone(),
         database: tab.database.clone(),
         engine: tab.engine.clone(),
+        pinned: tab.pinned,
     })
 }
 

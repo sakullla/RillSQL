@@ -245,6 +245,32 @@ pub fn place_submenu(parent_x: f32, parent_y: f32, parent_w: f32, width: f32, he
     (x, y)
 }
 
+/// 页签右键菜单的现场事实：这个标签是否固定，有几个标签可以不经确认直接关掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabMenuFacts {
+    pub pinned: bool,
+    pub unmodified: usize,
+}
+
+/// 页签菜单。“固定 / 取消固定”随标签状态切换文案；“关闭全部未修改”没有可关的标签时禁用并说明原因。
+pub fn tab_bar_items(facts: &TabMenuFacts) -> Vec<MenuItem> {
+    let pin = if facts.pinned { with_icon(item("tab-pin", "shell.tabs.unpin"), IconName::PinOff) } else { with_icon(item("tab-pin", "shell.tabs.pin"), IconName::Pin) };
+    let unmodified = if facts.unmodified > 0 {
+        item("tab-close-unmodified", "shell.tabs.closeUnmodified")
+    } else {
+        disabled("tab-close-unmodified", "shell.tabs.closeUnmodified", "shell.tabs.noneUnmodified")
+    };
+    vec![
+        with_icon(item("close-tab", "common.close"), IconName::X),
+        with_icon(item("tab-close-others", "shell.tabs.closeOthers"), IconName::CircleX),
+        with_icon(item("tab-close-right", "shell.tabs.closeRight"), IconName::ArrowRight),
+        with_icon(unmodified, IconName::Eraser),
+        with_icon(item("tab-close-all", "shell.tabs.closeAll"), IconName::Trash),
+        sep(pin),
+        sep(with_icon(item("history-copy", "query.editor.menu.copy"), IconName::Copy)),
+    ]
+}
+
 pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
     match place {
         // 分组菜单的条目由模型按分组现算（名字与命令都带目标），这里没有通用项。
@@ -252,13 +278,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         MenuPlace::Results => results_items(&ResultsMenuFacts::default()),
         MenuPlace::ObjectTree => object_tree_items(target, None),
         MenuPlace::Grid => grid_items(&GridMenuFacts { table: true, writable: target == MenuTarget::WritableGrid, ..GridMenuFacts::default() }),
-        MenuPlace::TabBar => vec![
-            with_icon(item("close-tab", "common.close"), IconName::X),
-            with_icon(item("tab-close-others", "shell.tabs.closeOthers"), IconName::CircleX),
-            with_icon(item("tab-close-right", "shell.tabs.closeRight"), IconName::ArrowRight),
-            with_icon(item("tab-close-all", "shell.tabs.closeAll"), IconName::Trash),
-            sep(with_icon(item("history-copy", "query.editor.menu.copy"), IconName::Copy)),
-        ],
+        MenuPlace::TabBar => tab_bar_items(&TabMenuFacts::default()),
         MenuPlace::Editor => vec![
             with_icon(item("execute-query", "query.editor.menu.run"), IconName::Play),
             with_icon(item("run-current", "query.editor.menu.runCurrent"), IconName::StepForward),

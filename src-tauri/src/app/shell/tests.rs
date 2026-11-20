@@ -2379,6 +2379,8 @@ fn query_commands_refuse_a_hidden_query_while_a_table_item_is_active(cx: &mut gp
             let query = view.model.active_tab.clone().expect("query item");
             view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
             view.model.tabs.iter_mut().find(|tab| tab.id == query).unwrap().draft = "select   1".to_owned();
+            // 直接改模型不经过命令：按事件到来整理一次（生产里由通知触发）。
+            view.settle(cx);
         });
         window.render_frame(cx);
         view.update(cx, |view, cx| assert_eq!(view.query_draft(cx), "select   1"));
@@ -2604,8 +2606,9 @@ fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(c
     // 回到查询工作项，来源自动回到查询结果。
     let query = cx.update(|cx| view.read(cx).model.tabs.iter().find(|tab| tab.kind.is_query()).unwrap().id.clone());
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             assert!(view.model.activate_item(&query));
+            cx.notify();
         });
         window.render_frame(cx);
     })
@@ -13055,4 +13058,224 @@ fn query_result_cell_and_row_header_menus_differ_and_explain_readonly(cx: &mut g
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R5：固定标签排在左侧、随会话保存（旧会话按未固定读取）、批量关闭时跳过；
+/// “关闭全部未修改”只关不需要确认的标签，有草稿和正在执行的留下；菜单项随状态切换文案和可用性。
+#[test]
+fn pinned_tabs_and_close_unmodified_follow_the_tab_menu_and_the_session() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    for _ in 0..4 {
+        assert!(model.dispatch("new-query").is_some());
+    }
+    let ids: Vec<String> = model.tabs.iter().map(|tab| tab.id.clone()).collect();
+    model.tabs[1].draft = "select 1".into();
+    model.tabs[2].running = true;
+    let tab_menu = |model: &mut WorkbenchModel| {
+        model.open_tab_menu();
+        let items = model.menu.as_ref().expect("页签菜单").items.clone();
+        model.menu = None;
+        items
+    };
+    let find = |items: &[crate::app::shell::menus::MenuItem], id: &str| items.iter().find(|item| item.id == id).cloned().expect(id);
+
+    // 固定最后一个：它挪到最左侧，菜单改成“取消固定”。
+    assert!(model.activate_item(&ids[3]));
+    let items = tab_menu(&mut model);
+    assert_eq!(find(&items, "tab-pin").label_key, "shell.tabs.pin");
+    assert!(find(&items, "tab-close-unmodified").enabled, "有空查询可关");
+    assert!(model.dispatch("tab-pin").is_some());
+    assert_eq!(model.tabs[0].id, ids[3]);
+    assert!(model.tabs[0].pinned);
+    assert_eq!(find(&tab_menu(&mut model), "tab-pin").label_key, "shell.tabs.unpin");
+
+    // 关闭全部未修改：空查询关掉；有草稿、正在执行、固定的都留下，也不弹确认。
+    assert!(model.dispatch("tab-close-unmodified").is_some());
+    let left: Vec<&str> = model.tabs.iter().map(|tab| tab.id.as_str()).collect();
+    assert_eq!(left, [ids[3].as_str(), ids[1].as_str(), ids[2].as_str()]);
+    assert!(model.close_prompt.is_none());
+    let items = tab_menu(&mut model);
+    let none = find(&items, "tab-close-unmodified");
+    assert!(!none.enabled);
+    assert_eq!(none.reason_key, Some("shell.tabs.noneUnmodified"), "禁用时说明原因");
+
+    // 批量关闭跳过固定标签。
+    model.tabs.iter_mut().for_each(|tab| {
+        tab.running = false;
+        tab.draft.clear();
+    });
+    assert!(model.activate_item(&ids[1]));
+    assert!(model.dispatch("tab-close-all").is_some());
+    assert_eq!(model.tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>(), [ids[3].as_str()], "关闭全部留下固定标签");
+
+    // 会话：固定状态写出并读回；旧会话没有这一项时按未固定读取；乱序的固定标签收拢到左侧。
+    assert!(model.dispatch("new-query").is_some());
+    let fresh = model.active_tab.clone().unwrap();
+    let bytes = crate::state::to_bytes(&model.snapshot()).unwrap();
+    let parsed = crate::state::parse_stored(&bytes).unwrap();
+    let mut restored = WorkbenchModel::new(Shell::default());
+    restored.restore_session(&parsed.session);
+    assert!(restored.is_pinned(&ids[3]));
+    assert!(!restored.is_pinned(&fresh));
+    let mut session = parsed.session.clone();
+    session.tabs.reverse();
+    restored.restore_session(&session);
+    assert_eq!(restored.tabs[0].id, ids[3], "固定标签恢复后仍在最左侧");
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for tab in legacy["session"]["tabs"].as_array_mut().unwrap() {
+        tab.as_object_mut().unwrap().remove("pinned");
+    }
+    let old = crate::state::parse_stored(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+    restored.restore_session(&old.session);
+    assert!(restored.tabs.iter().all(|tab| !tab.pinned), "旧会话按未固定读取");
+
+    // 取消固定：放到固定区之后的第一个。
+    assert!(model.set_pinned(&fresh, true));
+    assert_eq!(model.tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>(), [ids[3].as_str(), fresh.as_str()]);
+    assert!(model.set_pinned(&ids[3], false));
+    assert_eq!(model.tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>(), [fresh.as_str(), ids[3].as_str()]);
+    assert!(!model.set_pinned(&ids[3], false), "状态没变不算变化");
+}
+
+/// R6：作废的目录读取回来时，只有节点上没有更新的读取在途才收起加载态。
+#[test]
+fn a_dropped_nav_read_clears_loading_unless_a_newer_read_is_in_flight() {
+    use super::view::nav_read_drop_clears;
+    assert!(nav_read_drop_clears(false, true), "没被取消（连接版本变了）：登记的就是自己，收起");
+    assert!(nav_read_drop_clears(true, false), "被取消且没有别的读取：收起");
+    assert!(!nav_read_drop_clears(true, true), "被同一节点更新的读取顶掉：留给新读取收尾");
+}
+
+fn plain_workbench(cx: &mut gpui_kit::TestAppContext) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>) {
+    let dir = std::env::temp_dir().join(format!("rillsql-tabs-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(720.)) };
+        let (window, view) = gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |window, cx| cx.new(|cx| super::view::Workbench::with_services(window, cx, services, false)),
+        )
+        .expect("workbench");
+        (window, view)
+    })
+}
+
+/// R5/R6：300 个查询标签只建一个编辑器；空闲重绘不再做整理（同步只由事件触发）；
+/// 标签列表按标题、连接、库搜索，选中后切到对应标签。
+#[gpui_kit::test]
+fn hundreds_of_query_tabs_stay_lazy_idle_frames_do_not_settle_and_the_tab_list_switches(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view) = plain_workbench(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..300 {
+                view.perform("new-query", cx);
+            }
+            let first = view.model.tabs[0].id.clone();
+            assert!(view.model.activate_item(&first));
+            view.model.tabs[0].connection_name = Some("Atlas".to_owned());
+            view.model.tabs[0].database = Some("orders".to_owned());
+            view.settle(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.tabs.iter().filter(|tab| tab.kind.is_query()).count(), 300);
+        assert_eq!(view.query.read(cx).editor_count(), 1, "只给当前标签建编辑器");
+    });
+
+    // 空闲：没有事件时重绘只构建元素，不再跑整理。
+    let settled = cx.update(|cx| view.read(cx).settle_count.get());
+    let rendered = cx.update(|cx| view.read(cx).render_count.get());
+    for _ in 0..3 {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    let (settles, renders) = cx.update(|cx| (view.read(cx).settle_count.get() - settled, view.read(cx).render_count.get() - rendered));
+    assert!(renders >= 3, "每次通知都重绘：{renders}");
+    assert_eq!(settles, 3, "每次事件整理一次，整理本身不再引出下一轮：{settles} / {renders}");
+    let before = cx.update(|cx| view.read(cx).settle_count.get());
+    for _ in 0..3 {
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+    }
+    assert_eq!(cx.update(|cx| view.read(cx).settle_count.get()), before, "没有事件的重绘不整理");
+
+    // 标签列表：按连接名搜索到第一个标签，回车切过去。
+    let last = cx.update(|cx| view.read(cx).model.tabs.last().unwrap().id.clone());
+    let first = cx.update(|cx| view.read(cx).model.tabs[0].id.clone());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.activate_item(&last));
+            view.toggle_tab_picker(window, cx);
+        });
+        window.render_frame(cx);
+        let picker = view.read(cx).tab_picker.as_ref().map(|(picker, _)| picker.clone()).expect("标签列表打开");
+        assert_eq!(picker.read(cx).model().items().len(), 300);
+        picker.update(cx, |picker, cx| picker.set_query("atlas", cx));
+        assert_eq!(picker.read(cx).model().matches().len(), 1, "按连接名搜索");
+        picker.update(cx, |picker, cx| picker.set_query("orders", cx));
+        assert_eq!(picker.read(cx).model().matches().len(), 1, "按库名搜索");
+        picker.update(cx, |picker, cx| {
+            assert!(picker.press("enter", cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.tab_picker.is_none(), "选中后关闭");
+        assert_eq!(view.model.active_tab.as_deref(), Some(first.as_str()));
+        assert!(view.query.read(cx).editor_count() <= 2, "访问过的标签才有编辑器");
+    });
+}
+
+/// R6：编辑器光标闪烁只把工作台标脏、不通知它：工作台照常重绘，但页签条是缓存视图，
+/// 几百个页签不随每次闪烁重建；工作台真被通知时页签条跟着重建。
+#[gpui_kit::test]
+fn caret_blink_redraws_do_not_rebuild_the_tab_strip(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view) = plain_workbench(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..300 {
+                view.perform("new-query", cx);
+            }
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+    assert!(cx.update_window(window, |_, window, cx| view.read(cx).query_editor_focused(window, cx)).unwrap(), "编辑器有焦点，光标在闪");
+    let counts = |cx: &mut gpui_kit::TestAppContext| cx.update(|cx| {
+        let view = view.read(cx);
+        (view.render_count.get(), view.settle_count.get(), view.strip_count.get())
+    });
+    let (r0, s0, t0) = counts(cx);
+    for _ in 0..4 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+    }
+    let (r1, s1, t1) = counts(cx);
+    assert!(r1 > r0, "光标闪烁让工作台重绘：{r0} -> {r1}");
+    assert_eq!(s1, s0, "闪烁不是事件，不整理");
+    assert_eq!(t1, t0, "页签条沿用缓存，不随闪烁重建");
+    // 工作台被通知（状态可能变了）：页签条重建。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |_, cx| cx.notify());
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(counts(cx).2 > t1, "工作台被通知后页签条重建");
 }

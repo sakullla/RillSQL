@@ -1052,6 +1052,13 @@ impl NavTree {
         true
     }
 
+    /// 读取被取消或作废（换了更新的读取、整条连接刷新、窗口关闭）：只收起加载态，
+    /// 不留错误、不动已有子节点。节点上没有别的读取在途时由调用方调用，避免转圈一直不停。
+    pub fn end_loading(&mut self, id: &str) -> bool {
+        let Some(node) = self.nodes.get_mut(id) else { return false };
+        std::mem::replace(&mut node.loading, false)
+    }
+
     /// 只有目录读取失败时才调用；保留已经读到的对象和它们的子节点。
     pub fn set_error(&mut self, id: &str, message: impl Into<String>) -> bool {
         let Some(node) = self.nodes.get_mut(id) else { return false };
@@ -2299,6 +2306,49 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(tree.node(&first).unwrap().object().unwrap().database, "shop");
         assert_eq!(tree.node(&second).unwrap().object().unwrap().database, "archive");
+    }
+
+    /// R6：树节点的加载态在失败、超时、取消后都收起，转圈不会一直转（空闲时也不再请求动画帧）。
+    #[test]
+    fn loading_ends_on_failure_timeout_and_cancel() {
+        let timeout = crate::catalog::nav_read::METADATA_TIMEOUT_MESSAGE;
+        let shop = || vec![database("shop", vec![schema("public", vec![table("orders")])]), database("audit", Vec::new())];
+        let mut outline = connection(Engine::Postgres, shop());
+        outline.outline_only = true;
+        let mut tree = NavTree::new();
+        tree.apply(&[outline]);
+        let other = database_node_id("conn-postgres", "audit");
+        // 超时：库清单读取超时，原因落在库节点上，加载态收起。
+        assert!(tree.begin_database(&other));
+        tree.set_database(&other, Err(timeout.to_owned()));
+        assert!(!tree.node(&other).unwrap().loading, "超时后离开加载态");
+        assert_eq!(tree.node(&other).unwrap().error.as_deref(), Some(timeout));
+
+        let mut tree = NavTree::new();
+        tree.apply(&[connection(Engine::Postgres, shop())]);
+        let object = object_node_id("conn-postgres", "shop", "public", &table("orders"));
+        let group = group_node_id("conn-postgres", "shop", "public", ObjectKind::Table);
+
+        // 失败：对象的列/索引读取报错。
+        assert!(tree.begin_details(&object));
+        tree.set_details(&object, Err("连接中断".to_owned()), Err("连接中断".to_owned()));
+        assert!(!tree.node(&object).unwrap().loading, "失败后离开加载态");
+        assert_eq!(tree.node(&object).unwrap().error.as_deref(), Some("连接中断"));
+
+        // 超时：分组读取超时同样收起。
+        assert!(tree.begin_group(&group));
+        tree.set_kind_page(&group, &[], 0, Some(timeout.to_owned()));
+        assert!(!tree.node(&group).unwrap().loading);
+
+        // 取消：读取被作废（换了更新的读取、整条连接刷新），只收起加载态，不留错误、不动子节点。
+        let children = tree.node(&group).unwrap().children.clone();
+        assert!(tree.begin_group(&group));
+        assert!(tree.end_loading(&group), "收起了在途的加载态");
+        let node = tree.node(&group).unwrap();
+        assert!(!node.loading && node.error.is_none());
+        assert_eq!(node.children, children);
+        assert!(!tree.end_loading(&group), "没有在途读取时不算变化");
+        assert!(!tree.end_loading("missing"));
     }
 
     #[test]

@@ -177,6 +177,12 @@ dict! {
     "shell.tabs.closeOthers" => "关闭其他", "Close others";
     "shell.tabs.closeRight" => "关闭右侧", "Close to the right";
     "shell.tabs.closeAll" => "关闭全部", "Close all";
+    "shell.tabs.closeUnmodified" => "关闭全部未修改", "Close all unmodified";
+    "shell.tabs.noneUnmodified" => "没有可以直接关闭的标签：其余标签有草稿、未提交的修改、正在执行或已固定", "No tab can be closed without confirmation: the rest have drafts, staged changes, running work or are pinned";
+    "shell.tabs.pin" => "固定标签", "Pin tab";
+    "shell.tabs.unpin" => "取消固定", "Unpin tab";
+    "shell.tabs.pinned" => "已固定", "Pinned";
+    "shell.tabs.list" => "标签列表", "Tab list";
     "shell.tabs.pendingCells" => "先提交或撤销当前表格的暂存修改", "Commit or discard the staged grid changes first";
     "shell.tabs.needObject" => "先在对象树里选择表或视图。", "Choose a table or view in the object tree first.";
     "shell.closeGuard.closeWindow" => "关闭窗口？", "Close the window?";
