@@ -297,6 +297,8 @@ pub struct NavRow {
     pub primary: bool,
     /// 搜索时这个容器下面命中的对象数（含自身）。不在搜索里为 0。
     pub search_hits: usize,
+    /// Ctrl/⌘ 多选里选中了这一行（只有关系型表可以多选）。
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +315,8 @@ pub struct NavTree {
     search_closed: BTreeSet<String>,
     /// 只由服务端搜索命中合入、还没被正常读取确认过的节点。清除搜索时撤掉，树回到搜索前的样子。
     search_provisional: BTreeSet<String>,
+    /// Ctrl/⌘ 点击多选的表节点，按选中先后排列（第一张是基准，第二张是对照）。
+    selection: Vec<String>,
 }
 
 /// 搜索时容器默认展开的命中上限：命中少就直接摊开，命中多的库先收起并标出命中数，
@@ -358,7 +362,49 @@ impl NavTree {
             search_opened: BTreeSet::new(),
             search_closed: BTreeSet::new(),
             search_provisional: BTreeSet::new(),
+            selection: Vec::new(),
         }
+    }
+
+    /// 能否加入多选：只有关系型引擎的表节点可以。
+    pub fn selectable(&self, id: &str) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            node.kind == NavKind::Object && node.object_kind == Some(ObjectKind::Table) && node.engine.is_relational()
+        })
+    }
+
+    /// Ctrl/⌘ 点击：切换这一行是否选中。不能多选的节点不进选择，返回 false。
+    pub fn toggle_selection(&mut self, id: &str) -> bool {
+        if !self.selectable(id) {
+            return false;
+        }
+        if let Some(position) = self.selection.iter().position(|item| item == id) {
+            self.selection.remove(position);
+        } else {
+            self.selection.push(id.to_owned());
+        }
+        true
+    }
+
+    /// 普通点击：清空多选。返回是否真的清掉了什么。
+    pub fn clear_selection(&mut self) -> bool {
+        let had = !self.selection.is_empty();
+        self.selection.clear();
+        had
+    }
+
+    /// 仍在树上的已选节点，按选中先后排列。
+    pub fn selection(&self) -> Vec<String> {
+        self.selection.iter().filter(|id| self.selectable(id)).cloned().collect()
+    }
+
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selection.iter().any(|item| item == id)
+    }
+
+    /// 已选表的对象身份，按选中先后排列。
+    pub fn selected_tables(&self) -> Vec<ObjectKey> {
+        self.selection().iter().filter_map(|id| self.nodes.get(id).and_then(NavNode::object)).collect()
     }
 
     pub fn node(&self, id: &str) -> Option<&NavNode> {
@@ -1595,6 +1641,7 @@ impl NavTree {
             detail: if matches!(node.kind, NavKind::Column | NavKind::Index) { node.cursor.clone().unwrap_or_default() } else { String::new() },
             primary: node.primary,
             search_hits: 0,
+            selected: self.is_selected(&node.id),
         }
     }
 

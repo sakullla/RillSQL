@@ -360,6 +360,16 @@ pub struct SideRequest {
     pub engine: String,
 }
 
+/// 表对表对比的一对表：两侧表名可以不同，两侧可以是不同连接或不同库。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TablePair {
+    /// 基准一侧的表名。
+    pub baseline: String,
+    /// 对照一侧的表名；同步 SQL 针对这张表。
+    pub target: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StructureRequest {
@@ -369,14 +379,28 @@ pub struct StructureRequest {
     /// 每次读取的超时（秒），取设置里的查询超时；0 时用目录读取的默认超时。
     #[serde(default)]
     pub timeout_secs: u64,
+    /// 设置后只比较这一对表（表对表对比）；不设置时整库对比。
+    #[serde(default)]
+    pub objects: Option<TablePair>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataTableRequest {
+    /// 基准一侧的表名（不设置 `right_name` 时两侧同名）。
     pub name: String,
     #[serde(default)]
     pub key: Option<String>,
+    /// 对照一侧的表名；表对表对比时可以与 `name` 不同。
+    #[serde(default)]
+    pub right_name: Option<String>,
+}
+
+impl DataTableRequest {
+    /// 对照一侧实际读取和写同步语句的表名。
+    pub fn target_name(&self) -> &str {
+        self.right_name.as_deref().filter(|name| !name.trim().is_empty()).unwrap_or(&self.name)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

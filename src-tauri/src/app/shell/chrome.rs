@@ -1498,7 +1498,7 @@ impl Workbench {
             .group(group.clone())
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
-            .aria_selected(row.focused)
+            .aria_selected(row.focused || row.selected)
             .aria_expanded(row.expanded)
             // 右键菜单打开时不再挂悬停提示：提示浮层会盖住菜单的第一项。
             .when(self.model.menu.is_none(), |this| this.tooltip_text(tooltip))
@@ -1511,8 +1511,8 @@ impl Workbench {
             .items_center()
             .gap(px(5.))
             .rounded(px(Radius::CONTROL))
-            .when(row.focused, |this| this.bg(p.selection))
-            .when(!row.focused, |this| this.hover(|style| style.bg(p.hover)))
+            .when(row.focused || row.selected, |this| this.bg(p.selection))
+            .when(!row.focused && !row.selected, |this| this.hover(|style| style.bg(p.hover)))
             .children(guides)
             .child(
                 div()
@@ -1567,7 +1567,7 @@ impl Workbench {
                                 .invisible()
                                 .group_hover(group.clone(), |style| style.visible())
                                 // 底色与行当前底色一致：选中行是选中底，其余是悬停底，不出现色块。
-                                .bg(if row.focused { p.selection } else { p.hover })
+                                .bg(if row.focused || row.selected { p.selection } else { p.hover })
                                 .rounded(px(Radius::CONTROL))
                                 .child(explorer_hover_icon(
                                     SharedString::from(format!("nav-quick-data-{id}")),
@@ -1716,6 +1716,14 @@ impl Workbench {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.model.shell.focus = FocusTarget::Sidebar;
                 window.focus(&this.nav_focus, cx);
+                if event.modifiers().secondary(cx) {
+                    // Ctrl/⌘ 点击只切换多选（只有表可以多选），不展开、不打开概览。
+                    this.perform(&format!("nav-select-toggle:{click_id}"), cx);
+                    cx.notify();
+                    return;
+                }
+                // 普通点击清空多选。
+                this.perform("nav-select-clear", cx);
                 this.perform(&format!("nav-focus:{click_id}"), cx);
                 if is_group && !empty_group {
                     // 纯分组目录行（表 / 视图 / 列 / 索引）与用户连接组一样单击即展开/折叠；

@@ -1,7 +1,8 @@
 //! 把对照改成基准的结构脚本。这里不连接数据库，也不执行语句。
 
 use super::model::{
-    Category, ColumnShape, DataKey, DiffItem, Engine, ForeignKeyShape, IndexShape, KeyChoice, Kind, ObjectDef, Side, StructureReport, TableChoice, TableShape,
+    Category, ColumnShape, DataKey, DiffItem, Engine, ForeignKeyShape, IndexShape, KeyChoice, Kind, ObjectDef, Side, StructureReport, TableChoice, TablePair,
+    TableShape,
 };
 // 顺序决策的排序核心与 SQL 依赖分析已抽到 dump::order 共享，全库导出（R7）与这里共用同一套 Kahn 拓扑。
 use crate::dump::order::{
@@ -14,6 +15,130 @@ use crate::adapters::transfer::{qualify as qualify_on, transfer_of, InPlaceTypes
 
 pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     diff_sides(baseline, target, true).0
+}
+
+/// 表对表对比：两侧只留这一对表，基准表按对照表名比较，同步 SQL 只针对对照表。
+/// 表名不同、跨连接或跨库都可以；引擎仍须相同。
+pub fn diff_table_pair(baseline: &Side, target: &Side, pair: &TablePair) -> StructureReport {
+    if let Some(message) = refuse_pair(baseline, target) {
+        return empty_report(Some(message));
+    }
+    let (left, right) = match narrow_to_pair(baseline, target, pair) {
+        Ok(sides) => sides,
+        Err(message) => return empty_report(Some(message)),
+    };
+    let mut report = diff_structure(&left, &right);
+    if report.refused.is_some() {
+        return report;
+    }
+    // 表对表对比逐列列出差异：整库对比只给一条“列不同”。
+    if let (Some(base), Some(other)) = (left.objects[0].table.as_ref(), right.objects[0].table.as_ref()) {
+        let template = report.changed.iter().find(|item| item.kind == Kind::Table.label() && item.name == pair.target).cloned().unwrap_or_default();
+        let columns = column_items(base, other).into_iter().map(|mut item| {
+            item.owner = pair.target.clone();
+            item.baseline_definition = template.baseline_definition.clone();
+            item.target_definition = template.target_definition.clone();
+            item.sql = template.sql.clone();
+            item
+        });
+        report.changed.extend(columns);
+    }
+    let mut extra = Vec::new();
+    if pair.baseline != pair.target {
+        extra.push(format!("基准表 {} 与对照表 {} 按同一张表比较，同步 SQL 针对对照表 {}。", pair.baseline, pair.target, pair.target));
+    }
+    if let Some(reason) = pair_data_refusal(&report) {
+        extra.push(reason);
+    }
+    if !extra.is_empty() {
+        report.notes.extend(extra);
+        report.notes.sort();
+        report.notes.dedup();
+    }
+    report
+}
+
+/// 表对表对比时数据对比为什么不可用；可用时为 `None`。
+/// 数据对比要按主键或唯一键对应两侧的行。
+pub fn pair_data_refusal(report: &StructureReport) -> Option<String> {
+    let Some(table) = report.tables.first() else {
+        return Some("没有读到这对表的结构，只做结构对比。".to_owned());
+    };
+    if table.keys.is_empty() {
+        return Some(format!("表 {} 没有主键或唯一键，无法按键对应两侧的行，只做结构对比。", table.name));
+    }
+    None
+}
+
+/// 两张表逐列的差异：只在一侧的列、类型/可空/默认值/主键不同的列，各占一条。
+pub fn column_items(baseline: &TableShape, target: &TableShape) -> Vec<DiffItem> {
+    let kind = "列";
+    let mut items = Vec::new();
+    for column in &baseline.columns {
+        match target.columns.iter().find(|other| other.name == column.name) {
+            None => items.push(DiffItem::new(kind, column.name.clone(), format!("仅基准拥有：{}", column.type_name))),
+            Some(other) => {
+                let mut parts = Vec::new();
+                if !column.type_name.eq_ignore_ascii_case(&other.type_name) {
+                    parts.push(format!("类型 {} → {}", other.type_name, column.type_name));
+                }
+                if column.nullable != other.nullable {
+                    let label = |nullable: bool| if nullable { "可为空" } else { "不可为空" };
+                    parts.push(format!("{} → {}", label(other.nullable), label(column.nullable)));
+                }
+                if column.default_sql.trim() != other.default_sql.trim() {
+                    let shown = |text: &str| if text.trim().is_empty() { "无".to_owned() } else { text.trim().to_owned() };
+                    parts.push(format!("默认值 {} → {}", shown(&other.default_sql), shown(&column.default_sql)));
+                }
+                if column.primary != other.primary {
+                    parts.push(if column.primary { "基准属于主键".to_owned() } else { "对照属于主键".to_owned() });
+                }
+                if !parts.is_empty() {
+                    items.push(DiffItem::new(kind, column.name.clone(), parts.join("；")));
+                }
+            }
+        }
+    }
+    for column in target.columns.iter().filter(|column| !baseline.columns.iter().any(|base| base.name == column.name)) {
+        items.push(DiffItem::new(kind, column.name.clone(), format!("仅对照拥有：{}", column.type_name)));
+    }
+    items
+}
+
+/// 两侧只留这一对表。基准表改用对照表名，这样两侧按同一身份配对。
+/// 与这对表无关的类别读取失败（函数、视图…）不影响它。
+pub fn narrow_to_pair(baseline: &Side, target: &Side, pair: &TablePair) -> Result<(Side, Side), String> {
+    let pick = |side: &Side, name: &str, label: &str| -> Result<Side, String> {
+        if let Some(message) = &side.fatal {
+            return Err(format!("{message} 不生成脚本。"));
+        }
+        let found = side.objects.iter().find(|object| object.kind == Kind::Table && object.name == name).cloned();
+        let Some(mut object) = found else {
+            if side.cancelled || !side.listing_complete {
+                return Err(format!("{label}的对象名单没有读完，没有找到表 {name}，不生成脚本。"));
+            }
+            return Err(format!("{label}里没有表 {name}，不生成脚本。"));
+        };
+        object.name = pair.target.clone();
+        Ok(Side {
+            engine: side.engine.clone(),
+            database: side.database.clone(),
+            schema: side.schema.clone(),
+            connected: side.connected,
+            fatal: None,
+            objects: vec![object],
+            category_errors: side
+                .category_errors
+                .iter()
+                .filter(|(category, _)| matches!(category, Category::Table | Category::Index | Category::ForeignKey))
+                .cloned()
+                .collect(),
+            cancelled: side.cancelled,
+            // 这对表两侧都找到了：名单里其余对象与表对表对比无关。
+            listing_complete: true,
+        })
+    };
+    Ok((pick(baseline, &pair.baseline, "基准")?, pick(target, &pair.target, "对照")?))
 }
 
 /// `annotate` 为真时给每条差异补上并排定义与只针对该对象的同步语句，并列出相同的对象。

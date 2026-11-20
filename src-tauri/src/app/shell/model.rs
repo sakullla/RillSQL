@@ -32,7 +32,7 @@ use super::layout::{
     clamp_history_preview, clamp_sidebar, layout_with_sidebar, painted_frame_with_sidebar, unbreakable_px, ChromeLayout, PaintedFrame, HISTORY_PREVIEW_DEFAULT,
     SIDEBAR_DEFAULT,
 };
-use super::menus::{flatten_items, tree_menu_items, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
+use super::menus::{flatten_items, tree_menu_items_with_selection, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkTool {
@@ -2067,8 +2067,10 @@ impl WorkbenchModel {
             engine: node.engine,
             kind: node.object_kind.unwrap_or(crate::catalog::model::ObjectKind::Table),
         });
+        // 在多选里的表上右键：菜单按多选数量给“对比表”；不在多选里的行按单表处理。
+        let selected = if self.nav.is_selected(node_id) { self.nav.selection().len() } else { 0 };
         self.open_menu(MenuPlace::ObjectTree, target);
-        self.menu = Some(OpenMenu::with_items(MenuPlace::ObjectTree, tree_menu_items(target, facts)));
+        self.menu = Some(OpenMenu::with_items(MenuPlace::ObjectTree, tree_menu_items_with_selection(target, facts, selected)));
         self.nav_menu_node = Some(node_id.to_owned());
         true
     }
@@ -3994,6 +3996,18 @@ impl WorkbenchModel {
             self.sync_object_spec_from_focus();
             return true;
         }
+        if let Some(rest) = id.strip_prefix("nav-select-toggle:") {
+            // Ctrl/⌘ 点击：只切换多选，焦点跟到这一行；不能多选的行（视图、Redis、Mongo…）只移焦点。
+            self.nav.toggle_selection(rest);
+            self.nav.set_focus(rest);
+            self.explorer_current = Some(ExplorerRow::Node(rest.to_owned()));
+            self.sync_object_spec_from_focus();
+            return true;
+        }
+        if id == "nav-select-clear" {
+            self.nav.clear_selection();
+            return true;
+        }
         if let Some(rest) = id.strip_prefix("nav-focus:") {
             self.nav.set_focus(rest);
             self.explorer_current = Some(ExplorerRow::Node(rest.to_owned()));
@@ -5662,6 +5676,16 @@ impl WorkbenchModel {
     /// 对比入口带入的目标：优先当前对象，其次当前连接/库范围。
     pub fn compare_target(&self) -> Option<ObjectTarget> {
         self.current_object().or_else(|| self.active_scope())
+    }
+
+    /// 资源树里 Ctrl/⌘ 多选的表（按选中先后）对应的对象目标；第一张是基准，第二张是对照。
+    pub fn selected_table_targets(&self) -> Vec<ObjectTarget> {
+        self.nav
+            .selection()
+            .iter()
+            .filter_map(|id| self.nav.node(id))
+            .filter_map(|node| nav::target_for(node, &self.nav_environment(&node.connection_id)))
+            .collect()
     }
 
     /// 命令面板“对比”条目要说明的上下文；缺失条件也要说清楚。

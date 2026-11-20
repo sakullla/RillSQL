@@ -350,6 +350,9 @@ dict! {
     "catalog.tree.noData" => "这个对象没有行数据", "This object has no row data";
     "catalog.tree.noStructure" => "这个对象没有 SQL 结构，文档在集合浏览器查看", "This object has no SQL structure; open the collection browser for documents";
     "catalog.tree.relationalOnly" => "这个动作只适用于关系型表或视图", "This action applies only to relational tables or views";
+    "catalog.tree.compareTable" => "对比表…", "Compare table…";
+    "catalog.tree.compareTables" => "对比表", "Compare tables";
+    "catalog.tree.compareNeedsTwo" => "正好选中两张表时才能对比（按住 ⌘/Ctrl 点击表多选）", "Select exactly two tables to compare (⌘/Ctrl-click tables to multi-select)";
     "catalog.tree.actionUnavailable" => "这一行没有这个动作", "This row does not support this action";
     "catalog.tree.expand" => "展开", "Expand";
     "catalog.tree.collapse" => "折叠", "Collapse";
@@ -824,6 +827,16 @@ dict! {
     "export.task.range" => "实际完成范围", "Actual completed range";
     "catalog.tree.diagram" => "关系图", "Diagram";
     "compare.dialog.title" => "对比库", "Compare databases";
+    "compare.table.title" => "对比表", "Compare tables";
+    "compare.table.note" => "表对表对比：基准 {baseline} ↔ 对照 {target}。两侧可以是不同连接或不同库。", "Table comparison: baseline {baseline} ↔ target {target}. The two sides may be different connections or databases.";
+    "compare.table.targetMissing" => "（填写对照表名）", "(enter the target table)";
+    "compare.table.hint" => "只比较这两张表。同步 SQL 只做预览，放入查询编辑器后由你决定是否执行。", "Only these two tables are compared. Sync SQL is a preview; you decide whether to run it after placing it in the query editor.";
+    "compare.table.exit" => "改为整库对比", "Compare whole databases";
+    "compare.table.baselineTable" => "基准表", "Baseline table";
+    "compare.table.targetTable" => "对照表", "Target table";
+    "compare.table.namePlaceholder" => "表名", "Table name";
+    "compare.table.needBoth" => "需要填写基准表和对照表，不生成脚本。", "Enter both the baseline and the target table; no script is generated.";
+    "compare.table.structureFirst" => "先对比结构；确认两张表有主键或唯一键后再对比数据。", "Compare the structure first; data can be compared once both tables have a primary or unique key.";
     "compare.dialog.subtitle" => "基准是期望的一侧。脚本只描述如何让对照变成基准，生成时不执行。", "The baseline is the expected side. The script only describes how to turn the target into the baseline; it is never executed when generated.";
     "compare.dialog.baseline" => "基准", "Baseline";
     "compare.dialog.target" => "对照", "Target";

@@ -691,6 +691,39 @@ impl Workbench {
                 cx.notify();
                 return;
             }
+            // 表对表对比：“对比表…”取右键的这张表预填基准侧；“对比表”取多选的两张表。
+            if id == "compare-table" || id == "compare-tables" {
+                let (left, right) = if id == "compare-tables" {
+                    let mut picked = self.model.selected_table_targets().into_iter();
+                    match (picked.next(), picked.next(), picked.next()) {
+                        (Some(left), Some(right), None) => (Some(left), Some(right)),
+                        _ => (None, None),
+                    }
+                } else {
+                    (self.model.object_target(), None)
+                };
+                self.model.nav_menu_node = None;
+                let Some(left) = left.filter(|target| target.is_relational()) else {
+                    self.model.notice_key = Some(if id == "compare-tables" { "catalog.tree.compareNeedsTwo" } else { "catalog.tree.relationalOnly" });
+                    self.model.notice_detail.clear();
+                    self.persist_if_needed(cx);
+                    cx.notify();
+                    return;
+                };
+                let left = CompareContext::of(&left);
+                let right = right.map(|target| CompareContext::of(&target));
+                let _ = self.model.dispatch(id);
+                let locale = self.model.locale();
+                self.compare.update(cx, |pane, cx| {
+                    pane.set_locale(locale);
+                    pane.open_table_pair(left, right, cx);
+                    pane.command(id, cx);
+                });
+                self.refresh_compare(cx);
+                self.persist_if_needed(cx);
+                cx.notify();
+                return;
+            }
             // 对比入口按触发面取目标：网格菜单只认正在显示的表格/结果，
             // 对象树菜单认树里的选择，命令面板与快捷键用当前工作项或对象树选择。
             // 目标在切换页面前取，避免“打开对比”自己改掉页面的判定。

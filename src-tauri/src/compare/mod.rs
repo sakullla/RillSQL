@@ -7,10 +7,10 @@ mod read;
 pub(crate) mod structure;
 
 pub use data::diff_data;
-pub use structure::diff_structure;
+pub use structure::{diff_structure, pair_data_refusal};
 #[allow(unused_imports)]
 pub(crate) use model::{
-    DataDiff, DataReport, DataRequest, DataTableRequest, DataTableSummary, DiffItem, FieldDiff, KeyChoice, SideRequest, StructureReport, StructureRequest, TableChoice,
+    DataDiff, DataReport, DataRequest, DataTableRequest, DataTableSummary, DiffItem, FieldDiff, KeyChoice, SideRequest, StructureReport, StructureRequest, TableChoice, TablePair,
 };
 pub(crate) use read::{
     is_cancelled as compare_is_cancelled, list_schemas, progress_of as compare_progress, read_data, read_structure, request_cancel as request_compare_cancel, timeout_message,

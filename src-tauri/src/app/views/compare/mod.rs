@@ -13,12 +13,12 @@ use gpui_kit::{
     Styled as _, TestSupportExt as _, Window, div, px, relative,
 };
 
-use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, Space, Tip as _, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::{AppServices, cancel_compare, compare_cancelled, compare_progress};
-use crate::compare::{CompareProgress, CompareStage, DataReport, DataRequest, DataTableRequest, DiffItem, SideRequest, StructureReport, StructureRequest};
+use crate::compare::{CompareProgress, CompareStage, DataReport, DataRequest, DataTableRequest, DiffItem, SideRequest, StructureReport, StructureRequest, TablePair};
 use crate::connections::model::Engine;
 use crate::i18n::{self, Locale};
 
@@ -193,6 +193,13 @@ pub struct ComparePane {
     picked: Option<String>,
     /// 数据对比下钻的表。
     data_table: Option<String>,
+    /// 表对表对比：(基准表名, 对照表名)。为空时是整库对比。
+    table_pair: Option<(String, String)>,
+    /// 从资源树带进来、还没落到两侧的表（基准，可选的对照）；连接清单读完后再落。
+    pair_pending: Option<(CompareContext, Option<CompareContext>)>,
+    table_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
+    /// 表名被命令改过（交换、重新带入）：下一帧把输入框同步成新值。
+    table_reload: bool,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -243,6 +250,10 @@ impl ComparePane {
             only_diffs: true,
             picked: None,
             data_table: None,
+            table_pair: None,
+            pair_pending: None,
+            table_inputs: BTreeMap::new(),
+            table_reload: false,
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -297,6 +308,12 @@ impl ComparePane {
     /// 打开对比时带入当前对象或连接/库范围；没有上下文时说明缺什么，
     /// 而不是把某个连接当成“当前目标”。
     pub fn open_context(&mut self, context: Option<CompareContext>, cx: &mut Context<Self>) {
+        // 整库对比入口：离开表对表模式。
+        if self.table_pair.is_some() || self.pair_pending.is_some() {
+            self.table_pair = None;
+            self.pair_pending = None;
+            self.invalidate_results();
+        }
         match context {
             Some(context) => {
                 self.context = Some(context);
@@ -319,6 +336,85 @@ impl ComparePane {
         }
     }
 
+    /// 表对表对比：基准是 `left` 这张表，对照是 `right`（单表“对比表…”时为空，由用户填写对照表名）。
+    /// 两侧可以是不同连接、不同库；连接清单到达后再落到两侧。
+    pub fn open_table_pair(&mut self, left: CompareContext, right: Option<CompareContext>, cx: &mut Context<Self>) {
+        let pair = (left.object.clone(), right.as_ref().map(|right| right.object.clone()).unwrap_or_default());
+        self.invalidate_results();
+        self.context = None;
+        self.table_pair = Some(pair);
+        self.table_reload = true;
+        self.pair_pending = Some((left, right));
+        self.context_note = self.pair_note();
+        if self.choices.is_empty() {
+            if !self.choices_loading {
+                self.refresh_choices(cx);
+            }
+        } else {
+            self.apply_table_pair(cx);
+        }
+    }
+
+    /// 是否是表对表对比。
+    pub fn table_mode(&self) -> bool {
+        self.table_pair.is_some()
+    }
+
+    /// 表对表对比的两张表名（基准，对照）。
+    pub fn table_pair(&self) -> Option<(String, String)> {
+        self.table_pair.clone()
+    }
+
+    fn pair_note(&self) -> String {
+        let Some((left, right)) = &self.table_pair else { return String::new() };
+        let right = if right.trim().is_empty() { self.text("compare.table.targetMissing") } else { right.clone() };
+        fill(&self.text("compare.table.note"), &[("{baseline}", left), ("{target}", &right)])
+    }
+
+    /// 把带进来的两张表落到两侧：基准取左表所在的连接/库/schema，对照取右表的；
+    /// 只带了一张表时对照先放在同一个库，用户再改连接、库或表名。
+    fn apply_table_pair(&mut self, cx: &mut Context<Self>) {
+        let Some((left, right)) = self.pair_pending.clone() else { return };
+        let side_of = |this: &Self, context: &CompareContext| -> Option<SidePick> {
+            let choice = this.choices.iter().find(|choice| choice.id == context.connection_id)?;
+            let database = if context.database.is_empty() { choice.databases.first().cloned().unwrap_or_default() } else { context.database.clone() };
+            Some(SidePick { connection_id: context.connection_id.clone(), database, schema: context.schema.clone() })
+        };
+        let Some(baseline) = side_of(self, &left) else {
+            self.context_note = fill(&self.text("compare.context.sideMissing"), &[("{path}", &left.path)]);
+            return;
+        };
+        let target = match right.as_ref() {
+            Some(right) => match side_of(self, right) {
+                Some(side) => side,
+                None => {
+                    self.context_note = fill(&self.text("compare.context.sideMissing"), &[("{path}", &right.path)]);
+                    return;
+                }
+            },
+            None => SidePick { connection_id: baseline.connection_id.clone(), database: baseline.database.clone(), schema: baseline.schema.clone() },
+        };
+        self.baseline = baseline;
+        self.target = target;
+        self.pair_pending = None;
+        self.schema_reload = true;
+        self.context_note = self.pair_note();
+        self.ensure_schemas(true, cx);
+        self.ensure_schemas(false, cx);
+    }
+
+    /// 改表对表对比的一侧表名；旧报告不再属于新的这对表。
+    fn set_table_name(&mut self, baseline: bool, name: &str) {
+        let Some(pair) = self.table_pair.as_mut() else { return };
+        let slot = if baseline { &mut pair.0 } else { &mut pair.1 };
+        if slot.as_str() == name.trim() {
+            return;
+        }
+        *slot = name.trim().to_owned();
+        self.invalidate_results();
+        self.context_note = self.pair_note();
+    }
+
     /// 带入说明只描述真正带入的对象；基准侧是否缺失单独拼在后面，
     /// 已经找到另一条可比连接时不再声称“还需要一个已打开的连接”。
     fn carried_note(&self) -> String {
@@ -335,6 +431,10 @@ impl ComparePane {
     /// 把带入的上下文落到两侧：当前对象放在对照侧，基准侧优先取另一个已打开连接。
     /// 两侧任何一侧变化都算新目标：旧报告、选择和已放入脚本不再属于这次带入的上下文。
     fn apply_context(&mut self, cx: &mut Context<Self>) {
+        if self.pair_pending.is_some() {
+            self.apply_table_pair(cx);
+            return;
+        }
         let Some(context) = self.context.clone() else { return };
         let Some(choice) = self.choices.iter().find(|choice| choice.id == context.connection_id).cloned() else {
             // 这个连接没有打开或不可比较：保留带入说明，并指出这一侧缺什么，不改两侧选择。
@@ -421,7 +521,7 @@ impl ComparePane {
             cx.notify();
             return;
         }
-        if id == "compare-object" || id == "compare-grid" {
+        if id == "compare-object" || id == "compare-grid" || id == "compare-table" || id == "compare-tables" {
             // 外壳负责把完整对象目标交给 open_context；这里只刷新连接清单，
             // 刚打开的目标连接才会出现在候选里。
             self.refresh_choices(cx);
@@ -450,6 +550,16 @@ impl ComparePane {
             self.invalidate_results();
         } else if let Some(name) = id.strip_prefix("compare-schema:target:") {
             self.target.schema = name.to_owned();
+            self.invalidate_results();
+        } else if let Some(name) = id.strip_prefix("compare-table-name:baseline:") {
+            self.set_table_name(true, name);
+        } else if let Some(name) = id.strip_prefix("compare-table-name:target:") {
+            self.set_table_name(false, name);
+        } else if id == "compare-table-exit" {
+            // 回到整库对比：两侧连接与库保留。
+            self.table_pair = None;
+            self.pair_pending = None;
+            self.context_note.clear();
             self.invalidate_results();
         } else if let Some(name) = id.strip_prefix("compare-toggle:") {
             let selected = self.selected.get(name).copied().unwrap_or(false);
@@ -498,12 +608,19 @@ impl ComparePane {
 
     fn swap_sides(&mut self) {
         std::mem::swap(&mut self.baseline, &mut self.target);
+        if let Some(pair) = self.table_pair.as_mut() {
+            std::mem::swap(&mut pair.0, &mut pair.1);
+            self.table_reload = true;
+        }
         let left = self.schema_draft.remove("baseline").unwrap_or_default();
         let right = self.schema_draft.remove("target").unwrap_or_default();
         self.schema_draft.insert("baseline".into(), right);
         self.schema_draft.insert("target".into(), left);
         self.schema_reload = true;
         self.invalidate_results();
+        if self.table_pair.is_some() {
+            self.context_note = self.pair_note();
+        }
     }
 
     fn select_all_tables(&mut self) {
@@ -778,6 +895,11 @@ impl ComparePane {
             self.structure_status = Status::Refused;
             return;
         };
+        if self.table_pair.as_ref().is_some_and(|(left, right)| left.trim().is_empty() || right.trim().is_empty()) {
+            self.structure = Some(Arc::new(empty_structure(Some(self.text("compare.table.needBoth")))));
+            self.structure_status = Status::Refused;
+            return;
+        }
         if let Some(message) = self.refuse_local() {
             self.structure = Some(Arc::new(empty_structure(Some(message))));
             self.structure_status = Status::Refused;
@@ -805,6 +927,11 @@ impl ComparePane {
             self.data_status = Status::Refused;
             return;
         }
+        if let Some(message) = self.table_data_block() {
+            self.data = Some(Arc::new(empty_data(Some(message))));
+            self.data_status = Status::Refused;
+            return;
+        }
         if request.tables.is_empty() {
             self.data = Some(Arc::new(empty_data(Some(self.text("compare.gates.noTablesPicked")))));
             self.data_status = Status::Refused;
@@ -817,7 +944,22 @@ impl ComparePane {
         let baseline = self.side_request(&self.baseline)?;
         let target = self.side_request(&self.target)?;
         let id = format!("compare-{}", uuid::Uuid::new_v4());
-        Some(StructureRequest { id, baseline, target, timeout_secs: self.query_timeout_sec })
+        let objects = self
+            .table_pair
+            .as_ref()
+            .filter(|(left, right)| !left.trim().is_empty() && !right.trim().is_empty())
+            .map(|(left, right)| TablePair { baseline: left.clone(), target: right.clone() });
+        Some(StructureRequest { id, baseline, target, timeout_secs: self.query_timeout_sec, objects })
+    }
+
+    /// 表对表对比时数据对比为什么不能做：还没对比结构，或者这对表没有主键/唯一键。
+    /// 不能做时只做结构对比。
+    pub fn table_data_block(&self) -> Option<String> {
+        self.table_pair.as_ref()?;
+        let Some(report) = self.structure.as_ref().filter(|report| report.refused.is_none()) else {
+            return Some(self.text("compare.table.structureFirst"));
+        };
+        crate::compare::pair_data_refusal(report)
     }
 
     fn data_request(&self) -> Option<DataRequest> {
@@ -831,9 +973,18 @@ impl ComparePane {
                     .tables
                     .iter()
                     .filter(|table| table.on_both && self.selected.get(&table.name).copied().unwrap_or(false))
-                    .map(|table| DataTableRequest {
-                        name: table.name.clone(),
-                        key: self.chosen_key.get(&table.name).filter(|key| !key.is_empty()).cloned(),
+                    .map(|table| match &self.table_pair {
+                        // 表对表：报告里的表名是对照表名，基准按自己的表名读。
+                        Some((left, right)) => DataTableRequest {
+                            name: left.clone(),
+                            key: self.chosen_key.get(&table.name).filter(|key| !key.is_empty()).cloned(),
+                            right_name: Some(right.clone()),
+                        },
+                        None => DataTableRequest {
+                            name: table.name.clone(),
+                            key: self.chosen_key.get(&table.name).filter(|key| !key.is_empty()).cloned(),
+                            right_name: None,
+                        },
                     })
                     .collect()
             })
@@ -1284,7 +1435,14 @@ impl ComparePane {
 
     pub fn lines(&self) -> Vec<String> {
         // 只列实际画出来的文字：`compare.dialog.subtitle` 平时只在标题悬停提示里，初始指导出现时才常驻。
-        let mut lines = vec![self.text("compare.dialog.title")];
+        let mut lines = vec![self.text(if self.table_pair.is_some() { "compare.table.title" } else { "compare.dialog.title" })];
+        if let Some((left, right)) = &self.table_pair {
+            lines.push(format!("{} {left}", self.text("compare.table.baselineTable")));
+            lines.push(format!("{} {right}", self.text("compare.table.targetTable")));
+            if let Some(reason) = self.table_data_block().filter(|_| self.structure.is_some()) {
+                lines.push(reason);
+            }
+        }
         if self.show_empty_guide() {
             // 初始指导现在是一整块状态：标题、说明与主操作都要算进画出来的文字。
             lines.push(self.text("compare.empty.guide"));
@@ -1560,7 +1718,17 @@ impl Render for ComparePane {
         actions
         });
 
-        let mut body = div().flex().flex_col().gap(px(m.section_gap())).child(sides).child(actions);
+        let pair_card = self.table_pair.is_some().then(|| self.pair_card(&entity, window, cx));
+        // 表对表：数据对比做不了时说明原因，只做结构对比。
+        let data_block = self.table_data_block().filter(|_| self.structure.as_ref().is_some_and(|report| report.refused.is_none()));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(m.section_gap()))
+            .when_some(pair_card, |this, card| this.child(card))
+            .child(sides)
+            .child(actions)
+            .when_some(data_block, |this, reason| this.child(note_banner(IconName::Info, reason, p.warn, p.warn_soft)));
         body = stack_frame(|| {
         let mut body = body;
         // 正在比较且还没有报告：给骨架占位与一条局部加载，不让详情区空着。
@@ -1671,7 +1839,7 @@ impl Render for ComparePane {
             .overflow_hidden()
             .child(
                 div().id("compare-title").tooltip_text(t(self, "compare.dialog.subtitle")).child(
-                    kit::page_header(t(self, "compare.dialog.title"), &[], &m, &p)
+                    kit::page_header(t(self, if self.table_pair.is_some() { "compare.table.title" } else { "compare.dialog.title" }), &[], &m, &p)
                         .child(div().flex_1())
                         .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
                 ),
@@ -1837,6 +2005,76 @@ impl ComparePane {
             }
         }
         card.into_any_element()
+    }
+
+    /// 表对表对比的头部：两侧表名（可改）与“改为整库对比”。
+    fn pair_card(&mut self, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
+        let baseline = self.table_input("baseline", window, cx);
+        let target = self.table_input("target", window, cx);
+        self.table_reload = false;
+        let field = |which: &'static str, label: String, input: Entity<InputState>, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla| {
+            div()
+                .flex_1()
+                .min_w(px(kit::ControlSize::PICKER_MIN_W))
+                .flex()
+                .flex_col()
+                .gap(px(Space::SM))
+                .child(kit::pill(SharedString::from(label.clone()), tone, soft))
+                .child(kit::text_input(SharedString::from(format!("compare-table-input:{which}")), &input, label))
+        };
+        kit::card(&p)
+            .id("compare-table-pair")
+            .test_support()
+            .p(px(m.card_pad()))
+            .flex()
+            .flex_col()
+            .gap(px(m.pane_pad()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::MD))
+                    .child(kit::icon(IconName::Table, TypeScale::LG, p.text_muted))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("compare.table.hint"))))
+                    .child(kit::tool_button("compare-table-exit", Some(IconName::Database), SharedString::from(self.text("compare.table.exit")), compare_act("compare-table-exit", entity))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(m.pane_pad()))
+                    .child(field("baseline", self.text("compare.table.baselineTable"), baseline, p.ok, p.ok_soft))
+                    .child(field("target", self.text("compare.table.targetTable"), target, p.info, p.accent_soft)),
+            )
+            .into_any_element()
+    }
+
+    /// 表名输入：改动即生效（旧报告作废），交换或重新带入时同步成新值。
+    fn table_input(&mut self, side: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        let wanted = self.table_pair.as_ref().map(|(left, right)| if side == "baseline" { left.clone() } else { right.clone() }).unwrap_or_default();
+        if let Some((state, _)) = self.table_inputs.get(side) {
+            if self.table_reload {
+                state.update(cx, |input, cx| {
+                    if input.value().as_ref() != wanted {
+                        input.set_value(wanted.clone(), window, cx);
+                    }
+                });
+            }
+            return state.clone();
+        }
+        let placeholder = SharedString::from(self.text("compare.table.namePlaceholder"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(SharedString::from(wanted)));
+        let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = state.read(cx).value().to_string();
+                this.set_table_name(side == "baseline", &text);
+                cx.notify();
+            }
+        });
+        self.table_inputs.insert(side, (state.clone(), subscription));
+        state
     }
 
     fn schema_input(&mut self, side: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
@@ -2033,7 +2271,7 @@ fn entry_item<'a>(report: &'a StructureReport, key: &str) -> Option<&'a DiffItem
 
 /// 差异树分组顺序：对象种类在前，表下属的索引、外键在后。后端给的是种类标签。
 fn kind_rank(kind: &str) -> usize {
-    const ORDER: &[&str] = &["表", "视图", "函数", "过程", "触发器", "序列", "枚举", "域", "索引", "外键"];
+    const ORDER: &[&str] = &["表", "列", "视图", "函数", "过程", "触发器", "序列", "枚举", "域", "索引", "外键"];
     ORDER.iter().position(|label| *label == kind).unwrap_or(ORDER.len())
 }
 
@@ -3581,6 +3819,210 @@ mod workbench {
             assert!(window.try_find("compare-retry").is_none(), "取消不给重试");
         })
         .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 资源树多选两张表 → “对比表”：两侧不同连接、表名不同；结构差异逐列列出，
+    /// 数据对比针对对照表；同步 SQL 只放进编辑器，不执行。没有主键的一对表只做结构对比并说明原因。
+    #[gpui_kit::test]
+    fn compare_tables_from_the_tree_shows_column_diffs_and_previews_sql(cx: &mut TestAppContext) {
+        use crate::catalog::model::{ConnStatus, DatabaseNode, ObjectRow, SchemaNode};
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-pair-ui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let baseline_file = dir.join("baseline.sqlite");
+        let target_file = dir.join("target.sqlite");
+        let config = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target_for_setup = target_file.clone();
+        crate::app::views::grid::runtime_for_views().spawn(async move {
+            let open = |file: std::path::PathBuf| async move {
+                sqlx::sqlite::SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&file).create_if_missing(true))
+                    .await
+                    .unwrap()
+            };
+            let baseline = open(baseline_file.clone()).await;
+            for sql in [
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, note TEXT)",
+                "INSERT INTO orders (id, note) VALUES (1, 'a'), (3, 'c')",
+                "CREATE TABLE notes (label TEXT, body TEXT)",
+            ] {
+                sqlx::query(sql).execute(&baseline).await.unwrap();
+            }
+            baseline.close().await;
+            let target = open(target_for_setup.clone()).await;
+            for sql in [
+                "CREATE TABLE orders_copy (id INTEGER PRIMARY KEY, note TEXT, extra TEXT)",
+                "INSERT INTO orders_copy (id, note) VALUES (1, 'b'), (2, 'x')",
+                "CREATE TABLE notes_old (label TEXT)",
+            ] {
+                sqlx::query(sql).execute(&target).await.unwrap();
+            }
+            target.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("base", "基准", &baseline_file).await.unwrap();
+            services.connections.open_sqlite_for_test("other", "对照", &target_for_setup).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("sqlite pair setup");
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(1800.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
+            )
+            .expect("workbench")
+        });
+        let orders = ObjectRow::table("orders", Some(2));
+        let orders_copy = ObjectRow::table("orders_copy", Some(2));
+        let tree = |id: &str, name: &str, objects: Vec<ObjectRow>| {
+            let mut connection = crate::catalog::NavConnection::new(id, name, crate::catalog::model::Engine::Sqlite, ConnStatus::Connected);
+            let total = objects.len();
+            connection.databases = vec![DatabaseNode {
+                name: "main".to_owned(),
+                schemas: vec![SchemaNode { name: String::new(), objects, total, error: None, kind_reports: Vec::new() }],
+                error: None,
+            }];
+            connection
+        };
+        let left = crate::catalog::hierarchy::object_node_id("base", "main", "", &orders);
+        let right = crate::catalog::hierarchy::object_node_id("other", "main", "", &orders_copy);
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.model.apply_navigation(&[tree("base", "基准", vec![orders.clone()]), tree("other", "对照", vec![orders_copy.clone()])], false);
+                view.perform(&format!("nav-select-toggle:{left}"), cx);
+                view.perform(&format!("nav-select-toggle:{right}"), cx);
+                assert_eq!(view.model.selected_table_targets().len(), 2);
+                view.perform("compare-tables", cx);
+            });
+        })
+        .unwrap();
+        assert!(
+            pump(cx, window, &view, |view, app| {
+                let text = view.compare_text(app);
+                text.starts_with("对比表")
+                    && text.contains("基准表 orders")
+                    && text.contains("对照表 orders_copy")
+                    && text.contains("基准 基准")
+                    && text.contains("对照 对照")
+                    && view.model.shell.page == crate::app::AppPage::Compare
+            }),
+            "没有进入表对表对比"
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("compare-table-pair").is_some());
+            window.click("compare-structure", cx);
+        })
+        .unwrap();
+        assert!(
+            pump(cx, window, &view, |view, app| view.compare_structure_ready(app) && view.compare_text(app).contains("extra")),
+            "表对表的结构差异没有出现：{}",
+            cx.update(|app| view.read(app).compare_text(app))
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                let text = view.compare_text(cx);
+                assert!(text.contains("列 extra 仅对照拥有"), "逐列列出：{text}");
+                assert!(text.contains("orders_copy") && !text.contains("仅基准拥有 表"), "{text}");
+            });
+            window.click("compare-data", cx);
+        })
+        .unwrap();
+        assert!(
+            pump(cx, window, &view, |view, app| {
+                let text = view.compare_text(app);
+                view.compare_data_ready(app) && text.contains("UPDATE") && text.contains("INSERT") && text.contains("DELETE")
+            }),
+            "表对表的数据差异没有出现：{}",
+            cx.update(|app| view.read(app).compare_text(app))
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("compare-place:structure", cx);
+            window.render_frame(cx);
+            window.click("compare-place-confirm", cx);
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                let draft = view.model.active_tab().expect("query").draft.clone();
+                assert!(draft.contains("orders_copy"), "{draft}");
+                assert!(view.model.active_tab().unwrap().last_executed_sql.is_none());
+                assert!(!view.query_executed(cx));
+                assert_eq!(view.model.executions, 0);
+            });
+        })
+        .unwrap();
+
+        // 单表“对比表…”：预填基准，填对照表名；没有主键时只做结构对比并说明原因。
+        let notes = ObjectRow::table("notes", Some(0));
+        let notes_id = crate::catalog::hierarchy::object_node_id("base", "main", "", &notes);
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.model.apply_navigation(&[tree("base", "基准", vec![orders.clone(), notes.clone()])], false);
+                view.perform("nav-select-clear", cx);
+                view.perform(&format!("nav-focus:{notes_id}"), cx);
+                assert!(view.model.open_nav_menu(&notes_id));
+                view.perform("compare-table", cx);
+            });
+        })
+        .unwrap();
+        assert!(
+            pump(cx, window, &view, |view, app| {
+                let text = view.compare_text(app);
+                text.contains("基准表 notes") && text.contains("对照表 ") && text.contains("基准 基准")
+            }),
+            "单表对比没有预填基准"
+        );
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.perform("compare-structure", cx);
+                assert!(view.compare_text(cx).contains("需要填写基准表和对照表"), "{}", view.compare_text(cx));
+                view.perform("compare-target:other", cx);
+                view.perform("compare-table-name:target:notes_old", cx);
+            });
+            window.render_frame(cx);
+            view.update(cx, |view, cx| view.perform("compare-structure", cx));
+        })
+        .unwrap();
+        assert!(
+            pump(cx, window, &view, |view, app| view.compare_structure_ready(app)),
+            "单表对比的结构差异没有完成：{}",
+            cx.update(|app| view.read(app).compare_text(app))
+        );
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                let text = view.compare_text(cx);
+                assert!(text.contains("列 body 仅基准拥有"), "{text}");
+                assert!(text.contains("没有主键或唯一键") && text.contains("只做结构对比"), "{text}");
+            });
+            view.update(cx, |view, cx| {
+                view.perform("compare-data", cx);
+                let text = view.compare_text(cx);
+                assert!(!view.compare_data_ready(cx), "{text}");
+                assert!(text.contains("没有主键或唯一键"), "{text}");
+            });
+        })
+        .unwrap();
+        // 目标库没有被改动。
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::app::views::grid::runtime_for_views().spawn(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&target_file).read_only(true))
+                .await
+                .unwrap();
+            let note: String = sqlx::query_scalar("SELECT note FROM orders_copy WHERE id = 1").fetch_one(&pool).await.unwrap();
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM orders_copy").fetch_one(&pool).await.unwrap();
+            pool.close().await;
+            let _ = tx.send((note, rows));
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(30)).expect("read target"), ("b".to_owned(), 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

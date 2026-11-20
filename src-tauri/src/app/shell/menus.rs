@@ -276,7 +276,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
         // 分组菜单的条目由模型按分组现算（名字与命令都带目标），这里没有通用项。
         MenuPlace::ExplorerGroup => Vec::new(),
         MenuPlace::Results => results_items(&ResultsMenuFacts::default()),
-        MenuPlace::ObjectTree => object_tree_items(target, None),
+        MenuPlace::ObjectTree => object_tree_items(target, None, 0),
         MenuPlace::Grid => grid_items(&GridMenuFacts { table: true, writable: target == MenuTarget::WritableGrid, ..GridMenuFacts::default() }),
         MenuPlace::TabBar => tab_bar_items(&TabMenuFacts::default()),
         MenuPlace::Editor => vec![
@@ -483,7 +483,22 @@ pub fn results_items(facts: &ResultsMenuFacts) -> Vec<MenuItem> {
     ]
 }
 
-fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<MenuItem> {
+/// 表菜单里的对比入口：多选了两张及以上时是“对比表”（正好两张才可用，其他数量禁用并说明原因）；
+/// 否则是单表的“对比表…”，打开对比并预填基准侧。
+fn compare_table_item(selected_tables: usize) -> MenuItem {
+    if selected_tables >= 2 {
+        let entry = if selected_tables == 2 {
+            item("compare-tables", "catalog.tree.compareTables")
+        } else {
+            disabled("compare-tables", "catalog.tree.compareTables", "catalog.tree.compareNeedsTwo")
+        };
+        with_icon(entry, IconName::GitCompare)
+    } else {
+        with_icon(item("compare-table", "catalog.tree.compareTable"), IconName::GitCompare)
+    }
+}
+
+fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>, selected_tables: usize) -> Vec<MenuItem> {
     if target == MenuTarget::Column {
         return vec![
             with_icon(item("tree-copy-column", "catalog.tree.copyColumn"), IconName::Copy),
@@ -500,6 +515,8 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
         let relational = facts.map(|facts| facts.engine.is_relational()).unwrap_or(true);
         if relational {
             items.push(with_icon(item("tree-create-table", "structure.action.createTable"), IconName::Plus));
+            // 对比库留在库/范围行上；表和其它对象改用“对比表”。
+            items.push(with_icon(item("compare-object", "shell.command.compare"), IconName::GitCompare));
             items.push(with_icon(item("open-admin", "ui.tool.admin"), IconName::Gauge));
         }
         return items;
@@ -517,7 +534,6 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
                 IconName::FolderOpen,
                 vec![
                     disabled("open-diagram", "catalog.tree.diagram", "diagram.unsupported"),
-                    disabled("compare-object", "shell.command.compare", "catalog.tree.relationalOnly"),
                     disabled("exchange-object", "shell.command.openExchange", "catalog.tree.relationalOnly"),
                 ],
             ),
@@ -589,7 +605,9 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<Menu
         if data_object {
             items.push(with_icon(item("open-diagram", "catalog.tree.diagram"), IconName::ChartNetwork));
         }
-        items.push(with_icon(item("compare-object", "shell.command.compare"), IconName::GitCompare));
+        if target == MenuTarget::Object && table {
+            items.push(compare_table_item(selected_tables));
+        }
     }
 
     // 危险操作平铺在最下面：红色、带省略号表示还要确认，不藏进二级菜单。
@@ -619,8 +637,14 @@ pub struct ObjectFacts {
 /// - DDL 项只给关系型对象行；读不到定义时禁用并说明原因，不打开空查看器。
 /// - 模板与危险项只给关系型引擎的表/视图；清空与重命名只给表。
 ///   MongoDB、Redis、例程/触发器/序列等、范围行与列行都没有这些项（R11）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tree_menu_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<MenuItem> {
-    object_tree_items(target, facts)
+    object_tree_items(target, facts, 0)
+}
+
+/// 同上，并按资源树里 Ctrl/⌘ 多选的表数量给出“对比表”的可用状态。
+pub fn tree_menu_items_with_selection(target: MenuTarget, facts: Option<ObjectFacts>, selected_tables: usize) -> Vec<MenuItem> {
+    object_tree_items(target, facts, selected_tables)
 }
 
 
@@ -961,7 +985,7 @@ mod tests {
         // 范围行：自己的动作，加上关系型的新建表和管理页；刷新留在范围行上。
         assert_eq!(
             top_ids(&tree_menu_items(MenuTarget::Scope, None)),
-            vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "open-admin"]
+            vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "compare-object", "open-admin"]
         );
         let redis_scope = tree_menu_items(MenuTarget::Scope, facts(Engine::Redis, ObjectKind::Table));
         assert!(!ids(&redis_scope).contains(&"open-admin"));
@@ -1075,6 +1099,51 @@ mod tests {
         assert_eq!(state(&collapsed, "result-collapse").2, "query.results.menu.expand");
         assert_eq!(state(&collapsed, "result-close"), (false, Some("query.results.menu.closed"), "query.results.menu.close"));
         assert_eq!(MenuPlace::Results.label_key(), "ui.query.results");
+    }
+
+    #[test]
+    fn compare_tables_follows_the_multi_selection_and_compare_databases_stays_on_scopes() {
+        let entry = |items: &[MenuItem], id: &str| flatten_items(items).into_iter().find(|item| item.id == id).cloned();
+        for engine in [Engine::Sqlite, Engine::Mysql, Engine::Postgres, Engine::Sqlserver] {
+            // 单表：“对比表…”可用；表菜单里不再有“对比库”。
+            let single = tree_menu_items_with_selection(MenuTarget::Object, facts(engine, ObjectKind::Table), 0);
+            assert!(entry(&single, "compare-table").is_some_and(|item| item.enabled), "{engine:?}");
+            assert!(entry(&single, "compare-object").is_none(), "{engine:?} 表菜单没有对比库");
+            assert!(entry(&single, "compare-tables").is_none());
+            // 正好两张：“对比表”可用。
+            let two = tree_menu_items_with_selection(MenuTarget::Object, facts(engine, ObjectKind::Table), 2);
+            let pair = entry(&two, "compare-tables").expect("对比表");
+            assert!(pair.enabled && pair.label_key == "catalog.tree.compareTables", "{engine:?}");
+            assert!(entry(&two, "compare-object").is_none());
+            // 三张：禁用并说明原因。
+            let three = tree_menu_items_with_selection(MenuTarget::Object, facts(engine, ObjectKind::Table), 3);
+            let pair = entry(&three, "compare-tables").expect("对比表");
+            assert!(!pair.enabled && pair.reason_key == Some("catalog.tree.compareNeedsTwo"), "{engine:?}");
+            // 视图与其它对象：没有对比库，也没有对比表。
+            for (target, kind) in [(MenuTarget::Object, ObjectKind::View), (MenuTarget::NonDataObject, ObjectKind::Function)] {
+                let items = tree_menu_items_with_selection(target, facts(engine, kind), 2);
+                for id in ["compare-object", "compare-table", "compare-tables"] {
+                    assert!(entry(&items, id).is_none(), "{engine:?} {kind:?} {id}");
+                }
+            }
+        }
+        // 库/范围行仍有“对比库”，连接行也保留。
+        let scope = tree_menu_items(MenuTarget::Scope, facts(Engine::Postgres, ObjectKind::Table));
+        assert!(entry(&scope, "compare-object").is_some_and(|item| item.enabled && item.label_key == "shell.command.compare"));
+        assert!(entry(&explorer_connection_menu_items(true, true), "compare-object").is_some());
+        // Redis、MongoDB 节点不显示对比表，也不显示对比库。
+        for (target, engine) in [
+            (MenuTarget::DocumentObject, Engine::Mongodb),
+            (MenuTarget::Object, Engine::Mongodb),
+            (MenuTarget::Object, Engine::Redis),
+            (MenuTarget::Scope, Engine::Redis),
+            (MenuTarget::Scope, Engine::Mongodb),
+        ] {
+            let items = tree_menu_items_with_selection(target, facts(engine, ObjectKind::Table), 2);
+            for id in ["compare-table", "compare-tables", "compare-object"] {
+                assert!(entry(&items, id).is_none(), "{target:?} {engine:?} {id}");
+            }
+        }
     }
 
     #[test]

@@ -22,7 +22,7 @@ use super::model::{
     needs_ephemeral_postgres, Category, ColumnShape, DataColumn, DataInput, DataReport, DataRequest, DataTable, ForeignKeyShape, IndexShape, Kind, ObjectDef, Side,
     Engine, SideRequest, StructureReport, StructureRequest, TableShape,
 };
-use super::structure::{diff_structure, table_data_keys};
+use super::structure::{diff_structure, diff_table_pair, table_data_keys};
 
 static CANCELLED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 static PROGRESS: Mutex<BTreeMap<String, Progress>> = Mutex::new(BTreeMap::new());
@@ -171,9 +171,17 @@ struct Held {
 
 pub async fn read_structure(service: &Service, request: &StructureRequest) -> StructureReport {
     let run = Run::new(&request.id, request.timeout_secs);
-    let (baseline, target) = tokio::join!(load_side(service, &request.baseline, &run, None), load_side(service, &request.target, &run, None));
+    // 表对表对比只读这一对表的定义；名单仍然读全，用来确认表在不在。
+    let only = request.objects.as_ref().map(|pair| (BTreeSet::from([pair.baseline.clone()]), BTreeSet::from([pair.target.clone()])));
+    let (baseline, target) = tokio::join!(
+        load_side(service, &request.baseline, &run, only.as_ref().map(|(left, _)| left)),
+        load_side(service, &request.target, &run, only.as_ref().map(|(_, right)| right)),
+    );
     run.stage(Stage::Diffing);
-    let mut report = diff_structure(&baseline, &target);
+    let mut report = match &request.objects {
+        Some(pair) => diff_table_pair(&baseline, &target, pair),
+        None => diff_structure(&baseline, &target),
+    };
     report.timed_out = run.timed_out();
     report
 }
@@ -184,10 +192,12 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
         return diff_data(&DataInput { baseline_engine: request.baseline.engine.clone(), target_engine: request.target.engine.clone(), tables: Vec::new(), cancelled: false });
     }
     // 数据对比只需要选中表的结构：名单照常读全，定义只读这些表。
-    let wanted: BTreeSet<String> = request.tables.iter().map(|table| table.name.clone()).collect();
+    // 表对表对比时对照侧表名可以不同。
+    let wanted_left: BTreeSet<String> = request.tables.iter().map(|table| table.name.clone()).collect();
+    let wanted_right: BTreeSet<String> = request.tables.iter().map(|table| table.target_name().to_owned()).collect();
     let (baseline, target) = tokio::join!(
-        load_side(service, &request.baseline, &run, Some(&wanted)),
-        load_side(service, &request.target, &run, Some(&wanted)),
+        load_side(service, &request.baseline, &run, Some(&wanted_left)),
+        load_side(service, &request.target, &run, Some(&wanted_right)),
     );
     if let Some(message) = refuse_loaded(&baseline, &target) {
         let mut report = DataReport::refused(message);
@@ -203,7 +213,7 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
             cancelled |= run.cancelled();
             let reason = if run.timed_out() { run.timeout_message() } else { "对比已取消".to_owned() };
             tables.push(DataTable {
-                name: wanted.name.clone(),
+                name: wanted.target_name().to_owned(),
                 qualify: String::new(),
                 columns: Vec::new(),
                 keys: Vec::new(),
@@ -216,7 +226,7 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
             });
             continue;
         }
-        tables.push(load_data_table(service, &request.baseline, &request.target, &baseline, &target, &wanted.name, wanted.key.clone(), &run).await);
+        tables.push(load_data_table(service, &request.baseline, &request.target, &baseline, &target, &wanted.name, wanted.target_name(), wanted.key.clone(), &run).await);
         run.add_done(1);
         if run.cancelled() {
             cancelled = true;
@@ -227,6 +237,11 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
     report.timed_out = run.timed_out();
     if report.timed_out {
         report.incomplete = true;
+    }
+    for wanted in &request.tables {
+        if wanted.target_name() != wanted.name && report.refused.is_none() {
+            report.notes.push(format!("基准表 {} 与对照表 {} 按键对应行，同步 SQL 针对对照表 {}。", wanted.name, wanted.target_name(), wanted.target_name()));
+        }
     }
     report
 }
@@ -401,11 +416,13 @@ async fn load_data_table(
     target_request: &SideRequest,
     baseline: &Side,
     target: &Side,
+    left_name: &str,
     name: &str,
     chosen_key: Option<String>,
     run: &Run,
 ) -> DataTable {
-    let left = baseline.objects.iter().find(|object| object.kind == Kind::Table && object.name == name);
+    // `name` 是对照侧表名：同步语句针对它。基准侧按 `left_name` 读取。
+    let left = baseline.objects.iter().find(|object| object.kind == Kind::Table && object.name == left_name);
     let right = target.objects.iter().find(|object| object.kind == Kind::Table && object.name == name);
     if left.is_none() || right.is_none() {
         let only_side = if left.is_some() { "基准" } else { "对照" };
@@ -471,7 +488,7 @@ async fn load_data_table(
     };
     // 两侧的行并行读取。
     let ((baseline_rows, baseline_error), (target_rows, target_error)) = tokio::join!(
-        read_all_rows(&base_held.session, &base_database, &baseline_request.schema, name, &baseline_request.engine, run),
+        read_all_rows(&base_held.session, &base_database, &baseline_request.schema, left_name, &baseline_request.engine, run),
         read_all_rows(&target_held.session, &target_database, &target_request.schema, name, &target_request.engine, run),
     );
     table.baseline = baseline_rows;

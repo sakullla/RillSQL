@@ -144,7 +144,7 @@ async fn live_mysql_two_databases_on_one_connection_finish_with_no_difference() 
         create_side(&session, "mysql", &left, false).await?;
         create_side(&session, "mysql", &right, false).await?;
         let (baseline, target) = sides(&spec, "", &left, &right);
-        let request = StructureRequest { id: format!("live-same-{suffix}"), baseline, target, timeout_secs: 15 };
+        let request = StructureRequest { id: format!("live-same-{suffix}"), baseline, target, timeout_secs: 15, objects: None };
         let tasks = TaskBoard::new();
         let token = tasks.begin("compare");
         let started = std::time::Instant::now();
@@ -246,6 +246,7 @@ async fn exercise(services: &AppServices, spec: &LiveEngine) -> Result<String, S
                 baseline,
                 target,
                 timeout_secs: 0,
+                objects: None,
             };
             let outcome = crate::application::work::compare_structure(&services.connections, &tasks, "compare", token, &request).await;
             let report = match outcome {

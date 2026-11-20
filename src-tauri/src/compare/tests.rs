@@ -1467,6 +1467,7 @@ async fn sqlite_compare_reads_both_connections_and_does_not_execute_the_script()
             baseline: super::model::SideRequest { connection_id: "base".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             target: super::model::SideRequest { connection_id: "other".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             timeout_secs: 0,
+            objects: None,
         },
     )
     .await;
@@ -1490,7 +1491,7 @@ async fn sqlite_compare_reads_both_connections_and_does_not_execute_the_script()
             id: "data".to_owned(),
             baseline: super::model::SideRequest { connection_id: "base".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
             target: super::model::SideRequest { connection_id: "other".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() },
-            tables: vec![super::model::DataTableRequest { name: "orders".to_owned(), key: None }, super::model::DataTableRequest { name: "customers".to_owned(), key: None }],
+            tables: vec![super::model::DataTableRequest { name: "orders".to_owned(), key: None, right_name: None }, super::model::DataTableRequest { name: "customers".to_owned(), key: None, right_name: None }],
             timeout_secs: 0,
         },
     )
@@ -1636,4 +1637,153 @@ fn data_report_summarizes_each_table_and_keeps_field_level_differences() {
     assert!(report.script.contains(insert.sql.trim_end_matches(';')));
     let delete = report.diffs.iter().find(|diff| diff.action == "delete").expect("删除行");
     assert!(delete.fields.iter().any(|field| field.column == "note" && field.target.as_deref() == Some("gone") && field.baseline.is_none()));
+}
+
+fn pair(baseline: &str, target: &str) -> super::model::TablePair {
+    super::model::TablePair { baseline: baseline.to_owned(), target: target.to_owned() }
+}
+
+fn named_orders(name: &str, type_name: &str) -> ObjectDef {
+    ObjectDef::table(name, shape(vec![column("id", "integer", false, true), column("note", type_name, true, false)], Vec::new()))
+}
+
+#[test]
+fn table_pair_with_the_same_name_compares_only_that_table() {
+    let customers = ObjectDef::table("customers", shape(vec![column("id", "integer", false, true)], Vec::new()));
+    let legacy = ObjectDef::table("legacy", shape(vec![column("id", "integer", false, true)], Vec::new()));
+    let baseline = Side::ready("postgres", "app", "public", vec![orders("text"), customers]);
+    let target = Side::ready("postgres", "app", "public", vec![orders("integer"), legacy]);
+    let report = super::structure::diff_table_pair(&baseline, &target, &pair("orders", "orders"));
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    // 只有这对表：另外的表既不算仅基准，也不算仅对照。
+    assert!(report.only_baseline.is_empty() && report.only_target.is_empty(), "{report:?}");
+    assert!(report.changed.iter().any(|item| item.kind == "表" && item.name == "orders"));
+    // 结构差异逐列列出。
+    let note = report.changed.iter().find(|item| item.kind == "列" && item.name == "note").expect("列 note 的差异");
+    assert!(note.detail.contains("integer") && note.detail.contains("text"), "{}", note.detail);
+    assert!(!note.sql.is_empty() && note.owner == "orders");
+    assert!(report.script.to_ascii_uppercase().contains("ALTER TABLE"), "{}", report.script);
+    assert!(!report.script.contains("customers") && !report.script.contains("legacy"), "{}", report.script);
+    assert_eq!(report.tables.len(), 1);
+    assert!(super::structure::pair_data_refusal(&report).is_none(), "有主键时可以对比数据");
+}
+
+#[test]
+fn table_pair_with_different_names_targets_the_target_table() {
+    let baseline = Side::ready("postgres", "app", "public", vec![named_orders("orders", "text")]);
+    let mut extra = named_orders("orders_copy", "integer");
+    if let Some(table) = extra.table.as_mut() {
+        table.columns.push(column("archived", "boolean", true, false));
+    }
+    let target = Side::ready("postgres", "app", "public", vec![extra, named_orders("orders", "text")]);
+    let report = super::structure::diff_table_pair(&baseline, &target, &pair("orders", "orders_copy"));
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    assert!(report.only_baseline.is_empty() && report.only_target.is_empty(), "不同名的一对表按同一张表比较：{report:?}");
+    let names: Vec<&str> = report.changed.iter().filter(|item| item.kind == "列").map(|item| item.name.as_str()).collect();
+    assert!(names.contains(&"note") && names.contains(&"archived"), "{names:?}");
+    let archived = report.changed.iter().find(|item| item.name == "archived").unwrap();
+    assert!(archived.detail.contains("仅对照"), "{}", archived.detail);
+    // 同步 SQL 只改对照表，不碰同库里同名的 orders。
+    assert!(report.script.contains("orders_copy"), "{}", report.script);
+    for line in report.script.lines().filter(|line| !line.starts_with("--")) {
+        assert!(line.contains("orders_copy"), "同步语句只针对对照表：{line}");
+    }
+    assert!(report.notes.iter().any(|note| note.contains("orders") && note.contains("orders_copy")), "{:?}", report.notes);
+    assert_eq!(report.tables.first().map(|table| table.name.as_str()), Some("orders_copy"));
+    // 找不到这对表时说明哪一侧缺表，不生成脚本。
+    let missing = super::structure::diff_table_pair(&baseline, &target, &pair("orders", "nope"));
+    assert!(missing.refused.as_deref().is_some_and(|reason| reason.contains("对照") && reason.contains("nope")), "{:?}", missing.refused);
+    assert!(missing.script.is_empty());
+}
+
+#[test]
+fn table_pair_across_databases_qualifies_the_target_database() {
+    let baseline = Side::ready("mysql", "shop_a", "", vec![named_orders("orders", "text")]);
+    let target = Side::ready("mysql", "shop_b", "", vec![named_orders("orders_v2", "int")]);
+    let report = super::structure::diff_table_pair(&baseline, &target, &pair("orders", "orders_v2"));
+    assert!(report.refused.is_none(), "{:?}", report.refused);
+    assert!(report.script.contains("shop_b") && report.script.contains("orders_v2"), "{}", report.script);
+    assert!(!report.script.contains("shop_a"), "同步 SQL 不写基准库：{}", report.script);
+    // 引擎不同仍然拒绝。
+    let other = Side::ready("postgres", "shop_b", "public", vec![named_orders("orders_v2", "int")]);
+    assert!(super::structure::diff_table_pair(&baseline, &other, &pair("orders", "orders_v2")).refused.is_some());
+}
+
+#[test]
+fn table_pair_without_a_key_explains_that_only_structure_is_compared() {
+    let keyless = |name: &str| ObjectDef::table(name, shape(vec![column("label", "text", true, false), column("note", "text", true, false)], Vec::new()));
+    let baseline = Side::ready("sqlite", "main", "", vec![keyless("notes")]);
+    let target = Side::ready("sqlite", "main", "", vec![keyless("notes_old")]);
+    let report = super::structure::diff_table_pair(&baseline, &target, &pair("notes", "notes_old"));
+    assert!(report.refused.is_none());
+    let reason = super::structure::pair_data_refusal(&report).expect("没有主键或唯一键");
+    assert!(reason.contains("没有主键或唯一键") && reason.contains("只做结构对比"), "{reason}");
+    assert!(report.notes.iter().any(|note| note == &reason), "{:?}", report.notes);
+    // 有唯一键时可以对比数据。
+    let unique = ObjectDef::table("notes", shape(vec![column("label", "text", false, false)], vec![index("notes_label", true, &[("label", false)])]));
+    let unique_target = ObjectDef::table("notes_old", shape(vec![column("label", "text", false, false)], vec![index("notes_label", true, &[("label", false)])]));
+    let report = super::structure::diff_table_pair(&Side::ready("sqlite", "main", "", vec![unique]), &Side::ready("sqlite", "main", "", vec![unique_target]), &pair("notes", "notes_old"));
+    assert!(super::structure::pair_data_refusal(&report).is_none(), "{:?}", report.tables);
+}
+
+#[tokio::test]
+async fn sqlite_table_pair_reads_two_connections_with_different_table_names() {
+    let dir = std::env::temp_dir().join(format!("rillsql-compare-pair-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let open = |file: std::path::PathBuf| async move {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&file).create_if_missing(true))
+            .await
+            .unwrap()
+    };
+    let baseline_file = dir.join("baseline.sqlite");
+    let target_file = dir.join("target.sqlite");
+    let baseline = open(baseline_file.clone()).await;
+    for sql in ["CREATE TABLE orders (id INTEGER PRIMARY KEY, note TEXT)", "INSERT INTO orders (id, note) VALUES (1, 'a'), (3, 'c')", "CREATE TABLE other (id INTEGER PRIMARY KEY)"] {
+        sqlx::query(sql).execute(&baseline).await.unwrap();
+    }
+    baseline.close().await;
+    let target = open(target_file.clone()).await;
+    for sql in ["CREATE TABLE orders_copy (id INTEGER PRIMARY KEY, note TEXT, extra TEXT)", "INSERT INTO orders_copy (id, note) VALUES (1, 'b'), (2, 'x')", "CREATE TABLE legacy (id INTEGER PRIMARY KEY)"] {
+        sqlx::query(sql).execute(&target).await.unwrap();
+    }
+    target.close().await;
+    let service = crate::connections::Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("base", "基准", &baseline_file).await.unwrap();
+    service.open_sqlite_for_test("other", "对照", &target_file).await.unwrap();
+    let side = |id: &str| super::model::SideRequest { connection_id: id.to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() };
+    let structure = super::read::read_structure(
+        &service,
+        &super::model::StructureRequest { id: "pair-structure".to_owned(), baseline: side("base"), target: side("other"), timeout_secs: 0, objects: Some(pair("orders", "orders_copy")) },
+    )
+    .await;
+    assert!(structure.refused.is_none(), "{:?}", structure.refused);
+    assert!(structure.only_baseline.is_empty() && structure.only_target.is_empty(), "other / legacy 不参与表对表对比：{structure:?}");
+    assert!(structure.changed.iter().any(|item| item.kind == "列" && item.name == "extra"), "{:?}", structure.changed);
+    assert!(structure.script.contains("orders_copy") && !structure.script.contains("legacy"), "{}", structure.script);
+
+    let data = super::read::read_data(
+        &service,
+        &super::model::DataRequest {
+            id: "pair-data".to_owned(),
+            baseline: side("base"),
+            target: side("other"),
+            tables: vec![super::model::DataTableRequest { name: "orders".to_owned(), key: None, right_name: Some("orders_copy".to_owned()) }],
+            timeout_secs: 0,
+        },
+    )
+    .await;
+    assert!(data.refused.is_none(), "{:?}", data.refused);
+    for action in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(data.script.contains(action), "{action}: {}", data.script);
+    }
+    for line in data.script.lines().filter(|line| !line.starts_with("--")) {
+        assert!(line.contains("orders_copy"), "数据同步语句针对对照表：{line}");
+    }
+    // 只生成脚本，不执行。
+    let crate::connections::CatalogSession::Sqlite { pool, .. } = service.catalog_session("other").unwrap() else { panic!("对照会话还在") };
+    let note: String = sqlx::query_scalar("SELECT note FROM orders_copy WHERE id = 1").fetch_one(&pool).await.unwrap();
+    assert_eq!(note, "b");
+    let _ = fs::remove_dir_all(&dir);
 }

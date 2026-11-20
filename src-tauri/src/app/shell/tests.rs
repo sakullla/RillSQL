@@ -5483,8 +5483,8 @@ fn non_object_rows_never_borrow_another_object() {
     let ids: Vec<&str> = model.menu.as_ref().expect("菜单").items.iter().map(|item| item.id).collect();
     assert_eq!(
         ids,
-        vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "open-admin"],
-        "范围行只有自己的动作，外加新建表和管理页"
+        vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "compare-object", "open-admin"],
+        "范围行只有自己的动作，外加新建表、对比库和管理页"
     );
     assert!(!ids.iter().any(|id| matches!(*id, "tree-open-data" | "tree-insert-select" | "tree-drop-object")));
     let tabs = model.tabs.len();
@@ -5517,6 +5517,104 @@ fn non_object_rows_never_borrow_another_object() {
     assert!(crate::app::shell::menus::flatten_items(&model.menu.as_ref().unwrap().items).iter().any(|item| item.id == "tree-select-sql"));
     let _ = model.dispatch("tree-copy-name");
     assert_eq!(model.copied, "public.orders");
+}
+
+/// 资源树 Ctrl/⌘ 多选：只有关系型表能选；正好两张时“对比表”可用，三张时禁用并说明原因；
+/// 普通点击清空多选。表菜单没有“对比库”，库菜单仍有；Redis、Mongo 节点没有“对比表”。
+#[test]
+fn tree_multi_selection_drives_compare_tables() {
+    use crate::catalog::model::{ConnStatus, DatabaseNode, ObjectKind, ObjectRow, SchemaNode};
+    let orders = ObjectRow::table("orders", Some(2));
+    let customers = ObjectRow::table("customers", Some(2));
+    let items = ObjectRow::table("items", Some(2));
+    let view = ObjectRow::fresh("v_orders", ObjectKind::View);
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone(), customers.clone(), items.clone(), view.clone()])]);
+    let users = ObjectRow::fresh("users", ObjectKind::Table);
+    let mut mongo = crate::catalog::NavConnection::new("docs", "文档", Engine::Mongodb, ConnStatus::Connected);
+    mongo.databases = vec![DatabaseNode {
+        name: "app".to_owned(),
+        schemas: vec![SchemaNode { name: String::new(), objects: vec![users.clone()], total: 1, error: None, kind_reports: Vec::new() }],
+        error: None,
+    }];
+    let redis = nav_connection(Engine::Redis, "rd", "缓存", vec![nav_database("0", Vec::new())]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg, mongo, redis], false);
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+    let customers_id = nav_id("pg", "shop", "public", &customers);
+    let items_id = nav_id("pg", "shop", "public", &items);
+    let view_id = nav_id("pg", "shop", "public", &view);
+    let collection = crate::catalog::hierarchy::object_node_id("docs", "app", "", &users);
+    let entry = |model: &WorkbenchModel, id: &str| {
+        crate::app::shell::menus::flatten_items(&model.menu.as_ref().expect("菜单").items).into_iter().find(|item| item.id == id).cloned()
+    };
+
+    // 单表右键：“对比表…”，没有“对比库”。
+    assert!(model.open_nav_menu(&orders_id));
+    assert!(entry(&model, "compare-table").is_some_and(|item| item.enabled && item.label_key == "catalog.tree.compareTable"));
+    assert!(entry(&model, "compare-object").is_none(), "表菜单没有对比库");
+    assert!(entry(&model, "compare-tables").is_none());
+
+    // Ctrl/⌘ 点击两张表：“对比表”可用，目标按选中先后排列。
+    let _ = model.dispatch(&format!("nav-select-toggle:{orders_id}"));
+    let _ = model.dispatch(&format!("nav-select-toggle:{customers_id}"));
+    assert_eq!(model.nav.selection(), vec![orders_id.clone(), customers_id.clone()]);
+    assert!(model.nav.is_selected(&orders_id) && !model.nav.is_selected(&items_id));
+    expand_all(
+        &mut model,
+        &[
+            crate::catalog::hierarchy::connection_node_id("pg"),
+            crate::catalog::hierarchy::database_node_id("pg", "shop"),
+            crate::catalog::hierarchy::schema_node_id("pg", "shop", "public"),
+            crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Table),
+        ],
+    );
+    let rows = model.nav.visible();
+    assert!(rows.iter().any(|row| row.id == orders_id && row.selected), "选中的表在树上标出");
+    assert!(rows.iter().any(|row| row.id == items_id && !row.selected));
+    assert!(model.open_nav_menu(&customers_id));
+    let pair = entry(&model, "compare-tables").expect("对比表");
+    assert!(pair.enabled, "{pair:?}");
+    assert!(entry(&model, "compare-table").is_none() && entry(&model, "compare-object").is_none());
+    let targets = model.selected_table_targets();
+    assert_eq!(targets.iter().map(|target| target.name.as_str()).collect::<Vec<_>>(), vec!["orders", "customers"]);
+
+    // 视图、Mongo 集合、Redis 键空间不能多选。
+    let _ = model.dispatch(&format!("nav-select-toggle:{view_id}"));
+    let _ = model.dispatch(&format!("nav-select-toggle:{collection}"));
+    assert_eq!(model.nav.selection().len(), 2, "只有关系型表能多选");
+
+    // 三张：禁用并说明原因。
+    let _ = model.dispatch(&format!("nav-select-toggle:{items_id}"));
+    assert!(model.open_nav_menu(&items_id));
+    let pair = entry(&model, "compare-tables").expect("对比表");
+    assert!(!pair.enabled && pair.reason_key == Some("catalog.tree.compareNeedsTwo"), "{pair:?}");
+    // 再点一次取消选中，回到两张。
+    let _ = model.dispatch(&format!("nav-select-toggle:{items_id}"));
+    assert_eq!(model.nav.selection().len(), 2);
+
+    // 普通点击清空多选。
+    let _ = model.dispatch("nav-select-clear");
+    assert!(model.nav.selection().is_empty());
+    assert!(model.nav.visible().iter().all(|row| !row.selected));
+
+    // 库菜单仍有“对比库”。
+    let database = crate::catalog::hierarchy::database_node_id("pg", "shop");
+    assert!(model.open_nav_menu(&database));
+    assert!(entry(&model, "compare-object").is_some_and(|item| item.enabled));
+
+    // Redis、Mongo 节点不显示“对比表”。
+    let keyspace = model
+        .nav
+        .nodes()
+        .find(|node| node.connection_id == "rd" && node.kind != crate::catalog::hierarchy::NavKind::Connection)
+        .map(|node| node.id.clone())
+        .expect("Redis 节点");
+    for node in [collection.clone(), keyspace, crate::catalog::hierarchy::connection_node_id("rd")] {
+        assert!(model.open_nav_menu(&node), "{node}");
+        for id in ["compare-table", "compare-tables"] {
+            assert!(entry(&model, id).is_none(), "{node} {id}");
+        }
+    }
 }
 
 /// MongoDB 集合是文档：菜单和打开入口都不走关系型表/结构/关系图。
