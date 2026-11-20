@@ -340,9 +340,10 @@ pub trait DdlDialect: Sync {
         false
     }
 
-    /// 索引名的长度上限（字节）。None 表示不限；没有声明的方言按保守的 60。
+    /// 索引名的长度上限（字节）。None 表示不限。默认值 64 即 MySQL/MariaDB 的标识符上限；
+    /// 其他方言（PostgreSQL 63、SQL Server 128、SQLite 不限）各自覆盖。
     fn max_index_name_len(&self) -> Option<usize> {
-        Some(60)
+        Some(64)
     }
 
     /// 读目标表与生成引用时使用的模式：None 表示与本表同一处。

@@ -53,7 +53,7 @@ impl IndexNaming {
     }
 }
 
-/// 方言的索引名长度上限：MySQL/MariaDB 64，PostgreSQL 63，SQL Server 128，SQLite 不限，其余 60。
+/// 方言的索引名长度上限：MySQL/MariaDB 64，PostgreSQL 63，SQL Server 128，SQLite 不限；没有 DDL 方言的引擎按 FALLBACK_LIMIT。
 pub fn index_name_limit(engine: &str) -> Option<usize> {
     crate::adapters::ddl::ddl_named(engine).map_or(Some(FALLBACK_LIMIT), |dialect| dialect.max_index_name_len())
 }
