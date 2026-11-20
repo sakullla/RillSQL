@@ -232,6 +232,8 @@ pub struct GridPane {
     /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
     pending_batch: bool,
     search_subscription: Option<gpui_kit::Subscription>,
+    /// 宿主（查询结果全屏）把 Esc 留给自己：网格不再拿 Esc 清选区，而是让它冒泡出去退出全屏，选区保留。
+    escape_to_host: bool,
     /// 查找栏是否展开（R10）。默认收起；⌘F/Ctrl+F 或工具栏按钮展开并聚焦，Esc 收起，查找条件保留。
     find_open: bool,
     /// 下一次绘制把键盘焦点交给查找输入框（打开查找栏时要等拿到 Window）。
@@ -349,6 +351,7 @@ impl GridPane {
             }
         });
         Self {
+            escape_to_host: false,
             session: SharedGrid::new(),
             services,
             table,
@@ -622,6 +625,17 @@ impl GridPane {
     #[cfg(test)]
     pub fn focus_cell(&self) -> Option<(usize, usize)> {
         self.session.focus_cell()
+    }
+
+    /// 测试用：完整值查看面板是否开着。
+    #[cfg(test)]
+    pub fn viewer_open(&self) -> bool {
+        self.session.viewer().is_some()
+    }
+
+    /// 宿主要不要接手“无事可做”的 Esc。开着时 Esc 不清选区，直接冒泡给宿主。
+    pub fn set_escape_to_host(&mut self, on: bool) {
+        self.escape_to_host = on;
     }
 
     /// 正在原位编辑一格：Esc 属于这一格（取消编辑），外层不拿它做别的事。
@@ -3211,14 +3225,19 @@ impl Render for GridPane {
                     return;
                 }
                 if key == "escape" {
+                    // 网格自己处理了的 Esc（关预览、关查看面板）到此为止，不再冒泡让宿主再做一件事（例如退出全屏）。
                     if this.session.preview_open() {
+                        cx.stop_propagation();
                         this.cancel_preview(cx);
                         this.refocus = true;
                     } else if this.session.viewer().is_some() {
                         // 关闭查看面板后键盘回到网格，方向和 Enter 仍然可用。
+                        cx.stop_propagation();
                         this.session.close_value();
                         this.refocus = true;
                         cx.notify();
+                    } else if this.escape_to_host {
+                        // 宿主接手：选区保持不变，Esc 冒泡出去。
                     } else {
                         this.session.clear_selection();
                         this.sync_table(cx);

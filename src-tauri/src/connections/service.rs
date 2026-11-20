@@ -1036,7 +1036,7 @@ impl Service {
         self.sessions.lock().expect("sessions").get(id).and_then(|session| session.server_version.clone())
     }
 
-        pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
+    pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
         self.sessions.lock().expect("sessions").get(id).map(|session| session.cancel.clone())
     }
 

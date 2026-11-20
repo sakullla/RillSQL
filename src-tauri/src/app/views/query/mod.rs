@@ -98,8 +98,6 @@ pub struct ResultsMenuFacts {
     pub has_sql: bool,
     /// 消息页有记录可复制。
     pub has_messages: bool,
-    /// 当前标签正在执行：关闭结果要等执行结束。
-    pub running: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -855,6 +853,27 @@ impl QueryPane {
 
     pub fn draft(&self) -> String {
         self.desk.draft()
+    }
+
+    /// 测试用：结果表格的焦点格、查看面板是否打开，以及把键盘焦点交给表格。
+    #[cfg(test)]
+    pub fn grid_focus_cell(&self, cx: &App) -> Option<(usize, usize)> {
+        self.grid.read(cx).focus_cell()
+    }
+
+    #[cfg(test)]
+    pub fn grid_viewer_open(&self, cx: &App) -> bool {
+        self.grid.read(cx).viewer_open()
+    }
+
+    #[cfg(test)]
+    pub fn grid_focus_handle(&self, cx: &App) -> gpui_kit::FocusHandle {
+        self.grid.read(cx).focus_handle()
+    }
+
+    #[cfg(test)]
+    pub fn select_grid_cell(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        self.grid.update(cx, |grid, cx| grid.select_for_menu(row, column, cx));
     }
 
     pub fn cell(&self, row: usize, col: usize, cx: &App) -> String {
@@ -2593,6 +2612,9 @@ impl QueryPane {
     }
 
     fn sync_grid(&mut self, cx: &mut App) {
+        // 全屏时 Esc 归结果区退出全屏：网格不拿它清选区。
+        let to_host = self.result_layout() == ResultLayout::Maximized;
+        self.grid.update(cx, |grid, _| grid.set_escape_to_host(to_host));
         let key = (self.desk.active_id().map(str::to_owned), self.desk.view_gen(), self.desk.statement());
         if self.painted.as_ref() == Some(&key) {
             return;
@@ -4089,13 +4111,11 @@ impl QueryPane {
 
     /// 结果区菜单要用的现场事实。
     pub fn results_menu_facts(&self) -> ResultsMenuFacts {
-        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|item| item == id));
         ResultsMenuFacts {
             has_result: self.has_result_content(),
             layout: self.result_layout(),
             has_sql: self.result_sql().is_some(),
             has_messages: !self.desk.log().is_empty(),
-            running,
         }
     }
 
@@ -4117,7 +4137,7 @@ impl QueryPane {
             .join("\n\n")
     }
 
-    /// 结果区的全屏、收起、关闭与复制。布局只改活动标签自己的那一份。
+    /// 结果区的全屏、收起、关闭（隐藏结果区，结果保留）与复制。布局只改活动标签自己的那一份。
     fn result_command(&mut self, id: &str, cx: &mut Context<Self>) {
         let layout = self.result_layout();
         match id {
@@ -4133,13 +4153,10 @@ impl QueryPane {
                 self.set_result_layout(next);
             }
             "result-restore" => self.set_result_layout(ResultLayout::Normal),
+            // 关闭结果只把结果区让给编辑器：结果原样保留，收起细栏的“展开”或下一次运行把它们带回来。
             "result-close" => {
-                if self.desk.close_results() {
-                    self.row_count = None;
-                    if layout == ResultLayout::Maximized && !self.has_result_content() {
-                        self.set_result_layout(ResultLayout::Normal);
-                    }
-                    self.rebind_grid(cx);
+                if self.has_result_content() {
+                    self.set_result_layout(ResultLayout::Collapsed);
                 }
             }
             "result-copy-sql" | "result-copy-messages" => {
@@ -6416,7 +6433,7 @@ mod tests {
         .unwrap();
     }
 
-    /// 结果区菜单：复制 SQL 与消息、关闭结果；关闭结果后固定结果与消息保留。
+    /// 结果区菜单：复制 SQL 与消息、关闭结果；关闭结果只隐藏结果区，展开后仍是原来的结果。
     #[gpui_kit::test]
     fn results_menu_commands_copy_and_close_the_current_result(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
@@ -6427,7 +6444,7 @@ mod tests {
             });
             window.render_frame(cx);
             let facts = pane.read(cx).results_menu_facts();
-            assert!(facts.has_result && facts.has_sql && facts.has_messages && !facts.running);
+            assert!(facts.has_result && facts.has_sql && facts.has_messages);
             pane.update(cx, |pane, cx| pane.command("result-copy-sql", cx));
             assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("SELECT * FROM customers"));
             pane.update(cx, |pane, cx| pane.command("result-copy-messages", cx));
@@ -6436,10 +6453,17 @@ mod tests {
             pane.update(cx, |pane, cx| pane.command("result-maximize", cx));
             pane.update(cx, |pane, cx| pane.command("result-close", cx));
             window.render_frame(cx);
-            assert!(pane.read(cx).desk.results().is_empty());
-            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal, "没有结果可全屏时回到普通布局");
-            assert!(!pane.read(cx).results_menu_facts().has_result);
-            assert!(window.try_find("query-results-empty").is_some());
+            // 关闭结果只把结果区让给编辑器：结果不删，编辑器铺到底部，细栏能把原结果带回来。
+            assert_eq!(pane.read(cx).desk.results().len(), 1, "关闭结果不丢结果");
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Collapsed);
+            assert!(window.try_find("query-results").is_none());
+            assert!(window.try_find("query-editor").is_some());
+            assert!(pane.read(cx).results_menu_facts().has_result);
+            window.click("query-results-collapsed", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal);
+            assert!(window.try_find("query-results-empty").is_none());
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "1", "展开后仍是原来的结果");
         })
         .unwrap();
     }

@@ -12959,6 +12959,60 @@ fn result_area_right_click_opens_its_own_menu_and_menus_close_on_scroll_right_cl
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 结果全屏时网格拿着键盘：Esc 退出全屏且选区不变；查看面板开着时 Esc 只关面板、仍在全屏。
+/// 走真实按键路径（网格 key_down → 外壳根节点），不直接调 handle_escape。
+#[gpui_kit::test]
+fn escape_in_maximized_results_keeps_selection_and_closes_inner_panels_first(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::query::ResultLayout;
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-results-escape-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let layout = |view: &gpui_kit::Entity<super::view::Workbench>, cx: &gpui_kit::App| view.read(cx).query.read(cx).result_layout();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.plant_query_result(vec!["id".into()], vec![vec!["1".into()], vec!["2".into()], vec!["3".into()]], cx));
+        window.render_frame(cx);
+        let query = view.read(cx).query.clone();
+        query.update(cx, |pane, cx| pane.select_grid_cell(2, 0, cx));
+        view.update(cx, |view, cx| view.perform("result-maximize", cx));
+        window.render_frame(cx);
+        assert_eq!(layout(&view, cx), ResultLayout::Maximized);
+        let focus = query.read(cx).grid_focus_handle(cx);
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+
+        // 查看面板开着：Esc 只关面板，仍在全屏。
+        query.update(cx, |pane, cx| {
+            let _ = pane.grid_command("grid-value-open", cx);
+        });
+        window.render_frame(cx);
+        assert!(query.read(cx).grid_viewer_open(cx));
+        window.focus(&focus, cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!query.read(cx).grid_viewer_open(cx), "Esc 关掉查看面板");
+        assert_eq!(layout(&view, cx), ResultLayout::Maximized, "关查看面板的那次 Esc 不退出全屏");
+
+        // 网格没有别的事可做：Esc 退出全屏，选区不变。
+        window.focus(&focus, cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(layout(&view, cx), ResultLayout::Normal, "Esc 退出全屏");
+        assert_eq!(query.read(cx).grid_focus_cell(cx), Some((2, 0)), "退出全屏时选区保留");
+
+        // 普通布局下 Esc 仍按原样清掉选区。
+        window.focus(&focus, cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(layout(&view, cx), ResultLayout::Normal);
+        assert_eq!(query.read(cx).grid_focus_cell(cx), None, "普通布局下 Esc 清选区");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 只读查询结果的单元格右键：写入项保留但禁用，悬停说明会话给出的具体原因；行号格右键是整行菜单。
 #[gpui_kit::test]
 fn query_result_cell_and_row_header_menus_differ_and_explain_readonly(cx: &mut gpui_kit::TestAppContext) {

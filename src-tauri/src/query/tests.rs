@@ -2461,40 +2461,18 @@ fn explain_uses_the_target_server_version_and_refuses_ddl_locally() {
         let reason = desk.explain_active().expect_err(ddl);
         assert!(reason.contains(&split::first_keyword(ddl)), "{ddl}: {reason}");
     }
-}
-
-/// 关闭结果清掉这一批语句结果，消息与固定结果保留；执行中或没有结果时不做任何事。
-#[test]
-fn closing_results_keeps_messages_and_pins() {
-    use crate::query::desk::{Desk, StatementView};
-    let mut desk = Desk::new();
-    desk.import_tab("a", "select 1", None);
-    desk.focus_tab(Some("a"));
-    assert!(!desk.close_results(), "没有结果时什么也不做");
-    let view = StatementView {
-        sql: "select 1".to_owned(),
-        sent_sql: None,
-        rewrite: None,
-        rewrite_anchor: None,
-        status: "ok".to_owned(),
-        message: String::new(),
-        columns: vec!["1".to_owned()],
-        rows: vec![vec![Some("1".to_owned())]],
-        truncated: false,
-        affected: None,
-        elapsed_ms: Some(1),
-        error_at: None,
-        error_code: None,
-        range: None,
-        error_mark: None,
-    };
-    desk.plant_run(vec![view]);
-    assert!(desk.pin_current().is_some());
-    let _ = desk.set_result_view(crate::query::desk::ResultView::Current);
-    let generation = desk.view_gen();
-    assert!(desk.close_results());
-    assert!(desk.results().is_empty());
-    assert_eq!(desk.pinned().len(), 1, "固定结果保留");
-    assert_eq!(desk.log().len(), 1, "消息保留");
-    assert!(desk.view_gen() > generation, "表格重新绑定");
+    // 能看计划的不在本地拒绝：CTAS、物化视图、PostgreSQL 的 DECLARE 游标、MySQL 的 DESC/DESCRIBE。
+    for allowed in [
+        "CREATE TABLE t AS SELECT * FROM orders",
+        "CREATE TEMPORARY TABLE assets AS (SELECT 1)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+        "DECLARE c CURSOR FOR SELECT 1",
+        "DESC SELECT * FROM orders",
+        "DESCRIBE SELECT * FROM orders",
+    ] {
+        assert_eq!(crate::query::assist::unexplainable(allowed), None, "{allowed}");
+    }
+    for refused in ["CREATE TABLE assets (id int)", "CREATE VIEW v AS SELECT 1", "CREATE INDEX i ON t (asof)"] {
+        assert!(crate::query::assist::unexplainable(refused).is_some(), "{refused}");
+    }
 }

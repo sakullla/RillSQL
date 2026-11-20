@@ -455,8 +455,8 @@ pub fn results_items(facts: &ResultsMenuFacts) -> Vec<MenuItem> {
         sep(with_icon(
             gate(
                 gate(item("result-close", "query.results.menu.close"), facts.has_result, "query.results.menu.noResult"),
-                !facts.running,
-                "query.results.menu.closeRunning",
+                !collapsed,
+                "query.results.menu.closed",
             ),
             IconName::X,
         )),
@@ -1038,7 +1038,7 @@ mod tests {
         assert_ne!(ids(&busy), row_ids, "单元格与行头的菜单不同");
     }
 
-    /// 结果区菜单：复制、全屏 / 退出全屏、收起 / 展开、关闭结果；没有结果时全屏与关闭禁用，执行中不能关闭。
+    /// 结果区菜单：复制、全屏 / 退出全屏、收起 / 展开、关闭结果；没有结果时全屏与关闭禁用；关闭只隐藏结果区、不删结果，已收起时禁用。
     #[test]
     fn results_menu_offers_layout_and_copy_for_the_result_area() {
         use crate::app::views::query::ResultLayout;
@@ -1048,13 +1048,12 @@ mod tests {
         assert_eq!(state(&empty, "result-maximize"), (false, Some("query.results.menu.noResult"), "query.results.menu.maximize"));
         assert!(!state(&empty, "result-close").0);
         assert!(state(&empty, "result-collapse").0, "没有结果也可以收起");
-        let full = results_items(&ResultsMenuFacts { has_result: true, has_sql: true, has_messages: true, layout: ResultLayout::Maximized, running: false });
+        let full = results_items(&ResultsMenuFacts { has_result: true, has_sql: true, has_messages: true, layout: ResultLayout::Maximized });
         assert!(full.iter().all(|item| item.enabled));
         assert_eq!(state(&full, "result-maximize").2, "query.results.menu.restore");
         let collapsed = results_items(&ResultsMenuFacts { has_result: true, layout: ResultLayout::Collapsed, ..ResultsMenuFacts::default() });
         assert_eq!(state(&collapsed, "result-collapse").2, "query.results.menu.expand");
-        let running = results_items(&ResultsMenuFacts { has_result: true, running: true, ..ResultsMenuFacts::default() });
-        assert_eq!(state(&running, "result-close"), (false, Some("query.results.menu.closeRunning"), "query.results.menu.close"));
+        assert_eq!(state(&collapsed, "result-close"), (false, Some("query.results.menu.closed"), "query.results.menu.close"));
         assert_eq!(MenuPlace::Results.label_key(), "ui.query.results");
     }
 

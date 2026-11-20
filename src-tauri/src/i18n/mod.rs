@@ -667,7 +667,7 @@ dict! {
     "query.results.menu.expand" => "展开结果", "Expand results";
     "query.results.menu.close" => "关闭结果", "Close results";
     "query.results.menu.noResult" => "还没有结果。运行查询后再试。", "There are no results yet. Run a query first.";
-    "query.results.menu.closeRunning" => "查询正在执行，结束后才能关闭结果。", "The query is still running; close the results after it finishes.";
+    "query.results.menu.closed" => "结果区已关闭。在底部细栏展开即可看回原来的结果。", "The results area is already closed. Expand it from the bottom bar to see the same results.";
     "query.results.menu.copied" => "已复制。", "Copied.";
     "query.results.collapsedBar" => "显示结果（{count} 行）", "Show results ({count} rows)";
     "query.results.collapsedEmpty" => "显示结果", "Show results";

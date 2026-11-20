@@ -613,19 +613,37 @@ pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &s
 }
 
 /// 不能看执行计划的语句（DDL、DCL、会话与事务控制）。在本地直接拒绝并说明原因，不发给服务器。
+/// DESC/DESCRIBE 是 MySQL 里 EXPLAIN 的同义词、DECLARE 游标在 PostgreSQL 可以看计划，都不在这里；
+/// CREATE 中的 CREATE TABLE … AS / CREATE MATERIALIZED VIEW … AS 也能看计划，见 [`unexplainable`]。
 const UNEXPLAINABLE: &[&str] = &[
     "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "GRANT", "REVOKE", "SET", "RESET", "USE", "BEGIN", "START",
-    "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "LOCK", "UNLOCK", "FLUSH", "KILL", "SHOW", "DESCRIBE", "DESC", "OPTIMIZE",
-    "REPAIR", "VACUUM", "REINDEX", "CLUSTER", "DECLARE", "PREPARE", "DEALLOCATE", "INSTALL", "UNINSTALL", "SHUTDOWN", "LOAD",
+    "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "LOCK", "UNLOCK", "FLUSH", "KILL", "SHOW", "OPTIMIZE", "REPAIR", "VACUUM",
+    "REINDEX", "CLUSTER", "PREPARE", "DEALLOCATE", "INSTALL", "UNINSTALL", "SHUTDOWN", "LOAD",
 ];
 
-/// 语句首个关键字属于 [`UNEXPLAINABLE`] 时返回拒绝说明。
+/// 语句首个关键字属于 [`UNEXPLAINABLE`] 时返回拒绝说明；带查询体的建表（CTAS、物化视图）放行。
 pub fn unexplainable(statement: &str) -> Option<String> {
     let keyword = split::first_keyword(statement);
-    if !UNEXPLAINABLE.contains(&keyword.as_str()) {
+    if !UNEXPLAINABLE.contains(&keyword.as_str()) || (keyword == "CREATE" && creates_from_query(statement)) {
         return None;
     }
     Some(crate::i18n::fill(&key_text("query.plan.unexplainable"), &[("keyword", &keyword)]))
+}
+
+/// `CREATE … TABLE … AS <查询>` 或 `CREATE MATERIALIZED VIEW … AS <查询>`：数据库可以给它出执行计划。
+fn creates_from_query(statement: &str) -> bool {
+    let upper = statement.to_ascii_uppercase();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    // 第一个独立的 AS 关键字（不是 ASSETS 这类标识符的一部分）。
+    let Some(as_at) = upper.match_indices("AS").map(|(at, _)| at).find(|&at| {
+        !upper[..at].chars().next_back().is_some_and(ident) && !upper[at + 2..].chars().next().is_some_and(ident)
+    }) else {
+        return false;
+    };
+    let head: Vec<&str> = upper[..as_at].split(|c: char| !ident(c)).filter(|word| !word.is_empty()).collect();
+    let builds = head.contains(&"TABLE") || head.windows(2).any(|pair| pair == ["MATERIALIZED", "VIEW"]);
+    let after = upper[as_at + 2..].trim_start();
+    builds && ["SELECT", "WITH", "VALUES", "TABLE", "EXECUTE", "("].iter().any(|start| after.starts_with(start))
 }
 
 /// 按服务器版本把语句包成只看执行计划的语句；`server_version` 未知时由方言选择保守格式。

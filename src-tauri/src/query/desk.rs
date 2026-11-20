@@ -792,24 +792,6 @@ impl Desk {
         Some(id)
     }
 
-    /// 关闭当前结果（结果区右键“关闭结果”）：清掉这一批语句结果，消息与固定结果保留。
-    /// 执行中不关闭，避免迟到的快照又把结果写回来；没有结果时什么也不做。
-    pub fn close_results(&mut self) -> bool {
-        let Some(tab) = self.active_mut() else {
-            return false;
-        };
-        if tab.running || tab.results.is_empty() {
-            return false;
-        }
-        tab.results.clear();
-        tab.result_column_types.clear();
-        tab.results_target = None;
-        tab.results_fresh = false;
-        tab.statement = 0;
-        self.view_gen = self.view_gen.saturating_add(1);
-        true
-    }
-
     /// 关掉一个固定结果；正在看它时回到当前结果。
     pub fn unpin(&mut self, id: u64) -> bool {
         let Some(tab) = self.active_mut() else {
