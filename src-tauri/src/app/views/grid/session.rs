@@ -407,12 +407,14 @@ pub enum FilterSource {
 #[derive(Clone, Debug)]
 struct PendingCondition {
     mode: FilterMode,
+    /// 规范化后的完整条件；不完整的草稿已经被跳过。
     drafts: Vec<FilterDraft>,
     expression: String,
 }
 
 /// 一条筛选条件草稿。文本保留用户的原文，只有"应用"时才编译成请求参数。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// 是否"未应用"不记在草稿上：规范化后与已应用的那份条件比较得出（R3）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FilterDraft {
     pub column: String,
     pub op: String,
@@ -421,8 +423,6 @@ pub struct FilterDraft {
     pub second: String,
     /// in 的集合输入，逗号或换行分隔。
     pub values: String,
-    /// 还在编辑、尚未应用的草稿不进请求，也不参与本地筛选。
-    pub dirty: bool,
 }
 
 /// 一个矩形选区（行起、列起、行止、列止），始终归一化成 起 <= 止。
@@ -509,6 +509,8 @@ pub struct SharedGrid {
     /// 目标表所在连接是否仍然可用（已打开且未失联）；会话自己拿不到服务，由 GridPane 同步。
     target_live: bool,
     filters: Vec<FilterDraft>,
+    /// 已应用的可视化条件（规范化后）：请求、本地筛选和"未应用"判定都以它为准。
+    applied_filters: Vec<FilterDraft>,
     /// 当前正在编辑的筛选形态；切换它本身不读取。
     filter_mode: FilterMode,
     /// 直接 SQL 条件的草稿文本；与可视化草稿分开保存，互不覆盖。
@@ -616,6 +618,7 @@ impl SharedGrid {
             find_scope: FindScope::Loaded,
             target_live: true,
             filters: Vec::new(),
+            applied_filters: Vec::new(),
             filter_mode: FilterMode::Visual,
             filter_sql: String::new(),
             generated_sql: String::new(),
@@ -1361,15 +1364,88 @@ impl SharedGrid {
         i18n::text(self.locale, &format!("grid.op.{op}"))
     }
 
-    fn draft_index(&self, column: &str) -> Option<usize> {
-        self.filters.iter().position(|item| item.column == column)
-    }
-
     fn filter_values(draft: &FilterDraft) -> Vec<String> {
         draft.values.split([',', '\n']).map(str::trim).filter(|item| !item.is_empty()).map(str::to_owned).collect()
     }
 
-    /// 按列替换一条条件并立即应用；保持既有"设了就生效"的用法。
+    /// 一条草稿的规范形态：None 表示不完整（没选列或缺值），不进查询也不算"未应用"；
+    /// Err 是非法条件；Ok 是去掉了与运算符无关的输入后的条件，用来和已应用的条件比较。
+    fn normalize_draft(&self, draft: &FilterDraft) -> Option<Result<FilterDraft, String>> {
+        if draft.column.trim().is_empty() {
+            return None;
+        }
+        let op = draft.op.as_str();
+        if !FILTER_OPS.contains(&op) {
+            return Some(Err(i18n::text(self.locale, "grid.filter.unknownOp")));
+        }
+        let mut normal = FilterDraft { column: draft.column.clone(), op: op.to_owned(), ..FilterDraft::default() };
+        match op {
+            "null" | "notnull" | "empty" => {}
+            "between" => {
+                if draft.value.trim().is_empty() || draft.second.trim().is_empty() {
+                    return None;
+                }
+                normal.value = draft.value.clone();
+                normal.second = draft.second.clone();
+            }
+            "in" => {
+                let values = Self::filter_values(draft);
+                if values.is_empty() {
+                    return None;
+                }
+                normal.values = values.join(",");
+            }
+            _ => {
+                if draft.value.trim().is_empty() {
+                    return None;
+                }
+                normal.value = draft.value.clone();
+            }
+        }
+        Some(Ok(normal))
+    }
+
+    /// 当前草稿里会参与查询的条件（规范化后）；不完整的跳过，非法的给出原因。
+    fn effective_filters(&self) -> Result<Vec<FilterDraft>, String> {
+        let mut out = Vec::with_capacity(self.filters.len());
+        for draft in &self.filters {
+            match self.normalize_draft(draft) {
+                Some(Ok(normal)) => out.push(normal),
+                Some(Err(error)) => return Err(error),
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// 因为不完整而不参与查询的条件数。
+    pub fn incomplete_filters(&self) -> usize {
+        self.filters.iter().filter(|draft| self.normalize_draft(draft).is_none()).count()
+    }
+
+    /// 已应用的可视化条件数（记录面板、状态文字用）。
+    pub fn applied_filter_count(&self) -> usize {
+        self.applied_filters.len()
+    }
+
+    /// 这一条草稿改过而还没应用：完整、且已应用条件里找不到与它相同的一份。不完整的条件不算。
+    /// 同一条件重复出现时按出现次数配对，第二份相同条件也会被标出来。
+    pub fn filter_draft_unapplied(&self, index: usize) -> bool {
+        let Some(draft) = self.filters.get(index) else {
+            return false;
+        };
+        match self.normalize_draft(draft) {
+            None => false,
+            Some(Err(_)) => true,
+            Some(Ok(normal)) => {
+                let seen = self.filters[..=index].iter().filter(|item| matches!(self.normalize_draft(item), Some(Ok(ref other)) if *other == normal)).count();
+                self.applied_filters.iter().filter(|item| **item == normal).count() < seen
+            }
+        }
+    }
+
+    /// 按列替换一条条件并立即应用；保持既有"设了就生效"的用法（按值筛选、快速筛选）。
+    /// "添加条件"不走这里：它总是追加一条新的空条件。
     pub fn set_filter(&mut self, column: &str, op: &str, value: &str) {
         self.set_filter_full(column, op, value, "", "");
     }
@@ -1381,27 +1457,39 @@ impl SharedGrid {
             value: value.to_owned(),
             second: second.to_owned(),
             values: values.to_owned(),
-            dirty: false,
         };
         // 结构化条件被使用时，编辑形态回到可视化一侧。
         self.filter_mode = FilterMode::Visual;
-        match self.draft_index(column) {
-            Some(index) => self.filters[index] = draft,
-            None => self.filters.push(draft),
+        match self.filters.iter().position(|item| item.column == column) {
+            Some(index) => {
+                let previous = std::mem::replace(&mut self.filters[index], draft.clone());
+                self.unapply(&previous);
+            }
+            None => self.filters.push(draft.clone()),
+        }
+        // 只有这一条立即生效；其他还在编辑的草稿保持原样。不完整或非法的条件不进查询。
+        if let Some(Ok(normal)) = self.normalize_draft(&draft) {
+            self.applied_filters.push(normal);
         }
         self.filter_error = None;
         self.recompute();
     }
 
-    /// 为一列新增一条待编辑条件；这一列已有条件就改成编辑已有的那条。
+    /// 从已应用条件里去掉这条草稿对应的那一份（如果有）。
+    fn unapply(&mut self, draft: &FilterDraft) {
+        if let Some(Ok(normal)) = self.normalize_draft(draft) {
+            if let Some(at) = self.applied_filters.iter().position(|item| *item == normal) {
+                self.applied_filters.remove(at);
+            }
+        }
+    }
+
+    /// 追加一条新的空条件（R3）：同一列可以有多条，已有条件不受影响；
+    /// 它在填好值之前不完整，不参与查询，也不算"未应用"。
     pub fn add_filter(&mut self, column: &str) -> usize {
         self.filter_mode = FilterMode::Visual;
-        if let Some(index) = self.draft_index(column) {
-            self.filters[index].dirty = true;
-            return index;
-        }
         let op = self.filter_ops_for(column).first().copied().unwrap_or("eq").to_owned();
-        self.filters.push(FilterDraft { column: column.to_owned(), op, value: String::new(), second: String::new(), values: String::new(), dirty: true });
+        self.filters.push(FilterDraft { column: column.to_owned(), op, ..FilterDraft::default() });
         self.filters.len() - 1
     }
 
@@ -1417,7 +1505,6 @@ impl SharedGrid {
             draft.second.clear();
             draft.values.clear();
         }
-        draft.dirty = true;
         true
     }
 
@@ -1439,7 +1526,6 @@ impl SharedGrid {
         if op != "in" {
             draft.values.clear();
         }
-        draft.dirty = true;
         true
     }
 
@@ -1465,7 +1551,6 @@ impl SharedGrid {
         draft.value = value.to_owned();
         draft.second = second.to_owned();
         draft.values = values.to_owned();
-        draft.dirty = true;
         true
     }
 
@@ -1480,7 +1565,6 @@ impl SharedGrid {
             1 => draft.second = value.to_owned(),
             _ => draft.values = value.to_owned(),
         }
-        draft.dirty = true;
         true
     }
 
@@ -1499,7 +1583,6 @@ impl SharedGrid {
         } else {
             draft.second = text.to_owned();
         }
-        draft.dirty = true;
         true
     }
 
@@ -1508,7 +1591,8 @@ impl SharedGrid {
             return false;
         }
         self.filter_mode = FilterMode::Visual;
-        self.filters.remove(index);
+        let removed = self.filters.remove(index);
+        self.unapply(&removed);
         self.filter_error = None;
         self.recompute();
         true
@@ -1524,6 +1608,7 @@ impl SharedGrid {
     /// 只清条件状态，不动行、也不重算：换结果集时用。
     fn reset_filter_state(&mut self) {
         self.filters.clear();
+        self.applied_filters.clear();
         self.filter_sql.clear();
         self.generated_sql.clear();
         self.filter_mode = FilterMode::Visual;
@@ -1569,15 +1654,12 @@ impl SharedGrid {
 
     /// 已应用条件的请求参数；还在编辑的草稿不进请求。
     pub fn filter_args(&self) -> Result<Vec<crate::grid::commands::FilterArg>, String> {
-        self.filters.iter().filter(|draft| !draft.dirty).map(|draft| self.compile_draft(draft)).collect()
+        self.applied_filters.iter().map(|draft| self.compile_draft(draft)).collect()
     }
 
-    /// 校验全部条件（含正在编辑的），非法时给出原因。
+    /// 校验全部条件（含正在编辑的），非法时给出原因；不完整的条件被跳过，不算错误。
     pub fn validate_filters(&self) -> Result<(), String> {
-        for draft in &self.filters {
-            self.compile_draft(draft)?;
-        }
-        Ok(())
+        self.effective_filters().map(|_| ())
     }
 
     /// 校验当前形态的全部条件；SQL 形态走表达式闸门。
@@ -1608,9 +1690,15 @@ impl SharedGrid {
         }
         self.filter_error = None;
         self.filter_hint = None;
+        let drafts = if self.filter_mode == FilterMode::Visual { self.effective_filters()? } else { Vec::new() };
+        // 不完整的条件没进查询：说一声，免得以为它也生效了。
+        let skipped = if self.filter_mode == FilterMode::Visual { self.incomplete_filters() } else { 0 };
+        if skipped > 0 {
+            self.filter_hint = Some(i18n::fill(&i18n::text(self.locale, "grid.filter.incompleteIgnored"), &[("count", &skipped.to_string())]));
+        }
         self.pending_filter = Some(PendingCondition {
             mode: self.filter_mode,
-            drafts: self.filters.clone(),
+            drafts,
             expression: self.filter_sql.trim().to_owned(),
         });
         if !awaits_read {
@@ -1620,16 +1708,14 @@ impl SharedGrid {
         Ok(())
     }
 
-    /// 这次读取成功了：把 pending 换成已应用来源并清掉 dirty。
+    /// 这次读取成功了：把 pending 换成已应用来源。
     pub fn commit_applied_filter(&mut self) {
         let Some(pending) = self.pending_filter.take() else {
             return;
         };
         match pending.mode {
             FilterMode::Visual => {
-                for draft in &mut self.filters {
-                    draft.dirty = false;
-                }
+                self.applied_filters = pending.drafts;
                 self.applied = FilterSource::Visual;
             }
             FilterMode::Sql => {
@@ -1655,12 +1741,16 @@ impl SharedGrid {
     }
 
     /// 还有正在编辑、尚未应用的筛选条件：界面据此标出"未应用"，避免把旧结果当成新条件的结果。
+    /// 可视化条件按规范化后的结果与已应用的条件比较：改了又改回原值不算，不完整的条件不算。
     pub fn unapplied_filters(&self) -> bool {
         if self.pending_filter.is_some() {
             return true;
         }
         match self.filter_mode {
-            FilterMode::Visual => self.filters.iter().any(|draft| draft.dirty),
+            FilterMode::Visual => match self.effective_filters() {
+                Ok(effective) => effective != self.applied_filters,
+                Err(_) => true,
+            },
             FilterMode::Sql => self.applied != FilterSource::Sql || self.applied_sql != self.filter_sql.trim(),
         }
     }
@@ -1718,7 +1808,7 @@ impl SharedGrid {
         let narrowing = !self.search.trim().is_empty()
             || match self.applied {
                 FilterSource::Sql => !self.applied_sql.trim().is_empty(),
-                FilterSource::Visual => self.filters.iter().any(|draft| !draft.dirty),
+                FilterSource::Visual => !self.applied_filters.is_empty(),
             };
         if narrowing {
             return SheetEmptiness::NoMatch;
@@ -3595,7 +3685,7 @@ impl SharedGrid {
         let mut rows = self.source.clone();
         // 直接 SQL 条件已经由服务器筛过，这里不再套用可视化条件（它们不是当前来源）。
         let visual = self.applied == FilterSource::Visual;
-        let applied = if visual { self.filters.iter().filter(|draft| !draft.dirty).count() } else { 0 };
+        let applied = if visual { self.applied_filters.len() } else { 0 };
         let filtering = !self.search.is_empty() || applied > 0 || self.sort.is_some();
         // 已读取范围的查找在本地筛；服务器范围的行已经是服务器筛过的，不再重复筛。
         if self.find_scope == FindScope::Loaded && !self.search.is_empty() {
@@ -3608,11 +3698,7 @@ impl SharedGrid {
         // 还在编辑、没有应用的草稿不改变可见行；非法条件也不改变可见行，
         // 否则一个漏填的上界会让整张表突然变空。
         let drafts: Vec<FilterDraft> = if visual {
-            self.filters
-                .iter()
-                .filter(|draft| !draft.dirty && self.compile_draft(draft).is_ok())
-                .cloned()
-                .collect()
+            self.applied_filters.iter().filter(|draft| self.compile_draft(draft).is_ok()).cloned().collect()
         } else {
             Vec::new()
         };
@@ -6216,16 +6302,16 @@ mod tests {
         assert_eq!(grid.loaded_len(), 3);
         grid.set_filter("name", "empty", "");
         assert_eq!(grid.loaded_len(), 1);
-        // 非法输入：不进请求，不改已有结果，并保留原因。
+        // 不完整的条件（R3）：不进请求，也不改已有结果。
         grid.clear_filters();
         grid.set_filter_full("id", "between", "2", "", "");
         assert_eq!(grid.loaded_len(), 4, "缺上界的条件不能让表变空");
-        let error = grid.page_request().unwrap_err();
-        assert_eq!(error, i18n::text(Locale::ZhCn, "grid.filter.needRange"));
+        assert!(grid.page_request().unwrap().filters.is_empty());
         grid.set_filter_full("id", "in", "", "", " , ");
-        assert_eq!(grid.page_request().unwrap_err(), i18n::text(Locale::ZhCn, "grid.filter.needList"));
+        assert!(grid.page_request().unwrap().filters.is_empty());
         grid.set_filter_full("id", "gt", "  ", "", "");
-        assert_eq!(grid.page_request().unwrap_err(), i18n::text(Locale::ZhCn, "grid.filter.needValue"));
+        assert!(grid.page_request().unwrap().filters.is_empty());
+        assert_eq!(grid.loaded_len(), 4);
         // 还在编辑的草稿同样不发查询。
         grid.clear_filters();
         let index = grid.add_filter("name");
@@ -6234,12 +6320,22 @@ mod tests {
         assert!(grid.page_request().unwrap().filters.is_empty());
         assert!(grid.apply_filters(false).is_ok());
         assert_eq!(grid.loaded_len(), 1);
-        // 应用失败时条件与结果都保留，可以改好再应用。
+        // 清空值后条件不完整：应用时被跳过并说明，条件草稿还在，可以改好再应用。
         assert!(grid.update_filter_text(index, true, ""));
-        let reason = i18n::text(Locale::ZhCn, "grid.filter.needValue");
+        assert!(grid.unapplied_filters(), "已应用的条件被清空：应用后结果会变");
+        assert_eq!(grid.loaded_len(), 1, "应用前结果不变");
+        assert!(grid.apply_filters(false).is_ok());
+        assert_eq!(grid.filter_error(), None);
+        assert_eq!(grid.filter_hint(), Some(i18n::fill(&i18n::text(Locale::ZhCn, "grid.filter.incompleteIgnored"), &[("count", "1")]).as_str()));
+        assert_eq!(grid.loaded_len(), 4);
+        assert_eq!(grid.filters().len(), 1, "草稿保留");
+        // 非法条件（未知运算符）仍被拒绝：不发查询，保留原因和上一次结果。
+        assert!(grid.update_filter(index, "bogus", "甲", "", ""));
+        let reason = i18n::text(Locale::ZhCn, "grid.filter.unknownOp");
         assert_eq!(grid.apply_filters(false).unwrap_err(), reason);
         assert_eq!(grid.filter_error(), Some(reason.as_str()));
-        assert_eq!(grid.loaded_len(), 1);
+        assert!(grid.unapplied_filters());
+        assert_eq!(grid.loaded_len(), 4);
         // 单删与全清。
         assert!(grid.remove_filter(index));
         assert!(grid.filters().is_empty());
@@ -6248,6 +6344,81 @@ mod tests {
         grid.clear_filters();
         assert!(grid.filters().is_empty());
         assert_eq!(grid.loaded_len(), 4);
+    }
+
+    /// R3：添加条件总是追加；同一列可以有多条；"未应用"按规范化后的条件与已应用的比较；
+    /// 不完整的条件不参与查询，也不算未应用。
+    #[test]
+    fn add_filter_appends_and_unapplied_compares_normalized_conditions() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![int_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), Some("甲")], true),
+                row("2", vec![Some("2"), None], true),
+                row("3", vec![Some("3"), Some("丙")], true),
+                row("4", vec![Some("4"), Some("")], true),
+            ],
+            Some(4),
+            Some(schema()),
+        );
+        // 应用一条 id > 1。
+        let first = grid.add_filter("id");
+        assert!(grid.set_filter_op(first, "gt"));
+        assert!(grid.update_filter_text(first, true, "1"));
+        assert!(grid.unapplied_filters());
+        grid.apply_filters(false).unwrap();
+        assert_eq!(grid.loaded_len(), 3);
+        assert!(!grid.unapplied_filters());
+        // 追加：第二条空条件，不是去编辑已有的那条；结果行数不变，不算未应用。
+        let second = grid.add_filter("id");
+        assert_eq!(second, 1, "总是新增一条");
+        assert_eq!(grid.filters().len(), 2);
+        assert_eq!(grid.filters()[0].value, "1", "已有条件不受影响");
+        assert!(grid.filters()[1].value.is_empty());
+        assert_eq!(grid.loaded_len(), 3, "空条件不改变结果");
+        assert!(!grid.unapplied_filters(), "不完整的条件不算未应用");
+        assert!(!grid.filter_draft_unapplied(second));
+        assert_eq!(grid.incomplete_filters(), 1);
+        // 同一列的第二条条件：id < 4，两条一起生效。
+        assert!(grid.set_filter_op(second, "lt"));
+        assert!(grid.update_filter_text(second, true, "4"));
+        assert!(grid.unapplied_filters());
+        assert!(grid.filter_draft_unapplied(second) && !grid.filter_draft_unapplied(first));
+        grid.apply_filters(false).unwrap();
+        assert_eq!(grid.loaded_len(), 2, "id > 1 且 id < 4");
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 2);
+        assert!(request.filters.iter().all(|arg| arg.column == "id"));
+        // 再给同一列加一条，同样是新增。
+        assert_eq!(grid.add_filter("id"), 2);
+        assert_eq!(grid.filters().len(), 3);
+        assert_eq!(grid.page_request().unwrap().filters.len(), 2, "空条件不进请求");
+        // 改了又改回原值：规范化后与已应用的相同，不算未应用。
+        assert!(grid.update_filter_text(first, true, "2"));
+        assert!(grid.unapplied_filters());
+        assert!(grid.update_filter_text(first, true, "1"));
+        assert!(!grid.unapplied_filters(), "改回原值就不是未应用");
+        // 与运算符无关的残留输入不影响比较；集合按逗号或换行规范化。
+        assert!(grid.update_filter(first, "gt", "1", "残留", ""));
+        assert!(!grid.unapplied_filters(), "between 以外的上界不参与比较");
+        assert!(grid.update_filter(first, "in", "", "", "2, 3"));
+        grid.apply_filters(false).unwrap();
+        assert!(grid.update_filter(first, "in", "", "", " 2 ,\n3 "));
+        assert!(!grid.unapplied_filters(), "集合写法不同但内容相同");
+        // 删掉空条件不改变已应用的条件。
+        assert!(grid.remove_filter(2));
+        assert!(!grid.unapplied_filters());
+        assert_eq!(grid.page_request().unwrap().filters.len(), 2);
+        // 把一条清空成不完整：不算未应用；应用后它不参与查询。
+        assert!(grid.update_filter_text(second, true, ""));
+        assert!(grid.unapplied_filters(), "已应用的条件变得不完整，应用后结果会变");
+        grid.apply_filters(false).unwrap();
+        assert_eq!(grid.page_request().unwrap().filters.len(), 1);
+        assert!(!grid.unapplied_filters());
+        assert_eq!(grid.loaded_len(), 2, "只剩 id in (2, 3)");
     }
 
     #[test]

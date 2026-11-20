@@ -404,6 +404,8 @@ dict! {
     "grid.filter.valuePlaceholder" => "值或集合（逗号分隔）", "Value or comma-separated set";
     "grid.filter.upperPlaceholder" => "上界", "Upper bound";
     "grid.filter.needValue" => "这个条件需要填值，没有发出查询。", "This condition needs a value; no query was sent.";
+    "grid.filter.incompleteIgnored" => "{count} 个条件还没填完，没有参与查询。", "{count} incomplete condition(s) were left out of the query.";
+    "grid.filter.pickColumn" => "选择字段", "Choose column";
     "grid.filter.needRange" => "范围条件需要起止两个值，没有发出查询。", "A range needs both bounds; no query was sent.";
     "grid.filter.needList" => "集合条件至少要一个值，没有发出查询。", "A set condition needs at least one value; no query was sent.";
     "grid.filter.unknownOp" => "这个引擎不支持该条件，没有发出查询。", "This engine does not support that condition; no query was sent.";
@@ -766,6 +768,8 @@ dict! {
     "grid.action.search" => "查找", "Search";
     "grid.action.sort" => "排序", "Sort";
     "grid.action.filter" => "筛选", "Filter";
+    "grid.action.jumpColumn" => "跳到列", "Go to column";
+    "grid.action.jumpColumnHint" => "搜索列名并跳到这一列", "Search a column name and jump to it";
     "grid.action.pageNext" => "下一页", "Next page";
     "grid.count.hint" => "点击统计总行数（大表可能耗时较长）", "Click to count all rows (large tables may take time)";
     "grid.count.running" => "正在统计总行数…", "Counting all rows…";

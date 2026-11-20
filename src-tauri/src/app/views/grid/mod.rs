@@ -1,5 +1,6 @@
 //! 共享虚拟网格。DataTable 只画可见窗口；选择和已读取/全量范围留在 session。
 
+mod column_pick;
 mod record;
 mod session;
 mod temporal;
@@ -14,13 +15,13 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableSelection, TableState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
     relative, DragMoveEvent,
 };
 
-use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::{self, Palette, Tip as _, Radius, Space, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -190,6 +191,12 @@ pub struct GridPane {
     /// 筛选条每一行的取值输入（值、上界/集合）；结构变化时整体重建。
     filter_inputs: Vec<FilterRowInputs>,
     filter_subscriptions: Vec<gpui_kit::Subscription>,
+    /// 字段选择器（R4）：筛选条件的字段和“跳到列”共用的 ui::picker 弹层。
+    column_picker: Option<column_pick::ColumnPicker>,
+    /// 等绘制阶段拿到 Window 再打开的选择器：添加条件后焦点落到新条件的字段选择器上。
+    picker_request: Option<column_pick::ColumnPickTarget>,
+    /// 触发按钮上一帧在窗口里的位置。
+    picker_anchors: column_pick::PickerAnchors,
     /// 直接 SQL 条件输入框与它的订阅：与结构化条件的输入框分开保存，切换形态不丢文本。
     sql_input: Option<Entity<InputState>>,
     sql_subscription: Option<gpui_kit::Subscription>,
@@ -388,6 +395,9 @@ impl GridPane {
             connect_request: None,
             filter_inputs: Vec::new(),
             filter_subscriptions: Vec::new(),
+            column_picker: None,
+            picker_request: None,
+            picker_anchors: Default::default(),
             sql_input: None,
             sql_subscription: None,
             filters_open: false,
@@ -1362,7 +1372,7 @@ impl GridPane {
         if let Some(sorted) = self.session.sort_text() {
             parts.push(sorted);
         }
-        let applied = self.session.filters().iter().filter(|draft| !draft.dirty).count();
+        let applied = self.session.applied_filter_count();
         if applied > 0 {
             parts.push(i18n::fill(&i18n::text(self.locale, "grid.record.filtered"), &[("count", &applied.to_string())]));
         }
@@ -1775,7 +1785,8 @@ impl GridPane {
         }
     }
 
-    /// 新建一条空条件：默认用焦点列（没有焦点时用第一个可见列），先不应用，等用户填值。
+    /// 新建一条空条件（R3）：总是追加，已有条件（包括同一列的）不受影响。默认用焦点列
+    /// （没有焦点时用第一个可见列），先不应用；字段选择器随即打开，焦点在它的搜索框里。
     pub fn new_filter(&mut self, cx: &mut Context<Self>) -> Option<usize> {
         let name = self.focused_column_name().or_else(|| {
             let names = self.session.column_names();
@@ -1783,6 +1794,7 @@ impl GridPane {
         })?;
         let index = self.session.add_filter(&name);
         self.filter_input_reset();
+        self.picker_request = Some(column_pick::ColumnPickTarget::Filter(index));
         cx.notify();
         Some(index)
     }
@@ -3189,6 +3201,10 @@ impl Render for GridPane {
                         return;
                     }
                 }
+                // 字段选择器开着：按键归它的搜索框（Delete 等不能落到网格命令上）。
+                if this.column_picker.is_some() {
+                    return;
+                }
                 // 文本输入接管字符、光标、选区、粘贴和撤销，这里只处理取消编辑与“设为 NULL/空字符串/默认值”。
                 if this.edit_target.is_some() {
                     if key == "escape" {
@@ -3288,7 +3304,7 @@ impl Render for GridPane {
         if let Some(preview) = self.render_preview(&p, &entity, cx) {
             column = column.child(preview);
         }
-        column
+        column.children(self.render_column_picker(window, cx))
     }
 }
 
@@ -3443,6 +3459,28 @@ impl GridPane {
         };
         let filter_button = kit::tool_button("grid-filter-add", Some(IconName::ListFilter), filter_label, pane_click(entity, "grid-filter-new"));
         left = left.child(if filters > 0 || self.filters_shown() { filter_button.selected(true) } else { filter_button });
+        // 跳到列（R4）：几百列的表上按名字搜索，选中后滚到那一列并整列选中。
+        if !self.session.column_names().is_empty() {
+            let jumping = self.column_picker_target() == Some(column_pick::ColumnPickTarget::Jump);
+            let jump = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Jump, window, cx));
+                }
+            };
+            let mut jump_button = kit::tool_button("grid-jump-column", Some(IconName::Columns3), t("grid.action.jumpColumn"), jump).tooltip(t("grid.action.jumpColumnHint"));
+            if jumping {
+                jump_button = jump_button.selected(true);
+            }
+            left = left.child(
+                div()
+                    .id("grid-jump-column-slot")
+                    .relative()
+                    .flex_none()
+                    .child(jump_button)
+                    .child(column_pick::anchor_probe(&self.picker_anchors, column_pick::ColumnPickTarget::Jump)),
+            );
+        }
         // 当前排序是一枚可清除的标签：看得出按哪列哪个方向排，点 × 回到原始顺序。
         if let Some(sorted) = self.session.sort_text() {
             left = left.child(
@@ -3849,7 +3887,7 @@ impl GridPane {
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap(px(6.));
+                .gap(px(Space::SM));
             for (index, draft) in drafts.iter().enumerate() {
                 // 条件之间是“且”：写出来，避免误以为是“或”。
                 if index > 0 {
@@ -3886,11 +3924,11 @@ impl GridPane {
                 .flex_1()
                 .min_w(px(220.))
                 .h(px(28.))
-                .pl(px(8.))
-                .pr(px(4.))
+                .pl(px(Space::MD))
+                .pr(px(Space::XS))
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .rounded(px(Radius::CONTROL))
                 .border_1()
                 // 改了还没应用时边框用强调色，与可视化条件块同一个意思。
@@ -3909,7 +3947,7 @@ impl GridPane {
                 row = row.child(
                     div()
                         .flex_1()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .font_family(mono)
                         // 输入框的可读名字用"直接写 WHERE 表达式"；示例长句留在占位符里。
                         .child(kit::inline_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle"))),
@@ -3924,14 +3962,14 @@ impl GridPane {
             )
             .into_any_element()
         };
-        let mut actions = div().id("grid-filter-actions").debug_selector(|| "grid-filter-actions".to_owned()).flex_none().flex().items_center().gap(px(4.));
+        let mut actions = div().id("grid-filter-actions").debug_selector(|| "grid-filter-actions".to_owned()).flex_none().flex().items_center().gap(px(Space::XS));
         if unapplied {
             // 条件改了还没应用：写成字，而不是只有一个小圆点。
             actions = actions.child(
                 div()
                     .id("grid-filter-unapplied-badge")
                     .debug_selector(|| "grid-filter-unapplied-badge".to_owned())
-                    .px(px(6.))
+                    .px(px(Space::SM))
                     .h(px(20.))
                     .flex()
                     .items_center()
@@ -3958,14 +3996,14 @@ impl GridPane {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(8.))
+            .gap(px(Space::MD))
             .child(
                 div()
                     .id("grid-filter-title")
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(Space::SM))
                     // 说明只挂在漏斗图标上：悬停写法切换时不弹出一大段提示挡住表格。
                     .child(div().id("grid-filter-mode-help").tooltip_text(t("grid.filter.modeHint")).child(kit::icon(IconName::Funnel, 13., p.text_muted)))
                     .child(modes),
@@ -3977,10 +4015,10 @@ impl GridPane {
             .debug_selector(|| "grid-filters".to_owned())
             .flex_none()
             .px(px(10.))
-            .py(px(6.))
+            .py(px(Space::SM))
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(Space::XS))
             .border_b_1()
             .border_color(p.line)
             .bg(p.chrome)
@@ -3996,6 +4034,8 @@ impl GridPane {
     #[inline(never)]
     fn render_filter_row(&self, index: usize, draft: &session::FilterDraft, p: &Palette, entity: &Entity<GridPane>) -> gpui_kit::AnyElement {
         let locale = self.locale;
+        // 改过而还没应用的条件（与已应用的那份比较；不完整的条件不算）。
+        let unapplied = self.session.filter_draft_unapplied(index);
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let remove = {
             let entity = entity.clone();
@@ -4005,23 +4045,19 @@ impl GridPane {
         };
         // 列：下拉列出全部列，换列不丢掉已经输入的值。长列名在条件行里缩短，
         // 完整名字留在悬停提示里，窄窗口下也不会把整个条件行撑破。
-        let names = self.session.column_names();
+        // 几百列时用可搜索的选择器（ui::picker），不再是一长串菜单。
         let column_entity = entity.clone();
         let column_label = shorten_column(&draft.column);
+        let picking = self.column_picker_target() == Some(column_pick::ColumnPickTarget::Filter(index));
         let column_picker = stack_frame(|| Button::new(SharedString::from(format!("grid-filter-column-{index}")))
             .ghost()
             .xsmall()
             .label(SharedString::from(column_label))
             .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, _| {
-                for name in names.clone() {
-                    let entity = column_entity.clone();
-                    let picked = name.clone();
-                    menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
-                        entity.update(cx, |pane, cx| pane.pick_filter_column(index, &picked, cx));
-                    }));
-                }
-                menu
+            .selected(picking)
+            .tooltip(t("grid.filter.pickColumn"))
+            .on_click(move |_, window, cx| {
+                column_entity.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Filter(index), window, cx));
             })
         );
         // 运算符：只列出这一列类型适用的运算符，当前项打勾。
@@ -4033,7 +4069,9 @@ impl GridPane {
             .xsmall()
             .label(SharedString::from(self.session.op_label(&draft.op)))
             .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, _| {
+            .dropdown_menu(move |menu, _, _| {
+                // 运算符不多，仍用菜单；窗口很矮时也能滚到最后一项。
+                let mut menu = menu.scrollable(true);
                 for op in ops.clone() {
                     let entity = op_entity.clone();
                     let label = i18n::text(locale, &format!("grid.op.{op}"));
@@ -4048,24 +4086,34 @@ impl GridPane {
             .id(SharedString::from(format!("grid-filter-chip-{index}")))
             .flex()
             .items_center()
-            .gap(px(2.))
-            .pl(px(2.))
-            .pr(px(2.))
+            .gap(px(Space::XXS))
+            .pl(px(Space::XXS))
+            .pr(px(Space::XXS))
             .h(px(26.))
             .rounded(px(Radius::CONTROL))
             .border_1()
             // 正在编辑、尚未应用的条件用强调边框标出来，避免把旧结果当成新条件的结果。
-            .border_color(if draft.dirty { p.accent } else { p.line })
+            .border_color(if unapplied { p.accent } else { p.line })
             .bg(p.raised)
             .max_w(px(420.))
-            .child(div().id(SharedString::from(format!("grid-filter-column-slot-{index}"))).max_w(px(180.)).min_w(px(0.)).flex_none().tooltip_text(draft.column.clone()).child(column_picker))
+            .child(
+                div()
+                    .id(SharedString::from(format!("grid-filter-column-slot-{index}")))
+                    .relative()
+                    .max_w(px(180.))
+                    .min_w_0()
+                    .flex_none()
+                    .tooltip_text(draft.column.clone())
+                    .child(column_picker)
+                    .child(column_pick::anchor_probe(&self.picker_anchors, column_pick::ColumnPickTarget::Filter(index))),
+            )
             .child(op_picker);
-        if draft.dirty {
+        if unapplied {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("grid-filter-unapplied-{index}")))
                     .debug_selector(|| "grid-filter-unapplied".to_owned())
-                    .mx(px(2.))
+                    .mx(px(Space::XXS))
                     .size(px(6.))
                     .rounded_full()
                     .bg(p.accent)
@@ -7414,12 +7462,13 @@ mod pane_tests {
                 assert_eq!(pane.session.filters()[0].op, "eq");
                 assert_eq!(pane.session.filters()[0].value, "甲");
                 assert_eq!(pane.loaded_len(), 1);
-                // 非法输入（空值）不发查询，保留上一次有效结果并说明原因。
+                // 清空值后条件不完整（R3）：不算未应用；应用时它不参与查询，并说明被跳过。
                 pane.session.update_filter_text(0, true, "");
-                let error = pane.apply_filters(cx).unwrap_err();
-                assert!(!error.is_empty());
-                assert_eq!(pane.notice, error, "非法原因要显示出来");
-                assert_eq!(pane.loaded_len(), 1, "非法条件不能清掉旧结果");
+                assert!(pane.session.unapplied_filters(), "已应用的条件被清空：应用后结果会变");
+                assert_eq!(pane.loaded_len(), 1, "没应用前结果不变");
+                pane.apply_filters(cx).expect("不完整的条件被跳过，不是错误");
+                assert!(pane.session.filter_hint().is_some(), "要说明有条件没进查询");
+                assert_eq!(pane.loaded_len(), 2, "不完整的条件不参与查询");
                 // 改好后再应用成功。
                 pane.session.update_filter_text(0, true, "乙");
                 assert!(pane.apply_filters(cx).is_ok());
@@ -9903,10 +9952,10 @@ mod filter_ui_tests {
                             plant_long(&pane, cx);
                             pane.update(cx, |pane, cx| {
                                 pane.set_locale(locale);
-                                // 一条长列名条件 + 一条未填值的条件：错误说明与条件行同时出现。
+                                // 一条长列名条件 + 一条未填值的条件：不完整的条件被跳过，说明与条件行同时出现。
                                 pane.session.add_filter(LONG_COLUMN);
                                 pane.session.add_filter("id");
-                                pane.apply_filters(cx).expect_err("缺值必须被拒绝");
+                                pane.apply_filters(cx).expect("不完整的条件被跳过，不是错误");
                                 let _ = long_error.len();
                             });
                             window.render_frame(cx);
@@ -9916,7 +9965,7 @@ mod filter_ui_tests {
                         let header = visual.debug_bounds("grid-filter-header").expect("动作行");
                         assert!(f32::from(header.size.width) <= width + 1., "{width}/{dark}/{locale:?} 动作行不能越界");
                         assert!(visual.debug_bounds("grid-filter-rows").is_some(), "{width}/{dark}/{locale:?} 条件行");
-                        assert!(visual.debug_bounds("grid-filter-error").is_some(), "{width}/{dark}/{locale:?} 错误说明");
+                        assert!(visual.debug_bounds("grid-filter-hint").is_some(), "{width}/{dark}/{locale:?} 跳过说明");
                         // 动作入口都在：添加、应用、清除。
                         let _ = visual.debug_bounds("grid-filters");
                         window_has(&pane, cx);
@@ -9945,11 +9994,176 @@ mod filter_ui_tests {
         }
     }
 
+    fn plant_wide(pane: &Entity<GridPane>, columns: usize, cx: &mut App) {
+        pane.update(cx, |pane, cx| {
+            let names = (0..columns).map(|ix| format!("col_{ix:03}")).collect::<Vec<_>>();
+            let rows = (0..3).map(|row| (0..columns).map(|ix| Some(format!("{row}-{ix}"))).collect()).collect();
+            pane.plant_loaded(target_of("wide_table_300"), names, rows, cx);
+        });
+    }
+
+    /// R3：已经应用一个条件后再“添加条件”：出现第二个空条件，字段选择器打开且焦点在它的搜索框里，
+    /// 结果行数不变，也不标“未应用”。再加一次同列条件，同样是新增。
+    #[gpui_kit::test]
+    fn add_condition_appends_an_empty_one_and_focuses_its_field_picker(cx: &mut TestAppContext) {
+        let (window, pane) = open_at(cx, 1100.);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.update(|window, cx| {
+            plant_long(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 0, false);
+                let index = pane.session.add_filter("id");
+                pane.session.set_filter_op(index, "gt");
+                pane.session.update_filter_text(index, true, "1");
+                pane.apply_filters(cx).unwrap();
+                assert_eq!(pane.loaded_len(), 2);
+                assert!(!pane.session.unapplied_filters());
+            });
+            window.render_frame(cx);
+        });
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-filter-new", cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+        });
+        visual.update(|window, cx| {
+            let pane_ref = pane.read(cx);
+            assert_eq!(pane_ref.session.filters().len(), 2, "第二个空条件");
+            assert_eq!(pane_ref.session.filters()[0].value, "1", "已应用的那条不受影响");
+            assert!(pane_ref.session.filters()[1].value.is_empty());
+            assert_eq!(pane_ref.loaded_len(), 2, "结果行数不变");
+            assert!(!pane_ref.session.unapplied_filters(), "空条件不算未应用");
+            assert_eq!(pane_ref.column_picker_target(), Some(column_pick::ColumnPickTarget::Filter(1)));
+            let picker = pane_ref.column_picker.as_ref().expect("字段选择器已打开").picker.clone();
+            assert!(picker.read(cx).focus_handle(cx).contains_focused(window, cx), "焦点在新条件的字段选择器里");
+        });
+        assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_none());
+        // 输入即过滤，回车选中：新条件换成这一列，选择器关闭，焦点回到网格。
+        visual.update(|window, cx| window.input("customer_note", cx));
+        visual.update(|window, cx| window.press("enter", cx));
+        visual.update(|window, cx| {
+            let pane_ref = pane.read(cx);
+            assert_eq!(pane_ref.session.filters()[1].column, LONG_COLUMN);
+            assert!(pane_ref.column_picker.is_none());
+            assert!(pane_ref.grid_focus.is_focused(window), "Esc / 选中后键盘回到网格");
+        });
+        // 同一列再加一条：仍是新增。
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 0, false);
+                let _ = pane.command("grid-filter-new", cx);
+            });
+            window.render_frame(cx);
+        });
+        visual.update(|window, cx| {
+            let pane_ref = pane.read(cx);
+            assert_eq!(pane_ref.session.filters().len(), 3);
+            assert_eq!(pane_ref.session.filters()[2].column, "id", "同一列可以有多条");
+            assert_eq!(pane_ref.column_picker_target(), Some(column_pick::ColumnPickTarget::Filter(2)));
+            assert_eq!(pane_ref.loaded_len(), 2);
+            let _ = window;
+        });
+        // Esc 关闭，不改条件。
+        visual.update(|window, cx| window.press("escape", cx));
+        visual.update(|_, cx| {
+            let pane_ref = pane.read(cx);
+            assert!(pane_ref.column_picker.is_none());
+            assert_eq!(pane_ref.session.filters().len(), 3);
+        });
+    }
+
+    /// R4：300 列的表上，筛选字段选择器可以搜索并选到最后一列，弹层不超出窗口；
+    /// “跳到列”整列选中并把它滚进视野。
+    #[gpui_kit::test]
+    fn field_picker_and_jump_to_column_reach_the_last_of_300_columns(cx: &mut TestAppContext) {
+        let (window, pane) = open_at(cx, 900.);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.update(|window, cx| {
+            plant_wide(&pane, 300, cx);
+            window.render_frame(cx);
+        });
+        // 筛选字段：300 项都在，搜索后回车选到最后一列。
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                let (items, _) = pane.column_picker_items(column_pick::ColumnPickTarget::Jump);
+                assert_eq!(items.len(), 300);
+                pane.filters_open = true;
+                let index = pane.new_filter(cx).expect("新条件");
+                assert_eq!(index, 0);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+        });
+        visual.update(|window, cx| {
+            let picker = pane.read(cx).column_picker.as_ref().expect("字段选择器").picker.clone();
+            assert_eq!(picker.read(cx).model().items().len(), 300);
+            let bounds = window.find("picker").bounds();
+            let viewport = window.viewport_size();
+            assert!(bounds.origin.y >= px(0.) && bounds.bottom() <= viewport.height, "弹层不超出窗口：{bounds:?}");
+            assert!(bounds.origin.x >= px(0.) && bounds.right() <= viewport.width, "弹层不超出窗口：{bounds:?}");
+        });
+        visual.update(|window, cx| window.input("col_299", cx));
+        visual.update(|window, cx| window.press("enter", cx));
+        visual.update(|_, cx| {
+            assert_eq!(pane.read(cx).session.filters()[0].column, "col_299");
+        });
+        // 跳到列：打开、搜索、回车。
+        visual.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Jump, window, cx));
+            window.render_frame(cx);
+        });
+        visual.update(|window, cx| window.input("col_298", cx));
+        visual.update(|window, cx| window.press("enter", cx));
+        visual.update(|window, cx| {
+            window.render_frame(cx);
+            let pane_ref = pane.read(cx);
+            assert!(pane_ref.column_picker.is_none());
+            let last = pane_ref.loaded_len() - 1;
+            assert_eq!(pane_ref.session.selection_bounds(), Some((0, 298, last, 298)), "整列选中");
+            assert_eq!(pane_ref.session.focus_cell().map(|(_, column)| column), Some(298));
+        });
+        visual.update(|window, cx| window.render_frame(cx));
+        visual.update(|_, cx| {
+            let offset = pane.read(cx).table.read(cx).horizontal_scroll_handle.offset();
+            assert!(offset.x < px(-1000.), "横向滚到了靠后的列：{offset:?}");
+        });
+    }
+
+    /// R3：查找栏和筛选条同时展开时都排在网格主体上方，不盖住表头和 # 列；三档宽度都成立。
+    #[gpui_kit::test]
+    fn find_bar_and_filter_strip_never_cover_the_header_or_row_numbers(cx: &mut TestAppContext) {
+        for width in [1360., 900., 640.] {
+            let (window, pane) = open_at(cx, width);
+            let mut visual = VisualTestContext::from_window(window, cx);
+            visual.update(|window, cx| {
+                plant_long(&pane, cx);
+                pane.update(cx, |pane, cx| {
+                    pane.open_find(cx);
+                    pane.session.add_filter(LONG_COLUMN);
+                    let index = pane.session.add_filter("id");
+                    pane.session.update_filter_text(index, true, "1");
+                    pane.apply_filters(cx).unwrap();
+                });
+                window.render_frame(cx);
+                window.render_frame(cx);
+            });
+            let find = visual.debug_bounds("grid-find-bar").expect("查找栏");
+            let strip = visual.debug_bounds("grid-filters").expect("筛选条");
+            let body = visual.debug_bounds("grid-body").expect("网格主体");
+            assert!(find.bottom() <= strip.top() + px(0.5), "{width}: 查找栏在筛选条上方：{find:?} {strip:?}");
+            assert!(strip.bottom() <= body.top() + px(0.5), "{width}: 筛选条不压住表头：{strip:?} {body:?}");
+            assert!(find.bottom() <= body.top() + px(0.5), "{width}: 查找栏不压住表头");
+            assert!(find.left() >= body.left() - px(0.5), "{width}: 查找栏不伸到 # 列左侧");
+        }
+    }
+
     fn window_has(pane: &Entity<GridPane>, cx: &mut TestAppContext) {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.session.filters().len(), 2);
-            assert!(pane.session.filter_error().is_some());
+            assert!(pane.session.filter_hint().is_some());
         });
     }
 
@@ -10091,7 +10305,6 @@ mod filter_ui_tests {
                 assert_eq!(pane.loaded_len(), 3, "行集合当场变化");
                 assert_eq!(pane.cell(0, 1), "a");
                 assert_eq!(pane.cell(2, 1), "d");
-                assert!(pane.session.filters().iter().all(|draft| !draft.dirty), "dirty 要清掉");
                 assert!(!pane.session.unapplied_filters(), "应用过就不能再算未应用");
                 assert_eq!(pane.session.applied_source(), session::FilterSource::Visual);
                 assert!(pane.notice.is_empty(), "{}", pane.notice);
@@ -10101,21 +10314,21 @@ mod filter_ui_tests {
         visual.update(|window, cx| window.render_frame(cx));
         assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_none(), "未应用提示必须消失");
         assert!(visual.debug_bounds("grid-filter-rows").is_some(), "条件行还在");
-        // 失败的草稿：行集合和上一次已应用条件都不动，只说明原因。
+        // 不完整的草稿（R3）：不参与查询，也不算未应用；应用时只提示它被跳过。
         visual.update(|_, cx| {
             pane.update(cx, |pane, cx| {
                 pane.session.add_filter("id");
-                let error = pane.apply_filters(cx).expect_err("缺值必须被拒绝");
-                assert_eq!(pane.loaded_len(), 3, "失败的草稿没有改变行集合");
+                assert!(!pane.session.unapplied_filters(), "缺值的草稿不算未应用");
+                pane.apply_filters(cx).expect("不完整的条件被跳过，不是错误");
+                assert_eq!(pane.loaded_len(), 3, "不完整的草稿没有改变行集合");
                 let request = pane.session.page_request().expect("上一次条件仍合法");
                 assert_eq!(request.filters.len(), 1);
                 assert_eq!(request.filters[0].column, "name");
-                assert!(pane.session.unapplied_filters(), "缺值的草稿仍是未应用");
-                assert_eq!(pane.notice, error);
+                assert!(pane.session.filter_hint().is_some(), "要说明有条件没进查询");
             });
         });
         visual.update(|window, cx| window.render_frame(cx));
-        assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_some(), "失败的草稿要标出未应用");
+        assert!(visual.debug_bounds("grid-filter-unapplied-badge").is_none(), "不完整的草稿不标未应用");
         drop(visual);
         let _ = std::fs::remove_dir_all(dir);
     }
