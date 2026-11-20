@@ -55,6 +55,11 @@ impl DdlDialect for SqlserverDdl {
         true
     }
 
+    /// sysname 最长 128 个字符。
+    fn max_index_name_len(&self) -> Option<usize> {
+        Some(128)
+    }
+
     fn reference_scope<'a>(&self, ref_schema: &'a str) -> Option<&'a str> {
         (!ref_schema.is_empty()).then_some(ref_schema)
     }

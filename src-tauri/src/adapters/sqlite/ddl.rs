@@ -35,6 +35,11 @@ pub(crate) fn sqlite_at_least(version: &str, major: u64, minor: u64, patch: u64)
 
 #[async_trait::async_trait]
 impl DdlDialect for SqliteDdl {
+    /// SQLite 不限制标识符长度。
+    fn max_index_name_len(&self) -> Option<usize> {
+        None
+    }
+
     fn qualified_table(&self, database: &str, _schema: &str, table: &str) -> Result<String, String> {
         qualified(database, table)
     }

@@ -340,6 +340,11 @@ pub trait DdlDialect: Sync {
         false
     }
 
+    /// 索引名的长度上限（字节）。None 表示不限；没有声明的方言按保守的 60。
+    fn max_index_name_len(&self) -> Option<usize> {
+        Some(60)
+    }
+
     /// 读目标表与生成引用时使用的模式：None 表示与本表同一处。
     fn reference_scope<'a>(&self, _ref_schema: &'a str) -> Option<&'a str> {
         None

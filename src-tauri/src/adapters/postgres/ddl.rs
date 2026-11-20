@@ -51,6 +51,11 @@ impl DdlDialect for PostgresDdl {
         true
     }
 
+    /// 标识符超过 63 字节会被服务器静默截断，名字也就不再唯一。
+    fn max_index_name_len(&self) -> Option<usize> {
+        Some(63)
+    }
+
     /// 目标表总按外键写明的模式读取与限定（没写模式时由限定名报出缺少 schema）。
     fn reference_scope<'a>(&self, ref_schema: &'a str) -> Option<&'a str> {
         Some(ref_schema)
