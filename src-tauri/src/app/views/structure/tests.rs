@@ -1927,20 +1927,30 @@ fn added_rows_enter_edit_and_locked_attributes_explain_why() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 窄窗口按优先级隐藏列：先隐藏注释，再隐藏默认值；“显示全部列”强制显示。
+/// 窄窗口按优先级处理列：注释始终可见（先收窄），放不下时隐藏默认值；“显示全部列”强制显示默认值。
 #[test]
-fn narrow_windows_hide_comment_then_default_unless_show_all() {
+fn narrow_windows_keep_comment_and_hide_default_unless_show_all() {
     use super::browse::BrowseColumns;
     let wide = BrowseColumns::of(1200., false);
     assert!(wide.default && wide.comment);
+    assert_eq!(wide.widths.comment, BrowseColumns::COMMENT_W);
     assert!(wide.widths.min_total(false) <= 1200.);
     let unknown = BrowseColumns::of(0., false);
     assert!(unknown.default && unknown.comment, "还没量到宽度时按宽窗口");
+    // 最窄的真实内容宽度（534）：注释收窄但仍可见，默认值也在。
+    for w in [534., 600., 700., 776.] {
+        let cols = BrowseColumns::of(w, false);
+        assert!(cols.default && cols.comment, "{w}: 全部可见");
+        assert!(cols.widths.comment >= BrowseColumns::COMMENT_MIN, "{w}: 注释不小于最小宽度");
+        assert!(cols.widths.min_total(false) <= w + 0.01, "{w}: 放得下");
+        assert!(!BrowseColumns::hides_any(w));
+    }
     let medium = BrowseColumns::of(500., false);
-    assert!(medium.default && !medium.comment, "先隐藏注释");
+    assert!(!medium.default && medium.comment, "先隐藏默认值，注释保留");
+    assert!(medium.widths.comment >= BrowseColumns::COMMENT_MIN);
     assert!(BrowseColumns::hides_any(500.));
     let narrow = BrowseColumns::of(380., false);
-    assert!(!narrow.default && !narrow.comment, "再隐藏默认值");
+    assert!(!narrow.default && narrow.comment, "再窄注释也可见");
     let forced = BrowseColumns::of(380., true);
     assert!(forced.default && forced.comment, "显示全部列");
     assert!(!BrowseColumns::hides_any(1200.));

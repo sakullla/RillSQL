@@ -1,6 +1,6 @@
 //! 字段页（已有表）以浏览为主：`uniform_list` 只渲染可见行，每行默认是文本；
 //! 点击某行进入编辑（换成 `column_row` 的输入控件），Esc 或点击其他行退出编辑并保留草稿。
-//! 窄窗口里按优先级先隐藏注释列、再隐藏默认值列，“显示全部列”可强制显示。
+//! 注释列始终可见：窄窗口里先把注释列收窄，再隐藏默认值列，“显示全部列”可强制显示默认值。
 //! 另含新建索引表单里的多选列选择器（`ui::picker`）与已选列的有序列表。
 
 use std::collections::HashMap;
@@ -31,9 +31,13 @@ pub(super) struct BrowseColumns {
 
 impl BrowseColumns {
     pub const COMMENT_W: f32 = 160.;
+    /// 注释列的最小宽度：再窄也不隐藏注释，只隐藏默认值列。
+    pub const COMMENT_MIN: f32 = 84.;
 
-    /// 按内容宽度决定显示哪些列：放得下就全显示；不够时先隐藏注释，再隐藏默认值。
-    /// `content_w <= 0` 表示还没量到宽度，按宽窗口处理。`show_all` 强制全部显示（列宽取紧凑档）。
+    /// 按内容宽度决定显示哪些列。注释列优先级高于默认值列，始终显示：
+    /// 放得下就全显示（注释 160）；不够时注释收窄到不小于 `COMMENT_MIN`；仍不够就隐藏默认值，
+    /// 把让出的宽度给注释。`content_w <= 0` 表示还没量到宽度，按宽窗口处理。
+    /// `show_all` 强制显示默认值（列宽取紧凑档，可能溢出）。
     pub fn of(content_w: f32, show_all: bool) -> Self {
         if content_w <= 0. {
             let mut widths = FieldWidths::wide();
@@ -46,16 +50,18 @@ impl BrowseColumns {
             widths.comment = Self::COMMENT_W;
             return Self { widths, default: true, comment: true };
         }
-        let mut widths = FieldWidths::of(content_w, false);
-        if show_all {
-            widths.comment = widths.default;
+        // 注释收窄：默认值列保持紧凑或标准宽度，剩余给注释。
+        let mut widths = FieldWidths::of(content_w - Self::COMMENT_MIN - FieldWidths::GAP, false);
+        let spare = content_w - widths.min_total(false) - FieldWidths::GAP;
+        if spare >= Self::COMMENT_MIN || show_all {
+            widths.comment = spare.clamp(Self::COMMENT_MIN, Self::COMMENT_W);
             return Self { widths, default: true, comment: true };
         }
-        if widths.min_total(false) <= content_w {
-            return Self { widths, default: true, comment: false };
-        }
+        // 仍放不下：隐藏默认值列（连同它的间隙），注释拿到让出的宽度。
+        let freed = widths.default + FieldWidths::GAP;
         widths.default = 0.;
-        Self { widths, default: false, comment: false }
+        widths.comment = (spare + freed).clamp(Self::COMMENT_MIN, Self::COMMENT_W);
+        Self { widths, default: false, comment: true }
     }
 
     /// 有列因为宽度不够被隐藏（工具条显示“显示全部列”开关）。
