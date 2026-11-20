@@ -2461,18 +2461,16 @@ fn explain_uses_the_target_server_version_and_refuses_ddl_locally() {
         let reason = desk.explain_active().expect_err(ddl);
         assert!(reason.contains(&split::first_keyword(ddl)), "{ddl}: {reason}");
     }
-    // 能看计划的不在本地拒绝：CTAS、物化视图、PostgreSQL 的 DECLARE 游标、MySQL 的 DESC/DESCRIBE。
-    for allowed in [
-        "CREATE TABLE t AS SELECT * FROM orders",
-        "CREATE TEMPORARY TABLE assets AS (SELECT 1)",
-        "CREATE MATERIALIZED VIEW mv AS SELECT 1",
-        "DECLARE c CURSOR FOR SELECT 1",
-        "DESC SELECT * FROM orders",
-        "DESCRIBE SELECT * FROM orders",
-    ] {
-        assert_eq!(crate::query::assist::unexplainable(allowed), None, "{allowed}");
-    }
-    for refused in ["CREATE TABLE assets (id int)", "CREATE VIEW v AS SELECT 1", "CREATE INDEX i ON t (asof)"] {
-        assert!(crate::query::assist::unexplainable(refused).is_some(), "{refused}");
+    // MySQL 家族：DESC/DESCRIBE 跟着语句时就是 EXPLAIN，改写成 EXPLAIN 原样发送，不再包一层；
+    // DESC 表名是查看表结构，本地拒绝并说明。
+    desk.set_draft("DESC SELECT * FROM orders");
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN SELECT * FROM orders");
+    desk.set_draft("DESC orders");
+    let reason = desk.explain_active().expect_err("DESC 表名");
+    assert!(reason.contains("DESC SELECT"), "{reason}");
+    // CTAS 和 DECLARE 在 MySQL 不能 EXPLAIN，本地拒绝，不发送。
+    for refused in ["CREATE TABLE t AS SELECT * FROM orders", "DECLARE c CURSOR FOR SELECT 1"] {
+        desk.set_draft(refused);
+        assert!(desk.explain_active().is_err(), "{refused}");
     }
 }

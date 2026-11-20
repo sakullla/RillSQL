@@ -82,6 +82,11 @@ impl SqlSyntax for MysqlSyntax {
         &["REGEXP", "STRAIGHT_JOIN", "IFNULL", "GROUP_CONCAT", "UNSIGNED"]
     }
 
+    /// `DESC SELECT …`、`DESCRIBE UPDATE …` 等同于 EXPLAIN；`DESC 表名` 是查看表结构。
+    fn explain_synonyms(&self) -> &'static [&'static str] {
+        &["DESC", "DESCRIBE"]
+    }
+
     /// MySQL 8 用 TREE 格式；MariaDB 没有 TREE，用 JSON。
     fn explain(&self, body: &str) -> String {
         if body.to_ascii_uppercase().starts_with("EXPLAIN") {

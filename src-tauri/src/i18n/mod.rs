@@ -627,6 +627,7 @@ dict! {
     "query.plan.empty" => "没有可查看计划的语句。", "There is no statement to explain.";
     "query.plan.multiple" => "一次只能查看一条语句的执行计划。", "Only one statement can be explained at a time.";
     "query.plan.unexplainable" => "{keyword} 语句没有执行计划，没有发送这条语句。只能查看查询和增删改语句的计划。", "{keyword} statements have no execution plan; the statement was not sent. Plans are available for queries and data changes only.";
+    "query.plan.describeTable" => "{keyword} 后面是表名时查看的是表结构，没有执行计划，没有发送这条语句。要查看查询的计划，请写成 {keyword} SELECT …，或直接对查询语句点“执行计划”。", "{keyword} followed by a table name shows the table structure and has no execution plan; the statement was not sent. To see a plan, write {keyword} SELECT …, or use Execution plan on the query itself.";
     "query.plan.noAnalyze" => "计划不使用 ANALYZE，没有发送这条语句。", "Plans do not use ANALYZE; the statement was not sent.";
     "query.plan.sqliteAnalyze" => "SQLite 不支持实际执行并分析，没有发送会修改数据的语句。", "SQLite cannot analyze by executing; no statement that could change data was sent.";
     "query.plan.sqlserverAnalyze" => "SQL Server 的计划不实际执行语句，没有发送会修改数据的语句。", "SQL Server plans do not execute the statement; no statement that could change data was sent.";

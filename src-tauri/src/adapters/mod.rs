@@ -450,6 +450,12 @@ pub trait SqlSyntax: Sync {
         }
     }
 
+    /// 本方言中与 EXPLAIN 同义、后面跟着语句时就是查看执行计划的关键字（大写，如 MySQL 的 DESC/DESCRIBE）。
+    /// 计划入口把这类语句改写成 EXPLAIN 原样发送，不再包一层；后面跟表名时是查看表结构，在本地拒绝。
+    fn explain_synonyms(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// 按服务器版本包装执行计划语句。默认与 [`SqlSyntax::explain`] 相同；
     /// 计划格式随服务器版本变化的方言（MySQL）覆盖这个方法，版本未知时用保守格式。
     fn explain_for(&self, body: &str, _server_version: Option<&str>) -> String {

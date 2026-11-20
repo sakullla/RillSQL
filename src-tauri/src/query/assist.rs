@@ -606,52 +606,64 @@ pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &s
     if report.pieces.len() > 1 {
         return Err(key_text("query.plan.multiple"));
     }
-    if let Some(reason) = unexplainable(&report.pieces[0].text) {
+    if let Some(reason) = unexplainable(engine, &report.pieces[0].text) {
         return Err(reason);
     }
     Ok((report.pieces[0].text.clone(), pick.1, pick.2))
 }
 
 /// 不能看执行计划的语句（DDL、DCL、会话与事务控制）。在本地直接拒绝并说明原因，不发给服务器。
-/// DESC/DESCRIBE 是 MySQL 里 EXPLAIN 的同义词、DECLARE 游标在 PostgreSQL 可以看计划，都不在这里；
-/// CREATE 中的 CREATE TABLE … AS / CREATE MATERIALIZED VIEW … AS 也能看计划，见 [`unexplainable`]。
+/// 规则对所有引擎保守一致：CREATE（包括 CREATE TABLE … AS SELECT）和 DECLARE 一律拒绝，
+/// 因为 MySQL 家族的 EXPLAIN 只接受 SELECT、TABLE、INSERT、REPLACE、UPDATE、DELETE。
+/// DESC/DESCRIBE 在把它们当作 EXPLAIN 同义词的方言里另行处理，见 [`unexplainable`]。
 const UNEXPLAINABLE: &[&str] = &[
     "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "GRANT", "REVOKE", "SET", "RESET", "USE", "BEGIN", "START",
     "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "LOCK", "UNLOCK", "FLUSH", "KILL", "SHOW", "OPTIMIZE", "REPAIR", "VACUUM",
-    "REINDEX", "CLUSTER", "PREPARE", "DEALLOCATE", "INSTALL", "UNINSTALL", "SHUTDOWN", "LOAD",
+    "REINDEX", "CLUSTER", "PREPARE", "DEALLOCATE", "INSTALL", "UNINSTALL", "SHUTDOWN", "LOAD", "DECLARE", "DESC", "DESCRIBE",
 ];
 
-/// 语句首个关键字属于 [`UNEXPLAINABLE`] 时返回拒绝说明；带查询体的建表（CTAS、物化视图）放行。
-pub fn unexplainable(statement: &str) -> Option<String> {
+/// EXPLAIN 同义词（`DESC` 等）后面紧跟这些词或左括号时，整条语句就是在看执行计划。
+const EXPLAIN_SYNONYM_HEADS: &[&str] =
+    &["SELECT", "TABLE", "VALUES", "WITH", "INSERT", "REPLACE", "UPDATE", "DELETE", "FORMAT", "EXTENDED", "PARTITIONS", "FOR"];
+
+/// 这条语句在该引擎里看不了执行计划时返回拒绝说明。
+pub fn unexplainable(engine: &str, statement: &str) -> Option<String> {
     let keyword = split::first_keyword(statement);
-    if !UNEXPLAINABLE.contains(&keyword.as_str()) || (keyword == "CREATE" && creates_from_query(statement)) {
+    if let Some(rest) = explain_synonym_rest(engine, statement) {
+        let rest = rest.trim_start();
+        let head = split::first_keyword(rest);
+        if rest.starts_with('(') || EXPLAIN_SYNONYM_HEADS.contains(&head.as_str()) {
+            return None;
+        }
+        return Some(crate::i18n::fill(&key_text("query.plan.describeTable"), &[("keyword", &keyword)]));
+    }
+    if !UNEXPLAINABLE.contains(&keyword.as_str()) {
         return None;
     }
     Some(crate::i18n::fill(&key_text("query.plan.unexplainable"), &[("keyword", &keyword)]))
 }
 
-/// `CREATE … TABLE … AS <查询>` 或 `CREATE MATERIALIZED VIEW … AS <查询>`：数据库可以给它出执行计划。
-fn creates_from_query(statement: &str) -> bool {
-    let upper = statement.to_ascii_uppercase();
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    // 第一个独立的 AS 关键字（不是 ASSETS 这类标识符的一部分）。
-    let Some(as_at) = upper.match_indices("AS").map(|(at, _)| at).find(|&at| {
-        !upper[..at].chars().next_back().is_some_and(ident) && !upper[at + 2..].chars().next().is_some_and(ident)
-    }) else {
-        return false;
-    };
-    let head: Vec<&str> = upper[..as_at].split(|c: char| !ident(c)).filter(|word| !word.is_empty()).collect();
-    let builds = head.contains(&"TABLE") || head.windows(2).any(|pair| pair == ["MATERIALIZED", "VIEW"]);
-    let after = upper[as_at + 2..].trim_start();
-    builds && ["SELECT", "WITH", "VALUES", "TABLE", "EXECUTE", "("].iter().any(|start| after.starts_with(start))
+/// 语句以本方言的 EXPLAIN 同义词开头时，返回该关键字之后的文本（跳过开头注释）。
+fn explain_synonym_rest<'a>(engine: &str, statement: &'a str) -> Option<&'a str> {
+    let synonyms = crate::adapters::query::syntax_named(engine)?.explain_synonyms();
+    let (words, _) = split::top_level_words(engine, statement);
+    let (word, _, end) = words.first()?;
+    if !synonyms.contains(&word.as_str()) {
+        return None;
+    }
+    statement.get(*end..)
 }
 
 /// 按服务器版本把语句包成只看执行计划的语句；`server_version` 未知时由方言选择保守格式。
+/// `DESC SELECT …` 这类同义写法改成 `EXPLAIN SELECT …` 原样发送，不再包一层 EXPLAIN。
 pub fn explain_sql_for(engine: &str, statement: &str, server_version: Option<&str>) -> Result<String, String> {
     let body = checked_explain_body(engine, statement)?;
     let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
         return Err(key_text("query.errors.unknownDialect"));
     };
+    if let Some(rest) = explain_synonym_rest(engine, body) {
+        return Ok(format!("EXPLAIN {}", rest.trim_start()));
+    }
     Ok(syntax.explain_for(body, server_version))
 }
 
@@ -666,7 +678,7 @@ fn checked_explain_body<'a>(engine: &str, statement: &'a str) -> Result<&'a str,
     if has_analyze(body, engine) {
         return Err(key_text("query.plan.noAnalyze"));
     }
-    if let Some(reason) = unexplainable(body) {
+    if let Some(reason) = unexplainable(engine, body) {
         return Err(reason);
     }
     Ok(body)
@@ -1810,6 +1822,39 @@ mod tests {
         for sql in ["SELECT 1", "with x as (select 1) select * from x", "update t set a = 1", "delete from t", "insert into t values (1)"] {
             assert!(plan_statement(sql, 0, 0, 0, "mysql").is_ok(), "{sql}");
         }
+    }
+
+    /// 计划入口实际生成的 SQL：MySQL 家族的 DESC/DESCRIBE 不再被包成 `EXPLAIN … DESC …`，
+    /// CTAS 和 DECLARE 在所有引擎都本地拒绝，DESC 只在把它当 EXPLAIN 同义词的方言里放行。
+    #[test]
+    fn explain_sql_is_engine_aware_for_describe_ctas_and_declare() {
+        for (engine, version) in [("mysql", Some("8.0.36")), ("mysql", Some("5.7.44-log")), ("mysql", None), ("mariadb", Some("10.11.6-MariaDB"))] {
+            assert_eq!(explain_sql_for(engine, "DESC SELECT * FROM t", version).unwrap(), "EXPLAIN SELECT * FROM t", "{engine} {version:?}");
+            assert_eq!(explain_sql_for(engine, "describe update t set a = 1;", version).unwrap(), "EXPLAIN update t set a = 1");
+            assert_eq!(explain_sql_for(engine, "/* c */ DESC FORMAT=JSON SELECT 1", version).unwrap(), "EXPLAIN FORMAT=JSON SELECT 1");
+            assert_eq!(explain_sql_for(engine, "DESC (SELECT 1) UNION (SELECT 2)", version).unwrap(), "EXPLAIN (SELECT 1) UNION (SELECT 2)");
+            for sql in ["DESC orders", "describe shop.orders", "DESC orders id"] {
+                let reason = explain_sql_for(engine, sql, version).expect_err(sql);
+                assert!(reason.contains("SELECT"), "{engine} {sql}: {reason}");
+                assert!(plan_statement(sql, 0, 0, 0, engine).is_err(), "{engine} {sql}");
+            }
+            assert!(explain_sql_for(engine, "DESC ANALYZE SELECT 1", version).is_err());
+            for sql in ["CREATE TABLE t2 AS SELECT * FROM t", "CREATE TABLE t2 SELECT * FROM t", "DECLARE c CURSOR FOR SELECT 1"] {
+                assert!(explain_sql_for(engine, sql, version).is_err(), "{engine} {sql}");
+            }
+        }
+        for sql in [
+            "CREATE TABLE t2 AS SELECT * FROM t",
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+            "DECLARE c CURSOR FOR SELECT 1",
+            "DESC SELECT 1",
+            "DESC t",
+        ] {
+            assert!(explain_sql_for("postgres", sql, None).is_err(), "postgres {sql}");
+            assert!(plan_statement(sql, 0, 0, 0, "postgres").is_err(), "postgres {sql}");
+        }
+        assert_eq!(explain_sql_for("postgres", "SELECT 1", None).unwrap(), "EXPLAIN (FORMAT JSON) SELECT 1");
+        assert!(explain_sql_for("sqlite", "DESC SELECT 1", None).is_err());
     }
 
     #[test]
