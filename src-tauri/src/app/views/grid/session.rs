@@ -1460,28 +1460,71 @@ impl SharedGrid {
         };
         // 结构化条件被使用时，编辑形态回到可视化一侧。
         self.filter_mode = FilterMode::Visual;
-        match self.filters.iter().position(|item| item.column == column) {
+        // 可视化条件立即生效，取代还在等读取的直接表达式；否则这次读取仍会带着那条表达式。
+        if self.pending_filter.as_ref().is_some_and(|pending| pending.mode == FilterMode::Sql) {
+            self.pending_filter = None;
+        }
+        // 先按替换前的草稿配对，被替换那一格原来生效的条件（包括它改过而没应用时藏着的旧条件）才能一起换掉。
+        let mut paired = self.pair_applied();
+        let slot = match self.filters.iter().position(|item| item.column == column) {
             Some(index) => {
-                let previous = std::mem::replace(&mut self.filters[index], draft.clone());
-                self.unapply(&previous);
+                self.filters[index] = draft.clone();
+                index
             }
-            None => self.filters.push(draft.clone()),
-        }
-        // 只有这一条立即生效；其他还在编辑的草稿保持原样。不完整或非法的条件不进查询。
-        if let Some(Ok(normal)) = self.normalize_draft(&draft) {
-            self.applied_filters.push(normal);
-        }
+            None => {
+                self.filters.push(draft);
+                paired.push(None);
+                self.filters.len() - 1
+            }
+        };
+        // 只有这一格立即生效；不完整或非法的条件不进查询。其他草稿保持各自原来的生效状态。
+        paired[slot] = match self.normalize_draft(&self.filters[slot]) {
+            Some(Ok(normal)) => Some(normal),
+            _ => None,
+        };
+        self.applied_filters = paired.into_iter().flatten().collect();
+        self.applied = FilterSource::Visual;
         self.filter_error = None;
         self.recompute();
     }
 
-    /// 从已应用条件里去掉这条草稿对应的那一份（如果有）。
-    fn unapply(&mut self, draft: &FilterDraft) {
-        if let Some(Ok(normal)) = self.normalize_draft(draft) {
-            if let Some(at) = self.applied_filters.iter().position(|item| *item == normal) {
-                self.applied_filters.remove(at);
-            }
+    /// 把当前生效的可视化条件按草稿顺序配给草稿：每条草稿规范化后与一份相同的生效条件配对，
+    /// 同一条件出现多次时按出现次数依次配（与 filter_draft_unapplied 的判定一致）。
+    /// 生效条件取还在等读取的可视化 pending（它就是马上要落地的那份），否则取已应用的可视化来源；
+    /// pending 被吸收进来后清掉，调用方随后的读取带上合并后的结果。
+    /// 没有配上任何草稿的生效条件（草稿改过而没应用时藏着的旧条件）被丢弃：
+    /// 立即生效的操作之后，结果只由屏幕上可见、且没有标为未应用的条件决定。
+    fn pair_applied(&mut self) -> Vec<Option<FilterDraft>> {
+        let pending_visual = self.pending_filter.as_ref().is_some_and(|pending| pending.mode == FilterMode::Visual);
+        let mut remaining = if pending_visual {
+            self.pending_filter.take().map(|pending| pending.drafts).unwrap_or_default()
+        } else if self.applied == FilterSource::Visual {
+            std::mem::take(&mut self.applied_filters)
+        } else {
+            Vec::new()
+        };
+        self.filters
+            .iter()
+            .map(|draft| match self.normalize_draft(draft) {
+                Some(Ok(normal)) => remaining.iter().position(|item| *item == normal).map(|at| remaining.remove(at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 两组条件是否等价：按多重集合比较，与顺序无关（条件之间是 AND）。
+    fn same_conditions(left: &[FilterDraft], right: &[FilterDraft]) -> bool {
+        if left.len() != right.len() {
+            return false;
         }
+        let mut rest = right.to_vec();
+        left.iter().all(|item| match rest.iter().position(|other| other == item) {
+            Some(at) => {
+                rest.remove(at);
+                true
+            }
+            None => false,
+        })
     }
 
     /// 追加一条新的空条件（R3）：同一列可以有多条，已有条件不受影响；
@@ -1591,8 +1634,17 @@ impl SharedGrid {
             return false;
         }
         self.filter_mode = FilterMode::Visual;
-        let removed = self.filters.remove(index);
-        self.unapply(&removed);
+        // 删掉的是哪一格就去掉那一格配到的生效条件，不会误删另一条相同条件的生效份。
+        // 生效的是直接表达式时它不受影响，只删草稿。
+        let visual = self.applied == FilterSource::Visual
+            || self.pending_filter.as_ref().is_some_and(|pending| pending.mode == FilterMode::Visual);
+        let mut paired = self.pair_applied();
+        self.filters.remove(index);
+        paired.remove(index);
+        if visual {
+            self.applied_filters = paired.into_iter().flatten().collect();
+            self.applied = FilterSource::Visual;
+        }
         self.filter_error = None;
         self.recompute();
         true
@@ -1748,7 +1800,7 @@ impl SharedGrid {
         }
         match self.filter_mode {
             FilterMode::Visual => match self.effective_filters() {
-                Ok(effective) => effective != self.applied_filters,
+                Ok(effective) => !Self::same_conditions(&effective, &self.applied_filters),
                 Err(_) => true,
             },
             FilterMode::Sql => self.applied != FilterSource::Sql || self.applied_sql != self.filter_sql.trim(),
@@ -6419,6 +6471,125 @@ mod tests {
         assert_eq!(grid.page_request().unwrap().filters.len(), 1);
         assert!(!grid.unapplied_filters());
         assert_eq!(grid.loaded_len(), 2, "只剩 id in (2, 3)");
+    }
+
+    fn four_customers() -> SharedGrid {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![int_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), Some("甲")], true),
+                row("2", vec![Some("2"), None], true),
+                row("3", vec![Some("3"), Some("丙")], true),
+                row("4", vec![Some("4"), Some("")], true),
+            ],
+            Some(4),
+            Some(schema()),
+        );
+        grid
+    }
+
+    /// 快速筛选替换的不是最后一条条件时，已应用条件的顺序不能让"未应用"误报。
+    #[test]
+    fn quick_filter_on_earlier_condition_keeps_everything_applied() {
+        let mut grid = four_customers();
+        let first = grid.add_filter("id");
+        assert!(grid.update_filter(first, "gt", "1", "", ""));
+        let second = grid.add_filter("name");
+        assert!(grid.set_filter_op(second, "notnull"));
+        grid.apply_filters(false).unwrap();
+        assert!(!grid.unapplied_filters());
+        grid.set_filter("id", "eq", "3");
+        assert!(!grid.unapplied_filters(), "全部条件都已生效");
+        assert!(!grid.filter_draft_unapplied(first) && !grid.filter_draft_unapplied(second));
+        assert_eq!(grid.filters().len(), 2);
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 2);
+        assert_eq!(request.filters[0].column, "id", "已应用条件按草稿顺序");
+        assert_eq!(request.filters[0].value.as_deref(), Some("3"));
+        assert_eq!(grid.loaded_len(), 1);
+        // 顺序不同但内容相同的条件不算未应用。
+        let a = FilterDraft { column: "id".into(), op: "gt".into(), ..FilterDraft::default() };
+        let b = FilterDraft { column: "name".into(), op: "notnull".into(), ..FilterDraft::default() };
+        assert!(SharedGrid::same_conditions(&[a.clone(), b.clone()], &[b.clone(), a.clone()]));
+        assert!(!SharedGrid::same_conditions(&[a.clone(), a.clone()], &[a.clone(), b]));
+    }
+
+    /// 被替换的草稿改过而没应用时，它原来生效的条件不能藏在请求里：可见条件与结果一致。
+    #[test]
+    fn quick_filter_replaces_hidden_applied_condition_of_edited_draft() {
+        let mut grid = four_customers();
+        let index = grid.add_filter("id");
+        assert!(grid.update_filter(index, "gt", "3", "", ""));
+        grid.apply_filters(false).unwrap();
+        assert_eq!(grid.loaded_len(), 1);
+        // 改成 0 但不应用：已应用的 id > 3 暂时没有草稿显示它。
+        assert!(grid.update_filter_text(index, true, "0"));
+        assert!(grid.unapplied_filters());
+        grid.set_filter("id", "eq", "2");
+        assert_eq!(grid.filters().len(), 1);
+        assert_eq!(grid.filters()[0].value, "2");
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 1, "旧的 id > 3 不再藏在请求里");
+        assert_eq!(request.filters[0].op, "eq");
+        assert_eq!(grid.loaded_len(), 1);
+        assert!(!grid.unapplied_filters());
+        // 其他列改过而没应用的草稿：快速筛选之后它仍标为未应用，结果只含可见、已应用的条件。
+        let name = grid.add_filter("name");
+        assert!(grid.set_filter_op(name, "notnull"));
+        grid.apply_filters(false).unwrap();
+        assert!(grid.set_filter_op(name, "null"));
+        grid.set_filter("id", "gt", "1");
+        assert!(grid.filter_draft_unapplied(name), "没应用的改动仍然可见");
+        assert!(!grid.filter_draft_unapplied(0));
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 1, "只剩可见且已应用的 id > 1");
+        assert_eq!(grid.loaded_len(), 3);
+    }
+
+    /// 删除一条没应用的重复条件，不会误删另一条相同条件的生效份。
+    #[test]
+    fn removing_unapplied_duplicate_keeps_the_applied_one() {
+        let mut grid = four_customers();
+        let first = grid.add_filter("id");
+        assert!(grid.update_filter(first, "gt", "1", "", ""));
+        grid.apply_filters(false).unwrap();
+        let second = grid.add_filter("id");
+        assert!(grid.update_filter(second, "gt", "1", "", ""));
+        assert!(grid.filter_draft_unapplied(second) && !grid.filter_draft_unapplied(first));
+        assert!(grid.remove_filter(second));
+        assert!(!grid.unapplied_filters());
+        assert_eq!(grid.page_request().unwrap().filters.len(), 1);
+        assert_eq!(grid.loaded_len(), 3);
+    }
+
+    /// 可视化应用还在等读取时做快速筛选：等着落地的条件并入已应用，不会被之后的提交覆盖。
+    #[test]
+    fn quick_filter_during_pending_apply_is_not_overwritten() {
+        let mut grid = four_customers();
+        let index = grid.add_filter("id");
+        assert!(grid.update_filter(index, "gt", "1", "", ""));
+        grid.apply_filters(true).unwrap();
+        assert!(grid.has_pending_filter());
+        grid.set_filter("name", "notnull", "");
+        assert!(!grid.has_pending_filter(), "pending 已并入");
+        grid.commit_applied_filter();
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters.len(), 2, "id > 1 与 name 非空都在");
+        assert!(!grid.unapplied_filters());
+        assert_eq!(grid.loaded_len(), 2);
+        // 直接表达式还在等读取时做快速筛选：可视化条件取代它，请求不再带表达式。
+        grid.target_live = true;
+        assert!(grid.switch_filter_mode(FilterMode::Sql).is_ok());
+        grid.set_filter_sql("\"id\" = 4");
+        assert!(grid.apply_filters(true).is_ok());
+        grid.set_filter("id", "eq", "2");
+        assert!(!grid.has_pending_filter());
+        let request = grid.page_request().unwrap();
+        assert!(request.filter_expression.is_none());
+        assert_eq!(request.filters.len(), 2);
     }
 
     #[test]

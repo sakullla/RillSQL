@@ -2341,6 +2341,8 @@ impl GridPane {
             "column-filter-null" => {
                 self.session.set_filter(&name, "null", "");
                 self.filter_input_reset();
+                // 与按值筛选一致：立即生效，表数据页按条件重新读取整表，而不是只筛已读的一页。
+                let _ = self.apply_filters(cx);
                 None
             }
             "column-clear-filters" => {
