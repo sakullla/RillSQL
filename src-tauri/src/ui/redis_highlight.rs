@@ -5,12 +5,14 @@
 //! 数字、带引号的字符串分别着色；带键命令的第一个参数按键着色，其余参数按普通参数。
 //! 颜色取 `apply_sql_syntax` 已有的高亮名称，深浅主题跟着高亮主题自动切换。
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui_kit::base::input::{EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, InputHighlighterFactory, Rope};
 use gpui_kit::component::highlighter::SyntaxHighlighter;
-use gpui_kit::{Context, HighlightStyle, SharedString, Window};
+use gpui_kit::{Context, HighlightStyle, SharedString, Task, Window};
 
 use crate::adapters::redis::complete::COMMANDS;
 
@@ -233,26 +235,92 @@ impl InputHighlighter for RedisHighlighter {
     }
 }
 
-/// 换回 SQL 等其他语言时用组件库的语法高亮（整段重解析，不提供折叠候选）。
+/// 换回 SQL 等其他语言时用组件库的语法高亮。
+///
+/// 组件库默认的输入高亮适配器不对外开放，装上 Redis 工厂后这里接手：小文本在编辑当下限时解析（与组件库同样 2ms），
+/// 解析不完或文本较大时，停止输入 150ms 后在后台整段解析再换上新树，编辑过程不在主线程上整段重解析。
+/// 折叠候选从当前语法树取，换回 SQL 后折叠照常可用。
 struct SyntaxFallback {
-    inner: SyntaxHighlighter,
+    inner: Rc<RefCell<SyntaxHighlighter>>,
+    parse_task: Option<Task<()>>,
+}
+
+/// 编辑当下同步解析的文本上限，与组件库的默认适配器一致。
+const SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
+const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
+const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+impl SyntaxFallback {
+    fn new(language: &str) -> Self {
+        Self { inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))), parse_task: None }
+    }
+
+    /// 停止输入一段时间后，在后台用新的高亮器整段解析，完成后换上并刷新折叠候选。
+    fn schedule_parse(&mut self, text: &Rope, folding: bool, window: &mut Window, cx: &mut Context<EditorState>) {
+        let inner = Rc::clone(&self.inner);
+        let language = inner.borrow().language().to_string();
+        let text = text.clone();
+        self.parse_task = Some(cx.spawn_in(window, async move |entity, cx| {
+            cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            let parsed = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut highlighter = SyntaxHighlighter::new(&language);
+                    highlighter.update(None, &text, None);
+                    highlighter
+                })
+                .await;
+            *inner.borrow_mut() = parsed;
+            let folds = if folding { fold_candidates(&inner.borrow()) } else { Vec::new() };
+            let _ = entity.update(cx, |state, cx| state.apply_highlighter_fold_candidates(folds, cx));
+        }));
+    }
+}
+
+/// 语法树里跨三行及以上的具名节点作为折叠候选（与组件库默认适配器的规则一致）。
+fn fold_candidates(highlighter: &SyntaxHighlighter) -> Vec<FoldRange> {
+    let Some(tree) = highlighter.tree() else { return Vec::new() };
+    let root = tree.root_node();
+    let mut ranges = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack: Vec<_> = root.named_children(&mut cursor).collect();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        let start = node.start_position().row;
+        let end = node.end_position().row;
+        if end.saturating_sub(start) < 2 {
+            continue;
+        }
+        ranges.push(FoldRange::new(start, end));
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    ranges.sort_by_key(|range| range.start_line);
+    ranges.dedup_by_key(|range| range.start_line);
+    ranges
 }
 
 impl InputHighlighter for SyntaxFallback {
     fn language(&self) -> SharedString {
-        self.inner.language().clone()
+        self.inner.borrow().language().clone()
     }
 
-    fn update(&mut self, _edit: Option<InputEdit>, text: &Rope, _folding: bool, _window: &mut Window, _cx: &mut Context<EditorState>) {
-        self.inner.update(None, text, None);
+    fn update(&mut self, _edit: Option<InputEdit>, text: &Rope, folding: bool, window: &mut Window, cx: &mut Context<EditorState>) {
+        // 小文本当场限时解析；解析完就不再排后台任务。超时或大文本留着旧树显示，交给后台整段解析。
+        if text.len() <= SYNC_PARSE_MAX_BYTES && self.inner.borrow_mut().update(None, text, Some(SYNC_PARSE_TIMEOUT)) {
+            self.parse_task = None;
+            return;
+        }
+        self.schedule_parse(text, folding, window, cx);
     }
 
     fn styles(&self, range: &Range<usize>, resolver: &dyn HighlightStyleResolver) -> Vec<(Range<usize>, HighlightStyle)> {
-        self.inner.styles(range, resolver)
+        self.inner.borrow().styles(range, resolver)
     }
 
     fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
-        Vec::new()
+        fold_candidates(&self.inner.borrow())
     }
 }
 
@@ -262,7 +330,7 @@ pub fn highlighter_factory() -> InputHighlighterFactory {
         if language == REDIS_LANGUAGE {
             Some(Box::new(RedisHighlighter::default()))
         } else {
-            Some(Box::new(SyntaxFallback { inner: SyntaxHighlighter::new(language) }))
+            Some(Box::new(SyntaxFallback::new(language)))
         }
     })
 }
@@ -377,5 +445,15 @@ mod tests {
         let factory = highlighter_factory();
         assert_eq!(factory(REDIS_LANGUAGE).map(|h| h.language()), Some(SharedString::new_static(REDIS_LANGUAGE)));
         assert!(factory("sql").is_some(), "换回 SQL 时仍有语法高亮");
+    }
+
+    /// 换回 SQL 后折叠候选照常给出（多行语句可以折叠），不是空表。
+    #[test]
+    fn sql_fallback_keeps_fold_candidates() {
+        let mut highlighter = SyntaxHighlighter::new("sql");
+        let text = Rope::from("select\n  a,\n  b,\n  c\nfrom t\nwhere a = 1;\n");
+        assert!(highlighter.update(None, &text, None));
+        let folds = fold_candidates(&highlighter);
+        assert!(folds.iter().any(|range| range.start_line == 0 && range.end_line >= 2), "{folds:?}");
     }
 }

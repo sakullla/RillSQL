@@ -657,21 +657,24 @@ impl RedisPane {
         let connection_id = self.connection_id.clone();
         self.run_bg(
             cx,
-            async move { crate::application::redis::probe_value(connections.as_ref(), &connection_id, probe).await },
+            {
+                let probe = probe.clone();
+                async move { crate::application::redis::probe_value(connections.as_ref(), &connection_id, probe).await }
+            },
             move |pane, result, _| {
                 if pane.guard_generation == generation {
-                    pane.finish_guard(mutation, expected, result);
+                    pane.finish_guard(mutation, probe, expected, result);
                 }
             },
         );
     }
 
-    /// 核对结果：值没变 → 进确认框；变了 → 提示刷新，不进确认；读失败 → 报错。
-    pub(super) fn finish_guard(&mut self, mutation: RedisMutation, expected: u64, result: Result<Option<String>, String>) {
+    /// 核对结果：值没变 → 进确认框（确认后写入前再核对一次）；变了 → 提示刷新，不进确认；读失败 → 报错。
+    pub(super) fn finish_guard(&mut self, mutation: RedisMutation, probe: keys::ValueProbe, expected: u64, result: Result<Option<String>, String>) {
         match result {
             Ok(current) if keys::value_fingerprint(current.as_deref()) == expected => {
                 self.note.clear();
-                self.stage_if_key(mutation);
+                self.stage_if_key_guarded(mutation, Some((probe, expected)));
             }
             Ok(_) => {
                 self.stale_value = true;

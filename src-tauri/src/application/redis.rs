@@ -114,6 +114,24 @@ pub async fn mutate(service: &Service, connection_id: &str, mutation: RedisMutat
     outcome.map_err(|err| err.to_string())
 }
 
+/// 带核对的写回：确认之后、写入之前再读一次当前值，指纹与读取时不一致就不写（返回 `Ok(None)`）。
+/// 确认框开着的时候别人改了值，这里会拦下；剩下的窗口只有这一次读与写之间的一次往返。
+pub async fn mutate_unchanged(
+    service: &Service,
+    connection_id: &str,
+    mutation: RedisMutation,
+    probe: keys::ValueProbe,
+    expected: u64,
+    confirmed: bool,
+) -> Result<Option<i64>, String> {
+    keys::prepare_mutation(&mutation, confirmed)?;
+    let current = probe_value(service, connection_id, probe).await?;
+    if keys::value_fingerprint(current.as_deref()) != expected {
+        return Ok(None);
+    }
+    mutate(service, connection_id, mutation, confirmed).await.map(Some)
+}
+
 pub async fn delete_keys(service: &Service, connection_id: &str, keys: Vec<String>, confirmed: bool) -> Result<DeleteOutcome, String> {
     keys::require_delete(&keys, confirmed)?;
     let deleted = with_redis(service, connection_id, move |mut conn, _| async move {

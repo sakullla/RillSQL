@@ -20,7 +20,7 @@ use gpui_kit::{
     Point, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
 };
 
-use crate::application::redis::{DeleteOutcome, ExecOutcome, KeyspaceDb, RenameOutcome, TtlOutcome};
+use crate::application::redis::{DeleteOutcome, ExecOutcome, KeyspaceDb, TtlOutcome};
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::adapters::redis::complete::{self, RedisCompletion};
@@ -74,7 +74,8 @@ enum Confirm {
     Rename { from: String, to: String },
     Exec { command: String, args: Vec<String>, line: String },
     Ttl { key: String, seconds: Option<i64> },
-    Mutation { mutation: RedisMutation, key: String },
+    /// guard：写回核对（读取时的值指纹）。确认之后、写入之前再核对一次，确认框开着时别人改了值也不会被覆盖。
+    Mutation { mutation: RedisMutation, key: String, guard: Option<(keys::ValueProbe, u64)> },
     /// 模板批量操作：预览（数量与样例）就是确认框的内容。
     /// db：发起时的逻辑库，批量操作只在这个库上执行。
     Batch { template: String, keys: Vec<String>, op: BatchOp, preview: BatchPreview, db: u8 },
@@ -341,7 +342,6 @@ pub struct RedisPane {
     error: String,
     confirm: Option<Confirm>,
     confirm_prompt: String,
-    rename_landed: String,
     busy: bool,
     generation: u64,
     copied: String,
@@ -411,6 +411,8 @@ pub struct RedisPane {
     tables: HashMap<String, tables::TableSlot>,
     /// 条目表的行 → 条目下标（筛选、排序之后）。
     entry_rows: Vec<usize>,
+    /// 条目表当前对应的详情：换了详情（换键或重读）时，表里的选中重新对齐到当前条目。
+    entry_rows_detail: Option<Arc<RedisKeyDetail>>,
     /// 条目表排序：0 原顺序，1 升序，2 降序（按主列）。
     entry_sort: u8,
     /// 值区分隔条拖动：(起点 x, 起始宽度)。
@@ -479,7 +481,6 @@ impl RedisPane {
             error: String::new(),
             confirm: None,
             confirm_prompt: String::new(),
-            rename_landed: String::new(),
             busy: false,
             generation: 0,
             copied: String::new(),
@@ -538,6 +539,7 @@ impl RedisPane {
             gone: std::collections::HashSet::new(),
             tables: HashMap::new(),
             entry_rows: Vec::new(),
+            entry_rows_detail: None,
             entry_sort: 0,
             value_drag_start: None,
             guard_generation: 0,
@@ -752,7 +754,6 @@ impl RedisPane {
         self.error.clear();
         self.confirm = None;
         self.confirm_prompt.clear();
-        self.rename_landed.clear();
         self.pending_ttl = None;
         self.ttl_was_persist = false;
         self.follow = Follow::None;
@@ -797,6 +798,7 @@ impl RedisPane {
         self.gone.clear();
         self.tables.clear();
         self.entry_rows.clear();
+        self.entry_rows_detail = None;
         self.entry_sort = 0;
         self.value_drag_start = None;
         self.guard_generation = self.guard_generation.wrapping_add(1);
@@ -835,13 +837,15 @@ impl RedisPane {
         }
     }
 
-    /// 在新标签中固定打开一个键：交给外壳（`take_open_requests`）。
-    fn request_open_tab(&mut self, name: &str) {
-        if self.connection_id.is_empty() || name.is_empty() {
+    /// 双击、回车、「在新标签中固定打开」：先在当前视图里选中并打开这个键，同时把固定标签的请求留给外壳
+    /// （`take_open_requests`，格式 `连接|连接名|库|键`）。外壳还没接上这条请求之前，提示如实说明没有开新标签。
+    fn request_open_tab(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.connection_id.is_empty() || name.is_empty() || self.confirm.is_some() {
             return;
         }
+        self.select_key(name.to_owned(), cx);
         self.open_requests.push(format!("{}|{}|{}|{}", self.connection_id, self.connection_name, self.database, name));
-        self.note = i18n::fill(&self.text("redis.tab.openedInTab"), &[("key", name)]);
+        self.note = i18n::fill(&self.text("redis.tab.openTabUnavailable"), &[("key", name)]);
     }
 
     /// 打开目标时：先读本连接的键空间偏好与拓扑，再开始后台扫描（分隔符、上限都按偏好）。
@@ -1375,11 +1379,11 @@ impl RedisPane {
             self.invalidate_rows();
         } else if let Some(index) = id.strip_prefix("redis-open-tab:") {
             if let Some(name) = index.parse::<usize>().ok().and_then(|index| self.keys.get(index)).map(|key| key.name.clone()) {
-                self.request_open_tab(&name);
+                self.request_open_tab(&name, cx);
             }
         } else if id == "redis-open-tab" {
             let name = self.selected.clone();
-            self.request_open_tab(&name);
+            self.request_open_tab(&name, cx);
         } else if id == "redis-entry-sort" {
             self.entry_sort = (self.entry_sort + 1) % 3;
         } else if id == "redis-stale-refresh" {
@@ -1880,7 +1884,7 @@ impl RedisPane {
             Some(Confirm::Rename { from, to }) => self.run_rename(from, to, cx),
             Some(Confirm::Exec { command, args, line }) => self.exec_command(command, args, true, line, cx),
             Some(Confirm::Ttl { key, seconds }) => self.run_ttl(key, seconds, cx),
-            Some(Confirm::Mutation { mutation, key }) => self.run_mutation(mutation, key, cx),
+            Some(Confirm::Mutation { mutation, key, guard }) => self.run_mutation(mutation, key, guard, cx),
             None => {}
         }
     }
@@ -1896,21 +1900,31 @@ impl RedisPane {
         );
     }
 
-    fn run_mutation(&mut self, mutation: RedisMutation, key: String, cx: &mut Context<Self>) {
+    fn run_mutation(&mut self, mutation: RedisMutation, key: String, guard: Option<(keys::ValueProbe, u64)>, cx: &mut Context<Self>) {
         self.selected = key;
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         self.spawn(
             cx,
             false,
-            async move { crate::application::redis::mutate(connections.as_ref(), &connection_id, mutation, true).await },
+            async move {
+                match guard {
+                    Some((probe, expected)) => crate::application::redis::mutate_unchanged(connections.as_ref(), &connection_id, mutation, probe, expected, true).await,
+                    None => crate::application::redis::mutate(connections.as_ref(), &connection_id, mutation, true).await.map(Some),
+                }
+            },
             Self::finish_mutate,
         );
     }
 
-    fn finish_mutate(&mut self, result: Result<i64, String>, cx: &mut Context<Self>) {
+    /// `Ok(None)`：写入前的再次核对发现值已被别人改过，什么都没写。
+    fn finish_mutate(&mut self, result: Result<Option<i64>, String>, cx: &mut Context<Self>) {
         match result {
-            Ok(_) => {
+            Ok(None) => {
+                self.stale_value = true;
+                self.show_error(self.text("redis.value.stale"));
+            }
+            Ok(Some(_)) => {
                 self.note = self.text("redis.tab.executed");
                 self.error.clear();
                 self.new_open = false;
@@ -1924,10 +1938,15 @@ impl RedisPane {
     }
 
     fn stage_mutation(&mut self, mutation: RedisMutation) {
+        self.stage_guarded(mutation, None);
+    }
+
+    /// 进入写入确认；带 guard 时确认之后、写入之前还会再核对一次当前值。
+    fn stage_guarded(&mut self, mutation: RedisMutation, guard: Option<(keys::ValueProbe, u64)>) {
         let preview = keys::mutation_preview(&mutation);
         let key = mutation_key(&mutation);
         self.confirm_prompt = i18n::fill(&self.text("redis.confirm.pending"), &[("command", &preview)]);
-        self.confirm = Some(Confirm::Mutation { mutation, key });
+        self.confirm = Some(Confirm::Mutation { mutation, key, guard });
         self.note.clear();
         self.error.clear();
     }
@@ -1942,21 +1961,27 @@ impl RedisPane {
         self.spawn(
             cx,
             false,
-            async move { crate::application::redis::delete_keys(connections.as_ref(), &connection_id, vec![key], true).await },
+            // 删除的目标随结果一起回来：等待期间可以选别的键，完成时不能拿当时的选中去猜。
+            async move { crate::application::redis::delete_keys(connections.as_ref(), &connection_id, vec![key.clone()], true).await.map(|outcome| (key, outcome)) },
             Self::finish_delete,
         );
     }
 
-    fn finish_delete(&mut self, result: Result<DeleteOutcome, String>, cx: &mut Context<Self>) {
+    fn finish_delete(&mut self, result: Result<(String, DeleteOutcome), String>, cx: &mut Context<Self>) {
         match result {
-            Ok(outcome) => {
+            Ok((key, outcome)) => {
                 self.note = i18n::fill(&self.text("redis.tab.deletedCount"), &[("n", &outcome.deleted.to_string())]);
                 self.error.clear();
-                let gone: std::collections::HashSet<String> = std::iter::once(std::mem::take(&mut self.selected)).collect();
+                let gone: std::collections::HashSet<String> = std::iter::once(key.clone()).collect();
                 self.drop_keys(&gone);
-                self.detail = None;
-                self.detail_key.clear();
-                self.placement = None;
+                if self.selected == key {
+                    self.selected.clear();
+                    self.placement = None;
+                }
+                if self.detail_key == key {
+                    self.detail = None;
+                    self.detail_key.clear();
+                }
                 self.refresh_keyspace_counts(cx);
             }
             Err(message) => self.show_error(message),
@@ -1968,35 +1993,46 @@ impl RedisPane {
             self.show_error(self.text("redis.tab.renameNeedName"));
             return;
         }
-        self.rename_landed = to.clone();
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         self.spawn(
             cx,
             false,
-            async move { crate::application::redis::rename_key(connections.as_ref(), &connection_id, from, to, true).await },
+            // 源键和目标键随结果一起回来：等待期间可以选别的键，完成时只动这一对键。
+            async move {
+                crate::application::redis::rename_key(connections.as_ref(), &connection_id, from.clone(), to.clone(), true).await.map(|_| (from, to))
+            },
             Self::finish_rename,
         );
     }
 
-    fn finish_rename(&mut self, result: Result<RenameOutcome, String>, cx: &mut Context<Self>) {
+    fn finish_rename(&mut self, result: Result<(String, String), String>, cx: &mut Context<Self>) {
         match result {
-            Ok(_) => {
-                let target = std::mem::take(&mut self.rename_landed);
+            Ok((from, target)) => {
                 self.rename_open = false;
                 self.note = i18n::fill(&self.text("redis.tab.renamedNote"), &[("target", &target)]);
                 self.error.clear();
-                let gone: std::collections::HashSet<String> = std::iter::once(std::mem::replace(&mut self.selected, target)).collect();
+                let moved = self.keys.iter().find(|key| key.name == from).map(|key| RedisKeyInfo { name: target.clone(), key_type: key.key_type.clone(), ttl_ms: key.ttl_ms });
+                let gone: std::collections::HashSet<String> = std::iter::once(from.clone()).collect();
                 self.drop_keys(&gone);
-                self.rename_to.clear();
-                self.detail = None;
-                self.detail_key.clear();
-                self.after_write(cx);
+                if self.detail_key == from {
+                    self.detail = None;
+                    self.detail_key.clear();
+                }
+                if self.selected == from {
+                    // 仍停在被改名的键上：跟到新名字并重读（重读会把新名字收进列表）。
+                    self.selected = target;
+                    self.rename_to.clear();
+                    self.after_write(cx);
+                } else {
+                    // 等待期间换了键：选中和详情不动，只把新名字收进列表。
+                    if let Some(info) = moved {
+                        self.absorb_keys(vec![info]);
+                    }
+                    self.refresh_keyspace_counts(cx);
+                }
             }
-            Err(message) => {
-                self.rename_landed.clear();
-                self.show_error(message);
-            }
+            Err(message) => self.show_error(message),
         }
     }
 
@@ -2348,6 +2384,10 @@ impl RedisPane {
     }
 
     fn stage_if_key(&mut self, mutation: RedisMutation) {
+        self.stage_if_key_guarded(mutation, None);
+    }
+
+    fn stage_if_key_guarded(&mut self, mutation: RedisMutation, guard: Option<(keys::ValueProbe, u64)>) {
         if self.selected.is_empty() {
             self.show_error(self.text("redis.tab.needKey"));
             return;
@@ -2361,7 +2401,7 @@ impl RedisPane {
             self.show_error(message);
             return;
         }
-        self.stage_mutation(mutation);
+        self.stage_guarded(mutation, guard);
     }
 
     fn copy_hash(&mut self, index: &str, cx: &mut Context<Self>) {

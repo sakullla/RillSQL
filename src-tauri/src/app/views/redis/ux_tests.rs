@@ -386,14 +386,19 @@ fn applying_an_edit_checks_the_value_was_not_changed_by_someone_else() {
     pane.detail_key = "h".into();
     let mutation = RedisMutation::HashSet { key: "h".into(), field: "f".into(), value: "new".into() };
     let expected = keys::value_fingerprint(Some("old"));
-    pane.finish_guard(mutation.clone(), expected, Ok(Some("changed-by-someone".into())));
+    let probe = ValueProbe::HashField { key: "h".into(), field: "f".into() };
+    pane.finish_guard(mutation.clone(), probe.clone(), expected, Ok(Some("changed-by-someone".into())));
     assert!(!pane.confirm_open(), "值已被修改：不进确认");
     assert!(pane.stale_value && pane.error().contains("修改"), "{}", pane.error());
     pane.error.clear();
-    pane.finish_guard(mutation.clone(), expected, Ok(None));
+    pane.finish_guard(mutation.clone(), probe.clone(), expected, Ok(None));
     assert!(!pane.confirm_open(), "字段被删了也算被修改");
-    pane.finish_guard(mutation, expected, Ok(Some("old".into())));
+    pane.finish_guard(mutation, probe.clone(), expected, Ok(Some("old".into())));
     assert!(pane.confirm_open(), "没被修改：进入确认框");
+    assert!(
+        matches!(&pane.confirm, Some(Confirm::Mutation { guard: Some((guard_probe, guard_expected)), .. }) if *guard_probe == probe && *guard_expected == expected),
+        "确认框带着核对：确认之后、写入之前还要再核对一次"
+    );
     assert!(pane.confirm_preview().contains("HSET"), "{}", pane.confirm_preview());
     assert_eq!(keys::probe_command(&ValueProbe::HashField { key: "h".into(), field: "f".into() }), vec!["HGET", "h", "f"]);
     assert_eq!(keys::probe_command(&ValueProbe::ListIndex { key: "l".into(), index: 3 }), vec!["LINDEX", "l", "3"]);
@@ -454,7 +459,8 @@ fn diagnostic_tables_select_copy_and_activate(cx: &mut gpui_kit::TestAppContext)
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R14：键列表里双击或回车，在新标签中固定打开这个键（交给外壳的请求带上键名）；带键的规格会直接读这个键。
+/// R14：键列表里双击或回车，在当前视图打开这个键，并把固定标签请求（带键名）留给外壳；
+/// 外壳接上之前提示如实说明没有新建标签，不报假成功。带键的规格会直接读这个键。
 #[gpui_kit::test]
 fn double_click_or_enter_requests_a_pinned_tab(cx: &mut gpui_kit::TestAppContext) {
     // 选键会在后台运行时上发起读取（这里没有真实连接，结果是报错并被代数过滤）。
@@ -467,10 +473,15 @@ fn double_click_or_enter_requests_a_pinned_tab(cx: &mut gpui_kit::TestAppContext
     cx.update(|cx| {
         view.update(cx, |pane, cx| {
             pane.command("redis-open-tab:1", cx);
+            assert_eq!(pane.selected(), "user:2", "双击在当前视图打开这个键");
+            assert!(pane.reading(), "并开始读取它");
+            assert!(pane.note().contains("user:2") && pane.note().contains("暂不可用"), "不报「已在新标签中打开」的假成功：{}", pane.note());
+            assert!(!pane.note().contains("已在新标签中打开"), "{}", pane.note());
             assert_eq!(pane.take_open_requests(), vec!["cache|订单缓存|0|user:2".to_owned()]);
             pane.selected = "user:1".into();
             pane.key_list_key(&gpui_kit::KeyDownEvent { keystroke: gpui_kit::Keystroke::parse("enter").unwrap(), is_held: false, prefer_character_input: false }, cx);
             assert_eq!(pane.take_open_requests(), vec!["cache|订单缓存|0|user:1".to_owned()], "回车与双击相同");
+            assert_eq!(pane.selected(), "user:1");
         })
     });
     assert_eq!(spec_key("cache|订单缓存|0|a|b").as_deref(), Some("a|b"), "键名里可以有 |");
@@ -543,4 +554,106 @@ fn redis_view_bare_px_stays_below_the_t1_ceiling() {
     }
     const T1_CEILING: usize = 267;
     assert!(total < T1_CEILING, "redis 视图裸 px {total} 处，应低于 T1 上限 {T1_CEILING}");
+}
+
+/// R11：删除 / 改名等待回执期间可以选别的键；回执只作用于发起时的那个键，不按完成时的选中去猜。
+#[gpui_kit::test]
+fn delete_or_rename_completion_only_touches_the_key_it_was_issued_for(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let (_window, view, dir) = open(cx, 1280., |pane| {
+        pane.set_keys(vec![key("a", "string"), key("b", "hash"), key("c", "list")]);
+        pane.done = true;
+        pane.selected = "a".into();
+        pane.detail_key = "a".into();
+        pane.detail = Some(Arc::new(string_detail("alpha")));
+    });
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            // 确认删除 a，回执还没到时选了 b。
+            pane.command("redis-delete", cx);
+            assert!(pane.confirm_open());
+            pane.command("redis-confirm", cx);
+            assert!(pane.running(), "删除在等回执");
+            pane.command("redis-select:1", cx);
+            assert_eq!(pane.selected(), "b", "等待删除回执时仍可选别的键");
+            // b 的详情先到。
+            let generation = pane.read_generation;
+            assert!(pane.deliver_read(generation, "b".into(), Ok(hash_detail(&[("f", "v")])), cx));
+            // 删除 a 的回执到达（真实请求的回执被代数作废，这里直接投递）。
+            pane.generation = pane.generation.wrapping_add(1);
+            pane.busy = false;
+            pane.finish_delete(Ok(("a".into(), crate::application::redis::DeleteOutcome { deleted: 1 })), cx);
+            let names: Vec<&str> = pane.keys().iter().map(|key| key.name.as_str()).collect();
+            assert_eq!(names, vec!["b", "c"], "删掉的是 a，不是当前选中的 b");
+            assert_eq!(pane.selected(), "b", "选中不动");
+            assert_eq!(pane.detail_key, "b", "b 的详情还在");
+            assert!(pane.detail.is_some());
+
+            // 改名 c → d，等待期间选中的是 b：只把 c 换成 d，选中与详情不动。
+            pane.finish_rename(Ok(("c".into(), "d".into())), cx);
+            let names: Vec<&str> = pane.keys().iter().map(|key| key.name.as_str()).collect();
+            assert_eq!(names, vec!["b", "d"], "c 改名为 d，b 还在");
+            assert_eq!(pane.keys().iter().find(|key| key.name == "d").map(|key| key.key_type.as_str()), Some("list"), "新名字沿用原类型");
+            assert_eq!(pane.selected(), "b");
+            assert_eq!(pane.detail_key, "b");
+
+            // 改名的正是当前选中的键：选中跟到新名字。
+            pane.finish_rename(Ok(("b".into(), "b2".into())), cx);
+            assert_eq!(pane.selected(), "b2");
+            assert!(!pane.keys().iter().any(|key| key.name == "b"));
+        })
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R19：确认之后、写入之前再核对一次：发现值已被改过就不写，提示刷新。
+#[gpui_kit::test]
+fn a_write_rejected_by_the_second_check_reports_stale(cx: &mut gpui_kit::TestAppContext) {
+    let (_window, view, dir) = open(cx, 1280., |pane| {
+        pane.selected = "h".into();
+        pane.detail_key = "h".into();
+    });
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.finish_mutate(Ok(None), cx);
+            assert!(pane.stale_value, "标记为过期，给出刷新入口");
+            assert!(pane.error().contains("没有写入"), "{}", pane.error());
+            assert!(pane.note().is_empty() || !pane.note().contains("已执行"), "{}", pane.note());
+        })
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 在两个字段数相同的 Hash 之间切换：行映射一样，表里的选中也要回到当前条目（默认第一行），与右栏一致。
+#[gpui_kit::test]
+fn entry_table_selection_follows_the_detail_across_same_shaped_keys(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1360., |pane| {
+        pane.set_keys(vec![key("h1", "hash"), key("h2", "hash")]);
+        pane.done = true;
+        pane.selected = "h1".into();
+        pane.detail_key = "h1".into();
+        pane.entry_focus = Some(0);
+        pane.detail = Some(Arc::new(hash_detail(&[("a", "1"), ("b", "2")])));
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| view.update(cx, |pane, cx| pane.select_table_row(ENTRY_TABLE, 1, cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    // 换到 h2（同样两个字段）：读取落地后右栏回到第一行。
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.selected = "h2".into();
+            let generation = pane.begin_read();
+            assert!(pane.deliver_read(generation, "h2".into(), Ok(hash_detail(&[("x", "9"), ("y", "8")])), cx));
+            assert_eq!(pane.entry_focus, Some(0));
+        })
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    let (focus, selected_row) = cx.update(|cx| {
+        let pane = view.read(cx);
+        let table = pane.tables.get(ENTRY_TABLE).map(|slot| slot.table.clone()).unwrap();
+        (pane.entry_focus, table.read(cx).selection(cx).map(|selection| selection.focus.0))
+    });
+    assert_eq!(focus, Some(0));
+    assert_eq!(selected_row, Some(0), "表里高亮的行与右栏显示的条目一致");
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -1802,7 +1802,7 @@ dict! {
     "redis.value.gone" => "读取时这个键已经不存在（可能已过期或被删除）", "The key no longer exists (it may have expired or been deleted)";
     "redis.detail.more" => "更多操作", "More actions";
     "redis.menu.openInTab" => "在新标签中固定打开", "Open in pinned tab";
-    "redis.tab.openedInTab" => "已在新标签中打开 {key}", "Opened {key} in a new tab";
+    "redis.tab.openTabUnavailable" => "已在当前视图打开 {key}；在新标签中固定打开暂不可用，没有新建标签", "Opened {key} in this view; opening it in a pinned tab is not available yet, so no new tab was created";
     "redis.slowlog.inserted" => "已把命令填入命令栏", "Command placed in the command bar";
     "redis.slowlog.hint" => "双击一行把命令填入命令栏；⌘C 复制选中内容", "Double-click a row to put its command in the command bar; ⌘C copies the selection";
     "redis.info.key" => "指标", "Metric";

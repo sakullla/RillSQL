@@ -1599,8 +1599,11 @@ impl RedisPane {
         };
         let rows: Vec<Vec<SharedString>> = lines.iter().map(|line| line.cells.clone()).collect();
         let mapping: Vec<usize> = lines.iter().map(|line| line.index).collect();
-        let changed = self.entry_rows != mapping || !self.tables.contains_key(tables::ENTRY_TABLE);
+        // 映射相同也要看详情是否换了：两个字段数相同的 Hash 之间切换，映射一样，但表里的选中必须回到当前条目。
+        let same_detail = self.entry_rows_detail.as_ref().is_some_and(|seen| Arc::ptr_eq(seen, detail));
+        let changed = self.entry_rows != mapping || !same_detail || !self.tables.contains_key(tables::ENTRY_TABLE);
         self.entry_rows = mapping;
+        self.entry_rows_detail = Some(Arc::clone(detail));
         let empty = if total_loaded == 0 { self.text("redis.value.empty") } else { self.text("redis.entry.noMatch") };
         let table = self.table_slot(tables::ENTRY_TABLE, stamp, move |_| (columns, rows), Some(SharedString::from(empty)), window, cx);
         if changed {
@@ -2654,7 +2657,7 @@ mod tests {
         assert!(!pane.confirm_destructive());
         pane.confirm = Some(Confirm::Exec { command: "FLUSHDB".into(), args: Vec::new(), line: "FLUSHDB".into() });
         assert!(pane.confirm_destructive());
-        pane.confirm = Some(Confirm::Mutation { mutation: RedisMutation::HashDel { key: "h".into(), fields: vec!["f".into()] }, key: "h".into() });
+        pane.confirm = Some(Confirm::Mutation { mutation: RedisMutation::HashDel { key: "h".into(), fields: vec!["f".into()] }, key: "h".into(), guard: None });
         assert!(pane.confirm_destructive());
         let _ = std::fs::remove_dir_all(&dir);
     }
