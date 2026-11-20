@@ -1987,6 +1987,17 @@ dict! {
     "query.info.columnsHeader" => "字段（{count}）", "Columns ({count})";
     "query.info.moreColumns" => "… 还有 {count} 列", "… {count} more columns";
     "query.complete.detail.colsCount" => "{kind} · {count} 列", "{kind} · {count} cols";
+    "picker.search" => "搜索…", "Search…";
+    "picker.empty" => "没有匹配项", "No matches";
+    "picker.emptyHint" => "换个关键词试试", "Try a different keyword";
+    "picker.noItems" => "没有可选项", "Nothing to choose";
+    "readTable.empty" => "没有数据", "No rows";
+    "readTable.copyValue" => "复制值", "Copy value";
+    "readTable.copyRow" => "复制行", "Copy row";
+    "readTable.copyColumn" => "复制列", "Copy column";
+    "readTable.copyTsv" => "复制为 TSV", "Copy as TSV";
+    "readTable.copyCsv" => "复制为 CSV", "Copy as CSV";
+    "readTable.copyJson" => "复制为 JSON", "Copy as JSON";
 }
 
 #[cfg(test)]

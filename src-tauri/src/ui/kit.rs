@@ -66,6 +66,9 @@ pub struct Palette {
     pub ok_soft: Hsla,
     pub warn_soft: Hsla,
     pub danger_soft: Hsla,
+    /// 类型徽标与 chip 的低饱和底色：与正文色搭配，比 hover 更安静、比工作区更显。
+    #[allow(dead_code)] // 由 chip / type_badge 使用，页面在后续任务里接入。
+    pub badge: Hsla,
     pub dark: bool,
 }
 
@@ -114,6 +117,7 @@ impl Palette {
             ok_soft: hex(0xe6f7ef),
             warn_soft: hex(0xfef3e2),
             danger_soft: hex(0xfeecec),
+            badge: hex(0xeef1f6),
             dark: false,
         }
     }
@@ -126,11 +130,13 @@ impl Palette {
             raised: hex(0x20242e),
             // 比工作区更深的黑曜石底，避免和外壳、浮层挤在同一档明度上。
             sunken: hex(0x0d0f14),
-            hover: hex(0x262b37),
-            active: hex(0x2f3543),
-            line: hex(0x262b36),
-            line_soft: hex(0x1d212a),
-            line_strong: hex(0x373e4d),
+            // 深色单独校准（不取浅色反转）：悬停、分隔线比工作区多拉开一档，
+            // 表格行在 #14161c 上悬停与分隔一眼可见，又不抢正文。
+            hover: hex(0x282e3b),
+            active: hex(0x313848),
+            line: hex(0x2c3240),
+            line_soft: hex(0x222632),
+            line_strong: hex(0x3b4353),
             text: hex(0xeceef4),
             text_muted: hex(0xa5aec0),
             // 深色主题的选中/悬停底同样按 4.5:1 校准。
@@ -141,7 +147,8 @@ impl Palette {
             accent_soft: hex(0x222744),
             accent_text: hex(0xb0b8ff),
             on_accent: hex(0xffffff),
-            selection: alpha(0x7580ff, 0.22),
+            // 选中底比浅色更浓一档：深底上 0.22 的强调色几乎和悬停分不开。
+            selection: alpha(0x7580ff, 0.28),
             zebra: hex(0x171920),
             ok: hex(0x34d399),
             warn: hex(0xf5b841),
@@ -150,6 +157,7 @@ impl Palette {
             ok_soft: hex(0x133227),
             warn_soft: hex(0x382b14),
             danger_soft: hex(0x3a1c20),
+            badge: hex(0x272c38),
             dark: true,
         }
     }
@@ -435,6 +443,43 @@ impl Radius {
 
 /// 焦点环宽度：规范 S5.3 的 2px。
 pub const FOCUS_RING_W: f32 = 2.;
+
+/// 间距刻度：`2 / 4 / 6 / 8 / 12 / 16 / 24` px。业务视图的内边距、外边距与 gap 只取这里的档位；
+/// `px_literals_stay_under_ratchet` 按视图目录统计裸 `px(n)`，只许下降。
+pub struct Space;
+
+impl Space {
+    /// 图标与文字之间、紧贴的徽标内边距。
+    pub const XXS: f32 = 2.;
+    /// 行内元素间距、chip 内边距。
+    pub const XS: f32 = 4.;
+    /// 控件内水平内边距。
+    pub const SM: f32 = 6.;
+    /// 默认 gap：工具条按钮之间、列表行内边距。
+    pub const MD: f32 = 8.;
+    /// 分组之间、浮层内边距。
+    pub const LG: f32 = 12.;
+    /// 区块之间。
+    pub const XL: f32 = 16.;
+    /// 页面级大段落之间。
+    pub const XXL: f32 = 24.;
+
+    pub const ALL: [f32; 7] = [Self::XXS, Self::XS, Self::SM, Self::MD, Self::LG, Self::XL, Self::XXL];
+}
+
+/// 固定几何的小控件尺寸：徽标与 chip 在不同行里宽高一致，列表才对得齐。
+pub struct ControlSize;
+
+impl ControlSize {
+    #[allow(dead_code)] // 由 type_badge 使用。
+    /// 类型徽标固定宽度（Redis 类型、字段类型）：最长的 `stream` / `ZSET` 也不撑宽。
+    pub const BADGE_W: f32 = 44.;
+    /// 选择器弹层的最小 / 最大宽度。
+    pub const PICKER_MIN_W: f32 = 240.;
+    pub const PICKER_MAX_W: f32 = 420.;
+    /// 选择器弹层与窗口边缘之间至少留的距离。
+    pub const POPOVER_MARGIN: f32 = 8.;
+}
 
 // ---------------------------------------------------------------- 四态
 
@@ -760,6 +805,34 @@ impl Metrics {
     /// 次级页统一页头高度：紧凑 42 / 标准 48 / 宽松 54。
     pub fn header_h(&self) -> f32 {
         self.by_density(42., 48., 54.)
+    }
+
+    /// chip 与筛选胶囊高度：紧凑 20 / 标准 22 / 宽松 24。
+    pub fn chip_h(&self) -> f32 {
+        self.by_density(20., 22., 24.)
+    }
+
+    /// 类型徽标高度：紧凑 16 / 标准 18 / 宽松 20。总比所在行矮一截，不顶边。
+    pub fn badge_h(&self) -> f32 {
+        self.by_density(16., 18., 20.)
+    }
+
+    /// 只读表格与键列表的行高：与列表行同档。
+    pub fn table_row_h(&self) -> f32 {
+        self.row_h
+    }
+
+    /// 输入框、选择器搜索框高度：与控件同档。
+    pub fn input_h(&self) -> f32 {
+        self.control_h
+    }
+
+    /// 间距按密度映射：紧凑与标准取刻度本身，宽松上调一档（到 [`Space::XXL`] 封顶）。
+    /// 不在刻度上的值先向上吸附到最近的一档。
+    pub fn space(&self, step: f32) -> f32 {
+        let shift = self.by_density(0., 0., 1.) as usize;
+        let at = Space::ALL.iter().position(|value| *value >= step).unwrap_or(Space::ALL.len() - 1);
+        Space::ALL[(at + shift).min(Space::ALL.len() - 1)]
     }
 
     /// 水平页边距。视口窄于 [`NARROW_PAGE_WIDTH`] 时钳到紧凑档，不改垂直边距。
@@ -1804,6 +1877,149 @@ pub fn filter_chip(
         .into_any_element()
 }
 
+// ---------------------------------------------------------------- chip、徽标与表格行
+
+#[allow(dead_code)] // 共享样式：页面在后续任务里接入。
+/// chip 与类型徽标的语义色调。底色一律低饱和，文字保持 4.5:1。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipTone {
+    Neutral,
+    Accent,
+    Ok,
+    Warn,
+    Danger,
+    Info,
+}
+
+#[allow(dead_code)]
+impl ChipTone {
+    pub const ALL: [ChipTone; 6] = [ChipTone::Neutral, ChipTone::Accent, ChipTone::Ok, ChipTone::Warn, ChipTone::Danger, ChipTone::Info];
+
+    /// (前景, 底色)。中性色用正文色加徽标底，其余用状态色加各自的 soft 底。
+    pub fn colors(self, p: &Palette) -> (Hsla, Hsla) {
+        match self {
+            ChipTone::Neutral => (p.text, p.badge),
+            ChipTone::Accent => (p.accent_text, p.accent_soft),
+            ChipTone::Ok => (p.ok, p.ok_soft),
+            ChipTone::Warn => (p.warn, p.warn_soft),
+            ChipTone::Danger => (p.danger, p.danger_soft),
+            ChipTone::Info => (p.info, p.accent_soft),
+        }
+    }
+}
+
+#[allow(dead_code)]
+/// 类型徽标与 chip 的几何：高度跟密度，徽标宽度固定，chip 宽度跟文字。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChipStyle {
+    pub fg: Hsla,
+    pub bg: Hsla,
+    pub height: f32,
+    /// 固定宽度；None 时宽度跟文字走。
+    pub width: Option<f32>,
+    pub pad_x: f32,
+    pub radius: f32,
+    pub text_size: f32,
+}
+
+#[allow(dead_code)]
+pub fn chip_style(tone: ChipTone, fixed_width: bool, m: &Metrics, p: &Palette) -> ChipStyle {
+    let (fg, bg) = tone.colors(p);
+    if fixed_width {
+        ChipStyle { fg, bg, height: m.badge_h(), width: Some(ControlSize::BADGE_W), pad_x: Space::XS, radius: Radius::TAG, text_size: TypeScale::XS }
+    } else {
+        ChipStyle { fg, bg, height: m.chip_h(), width: None, pad_x: Space::SM, radius: Radius::TAG, text_size: TypeScale::XS }
+    }
+}
+
+#[allow(dead_code)]
+fn chip_element(label: SharedString, style: ChipStyle) -> gpui_kit::Div {
+    div()
+        .flex_none()
+        .h(px(style.height))
+        .when_some(style.width, |this, width| this.w(px(width)).justify_center())
+        .px(px(style.pad_x))
+        .rounded(px(Radius::TAG))
+        .bg(style.bg)
+        .text_color(style.fg)
+        .text_size(px(TypeScale::XS))
+        .line_height(px(line_height(style.text_size)))
+        .font_weight(FontWeight::MEDIUM)
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(div().truncate().child(label))
+}
+
+/// 通用 chip：状态、标签、计数。宽度跟文字，高度跟密度。
+#[allow(dead_code)]
+pub fn chip(label: impl Into<SharedString>, tone: ChipTone, m: &Metrics, p: &Palette) -> AnyElement {
+    chip_element(label.into(), chip_style(tone, false, m, p)).into_any_element()
+}
+
+/// 类型徽标（Redis 类型、字段类型）：固定宽高，文字居中，超长截断；一列里上下对齐。
+#[allow(dead_code)]
+pub fn type_badge(label: impl Into<SharedString>, tone: ChipTone, m: &Metrics, p: &Palette) -> AnyElement {
+    chip_element(label.into(), chip_style(tone, true, m, p)).into_any_element()
+}
+
+#[allow(dead_code)]
+/// 只读表格、键列表、资源列表行的状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowState {
+    Idle,
+    Hover,
+    Selected,
+    /// 选中且键盘焦点在这一行（或这一格）。
+    Focused,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowStyle {
+    pub bg: Option<Hsla>,
+    /// 内侧描边（仅焦点行）。
+    pub ring: Option<Hsla>,
+    /// 行底分隔线。只有一层，不嵌套卡片边框。
+    pub divider: Hsla,
+}
+
+#[allow(dead_code)]
+pub fn row_style(state: RowState, p: &Palette) -> RowStyle {
+    let divider = p.line_soft;
+    match state {
+        RowState::Idle => RowStyle { bg: None, ring: None, divider },
+        RowState::Hover => RowStyle { bg: Some(p.hover), ring: None, divider },
+        RowState::Selected => RowStyle { bg: Some(p.selection), ring: None, divider },
+        RowState::Focused => RowStyle { bg: Some(p.selection), ring: Some(p.accent), divider },
+    }
+}
+
+#[allow(dead_code)]
+/// 给一行套上统一的三态：悬停提亮、选中强调底、焦点加 1px 内描边。分隔线画在行底。
+pub fn table_row<E>(element: E, selected: bool, focused: bool, p: &Palette) -> E
+where
+    E: gpui_kit::StatefulInteractiveElement + gpui_kit::Styled,
+{
+    let state = match (selected, focused) {
+        (_, true) => RowState::Focused,
+        (true, false) => RowState::Selected,
+        _ => RowState::Idle,
+    };
+    let style = row_style(state, p);
+    let hover = row_style(RowState::Hover, p).bg;
+    let mut element = element.border_b_1().border_color(style.divider);
+    if let Some(bg) = style.bg {
+        element = element.bg(bg);
+    } else if let Some(bg) = hover {
+        element = element.hover(move |s| s.bg(bg));
+    }
+    if let Some(ring) = style.ring {
+        element = element.shadow(vec![focus_ring(ring, 1.)]);
+    }
+    element
+}
+
 /// 统一提示横幅的语义色调。
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2260,6 +2476,66 @@ mod palette_tests {
         }
     }
 
+    /// chip 与类型徽标：每种色调的文字在自己的低饱和底上都过 4.5:1；徽标宽度固定、高度跟密度。
+    #[test]
+    fn chips_and_badges_are_low_saturation_and_readable() {
+        for p in [Palette::light(), Palette::dark()] {
+            for tone in ChipTone::ALL {
+                let (fg, bg) = tone.colors(&p);
+                assert!(contrast(fg, bg) >= 4.5, "{tone:?} on its chip: {:.2} (dark={})", contrast(fg, bg), p.dark);
+                assert!(bg.s <= 0.6 || bg.l <= 0.25 || bg.l >= 0.9, "{tone:?} 底色低饱和：{bg:?}");
+            }
+            assert_ne!(p.badge, p.surface, "徽标底与工作区可区分");
+            assert!(contrast(p.text_faint, p.badge) >= 4.5, "徽标上的弱文字仍可读");
+        }
+        for m in [Metrics::compact(), Metrics::standard(), Metrics::relaxed()] {
+            let p = Palette::light();
+            let badge = chip_style(ChipTone::Neutral, true, &m, &p);
+            let chip = chip_style(ChipTone::Ok, false, &m, &p);
+            assert_eq!(badge.width, Some(ControlSize::BADGE_W), "徽标固定宽度");
+            assert_eq!(chip.width, None, "chip 宽度跟文字");
+            assert!(badge.height < m.row_h && chip.height < m.row_h, "徽标与 chip 比所在行矮");
+            assert_eq!((badge.text_size, badge.radius), (TypeScale::XS, Radius::TAG));
+        }
+        let (c, s, r) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
+        assert!(c.chip_h() < s.chip_h() && s.chip_h() < r.chip_h());
+        assert!(c.badge_h() < s.badge_h() && s.badge_h() < r.badge_h());
+        assert_eq!((c.table_row_h(), c.input_h()), (c.row_h, c.control_h));
+    }
+
+    /// 间距刻度与密度映射：紧凑、标准取刻度本身，宽松上调一档，封顶 24。
+    #[test]
+    fn space_scale_maps_by_density() {
+        assert_eq!(Space::ALL, [2., 4., 6., 8., 12., 16., 24.]);
+        let (c, s, r) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
+        assert_eq!((c.space(Space::MD), s.space(Space::MD), r.space(Space::MD)), (8., 8., 12.));
+        assert_eq!(r.space(Space::XXL), 24., "封顶");
+        assert_eq!(c.space(5.), 6., "不在刻度上的值向上吸附");
+    }
+
+    /// 表格行三态：悬停、选中、焦点各不相同；只有一层分隔线。深色主题单独校准：
+    /// 悬停底、分隔线在工作区上看得见，选中底比悬停更显眼。
+    #[test]
+    fn table_row_states_are_distinct_and_dark_theme_is_tuned() {
+        for p in [Palette::light(), Palette::dark()] {
+            let idle = row_style(RowState::Idle, &p);
+            let hover = row_style(RowState::Hover, &p);
+            let selected = row_style(RowState::Selected, &p);
+            let focused = row_style(RowState::Focused, &p);
+            assert_eq!(idle.bg, None);
+            assert_ne!(hover.bg, selected.bg);
+            assert_eq!(focused.bg, selected.bg);
+            assert!(focused.ring.is_some() && selected.ring.is_none());
+            assert!([idle, hover, selected, focused].iter().all(|s| s.divider == p.line_soft), "只有一层分隔线");
+        }
+        let dark = Palette::dark();
+        assert!(contrast(dark.hover, dark.surface) >= 1.25, "深色悬停底在工作区上可见：{:.2}", contrast(dark.hover, dark.surface));
+        assert!(contrast(dark.line, dark.surface) >= 1.25, "深色分隔线可见：{:.2}", contrast(dark.line, dark.surface));
+        assert!(contrast(dark.line_soft, dark.surface) >= 1.1, "深色行分隔线可见：{:.2}", contrast(dark.line_soft, dark.surface));
+        assert!(dark.selection.a > Palette::light().selection.a, "深色选中底单独加浓，不是浅色的反转");
+        assert_ne!(dark.badge, dark.hover, "徽标底与悬停底不同，悬停行里的徽标仍看得见");
+    }
+
     /// 三档密度必须真的拉开行高，否则切换只是文案变化。
     /// 紧凑与标准按规范 S9（紧凑 26/23/26、标准 32/30/30，行/树/控件）；宽松不小于标准。
     #[test]
@@ -2611,10 +2887,139 @@ mod token_tests {
         assert!(files.len() > 20, "扫描到了 app/ 与 ui/ 的源码");
         let bad = violations(&files);
         assert!(bad.is_empty(), "以下样式没有走设计 token：\n{}", bad.join("\n"));
+        // 间距与尺寸：各视图目录的裸 px(n) 计数不超过棘轮上限。
+        assert_px_ratchet(&files);
         for (file, expr, reason) in EXCEPTIONS {
             assert!(!reason.is_empty());
             assert!(files.iter().any(|(name, text)| name == file && text.contains(expr)), "例外 {file} {expr} 已不存在，应从清单删除");
         }
+    }
+
+    /// 裸 `px(n)` 的棘轮上限：按视图目录统计产品代码里写死数字的间距与尺寸（不含测试模块与注释行）。
+    /// 上限取 2026-11-20 建档时的计数：只许下降。改到某个目录、换成 `Space` / `Metrics` /
+    /// `ControlSize` 等 token 后，把这里的数字一起改小；新增视图目录必须在这里登记。
+    pub(super) const PX_CEILINGS: &[(&str, usize)] = &[
+        ("app/shell", 590),
+        ("app/views", 0),
+        ("app/views/admin", 35),
+        ("app/views/compare", 94),
+        ("app/views/connections", 0),
+        ("app/views/diagram", 32),
+        ("app/views/export", 44),
+        ("app/views/grid", 153),
+        ("app/views/history", 0),
+        ("app/views/mongo", 58),
+        ("app/views/overview", 0),
+        ("app/views/query", 190),
+        ("app/views/redis", 267),
+        ("app/views/settings", 0),
+        ("app/views/structure", 236),
+        ("app/views/welcome", 0),
+    ];
+
+    /// 产品代码部分：去掉注释行，遇到 `#[cfg(test)]` 模块即止；独立的测试文件整份不算。
+    fn product_code(name: &str, text: &str) -> String {
+        let file = name.rsplit('/').next().unwrap_or(name);
+        if file == "tests.rs" || file.ends_with("_tests.rs") {
+            return String::new();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = String::new();
+        for (ix, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[cfg(test)]") && lines.get(ix + 1).is_some_and(|next| next.trim_start().starts_with("mod ")) {
+                break;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `px(` 之后紧跟数字字面量（可带负号）的次数。`px(Space::MD)`、`px(m.row_h)` 不算。
+    pub(super) fn bare_px_count(source: &str) -> usize {
+        source
+            .match_indices("px(")
+            .filter(|(at, _)| {
+                let before = source[..*at].chars().next_back();
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return false;
+                }
+                let rest = source[at + 3..].trim_start();
+                let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+                rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+            .count()
+    }
+
+    /// 文件归入的棘轮组：`app/views/<目录>`、`app/views`（直属文件）与 `app/shell`；其余不统计。
+    pub(super) fn ratchet_group(name: &str) -> Option<String> {
+        if let Some(rest) = name.strip_prefix("app/views/") {
+            return Some(match rest.split_once('/') {
+                Some((dir, _)) => format!("app/views/{dir}"),
+                None => "app/views".to_owned(),
+            });
+        }
+        name.starts_with("app/shell/").then(|| "app/shell".to_owned())
+    }
+
+    pub(super) fn px_counts(files: &[(String, String)]) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for (name, text) in files {
+            if let Some(group) = ratchet_group(name) {
+                *counts.entry(group).or_insert(0) += bare_px_count(&product_code(name, text));
+            }
+        }
+        counts
+    }
+
+    /// 超过上限、或没有登记上限的组。
+    pub(super) fn px_ratchet_violations(counts: &std::collections::BTreeMap<String, usize>, ceilings: &[(&str, usize)]) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (group, count) in counts {
+            match ceilings.iter().find(|(name, _)| name == group) {
+                Some((_, ceiling)) if count > ceiling => bad.push(format!("{group}: 裸 px(n) {count} 处，超过上限 {ceiling}；新代码改用 Space / Metrics / ControlSize token")),
+                Some(_) => {}
+                None => bad.push(format!("{group}: 裸 px(n) {count} 处，没有登记上限；在 PX_CEILINGS 里加一行")),
+            }
+        }
+        bad
+    }
+
+    /// 视图目录与外壳里的裸 `px(n)` 不超过棘轮上限（`style_literals_follow_design_tokens` 调用）。
+    fn assert_px_ratchet(files: &[(String, String)]) {
+        let counts = px_counts(files);
+        assert!(counts.contains_key("app/shell") && counts.len() > 5, "扫描到了各视图目录：{counts:?}");
+        let bad = px_ratchet_violations(&counts, PX_CEILINGS);
+        assert!(bad.is_empty(), "裸 px(n) 棘轮：\n{}", bad.join("\n"));
+        for (group, _) in PX_CEILINGS {
+            assert!(counts.contains_key(*group), "上限 {group} 对应的目录已不存在，应从清单删除");
+        }
+    }
+
+    /// 棘轮本身：多一处裸 px 就失败；token、注释与测试模块不计数。
+    #[test]
+    fn px_ratchet_counts_bare_literals_only() {
+        assert_eq!(bare_px_count("div().p(px(8.)).h(px(-1.)).w(px( 12.0))"), 3);
+        assert_eq!(bare_px_count("div().p(px(Space::MD)).h(px(m.row_h)).w(px(size * 2.))"), 0);
+        assert_eq!(bare_px_count("let x = opx(3.); my_px(4.)"), 0);
+        let file = "fn a() { div().p(px(4.)); }\n// div().p(px(5.))\n#[cfg(test)]\nmod tests {\n fn b() { px(9.); }\n}\n";
+        assert_eq!(bare_px_count(&product_code("app/views/redis/view.rs", file)), 1);
+        assert_eq!(product_code("app/views/redis/tests.rs", file), "");
+        assert_eq!(ratchet_group("app/views/redis/view.rs").as_deref(), Some("app/views/redis"));
+        assert_eq!(ratchet_group("app/views/mod.rs").as_deref(), Some("app/views"));
+        assert_eq!(ratchet_group("app/shell/chrome.rs").as_deref(), Some("app/shell"));
+        assert_eq!(ratchet_group("ui/kit.rs"), None);
+        let files = vec![("app/views/probe/mod.rs".to_owned(), "div().p(px(4.)).m(px(2.))".to_owned())];
+        let counts = px_counts(&files);
+        assert!(px_ratchet_violations(&counts, &[("app/views/probe", 2)]).is_empty());
+        let over = px_ratchet_violations(&counts, &[("app/views/probe", 1)]);
+        assert_eq!(over.len(), 1, "多一处就失败");
+        assert!(over[0].contains("app/views/probe"));
+        assert_eq!(px_ratchet_violations(&counts, &[]).len(), 1, "未登记的目录也失败");
     }
 
     /// 回退任何一处替换（裸字号、旧圆角、标题裸字号）都会被扫描抓到。
