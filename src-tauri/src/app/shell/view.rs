@@ -329,6 +329,12 @@ impl Workbench {
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.sync_window_appearance(window.appearance(), cx);
             }),
+            // 窗口失焦时关掉右键菜单：回来时不会还挂着一个指向旧现场的菜单。
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() && this.model.close_menu() {
+                    cx.notify();
+                }
+            }),
         ];
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
@@ -429,6 +435,9 @@ impl Workbench {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
             let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
             self.model.grid_menu = if table { self.table.read(cx).menu_facts() } else { self.query.read(cx).grid_menu_facts(cx) };
+        }
+        if id == "menu-results" {
+            self.model.results_menu = self.query.read(cx).results_menu_facts();
         }
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
@@ -2799,7 +2808,7 @@ impl Workbench {
         };
     }
 
-    fn active_query_context(&self) -> bool {
+    pub(super) fn active_query_context(&self) -> bool {
         self.model.shell.page == AppPage::Workspace && self.model.active_tab().is_some_and(|tab| tab.kind == WorkItemKind::Query)
     }
 
@@ -3270,6 +3279,8 @@ fn query_command(id: &str) -> bool {
         || id.starts_with("unpin:")
         || id.starts_with("log:")
         || id.starts_with("side-mode:")
+        // 结果区的全屏、收起、关闭与复制（结果区菜单与页签头按钮）。
+        || id.starts_with("result-")
         // 查询页把自己的运行类命令（含大纲里的单条执行）交回外壳统一按需连接；
         // 外壳必须认得同一份清单再转发回去，否则这类命令会在外壳这一层被静默丢掉。
         || crate::app::views::query::runs_query(id)

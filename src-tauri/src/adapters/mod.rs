@@ -450,6 +450,12 @@ pub trait SqlSyntax: Sync {
         }
     }
 
+    /// 按服务器版本包装执行计划语句。默认与 [`SqlSyntax::explain`] 相同；
+    /// 计划格式随服务器版本变化的方言（MySQL）覆盖这个方法，版本未知时用保守格式。
+    fn explain_for(&self, body: &str, _server_version: Option<&str>) -> String {
+        self.explain(body)
+    }
+
     /// 解析执行计划结果；`explained` 表示语句以 EXPLAIN / SET SHOWPLAN 开头。认不出返回 None。
     fn parse_plan(&self, _sql: &str, _explained: bool, _columns: &[String], _rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
         None

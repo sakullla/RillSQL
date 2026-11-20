@@ -429,6 +429,11 @@ impl Workbench {
             {
                 return;
             }
+            // 查询结果全屏时 Esc 退出全屏（正在原位编辑单元格时 Esc 仍归那一格）。
+            if self.active_query_context() && self.query.update(cx, |pane, cx| pane.handle_escape(cx)) {
+                cx.notify();
+                return;
+            }
         }
         if key == "escape" && self.model.connections.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("conn-delete-cancel", cx);
@@ -1791,8 +1796,16 @@ impl Workbench {
                 .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
                     entity.update(cx, |this, cx| {
                         this.menu_at = event.position;
-                        let grid = this.query.update(cx, |pane, _| pane.take_grid_menu_request());
-                        this.perform(if grid { "menu-grid" } else { "menu-editor" }, cx);
+                        // 表格优先（表格在结果区里面，两种请求会同时记下），其次是结果区，最后才是编辑器。
+                        let (grid, results) = this.query.update(cx, |pane, _| (pane.take_grid_menu_request(), pane.take_results_menu_request()));
+                        let menu = if grid {
+                            "menu-grid"
+                        } else if results {
+                            "menu-results"
+                        } else {
+                            "menu-editor"
+                        };
+                        this.perform(menu, cx);
                     });
                 })
                 .child(self.query.clone())
@@ -6256,7 +6269,7 @@ impl Workbench {
         let anchor_y = f32::from(self.menu_at.y);
         let (x, y) = super::menus::place_popup(anchor_x, anchor_y, width, height, view_w, view_h);
         let list = self.context_menu_box("context-menu", menu.place.label_key(), x, y, width, &menu.items, menu.index, None, &p, cx);
-        let mut layer = backdrop("context-backdrop", 0., cx).child(list);
+        let mut layer = menu_backdrop(cx).child(list);
         if let Some((parent, child)) = menu.submenu {
             if let Some(parent_item) = menu.items.get(parent) {
                 if !parent_item.children.is_empty() {
@@ -6315,7 +6328,9 @@ impl Workbench {
             .border_color(p.line)
             .rounded(px(Radius::PANEL))
             .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // 菜单自己身上的右键不算“点在外面”，不关菜单。
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
         for (index, item) in items.iter().enumerate() {
             if item.separator_before || (index > 0 && item.danger && !items[index - 1].danger) {
                 list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line));
@@ -6338,6 +6353,8 @@ impl Workbench {
                 p.text
             };
             let element = if parent.is_some() { format!("ctx-sub-{id}") } else { format!("ctx-{id}") };
+            // 禁用原因：会话给出的具体文案优先，其次是固定的说明键。
+            let disabled_reason: Option<SharedString> = item.reason.clone().map(SharedString::from).or_else(|| item.reason_key.map(|key| self.t(key)));
             list = list.child(
                 div()
                     .id(SharedString::from(element))
@@ -6360,7 +6377,7 @@ impl Workbench {
                     .child(div().flex_1().min_w(px(0.)).truncate().child(label))
                     .when_some(shortcut, |this, shortcut| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(shortcut)))
                     .when(has_children, |this| this.child(kit::icon(IconName::ChevronRight, 12., p.text_faint)))
-                    .when_some(item.reason_key.filter(|_| !enabled), |this, reason| this.tooltip_text(self.t(reason)))
+                    .when_some(disabled_reason.filter(|_| !enabled), |this, reason| this.tooltip_text(reason))
                     .on_mouse_move(cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
                         let Some(menu) = this.model.menu.as_mut() else { return };
                         if parent.is_some() {
@@ -7400,6 +7417,42 @@ fn segment_track(p: &Palette) -> gpui_kit::Div {
         .bg(p.sunken)
         .border_1()
         .border_color(p.line_soft)
+}
+
+/// 右键菜单的遮罩：左键、右键点在菜单外，或在任何位置滚动，菜单都关闭。
+/// 右键只关菜单，不在遮罩下面再弹一个新菜单；滚动不会滚动菜单下面的页面。
+fn menu_backdrop(cx: &mut Context<Workbench>) -> impl IntoElement + gpui_kit::ParentElement {
+    let close = |entity: Entity<Workbench>| {
+        move |window: &mut Window, cx: &mut App| {
+            entity.update(cx, |this, cx| {
+                if this.model.close_menu() {
+                    this.restore_focus(window, cx);
+                }
+                cx.notify();
+            });
+        }
+    };
+    let left = close(cx.entity());
+    let right = close(cx.entity());
+    let wheel = close(cx.entity());
+    div()
+        .id("context-backdrop")
+        .test_support()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            left(window, cx);
+        })
+        .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+            cx.stop_propagation();
+            right(window, cx);
+        })
+        .on_scroll(move |_, window, cx| {
+            cx.stop_propagation();
+            wheel(window, cx);
+        })
 }
 
 pub(super) fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit::Stateful<gpui_kit::Div> {

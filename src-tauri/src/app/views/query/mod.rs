@@ -76,6 +76,32 @@ pub struct SyncEffect {
     pub selected_object: Option<String>,
 }
 
+/// 一个查询标签的结果区布局。只存在内存里，按标签区分，不写入会话。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResultLayout {
+    /// 编辑器与结果上下分栏。
+    #[default]
+    Normal,
+    /// 结果占满查询页，编辑器不画；Esc 退出。
+    Maximized,
+    /// 只画编辑器，底部留一条“显示结果”细栏。
+    Collapsed,
+}
+
+/// 查询结果区（结果页签头、消息页、语句状态）右键时的现场事实，外壳据此生成结果区菜单。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResultsMenuFacts {
+    /// 正在看的结果（或固定结果）存在：全屏与关闭结果可用。
+    pub has_result: bool,
+    pub layout: ResultLayout,
+    /// 有可复制的 SQL（当前结果对应的语句）。
+    pub has_sql: bool,
+    /// 消息页有记录可复制。
+    pub has_messages: bool,
+    /// 当前标签正在执行：关闭结果要等执行结束。
+    pub running: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CountIdentity {
     tab: String,
@@ -143,6 +169,12 @@ pub struct QueryPane {
     selected_object: Option<String>,
     variable_inputs: HashMap<String, (Entity<InputState>, String, gpui_kit::Subscription)>,
     grid_menu_requested: bool,
+    /// 结果区（页签头、消息页、语句状态）收到右键：外壳据此打开结果区菜单而不是编辑器菜单。
+    results_menu_requested: bool,
+    /// 每个查询标签自己的结果区布局（普通 / 全屏 / 收起）。
+    result_layout: HashMap<String, ResultLayout>,
+    /// 每个查询标签自己的编辑器 / 结果分割比例。
+    splits: HashMap<String, Entity<gpui_kit::component::ResizableState>>,
     /// 公开设置：编辑器字号/配色、查询读取行数、预览上限、对象上限、空值文本。
     editor_font: i64,
     editor_theme: String,
@@ -563,6 +595,9 @@ impl QueryPane {
             selected_object: None,
             variable_inputs: HashMap::new(),
             grid_menu_requested: false,
+            results_menu_requested: false,
+            result_layout: HashMap::new(),
+            splits: HashMap::new(),
             editor_font: 13,
             editor_theme: "auto".to_owned(),
             page_size: 100,
@@ -1132,6 +1167,11 @@ impl QueryPane {
             cx.notify();
             return;
         }
+        if id.starts_with("result-") {
+            self.result_command(id, cx);
+            cx.notify();
+            return;
+        }
         self.capture(cx);
         match id {
             "execute-query" | "run-selection" => self.start(RunScope::Auto, None, cx),
@@ -1246,6 +1286,8 @@ impl QueryPane {
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.result_layout.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.splits.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.desk.refresh_outline();
         self.note_lint();
         let mut drafts = Vec::new();
@@ -1590,6 +1632,10 @@ impl QueryPane {
     }
 
     fn start(&mut self, scope: RunScope, override_sql: Option<String>, cx: &mut Context<Self>) {
+        // 收起时再运行：结果区自动展开，新结果、变量输入和拒绝说明都看得到。
+        if let Some(id) = self.desk.active_id().map(str::to_owned) {
+            self.expand_collapsed(&id);
+        }
         if self.refuse_missing_target(cx) {
             return;
         }
@@ -1616,6 +1662,7 @@ impl QueryPane {
     }
 
     fn spawn_run(&mut self, prepared: PreparedRun, cx: &mut Context<Self>) {
+        self.expand_collapsed(&prepared.tab_id);
         let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
         self.run_clock.insert(prepared.tab_id.clone(), std::time::Instant::now());
         let services = Arc::clone(&self.services);
@@ -1938,6 +1985,10 @@ impl QueryPane {
     }
 
     fn explain(&mut self, cx: &mut Context<Self>) {
+        if let Some(connection_id) = self.desk.target().map(|target| target.connection_id) {
+            let version = self.services.connections.server_version(&connection_id);
+            self.desk.set_server_version(&connection_id, version);
+        }
         match self.desk.explain_active() {
             Ok(sql) => {
                 // 新的计划从树视图、第一个节点开始看。
@@ -2837,8 +2888,34 @@ impl Render for QueryPane {
         // 各区域在各自不内联的函数里搭建：未优化构建不复用栈槽，整页写在一个函数里时单帧近 800 KB，
         // 叠上外壳与布局递归会撑爆 Windows 主线程默认 1 MB 栈（调试版启动即崩）。
         let toolbar = self.render_toolbar(running, &p, metrics, &entity, cx);
-        let editor_row = self.render_editor_row(&p, metrics, &mono, &entity, cx);
-        let results_panel = self.render_results(running, &p, metrics, &mono, &entity, window, cx);
+        let layout = self.result_layout();
+        // 三种结果布局按标签各自保存：全屏时不画编辑器，收起时只画编辑器和底部细栏。
+        // 结果表格始终是同一个实体，切换布局时滚动位置与选区不丢。
+        let body = match layout {
+            ResultLayout::Maximized => self.render_results(running, &p, metrics, &mono, &entity, window, cx),
+            ResultLayout::Collapsed => {
+                let editor_row = self.render_editor_row(&p, metrics, &mono, &entity, cx);
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(editor_row))
+                    .child(self.render_collapsed_bar(&p, metrics, &entity))
+                    .into_any_element()
+            }
+            ResultLayout::Normal => {
+                let editor_row = self.render_editor_row(&p, metrics, &mono, &entity, cx);
+                let results_panel = self.render_results(running, &p, metrics, &mono, &entity, window, cx);
+                let mut split = v_resizable("query-split");
+                if let Some(state) = self.active_split(cx) {
+                    split = split.with_state(&state);
+                }
+                split
+                    .child(resizable_panel().size_range(px(120.)..px(4000.)).child(editor_row))
+                    .child(resizable_panel().size(px(300.)).size_range(px(90.)..px(4000.)).child(results_panel))
+                    .into_any_element()
+            }
+        };
 
         div()
             .id("query-pane")
@@ -2846,13 +2923,7 @@ impl Render for QueryPane {
             .flex_col()
             .size_full()
             .child(toolbar)
-            .child(
-                div().flex_1().min_h(px(0.)).child(
-                    v_resizable("query-split")
-                        .child(resizable_panel().size_range(px(120.)..px(4000.)).child(editor_row))
-                        .child(resizable_panel().size(px(300.)).size_range(px(90.)..px(4000.)).child(results_panel)),
-                ),
-            )
+            .child(div().id("query-body").flex_1().min_h(px(0.)).child(body))
     }
 }
 
@@ -3092,7 +3163,19 @@ impl QueryPane {
     #[inline(never)]
     fn render_results(&mut self, running: bool, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let header = self.render_results_head(running, p, metrics, entity);
-        let mut results_panel = div().id("query-results").flex().flex_col().size_full().bg(p.surface).child(header);
+        let menu_entity = entity.clone();
+        let mut results_panel = div()
+            .id("query-results")
+            .test_support()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(p.surface)
+            // 页签头、消息页与语句状态上的右键弹结果区菜单；表格自己的右键先一步记下网格菜单。
+            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                menu_entity.update(cx, |pane, _| pane.results_menu_requested = true);
+            })
+            .child(header);
         if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
             results_panel = results_panel.child(row);
         }
@@ -3106,6 +3189,7 @@ impl QueryPane {
         let tabs = self.render_result_tabs(p, metrics, entity);
         div()
             .id("query-results-head")
+            .test_support()
             .flex_none()
             .h(px(metrics.tabs_h))
             .flex()
@@ -3214,8 +3298,47 @@ impl QueryPane {
         )
     }
     /// 消息页签（在页签条之外、紧随其后：页签再多也不会被挤出视口）与固定按钮。
+    /// 收起时编辑器下方的细栏：说明有多少行结果，点一下展开；右键同样是结果区菜单。
     #[inline(never)]
-    fn render_head_actions(&self, p: &Palette, _metrics: Metrics, entity: &Entity<QueryPane>) -> [AnyElement; 2] {
+    fn render_collapsed_bar(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        let label = match self.desk.shown_result().filter(|result| !result.columns.is_empty()) {
+            Some(result) => i18n::fill(
+                &i18n::text(locale, "query.results.collapsedBar"),
+                &[("count", &crate::app::views::grid::group_digits(result.rows.len() as i64))],
+            ),
+            None => i18n::text(locale, "query.results.collapsedEmpty"),
+        };
+        let open = entity.clone();
+        let menu = entity.clone();
+        kit::interactive(div().id("query-results-collapsed"), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(SharedString::from(label.clone()))
+            .flex_none()
+            .h(px(metrics.tabs_h))
+            .px(px(kit::Space::LG))
+            .flex()
+            .items_center()
+            .gap(px(kit::Space::SM))
+            .bg(p.chrome)
+            .border_t_1()
+            .border_color(p.line)
+            .text_size(px(TypeScale::SM))
+            .text_color(p.text_muted)
+            .child(kit::icon(IconName::ChevronUp, 12., p.text_muted))
+            .child(SharedString::from(label))
+            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                menu.update(cx, |pane, _| pane.results_menu_requested = true);
+            })
+            .on_click(move |_, _, cx| {
+                open.update(cx, |pane, cx| pane.command("result-collapse", cx));
+            })
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_head_actions(&self, p: &Palette, _metrics: Metrics, entity: &Entity<QueryPane>) -> [AnyElement; 4] {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let log = self.desk.log();
@@ -3244,7 +3367,24 @@ impl QueryPane {
         .xsmall()
         .disabled(!self.desk.can_pin())
         .into_any_element();
-        [log_tab, pin]
+        // 全屏 / 退出全屏：没有结果时禁用；收起：结果区收成底部细栏，编辑器占满。
+        let maximized = self.result_layout() == ResultLayout::Maximized;
+        let max_entity = entity.clone();
+        let (max_icon, max_key) = if maximized { (IconName::Minimize2, "query.results.menu.restore") } else { (IconName::Maximize2, "query.results.menu.maximize") };
+        let maximize = kit::icon_button("query-act-result-maximize", max_icon, t(max_key), move |_, _, cx| {
+            max_entity.update(cx, |pane, cx| pane.command("result-maximize", cx));
+        })
+        .xsmall()
+        .selected(maximized)
+        .disabled(!maximized && !self.has_result_content())
+        .into_any_element();
+        let collapse_entity = entity.clone();
+        let collapse = kit::icon_button("query-act-result-collapse", IconName::ChevronDown, t("query.results.menu.collapse"), move |_, _, cx| {
+            collapse_entity.update(cx, |pane, cx| pane.command("result-collapse", cx));
+        })
+        .xsmall()
+        .into_any_element();
+        [log_tab, pin, maximize, collapse]
     }
 
     /// 页签头右侧：弹性留白、耗时/运行态、说明、行数摘要、加载更多。
@@ -3915,6 +4055,119 @@ impl QueryPane {
     pub fn take_grid_menu_request(&mut self) -> bool {
         std::mem::take(&mut self.grid_menu_requested)
     }
+
+    /// 结果区（页签头、消息页、语句状态）收到过右键：外壳打开结果区菜单。
+    pub fn take_results_menu_request(&mut self) -> bool {
+        std::mem::take(&mut self.results_menu_requested)
+    }
+
+    /// 活动标签的结果区布局；没有活动标签时是普通布局。
+    pub fn result_layout(&self) -> ResultLayout {
+        self.desk.active_id().and_then(|id| self.result_layout.get(id)).copied().unwrap_or_default()
+    }
+
+    fn set_result_layout(&mut self, layout: ResultLayout) {
+        let Some(id) = self.desk.active_id().map(str::to_owned) else { return };
+        if layout == ResultLayout::Normal {
+            self.result_layout.remove(&id);
+        } else {
+            self.result_layout.insert(id, layout);
+        }
+    }
+
+    /// 收起的标签开始执行时回到普通布局；全屏与普通布局不变。
+    fn expand_collapsed(&mut self, tab: &str) {
+        if self.result_layout.get(tab) == Some(&ResultLayout::Collapsed) {
+            self.result_layout.remove(tab);
+        }
+    }
+
+    /// 活动标签有可看的结果（当前结果或固定结果）：全屏按钮据此启用。
+    pub fn has_result_content(&self) -> bool {
+        !self.desk.results().is_empty() || !self.desk.pinned().is_empty()
+    }
+
+    /// 结果区菜单要用的现场事实。
+    pub fn results_menu_facts(&self) -> ResultsMenuFacts {
+        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|item| item == id));
+        ResultsMenuFacts {
+            has_result: self.has_result_content(),
+            layout: self.result_layout(),
+            has_sql: self.result_sql().is_some(),
+            has_messages: !self.desk.log().is_empty(),
+            running,
+        }
+    }
+
+    /// 结果区“复制 SQL”复制的语句：正在看的结果对应的那条；没有结果时为 None。
+    fn result_sql(&self) -> Option<String> {
+        self.desk.shown_result().map(|result| result.sql.trim().to_owned()).filter(|sql| !sql.is_empty())
+    }
+
+    /// 消息页全文：每条记录一行说明，下一行是完整语句。
+    fn messages_text(&self) -> String {
+        self.desk
+            .log()
+            .iter()
+            .map(|entry| {
+                let sql = entry.sql.trim();
+                if sql.is_empty() { log::entry_text(self.locale, entry) } else { format!("{}\n{sql}", log::entry_text(self.locale, entry)) }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// 结果区的全屏、收起、关闭与复制。布局只改活动标签自己的那一份。
+    fn result_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        let layout = self.result_layout();
+        match id {
+            "result-maximize" => {
+                if layout == ResultLayout::Maximized {
+                    self.set_result_layout(ResultLayout::Normal);
+                } else if self.has_result_content() {
+                    self.set_result_layout(ResultLayout::Maximized);
+                }
+            }
+            "result-collapse" => {
+                let next = if layout == ResultLayout::Collapsed { ResultLayout::Normal } else { ResultLayout::Collapsed };
+                self.set_result_layout(next);
+            }
+            "result-restore" => self.set_result_layout(ResultLayout::Normal),
+            "result-close" => {
+                if self.desk.close_results() {
+                    self.row_count = None;
+                    if layout == ResultLayout::Maximized && !self.has_result_content() {
+                        self.set_result_layout(ResultLayout::Normal);
+                    }
+                    self.rebind_grid(cx);
+                }
+            }
+            "result-copy-sql" | "result-copy-messages" => {
+                let text = if id == "result-copy-sql" { self.result_sql().unwrap_or_default() } else { self.messages_text() };
+                if !text.is_empty() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                    self.desk.set_active_note(&i18n::text(self.locale, "query.results.menu.copied"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Esc：结果区全屏时退出全屏。返回 true 表示这次 Esc 已被处理。
+    pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.result_layout() != ResultLayout::Maximized || self.grid.read(cx).editing() {
+            return false;
+        }
+        self.set_result_layout(ResultLayout::Normal);
+        cx.notify();
+        true
+    }
+
+    /// 活动标签自己的分割状态：每个标签各记各的比例，切换标签互不影响。
+    fn active_split(&mut self, cx: &mut Context<Self>) -> Option<Entity<gpui_kit::component::ResizableState>> {
+        let id = self.desk.active_id()?.to_owned();
+        Some(self.splits.entry(id).or_insert_with(|| cx.new(|_| gpui_kit::component::ResizableState::default())).clone())
+    }
 }
 
 /// 非查询工作项激活时的统一说明。
@@ -3985,6 +4238,7 @@ fn target_of(tab: &TabSnap) -> Option<Target> {
         engine: tab.engine.clone().unwrap_or_default(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     })
 }
 
@@ -4120,6 +4374,7 @@ mod tests {
             engine: "sqlite".to_owned(),
             schema: String::new(),
             environment: String::new(),
+            server_version: None,
         };
         assert!(load_more_targets_match(Some(&target("a", "main")), Some(&target("a", "main"))));
         assert!(!load_more_targets_match(Some(&target("a", "main")), Some(&target("a", "other"))), "换库后不在新库续读旧结果");
@@ -4142,6 +4397,9 @@ mod tests {
         sqlx::query("CREATE TABLE runs (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
         let service = Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
         service.open_sqlite_for_test("notes", "Notes", &database).await.unwrap();
+        // 打开会话时记下服务器版本，执行计划按它选格式。
+        assert!(service.server_version("notes").is_some_and(|version| version.starts_with('3')), "{:?}", service.server_version("notes"));
+        assert_eq!(service.server_version("missing"), None);
         let query = crate::query::QueryState::from_config_path(&dir.join("connections.sqlite"));
         for index in 0..6 {
             let started = start_run(&service, &query, StartRequest {
@@ -6049,6 +6307,139 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("query-act-statement-0").label(), Some("SELECT · customers"));
             assert_eq!(window.find("query-act-statement-1").label(), Some("SELECT · orders"));
+        })
+        .unwrap();
+    }
+
+    /// 结果区按标签有普通、全屏、收起三种布局：全屏时编辑器不画，Esc 退出，选区保留；
+    /// 收起后再运行自动展开；没有结果时全屏按钮禁用；各标签的布局与分割比例互不影响。
+    #[gpui_kit::test]
+    fn result_area_maximizes_collapses_and_restores_per_tab(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            let tabs = vec![bound("q", "SELECT * FROM customers"), bound("r", "SELECT * FROM orders")];
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&tabs, Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            // 没有结果：全屏按钮禁用，命令也不切换布局。
+            assert_eq!(window.find("query-act-result-maximize").disabled(), Some(true));
+            pane.update(cx, |pane, cx| pane.command("result-maximize", cx));
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal);
+            assert!(window.try_find("query-editor").is_some());
+
+            pane.update(cx, |pane, cx| {
+                pane.desk.plant_run(vec![result("SELECT * FROM customers", "ok", &["id"], &["1", "2", "3"], None, "")]);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert_ne!(window.find("query-act-result-maximize").disabled(), Some(true));
+            let grid = pane.read(cx).grid.entity_id();
+            pane.update(cx, |pane, cx| pane.grid.update(cx, |grid, cx| grid.select_for_menu(2, 0, cx)));
+            window.click("query-act-result-maximize", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Maximized);
+            assert!(window.try_find("query-editor").is_none(), "全屏时编辑器不可见");
+            assert!(window.try_find("query-results").is_some());
+            assert_eq!(pane.read(cx).grid.entity_id(), grid, "同一个表格实体：滚动位置不丢");
+            assert_eq!(pane.read(cx).grid.read(cx).focus_cell(), Some((2, 0)), "选区保留");
+            // Esc 退出全屏：选区仍在。
+            assert!(pane.update(cx, |pane, cx| pane.handle_escape(cx)));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal);
+            assert!(window.try_find("query-editor").is_some());
+            assert_eq!(pane.read(cx).grid.read(cx).focus_cell(), Some((2, 0)), "退出全屏后选区仍在");
+            assert!(!pane.update(cx, |pane, cx| pane.handle_escape(cx)), "普通布局下 Esc 不归结果区");
+            pane.update(cx, |pane, cx| pane.command("result-maximize", cx));
+            // 另一个标签不受影响。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&tabs, Some("r"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal);
+            assert!(window.try_find("query-editor").is_some());
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&tabs, Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Maximized, "切回来仍是这个标签自己的布局");
+            pane.update(cx, |pane, cx| pane.command("result-maximize", cx));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal, "再按一次退出全屏");
+
+            // 收起：只剩编辑器与底部细栏；再运行自动展开。
+            window.click("query-act-result-collapse", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Collapsed);
+            assert!(window.try_find("query-results").is_none());
+            assert_eq!(window.find("query-results-collapsed").label().map(str::to_owned), Some(i18n::fill(&i18n::text(Locale::ZhCn, "query.results.collapsedBar"), &[("count", "3")])));
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal, "收起后运行查询自动恢复");
+            assert!(window.try_find("query-results").is_some());
+
+            // 细栏点一下也能展开。
+            pane.update(cx, |pane, cx| pane.command("result-collapse", cx));
+            window.render_frame(cx);
+            window.click("query-results-collapsed", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal);
+
+            // 分割比例按标签各自保存。
+            let split_q = pane.read(cx).splits.get("q").map(|state| state.entity_id());
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&tabs, Some("r"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            let split_r = pane.read(cx).splits.get("r").map(|state| state.entity_id());
+            assert!(split_q.is_some() && split_r.is_some() && split_q != split_r, "每个标签一份分割状态");
+        })
+        .unwrap();
+    }
+
+    /// 消息页的 SQL 单行截断显示，悬停提示与可读名称给出保留换行的全文。
+    #[gpui_kit::test]
+    fn message_rows_expose_the_full_sql_behind_the_truncated_line(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 640., 600.);
+        let long = format!("SELECT id,\n       {}\nFROM customers", (0..40).map(|i| format!("column_{i}")).collect::<Vec<_>>().join(", "));
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", &long)), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result(&long, "ok", &["id"], &["1"], None, "")]);
+                pane.command("query-view:messages", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("query-log-sql-0").label().map(str::to_owned), Some(long.clone()), "全文保留换行");
+            window.hover("query-log-sql-0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    /// 结果区菜单：复制 SQL 与消息、关闭结果；关闭结果后固定结果与消息保留。
+    #[gpui_kit::test]
+    fn results_menu_commands_copy_and_close_the_current_result(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM customers")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("SELECT * FROM customers", "ok", &["id"], &["1"], None, "")]);
+            });
+            window.render_frame(cx);
+            let facts = pane.read(cx).results_menu_facts();
+            assert!(facts.has_result && facts.has_sql && facts.has_messages && !facts.running);
+            pane.update(cx, |pane, cx| pane.command("result-copy-sql", cx));
+            assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("SELECT * FROM customers"));
+            pane.update(cx, |pane, cx| pane.command("result-copy-messages", cx));
+            let messages = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+            assert!(messages.contains("SELECT * FROM customers"), "{messages}");
+            pane.update(cx, |pane, cx| pane.command("result-maximize", cx));
+            pane.update(cx, |pane, cx| pane.command("result-close", cx));
+            window.render_frame(cx);
+            assert!(pane.read(cx).desk.results().is_empty());
+            assert_eq!(pane.read(cx).result_layout(), ResultLayout::Normal, "没有结果可全屏时回到普通布局");
+            assert!(!pane.read(cx).results_menu_facts().has_result);
+            assert!(window.try_find("query-results-empty").is_some());
         })
         .unwrap();
     }

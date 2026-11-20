@@ -5,7 +5,6 @@ mod session;
 mod temporal;
 pub use session::group_digits;
 
-use std::ops::DerefMut;
 use std::sync::Arc;
 
 pub use session::{display_banner, operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
@@ -68,6 +67,25 @@ pub struct GridMenuFacts {
     pub foreign_key: bool,
     /// 有生效的筛选或排序：给出一键清除。
     pub conditions: bool,
+    /// 右键落在哪里：单元格与行头各有一套菜单；列头仍由表头自己的菜单处理。
+    pub area: GridMenuArea,
+    /// 不可写时写入项的具体原因（已按界面语言取好文案）；可写时为空。
+    pub readonly_reason: String,
+    /// 有选区：“复制为”各格式可用。
+    pub has_selection: bool,
+    /// 网格里有未提交的暂存：给出“撤销”。
+    pub dirty: bool,
+    /// 窗口里还有没读到原值的预览格：给出“读取完整值”。
+    pub unresolved: bool,
+}
+
+/// 网格右键的落点。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GridMenuArea {
+    #[default]
+    Cell,
+    /// 行号列或行尾空白：整行的操作，没有按格编辑和按值筛选。
+    RowHeader,
 }
 
 /// 单元格右键的出口：表格组件在格子上截住右键（stop_propagation），外层容器收不到；
@@ -184,6 +202,8 @@ pub struct GridPane {
     /// 外键跳转的出口：由外壳（直接消费者）注入，网格只负责生成目标和定位查询。
     navigation: Option<NavigationSink>,
     menu_sink: Option<MenuSink>,
+    /// 最近一次右键的落点（单元格或行头）；外壳取菜单事实时读它。
+    menu_area: GridMenuArea,
     structure_sink: Option<ActionSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
@@ -373,6 +393,7 @@ impl GridPane {
             pending_full: None,
             navigation: None,
             menu_sink: None,
+            menu_area: GridMenuArea::Cell,
             structure_sink: None,
             pending_viewer: false,
             record_open: false,
@@ -456,14 +477,46 @@ impl GridPane {
     /// 右键菜单要用的现场事实（按当前焦点格与会话状态现算）。
     pub fn menu_facts(&self) -> GridMenuFacts {
         let focus = self.session.focus_cell();
+        let writable = self.session.writable();
         GridMenuFacts {
             table: self.session.mode == GridMode::Table,
-            writable: self.session.writable(),
+            writable,
             cell_dirty: focus.is_some_and(|(row, column)| self.session.cell_dirty_state(row, column) != session::CellDirty::Clean),
             row_dirty: focus.is_some_and(|(row, _)| row_is_dirty(&self.session, row)),
             foreign_key: self.session.has_reference(),
             conditions: !self.session.filters().is_empty() || self.session.sort_text().is_some(),
+            area: self.menu_area,
+            readonly_reason: if writable { String::new() } else { self.readonly_text() },
+            has_selection: self.session.has_selection(),
+            dirty: self.session.uncommitted(),
+            unresolved: self.session.unresolved_previews() > 0,
         }
+    }
+
+    /// 不可写时写入项的说明：会话给出的具体原因（视图、无主键、聚合……），没有时用通用的只读说明。
+    /// 工具栏的只读原因、单元格菜单与右键菜单共用这一份。
+    fn readonly_text(&self) -> String {
+        let key = self.session.readonly_reason();
+        if key.is_empty() { i18n::text(self.locale, "grid.status.readonly") } else { i18n::text(self.locale, key) }
+    }
+
+    /// 行头（行号列、行尾空白）右键：这一行不在选区里时整行选中，菜单作用于整行。
+    pub(crate) fn select_row_for_menu(&mut self, row: usize, cx: &mut Context<Self>) {
+        let last = self.session.column_names().len().saturating_sub(1);
+        let covered = self.session.selection_bounds().is_some_and(|(top, left, bottom, right)| top <= row && row <= bottom && left == 0 && right >= last);
+        if !covered {
+            self.record_row_changed();
+            self.session.select(row, 0, false);
+            self.session.select(row, last, true);
+            self.notice.clear();
+            self.sync_table(cx);
+        }
+        cx.notify();
+    }
+
+    /// 记下这次右键的落点，再交给外壳弹出菜单。
+    pub(crate) fn set_menu_area(&mut self, area: GridMenuArea) {
+        self.menu_area = area;
     }
 
     /// 右键落在选区外的格子上：先选中它，菜单动作作用于用户指着的那一格；
@@ -565,7 +618,13 @@ impl GridPane {
         self.grid_focus.clone()
     }
 
+    /// 测试用：会话里的焦点格。
     #[cfg(test)]
+    pub fn focus_cell(&self) -> Option<(usize, usize)> {
+        self.session.focus_cell()
+    }
+
+    /// 正在原位编辑一格：Esc 属于这一格（取消编辑），外层不拿它做别的事。
     pub fn editing(&self) -> bool {
         self.edit_target.is_some()
     }
@@ -2799,12 +2858,7 @@ impl GridPane {
             .focus_cell()
             .map(|(row, column)| (self.session.cell_dirty_state(row, column) != session::CellDirty::Clean, row_is_dirty(&self.session, row)))
             .unwrap_or((false, false));
-        let write_reason = if writable {
-            String::new()
-        } else {
-            let key = self.session.readonly_reason();
-            if key.is_empty() { i18n::text(locale, "grid.status.readonly") } else { i18n::text(locale, key) }
-        };
+        let write_reason = if writable { String::new() } else { self.readonly_text() };
         // 格子内边距只由当前密度决定；换密度时同步刷新，列宽测量读的也是这一份。
         let cell_pad = cell_padding(kit::Metrics::of(cx));
         // 写回表格焦点的格子记下来：表格随后发回的 SelectCell 是回声，不是选择变更。
@@ -5025,22 +5079,6 @@ fn menu_label(locale: Locale, key: &str, id: &str) -> SharedString {
     }
 }
 
-/// 单元格菜单需要的网格状态。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CellMenuState {
-    pub writable: bool,
-    pub dirty: bool,
-    pub fk: bool,
-    pub unresolved: usize,
-    pub has_selection: bool,
-}
-
-/// 单元格菜单条目是否禁用：写入类在只读网格上禁用（原因沿用工具栏的只读说明），
-/// "复制为"在空选区时禁用。
-fn cell_item_disabled(id: &str, needs_write: bool, state: CellMenuState) -> bool {
-    (needs_write && !state.writable) || (CopyFormat::from_command(id).is_some() && !state.has_selection)
-}
-
 /// 表头菜单需要的状态：当前排序方向、能不能再藏一列、有没有冻结、哪些列被藏了。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ColumnMenuState {
@@ -5061,165 +5099,6 @@ fn column_item_disabled(id: &str, state: &ColumnMenuState) -> bool {
     }
 }
 
-fn grid_click(owner: Option<gpui_kit::WeakEntity<GridPane>>, id: &'static str) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
-    move |_, _, cx| {
-        if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
-            owner.update(cx, |pane, cx| {
-                let _ = pane.command(id, cx);
-                cx.notify();
-            });
-        }
-    }
-}
-
-/// 禁用的写入项仍留在菜单里，悬停说明原因。
-fn grid_item(locale: Locale, key: &'static str, id: &'static str, disabled: bool, reason: Option<String>, owner: Option<gpui_kit::WeakEntity<GridPane>>) -> PopupMenuItem {
-    let label = menu_label(locale, key, id);
-    if disabled {
-        let reason = reason.unwrap_or_default();
-        PopupMenuItem::element(move |_, cx| {
-            let p = Palette::of(cx);
-            div()
-                .id(SharedString::from(format!("grid-menu-{id}")))
-                .test_support()
-                .w_full()
-                .px(px(8.))
-                .py(px(4.))
-                .text_size(px(TypeScale::SM))
-                .text_color(p.text_faint)
-                .child(label.clone())
-                .tooltip_text(SharedString::from(reason.clone()))
-        })
-        .disabled(true)
-    } else {
-        PopupMenuItem::new(label).on_click(grid_click(owner, id))
-    }
-}
-
-fn write_reason_for(needs_write: bool, state: CellMenuState, write_reason: &str, locale: Locale, id: &str) -> Option<String> {
-    if cell_item_disabled(id, needs_write, state) && needs_write && !state.writable {
-        let reason = if write_reason.is_empty() { i18n::text(locale, "grid.status.readonly") } else { write_reason.to_owned() };
-        Some(reason)
-    } else if CopyFormat::from_command(id).is_some() && !state.has_selection {
-        Some(i18n::text(locale, "grid.copyAs.empty"))
-    } else {
-        None
-    }
-}
-
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn cell_menu(
-    menu: PopupMenu,
-    owner: Option<gpui_kit::WeakEntity<GridPane>>,
-    locale: Locale,
-    state: CellMenuState,
-    write_reason: String,
-    cell_dirty: bool,
-    row_dirty: bool,
-    window: &mut Window,
-    cx: &mut Context<TableState<SheetDelegate>>,
-) -> PopupMenu {
-    let reason_text = write_reason.clone();
-    let reason = move |needs_write: bool, id: &str| write_reason_for(needs_write, state, &reason_text, locale, id);
-    let item = |menu: PopupMenu, key: &'static str, id: &'static str, needs_write: bool| {
-        let disabled = cell_item_disabled(id, needs_write, state);
-        menu.item(grid_item(locale, key, id, disabled, reason(needs_write, id), owner.clone()))
-    };
-    // 常用在上：复制 → 编辑 → 筛选/导航 → 子菜单；每组之间用分隔线。
-    let mut menu = item(menu, "grid.menu.copySelection", "copy-region", false);
-    menu = menu.separator();
-    menu = item(menu, "grid.menu.editCell", "edit-cell", true);
-    menu = item(menu, "grid.value.null", "grid-set-null", true);
-    menu = item(menu, "grid.value.openFull", "grid-value-open", false);
-    if cell_dirty {
-        menu = item(menu, "grid.write.undoCell", "grid-undo-cell", false);
-    }
-    menu = menu.separator();
-    menu = item(menu, "grid.menu.filterByValue", "grid-filter-value", false);
-    if state.fk {
-        menu = item(menu, "grid.fk.jump", "grid-fk-jump", false);
-        menu = item(menu, "grid.fk.select", "grid-fk-select", false);
-    }
-    menu = menu.separator();
-    let row_menu = PopupMenu::build(window, cx.deref_mut(), {
-        let owner = owner.clone();
-        let write_reason = write_reason.clone();
-        move |menu, _, _| {
-            let mut menu = menu;
-            for (key, id, needs_write) in [
-                ("grid.action.insert", "grid-insert", true),
-                ("grid.write.clone", "grid-clone-row", true),
-                ("grid.write.setValue", "grid-selection-set", true),
-                ("grid.write.undoRow", "grid-undo-row", false),
-                ("grid.menu.markDelete", "mark-delete", true),
-            ] {
-                let disabled = cell_item_disabled(id, needs_write, state) || (id == "grid-undo-row" && !row_dirty);
-                let why = if id == "grid-undo-row" && !row_dirty {
-                    None
-                } else {
-                    write_reason_for(needs_write, state, &write_reason, locale, id)
-                };
-                menu = menu.item(grid_item(locale, key, id, disabled, why, owner.clone()));
-            }
-            if state.dirty {
-                menu = menu.separator().item(grid_item(locale, "grid.menu.undo", "grid-undo", false, None, owner.clone()));
-            }
-            menu
-        }
-    });
-    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.rowOps")), row_menu));
-    let copy_menu = PopupMenu::build(window, cx.deref_mut(), {
-        let owner = owner.clone();
-        let write_reason = write_reason.clone();
-        move |menu, _, _| {
-            let mut menu = menu;
-            for (key, id, needs_write) in [
-                ("grid.copyAs.value", "copy-region", false),
-                ("grid.copyAs.tsv", "grid-copy-as-tsv", false),
-                ("grid.copyAs.csv", "grid-copy-as-csv", false),
-                ("grid.copyAs.json", "grid-copy-as-json", false),
-                ("grid.copyAs.markdown", "grid-copy-as-markdown", false),
-                ("grid.copyAs.sqlLiteral", "copy-sql-value", false),
-                ("grid.copyAs.insert", "grid-copy-as-insert", false),
-            ] {
-                let disabled = cell_item_disabled(id, needs_write, state);
-                menu = menu.item(grid_item(locale, key, id, disabled, write_reason_for(needs_write, state, &write_reason, locale, id), owner.clone()));
-            }
-            menu
-        }
-    });
-    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.copyAs")), copy_menu));
-    let sql_menu = PopupMenu::build(window, cx.deref_mut(), {
-        let owner = owner.clone();
-        move |menu, _, _| {
-            let mut menu = menu;
-            for (key, id) in [
-                ("grid.sql.whereCell", "grid-copy-where"),
-                ("grid.sql.whereRow", "grid-copy-row-where"),
-                ("grid.sql.whereColumn", "grid-copy-column-where"),
-                ("grid.sql.select", "grid-sql-select"),
-                ("grid.sql.update", "grid-sql-update"),
-            ] {
-                menu = menu.item(grid_item(locale, key, id, false, None, owner.clone()));
-            }
-            menu
-        }
-    });
-    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.generateSql")), sql_menu));
-    let tools = PopupMenu::build(window, cx.deref_mut(), {
-        let owner = owner.clone();
-        move |menu, _, _| {
-            let mut menu = menu.item(grid_item(locale, "grid.record.open", "grid-record-toggle", false, None, owner.clone()));
-            if state.unresolved > 0 {
-                menu = menu.item(grid_item(locale, "grid.action.readFull", "grid-full-values", false, None, owner.clone()));
-            }
-            menu
-        }
-    });
-    menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.moreTools")), tools))
-}
-
 #[inline(never)]
 fn column_menu(
     menu: PopupMenu,
@@ -5237,6 +5116,7 @@ fn column_menu(
         ("column-clear-sort", "grid.menu.clearSort"),
         ("column-filter", "grid.menu.filterColumn"),
         ("column-fit", "grid.column.fit"),
+        ("column-copy-name", "grid.menu.copyColumnName"),
     ] {
         let item_owner = owner.clone();
         let current = matches!((id, state.sorted), ("column-sort-asc", Some(false)) | ("column-sort-desc", Some(true)));
@@ -5537,12 +5417,20 @@ impl TableDelegate for SheetDelegate {
                 })
             })
             // 右键：表格组件随后会在格子上截住这次右键并选中该格；菜单由外壳在指针处弹出。
+            // 行号格是行头：整行选中，弹出整行的菜单；数据格弹出这一格的菜单。
             .when_some(self.owner.clone(), |this, owner| {
                 this.on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
                     let Some(pane) = owner.upgrade() else { return };
                     let sink = pane.update(cx, |pane, cx| {
-                        if let Some(column) = logical {
-                            pane.select_for_menu(row_ix, column, cx);
+                        match logical {
+                            Some(column) => {
+                                pane.set_menu_area(GridMenuArea::Cell);
+                                pane.select_for_menu(row_ix, column, cx);
+                            }
+                            None => {
+                                pane.set_menu_area(GridMenuArea::RowHeader);
+                                pane.select_row_for_menu(row_ix, cx);
+                            }
                         }
                         pane.menu_sink()
                     });
@@ -5673,9 +5561,23 @@ impl TableDelegate for SheetDelegate {
             .into_any_element()
     }
 
-    fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, window: &mut Window, cx: &mut Context<TableState<Self>>) -> PopupMenu {
-        let state = CellMenuState { writable: self.writable, dirty: self.dirty, fk: self.fk, unresolved: self.unresolved, has_selection: self.has_selection };
-        cell_menu(menu, self.owner.clone(), self.locale, state, self.write_reason.clone(), self.cell_dirty, self.row_dirty, window, cx)
+    /// 行上不在格子里的右键（行尾空白）：与行号格一样是整行菜单，同样交给外壳弹出。
+    /// 网格只有外壳这一套右键菜单，表格组件自己的行菜单不再使用。
+    fn render_tr(&mut self, row_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let row = div().id(("row", row_ix));
+        let Some(owner) = self.owner.clone() else { return row };
+        row.on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+            let Some(pane) = owner.upgrade() else { return };
+            let sink = pane.update(cx, |pane, cx| {
+                pane.set_menu_area(GridMenuArea::RowHeader);
+                pane.select_row_for_menu(row_ix, cx);
+                pane.menu_sink()
+            });
+            if let Some(sink) = sink {
+                cx.stop_propagation();
+                sink(event.position, cx);
+            }
+        })
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, cx: &App) -> Option<SharedString> {
@@ -8713,11 +8615,10 @@ mod workbench_tests {
         });
         assert_eq!(notice, i18n::text(Locale::ZhCn, "grid.copyAs.empty"));
         assert_eq!(clipboard(cx).as_deref(), Some("原内容"));
-        let empty = CellMenuState { writable: true, has_selection: false, ..CellMenuState::default() };
-        for format in CopyFormat::ALL {
-            assert!(cell_item_disabled(format.command(), false, empty), "{format:?}");
-            assert!(!cell_item_disabled(format.command(), false, CellMenuState { has_selection: true, ..empty }), "{format:?}");
-        }
+        // 外壳菜单按现场事实禁用“复制为”：空选区时事实里没有选区。
+        assert!(!cx.update(|cx| pane.read(cx).menu_facts().has_selection));
+        cx.update(|cx| pane.update(cx, |pane, _| pane.session.select(0, 0, false)));
+        assert!(cx.update(|cx| pane.read(cx).menu_facts().has_selection));
         // 2 行 × 3 列：逐格式核对剪贴板文本。
         let expected = [
             ("grid-copy-as-tsv", "id\tname\tnote\n1\t\"a,\"\"b\"\"\"\tNULL\n2\t乙\tx"),
@@ -9402,11 +9303,10 @@ mod workbench_tests {
         let (dirty, notice) = cx.update(|cx| (pane.read(cx).session.uncommitted(), pane.read(cx).notice.clone()));
         assert!(!dirty);
         assert!(notice.contains(&i18n::text(Locale::ZhCn, "grid.readonly.aggregate")), "{notice}");
-        let readonly = CellMenuState { writable: false, has_selection: true, ..CellMenuState::default() };
-        for id in ["grid-paste", "grid-clone-row", "grid-selection-set", "grid-selection-null"] {
-            let needs_write = CELL_MENU.iter().find(|item| item.0 == id).map(|item| item.2).unwrap();
-            assert!(cell_item_disabled(id, needs_write, readonly), "{id}");
-        }
+        // 外壳菜单据此禁用写入项，悬停说明用的就是会话给出的具体只读原因。
+        let facts = cx.update(|cx| pane.read(cx).menu_facts());
+        assert!(!facts.writable);
+        assert_eq!(facts.readonly_reason, i18n::text(Locale::ZhCn, "grid.readonly.aggregate"));
     }
 
     /// 编辑栏里的 Ctrl/⌘+V 仍由文本输入自己粘贴，网格不接管，也不产生批量暂存。

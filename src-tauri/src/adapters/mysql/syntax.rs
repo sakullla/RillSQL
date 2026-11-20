@@ -93,6 +93,17 @@ impl SqlSyntax for MysqlSyntax {
         }
     }
 
+    /// MySQL 8.0.16 起才有 `FORMAT=TREE`；更低版本或版本未知时用传统表格格式。MariaDB 始终用 JSON。
+    fn explain_for(&self, body: &str, server_version: Option<&str>) -> String {
+        if self.mariadb || body.to_ascii_uppercase().starts_with("EXPLAIN") {
+            return self.explain(body);
+        }
+        match server_version.and_then(version_triple) {
+            Some(version) if version >= (8, 0, 16) => self.explain(body),
+            _ => format!("EXPLAIN {body}"),
+        }
+    }
+
     fn parse_plan(&self, _sql: &str, explained: bool, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
         if !explained {
             return None;
@@ -103,6 +114,17 @@ impl SqlSyntax for MysqlSyntax {
     fn functions(&self) -> &'static [FunctionSig] {
         super::functions::MYSQL
     }
+}
+
+/// 从版本说明（如 `8.0.36`、`5.7.44-log`、`8.0.36 · 说明`）读出主、次、修订号；读不出返回 None。
+pub(in crate::adapters) fn version_triple(text: &str) -> Option<(u32, u32, u32)> {
+    let start = text.find(|ch: char| ch.is_ascii_digit())?;
+    let head: String = text[start..].chars().take_while(|ch| ch.is_ascii_digit() || *ch == '.').collect();
+    let mut parts = head.split('.').filter(|part| !part.is_empty()).map(|part| part.parse::<u32>().ok());
+    let major = parts.next()??;
+    let minor = parts.next().flatten().unwrap_or(0);
+    let patch = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, patch))
 }
 
 /// MySQL 8.x 保留字并入 MariaDB 保留字；另含 USER（保守起见）。按字母序。

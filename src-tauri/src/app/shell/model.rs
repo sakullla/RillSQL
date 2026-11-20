@@ -434,6 +434,8 @@ pub struct WorkbenchModel {
     pub grid_writable: bool,
     /// 打开网格菜单那一刻从活动网格读到的现场事实。
     pub grid_menu: super::menus::GridMenuFacts,
+    /// 结果区菜单的现场事实（由视图在打开前填好）。
+    pub results_menu: super::menus::ResultsMenuFacts,
     /// 网格暂存不进 app-state.json，但窗口关闭仍要看见它。
     pub grid_dirty: bool,
     pub startup_warning: Option<String>,
@@ -610,6 +612,7 @@ impl WorkbenchModel {
             import_notes: Vec::new(),
             grid_writable: false,
             grid_menu: super::menus::GridMenuFacts::default(),
+            results_menu: super::menus::ResultsMenuFacts::default(),
             grid_dirty: false,
             startup_warning: None,
             tool: WorkTool::Query,
@@ -1240,6 +1243,7 @@ impl WorkbenchModel {
             "menu-grid" => self.open_grid_menu(),
             "menu-tab" => self.open_tab_menu(),
             "menu-editor" => self.open_editor_menu(),
+            "menu-results" => self.open_results_menu(),
             "menu-connection" => self.open_connection_menu(),
             "menu-explorer-connection" => self.open_explorer_connection_menu(),
             "menu-history" => self.open_history_menu(),
@@ -2208,6 +2212,13 @@ impl WorkbenchModel {
         self.open_menu(MenuPlace::Editor, MenuTarget::QueryTab);
     }
 
+    /// 查询结果区（页签头、消息页、语句状态、收起细栏）右键：复制、全屏、收起、关闭结果。
+    pub fn open_results_menu(&mut self) {
+        self.open_menu(MenuPlace::Results, MenuTarget::QueryTab);
+        let items = super::menus::results_items(&self.results_menu);
+        self.menu = Some(OpenMenu::with_items(MenuPlace::Results, items));
+    }
+
     pub fn open_tab_menu(&mut self) {
         self.open_menu(MenuPlace::TabBar, MenuTarget::QueryTab);
     }
@@ -2235,6 +2246,16 @@ impl WorkbenchModel {
     pub fn open_tree_menu(&mut self, object: bool) {
         let target = if object { MenuTarget::Object } else { MenuTarget::Connection };
         self.open_menu(MenuPlace::ObjectTree, target);
+    }
+
+    /// 只关右键菜单（滚动、切换标签、窗口失焦、右键点遮罩）：焦点回到打开菜单前的位置，其它浮层不动。
+    pub fn close_menu(&mut self) -> bool {
+        self.nav_menu_node = None;
+        if self.menu.take().is_some() {
+            self.shell.focus = self.menu_return;
+            return true;
+        }
+        false
     }
 
     pub fn dismiss(&mut self) -> Effect {
@@ -5070,6 +5091,10 @@ impl WorkbenchModel {
     }
 
     fn show_item(&mut self, id: &str, kind: WorkItemKind, spec: Option<String>) {
+        // 换到别的工作项时，打开着的右键菜单属于上一个工作项：直接关掉，不让它的动作落到新标签上。
+        if self.active_tab.as_deref() != Some(id) {
+            self.close_menu();
+        }
         self.active_tab = Some(id.to_owned());
         self.tool = kind.tool();
         self.shell.page = kind.page();

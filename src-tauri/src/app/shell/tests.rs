@@ -262,6 +262,7 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
             MenuPlace::HistoryEntry => MenuTarget::Run,
             // 分组菜单由模型用 with_items 现算，不在这份通用表里。
             MenuPlace::ExplorerGroup => MenuTarget::Connection,
+            MenuPlace::Results => MenuTarget::QueryTab,
         };
         let items = menu_items(place, target);
         assert!(!items.is_empty(), "{place:?}");
@@ -12894,4 +12895,110 @@ fn enter_without_an_explorer_row_is_a_no_op_not_a_recursion() {
     model.nav.set_focus("missing-node");
     assert!(model.explorer_current_row().is_none());
     assert_eq!(model.nav_key(NavKey::Enter), None);
+}
+
+/// 结果区（页签头、消息页）右键弹结果区菜单而不是编辑器菜单；菜单在右键点遮罩、滚动、
+/// 切换标签时关闭；结果区菜单的“全屏”转发到当前查询标签。
+#[gpui_kit::test]
+fn result_area_right_click_opens_its_own_menu_and_menus_close_on_scroll_right_click_and_tab_switch(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-results-menu-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let place = |view: &gpui_kit::Entity<super::view::Workbench>, cx: &mut gpui_kit::App| view.read(cx).model.menu.as_ref().map(|menu| menu.place);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            view.perform("new-query", cx);
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.plant_query_result(vec!["id".into()], vec![vec!["1".into()], vec!["2".into()]], cx));
+        window.render_frame(cx);
+        // 结果页签头右键：结果区菜单。
+        window.right_click("query-results-head", cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), Some(MenuPlace::Results));
+        let ids: Vec<&str> = view.read(cx).model.menu.as_ref().unwrap().items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec!["result-copy-sql", "result-copy-messages", "result-maximize", "result-collapse", "result-close"]);
+        // 右键点遮罩：菜单关闭，不再弹别的菜单。
+        window.right_click("context-backdrop", cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), None, "右键点遮罩关闭菜单");
+        // 滚动：菜单关闭。
+        window.right_click("query-results-head", cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), Some(MenuPlace::Results));
+        window.scroll("context-backdrop", gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., 3.)), cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), None, "滚动关闭菜单");
+        // 消息页同样是结果区菜单。
+        view.update(cx, |view, cx| view.perform("query-view:messages", cx));
+        window.render_frame(cx);
+        window.right_click("query-log", cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), Some(MenuPlace::Results), "消息区右键不再落到编辑器菜单");
+        // 切换标签：菜单关闭。
+        view.update(cx, |view, cx| view.perform("next-tab", cx));
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), None, "切换标签关闭菜单");
+        // 编辑器里右键仍是编辑器菜单。
+        view.update(cx, |view, cx| view.perform("menu-editor", cx));
+        assert_eq!(place(&view, cx), Some(MenuPlace::Editor));
+        assert!(view.update(cx, |view, _| view.model.close_menu()));
+        assert_eq!(place(&view, cx), None);
+        // 结果区菜单的“收起”经外壳转发到当前查询标签。
+        view.update(cx, |view, cx| view.perform("result-collapse", cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).query.read(cx).result_layout(), crate::app::views::query::ResultLayout::Collapsed);
+        assert!(window.try_find("query-results-collapsed").is_some());
+        window.right_click("query-results-collapsed", cx);
+        window.render_frame(cx);
+        assert_eq!(place(&view, cx), Some(MenuPlace::Results), "收起细栏右键也是结果区菜单");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只读查询结果的单元格右键：写入项保留但禁用，悬停说明会话给出的具体原因；行号格右键是整行菜单。
+#[gpui_kit::test]
+fn query_result_cell_and_row_header_menus_differ_and_explain_readonly(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-grid-areas-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.plant_query_result(vec!["id".into(), "name".into()], vec![vec!["1".into(), "a".into()], vec!["2".into(), "b".into()]], cx));
+        window.render_frame(cx);
+        window.right_click(gpui_kit::ElementId::named_usize("grid-cell-1", 1), cx);
+        window.render_frame(cx);
+        let cell: Vec<(String, bool, Option<String>)> = view
+            .read(cx)
+            .model
+            .menu
+            .as_ref()
+            .expect("单元格菜单")
+            .items
+            .iter()
+            .map(|item| (item.id.to_owned(), item.enabled, item.reason.clone()))
+            .collect();
+        assert_eq!(view.read(cx).model.menu.as_ref().map(|menu| menu.place), Some(MenuPlace::Grid));
+        let edit = cell.iter().find(|item| item.0 == "edit-cell").expect("只读结果也列出编辑");
+        assert!(!edit.1);
+        assert!(edit.2.as_deref().is_some_and(|reason| !reason.is_empty()), "禁用原因来自会话：{edit:?}");
+        assert!(cell.iter().any(|item| item.0 == "grid-filter-value"));
+        assert!(window.try_find("ctx-edit-cell").is_some());
+        view.update(cx, |view, _| {
+            view.model.close_menu();
+        });
+        window.render_frame(cx);
+        window.right_click(gpui_kit::ElementId::named_usize("grid-cell-0", 0), cx);
+        window.render_frame(cx);
+        let row: Vec<&str> = view.read(cx).model.menu.as_ref().expect("行头菜单").items.iter().map(|item| item.id).collect();
+        assert!(row.contains(&"grid-record-toggle") && row.contains(&"mark-delete"), "{row:?}");
+        assert!(!row.contains(&"edit-cell") && !row.contains(&"grid-filter-value"), "行头没有按格的动作：{row:?}");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

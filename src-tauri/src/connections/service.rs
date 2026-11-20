@@ -123,6 +123,8 @@ struct LiveEntry {
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
     health: Arc<SessionHealth>,
+    /// 连接阶段读到的服务器版本说明；没有读到时为 None。
+    server_version: Option<String>,
 }
 
 /// 会话健康状态（R4）。执行路径通过 `CancelTransport` 报告断线类错误（suspect），
@@ -928,6 +930,11 @@ impl Service {
             if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
             let health = Arc::new(SessionHealth::default());
             // 探针驱动的测试连接没有真实驱动句柄，也没有取消通道。
+            let server_version = match &attempt.remote {
+                Remote::Done { version } => Some(version.clone()),
+                _ => attempt.opened.as_ref().map(|opened| opened.version.clone()),
+            }
+            .filter(|version| !version.trim().is_empty());
             let (session, cancel): (Arc<dyn LiveSession>, CancelTransport) = match attempt.opened.take() {
                 Some(opened) => (opened.session, CancelTransport::new(opened.canceller, Arc::clone(&health))),
                 None => (Arc::new(ScriptedSession), CancelTransport::default()),
@@ -940,6 +947,7 @@ impl Service {
                     foreign_keys,
                     cancel,
                     health,
+                    server_version,
                 },
             );
             // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
@@ -1023,7 +1031,12 @@ impl Service {
         })
     }
 
-    pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
+    /// 打开会话时读到的服务器版本说明（如 `8.0.36`）；会话未打开或没有读到时为 None。
+    pub fn server_version(&self, id: &str) -> Option<String> {
+        self.sessions.lock().expect("sessions").get(id).and_then(|session| session.server_version.clone())
+    }
+
+        pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
         self.sessions.lock().expect("sessions").get(id).map(|session| session.cancel.clone())
     }
 

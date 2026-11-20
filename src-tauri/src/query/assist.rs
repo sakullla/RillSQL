@@ -606,10 +606,38 @@ pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &s
     if report.pieces.len() > 1 {
         return Err(key_text("query.plan.multiple"));
     }
+    if let Some(reason) = unexplainable(&report.pieces[0].text) {
+        return Err(reason);
+    }
     Ok((report.pieces[0].text.clone(), pick.1, pick.2))
 }
 
-pub fn explain_sql(engine: &str, statement: &str) -> Result<String, String> {
+/// 不能看执行计划的语句（DDL、DCL、会话与事务控制）。在本地直接拒绝并说明原因，不发给服务器。
+const UNEXPLAINABLE: &[&str] = &[
+    "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "GRANT", "REVOKE", "SET", "RESET", "USE", "BEGIN", "START",
+    "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "LOCK", "UNLOCK", "FLUSH", "KILL", "SHOW", "DESCRIBE", "DESC", "OPTIMIZE",
+    "REPAIR", "VACUUM", "REINDEX", "CLUSTER", "DECLARE", "PREPARE", "DEALLOCATE", "INSTALL", "UNINSTALL", "SHUTDOWN", "LOAD",
+];
+
+/// 语句首个关键字属于 [`UNEXPLAINABLE`] 时返回拒绝说明。
+pub fn unexplainable(statement: &str) -> Option<String> {
+    let keyword = split::first_keyword(statement);
+    if !UNEXPLAINABLE.contains(&keyword.as_str()) {
+        return None;
+    }
+    Some(crate::i18n::fill(&key_text("query.plan.unexplainable"), &[("keyword", &keyword)]))
+}
+
+/// 按服务器版本把语句包成只看执行计划的语句；`server_version` 未知时由方言选择保守格式。
+pub fn explain_sql_for(engine: &str, statement: &str, server_version: Option<&str>) -> Result<String, String> {
+    let body = checked_explain_body(engine, statement)?;
+    let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
+        return Err(key_text("query.errors.unknownDialect"));
+    };
+    Ok(syntax.explain_for(body, server_version))
+}
+
+fn checked_explain_body<'a>(engine: &str, statement: &'a str) -> Result<&'a str, String> {
     if !known_sql_engine(engine) {
         return Err(key_text("query.errors.unknownDialect"));
     }
@@ -620,10 +648,10 @@ pub fn explain_sql(engine: &str, statement: &str) -> Result<String, String> {
     if has_analyze(body, engine) {
         return Err(key_text("query.plan.noAnalyze"));
     }
-    let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
-        return Err(key_text("query.errors.unknownDialect"));
-    };
-    Ok(syntax.explain(body))
+    if let Some(reason) = unexplainable(body) {
+        return Err(reason);
+    }
+    Ok(body)
 }
 
 pub fn sql_save_name() -> String {
@@ -1739,11 +1767,49 @@ mod tests {
         assert_eq!(expand_star("sqlite", "SELECT *, COUNT(*) FROM t", &sources, true).sql, "SELECT id, name, COUNT(*) FROM t");
         assert_eq!(expand_star("sqlite", "SELECT COUNT(*) FROM t", &sources, true).sql, "SELECT COUNT(*) FROM t");
         assert_eq!(expand_star("sqlite", "SELECT * FROM t", &[], true).sql, "SELECT * FROM t");
-        let plan = explain_sql("sqlite", "SELECT * FROM t").unwrap();
+        let plan = explain_sql_for("sqlite", "SELECT * FROM t", None).unwrap();
         assert!(plan.starts_with("EXPLAIN QUERY PLAN"));
-        assert!(explain_sql("sqlite", "EXPLAIN ANALYZE SELECT 1").is_err());
+        assert!(explain_sql_for("sqlite", "EXPLAIN ANALYZE SELECT 1", None).is_err());
         let lint = lint_sql("select 'abc", "sqlite");
         assert_eq!(lint[0].message_key, "query.split.quoteUnclosed");
+    }
+
+    #[test]
+    fn explain_rejects_statements_without_a_plan_locally() {
+        for sql in [
+            "CREATE TABLE t (id int)",
+            "alter table t add column x int",
+            "DROP TABLE t",
+            "truncate t",
+            "GRANT SELECT ON db.* TO 'u'@'%'",
+            "SET @a = 1",
+            "/* c */ create index i on t(a)",
+        ] {
+            let reason = plan_statement(sql, 0, sql.len(), 0, "mysql").expect_err(sql);
+            assert!(reason.contains(&split::first_keyword(sql)), "{sql}: {reason}");
+            assert!(explain_sql_for("mysql", sql, Some("8.0.36")).is_err(), "{sql}");
+        }
+        for sql in ["SELECT 1", "with x as (select 1) select * from x", "update t set a = 1", "delete from t", "insert into t values (1)"] {
+            assert!(plan_statement(sql, 0, 0, 0, "mysql").is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_explain_format_follows_server_version() {
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", Some("8.0.16")).unwrap(), "EXPLAIN FORMAT=TREE SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", Some("8.4.3")).unwrap(), "EXPLAIN FORMAT=TREE SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", Some("9.1.0")).unwrap(), "EXPLAIN FORMAT=TREE SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1;", Some("8.0.15")).unwrap(), "EXPLAIN SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", Some("5.7.44-log")).unwrap(), "EXPLAIN SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", None).unwrap(), "EXPLAIN SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "SELECT 1", Some("未知版本")).unwrap(), "EXPLAIN SELECT 1");
+        assert_eq!(
+            explain_sql_for("mysql", "SELECT 1", Some("8.0.36 · 服务器横幅是 MariaDB，这条连接仍保持为 MySQL")).unwrap(),
+            "EXPLAIN FORMAT=TREE SELECT 1"
+        );
+        assert_eq!(explain_sql_for("mariadb", "SELECT 1", Some("10.11.6-MariaDB")).unwrap(), "EXPLAIN FORMAT=JSON SELECT 1");
+        assert_eq!(explain_sql_for("mariadb", "SELECT 1", None).unwrap(), "EXPLAIN FORMAT=JSON SELECT 1");
+        assert!(explain_sql_for("sqlite", "SELECT 1", Some("3.45")).unwrap().starts_with("EXPLAIN QUERY PLAN"));
     }
 
     #[test]

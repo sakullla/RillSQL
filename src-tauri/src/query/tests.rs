@@ -463,6 +463,7 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     desk.import_tab("a", "select 1", Some(target.clone()));
     desk.import_tab("b", "select 2", Some(target));
@@ -1662,6 +1663,7 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     desk.import_tab("a", draft, Some(target));
     desk.focus_tab(Some("a"));
@@ -1757,6 +1759,7 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     let tasks = TaskBoard::new();
     let values: HashMap<String, String> = [("id".to_owned(), "42".to_owned())].into_iter().collect();
@@ -2005,6 +2008,7 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     let tasks = TaskBoard::new();
     let mut desk = Desk::new();
@@ -2099,6 +2103,7 @@ fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     let tasks = TaskBoard::new();
     let mut desk = Desk::new();
@@ -2136,6 +2141,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     };
     let tasks = TaskBoard::new();
     let mut desk = Desk::new();
@@ -2173,6 +2179,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         engine: "sqlite".to_owned(),
         schema: String::new(),
         environment: String::new(),
+        server_version: None,
     }));
     desk.focus_tab(Some("b"));
     desk.plant_run(vec![StatementView {
@@ -2418,4 +2425,76 @@ fn single_table_proof_reads_quoted_names_and_dialect_strings() {
     // 切分同样按 MySQL 的反斜杠转义：字符串里的分号不切开语句；PG 不认反斜杠转义。
     assert_eq!(split::split_sql("mysql", "SELECT 'a\\'; b' FROM t; SELECT 2").pieces.len(), 2);
     assert_eq!(split::split_sql("postgres", "SELECT 'a\\'; SELECT 2").pieces.len(), 2);
+}
+
+/// 执行计划按目标连接的服务器版本选格式：MySQL 8.0.16 起用 TREE，更低或未知用传统 EXPLAIN；
+/// 不能看计划的语句在本地拒绝，不发送；版本只更新绑定同一连接的标签。
+#[test]
+fn explain_uses_the_target_server_version_and_refuses_ddl_locally() {
+    use crate::query::desk::{Desk, Target};
+    let target = |connection: &str| Target {
+        connection_id: connection.to_owned(),
+        connection_name: connection.to_owned(),
+        database: "shop".to_owned(),
+        engine: "mysql".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+        server_version: None,
+    };
+    let mut desk = Desk::new();
+    desk.import_tab("a", "SELECT * FROM orders", Some(target("m8")));
+    desk.import_tab("b", "SELECT * FROM orders", Some(target("m5")));
+    desk.focus_tab(Some("a"));
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN SELECT * FROM orders", "版本未知时用传统格式");
+    desk.set_server_version("m8", Some("8.0.36".to_owned()));
+    desk.set_server_version("m5", Some("5.7.44-log".to_owned()));
+    assert_eq!(desk.target().and_then(|target| target.server_version).as_deref(), Some("8.0.36"));
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN FORMAT=TREE SELECT * FROM orders");
+    desk.focus_tab(Some("b"));
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN SELECT * FROM orders", "5.7 没有 TREE 格式");
+    desk.set_server_version("m5", Some("8.0.15".to_owned()));
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN SELECT * FROM orders", "8.0.15 仍是传统格式");
+    desk.set_server_version("m5", Some("8.0.16".to_owned()));
+    assert_eq!(desk.explain_active().unwrap(), "EXPLAIN FORMAT=TREE SELECT * FROM orders");
+    for ddl in ["CREATE TABLE t (id int)", "ALTER TABLE t ADD c int", "DROP TABLE t", "TRUNCATE TABLE t", "GRANT ALL ON *.* TO u", "SET NAMES utf8mb4"] {
+        desk.set_draft(ddl);
+        let reason = desk.explain_active().expect_err(ddl);
+        assert!(reason.contains(&split::first_keyword(ddl)), "{ddl}: {reason}");
+    }
+}
+
+/// 关闭结果清掉这一批语句结果，消息与固定结果保留；执行中或没有结果时不做任何事。
+#[test]
+fn closing_results_keeps_messages_and_pins() {
+    use crate::query::desk::{Desk, StatementView};
+    let mut desk = Desk::new();
+    desk.import_tab("a", "select 1", None);
+    desk.focus_tab(Some("a"));
+    assert!(!desk.close_results(), "没有结果时什么也不做");
+    let view = StatementView {
+        sql: "select 1".to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        rewrite_anchor: None,
+        status: "ok".to_owned(),
+        message: String::new(),
+        columns: vec!["1".to_owned()],
+        rows: vec![vec![Some("1".to_owned())]],
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(1),
+        error_at: None,
+        error_code: None,
+        range: None,
+        error_mark: None,
+    };
+    desk.plant_run(vec![view]);
+    assert!(desk.pin_current().is_some());
+    let _ = desk.set_result_view(crate::query::desk::ResultView::Current);
+    let generation = desk.view_gen();
+    assert!(desk.close_results());
+    assert!(desk.results().is_empty());
+    assert_eq!(desk.pinned().len(), 1, "固定结果保留");
+    assert_eq!(desk.log().len(), 1, "消息保留");
+    assert!(desk.view_gen() > generation, "表格重新绑定");
 }

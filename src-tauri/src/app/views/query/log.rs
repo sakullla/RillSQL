@@ -11,6 +11,7 @@ use crate::i18n::{self, Locale};
 use crate::query::desk::LogEntry;
 use crate::ui::kit::{self, Metrics, Palette, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
+use crate::ui::kit::Tip as _;
 
 use super::{elapsed_label, rewrite_note, QueryPane};
 
@@ -121,6 +122,7 @@ impl LogPanel<'_> {
                 None => i18n::text(locale, "query.log.run"),
             };
             let sql = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let full_sql = entry.sql.trim().to_owned();
             list = list.child(
                 div()
                     .id(SharedString::from(format!("query-log-{index}")))
@@ -167,7 +169,20 @@ impl LogPanel<'_> {
                                     )
                                     .when(!counts.is_empty(), |this| this.child(div().flex_none().text_color(p.text_muted).child(SharedString::from(counts))))
                                     .when_some(entry.elapsed_ms, |this, ms| this.child(div().flex_none().text_color(p.text_faint).child(SharedString::from(elapsed_label(ms)))))
-                                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_color(p.text_faint).child(SharedString::from(sql))),
+                                    // 单行截断的 SQL 悬停显示全文（保留原始换行）。
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("query-log-sql-{index}")))
+                                            .test_support()
+                                            .aria_label(SharedString::from(full_sql.clone()))
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .font_family(self.mono.clone())
+                                            .text_color(p.text_faint)
+                                            .when(!full_sql.is_empty(), |this| this.tooltip_text(SharedString::from(full_sql)))
+                                            .child(SharedString::from(sql)),
+                                    ),
                             )
                             .when(!entry.message.is_empty() && entry.status != "skipped", |this| {
                                 this.child(

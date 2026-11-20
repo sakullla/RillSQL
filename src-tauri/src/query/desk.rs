@@ -37,6 +37,8 @@ pub struct Target {
     pub engine: String,
     pub schema: String,
     pub environment: String,
+    /// 连接时读到的服务器版本说明；执行计划据此选择格式。未连接或没有读到时为 None。
+    pub server_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -529,6 +531,7 @@ impl Desk {
                 engine: engine.to_owned(),
                 schema: String::new(),
                 environment,
+                server_version: None,
             }),
             false,
         )
@@ -546,6 +549,7 @@ impl Desk {
                 engine: object.engine.clone(),
                 schema: object.schema.clone(),
                 environment,
+                server_version: None,
             }),
             false,
         )
@@ -788,6 +792,24 @@ impl Desk {
         Some(id)
     }
 
+    /// 关闭当前结果（结果区右键“关闭结果”）：清掉这一批语句结果，消息与固定结果保留。
+    /// 执行中不关闭，避免迟到的快照又把结果写回来；没有结果时什么也不做。
+    pub fn close_results(&mut self) -> bool {
+        let Some(tab) = self.active_mut() else {
+            return false;
+        };
+        if tab.running || tab.results.is_empty() {
+            return false;
+        }
+        tab.results.clear();
+        tab.result_column_types.clear();
+        tab.results_target = None;
+        tab.results_fresh = false;
+        tab.statement = 0;
+        self.view_gen = self.view_gen.saturating_add(1);
+        true
+    }
+
     /// 关掉一个固定结果；正在看它时回到当前结果。
     pub fn unpin(&mut self, id: u64) -> bool {
         let Some(tab) = self.active_mut() else {
@@ -1008,6 +1030,7 @@ impl Desk {
             engine: link.engine.clone(),
             schema: String::new(),
             environment,
+            server_version: None,
         });
         self.remember_database(database);
         true
@@ -1140,13 +1163,23 @@ impl Desk {
         expanded
     }
 
+    /// 记下连接的服务器版本（来自连接阶段的说明）；所有绑定这条连接的标签同步更新。
+    pub fn set_server_version(&mut self, connection_id: &str, version: Option<String>) {
+        for tab in &mut self.tabs {
+            if let Some(target) = tab.target.as_mut().filter(|target| target.connection_id == connection_id) {
+                target.server_version = version.clone();
+            }
+        }
+    }
+
     pub fn explain_active(&mut self) -> Result<String, String> {
         let Some(tab) = self.active_tab() else {
             return Err(assist_text("query.errors.needTarget"));
         };
         let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
         let (statement, _, _) = assist::plan_statement(&tab.draft, tab.selection.0, tab.selection.1, tab.head, engine)?;
-        let sql = assist::explain_sql(engine, &statement)?;
+        let version = tab.target.as_ref().and_then(|target| target.server_version.as_deref());
+        let sql = assist::explain_sql_for(engine, &statement, version)?;
         if self.active_tab().map(|tab| tab.draft.as_str()) != Some(tab.draft.as_str()) {
             return Err(assist_text("query.errors.unknownDialect"));
         }
