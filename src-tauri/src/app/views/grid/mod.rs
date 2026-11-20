@@ -22,6 +22,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::prelude::FluentBuilder as _;
 
@@ -4039,7 +4040,11 @@ impl GridPane {
                 .with_size(gpui_kit::component::Size::Size(row_height(m)))
                 .header_row_height(row_height(m))
                 .stripe(true)
+                // 横向滚动条不叠在表格上：放到表格下面单独的一条里（见 grid_hscroll_band），
+                // 滚到最底时最后一行不被它压住（ADR-8）。纵向条仍浮在右侧，末列后的留白给它让位。
+                .scrollbar_visible(true, false)
                 .accessibility_label("shared-grid");
+            let hbar = grid_hscroll_band(&table, cx);
             let content = if self.record_open {
                 let width = self.side_width.clamp(RECORD_SIDE_MIN, RECORD_SIDE_MAX);
                 let dragging = self.record_dragging;
@@ -4071,7 +4076,7 @@ impl GridPane {
                             cx.notify();
                         }
                     }))
-                    .child(div().flex_1().min_w(px(0.)).h_full().child(data_table))
+                    .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(div().flex_1().min_h(px(0.)).child(data_table)).child(hbar))
                     .child(kit::resize_handle("grid-record-resize", t("grid.record.open"), dragging, p, move |_, _, cx| {
                         reset.update(cx, |pane, cx| {
                             pane.side_width = RECORD_SIDE_DEFAULT;
@@ -4096,7 +4101,7 @@ impl GridPane {
                         self.format_viewer.clone(),
                     ))
             } else {
-                div().flex_1().min_h(px(0.)).child(data_table)
+                div().flex_1().min_h(px(0.)).flex().flex_col().child(div().flex_1().min_h(px(0.)).child(data_table)).child(hbar)
             };
             // 横向滚动只发生在网格正文里：容器收窄到可用宽度并裁掉溢出，
             // 列再宽也只是表格自己的横向滚动条，不会把查询页/表数据页撑宽。
@@ -4582,7 +4587,7 @@ impl GridPane {
             .aria_label(t("grid.value.copyValue"))
             .flex_none()
             .max_h(px(if embed.is_some() { 460. } else { 180. }))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .px(px(14.))
             .py(px(10.))
             .border_t_1()
@@ -4681,7 +4686,7 @@ impl GridPane {
                             div()
                                 .id("grid-preview-sql")
                                 .max_h(px(280.))
-                                .overflow_y_scroll()
+                                .scroll_area_y()
                                 .p(px(12.))
                                 .rounded(px(Radius::PANEL))
                                 .bg(p.chrome)
@@ -5308,6 +5313,37 @@ fn column_disabled_item(
 }
 
 
+/// 末列之后的留白：纵向滚动条浮在表格右缘（宽 [`Scrollbar::width`]），再多留 8px，
+/// 横向滚到最右时末列（含右对齐的数字）既不贴边也不被滚动条盖住（ADR-8）。
+pub(crate) fn grid_trailing_gap() -> gpui_kit::Pixels {
+    gpui_kit::component::scroll::Scrollbar::width() + px(8.)
+}
+
+/// 表格下方的横向滚动条带：高度等于滚动条宽度，左侧让出冻结列（它们不随横向滚动）。
+/// 与表格的横向滚动句柄同步；不和最后一行重叠。
+fn grid_hscroll_band(table: &Entity<TableState<SheetDelegate>>, cx: &App) -> gpui_kit::AnyElement {
+    use gpui_kit::component::scroll::Scrollbar;
+    let state = table.read(cx);
+    let frozen = state
+        .delegate()
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.2)
+        .map(|(ix, column)| state.col_width(ix).unwrap_or(px(column.1)))
+        .fold(px(0.), |sum, width| sum + width);
+    let handle = state.horizontal_scroll_handle.clone();
+    div()
+        .id("grid-hscroll")
+        .debug_selector(|| "grid-hscroll".to_owned())
+        .flex_none()
+        .relative()
+        .h(Scrollbar::width())
+        .w_full()
+        .child(div().absolute().top_0().bottom_0().right_0().left(frozen).child(Scrollbar::horizontal(&handle).id("grid-hscroll-bar").viewport_from_layout()))
+        .into_any_element()
+}
+
 impl TableDelegate for SheetDelegate {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len().max(1)
@@ -5519,6 +5555,11 @@ impl TableDelegate for SheetDelegate {
             .aria_selected(selected)
             .test_support()
             .into_any_element()
+    }
+
+    fn render_last_empty_col(&mut self, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
+        // 组件默认只留 12px，比浮在右缘的纵向滚动条（16px）还窄：滚到最右时末列被它压住。
+        div().id("grid-trailing-gap").debug_selector(|| "grid-trailing-gap".to_owned()).w(grid_trailing_gap()).h_full().flex_shrink_0()
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
@@ -7036,6 +7077,50 @@ mod pane_tests {
             assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙");
             assert_eq!(pane.session.focus_cell(), Some((1, 1)), "松开后焦点停在拖到的格子");
         });
+    }
+
+    /// ADR-8：宽表横向滚到最右、纵向滚到最底时，末列右侧留出比浮动纵向滚动条更宽的空隙，
+    /// 横向滚动条在表格下方单独一条，不压住最后一行。
+    #[gpui_kit::test]
+    fn wide_table_scrolled_to_the_end_keeps_last_column_and_row_clear_of_scrollbars(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let names: Vec<String> = (0..24).map(|ix| format!("amount_{ix}")).collect();
+        let values: Vec<String> = (0..60).map(|row| format!("{}", 1_000_000 + row)).collect();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let mut columns = vec![("id", "integer")];
+                columns.extend(names.iter().map(|name| (name.as_str(), "integer")));
+                let rows = values
+                    .iter()
+                    .map(|value| std::iter::repeat_n(Some(value.as_str()), names.len() + 1).collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                pane.plant_writable(target(), columns, rows, "id", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let body = visual.debug_bounds("grid-body").expect("网格主体");
+        // 先横向、再纵向各滚到底：滚轮增量远大于内容，由视口夹到最大偏移。
+        for delta in [gpui_kit::point(px(-100_000.), px(0.)), gpui_kit::point(px(0.), px(-100_000.))] {
+            visual.simulate_event(gpui_kit::ScrollEvent { position: body.center(), delta: gpui_kit::ScrollDelta::Pixels(delta), ..Default::default() });
+            visual.run_until_parked();
+            visual.update(|window, cx| window.render_frame(cx));
+        }
+        let last_col = names.len() + 1;
+        let last_row = values.len() - 1;
+        let cell_selector: &'static str = format!("grid-cell-{last_row}-{last_col}").leak();
+        let cell = visual.debug_bounds(cell_selector).expect("末行末列格子已滚进视野");
+        let gap = visual.debug_bounds("grid-trailing-gap").expect("末列后的留白");
+        let band = visual.debug_bounds("grid-hscroll").expect("表格下方的横向滚动条带");
+        let bar = gpui_kit::component::scroll::Scrollbar::width();
+        assert!(gap.size.width >= bar + px(8.), "留白比滚动条宽：{:?}", gap.size.width);
+        // 留白起点就是末列（含格内边距）的右缘：它必须在浮动纵向滚动条占的那一条左边。
+        assert!(gap.left() <= body.right() - bar, "末列不在浮动纵向滚动条下面：列右缘 {:?} 网格右缘 {:?}", gap.left(), body.right());
+        assert!(cell.right() <= gap.left() + px(0.5), "末列之后紧跟留白");
+        assert!(cell.bottom() <= band.top() + px(0.5), "最后一行不被横向滚动条压住：cell {:?} band {:?}", cell.bottom(), band.top());
+        assert_eq!(band.size.height, bar, "横向条带高度就是滚动条宽度");
+        assert!(band.bottom() <= body.bottom() + px(0.5), "条带在网格主体之内");
     }
 
     #[gpui_kit::test]

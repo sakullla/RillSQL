@@ -11,6 +11,7 @@ use gpui_kit::{div, px, relative, AnyElement, Entity, FocusHandle, FontWeight, I
 use crate::i18n::{self, Locale};
 use crate::query::plan::{OpKind, Plan};
 use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
@@ -202,7 +203,7 @@ impl PlanView<'_> {
 
         // 滚动区只放列标题和节点行（子元素 0 是列标题，节点 i 是第 i + 1 个），
         // 焦点与描边在外层容器上，描边不挤占滚动区的可视范围。
-        let mut tree = div().id("query-plan-tree-scroll").track_scroll(&self.scroll).flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut tree = div().id("query-plan-tree-scroll").flex_1().min_h(px(0.)).scroll_area_y().scroll_handle(&self.scroll).flex().flex_col();
         tree = tree.child(
             div()
                 .flex_none()
@@ -335,7 +336,7 @@ impl PlanView<'_> {
             .test_support()
             .aria_label(SharedString::from(node_label(&lines, selected)))
             .flex_none()
-            .overflow_y_scroll()
+            .scroll_area_y()
             .p(px(12.))
             .flex()
             .flex_col()

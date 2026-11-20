@@ -18,6 +18,9 @@ use gpui_kit::{
     div, hsla, px, rgb,
 };
 
+pub use super::scroll_area::{scrollbar_overlay, ScrollAreaExt};
+pub use gpui_kit::component::scroll::ScrollbarAxis;
+
 /// 将较大的元素构建分支放到独立栈帧，降低未优化构建的栈峰值。
 /// 闭包在当前线程立即执行，不分配堆内存；发布构建允许编译器内联。
 #[cfg_attr(debug_assertions, inline(never))]

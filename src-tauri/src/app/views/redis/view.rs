@@ -5,6 +5,7 @@
 //! 写删确认与新建键是盖在面板上的对话框：确认就近出现在视线中央，不再落到底部控制台里。
 
 use super::*;
+use crate::ui::kit::ScrollAreaExt as _;
 use gpui_kit::{hsla, Hsla};
 
 /// 键列表行里键名的等宽字宽估计（12px 等宽字体约 0.6em）。只用来决定中间省略的字符数，
@@ -908,18 +909,29 @@ impl RedisPane {
         // 虚拟列表：只渲染可见行，键数没有上限（内存索引上限由偏好控制）。
         let owner = entity.downgrade();
         let row_entity = entity.clone();
+        // 虚拟列表不是 overflow 容器：在同大小的 relative 父层上叠一条可见滚动条（ADR-8）。
         list.child(
-            gpui_kit::uniform_list("redis-key-rows", visible, move |range, _window, cx| {
-                let rows = Rc::clone(&rows);
-                let templates = templates.clone();
-                let entity = row_entity.clone();
-                owner
-                    .update(cx, |this, cx| {
-                        range.map(|index| this.key_row_element(&rows[index], templates.as_deref(), side_w, &entity, cx)).collect::<Vec<_>>()
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .child(
+                    gpui_kit::uniform_list("redis-key-rows", visible, move |range, _window, cx| {
+                        let rows = Rc::clone(&rows);
+                        let templates = templates.clone();
+                        let entity = row_entity.clone();
+                        owner
+                            .update(cx, |this, cx| {
+                                range.map(|index| this.key_row_element(&rows[index], templates.as_deref(), side_w, &entity, cx)).collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
                     })
-                    .unwrap_or_default()
-            })
-            .flex_1(),
+                    .track_scroll(&self.key_scroll)
+                    .flex_1(),
+                )
+                .child(kit::scrollbar_overlay("redis-key-rows-bar", &self.key_scroll, kit::ScrollbarAxis::Vertical)),
         )
         .into_any_element()
     }
@@ -1753,7 +1765,7 @@ impl RedisPane {
         }
         header = header.child(div().flex_none().w(px(actions_w)));
 
-        let mut body = div().id("redis-entries-scroll").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div().id("redis-entries-scroll").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         if rows.is_empty() {
             let message = if total == 0 { self.text("redis.value.empty") } else { self.text("redis.entry.noMatch") };
             body = body.child(div().px(px(10.)).py(px(8.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(message)));
@@ -2149,7 +2161,7 @@ impl RedisPane {
                             .id("redis-console-output")
                             .test_support()
                             .max_h(px(160.))
-                            .overflow_y_scroll()
+                            .scroll_area_y()
                             .px(px(10.))
                             .pb(px(8.))
                             .font_family(mono.clone())
@@ -2169,7 +2181,7 @@ impl RedisPane {
                 .mx(px(pad))
                 .mt(px(8.))
                 .max_h(px(176.))
-                .overflow_y_scroll()
+                .scroll_area_y()
                 .p(px(4.))
                 .rounded(px(Radius::PANEL))
                 .bg(p.raised)
@@ -2331,7 +2343,7 @@ impl RedisPane {
                     .id("redis-confirm-preview")
                     .test_support()
                     .max_h(px(140.))
-                    .overflow_y_scroll()
+                    .scroll_area_y()
                     .px(px(10.))
                     .py(px(8.))
                     .rounded(px(Radius::CONTROL))

@@ -10,6 +10,7 @@ use gpui_kit::{
 use crate::i18n::{self, Locale};
 use crate::query::desk::LogEntry;
 use crate::ui::kit::{self, Metrics, Palette, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::{elapsed_label, rewrite_note, QueryPane};
 
@@ -81,7 +82,7 @@ impl LogPanel<'_> {
             .aria_label(SharedString::from(heading.clone()))
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .flex()
             .flex_col()
             .bg(p.surface)

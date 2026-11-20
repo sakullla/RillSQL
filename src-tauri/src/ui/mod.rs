@@ -3,6 +3,7 @@ mod format_viewer;
 mod foundation;
 mod grid_proto;
 pub mod kit;
+mod scroll_area;
 pub mod tabs;
 
 pub use editor_proto::{ExecError, ObjectHandler, ObjectLink, SqlEditor};

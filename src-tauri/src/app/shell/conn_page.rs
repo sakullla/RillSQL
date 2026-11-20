@@ -15,6 +15,7 @@ use crate::app::views::connections::LinkStatus;
 use crate::connections::model::TlsMode;
 use crate::connections::ConnectionRecord;
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::chrome::{act, connection_detail, short_path, status_parts};
 use super::model::DraftField;
@@ -274,13 +275,13 @@ impl Workbench {
         let cards = self.model.conn_board_cards && self.model.viewport_width >= 720;
         let mut body = div()
             .id("launcher-scroll")
-            .track_scroll(&self.launcher_scroll)
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.))
             .h_full()
-            .overflow_y_scroll()
+            .scroll_area_y()
+            .scroll_handle(&self.launcher_scroll)
             .px(px(if cards { m.page_pad } else { m.page_pad - 6. }))
             .py(px(if cards { 12. } else { 8. }))
             .gap(px(if cards { 8. } else { 1. }));
@@ -906,7 +907,7 @@ impl Workbench {
     /// 详情栏：所选连接的身份、状态（含失败原因与一键重试）、常用操作、分组切换与配置摘要。
     fn connection_detail_panel(&mut self, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let detail_w = if self.model.viewport_width >= 1080 { 340. } else { DETAIL_W };
-        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(detail_w)).h_full().border_l_1().border_color(p.line).bg(p.chrome).overflow_y_scroll();
+        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(detail_w)).h_full().border_l_1().border_color(p.line).bg(p.chrome).scroll_area_y();
         let Some(row) = self.model.connections.selected.as_ref().and_then(|id| self.model.connections.rows.iter().find(|row| &row.saved.id == id)).cloned() else {
             return panel.child(div().p(px(20.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("conn.page.pickHint"))).into_any_element();
         };
@@ -980,7 +981,7 @@ impl Workbench {
                                 .flex_1()
                                 .min_w(px(0.))
                                 .max_h(px(88.))
-                                .overflow_y_scroll()
+                                .scroll_area_y()
                                 .text_size(px(TypeScale::XS))
                                 .text_color(p.danger)
                                 .child(SharedString::from(reason)),
@@ -1339,7 +1340,7 @@ impl Workbench {
         }
         let editing_id = editing.as_ref().and_then(|draft| draft.id.clone());
         let mut editor = editor;
-        let mut list = div().id("tag-list").flex().flex_col().gap(px(4.)).max_h(px(360.)).overflow_y_scroll();
+        let mut list = div().id("tag-list").flex().flex_col().gap(px(4.)).max_h(px(360.)).scroll_area_y();
         for tag in self.model.env_tags.clone() {
             if editing_id.as_deref() == Some(tag.id.as_str()) {
                 if let Some(editor) = editor.take() {

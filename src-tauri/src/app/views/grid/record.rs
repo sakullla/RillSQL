@@ -9,6 +9,7 @@ use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoEl
 
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::FormatViewer;
 
 use super::session::{type_abbr, CellKind, SharedGrid};
@@ -158,7 +159,7 @@ pub fn render_record(
         .child(kit::icon_button("grid-record-prev", IconName::ChevronUp, t("grid.record.prev"), pane_command(entity, "grid-record-prev")).disabled(!can_prev))
         .child(kit::icon_button("grid-record-next", IconName::ChevronDown, t("grid.record.next"), pane_command(entity, "grid-record-next")).disabled(!can_next))
         .child(kit::icon_button("grid-record-close", IconName::X, t("grid.record.close"), pane_command(entity, "grid-record-close")));
-    let mut body = div().id("grid-record-fields").flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+    let mut body = div().id("grid-record-fields").flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
     match view {
         Some(view) => {
             for field in view.fields {

@@ -29,6 +29,7 @@ use crate::ddl::{
 };
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
+use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
 
 /// 与 `ddl::model::fk_actions` 相同的级联动作。结构页按引擎原样列出（由适配器的类型规则给出）。
@@ -1804,7 +1805,7 @@ impl StructurePane {
         div()
             .id("structure-definition")
             .max_h(px(260.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .p(px(metrics.card_pad()))
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(px(TypeScale::SM))
@@ -3262,7 +3263,7 @@ impl StructurePane {
                             .id("structure-create-live-sql-scroll")
                             .p(px(12.))
                             .max_h(px(180.))
-                            .overflow_y_scroll()
+                            .scroll_area_y()
                             .font_family(mono)
                             .text_size(px(TypeScale::SM))
                             .text_color(if live_sql.is_some() { p.text } else { p.text_faint })
@@ -4307,7 +4308,7 @@ impl StructurePane {
                                             div()
                                                 .id(SharedString::from(format!("structure-trigger-sql-{idx}")))
                                                 .max_h(px(120.))
-                                                .overflow_y_scroll()
+                                                .scroll_area_y()
                                                 .font_family(mono.clone())
                                                 .text_size(px(TypeScale::XS))
                                                 .text_color(p.text_muted)
@@ -4838,9 +4839,10 @@ impl StructurePane {
 
         let mut body = div()
             .id("structure-body")
+            .test_support()
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .p(px(metrics.page_pad))
             .flex()
             .flex_col()
@@ -4920,7 +4922,7 @@ impl StructurePane {
                     .child(SharedString::from(self.session.note())),
             );
         }
-        column = column.child(body.test_support());
+        column = column.child(body);
         if let Some(actions) = self.preview_footer(&entity, &p, locale, metrics) {
             column = column.child(actions);
         }
@@ -5092,7 +5094,7 @@ impl StructurePane {
                             .test_support()
                             .flex_1()
                             .min_h(px(0.))
-                            .overflow_y_scroll()
+                            .scroll_area_y()
                             .px(px(metrics.card_pad()))
                             .py(px(10.))
                             .flex()
@@ -5143,7 +5145,7 @@ impl StructurePane {
                                             div()
                                                 .id("structure-preview-sql")
                                                 .max_h(px(240.))
-                                                .overflow_y_scroll()
+                                                .scroll_area_y()
                                                 .p(px(12.))
                                                 .rounded(px(Radius::PANEL))
                                                 .bg(p.sunken)

@@ -13,6 +13,7 @@ use crate::i18n::{self, Locale};
 use crate::query::assist::{self, OutlineItem};
 use crate::query::desk::ObjectInfo;
 use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
@@ -135,7 +136,7 @@ fn outline(items: &[OutlineItem], active_statement: Option<usize>, locale: Local
         .test_support()
         .flex_1()
         .min_h(px(0.))
-        .overflow_y_scroll()
+        .scroll_area_y()
         .p(px(8.))
         .flex()
         .flex_col()
@@ -360,7 +361,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
         .test_support()
         .flex_1()
         .min_h(px(0.))
-        .overflow_y_scroll()
+        .scroll_area_y()
         .flex()
         .flex_col()
         .child(

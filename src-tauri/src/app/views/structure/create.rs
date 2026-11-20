@@ -17,6 +17,7 @@ use crate::ddl::templates::{is_builtin_id, ColumnTemplate, TemplateColumn, Templ
 use crate::ddl::{DefaultMode, DefaultSpec};
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, FieldSpec, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::{check_box, default_column_type, on_draft, DraftIssue, IssueField, StructureMode, StructurePane};
 
@@ -704,7 +705,7 @@ impl StructurePane {
         let engine = self.session.target.engine.clone();
 
         // 左栏：内置模板与用户模板。
-        let mut list = div().id("structure-templates-list").test_support().flex().flex_col().gap(px(2.)).w(px(240.)).flex_none().overflow_y_scroll();
+        let mut list = div().id("structure-templates-list").test_support().flex().flex_col().gap(px(2.)).w(px(240.)).flex_none().scroll_area_y();
         list = list.child(div().pb(px(4.)).child(kit::eyebrow(t("structure.templates.builtin"), p)));
         for (id, key) in BUILTIN {
             let hidden = self.templates.is_hidden(id);
@@ -1107,7 +1108,7 @@ impl StructurePane {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .child(div().max_w(px(360.)).child(kit::form_row(t("structure.templates.name"), name, p)))
             .child(kit::form_row(t("structure.templates.engines"), engines, p))
             .child(kit::card(p).overflow_hidden().flex().flex_col().child(head).child(rows).child(

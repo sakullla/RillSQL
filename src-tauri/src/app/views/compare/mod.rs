@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::{AppServices, cancel_compare, compare_cancelled, compare_progress};
@@ -1680,7 +1681,7 @@ impl Render for ComparePane {
                     .id("compare-scroll")
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
+                    .scroll_area_y()
                     .child(
                         div()
                             .max_w(px(1080.))
@@ -1731,7 +1732,7 @@ impl ComparePane {
             .flex()
             .flex_col()
             .max_h(px(m.control_h * 4.5))
-            .overflow_y_scroll();
+            .scroll_area_y();
         if self.choices.is_empty() {
             // 清单还在读：骨架占位，不先写一句“选择连接”；读完了还是空才提示选连接。
             connections = if self.choices_loading {
@@ -1764,7 +1765,7 @@ impl ComparePane {
                     .flex()
                     .flex_col()
                     .max_h(px(m.control_h * 4.5))
-                    .overflow_y_scroll();
+                    .scroll_area_y();
                 for name in &choice.databases {
                     let id = format!("compare-database:{which}:{name}");
                     list = list.child(
@@ -1785,7 +1786,7 @@ impl ComparePane {
                             .flex()
                             .flex_col()
                             .max_h(px(m.control_h * 4.5))
-                            .overflow_y_scroll();
+                            .scroll_area_y();
                         for name in names {
                             let id = format!("compare-schema:{which}:{name}");
                             list = list.child(
@@ -2299,7 +2300,7 @@ impl ComparePane {
     }
 
     fn diff_tree(&self, report: &StructureReport, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics) -> AnyElement {
-        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).flex().flex_col().gap(px(1.)).max_h(px(420.)).overflow_y_scroll();
+        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).flex().flex_col().gap(px(1.)).max_h(px(420.)).scroll_area_y();
         let visible = self.visible_entries(report);
         if visible.is_empty() {
             tree = tree.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.tree.empty")), p)));
@@ -2357,7 +2358,7 @@ impl ComparePane {
         };
         let mono = gpui_kit::component::ActiveTheme::theme(&**cx).mono_font_family.clone();
         let side = |label: String, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla, mine: &str, other: &str, missing: String| {
-            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).flex().flex_col().max_h(px(320.)).overflow_y_scroll().font_family(mono.clone()).text_size(px(TypeScale::XS));
+            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).flex().flex_col().max_h(px(320.)).scroll_area_y().font_family(mono.clone()).text_size(px(TypeScale::XS));
             if mine.trim().is_empty() {
                 block = block.child(div().px(px(4.)).text_color(p.text_faint).child(SharedString::from(missing)));
             } else {
@@ -2520,7 +2521,7 @@ impl ComparePane {
     fn data_rows(&self, report: &DataReport, table: &str, p: &Palette, cx: &App) -> AnyElement {
         let mono = gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.clone();
         let rows: Vec<_> = report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").collect();
-        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).flex().flex_col().gap(px(6.)).max_h(px(420.)).overflow_y_scroll();
+        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).flex().flex_col().gap(px(6.)).max_h(px(420.)).scroll_area_y();
         if rows.is_empty() {
             let reason = report.tables.iter().find(|item| item.table == table).and_then(|item| item.skipped.clone()).unwrap_or_else(|| self.text("compare.data.same"));
             return block.child(kit::muted(SharedString::from(reason), p)).into_any_element();

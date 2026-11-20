@@ -11,6 +11,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -1039,7 +1040,7 @@ impl Render for AdminPane {
             )));
         }
         column = column
-            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(states).child(cards).when(!note.is_empty(), |this| {
+            .child(div().id("admin-body").flex_1().min_h(px(0.)).scroll_area_y().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(states).child(cards).when(!note.is_empty(), |this| {
                 this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(note)))
             })))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
@@ -1072,7 +1073,7 @@ impl Render for AdminPane {
                             div()
                                 .id("admin-preview-sql")
                                 .max_h(px(260.))
-                                .overflow_y_scroll()
+                                .scroll_area_y()
                                 .p(px(12.))
                                 .rounded(px(Radius::PANEL))
                                 .bg(p.chrome)

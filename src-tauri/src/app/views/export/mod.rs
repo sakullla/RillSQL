@@ -2288,6 +2288,7 @@ mod unified_state_tests {
 
     impl Render for PaneHost {
         fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            use crate::ui::kit::ScrollAreaExt as _;
             // 与外壳的交换层同一套几何：宽 520，窗口更窄时右端留 60px。
             let drawer = 520.0_f32.min(f32::from(window.viewport_size().width) - 60.);
             div()
@@ -2301,7 +2302,7 @@ mod unified_state_tests {
                         .test_support()
                         .w(px(drawer))
                         .h_full()
-                        .overflow_y_scroll()
+                        .scroll_area_y()
                         .child(self.pane.clone()),
                 )
         }

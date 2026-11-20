@@ -15,6 +15,7 @@ use gpui_kit::{
 
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 /// 面板能切换的六种视图。手动选择不改原始文本。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -745,7 +746,7 @@ fn hex_body(viewer: &FormatViewer, p: &Palette) -> AnyElement {
         .id("format-hex-dump")
         .flex_1()
         .min_h(px(0.))
-        .overflow_y_scroll()
+        .scroll_area_y()
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -774,7 +775,7 @@ fn tree_body(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette) 
             if nodes.is_empty() {
                 column = column.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(viewer.text("format.tree.empty")));
             }
-            let mut list = div().id("format-json-tree").flex_1().min_h(px(0.)).overflow_y_scroll();
+            let mut list = div().id("format-json-tree").flex_1().min_h(px(0.)).scroll_area_y();
             for node in nodes {
                 list = list.child(tree_row(entity, viewer, p, &node));
             }

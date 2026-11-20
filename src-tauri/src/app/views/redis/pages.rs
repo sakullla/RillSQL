@@ -1,6 +1,7 @@
 //! 顶栏（连接/逻辑库或集群 + 页签）与诊断页：慢日志、信息、大键、客户端、Pub/Sub、节点。
 
 use super::view::{action, cmd_click, icon_btn, Kind};
+use crate::ui::kit::ScrollAreaExt as _;
 use super::*;
 use gpui_kit::Hsla;
 
@@ -273,7 +274,7 @@ impl RedisPane {
             col(self.text("redis.slowlog.command"), None),
             col(self.text("redis.slowlog.client"), Some(150.)),
         ];
-        let mut body = div().id("redis-slowlog-rows").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div().id("redis-slowlog-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         if self.diag.slowlog.is_empty() && self.diag.slow_loaded {
             body = body.child(kit::empty_state(IconName::Timer, SharedString::from(self.text("redis.slowlog.empty")), SharedString::from(""), p));
         }
@@ -352,7 +353,7 @@ impl RedisPane {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(div().id("redis-info-scroll").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().child(cards).child(sections))
+            .child(div().id("redis-info-scroll").test_support().flex_1().min_h(px(0.)).scroll_area_y().child(cards).child(sections))
             .into_any_element()
     }
 
@@ -393,7 +394,7 @@ impl RedisPane {
             col(self.text("redis.bigkeys.size"), Some(110.)),
             col(self.text("redis.bigkeys.memoryCol"), Some(110.)),
         ];
-        let mut body = div().id("redis-big-rows").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div().id("redis-big-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         if self.diag.big.is_empty() && !self.diag.big_running {
             body = body.child(kit::empty_state(IconName::ChartBar, SharedString::from(self.text("redis.bigkeys.empty")), SharedString::from(self.text("redis.bigkeys.hint")), p));
         }
@@ -433,7 +434,7 @@ impl RedisPane {
             col(self.text("redis.clients.cmd"), None),
             col(String::new(), Some(28.)),
         ];
-        let mut body = div().id("redis-client-rows").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div().id("redis-client-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         for (index, client) in self.diag.clients.iter().enumerate() {
             let kill = icon_btn(format!("redis-client-kill:{index}"), IconName::Unplug, &self.text("redis.clients.kill"), entity).xsmall().into_any_element();
             body = body.child(self.table_row(
@@ -484,7 +485,7 @@ impl RedisPane {
                 self.text("redis.pubsub.idle")
             },
         ));
-        let mut list = div().id("redis-pubsub-messages").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col().mx(px(m.pane_pad())).rounded(px(Radius::PANEL)).border_1().border_color(p.line);
+        let mut list = div().id("redis-pubsub-messages").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col().mx(px(m.pane_pad())).rounded(px(Radius::PANEL)).border_1().border_color(p.line);
         for (index, message) in self.diag.messages.iter().enumerate() {
             list = list.child(
                 div()
@@ -527,7 +528,7 @@ impl RedisPane {
             col(self.text("redis.nodes.slotCount"), Some(80.)),
             col(self.text("redis.nodes.keys"), Some(90.)),
         ];
-        let mut body = div().id("redis-node-rows").test_support().flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div().id("redis-node-rows").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col();
         for (index, node) in self.topology.nodes.iter().enumerate() {
             let status = node.status();
             let color = match status {

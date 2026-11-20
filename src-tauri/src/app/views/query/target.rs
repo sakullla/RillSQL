@@ -11,6 +11,7 @@ use gpui_kit::{
 
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
@@ -221,7 +222,7 @@ pub fn popover(
         .w(px(left_w))
         .flex_none()
         .h_full()
-        .overflow_y_scroll()
+        .scroll_area_y()
         .border_r_1()
         .border_color(p.line)
         .py(px(4.));
@@ -270,7 +271,7 @@ pub fn popover(
         .flex_1()
         .min_w(px(0.))
         .h_full()
-        .overflow_y_scroll()
+        .scroll_area_y()
         .py(px(4.));
     match focused {
         None if no_connections => {

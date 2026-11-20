@@ -298,6 +298,8 @@ pub fn tab_strip_with_double_click(
         .test_support()
         .flex_shrink(1.)
         .min_w(px(0.))
+        // 标签条高度只够一行标签，浮动横条会压住标签文字与激活下划线；溢出靠滚轮/触控板横滑，
+        // 当前标签总由 reveal 滚进视野。滚动条例外：页签条不画横向滚动条。
         .overflow_x_scroll()
         .track_scroll(scroll);
     if let Some(index) = reveal {

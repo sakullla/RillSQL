@@ -395,6 +395,8 @@ pub struct RedisPane {
     entry_viewer_sub: Option<Subscription>,
     /// 下一帧要聚焦的输入框（打开 TTL / 重命名 / 新建键 / 条目表单时把光标放进去）。
     focus_request: Option<Field>,
+    /// 键列表（虚拟列表）的滚动句柄：叠在列表右侧的可见滚动条与它同步。
+    key_scroll: gpui_kit::UniformListScrollHandle,
 }
 
 impl RedisPane {
@@ -500,6 +502,7 @@ impl RedisPane {
             entry_target: None,
             entry_viewer_sub: None,
             focus_request: None,
+            key_scroll: gpui_kit::UniformListScrollHandle::new(),
         }
     }
 

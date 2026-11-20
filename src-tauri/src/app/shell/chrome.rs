@@ -24,6 +24,7 @@ use crate::catalog::model::ObjectKind;
 use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::tabs;
 
 use gpui_kit::base::FocusTrapElement as _;
@@ -766,12 +767,12 @@ impl Workbench {
             .id("explorer-list")
             .test_support()
             .track_focus(&self.nav_focus)
-            .track_scroll(&self.explorer_scroll)
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .scroll_area_y()
+            .scroll_handle(&self.explorer_scroll)
             .px(px(6.))
             .pb(px(8.));
         if self.model.connections.rows.is_empty() {
@@ -2431,7 +2432,7 @@ impl Workbench {
                         .child(kit::eyebrow(self.t("shell.welcome.recent"), &p))
                         .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(recent_runs.len().to_string()))),
                 )
-                .child(div().id("welcome-recent-runs").max_h(px(240.)).overflow_y_scroll().child(history_rows))
+                .child(div().id("welcome-recent-runs").max_h(px(240.)).scroll_area_y().child(history_rows))
                 .into_any_element()
         });
 
@@ -2443,7 +2444,7 @@ impl Workbench {
             .aria_label(self.t("shell.welcome.title"))
             .test_support()
             .size_full()
-            .overflow_y_scroll()
+            .scroll_area_y()
             .flex()
             .flex_col()
             .items_center()
@@ -3354,7 +3355,7 @@ impl Workbench {
                 .id("conn-modal-scroll")
                 .flex_1()
                 .min_h(px(0.))
-                .overflow_y_scroll()
+                .scroll_area_y()
                 .child(div().px(px(pad)).py(px(14.)).child(tab_body));
 
             let trap = self.modal_focus.clone();
@@ -4255,7 +4256,7 @@ impl Workbench {
             .top(px(y))
             .w(px(width))
             .max_h(px(view_h - 24.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .p(px(4.))
             .flex()
             .flex_col()
@@ -4475,14 +4476,14 @@ impl Workbench {
         let mono = cx.theme().mono_font_family.clone();
         let mut list = div()
             .id("history-list")
-            .track_scroll(&self.history_scroll)
             .flex()
             .flex_col()
             .gap(px(6.))
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .scroll_area_y()
+            .scroll_handle(&self.history_scroll)
             .px(px(m.page_pad))
             .pb(px(m.page_pad_y));
         let mut child_count = 0usize;
@@ -5336,7 +5337,7 @@ impl Workbench {
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .scroll_area_y()
             .child(
                 div()
                     .max_w(px(760.))
@@ -5582,7 +5583,7 @@ impl Workbench {
         // 更新说明：有新版本、下载中或待重启时显示；纯文本行，标题加粗，长说明在框内滚动。
         let show_notes = matches!(update.stage, UpdateStage::Available | UpdateStage::Downloading { .. } | UpdateStage::Installing | UpdateStage::Ready | UpdateStage::Failed { .. });
         let notes = offer.filter(|offer| show_notes && !offer.notes.is_empty()).map(|offer| {
-            let mut body = div().id("update-notes-body").flex().flex_col().gap(px(2.)).max_h(px(220.)).overflow_y_scroll();
+            let mut body = div().id("update-notes-body").flex().flex_col().gap(px(2.)).max_h(px(220.)).scroll_area_y();
             for (heading, line) in super::update::notes_lines(&offer.notes) {
                 body = body.child(if line.is_empty() {
                     div().h(px(6.))
@@ -5751,7 +5752,7 @@ impl Workbench {
                 .p(px(8.))
                 .border_r_1()
                 .border_color(p.line)
-                .overflow_y_scroll();
+                .scroll_area_y();
             let nav_item = |id: String, label: SharedString, count: usize, on: bool, command: String, cx: &mut Context<Self>| {
                 div()
                     .id(SharedString::from(id))
@@ -5808,7 +5809,7 @@ impl Workbench {
                 .h_full()
                 .flex()
                 .flex_col()
-                .overflow_y_scroll()
+                .scroll_area_y()
                 .p(px(8.));
             if sections.is_empty() {
                 list = list.child(
@@ -5929,10 +5930,10 @@ impl Workbench {
             let mut list = div()
                 .id("palette-list")
                 .test_support()
-                .track_scroll(&self.palette_scroll)
                 .flex()
                 .flex_col()
-                .overflow_y_scroll()
+                .scroll_area_y()
+                .scroll_handle(&self.palette_scroll)
                 .p(px(6.))
                 .max_h(px(list_max_h));
             if entries.is_empty() {
@@ -6036,7 +6037,13 @@ impl Workbench {
                         }).collect::<Vec<_>>()
                     }).unwrap_or_default()
                 }).track_scroll(&self.palette_virtual_scroll).h(px(list_max_h - 12.));
-                list = list.child(virtual_list);
+                // 虚拟列表自己滚动：在同大小的 relative 父层上叠可见滚动条（ADR-8）。
+                list = list.child(
+                    div()
+                        .relative()
+                        .child(virtual_list)
+                        .child(kit::scrollbar_overlay("palette-virtual-bar", &self.palette_virtual_scroll, kit::ScrollbarAxis::Vertical)),
+                );
                 Vec::new()
             } else { entries };
             let mut last_group = "";
@@ -6767,7 +6774,7 @@ impl Workbench {
             let dialog = dialog_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
                 .test_support()
                 .max_w(px(560.))
-                .child(div().id("danger-body").max_h(px(420.)).overflow_y_scroll().child(content))
+                .child(div().id("danger-body").max_h(px(420.)).scroll_area_y().child(content))
                 .child(
                     div()
                         .flex()
@@ -6868,7 +6875,7 @@ impl Workbench {
                     .child(div().flex().items_center().gap(px(8.)).child(kit::icon(IconName::ArrowDownUp, 15., p.accent)).child(kit::title(self.t("export.open"), TypeScale::LG, &p)))
                     .child(kit::icon_button("exchange-close", IconName::X, self.t("common.close"), act("open-exchange", cx))),
             )
-            .child(div().id("exchange-scroll").flex_1().min_h(px(0.)).overflow_y_scroll().child(self.exchange.clone()));
+            .child(div().id("exchange-scroll").flex_1().min_h(px(0.)).scroll_area_y().child(self.exchange.clone()));
         let entity = cx.entity();
         div()
             .id("exchange-backdrop")
@@ -7266,7 +7273,7 @@ pub(super) fn test_verdict(report: &crate::connections::stages::TestReport, head
                 .min_w(px(0.))
                 // 驱动的报错可能很长：结论条自己滚，不把表单主体挤没。
                 .max_h(px(132.))
-                .overflow_y_scroll()
+                .scroll_area_y()
                 .flex()
                 .flex_col()
                 .gap(px(4.))

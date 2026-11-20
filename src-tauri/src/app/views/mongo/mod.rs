@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 
 use crate::application::mongo::{DeleteOutcome, InsertOutcome, ReplaceOutcome};
@@ -1060,7 +1061,7 @@ impl Render for MongoPane {
         let panel_w = if overlay_nav { nav_w.min((self.viewport_w - 32.).max(160.)) } else { nav_w };
         // ---- 左栏：库与集合
         let nav_column = stack_frame(|| {
-        let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
+        let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).scroll_area_y().p(px(6.));
         nav = nav.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.databases")), &p)));
         for (index, database) in self.databases.iter().take(60).enumerate() {
             let selected = database.name == self.database;
@@ -1220,7 +1221,7 @@ impl Render for MongoPane {
         right = stack_frame(|| {
         let mut right = right;
         if self.crumb_db || self.crumb_coll {
-            let mut menu = div().id("mongo-crumb-menu").flex().flex_col().max_h(px(m.header_h() * 6.)).overflow_y_scroll().p(px(m.pad)).border_b_1().border_color(p.line).bg(p.chrome);
+            let mut menu = div().id("mongo-crumb-menu").flex().flex_col().max_h(px(m.header_h() * 6.)).scroll_area_y().p(px(m.pad)).border_b_1().border_color(p.line).bg(p.chrome);
             if self.crumb_db {
                 for (index, database) in self.databases.iter().take(60).enumerate() {
                     menu = menu.child(nav_row(
@@ -1458,7 +1459,11 @@ impl MongoPane {
         if let Some(handle) = cell_focus {
             area = area.track_focus(&handle);
         }
-        area = if matches!(state, DocsState::Rows) { area.overflow_y_scroll().overflow_x_scroll() } else { area.overflow_hidden() };
+        // 有行时两个方向都滚，带可见滚动条（在下面收尾时包装）；其余三态不滚。
+        let scrolls = matches!(state, DocsState::Rows);
+        if !scrolls {
+            area = area.overflow_hidden();
+        }
         // 读失败只由下面的错误态呈现：这里不再另画一条同样的红条和第二个重试按钮。
         // 已有内容时的局部刷新：一行局部加载，不把整块换成首屏骨架。
         if self.busy && matches!(state, DocsState::Rows) {
@@ -1493,7 +1498,7 @@ impl MongoPane {
                     .child(self.docs_state_block(state, p, m, entity)),
             );
         }
-        area.into_any_element()
+        if scrolls { area.scroll_area_xy().into_any_element() } else { area.into_any_element() }
     }
 
     /// 六态里除"有行"之外的呈现：说明 + 下一步；主操作进状态块的动作位，不另起一行居中追加。
@@ -1731,7 +1736,7 @@ impl MongoPane {
 
     fn document_tree(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
         // 空/加载/错误已在文档数据区的六态里处理，树视图只负责"有行"时的排版。
-        let mut tree = div().id("mongo-doc-tree").test_support().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.)).overflow_y_scroll();
+        let mut tree = div().id("mongo-doc-tree").test_support().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.)).scroll_area_y();
         for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
             let parsed = serde_json::from_str::<serde_json::Value>(&doc.json).ok();
             let nodes = parsed.as_ref().map(|value| crate::ui::visible_json_nodes(value, &std::collections::BTreeSet::new(), "")).unwrap_or_default();
