@@ -293,9 +293,9 @@ impl StructurePane {
             .flex()
             .items_center()
             .gap(px(2.))
-            .min_w(px(0.))
+            .min_w_0()
             .child(div().flex_none().child(mode_button))
-            .child(div().flex_1().min_w(px(0.)).child(value))
+            .child(div().flex_1().min_w_0().child(value))
             .into_any_element()
     }
 
@@ -728,7 +728,7 @@ impl StructurePane {
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(Radius::CONTROL))
-                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(hidden, |this| this.text_color(p.text_faint).line_through()).child(t(key)))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).when(hidden, |this| this.text_color(p.text_faint).line_through()).child(t(key)))
                     .child(
                         kit::icon_button(
                             SharedString::from(format!("structure-template-hide-{id}")),
@@ -777,7 +777,7 @@ impl StructurePane {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .child(div().truncate().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(template.name.clone())))
@@ -907,7 +907,7 @@ impl StructurePane {
                         .child(
                             div()
                                 .flex_1()
-                                .min_h(px(0.))
+                                .min_h_0()
                                 .flex()
                                 .gap(px(16.))
                                 .px(px(metrics.card_pad()))
@@ -1052,7 +1052,7 @@ impl StructurePane {
                     .border_b_1()
                     .border_color(p.line_soft)
                     .child(div().w(px(130.)).flex_none().child(column_name))
-                    .child(div().w(px(130.)).flex_none().flex().items_center().child(div().flex_1().min_w(px(0.)).child(kind)).child(type_button))
+                    .child(div().w(px(130.)).flex_none().flex().items_center().child(div().flex_1().min_w_0().child(kind)).child(type_button))
                     .child(
                         div().w(px(44.)).flex_none().flex().justify_center().child(
                             check_box(SharedString::from(format!("structure-template-null-{index}")), column.nullable, true, t("ui.structure.nullable"), p).on_click(move |_, _, cx| {
@@ -1063,7 +1063,7 @@ impl StructurePane {
                             }),
                         ),
                     )
-                    .child(div().w(px(170.)).flex_none().flex().items_center().gap(px(2.)).child(mode_button).child(div().flex_1().min_w(px(0.)).child(default_value)))
+                    .child(div().w(px(170.)).flex_none().flex().items_center().gap(px(2.)).child(mode_button).child(div().flex_1().min_w_0().child(default_value)))
                     .child(div().flex_1().min_w(px(80.)).child(comment))
                     .child(
                         div()
@@ -1111,7 +1111,7 @@ impl StructurePane {
             .id("structure-template-editor")
             .test_support()
             .flex_1()
-            .min_w(px(0.))
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -1166,7 +1166,7 @@ pub(super) fn issue_line(id: impl Into<gpui_kit::ElementId>, text: &str, p: &Pal
         .text_size(px(TypeScale::XS))
         .text_color(p.danger)
         .child(kit::icon(IconName::TriangleAlert, 12., p.danger))
-        .child(div().min_w(px(0.)).child(SharedString::from(text.to_owned())))
+        .child(div().min_w_0().child(SharedString::from(text.to_owned())))
         .into_any_element()
 }
 

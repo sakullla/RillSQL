@@ -60,8 +60,13 @@ pub(super) fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl F
     }
 }
 
-fn field_changed(this: &mut Workbench, field: DraftField, value: String, _cx: &mut Context<Workbench>) {
+fn field_changed(this: &mut Workbench, field: DraftField, value: String, cx: &mut Context<Workbench>) {
+    let setting = matches!(field, DraftField::IndexNamingNormal | DraftField::IndexNamingUnique | DraftField::IndexNamingJoiner);
     this.model.set_field(field, value);
+    // 索引命名模板是设置：改了就写盘（带保存反馈），结构页下一次整理时拿到新模板。
+    if setting {
+        this.persist_settings(cx);
+    }
 }
 
 impl Workbench {
@@ -161,7 +166,7 @@ impl Workbench {
         let content: AnyElement = match page {
             AppPage::Connections => self.connections_page(window, cx),
             AppPage::History => self.history_page(window, cx),
-            AppPage::Settings => self.settings_page(cx),
+            AppPage::Settings => self.settings_page(window, cx),
             _ => self.workspace(window, cx),
         };
 
@@ -5255,7 +5260,7 @@ impl Workbench {
 
     // ------------------------------------------------------------ 设置
 
-    fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn settings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
         let s = self.model.settings.clone();
@@ -5458,10 +5463,12 @@ impl Workbench {
                     );
                 }
                 object_page = object_page.child(object_page_step);
+                let naming_rows = self.index_naming_rows(&s.index_naming, &p, window, cx);
                 div()
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
+                .child(group("settings-group-index-naming", self.t("ui.settings.indexNaming"), naming_rows, &p))
                 .child(group(
                     "settings-group-data",
                     self.t("ui.settings.data"),
@@ -5822,6 +5829,39 @@ impl Workbench {
     }
 
     /// 设置写盘的可见结果：失败给原因与就地重试，不把错误吞在后台任务里。
+    /// 设置页“数据”分区的索引命名模板：普通、唯一、连接符三个输入框，下方实时预览示例名字。
+    fn index_naming_rows(
+        &mut self,
+        naming: &crate::ddl::naming::IndexNaming,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(SharedString, Option<SharedString>, AnyElement)> {
+        let input_w = kit::ControlSize::PICKER_MIN_W;
+        let normal = self.input_for(DraftField::IndexNamingNormal, crate::ddl::naming::DEFAULT_NORMAL, false, window, cx);
+        let unique = self.input_for(DraftField::IndexNamingUnique, crate::ddl::naming::DEFAULT_UNIQUE, false, window, cx);
+        let joiner = self.input_for(DraftField::IndexNamingJoiner, crate::ddl::naming::DEFAULT_JOINER, false, window, cx);
+        let sample = ["user_id", "created_at"];
+        let preview = |unique: bool| naming.render("orders", unique, &sample);
+        let preview_line = div()
+            .id("settings-index-naming-preview")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap(px(kit::Space::XS))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(TypeScale::SM))
+            .text_color(p.text_muted)
+            .child(SharedString::from(preview(false)))
+            .child(SharedString::from(preview(true)));
+        vec![
+            (self.t("ui.settings.indexNormal"), Some(self.t("ui.settings.indexPlaceholders")), div().w(px(input_w)).child(normal).into_any_element()),
+            (self.t("ui.settings.indexUnique"), None, div().w(px(input_w)).child(unique).into_any_element()),
+            (self.t("ui.settings.indexJoiner"), None, div().w(px(input_w)).child(joiner).into_any_element()),
+            (self.t("ui.settings.indexPreview"), Some(self.t("ui.settings.indexPreviewHint")), preview_line.into_any_element()),
+        ]
+    }
+
     fn settings_save_row(&self, p: &Palette, m: &kit::Metrics, cx: &mut Context<Self>) -> AnyElement {
         match self.model.settings_save.clone() {
             SaveState::Idle => div().into_any_element(),

@@ -618,7 +618,14 @@ fn primary_action_stays_outside_the_scrolled_body_at_every_width(cx: &mut gpui_k
             let (window, pane) = gpui_kit::open_window(
                 gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
                 cx,
-                |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 26)),
+                |_window, cx| {
+                    cx.new(|_| {
+                        // 预览按钮只在有改动时出现：先改一处。
+                        let mut pane = pane_with_snapshot(services.clone(), 26);
+                        pane.session.kept_columns[1].name = "renamed_col".into();
+                        pane
+                    })
+                },
             )
             .expect("structure pane");
             (window, pane)
@@ -695,7 +702,13 @@ fn structure_lists_follow_density_in_both_themes(cx: &mut gpui_kit::TestAppConte
                 let (window, pane) = gpui_kit::open_window(
                     gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
                     cx,
-                    |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 3)),
+                    |_window, cx| {
+                        cx.new(|_| {
+                            let mut pane = pane_with_snapshot(services.clone(), 3);
+                            pane.session.kept_columns[2].name = "renamed_col".into();
+                            pane
+                        })
+                    },
                 )
                 .expect("structure pane");
                 (window, pane)
@@ -1779,4 +1792,289 @@ fn sample_query_follows_the_dialect_and_skips_unknown_engines() {
     let sql = select_sample_sql(&target("postgres", "orders")).expect("postgres");
     assert!(sql.contains("LIMIT 100"), "{sql}");
     assert_eq!(select_sample_sql(&target("unknown-engine", "orders")), None);
+}
+
+fn open_pane(
+    cx: &mut gpui_kit::TestAppContext,
+    width: f32,
+    height: f32,
+    build: impl FnOnce() -> StructurePane + 'static,
+) -> (gpui_kit::AnyWindowHandle, Entity<StructurePane>) {
+    use gpui_kit::AppContext as _;
+    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(height)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| cx.new(|_| build()),
+        )
+        .expect("structure pane")
+    })
+}
+
+/// R9：几百个字段时只渲染可见行；默认文本浏览，点击某行才换成输入控件，Esc 退出并保留草稿；
+/// 没有改动时底部不显示“预览 SQL”，改了一处后显示改动计数与预览，预览里只有这一处。
+#[gpui_kit::test]
+fn columns_browse_virtualized_and_edit_one_row_at_a_time(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("browse");
+    let (window, pane) = open_pane(cx, 1100., 800., move || pane_with_snapshot(services, 300));
+
+    let (first, last, rows, inputs, preview, hint, comment_head) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let rows = (0..300).filter(|ix| window.try_find(SharedString::from(format!("structure-row-columns-{ix}"))).is_some()).count();
+            (
+                window.try_find("structure-row-columns-0").is_some(),
+                window.try_find("structure-row-columns-299").is_some(),
+                rows,
+                window.try_find("structure-draft-10000").is_some(),
+                window.try_find("structure-preview").is_some(),
+                window.try_find("structure-browse-hint").is_some(),
+                window.try_find("structure-head-comment").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(first && !last, "虚拟列表只渲染可见行");
+    assert!(rows > 5 && rows < 60, "300 个字段只渲染了 {rows} 行");
+    assert!(!inputs, "浏览态没有输入控件");
+    assert!(!preview && hint, "没有改动时不显示预览按钮，只有只读说明");
+    assert!(comment_head, "宽窗口里注释列始终可见");
+
+    // 点击第 3 行进入编辑：只有这一行变成输入控件。
+    cx.update_window(window, |_, window, cx| {
+        window.click("structure-row-columns-3", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (editing, row3_input, row4_input) = cx
+        .update_window(window, |_, window, cx| {
+            (pane.read(cx).editing_row(), window.try_find("structure-draft-10003").is_some(), window.try_find("structure-draft-10004").is_some())
+        })
+        .unwrap();
+    assert_eq!(editing, Some(3));
+    assert!(row3_input && !row4_input, "只有被点击的行进入编辑");
+
+    // 改名，再点另一行：前一行回到文本，草稿保留；改动计数为 1。
+    cx.update(|cx| pane.update(cx, |pane, _| pane.write_draft(10_003, "renamed_three".into())));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-row-columns-5", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.editing_row(), Some(5));
+        assert_eq!(pane.session.kept_columns[3].name, "renamed_three", "切到别的行，草稿保留");
+        assert_eq!(pane.pending_changes(), 1);
+    });
+
+    // Esc 退出编辑，草稿仍在；预览按钮出现。
+    cx.update(|cx| pane.update(cx, |pane, _| assert!(pane.handle_escape())));
+    let (editing, preview, row5_input) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (pane.read(cx).editing_row(), window.try_find("structure-preview").is_some(), window.try_find("structure-draft-10005").is_some())
+        })
+        .unwrap();
+    assert_eq!(editing, None);
+    assert!(!row5_input, "Esc 后回到文本浏览");
+    assert!(preview, "有改动时显示预览按钮");
+
+    // 只改了一处：预览里只有这一处。
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            let snapshot = pane.snapshot.clone().unwrap();
+            assert_eq!(pane.session.kept_columns[3].name, "renamed_three");
+            pane.session.arm_fixture(&snapshot);
+            let sql = pane.session.preview_sql();
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            assert!(sql[0].contains("col_3") && sql[0].contains("renamed_three"), "{sql:?}");
+            pane.session.cancel();
+            pane.revert_column(3);
+            assert_eq!(pane.pending_changes(), 0);
+            assert!(!pane.preview_button_visible(), "改回原样后预览按钮又隐藏");
+        })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 新增字段直接进入编辑；删掉这条未落库的新增行后编辑行复位。主键的可空与类型不可改，并说明原因。
+#[test]
+fn added_rows_enter_edit_and_locked_attributes_explain_why() {
+    let (services, dir) = offline_services("browse-add");
+    let mut pane = pane_with_snapshot(services, 3);
+    pane.add_column();
+    assert_eq!(pane.editing_row(), Some(3), "新增的行直接进入编辑");
+    assert_eq!(pane.pending_changes(), 1);
+    pane.toggle_column(3, "drop");
+    assert_eq!(pane.editing_row(), None, "删掉新增行后不再指向它");
+    pane.begin_edit_row(2);
+    pane.add_column();
+    pane.begin_edit_row(3);
+    pane.toggle_column(2, "drop");
+    assert_eq!(pane.editing_row(), Some(3), "删除已有列只是标记，不影响编辑行");
+    pane.reset_draft();
+    assert_eq!(pane.editing_row(), None, "放弃改动后退出编辑");
+
+    assert_eq!(i18n::text(Locale::ZhCn, "structure.field.pkNullLocked"), "主键列必须非空，不能改为可空");
+    assert!(i18n::static_text(Locale::En, "structure.field.pkTypeLocked").is_some());
+    let entries = pane.column_menu_entries(0, &pane.session.kept_columns[0].clone(), ColumnChange::Clean, false);
+    let drop = entries.iter().find(|entry| entry.id == "edit-drop-col-0").unwrap();
+    assert_eq!(drop.reason.as_deref(), Some(i18n::text(Locale::ZhCn, "structure.field.pkLocked").as_str()), "主键列的删除项说明原因");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 窄窗口按优先级隐藏列：先隐藏注释，再隐藏默认值；“显示全部列”强制显示。
+#[test]
+fn narrow_windows_hide_comment_then_default_unless_show_all() {
+    use super::browse::BrowseColumns;
+    let wide = BrowseColumns::of(1200., false);
+    assert!(wide.default && wide.comment);
+    assert!(wide.widths.min_total(false) <= 1200.);
+    let unknown = BrowseColumns::of(0., false);
+    assert!(unknown.default && unknown.comment, "还没量到宽度时按宽窗口");
+    let medium = BrowseColumns::of(500., false);
+    assert!(medium.default && !medium.comment, "先隐藏注释");
+    assert!(BrowseColumns::hides_any(500.));
+    let narrow = BrowseColumns::of(380., false);
+    assert!(!narrow.default && !narrow.comment, "再隐藏默认值");
+    let forced = BrowseColumns::of(380., true);
+    assert!(forced.default && forced.comment, "显示全部列");
+    assert!(!BrowseColumns::hides_any(1200.));
+}
+
+/// R8 / R9：新建索引在表单内的多选选择器里勾选列，已选列可调整顺序与升降序；
+/// 生成的 SQL 列顺序与所选顺序一致；名字按设置里的模板生成，按方言截断，重名就地提示。
+#[gpui_kit::test]
+fn index_picker_orders_columns_and_names_follow_the_template(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("index-picker");
+    let (window, pane) = open_pane(cx, 1100., 800., move || {
+        let mut pane = pane_with_snapshot(services, 6);
+        if let Some(snap) = pane.snapshot.as_mut() {
+            snap.indexes = vec![Index {
+                name: "idx_orders_col_4".into(),
+                unique: false,
+                columns: vec![IndexColumn { name: "col_4".into(), descending: false }],
+                protected: false,
+                reason: String::new(),
+                partial: false,
+                expression: false,
+                sql: None,
+            }];
+        }
+        pane.session.section = Section::Indexes;
+        pane.composer_open = true;
+        pane
+    });
+    let (picker, order) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.try_find("picker").is_some(), window.try_find("structure-index-order").is_some())
+        })
+        .unwrap();
+    assert!(picker && order, "列选择器与已选列表都在表单内");
+
+    // 在选择器里依次勾选第 3、第 2 项（col_2、col_1）：草稿按勾选先后排列。
+    let picker = cx.update(|cx| pane.read(cx).index_picker.as_ref().map(|(picker, _)| picker.clone()).unwrap());
+    cx.update(|cx| {
+        picker.update(cx, |picker, cx| {
+            picker.choose_at(2, cx);
+            picker.choose_at(1, cx);
+        })
+    });
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        let names: Vec<&str> = pane.session.index_columns.iter().map(|column| column.name.as_str()).collect();
+        assert_eq!(names, ["col_2", "col_1"]);
+        assert_eq!(pane.session.index_name, "idx_orders_col_2_col_1");
+        let sql = pane.live_composer_sql().expect("实时 SQL");
+        assert!(sql.find("col_2").unwrap() < sql.find("col_1").unwrap(), "SQL 列顺序与所选顺序一致：{sql}");
+    });
+
+    // 调整顺序与升降序。
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            pane.move_index_column(1, -1);
+            pane.toggle_index_order("col_2");
+            let sql = pane.live_composer_sql().unwrap();
+            let one = sql.find("col_1").unwrap();
+            let two = sql.find("col_2").unwrap();
+            assert!(one < two, "{sql}");
+            assert!(sql[two..].contains("DESC"), "{sql}");
+            assert_eq!(pane.session.index_name, "idx_orders_col_1_col_2", "自动命名跟着顺序走");
+        })
+    });
+
+    // 从有序列表移除一列后，选择器的勾选随之同步。
+    cx.update(|cx| pane.update(cx, |pane, _| pane.toggle_index_column("col_1")));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        let picker = pane.index_picker.as_ref().unwrap().0.read(cx);
+        let chosen: Vec<&str> = picker.model().chosen().iter().map(|id| id.as_ref()).collect();
+        assert_eq!(chosen, ["col_2"]);
+    });
+
+    // 模板来自设置：改模板后自动名称立即重算；手动改名后不再覆盖。
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            pane.set_index_naming(crate::ddl::naming::IndexNaming { normal: "ix_{column1}__{table}".into(), unique: "uq_{columns}".into(), joiner: "$".into() });
+            assert_eq!(pane.session.index_name, "ix_col_2__orders");
+            pane.session.index_unique = true;
+            pane.sync_auto_index_name();
+            pane.set_index_selection(&["col_2", "col_3"]);
+            assert_eq!(pane.session.index_name, "uq_col_2$col_3");
+            pane.set_field("index_name", "my_index".into());
+            pane.set_index_selection(&["col_2", "col_3", "col_5"]);
+            assert_eq!(pane.session.index_name, "my_index", "手动名称不被增删列覆盖");
+            pane.set_index_selection(&["col_3"]);
+            assert_eq!(pane.session.index_name, "my_index");
+        })
+    });
+
+    // 与已有索引重名：提交前就地提示，预览也拦下。
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            pane.set_field("index_name", "IDX_orders_col_4".into());
+            assert!(pane.index_name_conflict());
+        })
+    });
+    let conflict = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("structure-index-name-conflict").is_some()
+        })
+        .unwrap();
+    assert!(conflict, "重名提示在表单里");
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            let snapshot = pane.snapshot.clone().unwrap();
+            pane.session.arm_fixture(&snapshot);
+            assert!(!pane.session.blocked().is_empty(), "预览拦下重名");
+            pane.session.cancel();
+            pane.set_field("index_name", "idx_fresh".into());
+            assert!(!pane.index_name_conflict());
+        })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 索引名按方言长度上限截断并加哈希（PostgreSQL 63）。
+#[test]
+fn suggested_index_names_respect_the_dialect_limit() {
+    let naming = crate::ddl::naming::IndexNaming::default();
+    let columns: Vec<IndexColumnDraft> =
+        (0..8).map(|ix| IndexColumnDraft { name: format!("a_rather_long_column_name_{ix}"), descending: false }).collect();
+    for (engine, limit) in [("postgres", 63), ("mysql", 64), ("mariadb", 64), ("sqlserver", 128)] {
+        let name = suggested_index_name(&naming, engine, "orders", false, &columns);
+        assert_eq!(name.len(), limit, "{engine}: {name}");
+        assert!(name.starts_with("idx_orders_a_rather_long_column_name_0"), "{engine}: {name}");
+    }
+    let sqlite = suggested_index_name(&naming, "sqlite", "orders", false, &columns);
+    assert!(sqlite.len() > 128, "SQLite 不截断");
+    assert_eq!(suggested_index_name(&naming, "postgres", "orders", false, &[]), "");
 }

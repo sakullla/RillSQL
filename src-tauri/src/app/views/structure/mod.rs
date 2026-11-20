@@ -14,12 +14,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, UniformListScrollHandle, Window, div, px, relative,
 };
 
 use crate::app::views::grid::{GridTarget, group_digits, operation_banner};
 use crate::application::AppServices;
 use crate::ddl::english::{localize, localize_missing_item};
+use crate::ddl::naming::{IndexNaming, index_name_limit};
 use crate::adapters::ddl::types_named;
 use crate::ddl::sql::{default_problem, existing_default, valid_name, valid_type};
 use crate::ddl::templates::{ColumnTemplate, TemplateStore};
@@ -30,6 +31,7 @@ use crate::ddl::{
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
 use crate::ui::kit::ScrollAreaExt as _;
+use crate::ui::picker::Picker;
 use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
 
 /// 与 `ddl::model::fk_actions` 相同的级联动作。结构页按引擎原样列出（由适配器的类型规则给出）。
@@ -93,18 +95,10 @@ fn is_placeholder_definition(sql: &str) -> bool {
     sql.lines().map(str::trim).filter(|line| !line.is_empty()).all(|line| line.starts_with("--"))
 }
 
-fn suggested_index_name(table: &str, unique: bool, columns: &[IndexColumnDraft]) -> String {
-    if columns.is_empty() {
-        return String::new();
-    }
-    let prefix = if unique { "uk" } else { "idx" };
-    let base = if table.trim().is_empty() { "table" } else { table.trim() };
-    let cols = columns.iter().map(|col| col.name.trim()).filter(|name| !name.is_empty()).collect::<Vec<_>>().join("_");
-    if cols.is_empty() {
-        return String::new();
-    }
-    let candidate = format!("{prefix}_{base}_{cols}");
-    if candidate.len() <= 60 { candidate } else { candidate.chars().take(60).collect() }
+/// 按设置里的命名模板生成索引名，并按方言的长度上限截断（超长时末尾加 `_` 和 6 位哈希）。
+fn suggested_index_name(naming: &IndexNaming, engine: &str, table: &str, unique: bool, columns: &[IndexColumnDraft]) -> String {
+    let names: Vec<&str> = columns.iter().map(|col| col.name.as_str()).collect();
+    naming.name(table, unique, &names, index_name_limit(engine))
 }
 
 fn suggested_fk_name(table: &str, column: &str, ref_table: &str) -> String {
@@ -782,6 +776,17 @@ pub struct StructurePane {
     template_manager: Option<create::TemplateManager>,
     /// 新建表的表级选项折叠区是否展开。
     options_open: bool,
+    /// 索引命名模板（设置页下发）。
+    index_naming: IndexNaming,
+    /// 新建索引表单里的多选列选择器与它的订阅。
+    index_picker: Option<(Entity<Picker>, Subscription)>,
+    /// 字段页（已有表）正在编辑的那一行（`kept_columns` 下标）。其余行以文本浏览。
+    editing_row: Option<usize>,
+    /// 下一帧把字段列表滚到这一行（`kept_columns` 下标）。
+    scroll_to_column: Option<usize>,
+    /// 窄窗口里被按优先级隐藏的列（注释、默认值）强制显示。
+    show_all_columns: bool,
+    columns_scroll: UniformListScrollHandle,
 }
 
 impl StructurePane {
@@ -832,7 +837,38 @@ impl StructurePane {
             templates_sink: None,
             template_manager: None,
             options_open: false,
+            index_naming: IndexNaming::default(),
+            index_picker: None,
+            editing_row: None,
+            scroll_to_column: None,
+            show_all_columns: false,
+            columns_scroll: UniformListScrollHandle::new(),
         }
+    }
+
+    pub fn index_naming(&self) -> &IndexNaming {
+        &self.index_naming
+    }
+
+    /// 设置页改了索引命名模板：自动命名中的索引名立即按新模板重算，手动名称不动。
+    pub fn set_index_naming(&mut self, naming: IndexNaming) {
+        if self.index_naming == naming {
+            return;
+        }
+        self.index_naming = naming;
+        if self.index_name_auto && !self.session.index_columns.is_empty() {
+            self.session.index_name = self.suggested_index_name();
+        }
+    }
+
+    fn suggested_index_name(&self) -> String {
+        suggested_index_name(&self.index_naming, &self.session.target.engine, &self.session.target.table, self.session.index_unique, &self.session.index_columns)
+    }
+
+    /// 新建索引的名字与当前表已有索引重名（大小写不敏感）。提交前就地提示，预览也会拦下。
+    pub fn index_name_conflict(&self) -> bool {
+        let existing: Vec<String> = self.snapshot.as_ref().map(|snap| snap.indexes.iter().map(|index| index.name.clone()).collect()).unwrap_or_default();
+        crate::ddl::naming::collides(&existing, &self.session.index_name)
     }
 
     pub fn set_data_sink(&mut self, sink: DataSink) {
@@ -978,6 +1014,10 @@ impl StructurePane {
         self.index_name_auto = true;
         self.fk_name_auto = true;
         self.pending_focus_draft = None;
+        self.index_picker = None;
+        self.editing_row = None;
+        self.scroll_to_column = None;
+        self.show_all_columns = false;
         if target.table.is_empty() && !target.connection_id.is_empty() {
             self.enter_create();
         }
@@ -1273,6 +1313,7 @@ impl StructurePane {
         if !self.drafts_ready {
             self.drafts_ready = true;
             self.session.kept_columns = column_drafts(snapshot);
+            self.editing_row = None;
             if self.session.view_sql.is_empty() {
                 self.session.view_sql = snapshot.table_sql.clone();
             }
@@ -1323,7 +1364,7 @@ impl StructurePane {
             if value.trim().is_empty() {
                 self.index_name_auto = true;
             } else {
-                let auto = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+                let auto = self.suggested_index_name();
                 if value != auto {
                     self.index_name_auto = false;
                 }
@@ -1455,6 +1496,7 @@ impl StructurePane {
             let is_unsaved_new = self.session.kept_columns.get(index).is_some_and(|col| col.original.is_none());
             if is_unsaved_new && (!create || self.session.kept_columns.len() > 1) {
                 self.session.kept_columns.remove(index);
+                self.forget_row(index);
                 self.session.cancel();
                 return;
             }
@@ -1535,6 +1577,11 @@ impl StructurePane {
         });
         self.session.column_name.clear();
         self.only_changed_columns = false;
+        if self.session.mode != StructureMode::Create {
+            // 已有表：新增的这一行直接进入编辑，并滚到可见处。
+            self.editing_row = Some(new_index);
+            self.scroll_to_column = Some(new_index);
+        }
         self.pending_focus_draft = Some(10_000 + new_index as u32);
         self.pending_focus_select = true;
         self.session.cancel();
@@ -1580,18 +1627,19 @@ impl StructurePane {
             self.session.kept_columns = column_drafts(snapshot);
             self.session.view_sql = snapshot.table_sql.clone();
         }
+        self.editing_row = None;
     }
 
     fn sync_auto_index_name(&mut self) {
         if self.index_name_auto || self.session.index_name.trim().is_empty() {
-            self.session.index_name = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+            self.session.index_name = self.suggested_index_name();
             self.index_name_auto = true;
         }
     }
 
     pub fn apply_auto_index_name(&mut self) {
         self.index_name_auto = true;
-        self.session.index_name = suggested_index_name(&self.session.target.table, self.session.index_unique, &self.session.index_columns);
+        self.session.index_name = self.suggested_index_name();
         self.session.cancel();
     }
 
@@ -1917,7 +1965,7 @@ impl StructurePane {
                     } else {
                         extract_index_target_expr(row.sql.as_deref())
                     };
-                    let mut kind_badges = div().flex().items_center().gap(px(4.)).min_w(px(0.));
+                    let mut kind_badges = div().flex().items_center().gap(px(4.)).min_w_0();
                     if is_pk {
                         kind_badges = kind_badges.child(kit::pill(text("structure.index.primaryBadge"), p.warn, p.warn_soft));
                     } else if row.unique {
@@ -1934,7 +1982,7 @@ impl StructurePane {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .min_w(px(0.))
+                        .min_w_0()
                         .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.name.clone())))
                         .when(row.protected, |this| {
                             let tip = if reason.is_empty() { text("structure.index.primaryBadge") } else { reason.clone() };
@@ -2041,7 +2089,7 @@ impl StructurePane {
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .min_w(px(0.))
+                        .min_w_0()
                         .tooltip_text(SharedString::from(text("structure.fk.openRef")))
                         .child(
                             div()
@@ -2116,7 +2164,7 @@ impl StructurePane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .min_w(px(0.))
+                    .min_w_0()
                     .tooltip_text(SharedString::from(text("structure.fk.openChild")))
                     .child(
                         div()
@@ -2240,6 +2288,11 @@ impl StructurePane {
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
         let composing = !matches!(section, Section::Indexes | Section::ForeignKeys) || self.composer_open;
         self.form_visible() && composing && !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view)
+    }
+
+    /// 底部“预览 SQL”按钮：已有表的字段页没有改动时不显示（只读浏览），只留一句说明。
+    pub fn preview_button_visible(&self) -> bool {
+        self.preview_action_visible() && !(self.session.section == Section::Columns && self.session.mode != StructureMode::Create && self.pending_changes() == 0)
     }
 
     fn apply_row_action(&mut self, action: RowAction, cx: &mut Context<Self>) {
@@ -2414,6 +2467,23 @@ impl StructurePane {
             owner.update(cx, |pane, cx| pane.preview_current(cx));
         };
         let tip = SharedString::from(format!("{} · {}", i18n::text(locale, "structure.action.preview"), kit::shortcut("Mod+Enter")));
+        if !self.preview_button_visible() {
+            return Some(
+                div()
+                    .id("structure-actions")
+                    .test_support()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(metrics.page_pad))
+                    .py(px(kit::Space::MD))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .bg(p.surface)
+                    .child(div().id("structure-browse-hint").test_support().flex_1().min_w_0().child(kit::muted(t("structure.columns.browseHint"), p)))
+                    .into_any_element(),
+            );
+        }
         let button = if section == Section::Danger {
             kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click)
                 .loading(self.previewing)
@@ -2431,17 +2501,17 @@ impl StructurePane {
                 .id("structure-draft-diagnostic")
                 .test_support()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .child(kit::icon(IconName::TriangleAlert, 13., p.warn))
-                .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.warn).font_weight(FontWeight::MEDIUM).child(SharedString::from(diag)))
+                .child(div().min_w_0().truncate().text_size(px(TypeScale::SM)).text_color(p.warn).font_weight(FontWeight::MEDIUM).child(SharedString::from(diag)))
                 .into_any_element()
         } else if pending > 0 {
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -2451,14 +2521,14 @@ impl StructurePane {
         } else if let Some((no_pk, text)) = create_summary {
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .items_center()
                 .gap(px(6.))
                 .when(no_pk, |this| this.child(kit::icon(IconName::TriangleAlert, 13., p.warn)))
                 .child(
                     div()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .truncate()
                         .text_size(px(TypeScale::SM))
                         .text_color(if no_pk { p.warn } else { p.text_muted })
@@ -2466,7 +2536,7 @@ impl StructurePane {
                 )
                 .into_any_element()
         } else {
-            div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p)).into_any_element()
+            div().flex_1().min_w_0().child(kit::muted(t("structure.action.hint"), p)).into_any_element()
         };
         Some(
             div()
@@ -2557,7 +2627,7 @@ fn fk_rules_cell(on_delete: &str, on_update: &str, p: &Palette) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(4.))
-        .min_w(px(0.))
+        .min_w_0()
         .overflow_hidden()
         .child(badge("DEL", del))
         .when(!upd.eq_ignore_ascii_case("NO ACTION") && !upd.eq_ignore_ascii_case("RESTRICT"), |this| {
@@ -2701,7 +2771,7 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
             .id(SharedString::from(format!("structure-row-cells-{}", row.id)))
             .flex()
             .flex_1()
-            .min_w(px(0.))
+            .min_w_0()
             .items_center();
         for (cell, column) in row.cells.into_iter().zip(columns.iter()) {
             cells = cells.child(table_cell(*column, cell));
@@ -2849,7 +2919,7 @@ fn cell_main(text: String, icon: Option<IconName>, p: &Palette) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(6.))
-        .min_w(px(0.))
+        .min_w_0()
         .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(text)))
         .when_some(icon, |this, icon| this.child(kit::icon(icon, 12., p.warn)))
         .into_any_element()
@@ -2883,11 +2953,14 @@ impl StructurePane {
             self.composer_open = false;
             return true;
         }
+        if self.end_edit_row() {
+            return true;
+        }
         false
     }
 
     pub fn trigger_preview_shortcut(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.session.preview_open() && self.preview_action_visible() && !self.previewing {
+        if !self.session.preview_open() && self.preview_button_visible() && !self.previewing {
             self.preview_current(cx);
             return true;
         }
@@ -3023,6 +3096,8 @@ impl StructurePane {
         let content_w = (self.content_width - 2. * metrics.page_pad).max(0.);
         let widths = FieldWidths::of(content_w, create).with_comment(content_w, create && self.shows_column_comments());
         let mut editor = div().flex().flex_col().gap(px(metrics.section_gap()));
+        let browse_cols = browse::BrowseColumns::of(content_w, self.show_all_columns);
+        let hides_columns = !create && (self.show_all_columns || browse::BrowseColumns::hides_any(content_w));
 
         let issues = self.draft_issues();
         if create {
@@ -3080,7 +3155,7 @@ impl StructurePane {
                 cx,
                 |this: &mut Self, field, value, _| this.set_field(field, value),
             );
-            let show_toolbar = total_cols >= 5 || !filter_val.is_empty() || self.only_changed_columns || pending > 0;
+            let show_toolbar = total_cols >= 5 || !filter_val.is_empty() || self.only_changed_columns || pending > 0 || hides_columns;
             if show_toolbar {
                 let clear_entity = entity.clone();
                 let changed_entity = entity.clone();
@@ -3122,7 +3197,7 @@ impl StructurePane {
                                 .flex()
                                 .items_center()
                                 .child(kit::input_prefix(IconName::Search, 13., p.text_faint))
-                                .child(div().flex_1().min_w(px(0.)).child(kit::borderless_input("structure-column-filter", &filter_state, filter_placeholder)))
+                                .child(div().flex_1().min_w_0().child(kit::borderless_input("structure-column-filter", &filter_state, filter_placeholder)))
                                 .when(!filter_val.is_empty(), |this| {
                                     this.child(
                                         kit::icon_button("structure-column-filter-clear", IconName::X, t("structure.columns.filterClear"), move |_, _, cx| {
@@ -3151,6 +3226,18 @@ impl StructurePane {
                             )
                         })
                         .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(count_label)))
+                        .when(hides_columns, |this| {
+                            let owner = entity.clone();
+                            this.child(
+                                kit::tool_button("structure-show-all-columns", Some(IconName::Columns3), t("structure.columns.showAll"), move |_, _, cx| {
+                                    owner.update(cx, |pane, cx| {
+                                        pane.show_all_columns = !pane.show_all_columns;
+                                        cx.notify();
+                                    });
+                                })
+                                .selected(self.show_all_columns),
+                            )
+                        })
                         .child(div().flex_1())
                         .when(content_w >= 560., |this| this.child(presets_btn))
                         .child(kit::secondary_button("structure-add-column-top", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
@@ -3161,6 +3248,38 @@ impl StructurePane {
                         })),
                 );
             }
+        }
+
+        if !create {
+            // 已有表：先读后改。虚拟列表只渲染可见行，点哪一行就只编辑哪一行。
+            let visible: Vec<usize> = self
+                .session
+                .kept_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| self.column_matches_filter(column, self.column_change(column)))
+                .map(|(index, _)| index)
+                .collect();
+            if visible.is_empty() && (!self.column_filter.trim().is_empty() || self.only_changed_columns) {
+                let clear_owner = entity.clone();
+                let clear_btn = kit::secondary_button("structure-clear-col-filter", None, t("structure.columns.filterClear"), move |_, _, cx| {
+                    clear_owner.update(cx, |pane, cx| {
+                        pane.clear_column_filter();
+                        cx.notify();
+                    });
+                });
+                return editor
+                    .child(kit::card(&p).overflow_hidden().child(kit::no_match_state_with_action(
+                        IconName::Search,
+                        t("structure.columns.noMatch"),
+                        t("structure.columns.noMatchHint"),
+                        clear_btn,
+                        &p,
+                    )))
+                    .into_any_element();
+            }
+            let browser = self.column_browser(visible, browse_cols, window, cx);
+            return editor.flex_1().min_h_0().child(browser).into_any_element();
         }
 
         let head = div()
@@ -3331,7 +3450,23 @@ impl StructurePane {
 
         let name = self.draft_input_enter(10_000 + index as u32, &column.name, "name", window, cx);
         let kind = self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
-        let comment_input = (widths.comment > 0.).then(|| self.draft_input(40_000 + index as u32, &column.comment, "", window, cx));
+        // 已有字段的注释本轮只读（修改注释不在需求内）：编辑行里仍以文本显示，悬停看全文。
+        let comment_input = (widths.comment > 0.).then(|| {
+            if create {
+                self.draft_input(40_000 + index as u32, &column.comment, "", window, cx)
+            } else {
+                let text = col_comment.clone().unwrap_or_else(|| column.comment.clone());
+                div()
+                    .id(SharedString::from(format!("structure-col-comment-{index}")))
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .when(!text.is_empty(), |this| this.tooltip_text(SharedString::from(text.clone())))
+                    .child(SharedString::from(text))
+                    .into_any_element()
+            }
+        });
 
         let type_entity = entity.clone();
         let type_locked = orig_primary || orig_generated;
@@ -3342,7 +3477,13 @@ impl StructurePane {
             .xsmall()
             .icon(IconName::ChevronDown)
             .disabled(type_locked)
-            .tooltip(t("structure.field.pickType"))
+            .tooltip(if orig_primary {
+                t("structure.field.pkTypeLocked")
+            } else if orig_generated {
+                t("structure.field.genLocked")
+            } else {
+                t("structure.field.pickType")
+            })
             .dropdown_menu(move |menu, _, _| {
                 let entity = type_entity.clone();
                 create::type_menu(menu, &menu_engine, &current_type, locale, move |choice, cx| {
@@ -3436,42 +3577,7 @@ impl StructurePane {
             .tooltip(tip)
         });
 
-        let mut row_menu_entries = vec![MenuEntry {
-            id: format!("edit-copy-col-{index}"),
-            label: i18n::text(locale, "structure.menu.copyName"),
-            action: RowAction::Copy(column.name.clone()),
-            disabled: column.name.trim().is_empty(),
-            reason: None,
-        }];
-        if !create && change == ColumnChange::Modified {
-            row_menu_entries.push(MenuEntry {
-                id: format!("edit-revert-col-{index}"),
-                label: i18n::text(locale, "structure.field.revert"),
-                action: RowAction::RevertColumn(index),
-                disabled: false,
-                reason: None,
-            });
-        }
-        row_menu_entries.push(MenuEntry {
-            id: format!("edit-add-col-{index}"),
-            label: i18n::text(locale, "structure.field.addColumn"),
-            action: RowAction::AddColumn,
-            disabled: false,
-            reason: None,
-        });
-        row_menu_entries.push(MenuEntry {
-            id: format!("edit-drop-col-{index}"),
-            label: drop_label.to_string(),
-            action: RowAction::ToggleColumnDrop(index),
-            disabled: drop_locked,
-            reason: if orig_primary {
-                Some(i18n::text(locale, "structure.field.pkLocked"))
-            } else if orig_generated {
-                Some(i18n::text(locale, "structure.field.genLocked"))
-            } else {
-                None
-            },
-        });
+        let row_menu_entries = self.column_menu_entries(index, column, change, create);
 
         let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if column.primary {
             let mut tip = i18n::text(locale, "structure.field.primary");
@@ -3561,7 +3667,7 @@ impl StructurePane {
                                 )
                             }),
                     )
-                    .child(div().flex_1().min_w(px(0.)).when(dropped, |this| this.opacity(0.5).line_through()).child(name))
+                    .child(div().flex_1().min_w_0().when(dropped, |this| this.opacity(0.5).line_through()).child(name))
                     .when(show_inline_badge, |this| {
                         let key = if orig_generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
                         this.child(kit::pill(t(key), p.text_muted, p.hover))
@@ -3575,7 +3681,7 @@ impl StructurePane {
                     .items_center()
                     .gap(px(2.))
                     .when(dropped, |this| this.opacity(0.5))
-                    .child(div().flex_1().min_w(px(0.)).child(kind))
+                    .child(div().flex_1().min_w_0().child(kind))
                     .child(type_menu),
             )
             .child(
@@ -3588,17 +3694,20 @@ impl StructurePane {
                         format!("structure-null-{index}"),
                         column.nullable,
                         "null",
-                        t("ui.structure.nullable"),
+                        // 不可修改时提示框直接说明原因。
+                        if column.primary {
+                            t("structure.field.pkNullLocked")
+                        } else if orig_generated {
+                            t("structure.field.genLocked")
+                        } else {
+                            t("ui.structure.nullable")
+                        },
                         !dropped && !column.primary && !orig_generated,
                     )),
             )
-            .child(
-                div()
-                    .w(px(widths.default))
-                    .flex_none()
-                    .when(dropped, |this| this.opacity(0.5))
-                    .child(default_cell),
-            )
+            .when(widths.default > 0., |this| {
+                this.child(div().w(px(widths.default)).flex_none().when(dropped, |this| this.opacity(0.5)).child(default_cell))
+            })
             .when_some(comment_input, |this, input| this.child(div().w(px(widths.comment)).flex_none().child(input)));
 
         if create {
@@ -3692,7 +3801,7 @@ impl StructurePane {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.view.readonlyColumns"), &p)))
+                        .child(div().flex_1().min_w_0().child(kit::muted(t("structure.view.readonlyColumns"), &p)))
                         .child(kit::secondary_button("structure-switch-view-def", Some(IconName::SquarePen), t("structure.view.editDef"), move |_, _, cx| {
                             edit_entity.update(cx, |pane, cx| {
                                 pane.session.section = Section::View;
@@ -3702,6 +3811,7 @@ impl StructurePane {
                         })),
                 )
             }
+            Section::Columns if self.session.mode != StructureMode::Create => form.flex_1().min_h_0().child(self.column_editor(window, cx)),
             Section::Columns => form.child(self.column_editor(window, cx)),
             Section::Indexes => stack_frame(|| {
                 let mut form = form;
@@ -3753,127 +3863,28 @@ impl StructurePane {
                                 }),
                         ),
                 );
-                let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
-                if selected.is_empty() {
-                    chips = chips.child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("structure.index.pickHint")));
+                let picker = self.ensure_index_picker(&names, window, cx);
+                let ordered = self.index_order_list(&entity, &selected, &p, cx);
+                form = form.child(kit::form_row(
+                    t("structure.section.columns"),
+                    div()
+                        .id("structure-index-columns")
+                        .test_support()
+                        .flex()
+                        .flex_wrap()
+                        .items_start()
+                        .gap(px(kit::Space::LG))
+                        .child(div().flex_none().child(picker))
+                        .child(ordered),
+                    &p,
+                ));
+                if self.index_name_conflict() {
+                    form = form.child(create::issue_line(
+                        "structure-index-name-conflict",
+                        &i18n::fill(&i18n::text(locale, "structure.index.nameTaken"), &[("name", self.session.index_name.trim())]),
+                        &p,
+                    ));
                 }
-                let selected_len = selected.len();
-                for (chip_idx, column) in selected.iter().enumerate() {
-                    let order_entity = entity.clone();
-                    let remove_entity = entity.clone();
-                    let left_entity = entity.clone();
-                    let right_entity = entity.clone();
-                    let order_name = column.name.clone();
-                    let remove_name = column.name.clone();
-                    chips = chips.child(
-                        div()
-                            .id(SharedString::from(format!("structure-index-chip-{}", column.name)))
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .h(px(26.))
-                            .pl(px(8.))
-                            .pr(px(3.))
-                            .rounded(px(Radius::CONTROL))
-                            .bg(p.accent_soft)
-                            .text_color(p.accent_text)
-                            .text_size(px(TypeScale::SM))
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .when(selected_len > 1, |this| {
-                                this.child(
-                                    div()
-                                        .text_size(px(TypeScale::XS))
-                                        .text_color(p.text_faint)
-                                        .child(SharedString::from(format!("{}.", chip_idx + 1))),
-                                )
-                            })
-                            .child(SharedString::from(column.name.clone()))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("structure-index-order-{}", column.name)))
-                                    .px(px(4.))
-                                    .rounded(px(Radius::TAG))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(p.surface))
-                                    .tooltip_text(t("structure.index.toggleOrder"))
-                                    .child(if column.descending { t("structure.index.desc") } else { t("structure.index.asc") })
-                                    .on_click(move |_, _, cx| {
-                                        let name = order_name.clone();
-                                        order_entity.update(cx, |pane, cx| {
-                                            pane.toggle_index_order(&name);
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .when(selected_len > 1 && chip_idx > 0, |this| {
-                                this.child(
-                                    kit::icon_button(
-                                        SharedString::from(format!("structure-index-left-{}", column.name)),
-                                        IconName::ChevronLeft,
-                                        t("structure.index.moveLeft"),
-                                        move |_, _, cx| {
-                                            left_entity.update(cx, |pane, cx| {
-                                                pane.move_index_column(chip_idx, -1);
-                                                cx.notify();
-                                            });
-                                        },
-                                    )
-                                    .xsmall(),
-                                )
-                            })
-                            .when(selected_len > 1 && chip_idx + 1 < selected_len, |this| {
-                                this.child(
-                                    kit::icon_button(
-                                        SharedString::from(format!("structure-index-right-{}", column.name)),
-                                        IconName::ChevronRight,
-                                        t("structure.index.moveRight"),
-                                        move |_, _, cx| {
-                                            right_entity.update(cx, |pane, cx| {
-                                                pane.move_index_column(chip_idx, 1);
-                                                cx.notify();
-                                            });
-                                        },
-                                    )
-                                    .xsmall(),
-                                )
-                            })
-                            .child(
-                                kit::icon_button(
-                                    SharedString::from(format!("structure-index-remove-{}", column.name)),
-                                    IconName::X,
-                                    t("structure.index.removeColumn"),
-                                    move |_, _, cx| {
-                                        let name = remove_name.clone();
-                                        remove_entity.update(cx, |pane, cx| {
-                                            pane.toggle_index_column(&name);
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                                .xsmall(),
-                            ),
-                    );
-                }
-                let remaining: Vec<String> = names.into_iter().filter(|name| !selected.iter().any(|column| &column.name == name)).collect();
-                let add_entity = entity.clone();
-                chips = chips.child(
-                    Button::new("structure-index-add-column")
-                        .ghost()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label(t("structure.index.addColumn"))
-                        .disabled(remaining.is_empty())
-                        .dropdown_menu(move |menu, _, _| {
-                            let entity = add_entity.clone();
-                            choice_menu(menu, &remaining, "", locale, move |name, cx| {
-                                entity.update(cx, |pane, cx| {
-                                    pane.toggle_index_column(&name);
-                                    cx.notify();
-                                });
-                            })
-                        }),
-                );
-                form = form.child(kit::form_row(t("structure.section.columns"), chips, &p));
                 if let Some(sql) = self.live_composer_sql() {
                     form = form.child(
                         kit::sunken(&p)
@@ -3975,7 +3986,7 @@ impl StructurePane {
                                 .flex()
                                 .items_end()
                                 .gap(px(4.))
-                                .child(div().flex_1().min_w(px(0.)).child(column))
+                                .child(div().flex_1().min_w_0().child(column))
                                 .child(local_button),
                         ),
                 );
@@ -3989,7 +4000,7 @@ impl StructurePane {
                             .flex()
                             .items_end()
                             .gap(px(4.))
-                            .child(div().flex_1().min_w(px(0.)).child(schema))
+                            .child(div().flex_1().min_w_0().child(schema))
                             .child(
                                 Button::new("structure-fk-schemas")
                                     .ghost()
@@ -4022,7 +4033,7 @@ impl StructurePane {
                                 .flex()
                                 .items_end()
                                 .gap(px(4.))
-                                .child(div().flex_1().min_w(px(0.)).child(table))
+                                .child(div().flex_1().min_w_0().child(table))
                                 .child(tables_button),
                         )
                         .child(
@@ -4032,7 +4043,7 @@ impl StructurePane {
                                 .flex()
                                 .items_end()
                                 .gap(px(4.))
-                                .child(div().flex_1().min_w(px(0.)).child(target))
+                                .child(div().flex_1().min_w_0().child(target))
                                 .child(columns_button),
                         ),
                 );
@@ -4265,7 +4276,7 @@ impl StructurePane {
                             .text_size(px(TypeScale::XS))
                             .text_color(p.text_muted)
                             .child(kit::icon(IconName::Info, 13., p.text_muted))
-                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(notice))),
+                            .child(div().flex_1().min_w_0().child(SharedString::from(notice))),
                     );
                 }
                 if let Some(snap) = &self.snapshot {
@@ -4420,7 +4431,7 @@ impl StructurePane {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap(px(3.))
@@ -4696,7 +4707,7 @@ impl StructurePane {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .min_w(px(0.))
+                .min_w_0()
                 .child(kit::copyable(
                     "structure-copy-name",
                     self.session.target.table.clone(),
@@ -4719,7 +4730,7 @@ impl StructurePane {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .min_w(px(0.))
+                .min_w_0()
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(kit::copyable(
@@ -4735,7 +4746,7 @@ impl StructurePane {
                     this.child(div().text_color(p.text_faint).child("·")).child(
                         div()
                             .id("structure-table-comment")
-                            .min_w(px(0.))
+                            .min_w_0()
                             .truncate()
                             .text_color(p.text_faint)
                             .tooltip_text(SharedString::from(comment.clone()))
@@ -4835,18 +4846,11 @@ impl StructurePane {
                     .child(tabs),
             );
 
-        let mut body = div()
-            .id("structure-body")
-            .test_support()
-            .flex_1()
-            .min_h(px(0.))
-            .scroll_area_y()
-            .p(px(metrics.page_pad))
-            .flex()
-            .flex_col()
-            .gap(px(metrics.section_gap()));
+        let mut body = div().flex().flex_col().gap(px(metrics.section_gap()));
         let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
         let editing_columns = section == Section::Columns && self.form_visible() && !readonly_view;
+        // 已有表的字段页用虚拟列表，自己滚动：外层不再滚动，列表占满剩余高度。
+        let virtual_columns = editing_columns && self.session.mode != StructureMode::Create;
         let composer_section = matches!(section, Section::Indexes | Section::ForeignKeys);
         if editing_columns {
             if let Some(form) = form {
@@ -4920,6 +4924,30 @@ impl StructurePane {
                     .child(SharedString::from(self.session.note())),
             );
         }
+        let body = if virtual_columns {
+            div()
+                .id("structure-body")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .p(px(metrics.page_pad))
+                .flex()
+                .flex_col()
+                .child(body.flex_1().min_h_0())
+                .into_any_element()
+        } else {
+            div()
+                .id("structure-body")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .scroll_area_y()
+                .p(px(metrics.page_pad))
+                .flex()
+                .flex_col()
+                .child(body)
+                .into_any_element()
+        };
         column = column.child(body);
         if let Some(actions) = self.preview_footer(&entity, &p, locale, metrics) {
             column = column.child(actions);
@@ -5072,12 +5100,12 @@ impl StructurePane {
                             .when(dangerous, |this| this.child(kit::icon(IconName::TriangleAlert, 16., p.danger)))
                             .when(!dangerous, |this| this.child(kit::icon(IconName::Code, 16., p.accent)))
                             .child(kit::title(preview_title, TypeScale::LG, p))
-                            .child(div().flex_1().min_w(px(0.)))
+                            .child(div().flex_1().min_w_0())
                             .child(
                                 div()
                                     .id("structure-preview-object")
                                     .test_support()
-                                    .min_w(px(0.))
+                                    .min_w_0()
                                     .font_family(cx.theme().mono_font_family.clone())
                                     .text_size(px(TypeScale::SM))
                                     .text_color(p.text_muted)
@@ -5091,7 +5119,7 @@ impl StructurePane {
                             .id("structure-preview-body")
                             .test_support()
                             .flex_1()
-                            .min_h(px(0.))
+                            .min_h_0()
                             .scroll_area_y()
                             .px(px(metrics.card_pad()))
                             .py(px(10.))
@@ -5178,7 +5206,7 @@ impl StructurePane {
                                             .text_color(fg)
                                             .text_size(px(TypeScale::SM))
                                             .child(div().pt(px(2.)).flex_none().child(kit::icon(ic, 13., fg)))
-                                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text))),
+                                            .child(div().flex_1().min_w_0().child(SharedString::from(text))),
                                     );
                                 }
                                 this.child(list)
@@ -5213,7 +5241,7 @@ impl StructurePane {
                                             .text_size(px(TypeScale::SM))
                                             .font_weight(FontWeight::MEDIUM)
                                             .child(kit::icon(IconName::TriangleAlert, 14., p.danger))
-                                            .child(div().flex_1().min_w(px(0.)).child(SharedString::from(note_text))),
+                                            .child(div().flex_1().min_w_0().child(SharedString::from(note_text))),
                                     )
                                 } else {
                                     this.child(kit::muted(SharedString::from(note_text), p))
@@ -5252,6 +5280,7 @@ impl StructurePane {
     }
 }
 
+mod browse;
 mod create;
 
 #[cfg(test)]

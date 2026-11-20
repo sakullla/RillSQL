@@ -997,6 +997,13 @@ impl Workbench {
     fn sync_view_settings(&mut self, cx: &mut Context<Self>) {
         let settings = self.model.settings.to_settings();
         self.query.update(cx, |pane, cx| pane.apply_public_settings(&settings, cx));
+        if self.structure.read(cx).index_naming() != &settings.index_naming {
+            let naming = settings.index_naming.clone();
+            self.structure.update(cx, |pane, cx| {
+                pane.set_index_naming(naming);
+                cx.notify();
+            });
+        }
         if self.model.connections.loaded {
             let saved: Vec<&str> = self.model.connections.rows.iter().map(|row| row.saved.id.as_str()).collect();
             self.query.update(cx, |pane, cx| pane.retain_saved_targets(&saved, cx));

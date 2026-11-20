@@ -60,6 +60,9 @@ pub struct ShellSettings {
     /// 空字符串在网格里怎么画（R20）：`hint` 弱化提示（默认），`blank` 完全留空。旧文件没有这一项时取默认。
     #[serde(default = "default_empty_display")]
     pub empty_display: String,
+    /// 索引命名模板（R8）。旧文件没有这一项时取默认，与原来的固定命名一致。
+    #[serde(default)]
+    pub index_naming: crate::ddl::naming::IndexNaming,
 }
 
 fn default_empty_display() -> String {
@@ -81,6 +84,7 @@ impl Default for ShellSettings {
             query_timeout_sec: 0,
             auto_check_updates: true,
             empty_display: default_empty_display(),
+            index_naming: crate::ddl::naming::IndexNaming::default(),
         }
     }
 }

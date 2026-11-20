@@ -5,6 +5,7 @@ pub(crate) mod english;
 pub(crate) mod exec;
 pub(crate) mod introspect;
 pub(crate) mod model;
+pub(crate) mod naming;
 pub(crate) mod plan;
 pub(crate) mod sql;
 pub(crate) mod templates;

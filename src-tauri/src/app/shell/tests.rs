@@ -3486,6 +3486,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         query_timeout_sec: -5,
         auto_check_updates: true,
         empty_display: "hint".into(),
+        index_naming: crate::ddl::naming::IndexNaming::default(),
     };
     model.apply_settings(&illegal);
     assert_eq!(model.settings.theme, "system");
@@ -3616,6 +3617,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         query_timeout_sec: 0,
         auto_check_updates: true,
         empty_display: "hint".into(),
+        index_naming: crate::ddl::naming::IndexNaming::default(),
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -13333,4 +13335,52 @@ fn caret_blink_redraws_do_not_rebuild_the_tab_strip(cx: &mut gpui_kit::TestAppCo
     .unwrap();
     cx.run_until_parked();
     assert!(counts(cx).2 > t1, "工作台被通知后页签条重建");
+}
+
+/// R8：设置页“数据”分区编辑索引命名模板，下方示例实时更新；改动写盘，结构页拿到新模板。
+#[gpui_kit::test]
+fn index_naming_templates_are_edited_in_settings_and_reach_the_structure_pane(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::settings::SaveState;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-index-naming-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            view.perform("settings-section-data", cx);
+        })
+    });
+    let (group, preview, normal) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.try_find("settings-group-index-naming").is_some(),
+                window.try_find("settings-index-naming-preview").is_some(),
+                window.try_find("field-IndexNamingNormal").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(group && preview && normal, "数据分区有索引命名模板与示例");
+    assert_eq!(cx.update(|cx| view.read(cx).model.field_value(DraftField::IndexNamingNormal)), crate::ddl::naming::DEFAULT_NORMAL);
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("field-IndexNamingJoiner", cx);
+        window.input("$", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let joiner = cx.update(|cx| view.read(cx).model.settings.index_naming.joiner.clone());
+    assert!(joiner.contains('$'), "输入落到设置：{joiner:?}");
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.model.settings_save == SaveState::Saved
+            && view.structure.read(cx).index_naming().joiner == view.model.settings.index_naming.joiner),
+        "模板改动写盘，并下发到结构页"
+    );
+    let stored = cx.update(|cx| view.read(cx).model.settings.to_settings().index_naming);
+    assert_eq!(stored.joiner, joiner);
+    let _ = std::fs::remove_dir_all(&dir);
 }

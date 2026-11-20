@@ -1062,6 +1062,13 @@ dict! {
     "ui.settings.emptyBlank" => "留空", "Blank";
     "ui.settings.nullEmptyClash" => "复制时 NULL 与空字符串都会成为空文本，两者无法区分。", "When copying, NULL and empty strings both become empty text and cannot be told apart.";
     "shell.settings.emptyDisplay" => "空字符串显示", "Empty string display";
+    "ui.settings.indexNaming" => "索引命名", "Index naming";
+    "ui.settings.indexNormal" => "普通索引模板", "Index template";
+    "ui.settings.indexUnique" => "唯一索引模板", "Unique index template";
+    "ui.settings.indexJoiner" => "列名连接符", "Column joiner";
+    "ui.settings.indexPlaceholders" => "可用占位符：{table} 表名，{columns} 全部列，{column1} 第一列。留空使用默认模板。", "Placeholders: {table} table name, {columns} all columns, {column1} first column. Leave empty for the default.";
+    "ui.settings.indexPreview" => "示例", "Preview";
+    "ui.settings.indexPreviewHint" => "表 orders，列 user_id、created_at。超过数据库的长度上限时截断，并在末尾加 _ 和 6 位哈希。", "Table orders, columns user_id and created_at. Names longer than the database limit are cut and end with _ and a 6-character hash.";
     "ui.palette.placeholder" => "搜索命令、连接或对象…", "Search commands, connections, or objects…";
     "ui.palette.empty" => "没有匹配项", "No matches";
     "ui.palette.noObjects" => "先连接并读取对象", "Connect and load objects first";
@@ -1336,7 +1343,8 @@ dict! {
     "structure.section.definition" => "定义", "Definition";
     "structure.danger.renameDetail" => "引用这张表的视图、查询与程序需要跟着改名。", "Views, queries and code that reference this table must be updated too.";
     "structure.danger.truncateDetail" => "删除表里的全部行，表结构保留；无法撤销。", "Deletes every row but keeps the table; this can't be undone.";
-    "structure.index.pickHint" => "还没有选列，用右边的“添加列”选择索引包含的列。", "No columns yet. Use \u{201c}Add column\u{201d} to choose the indexed columns.";
+    "structure.index.pickHint" => "还没有选列。在左边的列表里搜索并勾选索引包含的列，勾选顺序就是索引列顺序。", "No columns yet. Search and check the indexed columns on the left; the check order is the column order.";
+    "structure.index.nameTaken" => "这张表已经有名为 {name} 的索引，换一个名字再预览。", "This table already has an index named {name}. Choose another name before previewing.";
     "structure.index.toggleOrder" => "切换升序 / 降序", "Toggle ascending / descending";
     "structure.index.removeColumn" => "移除这一列", "Remove this column";
     "structure.index.addColumn" => "添加列", "Add column";
@@ -1890,6 +1898,11 @@ dict! {
     "structure.field.pkLocked" => "主键列不能在此直接删除", "Primary key columns can't be dropped here";
     "structure.field.genLocked" => "生成列只读，不能直接修改或删除", "Generated columns are read-only here";
     "structure.field.badgeAuto" => "自增", "AUTO";
+    "structure.field.badgeIndex" => "索引", "IDX";
+    "structure.field.pkNullLocked" => "主键列必须非空，不能改为可空", "Primary key columns must be NOT NULL";
+    "structure.field.pkTypeLocked" => "主键列的类型不能在此修改", "Primary key column types can't be changed here";
+    "structure.columns.showAll" => "显示全部列", "Show all columns";
+    "structure.columns.browseHint" => "字段只读浏览。点击某一行进入编辑，改动后可预览 SQL。", "Browsing columns. Click a row to edit it; preview SQL appears once something changes.";
     "structure.field.badgeGen" => "生成", "GEN";
     "structure.field.badgeFk" => "外键 → {target}", "FK → {target}";
     "structure.field.changedFrom" => "原定义：{detail}", "Original: {detail}";

@@ -1,6 +1,7 @@
 //! 设置映射到版本化的 ShellSettings。密度保留 compact / standard / relaxed 三档。
 
 use crate::app::{Density, Locale, Shell, ThemePreference};
+use crate::ddl::naming::IndexNaming;
 use crate::state::ShellSettings;
 
 pub const EDITOR_THEMES: &[&str] = &["auto", "contrast", "warm", "cool", "mono"];
@@ -117,6 +118,7 @@ pub struct SettingsForm {
     pub query_timeout_sec: i64,
     pub auto_check_updates: bool,
     pub empty_display: String,
+    pub index_naming: IndexNaming,
 }
 
 /// 空字符串的两种画法：弱化提示（默认）或留空。
@@ -148,6 +150,7 @@ impl SettingsForm {
             query_timeout_sec: settings.query_timeout_sec.max(0),
             auto_check_updates: settings.auto_check_updates,
             empty_display: normalize_empty_display(&settings.empty_display).to_owned(),
+            index_naming: settings.index_naming.clone(),
         }
     }
 
@@ -166,6 +169,7 @@ impl SettingsForm {
             query_timeout_sec: self.query_timeout_sec.max(0),
             auto_check_updates: self.auto_check_updates,
             empty_display: normalize_empty_display(&self.empty_display).to_owned(),
+            index_naming: self.index_naming.clone(),
         }
     }
 
@@ -184,6 +188,7 @@ impl SettingsForm {
             query_timeout_sec: form.query_timeout_sec,
             auto_check_updates: form.auto_check_updates,
             empty_display: form.empty_display,
+            index_naming: form.index_naming,
         }
     }
 
@@ -425,11 +430,25 @@ mod tests {
         )
         .expect("旧文件仍能读入");
         assert_eq!(old.empty_display, "hint");
+        assert_eq!(old.index_naming, IndexNaming::default(), "旧文件没有索引命名模板时取默认");
         let mut form = SettingsForm::from_settings(&old);
         form.empty_display = "blank".into();
         assert_eq!(form.to_settings().empty_display, "blank");
         form.empty_display = "bogus".into();
         assert_eq!(form.to_settings().empty_display, "hint");
+    }
+
+    /// R8：索引命名模板随设置写盘、读回，旧文件缺字段时取默认。
+    #[test]
+    fn index_naming_round_trips_through_settings() {
+        let mut form = SettingsForm::default();
+        assert_eq!(form.index_naming, IndexNaming::default());
+        form.index_naming.normal = "ix_{table}__{columns}".into();
+        form.index_naming.joiner = "__".into();
+        let stored = serde_json::to_string(&form.to_settings()).unwrap();
+        assert!(stored.contains("\"indexNaming\""), "{stored}");
+        let back: ShellSettings = serde_json::from_str(&stored).unwrap();
+        assert_eq!(SettingsForm::from_settings(&back).index_naming, form.index_naming);
     }
 
     #[test]
@@ -447,6 +466,7 @@ mod tests {
             query_timeout_sec: -5,
             auto_check_updates: true,
             empty_display: "hint".into(),
+            index_naming: IndexNaming::default(),
         };
         let mut form = SettingsForm::from_settings(&illegal);
         assert_eq!(form.theme, "system");

@@ -218,6 +218,12 @@ pub enum DraftField {
     TagLabel,
     /// 连接缺密码或密码被拒时的密码输入框。
     PromptPassword,
+    /// 设置页“数据”分区：普通索引的命名模板。
+    IndexNamingNormal,
+    /// 设置页“数据”分区：唯一索引的命名模板。
+    IndexNamingUnique,
+    /// 设置页“数据”分区：索引名里列名之间的连接符。
+    IndexNamingJoiner,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5795,6 +5801,9 @@ impl WorkbenchModel {
                     prompt.text = value;
                 }
             }
+            DraftField::IndexNamingNormal => self.settings.index_naming.normal = value,
+            DraftField::IndexNamingUnique => self.settings.index_naming.unique = value,
+            DraftField::IndexNamingJoiner => self.settings.index_naming.joiner = value,
             other => {
                 if other == DraftField::Host && value.contains("://") && value.trim().len() > 6 {
                     let trimmed = value.trim().to_owned();
@@ -5854,6 +5863,9 @@ impl WorkbenchModel {
             DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
             DraftField::DangerNewName => self.danger.as_ref().map(|prompt| prompt.new_name.clone()).unwrap_or_default(),
             DraftField::PromptPassword => self.password_prompt.as_ref().map(|prompt| prompt.text.clone()).unwrap_or_default(),
+            DraftField::IndexNamingNormal => self.settings.index_naming.normal.clone(),
+            DraftField::IndexNamingUnique => self.settings.index_naming.unique.clone(),
+            DraftField::IndexNamingJoiner => self.settings.index_naming.joiner.clone(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
         }
     }
