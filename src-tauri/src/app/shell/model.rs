@@ -872,6 +872,9 @@ impl WorkbenchModel {
         if id.starts_with("overview-") {
             return self.overview_command(id);
         }
+        if self.history_multi_command(id) {
+            return true;
+        }
         if (id.starts_with("group-") || id.starts_with("conn-move-group")) && self.group_command(id) {
             return true;
         }
@@ -2181,6 +2184,36 @@ impl WorkbenchModel {
     pub fn open_history_menu(&mut self) {
         let target = if self.history.section == HistorySection::Saved { MenuTarget::Saved } else { MenuTarget::Run };
         self.open_menu(MenuPlace::HistoryEntry, target);
+        // R13：历史列表的右键也带只读表的复制方式，按当前多选生成。
+        if let Some(menu) = self.menu.as_mut() {
+            menu.items.extend(super::menus::row_copy_items("history-copy-as"));
+        }
+    }
+
+    /// 历史列表的多选与复制（R13）：普通单击、Shift 扩展、⌘ 切换，Shift+上下扩展，按方式复制。
+    /// 都只改选中或写剪贴板，不载入、不执行、不删除。
+    fn history_multi_command(&mut self, id: &str) -> bool {
+        use crate::ui::read_table::RowPick;
+        for (prefix, how) in [("history-pick:", RowPick::Replace), ("history-pick-extend:", RowPick::Extend), ("history-pick-toggle:", RowPick::Toggle)] {
+            if let Some(row) = id.strip_prefix(prefix) {
+                self.history.pick(row, how);
+                return true;
+            }
+        }
+        match id {
+            "history-extend-next" => self.history.extend_selection(1),
+            "history-extend-prev" => self.history.extend_selection(-1),
+            _ => {
+                let Some(kind) = id.strip_prefix("history-copy-as:") else { return false };
+                let Some(kind) = super::menus::parse_row_copy_kind(kind) else { return true };
+                let text = self.history.copy_text(|key| self.text(key), Some(kind)).unwrap_or_default();
+                self.copied = text.clone();
+                if !text.is_empty() {
+                    self.clipboard_out = Some(text);
+                }
+            }
+        }
+        true
     }
 
     /// 启动页“最近执行”行右键：菜单绑定这一条执行记录。
@@ -5333,7 +5366,10 @@ impl WorkbenchModel {
     }
 
     fn copy_selected_sql(&mut self) {
-        let sql = if self.history.section == HistorySection::Saved {
+        let sql = if self.shell.page == AppPage::History && self.history.multi_selected() {
+            // 多选时 ⌘C / 复制得到含表头的 TSV（SQL 在第一列，其余为连接、库、状态、时间等）。
+            self.history.copy_text(|key| self.text(key), None).unwrap_or_default()
+        } else if self.history.section == HistorySection::Saved {
             self.history.plan_saved(&self.known_ids()).map(|plan| plan.sql).unwrap_or_default()
         } else if self.shell.page == AppPage::Workspace {
             self.active_tab().map(|tab| tab.draft.clone()).unwrap_or_default()

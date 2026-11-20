@@ -25,6 +25,7 @@ use crate::i18n;
 use crate::ui::kit::{self, ControlSize, FieldSpec, Palette, Tip as _, Radius, Space, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::tabs;
+use crate::ui::read_table::RowPick;
 
 use gpui_kit::base::FocusTrapElement as _;
 
@@ -553,6 +554,12 @@ impl Workbench {
             let mods = event.keystroke.modifiers;
             if key == "c" && mods.secondary(cx) && !mods.shift && !mods.alt && !any_input {
                 self.perform("history-copy", cx);
+                cx.notify();
+                return;
+            }
+            if mods.shift && !mods.secondary(cx) && !mods.alt && !any_input && matches!(key, "up" | "down") && !self.model.history.confirm_open() {
+                self.perform(if key == "down" { "history-extend-next" } else { "history-extend-prev" }, cx);
+                self.model.history_reveal = true;
                 cx.notify();
                 return;
             }
@@ -1854,6 +1861,15 @@ impl Workbench {
             self.tab_rename_focused = true;
             self.fields.focus(DraftField::TabTitle, window, cx);
             state.update(cx, |state, cx| state.select_all(window, cx));
+            // 失焦（点到编辑器、别的面板或窗口外）按当前输入确认，与切到别的标签一致；
+            // 回车、Esc 已经结束重命名时这里什么都不做。
+            let handle = state.read(cx).focus_handle(cx);
+            self.tab_rename_blur = Some(cx.on_blur(&handle, window, |this, _, cx| {
+                this.tab_rename_blur = None;
+                if this.model.tab_rename.is_some() {
+                    this.perform("tab-rename-confirm", cx);
+                }
+            }));
         }
         div()
             .id("tab-rename")
@@ -1924,6 +1940,7 @@ impl Workbench {
         let renaming = self.model.tab_rename.as_ref().map(|(id, _)| id.clone());
         if renaming.is_none() {
             self.tab_rename_focused = false;
+            self.tab_rename_blur = None;
         }
         for tab in self.model.tabs.clone() {
             if renaming.as_deref() == Some(tab.id.as_str()) {
@@ -4721,6 +4738,8 @@ impl Workbench {
         let mut child_count = 0usize;
         let mut selected_child: Option<usize> = None;
         let phase = self.model.history.phase_for(section);
+        // R13：多选中的其他行与当前行同样高亮。
+        let marked_ids: std::collections::HashSet<String> = self.model.history.marked_ids().into_iter().collect();
         // 读取失败与空态不是一回事：失败给原因和“重新读取”，旧行仍留在下面可读。
         if let Some(key) = self.model.history.failure_key {
             let detail = self.model.history.failure_detail.clone();
@@ -4770,6 +4789,7 @@ impl Workbench {
             for entry in runs {
                 let id = entry.id.clone();
                 let selected = self.model.history.selected_run.as_deref() == Some(id.as_str());
+                let marked = selected || marked_ids.contains(&id);
                 if selected {
                     selected_child = Some(child_count);
                 }
@@ -4794,8 +4814,8 @@ impl Workbench {
                         .gap(px(8.))
                         .rounded(px(Radius::PANEL))
                         .border_1()
-                        .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft))
-                        .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
+                        .when(marked, |this| this.border_color(p.accent).bg(p.accent_soft))
+                        .when(!marked, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
                             div()
                                 .min_w_0()
@@ -4854,9 +4874,15 @@ impl Workbench {
                             this.perform("menu-history", cx);
                         }))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                            this.model.history.selected_run = Some(select.clone());
-                            this.model.history.preview_open = true;
-                            if event.click_count() >= 2 {
+                            // R13：Shift 扩展、⌘/Ctrl 切换多选；普通单击只选这一条。
+                            let mods = event.modifiers();
+                            let prefix = match RowPick::from_modifiers(mods.shift, mods.secondary(cx)) {
+                                RowPick::Replace => "history-pick",
+                                RowPick::Extend => "history-pick-extend",
+                                RowPick::Toggle => "history-pick-toggle",
+                            };
+                            this.perform(&format!("{prefix}:{select}"), cx);
+                            if event.click_count() >= 2 && !mods.modified() {
                                 this.perform("history-load", cx);
                             }
                             cx.notify();
@@ -4901,6 +4927,7 @@ impl Workbench {
             for item in saved {
                 let id = item.id.clone();
                 let selected = self.model.history.selected_saved.as_deref() == Some(id.as_str());
+                let marked = selected || marked_ids.contains(&id);
                 if selected {
                     selected_child = Some(child_count);
                 }
@@ -4923,8 +4950,8 @@ impl Workbench {
                         .gap(px(6.))
                         .rounded(px(Radius::PANEL))
                         .border_1()
-                        .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft))
-                        .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
+                        .when(marked, |this| this.border_color(p.accent).bg(p.accent_soft))
+                        .when(!marked, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
                             div()
                                 .flex()
@@ -4982,9 +5009,14 @@ impl Workbench {
                         }))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.section = HistorySection::Saved;
-                            this.model.history.selected_saved = Some(select.clone());
-                            this.model.history.preview_open = true;
-                            if event.click_count() >= 2 {
+                            let mods = event.modifiers();
+                            let prefix = match RowPick::from_modifiers(mods.shift, mods.secondary(cx)) {
+                                RowPick::Replace => "history-pick",
+                                RowPick::Extend => "history-pick-extend",
+                                RowPick::Toggle => "history-pick-toggle",
+                            };
+                            this.perform(&format!("{prefix}:{select}"), cx);
+                            if event.click_count() >= 2 && !mods.modified() {
                                 this.perform("history-load", cx);
                             }
                             cx.notify();

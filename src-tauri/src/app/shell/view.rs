@@ -72,6 +72,8 @@ pub struct Workbench {
     pub(super) overview_focus: FocusHandle,
     /// 就地重命名的输入框已拿到焦点（只在打开时聚焦一次）。
     pub(super) tab_rename_focused: bool,
+    /// 重命名输入框失焦即确认（点到编辑器或别的区域时不让输入框一直挂在标签栏上）。
+    pub(super) tab_rename_blur: Option<gpui_kit::Subscription>,
     /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
     pub(super) conn_launcher_focus: FocusHandle,
     /// 对象树空态"新建连接"按钮：同上。
@@ -426,6 +428,7 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             overview_focus: cx.focus_handle(),
             tab_rename_focused: false,
+            tab_rename_blur: None,
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
             modal_focus: cx.focus_handle(),

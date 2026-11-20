@@ -1512,6 +1512,13 @@ dict! {
     "connections.launcher.all" => "全部连接", "All connections";
     "history.preview.copy" => "复制 SQL", "Copy SQL";
     "history.preview.saveQuery" => "保存为查询", "Save as query";
+    "history.copy.sql" => "SQL", "SQL";
+    "history.copy.name" => "名称", "Name";
+    "history.copy.connection" => "连接", "Connection";
+    "history.copy.database" => "库", "Database";
+    "history.copy.status" => "状态", "Status";
+    "history.copy.time" => "时间", "Time";
+    "history.copy.elapsed" => "耗时 (ms)", "Elapsed (ms)";
     "history.preview.failed" => "预览失败，原文仍保留。", "Preview failed; the original text was kept.";
     "mongo.nav.collapse" => "折叠导航", "Collapse navigation";
     "mongo.nav.breadcrumb" => "库与集合", "Database and collection";

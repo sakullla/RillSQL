@@ -253,6 +253,148 @@ pub fn menu_entries(rows: usize, cols: usize, selection: Option<ReadSelection>) 
     CopyKind::MENU.iter().map(|kind| (*kind, !enabled)).collect()
 }
 
+// ---------------------------------------------------------------- 行列表的多选
+
+/// 点选一行时的修饰：普通单击替换选区，Shift 扩展到这一行，⌘/Ctrl 切换这一行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPick {
+    Replace,
+    Extend,
+    Toggle,
+}
+
+impl RowPick {
+    pub fn from_modifiers(shift: bool, secondary: bool) -> Self {
+        if shift {
+            RowPick::Extend
+        } else if secondary {
+            RowPick::Toggle
+        } else {
+            RowPick::Replace
+        }
+    }
+}
+
+/// 以行为单位的只读列表（库概览、历史等）的多选，与 `ReadTable` 的 Shift 扩展、复制规则一致。
+///
+/// 列表自己的“焦点行”（概览的 `selected`、历史的 `selected_run`）仍是唯一的当前行，
+/// 这里只记锚点与额外选中的行。焦点不在集合里时（键盘移动、外部直接改了焦点）只算焦点一行，
+/// 所以旧的单选代码路径不需要知道多选的存在。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowMarks {
+    anchor: Option<String>,
+    ids: Vec<String>,
+}
+
+impl RowMarks {
+    pub fn clear(&mut self) {
+        self.anchor = None;
+        self.ids.clear();
+    }
+
+    /// 选中行在 `visible` 中的下标，升序。
+    pub fn selected(&self, visible: &[String], focus: Option<&str>) -> Vec<usize> {
+        let Some(focus) = focus else { return Vec::new() };
+        if self.ids.iter().any(|id| id == focus) {
+            visible.iter().enumerate().filter(|(_, id)| self.ids.contains(id)).map(|(index, _)| index).collect()
+        } else {
+            visible.iter().position(|id| id == focus).into_iter().collect()
+        }
+    }
+
+    pub fn is_selected(&self, visible: &[String], focus: Option<&str>, id: &str) -> bool {
+        match focus {
+            Some(focus) if self.ids.iter().any(|item| item == focus) => self.ids.iter().any(|item| item == id) && visible.iter().any(|item| item == id),
+            Some(focus) => focus == id,
+            None => false,
+        }
+    }
+
+    /// 点选 `target`，返回新的焦点行。目标不在可见行里时按普通单击处理。
+    pub fn pick(&mut self, visible: &[String], focus: Option<&str>, target: &str, how: RowPick) -> Option<String> {
+        let Some(target_ix) = visible.iter().position(|id| id == target) else {
+            self.anchor = Some(target.to_owned());
+            self.ids = vec![target.to_owned()];
+            return Some(target.to_owned());
+        };
+        match how {
+            RowPick::Replace => {
+                self.anchor = Some(target.to_owned());
+                self.ids = vec![target.to_owned()];
+                Some(target.to_owned())
+            }
+            RowPick::Extend => {
+                let anchor_ix = self
+                    .anchor
+                    .as_deref()
+                    .filter(|anchor| self.ids.iter().any(|id| Some(id.as_str()) == focus) || focus == Some(*anchor))
+                    .or(focus)
+                    .and_then(|anchor| visible.iter().position(|id| id == anchor))
+                    .unwrap_or(target_ix);
+                self.anchor = Some(visible[anchor_ix].clone());
+                let (from, to) = (anchor_ix.min(target_ix), anchor_ix.max(target_ix));
+                self.ids = visible[from..=to].to_vec();
+                Some(target.to_owned())
+            }
+            RowPick::Toggle => {
+                let mut current: Vec<String> = self.selected(visible, focus).into_iter().map(|index| visible[index].clone()).collect();
+                self.anchor = Some(target.to_owned());
+                if let Some(position) = current.iter().position(|id| id == target) {
+                    if current.len() == 1 {
+                        // 最后一行不取消：列表总要有一个当前行。
+                        self.ids = current;
+                        return Some(target.to_owned());
+                    }
+                    current.remove(position);
+                    let next = current[position.min(current.len() - 1)].clone();
+                    self.ids = current;
+                    Some(next)
+                } else {
+                    current.push(target.to_owned());
+                    self.ids = current;
+                    Some(target.to_owned())
+                }
+            }
+        }
+    }
+
+    /// Shift+方向键：从焦点向上或向下扩展一行，返回新的焦点。
+    pub fn extend_step(&mut self, visible: &[String], focus: Option<&str>, step: isize) -> Option<String> {
+        if visible.is_empty() {
+            return None;
+        }
+        let current = focus.and_then(|focus| visible.iter().position(|id| id == focus));
+        let next = match current {
+            Some(index) => (index as isize + step).clamp(0, visible.len() as isize - 1) as usize,
+            None if step < 0 => visible.len() - 1,
+            None => 0,
+        };
+        let focus = focus.filter(|_| current.is_some());
+        self.pick(visible, focus, &visible[next].clone(), if focus.is_some() { RowPick::Extend } else { RowPick::Replace })
+    }
+}
+
+/// 行列表的复制：`rows` 只含选中的行（按列表顺序），`focus_row` 是焦点行在其中的位置，
+/// `column` 是右键所在的列。值 = 焦点行这一列；行 = 选中行，无表头；列 = 这一列在选中行里的值；
+/// TSV / CSV / JSON = 选中行全部列，含表头。没有选中行时为 None。
+pub fn row_list_copy_text(columns: &[ReadColumn], rows: &ReadRows, focus_row: usize, column: usize, kind: CopyKind) -> Option<String> {
+    if rows.is_empty() || columns.is_empty() {
+        return None;
+    }
+    let column = column.min(columns.len() - 1);
+    if kind == CopyKind::Value {
+        return Some(rows.cell(focus_row.min(rows.len() - 1), column).to_string());
+    }
+    let selection = ReadSelection { anchor: (0, column), focus: (rows.len() - 1, column), mode: SelectionMode::Rows };
+    copy_text(columns, rows, Some(selection), kind)
+}
+
+/// 行列表的 ⌘C：一行复制这一行（制表符分隔，无表头），多行复制含表头的 TSV。
+pub fn row_list_clipboard_text(columns: &[ReadColumn], rows: &ReadRows) -> Option<String> {
+    let kind = if rows.len() == 1 { CopyKind::Row } else { CopyKind::Tsv };
+    row_list_copy_text(columns, rows, 0, 0, kind)
+}
+
 // ---------------------------------------------------------------- delegate
 
 pub struct ReadDelegate {
@@ -652,6 +794,59 @@ mod tests {
             copy_text(&cols, &rows, sel, CopyKind::Json).as_deref(),
             Some("[{\"name\":\"甲\",\"note\":\"a\\tb\"},{\"name\":\"乙\",\"note\":\"say \\\"hi\\\"\"}]")
         );
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn row_marks_extend_toggle_and_fall_back_to_the_focus_row() {
+        let visible = ids(&["a", "b", "c", "d"]);
+        let mut marks = RowMarks::default();
+        let focus = marks.pick(&visible, None, "b", RowPick::Replace);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![1]);
+        // Shift 扩展：锚点留在 b，向下到 d；再向上到 a 时仍以 b 为锚点。
+        let focus = marks.pick(&visible, focus.as_deref(), "d", RowPick::Extend);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![1, 2, 3]);
+        let focus = marks.pick(&visible, focus.as_deref(), "a", RowPick::Extend);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![0, 1]);
+        // ⌘ 切换：加上 d，再去掉 a，焦点落到剩下的行。
+        let focus = marks.pick(&visible, focus.as_deref(), "d", RowPick::Toggle);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![0, 1, 3]);
+        let focus = marks.pick(&visible, focus.as_deref(), "a", RowPick::Toggle);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![1, 3]);
+        assert!(focus.as_deref() == Some("b") || focus.as_deref() == Some("d"));
+        assert!(marks.is_selected(&visible, focus.as_deref(), "d"));
+        assert!(!marks.is_selected(&visible, focus.as_deref(), "c"));
+        // 焦点被外部移到集合外（键盘上下）：只算焦点一行。
+        assert_eq!(marks.selected(&visible, Some("c")), vec![2]);
+        assert!(!marks.is_selected(&visible, Some("c"), "d"));
+        // Shift+方向键从外部焦点开始扩展。
+        let focus = marks.extend_step(&visible, Some("c"), 1);
+        assert_eq!(marks.selected(&visible, focus.as_deref()), vec![2, 3]);
+        // 最后一行不能被 ⌘ 取消。
+        let mut single = RowMarks::default();
+        let focus = single.pick(&visible, None, "a", RowPick::Toggle);
+        let focus = single.pick(&visible, focus.as_deref(), "a", RowPick::Toggle);
+        assert_eq!(single.selected(&visible, focus.as_deref()), vec![0]);
+        assert_eq!(single.selected(&visible, None), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn row_list_copy_covers_value_row_column_and_formats() {
+        let cols = columns();
+        let text = |cells: [&str; 3]| cells.iter().map(|c| SharedString::from(c.to_string())).collect::<Vec<_>>();
+        let picked = ReadRows::Static(vec![text(["1", "甲", "x"]), text(["3", "丙", ""])]);
+        assert_eq!(row_list_copy_text(&cols, &picked, 1, 1, CopyKind::Value).as_deref(), Some("丙"));
+        assert_eq!(row_list_copy_text(&cols, &picked, 1, 1, CopyKind::Row).as_deref(), Some("1\t甲\tx\n3\t丙\t"));
+        assert_eq!(row_list_copy_text(&cols, &picked, 1, 1, CopyKind::Column).as_deref(), Some("甲\n丙"));
+        assert_eq!(row_list_copy_text(&cols, &picked, 0, 0, CopyKind::Tsv).as_deref(), Some("id\tname\tnote\n1\t甲\tx\n3\t丙\t"));
+        assert_eq!(row_list_copy_text(&cols, &picked, 0, 0, CopyKind::Json).as_deref(), Some("[{\"id\":\"1\",\"name\":\"甲\",\"note\":\"x\"},{\"id\":\"3\",\"name\":\"丙\",\"note\":\"\"}]"));
+        assert_eq!(row_list_clipboard_text(&cols, &picked).as_deref(), Some("id\tname\tnote\n1\t甲\tx\n3\t丙\t"));
+        let one = ReadRows::Static(vec![text(["1", "甲", "x"])]);
+        assert_eq!(row_list_clipboard_text(&cols, &one).as_deref(), Some("1\t甲\tx"), "一行不带表头");
+        assert_eq!(row_list_copy_text(&cols, &ReadRows::default(), 0, 0, CopyKind::Tsv), None);
     }
 
     #[test]

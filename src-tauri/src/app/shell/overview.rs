@@ -15,6 +15,7 @@ use crate::app::views::overview::{columns, format_size, OverviewColumn, Overview
 use crate::catalog::hierarchy::NavKind;
 use crate::catalog::{StatRow, StatsLevel};
 use crate::ui::kit::{self, Palette, TypeScale};
+use crate::ui::read_table::RowPick;
 
 use super::conn_modal::{ConnectAction, ConnectIntent};
 use super::model::{next_epoch, DraftField, WorkItemKind, WorkbenchModel};
@@ -286,13 +287,24 @@ impl WorkbenchModel {
             }
             return true;
         }
-        if let Some(name) = id.strip_prefix("overview-select:") {
+        if id == "overview-extend-next" || id == "overview-extend-prev" {
             if let Some(state) = self.active_overview_mut() {
-                if state.row(name).is_some() {
-                    state.selected = Some(name.to_owned());
-                }
+                state.extend_selection(if id == "overview-extend-next" { 1 } else { -1 });
             }
             return true;
+        }
+        // R13：普通单击替换选区，Shift 扩展到这一行，⌘/Ctrl 切换这一行。
+        for (prefix, how) in [
+            ("overview-select:", RowPick::Replace),
+            ("overview-select-extend:", RowPick::Extend),
+            ("overview-select-toggle:", RowPick::Toggle),
+        ] {
+            if let Some(name) = id.strip_prefix(prefix) {
+                if let Some(state) = self.active_overview_mut() {
+                    state.pick(name, how);
+                }
+                return true;
+            }
         }
         if let Some(name) = id.strip_prefix("overview-activate:") {
             // 双击（或回车）：库/模式行进入下一层，表/视图打开数据。
@@ -312,17 +324,30 @@ impl WorkbenchModel {
         if let Some(name) = id.strip_prefix("overview-menu:") {
             let Some((target, row)) = self.overview_row(name) else { return true };
             if let Some(state) = self.active_overview_mut() {
-                state.selected = Some(name.to_owned());
+                // 点在多选之外先只选中这一行；点在多选里则保留多选，当前行移到这一行。
+                let visible = state.visible_names();
+                if state.is_marked(&visible, name) {
+                    state.selected = Some(name.to_owned());
+                } else {
+                    state.pick(name, RowPick::Replace);
+                }
             }
             self.pin_overview();
             // 对象树里已经有这一行：用对象树同一册菜单（结构、DDL、模板、危险操作都在）。
-            if let Some(node) = self.overview_nav_node(&target, &row) {
-                return self.open_nav_menu(&node);
+            let opened = match self.overview_nav_node(&target, &row) {
+                Some(node) => self.open_nav_menu(&node),
+                None => {
+                    let items = super::menus::overview_menu_items(name, row.kind.is_some(), target.engine.is_relational());
+                    self.open_menu(super::menus::MenuPlace::ObjectTree, super::menus::MenuTarget::Object);
+                    self.menu = Some(super::menus::OpenMenu::with_items(super::menus::MenuPlace::ObjectTree, items));
+                    true
+                }
+            };
+            // R13：列表里的右键都带上只读表的复制方式（值 / 行 / 列 / TSV / CSV / JSON）。
+            if let Some(menu) = self.menu.as_mut() {
+                menu.items.extend(super::menus::row_copy_items("overview-copy"));
             }
-            let items = super::menus::overview_menu_items(name, row.kind.is_some(), target.engine.is_relational());
-            self.open_menu(super::menus::MenuPlace::ObjectTree, super::menus::MenuTarget::Object);
-            self.menu = Some(super::menus::OpenMenu::with_items(super::menus::MenuPlace::ObjectTree, items));
-            return true;
+            return opened;
         }
         if let Some(name) = id.strip_prefix("overview-open-data:") {
             let Some((target, row)) = self.overview_row(name) else { return true };
@@ -364,11 +389,15 @@ impl WorkbenchModel {
             );
             return true;
         }
-        if id == "overview-copy-selected" {
-            // R13：⌘C 复制选中行（制表符分隔，列顺序与列表一致），可以直接粘贴到表格软件。
+        if id == "overview-copy-selected" || id.starts_with("overview-copy:") {
+            // R13：⌘C 一行复制这一行（制表符分隔），多行复制含表头的 TSV；右键按所选方式复制。
+            let kind = id.strip_prefix("overview-copy:").and_then(super::menus::parse_row_copy_kind);
+            if id != "overview-copy-selected" && kind.is_none() {
+                return true;
+            }
             let Some(state) = self.active_overview() else { return true };
-            let Some(row) = state.selected.as_deref().and_then(|name| state.row(name)) else { return true };
-            let text = overview_row_tsv(columns(state.level()), row);
+            let titles: Vec<String> = columns(state.level()).iter().map(|column| self.text(column.label_key())).collect();
+            let Some(text) = state.copy_text(&titles, kind) else { return true };
             self.copied = text.clone();
             self.clipboard_out = Some(text);
             return true;
@@ -386,11 +415,6 @@ impl WorkbenchModel {
         }
         false
     }
-}
-
-/// 一行概览的 TSV：各列的显示文字，制表符分隔；字段里的制表符和换行按共享只读表的规则加引号。
-pub(super) fn overview_row_tsv(cols: &[OverviewColumn], row: &StatRow) -> String {
-    cols.iter().map(|column| crate::ui::read_table::quote_tsv(&column.text(row))).collect::<Vec<_>>().join("\t")
 }
 
 impl Workbench {
@@ -542,7 +566,8 @@ impl Workbench {
             _ => {
                 let row_h = m.row_h + 4.;
                 let owner = cx.entity().downgrade();
-                let selected = state.selected.clone();
+                let names: Vec<String> = visible.iter().map(|row| row.name.clone()).collect();
+                let marked: std::collections::HashSet<String> = names.iter().filter(|name| state.is_marked(&names, name)).cloned().collect();
                 let rows = std::rc::Rc::new(visible);
                 let list_rows = std::rc::Rc::clone(&rows);
                 // 每个概览目标各记一份滚动位置；句柄同时喂给可见滚动条（ADR-8）。
@@ -552,7 +577,7 @@ impl Workbench {
                     owner
                         .update(cx, |this, cx| {
                             range
-                                .map(|index| this.overview_row_element(&list_rows[index], index, cols, total_width, row_h, selected.as_deref() == Some(list_rows[index].name.as_str()), cx))
+                                .map(|index| this.overview_row_element(&list_rows[index], index, cols, total_width, row_h, marked.contains(&list_rows[index].name), cx))
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default()
@@ -580,6 +605,12 @@ impl Workbench {
                         cx.stop_propagation();
                         this.perform("overview-copy-selected", cx);
                     }
+                    return;
+                }
+                // Shift+上下扩展多选（R13）。
+                if mods.shift && !mods.secondary(cx) && !mods.alt && matches!(event.keystroke.key.as_str(), "up" | "down") {
+                    cx.stop_propagation();
+                    this.perform(if event.keystroke.key == "down" { "overview-extend-next" } else { "overview-extend-prev" }, cx);
                     return;
                 }
                 if mods.modified() {
@@ -632,10 +663,16 @@ impl Workbench {
             .border_color(p.line_soft)
             .when(selected, |this| this.bg(p.selection))
             .text_size(px(TypeScale::SM));
-        for column in cols {
+        for (column_ix, column) in cols.iter().enumerate() {
             let text = column.text(row);
             let faint = text == MISSING || (*column == OverviewColumn::Comment && text.is_empty());
+            // 右键先到单元格：记下所在的列，“复制值 / 列”取这一列；事件继续冒泡到行上打开菜单。
             let mut cell = div()
+                .on_mouse_down(MouseButton::Right, cx.listener(move |this, _: &MouseDownEvent, _, _| {
+                    if let Some(state) = this.model.active_overview_mut() {
+                        state.menu_column = column_ix;
+                    }
+                }))
                 .flex_none()
                 .w(relative(column.width() / total_width))
                 .min_w_0()
@@ -658,8 +695,14 @@ impl Workbench {
             }))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 window.focus(&this.overview_focus, cx);
-                this.perform(&format!("overview-select:{click_name}"), cx);
-                if event.click_count() >= 2 {
+                let mods = event.modifiers();
+                let prefix = match RowPick::from_modifiers(mods.shift, mods.secondary(cx)) {
+                    RowPick::Replace => "overview-select",
+                    RowPick::Extend => "overview-select-extend",
+                    RowPick::Toggle => "overview-select-toggle",
+                };
+                this.perform(&format!("{prefix}:{click_name}"), cx);
+                if event.click_count() >= 2 && !mods.modified() {
                     this.perform(&format!("overview-activate:{click_name}"), cx);
                 }
                 cx.notify();

@@ -2,6 +2,7 @@
 
 use crate::application::AppServices;
 use crate::query::{HistoryEntry, RenameRequest, SaveRequest, SavedQuery};
+use crate::ui::read_table::{row_list_clipboard_text, row_list_copy_text, CopyKind, ReadColumn, ReadRows, RowMarks, RowPick};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistorySection {
@@ -42,6 +43,9 @@ pub struct HistoryPage {
     pub filter_status: String,
     pub selected_run: Option<String>,
     pub selected_saved: Option<String>,
+    /// R13：两个分区各自的 Shift / ⌘ 多选（`selected_run` / `selected_saved` 仍是当前行）。
+    pub run_marks: RowMarks,
+    pub saved_marks: RowMarks,
     pub save_name: String,
     pub preview_open: bool,
     pub rename_open: bool,
@@ -73,6 +77,8 @@ impl Default for HistoryPage {
             filter_status: String::new(),
             selected_run: None,
             selected_saved: None,
+            run_marks: RowMarks::default(),
+            saved_marks: RowMarks::default(),
             save_name: String::new(),
             preview_open: true,
             rename_open: false,
@@ -206,8 +212,96 @@ impl HistoryPage {
         self.preview_open = true;
     }
 
+    fn focus_and_marks(&mut self) -> (Option<String>, &mut RowMarks) {
+        match self.section {
+            HistorySection::Runs => (self.selected_run.clone(), &mut self.run_marks),
+            HistorySection::Saved => (self.selected_saved.clone(), &mut self.saved_marks),
+        }
+    }
+
+    fn current_focus(&self) -> Option<&str> {
+        if self.section == HistorySection::Saved { self.selected_saved.as_deref() } else { self.selected_run.as_deref() }
+    }
+
+    fn current_marks(&self) -> &RowMarks {
+        if self.section == HistorySection::Saved { &self.saved_marks } else { &self.run_marks }
+    }
+
+    /// 点选当前分区的一行：普通单击、Shift 扩展或 ⌘ 切换。预览跟着当前行。
+    pub fn pick(&mut self, id: &str, how: RowPick) {
+        let visible = self.visible_ids();
+        let (focus, marks) = self.focus_and_marks();
+        let next = marks.pick(&visible, focus.as_deref(), id, how);
+        self.select(next);
+    }
+
+    /// Shift+上下：从当前行扩展一行。
+    pub fn extend_selection(&mut self, step: isize) {
+        let visible = self.visible_ids();
+        let (focus, marks) = self.focus_and_marks();
+        let next = marks.extend_step(&visible, focus.as_deref(), step);
+        self.select(next);
+    }
+
+    /// 当前分区选中的行 id（可见顺序）；没有多选时就是当前行。
+    pub fn marked_ids(&self) -> Vec<String> {
+        let visible = self.visible_ids();
+        self.current_marks().selected(&visible, self.current_focus()).into_iter().map(|index| visible[index].clone()).collect()
+    }
+
+    /// 多选中的行数（至少两行才算多选）。
+    pub fn multi_selected(&self) -> bool {
+        self.marked_ids().len() > 1
+    }
+
+    /// 复制的列：SQL 放第一列，“复制值 / 列”取的就是 SQL。返回列标题的词条与选中行的单元格。
+    pub fn copy_grid(&self) -> (Vec<&'static str>, Vec<Vec<String>>) {
+        let ids = self.marked_ids();
+        if self.section == HistorySection::Saved {
+            let rows = ids
+                .iter()
+                .filter_map(|id| self.saved.iter().find(|item| &item.id == id))
+                .map(|item| vec![item.sql.clone(), item.name.clone(), item.connection_name.clone(), item.database_name.clone(), item.updated_at.clone()])
+                .collect();
+            (vec!["history.copy.sql", "history.copy.name", "history.copy.connection", "history.copy.database", "history.copy.time"], rows)
+        } else {
+            let rows = ids
+                .iter()
+                .filter_map(|id| self.runs.iter().find(|entry| &entry.id == id))
+                .map(|entry| {
+                    vec![
+                        entry.sql.clone(),
+                        entry.connection_name.clone(),
+                        entry.database_name.clone(),
+                        entry.status.clone(),
+                        entry.started_at.clone(),
+                        entry.elapsed_ms.map(|ms| ms.to_string()).unwrap_or_default(),
+                    ]
+                })
+                .collect();
+            (vec!["history.copy.sql", "history.copy.connection", "history.copy.database", "history.copy.status", "history.copy.time", "history.copy.elapsed"], rows)
+        }
+    }
+
+    /// 复制选中行：`kind` 为 None 时是 ⌘C（一行复制 SQL，多行复制含表头的 TSV）。
+    /// `title` 把列标题词条转成显示文字。
+    pub fn copy_text(&self, title: impl Fn(&str) -> String, kind: Option<CopyKind>) -> Option<String> {
+        let (keys, cells) = self.copy_grid();
+        let columns: Vec<ReadColumn> = keys.iter().map(|key| ReadColumn::new(title(key))).collect();
+        let focus = self.current_focus().and_then(|focus| self.marked_ids().iter().position(|id| id == focus)).unwrap_or(0);
+        let single = cells.len() == 1;
+        let rows = ReadRows::Static(cells.into_iter().map(|row| row.into_iter().map(Into::into).collect()).collect());
+        match kind {
+            Some(kind) => row_list_copy_text(&columns, &rows, focus, 0, kind),
+            None if single => row_list_copy_text(&columns, &rows, 0, 0, CopyKind::Value),
+            None => row_list_clipboard_text(&columns, &rows),
+        }
+    }
+
     /// 方向键在筛选后的可见行里移动一格；没有选中时从首行开始。返回是否换了行。
+    /// 普通移动结束多选。
     pub fn move_selection(&mut self, step: isize) -> bool {
+        self.focus_and_marks().1.clear();
         let ids = self.visible_ids();
         if ids.is_empty() {
             self.select(None);
@@ -225,6 +319,7 @@ impl HistoryPage {
 
     /// Home / End 跳到筛选后的第一行或最后一行。
     pub fn select_edge(&mut self, first: bool) -> bool {
+        self.focus_and_marks().1.clear();
         let ids = self.visible_ids();
         let Some(id) = (if first { ids.first() } else { ids.last() }).cloned() else {
             self.select(None);

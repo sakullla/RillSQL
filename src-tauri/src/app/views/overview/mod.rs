@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 
 use crate::catalog::model::{Engine, ObjectKind};
 use crate::catalog::{stats_level, StatRow, StatsBody, StatsLevel};
+use crate::ui::read_table::{row_list_clipboard_text, row_list_copy_text, CopyKind, ReadColumn, ReadRows, RowMarks, RowPick};
 
 /// 概览的范围：连接 | 连接名 | 库 | 模式 | （空，对象位）| 引擎 | 环境。
 /// 与工作项规格同一布局，状态栏与关闭保护读到同一个连接与库。
@@ -262,6 +263,10 @@ pub struct OverviewState {
     pub descending: bool,
     /// 选中的行（按名字，过滤与排序后仍指向同一行）。
     pub selected: Option<String>,
+    /// R13：Shift / ⌘ 扩展的多选（`selected` 仍是当前行）。
+    pub marks: RowMarks,
+    /// 右键所在的列：“复制值 / 列”取这一列。
+    pub menu_column: usize,
     /// 读取代数：刷新后迟到的旧结果丢弃。
     pub generation: u64,
     /// 失败来自按需连接（不是统计读取）：连接之后从别处连上（密码框、对象树）时自动重读。
@@ -279,6 +284,8 @@ impl OverviewState {
             sort: OverviewColumn::Name,
             descending: false,
             selected: None,
+            marks: RowMarks::default(),
+            menu_column: 0,
             generation: 0,
             connect_failed: false,
         }
@@ -363,8 +370,55 @@ impl OverviewState {
         rows
     }
 
-    /// 选中行的下一个/上一个（键盘上下移动）。
+    /// 过滤排序后可见行的名字，多选与复制按这个顺序。
+    pub fn visible_names(&self) -> Vec<String> {
+        self.visible().iter().map(|row| row.name.clone()).collect()
+    }
+
+    /// 点选一行：普通单击、Shift 扩展或 ⌘ 切换。
+    pub fn pick(&mut self, name: &str, how: RowPick) {
+        if self.row(name).is_none() {
+            return;
+        }
+        let visible = self.visible_names();
+        self.selected = self.marks.pick(&visible, self.selected.as_deref(), name, how);
+    }
+
+    /// Shift+上下：从当前行扩展一行。
+    pub fn extend_selection(&mut self, delta: isize) {
+        let visible = self.visible_names();
+        let next = self.marks.extend_step(&visible, self.selected.as_deref(), delta);
+        self.selected = next;
+    }
+
+    /// 选中的行（可见顺序）；没有多选时就是当前行。
+    pub fn selected_rows(&self) -> Vec<&StatRow> {
+        let visible = self.visible();
+        let names: Vec<String> = visible.iter().map(|row| row.name.clone()).collect();
+        self.marks.selected(&names, self.selected.as_deref()).into_iter().map(|index| visible[index]).collect()
+    }
+
+    pub fn is_marked(&self, visible: &[String], name: &str) -> bool {
+        self.marks.is_selected(visible, self.selected.as_deref(), name)
+    }
+
+    /// 复制选中行：`kind` 为 None 时按 ⌘C 规则（一行无表头，多行含表头 TSV）。
+    /// `titles` 是各列显示的列名（与 `columns(level)` 同序）。
+    pub fn copy_text(&self, titles: &[String], kind: Option<CopyKind>) -> Option<String> {
+        let cols = columns(self.level());
+        let selected = self.selected_rows();
+        let read_columns: Vec<ReadColumn> = cols.iter().enumerate().map(|(index, _)| ReadColumn::new(titles.get(index).cloned().unwrap_or_default())).collect();
+        let rows = ReadRows::Static(selected.iter().map(|row| cols.iter().map(|column| column.text(row).into()).collect()).collect());
+        let focus = self.selected.as_deref().and_then(|name| selected.iter().position(|row| row.name == name)).unwrap_or(0);
+        match kind {
+            Some(kind) => row_list_copy_text(&read_columns, &rows, focus, self.menu_column, kind),
+            None => row_list_clipboard_text(&read_columns, &rows),
+        }
+    }
+
+    /// 选中行的下一个/上一个（键盘上下移动）。普通移动结束多选。
     pub fn step_selection(&mut self, delta: isize) {
+        self.marks.clear();
         let names: Vec<String> = self.visible().iter().map(|row| row.name.clone()).collect();
         if names.is_empty() {
             self.selected = None;

@@ -3241,6 +3241,56 @@ fn history_run(id: &str, sql: &str, connection: &str, status: &str) -> HistoryEn
     }
 }
 
+/// R13：历史列表 Shift / ⌘ 多选，⌘C 多行得到含表头的 TSV，右键带复制值 / 行 / 列 / TSV / CSV / JSON。
+/// 只改选中和写剪贴板，不载入、不执行。
+#[test]
+fn history_rows_multi_select_and_copy_like_read_only_tables() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.page = AppPage::History;
+    model.history.runs = vec![
+        history_run("a", "select 1", "live", "ok"),
+        history_run("b", "select\t2", "live", "error"),
+        history_run("c", "select 3", "other", "ok"),
+        history_run("d", "select 4", "other", "ok"),
+    ];
+    let loads = model.loads;
+    let _ = model.dispatch("history-pick:a");
+    assert_eq!(model.history.marked_ids(), ["a"]);
+    let _ = model.dispatch("history-copy");
+    assert_eq!(model.copied, "select 1", "单行 ⌘C 仍是 SQL 本身");
+    let _ = model.dispatch("history-pick-extend:c");
+    assert_eq!(model.history.marked_ids(), ["a", "b", "c"]);
+    assert_eq!(model.history.selected_run.as_deref(), Some("c"), "当前行跟到扩展的一端");
+    let _ = model.dispatch("history-pick-toggle:b");
+    assert_eq!(model.history.marked_ids(), ["a", "c"]);
+    let _ = model.dispatch("history-copy");
+    let lines: Vec<&str> = model.copied.lines().collect();
+    assert_eq!(lines.len(), 3, "{:?}", model.copied);
+    assert!(lines[1].starts_with("select 1\tconn-live\tapp\tok\t") && lines[2].starts_with("select 3\t"), "{lines:?}");
+
+    let _ = model.dispatch("menu-history");
+    let ids: Vec<&str> = model.menu.as_ref().unwrap().items.iter().map(|item| item.id).collect();
+    for id in ["history-load", "read-table-copy-value", "read-table-copy-row", "read-table-copy-column", "read-table-copy-tsv", "read-table-copy-csv", "read-table-copy-json"] {
+        assert!(ids.contains(&id), "{id} in {ids:?}");
+    }
+    model.menu = None;
+    let _ = model.dispatch("history-copy-as:column");
+    assert_eq!(model.copied, "select 1\nselect 3", "列 = 选中行的 SQL");
+    let _ = model.dispatch("history-copy-as:value");
+    assert_eq!(model.copied, "select 3", "值 = 当前行的 SQL");
+    let _ = model.dispatch("history-copy-as:csv");
+    assert!(model.copied.starts_with("\"SQL\",") && model.copied.contains("\"select 3\""), "{}", model.copied);
+    // Shift+↓ 从当前行扩展；普通上下结束多选。
+    let _ = model.dispatch("history-pick:b");
+    let _ = model.dispatch("history-extend-next");
+    assert_eq!(model.history.marked_ids(), ["b", "c"]);
+    assert_eq!(model.history_key(super::menus::NavKey::ArrowDown), None);
+    assert_eq!(model.history.marked_ids(), ["d"]);
+    assert_eq!(model.loads, loads, "选择与复制都不载入");
+    assert_eq!(model.executions, 0);
+    assert_eq!(model.pending_len(), 0);
+}
+
 #[test]
 fn history_search_filter_preview_copy_delete_and_clear_are_reversible() {
     let mut model = WorkbenchModel::new(Shell::default());
@@ -13673,5 +13723,43 @@ fn double_clicking_a_query_tab_renames_it(cx: &mut gpui_kit::TestAppContext) {
         assert_eq!(view.model.active_tab().unwrap().title, "对账");
         assert!(view.model.tab_rename.is_none());
     });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 重命名输入框失焦（点到编辑器或别的区域）时按当前输入确认，不一直挂在标签栏上。
+#[gpui_kit::test]
+fn tab_rename_confirms_when_the_input_loses_focus(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tab-rename-blur-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    // 失焦事件只在活动窗口里派发（与原生窗口一致）。
+    cx.update_window(window, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tab-rename", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    let focused = cx.update_window(window, |_, window, cx| view.update(cx, |view, cx| view.fields.is_focused(DraftField::TabTitle, window, cx))).unwrap();
+    assert!(focused, "重命名输入框打开即拿到焦点");
+    cx.update(|cx| view.update(cx, |view, _| view.model.set_field(DraftField::TabTitle, "月报".into())));
+    // 焦点移到别处（等同点击编辑器或其他面板）。
+    cx.update_window(window, |_, window, cx| {
+        let other = view.read(cx).overview_focus.clone();
+        window.focus(&other, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.model.tab_rename.is_none(), "失焦后结束重命名");
+        assert_eq!(view.model.active_tab().unwrap().title, "月报", "按当前输入确认");
+    });
+    let found = cx.update_window(window, |_, window, _| window.try_find("tab-rename").is_some()).unwrap();
+    assert!(!found, "输入框不再显示");
     let _ = std::fs::remove_dir_all(dir);
 }

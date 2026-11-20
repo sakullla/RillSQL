@@ -399,10 +399,82 @@ fn clicking_a_real_sqlite_connection_renders_its_overview_and_double_click_opens
         let copied = view.read(cx).model.copied.clone();
         assert!(copied.starts_with("item_labels\t"), "⌘C 复制选中行：{copied:?}");
     });
+    // R13：Shift+↑ 扩展到两行，⌘C 得到含表头的 TSV；普通 ↓ 结束多选。
+    cx.update_window(window, |_, window, cx| window.press("shift-up", cx)).unwrap();
+    cx.update_window(window, |_, window, cx| window.press(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, cx)).unwrap();
+    cx.update(|cx| {
+        let copied = view.read(cx).model.copied.clone();
+        let lines: Vec<&str> = copied.lines().collect();
+        assert_eq!(lines.len(), 3, "表头 + 两行：{copied:?}");
+        assert!(lines[1].starts_with("item\t") && lines[2].starts_with("item_labels\t"), "{copied:?}");
+    });
+    cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.update(|cx| {
+        let state = view.read(cx).model.active_overview().cloned().unwrap();
+        assert_eq!(state.selected.as_deref(), Some("item_labels"));
+        assert_eq!(state.selected_rows().len(), 1, "普通移动结束多选");
+    });
     cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
     assert!(
         wait(cx, &|view| view.model.active_tab().and_then(|tab| tab.spec.clone()).is_some_and(|spec| spec.starts_with("notes|笔记|main||item_labels|"))),
         "回车打开选中的视图"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R13：概览列表 Shift / ⌘ 多选，右键带复制值 / 行 / 列 / TSV / CSV / JSON，按右键所在列和多选生成文本。
+#[test]
+fn overview_rows_multi_select_and_copy_like_read_only_tables() {
+    let mut model = model();
+    model.overview_click_node(&database_node_id("my", "shop"), false);
+    let (target, generation) = model.overview_read_request().unwrap();
+    let rows = vec![
+        StatRow { rows: Some(3), comment: "订单".into(), ..StatRow::named("orders", Some(ObjectKind::Table)) },
+        StatRow { rows: Some(1200), ..StatRow::named("items", Some(ObjectKind::Table)) },
+        StatRow::named("users", Some(ObjectKind::Table)),
+        StatRow::named("paid", Some(ObjectKind::View)),
+    ];
+    assert!(model.finish_overview_read(&target.spec(), generation, Ok(body(StatsLevel::Objects, rows, None))));
+    let names = |model: &WorkbenchModel| model.active_overview().unwrap().selected_rows().iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+    // 可见顺序按名称：items, orders, paid, users。
+    model.dispatch("overview-select:items");
+    model.dispatch("overview-select-extend:paid");
+    assert_eq!(names(&model), ["items", "orders", "paid"], "Shift 扩展成区间");
+    model.dispatch("overview-select-toggle:orders");
+    model.dispatch("overview-select-toggle:users");
+    assert_eq!(names(&model), ["items", "paid", "users"], "⌘ 切换单行");
+    model.dispatch("overview-copy-selected");
+    let lines: Vec<String> = model.copied.lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 4, "⌘C 多行：表头 + 三行 {:?}", model.copied);
+    assert!(lines[1].starts_with("items\t1,200\t"), "{:?}", lines);
+
+    // 右键多选里的一行：保留多选，菜单末尾带上复制方式；表在对象树里时也一样。
+    model.active_overview_mut().unwrap().menu_column = 0;
+    model.dispatch("overview-menu:paid");
+    assert_eq!(names(&model), ["items", "paid", "users"], "右键多选内的行不打散多选");
+    let copy_ids: Vec<&str> = model.menu.as_ref().expect("菜单打开").items.iter().filter(|item| item.id.starts_with("read-table-copy-")).map(|item| item.id).collect();
+    assert_eq!(copy_ids, ["read-table-copy-value", "read-table-copy-row", "read-table-copy-column", "read-table-copy-tsv", "read-table-copy-csv", "read-table-copy-json"]);
+    model.menu = None;
+    model.dispatch("overview-copy:value");
+    assert_eq!(model.copied, "paid", "值取右键所在的行与列");
+    model.dispatch("overview-copy:column");
+    assert_eq!(model.copied, "items\npaid\nusers");
+    model.dispatch("overview-copy:row");
+    assert_eq!(model.copied.lines().count(), 3, "行不带表头");
+    model.dispatch("overview-copy:json");
+    assert!(model.copied.starts_with("[{") && model.copied.matches("},{").count() == 2, "{}", model.copied);
+
+    // 右键多选之外的一行：只选中这一行，菜单同样带复制。
+    model.dispatch("overview-menu:orders");
+    assert_eq!(names(&model), ["orders"]);
+    assert!(model.menu.as_ref().unwrap().items.iter().any(|item| item.id == "read-table-copy-tsv"));
+    model.menu = None;
+    model.active_overview_mut().unwrap().menu_column = 2;
+    model.dispatch("overview-copy:value");
+    assert_eq!(model.copied, "订单", "第三列是注释");
+    // Shift+↓ 从当前行扩展；普通 ↓ 结束多选。
+    model.dispatch("overview-extend-next");
+    assert_eq!(names(&model), ["orders", "paid"]);
+    model.dispatch("overview-next");
+    assert_eq!(names(&model), ["users"]);
 }

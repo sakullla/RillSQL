@@ -676,6 +676,41 @@ pub fn overview_menu_items(name: &str, object: bool, relational: bool) -> Vec<Me
     items
 }
 
+/// 只读行列表（库概览、历史）的复制条目：与 `ui::read_table` 的右键菜单同一组方式与文案。
+/// 命令为 `{prefix}:{kind}`，由各列表按当前多选与右键所在的列生成文本。第一项前加分隔线。
+pub fn row_copy_items(prefix: &str) -> Vec<MenuItem> {
+    use crate::ui::read_table::CopyKind;
+    CopyKind::MENU
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let entry = with_icon(targeted(kind.id(), kind.label_key(), format!("{prefix}:{}", row_copy_kind_id(*kind))), IconName::Copy);
+            if index == 0 {
+                sep(entry)
+            } else {
+                entry
+            }
+        })
+        .collect()
+}
+
+/// 复制方式在命令里的名字。
+pub fn row_copy_kind_id(kind: crate::ui::read_table::CopyKind) -> &'static str {
+    use crate::ui::read_table::CopyKind;
+    match kind {
+        CopyKind::Value => "value",
+        CopyKind::Row => "row",
+        CopyKind::Column => "column",
+        CopyKind::Tsv => "tsv",
+        CopyKind::Csv => "csv",
+        CopyKind::Json => "json",
+    }
+}
+
+pub fn parse_row_copy_kind(id: &str) -> Option<crate::ui::read_table::CopyKind> {
+    crate::ui::read_table::CopyKind::MENU.into_iter().find(|kind| row_copy_kind_id(*kind) == id)
+}
+
 /// 资源管理器分组标题的菜单：新建、折叠/展开、重命名、删除（连接保留）。
 pub fn group_menu_items(group_id: &str, collapsed: bool) -> Vec<MenuItem> {
     let toggle_key = if collapsed { "ui.group.expand" } else { "ui.group.collapse" };
