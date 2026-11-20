@@ -1860,7 +1860,12 @@ impl Workbench {
         let reveal = tabs::reveal_step(&mut self.tab_scroll_pending, visible);
         if reveal.is_some() {
             // 这一帧才开始滚，页签位置要等画完才量得出来：再要一帧确认它真的进来了。
-            cx.notify();
+            // 页签条是缓存视图，在 prepaint 阶段才构建；这时的通知不产生效果，
+            // 所以延到这一轮结束再通知页签条自己，下一帧它才会重建并确认。
+            let host = self.tab_strip_host.downgrade();
+            cx.defer(move |cx| {
+                let _ = host.update(cx, |_, cx| cx.notify());
+            });
         }
         // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
         let dirty_text = self.t("ui.grid.pending");
@@ -4696,7 +4701,7 @@ impl Workbench {
                 child_count += 1;
             } else if self.model.history.loading {
                 // 刷新时旧行继续显示，只在列表顶部说明还在读，不整块换成骨架。
-                list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loading"), &m, &p)));
+                list = list.child(div().id("history-loading").test_support().child(super::loading::inline_loading(self.spinners.element("history-loading", Size::Small, Some(p.accent), cx), self.t("history.page.loading"), &m, &p)));
                 child_count += 1;
             }
             for entry in runs {
@@ -4827,7 +4832,7 @@ impl Workbench {
                 });
                 child_count += 1;
             } else if self.model.history.loading {
-                list = list.child(div().id("history-loading").test_support().child(kit::inline_loading(self.t("history.page.loadingSaved"), &m, &p)));
+                list = list.child(div().id("history-loading").test_support().child(super::loading::inline_loading(self.spinners.element("history-loading-saved", Size::Small, Some(p.accent), cx), self.t("history.page.loadingSaved"), &m, &p)));
                 child_count += 1;
             }
             for item in saved {
@@ -5823,7 +5828,7 @@ impl Workbench {
             SaveState::Saving => div()
                 .id("settings-save-state")
                 .test_support()
-                .child(kit::inline_loading(self.t("ui.settings.saving"), m, p))
+                .child(super::loading::inline_loading(self.spinners.element("settings-saving", Size::Small, Some(p.accent), cx), self.t("ui.settings.saving"), m, p))
                 .into_any_element(),
             SaveState::Saved => div()
                 .id("settings-save-state")
@@ -6683,7 +6688,7 @@ impl Workbench {
         let title = SharedString::from(format!("{} · {name}", self.model.text("catalog.ddl.title")));
         let viewer_h = (self.model.viewport_height.max(520) as f32 - 220.).clamp(220., 520.);
         let body: AnyElement = if view.loading {
-            kit::loading_state(self.t("catalog.ddl.loading"), &p)
+            super::loading::loading_state(self.spinners.element("ddl-loading", Size::Small, Some(p.accent), cx), self.t("catalog.ddl.loading"), &p)
                 .py(px(28.))
                 .into_any_element()
         } else if let Some(text) = view.text.clone() {
@@ -6851,7 +6856,7 @@ impl Workbench {
             );
         }
         if prompt.loading {
-            content = content.child(kit::inline_loading(self.t("catalog.danger.loading"), &m, &p));
+            content = content.child(super::loading::inline_loading(self.spinners.element("danger-loading", Size::Small, Some(p.accent), cx), self.t("catalog.danger.loading"), &m, &p));
         } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
             content = content.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
         }
@@ -6936,7 +6941,7 @@ impl Workbench {
             }
         }
         if prompt.running {
-            content = content.child(kit::inline_loading(self.t("catalog.danger.running"), &m, &p));
+            content = content.child(super::loading::inline_loading(self.spinners.element("danger-running", Size::Small, Some(p.accent), cx), self.t("catalog.danger.running"), &m, &p));
         }
         let ready = prompt.execute_ready();
         let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };

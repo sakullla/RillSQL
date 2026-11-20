@@ -10449,6 +10449,42 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 页签条是缓存视图：新建页签的第一帧还量不出它的位置，确认可见的那一帧要靠页签条
+/// 自己被通知才会重建。这里每帧之间只让事件跑完（不手动通知），新页签仍要在第二帧内确认可见。
+#[gpui_kit::test]
+fn a_new_tab_in_the_cached_strip_is_revealed_on_the_next_frame(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::SharedString;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tab-reveal-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 640., 900.);
+    for _ in 0..12 {
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("new-query", cx)));
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+    }
+    let strips = cx.update(|cx| view.read(cx).strip_count.get());
+    let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+    cx.run_until_parked();
+    let active = cx.update(|cx| view.read(cx).model.active_tab.clone().expect("新建后的工作项"));
+    let inside = cx
+        .update_window(window, |_, window, _| {
+            let list = window.find("tab-list").bounds();
+            let chip = window.find(SharedString::from(format!("tab-{active}"))).bounds();
+            f32::from(chip.origin.x) >= f32::from(list.origin.x) - 0.5
+                && f32::from(chip.origin.x + chip.size.width) <= f32::from(list.origin.x + list.size.width) + 0.5
+        })
+        .unwrap();
+    assert!(inside, "新建的页签在下一帧就进入可视区");
+    assert!(cx.update(|cx| view.read(cx).tab_scroll_pending).is_none(), "确认可见后结束滚动请求");
+    assert!(cx.update(|cx| view.read(cx).strip_count.get()) >= strips, "页签条按需重建");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 640 宽、工作项多到页签条放不下时，新建和 Ctrl+Tab 之后的当前页签要自动进入
 /// tab-list 的可视区，尾部新建动作始终留在视口内（R12：当前项到达）。
 #[gpui_kit::test]
@@ -13238,6 +13274,26 @@ fn hundreds_of_query_tabs_stay_lazy_idle_frames_do_not_settle_and_the_tab_list_s
         assert_eq!(view.model.active_tab.as_deref(), Some(first.as_str()));
         assert!(view.query.read(cx).editor_count() <= 2, "访问过的标签才有编辑器");
     });
+}
+
+/// 一波事件里连续整理到了上限时不丢后面的通知：补排一次延后整理（每帧最多一次），
+/// 后到的回执不用等到下一个无关事件才处理。
+#[gpui_kit::test]
+fn settle_cap_defers_one_more_settle_instead_of_dropping(cx: &mut gpui_kit::TestAppContext) {
+    let (_window, view) = plain_workbench(cx);
+    cx.run_until_parked();
+    let (s0, d0) = cx.update(|cx| (view.read(cx).settle_count.get(), view.read(cx).deferred_settle_count.get()));
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..(super::view::SETTLE_PASSES + 3) {
+                view.settle_from_event(cx);
+            }
+            assert_eq!(view.settle_count.get() - s0, super::view::SETTLE_PASSES as usize, "上限以内照常整理");
+        });
+    });
+    let (s1, d1) = cx.update(|cx| (view.read(cx).settle_count.get(), view.read(cx).deferred_settle_count.get()));
+    assert_eq!(d1 - d0, 1, "超过上限的几次合并成一次延后整理");
+    assert_eq!(s1 - s0, super::view::SETTLE_PASSES as usize + 1);
 }
 
 /// R6：编辑器光标闪烁只把工作台标脏、不通知它：工作台照常重绘，但页签条是缓存视图，

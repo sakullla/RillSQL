@@ -205,6 +205,7 @@ pub fn popover(
     metrics: Metrics,
     p: &Palette,
     entity: &Entity<QueryPane>,
+    connecting_spinner: Option<AnyElement>,
 ) -> Option<AnyElement> {
     let anchor = picker.anchor?;
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
@@ -307,7 +308,8 @@ pub fn popover(
                     .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(choice.name.clone())))
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.query.targetNotOpen")))
                     .child(if pending {
-                        kit::inline_loading(t("ui.conn.connecting"), &metrics, p).into_any_element()
+                        let spinner = connecting_spinner.unwrap_or_else(|| div().into_any_element());
+                        crate::app::shell::loading::inline_loading(spinner, t("ui.conn.connecting"), &metrics, p).into_any_element()
                     } else {
                         kit::primary_button("query-target-connect", Some(IconName::Plug), t("connections.page.connect"), move |_, _, cx| {
                             let id = id.clone();

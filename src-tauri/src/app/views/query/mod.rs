@@ -222,8 +222,8 @@ pub struct QueryPane {
     result_scroll_pending: Option<tabs::Reveal>,
     /// 结果头、行数摘要与语句结果里的转圈：隔离实体，动画帧不通知查询页和工作台。
     spinners: crate::ui::spinner_view::SpinnerPool,
-    /// 这一帧取好的转圈视图（结果头、行数摘要、语句进度）；只在运行时画出来。
-    frame_spinners: Option<[gpui_kit::AnyView; 3]>,
+    /// 这一帧取好的转圈视图（结果头、行数摘要、语句进度、首次运行、目标连接中）；只在运行时画出来。
+    frame_spinners: Option<[gpui_kit::AnyView; 5]>,
     _target_tab_sub: gpui_kit::Subscription,
 }
 
@@ -2933,6 +2933,8 @@ impl Render for QueryPane {
             self.spinners.view("query-head", Size::XSmall, Some(accent), cx),
             self.spinners.view("query-summary", Size::XSmall, Some(accent), cx),
             self.spinners.view("query-outcome", Size::Small, Some(accent), cx),
+            self.spinners.view("query-running", Size::Small, Some(accent), cx),
+            self.spinners.view("query-target-connecting", Size::Small, Some(accent), cx),
         ]);
         self.apply_pending(window, cx);
         self.sync_error_marks(cx);
@@ -3118,6 +3120,7 @@ impl QueryPane {
             metrics,
             p,
             entity,
+            self.frame_spinner(4),
         ) {
             items.push(popover);
         }
@@ -3713,7 +3716,7 @@ impl QueryPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(kit::loading_state(SharedString::from(self.running_text()), p))
+                    .children(self.frame_spinner(3).map(|spinner| crate::app::shell::loading::loading_state(spinner, SharedString::from(self.running_text()), p)))
                     .into_any_element();
             }
             // 空结果页顺带教会三种执行方式：快捷键和工具条按钮是一一对应的。

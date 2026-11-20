@@ -508,9 +508,9 @@ impl Workbench {
         };
         let body: AnyElement = match &state.load {
             OverviewLoad::Pending | OverviewLoad::Loading if state.rows.is_empty() => {
-                div().flex_1().child(kit::loading_state(self.t("catalog.overview.loading"), &p)).into_any_element()
+                div().flex_1().child(super::loading::loading_state(self.spinners.element("overview-loading", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.loading"), &p)).into_any_element()
             }
-            OverviewLoad::Connecting => div().flex_1().child(kit::loading_state(self.t("catalog.overview.connecting"), &p)).into_any_element(),
+            OverviewLoad::Connecting => div().flex_1().child(super::loading::loading_state(self.spinners.element("overview-connecting", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.connecting"), &p)).into_any_element(),
             OverviewLoad::Failed(reason) => {
                 let retry = kit::secondary_button("overview-retry", Some(IconName::RefreshCw), self.t("common.retry"), act("overview-connect", cx));
                 div()

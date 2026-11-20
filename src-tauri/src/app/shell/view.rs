@@ -160,11 +160,15 @@ pub struct Workbench {
     settle_passes: u32,
     settle_burst: std::time::Instant,
     settling: bool,
+    /// 这一帧里已经因为整理上限补排过一次延后整理；画完一帧归零。
+    settle_deferred: bool,
     /// 测试用：render 与 settle 各执行了多少次。
     #[cfg(test)]
     pub(super) render_count: std::cell::Cell<usize>,
     #[cfg(test)]
     pub(super) settle_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) deferred_settle_count: std::cell::Cell<usize>,
     #[cfg(test)]
     pub(super) strip_count: std::cell::Cell<usize>,
     _child_subscriptions: Vec<gpui_kit::Subscription>,
@@ -472,10 +476,13 @@ impl Workbench {
             settle_passes: 0,
             settle_burst: std::time::Instant::now(),
             settling: false,
+            settle_deferred: false,
             #[cfg(test)]
             render_count: std::cell::Cell::new(0),
             #[cfg(test)]
             settle_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            deferred_settle_count: std::cell::Cell::new(0),
             #[cfg(test)]
             strip_count: std::cell::Cell::new(0),
             _child_subscriptions: child_subscriptions,
@@ -3217,17 +3224,18 @@ impl Render for Workbench {
         self.render_count.set(self.render_count.get() + 1);
         // 一帧画完，下一批事件重新计数；见 `settle_from_event`。
         self.settle_passes = 0;
+        self.settle_deferred = false;
         self.render_root(window, cx)
     }
 }
 
 /// 一次事件波及里最多连续整理几遍：整理本身改了状态会再通知自己，通常两遍内收敛；
 /// 超过就停，避免某个同步函数每次都通知自己时空转。下一帧或稍后的事件会重新计数。
-const SETTLE_PASSES: u32 = 4;
+pub(super) const SETTLE_PASSES: u32 = 4;
 
 impl Workbench {
     /// 自身被通知（含子视图通知转来的）时整理一次状态。连续整理有上限，见 `SETTLE_PASSES`。
-    fn settle_from_event(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn settle_from_event(&mut self, cx: &mut Context<Self>) {
         let now = std::time::Instant::now();
         if now.duration_since(self.settle_burst) > std::time::Duration::from_millis(50) {
             self.settle_passes = 0;
@@ -3236,6 +3244,21 @@ impl Workbench {
             self.settle_burst = now;
         }
         if self.settle_passes >= SETTLE_PASSES {
+            // 到了上限不直接丢：后面的通知可能带着新回执或新请求。补排一次延后整理，
+            // 每帧最多一次，避免某个同步函数每次都通知自己时空转。
+            if !self.settle_deferred {
+                self.settle_deferred = true;
+                let this = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    if let Some(this) = this.upgrade() {
+                        this.update(cx, |this, cx| {
+                            #[cfg(test)]
+                            this.deferred_settle_count.set(this.deferred_settle_count.get() + 1);
+                            this.settle(cx);
+                        });
+                    }
+                });
+            }
             return;
         }
         self.settle_passes += 1;
@@ -3346,10 +3369,6 @@ impl Workbench {
     }
 }
 
-/// 作废的目录读取回来时要不要收起节点的加载态。
-/// `ours_aborted`：这次读取被取消了；`other_live`：节点上登记着一个仍在途的读取。
-/// 没被取消（只是连接版本变了）时节点登记的就是这次读取自己，收起；
-/// 被同一节点更新的读取顶掉时，新读取还在途，加载态留给它收尾。
 /// 页签条的缓存视图。内容仍由工作台构建（状态和命令都在工作台），这里只提供一个独立的实体边界：
 /// 用 `.cached()` 挂进工作台后，只有它自己被通知（工作台被通知时转告、悬停变化）才重建。
 /// 缓存视图在 prepaint 阶段才画，工作台的 render 已经结束，可以在这里借用工作台。
@@ -3366,6 +3385,10 @@ impl Render for TabStripHost {
     }
 }
 
+/// 作废的目录读取回来时要不要收起节点的加载态。
+/// `ours_aborted`：这次读取被取消了；`other_live`：节点上登记着一个仍在途的读取。
+/// 没被取消（只是连接版本变了）时节点登记的就是这次读取自己，收起；
+/// 被同一节点更新的读取顶掉时，新读取还在途，加载态留给它收尾。
 pub(super) fn nav_read_drop_clears(ours_aborted: bool, other_live: bool) -> bool {
     !ours_aborted || !other_live
 }
