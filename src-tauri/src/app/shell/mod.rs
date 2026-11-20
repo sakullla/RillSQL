@@ -8,7 +8,6 @@ mod danger;
 pub(crate) mod explorer;
 pub(crate) mod jobs;
 pub(crate) mod layout;
-pub(crate) mod loading;
 mod menus;
 mod model;
 pub(crate) mod nav;

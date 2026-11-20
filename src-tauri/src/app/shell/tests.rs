@@ -3938,6 +3938,9 @@ fn history_keyboard_walks_rows_and_enter_only_loads(cx: &mut gpui_kit::TestAppCo
         assert_eq!(view.read(cx).model.history.selected_run.as_deref(), Some("c"), "End 到末行");
         window.press("home", cx);
         assert_eq!(view.read(cx).model.history.selected_run.as_deref(), Some("a"), "Home 回首行");
+        // R13：列表里 ⌘C（其他平台 Ctrl+C）复制选中条目的 SQL。
+        window.press(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, cx);
+        assert_eq!(view.read(cx).model.copied, "select 1", "⌘C 复制选中条目的 SQL");
         // Delete 与行上的删除按钮同一条命令：保存的查询先开确认层，不直接删；
         // 表格的标记删除只属于网格，不能在历史页里累计。
         view.update(cx, |view, _| {
@@ -13471,6 +13474,42 @@ fn caret_blink_redraws_do_not_rebuild_the_tab_strip(cx: &mut gpui_kit::TestAppCo
     assert!(counts(cx).2 > t1, "工作台被通知后页签条重建");
 }
 
+/// R6：光标静置 `CARET_IDLE_SECS` 秒后停止闪烁，窗口静置时工作台不再每 500ms 重绘；按键后重新开始闪烁。
+#[gpui_kit::test]
+fn an_idle_caret_stops_blinking_and_the_workbench_stops_redrawing(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view) = plain_workbench(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+    assert!(cx.update_window(window, |_, window, cx| view.read(cx).query_editor_focused(window, cx)).unwrap(), "编辑器有焦点");
+    assert_eq!(
+        cx.update(|cx| gpui_kit::component::ActiveTheme::theme(cx).cursor_blink.idle_timeout()),
+        Some(std::time::Duration::from_secs(crate::ui::kit::CARET_IDLE_SECS)),
+        "主题里装了静置停闪策略"
+    );
+    let renders = |cx: &mut gpui_kit::TestAppContext| cx.update(|cx| view.read(cx).render_count.get());
+    let r0 = renders(cx);
+    for _ in 0..3 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+    }
+    assert!(renders(cx) > r0, "刚聚焦时光标在闪");
+    for _ in 0..crate::ui::kit::CARET_IDLE_SECS {
+        cx.executor().advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+    }
+    let r1 = renders(cx);
+    for _ in 0..10 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+    }
+    assert_eq!(renders(cx), r1, "静置后不再因光标闪烁重绘");
+}
+
 /// R8：设置页“数据”分区编辑索引命名模板，下方示例实时更新；改动写盘，结构页拿到新模板。
 #[gpui_kit::test]
 fn index_naming_templates_are_edited_in_settings_and_reach_the_structure_pane(cx: &mut gpui_kit::TestAppContext) {
@@ -13517,4 +13556,122 @@ fn index_naming_templates_are_edited_in_settings_and_reach_the_structure_pane(cx
     let stored = cx.update(|cx| view.read(cx).model.settings.to_settings().index_naming);
     assert_eq!(stored.joiner, joiner);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R14：Redis 键浏览器里双击、回车或「在新标签中固定打开」留下的请求由外壳取走：
+/// 新建一个固定的 Redis 标签（标题是键名），面板按带键的规格直接选中这个键；同一个键再请求一次只切过去，不重复建标签。
+#[gpui_kit::test]
+fn redis_open_requests_open_a_pinned_key_tab(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-redis-pin-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-redis:missing|缓存|0", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let browse_tab = cx.update(|cx| view.read(cx).model.active_tab.clone().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.redis.update(cx, |pane, cx| {
+                pane.plant_key("a|b");
+                pane.command("redis-open-tab:0", cx);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let spec = "missing|缓存|0|a|b";
+        let tab = view.model.tabs.iter().find(|tab| tab.spec.as_deref() == Some(spec)).expect("请求被取走并新建了标签");
+        assert!(tab.pinned, "新标签是固定的");
+        assert_eq!(tab.title, "a|b", "标题是键名，键名里可以有 |");
+        assert_eq!(view.model.active_tab.as_deref(), Some(tab.id.as_str()), "并切到这个标签");
+        assert_eq!(view.model.tabs[0].id, tab.id, "固定标签排在最左侧");
+        assert_ne!(tab.id, browse_tab);
+        assert_eq!(view.model.redis_spec.as_deref(), Some(spec));
+        assert_eq!(view.redis.read(cx).selected(), "a|b", "面板按带键的规格选中这个键");
+    });
+    let count = cx.update(|cx| view.read(cx).model.tabs.len());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.redis.update(cx, |pane, cx| {
+                pane.plant_key("a|b");
+                pane.command("redis-open-tab", cx);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(view.read(cx).model.tabs.len(), count, "同一个键不重复建标签"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R14：双击查询标签就地重命名：回车确认、Esc 取消、清空恢复自动编号；改过的名字写进会话并能恢复，
+/// 不再被「查询 n」自动编号覆盖。只改标题，不碰草稿。
+#[test]
+fn query_tab_rename_confirms_cancels_and_survives_the_session() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.dispatch("new-query");
+    model.dispatch("new-query");
+    let id = model.active_tab.clone().unwrap();
+    model.tabs.iter_mut().find(|tab| tab.id == id).unwrap().draft = "select 1".into();
+    let auto = model.active_tab().unwrap().title.clone();
+    assert!(model.begin_tab_rename());
+    assert_eq!(model.field_value(DraftField::TabTitle), auto, "输入框带着原标题");
+    model.set_field(DraftField::TabTitle, "  月报  ".into());
+    model.dispatch("tab-rename-confirm");
+    assert_eq!(model.active_tab().unwrap().title, "月报");
+    assert_eq!(model.active_tab().unwrap().draft, "select 1", "重命名不碰草稿");
+    model.dispatch("new-query");
+    assert_eq!(model.tabs.iter().find(|tab| tab.id == id).unwrap().title, "月报", "新开标签重新编号时不覆盖改过的名字");
+
+    let _ = model.activate_item(&id);
+    assert!(model.begin_tab_rename());
+    model.set_field(DraftField::TabTitle, "不要".into());
+    model.dispatch("tab-rename-cancel");
+    assert_eq!(model.active_tab().unwrap().title, "月报", "Esc 取消");
+
+    let mut restored = WorkbenchModel::new(Shell::default());
+    restored.restore_session(&model.snapshot().session);
+    assert_eq!(restored.tabs.iter().find(|tab| tab.id == id).unwrap().title, "月报", "会话恢复后保留改过的名字");
+    assert!(restored.renamed_tabs.contains(&id));
+
+    let _ = model.activate_item(&id);
+    assert!(model.begin_tab_rename());
+    model.set_field(DraftField::TabTitle, "   ".into());
+    model.dispatch("tab-rename-confirm");
+    assert_eq!(model.active_tab().unwrap().title, auto, "清空恢复自动编号");
+
+    model.dispatch("open-redis:cache|缓存|0");
+    assert!(!model.begin_tab_rename(), "非查询标签不能改名");
+}
+
+/// R14：原生窗口里双击查询标签出现重命名输入框，回车确认。
+#[gpui_kit::test]
+fn double_clicking_a_query_tab_renames_it(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tab-rename-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let id = cx.update(|cx| view.read(cx).model.active_tab.clone().unwrap());
+    cx.update_window(window, |_, window, cx| window.double_click(format!("tab-{id}"), cx)).unwrap();
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    let shown = cx.update_window(window, |_, window, _| window.try_find("tab-rename").is_some()).unwrap();
+    assert!(shown, "双击后出现重命名输入框");
+    cx.update(|cx| view.update(cx, |view, _| view.model.set_field(DraftField::TabTitle, "对账".into())));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tab-rename-confirm", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.active_tab().unwrap().title, "对账");
+        assert!(view.model.tab_rename.is_none());
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }

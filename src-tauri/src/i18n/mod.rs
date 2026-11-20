@@ -180,6 +180,7 @@ dict! {
     "shell.tabs.closeUnmodified" => "关闭全部未修改", "Close all unmodified";
     "shell.tabs.noneUnmodified" => "没有可以直接关闭的标签：其余标签有草稿、未提交的修改、正在执行或已固定", "No tab can be closed without confirmation: the rest have drafts, staged changes, running work or are pinned";
     "shell.tabs.pin" => "固定标签", "Pin tab";
+    "shell.tabs.rename" => "标签名称", "Tab name";
     "shell.tabs.unpin" => "取消固定", "Unpin tab";
     "shell.tabs.pinned" => "已固定", "Pinned";
     "shell.tabs.list" => "标签列表", "Tab list";
@@ -976,6 +977,7 @@ dict! {
     "mongo.docs.mustBeObject" => "文档应为 JSON 对象，不是数组或标量。", "The document must be a JSON object, not an array or scalar.";
     "mongo.docs.syntaxError" => "JSON 语法错误：{message}", "JSON syntax error: {message}";
     "mongo.docs.copiedJson" => "已复制文档 JSON。", "Document JSON copied.";
+    "mongo.docs.copiedCells" => "已复制选中的单元格。", "Selected cells copied.";
     "mongo.docs.notMatched" => "没有匹配到这篇文档，本次没有改动任何数据。", "No document matched, so nothing was changed.";
     "mongo.docs.replacedNote" => "已整体覆盖保存。", "The document was replaced.";
     "mongo.docs.insertedNote" => "已新增文档，_id = {id}。", "Inserted a document, _id = {id}.";
@@ -1484,6 +1486,12 @@ dict! {
     "compare.data.action.update" => "更新", "Update";
     "compare.data.action.delete" => "删除", "Delete";
     "compare.data.action.rejected" => "未生成", "Not generated";
+    "compare.data.col.action" => "动作", "Action";
+    "compare.data.col.column" => "列", "Column";
+    "compare.data.col.baseline" => "基准值", "Baseline";
+    "compare.data.col.target" => "对照值", "Target";
+    "compare.data.col.changed" => "不同", "Diff";
+    "compare.data.col.sql" => "同步语句", "Sync SQL";
     "compare.data.noDiff" => "所选表的数据一致，没有差异。", "The selected tables hold the same data. No differences.";
     "diagram.zoom.in" => "放大", "Zoom in";
     "diagram.zoom.out" => "缩小", "Zoom out";
@@ -1802,7 +1810,6 @@ dict! {
     "redis.value.gone" => "读取时这个键已经不存在（可能已过期或被删除）", "The key no longer exists (it may have expired or been deleted)";
     "redis.detail.more" => "更多操作", "More actions";
     "redis.menu.openInTab" => "在新标签中固定打开", "Open in pinned tab";
-    "redis.tab.openTabUnavailable" => "已在当前视图打开 {key}；在新标签中固定打开暂不可用，没有新建标签", "Opened {key} in this view; opening it in a pinned tab is not available yet, so no new tab was created";
     "redis.slowlog.inserted" => "已把命令填入命令栏", "Command placed in the command bar";
     "redis.slowlog.hint" => "双击一行把命令填入命令栏；⌘C 复制选中内容", "Double-click a row to put its command in the command bar; ⌘C copies the selection";
     "redis.info.key" => "指标", "Metric";

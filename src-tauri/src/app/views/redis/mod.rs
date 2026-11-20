@@ -837,15 +837,15 @@ impl RedisPane {
         }
     }
 
-    /// 双击、回车、「在新标签中固定打开」：先在当前视图里选中并打开这个键，同时把固定标签的请求留给外壳
-    /// （`take_open_requests`，格式 `连接|连接名|库|键`）。外壳还没接上这条请求之前，提示如实说明没有开新标签。
+    /// 双击、回车、「在新标签中固定打开」：先在当前视图里选中这个键，同时把固定标签的请求留给外壳
+    /// （`take_open_requests`，格式 `连接|连接名|库|键`）。外壳观察到通知后取走请求，新建固定的 Redis 标签并直接读这个键。
     fn request_open_tab(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.connection_id.is_empty() || name.is_empty() || self.confirm.is_some() {
             return;
         }
         self.select_key(name.to_owned(), cx);
         self.open_requests.push(format!("{}|{}|{}|{}", self.connection_id, self.connection_name, self.database, name));
-        self.note = i18n::fill(&self.text("redis.tab.openTabUnavailable"), &[("key", name)]);
+        cx.notify();
     }
 
     /// 打开目标时：先读本连接的键空间偏好与拓扑，再开始后台扫描（分隔符、上限都按偏好）。

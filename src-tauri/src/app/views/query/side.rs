@@ -135,7 +135,7 @@ fn outline(items: &[OutlineItem], active_statement: Option<usize>, locale: Local
         .id("query-outline")
         .test_support()
         .flex_1()
-        .min_h(px(0.))
+        .min_h_0()
         .scroll_area_y()
         .p(px(8.))
         .flex()
@@ -194,7 +194,7 @@ fn outline_row(item: &OutlineItem, current: bool, locale: Locale, metrics: Metri
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .truncate()
                 .font_family(mono.clone())
                 .when(current && !failed && !skipped, |this| this.text_color(p.accent_text).font_weight(gpui_kit::FontWeight::MEDIUM))
@@ -322,7 +322,7 @@ fn object_column(
                 .gap(px(6.))
                 .when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn)))
                 .when(column.foreign_key, |this| this.child(kit::icon(IconName::Link, 12., p.accent)))
-                .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_color(p.text).child(SharedString::from(column.name.clone())))
+                .child(div().min_w_0().truncate().font_family(mono.clone()).text_color(p.text).child(SharedString::from(column.name.clone())))
                 .child(div().flex_1())
                 .child(div().flex_none().text_color(p.text_muted).child(SharedString::from(column.type_name.clone())))
                 .when(!nullable.is_empty(), |this| this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(nullable)))),
@@ -360,7 +360,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
         .id("query-side-object")
         .test_support()
         .flex_1()
-        .min_h(px(0.))
+        .min_h_0()
         .scroll_area_y()
         .flex()
         .flex_col()
@@ -404,7 +404,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                                 }))
                             }
                         })
-                        .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::MD)).text_color(p.text).child(SharedString::from(qualified)))
+                        .child(div().min_w_0().truncate().font_family(mono.clone()).text_size(px(TypeScale::MD)).text_color(p.text).child(SharedString::from(qualified)))
                         .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(kind))),
                 )
                 .when(!info.comment.is_empty(), |this| {

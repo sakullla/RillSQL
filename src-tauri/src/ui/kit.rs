@@ -177,8 +177,21 @@ pub fn apply_theme(dark: bool, cx: &mut App) {
     let p = if dark { Palette::dark() } else { Palette::light() };
     let white = hex(0xffffff);
     let clear = hsla(0., 0., 0., 0.);
-    Theme::update(cx, |theme| brand(theme, &p, white, clear));
+    Theme::update(cx, |theme| {
+        brand(theme, &p, white, clear);
+        theme.cursor_blink = caret_blink();
+    });
     paint_editor_surface(dark, cx);
+}
+
+/// 光标静置多久后停止闪烁（保持可见）。闪烁每 500ms 通知一次编辑器，会连带整个工作台重新 prepaint/paint；
+/// 停在桌面上不动的窗口（包括失焦、在后台的窗口）因此有持续的空闲 CPU（T4 实测 300 个标签时约 18%）。
+/// 任何按键、点击或光标移动都会重新开始闪烁。
+pub const CARET_IDLE_SECS: u64 = 8;
+
+/// 全应用的光标闪烁策略：500ms 一闪，静置 `CARET_IDLE_SECS` 秒后停在可见状态。
+pub fn caret_blink() -> gpui_kit::component::input::CursorBlink {
+    gpui_kit::component::input::CursorBlink::default().with_idle_timeout(std::time::Duration::from_secs(CARET_IDLE_SECS))
 }
 
 /// 当前编辑器配色（auto / contrast / warm / cool / mono）。主题切换时据此重设编辑器底色，
@@ -2896,24 +2909,25 @@ mod token_tests {
     }
 
     /// 裸 `px(n)` 的棘轮上限：按视图目录统计产品代码里写死数字的间距与尺寸（不含测试模块与注释行）。
-    /// 上限取 2026-11-20 建档时的计数：只许下降。改到某个目录、换成 `Space` / `Metrics` /
+    /// 上限起始于 2026-11-20 建档时的计数（外壳 590、对比 94、表数据 153、Mongo 58、查询 190、Redis 267、结构 236），只许下降。改到某个目录、换成 `Space` / `Metrics` /
     /// `ControlSize` 等 token 后，把这里的数字一起改小；新增视图目录必须在这里登记。
     pub(super) const PX_CEILINGS: &[(&str, usize)] = &[
-        ("app/shell", 590),
+        // 2026-11-21（T8）按当前计数下调：改到的目录（外壳、对比、表数据、Mongo、查询、Redis、结构）都比建档时少。
+        ("app/shell", 495),
         ("app/views", 0),
         ("app/views/admin", 35),
-        ("app/views/compare", 94),
+        ("app/views/compare", 69),
         ("app/views/connections", 0),
         ("app/views/diagram", 32),
         ("app/views/export", 44),
-        ("app/views/grid", 153),
+        ("app/views/grid", 135),
         ("app/views/history", 0),
-        ("app/views/mongo", 58),
+        ("app/views/mongo", 41),
         ("app/views/overview", 0),
-        ("app/views/query", 190),
-        ("app/views/redis", 267),
+        ("app/views/query", 155),
+        ("app/views/redis", 174),
         ("app/views/settings", 0),
-        ("app/views/structure", 236),
+        ("app/views/structure", 189),
         ("app/views/welcome", 0),
     ];
 

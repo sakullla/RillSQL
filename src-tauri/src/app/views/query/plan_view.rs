@@ -93,7 +93,7 @@ impl PlanView<'_> {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let findings = self.plan.findings();
         let chip = |label: String, fg, bg| kit::pill(SharedString::from(label), fg, bg);
-        let mut summary = div().flex().flex_wrap().items_center().gap(px(6.)).min_w(px(0.));
+        let mut summary = div().flex().flex_wrap().items_center().gap(px(6.)).min_w_0();
         if let Some(cost) = self.plan.total_cost() {
             summary = summary.child(chip(format!("{} {}", i18n::text(locale, "query.plan.cost"), cost_text(cost)), p.text_muted, p.hover));
         }
@@ -187,7 +187,7 @@ impl PlanView<'_> {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .flex()
                                 .flex_wrap()
                                 .gap_x(px(6.))
@@ -203,7 +203,7 @@ impl PlanView<'_> {
 
         // 滚动区只放列标题和节点行（子元素 0 是列标题，节点 i 是第 i + 1 个），
         // 焦点与描边在外层容器上，描边不挤占滚动区的可视范围。
-        let mut tree = div().id("query-plan-tree-scroll").flex_1().min_h(px(0.)).scroll_area_y().scroll_handle(&self.scroll).flex().flex_col();
+        let mut tree = div().id("query-plan-tree-scroll").flex_1().min_h_0().scroll_area_y().scroll_handle(&self.scroll).flex().flex_col();
         tree = tree.child(
             div()
                 .flex_none()
@@ -271,11 +271,11 @@ impl PlanView<'_> {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .min_w(px(0.))
+                .min_w_0()
                 .child(kit::icon(icon, 14., tone))
                 .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(node.op.clone())));
             if let Some(object) = &node.object {
-                head = head.child(div().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object.clone())));
+                head = head.child(div().min_w_0().truncate().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object.clone())));
             }
             for issue in &node.issues {
                 head = head.child(kit::pill(SharedString::from(i18n::text(locale, issue.label_key())), p.warn, p.warn_soft));
@@ -283,7 +283,7 @@ impl PlanView<'_> {
             // 条件、用到的索引等补充说明放第二行，不再和操作名挤在一行里被截掉。
             let label = div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(1.))
@@ -292,7 +292,7 @@ impl PlanView<'_> {
                     this.child(
                         div()
                             .pl(px(20.))
-                            .min_w(px(0.))
+                            .min_w_0()
                             .truncate()
                             .font_family(self.mono.clone())
                             .text_size(px(TypeScale::XS))
@@ -349,7 +349,7 @@ impl PlanView<'_> {
             let metric = |label: SharedString, value: String| {
                 div()
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .px(px(8.))
                     .py(px(6.))
                     .rounded(px(Radius::CONTROL))
@@ -439,19 +439,19 @@ impl PlanView<'_> {
                 }
             })
             .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .when(!self.narrow, |this| this.h_full())
             .flex()
             .flex_col()
             .child(tree);
         let main = div()
             .flex_1()
-            .min_h(px(0.))
+            .min_h_0()
             .flex()
             .when(self.narrow, |this| this.flex_col())
             .child(tree)
             .child(detail);
-        div().id("query-plan").flex_1().min_h(px(0.)).flex().flex_col().children(advice).child(main).into_any_element()
+        div().id("query-plan").flex_1().min_h_0().flex().flex_col().children(advice).child(main).into_any_element()
     }
 }

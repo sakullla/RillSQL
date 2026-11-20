@@ -22,7 +22,7 @@ use crate::catalog::hierarchy::{NavKind, NavRow};
 use crate::catalog::model::ObjectKind;
 use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 use crate::i18n;
-use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::{self, ControlSize, FieldSpec, Palette, Tip as _, Radius, Space, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::tabs;
 
@@ -197,7 +197,7 @@ impl Workbench {
                     .relative()
                     .flex()
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_h_0()
                     .overflow_hidden()
                     .child(self.rail(cx))
                     .when_some(if docked_sidebar { sidebar } else { None }, |this, sidebar| this.child(sidebar))
@@ -209,7 +209,7 @@ impl Workbench {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .bg(p.surface)
                             .border_l_1()
                             .border_color(p.line)
@@ -549,6 +549,13 @@ impl Workbench {
             if rename_focused || save_focused {
                 return;
             }
+            // R13：列表里 ⌘C 复制选中条目的 SQL（与右键「复制」同一条命令）；输入框里的 ⌘C 留给输入框。
+            let mods = event.keystroke.modifiers;
+            if key == "c" && mods.secondary(cx) && !mods.shift && !mods.alt && !any_input {
+                self.perform("history-copy", cx);
+                cx.notify();
+                return;
+            }
             if key == "delete" && !any_input {
                 if let Some(command) = self.model.history.delete_command() {
                     self.perform(command, cx);
@@ -663,7 +670,7 @@ impl Workbench {
             .aria_label(self.t("shell.command.newQuery"))
             .h_full()
             .flex_1()
-            .min_w(px(0.))
+            .min_w_0()
             .pr(px(10.))
             .flex()
             .items_center()
@@ -798,7 +805,7 @@ impl Workbench {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.))
+            .min_h_0()
             .scroll_area_y()
             .scroll_handle(&self.explorer_scroll)
             .px(px(6.))
@@ -892,7 +899,7 @@ impl Workbench {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .h_full()
                     .flex()
                     .flex_col()
@@ -997,7 +1004,7 @@ impl Workbench {
                         div()
                             .id("explorer-error-text")
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .truncate()
                             .tooltip_text(SharedString::from(full_error.clone()))
                             .text_size(px(TypeScale::SM))
@@ -1027,7 +1034,7 @@ impl Workbench {
                     .gap(px(8.))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_faint)
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(self.t("ui.explorer.noMatch")))
+                    .child(div().flex_1().min_w_0().truncate().child(self.t("ui.explorer.noMatch")))
                     .when(has_object_filter, |this| {
                         this.child(
                             kit::tool_button(
@@ -1104,7 +1111,7 @@ impl Workbench {
                     })),
             )
             .child(kit::icon(IconName::Folder, 13., p.text_muted))
-            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(name.clone())))
+            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(name.clone())))
             .child(
                 div()
                     .flex_none()
@@ -1254,7 +1261,7 @@ impl Workbench {
                     })),
             )
             .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
-            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(name))
+            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(name))
             .when(status == LinkStatus::Connecting, |this| this.child(self.spinners.element(format!("conn-{}", row.saved.id), Size::XSmall, Some(p.text_muted), cx)))
             .when(supports_query, |this| {
                 this.child(explorer_hover_icon(
@@ -1328,7 +1335,7 @@ impl Workbench {
                     .aria_label(SharedString::from(full.clone()))
                     .tooltip_text(SharedString::from(full.clone()))
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .truncate()
                     .text_size(px(TypeScale::XS))
                     .text_color(p.danger)
@@ -1367,7 +1374,7 @@ impl Workbench {
                     .aria_label(full.clone())
                     .tooltip_text(full.clone())
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .truncate()
                     .text_size(px(TypeScale::XS))
                     .text_color(p.danger)
@@ -1469,7 +1476,7 @@ impl Workbench {
         let empty_group = row.kind == NavKind::Group && !row.unloaded && !row.loading && row.error.is_none() && row.total == 0 && row.loaded == 0 && !row.has_more;
         let body = match row.highlight {
             Some((start, end)) if end > start && end <= label.len() => highlight_label(&id, &label, start, end, p),
-            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(empty_group, |this| this.text_color(p.text_faint)).child(label.clone()).into_any_element(),
+            _ => div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).when(empty_group, |this| this.text_color(p.text_faint)).child(label.clone()).into_any_element(),
         };
         let click_id = id.clone();
         let menu_id = id.clone();
@@ -1545,7 +1552,7 @@ impl Workbench {
                     .test_support()
                     .relative()
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .h_full()
                     .flex()
                     .items_center()
@@ -1658,7 +1665,7 @@ impl Workbench {
                         .flex_basis(px(0.))
                         .flex_grow(0.5)
                         .flex_shrink(1.)
-                        .min_w(px(0.))
+                        .min_w_0()
                         .truncate()
                         .max_w(px(120.))
                         .text_size(px(TypeScale::XS))
@@ -1835,7 +1842,38 @@ impl Workbench {
             .flex_col()
             .size_full()
             .children(strip)
-            .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(body))
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .into_any_element()
+    }
+
+    /// 就地重命名中的查询标签：一个输入框，回车确认、Esc 取消；切到别的标签时按当前输入确认。
+    fn tab_rename_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics();
+        let (input, state) = self.field_input(DraftField::TabTitle, &self.model.text("shell.tabs.rename"), false, window, cx);
+        if !self.tab_rename_focused {
+            self.tab_rename_focused = true;
+            self.fields.focus(DraftField::TabTitle, window, cx);
+            state.update(cx, |state, cx| state.select_all(window, cx));
+        }
+        div()
+            .id("tab-rename")
+            .test_support()
+            .flex_none()
+            .w(px(ControlSize::PICKER_MIN_W - 60.))
+            .h(px(m.tabs_h))
+            .px(px(Space::XS))
+            .flex()
+            .items_center()
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let command = match event.keystroke.key.as_str() {
+                    "enter" => "tab-rename-confirm",
+                    "escape" => "tab-rename-cancel",
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.perform(command, cx);
+            }))
+            .child(input)
             .into_any_element()
     }
 
@@ -1883,7 +1921,15 @@ impl Workbench {
         // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
         let dirty_text = self.t("ui.grid.pending");
         let pinned_text = self.t("shell.tabs.pinned");
+        let renaming = self.model.tab_rename.as_ref().map(|(id, _)| id.clone());
+        if renaming.is_none() {
+            self.tab_rename_focused = false;
+        }
         for tab in self.model.tabs.clone() {
+            if renaming.as_deref() == Some(tab.id.as_str()) {
+                items.push(self.tab_rename_chip(window, cx));
+                continue;
+            }
             // 只有工作页才把标签显示为选中；设置、对比、关系图页不伪装成某个工作项。
             let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
             let dirty = tab.uncommitted_cells;
@@ -1963,9 +2009,13 @@ impl Workbench {
             }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 let _ = this.model.activate_item(&id);
-                // 双击预览标签把它转为固定标签。
+                // 双击预览标签把它转为固定标签；双击查询标签就地重命名（R14，不触发任何破坏性操作）。
                 if event.click_count() >= 2 {
                     this.model.pin_overview();
+                    if this.model.active_tab().is_some_and(|tab| tab.id == id && tab.kind.is_query()) {
+                        this.perform("tab-rename", cx);
+                        return;
+                    }
                 }
                 if this.model.tool == WorkTool::Query {
                     this.query.update(cx, |pane, _| pane.request_focus());
@@ -2167,13 +2217,13 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .min_w(px(0.))
+                    .min_w_0()
                     .max_w(px(target_max))
                     .rounded(px(Radius::CONTROL))
                     .px(px(4.))
                     .hover(|style| style.bg(p.hover).text_color(p.text))
                     .child(kit::engine_badge(&engine, 14.))
-                    .child(div().min_w(px(0.)).truncate().child(label))
+                    .child(div().min_w_0().truncate().child(label))
                     .when(missing, |this| this.child(kit::icon(IconName::TriangleAlert, 12., p.warn)))
                     .children(self.env_pill(&env, &p))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -2244,7 +2294,7 @@ impl Workbench {
             .text_size(px(TypeScale::XS))
             .text_color(p.text_muted)
             .child(target)
-            .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(notice)))
+            .child(div().flex_1().min_w_0().truncate().child(SharedString::from(notice)))
             .when(running, |this| {
                 this.child(
                     kit::interactive_states(div().id("status-jobs"), &p, false)
@@ -2496,7 +2546,7 @@ impl Workbench {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap(px(1.))
@@ -2569,7 +2619,7 @@ impl Workbench {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .truncate()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(px(TypeScale::SM))
@@ -2785,7 +2835,7 @@ impl Workbench {
             })
             .child(kit::icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
             .child(kit::icon(if expanded { IconName::FolderOpen } else { IconName::Folder }, 14., p.text_muted))
-            .child(div().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::SM)).child(SharedString::from(name.to_owned())))
+            .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(TypeScale::SM)).child(SharedString::from(name.to_owned())))
             .child(
                 div()
                     .flex_none()
@@ -2934,13 +2984,13 @@ impl Workbench {
                         .flex()
                         .flex_col()
                         .flex_1()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(px(8.))
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .child(
                                     div()
                                         .id("conn-form-title")
@@ -3536,7 +3586,7 @@ impl Workbench {
             let body = div()
                 .id("conn-modal-scroll")
                 .flex_1()
-                .min_h(px(0.))
+                .min_h_0()
                 .scroll_area_y()
                 .child(div().px(px(pad)).py(px(14.)).child(tab_body));
 
@@ -4161,7 +4211,7 @@ impl Workbench {
             .hover(|style| style.border_color(if on { p.accent.opacity(0.48) } else { p.line }))
             .child(switch_visual(on, p))
             .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(label))
-            .child(div().min_w(px(0.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(detail))
+            .child(div().min_w_0().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(detail))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.activate_modal_control(id, cx);
             }))
@@ -4203,7 +4253,7 @@ impl Workbench {
     /// 字段旁的错误：同一字段的结论就显示在它旁边，不再汇总到底部。
     fn field_row(&self, label: SharedString, field: &str, control: impl IntoElement, p: &Palette) -> AnyElement {
         let issue = self.model.connections.issues.iter().find(|issue| issue.field == field);
-        let mut row = div().flex().flex_col().gap(px(4.)).min_w(px(0.)).child(kit::form_row(label, control, p));
+        let mut row = div().flex().flex_col().gap(px(4.)).min_w_0().child(kit::form_row(label, control, p));
         if let Some(issue) = issue {
             row = row.child(
                 div()
@@ -4241,8 +4291,8 @@ impl Workbench {
                     .flex()
                     .items_end()
                     .gap(px(6.))
-                    .min_w(px(0.))
-                    .child(div().flex_1().min_w(px(0.)).child(kit::form_row(label, input, p)))
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().child(kit::form_row(label, input, p)))
                     .child(browse),
             );
         if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == field) {
@@ -4662,8 +4712,8 @@ impl Workbench {
             .flex_col()
             .gap(px(6.))
             .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .scroll_area_y()
             .scroll_handle(&self.history_scroll)
             .px(px(m.page_pad))
@@ -4714,7 +4764,7 @@ impl Workbench {
                 child_count += 1;
             } else if self.model.history.loading {
                 // 刷新时旧行继续显示，只在列表顶部说明还在读，不整块换成骨架。
-                list = list.child(div().id("history-loading").test_support().child(super::loading::inline_loading(self.spinners.element("history-loading", Size::Small, Some(p.accent), cx), self.t("history.page.loading"), &m, &p)));
+                list = list.child(div().id("history-loading").test_support().child(crate::ui::loading::inline_loading(self.spinners.element("history-loading", Size::Small, Some(p.accent), cx), self.t("history.page.loading"), &m, &p)));
                 child_count += 1;
             }
             for entry in runs {
@@ -4738,7 +4788,7 @@ impl Workbench {
                         .aria_label(SharedString::from(entry.sql.clone()))
                         .aria_selected(selected)
                         .p(px(m.row_pad_y + 5.))
-                        .min_w(px(0.))
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap(px(8.))
@@ -4748,7 +4798,7 @@ impl Workbench {
                         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
                             div()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .font_family(mono.clone())
                                 .text_size(px(TypeScale::SM))
                                 .text_color(p.text)
@@ -4845,7 +4895,7 @@ impl Workbench {
                 });
                 child_count += 1;
             } else if self.model.history.loading {
-                list = list.child(div().id("history-loading").test_support().child(super::loading::inline_loading(self.spinners.element("history-loading-saved", Size::Small, Some(p.accent), cx), self.t("history.page.loadingSaved"), &m, &p)));
+                list = list.child(div().id("history-loading").test_support().child(crate::ui::loading::inline_loading(self.spinners.element("history-loading-saved", Size::Small, Some(p.accent), cx), self.t("history.page.loadingSaved"), &m, &p)));
                 child_count += 1;
             }
             for item in saved {
@@ -4867,7 +4917,7 @@ impl Workbench {
                         .aria_label(SharedString::from(item.name.clone()))
                         .aria_selected(selected)
                         .p(px(m.row_pad_y + 5.))
-                        .min_w(px(0.))
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -4881,7 +4931,7 @@ impl Workbench {
                                 .items_center()
                                 .gap(px(8.))
                                 .child(kit::icon(IconName::Bookmark, 14., p.accent))
-                                .child(div().id(SharedString::from(format!("saved-name-{id}"))).flex_1().min_w(px(0.)).truncate().tooltip_text(SharedString::from(item.name.clone())).font_weight(FontWeight::MEDIUM).child(SharedString::from(item.name.clone())))
+                                .child(div().id(SharedString::from(format!("saved-name-{id}"))).flex_1().min_w_0().truncate().tooltip_text(SharedString::from(item.name.clone())).font_weight(FontWeight::MEDIUM).child(SharedString::from(item.name.clone())))
                                 .child(kit::engine_badge(&item.engine, 14.))
                                 .child(
                                     div()
@@ -4920,7 +4970,7 @@ impl Workbench {
                                         })).xsmall()),
                                 ),
                         )
-                        .child(div().min_w(px(0.)).font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
+                        .child(div().min_w_0().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
                         .on_mouse_down(MouseButton::Right, cx.listener({
                             let menu = id.clone();
                             move |this, event: &MouseDownEvent, _, cx| {
@@ -5055,14 +5105,14 @@ impl Workbench {
             div().into_any_element()
         };
         let body = if narrow {
-            let mut column = div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).flex_col();
+            let mut column = div().flex().flex_1().min_w_0().min_h_0().flex_col();
             if has_preview {
                 // 与列表分享剩余高度，最高 300；空预览不占位，矮窗口列表不会被压没。
                 column = column.child(
                     div()
                         .flex_1()
                         .max_h(px(300.))
-                        .min_h(px(0.))
+                        .min_h_0()
                         .flex()
                         .flex_col()
                         .overflow_hidden()
@@ -5071,7 +5121,7 @@ impl Workbench {
             }
             column.child(list)
         } else {
-            div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview)
+            div().flex().flex_1().min_w_0().min_h_0().child(list).child(preview)
         };
         div()
             .id("history-page")
@@ -5155,8 +5205,8 @@ impl Workbench {
             .id("history-preview")
             .role(gpui_kit::Role::Group)
             .flex_none()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .when(narrow, |this| this.h_full().w_full().border_t_1())
             .when(!narrow, |this| this.w(px(preview_width)).border_l_1())
             .border_color(p.line)
@@ -5190,8 +5240,8 @@ impl Workbench {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.))
-                    .min_h(px(0.))
+                    .min_w_0()
+                    .min_h_0()
                     .p(px(if narrow { 12. } else { 14. }))
                     .flex()
                     .flex_col()
@@ -5254,7 +5304,7 @@ impl Workbench {
                         div()
                             .id("history-preview-sql")
                             .flex_1()
-                            .min_h(px(0.))
+                            .min_h_0()
                             .rounded(px(Radius::PANEL))
                             .border_1()
                             .border_color(p.line)
@@ -5519,13 +5569,13 @@ impl Workbench {
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("shell.settings.title"))
             .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .scroll_area_y()
             .child(
                 div()
                     .max_w(px(760.))
-                    .min_w(px(0.))
+                    .min_w_0()
                     .px(px(m.page_pad))
                     .py(px(m.page_pad_y))
                     .flex()
@@ -5594,8 +5644,8 @@ impl Workbench {
         let body = div()
             .flex()
             .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .when(side_by_side, |this| this.flex_row())
             .when(!side_by_side, |this| this.flex_col())
             .child(nav)
@@ -5876,7 +5926,7 @@ impl Workbench {
             SaveState::Saving => div()
                 .id("settings-save-state")
                 .test_support()
-                .child(super::loading::inline_loading(self.spinners.element("settings-saving", Size::Small, Some(p.accent), cx), self.t("ui.settings.saving"), m, p))
+                .child(crate::ui::loading::inline_loading(self.spinners.element("settings-saving", Size::Small, Some(p.accent), cx), self.t("ui.settings.saving"), m, p))
                 .into_any_element(),
             SaveState::Saved => div()
                 .id("settings-save-state")
@@ -5991,7 +6041,7 @@ impl Workbench {
                     .text_color(if on { p.accent_text } else { p.text })
                     .when(on, |this| this.bg(p.accent_soft))
                     .when(!on, |this| this.hover(|style| style.bg(p.hover)))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(div().text_color(p.text_faint).font_features(kit::tabular_figures()).child(SharedString::from(count.to_string())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.model.help_query.clear();
@@ -6024,7 +6074,7 @@ impl Workbench {
                 .test_support()
                 .role(gpui_kit::Role::List)
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .h_full()
                 .flex()
                 .flex_col()
@@ -6056,9 +6106,9 @@ impl Workbench {
                     let name = match label_hit {
                         Some((start, end)) => help_hit_text(format!("help-match-{}", shortcut.id), label.as_ref(), start, end, &p)
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .into_any_element(),
-                        None => div().flex_1().min_w(px(0.)).child(label.clone()).into_any_element(),
+                        None => div().flex_1().min_w_0().child(label.clone()).into_any_element(),
                     };
                     let key = match key_hit {
                         Some((start, end)) => kit::kbd_element(help_hit_text(format!("help-key-match-{}", shortcut.id), &shown, start, end, &p), &p),
@@ -6106,7 +6156,7 @@ impl Workbench {
                         .border_color(p.line)
                         .child(input.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)),
                 )
-                .child(div().flex_1().min_h(px(0.)).flex().flex_row().child(nav).child(list));
+                .child(div().flex_1().min_h_0().flex().flex_row().child(nav).child(list));
             panel
             });
         } else {
@@ -6334,7 +6384,7 @@ impl Workbench {
                         )
                         .child(scopes),
                 )
-                .child(list.flex_1().min_h(px(0.)))
+                .child(list.flex_1().min_h_0())
                 .child(footer);
             panel
             });
@@ -6390,11 +6440,11 @@ impl Workbench {
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
                         // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
                         .when(!detail.is_empty(), |this| {
                             let full_detail = SharedString::from(detail.clone());
@@ -6559,7 +6609,7 @@ impl Workbench {
                     .when(enabled && selected, |this| this.bg(p.hover))
                     .when(enabled, |this| this.hover(|style| style.bg(if item.danger { p.danger_soft } else { p.hover })))
                     .when_some(item.icon, |this, icon| this.child(kit::icon(icon, 14., fg)))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
                     .when_some(shortcut, |this, shortcut| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(shortcut)))
                     .when(has_children, |this| this.child(kit::icon(IconName::ChevronRight, 12., p.text_faint)))
                     .when_some(disabled_reason.filter(|_| !enabled), |this, reason| this.tooltip_text(reason))
@@ -6736,7 +6786,7 @@ impl Workbench {
         let title = SharedString::from(format!("{} · {name}", self.model.text("catalog.ddl.title")));
         let viewer_h = (self.model.viewport_height.max(520) as f32 - 220.).clamp(220., 520.);
         let body: AnyElement = if view.loading {
-            super::loading::loading_state(self.spinners.element("ddl-loading", Size::Small, Some(p.accent), cx), self.t("catalog.ddl.loading"), &p)
+            crate::ui::loading::loading_state(self.spinners.element("ddl-loading", Size::Small, Some(p.accent), cx), self.t("catalog.ddl.loading"), &p)
                 .py(px(28.))
                 .into_any_element()
         } else if let Some(text) = view.text.clone() {
@@ -6799,7 +6849,7 @@ impl Workbench {
             .occlude()
             .w_full()
             .max_w(px(760.))
-            .min_w(px(0.))
+            .min_w_0()
             .p(px(20.))
             .flex()
             .flex_col()
@@ -6816,7 +6866,7 @@ impl Workbench {
                     .items_center()
                     .gap(px(8.))
                     .child(kit::icon(IconName::Code, 16., p.accent))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, TypeScale::LG, &p)))
+                    .child(div().flex_1().min_w_0().truncate().child(kit::title(title, TypeScale::LG, &p)))
                     .child(kit::icon_button("ddl-header-close", IconName::X, self.t("common.close"), act("ddl-close", cx))),
             )
             .when_some(rebuilt, |this, rebuilt| this.child(rebuilt))
@@ -6866,7 +6916,7 @@ impl Workbench {
                         .flex()
                         .gap(px(8.))
                         .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.target")))
-                        .child(div().id("danger-target").min_w(px(0.)).truncate().child(SharedString::from(name.clone()))),
+                        .child(div().id("danger-target").min_w_0().truncate().child(SharedString::from(name.clone()))),
                 )
                 .child(
                     div()
@@ -6899,12 +6949,12 @@ impl Workbench {
                             this.perform("danger-preview", cx);
                         }
                     }))
-                    .child(div().flex_1().min_w(px(0.)).child(input))
+                    .child(div().flex_1().min_w_0().child(input))
                     .child(kit::secondary_button("cmd-danger-preview", Some(IconName::Eye), self.t("catalog.danger.preview"), act("danger-preview", cx)).disabled(prompt.running)),
             );
         }
         if prompt.loading {
-            content = content.child(super::loading::inline_loading(self.spinners.element("danger-loading", Size::Small, Some(p.accent), cx), self.t("catalog.danger.loading"), &m, &p));
+            content = content.child(crate::ui::loading::inline_loading(self.spinners.element("danger-loading", Size::Small, Some(p.accent), cx), self.t("catalog.danger.loading"), &m, &p));
         } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
             content = content.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
         }
@@ -6989,7 +7039,7 @@ impl Workbench {
             }
         }
         if prompt.running {
-            content = content.child(super::loading::inline_loading(self.spinners.element("danger-running", Size::Small, Some(p.accent), cx), self.t("catalog.danger.running"), &m, &p));
+            content = content.child(crate::ui::loading::inline_loading(self.spinners.element("danger-running", Size::Small, Some(p.accent), cx), self.t("catalog.danger.running"), &m, &p));
         }
         let ready = prompt.execute_ready();
         let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };
@@ -7098,7 +7148,7 @@ impl Workbench {
                     .child(div().flex().items_center().gap(px(8.)).child(kit::icon(IconName::ArrowDownUp, 15., p.accent)).child(kit::title(self.t("export.open"), TypeScale::LG, &p)))
                     .child(kit::icon_button("exchange-close", IconName::X, self.t("common.close"), act("open-exchange", cx))),
             )
-            .child(div().id("exchange-scroll").flex_1().min_h(px(0.)).scroll_area_y().child(self.exchange.clone()));
+            .child(div().id("exchange-scroll").flex_1().min_h_0().scroll_area_y().child(self.exchange.clone()));
         let entity = cx.entity();
         div()
             .id("exchange-backdrop")
@@ -7158,12 +7208,12 @@ fn highlight_label(id: &str, label: &SharedString, start: usize, end: usize, p: 
     let tail = if end < text.len() { SharedString::from(text[end..].to_owned()) } else { SharedString::from("") };
     div()
         .flex_1()
-        .min_w(px(0.))
+        .min_w_0()
         .flex()
         .items_center()
         .overflow_hidden()
         .text_size(px(TypeScale::SM))
-        .child(div().min_w(px(0.)).flex_shrink(1.).truncate().child(head))
+        .child(div().min_w_0().flex_shrink(1.).truncate().child(head))
         .child(
             div()
                 .id(SharedString::from(format!("nav-match-{id}")))
@@ -7175,7 +7225,7 @@ fn highlight_label(id: &str, label: &SharedString, start: usize, end: usize, p: 
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(hit),
         )
-        .child(div().flex_1().min_w(px(0.)).truncate().child(tail))
+        .child(div().flex_1().min_w_0().truncate().child(tail))
         .into_any_element()
 }
 
@@ -7387,7 +7437,7 @@ fn credentials_row(issue: &crate::app::views::connections::FieldIssue, heading: 
         .items_start()
         .gap(px(6.))
         .child(kit::icon(IconName::CircleAlert, 13., p.danger))
-        .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(text)))
+        .child(div().flex_1().min_w_0().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(text)))
         .into_any_element()
 }
 
@@ -7493,7 +7543,7 @@ pub(super) fn test_verdict(report: &crate::connections::stages::TestReport, head
             div()
                 .id("conn-test-verdict-text")
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 // 驱动的报错可能很长：结论条自己滚，不把表单主体挤没。
                 .max_h(px(132.))
                 .scroll_area_y()
@@ -7522,7 +7572,7 @@ fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::
         .text_color(fg)
         .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
-        .child(div().flex_1().min_w(px(0.)).child(text))
+        .child(div().flex_1().min_w_0().child(text))
         .into_any_element()
 }
 
@@ -7554,7 +7604,7 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
         .occlude()
         .w_full()
         .max_w(px(440.))
-        .min_w(px(0.))
+        .min_w_0()
         .p(px(20.))
         .flex()
         .flex_col()
@@ -7582,7 +7632,7 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
                         .justify_center()
                         .child(kit::icon(icon, 17., tone)),
                 )
-                .child(div().flex().flex_col().gap(px(6.)).min_w(px(0.)).child(kit::title(title, TypeScale::LG, p)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body))),
+                .child(div().flex().flex_col().gap(px(6.)).min_w_0().child(kit::title(title, TypeScale::LG, p)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body))),
         )
 }
 

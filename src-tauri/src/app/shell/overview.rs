@@ -364,6 +364,15 @@ impl WorkbenchModel {
             );
             return true;
         }
+        if id == "overview-copy-selected" {
+            // R13：⌘C 复制选中行（制表符分隔，列顺序与列表一致），可以直接粘贴到表格软件。
+            let Some(state) = self.active_overview() else { return true };
+            let Some(row) = state.selected.as_deref().and_then(|name| state.row(name)) else { return true };
+            let text = overview_row_tsv(columns(state.level()), row);
+            self.copied = text.clone();
+            self.clipboard_out = Some(text);
+            return true;
+        }
         if let Some(name) = id.strip_prefix("overview-copy-name:") {
             let Some((target, row)) = self.overview_row(name) else { return true };
             let text = if row.kind.is_some() {
@@ -377,6 +386,11 @@ impl WorkbenchModel {
         }
         false
     }
+}
+
+/// 一行概览的 TSV：各列的显示文字，制表符分隔；字段里的制表符和换行按共享只读表的规则加引号。
+pub(super) fn overview_row_tsv(cols: &[OverviewColumn], row: &StatRow) -> String {
+    cols.iter().map(|column| crate::ui::read_table::quote_tsv(&column.text(row))).collect::<Vec<_>>().join("\t")
 }
 
 impl Workbench {
@@ -432,7 +446,7 @@ impl Workbench {
                 div()
                     .flex()
                     .flex_col()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .flex_1()
                     .child(
                         div()
@@ -487,7 +501,7 @@ impl Workbench {
                     .aria_label(self.t(column.label_key()))
                     .flex_none()
                     .w(relative(column.width() / total_width))
-                    .min_w(px(0.))
+                    .min_w_0()
                     .h_full()
                     .px(px(6.))
                     .flex()
@@ -508,9 +522,9 @@ impl Workbench {
         };
         let body: AnyElement = match &state.load {
             OverviewLoad::Pending | OverviewLoad::Loading if state.rows.is_empty() => {
-                div().flex_1().child(super::loading::loading_state(self.spinners.element("overview-loading", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.loading"), &p)).into_any_element()
+                div().flex_1().child(crate::ui::loading::loading_state(self.spinners.element("overview-loading", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.loading"), &p)).into_any_element()
             }
-            OverviewLoad::Connecting => div().flex_1().child(super::loading::loading_state(self.spinners.element("overview-connecting", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.connecting"), &p)).into_any_element(),
+            OverviewLoad::Connecting => div().flex_1().child(crate::ui::loading::loading_state(self.spinners.element("overview-connecting", gpui_kit::component::Size::Small, Some(p.accent), cx), self.t("catalog.overview.connecting"), &p)).into_any_element(),
             OverviewLoad::Failed(reason) => {
                 let retry = kit::secondary_button("overview-retry", Some(IconName::RefreshCw), self.t("common.retry"), act("overview-connect", cx));
                 div()
@@ -547,7 +561,7 @@ impl Workbench {
                 .size_full();
                 div()
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_h_0()
                     .relative()
                     .child(list)
                     .child(kit::scrollbar_overlay("overview-list-bar", &scroll, kit::ScrollbarAxis::Vertical))
@@ -557,6 +571,29 @@ impl Workbench {
         div()
             .id("overview-page")
             .test_support()
+            .track_focus(&self.overview_focus)
+            // R14：回车 = 双击（库/模式进入下一层，表/视图打开数据）；上下方向键移动选中。都不触发破坏性操作。
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let mods = event.keystroke.modifiers;
+                if event.keystroke.key == "c" && mods.secondary(cx) && !mods.shift && !mods.alt {
+                    if this.model.active_overview().is_some_and(|state| state.selected.is_some()) {
+                        cx.stop_propagation();
+                        this.perform("overview-copy-selected", cx);
+                    }
+                    return;
+                }
+                if mods.modified() {
+                    return;
+                }
+                let command = match event.keystroke.key.as_str() {
+                    "enter" => "overview-activate-selected",
+                    "down" => "overview-next",
+                    "up" => "overview-prev",
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.perform(command, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -564,7 +601,7 @@ impl Workbench {
             .child(header)
             .children(missing_banner)
             .child(column_header)
-            .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(body))
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .into_any_element()
     }
 
@@ -601,7 +638,7 @@ impl Workbench {
             let mut cell = div()
                 .flex_none()
                 .w(relative(column.width() / total_width))
-                .min_w(px(0.))
+                .min_w_0()
                 .px(px(6.))
                 .flex()
                 .items_center()
@@ -611,7 +648,7 @@ impl Workbench {
             if *column == OverviewColumn::Name {
                 cell = cell.child(kit::icon(icon, 13., p.text_muted));
             }
-            cell = cell.child(div().min_w(px(0.)).truncate().child(SharedString::from(text)));
+            cell = cell.child(div().min_w_0().truncate().child(SharedString::from(text)));
             element = element.child(cell);
         }
         element
@@ -619,7 +656,8 @@ impl Workbench {
                 this.menu_at = event.position;
                 this.perform(&format!("overview-menu:{menu_name}"), cx);
             }))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                window.focus(&this.overview_focus, cx);
                 this.perform(&format!("overview-select:{click_name}"), cx);
                 if event.click_count() >= 2 {
                     this.perform(&format!("overview-activate:{click_name}"), cx);

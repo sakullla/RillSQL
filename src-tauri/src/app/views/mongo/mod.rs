@@ -21,6 +21,8 @@ use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::adapters::mongodb::docs::{CollectionSummary, DatabaseSummary, DocumentsPage, MongoDoc};
 
+mod select;
+
 const PAGE_LIMIT: u64 = 20;
 /// 文档表每列的最小宽度：窄窗口靠横向滚动，不把列压到只剩省略号。
 const DOC_COL_MIN: f32 = 120.;
@@ -117,6 +119,9 @@ pub struct MongoPane {
     cell_focus: Option<FocusHandle>,
     /// 键盘光标所在单元格（行、列下标），鼠标点格子也会同步到这里。
     focused_cell: Option<(usize, usize)>,
+    /// 文档表的复制选区（与 `ui::read_table` 同一模型）；换页、换目标时清掉。
+    doc_selection: Option<crate::ui::read_table::ReadSelection>,
+    copy_menu: Option<select::CopyMenu>,
     drawer_tall: bool,
 }
 
@@ -168,6 +173,8 @@ impl MongoPane {
             viewport_w: 1200.,
             cell_focus: None,
             focused_cell: None,
+            doc_selection: None,
+            copy_menu: None,
             drawer_tall: false,
         }
     }
@@ -366,6 +373,8 @@ impl MongoPane {
         self.viewer_sub = None;
         self.viewer_editable = false;
         self.focused_cell = None;
+        self.doc_selection = None;
+        self.copy_menu = None;
     }
 
     fn nav_collapsed(&self, width: f32) -> bool {
@@ -659,6 +668,7 @@ impl MongoPane {
                 self.documents = page.documents;
                 self.total = page.total;
                 self.columns = columns_of(&self.documents);
+                self.doc_selection = None;
                 self.error.clear();
             }
             Err(message) => {
@@ -1061,7 +1071,7 @@ impl Render for MongoPane {
         let panel_w = if overlay_nav { nav_w.min((self.viewport_w - 32.).max(160.)) } else { nav_w };
         // ---- 左栏：库与集合
         let nav_column = stack_frame(|| {
-        let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).scroll_area_y().p(px(6.));
+        let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h_0().scroll_area_y().p(px(6.));
         nav = nav.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.databases")), &p)));
         for (index, database) in self.databases.iter().take(60).enumerate() {
             let selected = database.name == self.database;
@@ -1120,7 +1130,7 @@ impl Render for MongoPane {
                     .border_b_1()
                     .border_color(p.line)
                     .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Mongo), 20.))
-                    .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
+                    .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
                     .child(mongo_icon("mongo-refresh-db", IconName::RefreshCw, &self.text("mongo.tab.databases"), &entity)),
             )
             .child(nav)
@@ -1178,7 +1188,7 @@ impl Render for MongoPane {
                     .flex_wrap()
                     .items_center()
                     .gap(px(4.))
-                    .min_w(px(0.))
+                    .min_w_0()
                     .max_w_full()
                     .text_size(px(TypeScale::MD))
                     .child(mongo_button("mongo-crumb-db", None, &self.text("mongo.nav.breadcrumb"), Kind::Tool, &entity))
@@ -1217,7 +1227,7 @@ impl Render for MongoPane {
         let docs_focused = cell_focus.is_focused(window);
         let documents = self.docs_body(state, docs_focused, &mono, &p, &m, &entity, cx);
 
-        let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar);
+        let mut right = div().flex_1().min_w_0().h_full().flex().flex_col().relative().child(toolbar);
         right = stack_frame(|| {
         let mut right = right;
         if self.crumb_db || self.crumb_coll {
@@ -1321,7 +1331,7 @@ impl Render for MongoPane {
                                 .child(close_btn),
                         ),
                 )
-                .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_hidden().child(viewer));
+                .child(div().id("mongo-view-json").flex_1().min_h_0().overflow_hidden().child(viewer));
             if editable {
                 drawer = drawer
                     .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
@@ -1347,7 +1357,7 @@ impl Render for MongoPane {
                     .bg(if delete { p.danger_soft } else { p.warn_soft })
                     .text_color(if delete { p.danger } else { p.warn })
                     .child(kit::icon(IconName::TriangleAlert, 15., if delete { p.danger } else { p.warn }))
-                    .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::SM)).child(SharedString::from(self.confirm_prompt.clone())))
+                    .child(div().flex_1().min_w_0().text_size(px(TypeScale::SM)).child(SharedString::from(self.confirm_prompt.clone())))
                     .child(mongo_button("mongo-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
                     .child(mongo_button(
                         "mongo-confirm",
@@ -1394,7 +1404,7 @@ impl Render for MongoPane {
         });
 
         // 页面根只负责分栏：不滚横向、不撑宽，滚动全部交给左栏或文档数据区自己。
-        let mut root = div().id("mongo-pane").test_support().relative().size_full().flex().min_w(px(0.)).overflow_hidden();
+        let mut root = div().id("mongo-pane").test_support().relative().size_full().flex().min_w_0().overflow_hidden();
         if overlay_nav {
             // 窄窗口的抽屉：先画内容，再压一层遮罩与左栏，点遮罩收回导航。
             let dismiss = entity.clone();
@@ -1441,9 +1451,10 @@ impl MongoPane {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.))
-            .min_w(px(0.))
+            .min_h_0()
+            .min_w_0()
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let mods = event.keystroke.modifiers;
                 let key = match event.keystroke.key.as_str() {
                     "arrowup" => "up",
                     "arrowdown" => "down",
@@ -1451,7 +1462,21 @@ impl MongoPane {
                     "arrowright" => "right",
                     other => other,
                 };
+                // ⌘C（Windows/Linux 为 Ctrl+C）：复制选区；没有选区时不吃掉按键。
+                if key == "c" && mods.secondary(cx) && !mods.shift && !mods.alt {
+                    if this.copy_docs(None, cx).is_some() {
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if this.cell_key(key, cx) {
+                    // 光标移动同步选区：Shift 扩展，否则只选当前格。
+                    if matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+                        if let Some((row, column)) = this.focused_cell {
+                            this.select_doc_cell(row, column, mods.shift);
+                        }
+                    }
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1489,8 +1514,8 @@ impl MongoPane {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(0.))
-                    .min_w(px(0.))
+                    .min_h_0()
+                    .min_w_0()
                     .items_start()
                     .justify_center()
                     .px(px(m.pane_pad()))
@@ -1498,7 +1523,12 @@ impl MongoPane {
                     .child(self.docs_state_block(state, p, m, entity)),
             );
         }
-        if scrolls { area.scroll_area_xy().into_any_element() } else { area.into_any_element() }
+        let menu = self.copy_menu_element();
+        let area = if scrolls { area.scroll_area_xy().into_any_element() } else { area.into_any_element() };
+        match menu {
+            Some(menu) => div().flex().flex_col().flex_1().min_h_0().min_w_0().child(area).child(menu).into_any_element(),
+            None => area,
+        }
     }
 
     /// 六态里除"有行"之外的呈现：说明 + 下一步；主操作进状态块的动作位，不另起一行居中追加。
@@ -1576,7 +1606,7 @@ impl MongoPane {
             .text_size(px(TypeScale::XS))
             .text_color(p.text_faint);
         for name in &shown {
-            head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
+            head = head.child(div().flex_1().flex_basis(px(0.)).min_w_0().truncate().pr(px(8.)).child(SharedString::from(name.clone())));
         }
         head = head.child(div().flex_none().w(px(DOC_ACTIONS_W)));
         table = table.child(head);
@@ -1606,7 +1636,7 @@ impl MongoPane {
                     cell_badge_value(value),
                     mono,
                     focus_handle.clone(),
-                    focused,
+                    (focused, self.doc_cell_selected(index, column_index)),
                     p,
                     entity,
                 ));
@@ -1640,7 +1670,7 @@ fn doc_cell(
     badge: Option<String>,
     mono: &SharedString,
     focus_handle: Option<FocusHandle>,
-    focused: bool,
+    (focused, selected): (bool, bool),
     p: &Palette,
     entity: &Entity<MongoPane>,
 ) -> AnyElement {
@@ -1653,7 +1683,7 @@ fn doc_cell(
         .aria_label(SharedString::from(format!("{column} {text}")))
         .flex_1()
         .flex_basis(px(0.))
-        .min_w(px(0.))
+        .min_w_0()
         .pr(px(8.))
         .h_full()
         .flex()
@@ -1662,25 +1692,40 @@ fn doc_cell(
         .rounded(px(Radius::CONTROL))
         .text_size(px(TypeScale::SM))
         .when(column == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
-        .when(faint && badge.is_none(), |this| this.text_color(p.text_faint));
+        .when(faint && badge.is_none(), |this| this.text_color(p.text_faint))
+        .when(selected, |this| this.bg(p.selection));
     if let Some(badge) = badge {
         cell = cell.child(kit::pill(SharedString::from(badge), p.accent_text, p.accent_soft));
     }
-    cell = cell.child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(text)));
+    cell = cell.child(div().flex_1().min_w_0().truncate().child(SharedString::from(text)));
     let mut cell = kit::interactive(cell, p, false).tab_stop(false);
     if focused {
         cell = cell.shadow(vec![kit::focus_ring(p.accent, kit::FOCUS_RING_W)]);
     }
     let owner = entity.clone();
+    let menu_owner = entity.clone();
     let command = id;
-    cell.on_click(move |_, window, cx| {
+    // 右键：选中（点在选区外时）并打开复制菜单；不打开格子，也不触发任何写操作。
+    cell.on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
+        cx.stop_propagation();
+        let at = event.position;
+        menu_owner.update(cx, |pane, cx| pane.open_copy_menu(row, column_index, at, window, cx));
+    })
+    .on_click(move |event, window, cx| {
         if let Some(handle) = focus_handle.clone() {
             window.focus(&handle, cx);
         }
         let command = command.clone();
+        let extend = event.modifiers().shift;
         owner.update(cx, |pane, cx| {
             pane.focused_cell = Some((row, column_index));
-            pane.command(&command, cx);
+            pane.select_doc_cell(row, column_index, extend);
+            // Shift+单击只扩展选区，不打开格子。
+            if extend {
+                cx.notify();
+            } else {
+                pane.command(&command, cx);
+            }
         });
     })
     .into_any_element()
@@ -1736,7 +1781,7 @@ impl MongoPane {
 
     fn document_tree(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
         // 空/加载/错误已在文档数据区的六态里处理，树视图只负责"有行"时的排版。
-        let mut tree = div().id("mongo-doc-tree").test_support().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.)).scroll_area_y();
+        let mut tree = div().id("mongo-doc-tree").test_support().flex().flex_col().flex_1().min_h_0().min_w_0().scroll_area_y();
         for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
             let parsed = serde_json::from_str::<serde_json::Value>(&doc.json).ok();
             let nodes = parsed.as_ref().map(|value| crate::ui::visible_json_nodes(value, &std::collections::BTreeSet::new(), "")).unwrap_or_default();
@@ -1800,7 +1845,7 @@ fn nav_row(id: String, label: String, icon: IconName, text: String, count: Strin
         .when(selected, |this| this.bg(p.selection))
         .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, 13., if selected { p.accent } else { p.text_faint }))
-        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(text)))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).child(SharedString::from(text)))
         .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(count)))
         .on_click(move |_, _, cx| {
             let command = command.clone();
@@ -2182,6 +2227,47 @@ mod tests {
             assert!(pane.view_json().contains("c1"), "点单元格要看到这条字段的值：{}", pane.view_json());
             assert!(pane.view_open(), "点单元格直接打开值，不是点了没反应");
             assert_eq!(pane.focused_cell(), Some((0, 1)), "鼠标点格子同步键盘光标");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R13：文档表可以选中：Shift+方向键扩展选区，⌘C 复制含表头的 TSV；右键打开复制菜单；换页清掉选区。
+    #[gpui_kit::test]
+    fn document_cells_are_selectable_and_copyable(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("cell-copy");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.plant_documents("app", "orders", vec![doc("1", "c1", "active"), doc("2", "c2", "idle")]);
+            });
+        });
+        render(window, cx);
+        let empty = cx.update(|cx| pane.update(cx, |pane, cx| pane.copy_docs(None, cx)));
+        assert_eq!(empty, None, "没有选区时不动剪贴板");
+        assert!(cx.update(|cx| pane.read(cx).doc_menu_entries().iter().all(|(_, disabled)| *disabled)), "没有选区时复制项禁用");
+        let handle = cx.update(|cx| pane.read(cx).cell_focus.clone()).expect("文档区焦点句柄");
+        cx.update_window(window, |_, window, cx| window.focus(&handle, cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("right", cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("shift-down", cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("shift-right", cx)).unwrap();
+        let copied = cx.update(|cx| pane.update(cx, |pane, cx| pane.copy_docs(None, cx)));
+        assert_eq!(copied.as_deref(), Some("customer\tstatus\nc1\tactive\nc2\tidle"));
+        assert_eq!(cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())).as_deref(), copied.as_deref());
+        let row = cx.update(|cx| pane.update(cx, |pane, cx| pane.copy_docs(Some(crate::ui::read_table::CopyKind::Row), cx)));
+        assert_eq!(row.as_deref(), Some("1\tc1\tactive\n2\tc2\tidle"));
+        render(window, cx);
+        cx.update_window(window, |_, window, cx| window.right_click("mongo-cell:0:_id", cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.copy_menu_open(), "右键打开复制菜单");
+            assert_eq!(pane.doc_selection().map(|selection| selection.focus), Some((0, 0)), "右键点在选区外先选中这一格");
+            assert!(!pane.confirm_open(), "右键不触发写操作");
+        });
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.finish_find(Ok(DocumentsPage { documents: vec![doc("3", "c3", "new")], total: 1 }), cx);
+                assert_eq!(pane.doc_selection(), None, "换页清掉选区");
+            })
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

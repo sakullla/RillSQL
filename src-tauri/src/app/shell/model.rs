@@ -202,6 +202,8 @@ pub enum DraftField {
     HistorySearch,
     SaveName,
     RenameName,
+    /// 查询标签的标题（双击标签就地重命名）。
+    TabTitle,
     PaletteQuery,
     /// 快捷键面板的搜索框。
     HelpQuery,
@@ -497,6 +499,10 @@ pub struct WorkbenchModel {
     pub overview_spec: Option<String>,
     /// 当前的概览预览标签：单击对象树打开，下一次单击就地替换；双击或在其中操作后转为固定标签。
     pub preview_tab: Option<String>,
+    /// 正在就地重命名的查询标签：(标签 id, 输入中的标题)。
+    pub tab_rename: Option<(String, String)>,
+    /// 用户改过名的查询标签：不再按「查询 n」自动编号；会话里用 `titleKey = custom` 记下。
+    pub renamed_tabs: std::collections::BTreeSet<String>,
     /// 每个概览标签（按范围规格）的读取结果、过滤、排序与选择。
     pub overviews: std::collections::BTreeMap<String, crate::app::views::overview::OverviewState>,
     /// Redis 键浏览或命令还在跑。关闭守卫把它和网格暂存、查询草稿分开。
@@ -650,6 +656,8 @@ impl WorkbenchModel {
             mongo_spec: None,
             overview_spec: None,
             preview_tab: None,
+            tab_rename: None,
+            renamed_tabs: std::collections::BTreeSet::new(),
             overviews: std::collections::BTreeMap::new(),
             redis_running: false,
             mongo_running: false,
@@ -1368,6 +1376,13 @@ impl WorkbenchModel {
             "tab-close-all" => self.request_close_all(),
             "tab-close-unmodified" => self.close_unmodified(),
             "tab-pin" => self.toggle_pin_active(),
+            "tab-rename" => {
+                let _ = self.begin_tab_rename();
+            }
+            "tab-rename-confirm" => {
+                let _ = self.confirm_tab_rename();
+            }
+            "tab-rename-cancel" => self.tab_rename = None,
             "editor-clear" => self.clear_editor(),
             "history-load" => self.load_selected_history(),
             "history-copy" => self.copy_selected_sql(),
@@ -5057,6 +5072,24 @@ impl WorkbenchModel {
         true
     }
 
+    /// Redis 键浏览器的「在新标签中固定打开」（双击、回车、菜单）：规格 `连接|名称|库|键`。
+    /// 同一个键已有标签时只切过去；新建的标签固定在左侧。键名里的 `|` 不会被当成引擎段。
+    pub fn open_redis_key(&mut self, spec: &str) -> bool {
+        let parts: Vec<&str> = spec.splitn(4, '|').collect();
+        if parts.len() < 4 || parts[0].trim().is_empty() || parts[3].is_empty() {
+            return false;
+        }
+        self.open_item(WorkItemKind::Redis, spec.to_owned());
+        let Some(id) = self.active_tab.clone() else { return false };
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else { return false };
+        if tab.kind != WorkItemKind::Redis || tab.spec.as_deref() != Some(spec) {
+            return false;
+        }
+        tab.engine = None;
+        self.set_pinned(&id, true);
+        true
+    }
+
     /// 会话恢复和外部插入之后把固定标签收拢到左侧，相对顺序不变。
     fn group_pinned(&mut self) {
         if self.tabs.iter().skip_while(|tab| tab.pinned).any(|tab| tab.pinned) {
@@ -5179,6 +5212,10 @@ impl WorkbenchModel {
         if self.active_tab.as_deref() != Some(id) {
             self.close_menu();
         }
+        // 正在重命名别的标签时切走：按当前输入确认，不丢掉已经输入的名字。
+        if self.tab_rename.as_ref().is_some_and(|(renaming, _)| renaming != id) {
+            let _ = self.confirm_tab_rename();
+        }
         self.active_tab = Some(id.to_owned());
         self.tool = kind.tool();
         self.shell.page = kind.page();
@@ -5237,6 +5274,10 @@ impl WorkbenchModel {
             }
             WorkItemKind::Admin => self.text("ui.tool.admin"),
             WorkItemKind::Redis => {
+                // 带键的规格（键浏览器里「在新标签中固定打开」）：标题就是键名（键里可以有 `|`）。
+                if let Some(key) = spec.splitn(4, '|').nth(3).filter(|key| !key.is_empty()) {
+                    return key.to_owned();
+                }
                 let db = field(2);
                 let db = db.trim().trim_start_matches("db");
                 if db.is_empty() {
@@ -5508,6 +5549,9 @@ impl WorkbenchModel {
     }
 
     fn open_query_draft(&mut self, draft: String, keep_page: bool) {
+        // 关掉的标签可能留下改名标记；新标签的 id 可能复用，先清掉不存在的。
+        let tabs = &self.tabs;
+        self.renamed_tabs.retain(|id| tabs.iter().any(|tab| &tab.id == id));
         let id = self.next_item_id(WorkItemKind::Query);
         // 标签标题是界面文案，不是用户数据；按当前语言生成并在语言切换时重排。
         self.tabs.push(WorkItem::query(id.clone(), String::new(), draft));
@@ -5615,16 +5659,46 @@ impl WorkbenchModel {
 
     /// 查询标签按当前语言的“查询 N / Query N”重新编号；从 `.sql` 文件打开的标签保留文件名。
     fn relabel_query_tabs(&mut self) {
+        let tabs = &self.tabs;
+        self.renamed_tabs.retain(|id| tabs.iter().any(|tab| &tab.id == id));
         let template = i18n::text(self.locale(), "ui.query.tabTitle");
         let mut ordinal = 0;
         for tab in &mut self.tabs {
             if tab.kind.is_query() {
                 ordinal += 1;
-                if tab.path.is_none() {
+                if tab.path.is_none() && !self.renamed_tabs.contains(&tab.id) {
                     tab.title = i18n::fill(&template, &[("n", &ordinal.to_string())]);
                 }
             }
         }
+    }
+
+    /// 双击查询标签：就地重命名当前查询标签。其他种类的标签标题来自目标，不能改。
+    pub fn begin_tab_rename(&mut self) -> bool {
+        let Some(tab) = self.active_tab().filter(|tab| tab.kind.is_query()) else { return false };
+        self.tab_rename = Some((tab.id.clone(), tab.title.clone()));
+        self.focused_field = Some(DraftField::TabTitle);
+        true
+    }
+
+    /// 回车确认：去掉首尾空白；清空时恢复自动编号的标题。只改界面标题，不碰草稿、文件和连接。
+    pub fn confirm_tab_rename(&mut self) -> bool {
+        let Some((id, text)) = self.tab_rename.take() else { return false };
+        let title = text.trim().to_owned();
+        if title.is_empty() {
+            self.renamed_tabs.remove(&id);
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                if let Some(path) = tab.path.as_deref() {
+                    tab.title = std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or("query.sql").to_owned();
+                }
+            }
+            self.relabel_query_tabs();
+            return true;
+        }
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else { return false };
+        tab.title = title;
+        self.renamed_tabs.insert(id);
+        true
     }
 
     pub fn active_tab(&self) -> Option<&WorkItem> {
@@ -5793,6 +5867,11 @@ impl WorkbenchModel {
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
             DraftField::RenameName => self.history.rename_text = value,
+            DraftField::TabTitle => {
+                if let Some((_, text)) = self.tab_rename.as_mut() {
+                    *text = value;
+                }
+            }
             DraftField::PaletteQuery => self.palette_query = value,
             DraftField::HelpQuery => self.help_query = value,
             DraftField::OverviewFilter => self.set_overview_filter(value),
@@ -5879,6 +5958,7 @@ impl WorkbenchModel {
             DraftField::HistorySearch => self.history.filter_text.clone(),
             DraftField::SaveName => self.history.save_name.clone(),
             DraftField::RenameName => self.history.rename_text.clone(),
+            DraftField::TabTitle => self.tab_rename.as_ref().map(|(_, text)| text.clone()).unwrap_or_default(),
             DraftField::PaletteQuery => self.palette_query.clone(),
             DraftField::HelpQuery => self.help_query.clone(),
             DraftField::OverviewFilter => self.active_overview().map(|state| state.filter.clone()).unwrap_or_default(),
@@ -6085,7 +6165,17 @@ impl WorkbenchModel {
     pub fn snapshot(&self) -> AppState {
         let session = SessionState {
             active_id: self.active_tab.clone(),
-            tabs: self.tabs.iter().map(tab_to_session).collect(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let mut stored = tab_to_session(tab);
+                    if self.renamed_tabs.contains(&tab.id) {
+                        stored.title_key = serde_json::from_value(serde_json::json!({ "key": CUSTOM_TITLE_KEY })).ok();
+                    }
+                    stored
+                })
+                .collect(),
             pinned: self.tabs.iter().filter(|tab| tab.pinned).map(|tab| tab.id.clone()).collect(),
         };
         AppState::new(self.settings.to_settings(), session).with_templates(self.column_templates.clone())
@@ -6096,6 +6186,14 @@ impl WorkbenchModel {
         for tab in &mut self.tabs {
             tab.pinned = session.pinned.contains(&tab.id);
         }
+        self.tab_rename = None;
+        self.renamed_tabs = session
+            .tabs
+            .iter()
+            .filter(|tab| tab.title_key.as_ref().is_some_and(|key| key.key == CUSTOM_TITLE_KEY) && !tab.title.trim().is_empty())
+            .map(|tab| tab.id.clone())
+            .filter(|id| self.tabs.iter().any(|tab| &tab.id == id && tab.kind.is_query()))
+            .collect();
         self.group_pinned();
         self.relabel_query_tabs();
         self.tool = WorkTool::Query;
@@ -6119,6 +6217,9 @@ impl WorkbenchModel {
         &self.connections.secrets
     }
 }
+
+/// 会话里标记「用户改过名」的标题键：恢复时保留存下的标题，不再自动编号。旧版本读取时忽略这个键。
+const CUSTOM_TITLE_KEY: &str = "custom";
 
 fn tab_to_session(tab: &WorkItem) -> SessionTab {
     SessionTab {

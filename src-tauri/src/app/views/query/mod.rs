@@ -221,7 +221,7 @@ pub struct QueryPane {
     /// 还没确认进入视口的滚动请求。
     result_scroll_pending: Option<tabs::Reveal>,
     /// 结果头、行数摘要与语句结果里的转圈：隔离实体，动画帧不通知查询页和工作台。
-    spinners: crate::app::shell::loading::SpinnerPool,
+    spinners: crate::ui::loading::SpinnerPool,
     /// 这一帧取好的转圈视图（结果头、行数摘要、语句进度、首次运行、目标连接中）；只在运行时画出来。
     frame_spinners: Option<[gpui_kit::AnyView; 5]>,
     _target_tab_sub: gpui_kit::Subscription,
@@ -410,7 +410,7 @@ fn statement_sql_block(result: &desk::StatementView, failed: bool, locale: Local
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(div().flex_none().pt(px(2.)).child(kit::icon(IconName::Info, 13., p.text_faint)))
-                .child(div().flex_1().min_w(px(0.)).child(SharedString::from(note))),
+                .child(div().flex_1().min_w_0().child(SharedString::from(note))),
         )
         .child(sql_block("query-rewrite-sql", sent, mono, p))
         .into_any_element()
@@ -625,7 +625,7 @@ impl QueryPane {
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
-            spinners: crate::app::shell::loading::SpinnerPool::new(),
+            spinners: crate::ui::loading::SpinnerPool::new(),
             frame_spinners: None,
             _target_tab_sub: target_tab_sub,
         }
@@ -2996,7 +2996,7 @@ impl Render for QueryPane {
             .flex_col()
             .size_full()
             .child(toolbar)
-            .child(div().id("query-body").flex_1().min_h(px(0.)).child(body))
+            .child(div().id("query-body").flex_1().min_h_0().child(body))
     }
 }
 
@@ -3146,7 +3146,7 @@ impl QueryPane {
             .relative()
             .flex()
             .size_full()
-            .min_h(px(0.))
+            .min_h_0()
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
                 if event.drag(cx).key.as_ref() != "query-side-resize" {
                     return;
@@ -3171,7 +3171,7 @@ impl QueryPane {
                 let cursor = state.selected_range(cx).end.min(text.len());
                 cursor_text = Some((text, cursor));
             }
-            editor_row = editor_row.child(div().id("query-editor").test_support().flex_1().min_w(px(0.)).h_full().child(editor));
+            editor_row = editor_row.child(div().id("query-editor").test_support().flex_1().min_w_0().h_full().child(editor));
         } else {
             editor_row = editor_row.child(
                 div()
@@ -3276,7 +3276,7 @@ impl QueryPane {
             .border_color(p.line)
             // 页签条按内容取宽、空间不够时再收缩并横向滚动：消息页签紧跟在结果页签之后，
             // 不会被一段弹性留白推到页签头中间。
-            .child(div().flex_initial().min_w(px(0.)).h_full().child(tabs))
+            .child(div().flex_initial().min_w_0().h_full().child(tabs))
             .children(self.render_head_actions(p, metrics, entity))
             .children(self.render_head_status(running, p, metrics, entity))
             .into_any_element()
@@ -3522,7 +3522,7 @@ impl QueryPane {
             items.push(
                 div()
                     .id("query-note")
-                    .min_w(px(0.))
+                    .min_w_0()
                     .max_w(px(520.))
                     .truncate()
                     .px(px(6.))
@@ -3722,7 +3722,7 @@ impl QueryPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .children(self.frame_spinner(3).map(|spinner| crate::app::shell::loading::loading_state(spinner, SharedString::from(self.running_text()), p)))
+                    .children(self.frame_spinner(3).map(|spinner| crate::ui::loading::loading_state(spinner, SharedString::from(self.running_text()), p)))
                     .into_any_element();
             }
             // 空结果页顺带教会三种执行方式：快捷键和工具条按钮是一一对应的。
@@ -3800,18 +3800,18 @@ impl QueryPane {
             };
             let header = view.header(p, entity);
             let body = if self.plan_raw {
-                div().id("query-grid").test_support().flex_1().min_h(px(0.)).child(self.grid.clone()).into_any_element()
+                div().id("query-grid").test_support().flex_1().min_h_0().child(self.grid.clone()).into_any_element()
             } else {
                 view.body(p, entity)
             };
-            return div().flex_1().min_h(px(0.)).flex().flex_col().child(header).child(body).into_any_element();
+            return div().flex_1().min_h_0().flex().flex_col().child(header).child(body).into_any_element();
         }
         let grid_entity = entity.clone();
         div()
             .id("query-grid")
             .test_support()
             .flex_1()
-            .min_h(px(0.))
+            .min_h_0()
             .on_mouse_down(MouseButton::Right, move |_, _, cx| {
                 grid_entity.update(cx, |pane, _| pane.grid_menu_requested = true);
             })
@@ -3931,7 +3931,7 @@ fn failure_status(result: &desk::StatementView, with_jump: bool, locale: Locale,
             .test_support()
             // 读屏也只读这句短状态；完整原文在下面的语句面板和消息页里各出现一次。
             .aria_label(SharedString::from(label.clone()))
-            .min_w(px(0.))
+            .min_w_0()
             .max_w(px(360.))
             .truncate()
             .px(px(6.))

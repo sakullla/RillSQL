@@ -68,6 +68,10 @@ pub struct Workbench {
     pub(super) focus: FocusHandle,
     /// 对象树自己的焦点；点击树行后方向键归树，离开时归还编辑器。
     pub(super) nav_focus: FocusHandle,
+    /// 库概览列表：单击行后获得焦点，方向键移动选中，回车执行主操作（与双击相同）。
+    pub(super) overview_focus: FocusHandle,
+    /// 就地重命名的输入框已拿到焦点（只在打开时聚焦一次）。
+    pub(super) tab_rename_focused: bool,
     /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
     pub(super) conn_launcher_focus: FocusHandle,
     /// 对象树空态"新建连接"按钮：同上。
@@ -148,7 +152,7 @@ pub struct Workbench {
     /// 历史预览的只读 SQL 编辑器，按条目 id 与原文重建。
     pub(super) history_editor: Option<(String, Entity<gpui_kit::component::input::EditorState>)>,
     /// 页签、资源树行、状态栏等位置的转圈：每个位置一个隔离实体，动画帧不通知工作台。
-    pub(super) spinners: crate::app::shell::loading::SpinnerPool,
+    pub(super) spinners: crate::ui::loading::SpinnerPool,
     /// 页签条的缓存视图：编辑器光标闪烁、转圈动画只把工作台标脏，不通知它；
     /// 页签条沿用上一帧的布局和绘制，几百个标签时空闲重绘不再逐个重排页签。
     pub(super) tab_strip_host: Entity<TabStripHost>,
@@ -332,7 +336,11 @@ impl Workbench {
             cx.observe(&structure, |_, _, cx| cx.notify()),
             cx.observe(&compare, |_, _, cx| cx.notify()),
             cx.observe(&diagram, |_, _, cx| cx.notify()),
-            cx.observe(&redis, |_, _, cx| cx.notify()),
+            // 键浏览器里双击、回车或菜单「在新标签中固定打开」留下的请求：在这里取走并新建固定的 Redis 标签。
+            cx.observe(&redis, |this, redis, cx| {
+                this.drain_redis_open_requests(&redis, cx);
+                cx.notify();
+            }),
             cx.observe(&mongo, |_, _, cx| cx.notify()),
             // 命令面板打开且搜索框为空时，Input 的 Home/End 动作会先于 capture_key_down 抢走按键；
             // 在拦截阶段转成首项/末项跳转，有输入文本时则保留原生光标跳转。
@@ -416,6 +424,8 @@ impl Workbench {
             services,
             focus: cx.focus_handle().tab_stop(true),
             nav_focus: cx.focus_handle().tab_stop(true),
+            overview_focus: cx.focus_handle(),
+            tab_rename_focused: false,
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
             modal_focus: cx.focus_handle(),
@@ -469,7 +479,7 @@ impl Workbench {
             seen_page: AppPage::Workspace,
             admin_link: None,
             history_editor: None,
-            spinners: crate::app::shell::loading::SpinnerPool::new(),
+            spinners: crate::ui::loading::SpinnerPool::new(),
             tab_strip_host: cx.new(|_| TabStripHost { workbench: weak_self }),
             tab_picker: None,
             tab_picker_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1246,6 +1256,19 @@ impl Workbench {
         }
         self.applied_redis = Some(spec.clone());
         self.redis.update(cx, |pane, cx| pane.open_spec(&spec, cx));
+    }
+
+    /// 取走 Redis 面板的「在新标签中固定打开」请求（`连接|名称|库|键`），逐个新建固定标签。
+    /// 新标签激活后由 `ensure_redis` 把带键的规格交给面板，面板直接选中并读取这个键。
+    pub(super) fn drain_redis_open_requests(&mut self, redis: &Entity<RedisPane>, cx: &mut Context<Self>) {
+        let requests = redis.update(cx, |pane, _| pane.take_open_requests());
+        if requests.is_empty() {
+            return;
+        }
+        for spec in requests {
+            let _ = self.model.open_redis_key(&spec);
+        }
+        self.persist_if_needed(cx);
     }
 
     /// 键浏览目标（`id|name|db`）对应的连接此刻是否按生产处理。

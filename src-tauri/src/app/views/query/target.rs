@@ -154,7 +154,7 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
             this.child(kit::engine_badge(engine, 16.))
                 .child(
                     div()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .truncate()
                         .font_weight(FontWeight::MEDIUM)
                         .when(missing, |this| this.text_color(p.warn).line_through())
@@ -256,7 +256,7 @@ pub fn popover(
                 .when(selected, |this| this.bg(p.selection))
                 .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                 .child(kit::engine_badge(&choice.engine, 16.))
-                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).when(current, |this| this.font_weight(FontWeight::SEMIBOLD)).child(SharedString::from(choice.name.clone())))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).when(current, |this| this.font_weight(FontWeight::SEMIBOLD)).child(SharedString::from(choice.name.clone())))
                 .child(kit::status_dot(if choice.connected { p.ok } else { p.line_strong }))
                 .child(kit::icon(IconName::ChevronRight, 12., if selected { p.text_muted } else { p.text_faint }))
                 .on_click(move |_, _, cx| {
@@ -270,7 +270,7 @@ pub fn popover(
         .id("query-target-databases")
         .track_scroll(&picker.db_scroll)
         .flex_1()
-        .min_w(px(0.))
+        .min_w_0()
         .h_full()
         .scroll_area_y()
         .py(px(4.));
@@ -309,7 +309,7 @@ pub fn popover(
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.query.targetNotOpen")))
                     .child(if pending {
                         let spinner = connecting_spinner.unwrap_or_else(|| div().into_any_element());
-                        crate::app::shell::loading::inline_loading(spinner, t("ui.conn.connecting"), &metrics, p).into_any_element()
+                        crate::ui::loading::inline_loading(spinner, t("ui.conn.connecting"), &metrics, p).into_any_element()
                     } else {
                         kit::primary_button("query-target-connect", Some(IconName::Plug), t("connections.page.connect"), move |_, _, cx| {
                             let id = id.clone();
@@ -359,7 +359,7 @@ pub fn popover(
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .truncate()
                                 .text_size(px(TypeScale::SM))
                                 .when(current, |this| this.text_color(p.accent_text).font_weight(FontWeight::MEDIUM))
@@ -455,7 +455,7 @@ pub fn popover(
             }
         })
         .children(search.map(|input| div().flex_none().p(px(8.)).border_b_1().border_color(p.line).child(input)))
-        .child(div().flex_1().min_h(px(0.)).flex().child(left).child(right))
+        .child(div().flex_1().min_h_0().flex().child(left).child(right))
         .child(footer);
     Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(div().pt(px(14.)).child(panel))).with_priority(2).into_any_element())
 }

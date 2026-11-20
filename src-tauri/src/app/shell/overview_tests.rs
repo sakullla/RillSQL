@@ -383,5 +383,26 @@ fn clicking_a_real_sqlite_connection_renders_its_overview_and_double_click_opens
         let spec = view.model.active_tab().and_then(|tab| tab.spec.clone()).unwrap();
         assert!(spec.starts_with("notes|笔记|main||item|"), "{spec}");
     });
+    // R14：回车与双击相同。回到概览，单击第一行获得焦点，↓ 移到视图行，回车打开它的数据。
+    let overview_tab = cx.update(|cx| view.read(cx).model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Overview).map(|tab| tab.id.clone()).unwrap());
+    cx.update(|cx| view.update(cx, |view, cx| {
+        let _ = view.model.activate_item(&overview_tab);
+        cx.notify();
+    }));
+    assert!(wait(cx, &|view| view.model.active_tab().is_some_and(|tab| tab.kind == WorkItemKind::Overview)), "回到概览");
+    cx.update_window(window, |_, window, cx| window.click("overview-row-0", cx)).unwrap();
+    cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
+    cx.update(|cx| assert_eq!(view.read(cx).model.active_overview().and_then(|state| state.selected.clone()).as_deref(), Some("item_labels"), "↓ 移动选中"));
+    // R13：⌘C 复制选中行（制表符分隔）。
+    cx.update_window(window, |_, window, cx| window.press(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, cx)).unwrap();
+    cx.update(|cx| {
+        let copied = view.read(cx).model.copied.clone();
+        assert!(copied.starts_with("item_labels\t"), "⌘C 复制选中行：{copied:?}");
+    });
+    cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+    assert!(
+        wait(cx, &|view| view.model.active_tab().and_then(|tab| tab.spec.clone()).is_some_and(|spec| spec.starts_with("notes|笔记|main||item_labels|"))),
+        "回车打开选中的视图"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

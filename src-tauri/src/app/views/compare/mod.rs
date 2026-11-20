@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, Palette, Radius, Space, Tip as _, TypeScale};
+use crate::ui::read_table::{ReadColumn, ReadRows, ReadTable};
 use crate::ui::kit::ScrollAreaExt as _;
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
@@ -200,6 +201,8 @@ pub struct ComparePane {
     table_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
     /// 表名被命令改过（交换、重新带入）：下一帧把输入框同步成新值。
     table_reload: bool,
+    /// 下钻表的行级差异表格（共享只读表：可选中、⌘C 与右键复制）。戳 = (报告指针, 表名, 语言)。
+    rows_table: Option<(u64, Entity<ReadTable>)>,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -254,6 +257,7 @@ impl ComparePane {
             pair_pending: None,
             table_inputs: BTreeMap::new(),
             table_reload: false,
+            rows_table: None,
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -1681,17 +1685,17 @@ impl Render for ComparePane {
                 .flex()
                 .flex_col()
                 .gap(px(m.pane_pad()))
-                .child(div().w_full().min_w(px(0.)).child(baseline_card))
+                .child(div().w_full().min_w_0().child(baseline_card))
                 .child(div().flex().justify_center().child(swap))
-                .child(div().w_full().min_w(px(0.)).child(target_card))
+                .child(div().w_full().min_w_0().child(target_card))
         } else {
             div()
                 .flex()
                 .gap(px(m.pane_pad()))
                 .items_start()
-                .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
+                .child(div().flex_1().flex_basis(px(0.)).min_w_0().child(baseline_card))
                 .child(div().flex_none().pt(px(m.header_h() / 2.)).child(swap))
-                .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card))
+                .child(div().flex_1().flex_basis(px(0.)).min_w_0().child(target_card))
         });
 
         let guide_open = self.show_empty_guide();
@@ -1848,7 +1852,7 @@ impl Render for ComparePane {
                 div()
                     .id("compare-scroll")
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_h_0()
                     .scroll_area_y()
                     .child(
                         div()
@@ -2482,7 +2486,7 @@ impl ComparePane {
                 .items_start()
                 .gap(px(m.pane_pad()))
                 .child(div().w(px(300.)).flex_none().child(tree))
-                .child(div().flex_1().min_w(px(0.)).child(detail))
+                .child(div().flex_1().min_w_0().child(detail))
         };
         card = card.child(split);
         for note in &report.notes {
@@ -2576,7 +2580,7 @@ impl ComparePane {
                 .child(
                     div()
                         .flex_1()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(div().truncate().child(SharedString::from(entry.item.name.clone())))
@@ -2611,7 +2615,7 @@ impl ComparePane {
                     );
                 }
             }
-            div().flex_1().flex_basis(px(0.)).min_w(px(0.)).flex().flex_col().gap(px(4.)).child(kit::eyebrow(SharedString::from(label), p)).child(block)
+            div().flex_1().flex_basis(px(0.)).min_w_0().flex().flex_col().gap(px(4.)).child(kit::eyebrow(SharedString::from(label), p)).child(block)
         };
         let missing = self.text("compare.detail.missing");
         let baseline = side(self.text("compare.dialog.baseline"), p.ok, p.ok_soft, &item.baseline_definition, &item.target_definition, missing.clone());
@@ -2692,7 +2696,7 @@ impl ComparePane {
                 &self.text("compare.data.summary"),
                 &[("{insert}", &table.inserts.to_string()), ("{update}", &table.updates.to_string()), ("{delete}", &table.deletes.to_string())],
             );
-            let mut info = div().flex_1().min_w(px(0.)).flex().flex_col().gap(px(1.)).child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())));
+            let mut info = div().flex_1().min_w_0().flex().flex_col().gap(px(1.)).child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())));
             let sub = if let Some(reason) = &table.skipped {
                 reason.clone()
             } else if !table.key.is_empty() {
@@ -2734,7 +2738,7 @@ impl ComparePane {
                 .on_click(compare_act(id, entity));
             list = list.child(row);
             if open {
-                list = list.child(self.data_rows(report, &table.table, &p, cx));
+                list = list.child(self.data_rows(report, &table.table, &p, window, cx));
             }
         }
         card = card.child(list);
@@ -2755,67 +2759,107 @@ impl ComparePane {
         card.into_any_element()
     }
 
-    /// 一张表的行级差异：按键对齐，字段级高亮基准值与对照值，并附该行的同步语句。
-    fn data_rows(&self, report: &DataReport, table: &str, p: &Palette, cx: &App) -> AnyElement {
-        let mono = gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.clone();
-        let rows: Vec<_> = report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").collect();
-        let mut block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).ml(px(20.)).p(px(6.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().gap(px(6.)).max_h(px(420.)).scroll_area_y();
-        if rows.is_empty() {
+    /// 一张表的行级差异：每个字段一行（动作、键、列、基准值、对照值、是否不同），第一行附同步语句。
+    /// 用共享只读表渲染：虚拟化、可选中，⌘C 与右键「复制值 / 行 / 列 / TSV / CSV / JSON」。
+    fn data_rows(&mut self, report: &Arc<DataReport>, table: &str, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let block = div().id(SharedString::from(format!("compare-data-rows:{table}"))).test_support().ml(px(Space::XL)).p(px(Space::SM)).flex().flex_col().gap(px(Space::SM));
+        let shown = report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").count();
+        if shown == 0 {
+            self.rows_table = None;
             let reason = report.tables.iter().find(|item| item.table == table).and_then(|item| item.skipped.clone()).unwrap_or_else(|| self.text("compare.data.same"));
             return block.child(kit::muted(SharedString::from(reason), p)).into_any_element();
         }
-        for diff in rows.iter().take(DATA_ROWS_SHOWN) {
-            let (label, tone, soft) = match diff.action.as_str() {
-                "insert" => (self.text("compare.data.action.insert"), p.ok, p.ok_soft),
-                "delete" => (self.text("compare.data.action.delete"), p.danger, p.danger_soft),
-                "update" => (self.text("compare.data.action.update"), p.warn, p.warn_soft),
-                _ => (self.text("compare.data.action.rejected"), p.danger, p.danger_soft),
-            };
-            let mut entry = div()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .p(px(6.))
-                .rounded(px(Radius::CONTROL))
-                .border_1()
-                .border_color(p.line)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .text_size(px(TypeScale::SM))
-                        .child(kit::pill(SharedString::from(label), tone, soft))
-                        .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(format!("{} {}", self.text("compare.dialog.key"), diff.key)))),
-                );
-            if diff.action == "rejected" {
-                entry = entry.child(div().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(diff.detail.clone())));
+        let stamp = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (Arc::as_ptr(report) as usize).hash(&mut hasher);
+            table.hash(&mut hasher);
+            matches!(self.locale, Locale::En).hash(&mut hasher);
+            hasher.finish()
+        };
+        let (columns, rows) = data_row_cells(report, table, DATA_ROWS_SHOWN, |key| self.text(key));
+        let entity = match &self.rows_table {
+            Some((old, entity)) if *old == stamp => entity.clone(),
+            Some((_, entity)) => {
+                let entity = entity.clone();
+                let locale = self.locale;
+                entity.update(cx, |view, cx| {
+                    view.set_locale(locale, cx);
+                    view.set_data(columns, ReadRows::Static(rows), cx);
+                });
+                self.rows_table = Some((stamp, entity.clone()));
+                entity
             }
-            for field in &diff.fields {
-                let value = |text: &Option<String>| text.clone().unwrap_or_else(|| "∅".to_owned());
-                entry = entry.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .text_size(px(TypeScale::XS))
-                        .font_family(mono.clone())
-                        .child(div().w(px(140.)).flex_none().truncate().text_color(p.text_muted).child(SharedString::from(field.column.clone())))
-                        .child(div().flex_1().min_w(px(0.)).truncate().px(px(4.)).when(field.changed && field.baseline.is_some(), |this| this.bg(p.ok_soft).text_color(p.ok)).child(SharedString::from(value(&field.baseline))))
-                        .child(div().flex_none().text_color(p.text_faint).child("→"))
-                        .child(div().flex_1().min_w(px(0.)).truncate().px(px(4.)).when(field.changed && field.target.is_some(), |this| this.bg(p.danger_soft).text_color(p.danger)).child(SharedString::from(value(&field.target)))),
-                );
+            None => {
+                let locale = self.locale;
+                let entity = cx.new(|cx| ReadTable::new(columns, ReadRows::Static(rows), locale, window, cx));
+                self.rows_table = Some((stamp, entity.clone()));
+                entity
             }
-            if !diff.sql.is_empty() {
-                entry = entry.child(div().text_size(px(TypeScale::XS)).font_family(mono.clone()).text_color(p.text_muted).truncate().child(SharedString::from(diff.sql.clone())));
-            }
-            block = block.child(entry);
-        }
-        if rows.len() > DATA_ROWS_SHOWN {
+        };
+        let m = kit::Metrics::of(cx);
+        let visible = data_row_count(report, table, DATA_ROWS_SHOWN).clamp(1, 14) as f32;
+        let mut block = block.child(div().id("compare-data-rows-table").test_support().h(px((visible + 1.) * m.row_h + Space::SM)).child(entity));
+        if shown > DATA_ROWS_SHOWN {
             block = block.child(kit::muted(SharedString::from(fill(&self.text("compare.data.truncated"), &[("{count}", &DATA_ROWS_SHOWN.to_string())])), p));
         }
         block.into_any_element()
     }
+
+    /// 下钻表格（测试取选区与复制文本用）。
+    #[cfg(test)]
+    pub(crate) fn rows_table(&self) -> Option<Entity<ReadTable>> {
+        self.rows_table.as_ref().map(|(_, entity)| entity.clone())
+    }
+}
+
+/// 下钻表格的行数（与 `data_row_cells` 一致）：每个字段一行，没有字段的差异一行。
+fn data_row_count(report: &DataReport, table: &str, limit: usize) -> usize {
+    report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").take(limit).map(|diff| diff.fields.len().max(1)).sum()
+}
+
+/// 行级差异的表格数据：动作、键、列、基准值、对照值、不同（≠）、同步语句（只在该差异的第一行）。
+/// 未生成的行把原因放在基准值一格。值为 NULL 的一侧缺行时显示 ∅。
+fn data_row_cells(report: &DataReport, table: &str, limit: usize, text: impl Fn(&str) -> String) -> (Vec<ReadColumn>, Vec<Vec<SharedString>>) {
+    let columns = vec![
+        ReadColumn::new(text("compare.data.col.action")).width(72.),
+        ReadColumn::new(text("compare.dialog.key")).width(160.).mono(),
+        ReadColumn::new(text("compare.data.col.column")).width(140.).mono(),
+        ReadColumn::new(text("compare.data.col.baseline")).width(180.).mono(),
+        ReadColumn::new(text("compare.data.col.target")).width(180.).mono(),
+        ReadColumn::new(text("compare.data.col.changed")).width(48.),
+        ReadColumn::new(text("compare.data.col.sql")).width(360.).mono(),
+    ];
+    let value = |text: &Option<String>| SharedString::from(text.clone().unwrap_or_else(|| "∅".to_owned()));
+    let mut rows = Vec::new();
+    for diff in report.diffs.iter().filter(|diff| diff.table == table && diff.action != "skipped").take(limit) {
+        let action = SharedString::from(match diff.action.as_str() {
+            "insert" => text("compare.data.action.insert"),
+            "delete" => text("compare.data.action.delete"),
+            "update" => text("compare.data.action.update"),
+            _ => text("compare.data.action.rejected"),
+        });
+        let key = SharedString::from(diff.key.clone());
+        let sql = SharedString::from(diff.sql.clone());
+        if diff.fields.is_empty() {
+            let detail = SharedString::from(diff.detail.clone());
+            rows.push(vec![action, key, SharedString::default(), detail, SharedString::default(), SharedString::default(), sql]);
+            continue;
+        }
+        for (ix, field) in diff.fields.iter().enumerate() {
+            let baseline = if ix == 0 && diff.action == "rejected" && !diff.detail.is_empty() { SharedString::from(diff.detail.clone()) } else { value(&field.baseline) };
+            rows.push(vec![
+                action.clone(),
+                key.clone(),
+                SharedString::from(field.column.clone()),
+                baseline,
+                value(&field.target),
+                SharedString::from(if field.changed { "≠" } else { "" }),
+                if ix == 0 { sql.clone() } else { SharedString::default() },
+            ]);
+        }
+    }
+    (columns, rows)
 }
 
 fn compare_act(id: impl Into<String>, entity: &Entity<ComparePane>) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
@@ -2856,7 +2900,7 @@ fn list_choice(
         })
         .when(!selected, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint }))
-        .child(div().flex_1().min_w(px(0.)).truncate().child(text))
+        .child(div().flex_1().min_w_0().truncate().child(text))
         .when(selected, |this| this.child(kit::icon(IconName::Check, 13., p.accent_text)))
 }
 
@@ -2906,7 +2950,7 @@ fn note_banner(icon: IconName, text: String, fg: gpui_kit::Hsla, bg: gpui_kit::H
         .text_color(fg)
         .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
-        .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
+        .child(div().flex_1().min_w_0().child(SharedString::from(text)))
         .into_any_element()
 }
 
@@ -3238,6 +3282,85 @@ mod tests {
         assert!(text.contains("drill orders") && text.contains("field note new -> old") && text.contains("row-sql UPDATE orders"), "{text}");
         assert!(pane.view_command("compare-data-table:orders"));
         assert!(!pane.lines().join("\n").contains("drill orders"), "再点一次收起");
+    }
+
+    fn drill_report() -> DataReport {
+        let mut report = empty_data(None);
+        report.tables = vec![crate::compare::DataTableSummary { table: "orders".into(), inserts: 1, updates: 1, deletes: 0, rejected: 0, skipped: None, key: vec!["id".into()] }];
+        report.diffs = vec![
+            crate::compare::DataDiff {
+                table: "orders".into(),
+                action: "update".into(),
+                key: "1".into(),
+                detail: String::new(),
+                fields: vec![
+                    crate::compare::FieldDiff { column: "note".into(), baseline: Some("new".into()), target: Some("old".into()), changed: true },
+                    crate::compare::FieldDiff { column: "qty".into(), baseline: Some("2".into()), target: Some("2".into()), changed: false },
+                ],
+                sql: "UPDATE orders SET note = 'new' WHERE id = 1;".into(),
+            },
+            crate::compare::DataDiff {
+                table: "orders".into(),
+                action: "insert".into(),
+                key: "2".into(),
+                detail: String::new(),
+                fields: vec![crate::compare::FieldDiff { column: "note".into(), baseline: Some("x".into()), target: None, changed: true }],
+                sql: "INSERT INTO orders (id, note) VALUES (2, 'x');".into(),
+            },
+        ];
+        report
+    }
+
+    /// R13：对比数据行用共享只读表：每个字段一行，同步语句只在该差异的第一行；缺行一侧显示 ∅。
+    #[test]
+    fn data_row_cells_flatten_fields_for_the_read_table() {
+        let report = drill_report();
+        let (columns, rows) = data_row_cells(&report, "orders", 200, |key| key.to_owned());
+        assert_eq!(columns.len(), 7);
+        assert_eq!(rows.len(), 3, "两个字段 + 一个字段");
+        assert_eq!(rows[0][2].as_ref(), "note");
+        assert_eq!(rows[0][5].as_ref(), "≠");
+        assert_eq!(rows[1][5].as_ref(), "", "相同的列不标不同");
+        assert!(rows[0][6].starts_with("UPDATE") && rows[1][6].is_empty(), "语句只在第一行");
+        assert_eq!(rows[2][4].as_ref(), "∅");
+        assert_eq!(data_row_count(&report, "orders", 200), 3);
+        assert_eq!(data_row_count(&report, "orders", 1), 2, "按差异数截断");
+    }
+
+    /// R13：下钻后的行级差异可以选中，⌘C 复制选区（多格为含表头的 TSV）。
+    #[gpui_kit::test]
+    fn drilled_data_rows_are_selectable_and_copyable(cx: &mut gpui_kit::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(px(1200.), px(900.)) };
+            let (window, view) = gpui_kit::open_window(gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |_, cx| {
+                cx.new(|_| {
+                    let mut pane = ComparePane::new(Arc::clone(&services));
+                    sqlite_pair(&mut pane);
+                    pane.install_data(drill_report());
+                    assert!(pane.view_command("compare-data-table:orders"));
+                    pane
+                })
+            })
+            .expect("compare pane");
+            (window, view)
+        });
+        cx.update_window(window, |_, window, cx| gpui_kit::test::TestWindowExt::render_frame(window, cx)).unwrap();
+        let table = cx.update(|cx| view.read(cx).rows_table()).expect("下钻后建了只读表");
+        let copied = cx.update(|cx| {
+            assert_eq!(table.read(cx).rows_len(cx), 3);
+            table.update(cx, |table, cx| {
+                table.select(0, 2, false, cx);
+                table.select(1, 4, true, cx);
+                table.copy_selection(cx)
+            })
+        });
+        assert_eq!(copied.as_deref(), Some("列\t基准值\t对照值\nnote\tnew\told\nqty\t2\t2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {

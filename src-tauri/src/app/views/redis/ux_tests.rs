@@ -459,8 +459,8 @@ fn diagnostic_tables_select_copy_and_activate(cx: &mut gpui_kit::TestAppContext)
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R14：键列表里双击或回车，在当前视图打开这个键，并把固定标签请求（带键名）留给外壳；
-/// 外壳接上之前提示如实说明没有新建标签，不报假成功。带键的规格会直接读这个键。
+/// R14：键列表里双击或回车，在当前视图选中这个键，并把固定标签请求（带键名）留给外壳；
+/// 外壳取走请求后新建固定标签（见 shell 测试 `redis_open_requests_open_a_pinned_key_tab`）。带键的规格会直接读这个键。
 #[gpui_kit::test]
 fn double_click_or_enter_requests_a_pinned_tab(cx: &mut gpui_kit::TestAppContext) {
     // 选键会在后台运行时上发起读取（这里没有真实连接，结果是报错并被代数过滤）。
@@ -475,8 +475,6 @@ fn double_click_or_enter_requests_a_pinned_tab(cx: &mut gpui_kit::TestAppContext
             pane.command("redis-open-tab:1", cx);
             assert_eq!(pane.selected(), "user:2", "双击在当前视图打开这个键");
             assert!(pane.reading(), "并开始读取它");
-            assert!(pane.note().contains("user:2") && pane.note().contains("暂不可用"), "不报「已在新标签中打开」的假成功：{}", pane.note());
-            assert!(!pane.note().contains("已在新标签中打开"), "{}", pane.note());
             assert_eq!(pane.take_open_requests(), vec!["cache|订单缓存|0|user:2".to_owned()]);
             pane.selected = "user:1".into();
             pane.key_list_key(&gpui_kit::KeyDownEvent { keystroke: gpui_kit::Keystroke::parse("enter").unwrap(), is_held: false, prefer_character_input: false }, cx);

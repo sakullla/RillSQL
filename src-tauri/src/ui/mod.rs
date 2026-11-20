@@ -3,6 +3,7 @@ mod format_viewer;
 mod foundation;
 mod grid_proto;
 pub mod kit;
+pub mod loading;
 pub mod picker;
 pub mod read_table;
 pub mod redis_highlight;

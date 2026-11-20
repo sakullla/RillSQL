@@ -46,7 +46,7 @@ impl Workbench {
             .flex_col()
             .overflow_hidden()
             .child(self.launcher_header(window, cx))
-            .child(div().flex_1().min_h(px(0.)).flex().child(self.launcher_body(wide, window, cx)).children(detail))
+            .child(div().flex_1().min_h_0().flex().child(self.launcher_body(wide, window, cx)).children(detail))
             .into_any_element()
     }
 
@@ -278,7 +278,7 @@ impl Workbench {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.))
+            .min_w_0()
             .h_full()
             .scroll_area_y()
             .scroll_handle(&self.launcher_scroll)
@@ -343,7 +343,7 @@ impl Workbench {
                             .aria_label(SharedString::from(label.clone()))
                             .when(!reason.is_empty(), |this| this.tooltip_text(SharedString::from(reason.clone())))
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .truncate()
                             .text_size(px(TypeScale::SM))
                             .text_color(p.danger)
@@ -703,14 +703,14 @@ impl Workbench {
                     .child(kit::engine_badge(row.saved.engine.as_str(), 30.))
                     .child(
                         div()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .flex_1()
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .child(
                                 div()
-                                    .min_w(px(0.))
+                                    .min_w_0()
                                     .flex_shrink(1.)
                                     .truncate()
                                     .text_size(px(TypeScale::MD))
@@ -723,13 +723,13 @@ impl Workbench {
             )
             .child(
                 div()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap(px(6.))
                     .child(
                         div()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .flex_1()
                             .truncate()
                             .font_family(cx.theme().mono_font_family.clone())
@@ -858,21 +858,21 @@ impl Workbench {
             .child(kit::engine_badge(row.saved.engine.as_str(), 28.))
             .child(
                 div()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .flex_1()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
                     .child(
                         div()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().min_w(px(0.)).flex_shrink(1.).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
+                            .child(div().min_w_0().flex_shrink(1.).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
                             .children(self.env_pill(&row.saved.env, p)),
                     )
-                    .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(shown_detail))),
+                    .child(div().min_w_0().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(shown_detail))),
             )
             .child(
                 div()
@@ -979,7 +979,7 @@ impl Workbench {
                             div()
                                 .id("conn-detail-failure-scroll")
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w_0()
                                 .max_h(px(88.))
                                 .scroll_area_y()
                                 .text_size(px(TypeScale::XS))
@@ -1041,7 +1041,7 @@ impl Workbench {
             let value_cell: AnyElement = if copyable {
                 div()
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .flex()
                     .text_color(p.text)
                     .child(kit::copyable(
@@ -1058,7 +1058,7 @@ impl Workbench {
                 div()
                     .id(SharedString::from(format!("conn-fact-{key}")))
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w_0()
                     .truncate()
                     .text_color(if has_value { p.text } else { p.text_faint })
                     .when(has_value, |this| this.tooltip_text(SharedString::from(value.clone())))
@@ -1182,7 +1182,7 @@ impl Workbench {
                     div()
                         .id("conn-fact-conn.page.group")
                         .flex_1()
-                        .min_w(px(0.))
+                        .min_w_0()
                         .truncate()
                         .text_color(if has_group { p.text } else { p.text_faint })
                         .child(SharedString::from(group_name)),
@@ -1227,7 +1227,7 @@ impl Workbench {
                                 .child(
                                     div()
                                         .flex_1()
-                                        .min_w(px(0.))
+                                        .min_w_0()
                                         .flex()
                                         .flex_col()
                                         .gap(px(4.))
@@ -1407,7 +1407,7 @@ impl Workbench {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(name)))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(name)))
                             .child(
                                 kit::icon_button(SharedString::from(format!("tag-untag-{connection}")), IconName::X, self.model.text("tags.untag"), act(format!("tag-untag:{connection}"), cx))
                                     .xsmall(),
