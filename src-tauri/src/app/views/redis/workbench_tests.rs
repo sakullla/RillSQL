@@ -503,6 +503,30 @@ fn running_batch_pins_its_db_and_blocks_db_switches(cx: &mut gpui_kit::TestAppCo
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 集群退回单节点浏览时仍只有 0 号库：切库与控制台 SELECT n 在发送前被拒，库与索引不变。
+#[gpui_kit::test]
+fn cluster_fallback_keeps_db_zero_only(cx: &mut gpui_kit::TestAppContext) {
+    let (pane, dir) = pane("fallback-db");
+    let view = cx.update(|cx| cx.new(|_| pane));
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.database = "0".into();
+            pane.topology = Topology { cluster: false, nodes: Vec::new(), addr: "10.0.0.5:7001".into(), fallback: Some(ClusterFallback::Tunnel) };
+            pane.set_keys(vec![key("order:1001", "hash")]);
+            pane.command("redis-db-pick:1", cx);
+            assert_eq!(pane.database, "0", "退回单节点的集群不切库");
+            assert_eq!(pane.keys().len(), 1, "索引保留");
+            assert!(pane.error().contains("0 号库"), "{}", pane.error());
+
+            pane.error.clear();
+            pane.exec_command("SELECT".into(), vec!["2".into()], true, "SELECT 2".into(), cx);
+            assert_eq!(pane.database, "0", "控制台 SELECT 2 被拒");
+            assert!(pane.error().contains("0 号库"), "{}", pane.error());
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 集群退回单节点：顶栏显示单节点浏览标记，说明里带原因。
 #[gpui_kit::test]
 fn cluster_fallback_is_explained(cx: &mut gpui_kit::TestAppContext) {

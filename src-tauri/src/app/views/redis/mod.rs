@@ -900,6 +900,11 @@ impl RedisPane {
         );
     }
 
+    /// 集群（含退回单节点浏览的集群节点）只有 0 号库，切到其他库服务端会拒绝。
+    fn db_zero_only(&self) -> bool {
+        self.topology.cluster || self.topology.fallback.is_some()
+    }
+
     fn switch_db(&mut self, db: u8, cx: &mut Context<Self>) {
         self.db_picker_open = false;
         self.context_menu = None;
@@ -908,7 +913,7 @@ impl RedisPane {
             self.database = target_db;
             return;
         }
-        if self.topology.cluster && db != 0 {
+        if self.db_zero_only() && db != 0 {
             self.show_error_from(ErrorSource::Scan, self.text("redis.cluster.dbOnlyZero"));
             return;
         }
@@ -1841,6 +1846,10 @@ impl RedisPane {
             return;
         }
         if command.eq_ignore_ascii_case("SELECT") {
+            if self.db_zero_only() && args.first().is_some_and(|arg| arg.trim() != "0") {
+                self.show_error(self.text("redis.cluster.dbOnlyZero"));
+                return;
+            }
             if self.batch_running() {
                 self.show_error(self.text("redis.batch.switchBlocked"));
                 return;

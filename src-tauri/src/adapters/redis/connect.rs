@@ -278,7 +278,8 @@ impl Connector for RedisConnector {
             }
             ClusterSettle::Single => (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr, fallback: None }, opened.version),
             ClusterSettle::Fallback(reason) => {
-                let version = format!("{} · Cluster（集群连接未建立，按单节点浏览）", opened.version);
+                // 退回原因由界面按语言显示（Topology.fallback），版本串保持与语言无关。
+                let version = format!("{} · Cluster", opened.version);
                 (RedisConn::Single(opened.conn), None, Topology { cluster: false, nodes: Vec::new(), addr, fallback: Some(reason) }, version)
             }
         };
