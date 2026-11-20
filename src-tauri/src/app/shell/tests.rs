@@ -13158,9 +13158,8 @@ fn pinned_tabs_and_close_unmodified_follow_the_tab_menu_and_the_session() {
     restored.restore_session(&session);
     assert_eq!(restored.tabs[0].id, ids[3], "固定标签恢复后仍在最左侧");
     let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    for tab in legacy["session"]["tabs"].as_array_mut().unwrap() {
-        tab.as_object_mut().unwrap().remove("pinned");
-    }
+    assert!(legacy["session"]["pinned"].is_array(), "固定标签写进会话");
+    legacy["session"].as_object_mut().unwrap().remove("pinned");
     let old = crate::state::parse_stored(&serde_json::to_vec(&legacy).unwrap()).unwrap();
     restored.restore_session(&old.session);
     assert!(restored.tabs.iter().all(|tab| !tab.pinned), "旧会话按未固定读取");

@@ -148,7 +148,7 @@ pub struct Workbench {
     /// 历史预览的只读 SQL 编辑器，按条目 id 与原文重建。
     pub(super) history_editor: Option<(String, Entity<gpui_kit::component::input::EditorState>)>,
     /// 页签、资源树行、状态栏等位置的转圈：每个位置一个隔离实体，动画帧不通知工作台。
-    pub(super) spinners: crate::ui::spinner_view::SpinnerPool,
+    pub(super) spinners: crate::app::shell::loading::SpinnerPool,
     /// 页签条的缓存视图：编辑器光标闪烁、转圈动画只把工作台标脏，不通知它；
     /// 页签条沿用上一帧的布局和绘制，几百个标签时空闲重绘不再逐个重排页签。
     pub(super) tab_strip_host: Entity<TabStripHost>,
@@ -469,7 +469,7 @@ impl Workbench {
             seen_page: AppPage::Workspace,
             admin_link: None,
             history_editor: None,
-            spinners: crate::ui::spinner_view::SpinnerPool::new(),
+            spinners: crate::app::shell::loading::SpinnerPool::new(),
             tab_strip_host: cx.new(|_| TabStripHost { workbench: weak_self }),
             tab_picker: None,
             tab_picker_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -3225,6 +3225,10 @@ impl Render for Workbench {
         // 一帧画完，下一批事件重新计数；见 `settle_from_event`。
         self.settle_passes = 0;
         self.settle_deferred = false;
+        // 唯一的例外：对比页的交接（放入查询页、返回、运行标记）在这里也收一次。只有两次 take 和一次
+        // 布尔读取，不遍历、不分配；对比页的按钮直接改它自己的实体，嵌套更新里观察回调还没轮到时，
+        // 下一帧仍能拿到交接，关闭窗口的判断也不会读到旧的运行标记。
+        self.refresh_compare(cx);
         self.render_root(window, cx)
     }
 }
@@ -3239,6 +3243,7 @@ impl Workbench {
         let now = std::time::Instant::now();
         if now.duration_since(self.settle_burst) > std::time::Duration::from_millis(50) {
             self.settle_passes = 0;
+            self.settle_deferred = false;
         }
         if self.settle_passes == 0 {
             self.settle_burst = now;
@@ -3254,6 +3259,8 @@ impl Workbench {
                         this.update(cx, |this, cx| {
                             #[cfg(test)]
                             this.deferred_settle_count.set(this.deferred_settle_count.get() + 1);
+                            // 延后整理可能不产生新帧（没改东西或窗口被遮挡），在这里就放开，不等 render。
+                            this.settle_deferred = false;
                             this.settle(cx);
                         });
                     }

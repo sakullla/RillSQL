@@ -6050,12 +6050,16 @@ impl WorkbenchModel {
         let session = SessionState {
             active_id: self.active_tab.clone(),
             tabs: self.tabs.iter().map(tab_to_session).collect(),
+            pinned: self.tabs.iter().filter(|tab| tab.pinned).map(|tab| tab.id.clone()).collect(),
         };
         AppState::new(self.settings.to_settings(), session).with_templates(self.column_templates.clone())
     }
 
     pub fn restore_session(&mut self, session: &SessionState) {
         self.tabs = session.tabs.iter().filter_map(session_to_item).collect();
+        for tab in &mut self.tabs {
+            tab.pinned = session.pinned.contains(&tab.id);
+        }
         self.group_pinned();
         self.relabel_query_tabs();
         self.tool = WorkTool::Query;
@@ -6105,7 +6109,6 @@ fn tab_to_session(tab: &WorkItem) -> SessionTab {
         doc_collection: None,
         admin_schema: None,
         title_key: None,
-        pinned: tab.pinned,
     }
 }
 
@@ -6132,7 +6135,8 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
         connection_name: tab.connection_name.clone(),
         database: tab.database.clone(),
         engine: tab.engine.clone(),
-        pinned: tab.pinned,
+        // 固定状态记在 SessionState.pinned，由 restore_session 补上。
+        pinned: false,
     })
 }
 

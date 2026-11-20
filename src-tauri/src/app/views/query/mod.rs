@@ -221,7 +221,7 @@ pub struct QueryPane {
     /// 还没确认进入视口的滚动请求。
     result_scroll_pending: Option<tabs::Reveal>,
     /// 结果头、行数摘要与语句结果里的转圈：隔离实体，动画帧不通知查询页和工作台。
-    spinners: crate::ui::spinner_view::SpinnerPool,
+    spinners: crate::app::shell::loading::SpinnerPool,
     /// 这一帧取好的转圈视图（结果头、行数摘要、语句进度、首次运行、目标连接中）；只在运行时画出来。
     frame_spinners: Option<[gpui_kit::AnyView; 5]>,
     _target_tab_sub: gpui_kit::Subscription,
@@ -625,7 +625,7 @@ impl QueryPane {
             result_scroll: gpui_kit::ScrollHandle::new(),
             result_scroll_seen: None,
             result_scroll_pending: None,
-            spinners: crate::ui::spinner_view::SpinnerPool::new(),
+            spinners: crate::app::shell::loading::SpinnerPool::new(),
             frame_spinners: None,
             _target_tab_sub: target_tab_sub,
         }

@@ -140,9 +140,6 @@ pub struct SessionTab {
     pub admin_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_key: Option<TitleKey>,
-    /// 固定标签（排在左侧、批量关闭时跳过）。旧会话没有这一项时按未固定读取；未固定时不写出。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +148,9 @@ pub struct SessionTab {
 pub struct SessionState {
     pub tabs: Vec<SessionTab>,
     pub active_id: Option<String>,
+    /// 固定标签的 id（排在左侧、批量关闭时跳过）。旧会话没有这一项时按都未固定读取；没有固定时不写出。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
 }
 
 
@@ -288,7 +288,12 @@ pub fn session_from_legacy(value: &Value) -> Result<SessionState, String> {
     } else {
         tabs.last().map(|tab| tab.id.clone())
     };
-    Ok(SessionState { tabs, active_id })
+    let pinned = object
+        .get("pinned")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).filter(|id| tabs.iter().any(|tab| tab.id == *id)).map(str::to_owned).collect())
+        .unwrap_or_default();
+    Ok(SessionState { tabs, active_id, pinned })
 }
 
 fn tab_from_legacy(value: &Value) -> Result<SessionTab, String> {
@@ -333,7 +338,6 @@ fn tab_from_legacy(value: &Value) -> Result<SessionTab, String> {
         doc_collection: optional_text(tab, "docCollection")?,
         admin_schema: optional_text(tab, "adminSchema")?,
         title_key: title_key_from(tab.get("titleKey"))?,
-        pinned: tab.get("pinned").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -430,5 +434,69 @@ fn optional_enum(object: &Map<String, Value>, key: &str, allowed: &[&str]) -> Re
         None => Ok(None),
         Some(Value::String(value)) if allowed.contains(&value.as_str()) => Ok(Some(value.clone())),
         Some(_) => Err(format!("标签字段 {key} 无效，没有写入新状态。")),
+    }
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use super::*;
+
+    fn tab(id: &str) -> SessionTab {
+        SessionTab {
+            id: id.into(),
+            title: id.into(),
+            kind: "query".into(),
+            spec: None,
+            draft: String::new(),
+            connection_id: None,
+            connection_name: None,
+            database: None,
+            engine: None,
+            connection_status: None,
+            target_text: None,
+            target_notice: None,
+            path: None,
+            last_executed_sql: None,
+            table_pane: None,
+            structure_section: None,
+            definition: None,
+            diagram_schema: None,
+            redis_key: None,
+            doc_database: None,
+            doc_collection: None,
+            admin_schema: None,
+            title_key: None,
+        }
+    }
+
+    /// 固定标签随会话保存；旧会话没有 pinned 时按都未固定读取，不判为损坏；没有固定时不写出这一项。
+    #[test]
+    fn pinned_tabs_round_trip_and_old_sessions_still_parse() {
+        let session = SessionState { tabs: vec![tab("a"), tab("b")], active_id: Some("a".into()), pinned: vec!["b".into()] };
+        let state = AppState::new(ShellSettings::default(), session);
+        let bytes = to_bytes(&state).unwrap();
+        let parsed = parse_stored(&bytes).unwrap();
+        assert_eq!(parsed.session.pinned, ["b"]);
+
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        value["session"].as_object_mut().unwrap().remove("pinned");
+        let old = parse_stored(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(old.session.pinned.is_empty());
+        let rewritten = String::from_utf8(to_bytes(&old).unwrap()).unwrap();
+        assert!(!rewritten.contains("pinned"), "{rewritten}");
+    }
+
+    /// 旧 rillsql.session 迁移：有 pinned 列表时只保留存在的标签，没有时为空。
+    #[test]
+    fn legacy_sessions_read_pinned_ids_when_present() {
+        let legacy = serde_json::json!({
+            "tabs": [{"id": "a", "title": "A", "draft": ""}, {"id": "b", "title": "B", "draft": ""}],
+            "activeId": "a",
+            "pinned": ["b", "gone"],
+        });
+        assert_eq!(session_from_legacy(&legacy).unwrap().pinned, ["b"]);
+        let mut without = legacy.clone();
+        without.as_object_mut().unwrap().remove("pinned");
+        assert!(session_from_legacy(&without).unwrap().pinned.is_empty());
     }
 }
