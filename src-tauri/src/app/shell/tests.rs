@@ -5617,6 +5617,42 @@ fn tree_multi_selection_drives_compare_tables() {
     }
 }
 
+/// 先点过一张表，再右键另一个库选“对比库”：对比带的是被右键的库，不是之前那张表。
+#[gpui_kit::test]
+fn compare_object_from_a_database_menu_uses_that_database_not_the_last_table(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-compare-scope-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let orders = crate::catalog::model::ObjectRow::table("orders", Some(2));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone()])]);
+    let other = nav_connection(Engine::Postgres, "wh", "仓库", vec![nav_database("stock", Vec::new())]);
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+    let stock = crate::catalog::hierarchy::database_node_id("wh", "stock");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.apply_navigation(&[pg, other], false);
+            // 先在表上右键（同步了 object_spec），然后关掉菜单。
+            assert!(view.model.open_nav_menu(&orders_id));
+            assert_eq!(view.model.object_target().map(|target| target.name), Some("orders".to_owned()));
+            view.model.close_menu();
+            // 再右键另一个连接里的库，选“对比库”。
+            assert!(view.model.open_nav_menu(&stock));
+            view.perform("compare-object", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.shell.page, AppPage::Compare);
+        let (context, note, _baseline, _target) = view.compare_state(cx);
+        let context = context.unwrap_or_default();
+        assert!(context.starts_with("stock") && context.contains("仓库"), "对比库必须带被右键的库：{context} / {note}");
+        assert!(!context.contains("orders") && !context.contains("销售库"), "不能借用之前点过的表：{context}");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// MongoDB 集合是文档：菜单和打开入口都不走关系型表/结构/关系图。
 #[test]
 fn document_objects_use_documents_not_relational_pages() {

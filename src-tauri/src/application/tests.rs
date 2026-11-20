@@ -299,7 +299,7 @@ async fn typed_service_compare(dir: &std::path::Path, service: Arc<Service>) {
         &tasks,
         "compare",
         token,
-        &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side.clone(), timeout_secs: 0 },
+        &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side.clone(), timeout_secs: 0, objects: None },
     )
     .await
     {
@@ -318,7 +318,7 @@ async fn typed_service_compare(dir: &std::path::Path, service: Arc<Service>) {
             id: "data".to_owned(),
             baseline: side.clone(),
             target: side,
-            tables: vec![DataTableRequest { name: "customers".to_owned(), key: None }],
+            tables: vec![DataTableRequest { name: "customers".to_owned(), key: None, right_name: None }],
             timeout_secs: 0,
         },
     )
@@ -551,7 +551,7 @@ async fn superseded_compare_dump_and_migrate_drop_the_result_and_its_progress() 
     let side = SideRequest { connection_id: "notes".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() };
     let token = tasks.begin("compare");
     tasks.supersede("compare");
-    match super::work::compare_structure(&service, &tasks, "compare", token, &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side, timeout_secs: 0 }).await {
+    match super::work::compare_structure(&service, &tasks, "compare", token, &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side, timeout_secs: 0, objects: None }).await {
         TaskOutcome::Stale { .. } => {}
         TaskOutcome::Current { .. } => panic!("切换后仍拿到了完整比较结果"),
         TaskOutcome::Cancelled { .. } => panic!("比较被当成取消"),

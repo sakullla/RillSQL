@@ -733,12 +733,16 @@ impl Workbench {
                 "compare-grid" => self.grid_compare_target(),
                 // 对象菜单以右键/当前对象为准；没有选中对象时退回当前工作项的目标。
                 // 文档集合没有关系型比较：说明原因，不换成别的对象。
+                // 从对象树右键库/模式/连接进入时，以被点的那一行为准：object_spec 只在
+                // 对象节点上同步，之前点过的表会残留，不能顶掉这次右键的库。
                 "compare-object" => {
-                    let target = self
-                        .model
-                        .object_target()
-                        .or_else(|| self.model.nav_scope_target())
-                        .or_else(|| self.model.compare_target());
+                    let from_tree_menu = self.model.nav_menu_node.is_some();
+                    let picked = if from_tree_menu {
+                        self.model.nav_scope_target().or_else(|| self.model.object_target())
+                    } else {
+                        self.model.object_target().or_else(|| self.model.nav_scope_target())
+                    };
+                    let target = picked.or_else(|| self.model.compare_target());
                     self.model.nav_menu_node = None;
                     if target.as_ref().is_some_and(|target| !target.is_relational()) {
                         self.model.notice_key = Some("catalog.tree.relationalOnly");
