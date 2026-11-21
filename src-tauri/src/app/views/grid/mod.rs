@@ -22,6 +22,11 @@ use gpui_kit::{
 };
 
 use crate::ui::kit::{self, Palette, Tip as _, Radius, Space, TypeScale};
+
+/// 工具栏角标圆点/计数徽章尺寸。
+const TOOLBAR_BADGE_SIZE: f32 = 14.;
+/// 工具栏单行提示消息最大宽度（超出截断并在悬停提示展示全文）。
+const NOTICE_MAX_W: f32 = 360.;
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -3634,11 +3639,11 @@ impl GridPane {
                     .debug_selector(|| "grid-find-badge".to_owned())
                     .test_support()
                     .absolute()
-                    .top(px(-3.))
-                    .right(px(-3.))
-                    .min_w(px(14.))
-                    .h(px(14.))
-                    .px(px(3.))
+                    .top(px(-Space::XXS))
+                    .right(px(-Space::XXS))
+                    .min_w(px(TOOLBAR_BADGE_SIZE))
+                    .h(px(TOOLBAR_BADGE_SIZE))
+                    .px(px(Space::XXS))
                     .rounded_full()
                     .flex()
                     .items_center()
@@ -3682,11 +3687,11 @@ impl GridPane {
                     .debug_selector(|| "grid-filter-collapsed-badge".to_owned())
                     .test_support()
                     .absolute()
-                    .top(px(-3.))
-                    .right(px(-3.))
-                    .min_w(px(14.))
-                    .h(px(14.))
-                    .px(px(3.))
+                    .top(px(-Space::XXS))
+                    .right(px(-Space::XXS))
+                    .min_w(px(TOOLBAR_BADGE_SIZE))
+                    .h(px(TOOLBAR_BADGE_SIZE))
+                    .px(px(Space::XXS))
                     .rounded_full()
                     .flex()
                     .items_center()
@@ -3908,8 +3913,8 @@ impl GridPane {
                     .id("grid-notice")
                     .debug_selector(|| "grid-notice".to_owned())
                     .test_support()
-                    .min_w(px(0.))
-                    .max_w(px(360.))
+                    .min_w_0()
+                    .max_w(px(NOTICE_MAX_W))
                     .truncate()
                     .text_size(px(TypeScale::SM))
                     .text_color(color)
@@ -5137,7 +5142,7 @@ impl GridPane {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .gap(px(8.))
+                                .gap(px(Space::MD))
                                 .child(kit::title(t("grid.preview.title"), TypeScale::LG, p))
                                 .child(
                                     kit::tool_button("grid-preview-copy", Some(IconName::Copy), t("grid.preview.copySql"), move |_, _, cx| {

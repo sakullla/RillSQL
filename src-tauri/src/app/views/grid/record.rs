@@ -15,6 +15,9 @@ use crate::ui::FormatViewer;
 use super::session::{type_abbr, CellKind, SharedGrid};
 use super::GridPane;
 
+/// 记录面板只读字段值的最大预览高度：避免单条长/多行文本把其余字段挤出可视区。
+const RECORD_VALUE_MAX_H: f32 = 72.;
+
 /// 记录面板的就地暂存状态。非模态：值直接在字段行里改，Enter 暂存、Esc 取消。
 pub struct RecordEdit {
     /// 正在编辑的逻辑列。
@@ -239,10 +242,10 @@ pub fn render_record(
                                 };
                                 let mut editor = div()
                                     .flex_1()
-                                    .min_w(px(0.))
+                                    .min_w_0()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(4.))
+                                    .gap(px(kit::Space::XS))
                                     .child(kit::text_input("grid-record-input", input, t("grid.record.editHint")).small());
                                 if edit.can_null || edit.can_default {
                                     editor = editor.child(
@@ -250,7 +253,7 @@ pub fn render_record(
                                             .flex()
                                             .flex_wrap()
                                             .items_center()
-                                            .gap(px(4.))
+                                            .gap(px(kit::Space::XS))
                                             .when(edit.can_null, |this| {
                                                 this.child(kit::tool_button("grid-record-set-null", None, t("grid.value.setNull"), set_null).xsmall())
                                             })
@@ -267,11 +270,11 @@ pub fn render_record(
                                             .test_support()
                                             .flex()
                                             .items_center()
-                                            .gap(px(4.))
+                                            .gap(px(kit::Space::XS))
                                             .text_size(px(TypeScale::XS))
                                             .text_color(p.danger)
                                             .child(kit::icon(IconName::CircleAlert, 12., p.danger))
-                                            .child(div().min_w(px(0.)).child(SharedString::from(error))),
+                                            .child(div().min_w_0().child(SharedString::from(error))),
                                     );
                                 }
                                 editor.into_any_element()
@@ -288,8 +291,8 @@ pub fn render_record(
                                     .id(("grid-record-value", column))
                                     .debug_selector(move || format!("grid-record-value-{column}"))
                                     .flex_1()
-                                    .min_w(px(0.))
-                                    .max_h(px(72.))
+                                    .min_w_0()
+                                    .max_h(px(RECORD_VALUE_MAX_H))
                                     .overflow_hidden()
                                     .font_family(mono.clone())
                                     .text_size(px(TypeScale::SM))

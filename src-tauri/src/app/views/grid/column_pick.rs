@@ -250,7 +250,11 @@ impl GridPane {
         let anchors = self.picker_anchors.borrow();
         let anchor = anchors.get(&ColumnPickTarget::Manage).copied().unwrap_or_default();
         drop(anchors);
-        let pos = Point::new(anchor.origin.x, anchor.bottom() + px(4.));
+        const MANAGER_W: f32 = 292.;
+        const MANAGER_LIST_MAX_H: f32 = 260.;
+        const MANAGER_ROW_H: f32 = 26.;
+        const MANAGER_TYPE_MAX_W: f32 = 72.;
+        let pos = Point::new(anchor.origin.x, anchor.bottom() + px(Space::XS));
 
         let ordered = self.session.ordered_columns();
         let names = self.session.column_names();
@@ -262,11 +266,11 @@ impl GridPane {
             .id("grid-column-manager-list")
             .debug_selector(|| "grid-column-manager-list".to_owned())
             .test_support()
-            .max_h(px(260.))
+            .max_h(px(MANAGER_LIST_MAX_H))
             .scroll_area_y()
             .flex()
             .flex_col()
-            .gap(px(2.));
+            .gap(px(Space::XXS));
         let mut matched = 0usize;
         let total = ordered.len();
         for (pos_ix, logical) in ordered.into_iter().enumerate() {
@@ -297,20 +301,20 @@ impl GridPane {
                     .id(("grid-col-mgr-row", logical))
                     .debug_selector(move || format!("grid-col-mgr-row-{logical}"))
                     .test_support()
-                    .h(px(26.))
-                    .px(px(6.))
+                    .h(px(MANAGER_ROW_H))
+                    .px(px(Space::SM))
                     .rounded(px(Radius::CONTROL))
                     .hover(|style| style.bg(p.hover))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(Space::SM))
                     .child(
                         div()
                             .id(("grid-col-mgr-toggle", logical))
                             .debug_selector(move || format!("grid-col-mgr-toggle-{logical}"))
                             .test_support()
                             .flex_none()
-                            .size(px(16.))
+                            .size(px(Space::XL))
                             .rounded(px(Radius::TAG))
                             .border_1()
                             .border_color(if hidden { p.line } else { p.accent })
@@ -330,7 +334,7 @@ impl GridPane {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w_0()
                             .truncate()
                             .text_size(px(TypeScale::SM))
                             .text_color(if hidden { p.text_faint } else { p.text })
@@ -340,7 +344,7 @@ impl GridPane {
                         this.child(
                             div()
                                 .flex_none()
-                                .max_w(px(72.))
+                                .max_w(px(MANAGER_TYPE_MAX_W))
                                 .truncate()
                                 .text_size(px(TypeScale::XS))
                                 .text_color(p.text_faint)
@@ -364,7 +368,7 @@ impl GridPane {
             );
         }
         if matched == 0 {
-            list = list.child(div().p(px(10.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("grid.column.emptySearch")));
+            list = list.child(div().p(px(Space::MD)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("grid.column.emptySearch")));
         }
 
         let show_all_owner = entity.clone();
@@ -398,7 +402,7 @@ impl GridPane {
                         .debug_selector(|| "grid-column-manager".to_owned())
                         .test_support()
                         .occlude()
-                        .w(px(292.))
+                        .w(px(MANAGER_W))
                         .p(px(Space::SM))
                         .flex()
                         .flex_col()
@@ -423,13 +427,13 @@ impl GridPane {
                         .child(list)
                         .child(
                             div()
-                                .pt(px(4.))
+                                .pt(px(Space::XS))
                                 .border_t_1()
                                 .border_color(p.line_soft)
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .gap(px(4.))
+                                .gap(px(Space::XS))
                                 .child(
                                     kit::tool_button("grid-col-mgr-show-all", None, t("grid.column.showAll"), move |_, _, cx| {
                                         show_all_owner.update(cx, |pane, cx| pane.column_command(0, "column-show-all", cx));
