@@ -39,4 +39,6 @@ pub fn module_id() -> &'static str {
 }
 
 #[cfg(test)]
+mod live_tests;
+#[cfg(test)]
 mod tests;
