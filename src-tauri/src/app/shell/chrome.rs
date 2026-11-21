@@ -31,8 +31,10 @@ use gpui_kit::base::FocusTrapElement as _;
 
 use super::conn_modal;
 use super::model::{ConnFilterMenu, DraftField, PaletteScope, WorkItemKind, WorkTool};
+use super::transaction::{self, GuardDecision, TransactionActions, TransactionMenu};
 use super::view::Workbench;
 use crate::adapters::Workbench as WorkbenchKind;
+use crate::transaction::TransactionCapabilities;
 
 use crate::ui::kit::stack_frame;
 
@@ -287,6 +289,10 @@ impl Workbench {
             covered = true;
             root = root.child(self.close_layer(cx));
         }
+        if self.model.transaction_guard.is_some() {
+            covered = true;
+            root = root.child(self.transaction_guard_layer(cx));
+        }
         if self.model.connections.confirm_delete {
             covered = true;
             root = root.child(self.delete_layer(cx));
@@ -326,6 +332,14 @@ impl Workbench {
     /// 浮层打开时，方向键、回车与 Esc 归浮层。回车经由 `perform` 执行，保证效果完整。
     fn overlay_key(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        // 事务保护层独占键盘：Esc 取消，其他按键不在后面操作（对话框本身不是表单）。
+        if self.model.transaction_guard.is_some() {
+            if key == "escape" {
+                self.perform("tx-guard-cancel", cx);
+                cx.notify();
+            }
+            return;
+        }
         // 浮层关闭后键盘要回到打开它的地方，而不是留在已经消失的弹层上。
         let overlay_was_open = self.model.menu.is_some()
             || self.model.shell.palette_open
@@ -1762,6 +1776,302 @@ impl Workbench {
 
     // ------------------------------------------------------------ 工作区
 
+    /// 共享事务控件：查询、网格与结构工作区共用同一行，状态只读连接服务的共享快照。
+    ///
+    /// 任一入口（开始、提交、回滚、保存点、隔离/模式）都作用于 R2 的同一个用户事务；命令结果由
+    /// 视图执行并推进快照，其他标签在下一帧或轮询兜底时看到同一状态。
+    #[inline(never)]
+    fn transaction_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure) {
+            return None;
+        }
+        let target = self.model.transaction_target()?;
+        let snapshot = self.services.connections.transaction_snapshot(&target.connection_id)?;
+        let capabilities = self
+            .services
+            .connections
+            .transaction_coordinator(&target.connection_id)
+            .map(|coordinator| coordinator.capabilities())
+            .unwrap_or(TransactionCapabilities::UNSUPPORTED);
+        if !capabilities.explicit_control {
+            return None;
+        }
+        self.model.transactions.align(&target.connection_id);
+        let ui = self.model.transactions.clone();
+        let actions = TransactionActions::of(&snapshot, capabilities);
+        let state = snapshot.state;
+        let locale = self.model.locale();
+        let p = Palette::of(cx);
+        let metrics = self.metrics();
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let busy = ui.busy || self.transaction_busy();
+        let (state_fg, state_bg) = match state {
+            crate::transaction::TransactionState::Idle => (p.text_muted, p.surface),
+            crate::transaction::TransactionState::Active => (p.accent_text, p.accent_soft),
+            crate::transaction::TransactionState::Aborted => (p.warn, p.warn_soft),
+            crate::transaction::TransactionState::Unknown => (p.danger, p.danger_soft),
+        };
+        let owner = if target.connection_name.trim().is_empty() { target.connection_id.clone() } else { target.connection_name.clone() };
+        let mut row = div()
+            .id("transaction-bar")
+            .test_support()
+            .debug_selector(|| "transaction-bar".to_owned())
+            .flex_none()
+            .min_h(px(metrics.toolbar_h()))
+            .px(px(Space::LG))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Space::SM))
+            .bg(p.raised)
+            .border_b_1()
+            .border_color(p.line)
+            .child(kit::pill(t(transaction::state_key(state)), state_fg, state_bg))
+            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).whitespace_nowrap().child(SharedString::from(owner)))
+            .child(kit::vline(&p));
+
+        if actions.begin {
+            row = row.child(
+                kit::primary_button(transaction::BEGIN, Some(IconName::Play), t("transaction.action.begin"), act(transaction::BEGIN, cx))
+                    .disabled(busy),
+            );
+        }
+        if actions.commit {
+            row = row.child(
+                kit::primary_button(transaction::COMMIT, Some(IconName::Check), t("transaction.action.commit"), act(transaction::COMMIT, cx))
+                    .disabled(busy),
+            );
+        }
+        if actions.rollback {
+            row = row.child(
+                kit::danger_button(transaction::ROLLBACK, Some(IconName::RotateCcw), t("transaction.action.rollback"), act(transaction::ROLLBACK, cx))
+                    .disabled(busy),
+            );
+        }
+        if actions.savepoints || actions.savepoint_recovery {
+            let open = ui.menu == Some(TransactionMenu::Savepoints);
+            let button = kit::tool_button(transaction::SAVEPOINT_MENU, Some(IconName::Bookmark), t("transaction.action.savepoint"), act(transaction::SAVEPOINT_MENU, cx))
+                .disabled(busy);
+            row = row.child(if open { button.selected(true) } else { button });
+        }
+        if actions.resolve {
+            row = row
+                .child(
+                    kit::secondary_button(transaction::RESOLVE_COMMITTED, Some(IconName::Check), t("transaction.resolve.committed"), act(transaction::RESOLVE_COMMITTED, cx))
+                        .disabled(busy),
+                )
+                .child(
+                    kit::secondary_button(transaction::RESOLVE_ROLLED_BACK, Some(IconName::RotateCcw), t("transaction.resolve.rolledBack"), act(transaction::RESOLVE_ROLLED_BACK, cx))
+                        .disabled(busy),
+                );
+        }
+        if actions.isolation {
+            let open = ui.menu == Some(TransactionMenu::Isolation);
+            let button = kit::tool_button(transaction::ISOLATION_MENU, Some(IconName::Layers), t("transaction.action.isolation"), act(transaction::ISOLATION_MENU, cx))
+                .disabled(busy);
+            row = row.child(if open { button.selected(true) } else { button });
+        }
+        if actions.mode {
+            let open = ui.menu == Some(TransactionMenu::Mode);
+            let button = kit::tool_button(transaction::MODE_MENU, Some(IconName::SlidersHorizontal), t("transaction.action.mode"), act(transaction::MODE_MENU, cx))
+                .disabled(busy);
+            row = row.child(if open { button.selected(true) } else { button });
+        }
+
+        // 已有保存点：每个都可就地部分回滚；支持释放的方言再给一个释放按钮。
+        for name in &snapshot.savepoints {
+            let rollback = transaction::TransactionCommand::savepoint_rollback_id(name.as_str());
+            row = row.child(
+                kit::tool_button(rollback.clone(), Some(IconName::CornerDownLeft), SharedString::from(name.as_str()), act(rollback, cx))
+                    .tooltip(t("transaction.savepoint.rollback"))
+                    .disabled(busy || !(state == crate::transaction::TransactionState::Active || actions.savepoint_recovery)),
+            );
+            if capabilities.release_savepoint {
+                let release = transaction::TransactionCommand::savepoint_release_id(name.as_str());
+                row = row.child(
+                    kit::icon_button(release.clone(), IconName::X, t("transaction.savepoint.release"), act(release, cx))
+                        .xsmall()
+                        .disabled(busy || state != crate::transaction::TransactionState::Active),
+                );
+            }
+        }
+
+        row = row.child(div().flex_1());
+        if let Some(isolation) = &snapshot.settings.isolation {
+            row = row.child(kit::muted(t(&transaction::isolation_label_key(isolation)), &p));
+        }
+        if let Some(mode) = &snapshot.settings.mode {
+            row = row.child(kit::muted(t(&transaction::mode_label_key(mode)), &p));
+        }
+        if ui.busy {
+            row = row.child(kit::muted(t("transaction.busy"), &p));
+        } else if let Some(key) = ui.message_key {
+            let text = if ui.message_detail.trim().is_empty() {
+                self.model.text(key)
+            } else {
+                format!("{}：{}", self.model.text(key), ui.message_detail.trim())
+            };
+            row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(text)));
+        } else if let Some(hint) = transaction::state_hint_key(state) {
+            row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t(hint)));
+        }
+
+        let mut column = div().id("transaction-frame").flex().flex_col().child(row);
+        if let Some(menu) = ui.menu {
+            let options = match menu {
+                TransactionMenu::Savepoints => self.transaction_savepoint_menu(&snapshot, actions, busy, &p, cx),
+                TransactionMenu::Isolation => self.transaction_setting_menu(true, &snapshot, &capabilities, busy, &p, cx),
+                TransactionMenu::Mode => self.transaction_setting_menu(false, &snapshot, &capabilities, busy, &p, cx),
+            };
+            column = column.child(options);
+        }
+        Some(column.into_any_element())
+    }
+
+    fn transaction_savepoint_menu(
+        &self,
+        snapshot: &crate::transaction::TransactionSnapshot,
+        actions: TransactionActions,
+        busy: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let locale = self.model.locale();
+        let mut row = div()
+            .id("transaction-savepoint-menu")
+            .test_support()
+            .flex_none()
+            .px(px(Space::LG))
+            .py(px(Space::XS))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Space::SM))
+            .bg(p.surface)
+            .border_b_1()
+            .border_color(p.line);
+        if actions.savepoints {
+            let name = transaction::suggested_savepoint(snapshot);
+            let id = transaction::TransactionCommand::savepoint_create_id(&name);
+            let label = i18n::fill(&i18n::text(locale, "transaction.savepoint.createNamed"), &[("name", &name)]);
+            row = row.child(kit::secondary_button(id.clone(), Some(IconName::BookmarkPlus), SharedString::from(label), act(id, cx)).disabled(busy));
+        } else if actions.savepoint_recovery {
+            row = row.child(kit::muted(i18n::text(locale, "transaction.savepoint.recoveryOnly"), p));
+        }
+        if snapshot.savepoints.is_empty() {
+            row = row.child(kit::muted(i18n::text(locale, "transaction.savepoint.empty"), p));
+        } else {
+            for name in &snapshot.savepoints {
+                let rollback = transaction::TransactionCommand::savepoint_rollback_id(name.as_str());
+                row = row.child(
+                    kit::tool_button(rollback.clone(), Some(IconName::CornerDownLeft), SharedString::from(name.as_str()), act(rollback, cx))
+                        .tooltip(i18n::text(locale, "transaction.savepoint.rollback"))
+                        .disabled(busy),
+                );
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn transaction_setting_menu(
+        &self,
+        isolation: bool,
+        snapshot: &crate::transaction::TransactionSnapshot,
+        capabilities: &TransactionCapabilities,
+        busy: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let locale = self.model.locale();
+        let support = if isolation { capabilities.isolation } else { capabilities.mode };
+        let available = support.change != crate::transaction::SettingChange::Unsupported;
+        let current = if isolation { snapshot.settings.isolation.as_deref() } else { snapshot.settings.mode.as_deref() };
+        let locked = support.change == crate::transaction::SettingChange::WhileIdle
+            && snapshot.state != crate::transaction::TransactionState::Idle;
+        let mut row = div()
+            .id("transaction-setting-menu")
+            .test_support()
+            .flex_none()
+            .px(px(Space::LG))
+            .py(px(Space::XS))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Space::SM))
+            .bg(p.surface)
+            .border_b_1()
+            .border_color(p.line);
+        let mut choices: Vec<(Option<&str>, String, bool)> = vec![(None, "transaction.menu.default".to_owned(), current.is_none())];
+        for item in support.options {
+            let key = if isolation { transaction::isolation_label_key(item.id) } else { transaction::mode_label_key(item.id) };
+            choices.push((Some(item.id), key, current == Some(item.id)));
+        }
+        for (value, key, selected) in choices {
+            let id = if isolation { transaction::TransactionCommand::isolation_id(value) } else { transaction::TransactionCommand::mode_id(value) };
+            let label = SharedString::from(i18n::text(locale, &key));
+            let button = kit::tool_button(id.clone(), None, label, act(id, cx)).disabled(busy || locked || !available);
+            row = row.child(if selected { button.selected(true) } else { button });
+        }
+        if locked {
+            row = row.child(kit::muted(i18n::text(locale, "transaction.settings.locked"), p));
+        }
+        row.into_any_element()
+    }
+
+    /// 断开/退出/安装更新前的事务保护层：逐连接提供取消、提交后继续、回滚后继续。
+    #[inline(never)]
+    fn transaction_guard_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let Some(guard) = self.model.transaction_guard.clone() else { return div().into_any_element() };
+        let name = if guard.current.connection_name.trim().is_empty() { guard.current.connection_id.clone() } else { guard.current.connection_name.clone() };
+        let body = i18n::fill(&self.model.text("transaction.guard.body"), &[("name", &name)]);
+        let state = self.model.text(transaction::state_key(guard.current.state));
+        let remaining = guard.remaining();
+        let detail = if remaining > 0 {
+            format!("{body}\n{}\n{}", state, i18n::fill(&self.model.text("transaction.guard.multiple"), &[("count", &remaining.to_string())]))
+        } else {
+            format!("{body}\n{state}")
+        };
+        let cancel = act(transaction::GUARD_CANCEL, cx);
+        let commit = act(transaction::GUARD_COMMIT, cx);
+        let rollback = act(transaction::GUARD_ROLLBACK, cx);
+        let mut buttons = div().flex().justify_end().gap(px(Space::MD)).child(kit::secondary_button(transaction::GUARD_CANCEL, None, self.t("transaction.guard.cancel"), cancel));
+        if guard.allows(GuardDecision::Rollback) {
+            buttons = buttons.child(
+                kit::danger_button(transaction::GUARD_ROLLBACK, Some(IconName::RotateCcw), self.t("transaction.guard.rollback"), rollback)
+                    .disabled(guard.busy),
+            );
+        }
+        if guard.allows(GuardDecision::Commit) {
+            buttons = buttons.child(
+                kit::primary_button(transaction::GUARD_COMMIT, Some(IconName::Check), self.t("transaction.guard.commit"), commit)
+                    .disabled(guard.busy),
+            );
+        }
+        let mut dialog = dialog_card(
+            "transaction-guard",
+            IconName::TriangleAlert,
+            p.warn,
+            self.t(guard.cause.title_key()),
+            SharedString::from(detail),
+            &p,
+        )
+        .child(buttons);
+        if let Some(error) = &guard.error {
+            dialog = dialog.child(banner(IconName::CircleX, SharedString::from(error.clone()), p.danger, p.danger_soft));
+        }
+        if guard.busy {
+            dialog = dialog.child(self.t("transaction.busy"));
+        }
+        backdrop("transaction-guard-backdrop", 0.32, cx)
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(Space::XL + Space::XS))
+            .child(div().id("transaction-guard-dialog").test_support().w_full().flex().justify_center().child(dialog))
+            .into_any_element()
+    }
+
     fn workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let page = self.model.shell.page;
         let tool = self.model.tool;
@@ -1844,11 +2154,13 @@ impl Workbench {
                 .cached(gpui_kit::StyleRefinement::default().flex_none().w_full().h(px(tabs_h)))
         });
         let _ = window;
+        let transaction = self.transaction_bar(cx);
         div()
             .flex()
             .flex_col()
             .size_full()
             .children(strip)
+            .children(transaction)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .into_any_element()
     }
@@ -6685,7 +6997,7 @@ impl Workbench {
         let leave = cx.listener(|this, _: &ClickEvent, _, cx| {
             let window_scope = this.model.close_prompt.as_ref().is_some_and(|prompt| matches!(prompt.scope, super::close::CloseScope::Window));
             this.perform("close-leave", cx);
-            if window_scope && this.model.allow_system_close() {
+            if window_scope && this.allow_close(cx) {
                 cx.quit();
             }
         });

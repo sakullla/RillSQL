@@ -24,6 +24,7 @@ use super::danger::{DangerKind, DangerPrompt, DangerStep};
 use super::nav::{self, NavRequest, TemplateKind};
 use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
+use crate::transaction::{TransactionEffect, TransactionState};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
 use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl};
@@ -33,6 +34,10 @@ use super::layout::{
     SIDEBAR_DEFAULT,
 };
 use super::menus::{flatten_items, tree_menu_items_with_selection, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
+use super::transaction::{
+    self, GuardCause, GuardDecision, GuardFact, GuardOutcome, GuardStep, TransactionBarState, TransactionCommand, TransactionGuard, TransactionMenu,
+    TransactionRequest, TransactionTarget,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkTool {
@@ -575,6 +580,12 @@ pub struct WorkbenchModel {
     pub launcher_reveal: bool,
     /// 连接页布局：true 为卡片看板，false 为紧凑列表。
     pub conn_board_cards: bool,
+    /// 共享事务控件的一次性界面状态（菜单、回执）；事务状态本身只读连接服务里的共享快照。
+    pub transactions: TransactionBarState,
+    /// 取走执行的一条事务命令。
+    pub transaction_request: Option<TransactionRequest>,
+    /// 断开/退出/更新前的逐连接事务保护。
+    pub transaction_guard: Option<TransactionGuard>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -696,6 +707,9 @@ impl WorkbenchModel {
             history_reveal: false,
             launcher_reveal: false,
             conn_board_cards: true,
+            transactions: TransactionBarState::default(),
+            transaction_request: None,
+            transaction_guard: None,
         }
     }
 
@@ -762,6 +776,10 @@ impl WorkbenchModel {
     pub fn dispatch(&mut self, id: &str) -> Option<Effect> {
         self.commands.push(id.to_owned());
         if self.close_prompt.is_some() && !matches!(id, "close-stay" | "close-leave") {
+            return Some(Effect::None);
+        }
+        // 事务保护层独占动作：只有取消、提交后继续、回滚后继续能进来。
+        if self.transaction_guard.is_some() && !id.starts_with("tx-guard-") {
             return Some(Effect::None);
         }
         let page_before = self.shell.page;
@@ -850,6 +868,9 @@ impl WorkbenchModel {
     }
 
     fn local(&mut self, id: &str) -> bool {
+        if self.transaction_local(id) {
+            return true;
+        }
         if id == "help-group-all" {
             self.help_group = None;
             return true;
@@ -1695,7 +1716,7 @@ impl WorkbenchModel {
         }
     }
 
-    fn enqueue(&mut self, job: PendingJob) {
+    pub(super) fn enqueue(&mut self, job: PendingJob) {
         // 读历史是本机库的一次异步读取：排队即进入读取态，读到结果或失败才离开。
         if matches!(&job, PendingJob::RefreshHistory) {
             self.history.begin_load();
@@ -2327,6 +2348,11 @@ impl WorkbenchModel {
     }
 
     pub fn dismiss(&mut self) -> Effect {
+        // 事务保护层优先：Esc 只取消它，不顺手关掉下面的菜单或标签。
+        if self.transaction_guard.is_some() {
+            self.transaction_guard = None;
+            return Effect::None;
+        }
         // 筛选浮层也归外点/Esc 关闭，不留一个悬着的下拉。
         self.conn_filter_menu = None;
         // 菜单关掉就不再持着右键的那一行，之后的动作回到键盘焦点或当前工作项。
@@ -4813,6 +4839,147 @@ impl WorkbenchModel {
         } else {
             // 有搜索词却没命中：提示调整搜索，不和目录读取失败混用一条文案。
             "ui.palette.noMatch"
+        }
+    }
+
+    // ------------------------------------------------------------ 共享事务控件（ADR-5）
+
+    /// 当前业务标签的事务目标：查询、网格与结构共享同一连接；其他工作区不画事务控件。
+    pub fn transaction_target(&self) -> Option<TransactionTarget> {
+        let tab = self.active_tab()?;
+        if !matches!(tab.kind, WorkItemKind::Query | WorkItemKind::Table | WorkItemKind::Structure) {
+            return None;
+        }
+        let connection_id = tab.connection_id.clone().filter(|id| !id.trim().is_empty())?;
+        let engine = tab.engine.clone().unwrap_or_default();
+        if !crate::adapters::is_relational_named(&engine) {
+            return None;
+        }
+        Some(TransactionTarget {
+            connection_id,
+            connection_name: tab.connection_name.clone().unwrap_or_default(),
+            engine,
+            database: tab.database.clone().unwrap_or_default(),
+        })
+    }
+
+    /// 事务命令统一入口：按钮、隔离/模式选项和保存点条目都只排一次请求，由视图执行。
+    pub fn request_transaction(&mut self, command: TransactionCommand) -> bool {
+        let Some(target) = self.transaction_target() else {
+            self.notice_key = Some("transaction.needTarget");
+            self.notice_detail.clear();
+            return false;
+        };
+        self.transactions.align(&target.connection_id);
+        self.transactions.begin_request();
+        self.transaction_request = Some(TransactionRequest { target, command, guard: None });
+        true
+    }
+
+    /// 事务控件与关闭保护的动作分派。返回 false 表示不是这些命令，交回原有分派。
+    fn transaction_local(&mut self, id: &str) -> bool {
+        match id {
+            transaction::SAVEPOINT_MENU => {
+                self.transactions.toggle_menu(TransactionMenu::Savepoints);
+                true
+            }
+            transaction::ISOLATION_MENU => {
+                self.transactions.toggle_menu(TransactionMenu::Isolation);
+                true
+            }
+            transaction::MODE_MENU => {
+                self.transactions.toggle_menu(TransactionMenu::Mode);
+                true
+            }
+            transaction::GUARD_CANCEL => {
+                self.transaction_guard = None;
+                true
+            }
+            transaction::GUARD_COMMIT => {
+                self.guard_decide(GuardDecision::Commit);
+                true
+            }
+            transaction::GUARD_ROLLBACK => {
+                self.guard_decide(GuardDecision::Rollback);
+                true
+            }
+            _ => match TransactionCommand::parse(id) {
+                Some(command) => {
+                    self.request_transaction(command);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// 关闭、断开或安装更新前，把活动事务纳入保护。
+    ///
+    /// 返回 true 表示流程被拦下：有活动事务就打开逐连接的选择层；存在结果未知的事务时直接中止，
+    /// 要求先独立核对——未知状态不提供“直接离开”的旁路。
+    pub fn open_transaction_guard(&mut self, cause: GuardCause, facts: Vec<GuardFact>) -> bool {
+        if let Some(unknown) = facts.iter().find(|fact| fact.state == TransactionState::Unknown) {
+            self.notice_key = Some("transaction.guard.unknown");
+            self.notice_detail = unknown.connection_name.clone();
+            self.transaction_guard = None;
+            return true;
+        }
+        let mut blocked: Vec<GuardFact> = facts.into_iter().filter(|fact| fact.state != TransactionState::Idle).collect();
+        if blocked.is_empty() {
+            return false;
+        }
+        let current = blocked.remove(0);
+        let disconnect = (cause == GuardCause::Disconnect).then(|| current.connection_id.clone());
+        self.transaction_guard = Some(TransactionGuard { cause, current, queue: blocked, pending: None, busy: false, error: None, disconnect });
+        true
+    }
+
+    pub fn guard_open(&self) -> bool {
+        self.transaction_guard.is_some()
+    }
+
+    fn guard_decide(&mut self, decision: GuardDecision) {
+        let denied = self.text("transaction.guard.notAllowed");
+        let Some(guard) = self.transaction_guard.as_mut() else { return };
+        if guard.busy || guard.pending.is_some() {
+            return;
+        }
+        if !guard.allows(decision) {
+            guard.error = Some(denied);
+            return;
+        }
+        guard.busy = true;
+        guard.pending = Some(decision);
+        guard.error = None;
+        let target = guard.current.target();
+        self.transaction_request = Some(TransactionRequest { target, command: decision.command(), guard: Some(decision) });
+    }
+
+    /// 关闭保护里当前连接的结果。`Pending` 表示还要问下一条；`Continue` 是所有连接都确认后
+    /// 要继续的流程；`Stopped` 表示关闭已中止（失败或未知），状态保留给使用者处理。
+    pub fn guard_finished(&mut self, result: Result<TransactionEffect, String>) -> GuardOutcome {
+        let unconfirmed = self.text("transaction.guard.unconfirmed");
+        let Some(guard) = self.transaction_guard.as_mut() else { return GuardOutcome::Pending };
+        match result {
+            Ok(effect) => match guard.accept(effect) {
+                GuardStep::Next => GuardOutcome::Pending,
+                GuardStep::Complete(followup) => {
+                    self.transaction_guard = None;
+                    GuardOutcome::Continue(followup)
+                }
+                GuardStep::Mismatch => {
+                    guard.busy = false;
+                    guard.pending = None;
+                    guard.error = Some(unconfirmed);
+                    GuardOutcome::Stopped
+                }
+            },
+            Err(message) => {
+                guard.busy = false;
+                guard.pending = None;
+                guard.error = Some(message);
+                GuardOutcome::Stopped
+            }
         }
     }
 

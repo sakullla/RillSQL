@@ -12,6 +12,7 @@ mod menus;
 mod model;
 pub(crate) mod nav;
 mod overview;
+pub(crate) mod transaction;
 mod update;
 mod view;
 

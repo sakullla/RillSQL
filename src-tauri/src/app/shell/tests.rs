@@ -13763,3 +13763,257 @@ fn tab_rename_confirms_when_the_input_loses_focus(cx: &mut gpui_kit::TestAppCont
     assert!(!found, "输入框不再显示");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// 共享事务控件（ADR-5）：查询、网格与结构工作区共用同一行；开始在查询标签，提交也从同一条
+/// 快照推进。这里用真实 SQLite 连接验证动作 id、保存点入口和跨入口一致性。
+#[gpui_kit::test]
+fn the_shared_transaction_bar_begins_commits_and_reads_one_snapshot(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.open_bound_query("SELECT 1".into(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let find = |cx: &mut gpui_kit::TestAppContext, id: &'static str| {
+        cx.update_window(window, |_, window, _| window.try_find(id).is_some()).unwrap()
+    };
+    assert!(find(cx, "transaction-bar"), "查询工作区有共享事务条");
+    assert!(find(cx, "tx-begin"), "自动提交下可以开始事务");
+    assert!(!find(cx, "tx-commit"), "没有活动事务时不显示提交");
+    assert!(find(cx, "tx-isolation-menu"), "隔离级别入口可到达");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("tx-isolation-menu", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(find(cx, "transaction-setting-menu"), "隔离级别选项展开");
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("tx-begin", cx));
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active)
+        }),
+        "开始事务落到共享快照"
+    );
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(find(cx, "tx-commit"), "活动事务显示提交入口");
+    assert!(!find(cx, "tx-begin"), "活动事务不再显示开始入口，部分回滚用保存点");
+
+    // 同连接再开一个业务标签：它读到的是同一份共享快照（R2、R5）。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.open_bound_query(String::new(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+        });
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(find(cx, "tx-commit"), "另一个同连接标签仍显示活动事务");
+
+    // 关闭其中一个标签只清掉这个标签，不结束连接事务（R11）。
+    let second = cx.update(|cx| view.read(cx).model.active_tab.clone()).expect("第二个查询标签");
+    cx.update(|cx| view.update(cx, |view, cx| { view.model.request_close_tab(&second); cx.notify(); }));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(find(cx, "tx-commit"), "关闭标签后其他标签仍显示并操作同一事务");
+    assert_eq!(
+        cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state)),
+        Some(crate::transaction::TransactionState::Active),
+        "关闭标签不结束连接事务"
+    );
+
+    // 保存点入口可达：菜单里给出新建保存点，创建后共享快照记下名称。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("tx-savepoint-menu", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(find(cx, "transaction-savepoint-menu"), "保存点菜单展开");
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("tx-savepoint-create:sp1", cx));
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.savepoints.iter().any(|name| name.as_str() == "sp1"))
+        }),
+        "保存点创建登记到共享快照"
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("tx-commit", cx));
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Idle)
+        }),
+        "提交结束共享事务"
+    );
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(find(cx, "tx-begin"), "提交后回到自动提交入口");
+    assert!(!find(cx, "tx-commit"), "提交后不再显示提交");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 查询结果头按语句显示事务效果：手写 BEGIN 的结局只属于这一条语句（R3、R5）。
+#[gpui_kit::test]
+fn the_query_head_shows_the_statement_transaction_effect(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.open_bound_query("BEGIN".into(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+            view.perform("execute-query", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active)
+                && view.model.active_tab().is_some_and(|tab| !tab.running)
+        }),
+        "手写 BEGIN 执行完成"
+    );
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| window.try_find("query-statement-transaction").is_some()).unwrap(),
+        "结果头显示这条语句的事务效果"
+    );
+    // 收尾：回滚，避免把活动事务留给后面的用例。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-rollback", cx)));
+    assert!(pump_until(cx, window, &view, |view, _| {
+        view.services
+            .connections
+            .transaction_snapshot("notes")
+            .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Idle)
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 未知事务不提供“直接离开”：关闭被拦下，保护层不打开可绕过的按钮（R10、R11）。
+#[gpui_kit::test]
+fn an_unknown_transaction_blocks_closing_without_an_escape_hatch(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.open_bound_query(String::new(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let coordinator = view.services.connections.transaction_coordinator("notes").expect("协调器");
+            use crate::transaction::{ControlOutcome, ControlStatement, UnknownReason};
+            coordinator.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+            coordinator
+                .acknowledge(
+                    &ControlStatement::Commit { chain: false },
+                    ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
+                )
+                .unwrap();
+            assert_eq!(
+                view.services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state),
+                Some(crate::transaction::TransactionState::Unknown)
+            );
+        });
+    });
+    let allowed = cx.update(|cx| view.update(cx, |view, cx| view.allow_close(cx)));
+    assert!(!allowed, "结果未知时关闭必须中止");
+    assert!(cx.update(|cx| view.read(cx).model.transaction_guard.is_none()), "未知状态不打开提交/回滚对话框");
+    assert_eq!(
+        cx.update(|cx| view.read(cx).model.notice_key),
+        Some("transaction.guard.unknown"),
+        "界面说明为什么不能关闭"
+    );
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 退出保护（R11）：有活动事务时先逐连接要求取消、提交后继续或回滚后继续；
+/// 取消保持原状，回滚确认后才回到原有的草稿关闭守卫。
+#[gpui_kit::test]
+fn quitting_with_an_active_transaction_asks_first_and_only_continues_after_rollback(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.model.open_bound_query("SELECT 1".into(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("tx-begin", cx));
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| {
+        view.services
+            .connections
+            .transaction_snapshot("notes")
+            .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active)
+    }));
+
+    let allowed = cx.update(|cx| view.update(cx, |view, cx| view.allow_close(cx)));
+    assert!(!allowed, "活动事务必须先处理，不能直接退出");
+    let guard = cx.update(|cx| view.read(cx).model.transaction_guard.clone()).expect("事务保护层");
+    assert_eq!(guard.current.connection_id, "notes");
+    assert!(cx.update_window(window, |_, window, cx| { window.render_frame(cx); window.try_find("transaction-guard-dialog").is_some() }).unwrap());
+
+    // 取消：会话与事务保持原状。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-guard-cancel", cx)));
+    assert!(cx.update(|cx| view.read(cx).model.transaction_guard.is_none()));
+    assert_eq!(
+        cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state)),
+        Some(crate::transaction::TransactionState::Active)
+    );
+
+    // 断开连接同样先处理事务：取消后连接与事务都不动。
+    cx.update(|cx| view.update(cx, |view, _| view.model.connections.selected = Some("notes".into())));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("conn-disconnect", cx)));
+    let guard = cx.update(|cx| view.read(cx).model.transaction_guard.clone()).expect("断开前的事务保护层");
+    assert_eq!(guard.cause, super::transaction::GuardCause::Disconnect);
+    assert_eq!(guard.current.connection_id, "notes");
+    assert_eq!(
+        cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state)),
+        Some(crate::transaction::TransactionState::Active),
+        "提示期间事务仍然活动"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-guard-cancel", cx)));
+    assert!(cx.update(|cx| view.read(cx).model.transaction_guard.is_none()));
+
+    // 再次退出并选择回滚后继续：只有回滚确认才走到原来的关闭守卫。
+    let allowed = cx.update(|cx| view.update(cx, |view, cx| view.allow_close(cx)));
+    assert!(!allowed);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-guard-rollback", cx)));
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.transaction_guard.is_none()),
+        "回滚确认后事务保护层结束"
+    );
+    assert_eq!(
+        cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state)),
+        Some(crate::transaction::TransactionState::Idle)
+    );
+    assert!(cx.update(|cx| view.read(cx).model.transaction_guard.is_none()), "确认后不再有事务保护层");
+    assert!(
+        cx.update(|cx| view.read(cx).model.close_prompt.is_some()),
+        "事务处理完后回到原有的草稿关闭守卫，不替用户直接退出"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+

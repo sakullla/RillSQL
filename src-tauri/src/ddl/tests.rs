@@ -513,7 +513,8 @@ fn ddl_commands_stay_registered_beside_existing_commands() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let structure = fs::read_to_string(root.join("src/app/views/structure/mod.rs")).unwrap();
     assert!(structure.contains("application::ddl::preview_request("));
-    assert!(structure.contains("application::ddl::execute_request("));
+    // T5 起结构执行走带回执事务信息的入口：应用/提交/隐式提交必须在界面分开说明。
+    assert!(structure.contains("application::ddl::execute_request_tracked("));
     let query = fs::read_to_string(root.join("src/app/views/query/mod.rs")).unwrap();
     assert!(query.contains("query::commands::start_run("));
     assert!(query.contains("query::commands::poll_run("));

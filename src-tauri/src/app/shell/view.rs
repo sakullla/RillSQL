@@ -30,7 +30,9 @@ use crate::ui::Foundation;
 use super::jobs::{self, apply_done, job_request};
 use super::menus::NavKey;
 use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
+use super::transaction::{GuardCause, GuardFact, GuardFollowup, GuardOutcome, TransactionRequest};
 use crate::app::Shell;
+use crate::transaction::{TransactionEffect, TransactionState};
 
 #[derive(PartialEq, Eq)]
 enum ExchangeStamp {
@@ -64,7 +66,7 @@ pub struct Workbench {
     applied_diagram: Option<String>,
     applied_redis: Option<String>,
     applied_mongo: Option<String>,
-    services: Arc<AppServices>,
+    pub(super) services: Arc<AppServices>,
     pub(super) focus: FocusHandle,
     /// 对象树自己的焦点；点击树行后方向键归树，离开时归还编辑器。
     pub(super) nav_focus: FocusHandle,
@@ -95,6 +97,10 @@ pub struct Workbench {
     /// 应用内更新的后台任务（检查、下载、安装）与启动后的延迟检查：持有句柄，随视图在界面线程上释放。
     update_task: Option<gpui_kit::Task<()>>,
     update_timer: Option<gpui_kit::Task<()>>,
+    /// 正在执行的一条事务命令；同一时刻只排一条，执行期间控件显示忙碌。
+    transaction_task: Option<gpui_kit::Task<()>>,
+    /// 轮询兜底：每条连接上一次看到的共享事务快照修订；变化时通知各业务页重绘同一状态。
+    transaction_revisions: std::collections::BTreeMap<String, u64>,
     /// 状态栏提示的时效：同一句提示显示一段时间后自动退场，不让“已连接”“清空历史？”一直挂着。
     pub(super) notice_seen: (Option<&'static str>, String),
     pub(super) notice_since: std::time::Instant,
@@ -257,6 +263,14 @@ impl Workbench {
             }
         });
         table.update(cx, |pane, _| pane.set_menu_sink(Arc::clone(&grid_menu)));
+        // 网格里的“提交事务”与顶部事务条同一条命令：状态只由外壳推进。
+        let transaction_owner = cx.entity().downgrade();
+        let transaction_sink: crate::app::views::grid::CommandSink = Arc::new(move |id: &str, cx: &mut App| {
+            if let Some(owner) = transaction_owner.upgrade() {
+                owner.update(cx, |view, cx| view.perform(id, cx));
+            }
+        });
+        table.update(cx, |pane, _| pane.set_transaction_sink(Arc::clone(&transaction_sink)));
         query.update(cx, |pane, cx| pane.set_grid_menu_sink(grid_menu, cx));
         // 编辑器里 Ctrl/⌘+点击对象的出口：查询页只解析出对象，树定位和结构页由外壳负责。
         let definition_owner = cx.entity().downgrade();
@@ -424,6 +438,8 @@ impl Workbench {
             applied_redis: None,
             applied_mongo: None,
             services,
+            transaction_task: None,
+            transaction_revisions: std::collections::BTreeMap::new(),
             focus: cx.focus_handle().tab_stop(true),
             nav_focus: cx.focus_handle().tab_stop(true),
             overview_focus: cx.focus_handle(),
@@ -530,6 +546,16 @@ impl Workbench {
         if id == "menu-results" {
             self.model.results_menu = self.query.read(cx).results_menu_facts();
         }
+        // 事务保护：断开只处理这一条连接；安装更新前处理所有未结束事务。
+        if id == "conn-disconnect" {
+            let selected = self.model.connections.selected.clone();
+            if self.begin_transaction_guard(GuardCause::Disconnect, selected.as_deref(), cx) {
+                return;
+            }
+        }
+        if id == "update-install" && self.begin_transaction_guard(GuardCause::Update, None, cx) {
+            return;
+        }
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
         if self.model.gate_on_demand(id) {
@@ -573,7 +599,7 @@ impl Workbench {
             return;
         }
         if id == "quit-window" {
-            if self.model.allow_system_close() {
+            if self.allow_close(cx) {
                 cx.quit();
             }
             cx.notify();
@@ -2358,6 +2384,15 @@ impl Workbench {
                 return;
             }
         };
+        if !self.transaction_facts(None).is_empty() {
+            // 下载期间开始了新事务：安装会终止会话，必须先把事务处理完再重试安装。
+            let text = self.model.text("transaction.guard.blocksUpdate");
+            self.model.update.fail(text);
+            self.model.notice_key = Some("transaction.guard.blocksUpdate");
+            self.model.notice_detail.clear();
+            cx.notify();
+            return;
+        }
         if self.model.request_update_install().is_err() {
             return;
         }
@@ -2415,7 +2450,7 @@ impl Workbench {
         let Some(mut command) = crate::release::check::relaunch_command(&self.model.update_route) else {
             return;
         };
-        if !self.model.allow_system_close() {
+        if !self.allow_close(cx) {
             return;
         }
         self.persist_if_needed(cx);
@@ -2425,8 +2460,184 @@ impl Workbench {
         }
     }
 
-    fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
-        let connected: std::collections::BTreeSet<String> = self
+    // ---------------------------------------------------------- 共享事务（ADR-5）
+
+    /// 已打开连接里还有未结束事务或结果未知的那些，供关闭保护逐条询问。
+    /// 事实从连接服务的共享快照读，不从标签或页面本地推断。
+    fn transaction_facts(&self, only: Option<&str>) -> Vec<GuardFact> {
+        let mut known: Vec<(String, String, String, String)> = self
+            .model
+            .connections
+            .rows
+            .iter()
+            .map(|row| {
+                let saved = &row.saved;
+                (saved.id.clone(), saved.name.clone(), saved.engine.as_str().to_owned(), saved.database.clone().unwrap_or_default())
+            })
+            .collect();
+        for tab in &self.model.tabs {
+            let (Some(id), Some(engine)) = (&tab.connection_id, &tab.engine) else { continue };
+            if known.iter().any(|(known_id, ..)| known_id == id) {
+                continue;
+            }
+            known.push((id.clone(), tab.connection_name.clone().unwrap_or_default(), engine.clone(), tab.database.clone().unwrap_or_default()));
+        }
+        known
+            .into_iter()
+            .filter(|(connection_id, ..)| only.is_none_or(|wanted| wanted == connection_id))
+            .filter_map(|(connection_id, connection_name, engine, database)| {
+                if !crate::adapters::is_relational_named(&engine) {
+                    return None;
+                }
+                let snapshot = self.services.connections.transaction_snapshot(&connection_id)?;
+                if snapshot.state == TransactionState::Idle {
+                    return None;
+                }
+                Some(GuardFact { connection_id, connection_name, engine, database, state: snapshot.state })
+            })
+            .collect()
+    }
+
+    /// 关闭/断开/更新前的事务保护。返回 true 表示流程已被拦下（对话框已打开或未知阻止关闭）。
+    fn begin_transaction_guard(&mut self, cause: GuardCause, only: Option<&str>, cx: &mut Context<Self>) -> bool {
+        // 对话框已经打开：重复的关闭/断开请求不再重置当前进度。
+        if self.model.guard_open() {
+            return true;
+        }
+        let facts = self.transaction_facts(only);
+        let blocked = self.model.open_transaction_guard(cause, facts);
+        if blocked {
+            self.persist_if_needed(cx);
+            cx.notify();
+        }
+        blocked
+    }
+
+    /// 共享事务控件是否正在执行一条命令（与顶部事务条的忙碌状态同源）。
+    pub(super) fn transaction_busy(&self) -> bool {
+        self.model.transactions.busy || self.transaction_task.is_some()
+    }
+
+    /// 窗口关闭与“退出”动作：先处理未结束事务，再走原有草稿/暂存守卫。
+    pub(super) fn allow_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.begin_transaction_guard(GuardCause::Quit, None, cx) {
+            return false;
+        }
+        self.model.allow_system_close()
+    }
+
+    /// 取走并执行一条事务命令；结果写回共享控件，关闭保护会按结果决定是否继续。
+    fn pump_transactions(&mut self, cx: &mut Context<Self>) {
+        if self.transaction_task.is_some() {
+            return;
+        }
+        let Some(request) = self.model.transaction_request.take() else { return };
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        self.transaction_task = Some(cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let target = request.target.clone();
+            let command = request.command.clone();
+            jobs::runtime().spawn(async move {
+                let result = super::transaction::execute(&services.connections, &target, &command).await;
+                let _ = tx.send(result);
+            });
+            let result = rx.await.unwrap_or_else(|_| Err("事务命令没有完成".to_owned()));
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    this.transaction_task = None;
+                    this.finish_transaction(request, result, cx);
+                });
+            });
+        }));
+    }
+
+    /// 一条事务命令的结果：先写控件回执，再由关闭保护或业务页消费。
+    fn finish_transaction(&mut self, request: TransactionRequest, result: Result<TransactionEffect, String>, cx: &mut Context<Self>) {
+        match &result {
+            Ok(effect) => {
+                let key = super::transaction::command_effect_key(&request.command, *effect);
+                self.model.transactions.note(*effect, key, String::new());
+            }
+            Err(message) => self.model.transactions.note_error(message.clone()),
+        }
+        // 事务结束后业务结果与目录代次都要更新；活动事务里的中间结果不需要重读。
+        if let Ok(effect) = result {
+            self.refresh_after_transaction(&request, effect, cx);
+        }
+        if request.guard.is_some() {
+            match self.model.guard_finished(result) {
+                GuardOutcome::Continue(followup) => self.after_guard(followup, cx),
+                GuardOutcome::Pending => {}
+                // 失败或未知：关闭已中止，保护层与共享快照一起保留在界面上。
+                GuardOutcome::Stopped => {
+                    self.persist_if_needed(cx);
+                }
+            }
+        }
+        cx.notify();
+        self.settle(cx);
+    }
+
+    /// 所有连接都确认结束后继续原来的流程。只有确认成功才会走到这里。
+    fn after_guard(&mut self, followup: GuardFollowup, cx: &mut Context<Self>) {
+        match followup {
+            GuardFollowup::Quit => {
+                if self.model.allow_system_close() {
+                    cx.quit();
+                }
+            }
+            GuardFollowup::Update => self.perform("update-install", cx),
+            GuardFollowup::Disconnect(id) => {
+                if self.model.connections.selected.as_deref() == Some(id.as_str()) {
+                    self.model.enqueue(PendingJob::Disconnect);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 提交/回滚/隐式提交之后：同连接的表数据与结构页重读，目录刷新；未应用草稿保持原样。
+    fn refresh_after_transaction(&mut self, request: &TransactionRequest, effect: TransactionEffect, cx: &mut Context<Self>) {
+        if !effect.ends_transaction() {
+            return;
+        }
+        let connection = request.target.connection_id.clone();
+        self.table.update(cx, |pane, cx| pane.transaction_settled(&connection, cx));
+        self.structure.update(cx, |pane, cx| {
+            pane.transaction_settled(&connection);
+            cx.notify();
+        });
+        self.model.request_nav_refresh(Some(connection.clone()));
+        self.pump_nav(cx);
+    }
+
+    /// 轮询与命令之后的兜底：共享快照修订一变，三个业务页都按同一份状态重绘。
+    fn sync_transaction_views(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut ids: std::collections::BTreeSet<String> = self.model.connections.rows.iter().map(|row| row.saved.id.clone()).collect();
+        ids.extend(self.model.tabs.iter().filter_map(|tab| tab.connection_id.clone()));
+        let mut changed = false;
+        for id in ids {
+            match self.services.connections.transaction_snapshot(&id) {
+                Some(snapshot) => {
+                    if self.transaction_revisions.get(&id) != Some(&snapshot.revision) {
+                        self.transaction_revisions.insert(id, snapshot.revision);
+                        changed = true;
+                    }
+                }
+                None => changed |= self.transaction_revisions.remove(&id).is_some(),
+            }
+        }
+        if changed {
+            self.query.update(cx, |_, cx| cx.notify());
+            self.table.update(cx, |_, cx| cx.notify());
+            self.structure.update(cx, |_, cx| cx.notify());
+        }
+        changed
+    }
+
+    fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {        let connected: std::collections::BTreeSet<String> = self
             .model
             .connections
             .status
@@ -2530,9 +2741,8 @@ impl Workbench {
                     // 关窗判断前先按最新的子页面状态整理一次（导出、对比、网格暂存都在里面）。
                     this.settle(cx);
                     this.refresh_exchange(cx);
-                    slot.set(this.model.allow_system_close());
-                    cx.notify();
-                });
+                    slot.set(this.allow_close(cx));
+                    cx.notify();                });
             }
             allow.get()
         });
@@ -3360,6 +3570,8 @@ impl Workbench {
         self.boot_state(cx);
         self.monitor_connections(cx);
         self.pump_jobs(cx);
+        self.pump_transactions(cx);
+        self.sync_transaction_views(cx);
         self.pump_nav(cx);
         self.pump_danger(cx);
         self.pump_update(cx);

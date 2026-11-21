@@ -96,6 +96,25 @@ pub type MenuSink = Arc<dyn Fn(gpui_kit::Point<gpui_kit::Pixels>, &mut App)>;
 /// 表数据页切换到表结构页的出口签名。
 pub type ActionSink = Arc<dyn Fn(&mut App)>;
 
+/// 页面把事务控件动作交回外壳的出口签名：与顶部共享事务条走同一个 `perform`。
+pub type CommandSink = Arc<dyn Fn(&str, &mut App)>;
+
+/// 活动事务里网格的主操作是“应用变更”，不是“预览并提交变更”：最终提交只由事务控件完成（R4）。
+fn review_label_key(in_transaction: bool) -> &'static str {
+    if in_transaction { "grid.changes.apply" } else { "grid.changes.review" }
+}
+
+/// 一次网格写入的回执文案：应用与最终提交必须分开说（R4）。
+fn commit_notice(report: &crate::grid::commands::CommitDto, locale: Locale) -> String {    match report.effect {
+        crate::transaction::TransactionEffect::ImplicitCommit => i18n::text(locale, "grid.commit.implicitCommit").to_owned(),
+        crate::transaction::TransactionEffect::Unknown => i18n::text(locale, "grid.commit.unknown").to_owned(),
+        crate::transaction::TransactionEffect::Aborted => i18n::text(locale, "grid.commit.aborted").to_owned(),
+        _ if report.applied_not_committed => i18n::text(locale, "grid.commit.appliedNotCommitted").to_owned(),
+        _ if report.committed => i18n::text(locale, "grid.commit.committed").to_owned(),
+        _ => report.failed.as_ref().map(|failed| failed.message.clone()).unwrap_or_default(),
+    }
+}
+
 /// 查看阶段里的 Preview 不等于截断。完整原值保持可编辑；真预览在读完原值前锁定。
 fn truncation_for_open_cell(phase: CellPhase, truncated: bool, total_bytes: u64, can_load_full: bool, error: &str) -> TruncationState {
     match phase {
@@ -212,6 +231,8 @@ pub struct GridPane {
     /// 最近一次右键的落点（单元格或行头）；外壳取菜单事实时读它。
     menu_area: GridMenuArea,
     structure_sink: Option<ActionSink>,
+    /// 事务控件动作的出口：外壳执行同一条命令，页面不自己驱动事务状态。
+    transaction_sink: Option<CommandSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
     /// 右侧纵向记录视图是否打开；它始终显示网格的焦点行。
@@ -408,6 +429,7 @@ impl GridPane {
             menu_sink: None,
             menu_area: GridMenuArea::Cell,
             structure_sink: None,
+            transaction_sink: None,
             pending_viewer: false,
             record_open: false,
             side_width: RECORD_SIDE_DEFAULT,
@@ -469,6 +491,11 @@ impl GridPane {
     /// 切换到当前对象的表结构视图，由外壳注入。
     pub fn set_structure_sink(&mut self, sink: ActionSink) {
         self.structure_sink = Some(sink);
+    }
+
+    /// 网格里的“提交事务”等动作交回外壳：事务状态只由共享快照推进。
+    pub fn set_transaction_sink(&mut self, sink: CommandSink) {
+        self.transaction_sink = Some(sink);
     }
 
     /// 表结构在结构页刚执行变更后：丢掉列结构缓存，切回表数据时重新读取最新列清单。
@@ -660,6 +687,23 @@ impl GridPane {
 
     pub fn uncommitted(&self) -> bool {
         self.session.uncommitted()
+    }
+
+    /// 提交或回滚事务之后：同连接的表数据重读；未应用的本地草稿原样保留并说明，
+    /// 不把草稿描述成数据库变更（R4、R5）。
+    pub fn transaction_settled(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        if self.session.target.connection_id != connection_id {
+            return;
+        }
+        if self.session.uncommitted() {
+            self.notice = i18n::text(self.locale, "grid.tx.draftsKept").to_owned();
+            cx.notify();
+            return;
+        }
+        if self.session.mode == GridMode::Table && self.live_target() {
+            self.fetch_current(true, cx);
+        }
+        cx.notify();
     }
 
     /// 首屏或替换读取仍在进行；旧快照不能当成本表的数据源。
@@ -1601,14 +1645,18 @@ impl GridPane {
     }
 
     /// 一次按定位读取完整值：读到就缓存，失败保留原因并可重试；两处都不写预览。
+    ///
+    /// 读取走业务会话并持有串行租约：同连接未提交的修改必须能被看到，不能退回元数据会话（R2）。
     fn start_full_reads(&mut self, reads: Vec<FullRead>, pending: Option<PendingFull>, cx: &mut Context<Self>) {
         if reads.is_empty() {
             return;
         }
         let schema = self.session.schema().cloned();
-        let session = self.services.connections.catalog_session(&self.session.target.connection_id);
-        let Some(connection) = session else {
-            let reason = i18n::text(self.locale, "grid.value.noConnection");
+        let connection_id = self.session.target.connection_id.clone();
+        // 连接没打开时同步失败：界面立刻说明原因，不排一个必然失败的后台读取。
+        // 这里只检查会话是否存在，真正的值仍从业务会话读取（R2）。
+        if self.services.connections.catalog_session(&connection_id).is_none() {
+            let reason = i18n::text(self.locale, "grid.value.noConnection").to_owned();
             for read in &reads {
                 self.session.fail_full(read, &reason);
             }
@@ -1617,20 +1665,33 @@ impl GridPane {
             self.sync_table(cx);
             cx.notify();
             return;
-        };
+        }
+        let no_schema = "没有读到表结构，无法按定位读取完整值".to_owned();
+        let no_connection = i18n::text(self.locale, "grid.value.noConnection").to_owned();
+        let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             runtime().spawn(async move {
-                let mut results = Vec::new();
-                for read in reads {
-                    let locator = read.locator.iter().map(|(name, value)| (name.clone(), cell_of(value.clone()))).collect::<Vec<_>>();
-                    let result = match &schema {
-                        Some(schema) => crate::grid::read_full_cell(&connection, schema, &locator, &read.column_name).await,
-                        None => Err("没有读到表结构，无法按定位读取完整值".to_owned()),
-                    };
-                    results.push((read, result));
-                }
+                let results = match services.connections.query_session(&connection_id).await {
+                    Ok(Some(query)) => {
+                        let lease = query.lease;
+                        let mut results = Vec::new();
+                        for read in reads {
+                            let locator = read.locator.iter().map(|(name, value)| (name.clone(), cell_of(value.clone()))).collect::<Vec<_>>();
+                            let result = match &schema {
+                                Some(schema) => crate::grid::read_full_cell(&query.session, schema, &locator, &read.column_name).await,
+                                None => Err(no_schema.clone()),
+                            };
+                            results.push((read, result));
+                        }
+                        // 读取结束才释放租约：不在一次读取中间把业务连接交给别的批次。
+                        drop(lease);
+                        results
+                    }
+                    Ok(None) => reads.into_iter().map(|read| (read, Err(no_connection.clone()))).collect(),
+                    Err(message) => reads.into_iter().map(|read| (read, Err(message.clone()))).collect(),
+                };
                 let _ = tx.send(results);
             });
             if let Ok(results) = rx.await {
@@ -2557,7 +2618,10 @@ impl GridPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             match result {
-                                Ok(report) => this.session.apply_commit(&report),
+                                Ok(report) => {
+                                    this.session.apply_commit(&report);
+                                    this.notice = commit_notice(&report, this.locale);
+                                }
                                 Err(message) => this.session.keep_failure(&message),
                             }
                             this.sync_table(cx);
@@ -3791,6 +3855,23 @@ impl GridPane {
                 });
             }
         };
+        // 活动事务里这次只把变更加入当前事务：按钮与提示都改述为“应用”，最终提交由事务控件完成。
+        let in_transaction = self
+            .services
+            .connections
+            .transaction_snapshot(&self.session.target.connection_id)
+            .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active);
+        let apply_label = t(review_label_key(in_transaction));
+        let mut apply = kit::primary_button("grid-preview", Some(IconName::Eye), apply_label, preview);
+        if in_transaction {
+            apply = apply.tooltip(t("grid.changes.applyHint"));
+        }
+        let commit = self.transaction_sink.clone().filter(|_| in_transaction).map(|sink| {
+            kit::secondary_button("grid-commit-transaction", Some(IconName::Check), t("transaction.action.commit"), move |_, _, cx| {
+                sink(crate::app::shell::transaction::COMMIT, cx);
+            })
+            .tooltip(t("grid.tx.hint"))
+        });
         Some(
             div()
                 .id("grid-staged-summary")
@@ -3816,7 +3897,8 @@ impl GridPane {
                 .child(kit::icon_button("grid-undo-cell", IconName::Undo2, t("grid.write.undoCell"), pane_click(entity, "grid-undo-cell")))
                 .child(kit::icon_button("grid-undo-row", IconName::RotateCcw, t("grid.write.undoRow"), pane_click(entity, "grid-undo-row")))
                 .child(kit::tool_button("grid-discard", Some(IconName::X), t("grid.changes.discard"), pane_click(entity, "grid-discard")))
-                .child(kit::primary_button("grid-preview", Some(IconName::Eye), t("grid.changes.review"), preview))
+                .child(apply)
+                .children(commit)
                 .into_any_element(),
         )
     }
@@ -10511,5 +10593,66 @@ mod filter_ui_tests {
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+// ---------------------------------------------------------------- 网格事务回执（ADR-5）
+
+#[cfg(test)]
+mod transaction_receipt_tests {
+    use super::*;
+    use crate::transaction::TransactionEffect;
+
+    fn report(effect: TransactionEffect) -> crate::grid::commands::CommitDto {
+        crate::grid::commands::CommitDto {
+            applied: Vec::new(),
+            failed: None,
+            pending_ids: Vec::new(),
+            rolled_back: false,
+            rule: String::new(),
+            effect,
+            transaction: None,
+            applied_not_committed: false,
+            committed: false,
+        }
+    }
+
+    #[test]
+    fn the_review_action_is_worded_as_apply_inside_a_transaction() {
+        assert_eq!(review_label_key(false), "grid.changes.review");
+        assert_eq!(review_label_key(true), "grid.changes.apply");
+        for locale in [Locale::ZhCn, Locale::En] {
+            let idle = i18n::text(locale, review_label_key(false));
+            let active = i18n::text(locale, review_label_key(true));
+            assert_ne!(idle, active, "活动事务里的主操作必须与普通提交改述不同");
+        }
+        assert!(i18n::text(Locale::ZhCn, review_label_key(true)).contains("应用"));
+        assert!(i18n::text(Locale::En, review_label_key(true)).contains("Apply"));
+        assert!(i18n::text(Locale::En, "grid.tx.hint").contains("not committing"));
+    }
+
+    #[test]
+    fn the_grid_receipt_separates_applied_from_committed() {
+        let mut applied = report(TransactionEffect::StillActive);        applied.applied_not_committed = true;
+        assert!(commit_notice(&applied, Locale::ZhCn).contains("尚未提交"), "应用不等于提交");
+        assert!(commit_notice(&applied, Locale::En).contains("not committed"));
+
+        let mut committed = report(TransactionEffect::Unchanged);
+        committed.committed = true;
+        assert!(commit_notice(&committed, Locale::En).contains("committed"));
+        assert!(!commit_notice(&committed, Locale::En).contains("not committed"), "自动提交下不提示未提交");
+
+        let implicit = report(TransactionEffect::ImplicitCommit);
+        assert!(commit_notice(&implicit, Locale::En).contains("implicitly committed"));
+        let unknown = report(TransactionEffect::Unknown);
+        assert!(commit_notice(&unknown, Locale::En).contains("cannot be confirmed"));
+        let aborted = report(TransactionEffect::Aborted);
+        assert!(commit_notice(&aborted, Locale::En).contains("aborted"));
+
+        let failed = crate::grid::commands::CommitDto {
+            failed: Some(crate::grid::commands::FailedDto { id: "c1".into(), sql: String::new(), label: String::new(), message: "boom".into() }),
+            ..report(TransactionEffect::StillActive)
+        };
+        assert_eq!(commit_notice(&failed, Locale::ZhCn), "boom", "失败原因原样显示");
     }
 }

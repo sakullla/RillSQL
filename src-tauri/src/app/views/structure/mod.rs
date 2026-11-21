@@ -386,6 +386,21 @@ impl Note {
     }
 }
 
+/// 执行回执里的事务说明：应用、最终结果与隐式提交分开说（R4、R9）。
+fn execution_note(executed: &crate::application::ddl::Executed) -> Note {
+    if executed.implicit_commit {
+        Note::Key("structure.execute.implicitCommit")
+    } else if executed.applied_not_committed {
+        Note::Key("structure.execute.appliedNotCommitted")
+    } else if executed.committed {
+        Note::Key("structure.execute.committed")
+    } else if let Some(note) = executed.transaction_note.clone().filter(|note| !note.trim().is_empty()) {
+        Note::Raw(vec![note])
+    } else {
+        Note::Key("structure.preview.done")
+    }
+}
+
 pub struct StructureSession {
     pub target: GridTarget,
     pub mode: StructureMode,
@@ -1177,7 +1192,7 @@ impl StructurePane {
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
-                let result = crate::application::ddl::execute_request(&services.connections, &connection, &request, &sql, true).await;
+                let result = crate::application::ddl::execute_request_tracked(&services.connections, &connection, &request, &sql, true).await;
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
@@ -1191,11 +1206,11 @@ impl StructurePane {
                                 return;
                             }
                             this.session.note = match result {
-                                Ok(receipt) if receipt.blocked.is_empty() => {
+                                Ok(executed) if executed.receipt.blocked.is_empty() => {
                                     this.session.open = false;
                                     this.session.armed = false;
-                                    let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
-                                    if all_ok && !receipt.steps.is_empty() {
+                                    let all_ok = executed.receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
+                                    if all_ok && !executed.receipt.steps.is_empty() {
                                         if let Some(dropped_view) = drop_kind {
                                             this.dropped = Some((this.session.target.clone(), dropped_view));
                                         } else if let Some(new_name) = renamed_to.filter(|name| !name.is_empty()) {
@@ -1222,11 +1237,11 @@ impl StructurePane {
                                             this.reload_after_execute();
                                         }
                                     }
-                                    Note::Key("structure.preview.done")
+                                    execution_note(&executed)
                                 }
-                                Ok(receipt) => {
+                                Ok(executed) => {
                                     this.session.armed = false;
-                                    Note::Raw(receipt.blocked)
+                                    Note::Raw(executed.receipt.blocked)
                                 }
                                 Err(message) => {
                                     this.session.armed = false;
@@ -2276,6 +2291,13 @@ impl StructurePane {
     pub fn retry_after_connect(&mut self, connection_id: &str, cx: &mut Context<Self>) {
         if self.session.target.connection_id == connection_id && !self.load_error.is_empty() {
             self.retry_load(cx);
+        }
+    }
+
+    /// 同连接事务结束后重读结构快照：提交后的真实结构与回滚后的原结构都按数据库重新读取（R4、R5）。
+    pub fn transaction_settled(&mut self, connection_id: &str) {
+        if self.session.target.connection_id == connection_id {
+            self.reload_after_execute();
         }
     }
 
@@ -5285,3 +5307,36 @@ mod create;
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------- 结构事务回执（ADR-5）
+
+#[cfg(test)]
+mod transaction_note_tests {
+    use super::*;
+
+    fn executed(applied_not_committed: bool, committed: bool, implicit_commit: bool) -> crate::application::ddl::Executed {
+        crate::application::ddl::Executed {
+            receipt: crate::ddl::exec::Receipt {
+                blocked: Vec::new(),
+                rule: String::new(),
+                steps: Vec::new(),
+                target: String::new(),
+                rebuild: false,
+            },
+            effect: crate::transaction::TransactionEffect::StillActive,
+            transaction: None,
+            implicit_commit,
+            applied_not_committed,
+            committed,
+            transaction_note: None,
+        }
+    }
+
+    #[test]
+    fn the_structure_receipt_states_apply_commit_and_implicit_commit() {
+        assert_eq!(execution_note(&executed(true, false, false)), Note::Key("structure.execute.appliedNotCommitted"));
+        assert_eq!(execution_note(&executed(false, true, false)), Note::Key("structure.execute.committed"));
+        assert_eq!(execution_note(&executed(false, false, true)), Note::Key("structure.execute.implicitCommit"));
+        assert_eq!(execution_note(&executed(false, false, false)), Note::Key("structure.preview.done"));
+    }
+}

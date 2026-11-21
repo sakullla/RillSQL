@@ -23,7 +23,7 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Metrics, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Space, Tip as _, Radius, TypeScale};
 use crate::ui::tabs::{self, Reveal, TabSpec};
 
 use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
@@ -122,6 +122,10 @@ pub struct QueryPane {
     editor_watch: HashMap<String, gpui_kit::Subscription>,
     /// 每个查询标签本次执行的开始时刻；执行中的结果头显示实时耗时。
     run_clock: HashMap<String, std::time::Instant>,
+    /// 每个查询标签最近一次执行携带的共享事务快照与效果（R3、R5、R9）。
+    run_transactions: HashMap<String, crate::query::commands::TransactionReport>,
+    /// 每个查询标签最近一次执行里每条语句的事务效果（StatementDto.transaction）。
+    run_effects: HashMap<String, Vec<Option<crate::transaction::TransactionEffect>>>,
     /// 执行中按固定间隔重绘耗时；没有执行时自己结束。
     run_ticker: Option<gpui_kit::Task<()>>,
     links: HashMap<String, DraftLink>,
@@ -560,6 +564,8 @@ impl QueryPane {
             editors: HashMap::new(),
             editor_watch: HashMap::new(),
             run_clock: HashMap::new(),
+            run_transactions: HashMap::new(),
+            run_effects: HashMap::new(),
             run_ticker: None,
             links: HashMap::new(),
             grid,
@@ -1329,6 +1335,8 @@ impl QueryPane {
         self.editors.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.editor_watch.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.run_transactions.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.run_effects.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.result_layout.retain(|id, _| ids.iter().any(|keep| keep == id));
@@ -1829,6 +1837,16 @@ impl QueryPane {
     /// 一条执行快照到达界面：中间批次也要立刻落到结果和网格上，
     /// 否则分批读取的行要等到终态才显示。返回 false 表示这次执行已经结束。
     fn apply_run_snapshot(&mut self, ticket: &Ticket, result: Result<RunDto, String>, cx: &mut Context<Self>) -> bool {
+        // 批次携带的同连接共享快照与本次效果：消息/状态标识据此显示事务效果（R3、R5、R9）。
+        let transaction = match &result {
+            Ok(run) => run.transaction.clone(),
+            Err(_) => None,
+        };
+        // 每条语句自己的效果：手写 COMMIT/ROLLBACK/SAVEPOINT 与隐式提交按语句显示。
+        let effects = match &result {
+            Ok(run) => Some(run.statements.iter().map(|statement| statement.transaction).collect::<Vec<_>>()),
+            Err(_) => None,
+        };
         let pending = match &result {
             Ok(run) => {
                 if !self.desk.run_noted(&ticket.tab_id, &run.id) {
@@ -1841,6 +1859,23 @@ impl QueryPane {
         };
         let cancel_text = i18n::text(self.locale, "query.run.cancel");
         self.desk.finish_polled(&self.services.tasks, ticket, result, &cancel_text);
+        match transaction {
+            Some(report) => {
+                self.run_transactions.insert(ticket.tab_id.clone(), report);
+            }
+            None => {
+                self.run_transactions.remove(&ticket.tab_id);
+            }
+        }
+        // 每条语句自己的效果与结果一起落地：中间快照只覆盖已经返回的那几条。
+        match effects {
+            Some(effects) => {
+                self.run_effects.insert(ticket.tab_id.clone(), effects);
+            }
+            None => {
+                self.run_effects.remove(&ticket.tab_id);
+            }
+        }
         self.rebind_grid(cx);
         cx.notify();
         pending
@@ -3511,11 +3546,74 @@ impl QueryPane {
                     .into_any_element(),
             );
         }
+        // 本次执行对共享事务的效果：开始/提交/回滚/隐式提交/中止/未知单独标明，
+        // 与“事务仍然活动”的常态区分开；状态本身仍以顶部共享事务条为准。
+        if let Some(report) = self.desk.active_id().and_then(|id| self.run_transactions.get(id)) {
+            let effect = report.effect.filter(|effect| {
+                !matches!(effect, crate::transaction::TransactionEffect::Unchanged | crate::transaction::TransactionEffect::StillActive)
+            });
+            if let Some(key) = effect.and_then(crate::app::shell::transaction::effect_key) {
+                let color = match effect {
+                    Some(crate::transaction::TransactionEffect::Committed) => p.ok,
+                    Some(crate::transaction::TransactionEffect::ImplicitCommit) => p.warn,
+                    Some(crate::transaction::TransactionEffect::Aborted | crate::transaction::TransactionEffect::Unknown) => p.danger,
+                    _ => p.accent_text,
+                };
+                let state = i18n::text(locale, crate::app::shell::transaction::state_key(report.snapshot.state));
+                items.push(
+                    div()
+                        .id("query-transaction")
+                        .test_support()
+                        .debug_selector(|| "query-transaction".to_owned())
+                        .px(px(Space::SM))
+                        .text_size(px(TypeScale::SM))
+                        .text_color(color)
+                        .tooltip_text(SharedString::from(state))
+                        .child(SharedString::from(i18n::text(locale, key)))
+                        .into_any_element(),
+                );
+            }
+        }
         if let Some(failure) = self.failure_view() {
             // 正在看的就是这条失败语句时，下面的语句面板里已经有“定位到出错位置”：头部只留短状态，不重复按钮。
             let panel_has_jump = self.desk.result_view() != ResultView::Messages
                 && self.desk.shown_result().is_some_and(|shown| statement_failed(shown) && shown.columns.is_empty());
             items.extend(failure_status(failure, !panel_has_jump, locale, p, metrics, entity));
+        }
+        // 当前语句自己的事务效果（手写 COMMIT/ROLLBACK/SAVEPOINT、隐式提交、中止与未知）：
+        // 它和整批效果分开显示，避免把一条语句的结局说成整批的结局。
+        if self.desk.result_view() == ResultView::Current {
+            let statement_effect = self
+                .desk
+                .active_id()
+                .and_then(|id| self.run_effects.get(id))
+                .and_then(|effects| effects.get(self.desk.statement()).copied().flatten())
+                .filter(|effect| {
+                    !matches!(
+                        effect,
+                        crate::transaction::TransactionEffect::Unchanged | crate::transaction::TransactionEffect::StillActive
+                    )
+                });
+            if let Some(key) = statement_effect.and_then(crate::app::shell::transaction::effect_key) {
+                let color = match statement_effect {
+                    Some(crate::transaction::TransactionEffect::Committed) => p.ok,
+                    Some(crate::transaction::TransactionEffect::ImplicitCommit) => p.warn,
+                    Some(crate::transaction::TransactionEffect::Aborted | crate::transaction::TransactionEffect::Unknown) => p.danger,
+                    _ => p.accent_text,
+                };
+                let label = format!("{} · {}", i18n::text(locale, "query.transaction.statement"), i18n::text(locale, key));
+                items.push(
+                    div()
+                        .id("query-statement-transaction")
+                        .test_support()
+                        .debug_selector(|| "query-statement-transaction".to_owned())
+                        .px(px(Space::SM))
+                        .text_size(px(TypeScale::SM))
+                        .text_color(color)
+                        .child(SharedString::from(label))
+                        .into_any_element(),
+                );
+            }
         }
         let note = self.desk.active_note();
         if !note.is_empty() {
