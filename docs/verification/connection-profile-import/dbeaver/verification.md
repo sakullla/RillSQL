@@ -20,7 +20,7 @@
 
 ## Windows 桌面取证
 
-本轮验收的 RillSQL 可执行文件 SHA-256 为 `377a04df07d272a089e98e4a57086002c7a763b097a4a3e04f3f812ae2a02723`。所有以下操作均经原生连接管理页发起，使用独立配置库。
+本轮验收的 RillSQL 可执行文件 SHA-256 为 `377a04df07d272a089e98e4a57086002c7a763b097a4a3e04f3f812ae2a02723`，对应 `43948da` 的 `src-tauri` 源码树 `74b0ce4154c9109d750afcc7aec5e09e13fa586c`。所有以下操作均经原生连接管理页发起，使用独立配置库。
 
 | 桌面操作 | 观测结果 |
 | --- | --- |
@@ -46,4 +46,4 @@
 
 ## Rust 回归覆盖
 
-桌面任务的模型测试以临时 SQLite 触发器构造单条写入失败，断言报告为成功 1、跳过 2、失败 1，随后撤销触发器重试，断言成功 1、跳过 3、失败 0，最终实际新增 2 条。存储层另有跨服务并发、同名改名、已有凭据保护、生产标签失效和失败重试测试。解析层覆盖带密码的 JDBC URL、字段和调试输出脱敏、生产环境的继承限制以及证书和 SSH 设置。[桌面任务测试](../../../../src-tauri/src/app/shell/tests.rs) · [持久化测试](../../../../src-tauri/src/connections/tests.rs) · [DBeaver 解析测试](../../../../src-tauri/src/connections/profile_import/tests.rs)
+桌面任务的模型测试以临时 SQLite 触发器构造单条写入失败，断言报告为成功 1、跳过 2、失败 1，随后撤销触发器重试，断言成功 1、跳过 3、失败 0，最终实际新增 2 条。存储层另有跨服务并发、同名改名、已有凭据保护、生产标签失效和失败重试测试。解析层覆盖带密码的 JDBC URL、字段和调试输出脱敏、生产环境的继承限制以及证书和 SSH 设置。[桌面任务测试](../../../../src-tauri/src/app/shell/tests.rs) · [持久化测试](../../../../src-tauri/src/connections/tests.rs) · [DBeaver 解析测试](../../../../src-tauri/src/adapters/profile_import/tests.rs)

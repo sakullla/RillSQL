@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod ddl;
 pub mod exec;
 pub mod grid;
+pub(crate) mod profile_import;
 pub mod query;
 pub mod registry;
 pub mod session;
