@@ -145,7 +145,9 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
             code: None,
         };
     }
-    if is_disconnect(&message) && is_write(sql) {
+    // 事务控制语句的断连同样无法确认结局：COMMIT/ROLLBACK 可能已经在服务器上执行，
+    // 不能因为 is_write 只覆盖数据写入就把它登记成普通的“语句被拒绝”。
+    if is_disconnect(&message) && (is_write(sql) || split::is_transaction_control(sql)) {
         return StatementStop::Unknown {
             message: format!("连接中断，无法确认写入是否完成。不会自动重放。{message}"),
         };

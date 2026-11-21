@@ -148,6 +148,10 @@ fn is_connection_failure(code: Option<&str>, message: &str) -> bool {
     lower.contains("server has gone away")
         || lower.contains("lost connection")
         || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connection is closed")
+        || lower.contains("forcibly closed")
+        || lower.contains("server closed")
         || lower.contains("broken pipe")
         || lower.contains("connection was killed")
         || lower.contains("server shutdown in progress")
@@ -277,7 +281,7 @@ fn leading_words(body: &str, limit: usize) -> (Vec<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::{classify_control, ControlMatch, ControlStatement, TransactionDialect};
+    use crate::transaction::{classify_control, ControlMatch, ControlOutcome, ControlStatement, StatementFailure, TransactionDialect, UnknownReason};
 
     #[test]
     fn control_sql_uses_mysql_family_vocabulary() {
@@ -361,6 +365,23 @@ mod tests {
         let dialect = MysqlTransaction;
         assert_eq!(dialect.statement_failure(Some("2013"), "Lost connection to MySQL server"), StatementFailure::ConnectionLost);
         assert_eq!(dialect.statement_failure(Some("1064"), "You have an error in your SQL syntax"), StatementFailure::TransactionUsable);
+        // 驱动在“命令已转发、响应前断开”时给出的是 I/O 文本，没有错误码：必须按连接失败处理。
+        for message in [
+            "Input/output error: Input/output error: connection closed",
+            "An existing connection was forcibly closed by the remote host. (os error 10054)",
+            "Server closed connection without sending any data",
+            "Lost connection to MySQL server during query",
+            "MySQL server has gone away",
+        ] {
+            assert_eq!(dialect.statement_failure(None, message), StatementFailure::ConnectionLost, "{message}");
+        }
+        // 控制失败路径：连接丢失必须登记未知；普通 SQL 错误仍是被拒绝。
+        let commit = ControlStatement::Commit { chain: false };
+        assert_eq!(
+            dialect.control_failure(StatementFailure::ConnectionLost, &commit),
+            ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost)
+        );
+        assert_eq!(dialect.control_failure(StatementFailure::TransactionUsable, &commit), ControlOutcome::Rejected);
         assert!(dialect.error_may_have_ended_transaction(Some("1213"), "Deadlock found when trying to get lock"));
         assert!(!dialect.error_may_have_ended_transaction(Some("1205"), "Lock wait timeout exceeded"));
         assert_eq!(dialect.capabilities().duplicate_begin, DuplicateBegin::EndsPrevious);

@@ -1,0 +1,260 @@
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:8:
+ use std::path::{Path, PathBuf};
+ use std::process::ExitCode;
+ 
+[31m-use rillsql_lib::release::{collect_release_assets, inspect_windows_nsis, require_complete_release, windows_nsis_name, PRODUCT_VERSION};
+[0m[32m+use rillsql_lib::release::{
+[0m[32m+    collect_release_assets, inspect_windows_nsis, require_complete_release, windows_nsis_name,
+[0m[32m+    PRODUCT_VERSION,
+[0m[32m+};
+[0m 
+ fn main() -> ExitCode {
+     match run() {
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:15:
+         Ok(()) => ExitCode::SUCCESS,
+         Err(err) => {
+             eprintln!("{err}");
+[31m-            if err.starts_with("incomplete release") { ExitCode::from(3) } else { ExitCode::from(1) }
+[0m[32m+            if err.starts_with("incomplete release") {
+[0m[32m+                ExitCode::from(3)
+[0m[32m+            } else {
+[0m[32m+                ExitCode::from(1)
+[0m[32m+            }
+[0m         }
+     }
+ }
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:46:
+ impl Args {
+     fn parse(values: impl Iterator<Item = String>) -> Result<Self, String> {
+         let mut args = Args {
+[31m-            formats: vec!["nsis".into(), "app".into(), "dmg".into(), "deb".into(), "appimage".into()],
+[0m[31m-            out: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("packager"),
+[0m[32m+            formats: vec![
+[0m[32m+                "nsis".into(),
+[0m[32m+                "app".into(),
+[0m[32m+                "dmg".into(),
+[0m[32m+                "deb".into(),
+[0m[32m+                "appimage".into(),
+[0m[32m+            ],
+[0m[32m+            out: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+[0m[32m+                .join("target")
+[0m[32m+                .join("packager"),
+[0m             check_dir: None,
+             require_complete: false,
+         };
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:58:
+             match arg.as_str() {
+                 "--require-complete" => args.require_complete = true,
+                 "--formats" | "--out" | "--check-dir" => {
+[31m-                    let value = values.get(index + 1).ok_or_else(|| format!("{arg} needs a value"))?;
+[0m[32m+                    let value = values
+[0m[32m+                        .get(index + 1)
+[0m[32m+                        .ok_or_else(|| format!("{arg} needs a value"))?;
+[0m                     match arg.as_str() {
+                         "--formats" => {
+[31m-                            args.formats = value.split(',').filter(|item| !item.is_empty()).map(ToOwned::to_owned).collect();
+[0m[32m+                            args.formats = value
+[0m[32m+                                .split(',')
+[0m[32m+                                .filter(|item| !item.is_empty())
+[0m[32m+                                .map(ToOwned::to_owned)
+[0m[32m+                                .collect();
+[0m                         }
+                         "--out" => args.out = PathBuf::from(value),
+                         "--check-dir" => args.check_dir = Some(PathBuf::from(value)),
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:87:
+ #[cfg(feature = "packager")]
+ fn packaged_binary() -> Result<PathBuf, String> {
+     let exe = env::current_exe().map_err(|err| err.to_string())?;
+[31m-    let dir = exe.parent().ok_or_else(|| format!("{} has no directory", exe.display()))?;
+[0m[31m-    let binary = dir.join(if cfg!(windows) { "rillsql.exe" } else { "rillsql" });
+[0m[32m+    let dir = exe
+[0m[32m+        .parent()
+[0m[32m+        .ok_or_else(|| format!("{} has no directory", exe.display()))?;
+[0m[32m+    let binary = dir.join(if cfg!(windows) {
+[0m[32m+        "rillsql.exe"
+[0m[32m+    } else {
+[0m[32m+        "rillsql"
+[0m[32m+    });
+[0m     if binary.is_file() {
+         return Ok(binary);
+     }
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:106:
+     }
+     if let Some(nsis) = find_named(directory, &windows_nsis_name(PRODUCT_VERSION))? {
+         let inspection = inspect_windows_nsis(&nsis, PRODUCT_VERSION)?;
+[31m-        println!("windows-nsis {} bytes version {} arch {}", inspection.size, inspection.version, inspection.arch);
+[0m[32m+        println!(
+[0m[32m+            "windows-nsis {} bytes version {} arch {}",
+[0m[32m+            inspection.size, inspection.version, inspection.arch
+[0m[32m+        );
+[0m     }
+     match require_complete_release(&assets, PRODUCT_VERSION) {
+         Ok(()) => println!("complete release {}", PRODUCT_VERSION),
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:118:
+ 
+ #[cfg(any(feature = "packager", test))]
+ fn resolve_out_dir(base: &Path, out: &Path) -> Result<PathBuf, String> {
+[31m-    let absolute = if out.is_absolute() { out.to_path_buf() } else { base.join(out) };
+[0m[32m+    let absolute = if out.is_absolute() {
+[0m[32m+        out.to_path_buf()
+[0m[32m+    } else {
+[0m[32m+        base.join(out)
+[0m[32m+    };
+[0m     fs::create_dir_all(&absolute).map_err(|err| format!("create {}: {err}", absolute.display()))?;
+[31m-    let canonical = fs::canonicalize(&absolute).map_err(|err| format!("output directory {}: {err}", absolute.display()))?;
+[0m[32m+    let canonical = fs::canonicalize(&absolute)
+[0m[32m+        .map_err(|err| format!("output directory {}: {err}", absolute.display()))?;
+[0m     Ok(strip_verbatim_prefix(&canonical))
+ }
+ 
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:144:
+ }
+ 
+ fn visit(directory: &Path, visit_file: &mut dyn FnMut(&Path)) -> Result<(), String> {
+[31m-    for entry in fs::read_dir(directory).map_err(|err| format!("read {}: {err}", directory.display()))? {
+[0m[32m+    for entry in
+[0m[32m+        fs::read_dir(directory).map_err(|err| format!("read {}: {err}", directory.display()))?
+[0m[32m+    {
+[0m         let path = entry.map_err(|err| err.to_string())?.path();
+         if path.is_dir() {
+             visit(&path, visit_file)?;
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:166:
+     let binary = packaged_binary()?;
+     let stage = manifest_dir.join("target").join("packager-stage");
+     fs::create_dir_all(&stage).map_err(|err| err.to_string())?;
+[31m-    let staged = stage.join(if cfg!(windows) { "RillSQL.exe" } else { "RillSQL" });
+[0m[32m+    let staged = stage.join(if cfg!(windows) {
+[0m[32m+        "RillSQL.exe"
+[0m[32m+    } else {
+[0m[32m+        "RillSQL"
+[0m[32m+    });
+[0m     fs::copy(&binary, &staged).map_err(|err| format!("stage binary: {err}"))?;
+     #[cfg(unix)]
+     {
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:173:
+         use std::os::unix::fs::PermissionsExt;
+[31m-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|err| err.to_string())?;
+[0m[32m+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+[0m[32m+            .map_err(|err| err.to_string())?;
+[0m     }
+ 
+     let base = env::current_dir().map_err(|err| err.to_string())?;
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:186:
+     config.formats = Some(parse_formats(&args.formats)?);
+     env::set_current_dir(&manifest_dir).map_err(|err| err.to_string())?;
+ 
+[31m-    let outputs = cargo_packager::package(&config).map_err(|err| format!("cargo-packager {}: {err}", rillsql_lib::release::PACKAGER_VERSION))?;
+[0m[32m+    let outputs = cargo_packager::package(&config).map_err(|err| {
+[0m[32m+        format!(
+[0m[32m+            "cargo-packager {}: {err}",
+[0m[32m+            rillsql_lib::release::PACKAGER_VERSION
+[0m[32m+        )
+[0m[32m+    })?;
+[0m     normalize_outputs(&out, &outputs)?;
+     sign_outputs(&out)?;
+     check_directory(&out, args.require_complete)?;
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:218:
+     struct MetadataTable {
+         packager: cargo_packager::Config,
+     }
+[31m-    let text = fs::read_to_string(manifest_dir.join("Cargo.toml")).map_err(|err| err.to_string())?;
+[0m[31m-    let manifest: ManifestFile = toml::from_str(&text).map_err(|err| format!("Packager metadata: {err}"))?;
+[0m[32m+    let text =
+[0m[32m+        fs::read_to_string(manifest_dir.join("Cargo.toml")).map_err(|err| err.to_string())?;
+[0m[32m+    let manifest: ManifestFile =
+[0m[32m+        toml::from_str(&text).map_err(|err| format!("Packager metadata: {err}"))?;
+[0m     Ok(manifest.package.metadata.packager)
+ }
+ 
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:227:
+ fn parse_formats(names: &[String]) -> Result<Vec<cargo_packager::PackageFormat>, String> {
+     names
+         .iter()
+[31m-        .map(|name| serde_json::from_value(serde_json::Value::String(name.clone())).map_err(|err| format!("unknown format {name}: {err}")))
+[0m[32m+        .map(|name| {
+[0m[32m+            serde_json::from_value(serde_json::Value::String(name.clone()))
+[0m[32m+                .map_err(|err| format!("unknown format {name}: {err}"))
+[0m[32m+        })
+[0m         .collect()
+ }
+ 
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:235:
+ fn normalize_outputs(out: &Path, outputs: &[cargo_packager::PackageOutput]) -> Result<(), String> {
+     for output in outputs {
+         for path in &output.paths {
+[31m-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+[0m[32m+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+[0m[32m+                continue;
+[0m[32m+            };
+[0m             if path.is_dir() {
+                 #[cfg(unix)]
+                 if name.ends_with(".app") {
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:242:
+[31m-                    archive_app(path, &out.join(rillsql_lib::release::macos_updater_name(PRODUCT_VERSION)))?;
+[0m[32m+                    archive_app(
+[0m[32m+                        path,
+[0m[32m+                        &out.join(rillsql_lib::release::macos_updater_name(PRODUCT_VERSION)),
+[0m[32m+                    )?;
+[0m                 }
+                 #[cfg(not(unix))]
+                 let _ = name;
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:251:
+                 if dest.exists() {
+                     fs::remove_file(&dest).map_err(|err| err.to_string())?;
+                 }
+[31m-                fs::rename(path, &dest).map_err(|err| format!("rename {} -> {}: {err}", path.display(), dest.display()))?;
+[0m[32m+                fs::rename(path, &dest).map_err(|err| {
+[0m[32m+                    format!("rename {} -> {}: {err}", path.display(), dest.display())
+[0m[32m+                })?;
+[0m             }
+         }
+     }
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:263:
+     if dest.exists() {
+         fs::remove_file(dest).map_err(|err| err.to_string())?;
+     }
+[31m-    let parent = app_dir.parent().ok_or_else(|| format!("{} has no parent", app_dir.display()))?;
+[0m[31m-    let name = app_dir.file_name().ok_or_else(|| format!("{} has no name", app_dir.display()))?;
+[0m[31m-    let status = std::process::Command::new("tar").arg("-czf").arg(dest).arg("-C").arg(parent).arg(name).status().map_err(|err| err.to_string())?;
+[0m[31m-    if status.success() { Ok(()) } else { Err(format!("tar exited {status}")) }
+[0m[32m+    let parent = app_dir
+[0m[32m+        .parent()
+[0m[32m+        .ok_or_else(|| format!("{} has no parent", app_dir.display()))?;
+[0m[32m+    let name = app_dir
+[0m[32m+        .file_name()
+[0m[32m+        .ok_or_else(|| format!("{} has no name", app_dir.display()))?;
+[0m[32m+    let status = std::process::Command::new("tar")
+[0m[32m+        .arg("-czf")
+[0m[32m+        .arg(dest)
+[0m[32m+        .arg("-C")
+[0m[32m+        .arg(parent)
+[0m[32m+        .arg(name)
+[0m[32m+        .status()
+[0m[32m+        .map_err(|err| err.to_string())?;
+[0m[32m+    if status.success() {
+[0m[32m+        Ok(())
+[0m[32m+    } else {
+[0m[32m+        Err(format!("tar exited {status}"))
+[0m[32m+    }
+[0m }
+ 
+ #[cfg(feature = "packager")]
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:273:
+ fn sign_outputs(out: &Path) -> Result<(), String> {
+[31m-    let Some(private_key) = env::var("TAURI_SIGNING_PRIVATE_KEY").ok().or_else(|| env::var("CARGO_PACKAGER_SIGN_PRIVATE_KEY").ok()) else {
+[0m[32m+    let Some(private_key) = env::var("TAURI_SIGNING_PRIVATE_KEY")
+[0m[32m+        .ok()
+[0m[32m+        .or_else(|| env::var("CARGO_PACKAGER_SIGN_PRIVATE_KEY").ok())
+[0m[32m+    else {
+[0m         println!("updater signing key is not set; signatures were not created");
+         return Ok(());
+     };
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:278:
+[31m-    let password = env::var("TAURI_SIGNING_PRIVATE_KEY_PASSWORD").ok().or_else(|| env::var("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD").ok());
+[0m[32m+    let password = env::var("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+[0m[32m+        .ok()
+[0m[32m+        .or_else(|| env::var("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD").ok());
+[0m     let secret = decode_secret(&private_key, password.as_deref())?;
+     let mut files = Vec::new();
+     visit(out, &mut |path| {
+Diff in \\?\C:\Users\12976\project\RillSQL-浜嬪姟\src-tauri\src\bin\rillsql-package.rs:286:

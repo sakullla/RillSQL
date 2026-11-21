@@ -132,6 +132,12 @@ pub fn is_write(sql: &str) -> bool {
     )
 }
 
+/// 事务控制语句。断连时这些语句的最终结果同样无法确认，不能因为它们不是数据写入
+/// 就当成普通失败；`END` 是 SQLite/PostgreSQL 的提交别名，T-SQL 的 `BEGIN` 也按控制语句保守处理。
+pub fn is_transaction_control(sql: &str) -> bool {
+    matches!(first_keyword(sql).as_str(), "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE")
+}
+
 /// 只读语句允许的开头关键字。其余开头（SET、PRAGMA、EXEC、RENAME、COMMENT 等）一律按可能写入处理。
 const READ_ONLY_LEADS: &[&str] = &["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH"];
 

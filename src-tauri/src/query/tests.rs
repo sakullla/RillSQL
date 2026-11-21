@@ -281,6 +281,34 @@ fn failure_marks_uncertain_writes_unknown_and_not_reads() {
     assert!(matches!(cancelled, StatementStop::Cancelled { .. }));
 }
 
+/// 事务控制语句的断连不是“语句被拒绝”：COMMIT/ROLLBACK 可能已在服务器执行，必须保留未知。
+#[test]
+fn disconnected_transaction_controls_are_unknown_not_ordinary_errors() {
+    for sql in [
+        "COMMIT",
+        "COMMIT;",
+        "  -- note\nROLLBACK",
+        "ROLLBACK TRANSACTION",
+        "SAVEPOINT sp1",
+        "RELEASE SAVEPOINT sp1",
+        "BEGIN",
+        "START TRANSACTION",
+        "END",
+    ] {
+        let stop = classify_failure(sql, "connection closed".to_owned(), false);
+        assert!(matches!(stop, StatementStop::Unknown { .. }), "{sql} 断连应保留未知，实际 {stop:?}");
+        assert!(split::is_transaction_control(sql), "{sql} 应识别为事务控制语句");
+    }
+    for sql in ["SELECT 1", "SHOW TABLES", "UPDATE t SET n = 1", "INSERT INTO t VALUES (1)"] {
+        assert!(!split::is_transaction_control(sql), "{sql} 不是事务控制语句");
+    }
+    // 只读语句与普通语法错误仍然按普通失败处理，不能扩大未知范围。
+    let read = classify_failure("SELECT 1", "connection closed".to_owned(), false);
+    assert!(matches!(read, StatementStop::Error { .. }));
+    let syntax = classify_failure("COMMIT", "You have an error in your SQL syntax".to_owned(), false);
+    assert!(matches!(syntax, StatementStop::Error { .. }));
+}
+
 #[test]
 fn timeout_statements_match_each_engine_and_none_disables_them() {
     assert_eq!(
