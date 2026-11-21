@@ -5239,7 +5239,9 @@ mod tests {
                 elapsed_ms: None,
                 error_at: None,
                 error_code: None,
+                transaction: None,
             }],
+            transaction: None,
             started_at: String::new(),
             elapsed_ms: 0,
         }

@@ -164,6 +164,8 @@ pub struct ControlSyntax {
     pub begin_modes: &'static [&'static str],
     /// `ROLLBACK TRAN[SACTION] <name>` 是回滚到保存点（T-SQL）。
     pub rollback_transaction_name: bool,
+    /// 接受 `SAVE TRAN[SACTION] <name>` 作为创建保存点（T-SQL；不是 `SAVEPOINT`）。
+    pub save_transaction: bool,
     /// `#` 起行注释（MySQL 家族）。
     pub hash_comments: bool,
     /// 引号标识符的开闭符号（标准 SQL 只有双引号；方言由适配器补充反引号、方括号）。
@@ -180,6 +182,7 @@ impl ControlSyntax {
         chained: false,
         begin_modes: &[],
         rollback_transaction_name: false,
+        save_transaction: false,
         hash_comments: false,
         identifier_quotes: &[('"', '"')],
     };
@@ -382,6 +385,8 @@ pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
             Some(name) => ControlMatch::Control(ControlStatement::Savepoint(name)),
             None => ControlMatch::Ambiguous,
         },
+        // T-SQL 的保存点写法：`SAVE {TRAN | TRANSACTION} <name>`。
+        "SAVE" if syntax.save_transaction => classify_save(rest),
         "RELEASE" => {
             let name = if keyword(rest.first(), "SAVEPOINT") { savepoint_name(&rest[1..]) } else { savepoint_name(rest) };
             match name {
@@ -436,13 +441,29 @@ fn classify_rollback(rest: &[Token], syntax: ControlSyntax) -> ControlMatch {
         };
     }
     if syntax.rollback_transaction_name && (keyword(rest.first(), "TRANSACTION") || keyword(rest.first(), "TRAN")) {
-        return match savepoint_name(&rest[1..]) {
-            Some(name) => ControlMatch::Control(ControlStatement::RollbackToSavepoint(name)),
-            None => ControlMatch::Control(ControlStatement::Rollback { chain: false }),
+        // `ROLLBACK TRAN` 没有名字才是整体回滚；带了名字就是回滚到保存点，
+        // 认不出名字（变量、多个词）时既不能当成整体回滚，也不能猜一个保存点名。
+        return match &rest[1..] {
+            [] => ControlMatch::Control(ControlStatement::Rollback { chain: false }),
+            tail => match savepoint_name(tail) {
+                Some(name) => ControlMatch::Control(ControlStatement::RollbackToSavepoint(name)),
+                None => ControlMatch::Ambiguous,
+            },
         };
     }
     // 其余形态（含带名字但方言不认的写法）不能确认实际效果。
     ControlMatch::Ambiguous
+}
+
+/// T-SQL 的 `SAVE {TRAN | TRANSACTION} <name>`：只有字面量名字可以登记成保存点。
+fn classify_save(rest: &[Token]) -> ControlMatch {
+    match rest {
+        [unit, name] if keyword(Some(unit), "TRANSACTION") || keyword(Some(unit), "TRAN") => match savepoint_name(std::slice::from_ref(name)) {
+            Some(name) => ControlMatch::Control(ControlStatement::Savepoint(name)),
+            None => ControlMatch::Ambiguous,
+        },
+        _ => ControlMatch::Ambiguous,
+    }
 }
 
 /// `COMMIT`/`ROLLBACK`/`ABORT` 之后的修饰语：只有工作单元词与 `AND [NO] CHAIN` 可确认。
@@ -514,6 +535,8 @@ fn keyword(token: Option<&Token>, word: &str) -> bool {
 
 fn savepoint_name(tokens: &[Token]) -> Option<SavepointName> {
     match tokens {
+        // T-SQL 的 `@name` 是变量，真实保存点名要到运行时才知道：不能登记成一个固定名字。
+        [token] if !token.quoted && token.text.starts_with('@') => None,
         [token] => SavepointName::parse(&token.text).ok(),
         _ => None,
     }

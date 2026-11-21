@@ -30,6 +30,7 @@ const POSTGRES_SYNTAX: ControlSyntax = ControlSyntax {
     chained: true,
     begin_modes: &[],
     rollback_transaction_name: false,
+    save_transaction: false,
     hash_comments: false,
     identifier_quotes: &[('"', '"')],
 };

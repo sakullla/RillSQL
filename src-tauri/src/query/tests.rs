@@ -345,7 +345,7 @@ async fn multi_statement_stops_on_failure_and_does_not_replay_unknown() {
     };
     let flag = Arc::new(AtomicBool::new(false));
     let parts = vec![piece("INSERT INTO t VALUES (1)"), piece("UPDATE t SET n = 2"), piece("DELETE FROM t")];
-    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    let report = run_batch(&parts, 100, &flag, false, &driver, None).await;
     assert_eq!(report.status, "unknown");
     assert_eq!(report.calls, 2);
     assert_eq!(report.statements[0].status, "ok");
@@ -366,7 +366,7 @@ async fn a_statement_error_skips_every_later_statement() {
     };
     let flag = Arc::new(AtomicBool::new(false));
     let parts = vec![piece("INSERT INTO t VALUES (1)"), piece("SELECT * FROM missing"), piece("DELETE FROM t")];
-    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    let report = run_batch(&parts, 100, &flag, false, &driver, None).await;
     assert_eq!(report.status, "error");
     assert_eq!(report.calls, 2, "失败之后不再发送");
     assert_eq!(report.statements[0].status, "ok");
@@ -374,6 +374,390 @@ async fn a_statement_error_skips_every_later_statement() {
     assert_eq!(report.statements[1].message, "no such table: missing");
     assert_eq!(report.statements[2].status, "skipped");
     assert_eq!(driver.calls.lock().expect("calls").len(), 2);
+}
+
+/// 关系型连接的协调器：方言来自适配器，测试不伪造事务语义。
+fn coordinator(engine: crate::connections::model::Engine) -> crate::connections::transaction::TransactionCoordinator {
+    use crate::connections::transaction::TransactionCoordinator;
+    TransactionCoordinator::new("notes", crate::adapters::adapter(engine).transaction())
+}
+
+fn scripted(steps: Vec<Result<StatementValue, StatementStop>>) -> Scripted {
+    Scripted {
+        steps: Mutex::new(steps),
+        calls: Mutex::new(Vec::new()),
+    }
+}
+
+#[tokio::test]
+async fn handwritten_controls_share_the_connection_transaction() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Postgres);
+    let driver = scripted(vec![Ok(ok_count()), Ok(ok_count()), Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("BEGIN"), piece("UPDATE item SET n = 1"), piece("COMMIT")];
+    let report = run_batch(&parts, 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "done");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Began));
+    assert_eq!(report.statements[1].transaction, Some(TransactionEffect::StillActive));
+    assert_eq!(report.statements[2].transaction, Some(TransactionEffect::Committed));
+    assert_eq!(report.transaction_effect, Some(TransactionEffect::Committed));
+    // 批次携带的是协调器里的同一份共享快照，不是这一批自己的副本。
+    let snapshot = report.transaction.expect("关系型批次要带事务快照");
+    assert_eq!(snapshot.state, TransactionState::Idle);
+    assert_eq!(Some(snapshot), transactions.snapshot(), "批次快照与协调器共享");
+    assert_eq!(driver.calls.lock().expect("calls").as_slice(), ["BEGIN", "UPDATE item SET n = 1", "COMMIT"]);
+}
+
+#[tokio::test]
+async fn refusals_never_reach_the_database() {
+    use crate::connections::model::Engine;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    // 没有活动事务时提交：明确失败，不伪造成功结果（R3）。
+    let transactions = coordinator(Engine::Mysql);
+    let driver = scripted(vec![Ok(ok_count())]);
+    let report = run_batch(&[piece("COMMIT")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "error");
+    assert_eq!(report.calls, 0);
+    assert_eq!(report.statements[0].status, "error");
+    assert!(report.statements[0].message.contains("没有活动事务"), "{}", report.statements[0].message);
+    assert!(report.statements[0].sent_sql.is_empty());
+    assert!(driver.calls.lock().expect("calls").is_empty(), "预检拒绝的控制语句不能下发");
+
+    // 活动事务里再次开始：PostgreSQL 只会忽略，界面必须引导到保存点（R3）。
+    let transactions = coordinator(Engine::Postgres);
+    transactions
+        .acknowledge(
+            &crate::transaction::ControlStatement::Begin { mode: None },
+            crate::transaction::ControlOutcome::Confirmed,
+        )
+        .unwrap();
+    let driver = scripted(vec![Ok(ok_count())]);
+    let report = run_batch(&[piece("BEGIN")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].status, "error");
+    assert!(report.statements[0].message.contains("保存点"), "{}", report.statements[0].message);
+    assert!(driver.calls.lock().expect("calls").is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_statement_aborts_the_postgres_transaction_and_skips_the_rest() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Postgres);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![
+        Ok(ok_count()),
+        Err(StatementStop::Error { message: "relation \"missing\" does not exist".to_owned(), at: None, code: Some("42P01".to_owned()) }),
+        Ok(ok_count()),
+    ]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("UPDATE item SET n = 1"), piece("UPDATE missing SET n = 1"), piece("SELECT 1")];
+    let report = run_batch(&parts, 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "error");
+    assert_eq!(report.statements[1].status, "error");
+    assert_eq!(report.statements[1].transaction, Some(TransactionEffect::Aborted));
+    assert!(report.statements[1].message.contains("只能回滚"), "{}", report.statements[1].message);
+    assert_eq!(report.statements[2].status, "skipped");
+    assert_eq!(report.statements[2].message, "事务已中止，未执行");
+    assert_eq!(report.calls, 2, "中止之后不再发送");
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Aborted);
+}
+
+#[tokio::test]
+async fn mysql_and_mariadb_ddl_report_the_implicit_commit_and_keep_running() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let transactions = coordinator(engine);
+        transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+        let driver = scripted(vec![Ok(ok_count()), Ok(ok_count())]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let parts = vec![piece("ALTER TABLE item ADD COLUMN note TEXT"), piece("INSERT INTO item (n) VALUES (1)")];
+        let report = run_batch(&parts, 100, &flag, false, &driver, Some(&transactions)).await;
+        assert_eq!(report.status, "done", "隐式提交不阻断这一批的后续语句");
+        assert_eq!(report.statements[0].status, "ok");
+        assert_eq!(report.statements[0].transaction, Some(TransactionEffect::ImplicitCommit), "{engine:?}");
+        assert!(report.statements[0].message.contains("隐式提交"), "{}", report.statements[0].message);
+        // 隐式提交之后这条语句又回到自动提交：不再宣称事务仍然活动。
+        assert_eq!(report.statements[1].transaction, Some(TransactionEffect::Unchanged));
+        assert_eq!(report.transaction_effect, Some(TransactionEffect::ImplicitCommit));
+        assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Idle);
+    }
+}
+
+#[tokio::test]
+async fn a_second_begin_on_mysql_reports_the_implicit_commit_instead_of_nesting() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Mysql);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("BEGIN")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].status, "ok");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::ImplicitCommit));
+    assert!(report.statements[0].message.contains("隐式提交"), "{}", report.statements[0].message);
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active, "新事务已经活动，不伪造嵌套层级");
+    assert_eq!(snapshot.depth, Some(1));
+}
+
+#[tokio::test]
+async fn an_unclassified_mysql_statement_marks_the_transaction_unknown_and_stops() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Mysql);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Ok(ok_count()), Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("CALL rotate_notes()"), piece("SELECT 1")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].status, "ok", "语句本身成功");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert!(report.statements[0].message.contains("无法确认"), "{}", report.statements[0].message);
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(report.status, "unknown");
+    assert_eq!(report.calls, 1);
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Unknown);
+}
+
+#[tokio::test]
+async fn an_unclassified_statement_in_autocommit_leaves_no_unknown_transaction() {
+    use crate::connections::model::Engine;
+    use crate::transaction::TransactionEffect;
+
+    // 自动提交下没有事务可被隐式提交或丢确认：不能因为语句未分类就留下未知状态。
+    let transactions = coordinator(Engine::Mysql);
+    let driver = scripted(vec![Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("CALL rotate_notes()")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "done");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unchanged));
+    assert!(report.statements[0].message.is_empty(), "{}", report.statements[0].message);
+    assert_eq!(report.transaction_effect, None);
+    assert!(transactions.snapshot().unwrap().unresolved.is_none());
+}
+
+#[tokio::test]
+async fn a_cancelled_statement_keeps_a_usable_mysql_transaction() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Mysql);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Cancelled { message: "Query execution was interrupted".to_owned() })]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("UPDATE item SET n = 1"), piece("DELETE FROM item")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "cancelled");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::StillActive), "取消不等于回滚");
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Active);
+
+    // PostgreSQL 的取消会让事务中止：同样按数据库真实状态报告，而不是替用户回滚。
+    let transactions = coordinator(Engine::Postgres);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Cancelled {
+        message: "canceling statement due to user request".to_owned(),
+    })]);
+    let report = run_batch(&[piece("SELECT pg_sleep(10)")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Aborted));
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Aborted, "取消后的中止由数据库决定，不自动回滚");
+}
+
+#[tokio::test]
+async fn a_disconnect_in_a_transaction_keeps_the_result_unknown() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState, UnknownReason};
+
+    let transactions = coordinator(Engine::Postgres);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Unknown {
+        message: "连接中断，无法确认写入是否完成。不会自动重放。connection reset by peer".to_owned(),
+    })]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("UPDATE item SET n = 1"), piece("SELECT 1")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "unknown");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(report.calls, 1);
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Unknown);
+    assert_eq!(snapshot.unresolved.expect("旧事务未知记录").reason, UnknownReason::ConnectionLost);
+}
+
+#[tokio::test]
+async fn sqlserver_native_savepoints_are_registered_and_keep_the_transaction_active() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{SavepointName, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Sqlserver);
+    let driver = scripted(vec![Ok(ok_count()), Ok(ok_count()), Ok(ok_count()), Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("BEGIN TRAN"), piece("SAVE TRAN sp1"), piece("UPDATE item SET n = 2"), piece("ROLLBACK TRAN sp1")];
+    let report = run_batch(&parts, 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "done", "{:?}", report.statements);
+    // T-SQL 手写保存点按方言映射成同一条控制语句，保存点因此被登记而不是当成普通语句。
+    assert_eq!(
+        driver.calls.lock().expect("calls").as_slice(),
+        ["BEGIN TRANSACTION", "SAVE TRANSACTION [sp1]", "UPDATE item SET n = 2", "ROLLBACK TRANSACTION [sp1]"]
+    );
+    assert_eq!(report.statements[1].transaction, Some(TransactionEffect::StillActive));
+    assert_eq!(report.statements[3].transaction, Some(TransactionEffect::StillActive));
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active, "回滚到保存点不结束外层事务");
+    assert_eq!(snapshot.savepoints, vec![SavepointName::parse("sp1").unwrap()]);
+
+    // 不带名字的 ROLLBACK TRANSACTION 才是整体回滚。
+    let driver = scripted(vec![Ok(ok_count())]);
+    let report = run_batch(&[piece("ROLLBACK TRANSACTION")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::RolledBack));
+    assert_eq!(driver.calls.lock().expect("calls").as_slice(), ["ROLLBACK TRANSACTION"]);
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Idle);
+}
+
+#[tokio::test]
+async fn the_sqlserver_probe_reconciles_an_unconfirmed_control_without_losing_the_unknown() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState, UnknownReason};
+
+    let transactions = coordinator(Engine::Sqlserver);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    transactions
+        .acknowledge(
+            &ControlStatement::Commit { chain: false },
+            ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+        )
+        .unwrap();
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Unknown);
+
+    // 探针确认数据库已经没有活动事务，随后两条普通语句在自动提交下执行。
+    let probe_rows = StatementValue {
+        columns: vec!["trancount".to_owned(), "state".to_owned()],
+        column_types: vec!["int".to_owned(), "int".to_owned()],
+        rows: vec![vec![Some("0".to_owned()), Some("0".to_owned())]],
+        truncated: false,
+        affected: None,
+    };
+    let driver = scripted(vec![Ok(probe_rows), Ok(ok_count()), Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("SELECT 1"), piece("SELECT 2")], 100, &flag, false, &driver, Some(&transactions)).await;
+    let calls = driver.calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[0].contains("XACT_STATE"), "未知之后先核对状态：{calls:?}");
+    assert_eq!(report.status, "done");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unchanged));
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Idle, "探针确认没有活动事务");
+    assert_eq!(
+        snapshot.unresolved.expect("旧事务结果仍然未知").reason,
+        UnknownReason::ConnectionLost,
+        "核对当前状态不等于确认旧事务的结局"
+    );
+}
+
+#[tokio::test]
+async fn an_unconfirmed_commit_is_reported_unknown_and_not_replayed() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Mysql);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Unknown { message: "连接中断，无法确认写入是否完成。".to_owned() })]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("COMMIT"), piece("SELECT 1")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].status, "unknown");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert!(report.statements[0].message.contains("没有重放"), "{}", report.statements[0].message);
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(driver.calls.lock().expect("calls").len(), 1, "控制语句没有重放");
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Unknown);
+}
+
+#[tokio::test]
+async fn handwritten_savepoints_keep_the_outer_transaction_active() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, SavepointName, TransactionEffect, TransactionState};
+
+    let transactions = coordinator(Engine::Postgres);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Ok(ok_count()), Ok(ok_count()), Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("SAVEPOINT sp1"), piece("UPDATE item SET n = 2"), piece("ROLLBACK TO SAVEPOINT sp1")];
+    let report = run_batch(&parts, 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "done");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::StillActive));
+    assert_eq!(report.statements[2].transaction, Some(TransactionEffect::StillActive));
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active, "回滚到保存点不结束外层事务");
+    assert_eq!(snapshot.savepoints, vec![SavepointName::parse("sp1").unwrap()]);
+    assert_eq!(
+        driver.calls.lock().expect("calls").as_slice(),
+        ["SAVEPOINT \"sp1\"", "UPDATE item SET n = 2", "ROLLBACK TO SAVEPOINT \"sp1\""]
+    );
+}
+
+#[tokio::test]
+async fn dialect_error_mappings_decide_the_transaction_effect() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState};
+
+    // SQL Server 的不可提交事务（3931）：只能整体回滚，不能继续执行普通语句。
+    let sqlserver = coordinator(Engine::Sqlserver);
+    sqlserver.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Error {
+        message: "The current transaction cannot be committed and cannot support operations that write to the log file".to_owned(),
+        at: None,
+        code: Some("3931".to_owned()),
+    })]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("UPDATE item SET n = 1")], 100, &flag, false, &driver, Some(&sqlserver)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Aborted));
+    assert_eq!(sqlserver.snapshot().unwrap().state, TransactionState::Aborted);
+
+    // MySQL 死锁（1213）由服务器回滚整个事务：不继续宣称活动，也不重放这条写入。
+    let mysql = coordinator(Engine::Mysql);
+    mysql.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    let driver = scripted(vec![Err(StatementStop::Error {
+        message: "Deadlock found when trying to get lock; try restarting transaction".to_owned(),
+        at: None,
+        code: Some("1213".to_owned()),
+    })]);
+    let report = run_batch(&[piece("UPDATE item SET n = 1"), piece("SELECT 1")], 100, &flag, false, &driver, Some(&mysql)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert_eq!(report.status, "error", "语句本身失败；事务结局另行报告为未知");
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(report.statements[1].message, "事务状态未知，未执行");
+    assert_eq!(mysql.snapshot().unwrap().state, TransactionState::Unknown);
+}
+
+#[tokio::test]
+async fn a_rollback_after_a_lost_commit_ends_the_transaction_but_keeps_the_result_unknown() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionEffect, TransactionState, UnknownReason};
+
+    let transactions = coordinator(Engine::Mysql);
+    transactions.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    // 丢失结果的 COMMIT：旧事务结局无法确认。
+    transactions
+        .acknowledge(
+            &ControlStatement::Commit { chain: false },
+            ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
+        )
+        .unwrap();
+    let driver = scripted(vec![Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("ROLLBACK"), piece("SELECT 1")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].status, "unknown", "回滚确实执行了，但旧事务结局仍不能宣称");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert!(report.statements[0].message.contains("仍无法确认"), "{}", report.statements[0].message);
+    assert_eq!(report.statements[1].status, "skipped");
+    assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Idle, "回滚之后新会话没有活动事务");
 }
 
 #[tokio::test]
@@ -499,7 +883,9 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
             elapsed_ms: None,
             error_at: None,
             error_code: None,
+            transaction: None,
         }],
+        transaction: None,
         started_at: String::new(),
         elapsed_ms: 1,
     };
@@ -845,6 +1231,67 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
     let _calls = AtomicUsize::new(0);
 }
 
+/// 手写事务、跨批次保留与共享快照：真实 SQLite 文件上的端到端检查（R2、R3、R5）。
+#[tokio::test]
+async fn a_handwritten_transaction_survives_batches_and_reports_the_shared_snapshot() {
+    use crate::connections::Service;
+    use crate::transaction::{TransactionEffect, TransactionState};
+    use super::commands::{start_run, QueryState, StartRequest};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-query-tx-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)").execute(&setup).await.unwrap();
+    setup.close().await;
+
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let state = QueryState::new(dir.join("query-history.sqlite"));
+    let request = |sql: &str| StartRequest {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        sql: sql.to_owned(),
+        limit: 50,
+        timeout_ms: None,
+    };
+    let count = |service: Arc<Service>| async move {
+        let session = service.catalog_session("notes").unwrap();
+        let check = exec::LiveDriver::attach(session, "sqlite", "main", service.cancel_transport("notes").unwrap(), None)
+            .await
+            .unwrap();
+        let rows = check.run("SELECT count(*) FROM t", 10, &Arc::new(AtomicBool::new(false))).await.outcome.unwrap();
+        rows.rows[0][0].clone()
+    };
+
+    let started = start_run(&service, &state, request("BEGIN;\nINSERT INTO t (id) VALUES (7);")).await.unwrap();
+    let opened = wait_done(&state, &started.id).await;
+    assert_eq!(opened.status, "done", "{:?}", opened.statements);
+    assert_eq!(opened.statements[0].transaction, Some(TransactionEffect::Began));
+    assert_eq!(opened.statements[1].transaction, Some(TransactionEffect::StillActive));
+    let report = opened.transaction.expect("关系型查询要带事务快照");
+    assert_eq!(report.snapshot.state, TransactionState::Active);
+    assert_eq!(report.effect, Some(TransactionEffect::StillActive));
+    // 同一连接的业务标签与查询标签看到的是同一份快照。
+    assert_eq!(service.transaction_snapshot("notes"), Some(report.snapshot.clone()));
+    assert_eq!(count(Arc::clone(&service)).await.as_deref(), Some("0"), "未提交的写入在元数据连接上不可见");
+
+    // 新批次沿用同一个活动事务：手写 ROLLBACK 在同一会话里结束它。
+    let started = start_run(&service, &state, request("ROLLBACK;")).await.unwrap();
+    let rolled = wait_done(&state, &started.id).await;
+    assert_eq!(rolled.statements[0].transaction, Some(TransactionEffect::RolledBack));
+    let snapshot = rolled.transaction.expect("回滚后的快照").snapshot;
+    assert_eq!(snapshot.state, TransactionState::Idle);
+    assert_eq!(count(Arc::clone(&service)).await.as_deref(), Some("0"), "回滚撤销了此前未提交的修改");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn tsql_split_keeps_top_level_begin_end_blocks_together() {
     // 顶层 BEGIN...END 是一条语句：块内的分号不结束语句。
@@ -1185,6 +1632,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
         &flag,
         false,
         &driver,
+        None,
     )
     .await;
     assert_eq!(report.status, "done", "{:?}", report.statements);
@@ -1209,7 +1657,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
     let driver = exec::LiveDriver::attach(CatalogSession::Mysql(pool.clone()), "mariadb", "app", CancelTransport::None, Some(1_500))
         .await
         .unwrap();
-    let limited = run_batch(&[piece("SELECT * FROM big")], 2, &flag, false, &driver).await;
+    let limited = run_batch(&[piece("SELECT * FROM big")], 2, &flag, false, &driver, None).await;
     assert_eq!(limited.statements[0].rows.len(), 2, "{:?}", limited.statements);
     assert!(limited.statements[0].truncated);
     assert_eq!(stub.rows_sent.load(Ordering::SeqCst), 3);
@@ -1546,7 +1994,7 @@ async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
     };
     let flag = Arc::new(AtomicBool::new(false));
     let parts = vec![piece("INSERT INTO t VALUES (1)"), piece("SELECT\nnope"), piece("DELETE FROM t")];
-    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    let report = run_batch(&parts, 100, &flag, false, &driver, None).await;
     assert!(report.statements[0].elapsed_ms.is_some_and(|ms| ms >= 1), "执行过的语句至少 1 ms");
     assert!(report.statements[0].error_at.is_none());
     assert_eq!(report.statements[1].status, "error");
@@ -1561,12 +2009,12 @@ async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
         steps: Mutex::new(vec![Err(StatementStop::Cancelled { message: "canceling statement due to user request".to_owned() })]),
         calls: Mutex::new(Vec::new()),
     };
-    let report = run_batch(&[piece("SELECT pg_sleep(10)")], 100, &flag, false, &cancelled).await;
+    let report = run_batch(&[piece("SELECT pg_sleep(10)")], 100, &flag, false, &cancelled, None).await;
     assert_eq!(report.statements[0].status, "cancelled");
     assert_eq!(report.statements[0].elapsed_ms, None, "取消的语句只标已取消，不给耗时");
 
     let waiting = Pausing { paused: Mutex::new(Duration::ZERO) };
-    let report = run_batch(&[piece("SELECT 1")], 100, &flag, false, &waiting).await;
+    let report = run_batch(&[piece("SELECT 1")], 100, &flag, false, &waiting, None).await;
     let spent = report.statements[0].elapsed_ms.expect("执行过");
     assert!(spent < 50, "等待继续读取的时间不算进耗时：{spent} ms");
 }
@@ -1685,6 +2133,7 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
         elapsed_ms: Some(3),
         error_at: at,
         error_code: None,
+        transaction: None,
     };
     let run = RunDto {
         id: "run".to_owned(),
@@ -1701,6 +2150,7 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
             statement("SELECT 1;", "ok", None),
             statement("SELECT 'é', nope\n  FROM t;", "error", Some(exec::ErrorAt::Line(2))),
         ],
+        transaction: None,
         started_at: String::new(),
         elapsed_ms: 6,
     };
@@ -1735,6 +2185,7 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
         elapsed_ms: Some(2),
         error_at: at,
         error_code: None,
+        transaction: None,
     };
     let run = |status: &str, statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -1748,6 +2199,7 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
         via_ssh: false,
         fresh_channel: false,
         statements,
+        transaction: None,
         started_at: String::new(),
         elapsed_ms: 4,
     };
@@ -1866,7 +2318,7 @@ impl StatementDriver for Capping {
         } else {
             Ok(ok_count())
         };
-        exec::DriverReport { sent: capped, outcome }
+        exec::DriverReport { sent: capped, outcome, failure: None }
     }
 }
 
@@ -1930,7 +2382,7 @@ async fn batch_carries_the_statement_it_sent_and_the_rewrite_source() {
     let flag = Arc::new(AtomicBool::new(false));
     let driver = Capping { engine: "sqlite" };
     let parts = vec![piece("SELECT * FROM t"), piece("SELECT * FROM logs WHERE"), piece("SELECT 3")];
-    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    let report = run_batch(&parts, 100, &flag, false, &driver, None).await;
     // 成功语句：原文、实际语句、改写来源三者都能对上。
     assert_eq!(report.statements[0].status, "ok");
     assert_eq!(report.statements[0].sql, "SELECT * FROM t");
@@ -1953,7 +2405,7 @@ async fn batch_carries_the_statement_it_sent_and_the_rewrite_source() {
 async fn hand_written_limit_keeps_the_sent_sql_and_adds_no_note() {
     let flag = Arc::new(AtomicBool::new(false));
     let driver = Capping { engine: "sqlite" };
-    let report = run_batch(&[piece("SELECT * FROM t LIMIT 10")], 100, &flag, false, &driver).await;
+    let report = run_batch(&[piece("SELECT * FROM t LIMIT 10")], 100, &flag, false, &driver, None).await;
     assert_eq!(report.statements[0].status, "ok");
     assert!(report.statements[0].rewrite.is_none(), "手写 LIMIT 不附加改写说明");
     assert_eq!(report.statements[0].sent_sql, "SELECT * FROM t LIMIT 10");
@@ -1985,6 +2437,7 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
         elapsed_ms: Some(2),
         error_at: at,
         error_code: None,
+        transaction: None,
     };
     let run = |statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -1998,6 +2451,7 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
         via_ssh: false,
         fresh_channel: false,
         statements,
+        transaction: None,
         started_at: String::new(),
         elapsed_ms: 3,
     };
@@ -2080,6 +2534,7 @@ fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
         elapsed_ms: Some(1),
         error_at: None,
         error_code: None,
+        transaction: None,
     };
     let run = |sql: &str, sent: &str, added: &str| RunDto {
         id: sql.to_owned(),
@@ -2093,6 +2548,7 @@ fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
         via_ssh: false,
         fresh_channel: false,
         statements: vec![statement(sent, added)],
+        transaction: None,
         started_at: String::new(),
         elapsed_ms: 1,
     };

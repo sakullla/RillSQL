@@ -31,6 +31,7 @@ const MYSQL_SYNTAX: ControlSyntax = ControlSyntax {
     chained: false,
     begin_modes: &[],
     rollback_transaction_name: false,
+    save_transaction: false,
     hash_comments: true,
     identifier_quotes: &[('`', '`')],
 };

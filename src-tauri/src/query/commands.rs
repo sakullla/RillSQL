@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
 use crate::connections::{Service, SessionCondition};
+use crate::transaction::{TransactionEffect, TransactionSnapshot};
 
 use super::cancel::{self, CancelView};
 use super::exec::{self, RowSink, StatementReport, StatementValue};
@@ -45,8 +46,21 @@ pub struct RunDto {
     pub via_ssh: bool,
     pub fresh_channel: bool,
     pub statements: Vec<StatementDto>,
+    /// 这条连接共享的事务快照与本次执行的事务效果；非关系型或连接未打开时为 None。
+    /// 同一连接的所有业务标签看到的快照来自同一个协调器（R5）。
+    pub transaction: Option<TransactionReport>,
     pub started_at: String,
     pub elapsed_ms: u64,
+}
+
+/// 查询结果携带的事务信息（R3、R5、R9、R10）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionReport {
+    /// 批次结束时这条连接共享的事务快照。
+    pub snapshot: TransactionSnapshot,
+    /// 批次里最后一条影响事务的语句的效果。
+    pub effect: Option<TransactionEffect>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +85,8 @@ pub struct StatementDto {
     pub error_at: Option<exec::ErrorAt>,
     /// 失败语句的驱动错误码（如 PostgreSQL 的 SQLSTATE）；驱动没给时为 None。
     pub error_code: Option<String>,
+    /// 这一条语句对连接级事务的效果；没有事务面或没有影响时为 None。
+    pub transaction: Option<TransactionEffect>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,8 +191,15 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             elapsed_ms: None,
             error_at: None,
             error_code: None,
+            transaction: None,
         })
         .collect::<Vec<_>>();
+    // 批次开始前先取一次共享快照：执行结束前界面看到的是这条连接当前的事务状态。
+    let transaction = service.transaction_coordinator(&request.connection_id);
+    let transaction_report = transaction
+        .as_ref()
+        .and_then(|coordinator| coordinator.snapshot())
+        .map(|snapshot| TransactionReport { snapshot, effect: None });
     let snapshot = RunDto {
         id: id.clone(),
         connection_id: request.connection_id.clone(),
@@ -189,6 +212,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         via_ssh,
         fresh_channel: false,
         statements,
+        transaction: transaction_report,
         started_at: started_at.clone(),
         elapsed_ms: 0,
     };
@@ -236,7 +260,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         // 批次从 attach 到复位一直持有业务执行租约：同连接的其他业务执行必须等待（ADR-1）。
         let _lease = lease;
         let _finish_pace = FinishPace(Arc::clone(&pace));
-        let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
+        let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver, transaction.as_deref()).await;
         // 整批结束后在业务会话上把语句超时设置复位，不泄漏到这一批之外。
         let _ = driver.finish().await;
         let summary = summary_of(&batch);
@@ -281,6 +305,11 @@ fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
     }
     snap.status = batch.status.to_owned();
     snap.elapsed_ms = u64::try_from(slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // 批次结束时的共享快照与最后效果：同连接其他标签与消息页据此同步（R5、R9、R10）。
+    snap.transaction = batch.transaction.map(|snapshot| TransactionReport {
+        snapshot,
+        effect: batch.transaction_effect,
+    });
     let mut statements = batch.statements.into_iter().map(statement_dto).collect::<Vec<_>>();
     if let Some(first) = statements.first_mut() {
         if !notices.is_empty() {
@@ -319,6 +348,7 @@ fn statement_dto(statement: StatementReport) -> StatementDto {
         elapsed_ms: statement.elapsed_ms,
         error_at: statement.error_at,
         error_code: statement.error_code,
+        transaction: statement.transaction,
     }
 }
 
@@ -530,7 +560,9 @@ mod resource_tests {
                 columns: vec!["value".to_owned()], column_types: vec!["text".to_owned()],
                 rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
                 elapsed_ms: Some(1), error_at: None, error_code: None,
+                transaction: None,
             }],
+            transaction: None,
             started_at: String::new(), elapsed_ms: 0,
         }
     }

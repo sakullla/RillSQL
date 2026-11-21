@@ -14,6 +14,7 @@ mod saved;
 pub mod plan;
 pub(crate) mod split;
 pub(crate) mod title;
+pub(crate) mod transaction;
 
 pub use commands::{
     query_cancel, query_history, query_history_clear, query_poll, query_saved_delete, query_saved_list, query_saved_rename, query_saved_save, query_start, QueryState,
@@ -36,6 +37,7 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&split_sql),
         std::any::type_name_of_val(&cancel::deliver_cancel),
         std::any::type_name_of_val(&exec::run_batch),
+        std::any::type_name_of_val(&transaction::plan),
     );
     let _ = _linked;
     "query"

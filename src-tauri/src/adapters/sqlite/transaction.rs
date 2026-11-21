@@ -28,6 +28,7 @@ const SQLITE_SYNTAX: ControlSyntax = ControlSyntax {
     chained: false,
     begin_modes: &["deferred", "immediate", "exclusive"],
     rollback_transaction_name: false,
+    save_transaction: false,
     hash_comments: false,
     identifier_quotes: &[('"', '"'), ('`', '`'), ('[', ']')],
 };

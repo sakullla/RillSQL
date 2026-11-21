@@ -142,7 +142,7 @@ fn postgres_dialect() -> TestDialect {
             mode: SettingSupport { options: &[READ_ONLY_OPTION, READ_WRITE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         },
-        ControlSyntax { bare_begin: true, start_transaction: true, end_commits: true, abort_rolls_back: true, chained: true, begin_modes: &[], rollback_transaction_name: false, hash_comments: false, identifier_quotes: &[('"', '"')] },
+        ControlSyntax { bare_begin: true, start_transaction: true, end_commits: true, abort_rolls_back: true, chained: true, begin_modes: &[], rollback_transaction_name: false, save_transaction: false, hash_comments: false, identifier_quotes: &[('"', '"')] },
         Quote::Double,
         SavepointStyle::Standard,
     )
@@ -162,7 +162,7 @@ fn mysql_dialect() -> TestDialect {
             mode: SettingSupport { options: &[READ_ONLY_OPTION, READ_WRITE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::MysqlFamily,
         },
-        ControlSyntax { bare_begin: true, start_transaction: true, end_commits: false, abort_rolls_back: false, chained: true, begin_modes: &[], rollback_transaction_name: false, hash_comments: true, identifier_quotes: &[('"', '"'), ('`', '`')] },
+        ControlSyntax { bare_begin: true, start_transaction: true, end_commits: false, abort_rolls_back: false, chained: true, begin_modes: &[], rollback_transaction_name: false, save_transaction: false, hash_comments: true, identifier_quotes: &[('"', '"'), ('`', '`')] },
         Quote::Backtick,
         SavepointStyle::Standard,
     )
@@ -181,7 +181,7 @@ fn sqlite_dialect() -> TestDialect {
             mode: SettingSupport { options: &[DEFERRED_OPTION, IMMEDIATE_OPTION, EXCLUSIVE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         },
-        ControlSyntax { bare_begin: true, start_transaction: false, end_commits: true, abort_rolls_back: false, chained: false, begin_modes: &["deferred", "immediate", "exclusive"], rollback_transaction_name: false, hash_comments: false, identifier_quotes: &[('"', '"'), ('`', '`'), ('[', ']')] },
+        ControlSyntax { bare_begin: true, start_transaction: false, end_commits: true, abort_rolls_back: false, chained: false, begin_modes: &["deferred", "immediate", "exclusive"], rollback_transaction_name: false, save_transaction: false, hash_comments: false, identifier_quotes: &[('"', '"'), ('`', '`'), ('[', ']')] },
         Quote::Double,
         SavepointStyle::Standard,
     )
@@ -205,7 +205,7 @@ fn sqlserver_dialect() -> TestDialect {
             mode: NO_MODE,
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         },
-        ControlSyntax { bare_begin: false, start_transaction: false, end_commits: false, abort_rolls_back: false, chained: false, begin_modes: &[], rollback_transaction_name: true, hash_comments: false, identifier_quotes: &[('"', '"'), ('[', ']')] },
+        ControlSyntax { bare_begin: false, start_transaction: false, end_commits: false, abort_rolls_back: false, chained: false, begin_modes: &[], rollback_transaction_name: true, save_transaction: true, hash_comments: false, identifier_quotes: &[('"', '"'), ('[', ']')] },
         Quote::Bracket,
         SavepointStyle::Transact,
     )
@@ -871,13 +871,32 @@ fn manual_control_is_classified_by_dialect_syntax() {
     assert_eq!(sqlserver.classify_control("BEGIN TRY"), ControlMatch::Ordinary);
     assert_eq!(sqlserver.classify_control("BEGIN TRAN"), control(begin()));
     assert_eq!(sqlserver.classify_control("BEGIN TRANSACTION"), control(begin()));
+    assert_eq!(sqlserver.classify_control("COMMIT TRAN"), control(commit()));
+    assert_eq!(sqlserver.classify_control("COMMIT TRANSACTION"), control(commit()));
     assert_eq!(sqlserver.classify_control("ROLLBACK TRAN"), control(rollback()));
     assert_eq!(sqlserver.classify_control("ROLLBACK TRANSACTION"), control(rollback()));
     assert_eq!(sqlserver.classify_control("ROLLBACK TRANSACTION sp1"), control(rollback_to("sp1")));
+    // T-SQL 的保存点是 SAVE TRAN[SACTION] <name>，不是 SAVEPOINT。
+    assert_eq!(sqlserver.classify_control("SAVE TRAN sp"), control(savepoint("sp")));
+    assert_eq!(sqlserver.classify_control("SAVE TRANSACTION [sp one]"), control(savepoint("sp one")));
+    assert_eq!(sqlserver.classify_control("ROLLBACK TRAN sp"), control(rollback_to("sp")));
+    assert_eq!(
+        sqlserver.sql_for(&savepoint("sp")),
+        ControlSql::Statement("SAVE TRANSACTION [sp]".to_owned()),
+        "手写 SAVE TRAN 与按钮使用同一套 T-SQL 写法"
+    );
+    assert_eq!(sqlserver.sql_for(&rollback_to("sp")), ControlSql::Statement("ROLLBACK TRANSACTION [sp]".to_owned()));
+    // @name 是变量、真实保存点名要到运行时才知道：不能登记成固定名字，更不能当成整体回滚。
+    assert_eq!(sqlserver.classify_control("SAVE TRAN @sp"), ControlMatch::Ambiguous);
+    assert_eq!(sqlserver.classify_control("ROLLBACK TRAN @sp"), ControlMatch::Ambiguous);
+    assert_eq!(sqlserver.classify_control("ROLLBACK TRANSACTION sp1 extra"), ControlMatch::Ambiguous);
     assert_eq!(sqlserver.classify_control("SAVEPOINT [sp one]"), control(savepoint("sp one")));
     assert_eq!(sqlserver.classify_control("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"), control(isolation(Some(SNAPSHOT))));
     assert_eq!(sqlserver.classify_control("END"), ControlMatch::Ordinary);
     assert_eq!(sqlserver.classify_control("COMMIT AND CHAIN"), ControlMatch::Ambiguous);
+    // SAVE TRAN 只属于 T-SQL：其他方言仍是普通语句，不会被登记成保存点。
+    assert_eq!(postgres.classify_control("SAVE TRAN sp"), ControlMatch::Ordinary);
+    assert_eq!(mysql.classify_control("SAVE TRAN sp"), ControlMatch::Ordinary);
 }
 
 #[test]

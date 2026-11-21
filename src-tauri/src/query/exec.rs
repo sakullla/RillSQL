@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::connections::transaction::TransactionCoordinator;
 use crate::connections::CancelTransport;
 use crate::connections::CatalogSession;
+use crate::transaction::{TransactionEffect, TransactionSnapshot};
 
 use super::cancel::{self, CancelView};
 use super::split::{self, is_write, Piece};
+use super::transaction::StatementTrial;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementValue {
@@ -94,6 +97,8 @@ pub struct StatementReport {
     pub error_at: Option<ErrorAt>,
     /// 失败语句的驱动错误码（结构化取得的）；只有 status 为 error 时可能有值。
     pub error_code: Option<String>,
+    /// 这条语句对连接级事务的效果；非关系型连接或没有影响时为 None。
+    pub transaction: Option<TransactionEffect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +107,10 @@ pub struct BatchReport {
     pub statements: Vec<StatementReport>,
     pub cancel: CancelView,
     pub calls: usize,
+    /// 批次结束时这条连接共享的事务快照；没有事务面时为 None。
+    pub transaction: Option<TransactionSnapshot>,
+    /// 批次里最后一条影响事务的语句的效果。
+    pub transaction_effect: Option<TransactionEffect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,13 +258,16 @@ pub fn is_disconnect(message: &str) -> bool {
 pub struct DriverReport {
     pub sent: CappedSql,
     pub outcome: Result<StatementValue, StatementStop>,
+    /// 驱动原始失败（含结构化错误码）。事务登记用它按方言判定事务影响；
+    /// `StatementStop::Unknown` 不会丢掉错误码。
+    pub failure: Option<Failure>,
 }
 
 impl DriverReport {
     /// 没有改写、直接发出原语句的结果。给测试替身用：真实驱动都经 cap_result_sql_detail。
     #[cfg(test)]
     pub fn unchanged(sql: &str, outcome: Result<StatementValue, StatementStop>) -> Self {
-        Self { sent: CappedSql::unchanged(sql), outcome }
+        Self { sent: CappedSql::unchanged(sql), outcome, failure: None }
     }
 }
 
@@ -263,13 +275,29 @@ impl DriverReport {
 pub trait StatementDriver: Send + Sync {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> DriverReport;
 
+    /// 方言的事务状态探针。它不是用户语句：不占语句序号，也不向结果区发布行。
+    /// 默认实现按普通语句执行；真实驱动覆盖它，避免探针行进入结果区或打乱语句序号。
+    async fn probe(&self, sql: &str) -> Option<StatementValue> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.run(sql, 1, &cancel).await.outcome.ok()
+    }
+
     /// 累计等待调用方“继续读取”的时间。语句耗时要扣掉它，不把用户停留算成执行时间。
     fn paused(&self) -> Duration {
         Duration::ZERO
     }
 }
 
-pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBool>, via_ssh: bool, driver: &dyn StatementDriver) -> BatchReport {
+/// 逐条执行一批语句。`transactions` 是这条连接的协调器：有事务面时每条语句的意图与结果都要
+/// 经过它登记，手写控制语句按方言映射后执行（R3、R8、R9、R10）。
+pub async fn run_batch(
+    parts: &[Piece],
+    limit: usize,
+    cancel_flag: &Arc<AtomicBool>,
+    via_ssh: bool,
+    driver: &dyn StatementDriver,
+    transactions: Option<&TransactionCoordinator>,
+) -> BatchReport {
     let mut statements = Vec::new();
     let mut calls = 0usize;
     let mut cancel = CancelView {
@@ -278,6 +306,9 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
         fresh_channel: false,
     };
     let mut status = "done";
+    let mut effect = None;
+    // 上一批留下的未知/层数不明先核对一次：确认后这一批的语句才能按真实状态登记（R10）。
+    super::transaction::reconcile(transactions, driver).await;
     for (index, piece) in parts.iter().enumerate() {
         if cancel_flag.load(Ordering::SeqCst) {
             if cancel.phase == "none" {
@@ -293,94 +324,92 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
             status = if cancel.phase == "failed" { "running" } else { "cancelled" };
             break;
         }
-        calls += 1;
-        let paused_before = driver.paused();
-        let started = Instant::now();
-        let report = driver.run(&piece.text, limit, cancel_flag).await;
-        let spent = started.elapsed().saturating_sub(driver.paused().saturating_sub(paused_before));
-        let sent_sql = report.sent.sql;
-        let rewrite = report.sent.rewrite;
-        match report.outcome {
-            Ok(value) => {
-                statements.push(StatementReport {
-                    sql: piece.text.clone(),
-                    sent_sql,
-                    rewrite,
-                    status: "ok",
-                    message: String::new(),
-                    columns: value.columns,
-                    column_types: value.column_types,
-                    rows: value.rows,
-                    truncated: value.truncated,
-                    affected: value.affected,
-                    elapsed_ms: Some(elapsed_ms(spent)),
-                    error_at: None,
-                    error_code: None,
-                });
-                if cancel_flag.load(Ordering::SeqCst) {
-                    if cancel.phase == "none" {
-                        cancel = cancel::on_request(via_ssh);
-                    }
-                    for rest in &parts[index + 1..] {
-                        statements.push(skipped(rest.text.clone(), "未执行"));
-                    }
-                    if cancel.phase == "requested" {
-                        cancel.message = "取消生效前，当前语句已经执行完成；后续语句未执行。".to_owned();
-                    }
-                    status = "done";
-                    break;
-                }
+        let plan = super::transaction::plan(transactions, &piece.text);
+        let trial = super::transaction::attempt(transactions, plan, driver, limit, cancel_flag, &piece.text).await;
+        if trial.attempted {
+            calls += 1;
+        }
+        // 只把真正改变了事务状态的效果带到批次层：自动提交下的 Unchanged 会盖掉前面的隐式提交。
+        if let Some(value) = trial.transaction.filter(|effect| *effect != TransactionEffect::Unchanged) {
+            effect = Some(value);
+        }
+        let statement_status = trial.status;
+        let (stop, remaining) = (trial.stop, trial.remaining);
+        statements.push(statement_report(piece.text.clone(), trial));
+        // 取消不等于回滚：事务效果已按方言登记，这里只收尾取消状态与未执行语句（R8）。
+        if statement_status == "cancelled" {
+            cancel::on_statement_end(&mut cancel, "cancelled");
+            if cancel.phase == "none" {
+                cancel = cancel::on_request(via_ssh);
+                cancel.phase = "confirmed";
+                cancel.message = "数据库已确认取消。".to_owned();
             }
-            Err(stop) => {
-                let (statement_status, message, error_at, error_code) = match stop {
-                    StatementStop::Error { message, at, code } => ("error", message, at, code),
-                    StatementStop::Unknown { message } => ("unknown", message, None, None),
-                    StatementStop::Cancelled { message } => ("cancelled", message, None, None),
-                };
-                if statement_status == "cancelled" {
-                    cancel::on_statement_end(&mut cancel, "cancelled");
-                    if cancel.phase == "none" {
-                        cancel = cancel::on_request(via_ssh);
-                        cancel.phase = "confirmed";
-                        cancel.message = "数据库已确认取消。".to_owned();
-                    }
-                }
-                statements.push(StatementReport {
-                    sql: piece.text.clone(),
-                    sent_sql,
-                    rewrite,
-                    status: statement_status,
-                    message,
-                    columns: Vec::new(),
-                    column_types: Vec::new(),
-                    rows: Vec::new(),
-                    truncated: false,
-                    affected: None,
-                    // 被取消的语句只标“已取消”，不报一个不完整的耗时。
-                    elapsed_ms: if statement_status == "cancelled" { None } else { Some(elapsed_ms(spent)) },
-                    error_at,
-                    error_code,
-                });
-                for rest in &parts[index + 1..] {
-                    statements.push(skipped(rest.text.clone(), "未执行"));
-                }
-                status = match statement_status {
-                    "unknown" => "unknown",
-                    "cancelled" => "cancelled",
-                    _ => "error",
-                };
-                break;
+        }
+        if stop {
+            for rest in &parts[index + 1..] {
+                statements.push(skipped(rest.text.clone(), remaining));
             }
+            status = batch_status(statement_status);
+            break;
+        }
+        if cancel_flag.load(Ordering::SeqCst) {
+            if cancel.phase == "none" {
+                cancel = cancel::on_request(via_ssh);
+            }
+            for rest in &parts[index + 1..] {
+                statements.push(skipped(rest.text.clone(), "未执行"));
+            }
+            if cancel.phase == "requested" {
+                cancel.message = "取消生效前，当前语句已经执行完成；后续语句未执行。".to_owned();
+            }
+            status = "done";
+            break;
         }
     }
     if statements.is_empty() {
         status = "error";
     }
+    // 这一批留下了未知或层数不明时再核对一次：能确认的立即显示真实状态，不把猜测留给界面。
+    super::transaction::reconcile(transactions, driver).await;
     BatchReport {
         status,
         statements,
         cancel,
         calls,
+        transaction: transactions.and_then(|transactions| transactions.snapshot()),
+        transaction_effect: effect,
+    }
+}
+
+/// 批次整体结局：语句成功但事务结果未知时同样不能报完成（R10）。
+fn batch_status(statement_status: &str) -> &'static str {
+    match statement_status {
+        "error" => "error",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn statement_report(sql: String, trial: StatementTrial) -> StatementReport {
+    let (columns, column_types, rows, truncated, affected) = match trial.value {
+        Some(value) => (value.columns, value.column_types, value.rows, value.truncated, value.affected),
+        None => (Vec::new(), Vec::new(), Vec::new(), false, None),
+    };
+    StatementReport {
+        sql,
+        sent_sql: trial.sent_sql,
+        rewrite: trial.rewrite,
+        status: trial.status,
+        message: trial.message,
+        columns,
+        column_types,
+        rows,
+        truncated,
+        affected,
+        elapsed_ms: trial.elapsed_ms,
+        error_at: trial.error_at,
+        error_code: trial.error_code,
+        transaction: trial.transaction,
     }
 }
 
@@ -400,6 +429,7 @@ fn skipped(sql: String, message: &str) -> StatementReport {
         elapsed_ms: None,
         error_at: None,
         error_code: None,
+        transaction: None,
     }
 }
 
@@ -643,15 +673,33 @@ impl StatementDriver for LiveDriver {
                 }
             }
         }
+        // 事务登记要按方言看错误码：StatementStop 的归类可能已经把写入断连折成 Unknown。
+        let failure = result.as_ref().err().cloned();
         let outcome = result.map_err(|failure| match classify_failure(sql, failure.message, cancel.load(Ordering::SeqCst)) {
             StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at, code: failure.code },
             other => other,
         });
-        DriverReport { sent: capped, outcome }
+        DriverReport { sent: capped, outcome, failure }
     }
 
     fn paused(&self) -> Duration {
         Duration::from_micros(self.paused_micros.load(Ordering::SeqCst))
+    }
+
+    /// 状态探针：不经过用户结果区，也不占用语句序号（结果区按序号对齐用户语句）。
+    async fn probe(&self, sql: &str) -> Option<StatementValue> {
+        let mut attached = self.session.lock().await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = attached.run(&self.transport, sql, sql, 1, &cancel, &NopSink, usize::MAX).await;
+        match &result {
+            Ok(_) => self.transport.note_activity(),
+            Err(failure) => {
+                if is_disconnect(&failure.message) {
+                    self.transport.note_disconnect();
+                }
+            }
+        }
+        result.ok()
     }
 }
 

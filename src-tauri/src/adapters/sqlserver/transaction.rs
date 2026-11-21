@@ -29,6 +29,8 @@ const SQLSERVER_SYNTAX: ControlSyntax = ControlSyntax {
     chained: false,
     begin_modes: &[],
     rollback_transaction_name: true,
+    // T-SQL 的保存点写法是 SAVE TRAN[SACTION] <name>，不是 SAVEPOINT。
+    save_transaction: true,
     hash_comments: false,
     identifier_quotes: &[('"', '"'), ('[', ']')],
 };
@@ -199,6 +201,37 @@ mod tests {
             ControlMatch::Control(ControlStatement::RollbackToSavepoint(SavepointName::parse("sp").unwrap()))
         );
         assert_eq!(classify_control("COMMIT AND CHAIN", dialect.syntax()), ControlMatch::Ambiguous);
+    }
+
+    /// T-SQL 的保存点是 `SAVE TRAN[SACTION] <name>`；`ROLLBACK TRAN` 没有名字才是整体回滚。
+    #[test]
+    fn native_save_transaction_is_recognized_as_a_savepoint() {
+        let dialect = SqlserverTransaction;
+        for sql in ["SAVE TRAN sp", "SAVE TRANSACTION sp", "SAVE TRANSACTION [sp]"] {
+            assert_eq!(
+                classify_control(sql, dialect.syntax()),
+                ControlMatch::Control(ControlStatement::Savepoint(SavepointName::parse("sp").unwrap())),
+                "{sql}"
+            );
+        }
+        assert_eq!(classify_control("COMMIT TRAN", dialect.syntax()), ControlMatch::Control(ControlStatement::Commit { chain: false }));
+        assert_eq!(classify_control("COMMIT TRANSACTION", dialect.syntax()), ControlMatch::Control(ControlStatement::Commit { chain: false }));
+        assert_eq!(
+            classify_control("ROLLBACK TRAN sp", dialect.syntax()),
+            ControlMatch::Control(ControlStatement::RollbackToSavepoint(SavepointName::parse("sp").unwrap()))
+        );
+        assert_eq!(
+            classify_control("ROLLBACK TRANSACTION", dialect.syntax()),
+            ControlMatch::Control(ControlStatement::Rollback { chain: false }),
+            "没有名字的 ROLLBACK TRANSACTION 是整体回滚"
+        );
+        // @name 变量与多余词：实际效果无法确认，既不能登记保存点也不能当成整体回滚。
+        for sql in ["SAVE TRAN @sp", "ROLLBACK TRAN @sp", "ROLLBACK TRANSACTION sp extra", "SAVE TRAN"] {
+            assert_eq!(classify_control(sql, dialect.syntax()), ControlMatch::Ambiguous, "{sql}");
+        }
+        // 按钮与手写使用同一套 T-SQL 写法。
+        assert_eq!(dialect.savepoint_sql(&SavepointName::parse("sp").unwrap()), "SAVE TRANSACTION [sp]");
+        assert_eq!(dialect.rollback_to_savepoint_sql(&SavepointName::parse("sp").unwrap()), "ROLLBACK TRANSACTION [sp]");
     }
 
     #[test]
