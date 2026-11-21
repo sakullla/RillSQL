@@ -167,6 +167,8 @@ dict! {
     "shell.palette.hintMove" => "选择", "Navigate";
     "shell.palette.hintRun" => "执行", "Run";
     "shell.palette.hintClose" => "关闭", "Close";
+    "shell.palette.hintScope" => "切分组", "Switch scope";
+    "shell.palette.hintCommands" => "仅命令", "Commands";
     "shell.welcome.title" => "RillSQL", "RillSQL";
     "shell.welcome.factEngines" => "支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis、MongoDB", "Supports PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB";
     "shell.welcome.resumeTitle" => "继续工作", "Continue working";
@@ -184,6 +186,8 @@ dict! {
     "shell.tabs.unpin" => "取消固定", "Unpin tab";
     "shell.tabs.pinned" => "已固定", "Pinned";
     "shell.tabs.list" => "标签列表", "Tab list";
+    "shell.tabs.unsavedDraft" => "有未保存的查询草稿", "Unsaved query draft";
+    "shell.tabs.pendingStructure" => "表结构有待应用的变更", "Pending structure changes";
     "shell.tabs.pendingCells" => "先提交或撤销当前表格的暂存修改", "Commit or discard the staged grid changes first";
     "shell.tabs.needObject" => "先在对象树里选择表或视图。", "Choose a table or view in the object tree first.";
     "shell.closeGuard.closeWindow" => "关闭窗口？", "Close the window?";
@@ -1029,7 +1033,10 @@ dict! {
     "ui.nav.loadAll" => "全部", "All";
     "ui.nav.loadAllTip" => "一次读取剩余全部对象", "Load all remaining objects";
     "ui.explorer.noObjects" => "尚未读取对象", "No objects loaded yet";
+    "ui.topbar.label" => "主工具栏", "Main toolbar";
     "ui.explorer.noMatch" => "没有匹配的对象", "No matching objects";
+    "ui.explorer.searchSkipped" => "已跳过 {n} 个未连接或未加载的连接", "{n} disconnected or unloaded connections skipped";
+    "ui.explorer.searchSkippedNoMatch" => "已加载连接中无匹配项（已跳过 {n} 个未连接或未加载连接，请先连接或展开）", "No matches in loaded connections ({n} disconnected or unloaded skipped — connect or expand them first)";
     "ui.explorer.error" => "读取对象失败", "Could not load objects";
     "ui.explorer.empty" => "还没有连接", "No connections yet";
     "ui.explorer.emptyHint" => "新建一个连接，或直接打开本机的 SQLite 文件。", "Create a connection, or open a local SQLite file.";
@@ -1144,6 +1151,9 @@ dict! {
     "shell.shortcuts.explorerMove" => "在对象树中上下移动", "Move up and down the object tree";
     "shell.shortcuts.explorerExpand" => "折叠 / 展开节点", "Collapse / expand a node";
     "shell.shortcuts.explorerOpen" => "打开对象（表打开数据）", "Open the object (tables open their data)";
+    "shell.shortcuts.explorerOpenStructure" => "直接打开表结构（对象树中）", "Open table structure directly (in object tree)";
+    "shell.shortcuts.explorerSearch" => "聚焦对象树搜索框", "Focus object tree search";
+    "shell.shortcuts.explorerQuickSearch" => "快速聚焦对象树搜索框（侧栏聚焦时）", "Quick-focus object tree search (in sidebar)";
     "shell.shortcuts.explorerClearSearch" => "在搜索框中清除对象搜索", "Clear the object search in the search box";
     "shell.shortcuts.keyspaceFilter" => "在模式框中按模式重新扫描键", "Rescan keys with the pattern in the pattern box";
     "shell.shortcuts.keyspaceExec" => "在命令框中执行命令（写命令先确认）", "Run the command in the command box (writes ask first)";

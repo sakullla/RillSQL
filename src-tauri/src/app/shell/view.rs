@@ -72,6 +72,8 @@ pub struct Workbench {
     pub(super) overview_focus: FocusHandle,
     /// 就地重命名的输入框已拿到焦点（只在打开时聚焦一次）。
     pub(super) tab_rename_focused: bool,
+    /// 通过快捷键请求聚焦对象树搜索框；渲染对象树时消费一次。
+    pub(super) focus_explorer_filter: bool,
     /// 重命名输入框失焦即确认（点到编辑器或别的区域时不让输入框一直挂在标签栏上）。
     pub(super) tab_rename_blur: Option<gpui_kit::Subscription>,
     /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
@@ -329,6 +331,7 @@ impl Workbench {
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
         let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
+        super::chrome::bind_palette_keys(cx);
         let palette_owner = cx.entity().downgrade();
         let child_subscriptions = vec![
             cx.observe(&query, |_, _, cx| cx.notify()),
@@ -428,6 +431,7 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             overview_focus: cx.focus_handle(),
             tab_rename_focused: false,
+            focus_explorer_filter: false,
             tab_rename_blur: None,
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
@@ -522,6 +526,9 @@ impl Workbench {
     }
 
     fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id == "explorer-search" {
+            self.focus_explorer_filter = true;
+        }
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
             let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
@@ -1173,6 +1180,8 @@ impl Workbench {
         }
         let table_dirty = self.table.read(cx).uncommitted();
         let query_dirty = self.query.read(cx).grid_uncommitted(cx);
+        let structure_dirty = self.structure.read(cx).pending_changes() > 0;
+        let structure_target = self.structure.read(cx).session.target.clone();
         self.model.grid_dirty = table_dirty || query_dirty;
         self.model.grid_writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
         let active = self.model.active_tab.clone();
@@ -1192,6 +1201,19 @@ impl Workbench {
                         }
                     } else {
                         tab.uncommitted_cells = false;
+                    }
+                }
+                WorkItemKind::Structure => {
+                    let matches_active = active.as_deref() == Some(tab.id.as_str()) && self.model.tool == WorkTool::Structure;
+                    let matches_spec = !structure_target.connection_id.is_empty()
+                        && tab.spec.as_deref().and_then(parse_target).is_some_and(|t| {
+                            t.connection_id == structure_target.connection_id
+                                && t.database == structure_target.database
+                                && t.schema == structure_target.schema
+                                && t.table == structure_target.table
+                        });
+                    if matches_active || matches_spec {
+                        tab.structure_dirty = structure_dirty;
                     }
                 }
                 _ => {}

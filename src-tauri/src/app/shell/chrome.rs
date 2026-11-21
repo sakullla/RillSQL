@@ -50,6 +50,23 @@ impl Render for ConnectionDragGhost {
     }
 }
 
+/// 拖拽页签重排时携带的源标签 id。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabDrag {
+    id: String,
+}
+
+gpui_kit::actions!(rillsql_palette, [PaletteNextScope, PalettePrevScope]);
+
+pub(super) fn bind_palette_keys(cx: &mut App) {
+    cx.bind_keys([
+        gpui_kit::KeyBinding::new("tab", PaletteNextScope, Some("Palette")),
+        gpui_kit::KeyBinding::new("shift-tab", PalettePrevScope, Some("Palette")),
+        gpui_kit::KeyBinding::new("tab", PaletteNextScope, Some("Palette && Input")),
+        gpui_kit::KeyBinding::new("shift-tab", PalettePrevScope, Some("Palette && Input")),
+    ]);
+}
+
 /// 点击后执行一条外壳命令。
 pub(super) fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
     let id: String = id.into();
@@ -481,7 +498,8 @@ impl Workbench {
         {
             return;
         }
-        // 侧栏有焦点时方向键属于对象树：上下移动、左右展开/折叠、回车打开。
+        // 侧栏有焦点时方向键属于对象树：上下移动、左右展开/折叠、回车打开；
+        // 搜索框获得焦点时完全放行给输入框，不拦截方向键、Home/End 或回车。
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open
@@ -489,23 +507,31 @@ impl Workbench {
             && self.model.shell.focus == FocusTarget::Sidebar
             && self.model.shell.sidebar_open
         {
-            {
-                let command = match key {
-                    "up" => self.model.nav_key(super::menus::NavKey::ArrowUp),
-                    "down" => self.model.nav_key(super::menus::NavKey::ArrowDown),
-                    "home" => self.model.nav_key(super::menus::NavKey::Home),
-                    "end" => self.model.nav_key(super::menus::NavKey::End),
-                    "right" => self.model.nav_step(true),
-                    "left" => self.model.nav_step(false),
-                    "enter" => self.model.nav_key(super::menus::NavKey::Enter),
-                    _ => None,
-                };
-                if let Some(command) = command {
-                    self.perform(&command, cx);
-                }
+            if self.fields.is_focused(DraftField::ObjectFilter, window, cx) {
+                return;
+            }
+            let mods = event.keystroke.modifiers;
+            if key == "/" && !mods.secondary(cx) && !mods.alt && !mods.control {
+                self.fields.focus(DraftField::ObjectFilter, window, cx);
                 cx.notify();
                 return;
             }
+            let command = match key {
+                "up" => self.model.nav_key(super::menus::NavKey::ArrowUp),
+                "down" => self.model.nav_key(super::menus::NavKey::ArrowDown),
+                "home" => self.model.nav_key(super::menus::NavKey::Home),
+                "end" => self.model.nav_key(super::menus::NavKey::End),
+                "right" => self.model.nav_step(true),
+                "left" => self.model.nav_step(false),
+                "enter" if mods.shift => self.model.explorer_open_structure(),
+                "enter" => self.model.nav_key(super::menus::NavKey::Enter),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.perform(&command, cx);
+            }
+            cx.notify();
+            return;
         }
         // 连接页的方向键属于连接启动台列表：上下/Home/End 在筛选后的可见连接里移动，回车打开/连接。
         if self.model.menu.is_none()
@@ -650,12 +676,46 @@ impl Workbench {
             // 查询页的结果网格属于 QueryPane。公开焦点入口是编辑器；表格页才回到共享网格。
             FocusTarget::Grid if self.model.tool == super::model::WorkTool::Query => self.query.update(cx, |pane, _| pane.request_focus()),
             FocusTarget::Grid => self.table.update(cx, |pane, _| pane.request_focus()),
+            // 结构页将焦点还原给 StructurePane，确保关闭浮层后结构页内快捷键立即恢复。
+            FocusTarget::Editor if self.model.shell.page == AppPage::Structure && self.model.tool == super::model::WorkTool::Structure => {
+                let handle = self.structure.update(cx, |pane, cx| pane.focus_handle(cx));
+                window.focus(&handle, cx);
+            }
             // 查询编辑器只画在工作区；在别的页面（连接页、历史页）关掉浮层时把焦点交回工作台根，
             // 否则焦点落在已经不在界面上的浮层输入框里，Esc、方向键都没人接。
             FocusTarget::Editor if self.model.shell.page != AppPage::Workspace => window.focus(&self.focus, cx),
+            FocusTarget::Editor if self.model.tool == super::model::WorkTool::Table => self.table.update(cx, |pane, _| pane.request_focus()),
             FocusTarget::Editor => self.query.update(cx, |pane, _| pane.request_focus()),
             _ => window.focus(&self.focus, cx),
         }
+    }
+
+    /// 活动连接/数据库目标摘要（顶栏与状态栏共用同一份事实源）。
+    fn active_target_summary(&self) -> Option<(String, String, String, String, String, bool)> {
+        let tab_target = self.model.active_tab().filter(|tab| tab.connection_id.is_some()).map(|tab| {
+            (
+                tab.connection_id.clone().unwrap_or_default(),
+                tab.engine.clone().unwrap_or_default(),
+                tab.connection_name.clone().unwrap_or_default(),
+                tab.database.clone().unwrap_or_default(),
+            )
+        });
+        let tree_target = || {
+            self.model.nav.focus_node().filter(|node| !node.connection_id.is_empty()).map(|node| {
+                (node.connection_id.clone(), node.engine.as_str().to_owned(), node.connection_name.clone(), node.database.clone())
+            })
+        };
+        let (connection_id, engine, name, database) = if self.model.active_tab().is_some() { tab_target } else { tab_target.or_else(tree_target) }?;
+        let env = self
+            .model
+            .connections
+            .rows
+            .iter()
+            .find(|row| row.saved.id == connection_id)
+            .map(|row| row.saved.env.clone())
+            .unwrap_or_default();
+        let missing = self.model.connections.loaded && !self.model.connections.rows.iter().any(|row| row.saved.id == connection_id);
+        Some((connection_id, engine, name, database, env, missing))
     }
 
     // ------------------------------------------------------------ 顶栏
@@ -670,11 +730,49 @@ impl Workbench {
         // 顶栏就是窗口标题栏：空白处拖动窗口、双击最大化，Windows/Linux 在右侧画最小化/最大化/关闭。
         // 按钮包在 occlude 里，命中测试才不会把点击当成拖动标题栏。
         let controls = |child: AnyElement| div().flex().items_center().gap(px(8.)).occlude().child(child);
+        let top_target = self.active_target_summary().and_then(|(_, engine, name, database, env, missing)| {
+            let is_prod = super::danger::env_is_prod(&env, Some(&self.model.env_tags));
+            if narrow && !is_prod {
+                return None;
+            }
+            let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
+            let max_w = if narrow { 140. } else { 240. };
+            Some(controls(
+                kit::interactive_states(div().id("top-target"), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(if missing { SharedString::from(format!("{label} · {}", self.t("ui.query.targetMissing"))) } else { label.clone() })
+                    .tooltip_text(if missing { self.t("ui.query.targetMissing") } else { self.t("ui.status.switchTargetHint") })
+                    .h(px(m.control_h))
+                    .max_w(px(max_w))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(Radius::CONTROL))
+                    .border_1()
+                    .border_color(if is_prod { p.danger.opacity(0.45) } else { p.line })
+                    .bg(if is_prod { p.danger_soft } else { p.surface })
+                    .text_size(px(TypeScale::XS))
+                    .text_color(if missing { p.warn } else if is_prod { p.danger } else { p.text_muted })
+                    .hover(|style| style.bg(if is_prod { p.danger_soft } else { p.hover }).text_color(if is_prod { p.danger } else { p.text }))
+                    .child(kit::engine_badge(&engine, 14.))
+                    .child(div().min_w_0().truncate().child(label))
+                    .when(missing, |this| this.child(kit::icon(IconName::TriangleAlert, 12., p.warn)))
+                    .children(self.env_pill(&env, &p))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.perform("status-target", cx);
+                        this.restore_focus(window, cx);
+                        this.open_query_target_picker(cx);
+                    }))
+                    .into_any_element(),
+            ))
+        });
         let row = div()
             .id("toolbar")
             .test_support()
             .role(gpui_kit::Role::Toolbar)
-            .aria_label(self.t("shell.command.newQuery"))
+            .aria_label(self.t("ui.topbar.label"))
             .h_full()
             .flex_1()
             .min_w_0()
@@ -696,12 +794,13 @@ impl Workbench {
                     .when(!narrow, |this| this.child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).child("RillSQL"))),
             )
             .child(div().flex_1())
+            .children(top_target)
             .child(controls(
                 kit::interactive_states(div().id("top-search"), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.palette.title"))
-                    .w(px(if narrow { 176. } else { 360. }))
+                    .w(px(if narrow { 176. } else { 320. }))
                     .h(px(m.control_h))
                     .px(px(10.))
                     .flex()
@@ -802,6 +901,11 @@ impl Workbench {
             self.field_input(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
         // Esc 清空筛选框：与框内 × 一样以空值送达，走唯一的清除入口；框已空时 Esc 照常向外传递。
         filter_state.update(cx, |state, _| state.set_clean_on_escape(true));
+        if self.focus_explorer_filter {
+            self.focus_explorer_filter = false;
+            self.fields.focus(DraftField::ObjectFilter, window, cx);
+        }
+        let search_skipped = self.model.nav_search_skipped_count();
         let group_prompt = self.group_prompt_panel(window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
         // 可见行先拍成扁平序列（分组标题 → 连接 → 树行），渲染只创建视口窗口里的行。
@@ -942,6 +1046,25 @@ impl Workbench {
                     .when(!self.model.connections.rows.is_empty(), |this| {
                         this.child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
                     })
+                    .when(search_skipped > 0, |this| {
+                        let msg = i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &search_skipped.to_string())]);
+                        this.child(
+                            div()
+                                .id("explorer-search-skipped")
+                                .test_support()
+                                .flex_none()
+                                .px(px(12.))
+                                .pb(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_faint)
+                                .tooltip_text(SharedString::from(msg.clone()))
+                                .child(kit::icon(IconName::Info, 12., p.text_faint))
+                                .child(div().flex_1().min_w_0().truncate().child(SharedString::from(msg))),
+                        )
+                    })
                     .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
             )
@@ -1029,19 +1152,27 @@ impl Workbench {
             ExplorerItem::NoMatch => {
                 let m = self.metrics();
                 let has_object_filter = !self.model.object_filter.trim().is_empty();
+                let skipped = self.model.nav_search_skipped_count();
+                let message: SharedString = if skipped > 0 {
+                    SharedString::from(i18n::fill(&self.model.text("ui.explorer.searchSkippedNoMatch"), &[("n", &skipped.to_string())]))
+                } else {
+                    self.t("ui.explorer.noMatch")
+                };
                 div()
                     .id("explorer-search-empty")
                     .test_support()
+                    .tooltip_text(message.clone())
                     .flex_none()
-                    .h(px(m.tree_row_h + 4.))
+                    .min_h(px(m.tree_row_h + 4.))
                     .px(px(16.))
+                    .py(px(4.))
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_faint)
-                    .child(div().flex_1().min_w_0().truncate().child(self.t("ui.explorer.noMatch")))
+                    .child(div().flex_1().min_w_0().truncate().child(message))
                     .when(has_object_filter, |this| {
                         this.child(
                             kit::tool_button(
@@ -1580,8 +1711,8 @@ impl Workbench {
                                 .gap(px(1.))
                                 .invisible()
                                 .group_hover(group.clone(), |style| style.visible())
-                                // 底色与行当前底色一致：选中行是选中底，其余是悬停底，不出现色块。
-                                .bg(if row.focused || row.selected { p.selection } else { p.hover })
+                                // 底色与行当前底色一致且完全不透明：选中行用 chrome+selection 合成不透明底，防止下方文字透出。
+                                .bg(if row.focused || row.selected { kit::blend_opaque(p.chrome, p.selection) } else { p.hover })
                                 .rounded(px(Radius::CONTROL))
                                 .child(explorer_hover_icon(
                                     SharedString::from(format!("nav-quick-data-{id}")),
@@ -1934,8 +2065,10 @@ impl Workbench {
                 let _ = host.update(cx, |_, cx| cx.notify());
             });
         }
-        // 未保存标记的文字版本进 tooltip：状态不只靠一个颜色点表达（不改 i18n 目录）。
-        let dirty_text = self.t("ui.grid.pending");
+        // 未保存标记的文字版本进 tooltip：表/查询/结构各自展示对应提示，状态不只靠颜色点表达。
+        let dirty_table_text = self.t("ui.grid.pending");
+        let dirty_query_text = self.t("shell.tabs.unsavedDraft");
+        let dirty_structure_text = self.t("shell.tabs.pendingStructure");
         let pinned_text = self.t("shell.tabs.pinned");
         let renaming = self.model.tab_rename.as_ref().map(|(id, _)| id.clone());
         if renaming.is_none() {
@@ -1949,7 +2082,21 @@ impl Workbench {
             }
             // 只有工作页才把标签显示为选中；设置、对比、关系图页不伪装成某个工作项。
             let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
-            let dirty = tab.uncommitted_cells;
+            let (dirty, dirty_tip) = match tab.kind {
+                WorkItemKind::Table => (tab.uncommitted_cells, Some(dirty_table_text.clone())),
+                WorkItemKind::Query => {
+                    let draft_dirty = super::close::draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref());
+                    if tab.uncommitted_cells {
+                        (true, Some(dirty_table_text.clone()))
+                    } else if draft_dirty {
+                        (true, Some(dirty_query_text.clone()))
+                    } else {
+                        (false, None)
+                    }
+                }
+                WorkItemKind::Structure => (tab.structure_dirty, Some(dirty_structure_text.clone())),
+                _ => (tab.uncommitted_cells, Some(dirty_table_text.clone())),
+            };
             let title = SharedString::from(tab.title.clone());
             let (is_prod, context_hint) = tab
                 .connection_id
@@ -1984,6 +2131,9 @@ impl Workbench {
             let close_id = tab.id.clone();
             let menu_id = tab.id.clone();
             let middle_id = tab.id.clone();
+            let drag_id = tab.id.clone();
+            let drop_id = tab.id.clone();
+            let drop_accent = p.accent;
             let preview = self.model.is_preview_tab(&tab.id);
             let close_label = self.t("common.close");
             // 运行中的转圈是独立小实体：动画帧不通知工作台，不触发工作台的整理。
@@ -1997,9 +2147,17 @@ impl Workbench {
                     .prod(is_prod)
                     .context(context_hint)
                     .preview(preview)
-                    .dirty(dirty, Some(dirty_text.clone())),
+                    .dirty(dirty, dirty_tip),
                 &p,
             )
+            .on_drag(TabDrag { id: drag_id }, |_, _, _, cx| cx.new(|_| ConnectionDragGhost))
+            .drag_over::<TabDrag>(move |style, _, _, _| style.border_l_2().border_color(drop_accent))
+            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                if this.model.reorder_tab(&drag.id, &drop_id) {
+                    this.persist_if_needed(cx);
+                    cx.notify();
+                }
+            }))
             .child(tabs::close_action(
                 SharedString::from(format!("tab-close-{id}")),
                 close_label,
@@ -2012,7 +2170,7 @@ impl Workbench {
                 }),
             ))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
+                // 右键只针对被点中的标签打开上下文菜单，不切换当前激活标签。
                 if this.model.tab_menu_for(&menu_id) {
                     this.menu_at = event.position;
                     this.persist_if_needed(cx);
@@ -2055,23 +2213,50 @@ impl Workbench {
             act("new-query", cx),
         )
         .into_any_element();
-        // 标签列表：标签多到放不下时也一直在右侧，可按标题、连接、库搜索后切过去。
+        // 标签列表：标签多到放不下时也一直在右侧，带计数入口，可按标题、连接、库搜索后切过去。
         let anchor = self.tab_picker_anchor.clone();
+        let tab_count = self.model.tabs.len();
         let list_action = div()
             .relative()
             .flex_none()
             .child(
-                kit::icon_action(
-                    "tab-picker",
-                    IconName::ChevronDown,
-                    self.t("shell.tabs.list"),
-                    kit::HitArea::CONTROL,
-                    p.text_muted,
-                    &p,
-                    self.model.tabs.is_empty(),
-                    self.tab_picker.is_some(),
-                    cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_tab_picker(window, cx)),
-                ),
+                kit::interactive_states(div().id("tab-picker"), &p, self.model.tabs.is_empty())
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t("shell.tabs.list"))
+                    .tooltip_text(self.t("shell.tabs.list"))
+                    .h(px(kit::HitArea::CONTROL))
+                    .min_w(px(kit::HitArea::CONTROL))
+                    .px(px(if tab_count > 1 { 6. } else { 0. }))
+                    .rounded(px(Radius::CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(3.))
+                    .when(self.tab_picker.is_some(), |this| this.bg(p.accent_soft).text_color(p.accent_text))
+                    .when(self.tab_picker.is_none() && !self.model.tabs.is_empty(), |this| {
+                        this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text))
+                    })
+                    .when(self.model.tabs.is_empty(), |this| this.text_color(p.text_faint))
+                    .when(tab_count > 1, |this| {
+                        this.child(
+                            div()
+                                .id("tab-picker-count")
+                                .test_support()
+                                .text_size(px(TypeScale::XS))
+                                .font_weight(FontWeight::MEDIUM)
+                                .font_features(kit::tabular_figures())
+                                .child(SharedString::from(tab_count.to_string())),
+                        )
+                    })
+                    .child(kit::icon(
+                        IconName::ChevronDown,
+                        12.,
+                        if self.tab_picker.is_some() { p.accent_text } else { p.text_muted },
+                    ))
+                    .when(!self.model.tabs.is_empty(), |this| {
+                        this.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_tab_picker(window, cx)))
+                    }),
             )
             .child(
                 gpui_kit::canvas(move |area, _, _| anchor.set(Some(area)), |_, _, _, _| {})
@@ -2198,32 +2383,8 @@ impl Workbench {
         let target_max = (self.model.viewport_width as f32 * 0.42).max(120.);
         // 目标：活动工作项自己的连接；没有工作项时（欢迎页、历史、设置）落到对象树里选中的连接，
         // 免得树上明明选着一条已连接的库，状态栏却说“未选择连接”。
-        let tab_target = self.model.active_tab().filter(|tab| tab.connection_id.is_some()).map(|tab| {
-            (
-                tab.connection_id.clone().unwrap_or_default(),
-                tab.engine.clone().unwrap_or_default(),
-                tab.connection_name.clone().unwrap_or_default(),
-                tab.database.clone().unwrap_or_default(),
-            )
-        });
-        let tree_target = || {
-            self.model.nav.focus_node().filter(|node| !node.connection_id.is_empty()).map(|node| {
-                (node.connection_id.clone(), node.engine.as_str().to_owned(), node.connection_name.clone(), node.database.clone())
-            })
-        };
-        let status_target = if self.model.active_tab().is_some() { tab_target } else { tab_target.or_else(tree_target) };
-        let target: AnyElement = match status_target {
-            Some((connection_id, engine, name, database)) => {
-                let env = self
-                    .model
-                    .connections
-                    .rows
-                    .iter()
-                    .find(|row| row.saved.id == connection_id)
-                    .map(|row| row.saved.env.clone())
-                    .unwrap_or_default();
-                // 绑定的连接已被删除：照样显示原名，但用警示色说明它已不存在，而不是看起来一切就绪。
-                let missing = self.model.connections.loaded && !self.model.connections.rows.iter().any(|row| row.saved.id == connection_id);
+        let target: AnyElement = match self.active_target_summary() {
+            Some((_, engine, name, database, env, missing)) => {
                 let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
                 kit::interactive_states(div().id("status-target"), &p, false)
                     .test_support()
@@ -2266,6 +2427,7 @@ impl Workbench {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.perform("status-target", cx);
                     this.restore_focus(window, cx);
+                    this.open_query_target_picker(cx);
                 }))
                 .into_any_element(),
         };
@@ -2381,7 +2543,7 @@ impl Workbench {
                         .on_click(act("settings", cx)),
                 )
             })
-            .when(self.model.tabs.len() > 1 && self.model.viewport_width >= 760, |this| {
+            .when(self.model.tabs.len() > 1, |this| {
                 let total = self.model.tabs.len();
                 let current = self
                     .model
@@ -2391,12 +2553,19 @@ impl Workbench {
                     .map(|idx| idx + 1)
                     .unwrap_or(1);
                 this.child(
-                    div()
-                        .id("status-tab-count")
+                    kit::interactive_states(div().id("status-tab-count"), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(self.t("shell.tabs.list"))
+                        .tooltip_text(self.t("shell.tabs.list"))
                         .flex_none()
+                        .px(px(4.))
+                        .rounded(px(Radius::CONTROL))
                         .text_size(px(TypeScale::XS))
                         .text_color(p.text_faint)
-                        .child(SharedString::from(format!("{current} / {total}"))),
+                        .hover(|style| style.bg(p.hover).text_color(p.text))
+                        .child(SharedString::from(format!("{current} / {total}")))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_tab_picker(window, cx))),
                 )
             })
             .child(
@@ -5997,6 +6166,26 @@ impl Workbench {
             .aria_label(self.t(if help { "shell.command.help" } else { "shell.palette.title" }))
             .aria_expanded(self.model.shell.palette_open)
             .key_context("Palette")
+            .on_action(cx.listener(|this, _: &PaletteNextScope, window, cx| {
+                if this.model.shell.palette_open {
+                    let next = this.model.effective_palette_scope().next();
+                    this.model.palette_scope = next;
+                    this.model.palette_index = 0;
+                    this.model.shell.palette_tables_only = false;
+                    this.fields.focus(DraftField::PaletteQuery, window, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PalettePrevScope, window, cx| {
+                if this.model.shell.palette_open {
+                    let prev = this.model.effective_palette_scope().prev();
+                    this.model.palette_scope = prev;
+                    this.model.palette_index = 0;
+                    this.model.shell.palette_tables_only = false;
+                    this.fields.focus(DraftField::PaletteQuery, window, cx);
+                    cx.notify();
+                }
+            }))
             .occlude()
             .w_full()
             .max_w(px(620.))
@@ -6012,6 +6201,18 @@ impl Workbench {
             .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 if this.model.shell.palette_open {
+                    if key == "tab" && !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform && !event.keystroke.modifiers.alt {
+                        cx.stop_propagation();
+                        let current = this.model.effective_palette_scope();
+                        let next = if event.keystroke.modifiers.shift { current.prev() } else { current.next() };
+                        this.model.palette_scope = next;
+                        this.model.palette_index = 0;
+                        // 手动切分组时退出仅表模式，使分组切换立即生效。
+                        this.model.shell.palette_tables_only = false;
+                        this.fields.focus(DraftField::PaletteQuery, window, cx);
+                        cx.notify();
+                        return;
+                    }
                     let query_empty = this.model.palette_query.is_empty();
                     let intercept = matches!(key, "up" | "down" | "enter" | "escape")
                         || (query_empty && matches!(key, "home" | "end"));
@@ -6399,6 +6600,8 @@ impl Workbench {
                 .text_size(px(TypeScale::XS))
                 .text_color(p.text_faint)
                 .child(hint("↑↓", self.t("shell.palette.hintMove")))
+                .child(hint("Tab", self.t("shell.palette.hintScope")))
+                .child(hint(">", self.t("shell.palette.hintCommands")))
                 .child(hint("Enter", self.t("shell.palette.hintRun")))
                 .child(hint("Esc", self.t("shell.palette.hintClose")));
             panel = panel
@@ -6443,6 +6646,18 @@ impl Workbench {
         let show_kind = entry.group != "command";
         let detail = entry.detail.clone();
         let icon = palette_icon(&entry.id);
+        let raw_query = self.model.palette_query.trim();
+        let match_query = raw_query.strip_prefix('>').map(str::trim).unwrap_or(raw_query);
+        let label_hit = crate::app::keymap::label_match(&entry.label, match_query);
+        let detail_hit = crate::app::keymap::label_match(&detail, match_query);
+        let label_el: AnyElement = match label_hit {
+            Some((start, end)) => help_hit_text(format!("pal-match-{index}"), &entry.label, start, end, &p)
+                .flex_1()
+                .min_w_0()
+                .text_size(px(TypeScale::MD))
+                .into_any_element(),
+            None => div().flex_1().min_w_0().truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label.clone())).into_any_element(),
+        };
         stack_frame(|| {
             kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
                 .test_support()
@@ -6476,21 +6691,25 @@ impl Workbench {
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
+                        .child(label_el)
                         // 上下文（库.模式 · 连接 / 引擎 · 库）：选中后去哪一目了然。
                         .when(!detail.is_empty(), |this| {
                             let full_detail = SharedString::from(detail.clone());
+                            let detail_content: AnyElement = match detail_hit {
+                                Some((start, end)) => help_hit_text(format!("pal-detail-match-{index}"), &detail, start, end, &p).into_any_element(),
+                                None => full_detail.clone().into_any_element(),
+                            };
                             this.child(
                                 div()
                                     .id(SharedString::from(format!("pal-detail-{index}")))
                                     .test_support()
-                                    .tooltip_text(full_detail.clone())
+                                    .tooltip_text(full_detail)
                                     .flex_none()
                                     .max_w(px(if show_kind { 190. } else { 256. }))
                                     .truncate()
                                     .text_size(px(TypeScale::XS))
                                     .text_color(if selected { p.accent_text } else { p.text_faint })
-                                    .child(full_detail),
+                                    .child(detail_content),
                             )
                         })
                         // 类型标注：表 / 视图 / 连接 / 库 / 保存的查询。
