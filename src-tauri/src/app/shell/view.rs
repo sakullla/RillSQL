@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, PathPromptOptions, Render, SharedString, Window,
-    WindowAppearance,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window,
+    WindowAppearance, div,
 };
 
 use crate::app::views::admin::AdminPane;
@@ -15,6 +15,7 @@ use crate::app::views::diagram::DiagramPane;
 use crate::app::views::export::{ExchangePane, ExchangeSource, ExchangeSourceKind};
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::mongo::MongoPane;
+use crate::app::views::object_editor::{EditorRequest, ObjectEditorPane};
 use crate::app::views::query::{requires_active_query, QueryPane, SyncEffect, TabSnap};
 use crate::app::views::redis::RedisPane;
 use crate::app::views::settings::SaveState;
@@ -45,6 +46,8 @@ pub struct Workbench {
     pub(super) table: Entity<GridPane>,
     pub(super) structure: Entity<StructurePane>,
     pub(super) admin: Entity<AdminPane>,
+    /// 事件 / 函数 / 存储过程 / 触发器的统一编辑器（覆盖在所有页面之上，按需打开）。
+    pub(super) object_editor: Entity<ObjectEditorPane>,
     pub(super) exchange: Entity<ExchangePane>,
     pub(super) compare: Entity<ComparePane>,
     pub(super) diagram: Entity<DiagramPane>,
@@ -324,6 +327,7 @@ impl Workbench {
             pane
         });
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
+        let object_editor = cx.new(|_| ObjectEditorPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
         let compare = cx.new(|_| ComparePane::new(Arc::clone(&services)));
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
@@ -334,6 +338,7 @@ impl Workbench {
             cx.observe(&query, |_, _, cx| cx.notify()),
             cx.observe(&table, |_, _, cx| cx.notify()),
             cx.observe(&admin, |_, _, cx| cx.notify()),
+            cx.observe(&object_editor, |_, _, cx| cx.notify()),
             cx.observe(&exchange, |_, _, cx| cx.notify()),
             cx.observe(&structure, |_, _, cx| cx.notify()),
             cx.observe(&compare, |_, _, cx| cx.notify()),
@@ -407,6 +412,7 @@ impl Workbench {
             table,
             structure,
             admin,
+            object_editor,
             exchange,
             compare,
             diagram,
@@ -521,6 +527,40 @@ impl Workbench {
         self.settle(cx);
     }
 
+    /// 对象编辑器要编辑的那个对象：右键的那一行优先，其次对象树焦点行。
+    ///
+    /// 只认事件、函数、存储过程与触发器；表与视图仍走结构页和定义页。
+    pub(super) fn object_editor_request(&mut self) -> Option<EditorRequest> {
+        let node_id = self.model.nav_menu_node.clone().or_else(|| self.model.nav.focus().map(str::to_owned));
+        self.model.nav_menu_node = None;
+        let node_id = node_id?;
+        let object = self.model.nav.node(&node_id)?.object()?;
+        if !crate::app::views::object_editor::editable(object.kind) {
+            return None;
+        }
+        Some(EditorRequest {
+            connection_id: object.connection_id,
+            database: object.database,
+            schema: object.schema,
+            engine: object.engine.as_str().to_owned(),
+            kind: object.kind,
+            name: object.name,
+        })
+    }
+
+    /// 编辑器里改成功（或删掉）一个对象后刷新对象树：树里的条目要跟服务器一致。
+    fn consume_object_editor(&mut self, cx: &mut Context<Self>) {
+        // 管理页的事件行要改整份定义：先取走它的请求，再由同一个编辑器打开。
+        if let Some(request) = self.admin.update(cx, |pane, _| pane.take_object_editor_request()) {
+            self.object_editor.update(cx, |pane, cx| pane.open_request(request, cx));
+        }
+        let Some((connection, database, _kind, name)) = self.object_editor.update(cx, |pane, _| pane.take_changed()) else { return };
+        self.model.request_nav_refresh(Some(connection));
+        self.model.notice_key = None;
+        self.model.notice_detail = String::new();
+        let _ = (database, name);
+    }
+
     fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
@@ -533,6 +573,21 @@ impl Workbench {
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
         if self.model.gate_on_demand(id) {
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        // 对象编辑器：对象树右键、管理页按钮与命令面板都到这一个入口，不另开执行路径。
+        if id == "open-object-editor" {
+            match self.object_editor_request() {
+                Some(request) => {
+                    self.object_editor.update(cx, |pane, cx| pane.open_request(request, cx));
+                }
+                None => {
+                    self.model.notice_key = Some("catalog.tree.noStructure");
+                    self.model.notice_detail = self.model.object_target().map(|target| target.name).unwrap_or_default();
+                }
+            }
             self.persist_if_needed(cx);
             cx.notify();
             return;
@@ -3299,7 +3354,13 @@ impl Render for Workbench {
         // 布尔读取，不遍历、不分配；对比页的按钮直接改它自己的实体，嵌套更新里观察回调还没轮到时，
         // 下一帧仍能拿到交接，关闭窗口的判断也不会读到旧的运行标记。
         self.refresh_compare(cx);
-        self.render_root(window, cx)
+        let root = self.render_root(window, cx);
+        // 对象编辑器覆盖在当前页面上：它自己是一层模态，不替换下面的工作项。
+        if self.object_editor.read(cx).is_open() {
+            let editor = self.object_editor.clone();
+            return div().relative().size_full().child(root).child(editor).into_any_element();
+        }
+        root
     }
 }
 
@@ -3395,6 +3456,7 @@ impl Workbench {
             }
             self.pump_nav(cx);
         }
+        self.consume_object_editor(cx);
         self.sync_view_settings(cx);
         self.sync_density(cx);
         self.sync_query(cx);
@@ -3407,6 +3469,10 @@ impl Workbench {
                 cx.notify();
             });
             self.admin.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.object_editor.update(cx, |pane, cx| {
                 pane.set_locale(locale);
                 cx.notify();
             });

@@ -339,10 +339,8 @@ fn plan_set_event_enabled(snapshot: &Snapshot, event: &str, enabled: bool, suppo
     if !blocked.is_empty() {
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
-    risks.push(Risk {
-        level: "warn".to_owned(),
-        text: "event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。".to_owned(),
-    });
+    // 提示按读到的 event_scheduler 实际状态给：关闭时说清“仍然不会运行”，打开时不能反过来吓人。
+    risks.extend(object_ddl::event_scheduler_risks(snapshot, enabled, false));
     match qualified_table(snapshot.engine, &snapshot.database, "", event) {
         Ok(name) => {
             let keyword = if enabled { "ENABLE" } else { "DISABLE" };

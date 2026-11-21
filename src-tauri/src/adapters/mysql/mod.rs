@@ -21,6 +21,8 @@ pub(in crate::adapters) mod table_ddl;
 // 因此比同组其它模块宽一级：只放宽可见性，不加新接口。
 pub(crate) mod table_read;
 #[cfg(test)]
+mod object_live_tests;
+#[cfg(test)]
 mod table_live_tests;
 pub(in crate::adapters) mod syntax;
 pub(in crate::adapters) mod transfer;

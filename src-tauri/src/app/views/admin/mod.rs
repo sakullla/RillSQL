@@ -371,6 +371,8 @@ pub struct AdminPane {
     link_open: Option<bool>,
     /// 离线时“立即连接”交给外壳。
     pub connect_request: Option<String>,
+    /// 要打开对象编辑器的目标（事件行上的“编辑”或“新建事件”）；由外壳取走后编辑。
+    object_editor_request: Option<crate::app::views::object_editor::EditorRequest>,
 }
 
 impl AdminPane {
@@ -384,7 +386,26 @@ impl AdminPane {
             probe_gen: 0,
             link_open: None,
             connect_request: None,
+            object_editor_request: None,
         }
+    }
+
+    /// 取走管理页请求打开的对象编辑器目标。
+    pub fn take_object_editor_request(&mut self) -> Option<crate::app::views::object_editor::EditorRequest> {
+        self.object_editor_request.take()
+    }
+
+    /// 管理页里请外壳打开对象编辑器：同一份连接、库与引擎，种类由调用方给。
+    fn request_object_editor(&mut self, kind: crate::catalog::model::ObjectKind, name: String) {
+        let target = &self.session.target;
+        self.object_editor_request = Some(crate::app::views::object_editor::EditorRequest {
+            connection_id: target.connection_id.clone(),
+            database: target.database.clone(),
+            schema: target.schema.clone(),
+            engine: target.engine.clone(),
+            kind,
+            name,
+        });
     }
 
     /// 兼容调用：不区分工作项实例，只按目标绑定。
@@ -876,7 +897,34 @@ impl Render for AdminPane {
                 toggles = toggles.child(kit::secondary_button(SharedString::from(format!("admin-event-toggle-{index}")), None, label, move |_, _, cx| {
                     toggle_entity.update(cx, |pane, cx| pane.toggle_event(index, cx));
                 }));
+                // 启停之外还要改定义：交给统一对象编辑器，不在这里再拼一套 ALTER EVENT 表单。
+                let edit_entity = entity.clone();
+                let event_name = choice.name.clone();
+                toggles = toggles.child(kit::icon_button(
+                    SharedString::from(format!("admin-event-edit-{index}")),
+                    IconName::SquarePen,
+                    t("objectEditor.title"),
+                    move |_, _, cx| {
+                        let name = event_name.clone();
+                        edit_entity.update(cx, |pane, cx| {
+                            pane.request_object_editor(crate::catalog::model::ObjectKind::Event, name);
+                            cx.notify();
+                        });
+                    },
+                ));
             }
+            let new_event_entity = entity.clone();
+            toggles = toggles.child(kit::secondary_button(
+                "admin-event-new",
+                Some(IconName::Plus),
+                t("objectEditor.event"),
+                move |_, _, cx| {
+                    new_event_entity.update(cx, |pane, cx| {
+                        pane.request_object_editor(crate::catalog::model::ObjectKind::Event, String::new());
+                        cx.notify();
+                    });
+                },
+            ));
             cards = cards.child(toggles).child(op_card(
                 "admin-event",
                 "event",

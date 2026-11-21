@@ -84,6 +84,47 @@ async fn read_mysql_kind(conn: &mut mysql_async::Conn, engine: Engine, database:
     read_mysql_kind_slice(conn, engine, database, kind, 0, window).await
 }
 
+/// 对象编辑器读取单个事件/例程/触发器的完整状态（R5 / R6 / R7）。
+///
+/// 读的是对象自己的定义与状态，不读某张表的结构；读不到就返回原因，编辑器据此阻断编辑，
+/// 不用空值覆盖服务器对象。桥接方向是从这里到 object_read：对象读回仍只写在 object_read 一份。
+pub(crate) async fn read_object_detail(
+    pool: &mysql_async::Pool,
+    database: &str,
+    kind: ObjectKind,
+    name: &str,
+) -> Result<crate::catalog::objects::ObjectDetail, String> {
+    use crate::catalog::objects::ObjectDetail;
+    use crate::ddl::model::RoutineKind;
+    match kind {
+        ObjectKind::Event => Ok(ObjectDetail::Event(super::object_read::load_event(pool, database, name).await?)),
+        ObjectKind::Function => {
+            Ok(ObjectDetail::Routine(super::object_read::load_routine(pool, database, RoutineKind::Function, name).await?))
+        }
+        ObjectKind::Procedure => {
+            Ok(ObjectDetail::Routine(super::object_read::load_routine(pool, database, RoutineKind::Procedure, name).await?))
+        }
+        ObjectKind::Trigger => Ok(ObjectDetail::Trigger(super::object_read::load_trigger(pool, database, name).await?)),
+        other => Err(format!("{} 不是可以在这里编辑的对象。", crate::catalog::model::kind_name(other))),
+    }
+}
+
+/// 会话守卫 + 读回：把“哪类会话读哪类对象”的判断留在适配器层，主代码只做通用拼装。
+///
+/// 不是 MySQL 家族的会话直接给出原因，不编造空对象。
+pub(crate) async fn read_object_detail_session(
+    session: &crate::connections::CatalogSession,
+    engine: Engine,
+    database: &str,
+    kind: ObjectKind,
+    name: &str,
+) -> Result<crate::catalog::objects::ObjectDetail, String> {
+    let crate::connections::CatalogSession::Mysql(pool) = session else {
+        return Err(format!("{} 没有事件、函数、存储过程与触发器，这里不读。", engine.as_str()));
+    };
+    read_object_detail(pool, database, kind, name).await
+}
+
 pub(super) async fn read_mysql_kind_slice(
     conn: &mut mysql_async::Conn,
     engine: Engine,

@@ -229,6 +229,31 @@ pub async fn object_snapshot(session: &CatalogSession, request: &Request) -> Res
         Action::SetPragma { .. } | Action::AttachDatabase { .. } | Action::Vacuum | Action::Reindex { .. } => {
             snapshot.kind = "database".to_owned();
         }
+        // 事件、例程与触发器是库级对象：kind 与目标名决定读哪个对象，状态由 read_object_state 读。
+        Action::CreateEvent { event } | Action::AlterEvent { event } => {
+            snapshot.kind = "event".to_owned();
+            snapshot.name = event.original.clone().unwrap_or_else(|| event.name.clone());
+        }
+        Action::DropEvent { event } => {
+            snapshot.kind = "event".to_owned();
+            snapshot.name = event.clone();
+        }
+        Action::CreateRoutine { routine } | Action::ReplaceRoutine { routine } => {
+            snapshot.kind = "routine".to_owned();
+            snapshot.name = routine.original.clone().unwrap_or_else(|| routine.name.clone());
+        }
+        Action::DropRoutine { name, .. } => {
+            snapshot.kind = "routine".to_owned();
+            snapshot.name = name.clone();
+        }
+        Action::CreateTrigger { trigger } | Action::ReplaceTrigger { trigger } => {
+            snapshot.kind = "trigger".to_owned();
+            snapshot.name = trigger.original.clone().unwrap_or_else(|| trigger.name.clone());
+        }
+        Action::DropTrigger { trigger } => {
+            snapshot.kind = "trigger".to_owned();
+            snapshot.name = trigger.clone();
+        }
         _ => return Err("这个动作需要指定表，不是数据库级动作。".to_owned()),
     }
     // 只有提供该动作的方言会读；其它引擎留空，计划给出“不属于这个引擎”的原因。

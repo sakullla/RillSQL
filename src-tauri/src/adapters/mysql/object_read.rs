@@ -48,9 +48,13 @@ impl EventRow {
 
 pub(super) const EVENT_SQL: &str = "SELECT EVENT_NAME, STATUS, CAST(EXECUTE_AT AS CHAR), INTERVAL_VALUE, INTERVAL_FIELD, CAST(STARTS AS CHAR), CAST(ENDS AS CHAR), ON_COMPLETION, EVENT_DEFINITION, DEFINER, EVENT_COMMENT FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? AND EVENT_NAME = ?";
 
-pub(super) const ROUTINE_SQL: &str = "SELECT ROUTINE_TYPE, DATA_TYPE, ROUTINE_DEFINITION, DEFINER, ROUTINE_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ?";
+/// 例程行。只按 schema + name 查，会在同库同名函数与存储过程并存时读到另一个对象，
+/// 因此必须再按 ROUTINE_TYPE 过滤（函数与存储过程是两个独立对象）。
+pub(super) const ROUTINE_SQL: &str = "SELECT ROUTINE_TYPE, DATA_TYPE, ROUTINE_DEFINITION, DEFINER, ROUTINE_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ? AND ROUTINE_TYPE = ?";
 
-pub(super) const PARAMETERS_SQL: &str = "SELECT ORDINAL_POSITION, PARAMETER_MODE, PARAMETER_NAME, DTD_IDENTIFIER FROM information_schema.PARAMETERS WHERE SPECIFIC_SCHEMA = ? AND SPECIFIC_NAME = ? ORDER BY ORDINAL_POSITION";
+/// 参数行。同样按 ROUTINE_TYPE 过滤，否则同名函数与存储过程的参数会被合并。
+/// ROUTINE_TYPE 也作为列读回来：读回类型与请求类型不一致时映射层再挡一次，不靠查询单点保证。
+pub(super) const PARAMETERS_SQL: &str = "SELECT ROUTINE_TYPE, ORDINAL_POSITION, PARAMETER_MODE, PARAMETER_NAME, DTD_IDENTIFIER FROM information_schema.PARAMETERS WHERE SPECIFIC_SCHEMA = ? AND SPECIFIC_NAME = ? AND ROUTINE_TYPE = ? ORDER BY ORDINAL_POSITION";
 
 pub(super) const TRIGGER_SQL: &str = "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_STATEMENT, DEFINER FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ? AND TRIGGER_NAME = ?";
 
@@ -100,12 +104,26 @@ pub(super) fn routine_kind_of(raw: &str) -> RoutineKind {
     }
 }
 
-/// 例程参数行（顺序号、模式、名字、类型）→ 结构化参数。
+/// 例程类型原文：查询参数与读回核对都用它，不靠调用方各自拼字符串。
+pub(super) fn routine_type_keyword(kind: RoutineKind) -> &'static str {
+    match kind {
+        RoutineKind::Function => "FUNCTION",
+        RoutineKind::Procedure => "PROCEDURE",
+    }
+}
+
+/// 例程参数行（例程类型、顺序号、模式、名字、类型）→ 结构化参数。
 /// 函数在信息模式里有一行顺序号 0 的返回类型（模式与名字为空），它不是参数。
-pub(super) fn routine_params(rows: &[(String, String, String, String)]) -> (Vec<RoutineParamState>, String) {
+///
+/// 同名函数与存储过程在同一个库里可以并存，它们是两个独立对象：这里按请求的类型再过滤一次，
+/// 查询本身也已经按 ROUTINE_TYPE 过滤；两处都做是为了让参数合并这种事故不可能只靠一条 SQL 成立。
+pub(super) fn routine_params(rows: &[(String, String, String, String, String)], kind: RoutineKind) -> (Vec<RoutineParamState>, String) {
     let mut params = Vec::new();
     let mut returns = String::new();
-    for (position, mode, name, type_name) in rows {
+    for (routine_type, position, mode, name, type_name) in rows {
+        if routine_kind_of(routine_type) != kind {
+            continue;
+        }
         let ordinal: u32 = position.trim().parse().unwrap_or(0);
         if mode.trim().is_empty() && name.trim().is_empty() {
             if ordinal == 0 {
@@ -168,7 +186,7 @@ pub(super) async fn load_routine(pool: &mysql_async::Pool, database: &str, kind:
     }
     let mut conn = pool.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
     let row: Option<mysql_async::Row> = conn
-        .exec_first(ROUTINE_SQL, (database.to_owned(), name.to_owned()))
+        .exec_first(ROUTINE_SQL, (database.to_owned(), name.to_owned(), routine_type_keyword(kind).to_owned()))
         .await
         .map_err(|err| format!("读不到例程 {database}.{name}：{}", crate::error_text::chain(&err)))?;
     let row = row.ok_or_else(|| format!("找不到例程 {database}.{name}。"))?;
@@ -177,14 +195,14 @@ pub(super) async fn load_routine(pool: &mysql_async::Pool, database: &str, kind:
         return Err(format!("{database}.{name} 是{}，不是{}。", label_of(routine_kind_of(&reported)), label_of(kind)));
     }
     let params: Vec<mysql_async::Row> = conn
-        .exec(PARAMETERS_SQL, (database.to_owned(), name.to_owned()))
+        .exec(PARAMETERS_SQL, (database.to_owned(), name.to_owned(), routine_type_keyword(kind).to_owned()))
         .await
         .map_err(|err| format!("读不到例程 {database}.{name} 的参数：{}", crate::error_text::chain(&err)))?;
-    let tuples: Vec<(String, String, String, String)> = params
+    let tuples: Vec<(String, String, String, String, String)> = params
         .iter()
-        .map(|row| (mysql_string(row, 0), mysql_string(row, 1), mysql_string(row, 2), mysql_string(row, 3)))
+        .map(|row| (mysql_string(row, 0), mysql_string(row, 1), mysql_string(row, 2), mysql_string(row, 3), mysql_string(row, 4)))
         .collect();
-    let (params, returns) = routine_params(&tuples);
+    let (params, returns) = routine_params(&tuples, kind);
     let reported_returns = mysql_string(&row, 1);
     Ok(RoutineState {
         kind,
@@ -232,8 +250,14 @@ pub(super) async fn load_trigger(pool: &mysql_async::Pool, database: &str, name:
 mod tests {
     use super::*;
 
-    fn row(values: &[(&str, &str, &str, &str)]) -> Vec<(String, String, String, String)> {
-        values.iter().map(|(a, b, c, d)| ((*a).to_owned(), (*b).to_owned(), (*c).to_owned(), (*d).to_owned())).collect()
+    /// 参数行：例程类型、顺序号、模式、名字、类型。
+    fn row(values: &[(&str, &str, &str, &str, &str)]) -> Vec<(String, String, String, String, String)> {
+        values
+            .iter()
+            .map(|(routine_type, position, mode, name, type_name)| {
+                ((*routine_type).to_owned(), (*position).to_owned(), (*mode).to_owned(), (*name).to_owned(), (*type_name).to_owned())
+            })
+            .collect()
     }
 
     /// 有间隔值是周期事件，没有就是单次事件；STARTS/ENDS 按读回原文保留。
@@ -257,15 +281,55 @@ mod tests {
     /// 函数的返回类型行（顺序号 0、没有模式与名字）不算参数，但它的类型是返回类型。
     #[test]
     fn function_return_row_is_not_a_parameter() {
-        let (params, returns) = routine_params(&row(&[("0", "", "", "int"), ("1", "IN", "seed", "int"), ("2", "IN", "step", "int")]));
+        let (params, returns) = routine_params(
+            &row(&[
+                ("FUNCTION", "0", "", "", "int"),
+                ("FUNCTION", "1", "IN", "seed", "int"),
+                ("FUNCTION", "2", "IN", "step", "int"),
+            ]),
+            RoutineKind::Function,
+        );
         assert_eq!(returns, "int");
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "seed");
         assert_eq!(params[0].mode, ParamMode::In);
-        let (params, returns) = routine_params(&row(&[("1", "OUT", "total", "decimal(10,2)"), ("2", "INOUT", "count", "int")]));
+        let (params, returns) = routine_params(
+            &row(&[("PROCEDURE", "1", "OUT", "total", "decimal(10,2)"), ("PROCEDURE", "2", "INOUT", "count", "int")]),
+            RoutineKind::Procedure,
+        );
         assert_eq!(returns, "");
         assert_eq!(params[1].mode, ParamMode::InOut);
         assert_eq!(params[0].type_name, "decimal(10,2)");
+    }
+
+    /// 同库同名函数与存储过程并存：参数行必须按 ROUTINE_TYPE 分开，不能把两类参数合并。
+    /// 查询本身带 ROUTINE_TYPE 条件，这里的映射层再挡一次，两条防线都要成立。
+    #[test]
+    fn same_name_function_and_procedure_do_not_share_parameters() {
+        let rows = row(&[
+            ("FUNCTION", "0", "", "", "int"),
+            ("FUNCTION", "1", "IN", "seed", "int"),
+            ("PROCEDURE", "1", "IN", "seed", "varchar(20)"),
+            ("PROCEDURE", "2", "OUT", "total", "decimal(10,2)"),
+        ]);
+        let (function_params, function_returns) = routine_params(&rows, RoutineKind::Function);
+        assert_eq!(function_returns, "int");
+        assert_eq!(function_params.len(), 1, "{function_params:?}");
+        assert_eq!(function_params[0].name, "seed");
+        assert_eq!(function_params[0].type_name, "int");
+        assert_eq!(function_params[0].mode, ParamMode::In);
+
+        let (procedure_params, procedure_returns) = routine_params(&rows, RoutineKind::Procedure);
+        assert_eq!(procedure_returns, "");
+        assert_eq!(procedure_params.len(), 2, "{procedure_params:?}");
+        assert_eq!(procedure_params[0].type_name, "varchar(20)");
+        assert_eq!(procedure_params[1].mode, ParamMode::Out);
+
+        // 两条查询都必须按 ROUTINE_TYPE 过滤：只按 schema + name 查会读到另一个对象。
+        assert!(ROUTINE_SQL.contains("ROUTINE_TYPE = ?"), "{ROUTINE_SQL}");
+        assert!(PARAMETERS_SQL.contains("ROUTINE_TYPE = ?"), "{PARAMETERS_SQL}");
+        assert_eq!(routine_type_keyword(RoutineKind::Function), "FUNCTION");
+        assert_eq!(routine_type_keyword(RoutineKind::Procedure), "PROCEDURE");
     }
 
     /// 时机关联到枚举；不认识的值按下限处理但原文仍可用于核对。

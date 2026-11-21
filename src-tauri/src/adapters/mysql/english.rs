@@ -20,7 +20,26 @@ pub(in crate::adapters) const MESSAGES_EN: &[(&str, &str)] = &[
     ("只改事件的启停状态，不改它的事件体。", "Only the event's enabled state changes; its body stays the same."),
     ("只有 MySQL 与 MariaDB 有事件（event）对象，这里不生成语句。", "Only MySQL and MariaDB have event objects, so no statement is generated here."),
     ("事件名无效。", "The event name is not valid."),
-    ("event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。", "Events still don't run while event_scheduler is off; the scheduler state is not changed here."),
+    (
+        "服务器 event_scheduler 现在是关闭的：事件启用后仍然不会运行，这里不改服务器级调度器状态。",
+        "event_scheduler is currently off on the server: the event still won't run after being enabled, and the server-level scheduler state is not changed here.",
+    ),
+    (
+        "事件会按调度运行（服务器 event_scheduler 已打开）；本语句不改调度器状态。",
+        "The event will run on its schedule (event_scheduler is on); this statement doesn't change the scheduler state.",
+    ),
+    (
+        "没有读到 event_scheduler 的实际状态：启用的事件只有在它打开时才会运行，这里不改服务器级状态。",
+        "The actual event_scheduler state could not be read: an enabled event runs only while it is on, and the server-level state is not changed here.",
+    ),
+    (
+        "事件保存为停用状态，不会运行；这里不改服务器级 event_scheduler 状态。",
+        "The event is saved disabled and will not run; the server-level event_scheduler state is not changed here.",
+    ),
+    (
+        "ALTER EVENT 只改这个事件的定义与状态，不启动或停止服务器调度器。",
+        "ALTER EVENT only changes this event's definition and state; it doesn't start or stop the server scheduler.",
+    ),
     ("启用事件 {}", "Enable event {0}"),
     ("停用事件 {}", "Disable event {0}"),
     ("读不到事件 {}：{}", "Event {0} could not be read: {1}"),

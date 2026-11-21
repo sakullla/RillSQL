@@ -4,6 +4,10 @@
 //! DDL 计划（plan）与 Receipt 视图，不另建执行或 SQL 拼接路径。各对象的语句生成在
 //! adapters/mysql/object_ddl.rs，读回在 adapters/mysql/object_read.rs。
 
+pub mod view;
+
+pub use view::{EditorRequest, ObjectEditorPane};
+
 use crate::catalog::model::ObjectKind;
 use crate::ddl::model::{EventDraft, RoutineDraft, TriggerDraft};
 use crate::i18n::{self, Locale};
@@ -149,5 +153,507 @@ mod tests {
         assert!(draft.matches(&new_target));
         assert_eq!(draft.name(), "purge");
         assert!(!draft.is_edit());
+    }
+}
+// ---------------------------------------------------------------- 表单模型
+
+/// 表单里的动作：保存（新建或替换）、删除、启停（只对事件）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorVerb {
+    Save,
+    Drop,
+    Enable,
+    Disable,
+}
+
+impl EditorVerb {
+    /// 动作标签对应的 i18n 键。
+    pub fn label_key(self) -> &'static str {
+        match self {
+            EditorVerb::Save => "common.save",
+            EditorVerb::Drop => "structure.section.danger",
+            EditorVerb::Enable | EditorVerb::Disable => "admin.action.event",
+        }
+    }
+}
+
+/// 对象编辑器的表单状态。这里是唯一的事实来源：文本框只把输入写回它，
+/// 语句由 ddl 的计划层生成（不在这里拼 SQL），执行走既有的确认链。
+#[derive(Clone, Debug)]
+pub struct ObjectEditorSession {
+    pub locale: Locale,
+    pub connection_id: String,
+    pub database: String,
+    /// 模式：MySQL 与 MariaDB 为空，只为和 Request 的字段对齐。
+    pub schema: String,
+    pub engine: String,
+    pub kind: ObjectKind,
+    /// 目标对象名；改已有对象时与读回的名字一致。
+    pub name: String,
+    /// 触发器的目标表。
+    pub table: String,
+    pub timing_after: bool,
+    pub event_kind: crate::ddl::model::TriggerEvent,
+    /// 事件：单次（AT）或周期（EVERY）。
+    pub one_time: bool,
+    pub at: String,
+    pub every: String,
+    pub unit: String,
+    pub starts: String,
+    pub ends: String,
+    pub enabled: bool,
+    pub preserve: bool,
+    pub comment: String,
+    /// 例程参数，每行一个：模式 名字 类型（函数的模式留空）。
+    pub params: String,
+    pub returns: String,
+    pub body: String,
+    pub verb: EditorVerb,
+    /// 已读到的对象状态。None 表示还没打开或读失败。
+    pub detail: Option<crate::catalog::objects::ObjectDetail>,
+    pub detail_error: String,
+    pub plan: Option<crate::ddl::Plan>,
+    pub receipt: Option<crate::ddl::Receipt>,
+    pub note: String,
+}
+
+impl Default for ObjectEditorSession {
+    fn default() -> Self {
+        Self {
+            locale: Locale::ZhCn,
+            connection_id: String::new(),
+            database: String::new(),
+            schema: String::new(),
+            engine: String::new(),
+            kind: ObjectKind::Event,
+            name: String::new(),
+            table: String::new(),
+            timing_after: false,
+            event_kind: crate::ddl::model::TriggerEvent::Insert,
+            one_time: true,
+            at: String::new(),
+            every: "1".to_owned(),
+            unit: "DAY".to_owned(),
+            starts: String::new(),
+            ends: String::new(),
+            enabled: false,
+            preserve: true,
+            comment: String::new(),
+            params: String::new(),
+            returns: String::new(),
+            body: String::new(),
+            verb: EditorVerb::Save,
+            detail: None,
+            detail_error: String::new(),
+            plan: None,
+            receipt: None,
+            note: String::new(),
+        }
+    }
+}
+
+impl ObjectEditorSession {
+    pub fn new(locale: Locale) -> Self {
+        Self { locale, ..Self::default() }
+    }
+
+    /// 换连接/库/引擎：旧对象的草稿与预览都不再适用。
+    pub fn rebind(&mut self, connection_id: &str, database: &str, engine: &str) {
+        if self.connection_id == connection_id && self.database == database && self.engine == engine {
+            return;
+        }
+        let locale = self.locale;
+        let kind = self.kind;
+        *self = Self { locale, kind, ..Self::default() };
+        self.connection_id = connection_id.to_owned();
+        self.database = database.to_owned();
+        self.engine = engine.to_owned();
+    }
+
+    /// 是否在改已有对象（读到了服务器上的定义）。
+    pub fn is_edit(&self) -> bool {
+        self.detail.is_some()
+    }
+
+    /// 切换对象类型：换类型就换一份草稿，避免把事件主体当成触发器主体提交。
+    pub fn set_kind(&mut self, kind: ObjectKind) {
+        if self.kind == kind {
+            return;
+        }
+        let locale = self.locale;
+        let connection_id = self.connection_id.clone();
+        let database = self.database.clone();
+        let engine = self.engine.clone();
+        *self = Self { locale, kind, ..Self::default() };
+        self.connection_id = connection_id;
+        self.database = database;
+        self.engine = engine;
+    }
+
+    /// 清除预览与结果：改任何输入都要重新预览。
+    pub fn cancel(&mut self) {
+        self.plan = None;
+        self.receipt = None;
+    }
+
+    /// 文本框当前值。键与界面上渲染的文本框一一对应。
+    pub fn field(&self, key: &'static str) -> String {
+        match key {
+            "name" => self.name.clone(),
+            "table" => self.table.clone(),
+            "at" => self.at.clone(),
+            "every" => self.every.clone(),
+            "unit" => self.unit.clone(),
+            "starts" => self.starts.clone(),
+            "ends" => self.ends.clone(),
+            "comment" => self.comment.clone(),
+            "params" => self.params.clone(),
+            "returns" => self.returns.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// 写回一个文本框的值，并作废这次预览。
+    pub fn set_field(&mut self, key: &'static str, value: String) {
+        match key {
+            "name" => self.name = value,
+            "table" => self.table = value,
+            "at" => self.at = value,
+            "every" => self.every = value,
+            "unit" => self.unit = value,
+            "starts" => self.starts = value,
+            "ends" => self.ends = value,
+            "comment" => self.comment = value,
+            "params" => self.params = value,
+            "returns" => self.returns = value,
+            _ => {}
+        }
+        self.cancel();
+    }
+
+    /// 用读回的对象状态起稿：已读到的属性原样带进表单，改的时候不会丢。
+    pub fn seed(&mut self, detail: &crate::catalog::objects::ObjectDetail) {
+        use crate::catalog::objects::ObjectDetail;
+        use crate::ddl::model::EventSchedule;
+        match detail {
+            ObjectDetail::Event(state) => {
+                self.name = state.name.clone();
+                self.body = state.body.clone();
+                self.enabled = state.enabled;
+                self.preserve = state.on_completion == crate::ddl::model::EventCompletion::Preserve;
+                self.comment = state.comment.clone();
+                match &state.schedule {
+                    EventSchedule::OneTime { at } => {
+                        self.one_time = true;
+                        self.at = at.clone();
+                    }
+                    EventSchedule::Recurring { every, unit, starts, ends } => {
+                        self.one_time = false;
+                        self.every = every.clone();
+                        self.unit = unit.clone();
+                        self.starts = starts.clone();
+                        self.ends = ends.clone();
+                    }
+                }
+            }
+            ObjectDetail::Routine(state) => {
+                self.name = state.name.clone();
+                self.body = state.body.clone();
+                self.returns = state.returns.clone();
+                self.comment = state.comment.clone();
+                self.params = params_text(&state.params);
+            }
+            ObjectDetail::Trigger(state) => {
+                self.name = state.name.clone();
+                self.table = state.table.clone();
+                self.body = state.body.clone();
+                self.timing_after = state.timing == crate::ddl::model::TriggerTiming::After;
+                self.event_kind = state.event;
+            }
+        }
+        self.detail = Some(detail.clone());
+        self.detail_error.clear();
+        self.cancel();
+        self.note.clear();
+    }
+
+    /// 把表单变成动作。动作名与目标名都来自这份草稿，SQL 由 ddl 计划层生成。
+    pub fn action(&self) -> Result<crate::ddl::Action, String> {
+        use crate::ddl::model::{Action, EventCompletion, EventDraft, EventSchedule, RoutineDraft, RoutineKind, TriggerDraft, TriggerTiming};
+        if self.name.trim().is_empty() {
+            return Err("先填对象名。".to_owned());
+        }
+        let original = self.detail.as_ref().map(|detail| detail.name().to_owned());
+        match self.kind {
+            ObjectKind::Event => {
+                let schedule = if self.one_time {
+                    EventSchedule::OneTime { at: self.at.clone() }
+                } else {
+                    EventSchedule::Recurring {
+                        every: self.every.clone(),
+                        unit: self.unit.clone(),
+                        starts: self.starts.clone(),
+                        ends: self.ends.clone(),
+                    }
+                };
+                let event = EventDraft {
+                    original: original.clone(),
+                    name: self.name.trim().to_owned(),
+                    schedule,
+                    body: self.body.clone(),
+                    enabled: self.enabled,
+                    on_completion: if self.preserve { EventCompletion::Preserve } else { EventCompletion::NotPreserve },
+                    comment: self.comment.clone(),
+                };
+                Ok(match self.verb {
+                    EditorVerb::Save if original.is_some() => Action::AlterEvent { event },
+                    EditorVerb::Save => Action::CreateEvent { event },
+                    EditorVerb::Drop => Action::DropEvent { event: self.name.trim().to_owned() },
+                    EditorVerb::Enable => Action::SetEventEnabled { event: self.name.trim().to_owned(), enabled: true },
+                    EditorVerb::Disable => Action::SetEventEnabled { event: self.name.trim().to_owned(), enabled: false },
+                })
+            }
+            ObjectKind::Function | ObjectKind::Procedure => {
+                let kind = if self.kind == ObjectKind::Function { RoutineKind::Function } else { RoutineKind::Procedure };
+                let routine = RoutineDraft {
+                    kind,
+                    original: original.clone(),
+                    name: self.name.trim().to_owned(),
+                    params: parse_params(&self.params, kind)?,
+                    returns: if kind == RoutineKind::Function { self.returns.clone() } else { String::new() },
+                    body: self.body.clone(),
+                    comment: self.comment.clone(),
+                };
+                Ok(match self.verb {
+                    // 修改已有例程是 DROP + CREATE；新建就是 CREATE。
+                    EditorVerb::Save if original.is_some() => Action::ReplaceRoutine { routine },
+                    EditorVerb::Save => Action::CreateRoutine { routine },
+                    EditorVerb::Drop => Action::DropRoutine { routine_kind: kind, name: self.name.trim().to_owned() },
+                    _ => return Err("例程没有启停动作。".to_owned()),
+                })
+            }
+            ObjectKind::Trigger => {
+                let trigger = TriggerDraft {
+                    original: original.clone(),
+                    name: self.name.trim().to_owned(),
+                    table: self.table.trim().to_owned(),
+                    timing: if self.timing_after { TriggerTiming::After } else { TriggerTiming::Before },
+                    event: self.event_kind,
+                    body: self.body.clone(),
+                };
+                Ok(match self.verb {
+                    EditorVerb::Save if original.is_some() => Action::ReplaceTrigger { trigger },
+                    EditorVerb::Save => Action::CreateTrigger { trigger },
+                    EditorVerb::Drop => Action::DropTrigger { trigger: self.name.trim().to_owned() },
+                    _ => return Err("触发器没有启停动作。".to_owned()),
+                })
+            }
+            _ => Err("这里只编辑事件、函数、存储过程与触发器。".to_owned()),
+        }
+    }
+
+    /// 预览过的语句：确认时提交给执行链，与计划逐字比对。
+    pub fn confirmed_sql(&self) -> Option<Vec<String>> {
+        self.plan.as_ref().map(|plan| plan.steps.iter().map(|step| step.sql.clone()).collect())
+    }
+}
+
+/// 参数原文：每行一个「模式 名字 类型」。函数的参数不写模式。
+pub fn params_text(params: &[crate::ddl::model::RoutineParamState]) -> String {
+    use crate::ddl::model::ParamMode;
+    params
+        .iter()
+        .map(|param| {
+            let mode = match param.mode {
+                ParamMode::In => "",
+                ParamMode::Out => "OUT ",
+                ParamMode::InOut => "INOUT ",
+            };
+            format!("{mode}{} {}", param.name, param.type_name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 解析参数行。空行跳过；缺名字或缺类型时给出具体行号，不把半行参数发给服务器。
+pub fn parse_params(text: &str, kind: crate::ddl::model::RoutineKind) -> Result<Vec<crate::ddl::model::RoutineParamDraft>, String> {
+    use crate::ddl::model::{ParamMode, RoutineKind, RoutineParamDraft};
+    let mut params = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        let (mode, name) = match first.to_ascii_uppercase().as_str() {
+            "IN" => (ParamMode::In, words.next().unwrap_or_default()),
+            "OUT" => (ParamMode::Out, words.next().unwrap_or_default()),
+            "INOUT" => (ParamMode::InOut, words.next().unwrap_or_default()),
+            _ => (ParamMode::In, first),
+        };
+        if name.is_empty() {
+            return Err(format!("第 {} 个参数缺名字。", index + 1));
+        }
+        if kind == RoutineKind::Function && mode != ParamMode::In {
+            return Err(format!("第 {} 个参数：函数的参数只能是 IN。", index + 1));
+        }
+        let type_name: String = words.collect::<Vec<_>>().join(" ");
+        if type_name.is_empty() {
+            return Err(format!("第 {} 个参数缺类型。", index + 1));
+        }
+        params.push(RoutineParamDraft { mode, name: name.to_owned(), type_name });
+    }
+    Ok(params)
+}
+// ---------------------------------------------------------------- 回执与失败判定
+
+/// 逐步回执是否算完成：被拦下、失败、跳过、未知、回滚都不算。
+///
+/// 只有全部 Ok 才允许显示统一的“已执行”，与结构页、管理页一致。
+pub fn receipt_all_ok(receipt: &crate::ddl::Receipt) -> bool {
+    receipt.blocked.is_empty() && !receipt.steps.is_empty() && receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok)
+}
+
+/// 一步的执行状态：用固定的技术标识，不跟着界面语言变，免得和服务端原文混在一起看不懂。
+pub fn step_status_text(status: crate::ddl::StepStatus, _locale: Locale) -> &'static str {
+    match status {
+        crate::ddl::StepStatus::Ok => "ok",
+        crate::ddl::StepStatus::Failed => "failed",
+        crate::ddl::StepStatus::Skipped => "skipped",
+        crate::ddl::StepStatus::Unknown => "unknown",
+        crate::ddl::StepStatus::RolledBack => "rolled back",
+    }
+}
+
+/// 执行失败后要不要保留草稿：除了“只删除成功”，其它结果都留着。
+///
+/// 删除成功时对象已经不在了，草稿再留着只会让人以为还能再删一次。
+pub fn keeps_draft(verb: EditorVerb, receipt: Option<&crate::ddl::Receipt>) -> bool {
+    match (verb, receipt) {
+        (EditorVerb::Drop, Some(receipt)) => !receipt_all_ok(receipt),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use crate::ddl::model::StepReceipt;
+    use crate::ddl::{Receipt, StepStatus};
+
+    fn step(status: StepStatus) -> StepReceipt {
+        StepReceipt { sql: "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP DO SELECT 1".to_owned(), label: "create".to_owned(), status, message: String::new() }
+    }
+
+    fn receipt(steps: Vec<StepReceipt>) -> Receipt {
+        Receipt { blocked: Vec::new(), rule: String::new(), steps, target: "app.e".to_owned(), rebuild: false }
+    }
+
+    /// 只有全部 Ok 才算完成：DROP + CREATE 的两步里第二步失败时不能显示“已执行”。
+    #[test]
+    fn only_all_ok_steps_count_as_done() {
+        assert!(receipt_all_ok(&receipt(vec![step(StepStatus::Ok)])));
+        assert!(receipt_all_ok(&receipt(vec![step(StepStatus::Ok), step(StepStatus::Ok)])));
+        for status in [StepStatus::Failed, StepStatus::Skipped, StepStatus::Unknown, StepStatus::RolledBack] {
+            assert!(!receipt_all_ok(&receipt(vec![step(StepStatus::Ok), step(status)])), "{status:?}");
+        }
+        let mut blocked = receipt(Vec::new());
+        blocked.blocked.push("目标表不存在".to_owned());
+        assert!(!receipt_all_ok(&blocked), "被拦下不算执行过");
+        assert!(!receipt_all_ok(&receipt(Vec::new())), "没有执行任何语句不算完成");
+    }
+
+    /// 失败保留草稿，删除成功才收起表单。
+    #[test]
+    fn drafts_stay_unless_the_drop_succeeded() {
+        let ok = receipt(vec![step(StepStatus::Ok)]);
+        let failed = receipt(vec![step(StepStatus::Failed)]);
+        assert!(keeps_draft(EditorVerb::Save, Some(&failed)));
+        assert!(keeps_draft(EditorVerb::Drop, Some(&failed)));
+        assert!(!keeps_draft(EditorVerb::Drop, Some(&ok)));
+        assert!(keeps_draft(EditorVerb::Save, Some(&ok)), "保存成功后表单留着，继续改同一份定义");
+        assert!(keeps_draft(EditorVerb::Drop, None), "还没执行，草稿当然留着");
+    }
+
+    /// 每类回执状态都有可读文本，不会把枚举名直接扔给用户。
+    #[test]
+    fn every_step_status_has_text() {
+        for status in [StepStatus::Ok, StepStatus::Failed, StepStatus::Skipped, StepStatus::Unknown, StepStatus::RolledBack] {
+            let text = step_status_text(status, Locale::ZhCn);
+            assert!(!text.is_empty());
+            assert!(!text.contains("StepStatus"));
+        }
+    }
+
+    /// 启停是独立动作；例程与触发器没有启停，不能把这几类混成一个动作。
+    #[test]
+    fn verbs_map_to_the_right_object_actions() {
+        use crate::ddl::Action;
+        let mut event = ObjectEditorSession { kind: ObjectKind::Event, name: "purge".to_owned(), ..ObjectEditorSession::default() };
+        event.verb = EditorVerb::Enable;
+        assert!(matches!(event.action(), Ok(Action::SetEventEnabled { enabled: true, .. })));
+        event.verb = EditorVerb::Disable;
+        assert!(matches!(event.action(), Ok(Action::SetEventEnabled { enabled: false, .. })));
+        // 新建是 CREATE，读到原对象之后才是 ALTER。
+        event.verb = EditorVerb::Save;
+        assert!(matches!(event.action(), Ok(Action::CreateEvent { .. })));
+
+        let mut routine = ObjectEditorSession { kind: ObjectKind::Procedure, name: "p".to_owned(), ..ObjectEditorSession::default() };
+        routine.verb = EditorVerb::Enable;
+        assert!(routine.action().is_err(), "例程没有启停动作");
+        let mut trigger = ObjectEditorSession { kind: ObjectKind::Trigger, name: "t".to_owned(), ..ObjectEditorSession::default() };
+        trigger.verb = EditorVerb::Disable;
+        assert!(trigger.action().is_err(), "触发器没有启停动作");
+
+        // 没有名字不生成任何语句：空草稿不会变成一条没有对象名的 CREATE。
+        let blank = ObjectEditorSession { kind: ObjectKind::Event, ..ObjectEditorSession::default() };
+        assert!(blank.action().is_err());
+    }
+
+    /// 参数原文按行解析：函数的参数只能是 IN，缺名字或类型时指出第几行。
+    #[test]
+    fn parameter_lines_are_parsed_with_the_routine_kind() {
+        use crate::ddl::model::{ParamMode, RoutineKind};
+        let params = parse_params("IN a INT\nOUT b VARCHAR(16)\n  \nINOUT c DECIMAL(10,2)", RoutineKind::Procedure).expect("过程参数");
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].mode, ParamMode::In);
+        assert_eq!(params[1].mode, ParamMode::Out);
+        assert_eq!(params[2].mode, ParamMode::InOut);
+        assert_eq!(params[2].type_name, "DECIMAL(10,2)");
+        assert!(parse_params("OUT b INT", RoutineKind::Function).is_err(), "函数参数只能是 IN");
+        assert!(parse_params("a", RoutineKind::Procedure).is_err(), "缺类型");
+        assert!(parse_params("IN INT", RoutineKind::Procedure).is_err(), "缺名字");
+
+        // 读回的参数原文里函数没有模式前缀。
+        let state = vec![crate::ddl::model::RoutineParamState { position: 1, mode: ParamMode::In, name: "a".to_owned(), type_name: "INT".to_owned() }];
+        assert_eq!(params_text(&state), "a INT");
+    }
+
+    /// 调度器状态只有事件有；未知不等于“会运行”。
+    #[test]
+    fn scheduler_state_is_reported_only_when_it_was_read() {
+        use crate::catalog::objects::ObjectDetail;
+        use crate::ddl::model::{EventSchedule, EventState, RoutineKind, RoutineState};
+        let event = EventState {
+            name: "purge".to_owned(),
+            schedule: EventSchedule::OneTime { at: "2026-01-01 00:00:00".to_owned() },
+            body: "SELECT 1".to_owned(),
+            enabled: true,
+            on_completion: crate::ddl::model::EventCompletion::Preserve,
+            comment: String::new(),
+            definer: String::new(),
+            scheduler_running: Some(false),
+        };
+        assert_eq!(ObjectDetail::Event(event).scheduler_running(), Some(false));
+        let routine = RoutineState {
+            kind: RoutineKind::Function,
+            name: "f".to_owned(),
+            params: Vec::new(),
+            returns: "INT".to_owned(),
+            body: "RETURN 1".to_owned(),
+            ..RoutineState::default()
+        };
+        assert_eq!(ObjectDetail::Routine(routine).scheduler_running(), None, "例程没有调度器");
     }
 }
