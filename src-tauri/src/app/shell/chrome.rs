@@ -3158,6 +3158,7 @@ impl Workbench {
             } else {
                 SharedString::from(format!("{} · {target}", kit::engine_label(engine.as_str())))
             };
+            let url_toggle = self.modal_url_toggle(url_visible, &p, cx);
             let close = self.modal_icon_button(
                 conn_modal::CLOSE,
                 IconName::X,
@@ -3171,9 +3172,9 @@ impl Workbench {
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(Space::MD))
                 .px(px(pad))
-                .py(px(12.))
+                .py(px(Space::LG))
                 .border_b_1()
                 .border_color(p.line)
                 .child(kit::engine_badge(engine.as_str(), 30.))
@@ -3187,7 +3188,7 @@ impl Workbench {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(8.))
+                                .gap(px(Space::MD))
                                 .min_w_0()
                                 .child(
                                     div()
@@ -3210,45 +3211,50 @@ impl Workbench {
                                 .child(subtitle),
                         ),
                 )
+                .child(url_toggle)
                 .child(close)
                 .into_any_element()
         });
 
-        // 2. 紧凑引擎选择条 + 分栏切换（常规 / SSH 隧道 / SSL·TLS）+ 可选 URL 快速解析开关。
+        // 2. 引擎选择条 + 分栏切换（常规 / SSH 隧道 / SSL·TLS；含配置启用与错误圆点）。
         let top_controls = stack_frame(|| {
-            let mut engine_row = div().flex().flex_wrap().items_center().gap(px(5.));
+            let mut engine_row = div().flex().flex_wrap().items_center().gap(px(Space::SM));
             for candidate in engines() {
                 engine_row = engine_row.child(self.modal_engine_item(candidate, candidate == engine, &p, cx));
             }
 
-            let mut subbar = div().flex().flex_wrap().items_center().gap(px(8.));
-            if !file_based {
+            let subbar = if !file_based {
                 let mut tabs = segment_track(&p);
                 for (tab, key, enabled_dot) in [
                     (conn_modal::ModalTab::General, "ui.conn.tab.general", false),
                     (conn_modal::ModalTab::Ssh, "ui.conn.tab.ssh", draft.ssh_on),
                     (conn_modal::ModalTab::Tls, "ui.conn.tab.tls", draft.tls_mode != TlsMode::Off),
                 ] {
-                    tabs = tabs.child(self.modal_tab_item(tab, self.t(key), active_tab == tab, enabled_dot, &p, cx));
+                    let has_issue = conn_modal::ConnectionModal::tab_has_issue(tab, &self.model.connections.issues);
+                    let dot = if has_issue {
+                        Some(p.danger)
+                    } else if enabled_dot {
+                        Some(p.ok)
+                    } else {
+                        None
+                    };
+                    tabs = tabs.child(self.modal_tab_item(tab, self.t(key), active_tab == tab, dot, &p, cx));
                 }
-                subbar = subbar.child(tabs);
+                div().flex().items_center().child(tabs)
             } else {
-                subbar = subbar.child(
-                    div()
-                        .text_size(px(TypeScale::XS))
-                        .text_color(p.text_muted)
-                        .child(self.t("ui.conn.block.fileHint")),
-                );
-            }
-            subbar = subbar.child(div().flex_1()).child(self.modal_url_toggle(url_visible, &p, cx));
+                div()
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_muted)
+                    .child(self.t("ui.conn.block.fileHint"))
+            };
 
             div()
                 .flex_none()
                 .px(px(pad))
-                .py(px(10.))
+                .py(px(Space::MD))
                 .flex()
                 .flex_col()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .bg(p.chrome)
                 .border_b_1()
                 .border_color(p.line_soft)
@@ -3398,7 +3404,11 @@ impl Workbench {
                         "ui.conn.savePasswordOff"
                     };
 
-                    let mut section = div().flex().flex_col().gap(px(12.));
+                    let mut section = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::LG))
+                        .child(kit::eyebrow(self.t("ui.conn.section.connection"), &p));
                     // 库索引是一个短数字：和端口排在同一行，用户名退到密码之后（可选的 ACL 用户）。
                     if crate::adapters::adapter(engine).meta().database_is_index() {
                         let (db_hint, db_masked) = self.field_hint(DraftField::Database);
@@ -3979,13 +3989,13 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 连接模态的配置分栏项（常规 / SSH 隧道 / SSL·TLS），已开启的隧道或加密带状态圆点。
+    /// 连接模态的配置分栏项（常规 / SSH 隧道 / SSL·TLS），已开启的隧道/加密或存在校验错误时带状态圆点。
     fn modal_tab_item(
         &mut self,
         tab: conn_modal::ModalTab,
         label: SharedString,
         selected: bool,
-        enabled_dot: bool,
+        dot: Option<gpui_kit::Hsla>,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3999,10 +4009,10 @@ impl Workbench {
             .aria_selected(selected)
             .track_focus(&handle)
             .h(px(height))
-            .px(px(10.))
+            .px(px(Space::LG))
             .flex()
             .items_center()
-            .gap(px(5.))
+            .gap(px(Space::SM))
             .rounded(px(Radius::CONTROL))
             .text_size(px(TypeScale::SM))
             .when(selected, |this| {
@@ -4013,7 +4023,7 @@ impl Workbench {
             })
             .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
             .child(label)
-            .when(enabled_dot, |this| this.child(kit::status_dot(p.ok)))
+            .when_some(dot, |this, color| this.child(kit::status_dot(color)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.activate_modal_control(id, cx);
             }))
@@ -4088,18 +4098,19 @@ impl Workbench {
         }
 
         let mut block = div()
-            .pt(px(12.))
+            .pt(px(Space::LG))
             .border_t_1()
             .border_color(p.line_soft)
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(Space::MD))
+            .child(kit::eyebrow(self.t("ui.conn.section.identity"), p))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_start()
-                    .gap(px(10.))
+                    .gap(px(Space::MD))
                     .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, p)))
                     .child(kit::form_row(self.t("conn.page.tag"), env_items, p)),
             );
@@ -4107,7 +4118,17 @@ impl Workbench {
         if !self.model.groups.is_empty() {
             let current_group = self.model.conn_modal.draft_group.clone();
             let groups = self.model.groups.clone();
-            let mut group_items = segment_track(p);
+            // 多分组时自动换行，不再挤出 640px 模态宽度。
+            let mut group_items = div()
+                .p(px(Space::XXS))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.sunken)
+                .border_1()
+                .border_color(p.line_soft)
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(Space::XXS));
             group_items = group_items.child(self.modal_segment_item(
                 conn_modal::group_control_id(None),
                 self.t("ui.conn.groupNone"),

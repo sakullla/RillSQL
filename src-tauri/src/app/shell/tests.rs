@@ -14412,3 +14412,47 @@ fn structure_preview_uses_full_window_shell_scrim_and_sets_overlay_flag(cx: &mut
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn connections_header_consolidates_transfer_menu_and_modal_stops_stay_synced(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-conn-redesign-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("activity-connections", cx));
+        window.render_frame(cx);
+
+        assert!(window.find("launcher-group-new").visible(), "保留新建分组入口");
+        assert!(window.find("launcher-open-file").visible(), "保留打开文件入口");
+        assert!(window.find("launcher-transfer-menu").visible(), "所有导入/导出收拢进统一下拉入口");
+        assert!(window.find("conn-new").visible(), "保留新建连接主按钮");
+        for scattered in ["launcher-import", "launcher-import-dbeaver", "launcher-import-navicat", "launcher-export"] {
+            assert!(window.try_find(scattered).is_none(), "顶栏不再平铺分散的导入/导出按钮: {scattered}");
+        }
+
+        // 打开新建连接模态：URL 切换移至页头后，rendered 与 modal_stops 保持完全一致。
+        view.update(cx, |view, cx| view.perform("conn-new-launcher", cx));
+        window.render_frame(cx);
+        let (rendered, stops) = view.read_with(cx, |view, _| {
+            let stop_controls: Vec<String> = view
+                .model
+                .modal_stops()
+                .into_iter()
+                .filter_map(|stop| stop.control_id().map(str::to_owned))
+                .collect();
+            (view.model.conn_modal.rendered.clone(), stop_controls)
+        });
+        assert_eq!(rendered, stops, "重排模态头部后，实际绘制控件与 Tab 停靠点序列必须一致");
+        assert_eq!(rendered.first().map(String::as_str), Some(super::conn_modal::URL_TOGGLE));
+        assert_eq!(rendered.get(1).map(String::as_str), Some(super::conn_modal::CLOSE));
+
+        // 校验分栏错误圆点识别：SSH / TLS / General 互不误报。
+        let ssh_issue = vec![crate::app::views::connections::FieldIssue::new("ssh_host", "connections.editor.required")];
+        assert!(super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::Ssh, &ssh_issue));
+        assert!(!super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::Tls, &ssh_issue));
+        assert!(!super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::General, &ssh_issue));
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

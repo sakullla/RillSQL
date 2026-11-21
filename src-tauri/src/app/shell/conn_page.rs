@@ -14,7 +14,7 @@ use gpui_kit::{
 use crate::app::views::connections::LinkStatus;
 use crate::connections::model::TlsMode;
 use crate::connections::ConnectionRecord;
-use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, Space, Tip as _, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 
 use super::chrome::{act, connection_detail, short_path, status_parts};
@@ -145,6 +145,7 @@ impl Workbench {
                     .on_click(act("conn-layout-list", cx)),
             );
 
+        let transfer_menu = self.transfer_dropdown("launcher-transfer-menu", wide_tools, true, &p, cx);
         let mut secondary: Vec<AnyElement> = if wide_tools {
             vec![
                 kit::tool_button("launcher-group-new", Some(IconName::FolderPlus), self.t("ui.group.new"), act("group-new", cx)).small().into_any_element(),
@@ -159,18 +160,7 @@ impl Workbench {
         if total == 0 {
             secondary.push(icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx));
         }
-        secondary.push(icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx));
-        secondary.push(
-            kit::tool_button("launcher-import-dbeaver", None, self.t("connections.profile.entry"), act("conn-import-dbeaver", cx))
-                .small()
-                .into_any_element(),
-        );
-        secondary.push(
-            kit::tool_button("launcher-import-navicat", None, self.t("connections.profile.navicat"), act("conn-import-navicat", cx))
-                .small()
-                .into_any_element(),
-        );
-        secondary.push(icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx));
+        secondary.push(transfer_menu);
 
         let focus = self.conn_launcher_focus.clone();
         let compact_search = self.model.viewport_width >= 820;
@@ -267,16 +257,78 @@ impl Workbench {
         if untagged > 0 {
             chips.push(("none".into(), self.t("conn.page.noTag"), None, untagged));
         }
-        let mut bar = div().id("conn-tag-bar").flex().flex_wrap().items_center().gap(px(6.));
+        let mut bar = div().id("conn-tag-bar").flex().flex_wrap().items_center().gap(px(Space::SM));
         for (id, label, tone, n) in chips {
             let on = current == id;
             let command = if on || id.is_empty() { "conn-filter-env:".to_owned() } else { format!("conn-filter-env:{id}") };
             let dot = tone.as_deref().map(|tone| kit::env_colors(tone, p).0);
             let aria = SharedString::from(format!("{label} {n}"));
             let chip_id = SharedString::from(format!("conn-tag-{}", if id.is_empty() { "all" } else { &id }));
-            bar = bar.child(kit::filter_chip(chip_id, label, Some(aria), dot, Some(n), on, p, act(command, cx)));
+            let muted_empty = n == 0 && !on && !id.is_empty();
+            let chip = kit::filter_chip(chip_id, label, Some(aria), dot, Some(n), on, p, act(command, cx));
+            bar = bar.child(div().when(muted_empty, |this| this.opacity(0.62)).child(chip));
         }
         bar.child(kit::tool_button("conn-tag-manage", Some(IconName::Settings2), self.t("conn.page.manageTags"), act("tags-manage", cx)).xsmall()).into_any_element()
+    }
+
+    /// 统一的“导入 / 导出”下拉入口：收拢 RillSQL JSON、DBeaver、Navicat 与导出，避免顶栏按钮杂乱堆叠。
+    fn transfer_dropdown(&self, id: &'static str, show_label: bool, include_export: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let import_rill = self.model.text("conn.page.importRill");
+        let import_dbeaver = self.model.text("connections.profile.entry");
+        let import_navicat = self.model.text("connections.profile.navicat");
+        let export_rill = self.model.text("conn.page.exportRill");
+        let label = self.t("conn.page.transfer");
+        let entity = cx.entity().downgrade();
+        Button::new(id)
+            .ghost()
+            .small()
+            .tooltip(label.clone())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .child(kit::icon(IconName::Download, 13., p.text_muted))
+                    .when(show_label, |this| this.child(label))
+                    .child(kit::icon(IconName::ChevronDown, 12., p.text_faint)),
+            )
+            .dropdown_menu(move |mut menu, _, _| {
+                const TRANSFER_MENU_MIN_W: f32 = 220.;
+                menu = menu.min_w(px(TRANSFER_MENU_MIN_W));
+                for (icon, text, cmd) in [
+                    (IconName::Download, import_rill.clone(), "conn-import"),
+                    (IconName::Database, import_dbeaver.clone(), "conn-import-dbeaver"),
+                    (IconName::FileCode, import_navicat.clone(), "conn-import-navicat"),
+                ] {
+                    let ent = entity.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            kit::popup_menu_row(Some(icon), text.clone(), None, false, &Palette::of(cx))
+                        })
+                        .on_click(move |_, _, cx| {
+                            if let Some(ent) = ent.upgrade() {
+                                ent.update(cx, |this, cx| this.perform(cmd, cx));
+                            }
+                        }),
+                    );
+                }
+                if include_export {
+                    let ent = entity.clone();
+                    let exp = export_rill.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::element(move |_, cx| {
+                            kit::popup_menu_row(Some(IconName::Upload), exp.clone(), None, false, &Palette::of(cx))
+                        })
+                        .on_click(move |_, _, cx| {
+                            if let Some(ent) = ent.upgrade() {
+                                ent.update(cx, |this, cx| this.perform("conn-export", cx));
+                            }
+                        }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     /// 列表/看板：失败重试条 → 最近 → 分组 / 未分组。只有这一块滚动。
@@ -314,9 +366,9 @@ impl Workbench {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(px(Space::SM))
                         .child(kit::primary_button("launcher-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("conn-new-launcher", cx)))
-                        .child(kit::secondary_button("launcher-empty-import", Some(IconName::Download), self.t("ui.conn.importList"), act("conn-import", cx))),
+                        .child(self.transfer_dropdown("launcher-empty-import", true, false, &p, cx)),
                     &p,
                 ))
                 .into_any_element();
@@ -450,18 +502,18 @@ impl Workbench {
                     div()
                         .id(SharedString::from(format!("launcher-group-empty-{}", group.id)))
                         .test_support()
-                        .ml(px(22.))
-                        .px(px(12.))
-                        .py(px(8.))
+                        .ml(px(Space::XL))
+                        .px(px(Space::LG))
+                        .py(px(Space::SM))
                         .max_w(px(520.))
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(10.))
-                        .rounded(px(Radius::PANEL))
+                        .gap(px(Space::MD))
+                        .rounded(px(Radius::CONTROL))
                         .border_1()
                         .border_color(p.line_soft)
-                        .bg(p.sunken.opacity(0.6))
+                        .bg(p.sunken.opacity(0.45))
                         .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft).border_color(drop_border))
                         .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
                             let connection = drag.connection.clone();
@@ -644,12 +696,12 @@ impl Workbench {
         };
 
         let actions = div()
-            .pt(px(8.))
+            .pt(px(Space::MD))
             .border_t_1()
             .border_color(p.line_soft)
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(Space::XS))
             .child(
                 kit::tool_button(
                     SharedString::from(format!("launcher-open-{prefix}-{id}")),
@@ -664,28 +716,35 @@ impl Workbench {
             .child(secondary_btn)
             .child(div().flex_1())
             .child(
-                kit::icon_button(
-                    SharedString::from(format!("launcher-edit-{prefix}-{id}")),
-                    IconName::Pencil,
-                    self.model.text("conn.page.edit"),
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.perform(&format!("connection-edit:{edit_id}"), cx);
-                    }),
-                )
-                .xsmall(),
-            )
-            .child(
-                kit::icon_button(
-                    SharedString::from(format!("launcher-more-{prefix}-{id}")),
-                    IconName::Ellipsis,
-                    self.model.text("conn.page.more"),
-                    cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.menu_at = event.position();
-                        this.model.connections.selected = Some(more_id.clone());
-                        this.perform("menu-connection", cx);
-                    }),
-                )
-                .xsmall(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XXS))
+                    .when(!selected, |this| this.opacity(0.).group_hover(group.clone(), |style| style.opacity(1.)))
+                    .child(
+                        kit::icon_button(
+                            SharedString::from(format!("launcher-edit-{prefix}-{id}")),
+                            IconName::Pencil,
+                            self.model.text("conn.page.edit"),
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.perform(&format!("connection-edit:{edit_id}"), cx);
+                            }),
+                        )
+                        .xsmall(),
+                    )
+                    .child(
+                        kit::icon_button(
+                            SharedString::from(format!("launcher-more-{prefix}-{id}")),
+                            IconName::Ellipsis,
+                            self.model.text("conn.page.more"),
+                            cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                this.menu_at = event.position();
+                                this.model.connections.selected = Some(more_id.clone());
+                                this.perform("menu-connection", cx);
+                            }),
+                        )
+                        .xsmall(),
+                    ),
             );
 
         kit::row_states(div().id(SharedString::from(row_id)), p)
@@ -1050,15 +1109,16 @@ impl Workbench {
         let mut table = div().flex().flex_col().gap(px(8.));
         for (key, value) in facts {
             let has_value = value != none;
-            // 地址、文件、库名、用户名、SSH 都是会被贴到别处的值：点一下就复制。
+            // 地址、文件、库名、用户名、SSH 都是会被贴到别处的值：点一下就复制，技术值使用等宽字体。
             let copyable = has_value && matches!(key, "conn.page.database" | "conn.page.user" | "conn.page.ssh");
-            // 地址 / 文件保留显式的复制按钮：复制后状态栏会提示，连接管理页的快捷操作也走它。
             let address = has_value && matches!(key, "conn.page.address" | "conn.page.file");
+            let mono_fact = has_value && matches!(key, "conn.page.address" | "conn.page.file" | "conn.page.database" | "conn.page.user" | "conn.page.ssh");
             let value_cell: AnyElement = if copyable {
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
+                    .when(mono_fact, |this| this.font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::XS)))
                     .text_color(p.text)
                     .child(kit::copyable(
                         SharedString::from(format!("conn-fact-{key}")),
@@ -1076,6 +1136,7 @@ impl Workbench {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .when(mono_fact, |this| this.font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::XS)))
                     .text_color(if has_value { p.text } else { p.text_faint })
                     .when(has_value, |this| this.tooltip_text(SharedString::from(value.clone())))
                     .child(SharedString::from(value))

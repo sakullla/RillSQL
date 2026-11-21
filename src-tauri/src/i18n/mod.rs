@@ -620,6 +620,11 @@ dict! {
     "conn.page.allTags" => "全部", "All";
     "conn.page.noTag" => "无标签", "Untagged";
     "conn.page.manageTags" => "管理标签", "Manage tags";
+    "conn.page.transfer" => "导入 / 导出", "Import / Export";
+    "conn.page.importRill" => "导入 RillSQL 连接 (.json)", "Import RillSQL connections (.json)";
+    "conn.page.exportRill" => "导出连接列表 (.json)", "Export connections (.json)";
+    "ui.conn.section.connection" => "连接配置", "Connection";
+    "ui.conn.section.identity" => "名称与归类", "Identity & organization";
     "conn.page.pickHint" => "选择一个连接查看详情", "Select a connection to see its details";
     "conn.page.openHint" => "双击列表中的连接，或点“连接”进入工作区。", "Double-click a connection or press Connect to open the workspace.";
     "tags.title" => "标签", "Tags";

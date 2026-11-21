@@ -339,6 +339,24 @@ impl ConnectionModal {
         }
     }
 
+    /// 指定分栏是否存在未解决的字段校验错误，用于在分栏上标示错误圆点。
+    pub fn tab_has_issue(tab: ModalTab, issues: &[crate::app::views::connections::FieldIssue]) -> bool {
+        issues.iter().any(|issue| {
+            let field = issue.field.as_str();
+            if field == "url" {
+                return false;
+            }
+            match tab {
+                ModalTab::Ssh => matches!(field, "ssh_host" | "ssh_port" | "ssh_user" | "ssh_key" | "ssh_password" | "passphrase"),
+                ModalTab::Tls => matches!(field, "ca_file" | "client_cert" | "client_key"),
+                ModalTab::General => !matches!(
+                    field,
+                    "ssh_host" | "ssh_port" | "ssh_user" | "ssh_key" | "ssh_password" | "passphrase" | "ca_file" | "client_cert" | "client_key"
+                ),
+            }
+        })
+    }
+
     /// 默认初始形态（常规分栏、URL 栏收起）下的 Tab 序列。
     pub fn stops(page: &ConnectionPage, envs: &[String]) -> Vec<ModalStop> {
         Self::default().stops_for(page, envs)
@@ -353,7 +371,10 @@ impl ConnectionModal {
         let Some(draft) = page.editor.as_ref() else {
             return Vec::new();
         };
-        let mut stops = vec![ModalStop::Control(CLOSE.to_owned())];
+        let mut stops = vec![
+            ModalStop::Control(URL_TOGGLE.to_owned()),
+            ModalStop::Control(CLOSE.to_owned()),
+        ];
         for engine in engines() {
             stops.push(ModalStop::Control(engine_control_id(engine)));
         }
@@ -362,7 +383,6 @@ impl ConnectionModal {
                 stops.push(ModalStop::Control(tab.control_id().to_owned()));
             }
         }
-        stops.push(ModalStop::Control(URL_TOGGLE.to_owned()));
         if self.url_visible(page) {
             stops.push(ModalStop::Field(DraftField::Url));
             stops.push(ModalStop::Control(APPLY_URL.to_owned()));
@@ -602,7 +622,8 @@ mod tests {
     #[test]
     fn the_sequence_starts_at_close_and_ends_at_save_and_connect() {
         let stops = ConnectionModal::stops(&page(Engine::Postgres), &["dev".to_owned()]);
-        assert_eq!(stops.first(), Some(&ModalStop::Control(CLOSE.to_owned())));
+        assert_eq!(stops.first(), Some(&ModalStop::Control(URL_TOGGLE.to_owned())));
+        assert_eq!(stops.get(1), Some(&ModalStop::Control(CLOSE.to_owned())));
         assert_eq!(stops.last(), Some(&ModalStop::SaveConnect));
         assert!(stops.len() > 10, "字段+控件+页脚都要在序列里：{stops:?}");
     }
