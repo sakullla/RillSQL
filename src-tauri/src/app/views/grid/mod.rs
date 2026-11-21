@@ -477,7 +477,7 @@ impl GridPane {
         }
     }
 
-    fn clear_notice(&mut self) {
+    pub(crate) fn clear_notice(&mut self) {
         self.notice.clear();
         self.notice_tone = NoticeTone::Info;
     }
@@ -582,7 +582,7 @@ impl GridPane {
             self.record_row_changed();
             self.session.select(row, 0, false);
             self.session.select(row, last, true);
-            self.notice.clear();
+            self.clear_notice();
             self.sync_table(cx);
         }
         cx.notify();
@@ -601,7 +601,7 @@ impl GridPane {
         }
         self.record_row_changed();
         self.session.select(row, column, false);
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
         cx.notify();
     }
@@ -624,7 +624,7 @@ impl GridPane {
             self.fetch_current(true, cx);
         } else if self.session.loaded_len() > 0 {
             // 查询结果不能由网格重跑：保留行，但说明新上限要重新执行查询才生效。
-            self.notice = i18n::text(self.locale, "grid.preview.reloadQuery");
+            self.set_notice(i18n::text(self.locale, "grid.preview.reloadQuery"));
         }
         self.sync_table(cx);
         cx.notify();
@@ -678,7 +678,7 @@ impl GridPane {
         self.record_row_changed();
         self.press = None;
         self.filter_input_reset();
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
     }
 
@@ -827,7 +827,7 @@ impl GridPane {
         let live = self.live_target();
         match self.session.begin_unlock(live) {
             Ok(_) => {
-                self.notice.clear();
+                self.clear_notice();
                 if self.session.complete_unlock() {
                     // 后台已经读到唯一键：直接打开编辑。
                     self.remember_unlock();
@@ -838,7 +838,7 @@ impl GridPane {
                     self.schedule_locate(token, cx);
                 }
             }
-            Err(reason) => self.notice = i18n::text(self.locale, reason),
+            Err(reason) => self.set_error_notice(i18n::text(self.locale, reason)),
         }
         cx.notify();
     }
@@ -889,9 +889,18 @@ impl GridPane {
         self.find_open
     }
 
-    /// 正在生效的查找/筛选条件数：关键字算一条，每条已应用的筛选各算一条。
+    fn has_sql_filter(&self) -> bool {
+        !self.session.applied_sql().trim().is_empty() || !self.session.filter_sql().trim().is_empty()
+    }
+
+    /// 正在生效的查找/筛选条件数：关键字算一条，每条可视化筛选或 SQL 筛选各算一条。
     pub fn active_conditions(&self) -> usize {
-        usize::from(!self.session.find_text().trim().is_empty()) + self.session.filters().len()
+        let filters = if self.session.applied_source() == session::FilterSource::Sql && self.has_sql_filter() {
+            1
+        } else {
+            self.session.filters().len().max(usize::from(self.has_sql_filter()))
+        };
+        usize::from(!self.session.find_text().trim().is_empty()) + filters
     }
 
     pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
@@ -959,7 +968,7 @@ impl GridPane {
                     if !self.live_target() && !self.session.target.connection_id.is_empty() {
                         // 连接没打开时重读只会再失败一次：先连接，连上后由外壳触发重读。
                         self.connect_request = Some(self.session.target.connection_id.clone());
-                        self.notice = i18n::text(self.locale, "ui.conn.connecting");
+                        self.set_notice(i18n::text(self.locale, "ui.conn.connecting"));
                     } else {
                         self.fetch_current(true, cx);
                     }
@@ -1105,7 +1114,7 @@ impl GridPane {
             }
             "grid-undo" => {
                 let _ = self.session.undo_last_stage();
-                self.notice.clear();
+                self.clear_notice();
                 None
             }
             "grid-search" => {
@@ -1169,13 +1178,13 @@ impl GridPane {
                 // 查询结果没有"下一页"：网格不重新执行语句，多语句和写语句更不能。
                 let forward = id == "grid-page-next";
                 if self.session.mode != GridMode::Table {
-                    self.notice = self.session.state_text(false);
+                    self.set_notice(self.session.state_text(false));
                 } else if !self.session.can_page(forward) {
                     // 第一页已经没有上一页，读到末尾就没有下一页；这里不假装成功，也不改偏移。
-                    self.notice = i18n::text(self.locale, if forward { "grid.state.noMorePages" } else { "grid.state.firstPage" });
+                    self.set_notice(i18n::text(self.locale, if forward { "grid.state.noMorePages" } else { "grid.state.firstPage" }));
                 } else if self.fetching || self.loading_more {
                     // 上一次翻页还在路上：重复点击不能叠加请求，也不能提前换页。
-                    self.notice = i18n::text(self.locale, "grid.state.loading");
+                    self.set_notice(i18n::text(self.locale, "grid.state.loading"));
                 } else {
                     // 编辑目标所在的行要离开窗口了，先结束编辑，避免 Enter 落到不存在的位置。
                     // 记录面板的就地暂存同样属于这一页的行，翻页后一律作废。
@@ -1210,7 +1219,7 @@ impl GridPane {
                     self.session.open_value(row, column);
                     let reads = self.session.begin_full_cells(&[(row, column)]);
                     self.start_full_reads(reads, None, cx);
-                    self.notice.clear();
+                    self.clear_notice();
                     self.refocus = true;
                 }
                 None
@@ -1232,7 +1241,7 @@ impl GridPane {
             "grid-value-copy" => Some(self.session.copy_cell()),
             // 导出前把当前窗口里还是预览的格子一次读成原值，导出与 WHERE 随后共用。
             "grid-full-values" => {
-                self.notice = i18n::text(self.locale, "grid.status.fullValues");
+                self.set_notice(i18n::text(self.locale, "grid.status.fullValues"));
                 None
             }
             // 外键：两件事分开。"跳转到引用行"真的打开引用表的工作项并带上定位查询；
@@ -1250,7 +1259,7 @@ impl GridPane {
                         } else {
                             format!("{}.{}.{}", reference.database, reference.schema, reference.table)
                         };
-                        self.notice = i18n::fill(&i18n::text(self.locale, "grid.fk.target"), &[("path", &path)]);
+                        self.set_notice(i18n::fill(&i18n::text(self.locale, "grid.fk.target"), &[("path", &path)]));
                         if id == "grid-fk-select" {
                             Some(reference.sql)
                         } else {
@@ -1259,7 +1268,7 @@ impl GridPane {
                         }
                     }
                     Err(key) => {
-                        self.notice = i18n::text(self.locale, key);
+                        self.set_error_notice(i18n::text(self.locale, key));
                         None
                     }
                 }
@@ -1270,7 +1279,11 @@ impl GridPane {
                 match self.session.copy_as(format) {
                     Ok(copied) => {
                         // 占位表名要说出来：这段 INSERT 不能原样执行。
-                        self.notice = if copied.placeholder { i18n::text(self.locale, "grid.copyAs.placeholder") } else { String::new() };
+                        if copied.placeholder {
+                            self.set_notice(i18n::text(self.locale, "grid.copyAs.placeholder"));
+                        } else {
+                            self.clear_notice();
+                        }
                         Some(copied.text)
                     }
                     Err(CopyBlock::Empty) => {
@@ -1286,10 +1299,10 @@ impl GridPane {
             }
             "grid-clone-row" => {
                 self.select_first_if_needed();
-                self.notice = match self.session.stage_clone() {
-                    Ok(()) => i18n::text(self.locale, "grid.write.cloned"),
-                    Err(reason) => reason,
-                };
+                match self.session.stage_clone() {
+                    Ok(()) => self.set_notice(i18n::text(self.locale, "grid.write.cloned")),
+                    Err(reason) => self.set_error_notice(reason),
+                }
                 None
             }
             "grid-paste" => {
@@ -1306,9 +1319,9 @@ impl GridPane {
             }
             "grid-selection-set" => {
                 if !self.session.writable() {
-                    self.notice = BatchReject::Readonly(self.session.gate_text(Gate::Readonly)).message(self.locale);
+                    self.set_error_notice(BatchReject::Readonly(self.session.gate_text(Gate::Readonly)).message(self.locale));
                 } else if self.session.selection_targets().is_empty() {
-                    self.notice = BatchReject::NoFocus.message(self.locale);
+                    self.set_error_notice(BatchReject::NoFocus.message(self.locale));
                 } else {
                     // 编辑栏要在绘制时拿到 Window 才能聚焦。
                     self.pending_batch = true;
@@ -1537,14 +1550,14 @@ impl GridPane {
         if self.session.needs_full_of(row_id, column) && self.session.full_text_of(row_id, column).is_none() {
             self.record_row_changed();
             let row = self.session.row_index(row_id).unwrap_or(0);
-            self.notice = self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+            self.set_error_notice(self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal")));
             self.refocus = true;
             cx.notify();
             return;
         }
         let Some(text) = self.session.edit_text_of(row_id, column) else {
             self.record_row_changed();
-            self.notice = i18n::text(self.locale, "grid.value.noOriginal");
+            self.set_error_notice(i18n::text(self.locale, "grid.value.noOriginal"));
             self.refocus = true;
             cx.notify();
             return;
@@ -1563,7 +1576,7 @@ impl GridPane {
         // 兜底：目标行已经离开当前快照（或这次暂存跨过了行变化），一个字都不写。
         let Some(row) = self.session.row_index(&row_id) else {
             self.record_row_changed();
-            self.notice = self.session.gate_text(Gate::Unlocated);
+            self.set_gate_notice(Gate::Unlocated);
             self.refocus = true;
             self.sync_table(cx);
             cx.notify();
@@ -1572,7 +1585,7 @@ impl GridPane {
         // 和 begin_edit 同一条判据：值还是预览信封就绝不写，空串不能顶替用户没看过的原值。
         if self.session.needs_full_of(&row_id, column) && self.session.full_text_of(&row_id, column).is_none() {
             self.record_row_changed();
-            self.notice = self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+            self.set_error_notice(self.session.cell_block(&[(row, column)]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal")));
             self.refocus = true;
             self.sync_table(cx);
             cx.notify();
@@ -1667,14 +1680,14 @@ impl GridPane {
     fn begin_batch_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cells = self.session.selection_targets();
         let Some((row_id, column)) = cells.first().cloned() else {
-            self.notice = BatchReject::NoFocus.message(self.locale);
+            self.set_error_notice(BatchReject::NoFocus.message(self.locale));
             return;
         };
         self.edit_target = Some(EditTarget { row_id, column, original: None, cells });
         self.edit_input.update(cx, |state, cx| state.set_value("", window, cx));
         let handle = self.edit_input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
-        self.notice.clear();
+        self.clear_notice();
         cx.notify();
     }
 
@@ -1694,7 +1707,7 @@ impl GridPane {
 
     fn open_navigation(&mut self, navigation: GridNavigation, cx: &mut Context<Self>) {
         let Some(sink) = self.navigation.clone() else {
-            self.notice = i18n::text(self.locale, "grid.fk.noShell");
+            self.set_error_notice(i18n::text(self.locale, "grid.fk.noShell"));
             cx.notify();
             return;
         };
@@ -1728,7 +1741,7 @@ impl GridPane {
         match block {
             None => true,
             Some(reason) => {
-                self.notice = reason;
+                self.set_error_notice(reason);
                 self.sync_table(cx);
                 cx.notify();
                 false
@@ -1748,7 +1761,7 @@ impl GridPane {
             for read in &reads {
                 self.session.fail_full(read, &reason);
             }
-            self.notice = reason;
+            self.set_error_notice(reason);
             self.pending_full = None;
             self.sync_table(cx);
             cx.notify();
@@ -1810,7 +1823,7 @@ impl GridPane {
         match failure {
             Some(message) => {
                 // 读取失败：预览仍然可见，但已经标成错误，不重跑动作也不退回预览。
-                self.notice = message;
+                self.set_error_notice(message);
                 cx.notify();
             }
             None => {
@@ -1841,7 +1854,7 @@ impl GridPane {
     fn sync_find_scope(&mut self) -> Option<&'static str> {
         self.session.set_target_live(self.live_target());
         if self.session.demote_server_find_scope() {
-            self.notice = i18n::text(self.locale, "grid.find.scopeOffline");
+            self.set_notice(i18n::text(self.locale, "grid.find.scopeOffline"));
         }
         self.session.find_scope_block()
     }
@@ -1907,13 +1920,13 @@ impl GridPane {
         let awaits_read = self.session.mode == GridMode::Table && self.live_target();
         match self.session.apply_filters(awaits_read) {
             Ok(()) => {
-                self.notice.clear();
+                self.clear_notice();
                 self.reload_after_condition_change(cx);
                 Ok(())
             }
             Err(error) => {
                 // 条件输入和上一次有效结果都保留，只把原因显示出来。
-                self.notice = error.clone();
+                self.set_error_notice(error.clone());
                 self.sync_table(cx);
                 cx.notify();
                 Err(error)
@@ -2013,7 +2026,7 @@ impl GridPane {
         }
         if scope == FindScope::Server {
             if let Some(reason) = self.sync_find_scope() {
-                self.notice = i18n::text(self.locale, reason);
+                self.set_error_notice(i18n::text(self.locale, reason));
                 self.sync_table(cx);
                 cx.notify();
                 return false;
@@ -2021,12 +2034,12 @@ impl GridPane {
         }
         match self.session.set_find_scope(scope) {
             Ok(()) => {
-                self.notice.clear();
+                self.clear_notice();
                 self.reload_after_condition_change(cx);
                 true
             }
             Err(reason) => {
-                self.notice = i18n::text(self.locale, reason);
+                self.set_error_notice(i18n::text(self.locale, reason));
                 self.sync_table(cx);
                 cx.notify();
                 false
@@ -2136,12 +2149,13 @@ impl GridPane {
         match self.session.switch_filter_mode(mode) {
             Ok(()) => {
                 self.filters_open = true;
-                self.notice.clear();
+                self.filters_collapsed = false;
+                self.clear_notice();
                 cx.notify();
                 true
             }
             Err(reason) => {
-                self.notice = reason;
+                self.set_error_notice(reason);
                 self.sync_table(cx);
                 cx.notify();
                 false
@@ -2172,7 +2186,7 @@ impl GridPane {
             PressMode::Toggle => self.session.toggle_press(row, column),
         }
         // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
         cx.notify();
     }
@@ -2187,7 +2201,7 @@ impl GridPane {
             PressMode::Toggle => self.session.toggle_drag(row, column),
             _ => self.session.select(row, column, true),
         }
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
         cx.notify();
     }
@@ -2217,7 +2231,7 @@ impl GridPane {
         };
         let reason = self.session.write_reason(row, column);
         if !reason.is_empty() {
-            self.notice = reason;
+            self.set_error_notice(reason);
             // 只读时退化为查看完整值：统一走查看路径，预览值会先按定位读取原值。
             self.session.open_value(row, column);
             self.pending_viewer = true;
@@ -2226,7 +2240,7 @@ impl GridPane {
             self.refocus = true;
             return;
         }
-        self.notice.clear();
+        self.clear_notice();
         self.pending_edit = Some(PendingEdit { row, column, select_all });
     }
 
@@ -2241,7 +2255,7 @@ impl GridPane {
             let reads = self.session.begin_full_cells(&[cell]);
             self.pending_edit = None;
             if reads.is_empty() {
-                self.notice = self.session.cell_block(&[cell]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+                self.set_error_notice(self.session.cell_block(&[cell]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal")));
                 cx.notify();
                 return;
             }
@@ -2259,7 +2273,7 @@ impl GridPane {
                 _ => Some(text),
             };
             let gate = self.session.stage_text_by_id(&previous.row_id, previous.column, value);
-            self.notice = self.session.gate_text(gate);
+            self.set_gate_notice(gate);
         }
         self.edit_error = None;
         let original = self.session.raw_value(pending.row, pending.column);
@@ -2273,7 +2287,7 @@ impl GridPane {
         });
         let handle = self.edit_input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
-        self.notice.clear();
+        self.clear_notice();
         cx.notify();
     }
 
@@ -2417,7 +2431,7 @@ impl GridPane {
         self.edit_target = None;
         self.pending_edit = None;
         self.edit_error = None;
-        self.notice.clear();
+        self.clear_notice();
         self.refocus = true;
     }
 
@@ -2639,7 +2653,7 @@ impl GridPane {
                     self.record_row_changed();
                     self.session.select(*row, column, false);
                     // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
-                    self.notice.clear();
+                    self.clear_notice();
                 }
             }
             TableEvent::DoubleClickedCell(row, col) => {
@@ -2702,7 +2716,7 @@ impl GridPane {
         } else {
             Gate::Readonly
         };
-        self.notice = self.session.gate_text(gate);
+        self.set_gate_notice(gate);
         self.sync_table(cx);
         gate
     }
@@ -2762,7 +2776,7 @@ impl GridPane {
                 self.loading_more = false;
                 self.fetching = false;
                 self.pending_page = None;
-                self.notice = error;
+                self.set_error_notice(error);
                 self.sync_table(cx);
                 return;
             }
@@ -2887,7 +2901,7 @@ impl GridPane {
             self.session.set_full_count(full);
             self.session.append_page(rows, full, truncated);
         }
-        self.notice.clear();
+        self.clear_notice();
         self.loading_more = false;
         self.fetching = false;
         self.sync_table(cx);
@@ -2900,7 +2914,7 @@ impl GridPane {
         self.loading_more = false;
         self.fetching = false;
         self.pending_page = None;
-        self.notice = message.clone();
+        self.set_error_notice(message.clone());
         // 这次读取失败：草稿、上一次已应用条件和旧结果都留着，条件不算应用成功。
         self.session.discard_pending_filter();
         if stale {
@@ -2913,13 +2927,13 @@ impl GridPane {
 
     fn count_rows(&mut self, cx: &mut Context<Self>) {
         if self.fetching || self.counting.is_some() || self.session.mode != GridMode::Table { return; }
-        let request = match self.session.page_request() { Ok(request) => count_of(&request), Err(error) => { self.notice = error; return; } };
+        let request = match self.session.page_request() { Ok(request) => count_of(&request), Err(error) => { self.set_error_notice(error); return; } };
         self.count_sequence = self.count_sequence.wrapping_add(1);
         let token = self.count_sequence;
         let scope = request.clone();
         self.counting = Some(token);
         self.count_scope = Some(scope.clone());
-        self.notice = i18n::text(self.locale, "grid.count.running");
+        self.set_notice(i18n::text(self.locale, "grid.count.running"));
         let services = Arc::clone(&self.services);
         let (tx, rx) = tokio::sync::oneshot::channel();
         runtime().spawn(async move { let _ = tx.send(crate::application::grid::count(&services.connections, &request).await); });
@@ -2933,9 +2947,9 @@ impl GridPane {
                     if pane.counting != Some(token) || current.as_ref() != Some(&scope) { return; }
                     pane.counting = None;
                     match result {
-                        Ok(Ok(count)) => { pane.session.set_full_count(Some(count.matched)); pane.notice.clear(); }
-                        Ok(Err(error)) => pane.notice = error,
-                        Err(_) => pane.notice = i18n::text(pane.locale, "grid.count.failed"),
+                        Ok(Ok(count)) => { pane.session.set_full_count(Some(count.matched)); pane.clear_notice(); }
+                        Ok(Err(error)) => pane.set_error_notice(error),
+                        Err(_) => pane.set_error_notice(i18n::text(pane.locale, "grid.count.failed")),
                     }
                     pane.sync_table(cx);
                     cx.notify();
@@ -3025,7 +3039,7 @@ impl GridPane {
         if let Some(message) = failure {
             // 只有用户在等解锁时才提示；后台预读失败不打扰，点解锁时会再读一次。
             if self.session.relock() {
-                self.notice = message;
+                self.set_error_notice(message);
             }
         }
         self.sync_table(cx);
@@ -3545,7 +3559,7 @@ impl GridPane {
                     return;
                 };
                 let gate = this.session.stage_text_by_id(&row_id, column, Some(text.clone()));
-                this.notice = this.session.gate_text(gate);
+                this.set_gate_notice(gate);
                 this.sync_table(cx);
                 cx.notify();
             }
@@ -3601,7 +3615,6 @@ impl GridPane {
         let table_mode = self.session.mode == GridMode::Table;
         // 每帧对齐连接状态：失去连接的整表筛选退回已读取行（查找栏收起时同样要对齐）。
         let _ = self.sync_find_scope();
-        let filters = self.session.filters().len();
         // 查找栏默认收起（R10）：工具栏只放一个查找按钮。展开时按钮高亮；收起但仍有生效的关键字或筛选时
         // 按钮带计数徽标并说明“显示的不是全部行”，免得把筛过的结果当成全部数据。
         let active = self.active_conditions();
@@ -3638,13 +3651,53 @@ impl GridPane {
             );
         }
         let mut left = div().id("grid-tools-left").flex().flex_wrap().items_center().gap(px(4.)).min_w(px(0.)).child(find_slot);
-        let filter_label = if filters > 0 {
-            SharedString::from(format!("{} {filters}", i18n::text(locale, "grid.action.filter")))
+        let visual_filters = self.session.filters().len();
+        let sql_filter = self.has_sql_filter();
+        let has_filter = visual_filters > 0 || sql_filter;
+        let filter_label = if (self.session.filter_mode() == session::FilterMode::Sql || self.session.applied_source() == session::FilterSource::Sql) && sql_filter {
+            SharedString::from(format!("{} SQL", i18n::text(locale, "grid.action.filter")))
+        } else if visual_filters > 0 {
+            SharedString::from(format!("{} {visual_filters}", i18n::text(locale, "grid.action.filter")))
+        } else if sql_filter {
+            SharedString::from(format!("{} SQL", i18n::text(locale, "grid.action.filter")))
         } else {
             t("grid.action.filter")
         };
         let filter_button = kit::tool_button("grid-filter-add", Some(IconName::ListFilter), filter_label, pane_click(entity, "grid-filter-toggle"));
-        left = left.child(if filters > 0 || self.filters_shown() { filter_button.selected(true) } else { filter_button });
+        let mut filter_slot = div()
+            .id("grid-filter-slot")
+            .debug_selector(|| "grid-filter-slot".to_owned())
+            .relative()
+            .flex_none()
+            .child(if has_filter || self.filters_shown() { filter_button.selected(true) } else { filter_button });
+        if has_filter && !self.filters_shown() {
+            let badge = if visual_filters > 0 && self.session.applied_source() != session::FilterSource::Sql {
+                SharedString::from(visual_filters.to_string())
+            } else {
+                SharedString::from("SQL")
+            };
+            filter_slot = filter_slot.child(
+                div()
+                    .id("grid-filter-collapsed-badge")
+                    .debug_selector(|| "grid-filter-collapsed-badge".to_owned())
+                    .test_support()
+                    .absolute()
+                    .top(px(-3.))
+                    .right(px(-3.))
+                    .min_w(px(14.))
+                    .h(px(14.))
+                    .px(px(3.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(p.accent)
+                    .text_color(p.on_accent)
+                    .text_size(px(TypeScale::XS))
+                    .child(badge),
+            );
+        }
+        left = left.child(filter_slot);
         // 跳到列（R4）与列管理（R7）：跳到列按名字快速定位；列管理集中控制显隐与顺序，隐藏列时显示计数提示。
         if !self.session.column_names().is_empty() {
             let jumping = self.column_picker_target() == Some(column_pick::ColumnPickTarget::Jump);
@@ -11162,6 +11215,125 @@ mod filter_ui_tests {
             );
             window.render_frame(cx);
             assert!(!pane.read(cx).session.preview_open(), "点击遮罩外部关闭预览弹窗");
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui_kit::test]
+    fn r7_notice_tone_uses_error_on_rejections_and_resets_to_info(cx: &mut TestAppContext) {
+        let (dir, window, pane) = open_local(cx, "r7-notice-tone-reset");
+        cx.update_window(window, |_, window, cx| {
+            // 只读查询结果上的写操作（编辑、克隆行）均使用 Error 语义色。
+            pane.update(cx, |pane, cx| {
+                pane.session.show_query_sheet(
+                    "SELECT id, name FROM items GROUP BY id, name",
+                    vec!["id".into(), "name".into()],
+                    vec![vec![Some("1".into()), Some("a".into())]],
+                    false,
+                    Some(1),
+                );
+                pane.session.select(0, 1, false);
+                let _ = pane.command("edit-cell", cx);
+            });
+            assert_eq!(pane.read(cx).notice_tone, NoticeTone::Error, "只读编辑退化提示使用 Error 语义色");
+            assert!(!pane.read(cx).notice.is_empty());
+            window.render_frame(cx);
+
+            // 随后的中性信息提示（如读取完整值提示）必须重置回 Info，不能滞留 Error。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-full-values", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).notice_tone, NoticeTone::Info, "中性提示应重置为 Info 语义色");
+            assert!(window.try_find("grid-notice").is_some());
+
+            // 只读克隆行失败使用 Error。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-clone-row", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).notice_tone, NoticeTone::Error, "只读克隆行被拒绝应使用 Error 语义色");
+            assert!(window.try_find("grid-notice").is_some());
+
+            // 切到可写表，非法 SQL 筛选报错使用 Error，随后成功克隆行重置回 Info。
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target_of("items"),
+                    vec![("id", "integer"), ("name", "text")],
+                    vec![vec![Some("1"), Some("a")]],
+                    "id",
+                    cx,
+                );
+                pane.session.set_target_live(true);
+                assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx));
+                pane.session.set_filter_sql("id = 1; DROP TABLE items");
+                assert!(pane.apply_filters(cx).is_err());
+            });
+            assert_eq!(pane.read(cx).notice_tone, NoticeTone::Error, "非法 SQL 筛选应使用 Error 语义色");
+
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 1, false);
+                let _ = pane.command("grid-clone-row", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).notice_tone, NoticeTone::Info, "后续成功提示必须重置回 Info 语义色");
+            assert!(!pane.read(cx).notice.is_empty());
+            assert!(window.try_find("grid-notice").is_some());
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui_kit::test]
+    async fn r6_sql_filter_collapsed_keeps_toolbar_active_indicator(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestAppContextExt as _;
+        cx.executor().allow_parking();
+        let (dir, services) = items_fixture("r6-sql-filter-collapsed");
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("items"), 100, cx));
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| pane.read(cx).loaded_len() == 4).await;
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx));
+                pane.session.set_filter_sql("id > 2");
+                pane.apply_filters(cx).expect("合法 SQL WHERE 条件");
+            });
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            pane.read(cx).loaded_len() == 2 && pane.read(cx).session.applied_sql() == "id > 2"
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).filters_shown(), "应用 SQL 筛选后筛选栏展开");
+            assert!(pane.read(cx).session.filters().is_empty(), "可视化条件为空");
+            assert_eq!(pane.read(cx).session.applied_sql(), "id > 2");
+            assert_eq!(pane.read(cx).active_conditions(), 1, "SQL 筛选计入活动条件数");
+
+            // 折叠筛选栏：保留 SQL 筛选，工具栏保持激活状态与折叠指示徽标。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-filter-toggle", cx);
+            });
+            window.render_frame(cx);
+            assert!(!pane.read(cx).filters_shown(), "SQL 筛选栏已折叠");
+            assert_eq!(pane.read(cx).session.applied_sql(), "id > 2", "折叠后保留已应用 SQL 筛选");
+            assert_eq!(pane.read(cx).active_conditions(), 1, "折叠后活动条件数仍为 1");
+            assert!(window.try_find("grid-filter-collapsed-badge").is_some(), "SQL 筛选折叠时工具栏显示激活指示徽标");
+            assert!(window.try_find("grid-find-badge").is_some(), "工具栏活动条件徽标保持可见");
+
+            // 再次点击展开筛选栏，SQL 筛选原文保持不变。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("grid-filter-toggle", cx);
+            });
+            window.render_frame(cx);
+            assert!(pane.read(cx).filters_shown());
+            assert_eq!(pane.read(cx).session.filter_sql(), "id > 2");
+            assert!(window.try_find("grid-filter-collapsed-badge").is_none(), "展开后隐藏折叠徽标");
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(dir);

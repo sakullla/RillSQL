@@ -152,7 +152,7 @@ impl GridPane {
             self.session.select(0, logical, false);
             self.session.select(last, logical, true);
         }
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
         if display >= self.session.frozen_count() {
             // 表格列号含最左边的行号列。
