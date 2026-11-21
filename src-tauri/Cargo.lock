@@ -8201,7 +8201,7 @@ dependencies = [
 
 [[package]]
 name = "rillsql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2 0.5.3",
  "async-trait",
