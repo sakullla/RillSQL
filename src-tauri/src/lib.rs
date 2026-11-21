@@ -18,6 +18,7 @@ mod product;
 mod query;
 pub mod release;
 mod state;
+pub mod transaction;
 mod ui;
 
 use serde::Serialize;
@@ -168,6 +169,7 @@ fn fixed_dependency_markers() -> usize {
         migrate::module_id(),
         adapters::redis::module_id(),
         adapters::mongodb::module_id(),
+        transaction::module_id(),
     ];
     markers.len()
 }
@@ -194,6 +196,7 @@ mod tests {
         assert_eq!(super::compare::module_id(), "compare");
         assert_eq!(super::dump::module_id(), "dump");
         assert_eq!(super::migrate::module_id(), "migrate");
+        assert_eq!(super::transaction::module_id(), "transaction");
         assert!(super::fixed_dependency_markers() >= 12);
         assert!(!super::local_data_dir().is_empty());
     }
