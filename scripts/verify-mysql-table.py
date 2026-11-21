@@ -131,7 +131,7 @@ def write_report(path, args, versions, evidence, output, command):
         ("生成列（VIRTUAL；STORED/PERSISTENT）", "adapters/mysql/table_ddl.rs generated_clause、profile.stored_keyword",
          "information_schema.columns.EXTRA / GENERATION_EXPRESSION", "建 VIRTUAL 生成列；追加持久化生成列；改表达式；表达式默认值不被当成生成列"),
         ("RANGE 分区", "adapters/mysql/table_ddl.rs partition_by_clause、partition_steps", "information_schema.PARTITIONS", "建立、新增、删除、重组"),
-        ("LIST 分区", "同上", "information_schema.PARTITIONS", "建立"),
+        ("LIST 分区", "同上", "information_schema.PARTITIONS", "建立、新增（VALUES IN 形状）、删除"),
         ("HASH 分区", "同上", "information_schema.PARTITIONS", "建立、按数量增、按数量减"),
         ("KEY 分区", "同上", "information_schema.PARTITIONS（PARTITION_EXPRESSION 是反引号包住的列清单）",
          "建立、读回列清单还原成裸列名后按同一函数重建、移除分区方案"),

@@ -106,6 +106,11 @@ fn normalized(expression: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// 读回的分区边界值可能带空白（"7, 8, 9"）：比较前只去掉空白，值本身原样对照。
+fn compact(description: &str) -> String {
+    description.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 fn plain_column(name: &str, type_name: &str) -> ColumnDraft {
     ColumnDraft {
         original: None,
@@ -383,7 +388,7 @@ async fn partition_round_trip(live: &Live, suffix: &str) {
         .collect();
     assert_eq!(names, vec!["p0".to_owned(), "p1a".to_owned(), "p1b".to_owned()]);
 
-    // LIST。
+    // LIST：命名分区的边界写成 VALUES IN，与 RANGE 的 VALUES LESS THAN 是两种形状。
     let list = PartitionDraft {
         op: PartitionOp::Replace,
         method: PartitionMethod::List,
@@ -395,11 +400,65 @@ async fn partition_round_trip(live: &Live, suffix: &str) {
         ..PartitionDraft::default()
     };
     let (plan, receipt) = live.run(Action::AlterPartitions { table: table.clone(), partition: list }).await;
-    println!("table-live: {} LIST 建立 -> {}", live.engine_name(), plan.steps[0].sql);
+    let sql = plan.steps[0].sql.clone();
+    println!("table-live: {} LIST 建立 -> {sql}", live.engine_name());
+    assert!(sql.contains("PARTITION BY LIST(id)"), "{sql}");
+    assert!(sql.contains("VALUES IN (1,2,3)"), "{sql}");
     assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
     let scheme = live.describe(&table).await.partitions.expect("分区");
     assert_eq!(scheme.method, PartitionMethod::List);
     assert_eq!(scheme.definitions.len(), 2);
+
+    // LIST 新增：VALUES IN 形状的 ADD PARTITION 必须在真机上走，不能拿 RANGE 的用例替代。
+    let list_add = PartitionDraft {
+        op: PartitionOp::Add,
+        method: PartitionMethod::List,
+        definitions: vec![PartitionDef { name: "p_high".to_owned(), description: "7,8,9".to_owned() }],
+        ..PartitionDraft::default()
+    };
+    let (plan, receipt) = live.run(Action::AlterPartitions { table: table.clone(), partition: list_add }).await;
+    let sql = plan.steps[0].sql.clone();
+    println!("table-live: {} LIST 新增 -> {sql}", live.engine_name());
+    assert!(sql.contains("ADD PARTITION (PARTITION p_high VALUES IN (7,8,9));"), "{sql}");
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+    let scheme = live.describe(&table).await.partitions.expect("分区");
+    assert_eq!(scheme.method, PartitionMethod::List, "{}: 新增分区后方式仍是 LIST", live.engine_name());
+    assert_eq!(scheme.definitions.len(), 3, "{}: 新增后分区数要 +1", live.engine_name());
+    let added = scheme.definitions.iter().find(|def| def.name == "p_high").expect("读回新增的 p_high");
+    assert_eq!(compact(&added.description), "7,8,9", "{}: 新增分区的定义要原样读回", live.engine_name());
+    println!(
+        "table-live: {} LIST 新增读回 {} 个分区，p_high = {}",
+        live.engine_name(),
+        scheme.definitions.len(),
+        added.description
+    );
+
+    // LIST 删除：删掉刚加的分区，读回分区数回到原值且该分区不存在。
+    let list_drop = PartitionDraft {
+        op: PartitionOp::Drop,
+        method: PartitionMethod::List,
+        targets: vec!["p_high".to_owned()],
+        ..PartitionDraft::default()
+    };
+    let (plan, receipt) = live.run(Action::AlterPartitions { table: table.clone(), partition: list_drop }).await;
+    let sql = plan.steps[0].sql.clone();
+    println!("table-live: {} LIST 删除 -> {sql}", live.engine_name());
+    assert!(sql.ends_with("DROP PARTITION p_high;"), "{sql}");
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+    let scheme = live.describe(&table).await.partitions.expect("分区");
+    assert_eq!(scheme.method, PartitionMethod::List);
+    assert_eq!(scheme.definitions.len(), 2, "{}: 删除后分区数要回到原值", live.engine_name());
+    assert!(
+        !scheme.definitions.iter().any(|def| def.name == "p_high"),
+        "{}: 删除后不该再有 p_high",
+        live.engine_name()
+    );
+    println!(
+        "table-live: {} LIST 删除读回 {} 个分区，剩余 {:?}",
+        live.engine_name(),
+        scheme.definitions.len(),
+        scheme.definitions.iter().map(|def| def.name.as_str()).collect::<Vec<_>>()
+    );
 
     // HASH：按数量建立，再按数量增、按数量减。
     let hash = PartitionDraft {

@@ -1,6 +1,6 @@
 # MySQL / MariaDB 表结构真实验收（T2）
 
-生成时间：2026-11-21 15:59:14 +0800
+生成时间：2026-11-22 01:31:55 +0800
 
 ## 运行命令
 
@@ -23,7 +23,7 @@ cargo test --manifest-path src-tauri\Cargo.toml --locked --lib -- --ignored --no
 | ENUM/SET 候选值 | adapters/mysql/table_ddl.rs enum_set_type、literal.rs | information_schema.columns.COLUMN_TYPE | 建 ENUM/SET 含空串、单引号、反斜杠、逗号与中文；改候选值；删字段；空候选值在预览前阻断 |
 | 生成列（VIRTUAL；STORED/PERSISTENT） | adapters/mysql/table_ddl.rs generated_clause、profile.stored_keyword | information_schema.columns.EXTRA / GENERATION_EXPRESSION | 建 VIRTUAL 生成列；追加持久化生成列；改表达式；表达式默认值不被当成生成列 |
 | RANGE 分区 | adapters/mysql/table_ddl.rs partition_by_clause、partition_steps | information_schema.PARTITIONS | 建立、新增、删除、重组 |
-| LIST 分区 | 同上 | information_schema.PARTITIONS | 建立 |
+| LIST 分区 | 同上 | information_schema.PARTITIONS | 建立、新增（VALUES IN 形状）、删除 |
 | HASH 分区 | 同上 | information_schema.PARTITIONS | 建立、按数量增、按数量减 |
 | KEY 分区 | 同上 | information_schema.PARTITIONS（PARTITION_EXPRESSION 是反引号包住的列清单） | 建立、读回列清单还原成裸列名后按同一函数重建、移除分区方案 |
 | 失败路径与风险 | ddl/exec.rs 逐条执行与 receipts；table_ddl.rs partition_applicability | 服务器原始错误 | 服务器拒绝新增分区后结构不变、原始错误保留；未分区的表删除分区在预览前阻断 |
@@ -62,147 +62,162 @@ cargo test --manifest-path src-tauri\Cargo.toml --locked --lib -- --ignored --no
 ## 用例证据（用例自身打印）
 
 ```
-table-live: mysql 建表 t2_enum_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_enum_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_enum_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_enum_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql ENUM 候选值读回 ["", "it's", "a\\b", "a,b", "中文"]
-table-live: mysql 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mysql_45944 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived');
+table-live: mysql 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mysql_24032 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived');
 table-live: mysql 空候选值被阻断：["字段 status 是 ENUM，至少要有一个候选值。"]
-table-live: mysql 建表 t2_gen_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_gen_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_gen_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_gen_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql VIRTUAL 生成列读回 (`price` * `quantity`) (VIRTUAL)
-table-live: mysql 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) STORED;
+table-live: mysql 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) STORED;
 table-live: mysql 持久化生成列读回 (STORED)
-table-live: mysql 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 DROP COLUMN total_x2;
-table-live: mysql 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 DROP COLUMN total;
+table-live: mysql 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 DROP COLUMN total_x2;
+table-live: mysql 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 DROP COLUMN total;
 table-live: mysql 生成列删除后读回不含 total，剩余列 ["id", "price", "quantity", "created_at"]
-table-live: mysql 建表 t2_part_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
-table-live: mysql RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
-table-live: mysql RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 DROP PARTITION p2;
-table-live: mysql RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
-table-live: mysql LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
-table-live: mysql HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY HASH(id) PARTITIONS 4;
-table-live: mysql HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 ADD PARTITION PARTITIONS 2;
-table-live: mysql HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 COALESCE PARTITION 3;
-table-live: mysql KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY KEY(id) PARTITIONS 3;
-table-live: mysql 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 REMOVE PARTITIONING;
-table-live: mysql 建表 t2_part_key_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_key_mysql_45944 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mysql 建表 t2_part_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
+table-live: mysql RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
+table-live: mysql RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 DROP PARTITION p2;
+table-live: mysql RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
+table-live: mysql LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
+table-live: mysql LIST 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION (PARTITION p_high VALUES IN (7,8,9));
+table-live: mysql LIST 新增读回 3 个分区，p_high = 7,8,9
+table-live: mysql LIST 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 DROP PARTITION p_high;
+table-live: mysql LIST 删除读回 2 个分区，剩余 ["p_low", "p_rest"]
+table-live: mysql HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY HASH(id) PARTITIONS 4;
+table-live: mysql HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION PARTITIONS 2;
+table-live: mysql HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 COALESCE PARTITION 3;
+table-live: mysql KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY KEY(id) PARTITIONS 3;
+table-live: mysql 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 REMOVE PARTITIONING;
+table-live: mysql 建表 t2_part_key_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_key_mysql_24032 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mysql KEY 读回列清单 "`a`,`b`" -> 裸列名 ["a", "b"]
-table-live: mysql KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mysql KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mysql KEY 重建后读回 3 个分区
-table-live: mysql 建表 t2_part_fail_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_part_fail_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql 服务器拒绝新增分区：ERROR 1481 (HY000): MAXVALUE can only be used in last partition definition
-table-live: mysql 建表 t2_part_plain_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql 未分区的表被阻断：["表 t2_part_plain_mysql_45944 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
+table-live: mysql 建表 t2_part_plain_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 未分区的表被阻断：["表 t2_part_plain_mysql_24032 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
 table-live: mysql 全部用例完成
-table-live: mariadb 建表 t2_enum_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_enum_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_enum_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_enum_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb ENUM 候选值读回 ["", "it's", "a\\b", "a,b", "中文"]
-table-live: mariadb 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mariadb_45944 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived') DEFAULT NULL;
+table-live: mariadb 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mariadb_24032 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived') DEFAULT NULL;
 table-live: mariadb 空候选值被阻断：["字段 status 是 ENUM，至少要有一个候选值。"]
-table-live: mariadb 建表 t2_gen_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_gen_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_gen_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_gen_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb VIRTUAL 生成列读回 `price` * `quantity` (VIRTUAL)
-table-live: mariadb 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) PERSISTENT;
+table-live: mariadb 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) PERSISTENT;
 table-live: mariadb 持久化生成列读回 (STORED)
-table-live: mariadb 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 DROP COLUMN total_x2;
-table-live: mariadb 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 DROP COLUMN total;
+table-live: mariadb 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 DROP COLUMN total_x2;
+table-live: mariadb 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 DROP COLUMN total;
 table-live: mariadb 生成列删除后读回不含 total，剩余列 ["id", "price", "quantity", "created_at"]
-table-live: mariadb 建表 t2_part_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
-table-live: mariadb RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
-table-live: mariadb RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 DROP PARTITION p2;
-table-live: mariadb RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
-table-live: mariadb LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
-table-live: mariadb HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY HASH(id) PARTITIONS 4;
-table-live: mariadb HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 ADD PARTITION PARTITIONS 2;
-table-live: mariadb HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 COALESCE PARTITION 3;
-table-live: mariadb KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY KEY(id) PARTITIONS 3;
-table-live: mariadb 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 REMOVE PARTITIONING;
-table-live: mariadb 建表 t2_part_key_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_key_mariadb_45944 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mariadb 建表 t2_part_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
+table-live: mariadb RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
+table-live: mariadb RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 DROP PARTITION p2;
+table-live: mariadb RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
+table-live: mariadb LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
+table-live: mariadb LIST 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION (PARTITION p_high VALUES IN (7,8,9));
+table-live: mariadb LIST 新增读回 3 个分区，p_high = 7,8,9
+table-live: mariadb LIST 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 DROP PARTITION p_high;
+table-live: mariadb LIST 删除读回 2 个分区，剩余 ["p_low", "p_rest"]
+table-live: mariadb HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY HASH(id) PARTITIONS 4;
+table-live: mariadb HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION PARTITIONS 2;
+table-live: mariadb HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 COALESCE PARTITION 3;
+table-live: mariadb KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY KEY(id) PARTITIONS 3;
+table-live: mariadb 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 REMOVE PARTITIONING;
+table-live: mariadb 建表 t2_part_key_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_key_mariadb_24032 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mariadb KEY 读回列清单 "`a`,`b`" -> 裸列名 ["a", "b"]
-table-live: mariadb KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mariadb KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mariadb KEY 重建后读回 3 个分区
-table-live: mariadb 建表 t2_part_fail_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_part_fail_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb 服务器拒绝新增分区：ERROR 1481 (HY000): MAXVALUE can only be used in last partition definition
-table-live: mariadb 建表 t2_part_plain_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb 未分区的表被阻断：["表 t2_part_plain_mariadb_45944 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
+table-live: mariadb 建表 t2_part_plain_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 未分区的表被阻断：["表 t2_part_plain_mariadb_24032 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
 table-live: mariadb 全部用例完成
 ```
 
 ## 测试结果与原始输出（末尾 80 行）
 
 ```
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1625 filtered out; finished in 9.35s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1675 filtered out; finished in 15.68s
 running 1 test
-table-live: mysql 建表 t2_enum_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_enum_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_enum_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_enum_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql ENUM 候选值读回 ["", "it's", "a\\b", "a,b", "中文"]
-table-live: mysql 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mysql_45944 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived');
+table-live: mysql 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mysql_24032 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived');
 table-live: mysql 空候选值被阻断：["字段 status 是 ENUM，至少要有一个候选值。"]
-table-live: mysql 建表 t2_gen_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_gen_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_gen_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_gen_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql VIRTUAL 生成列读回 (`price` * `quantity`) (VIRTUAL)
-table-live: mysql 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) STORED;
+table-live: mysql 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) STORED;
 table-live: mysql 持久化生成列读回 (STORED)
-table-live: mysql 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 DROP COLUMN total_x2;
-table-live: mysql 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_45944 DROP COLUMN total;
+table-live: mysql 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 DROP COLUMN total_x2;
+table-live: mysql 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mysql_24032 DROP COLUMN total;
 table-live: mysql 生成列删除后读回不含 total，剩余列 ["id", "price", "quantity", "created_at"]
-table-live: mysql 建表 t2_part_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
-table-live: mysql RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
-table-live: mysql RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 DROP PARTITION p2;
-table-live: mysql RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
-table-live: mysql LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
-table-live: mysql HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY HASH(id) PARTITIONS 4;
-table-live: mysql HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 ADD PARTITION PARTITIONS 2;
-table-live: mysql HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 COALESCE PARTITION 3;
-table-live: mysql KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 PARTITION BY KEY(id) PARTITIONS 3;
-table-live: mysql 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_45944 REMOVE PARTITIONING;
-table-live: mysql 建表 t2_part_key_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_key_mysql_45944 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mysql 建表 t2_part_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
+table-live: mysql RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
+table-live: mysql RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 DROP PARTITION p2;
+table-live: mysql RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
+table-live: mysql LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
+table-live: mysql LIST 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION (PARTITION p_high VALUES IN (7,8,9));
+table-live: mysql LIST 新增读回 3 个分区，p_high = 7,8,9
+table-live: mysql LIST 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 DROP PARTITION p_high;
+table-live: mysql LIST 删除读回 2 个分区，剩余 ["p_low", "p_rest"]
+table-live: mysql HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY HASH(id) PARTITIONS 4;
+table-live: mysql HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 ADD PARTITION PARTITIONS 2;
+table-live: mysql HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 COALESCE PARTITION 3;
+table-live: mysql KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 PARTITION BY KEY(id) PARTITIONS 3;
+table-live: mysql 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mysql_24032 REMOVE PARTITIONING;
+table-live: mysql 建表 t2_part_key_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_key_mysql_24032 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mysql KEY 读回列清单 "`a`,`b`" -> 裸列名 ["a", "b"]
-table-live: mysql KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mysql KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mysql_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mysql KEY 重建后读回 3 个分区
-table-live: mysql 建表 t2_part_fail_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 建表 t2_part_fail_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mysql 服务器拒绝新增分区：ERROR 1481 (HY000): MAXVALUE can only be used in last partition definition
-table-live: mysql 建表 t2_part_plain_mysql_45944 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mysql_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mysql 未分区的表被阻断：["表 t2_part_plain_mysql_45944 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
+table-live: mysql 建表 t2_part_plain_mysql_24032 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mysql_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mysql 未分区的表被阻断：["表 t2_part_plain_mysql_24032 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
 table-live: mysql 全部用例完成
-table-live: mariadb 建表 t2_enum_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_enum_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_enum_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_enum_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   status enum('','it''s','a\\b','a,b','中文'),   tags set('x','y''.z'),   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb ENUM 候选值读回 ["", "it's", "a\\b", "a,b", "中文"]
-table-live: mariadb 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mariadb_45944 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived') DEFAULT NULL;
+table-live: mariadb 修改 ENUM -> ALTER TABLE rillsql_proprietary.t2_enum_mariadb_24032 CHANGE COLUMN status status enum('','it''s','a\\b','a,b','中文','archived') DEFAULT NULL;
 table-live: mariadb 空候选值被阻断：["字段 status 是 ENUM，至少要有一个候选值。"]
-table-live: mariadb 建表 t2_gen_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_gen_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_gen_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_gen_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   price int NOT NULL DEFAULT 0,   quantity int NOT NULL DEFAULT 1,   total int GENERATED ALWAYS AS (price * quantity) VIRTUAL,   created_at datetime DEFAULT CURRENT_TIMESTAMP,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb VIRTUAL 生成列读回 `price` * `quantity` (VIRTUAL)
-table-live: mariadb 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) PERSISTENT;
+table-live: mariadb 新增持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 ADD COLUMN total_x2 int GENERATED ALWAYS AS (total * 2) PERSISTENT;
 table-live: mariadb 持久化生成列读回 (STORED)
-table-live: mariadb 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 DROP COLUMN total_x2;
-table-live: mariadb 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_45944 DROP COLUMN total;
+table-live: mariadb 删除持久化生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 DROP COLUMN total_x2;
+table-live: mariadb 删除 VIRTUAL 生成列 -> ALTER TABLE rillsql_proprietary.t2_gen_mariadb_24032 DROP COLUMN total;
 table-live: mariadb 生成列删除后读回不含 total，剩余列 ["id", "price", "quantity", "created_at"]
-table-live: mariadb 建表 t2_part_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
-table-live: mariadb RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
-table-live: mariadb RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 DROP PARTITION p2;
-table-live: mariadb RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
-table-live: mariadb LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
-table-live: mariadb HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY HASH(id) PARTITIONS 4;
-table-live: mariadb HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 ADD PARTITION PARTITIONS 2;
-table-live: mariadb HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 COALESCE PARTITION 3;
-table-live: mariadb KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 PARTITION BY KEY(id) PARTITIONS 3;
-table-live: mariadb 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_45944 REMOVE PARTITIONING;
-table-live: mariadb 建表 t2_part_key_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_key_mariadb_45944 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mariadb 建表 t2_part_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb RANGE 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));
+table-live: mariadb RANGE 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION (PARTITION p2 VALUES LESS THAN (MAXVALUE));
+table-live: mariadb RANGE 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 DROP PARTITION p2;
+table-live: mariadb RANGE 重组 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 REORGANIZE PARTITION p1 INTO (PARTITION p1a VALUES LESS THAN (150), PARTITION p1b VALUES LESS THAN (MAXVALUE));
+table-live: mariadb LIST 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY LIST(id) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_rest VALUES IN (4,5,6));
+table-live: mariadb LIST 新增 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION (PARTITION p_high VALUES IN (7,8,9));
+table-live: mariadb LIST 新增读回 3 个分区，p_high = 7,8,9
+table-live: mariadb LIST 删除 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 DROP PARTITION p_high;
+table-live: mariadb LIST 删除读回 2 个分区，剩余 ["p_low", "p_rest"]
+table-live: mariadb HASH 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY HASH(id) PARTITIONS 4;
+table-live: mariadb HASH 增加数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 ADD PARTITION PARTITIONS 2;
+table-live: mariadb HASH 减少数量 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 COALESCE PARTITION 3;
+table-live: mariadb KEY 建立 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 PARTITION BY KEY(id) PARTITIONS 3;
+table-live: mariadb 移除分区 -> ALTER TABLE rillsql_proprietary.t2_part_mariadb_24032 REMOVE PARTITIONING;
+table-live: mariadb 建表 t2_part_key_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_key_mariadb_24032 (   a int NOT NULL,   b int NOT NULL,   PRIMARY KEY (a, b) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb KEY 两列建立 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mariadb KEY 读回列清单 "`a`,`b`" -> 裸列名 ["a", "b"]
-table-live: mariadb KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_45944 PARTITION BY KEY(a, b) PARTITIONS 3;
+table-live: mariadb KEY 按读回重建 -> ALTER TABLE rillsql_proprietary.t2_part_key_mariadb_24032 PARTITION BY KEY(a, b) PARTITIONS 3;
 table-live: mariadb KEY 重建后读回 3 个分区
-table-live: mariadb 建表 t2_part_fail_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 建表 t2_part_fail_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_fail_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 table-live: mariadb 服务器拒绝新增分区：ERROR 1481 (HY000): MAXVALUE can only be used in last partition definition
-table-live: mariadb 建表 t2_part_plain_mariadb_45944 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mariadb_45944 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-table-live: mariadb 未分区的表被阻断：["表 t2_part_plain_mariadb_45944 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
+table-live: mariadb 建表 t2_part_plain_mariadb_24032 -> CREATE TABLE rillsql_proprietary.t2_part_plain_mariadb_24032 (   id bigint NOT NULL AUTO_INCREMENT,   PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+table-live: mariadb 未分区的表被阻断：["表 t2_part_plain_mariadb_24032 还没有分区方案，不能删除分区；先用“建立分区方案”分区。"]
 table-live: mariadb 全部用例完成
 test adapters::mysql::table_live_tests::table_features_round_trip_on_real_servers ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1625 filtered out; finished in 9.35s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1675 filtered out; finished in 15.68s
 
-    Blocking waiting for file lock on build directory
    Compiling rillsql v0.3.1 (C:\Users\12976\project\RillSQL\src-tauri)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 45s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 52.10s
      Running unittests src\lib.rs (C:/Users/12976/.cargo/target\debug\deps\rillsql_lib-b488e4f6c69edc93.exe)
 ```
