@@ -3,6 +3,7 @@
 
 mod log;
 mod plan_view;
+mod risk_panel;
 mod side;
 mod target;
 
@@ -1235,6 +1236,12 @@ impl QueryPane {
             }
             "refresh-tree" => self.refresh_tree(cx),
             "confirm-variables" => self.confirm_variables(cx),
+            "confirm-risks" => self.confirm_risks(cx),
+            "cancel-risks" => {
+                self.desk.cancel_risks();
+                self.desk.set_active_note("");
+                cx.notify();
+            }
             "cancel-variables" => {
                 self.desk.cancel_variables();
                 self.variable_values.clear();
@@ -1700,6 +1707,11 @@ impl QueryPane {
         }
         match self.desk.begin_run(&self.services.tasks, scope, override_sql) {
             BeginRun::Ready(prepared) => self.spawn_run(prepared, cx),
+            // 面板内容由 Desk 持有；这里只提示为什么还没执行。
+            BeginRun::Risks(prompt) => {
+                self.desk.set_active_note(&risk_panel::note(self.locale, &prompt));
+                cx.notify();
+            }
             BeginRun::Variables(fields) => {
                 self.variable_values.clear();
                 for field in fields {
@@ -1943,7 +1955,7 @@ impl QueryPane {
         };
         match self.desk.begin_run_limited(&self.services.tasks, RunScope::Current, Some(sql), limit) {
             BeginRun::Ready(prepared) => self.spawn_run(prepared, cx),
-            BeginRun::Variables(_) => {}
+            BeginRun::Variables(_) | BeginRun::Risks(_) => {}
             BeginRun::Rejected(reason) => {
                 self.desk.set_active_note(&reason);
                 cx.notify();
@@ -2087,6 +2099,14 @@ impl QueryPane {
         }
         self.pending_completion = true;
         cx.notify();
+    }
+
+    /// 风险确认后沿原执行路径发送：确认的文本原样送出，不再走第二条执行链。
+    fn confirm_risks(&mut self, cx: &mut Context<Self>) {
+        let Some(sql) = self.desk.confirm_risks() else {
+            return;
+        };
+        self.start(RunScope::Script, Some(sql), cx);
     }
 
     fn confirm_variables(&mut self, cx: &mut Context<Self>) {
@@ -3253,6 +3273,10 @@ impl QueryPane {
         if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
             results_panel = results_panel.child(row);
         }
+        // 执行前风险确认：确认或取消之前，这批语句一条都不发送。
+        if let Some(panel) = self.render_risks(p, metrics, mono, entity) {
+            results_panel = results_panel.child(panel);
+        }
         results_panel.child(self.render_results_body(running, p, metrics, mono, entity)).into_any_element()
     }
 
@@ -3657,6 +3681,13 @@ impl QueryPane {
                 .child(SharedString::from(i18n::text(locale, "query.results.allLoaded")))
                 .into_any_element(),
         })
+    }
+
+    /// 执行前的风险确认面板；没有等待确认的语句时不占位置。
+    #[inline(never)]
+    fn render_risks(&self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> Option<AnyElement> {
+        let prompt = self.desk.pending_risks()?;
+        Some(risk_panel::render(&prompt, self.locale, p, metrics, mono, entity))
     }
 
     /// 执行前要填的变量；没有变量时不占位置。
@@ -5255,7 +5286,7 @@ mod tests {
                 let prepared = match pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None) {
                     BeginRun::Ready(prepared) => prepared,
                     BeginRun::Rejected(reason) => panic!("{reason}"),
-                    BeginRun::Variables(_) => panic!("variables"),
+                    BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
                 };
                 let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
                 // 中间快照：行立刻显示，执行还没结束，也不能再起第二次。
@@ -5744,6 +5775,10 @@ mod tests {
             window.render_frame(cx);
             pane.update(cx, |pane, cx| pane.command("run-script", cx));
             window.render_frame(cx);
+            // 整表 UPDATE 有实际后果：确认面板先挡下整批，确认后才发送。
+            assert!(window.find("query-risks").visible(), "有风险语句时要先确认");
+            window.click("query-act-confirm-risks", cx);
+            window.render_frame(cx);
         })
         .unwrap();
         let done = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
@@ -5845,7 +5880,7 @@ mod tests {
         let prepared = match pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version }
     }

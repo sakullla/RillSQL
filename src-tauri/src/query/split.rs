@@ -138,7 +138,7 @@ const READ_ONLY_LEADS: &[&str] = &["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DES
 /// 出现在语句任意位置（含括号内的 CTE 体）即视为可能写入的代码词。
 /// INTO 覆盖 SELECT ... INTO 新表/文件；UPDATE 同时让 FOR UPDATE 锁行查询走确认。
 /// 其他写入语句的开头（COMMENT/VACUUM/COPY 等）不在 READ_ONLY_LEADS 里，已经按写入处理。
-const WRITE_WORDS: &[&str] = &[
+pub(crate) const WRITE_WORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "INTO", "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME",
     "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL",
 ];
@@ -167,6 +167,13 @@ pub fn is_clearly_read_only(engine: &str, sql: &str) -> bool {
         READ_ONLY_LEADS.contains(&lead.as_str())
             && !words.iter().any(|(word, _, _)| WRITE_WORDS.contains(&word.as_str()) || dialect.contains(&word.as_str()))
     })
+}
+
+/// 所有层级的代码词及其字节区间（含括号内与可执行注释里的内容）。
+/// 判断语句里是否潜藏写入动作时用它：`WITH x AS (DELETE ...)` 的写操作在括号内。
+pub(crate) fn all_code_words(engine: &str, sql: &str) -> Vec<(String, usize, usize)> {
+    let executable = crate::adapters::query::lexis_named(engine).executable_comments;
+    code_words(engine, sql, false, executable).0
 }
 
 /// 顶层代码词及其字节区间。字符串、注释、dollar-quote 和括号内的词不出现。
