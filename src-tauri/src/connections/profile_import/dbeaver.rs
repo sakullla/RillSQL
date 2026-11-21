@@ -186,6 +186,13 @@ fn row(entry: &Value, number: usize, types: Option<&Object>) -> ProfileRow {
         Ok(mode) => row.required_tls = mode,
         Err(reason) => row.block(reason),
     }
+    if engine == Engine::Postgres
+        && matches!(row.required_tls, Some(TlsMode::Require | TlsMode::Verify))
+    {
+        row.block(
+            "来源要求 PostgreSQL TLS 加密或证书校验，当前驱动在服务器拒绝 TLS 时可能回退到明文",
+        );
+    }
     if draft.engine == Engine::Sqlite && draft.ssh_on {
         row.block("SQLite 文件连接无法应用 SSH 跳板");
     }
@@ -417,10 +424,18 @@ fn driver_options(
             {
                 mode(TlsMode::Off)?
             }
+            "sslmode" if draft.engine == Engine::Postgres => {
+                mode(match value.to_ascii_lowercase().as_str() {
+                    "disable" => TlsMode::Off,
+                    "require" => TlsMode::Require,
+                    "verify-ca" | "verify-full" => TlsMode::Verify,
+                    _ => return Err("无法等价还原 PostgreSQL sslmode 的校验或回退行为"),
+                })?
+            }
             "sslmode" | "ssl-mode"
                 if matches!(
                     draft.engine,
-                    Engine::Postgres | Engine::Mysql | Engine::Mariadb | Engine::Mongodb
+                    Engine::Mysql | Engine::Mariadb | Engine::Mongodb
                 ) =>
             {
                 mode(match value.to_ascii_lowercase().as_str() {
@@ -476,6 +491,11 @@ fn driver_options(
     }
     if let Some(mode) = tls {
         draft.tls_mode = mode;
+    } else if draft.engine == Engine::Postgres {
+        notes.push(
+            "来源未要求 PostgreSQL TLS。启用 TLS 时，当前驱动在服务器拒绝 TLS 时可能回退到明文"
+                .into(),
+        );
     } else if draft.engine != Engine::Sqlite {
         notes.push("来源未显式声明 TLS 模式，预览显示 RillSQL 将采用的设置".into());
     }

@@ -79,7 +79,7 @@ pub(super) fn apply_url(
     let (credentials, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
     if !credentials.is_empty() {
         let user = credentials.split_once(':').map_or(credentials, |(u, _)| u);
-        draft.username = decode(user)?;
+        draft.username = decode(user, false)?;
     }
     let (host, port) = if let Some(ipv6) = host_port.strip_prefix('[') {
         let (host, suffix) = ipv6.split_once(']').ok_or("URL 的 IPv6 主机格式错误")?;
@@ -106,7 +106,12 @@ pub(super) fn apply_url(
             .to_string();
     }
     draft.host = host.to_owned();
-    draft.database = decode(path)?;
+    // pgJDBC uses Java URLDecoder for database names and query values.
+    let form_encoded = draft.engine == Engine::Postgres;
+    draft.database = decode(path, form_encoded)?;
+    if draft.database.trim() != draft.database {
+        return Err("URL 数据库名含首尾空白，保存时无法保留原名");
+    }
     if scheme == "rediss" {
         property(props, "tls", "true")?;
     }
@@ -115,19 +120,23 @@ pub(super) fn apply_url(
         .filter(|p| !p.is_empty())
     {
         let (key, value) = pair.split_once('=').ok_or("URL 参数缺少值")?;
-        let key = decode(key)?;
+        let key = if form_encoded {
+            key.to_owned()
+        } else {
+            decode(key, false)?
+        };
         if matches!(
             key.to_ascii_lowercase().as_str(),
             "password" | "pwd" | "passphrase" | "sslpassword"
         ) {
             continue;
         }
-        property(props, &key, &decode(value)?)?;
+        property(props, &key, &decode(value, form_encoded)?)?;
     }
     Ok(())
 }
 
-fn decode(text: &str) -> Result<String, &'static str> {
+fn decode(text: &str, form_encoded: bool) -> Result<String, &'static str> {
     let mut bytes = text.as_bytes().iter().copied();
     let mut decoded = Vec::with_capacity(text.len());
     while let Some(byte) = bytes.next() {
@@ -139,6 +148,8 @@ fn decode(text: &str) -> Result<String, &'static str> {
                     .ok_or("URL 百分号编码无效")
             };
             decoded.push((digit()? * 16 + digit()?) as u8);
+        } else if form_encoded && byte == b'+' {
+            decoded.push(b' ');
         } else {
             decoded.push(byte);
         }

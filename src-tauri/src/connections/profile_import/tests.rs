@@ -38,7 +38,7 @@ fn separates_file_errors_and_row_failures() {
 fn url_target_wins_and_no_password_or_raw_uri_survives() {
     let row = single(
         json!({"host":"fallback","port":"9","database":"wrong","user":"legacy",
-        "url":"jdbc:postgresql://actual:test-db-pass@db.internal:6543/rep%6Frts?sslmode=verify-full&password=test-url-pass",
+        "url":"jdbc:postgresql://actual:test-db-pass@db.internal:6543/rep%6Frts?sslmode=disable&password=test-url-pass",
         "password":"test-plain-pass",
         "handlers":{"ssh_tunnel":{"type":"TUNNEL","enabled":true,"user":"relay",
             "password":"test-ssh-pass","properties":{"host":"bastion","authType":"PASSWORD","passphrase":"test-key-pass"}}}}),
@@ -55,7 +55,7 @@ fn url_target_wins_and_no_password_or_raw_uri_survives() {
         ("db.internal", "6543", "reports", "actual")
     );
     assert!(draft.ssh_on);
-    assert_eq!(draft.tls_mode, TlsMode::Verify);
+    assert_eq!(draft.tls_mode, TlsMode::Off);
     let rendered = format!("{row:?} {}", serde_json::to_string(draft).unwrap());
     for secret in [
         "jdbc:",
@@ -69,7 +69,7 @@ fn url_target_wins_and_no_password_or_raw_uri_survives() {
     }
     let mut edit = draft.clone();
     edit.ssh_on = false;
-    edit.tls_mode = TlsMode::Off;
+    edit.tls_mode = TlsMode::Verify;
     assert_eq!(row.issues(&edit).len(), 2);
 }
 
@@ -148,10 +148,12 @@ fn checks_inherited_restrictions_and_missing_ssh_identity() {
 
 #[test]
 fn cert_rules_are_preserved_and_unknown_network_routes_are_blocked() {
-    let row = single(
-        json!({"host":"db","user":"reader","handlers":{"postgre_ssl":{"enabled":true,
-        "properties":{"ssl.sslMode":"verify-full","ssl.ca.cert":"${project.path}/ca.crt"}}}}),
+    let mut rows = parse(
+        json!({"connections":{"sql":{"provider":"mysql","driver":"mysql8",
+        "configuration":{"host":"db","user":"reader","handlers":{"mysql_ssl":{"enabled":true,
+        "properties":{"ssl.sslMode":"VERIFY_IDENTITY","ssl.ca.cert":"${project.path}/ca.crt"}}}}}}}),
     );
+    let row = rows.pop().unwrap();
     let mut draft = row.draft.clone().unwrap();
     assert_eq!(draft.ca_mode, CaMode::File);
     assert!(row.issues(&draft).iter().any(|e| e.field == "ca_file"));
@@ -175,6 +177,7 @@ fn cert_rules_are_preserved_and_unknown_network_routes_are_blocked() {
 fn allows_completion_of_driver_defaults_but_never_weakens_an_explicit_policy() {
     let row = single(json!({"host":"local","port":"5432","database":"app"}));
     let mut filled = row.draft.clone().unwrap();
+    assert!(row.notes.iter().any(|note| note.contains("可能回退到明文")));
     assert!(row
         .issues(&filled)
         .iter()
@@ -188,6 +191,42 @@ fn allows_completion_of_driver_defaults_but_never_weakens_an_explicit_policy() {
         .issues(&filled)
         .iter()
         .any(|issue| issue.field == "tls_mode"));
+}
+
+#[test]
+fn pgjdbc_decodes_form_encoded_database_and_property_values() {
+    let row = single(
+        json!({"url":"jdbc:postgresql://pg/sales+archive%2Bv2?user=first+last%2Bx&sslmode=disable"}),
+    );
+    let draft = row.draft.as_ref().unwrap();
+    assert!(row.issues(draft).is_empty());
+    assert_eq!(draft.database, "sales archive+v2");
+    assert_eq!(draft.username, "first last+x");
+}
+
+#[test]
+fn postgres_preview_blocks_tls_requirements_even_after_editing_the_row() {
+    for config in [
+        json!({"url":"jdbc:postgresql://pg/app?sslmode=require"}),
+        json!({"properties":{"sslmode":"verify-full"}}),
+        json!({"properties":{"sslmode":"verify-ca"}}),
+        json!({"properties":{"ssl":"true"}}),
+        json!({"properties":{"sslrootcert":"ca.crt"}}),
+        json!({"handlers":{"postgre_ssl":{"enabled":true,"properties":{"ssl.sslMode":"verify-full"}}}}),
+    ] {
+        let row = single(config);
+        let mut draft = row.draft.clone().unwrap();
+        draft.tls_mode = TlsMode::Off;
+        assert!(row
+            .issues(&draft)
+            .iter()
+            .any(|e| e.message.contains("回退到明文")));
+    }
+    for value in ["trust", "required", "disabled", "prefer", "unrecognized"] {
+        assert!(!single(json!({"properties":{"sslmode":value}}))
+            .blockers
+            .is_empty());
+    }
 }
 
 #[test]
