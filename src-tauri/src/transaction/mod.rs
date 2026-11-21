@@ -13,8 +13,8 @@ pub use dialect::{
     SERIALIZABLE, SNAPSHOT,
 };
 pub use model::{
-    ControlOutcome, ControlStatement, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine, TransactionProbe,
-    TransactionSettings, TransactionSnapshot, TransactionState, UnknownReason, UnknownResolution, UnknownTransaction,
+    ControlOutcome, ControlStatement, PendingControl, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine,
+    TransactionProbe, TransactionSettings, TransactionSnapshot, TransactionState, UnknownReason, UnknownResolution, UnknownTransaction,
 };
 
 pub fn module_id() -> &'static str {

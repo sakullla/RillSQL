@@ -92,6 +92,21 @@ pub enum UnknownReason {
     ObservationFailed,
 }
 
+/// 丢失确认的那条控制语句的方向。后续确认结果只有与它一致时才能解决这个未知：
+/// 丢失的是回滚时，之后一次“提交成功”可能只是数据库对一个已回滚事务的 no-op。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingControl {
+    /// 开始事务的结果未确认。
+    Begin,
+    /// 提交的结果未确认。
+    Commit,
+    /// 回滚的结果未确认。
+    Rollback,
+    /// 普通语句、保存点、设置、探针或无法识别的效果：方向不明。
+    Other,
+}
+
 /// 最近一个结果无法确认的事务。`state == Unknown` 时它就是当前事务；
 /// 重连或探针确认当前状态后仍保留为旧事务信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +116,8 @@ pub struct UnknownTransaction {
     pub generation: u64,
     /// 失去确认前的最后状态；`Idle` 表示无法确认是否已经开始了事务。
     pub state: TransactionState,
+    /// 失去确认的那条控制语句的方向；解决未知时必须与后续确认结果一致。
+    pub pending: PendingControl,
 }
 
 /// 独立核对（用户确认或另一条连接上的查询结果）给出的旧事务结局。
@@ -434,33 +451,38 @@ impl TransactionMachine {
                 }
                 StatementOutcome::Failed(StatementFailure::TransactionAborted) => self.abort_in_place(),
                 StatementOutcome::Failed(StatementFailure::ConnectionLost) => {
-                    self.lose_confirmation(UnknownReason::ConnectionLost);
+                    self.lose_confirmation(UnknownReason::ConnectionLost, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
                 StatementOutcome::Unconfirmed(reason) => {
-                    self.lose_confirmation(reason);
+                    // 过程/动态 SQL 的实际效果无法识别时，@@TRANCOUNT 也可能已被改变。
+                    self.mark_depth_unverified_for(reason);
+                    self.lose_confirmation(reason, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
             },
             TransactionState::Aborted => match outcome {
                 StatementOutcome::Succeeded => {
                     // 中止事务里普通语句成功与数据库规则矛盾：不据此认为事务已恢复可用。
-                    self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                    self.mark_depth_unverified_for(UnknownReason::UnrecognizedEffect);
+                    self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
                 StatementOutcome::Failed(StatementFailure::TransactionUsable | StatementFailure::TransactionAborted) => TransactionEffect::Aborted,
                 StatementOutcome::Failed(StatementFailure::ConnectionLost) => {
-                    self.lose_confirmation(UnknownReason::ConnectionLost);
+                    self.lose_confirmation(UnknownReason::ConnectionLost, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
                 StatementOutcome::Unconfirmed(reason) => {
-                    self.lose_confirmation(reason);
+                    self.mark_depth_unverified_for(reason);
+                    self.lose_confirmation(reason, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
             },
             TransactionState::Unknown => match outcome {
                 StatementOutcome::Unconfirmed(reason) => {
-                    self.lose_confirmation(reason);
+                    self.mark_depth_unverified_for(reason);
+                    self.lose_confirmation(reason, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
                 _ => TransactionEffect::Unknown,
@@ -478,9 +500,17 @@ impl TransactionMachine {
             self.record(TransactionEffect::Unchanged);
             return Ok(TransactionEffect::Unchanged);
         }
-        self.confirm_current_unknown();
-        self.end_transaction(TransactionEffect::ImplicitCommit, false);
-        Ok(TransactionEffect::ImplicitCommit)
+        // 未知状态下只有丢失的就是提交类控制时，隐式提交才能确认旧事务的结局；
+        // 丢失的是回滚（可能已在服务器成功）时，这里只是普通语句，不能宣称隐式提交。
+        let unknown_direction = self.snapshot.state == TransactionState::Unknown;
+        let confirmed = !unknown_direction || self.pending_matches(PendingControl::Commit);
+        let effect = if confirmed { TransactionEffect::ImplicitCommit } else { TransactionEffect::Unknown };
+        if confirmed {
+            // 未知状态要求方向一致；活动/中止时按“当前事务就是这条未知记录”判断。
+            self.clear_current_unknown(unknown_direction.then_some(PendingControl::Commit));
+        }
+        self.end_transaction(effect, false);
+        Ok(effect)
     }
 
     /// 方言探针观测到的真实状态。探针与模型不一致时以数据库为准；事务在没有确认结果的情况下消失时，
@@ -494,7 +524,12 @@ impl TransactionMachine {
             // 事务在没有确认结果的情况下结束：提交还是回滚无法从“没有活动事务”推出。
             (TransactionProbe::Idle, previous) => {
                 if previous != TransactionState::Unknown {
-                    self.snapshot.unresolved = Some(UnknownTransaction { reason: UnknownReason::ObservationFailed, generation: self.snapshot.generation, state: previous });
+                    self.snapshot.unresolved = Some(UnknownTransaction {
+                        reason: UnknownReason::ObservationFailed,
+                        generation: self.snapshot.generation,
+                        state: previous,
+                        pending: PendingControl::Other,
+                    });
                 }
                 self.snapshot.state = TransactionState::Idle;
                 self.snapshot.depth = Some(0);
@@ -505,10 +540,11 @@ impl TransactionMachine {
             }
             (TransactionProbe::Active { depth }, state) => {
                 let depth = depth.max(1);
-                let was_active = matches!(state, TransactionState::Active | TransactionState::Aborted);
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(depth);
-                if !was_active {
+                // 从 Idle 观察到事务存在是新的身份；从 Unknown/Aborted 确认同一事务不推进代次，
+                // 这样“未知记录是否就是当前事务”仍可按代次判断。
+                if state == TransactionState::Idle {
                     self.snapshot.generation = self.snapshot.generation.saturating_add(1);
                     self.snapshot.savepoints.clear();
                 }
@@ -517,7 +553,7 @@ impl TransactionMachine {
             }
             (TransactionProbe::Aborted, TransactionState::Idle) => {
                 // 没有事务却报告中止：观测自相矛盾，不能据此推出可用状态。
-                self.lose_confirmation(UnknownReason::ObservationFailed);
+                self.lose_confirmation(UnknownReason::ObservationFailed, PendingControl::Other);
                 TransactionEffect::Unknown
             }
             (TransactionProbe::Aborted, _) => {
@@ -552,7 +588,12 @@ impl TransactionMachine {
         let previous = self.snapshot.state;
         let effect = if previous == TransactionState::Idle { TransactionEffect::Unchanged } else { TransactionEffect::Unknown };
         if previous != TransactionState::Idle && self.snapshot.unresolved.is_none() {
-            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state: previous });
+            self.snapshot.unresolved = Some(UnknownTransaction {
+                reason,
+                generation: self.snapshot.generation,
+                state: previous,
+                pending: PendingControl::Other,
+            });
         }
         if previous != TransactionState::Idle {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
@@ -573,19 +614,19 @@ impl TransactionMachine {
             ControlOutcome::Unconfirmed(reason) => {
                 // Nests 方言：丢失的 BEGIN 可能改变 @@TRANCOUNT，之后不能再凭旧层数判断结束。
                 self.mark_depth_unverified();
-                self.lose_confirmation(reason);
+                self.lose_confirmation(reason, PendingControl::Begin);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
                 self.mark_depth_unverified();
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Begin);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
                 TransactionState::Active => self.restarted(mode),
                 // 中止事务里确认开始与数据库规则矛盾：不据此认为事务已恢复可用。
                 TransactionState::Aborted => {
-                    self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                    self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                     Ok(TransactionEffect::Unknown)
                 }
                 TransactionState::Idle => {
@@ -639,7 +680,7 @@ impl TransactionMachine {
             }
             DuplicateBegin::Rejected => {
                 // 方言应当拒绝重复开始；数据库却确认成功：无法解释，按未知处理。
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
         }
@@ -649,7 +690,9 @@ impl TransactionMachine {
     fn begin_while_unknown(&mut self, mode: Option<&str>) -> Result<TransactionEffect, TransactionError> {
         match self.capabilities.duplicate_begin {
             DuplicateBegin::EndsPrevious => {
-                // 旧的未知事务（若存在）已被这条语句隐式提交，随后立即开始新事务。
+                // 旧事务若仍活动，会被这条语句隐式提交；但丢失的控制方向可能不是提交
+                // （例如 ROLLBACK 已在服务器成功），此时不能宣称隐式提交，也不能清除未知记录。
+                let confirmed = self.pending_matches(PendingControl::Commit);
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(1);
                 self.snapshot.savepoints.clear();
@@ -657,10 +700,13 @@ impl TransactionMachine {
                     self.snapshot.settings.mode = Some(mode.to_owned());
                 }
                 self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-                self.snapshot.unresolved = None;
-                self.snapshot.last_effect = TransactionEffect::ImplicitCommit;
+                if confirmed {
+                    self.snapshot.unresolved = None;
+                }
+                let effect = if confirmed { TransactionEffect::ImplicitCommit } else { TransactionEffect::Unknown };
+                self.snapshot.last_effect = effect;
                 self.touch();
-                Ok(TransactionEffect::ImplicitCommit)
+                Ok(effect)
             }
             DuplicateBegin::Nests => {
                 // @@TRANCOUNT 的实际层数无法核实：保持未知，要求探针核对后再判断提交是否结束事务。
@@ -676,7 +722,7 @@ impl TransactionMachine {
                 Ok(TransactionEffect::StillActive)
             }
             DuplicateBegin::Rejected => {
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
         }
@@ -686,16 +732,17 @@ impl TransactionMachine {
         if chain && !self.capabilities.chained_transactions {
             return Err(TransactionError::ChainedTransactionUnsupported);
         }
+        let pending = if commit { PendingControl::Commit } else { PendingControl::Rollback };
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
                 // Nests 方言：丢失的提交可能已经结束事务，层数不能再凭旧值判断。
                 self.mark_depth_unverified();
-                self.lose_confirmation(reason);
+                self.lose_confirmation(reason, pending);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
                 self.mark_depth_unverified();
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, pending);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Rejected => Err(self.rejection()),
@@ -708,12 +755,13 @@ impl TransactionMachine {
             ControlOutcome::Confirmed | ControlOutcome::RolledBack => {
                 let committed = commit && outcome == ControlOutcome::Confirmed;
                 let effect = if committed { TransactionEffect::Committed } else { TransactionEffect::RolledBack };
+                let direction = if committed { PendingControl::Commit } else { PendingControl::Rollback };
                 match self.snapshot.state {
                     // 没有活动事务时提交/回滚不得伪造成功结果。
                     TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
                     // 中止事务里的成功提交与数据库规则矛盾：只能按未知处理。
                     TransactionState::Aborted if committed => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                         Ok(TransactionEffect::Unknown)
                     }
                     // 已知还有外层事务：一次 COMMIT 只减少层数，不能结束事务、也不能关闭未知记录。
@@ -731,12 +779,18 @@ impl TransactionMachine {
                     }
                     // 活动状态却缺少层数：与模型不变量矛盾，按未知处理而不是猜测结束。
                     TransactionState::Active if committed && self.snapshot.depth.is_none() => {
-                        self.lose_confirmation(UnknownReason::ObservationFailed);
+                        self.lose_confirmation(UnknownReason::ObservationFailed, PendingControl::Other);
+                        Ok(TransactionEffect::Unknown)
+                    }
+                    // 未知状态下丢失的控制方向不同（例如丢失 ROLLBACK，这里却确认了 COMMIT）：
+                    // 事务确实结束，但结局可能是提交或回滚，只能保留未知并报告不确定。
+                    TransactionState::Unknown if !self.pending_matches(direction) => {
+                        self.end_transaction(TransactionEffect::Unknown, chain);
                         Ok(TransactionEffect::Unknown)
                     }
                     TransactionState::Active | TransactionState::Aborted | TransactionState::Unknown => {
-                        // 未知状态下直接确认了当前事务的结局，这是观测而不是推测。
-                        self.confirm_current_unknown();
+                        // 未知状态方向一致，或活动/中止事务直接确认了结局：这是观测而不是推测。
+                        self.clear_current_unknown(if self.snapshot.state == TransactionState::Unknown { Some(direction) } else { None });
                         self.end_transaction(effect, chain);
                         Ok(effect)
                     }
@@ -751,11 +805,11 @@ impl TransactionMachine {
         }
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
-                self.lose_confirmation(reason);
+                self.lose_confirmation(reason, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
@@ -784,11 +838,11 @@ impl TransactionMachine {
         }
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
-                self.lose_confirmation(reason);
+                self.lose_confirmation(reason, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
@@ -802,7 +856,7 @@ impl TransactionMachine {
                     }
                     // 数据库确认了一个没有登记的保存点：保存点位置不可知。
                     None => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                         Ok(TransactionEffect::Unknown)
                     }
                 },
@@ -836,11 +890,11 @@ impl TransactionMachine {
         }
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
-                self.lose_confirmation(reason);
+                self.lose_confirmation(reason, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
@@ -852,7 +906,7 @@ impl TransactionMachine {
                         Ok(TransactionEffect::StillActive)
                     }
                     None => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                         Ok(TransactionEffect::Unknown)
                     }
                 },
@@ -920,7 +974,7 @@ impl TransactionMachine {
         if self.snapshot.state == TransactionState::Idle {
             return Err(TransactionError::ControlUnconfirmed);
         }
-        self.lose_confirmation(reason);
+        self.lose_confirmation(reason, PendingControl::Other);
         Ok(TransactionEffect::Unknown)
     }
 
@@ -993,9 +1047,38 @@ impl TransactionMachine {
         }
     }
 
-    /// 直接确认了当前未知事务的结局：清除未知记录。旧事务的记录不会被新事务的结束清除。
-    fn confirm_current_unknown(&mut self) {
-        if self.snapshot.state == TransactionState::Unknown {
+    /// 无法识别的效果（过程、动态 SQL）也可能改变 `@@TRANCOUNT`；其它原因不额外扩大影响。
+    fn mark_depth_unverified_for(&mut self, reason: UnknownReason) {
+        if reason == UnknownReason::UnrecognizedEffect {
+            self.mark_depth_unverified();
+        }
+    }
+
+    /// 这条未知记录描述的是否就是当前事务。失去确认时记录代次并把快照代次推进一格，
+    /// 之后只要没有开始/结束新事务，当前代次就等于记录代次加一。
+    fn unresolved_is_current(&self) -> bool {
+        match self.snapshot.unresolved.as_ref() {
+            Some(record) => self.snapshot.generation == record.generation.saturating_add(1),
+            None => false,
+        }
+    }
+
+    /// 丢失的控制方向是否与后续确认结果一致。
+    fn pending_matches(&self, direction: PendingControl) -> bool {
+        matches!(self.snapshot.unresolved.as_ref(), Some(record) if record.pending == direction)
+    }
+
+    /// 确认结束后关闭“当前事务”的未知记录。
+    ///
+    /// - `Some(direction)`（未知状态）：只有丢失的控制方向与后续结果一致才算确认结局；
+    /// - `None`（活动/中止状态）：事务是否存在已经确认，结束结果就是直接观测；
+    /// - 更早事务的未知记录（代次不匹配）不会被新事务的结束清除。
+    fn clear_current_unknown(&mut self, direction: Option<PendingControl>) {
+        let confirmed = match direction {
+            Some(direction) => self.pending_matches(direction),
+            None => self.unresolved_is_current(),
+        };
+        if confirmed {
             self.snapshot.unresolved = None;
         }
     }
@@ -1010,11 +1093,11 @@ impl TransactionMachine {
         TransactionEffect::Aborted
     }
 
-    /// 失去确认：第一次转为未知时记下原因与事务代次，之后保持不变直到被确认结果或核对解决。
-    fn lose_confirmation(&mut self, reason: UnknownReason) {
+    /// 失去确认：第一次转为未知时记下原因、方向与事务代次，之后保持不变直到被一致的结果或核对解决。
+    fn lose_confirmation(&mut self, reason: UnknownReason, pending: PendingControl) {
         if self.snapshot.state != TransactionState::Unknown {
             let state = self.snapshot.state;
-            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state });
+            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state, pending });
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
             self.snapshot.state = TransactionState::Unknown;
         }
