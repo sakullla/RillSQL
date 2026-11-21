@@ -620,12 +620,63 @@ fn ignored_begin_in_unknown_does_not_make_the_old_record_current() {
     assert_eq!(machine.state(), TransactionState::Idle);
     assert!(machine.snapshot().unresolved.is_some());
 
-    // 探针确认身份后，同样的结束就能给出确定结论。
+    // 没有 BEGIN 介入时，探针仍能确认身份，结束结果可以关闭记录。
     let mut machine = started(postgres_dialect().capabilities());
     machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
     assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
     assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Committed));
     assert!(machine.snapshot().unresolved.is_none());
+}
+
+#[test]
+fn ambiguous_begin_survives_a_later_probe_and_never_fakes_a_commit() {
+    // PostgreSQL：Ignored BEGIN 之后，探针只能证明“有活动事务”，不能证明它就是旧未知事务。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::StillActive);
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert_eq!(machine.state(), TransactionState::Active);
+    let record = machine.snapshot().unresolved.as_ref().expect("旧事务未知记录仍在");
+    assert!(record.identity_ambiguous, "重复 BEGIN 留下身份歧义");
+    assert!(!record.identity_confirmed, "歧义不能被普通探针消除");
+
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some(), "只有独立核对能关闭");
+    assert!(machine.resolve_unknown(UnknownResolution::RolledBack).is_some());
+
+    // 隐式提交同样不得清记录。
+    let mut machine = TransactionMachine::new("conn-1", caps_with_ignored_begin_and_implicit_commit());
+    confirmed(&mut machine, &begin());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::StillActive);
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // SQL Server 的 Nests 重复 BEGIN 同样留下身份歧义。
+    let mut machine = started(sqlserver_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::Unknown);
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 歧义记录进入 Aborted 后仍不能被状态探针确认。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    confirmed(&mut machine, &begin());
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::TransactionAborted));
+    assert_eq!(machine.state(), TransactionState::Aborted);
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    assert_eq!(machine.observe_probe(TransactionProbe::Aborted), TransactionEffect::Aborted);
+    assert!(!machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_confirmed));
+    assert_eq!(machine.acknowledge(&rollback(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
 }
 
 #[test]

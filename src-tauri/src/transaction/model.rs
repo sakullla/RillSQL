@@ -122,6 +122,9 @@ pub struct UnknownTransaction {
     /// 是否已经确认这条记录描述的就是当前事务。只有探针直接观测到同一事务时才为 true；
     /// “可能开了新事务”的观察（如 PostgreSQL 忽略式 `BEGIN`）必须保持 false。
     pub identity_confirmed: bool,
+    /// 是否出现了无法排除的身份歧义（重复 `BEGIN` 可能隐式提交旧事务并开了新事务）。
+    /// 为 true 时任何普通状态探针都不能重新确认身份：只有独立核对才能关闭这条记录。
+    pub identity_ambiguous: bool,
 }
 
 /// 独立核对（用户确认或另一条连接上的查询结果）给出的旧事务结局。
@@ -531,6 +534,7 @@ impl TransactionMachine {
                         state: previous,
                         pending: PendingControl::Other,
                         identity_confirmed: false,
+                        identity_ambiguous: false,
                     });
                 }
                 self.snapshot.state = TransactionState::Idle;
@@ -599,9 +603,10 @@ impl TransactionMachine {
                 state: previous,
                 pending: PendingControl::Other,
                 identity_confirmed: false,
+                identity_ambiguous: false,
             });
         }
-        // 新会话里不存在“当前未知事务”的身份依据。
+        // 新会话里不存在“当前未知事务”的身份依据；歧义标记随旧事务保留。
         if let Some(record) = self.snapshot.unresolved.as_mut() {
             record.identity_confirmed = false;
         }
@@ -717,6 +722,9 @@ impl TransactionMachine {
                 self.snapshot.generation = self.snapshot.generation.saturating_add(1);
                 if confirmed {
                     self.snapshot.unresolved = None;
+                } else {
+                    // 新事务已经替换旧事务：之后的状态探针不能再证明旧事务身份。
+                    self.mark_identity_ambiguous();
                 }
                 let effect = if confirmed { TransactionEffect::ImplicitCommit } else { TransactionEffect::Unknown };
                 self.snapshot.last_effect = effect;
@@ -726,9 +734,7 @@ impl TransactionMachine {
             DuplicateBegin::Nests => {
                 // @@TRANCOUNT 的实际层数无法核实：保持未知，要求探针核对后再判断提交是否结束事务。
                 self.snapshot.depth = None;
-                if let Some(record) = self.snapshot.unresolved.as_mut() {
-                    record.identity_confirmed = false;
-                }
+                self.mark_identity_ambiguous();
                 self.record(TransactionEffect::Unknown);
                 Ok(TransactionEffect::Unknown)
             }
@@ -737,9 +743,7 @@ impl TransactionMachine {
                 // 因此不能把未知记录当成当前事务，也不能伪造代次或清空保存点。
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(self.snapshot.depth.map_or(1, |depth| depth.max(1)));
-                if let Some(record) = self.snapshot.unresolved.as_mut() {
-                    record.identity_confirmed = false;
-                }
+                self.mark_identity_ambiguous();
                 self.record(TransactionEffect::StillActive);
                 Ok(TransactionEffect::StillActive)
             }
@@ -1080,11 +1084,16 @@ impl TransactionMachine {
         }
     }
 
-    /// 探针直接观测到了事务本身：把同一代次的未知记录标记为“就是当前事务”。
+    /// 探针直接观测到了事务本身：把同一代次、且没有身份歧义的未知记录标记为“就是当前事务”。
+    ///
+    /// 普通状态探针只能证明“存在活动事务”，不能证明它就是旧未知事务；出现重复 `BEGIN` 的
+    /// 身份歧义时，必须由独立核对或带身份凭据的探针才能关闭。
     fn mark_unknown_identity(&mut self) {
         if self.unresolved_is_current() {
             if let Some(record) = self.snapshot.unresolved.as_mut() {
-                record.identity_confirmed = true;
+                if !record.identity_ambiguous {
+                    record.identity_confirmed = true;
+                }
             }
         }
     }
@@ -1094,10 +1103,17 @@ impl TransactionMachine {
         matches!(self.snapshot.unresolved.as_ref(), Some(record) if record.pending == direction)
     }
 
-    /// 这条未知记录描述的就是当前事务，而且身份已由探针一类直接观测确认。
+    /// 当前未知记录是否存在无法排除的身份歧义。
+    fn unresolved_is_ambiguous(&self) -> bool {
+        matches!(self.snapshot.unresolved.as_ref(), Some(record) if record.identity_ambiguous)
+    }
+
+    /// 这条未知记录描述的就是当前事务，而且身份已由探针一类直接观测确认（不存在歧义）。
     fn unresolved_is_current_confirmed(&self) -> bool {
         match self.snapshot.unresolved.as_ref() {
-            Some(record) => record.identity_confirmed && self.snapshot.generation == record.generation.saturating_add(1),
+            Some(record) => {
+                record.identity_confirmed && !record.identity_ambiguous && self.snapshot.generation == record.generation.saturating_add(1)
+            }
             None => false,
         }
     }
@@ -1106,8 +1122,16 @@ impl TransactionMachine {
     /// 可能只是开始了一个新事务）：结束当前事务不能据此断言旧事务的结局。
     fn unresolved_maybe_current(&self) -> bool {
         match self.snapshot.unresolved.as_ref() {
-            Some(record) => !record.identity_confirmed && self.snapshot.generation == record.generation.saturating_add(1),
+            Some(record) => !self.unresolved_is_current_confirmed() && self.snapshot.generation == record.generation.saturating_add(1),
             None => false,
+        }
+    }
+
+    /// 当前未知记录的身份出现歧义：之后的普通状态探针不能再把“存在的事务”当成旧事务。
+    fn mark_identity_ambiguous(&mut self) {
+        if let Some(record) = self.snapshot.unresolved.as_mut() {
+            record.identity_ambiguous = true;
+            record.identity_confirmed = false;
         }
     }
 
@@ -1118,7 +1142,7 @@ impl TransactionMachine {
     fn end_with_unknown(&mut self, effect: TransactionEffect, chain: bool, direction: PendingControl) -> TransactionEffect {
         match self.snapshot.state {
             TransactionState::Unknown => {
-                if self.pending_matches(direction) {
+                if self.pending_matches(direction) && !self.unresolved_is_ambiguous() {
                     self.snapshot.unresolved = None;
                     self.end_transaction(effect, chain);
                     effect
@@ -1158,10 +1182,18 @@ impl TransactionMachine {
 
     /// 失去确认：第一次转为未知时记下原因、方向与事务代次；已经在未知时合并新丢失：
     /// 出现相反方向或无法识别的效果就把方向降级为 `Other`，之后任何同向确认都不能据此宣称结局。
+    /// 身份歧义标记在合并时保留，只有独立核对能关闭。
     fn lose_confirmation(&mut self, reason: UnknownReason, pending: PendingControl) {
         if self.snapshot.state != TransactionState::Unknown {
             let state = self.snapshot.state;
-            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state, pending, identity_confirmed: false });
+            self.snapshot.unresolved = Some(UnknownTransaction {
+                reason,
+                generation: self.snapshot.generation,
+                state,
+                pending,
+                identity_confirmed: false,
+                identity_ambiguous: false,
+            });
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
             self.snapshot.state = TransactionState::Unknown;
         } else if let Some(record) = self.snapshot.unresolved.as_mut() {
