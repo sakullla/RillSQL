@@ -172,14 +172,18 @@ pub struct TransactionSnapshot {
     pub generation: u64,
     /// 快照修订：任何可见变化都递增，供界面判断是否需要刷新。
     pub revision: u64,
-    /// 数据库内部事务层数（T-SQL 的 `@@TRANCOUNT`）。`Idle` 为 0；界面不把它展示为嵌套事务，
-    /// 只用于判断一次提交是否真的结束事务。
-    pub depth: u32,
+    /// 数据库内部事务层数（T-SQL 的 `@@TRANCOUNT`）。`Idle` 为 `Some(0)`；
+    /// `None` 表示层数无法再确认（Nests 方言丢失过控制结果），必须由探针核对。
+    /// 界面不把它展示为嵌套事务，只用于判断一次提交是否真的结束事务。
+    pub depth: Option<u32>,
     pub settings: TransactionSettings,
     /// 按登记顺序排列的保存点；同名保存点只保留最新边界。
     pub savepoints: Vec<SavepointName>,
     pub last_effect: TransactionEffect,
     /// 最近一个结果无法确认的事务；`state == Unknown` 时它就是当前事务。
+    ///
+    /// 只有单槽：更早的未知事务若尚未核对，会被后来的未知记录覆盖（R10 的持续提示以最近一次为准；
+    /// 需要保留完整历史时应由上层维护核对账本）。
     pub unresolved: Option<UnknownTransaction>,
 }
 
@@ -290,7 +294,7 @@ impl TransactionMachine {
                 state: TransactionState::Idle,
                 generation: 0,
                 revision: 0,
-                depth: 0,
+                depth: Some(0),
                 settings: TransactionSettings::default(),
                 savepoints: Vec::new(),
                 last_effect: TransactionEffect::Unchanged,
@@ -493,7 +497,7 @@ impl TransactionMachine {
                     self.snapshot.unresolved = Some(UnknownTransaction { reason: UnknownReason::ObservationFailed, generation: self.snapshot.generation, state: previous });
                 }
                 self.snapshot.state = TransactionState::Idle;
-                self.snapshot.depth = 0;
+                self.snapshot.depth = Some(0);
                 self.snapshot.savepoints.clear();
                 self.snapshot.generation = self.snapshot.generation.saturating_add(1);
                 self.record(TransactionEffect::Unknown);
@@ -503,7 +507,7 @@ impl TransactionMachine {
                 let depth = depth.max(1);
                 let was_active = matches!(state, TransactionState::Active | TransactionState::Aborted);
                 self.snapshot.state = TransactionState::Active;
-                self.snapshot.depth = depth;
+                self.snapshot.depth = Some(depth);
                 if !was_active {
                     self.snapshot.generation = self.snapshot.generation.saturating_add(1);
                     self.snapshot.savepoints.clear();
@@ -530,7 +534,7 @@ impl TransactionMachine {
         let resolved = self.snapshot.unresolved.take()?;
         if self.snapshot.state == TransactionState::Unknown {
             self.snapshot.state = TransactionState::Idle;
-            self.snapshot.depth = 0;
+            self.snapshot.depth = Some(0);
             self.snapshot.savepoints.clear();
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         }
@@ -554,7 +558,7 @@ impl TransactionMachine {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         }
         self.snapshot.state = TransactionState::Idle;
-        self.snapshot.depth = 0;
+        self.snapshot.depth = Some(0);
         self.snapshot.savepoints.clear();
         self.snapshot.settings = TransactionSettings::default();
         self.record(effect);
@@ -567,10 +571,13 @@ impl TransactionMachine {
         }
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
+                // Nests 方言：丢失的 BEGIN 可能改变 @@TRANCOUNT，之后不能再凭旧层数判断结束。
+                self.mark_depth_unverified();
                 self.lose_confirmation(reason);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
+                self.mark_depth_unverified();
                 self.lose_confirmation(UnknownReason::UnrecognizedEffect);
                 Ok(TransactionEffect::Unknown)
             }
@@ -581,10 +588,12 @@ impl TransactionMachine {
                     self.lose_confirmation(UnknownReason::UnrecognizedEffect);
                     Ok(TransactionEffect::Unknown)
                 }
-                TransactionState::Idle | TransactionState::Unknown => {
+                TransactionState::Idle => {
                     self.start(mode);
                     Ok(TransactionEffect::Began)
                 }
+                // 未知状态下不能假设新事务是从单层开始：按方言真实效果登记。
+                TransactionState::Unknown => self.begin_while_unknown(mode),
             },
             ControlOutcome::Rejected => match self.snapshot.state {
                 TransactionState::Active => Err(TransactionError::AlreadyActive),
@@ -607,7 +616,7 @@ impl TransactionMachine {
             DuplicateBegin::EndsPrevious => {
                 // 旧事务被隐式提交，新事务立即开始；两者合起来只推进一次代次。
                 self.snapshot.state = TransactionState::Active;
-                self.snapshot.depth = 1;
+                self.snapshot.depth = Some(1);
                 self.snapshot.savepoints.clear();
                 if let Some(mode) = mode {
                     self.snapshot.settings.mode = Some(mode.to_owned());
@@ -619,7 +628,7 @@ impl TransactionMachine {
             }
             DuplicateBegin::Nests => {
                 // T-SQL：@@TRANCOUNT 加一，一次 COMMIT 不会结束外层事务。
-                self.snapshot.depth = self.snapshot.depth.max(1).saturating_add(1);
+                self.snapshot.depth = self.snapshot.depth.map(|depth| depth.max(1).saturating_add(1));
                 self.record(TransactionEffect::StillActive);
                 Ok(TransactionEffect::StillActive)
             }
@@ -636,16 +645,56 @@ impl TransactionMachine {
         }
     }
 
+    /// 未知状态下确认了开始语句：不能假设层数从 1 重新开始，也不能凭空推进代次。
+    fn begin_while_unknown(&mut self, mode: Option<&str>) -> Result<TransactionEffect, TransactionError> {
+        match self.capabilities.duplicate_begin {
+            DuplicateBegin::EndsPrevious => {
+                // 旧的未知事务（若存在）已被这条语句隐式提交，随后立即开始新事务。
+                self.snapshot.state = TransactionState::Active;
+                self.snapshot.depth = Some(1);
+                self.snapshot.savepoints.clear();
+                if let Some(mode) = mode {
+                    self.snapshot.settings.mode = Some(mode.to_owned());
+                }
+                self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+                self.snapshot.unresolved = None;
+                self.snapshot.last_effect = TransactionEffect::ImplicitCommit;
+                self.touch();
+                Ok(TransactionEffect::ImplicitCommit)
+            }
+            DuplicateBegin::Nests => {
+                // @@TRANCOUNT 的实际层数无法核实：保持未知，要求探针核对后再判断提交是否结束事务。
+                self.snapshot.depth = None;
+                self.record(TransactionEffect::Unknown);
+                Ok(TransactionEffect::Unknown)
+            }
+            DuplicateBegin::Ignored => {
+                // 事务现在确定存在，但无法区分是新事务还是原来的未知事务：不伪造代次，也不清保存点。
+                self.snapshot.state = TransactionState::Active;
+                self.snapshot.depth = Some(self.snapshot.depth.map_or(1, |depth| depth.max(1)));
+                self.record(TransactionEffect::StillActive);
+                Ok(TransactionEffect::StillActive)
+            }
+            DuplicateBegin::Rejected => {
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect);
+                Ok(TransactionEffect::Unknown)
+            }
+        }
+    }
+
     fn finish(&mut self, commit: bool, chain: bool, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
         if chain && !self.capabilities.chained_transactions {
             return Err(TransactionError::ChainedTransactionUnsupported);
         }
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
+                // Nests 方言：丢失的提交可能已经结束事务，层数不能再凭旧值判断。
+                self.mark_depth_unverified();
                 self.lose_confirmation(reason);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Unrecognized => {
+                self.mark_depth_unverified();
                 self.lose_confirmation(UnknownReason::UnrecognizedEffect);
                 Ok(TransactionEffect::Unknown)
             }
@@ -667,11 +716,23 @@ impl TransactionMachine {
                         self.lose_confirmation(UnknownReason::UnrecognizedEffect);
                         Ok(TransactionEffect::Unknown)
                     }
-                    // 嵌套事务里的一次 COMMIT 只减少层数，外层事务仍然活动。
-                    TransactionState::Active if committed && self.snapshot.depth > 1 => {
-                        self.snapshot.depth -= 1;
+                    // 已知还有外层事务：一次 COMMIT 只减少层数，不能结束事务、也不能关闭未知记录。
+                    TransactionState::Active | TransactionState::Unknown if committed && matches!(self.snapshot.depth, Some(depth) if depth > 1) => {
+                        if let Some(depth) = self.snapshot.depth {
+                            self.snapshot.depth = Some(depth - 1);
+                        }
                         self.record(TransactionEffect::StillActive);
                         Ok(TransactionEffect::StillActive)
+                    }
+                    // 层数无法确认（Nests 方言丢失过控制结果）：不能宣称事务已结束，需要探针核对。
+                    TransactionState::Unknown if committed && self.snapshot.depth.is_none() => {
+                        self.record(TransactionEffect::Unknown);
+                        Ok(TransactionEffect::Unknown)
+                    }
+                    // 活动状态却缺少层数：与模型不变量矛盾，按未知处理而不是猜测结束。
+                    TransactionState::Active if committed && self.snapshot.depth.is_none() => {
+                        self.lose_confirmation(UnknownReason::ObservationFailed);
+                        Ok(TransactionEffect::Unknown)
                     }
                     TransactionState::Active | TransactionState::Aborted | TransactionState::Unknown => {
                         // 未知状态下直接确认了当前事务的结局，这是观测而不是推测。
@@ -907,7 +968,7 @@ impl TransactionMachine {
     fn start(&mut self, mode: Option<&str>) {
         self.snapshot.state = TransactionState::Active;
         self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-        self.snapshot.depth = 1;
+        self.snapshot.depth = Some(1);
         self.snapshot.savepoints.clear();
         if let Some(mode) = mode {
             self.snapshot.settings.mode = Some(mode.to_owned());
@@ -920,9 +981,16 @@ impl TransactionMachine {
         self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         self.snapshot.savepoints.clear();
         self.snapshot.state = if chain { TransactionState::Active } else { TransactionState::Idle };
-        self.snapshot.depth = if chain { 1 } else { 0 };
+        self.snapshot.depth = Some(if chain { 1 } else { 0 });
         self.snapshot.last_effect = effect;
         self.touch();
+    }
+
+    /// Nests 方言丢失了可能改变 `@@TRANCOUNT` 的控制结果：层数不再可信，需要探针核对。
+    fn mark_depth_unverified(&mut self) {
+        if self.capabilities.duplicate_begin == DuplicateBegin::Nests {
+            self.snapshot.depth = None;
+        }
     }
 
     /// 直接确认了当前未知事务的结局：清除未知记录。旧事务的记录不会被新事务的结束清除。

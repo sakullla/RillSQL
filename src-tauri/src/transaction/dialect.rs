@@ -506,6 +506,10 @@ fn tokenize(code: &str, quotes: &[(char, char)]) -> (Vec<Token>, bool) {
             let (value, used) = read_quoted(&rest[1..], '\'');
             tokens.push(Token { upper: value.to_uppercase(), text: value, quoted: true });
             rest = &rest[1..][used..];
+        } else if let Some(end) = if first == '$' { dollar_quote_end(rest) } else { None } {
+            // dollar-quote 的内容里可以出现分号与注释，不能当成语句分隔符。
+            tokens.push(Token { upper: String::new(), text: rest[..end].to_owned(), quoted: true });
+            rest = &rest[end..];
         } else if first == ';' {
             multiple = true;
             rest = &rest[1..];
@@ -527,6 +531,20 @@ fn tokenize(code: &str, quotes: &[(char, char)]) -> (Vec<Token>, bool) {
         rest = rest.trim_start();
     }
     (tokens, multiple)
+}
+
+/// `$tag$ ... $tag$`（PostgreSQL 的 dollar-quote）的结束位置（含结束标签）。
+/// 标签为空或只含标识符字符；找不到结束标签时返回 None。
+fn dollar_quote_end(text: &str) -> Option<usize> {
+    let after = text.strip_prefix('$')?;
+    let tag_len = after.find('$')?;
+    let tag = &after[..tag_len];
+    if !tag.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        return None;
+    }
+    let body_start = 1 + tag_len + 1;
+    let closing = format!("${tag}$");
+    text.get(body_start..)?.find(&closing).map(|offset| body_start + offset + closing.len())
 }
 
 /// 读取引号内文本，返回去转义后的值与消耗的字节数（含结束引号）。

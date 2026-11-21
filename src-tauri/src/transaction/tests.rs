@@ -311,7 +311,7 @@ fn states_and_generations_are_repeatable() {
     assert!(first.snapshot().revision > first.snapshot().generation);
     assert_eq!(first.snapshot().last_effect, TransactionEffect::Committed);
     assert_eq!(first.snapshot().savepoints, Vec::<SavepointName>::new());
-    assert_eq!(first.snapshot().depth, 0);
+    assert_eq!(first.snapshot().depth, Some(0));
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn new_machine_starts_idle_without_a_transaction() {
     assert_eq!(snapshot.state, TransactionState::Idle);
     assert_eq!(snapshot.generation, 0);
     assert_eq!(snapshot.revision, 0);
-    assert_eq!(snapshot.depth, 0);
+    assert_eq!(snapshot.depth, Some(0));
     assert_eq!(snapshot.savepoints, Vec::<SavepointName>::new());
     assert_eq!(snapshot.settings.isolation, None, "未设置时使用服务器默认");
     assert_eq!(snapshot.settings.mode, None);
@@ -374,7 +374,7 @@ fn confirmed_duplicate_begin_follows_the_dialect_instead_of_keeping_the_old_acti
     assert_eq!(confirmed(&mut mysql, &begin()), TransactionEffect::ImplicitCommit);
     assert_eq!(mysql.state(), TransactionState::Active);
     assert_eq!(mysql.snapshot().generation, generation + 1);
-    assert_eq!(mysql.snapshot().depth, 1);
+    assert_eq!(mysql.snapshot().depth, Some(1));
     assert!(mysql.snapshot().savepoints.is_empty());
 
     // PostgreSQL：警告并忽略，事务身份与保存点都不变。
@@ -389,13 +389,13 @@ fn confirmed_duplicate_begin_follows_the_dialect_instead_of_keeping_the_old_acti
     // SQL Server：层数加一，一次提交不结束外层事务。
     let mut sqlserver = started(sqlserver_dialect().capabilities());
     assert_eq!(confirmed(&mut sqlserver, &begin()), TransactionEffect::StillActive);
-    assert_eq!(sqlserver.snapshot().depth, 2);
+    assert_eq!(sqlserver.snapshot().depth, Some(2));
     assert_eq!(confirmed(&mut sqlserver, &commit()), TransactionEffect::StillActive);
     assert_eq!(sqlserver.state(), TransactionState::Active, "嵌套事务的第一层提交不结束事务");
-    assert_eq!(sqlserver.snapshot().depth, 1);
+    assert_eq!(sqlserver.snapshot().depth, Some(1));
     assert_eq!(confirmed(&mut sqlserver, &commit()), TransactionEffect::Committed);
     assert_eq!(sqlserver.state(), TransactionState::Idle);
-    assert_eq!(sqlserver.snapshot().depth, 0);
+    assert_eq!(sqlserver.snapshot().depth, Some(0));
 
     // 方言声明拒绝重复开始，数据库却确认成功：无法解释，按未知处理。
     let mut sqlite = started(sqlite_dialect().capabilities());
@@ -408,10 +408,83 @@ fn confirmed_duplicate_begin_follows_the_dialect_instead_of_keeping_the_old_acti
 fn nested_rollback_ends_the_whole_transaction() {
     let mut machine = started(sqlserver_dialect().capabilities());
     confirmed(&mut machine, &begin());
-    assert_eq!(machine.snapshot().depth, 2);
+    assert_eq!(machine.snapshot().depth, Some(2));
     assert_eq!(confirmed(&mut machine, &rollback()), TransactionEffect::RolledBack);
     assert_eq!(machine.state(), TransactionState::Idle, "T-SQL 的回滚结束所有嵌套层");
-    assert_eq!(machine.snapshot().depth, 0);
+    assert_eq!(machine.snapshot().depth, Some(0));
+}
+
+#[test]
+fn sqlserver_commit_in_unknown_with_unfinished_nesting_stays_unknown() {
+    // @@TRANCOUNT = 2，随后丢失一次语句结果进入未知。
+    let mut machine = started(sqlserver_dialect().capabilities());
+    confirmed(&mut machine, &begin());
+    assert_eq!(machine.snapshot().depth, Some(2));
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.snapshot().depth, Some(2), "普通语句丢失不改变已知层数");
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 这次 COMMIT 只把 @@TRANCOUNT 从 2 降到 1：事务仍活动，不得报告提交成功。
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::StillActive));
+    assert_eq!(machine.state(), TransactionState::Unknown, "外层事务仍未结束，未知记录不能关闭");
+    assert_eq!(machine.snapshot().depth, Some(1));
+    assert!(machine.snapshot().unresolved.is_some(), "事务未结束时未知记录保留");
+
+    // 再提交一次才真正结束事务：此时可以确认结局并关闭未知记录。
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Committed));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert_eq!(machine.snapshot().depth, Some(0));
+    assert!(machine.snapshot().unresolved.is_none());
+}
+
+#[test]
+fn sqlserver_begin_in_unknown_requires_a_probe_instead_of_resetting_depth() {
+    let mut machine = started(sqlserver_dialect().capabilities());
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.snapshot().depth, Some(1));
+
+    // 确认执行的嵌套 BEGIN 让 @@TRANCOUNT 无法核实：保持未知，不重置为单一层。
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.snapshot().depth, None, "层数无法确认，必须由探针核对");
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 层数不明时一次 COMMIT 不足以宣称事务结束。
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 探针确认没有事务后才回到 Idle，且未知记录仍需独立核对。
+    assert_eq!(machine.observe_probe(TransactionProbe::Idle), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+}
+
+#[test]
+fn begin_in_unknown_keeps_dialect_semantics() {
+    // MySQL/MariaDB：确认的 BEGIN 会隐式提交此前可能存在的未知事务，并开始新事务。
+    let mut mysql = started(mysql_dialect().capabilities());
+    mysql.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(mysql.state(), TransactionState::Unknown);
+    assert!(mysql.snapshot().unresolved.is_some());
+    assert_eq!(confirmed(&mut mysql, &begin()), TransactionEffect::ImplicitCommit);
+    assert_eq!(mysql.state(), TransactionState::Active);
+    assert_eq!(mysql.snapshot().depth, Some(1));
+    assert!(mysql.snapshot().unresolved.is_none(), "隐式提交结束了未知事务，记录已解决");
+
+    // PostgreSQL：BEGIN 被忽略，事务身份与仍有效的保存点都不变。
+    let mut postgres = started(postgres_dialect().capabilities());
+    confirmed(&mut postgres, &savepoint("sp"));
+    postgres.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(postgres.state(), TransactionState::Unknown);
+    let generation = postgres.snapshot().generation;
+    assert_eq!(confirmed(&mut postgres, &begin()), TransactionEffect::StillActive);
+    assert_eq!(postgres.state(), TransactionState::Active);
+    assert_eq!(postgres.snapshot().generation, generation, "不伪造新事务代次");
+    assert_eq!(postgres.snapshot().savepoints.len(), 1, "仍有效的保存点不能被清空");
+    assert!(postgres.snapshot().unresolved.is_some(), "事务身份仍未确认，保留未知记录");
 }
 
 #[test]
@@ -511,6 +584,10 @@ fn semicolons_and_multiple_statements_are_classified_without_hanging() {
     assert_eq!(postgres.classify_control("; COMMIT"), control(commit()));
     assert_eq!(postgres.classify_control(";; ;"), ControlMatch::Ordinary);
     assert_eq!(postgres.classify_control(""), ControlMatch::Ordinary);
+    // dollar-quote 里的分号不是语句分隔符（PostgreSQL）。
+    assert_eq!(postgres.classify_control("SELECT $$a;b$$"), ControlMatch::Ordinary);
+    assert_eq!(postgres.classify_control("DO $$BEGIN COMMIT; END$$"), ControlMatch::Ordinary);
+    assert_eq!(postgres.classify_control("SELECT 1; COMMIT"), ControlMatch::Ambiguous, "真正的多条语句仍按未知处理");
     // 多条语句同样不会推进状态。
     let machine = started(postgres_dialect().capabilities());
     let before = machine.snapshot().clone();
@@ -747,7 +824,7 @@ fn unconfirmed_commit_becomes_unknown_and_new_transactions_do_not_clear_the_old_
     assert_eq!(machine.state(), TransactionState::Idle);
     assert!(machine.snapshot().savepoints.is_empty());
     assert_eq!(machine.snapshot().settings.isolation, None);
-    assert_eq!(machine.snapshot().depth, 0);
+    assert_eq!(machine.snapshot().depth, Some(0));
     let unresolved = machine.snapshot().unresolved.clone().expect("重连后仍保留旧事务未知信息");
     assert_eq!(unresolved.state, TransactionState::Active);
     assert_eq!(unresolved.generation, generation);
@@ -826,7 +903,7 @@ fn probe_observation_reports_lost_outcome_instead_of_guessing() {
     assert_eq!(machine.observe_probe(TransactionProbe::Idle), TransactionEffect::Unknown);
     assert_eq!(machine.state(), TransactionState::Idle);
     assert_eq!(machine.snapshot().generation, generation + 1);
-    assert_eq!(machine.snapshot().depth, 0);
+    assert_eq!(machine.snapshot().depth, Some(0));
     assert!(machine.snapshot().unresolved.is_some(), "终点未知的结果继续保留");
 
     // 探针确认事务仍活动：采纳观测，旧结果仍未知。
@@ -850,9 +927,9 @@ fn probe_observation_reports_lost_outcome_instead_of_guessing() {
     // SQL Server 的探针层数被登记，提交只减少层数。
     let mut machine = started(sqlserver_dialect().capabilities());
     assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 2 }), TransactionEffect::StillActive);
-    assert_eq!(machine.snapshot().depth, 2);
+    assert_eq!(machine.snapshot().depth, Some(2));
     assert_eq!(confirmed(&mut machine, &commit()), TransactionEffect::StillActive);
-    assert_eq!(machine.snapshot().depth, 1);
+    assert_eq!(machine.snapshot().depth, Some(1));
 }
 
 #[test]
@@ -1000,7 +1077,7 @@ fn chained_transactions_stay_active_only_where_supported() {
     assert_eq!(machine.state(), TransactionState::Active, "AND CHAIN 立即开始新事务");
     assert!(machine.snapshot().savepoints.is_empty());
     assert_eq!(machine.snapshot().generation, 2, "提交加链式开始只推进一次代次");
-    assert_eq!(machine.snapshot().depth, 1);
+    assert_eq!(machine.snapshot().depth, Some(1));
 
     let mut sqlite = started(sqlite_dialect().capabilities());
     let before = sqlite.snapshot().clone();
