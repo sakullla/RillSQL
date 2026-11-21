@@ -680,6 +680,61 @@ fn ambiguous_begin_survives_a_later_probe_and_never_fakes_a_commit() {
 }
 
 #[test]
+fn ambiguous_identity_survives_a_later_lost_control() {
+    // 歧义之后再次丢失提交：新记录不能把歧义重置成“可确认”。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::StillActive);
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    let record = machine.snapshot().unresolved.as_ref().expect("记录仍在");
+    assert_eq!(record.pending, PendingControl::Commit);
+    assert!(record.identity_ambiguous, "再次丢失不能重置歧义");
+    assert!(!record.identity_confirmed);
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+    assert!(machine.resolve_unknown(UnknownResolution::Committed).is_some());
+
+    // 隐式提交同样不得清记录。
+    let mut machine = TransactionMachine::new("conn-1", caps_with_ignored_begin_and_implicit_commit());
+    confirmed(&mut machine, &begin());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    confirmed(&mut machine, &begin());
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+}
+
+#[test]
+fn ends_previous_ambiguity_blocks_a_later_confirmed_commit_and_begin() {
+    // MySQL/MariaDB：丢失 ROLLBACK → BEGIN 开了新事务（旧记录保留为歧义）→ 再次丢失提交。
+    let mut machine = started(mysql_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Active);
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_ambiguous));
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+    assert!(machine.resolve_unknown(UnknownResolution::RolledBack).is_some());
+
+    // 未知状态下方向虽一致（pending = Commit），歧义未解除时再次 BEGIN 也不能关闭记录。
+    let mut machine = started(mysql_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    confirmed(&mut machine, &begin());
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Commit));
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Active);
+    assert!(machine.snapshot().unresolved.is_some());
+}
+
+#[test]
 fn repeated_losses_with_conflicting_directions_keep_the_unknown() {
     // 丢失 COMMIT 后又丢失 ROLLBACK：方向不再唯一，任何同向确认都不能宣称结局。
     let mut machine = started(postgres_dialect().capabilities());

@@ -711,8 +711,9 @@ impl TransactionMachine {
         match self.capabilities.duplicate_begin {
             DuplicateBegin::EndsPrevious => {
                 // 旧事务若仍活动，会被这条语句隐式提交；但丢失的控制方向可能不是提交
-                // （例如 ROLLBACK 已在服务器成功），此时不能宣称隐式提交，也不能清除未知记录。
-                let confirmed = self.pending_matches(PendingControl::Commit);
+                // （例如 ROLLBACK 已在服务器成功），或此前已经出现身份歧义时，
+                // 都不能宣称隐式提交，也不能清除未知记录。
+                let confirmed = self.pending_matches(PendingControl::Commit) && !self.unresolved_is_ambiguous();
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(1);
                 self.snapshot.savepoints.clear();
@@ -1186,13 +1187,16 @@ impl TransactionMachine {
     fn lose_confirmation(&mut self, reason: UnknownReason, pending: PendingControl) {
         if self.snapshot.state != TransactionState::Unknown {
             let state = self.snapshot.state;
+            // 旧记录若仍有身份歧义，新的未知记录必须继承它：再次丢失不能把歧义重置成“可确认”，
+            // 否则后续同向确认会把可能是新事务的提交当成旧事务的结局。
+            let identity_ambiguous = self.unresolved_is_ambiguous();
             self.snapshot.unresolved = Some(UnknownTransaction {
                 reason,
                 generation: self.snapshot.generation,
                 state,
                 pending,
                 identity_confirmed: false,
-                identity_ambiguous: false,
+                identity_ambiguous,
             });
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
             self.snapshot.state = TransactionState::Unknown;
