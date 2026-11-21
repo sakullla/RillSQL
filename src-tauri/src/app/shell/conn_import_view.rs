@@ -4,14 +4,18 @@ use super::conn_import::{
 };
 use super::model::DraftField;
 use super::view::Workbench;
+use crate::adapters::profile_import::{absolute_path, ProfileRow};
 use crate::connections::model::{CaMode, ConnectionDraft, SshAuthKind, TlsMode};
 use crate::connections::store::{ImportConflict, ImportConflictKind};
-use crate::ui::kit::{self, Palette, Radius, ScrollAreaExt as _, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, ScrollAreaExt as _, Space, TypeScale};
 use gpui_kit::assets::IconName;
 use gpui_kit::{
     div, px, AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, Styled as _, Window,
 };
+
+const UNLOCK_FORM_MAX_WIDTH: f32 = 540.;
+const PROFILE_EDITOR_MAX_WIDTH: f32 = 620.;
 
 impl Workbench {
     pub(super) fn bundle_unlock_page(
@@ -29,7 +33,7 @@ impl Workbench {
             .p(px(self.metrics().page_pad))
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(Space::LG))
             .child(kit::title(
                 self.t("connections.page.importRillSql"),
                 TypeScale::LG,
@@ -38,13 +42,13 @@ impl Workbench {
             .child(self.t(message))
             .child(
                 div()
-                    .max_w(px(540.))
+                    .max_w(px(UNLOCK_FORM_MAX_WIDTH))
                     .child(kit::form_row(SharedString::from(label), input, &p)),
             )
             .child(
                 div()
                     .flex()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .child(kit::secondary_button(
                         "bundle-unlock-cancel",
                         None,
@@ -82,7 +86,7 @@ impl Workbench {
                 let footer = div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .child(
                         div()
                             .flex_1()
@@ -107,7 +111,7 @@ impl Workbench {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .child(
                         div()
                             .text_color(p.text_muted)
@@ -138,7 +142,7 @@ impl Workbench {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(px(Space::SM))
                     .child(div().text_color(p.danger).child(SharedString::from(error)))
                     .child(self.t("connections.profile.noSaved"))
                     .into_any_element(),
@@ -169,7 +173,7 @@ impl Workbench {
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(Space::LG))
             .p(px(self.metrics().page_pad))
             .overflow_hidden()
             .child(kit::title(self.t(title), TypeScale::LG, &p))
@@ -191,7 +195,7 @@ impl Workbench {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(px(Space::MD))
             .scroll_area_y();
         if preview.rows.is_empty() {
             list = list.child(self.t("connections.profile.empty"));
@@ -215,8 +219,8 @@ impl Workbench {
                 .flex_none()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
-                .p(px(10.))
+                .gap(px(Space::SM))
+                .p(px(Space::MD))
                 .rounded(px(Radius::CONTROL))
                 .border_1()
                 .border_color(p.line_soft)
@@ -225,7 +229,7 @@ impl Workbench {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(Space::MD))
                         .child(
                             kit::secondary_button(
                                 SharedString::from(format!("profile-row-toggle-{index}")),
@@ -318,7 +322,7 @@ impl Workbench {
         let mut target = base
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(px(Space::XXS))
             .child(SharedString::from(target))
             .child(SharedString::from(access));
         if draft.tls_mode != TlsMode::Off && draft.ca_mode == CaMode::File {
@@ -345,7 +349,7 @@ impl Workbench {
     fn profile_editor(
         &mut self,
         index: usize,
-        source: &crate::connections::profile_import::ProfileRow,
+        source: &ProfileRow,
         draft: &ConnectionDraft,
         p: &Palette,
         window: &mut Window,
@@ -354,7 +358,7 @@ impl Workbench {
         let mut fields = vec![ImportField::Name];
         let original = source.draft.as_ref().unwrap_or(draft);
         if crate::app::views::connections::file_based(draft.engine) {
-            if !crate::connections::profile_import::absolute_path(&original.file_path) {
+            if !absolute_path(&original.file_path) {
                 fields.push(ImportField::File);
             }
         } else {
@@ -389,7 +393,11 @@ impl Workbench {
                 fields.extend([ImportField::ClientCert, ImportField::ClientKey]);
             }
         }
-        let mut editor = div().flex().flex_col().gap(px(6.)).max_w(px(620.));
+        let mut editor = div()
+            .flex()
+            .flex_col()
+            .gap(px(Space::SM))
+            .max_w(px(PROFILE_EDITOR_MAX_WIDTH));
         for field in fields {
             let label = self.model.text(field.label());
             let input = self.input_for(
@@ -429,7 +437,7 @@ impl Workbench {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(Space::SM))
             .scroll_area_y();
         for row in &report.rows {
             let (detail, color) = match &row.result {
@@ -447,8 +455,8 @@ impl Workbench {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .py(px(6.))
+                    .gap(px(Space::XXS))
+                    .py(px(Space::SM))
                     .border_b_1()
                     .border_color(p.line_soft)
                     .child(
@@ -469,7 +477,7 @@ impl Workbench {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(px(Space::MD))
             .child(SharedString::from(counts))
             .child(list)
             .into_any_element()

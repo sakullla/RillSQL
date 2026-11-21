@@ -139,13 +139,18 @@ async fn navicat_jobs_preserve_the_selected_subset_and_skip_existing_profiles() 
     for (pass, expected) in [(0, (1, 2, 0)), (1, (0, 3, 0))] {
         model.queue_profile_preview(ProfileFormat::Navicat, path.clone());
         finish_import_job(&mut model, &services).await;
-        let ImportState::Preview(preview) = &model.profile_import else { panic!("missing NCX preview"); };
+        let ImportState::Preview(preview) = &model.profile_import else {
+            panic!("missing NCX preview: {:?}", model.profile_import);
+        };
         assert_eq!(preview.rows[0].conflict.is_some(), pass == 1);
         let _ = model.dispatch("profile-import-toggle:1");
         let _ = model.dispatch("profile-import-confirm");
         finish_import_job(&mut model, &services).await;
-        let ImportState::Report(report) = &model.profile_import else { panic!("missing NCX report"); };
+        let ImportState::Report(report) = &model.profile_import else {
+            panic!("missing NCX report: {:?}", model.profile_import);
+        };
         assert_eq!(report.counts(), expected);
+        assert_eq!(model.take_pending(), Some(PendingJob::RefreshConnections));
         let _ = model.dispatch("profile-import-close");
     }
     let saved = services.list_connections().await.unwrap();
@@ -1584,7 +1589,10 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
     std::fs::write(&import_file, b"{}").unwrap();
     let opened = import_file.canonicalize().unwrap();
     cx.update_window(window, |_, _, cx| {
-        view.update(cx, |view, cx| view.perform("conn-import", cx));
+        view.update(cx, |view, cx| {
+            view.model.bundle_passphrase.clear();
+            view.perform("conn-import", cx);
+        });
     })
     .unwrap();
     assert!(cx.did_prompt_for_paths());
@@ -1599,7 +1607,7 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
             let path = view.model.import_path.clone().expect("import path");
             assert_eq!(path, opened.display().to_string());
             let request = job_request(&view.model, PendingJob::ImportConnections, token);
-            assert_eq!(request.bundle_passphrase.as_deref(), Some("correct-horse"));
+            assert!(request.bundle_passphrase.is_none());
             assert_eq!(request.import_path.as_deref(), Some(path.as_str()));
         });
     });

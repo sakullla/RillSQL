@@ -17,7 +17,7 @@ DBX 的公开实现提供了字段交叉核对线索。此次兼容范围以本�
 
 ## Windows 桌面验证
 
-组合构建的 SHA-256 为 `377a04df07d272a089e98e4a57086002c7a763b097a4a3e04f3f812ae2a02723`。验收使用独立的 RillSQL 数据目录和本仓 PostgreSQL 16 容器。SQLite 夹具包含能辨认文件的 `fixture_marker` 行。
+组合构建的 SHA-256 为 `377a04df07d272a089e98e4a57086002c7a763b097a4a3e04f3f812ae2a02723`，对应 `43948da` 的 `src-tauri` 源码树 `74b0ce4154c9109d750afcc7aec5e09e13fa586c`。验收使用独立的 RillSQL 数据目录和本仓 PostgreSQL 16 容器。SQLite 夹具包含能辨认文件的 `fixture_marker` 行。
 
 | 操作 | 观测结果 |
 | --- | --- |
@@ -29,4 +29,4 @@ DBX 的公开实现提供了字段交叉核对线索。此次兼容范围以本�
 | 选取损坏的 NCX | 文件级 XML 错误，新增 0。[文件错误](file-error.png) |
 | 重开连接列表，手动打开两个本地测试连接 | PostgreSQL 通过现有凭据提示补填后连接，容器 `pg_stat_activity` 返回 `rillsql\|postgres\|RillSQL`。SQLite 打开后显示已连接，配置库保存的文件经读取含 `fixture_marker = rillsql-import-fixture`。[PostgreSQL 实际连接](target-connected.png) · [SQLite 实际连接](sqlite-connected.png) |
 
-MySQL 跳板与 HTTP 地址均为测试占位。该行以预览和持久化字段核验路由。Rust 回归另覆盖含测试凭据的 NCX、未知引擎、异常访问条件及部分勾选后的重复导入。[NCX 解析测试](../../../../src-tauri/src/connections/profile_import/navicat.rs) · [桌面任务测试](../../../../src-tauri/src/app/shell/tests.rs)
+MySQL 跳板与 HTTP 地址均为测试占位。该行以预览和持久化字段核验路由。Rust 回归另覆盖含测试凭据的 NCX、未知引擎、异常访问条件及部分勾选后的重复导入。[NCX 解析测试](../../../../src-tauri/src/adapters/profile_import/navicat.rs) · [桌面任务测试](../../../../src-tauri/src/app/shell/tests.rs)

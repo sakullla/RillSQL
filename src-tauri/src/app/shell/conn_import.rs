@@ -5,7 +5,7 @@ use crate::application::AppServices;
 use crate::connections::model::{
     normalize, ConnectionDraft, EnvTag, FieldError, SavedConnection, ENV_NONE,
 };
-use crate::connections::profile_import::{parse_dbeaver, parse_navicat, ProfileRow};
+use crate::adapters::profile_import::{parse_dbeaver, parse_navicat, ProfileRow};
 use crate::connections::store::{import_conflict, ImportConflict, ImportInsert};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
