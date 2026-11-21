@@ -3,12 +3,13 @@
 //! 这里的方言只用于验证接口边界（引用方式、能力表、分类词汇）；真实 SQL 由各适配器在后续任务提供。
 
 use super::dialect::{
-    classify_control, ControlMatch, ControlSql, ControlSyntax, ImplicitCommitSupport, ImplicitCommitVerdict, SettingChange, SettingOption, SettingSupport,
-    TransactionCapabilities, TransactionDialect, READ_COMMITTED, READ_ONLY, READ_UNCOMMITTED, READ_WRITE, REPEATABLE_READ, SERIALIZABLE, SNAPSHOT,
+    classify_control, AbortedRecovery, ControlMatch, ControlSql, ControlSyntax, DuplicateBegin, ImplicitCommitSupport, ImplicitCommitVerdict, SettingChange,
+    SettingOption, SettingSupport, TransactionCapabilities, TransactionDialect, READ_COMMITTED, READ_ONLY, READ_UNCOMMITTED, READ_WRITE, REPEATABLE_READ,
+    SERIALIZABLE, SNAPSHOT,
 };
 use super::model::{
-    ControlOutcome, ControlStatement, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine, TransactionState,
-    UnknownReason,
+    ControlOutcome, ControlStatement, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine, TransactionProbe,
+    TransactionState, UnknownReason, UnknownResolution,
 };
 
 const READ_UNCOMMITTED_OPTION: SettingOption = SettingOption { id: READ_UNCOMMITTED, label: "Read uncommitted" };
@@ -23,6 +24,10 @@ const IMMEDIATE_OPTION: SettingOption = SettingOption { id: "immediate", label: 
 const EXCLUSIVE_OPTION: SettingOption = SettingOption { id: "exclusive", label: "Exclusive" };
 
 const NO_MODE: SettingSupport = SettingSupport { options: &[], change: SettingChange::Unsupported };
+const STANDARD_LEVELS: SettingSupport = SettingSupport {
+    options: &[READ_UNCOMMITTED_OPTION, READ_COMMITTED_OPTION, REPEATABLE_READ_OPTION, SERIALIZABLE_OPTION],
+    change: SettingChange::WhileIdle,
+};
 
 /// 标识符引用方式：各引擎保存点名称的写法不同。
 #[derive(Debug, Clone, Copy)]
@@ -42,17 +47,25 @@ impl Quote {
     }
 }
 
+/// 保存点语句写法：标准 SQL 与 T-SQL 不能互相替代。
+#[derive(Debug, Clone, Copy)]
+enum SavepointStyle {
+    Standard,
+    Transact,
+}
+
 /// 测试用方言：按能力表与词汇表提供 SQL，不代表任何适配器的最终实现。
 #[derive(Debug, Clone, Copy)]
 struct TestDialect {
     capabilities: TransactionCapabilities,
     syntax: ControlSyntax,
     quote: Quote,
+    savepoint: SavepointStyle,
 }
 
 impl TestDialect {
-    fn new(capabilities: TransactionCapabilities, syntax: ControlSyntax, quote: Quote) -> Self {
-        Self { capabilities, syntax, quote }
+    fn new(capabilities: TransactionCapabilities, syntax: ControlSyntax, quote: Quote, savepoint: SavepointStyle) -> Self {
+        Self { capabilities, syntax, quote, savepoint }
     }
 }
 
@@ -84,6 +97,20 @@ impl TransactionDialect for TestDialect {
         if chain { "ROLLBACK AND CHAIN".to_owned() } else { "ROLLBACK".to_owned() }
     }
 
+    fn savepoint_sql(&self, name: &SavepointName) -> String {
+        match self.savepoint {
+            SavepointStyle::Standard => format!("SAVEPOINT {}", self.quote_identifier(name.as_str())),
+            SavepointStyle::Transact => format!("SAVE TRANSACTION {}", self.quote_identifier(name.as_str())),
+        }
+    }
+
+    fn rollback_to_savepoint_sql(&self, name: &SavepointName) -> String {
+        match self.savepoint {
+            SavepointStyle::Standard => format!("ROLLBACK TO SAVEPOINT {}", self.quote_identifier(name.as_str())),
+            SavepointStyle::Transact => format!("ROLLBACK TRANSACTION {}", self.quote_identifier(name.as_str())),
+        }
+    }
+
     fn isolation_sql(&self, level: Option<&str>) -> ControlSql {
         let level = match level {
             Some(level) => level.replace('_', " ").to_ascii_uppercase(),
@@ -105,58 +132,72 @@ impl TransactionDialect for TestDialect {
 fn postgres_dialect() -> TestDialect {
     TestDialect::new(
         TransactionCapabilities {
+            explicit_control: true,
             savepoints: true,
             release_savepoint: true,
             chained_transactions: true,
-            aborted_state: true,
-            isolation: SettingSupport { options: &[READ_UNCOMMITTED_OPTION, READ_COMMITTED_OPTION, REPEATABLE_READ_OPTION, SERIALIZABLE_OPTION], change: SettingChange::WhileIdle },
+            duplicate_begin: DuplicateBegin::Ignored,
+            aborted: AbortedRecovery::SavepointRecovery,
+            isolation: STANDARD_LEVELS,
             mode: SettingSupport { options: &[READ_ONLY_OPTION, READ_WRITE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         },
         ControlSyntax { bare_begin: true, start_transaction: true, end_commits: true, abort_rolls_back: true, chained: true, begin_modes: &[], rollback_transaction_name: false, hash_comments: false, identifier_quotes: &[('"', '"')] },
         Quote::Double,
+        SavepointStyle::Standard,
     )
 }
 
 fn mysql_dialect() -> TestDialect {
     TestDialect::new(
         TransactionCapabilities {
+            explicit_control: true,
             savepoints: true,
             release_savepoint: true,
             chained_transactions: true,
-            aborted_state: false,
-            isolation: SettingSupport { options: &[READ_UNCOMMITTED_OPTION, READ_COMMITTED_OPTION, REPEATABLE_READ_OPTION, SERIALIZABLE_OPTION], change: SettingChange::WhileIdle },
+            // BEGIN/START TRANSACTION 会隐式提交旧事务。
+            duplicate_begin: DuplicateBegin::EndsPrevious,
+            aborted: AbortedRecovery::NotApplicable,
+            isolation: STANDARD_LEVELS,
             mode: SettingSupport { options: &[READ_ONLY_OPTION, READ_WRITE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::MysqlFamily,
         },
         ControlSyntax { bare_begin: true, start_transaction: true, end_commits: false, abort_rolls_back: false, chained: true, begin_modes: &[], rollback_transaction_name: false, hash_comments: true, identifier_quotes: &[('"', '"'), ('`', '`')] },
         Quote::Backtick,
+        SavepointStyle::Standard,
     )
 }
 
 fn sqlite_dialect() -> TestDialect {
     TestDialect::new(
         TransactionCapabilities {
+            explicit_control: true,
             savepoints: true,
             release_savepoint: true,
             chained_transactions: false,
-            aborted_state: false,
+            duplicate_begin: DuplicateBegin::Rejected,
+            aborted: AbortedRecovery::NotApplicable,
             isolation: SettingSupport { options: &[READ_UNCOMMITTED_OPTION, SERIALIZABLE_OPTION], change: SettingChange::WhileIdle },
             mode: SettingSupport { options: &[DEFERRED_OPTION, IMMEDIATE_OPTION, EXCLUSIVE_OPTION], change: SettingChange::WhileIdle },
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         },
         ControlSyntax { bare_begin: true, start_transaction: false, end_commits: true, abort_rolls_back: false, chained: false, begin_modes: &["deferred", "immediate", "exclusive"], rollback_transaction_name: false, hash_comments: false, identifier_quotes: &[('"', '"'), ('`', '`'), ('[', ']')] },
         Quote::Double,
+        SavepointStyle::Standard,
     )
 }
 
 fn sqlserver_dialect() -> TestDialect {
     TestDialect::new(
         TransactionCapabilities {
+            explicit_control: true,
             savepoints: true,
             release_savepoint: false,
             chained_transactions: false,
-            aborted_state: true,
+            // 嵌套 BEGIN 只增 @@TRANCOUNT。
+            duplicate_begin: DuplicateBegin::Nests,
+            // XACT_STATE() = -1：只能整体回滚。
+            aborted: AbortedRecovery::RollbackOnly,
             isolation: SettingSupport {
                 options: &[READ_UNCOMMITTED_OPTION, READ_COMMITTED_OPTION, REPEATABLE_READ_OPTION, SERIALIZABLE_OPTION, SNAPSHOT_OPTION],
                 change: SettingChange::AnyTime,
@@ -166,11 +207,25 @@ fn sqlserver_dialect() -> TestDialect {
         },
         ControlSyntax { bare_begin: false, start_transaction: false, end_commits: false, abort_rolls_back: false, chained: false, begin_modes: &[], rollback_transaction_name: true, hash_comments: false, identifier_quotes: &[('"', '"'), ('[', ']')] },
         Quote::Bracket,
+        SavepointStyle::Transact,
     )
 }
 
 fn unsupported_dialect() -> TestDialect {
-    TestDialect::new(TransactionCapabilities::UNSUPPORTED, ControlSyntax::STANDARD, Quote::Double)
+    TestDialect::new(TransactionCapabilities::UNSUPPORTED, ControlSyntax::STANDARD, Quote::Double, SavepointStyle::Standard)
+}
+
+fn caps_without_savepoints() -> TransactionCapabilities {
+    let mut capabilities = postgres_dialect().capabilities();
+    capabilities.savepoints = false;
+    capabilities.release_savepoint = false;
+    capabilities
+}
+
+fn caps_without_settings() -> TransactionCapabilities {
+    let mut capabilities = postgres_dialect().capabilities();
+    capabilities.isolation = SettingSupport::NONE;
+    capabilities
 }
 
 fn machine(capabilities: TransactionCapabilities) -> TransactionMachine {
@@ -186,11 +241,15 @@ fn postgres_machine() -> TransactionMachine {
 }
 
 fn mysql_machine() -> TransactionMachine {
-    machine(mysql_dialect().capabilities())
+    machine_for(&mysql_dialect())
 }
 
 fn begin() -> ControlStatement {
     ControlStatement::Begin { mode: None }
+}
+
+fn begin_with(mode: &str) -> ControlStatement {
+    ControlStatement::Begin { mode: Some(mode.to_owned()) }
 }
 
 fn commit() -> ControlStatement {
@@ -231,7 +290,7 @@ fn started(capabilities: TransactionCapabilities) -> TransactionMachine {
     machine
 }
 
-/// 一条完整事务：开始、保存点、提交。用于验证代次可重复。
+/// 一条完整事务：开始、保存点、回滚到保存点、提交。用于验证代次可重复。
 fn committed_scenario() -> TransactionMachine {
     let mut machine = postgres_machine();
     assert_eq!(machine.state(), TransactionState::Idle);
@@ -252,6 +311,7 @@ fn states_and_generations_are_repeatable() {
     assert!(first.snapshot().revision > first.snapshot().generation);
     assert_eq!(first.snapshot().last_effect, TransactionEffect::Committed);
     assert_eq!(first.snapshot().savepoints, Vec::<SavepointName>::new());
+    assert_eq!(first.snapshot().depth, 0);
 }
 
 #[test]
@@ -262,6 +322,7 @@ fn new_machine_starts_idle_without_a_transaction() {
     assert_eq!(snapshot.state, TransactionState::Idle);
     assert_eq!(snapshot.generation, 0);
     assert_eq!(snapshot.revision, 0);
+    assert_eq!(snapshot.depth, 0);
     assert_eq!(snapshot.savepoints, Vec::<SavepointName>::new());
     assert_eq!(snapshot.settings.isolation, None, "未设置时使用服务器默认");
     assert_eq!(snapshot.settings.mode, None);
@@ -292,12 +353,65 @@ fn committing_without_an_active_transaction_is_not_success() {
 }
 
 #[test]
-fn starting_twice_does_not_create_a_nested_transaction() {
-    let mut machine = started(postgres_dialect().capabilities());
-    confirmed(&mut machine, &savepoint("mark"));
-    let before = machine.snapshot().clone();
-    assert_eq!(machine.acknowledge(&begin(), ControlOutcome::Confirmed), Err(TransactionError::AlreadyActive));
-    assert_eq!(machine.snapshot(), &before, "不构造伪嵌套事务，也不隐藏保存点");
+fn precheck_refuses_duplicate_begin_where_it_would_not_end_the_old_transaction() {
+    // MySQL/MariaDB 的重复开始会隐式提交旧事务：允许下发，但结果必须报告隐式提交。
+    let mysql = started(mysql_dialect().capabilities());
+    assert_eq!(mysql.precheck(&begin()), Ok(()));
+    // 其余方言的重复开始只会被忽略、拒绝或增加层数：界面先引导到保存点。
+    for capabilities in [postgres_dialect().capabilities(), sqlite_dialect().capabilities(), sqlserver_dialect().capabilities()] {
+        let machine = started(capabilities);
+        assert_eq!(machine.precheck(&begin()), Err(TransactionError::AlreadyActive));
+        assert_eq!(machine.state(), TransactionState::Active, "预检不改变状态");
+    }
+}
+
+#[test]
+fn confirmed_duplicate_begin_follows_the_dialect_instead_of_keeping_the_old_active_state() {
+    // MySQL/MariaDB：旧事务被隐式提交，新事务开始；旧保存点不再有效。
+    let mut mysql = started(mysql_dialect().capabilities());
+    confirmed(&mut mysql, &savepoint("sp"));
+    let generation = mysql.snapshot().generation;
+    assert_eq!(confirmed(&mut mysql, &begin()), TransactionEffect::ImplicitCommit);
+    assert_eq!(mysql.state(), TransactionState::Active);
+    assert_eq!(mysql.snapshot().generation, generation + 1);
+    assert_eq!(mysql.snapshot().depth, 1);
+    assert!(mysql.snapshot().savepoints.is_empty());
+
+    // PostgreSQL：警告并忽略，事务身份与保存点都不变。
+    let mut postgres = started(postgres_dialect().capabilities());
+    confirmed(&mut postgres, &savepoint("sp"));
+    let generation = postgres.snapshot().generation;
+    assert_eq!(confirmed(&mut postgres, &begin()), TransactionEffect::StillActive);
+    assert_eq!(postgres.state(), TransactionState::Active);
+    assert_eq!(postgres.snapshot().generation, generation);
+    assert_eq!(postgres.snapshot().savepoints.len(), 1);
+
+    // SQL Server：层数加一，一次提交不结束外层事务。
+    let mut sqlserver = started(sqlserver_dialect().capabilities());
+    assert_eq!(confirmed(&mut sqlserver, &begin()), TransactionEffect::StillActive);
+    assert_eq!(sqlserver.snapshot().depth, 2);
+    assert_eq!(confirmed(&mut sqlserver, &commit()), TransactionEffect::StillActive);
+    assert_eq!(sqlserver.state(), TransactionState::Active, "嵌套事务的第一层提交不结束事务");
+    assert_eq!(sqlserver.snapshot().depth, 1);
+    assert_eq!(confirmed(&mut sqlserver, &commit()), TransactionEffect::Committed);
+    assert_eq!(sqlserver.state(), TransactionState::Idle);
+    assert_eq!(sqlserver.snapshot().depth, 0);
+
+    // 方言声明拒绝重复开始，数据库却确认成功：无法解释，按未知处理。
+    let mut sqlite = started(sqlite_dialect().capabilities());
+    assert_eq!(confirmed(&mut sqlite, &begin()), TransactionEffect::Unknown);
+    assert_eq!(sqlite.state(), TransactionState::Unknown);
+    assert!(sqlite.snapshot().unresolved.is_some());
+}
+
+#[test]
+fn nested_rollback_ends_the_whole_transaction() {
+    let mut machine = started(sqlserver_dialect().capabilities());
+    confirmed(&mut machine, &begin());
+    assert_eq!(machine.snapshot().depth, 2);
+    assert_eq!(confirmed(&mut machine, &rollback()), TransactionEffect::RolledBack);
+    assert_eq!(machine.state(), TransactionState::Idle, "T-SQL 的回滚结束所有嵌套层");
+    assert_eq!(machine.snapshot().depth, 0);
 }
 
 #[test]
@@ -363,7 +477,7 @@ fn manual_control_is_classified_by_dialect_syntax() {
     assert_eq!(mysql.classify_control("SET @@autocommit = 1"), ControlMatch::Ambiguous);
 
     let sqlite = sqlite_dialect();
-    assert_eq!(sqlite.classify_control("BEGIN IMMEDIATE"), control(ControlStatement::Begin { mode: Some("immediate".to_owned()) }));
+    assert_eq!(sqlite.classify_control("BEGIN IMMEDIATE"), control(begin_with("immediate")));
     assert_eq!(sqlite.classify_control("BEGIN TRANSACTION"), control(begin()));
     assert_eq!(sqlite.classify_control("END TRANSACTION"), control(commit()));
     assert_eq!(sqlite.classify_control("START TRANSACTION"), ControlMatch::Ordinary, "SQLite 只认 BEGIN");
@@ -385,6 +499,26 @@ fn manual_control_is_classified_by_dialect_syntax() {
 }
 
 #[test]
+fn semicolons_and_multiple_statements_are_classified_without_hanging() {
+    let postgres = postgres_dialect();
+    // 多条语句：调用方应先切分，这里必须明确拒绝而不是把整段当成一条控制语句。
+    assert_eq!(postgres.classify_control("COMMIT;SELECT 1"), ControlMatch::Ambiguous);
+    assert_eq!(postgres.classify_control("BEGIN; COMMIT"), ControlMatch::Ambiguous);
+    assert_eq!(postgres.classify_control("SAVEPOINT sp; COMMIT"), ControlMatch::Ambiguous);
+    // 空语句与重复结尾分号仍是同一条语句。
+    assert_eq!(postgres.classify_control("COMMIT;;"), control(commit()));
+    assert_eq!(postgres.classify_control("COMMIT ; ; "), control(commit()));
+    assert_eq!(postgres.classify_control("; COMMIT"), control(commit()));
+    assert_eq!(postgres.classify_control(";; ;"), ControlMatch::Ordinary);
+    assert_eq!(postgres.classify_control(""), ControlMatch::Ordinary);
+    // 多条语句同样不会推进状态。
+    let machine = started(postgres_dialect().capabilities());
+    let before = machine.snapshot().clone();
+    assert_eq!(postgres.classify_control("COMMIT;SELECT 1"), ControlMatch::Ambiguous);
+    assert_eq!(machine.snapshot(), &before);
+}
+
+#[test]
 fn savepoint_names_are_validated_and_quoted() {
     assert_eq!(SavepointName::parse("  sp  ").unwrap().as_str(), "sp");
     assert!(SavepointName::parse("   ").is_err());
@@ -394,8 +528,9 @@ fn savepoint_names_are_validated_and_quoted() {
     let name = SavepointName::parse("sp one").unwrap();
     assert_eq!(postgres_dialect().savepoint_sql(&name), "SAVEPOINT \"sp one\"");
     assert_eq!(mysql_dialect().savepoint_sql(&name), "SAVEPOINT `sp one`");
-    assert_eq!(sqlserver_dialect().savepoint_sql(&name), "SAVEPOINT [sp one]");
+    assert_eq!(sqlserver_dialect().savepoint_sql(&name), "SAVE TRANSACTION [sp one]", "T-SQL 没有 SAVEPOINT 语句");
     assert_eq!(postgres_dialect().rollback_to_savepoint_sql(&name), "ROLLBACK TO SAVEPOINT \"sp one\"");
+    assert_eq!(sqlserver_dialect().rollback_to_savepoint_sql(&name), "ROLLBACK TRANSACTION [sp one]");
     let quote = SavepointName::parse("a\"b").unwrap();
     assert_eq!(postgres_dialect().savepoint_sql(&quote), "SAVEPOINT \"a\"\"b\"");
     assert_eq!(mysql_dialect().release_savepoint_sql(&name), ControlSql::Statement("RELEASE SAVEPOINT `sp one`".to_owned()));
@@ -403,21 +538,40 @@ fn savepoint_names_are_validated_and_quoted() {
 }
 
 #[test]
+fn savepoint_boundaries_are_matched_without_case_sensitivity() {
+    let mut machine = started(postgres_dialect().capabilities());
+    confirmed(&mut machine, &savepoint("Keep"));
+    assert_eq!(machine.acknowledge(&rollback_to("keep"), ControlOutcome::Confirmed), Ok(TransactionEffect::StillActive));
+    assert_eq!(machine.state(), TransactionState::Active, "大小写不同不是未知保存点");
+    assert_eq!(machine.snapshot().savepoints.len(), 1);
+    assert_eq!(machine.acknowledge(&release("KEEP"), ControlOutcome::Confirmed), Ok(TransactionEffect::StillActive));
+    assert!(machine.snapshot().savepoints.is_empty());
+    assert_eq!(machine.state(), TransactionState::Active);
+}
+
+#[test]
 fn control_commands_map_to_dialect_sql_or_unsupported() {
     assert_eq!(postgres_dialect().sql_for(&begin()), ControlSql::Statement("BEGIN".to_owned()));
     assert_eq!(sqlite_dialect().sql_for(&begin_with("immediate")), ControlSql::Statement("BEGIN IMMEDIATE".to_owned()));
+    assert_eq!(sqlite_dialect().sql_for(&begin_with("bogus")), ControlSql::Unsupported, "未声明的模式不下发");
     assert_eq!(postgres_dialect().sql_for(&ControlStatement::Commit { chain: true }), ControlSql::Statement("COMMIT AND CHAIN".to_owned()));
     assert_eq!(sqlite_dialect().sql_for(&ControlStatement::Commit { chain: true }), ControlSql::Unsupported);
+    assert_eq!(postgres_dialect().sql_for(&savepoint("sp")), ControlSql::Statement("SAVEPOINT \"sp\"".to_owned()));
     assert_eq!(postgres_dialect().sql_for(&rollback_to("sp")), ControlSql::Statement("ROLLBACK TO SAVEPOINT \"sp\"".to_owned()));
     assert_eq!(postgres_dialect().sql_for(&release("sp")), ControlSql::Statement("RELEASE SAVEPOINT \"sp\"".to_owned()));
+    assert_eq!(sqlserver_dialect().sql_for(&savepoint("sp")), ControlSql::Statement("SAVE TRANSACTION [sp]".to_owned()));
+    assert_eq!(sqlserver_dialect().sql_for(&rollback_to("sp")), ControlSql::Statement("ROLLBACK TRANSACTION [sp]".to_owned()));
     assert_eq!(sqlserver_dialect().sql_for(&release("sp")), ControlSql::Unsupported);
-    assert_eq!(postgres_dialect().sql_for(&savepoint("sp")), ControlSql::Statement("SAVEPOINT \"sp\"".to_owned()));
+    // 隔离/模式的选项之外不下发。
     assert_eq!(postgres_dialect().sql_for(&isolation(Some(READ_COMMITTED))), postgres_dialect().isolation_sql(Some(READ_COMMITTED)));
-    let bare = unsupported_dialect();
-    assert_eq!(bare.sql_for(&begin()), ControlSql::Statement("BEGIN".to_owned()), "开始事务的 SQL 由方言给出");
-    assert_eq!(bare.sql_for(&savepoint("sp")), ControlSql::Unsupported);
-    assert_eq!(bare.sql_for(&isolation(Some(READ_COMMITTED))), ControlSql::Unsupported, "能力表没有的隔离设置不下发");
-    assert_eq!(sqlite_dialect().sql_for(&begin_with("bogus")), ControlSql::Unsupported, "未声明的模式不下发");
+    assert_eq!(postgres_dialect().sql_for(&isolation(Some(SNAPSHOT))), ControlSql::Unsupported, "PostgreSQL 不提供快照隔离");
+    assert_eq!(postgres_dialect().sql_for(&isolation(Some("bogus"))), ControlSql::Unsupported);
+    assert_eq!(postgres_dialect().sql_for(&ControlStatement::SetMode { mode: Some("bogus".to_owned()) }), ControlSql::Unsupported);
+    assert_eq!(sqlserver_dialect().sql_for(&ControlStatement::SetMode { mode: Some(READ_ONLY.to_owned()) }), ControlSql::Unsupported);
+    // 没有显式事务控制的方言不生成任何控制 SQL。
+    for statement in [begin(), commit(), rollback(), savepoint("sp"), rollback_to("sp"), isolation(Some(READ_COMMITTED))] {
+        assert_eq!(unsupported_dialect().sql_for(&statement), ControlSql::Unsupported, "{statement:?}");
+    }
 }
 
 #[test]
@@ -449,6 +603,7 @@ fn rolling_back_to_an_unknown_savepoint_reports_failure_without_changes() {
     confirmed(&mut machine, &savepoint("a"));
     let before = machine.snapshot().clone();
     assert_eq!(machine.acknowledge(&rollback_to("missing"), ControlOutcome::Rejected), Err(TransactionError::UnknownSavepoint("missing".to_owned())));
+    assert_eq!(machine.precheck(&rollback_to("missing")), Err(TransactionError::UnknownSavepoint("missing".to_owned())));
     assert_eq!(machine.snapshot(), &before, "不伪造部分回滚结果");
     assert_eq!(machine.acknowledge(&rollback_to("a"), ControlOutcome::Rejected), Err(TransactionError::ControlRejected));
     assert_eq!(machine.snapshot(), &before);
@@ -462,6 +617,7 @@ fn rolling_back_to_an_unknown_savepoint_reports_failure_without_changes() {
 fn savepoints_require_an_active_transaction() {
     let mut machine = postgres_machine();
     let before = machine.snapshot().clone();
+    assert_eq!(machine.precheck(&savepoint("sp")), Err(TransactionError::NoActiveTransaction));
     assert_eq!(machine.acknowledge(&savepoint("sp"), ControlOutcome::Confirmed), Err(TransactionError::NoActiveTransaction));
     assert_eq!(machine.snapshot(), &before);
     assert_eq!(machine.acknowledge(&rollback_to("sp"), ControlOutcome::Confirmed), Err(TransactionError::NoActiveTransaction));
@@ -471,11 +627,24 @@ fn savepoints_require_an_active_transaction() {
 
 #[test]
 fn dialects_without_savepoints_refuse_every_savepoint_operation() {
-    let mut machine = machine(unsupported_dialect().capabilities());
+    let mut machine = machine(caps_without_savepoints());
     confirmed(&mut machine, &begin());
+    assert_eq!(machine.precheck(&savepoint("sp")), Err(TransactionError::SavepointsUnsupported));
     assert_eq!(machine.acknowledge(&savepoint("sp"), ControlOutcome::Confirmed), Err(TransactionError::SavepointsUnsupported));
     assert_eq!(machine.acknowledge(&rollback_to("sp"), ControlOutcome::Confirmed), Err(TransactionError::SavepointsUnsupported));
     assert_eq!(machine.acknowledge(&release("sp"), ControlOutcome::Confirmed), Err(TransactionError::SavepointsUnsupported));
+    assert_eq!(machine.state(), TransactionState::Active);
+}
+
+#[test]
+fn dialects_without_explicit_control_refuse_transaction_control() {
+    let mut machine = machine(TransactionCapabilities::UNSUPPORTED);
+    assert_eq!(machine.precheck(&begin()), Err(TransactionError::TransactionsUnsupported));
+    assert_eq!(machine.acknowledge(&begin(), ControlOutcome::Confirmed), Err(TransactionError::TransactionsUnsupported));
+    assert_eq!(machine.state(), TransactionState::Idle, "不支持事务的方言不会进入活动状态");
+    assert_eq!(unsupported_dialect().sql_for(&begin()), ControlSql::Unsupported);
+    assert_eq!(unsupported_dialect().sql_for(&commit()), ControlSql::Unsupported);
+    assert_eq!(unsupported_dialect().sql_for(&rollback()), ControlSql::Unsupported);
 }
 
 #[test]
@@ -483,6 +652,7 @@ fn releasing_a_savepoint_needs_the_capability() {
     let mut machine = machine(sqlserver_dialect().capabilities());
     confirmed(&mut machine, &begin());
     confirmed(&mut machine, &savepoint("sp"));
+    assert_eq!(machine.precheck(&release("sp")), Err(TransactionError::ReleaseSavepointUnsupported));
     assert_eq!(machine.acknowledge(&release("sp"), ControlOutcome::Confirmed), Err(TransactionError::ReleaseSavepointUnsupported));
     assert_eq!(machine.snapshot().savepoints.iter().map(SavepointName::as_str).collect::<Vec<_>>(), vec!["sp"]);
     assert_eq!(machine.state(), TransactionState::Active);
@@ -499,6 +669,7 @@ fn statement_failure_marks_aborted_and_savepoint_recovery_resumes() {
     assert_eq!(machine.snapshot().savepoints.len(), 1, "中止状态不丢弃保存点");
 
     // 回滚到保存点后恢复使用。
+    assert_eq!(machine.precheck(&rollback_to("keep")), Ok(()));
     assert_eq!(machine.acknowledge(&rollback_to("keep"), ControlOutcome::Confirmed), Ok(TransactionEffect::StillActive));
     assert_eq!(machine.state(), TransactionState::Active);
     assert_eq!(machine.observe_statement(StatementOutcome::Succeeded), TransactionEffect::StillActive);
@@ -506,6 +677,26 @@ fn statement_failure_marks_aborted_and_savepoint_recovery_resumes() {
     // 普通失败不会自动回滚事务。
     assert_eq!(machine.observe_statement(StatementOutcome::Failed(StatementFailure::TransactionUsable)), TransactionEffect::StillActive);
     assert_eq!(machine.state(), TransactionState::Active);
+}
+
+#[test]
+fn aborted_recovery_is_limited_to_the_dialect_capability() {
+    // PostgreSQL：可以回滚到保存点恢复。
+    let mut postgres = started(postgres_dialect().capabilities());
+    confirmed(&mut postgres, &savepoint("keep"));
+    postgres.observe_statement(StatementOutcome::Failed(StatementFailure::TransactionAborted));
+    assert_eq!(postgres.precheck(&rollback_to("keep")), Ok(()));
+    assert_eq!(postgres.acknowledge(&rollback_to("keep"), ControlOutcome::Confirmed), Ok(TransactionEffect::StillActive));
+    assert_eq!(postgres.state(), TransactionState::Active);
+
+    // SQL Server：uncommittable，只能整体回滚；保存点恢复入口不可用。
+    let mut sqlserver = started(sqlserver_dialect().capabilities());
+    confirmed(&mut sqlserver, &savepoint("keep"));
+    sqlserver.observe_statement(StatementOutcome::Failed(StatementFailure::TransactionAborted));
+    assert_eq!(sqlserver.precheck(&rollback_to("keep")), Err(TransactionError::RecoveryRequiresFullRollback));
+    assert_eq!(sqlserver.state(), TransactionState::Aborted, "预检不改变状态");
+    assert_eq!(sqlserver.acknowledge(&rollback(), ControlOutcome::Confirmed), Ok(TransactionEffect::RolledBack));
+    assert_eq!(sqlserver.state(), TransactionState::Idle);
 }
 
 #[test]
@@ -531,10 +722,10 @@ fn aborted_commit_reports_rollback_and_never_fakes_success() {
 }
 
 #[test]
-fn unconfirmed_commit_becomes_unknown_and_survives_reconnect() {
+fn unconfirmed_commit_becomes_unknown_and_new_transactions_do_not_clear_the_old_record() {
     let mut machine = started(mysql_dialect().capabilities());
-    confirmed(&mut machine, &savepoint("sp"));
     let generation = machine.snapshot().generation;
+    confirmed(&mut machine, &savepoint("sp"));
     assert_eq!(
         machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)),
         Ok(TransactionEffect::Unknown)
@@ -556,26 +747,40 @@ fn unconfirmed_commit_becomes_unknown_and_survives_reconnect() {
     assert_eq!(machine.state(), TransactionState::Idle);
     assert!(machine.snapshot().savepoints.is_empty());
     assert_eq!(machine.snapshot().settings.isolation, None);
+    assert_eq!(machine.snapshot().depth, 0);
     let unresolved = machine.snapshot().unresolved.clone().expect("重连后仍保留旧事务未知信息");
     assert_eq!(unresolved.state, TransactionState::Active);
     assert_eq!(unresolved.generation, generation);
 
-    // 新事务结束后旧信息才算解决。
+    // 新事务的提交不得清除旧事务的未知信息（R10）。
     confirmed(&mut machine, &begin());
-    assert!(machine.snapshot().unresolved.is_some(), "新事务不会清除旧事务的未知信息");
-    confirmed(&mut machine, &commit());
+    assert_eq!(confirmed(&mut machine, &commit()), TransactionEffect::Committed);
+    assert_eq!(machine.state(), TransactionState::Idle);
+    let unresolved = machine.snapshot().unresolved.clone().expect("新事务结束不清除旧未知");
+    assert_eq!(unresolved.generation, generation);
+
+    // 只有独立核对（用户确认或另一条连接的结果）能关闭未知记录。
+    let resolved = machine.resolve_unknown(UnknownResolution::Committed).expect("核对旧事务");
+    assert_eq!(resolved.reason, UnknownReason::ControlUnconfirmed);
+    assert_eq!(resolved.state, TransactionState::Active);
     assert!(machine.snapshot().unresolved.is_none());
+    assert_eq!(machine.state(), TransactionState::Idle, "核对不改变已确认的会话状态");
+    assert_eq!(machine.snapshot().last_effect, TransactionEffect::Committed);
+    assert!(machine.resolve_unknown(UnknownResolution::RolledBack).is_none(), "没有未知记录时不做任何事");
 }
 
 #[test]
-fn unconfirmed_rollback_is_unknown_until_a_later_confirmed_result() {
+fn confirming_the_unknown_transactions_outcome_clears_it() {
     let mut machine = started(postgres_dialect().capabilities());
     assert_eq!(
         machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost)),
         Ok(TransactionEffect::Unknown)
     );
     assert_eq!(machine.state(), TransactionState::Unknown);
-    // 用户再次回滚并得到确认：结果按已回滚报告，未知信息清除。
+    assert!(machine.snapshot().unresolved.is_some());
+    // 未知结果仍允许明确的回滚/提交核对路径。
+    assert_eq!(machine.precheck(&rollback()), Ok(()));
+    // 再次回滚并得到确认：这是对当前未知事务结局的直接观测。
     assert_eq!(machine.acknowledge(&rollback(), ControlOutcome::Confirmed), Ok(TransactionEffect::RolledBack));
     assert_eq!(machine.state(), TransactionState::Idle);
     assert!(machine.snapshot().unresolved.is_none());
@@ -597,20 +802,84 @@ fn unrecognized_effect_never_advances_to_success() {
 #[test]
 fn reconnect_without_a_transaction_reports_no_loss() {
     let mut machine = postgres_machine();
+    let generation = machine.snapshot().generation;
     assert_eq!(machine.reconnect(UnknownReason::ConnectionLost), TransactionEffect::Unchanged);
     assert_eq!(machine.state(), TransactionState::Idle);
+    assert_eq!(machine.snapshot().generation, generation, "没有事务时重连不推进代次");
     assert!(machine.snapshot().unresolved.is_none());
 }
 
 #[test]
 fn losing_the_connection_during_a_statement_marks_the_transaction_unknown() {
     let mut machine = started(postgres_dialect().capabilities());
-    assert_eq!(
-        machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost)),
-        TransactionEffect::Unknown
-    );
+    assert_eq!(machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost)), TransactionEffect::Unknown);
     assert_eq!(machine.state(), TransactionState::Unknown);
     assert_eq!(machine.snapshot().unresolved.as_ref().map(|unresolved| unresolved.reason), Some(UnknownReason::ConnectionLost));
+}
+
+#[test]
+fn probe_observation_reports_lost_outcome_instead_of_guessing() {
+    // 未知事务被探针确认为 Idle：不推断提交或回滚，保留未知记录。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    let generation = machine.snapshot().generation;
+    assert_eq!(machine.observe_probe(TransactionProbe::Idle), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert_eq!(machine.snapshot().generation, generation + 1);
+    assert_eq!(machine.snapshot().depth, 0);
+    assert!(machine.snapshot().unresolved.is_some(), "终点未知的结果继续保留");
+
+    // 探针确认事务仍活动：采纳观测，旧结果仍未知。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert_eq!(machine.state(), TransactionState::Active);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 探针确认中止。
+    let mut machine = started(postgres_dialect().capabilities());
+    assert_eq!(machine.observe_probe(TransactionProbe::Aborted), TransactionEffect::Aborted);
+    assert_eq!(machine.state(), TransactionState::Aborted);
+
+    // 没有事务却报告中止：观测自相矛盾，不能据此推出可用状态。
+    let mut machine = postgres_machine();
+    assert_eq!(machine.observe_probe(TransactionProbe::Aborted), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Unknown);
+
+    // SQL Server 的探针层数被登记，提交只减少层数。
+    let mut machine = started(sqlserver_dialect().capabilities());
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 2 }), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, 2);
+    assert_eq!(confirmed(&mut machine, &commit()), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, 1);
+}
+
+#[test]
+fn generation_and_unresolved_follow_the_documented_rules() {
+    // 开始/结束推进代次；保存点与中止不推进。
+    let mut machine = started(postgres_dialect().capabilities());
+    let after_start = machine.snapshot().generation;
+    confirmed(&mut machine, &savepoint("sp"));
+    assert_eq!(machine.snapshot().generation, after_start);
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::TransactionAborted));
+    assert_eq!(machine.state(), TransactionState::Aborted);
+    assert_eq!(machine.snapshot().generation, after_start, "中止不是新事务");
+    confirmed(&mut machine, &rollback());
+    assert_eq!(machine.snapshot().generation, after_start + 1);
+
+    // Idle 下 BEGIN 结果未确认：记录“无法确认是否已经开始了事务”，不宣称活动。
+    let mut idle = postgres_machine();
+    assert_eq!(idle.acknowledge(&begin(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)), Ok(TransactionEffect::Unknown));
+    assert_eq!(idle.state(), TransactionState::Unknown);
+    let unresolved = idle.snapshot().unresolved.as_ref().expect("state == Unknown 必须有未知记录");
+    assert_eq!(unresolved.state, TransactionState::Idle);
+    assert_eq!(unresolved.reason, UnknownReason::ControlUnconfirmed);
+
+    // 未知状态不能被普通语句或保存点操作推进。
+    assert_eq!(idle.precheck(&savepoint("sp")), Err(TransactionError::UnknownOutcome));
+    assert_eq!(idle.observe_statement(StatementOutcome::Succeeded), TransactionEffect::Unknown);
+    assert_eq!(idle.state(), TransactionState::Unknown);
 }
 
 #[test]
@@ -628,6 +897,7 @@ fn isolation_is_limited_to_the_dialect_levels() {
     assert_eq!(machine.acknowledge(&isolation(Some(SNAPSHOT)), ControlOutcome::Confirmed), Err(TransactionError::IsolationUnsupported(SNAPSHOT.to_owned())));
     assert_eq!(machine.snapshot().settings.isolation, None, "不支持的级别不静默替换");
 
+    assert_eq!(machine.precheck(&isolation(Some(READ_COMMITTED))), Ok(()));
     assert_eq!(machine.acknowledge(&isolation(Some(READ_COMMITTED)), ControlOutcome::Confirmed), Ok(TransactionEffect::Unchanged));
     assert_eq!(machine.snapshot().settings.isolation.as_deref(), Some(READ_COMMITTED));
 
@@ -635,14 +905,20 @@ fn isolation_is_limited_to_the_dialect_levels() {
     assert_eq!(machine.snapshot().settings.isolation, None, "恢复服务器默认");
 
     // 方言没有这类设置时明确拒绝。
-    let mut bare = machine_for(&unsupported_dialect());
+    let mut bare = TransactionMachine::new("conn-1", caps_without_settings());
+    assert_eq!(bare.precheck(&isolation(Some(READ_COMMITTED))), Err(TransactionError::IsolationUnsupported(READ_COMMITTED.to_owned())));
     assert_eq!(bare.acknowledge(&isolation(Some(READ_COMMITTED)), ControlOutcome::Confirmed), Err(TransactionError::IsolationUnsupported(READ_COMMITTED.to_owned())));
+    // 完全没有显式事务控制的方言：任何控制语句都按“不支持事务”拒绝。
+    let mut unsupported = TransactionMachine::new("conn-1", TransactionCapabilities::UNSUPPORTED);
+    assert_eq!(unsupported.acknowledge(&isolation(Some(READ_COMMITTED)), ControlOutcome::Confirmed), Err(TransactionError::TransactionsUnsupported));
+    assert_eq!(unsupported.state(), TransactionState::Idle);
 }
 
 #[test]
 fn changing_isolation_inside_a_transaction_is_refused_without_committing() {
     let mut machine = started(postgres_dialect().capabilities());
     let before = machine.snapshot().clone();
+    assert_eq!(machine.precheck(&isolation(Some(SERIALIZABLE))), Err(TransactionError::SettingLocked("隔离级别")));
     assert_eq!(machine.acknowledge(&isolation(Some(SERIALIZABLE)), ControlOutcome::Confirmed), Err(TransactionError::SettingLocked("隔离级别")));
     assert_eq!(machine.snapshot(), &before, "设置失败不提交、不结束原事务");
     assert_eq!(machine.state(), TransactionState::Active);
@@ -671,6 +947,7 @@ fn unconfirmed_or_rejected_isolation_is_not_shown_as_applied() {
 #[test]
 fn transaction_mode_is_limited_to_the_dialect_modes() {
     let mut sqlite = machine(sqlite_dialect().capabilities());
+    assert_eq!(sqlite.precheck(&begin_with("bogus")), Err(TransactionError::ModeUnsupported("bogus".to_owned())));
     assert_eq!(sqlite.acknowledge(&begin_with("bogus"), ControlOutcome::Confirmed), Err(TransactionError::ModeUnsupported("bogus".to_owned())));
     assert_eq!(sqlite.state(), TransactionState::Idle);
 
@@ -680,10 +957,6 @@ fn transaction_mode_is_limited_to_the_dialect_modes() {
     let mut postgres = postgres_machine();
     assert_eq!(postgres.acknowledge(&ControlStatement::SetMode { mode: Some(READ_ONLY.to_owned()) }, ControlOutcome::Confirmed), Ok(TransactionEffect::Unchanged));
     assert_eq!(postgres.snapshot().settings.mode.as_deref(), Some(READ_ONLY));
-}
-
-fn begin_with(mode: &str) -> ControlStatement {
-    ControlStatement::Begin { mode: Some(mode.to_owned()) }
 }
 
 #[test]
@@ -699,6 +972,15 @@ fn implicit_commit_ends_the_transaction_and_clears_savepoints() {
     // 自动提交下没有可被隐式提交的事务，不报告隐式提交。
     assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::Unchanged));
     assert_eq!(machine.state(), TransactionState::Idle);
+
+    // 旧事务的未知记录不因新事务的隐式提交消失。
+    let mut machine = mysql_machine();
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    machine.reconnect(UnknownReason::ConnectionLost);
+    confirmed(&mut machine, &begin());
+    confirmed(&mut machine, &savepoint("sp"));
+    assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::ImplicitCommit));
+    assert!(machine.snapshot().unresolved.is_some(), "旧未知只由核对关闭");
 }
 
 #[test]
@@ -718,6 +1000,7 @@ fn chained_transactions_stay_active_only_where_supported() {
     assert_eq!(machine.state(), TransactionState::Active, "AND CHAIN 立即开始新事务");
     assert!(machine.snapshot().savepoints.is_empty());
     assert_eq!(machine.snapshot().generation, 2, "提交加链式开始只推进一次代次");
+    assert_eq!(machine.snapshot().depth, 1);
 
     let mut sqlite = started(sqlite_dialect().capabilities());
     let before = sqlite.snapshot().clone();
@@ -733,7 +1016,7 @@ fn dialect_controls_expose_capability_boundaries() {
     assert_eq!(sqlite_dialect().begin_sql(Some("immediate")), "BEGIN IMMEDIATE");
     assert_eq!(postgres_dialect().begin_sql(None), "BEGIN");
     assert_eq!(postgres_dialect().commit_sql(true), "COMMIT AND CHAIN");
-    assert_eq!(sqlite_dialect().isolation_sql(None), ControlSql::Statement("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL DEFAULT".to_owned()));
+    assert_eq!(postgres_dialect().isolation_sql(None), ControlSql::Statement("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL DEFAULT".to_owned()));
     assert_eq!(
         mysql_dialect().isolation_sql(Some(READ_COMMITTED)),
         ControlSql::Statement("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED".to_owned())
@@ -741,22 +1024,28 @@ fn dialect_controls_expose_capability_boundaries() {
     assert_eq!(mysql_dialect().mode_sql(Some(READ_ONLY)), ControlSql::Statement("SET TRANSACTION READ ONLY".to_owned()));
     assert_eq!(sqlite_dialect().mode_sql(Some("bogus")), ControlSql::Unsupported);
 
-    // 保存点与释放按能力表回答。
+    // 保存点、释放、显式控制与重复开始按能力表回答。
     assert!(postgres_dialect().capabilities().savepoints);
     assert!(!sqlserver_dialect().capabilities().release_savepoint);
-    assert_eq!(unsupported_dialect().capabilities().isolation.change, SettingChange::Unsupported);
+    assert!(postgres_dialect().capabilities().explicit_control);
+    assert!(!unsupported_dialect().capabilities().explicit_control);
+    assert_eq!(postgres_dialect().capabilities().duplicate_begin, DuplicateBegin::Ignored);
+    assert_eq!(mysql_dialect().capabilities().duplicate_begin, DuplicateBegin::EndsPrevious);
+    assert_eq!(sqlite_dialect().capabilities().duplicate_begin, DuplicateBegin::Rejected);
+    assert_eq!(sqlserver_dialect().capabilities().duplicate_begin, DuplicateBegin::Nests);
+
+    // 中止后的恢复能力是显式声明，不让所有引擎共享同一种“中止”。
+    assert_eq!(postgres_dialect().capabilities().aborted, AbortedRecovery::SavepointRecovery);
+    assert_eq!(sqlserver_dialect().capabilities().aborted, AbortedRecovery::RollbackOnly);
+    assert_eq!(mysql_dialect().capabilities().aborted, AbortedRecovery::NotApplicable);
 
     // 隐式提交只有 MySQL/MariaDB 家族；其余方言必须回答“不适用”。
     assert_eq!(postgres_dialect().capabilities().implicit_commit, ImplicitCommitSupport::NotApplicable);
     assert_eq!(mysql_dialect().capabilities().implicit_commit, ImplicitCommitSupport::MysqlFamily);
     assert_eq!(postgres_dialect().implicit_commit("CREATE TABLE t (id INT)"), ImplicitCommitVerdict::NotApplicable);
     assert_eq!(mysql_dialect().implicit_commit("CREATE TABLE t (id INT)"), ImplicitCommitVerdict::Uncertain, "未由适配器分类前不宣称发生隐式提交");
-
-    // 中止状态与链式事务是显式能力，未声明的方言不受伪装。
-    assert!(postgres_dialect().capabilities().aborted_state);
-    assert!(sqlserver_dialect().capabilities().aborted_state);
-    assert!(!mysql_dialect().capabilities().aborted_state);
     assert!(!sqlite_dialect().capabilities().chained_transactions);
+    assert_eq!(unsupported_dialect().capabilities().isolation.change, SettingChange::Unsupported);
 }
 
 #[test]

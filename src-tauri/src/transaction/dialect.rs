@@ -57,16 +57,42 @@ pub enum ImplicitCommitSupport {
     MysqlFamily,
 }
 
+/// 活动事务中再次执行开始语句时数据库的真实行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateBegin {
+    /// 隐式提交旧事务并开始新事务（MySQL/MariaDB 的 `BEGIN`、`START TRANSACTION`）。
+    EndsPrevious,
+    /// 增加事务层数，一次提交不会结束外层事务（SQL Server 的 `@@TRANCOUNT`）。
+    Nests,
+    /// 警告并忽略，事务身份不变（PostgreSQL）。
+    Ignored,
+    /// 明确拒绝（SQLite 的 “cannot start a transaction within a transaction”）。
+    Rejected,
+}
+
+/// 语句错误后事务进入中止状态时的恢复能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortedRecovery {
+    /// 该方言不会把事务置为中止状态（MySQL/MariaDB、SQLite）。
+    NotApplicable,
+    /// 中止后可以回滚到保存点恢复（PostgreSQL）。
+    SavepointRecovery,
+    /// 中止后只能整体回滚（SQL Server 的 `XACT_STATE() = -1`）。
+    RollbackOnly,
+}
+
 /// 方言提供的事务能力边界。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransactionCapabilities {
+    /// 连接是否提供显式事务控制。关系型为 true；没有事务控制的方言为 false。
+    pub explicit_control: bool,
     pub savepoints: bool,
     /// 是否提供 `RELEASE SAVEPOINT`（SQL Server 只有 `SAVE TRANSACTION`，没有释放）。
     pub release_savepoint: bool,
     /// 是否支持 `COMMIT/ROLLBACK AND CHAIN`。
     pub chained_transactions: bool,
-    /// 语句错误后事务是否进入中止状态（PostgreSQL 类）。
-    pub aborted_state: bool,
+    pub duplicate_begin: DuplicateBegin,
+    pub aborted: AbortedRecovery,
     pub isolation: SettingSupport,
     pub mode: SettingSupport,
     pub implicit_commit: ImplicitCommitSupport,
@@ -75,10 +101,12 @@ pub struct TransactionCapabilities {
 impl TransactionCapabilities {
     /// 非事务方言（Redis、MongoDB 或引擎未知）：什么都不支持。
     pub const UNSUPPORTED: Self = Self {
+        explicit_control: false,
         savepoints: false,
         release_savepoint: false,
         chained_transactions: false,
-        aborted_state: false,
+        duplicate_begin: DuplicateBegin::Rejected,
+        aborted: AbortedRecovery::NotApplicable,
         isolation: SettingSupport::NONE,
         mode: SettingSupport::NONE,
         implicit_commit: ImplicitCommitSupport::NotApplicable,
@@ -103,7 +131,7 @@ pub enum ControlMatch {
     Control(ControlStatement),
     /// 不是事务控制语句，按普通语句执行。
     Ordinary,
-    /// 以事务控制关键字开头但形态超出可确认范围（过程、动态 SQL、未识别修饰语等）：
+    /// 以事务控制关键字开头但形态超出可确认范围（多条语句、过程、动态 SQL、未识别修饰语等）：
     /// 执行后必须按未知处理，不能当普通语句忽略，也不能据此推断成功。
     Ambiguous,
 }
@@ -172,13 +200,11 @@ pub trait TransactionDialect: Sync {
 
     fn rollback_sql(&self, chain: bool) -> String;
 
-    fn savepoint_sql(&self, name: &SavepointName) -> String {
-        format!("SAVEPOINT {}", self.quote_identifier(name.as_str()))
-    }
+    /// 创建保存点的语句。必须由方言实现：标准写法与 `SAVE TRANSACTION` 不能互相替代。
+    fn savepoint_sql(&self, name: &SavepointName) -> String;
 
-    fn rollback_to_savepoint_sql(&self, name: &SavepointName) -> String {
-        format!("ROLLBACK TO SAVEPOINT {}", self.quote_identifier(name.as_str()))
-    }
+    /// 回滚到保存点的语句。必须由方言实现（T-SQL 的 `ROLLBACK TRANSACTION <name>`）。
+    fn rollback_to_savepoint_sql(&self, name: &SavepointName) -> String;
 
     /// 释放保存点。方言在能力表里没有释放入口时返回 [`ControlSql::Unsupported`]。
     fn release_savepoint_sql(&self, name: &SavepointName) -> ControlSql {
@@ -198,9 +224,13 @@ pub trait TransactionDialect: Sync {
     /// 调用方不得为了继续执行而改用别的会话或静默降级。
     fn sql_for(&self, statement: &ControlStatement) -> ControlSql {
         let capabilities = self.capabilities();
+        // 没有显式事务控制的方言不生成任何控制语句。
+        if !capabilities.explicit_control {
+            return ControlSql::Unsupported;
+        }
         match statement {
             ControlStatement::Begin { mode } => match mode {
-                Some(mode) if !capabilities.mode.options.iter().any(|option| option.id == mode) => ControlSql::Unsupported,
+                Some(mode) if !supports_option(capabilities.mode, mode) => ControlSql::Unsupported,
                 _ => ControlSql::Statement(self.begin_sql(mode.as_deref())),
             },
             ControlStatement::Commit { chain } => {
@@ -230,22 +260,13 @@ pub trait TransactionDialect: Sync {
                 }
             }
             ControlStatement::ReleaseSavepoint(name) => self.release_savepoint_sql(name),
-            ControlStatement::SetIsolation { level } => {
-                if capabilities.isolation.change == SettingChange::Unsupported {
-                    return ControlSql::Unsupported;
-                }
-                self.isolation_sql(level.as_deref())
-            }
-            ControlStatement::SetMode { mode } => {
-                if capabilities.mode.change == SettingChange::Unsupported {
-                    return ControlSql::Unsupported;
-                }
-                self.mode_sql(mode.as_deref())
-            }
+            ControlStatement::SetIsolation { level } => setting_sql(capabilities.isolation, level.as_deref(), |level| self.isolation_sql(level)),
+            ControlStatement::SetMode { mode } => setting_sql(capabilities.mode, mode.as_deref(), |mode| self.mode_sql(mode)),
         }
     }
 
-    /// 分类一条手写语句。调用方负责按方言切分出单条语句。
+    /// 分类一条手写语句。调用方负责按方言切分出单条语句；传入多条语句时返回
+    /// [`ControlMatch::Ambiguous`]，不能当成单条控制语句处理。
     fn classify_control(&self, body: &str) -> ControlMatch {
         classify_control(body, self.syntax())
     }
@@ -259,6 +280,23 @@ pub trait TransactionDialect: Sync {
     }
 }
 
+fn supports_option(support: SettingSupport, value: &str) -> bool {
+    support.change != SettingChange::Unsupported && support.options.iter().any(|option| option.id == value)
+}
+
+/// 设置语句只在方言声明了这类设置、且值在选项内时生成。
+fn setting_sql(support: SettingSupport, value: Option<&str>, sql: impl FnOnce(Option<&str>) -> ControlSql) -> ControlSql {
+    if support.change == SettingChange::Unsupported {
+        return ControlSql::Unsupported;
+    }
+    if let Some(value) = value {
+        if !supports_option(support, value) {
+            return ControlSql::Unsupported;
+        }
+    }
+    sql(value)
+}
+
 /// 按 [`ControlSyntax`] 分类一条手写语句。
 ///
 /// 只做保守的前缀识别：识别不了的形态返回 [`ControlMatch::Ambiguous`]，普通 SQL 返回
@@ -266,8 +304,14 @@ pub trait TransactionDialect: Sync {
 pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
     let code = strip_comments(body, syntax.hash_comments, syntax.identifier_quotes);
     let code = code.trim();
-    let code = code.strip_suffix(';').map(str::trim_end).unwrap_or(code);
-    let tokens = tokenize(code, syntax.identifier_quotes);
+    // 去掉所有开头/结尾的空语句与分号（`COMMIT;;`、`; COMMIT` 都是单条语句）；
+    // 中间的分号说明传入了多条语句。
+    let code = code.trim_start_matches(|ch: char| ch == ';' || ch.is_whitespace());
+    let code = code.trim_end_matches(|ch: char| ch == ';' || ch.is_whitespace());
+    let (tokens, multiple) = tokenize(code, syntax.identifier_quotes);
+    if multiple {
+        return ControlMatch::Ambiguous;
+    }
     let Some(first) = tokens.first() else { return ControlMatch::Ordinary };
     if first.quoted || first.text.is_empty() {
         return ControlMatch::Ordinary;
@@ -445,8 +489,12 @@ struct Token {
     quoted: bool,
 }
 
-fn tokenize(code: &str, quotes: &[(char, char)]) -> Vec<Token> {
+/// 切出代码词，并报告是否出现语句分隔符（说明传入了多条语句）。
+///
+/// 循环保证每次都消耗至少一个字符：分隔符被显式消费，无法识别的字符按单个词消耗。
+fn tokenize(code: &str, quotes: &[(char, char)]) -> (Vec<Token>, bool) {
     let mut tokens = Vec::new();
+    let mut multiple = false;
     let mut rest = code.trim_start();
     while !rest.is_empty() {
         let first = rest.chars().next().unwrap();
@@ -458,18 +506,27 @@ fn tokenize(code: &str, quotes: &[(char, char)]) -> Vec<Token> {
             let (value, used) = read_quoted(&rest[1..], '\'');
             tokens.push(Token { upper: value.to_uppercase(), text: value, quoted: true });
             rest = &rest[1..][used..];
+        } else if first == ';' {
+            multiple = true;
+            rest = &rest[1..];
         } else if matches!(first, '(' | ')' | ',' | '=') {
             tokens.push(Token { upper: first.to_string(), text: first.to_string(), quoted: true });
             rest = &rest[first.len_utf8()..];
         } else {
             let end = rest.find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '(' | ')' | ',' | '=')).unwrap_or(rest.len());
-            let value = &rest[..end];
-            tokens.push(Token { upper: value.to_ascii_uppercase(), text: value.to_owned(), quoted: false });
-            rest = &rest[end..];
+            if end == 0 {
+                // 理论上不会发生（上面的分支已覆盖分隔符）；仍然显式消费一个字符，保证不挂死。
+                tokens.push(Token { upper: first.to_string(), text: first.to_string(), quoted: true });
+                rest = &rest[first.len_utf8()..];
+            } else {
+                let value = &rest[..end];
+                tokens.push(Token { upper: value.to_ascii_uppercase(), text: value.to_owned(), quoted: false });
+                rest = &rest[end..];
+            }
         }
         rest = rest.trim_start();
     }
-    tokens
+    (tokens, multiple)
 }
 
 /// 读取引号内文本，返回去转义后的值与消耗的字节数（含结束引号）。

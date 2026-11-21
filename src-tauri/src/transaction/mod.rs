@@ -8,12 +8,13 @@ pub mod dialect;
 pub mod model;
 
 pub use dialect::{
-    classify_control, ControlMatch, ControlSql, ControlSyntax, ImplicitCommitSupport, ImplicitCommitVerdict, SettingChange, SettingOption, SettingSupport,
-    TransactionCapabilities, TransactionDialect, READ_COMMITTED, READ_ONLY, READ_UNCOMMITTED, READ_WRITE, REPEATABLE_READ, SERIALIZABLE, SNAPSHOT,
+    classify_control, AbortedRecovery, ControlMatch, ControlSql, ControlSyntax, DuplicateBegin, ImplicitCommitSupport, ImplicitCommitVerdict, SettingChange,
+    SettingOption, SettingSupport, TransactionCapabilities, TransactionDialect, READ_COMMITTED, READ_ONLY, READ_UNCOMMITTED, READ_WRITE, REPEATABLE_READ,
+    SERIALIZABLE, SNAPSHOT,
 };
 pub use model::{
-    ControlOutcome, ControlStatement, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine, TransactionSettings,
-    TransactionSnapshot, TransactionState, UnknownReason, UnknownTransaction,
+    ControlOutcome, ControlStatement, SavepointName, StatementFailure, StatementOutcome, TransactionEffect, TransactionError, TransactionMachine, TransactionProbe,
+    TransactionSettings, TransactionSnapshot, TransactionState, UnknownReason, UnknownResolution, UnknownTransaction,
 };
 
 pub fn module_id() -> &'static str {
@@ -25,9 +26,12 @@ pub fn module_id() -> &'static str {
         std::any::type_name::<TransactionCapabilities>(),
         std::any::type_name::<UnknownTransaction>(),
         std::any::type_name_of_val(&classify_control),
+        std::any::type_name_of_val(&TransactionMachine::precheck),
         std::any::type_name_of_val(&TransactionMachine::acknowledge),
         std::any::type_name_of_val(&TransactionMachine::observe_statement),
         std::any::type_name_of_val(&TransactionMachine::observe_implicit_commit),
+        std::any::type_name_of_val(&TransactionMachine::observe_probe),
+        std::any::type_name_of_val(&TransactionMachine::resolve_unknown),
         std::any::type_name_of_val(&TransactionMachine::reconnect),
     );
     let _ = _linked;
