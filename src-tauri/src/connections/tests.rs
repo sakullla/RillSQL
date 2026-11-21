@@ -1757,3 +1757,75 @@ async fn sqlite_business_pool_keeps_an_open_transaction_between_statements() {
     assert_eq!(after, 0, "回滚撤销事务中的结构变更");
     let _ = std::fs::remove_dir_all(dir);
 }
+/// 编辑连接引擎后重新打开：旧方言不能驱动新会话，但旧事务的未知记录不能丢（R10）。
+#[tokio::test]
+async fn editing_the_engine_keeps_the_previous_unknown_transaction() {
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionState, UnknownReason, UnknownResolution};
+
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(false) });
+    let service = Arc::new(Service::with_probes(
+        dir.join("conn.sqlite"),
+        Arc::new(MemoryStore::default()),
+        health_probes(db.clone(), health.clone()),
+    ));
+    let mut draft = remote_draft(Engine::Mysql);
+    draft.id = Some("svc".to_owned());
+    service.save(draft, secrets("pw", "", "")).await.unwrap();
+    assert!(service.open("svc", SecretInput::default()).await.unwrap().connected);
+
+    let coordinator = service.transaction_coordinator("svc").expect("事务协调器");
+    coordinator.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    coordinator
+        .acknowledge(&ControlStatement::Commit { chain: false }, ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed))
+        .unwrap();
+    assert_eq!(service.transaction_snapshot("svc").unwrap().state, TransactionState::Unknown);
+
+    // 把连接引擎改成 PostgreSQL 再打开：新会话从 Idle 开始，旧事务未知记录随连接保留。
+    let mut edited = remote_draft(Engine::Postgres);
+    edited.id = Some("svc".to_owned());
+    service.save(edited, SecretInput::default()).await.unwrap();
+    assert!(service.open("svc", SecretInput::default()).await.unwrap().connected);
+
+    let snapshot = service.transaction_snapshot("svc").expect("仍有事务快照");
+    assert_eq!(snapshot.state, TransactionState::Idle, "新会话不显示旧事务仍活动");
+    let record = snapshot.unresolved.expect("引擎变更不能丢掉旧事务的未知结果");
+    assert_eq!(record.reason, UnknownReason::ControlUnconfirmed);
+
+    // 新会话里开始新事务也不会清除旧未知（R10）。
+    let coordinator = service.transaction_coordinator("svc").expect("事务协调器");
+    let begin = coordinator.begin(None).unwrap();
+    coordinator.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
+    let snapshot = service.transaction_snapshot("svc").unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active);
+    assert!(snapshot.unresolved.is_some(), "新事务不清除旧事务的未知记录");
+
+    // 独立核对可以关闭这条历史记录；当前新事务不受影响。
+    let resolved = coordinator
+        .resolve_unknown(UnknownResolution::RolledBack)
+        .expect("旧事务记录可被核对关闭");
+    assert_eq!(resolved.reason, UnknownReason::ControlUnconfirmed);
+    let snapshot = service.transaction_snapshot("svc").unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active, "核对旧事务不结束当前事务");
+    assert!(snapshot.unresolved.is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 重开连接不能把正在执行的业务批次留在被替换的会话上：先等旧租约释放（ADR-1）。
+#[tokio::test]
+async fn reopening_waits_for_a_running_business_lease() {
+    use std::time::Duration;
+
+    let dir = temp_workspace();
+    let database = dir.join("notes.sqlite");
+    sqlite_fixture(&database).await;
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+
+    let held = service.query_session("notes").await.unwrap().expect("业务会话");
+    let blocked = tokio::time::timeout(Duration::from_millis(60), service.open("notes", SecretInput::default())).await;
+    assert!(blocked.is_err(), "旧业务执行未结束前不替换会话");
+    drop(held);
+    assert!(service.open("notes", SecretInput::default()).await.unwrap().connected);
+    let _ = std::fs::remove_dir_all(dir);
+}

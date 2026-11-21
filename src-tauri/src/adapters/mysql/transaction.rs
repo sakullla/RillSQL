@@ -88,10 +88,11 @@ impl TransactionDialect for MysqlTransaction {
     }
 
     /// `SET SESSION TRANSACTION ISOLATION LEVEL` 只影响后续事务，不会提交当前事务。
+    /// 恢复默认用系统变量赋 `DEFAULT`（回到全局值），全局值可能被服务器配置改过（只读副本常见），
+    /// 不能写死 REPEATABLE READ。MariaDB 11.1+ 与 MySQL 都认这个变量名。
     fn isolation_sql(&self, level: Option<&str>) -> ControlSql {
         match level {
-            // 服务器默认就是 REPEATABLE READ（MySQL、MariaDB 一致）；恢复默认时明确写回它。
-            None => ControlSql::Statement("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned()),
+            None => ControlSql::Statement("SET SESSION transaction_isolation = DEFAULT".to_owned()),
             Some(level) => match isolation_keyword(level) {
                 Some(keyword) => ControlSql::Statement(format!("SET SESSION TRANSACTION ISOLATION LEVEL {keyword}")),
                 None => ControlSql::Unsupported,
@@ -99,9 +100,11 @@ impl TransactionDialect for MysqlTransaction {
         }
     }
 
+    /// 恢复默认模式的语义是回到全局 `transaction_read_only`，而不是写死 READ WRITE。
     fn mode_sql(&self, mode: Option<&str>) -> ControlSql {
         match mode {
-            None | Some(READ_WRITE) => ControlSql::Statement("SET SESSION TRANSACTION READ WRITE".to_owned()),
+            None => ControlSql::Statement("SET SESSION transaction_read_only = DEFAULT".to_owned()),
+            Some(READ_WRITE) => ControlSql::Statement("SET SESSION TRANSACTION READ WRITE".to_owned()),
             Some(READ_ONLY) => ControlSql::Statement("SET SESSION TRANSACTION READ ONLY".to_owned()),
             Some(_) => ControlSql::Unsupported,
         }
@@ -168,8 +171,21 @@ pub(crate) fn mysql_implicit_commit(body: &str) -> ImplicitCommitVerdict {
             _ => ImplicitCommitVerdict::Uncertain,
         },
         "CREATE" | "DROP" if second == "TEMPORARY" => ImplicitCommitVerdict::NotApplicable,
-        "ALTER" | "CREATE" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" | "ANALYZE" | "OPTIMIZE" | "REPAIR" | "FLUSH" | "RESET" | "INSTALL"
-        | "UNINSTALL" | "CACHE" | "LOCK" | "UNLOCK" => ImplicitCommitVerdict::Yes,
+        "ALTER" | "CREATE" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" | "ANALYZE" | "OPTIMIZE" | "REPAIR" | "FLUSH" | "INSTALL"
+        | "UNINSTALL" | "CACHE" => ImplicitCommitVerdict::Yes,
+        // RESET 在清单里，但 RESET PERSIST 明确不隐式提交。
+        "RESET" => match second {
+            "PERSIST" => ImplicitCommitVerdict::NotApplicable,
+            _ => ImplicitCommitVerdict::Yes,
+        },
+        // LOCK TABLES 隐式提交；LOCK INSTANCE FOR BACKUP 不隐式提交，其他形态无法静态确认。
+        "LOCK" => match second {
+            "TABLES" => ImplicitCommitVerdict::Yes,
+            "INSTANCE" => ImplicitCommitVerdict::NotApplicable,
+            _ => ImplicitCommitVerdict::Uncertain,
+        },
+        // UNLOCK TABLES 只在此前 LOCK TABLES 取得表锁时才隐式提交：不能无条件宣称。
+        "UNLOCK" => ImplicitCommitVerdict::Uncertain,
         "SET" => match second {
             "PASSWORD" => ImplicitCommitVerdict::Yes,
             "AUTOCOMMIT" => ImplicitCommitVerdict::Uncertain,
@@ -277,8 +293,11 @@ mod tests {
             dialect.isolation_sql(Some(SERIALIZABLE)),
             ControlSql::Statement("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE".to_owned())
         );
-        assert_eq!(dialect.isolation_sql(None), ControlSql::Statement("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned()));
+        // 恢复默认必须回到全局值：只读副本等环境的全局默认不是 REPEATABLE READ。
+        assert_eq!(dialect.isolation_sql(None), ControlSql::Statement("SET SESSION transaction_isolation = DEFAULT".to_owned()));
         assert_eq!(dialect.mode_sql(Some(READ_ONLY)), ControlSql::Statement("SET SESSION TRANSACTION READ ONLY".to_owned()));
+        assert_eq!(dialect.mode_sql(Some(READ_WRITE)), ControlSql::Statement("SET SESSION TRANSACTION READ WRITE".to_owned()));
+        assert_eq!(dialect.mode_sql(None), ControlSql::Statement("SET SESSION transaction_read_only = DEFAULT".to_owned()));
     }
 
     #[test]
@@ -323,6 +342,15 @@ mod tests {
         for sql in ["CALL rotate_notes()", "/*!40101 CREATE TABLE t (id INT) */", "SET autocommit = 1", "EXECUTE stmt"] {
             assert_eq!(mysql_implicit_commit(sql), ImplicitCommitVerdict::Uncertain, "{sql}");
         }
+        // 条件语句不能无条件宣称隐式提交：只有此前 LOCK TABLES 过的 UNLOCK TABLES 才会提交。
+        assert_eq!(mysql_implicit_commit("UNLOCK TABLES"), ImplicitCommitVerdict::Uncertain);
+        // RESET PERSIST 明确不提交；其余 RESET 在清单里。
+        assert_eq!(mysql_implicit_commit("RESET PERSIST"), ImplicitCommitVerdict::NotApplicable);
+        assert_eq!(mysql_implicit_commit("RESET MASTER"), ImplicitCommitVerdict::Yes);
+        // LOCK TABLES 隐式提交；LOCK INSTANCE FOR BACKUP 不提交；其他 LOCK 形态无法静态确认。
+        assert_eq!(mysql_implicit_commit("LOCK TABLES t READ"), ImplicitCommitVerdict::Yes);
+        assert_eq!(mysql_implicit_commit("LOCK INSTANCE FOR BACKUP"), ImplicitCommitVerdict::NotApplicable);
+        assert_eq!(mysql_implicit_commit("LOCK TABLE t WRITE"), ImplicitCommitVerdict::Uncertain);
         // 注释与大小写不影响分类。
         assert_eq!(mysql_implicit_commit("-- 说明\n  aLtEr TABLE t ADD c INT"), ImplicitCommitVerdict::Yes);
     }

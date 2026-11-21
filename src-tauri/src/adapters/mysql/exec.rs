@@ -28,25 +28,8 @@ async fn checkout_mysql_pool(pool: &mysql_async::Pool, wait: Duration) -> Result
     }
 }
 
-pub(in crate::adapters) async fn acquire_mysql_conn(
-    exec_pool: &mysql_async::Pool,
-    fallback_pool: Option<&mysql_async::Pool>,
-) -> Result<mysql_async::Conn, String> {
-    let primary_timeout = if fallback_pool.is_some() {
-        Duration::from_secs(4)
-    } else {
-        Duration::from_secs(12)
-    };
-    let primary_err = match checkout_mysql_pool(exec_pool, primary_timeout).await {
-        Ok(conn) => return Ok(conn),
-        Err(err) => err,
-    };
-    if let Some(meta_pool) = fallback_pool {
-        if let Ok(conn) = checkout_mysql_pool(meta_pool, Duration::from_secs(8)).await {
-            return Ok(conn);
-        }
-    }
-    Err(primary_err)
+pub(in crate::adapters) async fn acquire_mysql_conn(exec_pool: &mysql_async::Pool) -> Result<mysql_async::Conn, String> {
+    checkout_mysql_pool(exec_pool, Duration::from_secs(12)).await
 }
 
 pub(in crate::adapters) fn is_unsupported_timeout_var(message: &str) -> bool {

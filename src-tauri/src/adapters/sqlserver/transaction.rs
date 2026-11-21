@@ -118,12 +118,13 @@ impl TransactionDialect for SqlserverTransaction {
         }
     }
 
-    /// 连接类错误按断线处理；已不可提交的事务由探针核对，其余语句错误只影响语句本身。
+    /// 连接类错误按断线处理；不可提交事务（3930/3931/3998）只能整体回滚。
+    /// 6401 只是回滚目标保存点不存在：事务仍活动（@@TRANCOUNT 不变），不能标成中止。
     fn statement_failure(&self, code: Option<&str>, message: &str) -> StatementFailure {
         if is_connection_failure(code, message) {
             return StatementFailure::ConnectionLost;
         }
-        if matches!(code, Some("3998" | "3930" | "6401")) {
+        if matches!(code, Some("3998" | "3930" | "3931")) {
             return StatementFailure::TransactionAborted;
         }
         StatementFailure::TransactionUsable
@@ -218,11 +219,28 @@ mod tests {
     fn uncommittable_and_deadlock_errors_are_not_reported_as_usable() {
         let dialect = SqlserverTransaction;
         assert_eq!(dialect.statement_failure(Some("3998"), "cannot be committed"), StatementFailure::TransactionAborted);
+        assert_eq!(dialect.statement_failure(Some("3930"), "cannot support operations that write to the log"), StatementFailure::TransactionAborted);
+        assert_eq!(dialect.statement_failure(Some("3931"), "cannot be rolled back to a savepoint"), StatementFailure::TransactionAborted);
         assert_eq!(dialect.statement_failure(Some("10054"), "connection reset"), StatementFailure::ConnectionLost);
         assert_eq!(dialect.statement_failure(Some("2627"), "violation of primary key"), StatementFailure::TransactionUsable);
         assert!(dialect.error_may_have_ended_transaction(Some("1205"), "deadlock victim"));
         assert_eq!(dialect.capabilities().aborted, AbortedRecovery::RollbackOnly);
         assert_eq!(dialect.capabilities().duplicate_begin, DuplicateBegin::Nests);
         assert!(!dialect.capabilities().release_savepoint);
+    }
+
+    /// 6401 是回滚到不存在的保存点/名字：事务仍可用，不能迫使整体回滚。
+    #[test]
+    fn a_missing_savepoint_rollback_keeps_the_transaction_usable() {
+        let dialect = SqlserverTransaction;
+        assert_eq!(
+            dialect.statement_failure(Some("6401"), "Cannot roll back sp. No transaction or savepoint of that name was found."),
+            StatementFailure::TransactionUsable
+        );
+        // 3931 是 XACT_STATE()=-1 时回滚到保存点被拒：只能整体回滚，后续语句不得继续。
+        assert_eq!(
+            dialect.statement_failure(Some("3931"), "The current transaction cannot be rolled back to a savepoint."),
+            StatementFailure::TransactionAborted
+        );
     }
 }

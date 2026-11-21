@@ -87,8 +87,8 @@ impl CatalogSession {
                 _ => Attached::Sqlite(pool),
             },
             Self::Mysql(pool) => {
-                // 回退池已移除（用户查询不回退元数据会话）；这里固定只借业务执行池。
-                let mut conn = mysql::exec::acquire_mysql_conn(&pool, None)
+                // 用户查询固定只借业务执行池：不再回退元数据会话，也不再有第二套超时分支。
+                let mut conn = mysql::exec::acquire_mysql_conn(&pool)
                     .await
                     .map_err(|err| attach_failure(transport, err))?;
                 conn.reset_connection(false);

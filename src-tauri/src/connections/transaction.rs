@@ -28,6 +28,9 @@ pub struct TransactionCoordinator {
     machine: Mutex<TransactionMachine>,
     /// 业务执行租约：一个查询批次或一次业务读写从开始到结束独占这条连接。
     lease: Arc<AsyncMutex<()>>,
+    /// 同一连接更早会话（例如引擎被编辑前）留下的未知事务。它只用于展示与独立核对，
+    /// 不参与当前状态机的代次判断：新会话仍然从 `Idle` 开始（R10）。
+    inherited: Mutex<Option<UnknownTransaction>>,
 }
 
 impl TransactionCoordinator {
@@ -39,6 +42,7 @@ impl TransactionCoordinator {
             connection,
             dialect,
             lease: Arc::new(AsyncMutex::new(())),
+            inherited: Mutex::new(None),
         }
     }
 
@@ -60,10 +64,18 @@ impl TransactionCoordinator {
         self.dialect.is_some()
     }
 
-    /// 同连接所有业务标签共享的事务快照；非关系型连接没有。
+    /// 同连接所有业务标签共享的事务快照；非关系型连接没有当前事务面。
+    /// 引擎变更等情况下，旧会话的未知事务仍会出现在 `unresolved` 中（R10）。
     pub fn snapshot(&self) -> Option<TransactionSnapshot> {
-        self.dialect?;
-        Some(self.machine().snapshot().clone())
+        let inherited = self.inherited.lock().expect("inherited transaction").clone();
+        if self.dialect.is_none() && inherited.is_none() {
+            return None;
+        }
+        let mut snapshot = self.machine().snapshot().clone();
+        if snapshot.unresolved.is_none() {
+            snapshot.unresolved = inherited;
+        }
+        Some(snapshot)
     }
 
     pub fn state(&self) -> Option<TransactionState> {
@@ -198,10 +210,24 @@ impl TransactionCoordinator {
         }
     }
 
-    /// 独立核对（用户确认或另一条连接查询）关闭旧事务的未知记录。不重放任何语句。
+    /// 独立核对（用户确认或另一条连接查询）关闭旧事务的未知记录。先关当前事务的记录，
+    /// 再关更早会话继承下来的记录；不重放任何语句。
     pub fn resolve_unknown(&self, resolution: UnknownResolution) -> Option<UnknownTransaction> {
-        self.dialect?;
-        self.machine().resolve_unknown(resolution)
+        if self.dialect.is_some() {
+            if let Some(resolved) = self.machine().resolve_unknown(resolution) {
+                return Some(resolved);
+            }
+        }
+        self.inherited.lock().expect("inherited transaction").take()
+    }
+
+    /// 把同一连接更早会话（例如引擎被编辑前）的未知事务带入这个协调器：只登记历史，
+    /// 不改变当前状态、代次或控制能力。
+    pub fn inherit_unknown(&self, record: UnknownTransaction) {
+        let mut inherited = self.inherited.lock().expect("inherited transaction");
+        if inherited.is_none() {
+            *inherited = Some(record);
+        }
     }
 
     /// 会话重建（手动重开、自动重连、断开）：新会话从无活动事务开始，旧事务结果保留为未知。
@@ -322,6 +348,29 @@ mod tests {
         let snapshot = coordinator.snapshot().unwrap();
         assert_eq!(snapshot.state, TransactionState::Idle, "新会话不继承旧事务的活动标记");
         assert!(snapshot.unresolved.is_some(), "旧事务结果未知必须保留");
+    }
+
+    #[test]
+    fn an_inherited_unknown_survives_without_a_new_transaction_surface() {
+        let old = coordinator(Engine::Mysql);
+        old.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+        old.acknowledge(
+            &ControlStatement::Commit { chain: false },
+            ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
+        )
+        .unwrap();
+        let record = old.snapshot().unwrap().unresolved.expect("旧事务未知记录");
+
+        // 引擎改成非事务引擎：没有当前事务面，但旧未知仍要能读到（R10）。
+        let new = Arc::new(TransactionCoordinator::new("conn", None));
+        assert!(new.snapshot().is_none(), "新的非事务连接没有当前事务面");
+        new.inherit_unknown(record.clone());
+        let snapshot = new.snapshot().expect("旧未知仍要能读到");
+        assert_eq!(snapshot.state, TransactionState::Idle, "新会话不继承旧事务的活动标记");
+        assert_eq!(snapshot.unresolved, Some(record));
+        assert!(new.begin(None).is_err(), "非事务引擎仍然不能开始事务");
+        assert_eq!(new.resolve_unknown(crate::transaction::UnknownResolution::Committed), Some(snapshot.unresolved.unwrap()));
+        assert!(new.snapshot().is_none(), "核对关闭后非事务连接不再有快照");
     }
 
     #[test]

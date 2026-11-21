@@ -949,6 +949,13 @@ impl Service {
         let mut opened = false;
         if connected {
             // 提交会话与断开操作使用同一把短锁；迟到握手不能恢复已断开/被更新的会话。
+            {
+                let epochs = self.operation_epochs.lock().expect("connection epochs");
+                if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
+            }
+            // 旧协调器上可能还有正在执行的业务批次：等它释放租约后再替换会话，
+            // 避免把执行中的查询与它的事务留在被替换的会话上（ADR-1）。等待期间旧条目仍在表里，取消通道可用。
+            let previous_lease = self.previous_lease(session_id).await;
             let epochs = self.operation_epochs.lock().expect("connection epochs");
             if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
             let health = Arc::new(SessionHealth::default());
@@ -976,6 +983,8 @@ impl Service {
                     transaction,
                 },
             );
+            // 新旧两个协调器是同一个对象时，这里释放的只是旧批次的租约本身；新会话随后才能开始执行。
+            drop(previous_lease);
             // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
             self.reconnects.lock().expect("reconnects").remove(session_id);
             // 认证通过的手输机密记在内存里，供切换数据库和自动重连复用。
@@ -1131,11 +1140,30 @@ impl Service {
         let retired = self.retired.lock().expect("retired transactions").remove(id);
         let coordinator = match previous.or(retired) {
             Some(coordinator) if same_dialect(coordinator.dialect(), dialect) => coordinator,
-            // 引擎变了：旧方言不能再驱动新会话；旧事务记录只剩“未知”意义，不再暴露为当前连接。
-            _ => Arc::new(TransactionCoordinator::new(id.to_owned(), dialect)),
+            // 引擎变了：旧方言不能再驱动新会话，但旧事务的未知记录必须保留（R10）；
+            // 它作为只读历史随新协调器展示，不参与新会话的代次与控制能力。
+            Some(previous) => {
+                let coordinator = Arc::new(TransactionCoordinator::new(id.to_owned(), dialect));
+                if let Some(record) = previous.snapshot().and_then(|snapshot| snapshot.unresolved) {
+                    coordinator.inherit_unknown(record);
+                }
+                coordinator
+            }
+            None => Arc::new(TransactionCoordinator::new(id.to_owned(), dialect)),
         };
         coordinator.reconnect(UnknownReason::ConnectionLost);
         coordinator
+    }
+
+    /// 替换会话前先等旧协调器上的业务执行结束：重开不能把正在执行的查询和它的事务租约
+    /// 留在被替换的会话上（ADR-1）。旧会话条目此时仍然在表里，取消通道可用。
+    async fn previous_lease(&self, id: &str) -> Option<ExecutionLease> {
+        let coordinator = self.sessions.lock().expect("sessions").get(id).map(|entry| Arc::clone(&entry.transaction))?;
+        if coordinator.is_transactional() {
+            Some(coordinator.lease().await)
+        } else {
+            None
+        }
     }
 
     /// Redis 会话句柄：键浏览、值读取与命令行共用的连接（多路复用，调用方克隆后并发使用）。
