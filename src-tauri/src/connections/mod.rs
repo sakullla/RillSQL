@@ -8,6 +8,7 @@ pub(crate) mod forward;
 pub(crate) mod groups;
 mod hostkey;
 pub(crate) mod model;
+pub(crate) mod profile_import;
 pub(crate) mod route;
 pub(crate) mod secrets;
 mod service;
