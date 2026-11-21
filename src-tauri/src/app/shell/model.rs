@@ -25,7 +25,7 @@ use super::nav::{self, NavRequest, TemplateKind};
 use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
-use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
+use super::close::{draft_pending_with_saved, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
 use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl};
 use super::explorer::{focus_rows, ExplorerItem, ExplorerRow};
 use super::layout::{
@@ -139,6 +139,8 @@ pub struct WorkItem {
     pub path: Option<String>,
     pub draft: String,
     pub last_executed_sql: Option<String>,
+    /// 通过 Mod+S 或另存为已落盘的 SQL 基线，用于清掉未保存脏点并避免关闭误报；不覆盖 last_executed_sql 语义。
+    pub saved_sql: Option<String>,
     pub uncommitted_cells: bool,
     /// 表结构工作项是否有尚未应用的 DDL 变更。
     pub structure_dirty: bool,
@@ -163,6 +165,7 @@ impl WorkItem {
             path: None,
             draft,
             last_executed_sql: None,
+            saved_sql: None,
             uncommitted_cells: false,
             structure_dirty: false,
             cell_note: String::new(),
@@ -173,6 +176,15 @@ impl WorkItem {
             engine: None,
             pinned: false,
         }
+    }
+
+    pub fn is_draft_dirty(&self) -> bool {
+        draft_pending_with_saved(
+            self.kind.as_str(),
+            &self.draft,
+            self.last_executed_sql.as_deref(),
+            self.saved_sql.as_deref(),
+        )
     }
 }
 
@@ -4972,7 +4984,7 @@ impl WorkbenchModel {
     pub fn facts(&self) -> CloseFacts {
         let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.redis_running || self.mongo_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
-        let draft = self.tabs.iter().any(|tab| draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()));
+        let draft = self.tabs.iter().any(WorkItem::is_draft_dirty);
         CloseFacts { running, uncommitted, draft }
     }
 
@@ -4983,7 +4995,7 @@ impl WorkbenchModel {
         CloseFacts {
             running: tab.running,
             uncommitted: tab.uncommitted_cells,
-            draft: draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()),
+            draft: tab.is_draft_dirty(),
         }
     }
 
@@ -5361,6 +5373,7 @@ impl WorkbenchModel {
             path: None,
             draft: String::new(),
             last_executed_sql: None,
+            saved_sql: None,
             uncommitted_cells: false,
             structure_dirty: false,
             cell_note: String::new(),
@@ -6497,6 +6510,7 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
         path: tab.path.clone(),
         draft: tab.draft.clone(),
         last_executed_sql: tab.last_executed_sql.clone(),
+        saved_sql: None,
         uncommitted_cells: false,
         structure_dirty: false,
         cell_note: String::new(),

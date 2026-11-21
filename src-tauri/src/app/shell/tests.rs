@@ -14257,14 +14257,22 @@ fn query_mod_s_saves_in_place_and_f6_routes_to_query_pane(cx: &mut gpui_kit::Tes
     let services = Arc::new(AppServices::from_state(&crate::connections::commands::ConnectionsState::new()));
     let (window, view) = open_workbench(cx, services, false);
 
+    let mut tab_id = String::new();
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.model.open_sql_file(&sql_path, "SELECT 99;".into());
-            if let Some(tab_id) = view.model.active_tab.clone() {
-                view.query.update(cx, |pane, _| pane.set_tab_file_path(&tab_id, sql_path.clone()));
+            if let Some(id) = view.model.active_tab.clone() {
+                tab_id = id.clone();
+                view.query.update(cx, |pane, _| pane.set_tab_file_path(&id, sql_path.clone()));
             }
         });
         window.render_frame(cx);
+        // 保存前：未执行也未落盘，脏点为真且 last_executed_sql 保持 None。
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert!(tab.last_executed_sql.is_none());
+        assert!(tab.is_draft_dirty(), "保存前应显示未保存脏状态");
+        assert!(view.read(cx).model.tab_facts(&tab_id).draft, "保存前关闭守卫应标记草稿待确认");
+
         view.update(cx, |view, cx| {
             // Mod+S 在查询页触发原位保存 SQL。
             view.perform("commit", cx);
@@ -14276,11 +14284,35 @@ fn query_mod_s_saves_in_place_and_f6_routes_to_query_pane(cx: &mut gpui_kit::Tes
     .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !sql_path.exists() && std::time::Instant::now() < deadline {
+    while (!sql_path.exists() || cx.update(|cx| view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).is_some_and(|t| t.saved_sql.is_none())))
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(std::time::Duration::from_millis(15));
         cx.run_until_parked();
     }
     cx.run_until_parked();
     assert_eq!(std::fs::read_to_string(&sql_path).unwrap(), "SELECT 99;");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert_eq!(tab.saved_sql.as_deref(), Some("SELECT 99;"), "保存后应同步 saved_sql 基线");
+        assert!(tab.last_executed_sql.is_none(), "保存文件不应破坏 last_executed_sql 语义");
+        assert!(!tab.is_draft_dirty(), "Mod+S 保存后脏状态应清除");
+        assert!(!view.read(cx).model.tab_facts(&tab_id).draft, "已保存草稿关闭标签不应误报未保存");
+
+        // 再次编辑草稿后，脏状态与关闭守卫应重新激活。
+        view.update(cx, |view, cx| {
+            if let Some(tab) = view.model.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.draft = "SELECT 100;".into();
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert!(tab.is_draft_dirty(), "继续编辑后脏状态应重新出现");
+        assert!(view.read(cx).model.tab_facts(&tab_id).draft, "继续编辑后关闭守卫应再次提示未保存草稿");
+    })
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -70,6 +70,8 @@ pub struct SyncEffect {
     pub running: Vec<String>,
     /// 每个标签最近一次真正执行过的 SQL。
     pub executed: Vec<(String, String)>,
+    /// 每个标签刚刚成功落盘保存的 SQL 基线。
+    pub saved: Vec<(String, String)>,
     pub opens: Vec<OpenRequest>,
     pub targets: Vec<TargetRequest>,
     pub selected_object: Option<String>,
@@ -145,6 +147,7 @@ pub struct QueryPane {
     /// 每个查询标签关联的本地 SQL 文件路径与最近保存目录。
     file_paths: HashMap<String, std::path::PathBuf>,
     last_save_dir: Option<std::path::PathBuf>,
+    pending_saved: Vec<(String, String)>,
     /// 外壳密度；消息页和右侧面板的行高与控件高度跟它走。
     density: Density,
     /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
@@ -560,7 +563,7 @@ impl QueryPane {
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         let weak = cx.entity().downgrade();
-        let target_tab_sub = cx.intercept_keystrokes(move |event, _, cx| {
+        let target_tab_sub = cx.intercept_keystrokes(move |event, window, cx| {
             let key = event.keystroke.key.as_str();
             let mods = &event.keystroke.modifiers;
             if mods.control || mods.alt || mods.platform {
@@ -569,6 +572,9 @@ impl QueryPane {
             let Some(pane) = weak.upgrade() else {
                 return;
             };
+            if !pane.read(cx).context_active || crate::ui::ShellOverlayOpen::is_covered(window, cx) {
+                return;
+            }
             if pane.read(cx).target_picker.anchor.is_some() {
                 if key == "tab" {
                     let backward = mods.shift;
@@ -625,6 +631,7 @@ impl QueryPane {
             side_column_filter: None,
             file_paths: HashMap::new(),
             last_save_dir: None,
+            pending_saved: Vec::new(),
             row_count: None,
             density: Density::Compact,
             narrow: false,
@@ -1391,6 +1398,7 @@ impl QueryPane {
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.file_paths.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.result_layout.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.splits.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.desk.refresh_outline();
@@ -1415,6 +1423,7 @@ impl QueryPane {
             drafts,
             running: self.desk.running_ids(),
             executed,
+            saved: std::mem::take(&mut self.pending_saved),
             opens: std::mem::take(&mut self.opens),
             targets: std::mem::take(&mut self.targets),
             selected_object: self.selected_object.take(),
@@ -2752,6 +2761,7 @@ impl QueryPane {
 
     fn write_sql_to_path(&mut self, tab_id: Option<String>, path: std::path::PathBuf, sql: String, cx: &mut Context<Self>) {
         let saved_path = path.clone();
+        let written_sql = sql.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         runtime().spawn(async move {
             let wrote = crate::application::run_blocking(move || assist::write_sql_file(&path, &sql)).await;
@@ -2767,7 +2777,16 @@ impl QueryPane {
                                     pane.last_save_dir = Some(parent.to_path_buf());
                                 }
                                 if let Some(id) = tab_id {
-                                    pane.file_paths.insert(id, saved_path);
+                                    pane.file_paths.insert(id.clone(), saved_path);
+                                    pane.pending_saved.push((id.clone(), written_sql.clone()));
+                                    if let Some(owner) = pane.owner.clone() {
+                                        let sql_for_owner = written_sql.clone();
+                                        cx.defer(move |cx| {
+                                            if let Some(owner) = owner.upgrade() {
+                                                owner.update(cx, |view, cx| view.mark_query_saved(&id, sql_for_owner, cx));
+                                            }
+                                        });
+                                    }
                                 }
                                 pane.desk.set_active_note(&i18n::text(pane.locale, "query.fileIo.saved"));
                             }
@@ -7655,5 +7674,50 @@ mod tests {
         assert_eq!(plan_view::cost_share(Some(10.0), Some(-5.0)), None);
         assert_eq!(plan_view::cost_share(None, Some(100.0)), None);
         assert_eq!(plan_view::cost_share(Some(10.0), None), None);
+    }
+
+    #[gpui_kit::test]
+    fn r5_intercept_keystrokes_respects_context_active_and_shell_overlay_and_prunes_file_paths(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 680., 640.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.set_tab_file_path("q", std::path::PathBuf::from("/tmp/example.sql"));
+                pane.command("toggle-side", cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_some());
+
+            // 外壳前景浮层（如命令面板）打开时，QueryPane 不能吞掉 Esc。
+            crate::ui::ShellOverlayOpen::set(window, true, cx);
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_some(), "外壳浮层打开时 QueryPane 不应拦截 Esc");
+            crate::ui::ShellOverlayOpen::set(window, false, cx);
+
+            // 切到其它非查询标签（context_active == false）时，QueryPane 不能吞掉 Esc。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, false, cx);
+            });
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).side_open(), "查询页非激活时不应拦截 Esc");
+
+            // 恢复激活且无外壳浮层时，Esc 正常关闭窄屏侧栏浮层。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, true, cx);
+            });
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).side_open(), "查询页激活且无外壳浮层时 Esc 应关闭窄屏侧栏");
+
+            // 关闭标签后 prepare 应清理该标签的 file_paths 记录。
+            assert_eq!(pane.read(cx).file_paths.len(), 1);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(&[], None, Locale::ZhCn, false, cx);
+            });
+            assert!(pane.read(cx).file_paths.is_empty(), "关闭标签后应清理 file_paths");
+        })
+        .unwrap();
     }
 }

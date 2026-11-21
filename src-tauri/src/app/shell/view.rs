@@ -1170,6 +1170,18 @@ impl Workbench {
                 tab.last_executed_sql = Some(sql);
             }
         }
+        for (id, sql) in effect.saved {
+            if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.saved_sql = Some(sql);
+            }
+        }
+    }
+
+    pub(crate) fn mark_query_saved(&mut self, tab_id: &str, sql: String, cx: &mut Context<Self>) {
+        if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.saved_sql = Some(sql);
+            cx.notify();
+        }
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {

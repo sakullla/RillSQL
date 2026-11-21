@@ -2086,7 +2086,7 @@ impl Workbench {
             let (dirty, dirty_tip) = match tab.kind {
                 WorkItemKind::Table => (tab.uncommitted_cells, Some(dirty_table_text.clone())),
                 WorkItemKind::Query => {
-                    let draft_dirty = super::close::draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref());
+                    let draft_dirty = tab.is_draft_dirty();
                     if tab.uncommitted_cells {
                         (true, Some(dirty_table_text.clone()))
                     } else if draft_dirty {
