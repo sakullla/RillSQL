@@ -152,11 +152,30 @@ pub async fn query_page_search_preview(
     query_page_with_schema(session, &schema, filters, sort, search, expression, offset, limit, preview_bytes).await
 }
 
+/// 分页读取的本地计划：SQL 与列数都在这里定好；执行阶段只做数据库调用。
+/// 编译失败（未知列、非法筛选）从未发往数据库，调用方不能把它当成数据库错误改变事务状态。
+#[derive(Debug)]
+pub struct PagePlan {
+    /// 展示用的 SQL（含截断提示）。
+    pub sql: String,
+    /// 实际执行的 SQL；`None` 表示 limit 为 0，不需要读取。
+    pub executed: Option<String>,
+    pub width: usize,
+    pub limit: u64,
+    pub offset: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn query_page_with_schema(
-    session: &CatalogSession, schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>,
-    search: Option<&str>, expression: Option<&str>, offset: u64, limit: u64, preview_bytes: usize,
-) -> Result<LivePage, String> {
+pub fn plan_page(
+    schema: &TableSchema,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    search: Option<&str>,
+    expression: Option<&str>,
+    offset: u64,
+    limit: u64,
+    preview_bytes: usize,
+) -> Result<PagePlan, String> {
     let limit = limit.min(MAX_PAGE);
     if let Some(sort) = sort {
         if !schema.columns.iter().any(|column| column.name == sort.column) {
@@ -164,22 +183,39 @@ pub async fn query_page_with_schema(
         }
     }
     let display = page_sql(schema, filters, search, expression, sort, limit, offset, preview_bytes)?;
-    if limit == 0 {
-        return Ok(LivePage { rows: Vec::new(), truncated: false, sql: display });
-    }
-    let executed = page_sql(schema, filters, search, expression, sort, limit.saturating_add(1), offset, preview_bytes)?;
-    let width = schema.columns.len();
-    let mut fetched = fetch_cells(session, &executed, width).await?;
-    let truncated = fetched.len() as u64 > limit;
+    let executed = if limit == 0 {
+        None
+    } else {
+        Some(page_sql(schema, filters, search, expression, sort, limit.saturating_add(1), offset, preview_bytes)?)
+    };
+    Ok(PagePlan { sql: display, executed, width: schema.columns.len(), limit, offset })
+}
+
+/// 执行一份已经编译好的分页计划。这里的失败来自数据库。
+pub async fn run_page(session: &CatalogSession, schema: &TableSchema, plan: PagePlan) -> Result<LivePage, String> {
+    let Some(executed) = plan.executed else {
+        return Ok(LivePage { rows: Vec::new(), truncated: false, sql: plan.sql });
+    };
+    let mut fetched = fetch_cells(session, &executed, plan.width).await?;
+    let truncated = fetched.len() as u64 > plan.limit;
     if truncated {
-        fetched.truncate(limit as usize);
+        fetched.truncate(plan.limit as usize);
     }
     let rows = fetched
         .into_iter()
         .enumerate()
-        .map(|(index, cells)| live_row(schema, cells, offset, index))
+        .map(|(index, cells)| live_row(schema, cells, plan.offset, index))
         .collect();
-    Ok(LivePage { rows, truncated, sql: display })
+    Ok(LivePage { rows, truncated, sql: plan.sql })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn query_page_with_schema(
+    session: &CatalogSession, schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>,
+    search: Option<&str>, expression: Option<&str>, offset: u64, limit: u64, preview_bytes: usize,
+) -> Result<LivePage, String> {
+    let plan = plan_page(schema, filters, sort, search, expression, offset, limit, preview_bytes)?;
+    run_page(session, schema, plan).await
 }
 
 #[allow(dead_code)]
@@ -192,6 +228,16 @@ pub async fn count_rows(
     filters: &[Filter],
 ) -> Result<i64, String> {
     count_rows_search(session, database, schema_name, table, engine_hint, filters, None, None).await
+}
+
+/// count_rows_search 的本地编译部分：失败从未发往数据库。
+pub fn plan_count(schema: &TableSchema, filters: &[Filter], search: Option<&str>, expression: Option<&str>) -> Result<String, String> {
+    count_sql(schema, filters, search, expression)
+}
+
+/// 执行一条已经编译好的计数语句。这里的失败来自数据库。
+pub async fn run_count(session: &CatalogSession, sql: &str) -> Result<i64, String> {
+    fetch_count(session, sql).await
 }
 
 /// count_rows 的整表关键字形态（R3）：统计行数与分页读到同一组行。
@@ -208,8 +254,8 @@ pub async fn count_rows_search(
     expression: Option<&str>,
 ) -> Result<i64, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
-    let sql = count_sql(&schema, filters, search, expression)?;
-    fetch_count(session, &sql).await
+    let sql = plan_count(&schema, filters, search, expression)?;
+    run_count(session, &sql).await
 }
 
 /// 不带预览上限的提交：调用方拿不到读出这些值时的上限时才用，写回判断回退到默认上限。

@@ -14,12 +14,38 @@ use crate::grid::commands::{
     TableRef,
 };
 use crate::grid::{
-    commit_mutations_with_preview, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
+    commit_mutations_with_preview, describe as describe_table, foreign_keys, plan_count, plan_page, run_count, run_export, run_page, Cell, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
     Mutation, MutationKind, Sort, TableSchema,
 };
 use crate::transaction::{StatementOutcome, TransactionEffect, TransactionSnapshot, TransactionState, UnknownReason};
 
 const NOT_OPEN: &str = "这条连接还没有打开，没有另开新的连接。";
+
+/// 一次读取失败的来源。本地校验/编译错误从未发往数据库，不能改变共享事务状态；
+/// 只有真正执行到数据库的失败才按方言登记（R8）。
+pub(crate) enum ReadFailure<'a> {
+    /// 本地校验/编译错误：没有发往数据库，不能改变事务状态。
+    Local,
+    Database(&'a str),
+}
+
+/// 数据库执行失败才登记事务结果。PostgreSQL 的事务内错误会把事务置为中止；
+/// 数据库可能自行回滚整个事务的错误（死锁、磁盘错误）按未知处理（R8、R10）。
+pub(crate) fn note_read_failure(coordinator: &Option<Arc<TransactionCoordinator>>, failure: ReadFailure<'_>) {
+    let ReadFailure::Database(message) = failure else {
+        return;
+    };
+    let Some(coordinator) = coordinator else { return };
+    if coordinator.snapshot().is_none() {
+        return;
+    }
+    let outcome = if coordinator.error_may_have_ended_transaction(None, message) {
+        StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)
+    } else {
+        StatementOutcome::Failed(coordinator.statement_failure(None, message))
+    };
+    coordinator.observe_statement(outcome);
+}
 
 pub fn require_commit(confirmed: bool) -> Result<(), String> {
     if !confirmed {
@@ -46,20 +72,8 @@ impl Business {
         self.coordinator.as_ref().and_then(|coordinator| coordinator.snapshot())
     }
 
-    /// 数据库拒绝的读取也要按真实事务结果登记：PostgreSQL 的事务内错误会把事务置为中止（R8）。
-    /// 写入前的本地拒绝不经过这里。
-    fn note_read_failure(&self, message: &str) {
-        let Some(coordinator) = &self.coordinator else { return };
-        if coordinator.snapshot().is_none() {
-            return;
-        }
-        let outcome = if coordinator.error_may_have_ended_transaction(None, message) {
-            // 数据库可能自行回滚了整个事务（死锁、磁盘错误）：不继续宣称事务活动（R10）。
-            StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)
-        } else {
-            StatementOutcome::Failed(coordinator.statement_failure(None, message))
-        };
-        coordinator.observe_statement(outcome);
+    fn note_read_failure(&self, failure: ReadFailure<'_>) {
+        note_read_failure(&self.coordinator, failure);
     }
 }
 
@@ -76,22 +90,12 @@ pub async fn describe(service: &Service, request: &TableRef) -> Result<SchemaDto
         return Err("没有表名".to_owned());
     }
     let business = business(service, &request.connection_id).await?;
-    let schema = match describe_table(&business.session, &request.database, &request.schema, &request.table, &request.engine).await {
-        Ok(schema) => schema,
-        Err(message) => {
-            business.note_read_failure(&message);
-            return Err(message);
-        }
-    };
+    // 结构读取同时包含本地校验（跨库、会话类型）与数据库查询，这里无法区分来源；不登记，
+    // 避免把本地拒绝当成 PostgreSQL 事务中止。数据读取与写入的执行失败由 run_page/run_count/commit 登记。
+    let schema = describe_table(&business.session, &request.database, &request.schema, &request.table, &request.engine).await?;
     let keys = if request.include_foreign_keys {
-        // 外键失败只让这一项为空，不影响表结构本身；失败的语句仍要登记事务结果。
-        match foreign_keys(&business.session, &request.database, &request.schema, &request.table, &request.engine).await {
-            Ok(keys) => Some(keys),
-            Err(message) => {
-                business.note_read_failure(&message);
-                Some(Vec::new())
-            }
-        }
+        // 外键失败只让这一项为空，不影响表结构本身。
+        Some(foreign_keys(&business.session, &request.database, &request.schema, &request.table, &request.engine).await.unwrap_or_default())
     } else {
         None
     };
@@ -104,12 +108,10 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
     let business = business(service, &request.table.connection_id).await?;
-    let page = match query_page_search_preview(
-        &business.session,
-        &request.table.database,
-        &request.table.schema,
-        &request.table.table,
-        &request.table.engine,
+    let schema = describe_table(&business.session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine).await?;
+    // 先在本地编译：未知列、非法筛选等错误从未发往数据库，不能改变事务状态。
+    let plan = match plan_page(
+        &schema,
         &filters,
         sort.as_ref(),
         request.search.as_deref(),
@@ -117,12 +119,17 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
         request.offset,
         request.limit,
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
-    )
-    .await
-    {
+    ) {
+        Ok(plan) => plan,
+        Err(message) => {
+            business.note_read_failure(ReadFailure::Local);
+            return Err(message);
+        }
+    };
+    let page = match run_page(&business.session, &schema, plan).await {
         Ok(page) => page,
         Err(message) => {
-            business.note_read_failure(&message);
+            business.note_read_failure(ReadFailure::Database(&message));
             return Err(message);
         }
     };
@@ -135,8 +142,7 @@ pub async fn page_described(service: &Service, request: &PageRequest, schema: &c
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
     let business = business(service, &request.table.connection_id).await?;
-    let page = match crate::grid::query_page_with_schema(
-        &business.session,
+    let plan = match plan_page(
         schema,
         &filters,
         sort.as_ref(),
@@ -145,12 +151,17 @@ pub async fn page_described(service: &Service, request: &PageRequest, schema: &c
         request.offset,
         request.limit,
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
-    )
-    .await
-    {
+    ) {
+        Ok(plan) => plan,
+        Err(message) => {
+            business.note_read_failure(ReadFailure::Local);
+            return Err(message);
+        }
+    };
+    let page = match run_page(&business.session, schema, plan).await {
         Ok(page) => page,
         Err(message) => {
-            business.note_read_failure(&message);
+            business.note_read_failure(ReadFailure::Database(&message));
             return Err(message);
         }
     };
@@ -190,21 +201,19 @@ pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto
     let filters = filters_of(&request.filters)?;
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let business = business(service, &request.table.connection_id).await?;
-    let matched = match count_rows_search(
-        &business.session,
-        &request.table.database,
-        &request.table.schema,
-        &request.table.table,
-        &request.table.engine,
-        &filters,
-        request.search.as_deref(),
-        expression.as_deref(),
-    )
-    .await
-    {
+    let schema = describe_table(&business.session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine).await?;
+    // 与分页相同：本地编译错误从未发往数据库。
+    let sql = match plan_count(&schema, &filters, request.search.as_deref(), expression.as_deref()) {
+        Ok(sql) => sql,
+        Err(message) => {
+            business.note_read_failure(ReadFailure::Local);
+            return Err(message);
+        }
+    };
+    let matched = match run_count(&business.session, &sql).await {
         Ok(matched) => matched,
         Err(message) => {
-            business.note_read_failure(&message);
+            business.note_read_failure(ReadFailure::Database(&message));
             return Err(message);
         }
     };
@@ -273,10 +282,8 @@ pub async fn commit(service: &Service, request: &CommitRequest, confirmed: bool)
     .await
     {
         Ok(report) => report,
-        Err(message) => {
-            business.note_read_failure(&message);
-            return Err(message);
-        }
+        // 写入前的结构读取失败可能是本地校验（表不存在、跨库）：不登记为数据库执行错误。
+        Err(message) => return Err(message),
     };
     // 成功的语句先登记，再登记数据库拒绝的那一条：某条失败不会让之前已应用的语句变成没执行（R8）。
     let mut effect = TransactionEffect::Unchanged;

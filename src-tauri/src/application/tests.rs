@@ -226,12 +226,15 @@ async fn confirmed_grid_update_and_ddl_execute_hit_sqlite_and_reject_a_stale_pre
     };
     assert!(!plan.steps.is_empty(), "{}", plan.blocked.join("; "));
     let confirmed: Vec<String> = plan.steps.iter().map(|step| step.sql.clone()).collect();
-    let done = match crate::application::ddl::execute_request(&service, "notes", &request, &confirmed, true).await {
+    let done = match crate::application::ddl::execute_request_tracked(&service, "notes", &request, &confirmed, true).await {
         Ok(value) => value,
         Err(message) => panic!("{message}"),
     };
-    assert!(done.blocked.is_empty(), "{}", done.blocked.join("; "));
-    assert!(done.steps.iter().all(|step| step.status == StepStatus::Ok), "{}", done.steps.iter().map(|step| format!("{:?} {}", step.status, step.message)).collect::<Vec<_>>().join("; "));
+    assert!(done.receipt.blocked.is_empty(), "{}", done.receipt.blocked.join("; "));
+    assert!(done.receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{}", done.receipt.steps.iter().map(|step| format!("{:?} {}", step.status, step.message)).collect::<Vec<_>>().join("; "));
+    assert!(done.committed, "没有活动事务时结构变更已是最终结果");
+    assert!(!done.applied_not_committed);
+    assert!(done.transaction_note.is_none());
     let stale = match crate::application::ddl::execute_request(&service, "notes", &request, &["DROP TABLE \"customers\";".to_owned()], true).await {
         Err(message) => message,
         Ok(_) => panic!("与预览不一致的 SQL 应当被拒绝"),
@@ -401,6 +404,7 @@ async fn sqlite_rebuild_uses_a_savepoint_inside_the_shared_transaction() {
     assert!(executed.receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", executed.receipt.steps);
     assert!(executed.applied_not_committed, "结构变更不是最终保存：{}", executed.receipt.rule);
     assert!(!executed.committed);
+    assert!(executed.transaction_note.as_deref().is_some_and(|note| note.contains("尚未提交")), "{:?}", executed.transaction_note);
     assert_eq!(executed.effect, TransactionEffect::StillActive);
     assert_eq!(coordinator.snapshot().expect("事务快照").state, TransactionState::Active);
 
@@ -451,6 +455,9 @@ async fn a_failed_sqlite_rebuild_rolls_back_only_its_savepoint() {
     let executed = crate::application::ddl::execute_request_tracked(&service, "notes", &ddl, &confirmed, true).await.unwrap();
     // 重建失败，但只回滚到保存点：事务仍活动，之前的网格修改还在。
     assert_eq!(executed.effect, TransactionEffect::StillActive);
+    assert!(!executed.applied_not_committed, "回滚到保存点的失败重建没有应用变更");
+    assert!(!executed.committed);
+    assert!(executed.transaction_note.is_none(), "失败的重建不能声称已应用：{:?}", executed.transaction_note);
     assert!(executed.receipt.steps.iter().any(|step| step.status == StepStatus::Failed), "{:?}", executed.receipt.steps);
     assert!(executed.receipt.steps.iter().any(|step| step.status == StepStatus::RolledBack && step.message.contains("保存点")), "{:?}", executed.receipt.steps);
 
@@ -467,6 +474,45 @@ async fn a_failed_sqlite_rebuild_rolls_back_only_its_savepoint() {
 
     finish_shared(&service, false).await;
     assert_eq!(read_note(&service, 2).await.as_deref(), Some("x"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_rebuild_without_a_transaction_is_not_reported_as_applied() {
+    let (dir, service, _database) = open_sqlite_notes(
+        "idle-rebuild-failure",
+        &[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), label TEXT)",
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO child (id, parent_id, label) VALUES (1, 99, 'x')",
+        ],
+    )
+    .await;
+    let columns = vec![
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
+        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+    ];
+    let ddl = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "child".to_owned(), columns }).unwrap();
+    let plan = crate::application::ddl::preview_request(&service, "notes", &ddl).await.unwrap();
+    assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+    assert!(plan.steps.iter().any(|step| step.sql == "BEGIN;"), "没有外层事务时保留内部重建事务：{:?}", plan.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>());
+    let confirmed: Vec<String> = plan.steps.iter().map(|step| step.sql.clone()).collect();
+    let executed = crate::application::ddl::execute_request_tracked(&service, "notes", &ddl, &confirmed, true).await.unwrap();
+    assert!(executed.receipt.steps.iter().any(|step| step.status == StepStatus::Failed), "{:?}", executed.receipt.steps);
+    assert!(!executed.applied_not_committed, "内部重建事务已回滚，不能报告已应用");
+    assert!(!executed.committed, "失败的重建不是最终结果");
+    assert!(executed.transaction_note.is_none(), "{:?}", executed.transaction_note);
+    assert_eq!(executed.effect, TransactionEffect::Unchanged);
+    assert_eq!(executed.transaction.map(|snapshot| snapshot.state), Some(TransactionState::Idle));
+    let described = crate::application::grid::describe(
+        &service,
+        &TableRef { connection_id: "notes".to_owned(), database: "main".to_owned(), schema: String::new(), table: "child".to_owned(), engine: "sqlite".to_owned(), include_foreign_keys: false },
+    )
+    .await
+    .unwrap();
+    assert_eq!(described.columns.iter().find(|column| column.name == "label").map(|column| column.type_name.as_str()), Some("TEXT"), "回滚后结构不变");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -527,6 +573,48 @@ async fn an_unknown_transaction_blocks_grid_and_structure_writes() {
 
 fn dialected(engine: crate::connections::model::Engine) -> Arc<TransactionCoordinator> {
     Arc::new(TransactionCoordinator::new("c", crate::adapters::adapter(engine).transaction()))
+}
+
+#[test]
+fn local_grid_compile_errors_do_not_abort_a_postgres_transaction() {
+    let postgres = dialected(ConnEngine::Postgres);
+    let begin = postgres.begin(None).unwrap();
+    postgres.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
+    // 复查失败位置：网格在打开会话后先编译 SQL；未知列之类的错误从未发往数据库。
+    let schema = crate::grid::TableSchema {
+        engine: ConnEngine::Postgres,
+        schema: "public".to_owned(),
+        name: "notes".to_owned(),
+        kind: "table",
+        columns: vec![crate::grid::Column { name: "id".to_owned(), type_name: "integer".to_owned(), primary: true, ..crate::grid::Column::default() }],
+        key: vec!["id".to_owned()],
+    };
+    let local = crate::grid::plan_page(
+        &schema,
+        &[crate::grid::Filter { column: "note".to_owned(), op: crate::grid::FilterOp::Eq, value: Some("x".to_owned()), second: None, values: Vec::new() }],
+        None,
+        None,
+        None,
+        0,
+        10,
+        1024,
+    )
+    .expect_err("已删除的列在本地编译时就应失败");
+    assert!(local.contains("找不到列 note"), "{local}");
+    // 旧实现会把这条本地错误登记成 PostgreSQL 中止；现在本地错误不经过登记。
+    super::grid::note_read_failure(&Some(Arc::clone(&postgres)), super::grid::ReadFailure::Local);
+    assert_eq!(postgres.snapshot().unwrap().state, TransactionState::Active, "本地编译错误没有发往数据库");
+
+    // 同一句被误当成数据库错误时确实会让 PostgreSQL 中止（这就是要避免的旧行为）。
+    let mistaken = dialected(ConnEngine::Postgres);
+    let begin = mistaken.begin(None).unwrap();
+    mistaken.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
+    super::grid::note_read_failure(&Some(Arc::clone(&mistaken)), super::grid::ReadFailure::Database(&local));
+    assert_eq!(mistaken.snapshot().unwrap().state, TransactionState::Aborted);
+
+    // 真正由数据库返回的读取错误仍按方言登记。
+    super::grid::note_read_failure(&Some(Arc::clone(&postgres)), super::grid::ReadFailure::Database("column \"note\" does not exist"));
+    assert_eq!(postgres.snapshot().unwrap().state, TransactionState::Aborted);
 }
 
 fn staged_receipt(steps: Vec<(&str, StepStatus, &str)>) -> crate::ddl::Receipt {

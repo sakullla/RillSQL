@@ -162,6 +162,8 @@ pub struct ReceiptDto {
     applied_not_committed: bool,
     /// 步骤已经是数据库的最终结果（没有活动事务）。
     committed: bool,
+    /// 独立的事务说明（已应用未提交 / 隐式提交）；与 rule 分开以保持整句可翻译。
+    transaction_note: Option<String>,
 }
 
 fn request_from(database: String, schema: String, engine: &str, action: Action) -> Result<Request, String> {
@@ -260,6 +262,7 @@ fn receipt_dto(executed: crate::application::ddl::Executed) -> ReceiptDto {
         implicit_commit: executed.implicit_commit,
         applied_not_committed: executed.applied_not_committed,
         committed: executed.committed,
+        transaction_note: executed.transaction_note,
         steps: executed
             .receipt
             .steps

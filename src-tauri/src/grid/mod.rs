@@ -7,9 +7,8 @@ mod sql;
 mod store;
 
 pub(crate) use live::{
-    assemble_foreign_keys, commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, push_foreign_key,
-    query_page_search_preview, query_page_with_schema, read_full_cell, request_cancel as request_grid_export_cancel, run_export, ExportMode, ExportSpec, ForeignKey,
-    Mutation, MutationKind, LivePage,
+    assemble_foreign_keys, commit_with_preview as commit_mutations_with_preview, describe, fetch_cells, foreign_keys, insert_line, plan_count, plan_page, push_foreign_key, read_full_cell,
+    request_cancel as request_grid_export_cancel, run_count, run_export, run_page, ExportMode, ExportSpec, ForeignKey, Mutation, MutationKind, LivePage,
 };
 pub(crate) use sql::{
     compile_where, decimal_text, delete_sql, gate_filter_expression, insert_sql, integer_text, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal,
