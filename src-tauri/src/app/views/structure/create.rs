@@ -739,10 +739,13 @@ impl StructurePane {
             .test_support()
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(px(kit::Space::XXS))
             .flex_none()
             .when(!stacked, |this| this.w(px(240.)))
-            .when(stacked, |this| this.w_full().max_h(px(180.)))
+            .when(stacked, |this| {
+                const TEMPLATE_LIST_STACKED_MAX_H: f32 = 180.;
+                this.w_full().max_h(px(TEMPLATE_LIST_STACKED_MAX_H))
+            })
             .scroll_area_y();
         list = list.child(div().pb(px(4.)).child(kit::eyebrow(t("structure.templates.builtin"), p)));
         for (id, key) in BUILTIN {
@@ -942,8 +945,8 @@ impl StructurePane {
                                 .flex_1()
                                 .min_h_0()
                                 .flex()
-                                .when(stacked, |this| this.flex_col().gap(px(12.)))
-                                .when(!stacked, |this| this.gap(px(16.)))
+                                .when(stacked, |this| this.flex_col().gap(px(kit::Space::LG)))
+                                .when(!stacked, |this| this.gap(px(kit::Space::XL)))
                                 .px(px(metrics.card_pad()))
                                 .py(px(10.))
                                 .child(list)
@@ -1169,7 +1172,10 @@ impl StructurePane {
                             .test_support()
                             .w_full()
                             .scroll_area_x()
-                            .child(div().min_w(px(670.)).w_full().flex().flex_col().child(head).child(rows)),
+                            .child({
+                                const TEMPLATE_COLUMNS_MIN_W: f32 = 670.;
+                                div().min_w(px(TEMPLATE_COLUMNS_MIN_W)).w_full().flex().flex_col().child(head).child(rows)
+                            }),
                     )
                     .child(
                         div().px(px(6.)).py(px(4.)).child(kit::tool_button("structure-template-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {

@@ -4597,10 +4597,11 @@ impl StructurePane {
             .test_support()
             .role(gpui_kit::Role::TabList)
             .w_full()
+            // 滚动条例外：页签栏单行横向滚动，不占高度绘制滚动条。
             .overflow_x_scroll()
             .flex()
             .items_end()
-            .gap(px(4.));
+            .gap(px(kit::Space::XS));
         for value in self.session.visible_sections() {
             if value == Section::Danger && section != Section::Danger {
                 continue;
