@@ -457,6 +457,22 @@ impl Service {
         store.assign_group(connection_id, group).await.map_err(db_err)
     }
 
+    /// 迁入新连接只处理本地配置，不访问驱动或钥匙串。
+    pub(crate) async fn insert_imported_connection(&self, draft: &ConnectionDraft) -> Result<store::ImportInsert, ServiceError> {
+        for (field, host) in [("host", draft.host.as_str()), ("ssh_host", draft.ssh_host.as_str())] {
+            if host.contains("://") || host.contains(['@', '?', ';', '#', '=']) {
+                return Err(ServiceError::Fields(vec![FieldError {
+                    field: field.to_owned(),
+                    message: "请填写单独的主机地址".to_owned(),
+                }]));
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let candidate = crate::connections::model::normalize(draft, id).map_err(ServiceError::Fields)?;
+        let store = self.store().await.map_err(ServiceError::Message)?;
+        store.insert_imported(&candidate).await.map_err(|_| ServiceError::Message("写入本地连接配置失败".to_owned()))
+    }
+
     pub async fn save(&self, draft: ConnectionDraft, input: SecretInput) -> Result<SaveOutcome, ServiceError> {
         let id = draft
             .id

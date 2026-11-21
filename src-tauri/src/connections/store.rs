@@ -10,6 +10,85 @@ use crate::connections::model::{
     CaMode, Engine, EnvTag, SavedConnection, SshAuthKind, SshSettings, TlsMode, TlsSettings,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportConflictKind {
+    Duplicate,
+    NameTaken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportConflict {
+    pub kind: ImportConflictKind,
+    pub existing_name: String,
+    pub existing_target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImportInsert {
+    Inserted,
+    Conflict(ImportConflict),
+    MissingEnvironment,
+}
+
+/// 比较已经规范化的连接，来源 ID 和本机保存密码的状态不参与判重。
+pub(crate) fn import_conflict(candidate: &SavedConnection, existing: &SavedConnection) -> Option<ImportConflict> {
+    let same_target = candidate.engine == existing.engine
+        && candidate.host == existing.host
+        && candidate.port == existing.port
+        && candidate.database == existing.database
+        && candidate.file_path == existing.file_path
+        && candidate.username == existing.username
+        && candidate.replica_set == existing.replica_set
+        && candidate.ssh == existing.ssh
+        && candidate.tls == existing.tls
+        && candidate.env == existing.env;
+    let kind = if same_target {
+        ImportConflictKind::Duplicate
+    } else if candidate.name.trim() == existing.name.trim() {
+        ImportConflictKind::NameTaken
+    } else {
+        return None;
+    };
+    // 旧配置可能把含凭据的整串 URI 用作主机或默认名称。
+    let target = match &existing.file_path {
+        Some(path) => import_display_value(path),
+        None => {
+            let host = existing.host.as_deref().unwrap_or_default();
+            let mut target = import_display_value(host);
+            if let Some(port) = existing.port.filter(|_| !host.contains("://")) {
+                target.push_str(&format!(":{port}"));
+            }
+            if let Some(database) = &existing.database {
+                target.push('/');
+                target.push_str(&import_display_value(database));
+            }
+            target
+        }
+    };
+    Some(ImportConflict {
+        kind,
+        existing_name: import_display_value(&existing.name),
+        existing_target: target,
+    })
+}
+
+fn import_display_value(value: &str) -> String {
+    if let Some((_, uri)) = value.split_once("://") {
+        let authority = uri.split(['/', '?', '#', ';']).next().unwrap_or_default();
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        if !host.is_empty() && host.chars().all(|ch| ch.is_ascii_alphanumeric() || ".-_:[],".contains(ch)) {
+            return host.to_owned();
+        }
+        return "（已隐藏连接参数）".to_owned();
+    }
+    if value.contains(['?', ';', '=']) || value.starts_with("jdbc:")
+        || value.split_once('@').is_some_and(|(userinfo, _)| userinfo.contains(':'))
+    {
+        return "（已隐藏连接参数）".to_owned();
+    }
+    value.to_owned()
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -183,79 +262,39 @@ impl Store {
     }
 
     pub async fn upsert(&self, connection: &SavedConnection) -> Result<(), sqlx::Error> {
-        let tls = connection.tls.as_ref();
-        let ssh = connection.ssh.as_ref();
-        sqlx::query(
-            "INSERT INTO connections (
-                id, name, engine, env, host, port, database_name, username, file_path,
-                tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
-                ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                password_saved, ssh_password_saved, replica_set
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                engine = excluded.engine,
-                env = excluded.env,
-                host = excluded.host,
-                port = excluded.port,
-                database_name = excluded.database_name,
-                username = excluded.username,
-                file_path = excluded.file_path,
-                tls_mode = excluded.tls_mode,
-                tls_server_name = excluded.tls_server_name,
-                ca_mode = excluded.ca_mode,
-                ca_file = excluded.ca_file,
-                client_cert = excluded.client_cert,
-                client_key = excluded.client_key,
-                ssh_host = excluded.ssh_host,
-                ssh_port = excluded.ssh_port,
-                ssh_user = excluded.ssh_user,
-                ssh_auth = excluded.ssh_auth,
-                ssh_key_path = excluded.ssh_key_path,
-                password_saved = excluded.password_saved,
-                ssh_password_saved = excluded.ssh_password_saved,
-                replica_set = excluded.replica_set",
-        )
-        .bind(&connection.id)
-        .bind(&connection.name)
-        .bind(connection.engine.as_str())
-        .bind(&connection.env)
-        .bind(&connection.host)
-        .bind(connection.port.map(i64::from))
-        .bind(&connection.database)
-        .bind(&connection.username)
-        .bind(&connection.file_path)
-        .bind(tls.map(|item| item.mode.as_str()))
-        .bind(tls.map(|item| item.server_name.clone()))
-        .bind(tls.map(|item| item.ca_mode.as_str()))
-        .bind(tls.and_then(|item| item.ca_file.clone()))
-        .bind(tls.and_then(|item| item.client_cert.clone()))
-        .bind(tls.and_then(|item| item.client_key.clone()))
-        .bind(ssh.map(|item| item.host.clone()))
-        .bind(ssh.map(|item| i64::from(item.port)))
-        .bind(ssh.map(|item| item.username.clone()))
-        .bind(ssh.map(|item| item.auth.as_str()))
-        .bind(ssh.and_then(|item| item.key_path.clone()))
-        .bind(i64::from(u8::from(connection.password_saved)))
-        .bind(i64::from(u8::from(connection.ssh_password_saved)))
-        .bind(&connection.replica_set)
-        .execute(&self.pool)
-        .await?;
+        write_connection(&mut *self.pool.acquire().await?, connection, true).await?;
         self.checkpoint().await?;
         Ok(())
     }
 
+    /// 逐条在同一 SQLite 写锁下检查并新增，多个应用实例也会看到先提交的连接。
+    pub(crate) async fn insert_imported(&self, candidate: &SavedConnection) -> Result<ImportInsert, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for existing in list_connections(&mut tx, Some(candidate)).await? {
+            if let Some(conflict) = import_conflict(candidate, &existing) {
+                tx.rollback().await?;
+                return Ok(ImportInsert::Conflict(conflict));
+            }
+        }
+        if candidate.env != super::model::ENV_NONE {
+            let usable_tag: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM env_tags WHERE id = ?1 AND (?1 <> 'prod' OR tone = 'prod'))",
+            )
+                .bind(&candidate.env)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !usable_tag {
+                tx.rollback().await?;
+                return Ok(ImportInsert::MissingEnvironment);
+            }
+        }
+        write_connection(&mut tx, candidate, false).await?;
+        tx.commit().await?;
+        Ok(ImportInsert::Inserted)
+    }
+
     pub async fn list(&self) -> Result<Vec<SavedConnection>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, name, engine, env, host, port, database_name, username, file_path,
-                    tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
-                    ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                    password_saved, ssh_password_saved, replica_set
-             FROM connections ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(row_to_connection).collect()
+        list_connections(&mut *self.pool.acquire().await?, None).await
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<SavedConnection>, sqlx::Error> {
@@ -455,14 +494,16 @@ impl Store {
     }
 
     pub async fn delete_tag(&self, id: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE connections SET env = 'none' WHERE env = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM env_tags WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         self.checkpoint().await?;
         Ok(())
     }
@@ -582,6 +623,96 @@ impl Store {
         sqlx::query(crate::adapters::sqlite::connect::LOCAL_STORE_CHECKPOINT).execute(&self.pool).await?;
         Ok(())
     }
+}
+
+async fn write_connection(
+    db: &mut sqlx::SqliteConnection,
+    connection: &SavedConnection,
+    update_existing: bool,
+) -> Result<(), sqlx::Error> {
+    let tls = connection.tls.as_ref();
+    let ssh = connection.ssh.as_ref();
+    let mut statement = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "INSERT INTO connections (
+                id, name, engine, env, host, port, database_name, username, file_path,
+                tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
+                ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
+                password_saved, ssh_password_saved, replica_set
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+    );
+    if update_existing {
+        statement.push(
+            " ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                engine = excluded.engine,
+                env = excluded.env,
+                host = excluded.host,
+                port = excluded.port,
+                database_name = excluded.database_name,
+                username = excluded.username,
+                file_path = excluded.file_path,
+                tls_mode = excluded.tls_mode,
+                tls_server_name = excluded.tls_server_name,
+                ca_mode = excluded.ca_mode,
+                ca_file = excluded.ca_file,
+                client_cert = excluded.client_cert,
+                client_key = excluded.client_key,
+                ssh_host = excluded.ssh_host,
+                ssh_port = excluded.ssh_port,
+                ssh_user = excluded.ssh_user,
+                ssh_auth = excluded.ssh_auth,
+                ssh_key_path = excluded.ssh_key_path,
+                password_saved = excluded.password_saved,
+                ssh_password_saved = excluded.ssh_password_saved,
+                replica_set = excluded.replica_set",
+        );
+    }
+    statement.build()
+        .bind(&connection.id)
+        .bind(&connection.name)
+        .bind(connection.engine.as_str())
+        .bind(&connection.env)
+        .bind(&connection.host)
+        .bind(connection.port.map(i64::from))
+        .bind(&connection.database)
+        .bind(&connection.username)
+        .bind(&connection.file_path)
+        .bind(tls.map(|item| item.mode.as_str()))
+        .bind(tls.map(|item| item.server_name.clone()))
+        .bind(tls.map(|item| item.ca_mode.as_str()))
+        .bind(tls.and_then(|item| item.ca_file.clone()))
+        .bind(tls.and_then(|item| item.client_cert.clone()))
+        .bind(tls.and_then(|item| item.client_key.clone()))
+        .bind(ssh.map(|item| item.host.clone()))
+        .bind(ssh.map(|item| i64::from(item.port)))
+        .bind(ssh.map(|item| item.username.clone()))
+        .bind(ssh.map(|item| item.auth.as_str()))
+        .bind(ssh.and_then(|item| item.key_path.clone()))
+        .bind(i64::from(u8::from(connection.password_saved)))
+        .bind(i64::from(u8::from(connection.ssh_password_saved)))
+        .bind(&connection.replica_set)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn list_connections(db: &mut sqlx::SqliteConnection, candidate: Option<&SavedConnection>) -> Result<Vec<SavedConnection>, sqlx::Error> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, name, engine, env, host, port, database_name, username, file_path,
+                tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
+                ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
+                password_saved, ssh_password_saved, replica_set FROM connections",
+    );
+    if let Some(profile) = candidate {
+        // 旧名称可带 Unicode 空白；SQL 只缩小候选，最终以 Rust 的 trim 比对。
+        query.push(" WHERE instr(name, ").push_bind(&profile.name)
+            .push(") > 0 OR (engine = ").push_bind(profile.engine.as_str())
+            .push(" AND host IS ").push_bind(&profile.host)
+            .push(" AND file_path IS ").push_bind(&profile.file_path).push(")");
+    }
+    query.push(" ORDER BY name");
+    let rows = query.build().fetch_all(db).await?;
+    rows.iter().map(row_to_connection).collect()
 }
 
 fn row_to_tag(row: &sqlx::sqlite::SqliteRow) -> Result<EnvTag, sqlx::Error> {
