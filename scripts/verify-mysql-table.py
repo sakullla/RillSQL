@@ -133,7 +133,8 @@ def write_report(path, args, versions, evidence, output, command):
         ("RANGE 分区", "adapters/mysql/table_ddl.rs partition_by_clause、partition_steps", "information_schema.PARTITIONS", "建立、新增、删除、重组"),
         ("LIST 分区", "同上", "information_schema.PARTITIONS", "建立"),
         ("HASH 分区", "同上", "information_schema.PARTITIONS", "建立、按数量增、按数量减"),
-        ("KEY 分区", "同上", "information_schema.PARTITIONS", "建立、移除分区方案"),
+        ("KEY 分区", "同上", "information_schema.PARTITIONS（PARTITION_EXPRESSION 是反引号包住的列清单）",
+         "建立、读回列清单还原成裸列名后按同一函数重建、移除分区方案"),
         ("失败路径与风险", "ddl/exec.rs 逐条执行与 receipts；table_ddl.rs partition_applicability", "服务器原始错误",
          "服务器拒绝新增分区后结构不变、原始错误保留；未分区的表删除分区在预览前阻断"),
     ]
@@ -206,12 +207,14 @@ def write_report(path, args, versions, evidence, output, command):
     body.append("")
     body.append("- DDL 生成：`adapters/mysql/table_ddl.rs` 的 `enum_set_type`、`generated_clause`、`partition_by_clause`、`partition_steps` 对两个家族用同一份代码，没有按主次版本分支。")
     body.append("- 元数据读回：`information_schema.columns`（COLUMN_TYPE / EXTRA / GENERATION_EXPRESSION）与 `information_schema.PARTITIONS`，同样是同一份代码。")
+    body.append("- KEY 分区的列清单还原：`adapters/mysql/table_read.rs` 的 `key_columns_from_expression` 把读回的 PARTITION_EXPRESSION（两引擎实测都是 `a`,`b` 这种反引号形状）还原成裸列名，界面起稿与重建共用这一个函数；加引号仍由 table_ddl 按方言做。")
     body.append("- 驱动与协议：同一 mysql_async 0.37.1（rustls）。MySQL 与 MariaDB 不互相替代，两个引擎各自跑完整流程。")
     body.append("- 唯一的版本分叉在 `adapters/mysql/profile.rs` 的 FamilyFeatures：mysql —— %s；mariadb —— %s。两个分叉分支本轮都被实际执行（STORED 与 PERSISTENT 各一次）。" % (coverage["mysql"]["gate"], coverage["mariadb"]["gate"]))
     body.append("")
     body.append("仍属推断 / 限制（不得当作已验证事实）：")
     body.append("")
     body.append("- 上表“由它推断的更低目标版本”整列都是推断，本轮没有在这些版本上运行过。")
+    body.append("- KEY 分区的 PARTITION_EXPRESSION 只在 9.7.4 / 12.3.3 上实测为 `a`,`b` 的反引号形状；更低版本的返回写法按同一读回代码推断，本轮没有逐版本核对。")
     for engine in ("mysql", "mariadb"):
         for line in coverage[engine]["limits"]:
             body.append("- %s：%s。" % (coverage[engine]["family"], line))

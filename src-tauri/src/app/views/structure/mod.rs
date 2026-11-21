@@ -579,15 +579,11 @@ impl StructureSession {
     }
 
     /// 分区草稿换成动作参数：KEY 的列清单来自输入原文（逗号分隔），其余方式不用列清单。
+    /// 输入里的外层反引号与双写反引号按读回表达式同一规则还原成裸列名，用户手写 `id` 也不会被再包一层。
     fn partition_action(&self) -> PartitionDraft {
         let mut draft = self.partition.clone();
         if draft.method == PartitionMethod::Key {
-            draft.columns = self
-                .partition_columns
-                .split(',')
-                .map(|name| name.trim().to_owned())
-                .filter(|name| !name.is_empty())
-                .collect();
+            draft.columns = crate::adapters::mysql::table_read::key_columns_from_expression(&self.partition_columns);
         } else {
             draft.columns.clear();
         }
@@ -1415,9 +1411,13 @@ impl StructurePane {
             },
             None => PartitionDraft::default(),
         };
-        // KEY 分区的列清单直接用读回的表达式原文：怎么加引号是方言的事，界面不重新拼。
+        // KEY 分区的读回表达式是反引号包住的列清单，起稿就还原成裸列名：
+        // 加引号是 table_ddl::key_columns 按方言做的事，界面带着引号会把整段再包一层（KEY(```id```)）。
+        // RANGE/LIST/HASH 的表达式不是列清单，原样保留。
         self.session.partition_columns = match snapshot.partitions.as_ref() {
-            Some(current) if current.method == crate::ddl::model::PartitionMethod::Key => current.expression.clone(),
+            Some(current) if current.method == crate::ddl::model::PartitionMethod::Key => {
+                crate::adapters::mysql::table_read::key_columns_from_expression(&current.expression).join(", ")
+            }
             _ => String::new(),
         };
     }

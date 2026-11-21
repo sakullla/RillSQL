@@ -17,7 +17,9 @@ pub(in crate::adapters) mod object_read;
 mod plan;
 pub(in crate::adapters) mod profile;
 pub(in crate::adapters) mod table_ddl;
-pub(in crate::adapters) mod table_read;
+// table_read 里的 KEY 列清单还原（key_columns_from_expression）要在结构界面的起稿边界复用，
+// 因此比同组其它模块宽一级：只放宽可见性，不加新接口。
+pub(crate) mod table_read;
 #[cfg(test)]
 mod table_live_tests;
 pub(in crate::adapters) mod syntax;

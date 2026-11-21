@@ -87,6 +87,43 @@ pub(super) fn partition_state(rows: &[(String, String, String, String)]) -> Opti
     Some(PartitionState { method, expression: first.2.clone(), definitions })
 }
 
+/// KEY 分区的列清单还原：information_schema.PARTITIONS.PARTITION_EXPRESSION 对 KEY 分区返回的
+/// 是反引号包住的列清单（MySQL 与 MariaDB 都返回如 `id`,`tenant_id`），不是裸列名。
+/// 这里按逗号拆开、去空白、去掉外层反引号并把连续两个反引号还原成一个，界面起稿与重建都拿裸列名；
+/// 再加引号由 table_ddl::key_columns 按方言做，避免出现 KEY(```id```) 这种再包一层的写法。
+/// 逗号只在反引号之外才算分隔，列名里的逗号不会被拆开。RANGE/LIST/HASH 的表达式不是列清单，不走这里。
+pub(crate) fn key_columns_from_expression(expression: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for ch in expression.chars() {
+        match ch {
+            '`' => {
+                quoted = !quoted;
+                token.push(ch);
+            }
+            ',' if !quoted => tokens.push(std::mem::take(&mut token)),
+            _ => token.push(ch),
+        }
+    }
+    tokens.push(token);
+    tokens.iter().filter_map(|token| unquote_column(token)).collect()
+}
+
+/// 一个列清单片段还原成裸列名：去空白；成对的反引号去掉并把 `` 还原成 `；空的片段丢掉。
+fn unquote_column(token: &str) -> Option<String> {
+    let text = token.trim();
+    let name = match text.strip_prefix('`').and_then(|rest| rest.strip_suffix('`')) {
+        Some(inner) => inner.replace("``", "`"),
+        None => text.to_owned(),
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// 读一张表的分区方案。查询失败时给出原因，由调用方记进 snapshot.partition_error，不影响字段读取。
 pub(super) async fn load_partitions(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<Option<PartitionState>, String> {
     let rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(conn, PARTITIONS_SQL, (database.to_owned(), table.to_owned()))
@@ -169,5 +206,26 @@ mod tests {
 
         assert!(partition_state(&[]).is_none());
         assert!(partition_state(&[(String::new(), "SYSTEM".to_owned(), String::new(), String::new())]).is_none());
+    }
+
+    /// KEY 分区的读回表达式是反引号包住的列清单：还原成裸列名，才不会再包一层引号。
+    #[test]
+    fn key_columns_from_read_back_expression_are_bare_names() {
+        // 两个引擎读回的实际形状。
+        assert_eq!(key_columns_from_expression("`id`,`tenant_id`"), vec!["id".to_owned(), "tenant_id".to_owned()]);
+        // 空格不影响结果，空片段丢掉。
+        assert_eq!(key_columns_from_expression(" `id` , `tenant_id` , "), vec!["id".to_owned(), "tenant_id".to_owned()]);
+        // 列名里的反引号在表达式里是双写的：还原成一个。
+        assert_eq!(key_columns_from_expression("`a``b`"), vec!["a`b".to_owned()]);
+        assert_eq!(
+            key_columns_from_expression("`a``b`,`c`"),
+            vec!["a`b".to_owned(), "c".to_owned()]
+        );
+        // 反引号里的逗号是列名的一部分，不当分隔符。
+        assert_eq!(key_columns_from_expression("`a,b`"), vec!["a,b".to_owned()]);
+        // 没有反引号的写法（用户在界面上手写的裸列名）原样保留。
+        assert_eq!(key_columns_from_expression("id, tenant_id"), vec!["id".to_owned(), "tenant_id".to_owned()]);
+        assert!(key_columns_from_expression("   ").is_empty());
+        assert!(key_columns_from_expression("").is_empty());
     }
 }

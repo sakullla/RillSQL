@@ -2305,6 +2305,54 @@ fn partition_maintenance_follows_the_read_back_scheme() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// KEY 分区的列清单读回时带反引号（两引擎实测都是 `id`,`tenant_id`）：起稿还原成裸列名，
+/// 预览再按方言各包一层，不会拼出 KEY(```id```) 这种服务器拒绝的语句。
+#[test]
+fn key_partition_columns_are_seeded_bare_from_the_read_back_expression() {
+    let mut snapshot = mysql_snapshot(DdlEngine::Mysql);
+    snapshot.partitions = Some(PartitionState {
+        method: PartitionMethod::Key,
+        expression: "`id`,`tenant_id`".to_owned(),
+        definitions: vec![
+            PartitionDefState { name: "p0".to_owned(), description: String::new() },
+            PartitionDefState { name: "p1".to_owned(), description: String::new() },
+            PartitionDefState { name: "p2".to_owned(), description: String::new() },
+        ],
+    });
+    let dir = std::env::temp_dir().join(format!("rillsql-partition-key-seed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+        crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+    )));
+    let mut pane = StructurePane::new(services);
+    pane.seed_partition_draft(&snapshot);
+
+    assert_eq!(pane.session.partition_columns, "id, tenant_id");
+    let action = pane.session.partition_action();
+    assert_eq!(action.method, PartitionMethod::Key);
+    assert_eq!(action.columns, vec!["id".to_owned(), "tenant_id".to_owned()]);
+    assert_eq!(action.count, "3");
+
+    // 同一份草稿走到预览：KEY 的列各包一层引号，数量照读回的分区数重建。
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+    session.partition = action;
+    session.partition_columns = pane.session.partition_columns.clone();
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY KEY(id, tenant_id) PARTITIONS 3"), "{sql}");
+    assert!(!sql.contains("```"), "{sql}");
+
+    // 界面上手写的反引号（含双写与空格）按同一规则还原，不会二次加引号。
+    pane.session.partition_columns = " `id` , `ten``ant` ".to_owned();
+    assert_eq!(
+        pane.session.partition_action().columns,
+        vec!["id".to_owned(), "ten`ant".to_owned()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 界面：ENUM 行下面出现候选值面板，增删与排序都落在草稿上；生成列面板给出存储方式。
 #[gpui_kit::test]
 fn enum_and_generated_panels_edit_the_draft(cx: &mut gpui_kit::TestAppContext) {

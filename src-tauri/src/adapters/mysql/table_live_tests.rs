@@ -176,6 +176,7 @@ async fn run_engine(engine: Engine, port: String) {
     enum_set_round_trip(&live, &suffix).await;
     generated_column_round_trip(&live, &suffix).await;
     partition_round_trip(&live, &suffix).await;
+    partition_key_read_back_rebuild(&live, &suffix).await;
     partition_failure_keeps_the_definition(&live, &suffix).await;
     println!("table-live: {} 全部用例完成", live.engine_name());
 }
@@ -459,6 +460,63 @@ async fn partition_round_trip(live: &Live, suffix: &str) {
     assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
     let snapshot = live.describe(&table).await;
     assert!(snapshot.partitions.is_none(), "{}: 移除后不该再有分区方案", live.engine_name());
+    live.drop_table(&table).await;
+}
+
+/// KEY 分区读回后按原样重建：PARTITION_EXPRESSION 是反引号包住的列清单（两引擎都如此），
+/// 还原成裸列名后重建，语句必须可执行——直接拿读回原文会拼出 KEY(```a```,```b```) 被服务器拒绝。
+async fn partition_key_read_back_rebuild(live: &Live, suffix: &str) {
+    let table = format!("t2_part_key_{suffix}");
+    // 两列联合主键：KEY 分区的列必须覆盖所有唯一键，单列 id 主键上分不了 (a, b)。
+    let mut a = plain_column("a", "int");
+    a.nullable = false;
+    a.primary = true;
+    let mut b = plain_column("b", "int");
+    b.nullable = false;
+    b.primary = true;
+    live.create_table(&table, vec![a, b]).await;
+
+    let key = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Key,
+        columns: vec!["a".to_owned(), "b".to_owned()],
+        count: "3".to_owned(),
+        ..PartitionDraft::default()
+    };
+    let (plan, receipt) = live.run(Action::AlterPartitions { table: table.clone(), partition: key }).await;
+    println!("table-live: {} KEY 两列建立 -> {}", live.engine_name(), plan.steps[0].sql);
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+
+    let scheme = live.describe(&table).await.partitions.expect("读回 KEY 分区");
+    assert_eq!(scheme.method, PartitionMethod::Key);
+    assert_eq!(scheme.definitions.len(), 3);
+    let columns = super::table_read::key_columns_from_expression(&scheme.expression);
+    assert_eq!(columns, vec!["a".to_owned(), "b".to_owned()], "{}: 读回表达式 {:?}", live.engine_name(), scheme.expression);
+    println!(
+        "table-live: {} KEY 读回列清单 {:?} -> 裸列名 {:?}",
+        live.engine_name(),
+        scheme.expression,
+        columns
+    );
+
+    // 用读回的列清单按同一函数重建：这是打开已有 KEY 分区表后修改再重建的真实路径。
+    let rebuild = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Key,
+        columns,
+        count: scheme.definitions.len().to_string(),
+        ..PartitionDraft::default()
+    };
+    let (plan, receipt) = live.run(Action::AlterPartitions { table: table.clone(), partition: rebuild }).await;
+    let sql = plan.steps[0].sql.clone();
+    println!("table-live: {} KEY 按读回重建 -> {}", live.engine_name(), sql);
+    assert!(sql.contains("PARTITION BY KEY(a, b) PARTITIONS 3"), "{sql}");
+    assert!(!sql.contains("```"), "{sql}");
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+    let scheme = live.describe(&table).await.partitions.expect("重建后读回 KEY 分区");
+    assert_eq!(scheme.method, PartitionMethod::Key);
+    assert_eq!(scheme.definitions.len(), 3);
+    println!("table-live: {} KEY 重建后读回 {} 个分区", live.engine_name(), scheme.definitions.len());
     live.drop_table(&table).await;
 }
 
