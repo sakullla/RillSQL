@@ -795,6 +795,8 @@ dict! {
     "grid.preview.keysHint" => "回车确认写入 · Esc 取消", "Enter to write · Esc to cancel";
     "grid.preview.prodHint" => "生产环境：请点按“确认写入”", "Production: click “Confirm write” to apply";
     "grid.preview.cancel" => "取消预览", "Cancel preview";
+    "grid.preview.copySql" => "复制 SQL", "Copy SQL";
+    "grid.preview.copied" => "已复制预览 SQL", "Copied preview SQL";
     "grid.commit.needPreview" => "先打开预览并确认后才会写入。", "Open the preview and confirm before anything is written.";
     "structure.section.columns" => "字段", "Columns";
     "structure.section.indexes" => "索引", "Indexes";
@@ -1274,6 +1276,17 @@ dict! {
     "grid.column.unfreeze" => "取消冻结", "Unfreeze columns";
     "grid.column.fit" => "自适应列宽", "Auto-fit column width";
     "grid.column.lastVisible" => "至少要保留一个可见列", "At least one column must stay visible";
+    "grid.column.moveLeft" => "向左移动列", "Move column left";
+    "grid.column.moveRight" => "向右移动列", "Move column right";
+    "grid.column.resetOrder" => "重置列顺序", "Reset column order";
+    "grid.column.manage" => "列", "Columns";
+    "grid.column.manageHint" => "管理列显隐与顺序", "Manage column visibility and order";
+    "grid.column.hiddenCount" => "隐藏 {count} 列", "{count} hidden";
+    "grid.column.search" => "搜索列…", "Search columns…";
+    "grid.column.emptySearch" => "没有匹配的列", "No matching columns";
+    "grid.column.alreadyFrozen" => "当前已冻结到此列", "Already frozen at this column";
+    "grid.column.notSorted" => "当前未排序", "No active sort";
+    "grid.edit.expand" => "展开多行编辑", "Expand editor";
     "grid.record.open" => "记录视图", "Record view";
     "grid.record.title" => "第 {row} 行", "Row {row}";
     "grid.record.prev" => "上一行", "Previous row";
