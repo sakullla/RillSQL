@@ -26,14 +26,24 @@ pub struct TargetChoice {
     pub databases: Vec<String>,
 }
 
+/// 双栏弹层当前由上下键控制的栏。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TargetColumn {
+    Connections,
+    #[default]
+    Databases,
+}
+
 /// 选择器弹层的界面状态。
 pub struct TargetPicker {
-    /// 弹层的锚点（打开它的那次点击位置）；None 表示关闭。
+    /// 弹层的锚点（按钮右下角或打开位置）；None 表示关闭。
     pub anchor: Option<Point<Pixels>>,
     /// 左栏当前选中的连接（右栏列它的库）。
     pub focus: Option<String>,
     /// 右栏当前键盘高亮的库下标。
     pub db_index: usize,
+    /// 当前由上下方向键导航的栏（左栏连接 / 右栏数据库）。
+    pub column: TargetColumn,
     pub search: Option<Entity<InputState>>,
     /// 等着连接成功后再绑定的连接。
     pub pending: Option<String>,
@@ -47,6 +57,7 @@ impl Default for TargetPicker {
             anchor: None,
             focus: None,
             db_index: 0,
+            column: TargetColumn::Databases,
             search: None,
             pending: None,
             conn_scroll: gpui_kit::ScrollHandle::new(),
@@ -106,10 +117,10 @@ pub fn resolved_focus(
 /// 目标按钮上一帧的位置（窗口坐标）。没有点击坐标时（键盘、状态栏、执行被拦下）选择器贴着它弹出。
 pub type ButtonBounds = std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<Pixels>>>>;
 
-/// 选择器的锚点：按钮右下角向内一点，和鼠标点按钮时弹出的位置一致。
+/// 选择器的锚点：紧贴按钮右下角边界，鼠标点按钮与键盘/状态栏打开保持一致对齐。
 pub fn anchor_for(bounds: Option<gpui_kit::Bounds<Pixels>>) -> Point<Pixels> {
     match bounds {
-        Some(area) => gpui_kit::point(area.origin.x + area.size.width - px(4.), area.origin.y + area.size.height / 2.),
+        Some(area) => gpui_kit::point(area.origin.x + area.size.width, area.origin.y + area.size.height),
         None => gpui_kit::point(px(0.), px(0.)),
     }
 }
@@ -186,9 +197,12 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
             gpui_kit::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
         })
         .relative()
-        .on_click(move |event: &gpui_kit::ClickEvent, _, cx| {
-            let at = event.position();
-            owner.update(cx, |pane, cx| pane.toggle_target_picker(at, cx));
+        .on_click({
+            let bounds = bounds.clone();
+            move |event: &gpui_kit::ClickEvent, _, cx| {
+                let at = if bounds.get().is_some() { anchor_for(bounds.get()) } else { event.position() };
+                owner.update(cx, |pane, cx| pane.toggle_target_picker(at, cx));
+            }
         })
         .into_any_element()
 }
@@ -227,7 +241,16 @@ pub fn popover(
         .border_r_1()
         .border_color(p.line)
         .py(px(4.));
-    left = left.child(div().px(px(10.)).py(px(4.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("ui.query.targetConnections")));
+    let conn_col_active = picker.column == TargetColumn::Connections;
+    left = left.child(
+        div()
+            .px(px(10.))
+            .py(px(4.))
+            .text_size(px(TypeScale::XS))
+            .text_color(if conn_col_active { p.accent_text } else { p.text_faint })
+            .when(conn_col_active, |this| this.font_weight(FontWeight::SEMIBOLD))
+            .child(t("ui.query.targetConnections")),
+    );
     // 一条连接都没有和“筛选后没有匹配”是两回事：前者要给出新建连接的出口，而不是让人对着空列表找。
     let no_connections = choices.is_empty();
     if no_connections {
@@ -322,12 +345,14 @@ pub fn popover(
         Some(choice) => {
             let databases = filtered_databases(choice, filter);
             let active_db = picker.db_index.min(databases.len().saturating_sub(1));
+            let db_col_active = picker.column == TargetColumn::Databases;
             right = right.child(
                 div()
                     .px(px(10.))
                     .py(px(4.))
                     .text_size(px(TypeScale::XS))
-                    .text_color(p.text_faint)
+                    .text_color(if db_col_active { p.accent_text } else { p.text_faint })
+                    .when(db_col_active, |this| this.font_weight(FontWeight::SEMIBOLD))
                     .child(SharedString::from(i18n::fill(&i18n::text(locale, "ui.query.targetDatabases"), &[("name", &choice.name)]))),
             );
             if databases.is_empty() {
@@ -396,8 +421,9 @@ pub fn popover(
         .text_size(px(TypeScale::XS))
         .text_color(p.text_faint)
         .child(hint("↑↓", t("ui.query.targetHintMove")))
+        .child(hint("←→", t("ui.query.targetHintColumn")))
         .child(hint("Tab", t("ui.query.targetHintConn")))
-        .child(hint("Enter", t("shell.palette.hintRun")))
+        .child(hint("Enter", t("ui.query.targetHintSelect")))
         .child(hint("Esc", t("shell.palette.hintClose")));
     // 高度贴合内容，最高 360：只有一两条连接时不留一大块空白。右栏按所有已打开连接里最长的库清单估算，
     // 用 Tab 在连接间切换时面板不会跟着忽高忽低。
@@ -442,6 +468,14 @@ pub fn popover(
                     cx.stop_propagation();
                     keys.update(cx, |pane, cx| pane.step_target_picker(1, cx));
                 }
+                "left" => {
+                    cx.stop_propagation();
+                    keys.update(cx, |pane, cx| pane.switch_target_column(TargetColumn::Connections, cx));
+                }
+                "right" => {
+                    cx.stop_propagation();
+                    keys.update(cx, |pane, cx| pane.switch_target_column(TargetColumn::Databases, cx));
+                }
                 "tab" => {
                     cx.stop_propagation();
                     let backward = event.keystroke.modifiers.shift;
@@ -457,7 +491,7 @@ pub fn popover(
         .children(search.map(|input| div().flex_none().p(px(8.)).border_b_1().border_color(p.line).child(input)))
         .child(div().flex_1().min_h_0().flex().child(left).child(right))
         .child(footer);
-    Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(div().pt(px(14.)).child(panel))).with_priority(2).into_any_element())
+    Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(div().pt(px(4.)).child(panel))).with_priority(2).into_any_element())
 }
 
 trait TooltipOpt: Sized {

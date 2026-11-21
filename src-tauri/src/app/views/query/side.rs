@@ -2,10 +2,12 @@
 //! 宽窗口里它在编辑器旁边；窄窗口默认收起，打开时盖在编辑器上，不改变编辑器和结果区的布局。
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, ClickEvent, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    AnyElement, ClickEvent, Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     Styled as _, TestSupportExt as _, div, px,
 };
 
@@ -59,6 +61,9 @@ pub struct SidePanel<'a> {
     pub mono: SharedString,
     /// 当前目标的引擎，用来给点选插入的标识符加引号。
     pub engine: &'a str,
+    /// 对象检查器字段搜索框与当前小写筛选词。
+    pub column_filter: Option<&'a Entity<InputState>>,
+    pub column_query: &'a str,
 }
 
 impl SidePanel<'_> {
@@ -107,10 +112,11 @@ impl SidePanel<'_> {
             .xsmall());
         let body = match self.body {
             SideBody::Outline(items) => outline(items, self.active_statement, locale, self.metrics, &self.mono, p, entity),
-            SideBody::Object(info) => object(info, locale, self.metrics, &self.mono, p, self.engine, entity),
+            SideBody::Object(info) => object(info, self.column_filter, self.column_query, locale, self.metrics, &self.mono, p, self.engine, entity),
         };
         let panel_w = if self.overlay { PANEL_WIDTH } else { self.width.clamp(PANEL_MIN, PANEL_MAX) };
-        div()
+        let esc_entity = entity.clone();
+        let panel = div()
             .id("query-side-panel")
             .test_support()
             .role(gpui_kit::Role::Complementary)
@@ -123,10 +129,47 @@ impl SidePanel<'_> {
             .bg(p.chrome)
             .border_l_1()
             .border_color(p.line)
-            .when(self.overlay, |this| this.absolute().top_0().right_0().shadow_lg())
+            .when(self.overlay, |this| {
+                this.occlude().shadow_lg().on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                    {
+                        cx.stop_propagation();
+                        esc_entity.update(cx, |pane, cx| pane.command("close-side", cx));
+                    }
+                })
+            })
             .child(header)
-            .child(body)
-            .into_any_element()
+            .child(body);
+        if self.overlay {
+            let close_backdrop = entity.clone();
+            div()
+                .id("query-side-overlay")
+                .test_support()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_end()
+                .child(
+                    div()
+                        .id("query-side-backdrop")
+                        .test_support()
+                        .flex_1()
+                        .h_full()
+                        .bg(p.sunken.opacity(if p.dark { 0.55 } else { 0.45 }))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            close_backdrop.update(cx, |pane, cx| pane.command("close-side", cx));
+                        }),
+                )
+                .child(panel)
+                .into_any_element()
+        } else {
+            panel.into_any_element()
+        }
     }
 }
 
@@ -333,7 +376,28 @@ fn object_column(
         .into_any_element()
 }
 
-fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, engine: &str, entity: &Entity<QueryPane>) -> AnyElement {
+pub fn column_matches_query(column: &crate::query::assist::ColumnMeta, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    column.name.to_lowercase().contains(&query)
+        || column.type_name.to_lowercase().contains(&query)
+        || column.comment.to_lowercase().contains(&query)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn object(
+    info: Option<&ObjectInfo>,
+    column_filter: Option<&Entity<InputState>>,
+    column_query: &str,
+    locale: Locale,
+    metrics: Metrics,
+    mono: &SharedString,
+    p: &Palette,
+    engine: &str,
+    entity: &Entity<QueryPane>,
+) -> AnyElement {
     let Some(info) = info else {
         return div()
             .id("query-side-object")
@@ -413,9 +477,42 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
         );
     if info.columns.is_empty() {
         body = body.child(div().px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(i18n::text(locale, "query.side.noColumns"))));
-    }
-    for (index, column) in info.columns.iter().enumerate() {
-        body = body.child(object_column(index, column, info.column.as_deref(), locale, metrics, mono, p, engine, &info.name, entity));
+    } else {
+        if let Some(filter_state) = column_filter {
+            body = body.child(
+                div()
+                    .id("query-side-column-filter-wrap")
+                    .flex_none()
+                    .px(px(8.))
+                    .pb(px(6.))
+                    .child(
+                        kit::text_input("query-side-column-filter", filter_state, SharedString::from(i18n::text(locale, "query.side.filterColumns")))
+                            .prefix(kit::input_prefix(IconName::Search, 12., p.text_faint))
+                            .cleanable(true)
+                            .small(),
+                    ),
+            );
+        }
+        let mut matched = 0usize;
+        for (index, column) in info.columns.iter().enumerate() {
+            if !column_matches_query(column, column_query) {
+                continue;
+            }
+            matched += 1;
+            body = body.child(object_column(index, column, info.column.as_deref(), locale, metrics, mono, p, engine, &info.name, entity));
+        }
+        if matched == 0 {
+            body = body.child(
+                div()
+                    .id("query-side-columns-empty")
+                    .test_support()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(i18n::text(locale, "query.side.noMatchingColumns"))),
+            );
+        }
     }
     body.into_any_element()
 }

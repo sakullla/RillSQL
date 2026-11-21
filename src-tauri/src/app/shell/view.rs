@@ -820,6 +820,21 @@ impl Workbench {
             cx.notify();
             return;
         }
+        if id == "commit"
+            && self.model.shell.page == AppPage::Workspace
+            && self.model.tool == WorkTool::Query
+            && !self.query.read(cx).grid_uncommitted(cx)
+        {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            self.forward_query("save-sql-file", cx);
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
         if grid_surface_command(id) {
             if self.model.close_prompt.is_some() {
                 let _ = self.model.dispatch(id);
@@ -3213,6 +3228,9 @@ impl Workbench {
                             Ok(file) => {
                                 view.model.shell.note_opened(path.clone());
                                 view.model.open_sql_file(&path, file.sql);
+                                if let Some(tab_id) = view.model.active_tab.clone() {
+                                    view.query.update(cx, |pane, _| pane.set_tab_file_path(&tab_id, path.clone()));
+                                }
                                 view.query.update(cx, |pane, _| pane.request_focus());
                             }
                             Err(error) => {
@@ -3611,6 +3629,8 @@ fn query_command(id: &str) -> bool {
             | "expand-star"
             | "toggle-outline"
             | "toggle-side"
+            | "close-side"
+            | "switch-pane-focus"
             | "pin-result"
             | "refresh-tree"
             | "confirm-variables"

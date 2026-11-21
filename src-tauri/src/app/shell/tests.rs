@@ -14246,3 +14246,41 @@ fn palette_highlights_cycles_scopes_with_tab_and_restores_focus_to_structure_pan
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[gpui_kit::test]
+fn query_mod_s_saves_in_place_and_f6_routes_to_query_pane(cx: &mut gpui_kit::TestAppContext) {
+    assert_eq!(crate::app::keymap::command_chord("switch-pane-focus"), Some("F6"));
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-r4-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sql_path = dir.join("workbench_query.sql");
+    let services = Arc::new(AppServices::from_state(&crate::connections::commands::ConnectionsState::new()));
+    let (window, view) = open_workbench(cx, services, false);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.open_sql_file(&sql_path, "SELECT 99;".into());
+            if let Some(tab_id) = view.model.active_tab.clone() {
+                view.query.update(cx, |pane, _| pane.set_tab_file_path(&tab_id, sql_path.clone()));
+            }
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            // Mod+S 在查询页触发原位保存 SQL。
+            view.perform("commit", cx);
+            // F6 在外壳路由到查询页，无结果时安全忽略不崩溃。
+            view.perform("switch-pane-focus", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !sql_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        cx.run_until_parked();
+    }
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&sql_path).unwrap(), "SELECT 99;");
+    let _ = std::fs::remove_dir_all(&dir);
+}

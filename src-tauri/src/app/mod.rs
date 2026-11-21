@@ -68,6 +68,7 @@ actions!(
         FormatSql,
         ExplainSql,
         LeaveEditor,
+        SwitchPaneFocus,
         SelectAllCells,
         EditCell,
         CancelEdit,
@@ -266,6 +267,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");
     bind!(LeaveEditor, "leave-editor");
+    bind!(SwitchPaneFocus, "switch-pane-focus");
     bind!(SelectAllCells, "select-all-cells");
     bind!(EditCell, "edit-cell");
     bind!(CancelEdit, "cancel-edit");
@@ -360,6 +362,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");
     bind!(LeaveEditor, "leave-editor");
+    bind!(SwitchPaneFocus, "switch-pane-focus");
     bind!(SelectAllCells, "select-all-cells");
     bind!(EditCell, "edit-cell");
     bind!(CancelEdit, "cancel-edit");

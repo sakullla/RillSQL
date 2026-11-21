@@ -122,6 +122,7 @@ dict! {
     "shell.shortcuts.format" => "格式化选中的 SQL；无选中时格式化全部", "Format selected SQL; with nothing selected, format everything";
     "shell.shortcuts.explain" => "查看当前语句的执行计划", "Show the execution plan of the current statement";
     "shell.shortcuts.leaveEditor" => "离开编辑器（不会插入缩进）", "Leave the editor (no indentation inserted)";
+    "shell.shortcuts.switchPaneFocus" => "切换编辑器 / 结果焦点", "Switch editor / results focus";
     "shell.shortcuts.moveCells" => "移动单元格；按住 Shift 扩展选择", "Move between cells; hold Shift to extend the selection";
     "shell.shortcuts.selectAllCells" => "选中已读取的全部单元格", "Select every loaded cell";
     "shell.shortcuts.editCell" => "编辑单元格", "Edit cell";
@@ -735,6 +736,8 @@ dict! {
     "query.log.rows" => "{count} 行", "{count} rows";
     "query.log.affected" => "影响 {count} 行", "{count} affected";
     "query.log.noPosition" => "草稿在执行后改过，或这条错误没有位置，无法定位。", "The draft changed after the run, or this error has no position, so it can't be located.";
+    "query.log.copyMessage" => "复制消息", "Copy message";
+    "query.log.copySql" => "复制 SQL", "Copy SQL";
     "query.rewrite.note" => "执行前被自动改写（{clause}）。草稿不变，改的只是实际发出去的语句。", "Rewritten before execution ({clause}). Your draft is unchanged; only the statement actually sent differs.";
     "query.rewrite.sent" => "实际执行的语句", "Statement actually executed";
     "query.rewrite.limitAppend" => "追加 LIMIT {value}", "appended LIMIT {value}";
@@ -747,6 +750,8 @@ dict! {
     "query.side.object" => "对象", "Object";
     "query.side.noObject" => "光标处没有可识别的对象。", "No known object under the cursor.";
     "query.side.noColumns" => "还没有读到这个对象的列。", "Columns for this object haven't been read yet.";
+    "query.side.filterColumns" => "筛选字段…", "Filter columns…";
+    "query.side.noMatchingColumns" => "没有匹配的字段", "No matching columns";
     "query.side.noStatements" => "草稿里还没有语句。", "The draft has no statements yet.";
     "query.side.nullable" => "可空", "nullable";
     "query.side.notNull" => "非空", "not null";
@@ -1689,6 +1694,8 @@ dict! {
     "conn.page.copiedAddress" => "已复制地址", "Address copied";
     "ui.query.targetHintMove" => "选择库", "Navigate";
     "ui.query.targetHintConn" => "切换连接", "Switch connection";
+    "ui.query.targetHintColumn" => "切换栏", "Switch column";
+    "ui.query.targetHintSelect" => "选择 / 连接", "Select / connect";
     "ui.welcome.subtitle" => "轻量、现代的多引擎数据库工作台", "Modern, lightweight multi-engine database workbench";
     "ui.welcome.quickStart" => "快速开始", "Quick start";
     "ui.welcome.newConnDesc" => "连接 PostgreSQL、MySQL、SQL Server、Redis 等", "Connect PostgreSQL, MySQL, SQL Server, Redis, MongoDB, and more";

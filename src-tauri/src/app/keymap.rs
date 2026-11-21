@@ -10,7 +10,7 @@ use gpui_kit::KeyBinding;
 use super::{
     CloseTab, CommandPalette, CommitEdit, Dismiss, ExecuteCurrent, ExecuteQuery, ExecuteScript, ExplainSql, FocusExplorerSearch, FormatSql, NewQuery,
     NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ShowAutocomplete, ShowHelp, ToggleBlockComment, ToggleComment, ToggleResults, ToggleSidebar,
+    SelectTab7, SelectTab8, SelectTab9, ShowAutocomplete, ShowHelp, SwitchPaneFocus, ToggleBlockComment, ToggleComment, ToggleResults, ToggleSidebar,
 };
 
 /// 由组合键的一个按法（gpui 记法，如 `cmd-shift-f`）生成绑定；第二个参数是“是否按 macOS 生成”。
@@ -123,6 +123,9 @@ pub const SHORTCUTS: &[Shortcut] = &[
         .command("format")
         .binds(&[global!(FormatSql), |key, mac| mac.then(|| KeyBinding::new(key, FormatSql, Some(EDITOR_CONTEXT)))]),
     Shortcut::new("explain", "editor", "Mod+Shift+E", "shell.shortcuts.explain").command("explain").binds(&[global!(ExplainSql)]),
+    Shortcut::new("switch-pane-focus", "editor", "F6", "shell.shortcuts.switchPaneFocus")
+        .command("switch-pane-focus")
+        .binds(&[global!(SwitchPaneFocus)]),
     Shortcut::new("leave-editor", "editor", "Tab", "shell.shortcuts.leaveEditor"),
     Shortcut::new("move-cells", "table", "↑ ↓ ← →", "shell.shortcuts.moveCells"),
     Shortcut::new("select-all-cells", "table", "Mod+A", "shell.shortcuts.selectAllCells"),
