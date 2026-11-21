@@ -23,6 +23,7 @@ use crate::ddl::english::{localize, localize_missing_item};
 use crate::ddl::naming::{IndexNaming, index_name_limit};
 use crate::adapters::ddl::types_named;
 use crate::ddl::sql::{default_problem, existing_default, valid_name, valid_type};
+use crate::ddl::model::{EnumSetDraft, EnumSetKind, GeneratedColumnDraft, PartitionDraft, PartitionMethod};
 use crate::ddl::templates::{ColumnTemplate, TemplateStore};
 use crate::ddl::{
     Action, ColumnDraft, DdlEngine, DefaultSpec, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot, TableOptions,
@@ -72,7 +73,13 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             primary: column.primary,
             auto: column.auto,
             dropped: false,
-            ..ColumnDraft::default()
+            // 专有形态按读回的实际定义起稿：只改候选值、表达式或存储方式时草稿里也有完整定义，
+            // 生成语句不会被写成一条缺定义的普通列。
+            enum_set: snapshot.enum_sets.get(&column.name).map(|state| EnumSetDraft { kind: state.kind, values: state.values.clone() }),
+            generated: snapshot
+                .generation
+                .get(&column.name)
+                .map(|state| GeneratedColumnDraft { expression: state.expression.clone(), storage: state.storage }),
         })
         .collect()
 }
@@ -293,6 +300,12 @@ fn table_columns(section: Section) -> &'static [ColumnSpec] {
     }
 }
 
+/// 分区方案是不是这个引擎的结构能力，由方言的库级段落声明（见 DdlDialect::admin_sections），
+/// 界面不自己判断引擎名字。
+fn supports_partitions(engine: &str) -> bool {
+    crate::adapters::ddl::ddl_named(engine).is_some_and(|dialect| dialect.admin_sections().partitions)
+}
+
 /// 列表三态与内容态的判定：加载优先于错误，错误优先于空态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListState {
@@ -325,6 +338,8 @@ pub enum Section {
     Columns,
     Indexes,
     ForeignKeys,
+    /// 分区方案（RANGE/LIST/HASH/KEY 的建立、修改与移除）。只有 MySQL 与 MariaDB 有这一段。
+    Partitions,
     View,
     Ddl,
     Danger,
@@ -412,6 +427,10 @@ pub struct StructureSession {
     pub fk_on_delete: String,
     pub fk_on_update: String,
     pub view_sql: String,
+    /// 分区方案草稿。方式、操作、表达式、数量与分区定义都在这里，语句由方言生成。
+    pub partition: PartitionDraft,
+    /// KEY 分区的列清单原文（逗号分隔）。原样保留输入，动作前才拆成列名。
+    pub partition_columns: String,
     pub danger: DangerKind,
     pub rename_to: String,
     /// 生产环境确认前要输入的对象名。不写入 SQL。
@@ -453,6 +472,8 @@ impl StructureSession {
             fk_on_delete: "NO ACTION".to_owned(),
             fk_on_update: "NO ACTION".to_owned(),
             view_sql: String::new(),
+            partition: PartitionDraft::default(),
+            partition_columns: String::new(),
             danger: DangerKind::Drop,
             rename_to: String::new(),
             danger_name: String::new(),
@@ -490,7 +511,14 @@ impl StructureSession {
         if self.object_kind == "view" {
             return vec![Section::Columns, Section::View, Section::Danger];
         }
-        vec![Section::Columns, Section::Indexes, Section::ForeignKeys, Section::Ddl, Section::Danger]
+        let mut sections = vec![Section::Columns, Section::Indexes, Section::ForeignKeys];
+        // 分区方案只有 MySQL 家族的表有：别的引擎不给入口，也就不存在“看起来能用”。
+        if supports_partitions(&self.target.engine) {
+            sections.push(Section::Partitions);
+        }
+        sections.push(Section::Ddl);
+        sections.push(Section::Danger);
+        sections
     }
 
     pub fn production(&self) -> bool {
@@ -550,6 +578,22 @@ impl StructureSession {
         columns
     }
 
+    /// 分区草稿换成动作参数：KEY 的列清单来自输入原文（逗号分隔），其余方式不用列清单。
+    fn partition_action(&self) -> PartitionDraft {
+        let mut draft = self.partition.clone();
+        if draft.method == PartitionMethod::Key {
+            draft.columns = self
+                .partition_columns
+                .split(',')
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .collect();
+        } else {
+            draft.columns.clear();
+        }
+        draft
+    }
+
     fn index_drafts(&self) -> Vec<IndexColumnDraft> {
         if !self.index_columns.is_empty() {
             return self.index_columns.clone();
@@ -599,6 +643,7 @@ impl StructureSession {
                 EditIntent::DropForeignKey { name } => Action::DropForeignKey { table, name: name.clone() },
                 _ => Action::CreateForeignKey { table, foreign_key: self.foreign_key_draft() },
             },
+            Section::Partitions => Action::AlterPartitions { table, partition: self.partition_action() },
             Section::View => Action::ReplaceView { table, definition: self.view_sql.clone() },
             Section::Danger => self.danger_action(),
         }
@@ -1321,6 +1366,8 @@ impl StructurePane {
             if self.session.view_sql.is_empty() {
                 self.session.view_sql = snapshot.table_sql.clone();
             }
+            // 分区草稿按读回的实际方案起稿：界面先显示服务器上的现状，用户改的才是改动。
+            self.seed_partition_draft(snapshot);
         }
         let sections = self.session.visible_sections();
         if !sections.contains(&self.session.section) {
@@ -1342,6 +1389,37 @@ impl StructurePane {
         self.ddl_view = None;
         self.ddl_text.clear();
         self.retry_load(cx);
+    }
+
+    /// 分区草稿的起稿值：方式与表达式取读回的分区方案，命名分区按定义顺序填入。
+    /// 读不到分区方案（或读失败）时保留“建立分区方案”的空草稿，不猜现状。
+    fn seed_partition_draft(&mut self, snapshot: &Snapshot) {
+        use crate::ddl::model::{PartitionDef, PartitionDraft};
+        self.session.partition = match snapshot.partitions.as_ref() {
+            Some(current) => PartitionDraft {
+                op: crate::ddl::model::PartitionOp::Replace,
+                method: current.method,
+                expression: if current.method == crate::ddl::model::PartitionMethod::Key {
+                    String::new()
+                } else {
+                    current.expression.clone()
+                },
+                columns: Vec::new(),
+                count: if current.method.named() { String::new() } else { current.definitions.len().to_string() },
+                definitions: current
+                    .definitions
+                    .iter()
+                    .map(|def| PartitionDef { name: def.name.clone(), description: def.description.clone() })
+                    .collect(),
+                targets: Vec::new(),
+            },
+            None => PartitionDraft::default(),
+        };
+        // KEY 分区的列清单直接用读回的表达式原文：怎么加引号是方言的事，界面不重新拼。
+        self.session.partition_columns = match snapshot.partitions.as_ref() {
+            Some(current) if current.method == crate::ddl::model::PartitionMethod::Key => current.expression.clone(),
+            _ => String::new(),
+        };
     }
 
     fn reset_composer_drafts(&mut self) {
@@ -1457,10 +1535,50 @@ impl StructurePane {
                 self.write_template_cell(group, index, value);
                 false
             }
+            // ENUM/SET 候选值：key 的低 16 位拆成“字段行 × 值序号”，每个候选值单独一个输入框。
+            9 => {
+                let column = index / Self::ENUM_VALUE_STRIDE;
+                let position = index % Self::ENUM_VALUE_STRIDE;
+                self.edit_column(column, |draft| match draft.enum_set.as_mut().and_then(|state| state.values.get_mut(position)) {
+                    Some(slot) => replace_text(slot, value),
+                    None => false,
+                })
+            }
+            // 生成列表达式：每个字段行一个输入框。
+            10 => self.edit_column(index, |draft| match draft.generated.as_mut() {
+                Some(generated) => replace_text(&mut generated.expression, value),
+                None => false,
+            }),
+            // 分区方案：0/1/2 是表达式、数量、KEY 列清单；10 起是分区定义的名字与边界。
+            11 => self.write_partition_cell(index, value),
             _ => false,
         };
         if changed && key != 6 {
             self.session.cancel();
+        }
+    }
+
+    /// 一个字段行最多容纳的候选值个数（ENUM/SET 的输入框编号按它分段）。
+    const ENUM_VALUE_STRIDE: usize = 64;
+
+    fn write_partition_cell(&mut self, slot: usize, value: String) -> bool {
+        match slot {
+            0 => replace_text(&mut self.session.partition.expression, value),
+            1 => replace_text(&mut self.session.partition.count, value),
+            2 => replace_text(&mut self.session.partition_columns, value),
+            slot if slot >= 10 => {
+                let position = (slot - 10) / 2;
+                let which = (slot - 10) % 2;
+                let Some(def) = self.session.partition.definitions.get_mut(position) else {
+                    return false;
+                };
+                if which == 0 {
+                    replace_text(&mut def.name, value)
+                } else {
+                    replace_text(&mut def.description, value)
+                }
+            }
+            _ => false,
         }
     }
 
@@ -1482,6 +1600,14 @@ impl StructurePane {
         else {
             return;
         };
+        let enum_set = self.snapshot.as_ref().and_then(|snapshot| snapshot.enum_sets.get(&original_name)).map(|state| EnumSetDraft {
+            kind: state.kind,
+            values: state.values.clone(),
+        });
+        let generated = self.snapshot.as_ref().and_then(|snapshot| snapshot.generation.get(&original_name)).map(|state| GeneratedColumnDraft {
+            expression: state.expression.clone(),
+            storage: state.storage,
+        });
         if let Some(draft) = self.session.kept_columns.get_mut(index) {
             draft.name = before.name;
             draft.type_name = before.type_name;
@@ -1490,6 +1616,9 @@ impl StructurePane {
             draft.primary = before.primary;
             draft.auto = before.auto;
             draft.dropped = false;
+            // 还原也要连同专有形态一起还原：否则“还原”之后候选值或表达式还留着上一次的输入。
+            draft.enum_set = enum_set;
+            draft.generated = generated;
             self.session.cancel();
         }
     }
@@ -3012,10 +3141,16 @@ impl StructurePane {
         else {
             return ColumnChange::Clean;
         };
+        // ENUM/SET 候选值与生成列定义的变化用计划里的同一份判据，界面与 SQL 不会各说一套。
+        let shape = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| crate::ddl::plan::shape_changed(snapshot, before, column));
         let changed = before.name != column.name
             || !before.type_name.eq_ignore_ascii_case(&column.type_name)
             || before.nullable != column.nullable
-            || existing_default(engine, before.default_sql.as_deref()) != column.default;
+            || existing_default(engine, before.default_sql.as_deref()) != column.default
+            || shape;
         if changed { ColumnChange::Modified } else { ColumnChange::Clean }
     }
 
@@ -3283,8 +3418,21 @@ impl StructurePane {
                     )))
                     .into_any_element();
             }
+            // 正在编辑的那一行下面挂 ENUM/SET 候选值与生成列定义：这两个形态需要多行输入，
+            // 不塞进等高的一行里，免得挤掉整张字段表。
+            let detail = self
+                .editing_row
+                .and_then(|index| self.session.kept_columns.get(index).cloned().map(|column| (index, column)))
+                .and_then(|(index, column)| self.column_special_editor(index, &column, &engine, &p, window, cx));
             let browser = self.column_browser(visible, browse_cols, window, cx);
-            return editor.flex_1().min_h_0().child(browser).into_any_element();
+            return match detail {
+                Some(panel) => editor
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex().flex_col().flex_1().min_h_0().child(browser).child(panel))
+                    .into_any_element(),
+                None => editor.flex_1().min_h_0().child(browser).into_any_element(),
+            };
         }
 
         let head = div()
@@ -3352,6 +3500,9 @@ impl StructurePane {
             }));
             if let Some(issue) = self.row_issue(&issues, *index, &p) {
                 rows = rows.child(issue);
+            }
+            if let Some(panel) = self.column_special_editor(*index, column, &engine, &p, window, cx) {
+                rows = rows.child(panel);
             }
         }
         let add_entity = entity.clone();
@@ -3454,7 +3605,21 @@ impl StructurePane {
         });
 
         let name = self.draft_input_enter(10_000 + index as u32, &column.name, "name", window, cx);
-        let kind = self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
+        // ENUM/SET 的类型写法由候选值生成，不再让人在类型框里手写：这里只显示形态与候选值个数，
+        // 候选值本身在行下面的面板里编辑。
+        let kind: AnyElement = match column.enum_set.as_ref() {
+            Some(state) => div()
+                .id(SharedString::from(format!("structure-col-enum-{index}")))
+                .flex()
+                .items_center()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text_muted)
+                .tooltip_text(t("structure.enumTypePreview"))
+                .child(SharedString::from(format!("{} · {}", state.kind.keyword(), state.values.len())))
+                .into_any_element(),
+            None => self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx),
+        };
         // 已有字段的注释本轮只读（修改注释不在需求内）：编辑行里仍以文本显示，悬停看全文。
         let comment_input = (widths.comment > 0.).then(|| {
             if create {
@@ -3475,6 +3640,7 @@ impl StructurePane {
 
         let type_entity = entity.clone();
         let type_locked = orig_primary || orig_generated;
+        let generated_flag = column.generated.is_some();
         let menu_engine = engine.to_owned();
         let current_type = column.type_name.clone();
         let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
@@ -3491,13 +3657,33 @@ impl StructurePane {
             })
             .dropdown_menu(move |menu, _, _| {
                 let entity = type_entity.clone();
-                create::type_menu(menu, &menu_engine, &current_type, locale, move |choice, cx| {
-                    entity.update(cx, |pane, cx| {
+                let pick_entity = entity.clone();
+                let mut menu = create::type_menu(menu, &menu_engine, &current_type, locale, move |choice, cx| {
+                    pick_entity.update(cx, |pane, cx| {
                         pane.write_draft(20_000 + index as u32, choice);
                         pane.pending_focus_draft = Some(20_000 + index as u32);
                         cx.notify();
                     });
-                })
+                });
+                // ENUM/SET 与生成列不在“常用类型”里：选中后这一行下面出现候选值或表达式面板。
+                menu = menu.separator().label(i18n::text(locale, "structure.type.proprietary"));
+                for (key, kind) in [("structure.type.enum", EnumSetKind::Enum), ("structure.type.set", EnumSetKind::Set)] {
+                    let owner = entity.clone();
+                    menu = menu.item(PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.set_enum_set_kind(index, kind);
+                            cx.notify();
+                        });
+                    }));
+                }
+                let owner = entity.clone();
+                let label = if generated_flag { "structure.type.generatedOff" } else { "structure.type.generated" };
+                menu.item(PopupMenuItem::new(i18n::text(locale, label)).on_click(move |_, _, cx| {
+                    owner.update(cx, |pane, cx| {
+                        pane.toggle_generated(index);
+                        cx.notify();
+                    });
+                }))
             });
 
         let default_enabled = !orig_generated && !(create && column.auto) && change != ColumnChange::Dropped;
@@ -4348,6 +4534,7 @@ impl StructurePane {
                 }
                 form
             }),
+            Section::Partitions => div().child(self.partition_form(window, cx)),
             Section::Danger => stack_frame(|| {
                 let mut form = form;
                 let view = self.session.object_kind == "view";
@@ -4517,6 +4704,7 @@ impl StructurePane {
                 Section::Columns => "structure.section.columns",
                 Section::Indexes => "structure.section.indexes",
                 Section::ForeignKeys => "structure.section.foreign",
+                Section::Partitions => "structure.section.partitions",
                 Section::View => "structure.section.viewDef",
                 Section::Ddl => "structure.section.ddl",
                 Section::Danger => "structure.section.danger",
@@ -4882,8 +5070,10 @@ impl StructurePane {
             }
             let ddl_direct = section == Section::Ddl && form.is_some() && self.has_definition();
             let danger_direct = section == Section::Danger && form.is_some() && !self.loading && self.load_error.is_empty();
+            // 分区方案是一张表单，不需要先铺一张定义卡：直接给表单，读回来的现状写在表单顶部。
+            let partitions_direct = section == Section::Partitions && form.is_some() && !self.loading && self.load_error.is_empty();
             let mut form = form;
-            if ddl_direct || danger_direct {
+            if ddl_direct || danger_direct || partitions_direct {
                 if let Some(form) = form.take() {
                     body = body.child(div().id("structure-composer").test_support().child(form));
                 }
@@ -4899,6 +5089,7 @@ impl StructurePane {
                     Section::Indexes => t("structure.index.new"),
                     Section::ForeignKeys => t("structure.fk.new"),
                     Section::Danger => t("structure.section.danger"),
+                    Section::Partitions => t("structure.section.partitions"),
                     _ => t("structure.section.definition"),
                 };
                 body = body.child(
@@ -5287,6 +5478,7 @@ impl StructurePane {
 
 mod browse;
 mod create;
+mod special;
 
 #[cfg(test)]
 mod tests;

@@ -240,7 +240,9 @@ fn statement_alters(
     for change in changes {
         match change {
             Change::Add(draft) => {
-                let definition = column_sql(snapshot.engine, draft, false)?;
+                // 新增字段与修改字段一样按会话的转义方式编码字面量：NO_BACKSLASH_ESCAPES 会话下
+                // 含反斜杠的 ENUM/SET 候选值不能按反斜杠转义写。
+                let definition = column_sql_for(snapshot.engine, draft, false, snapshot.literal_quoting())?;
                 steps.push(Step {
                     sql: format!("ALTER TABLE {qualified} {add_verb} {definition};"),
                     label: format!("新增字段 {}", draft.name.trim()),
@@ -760,9 +762,9 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
             if original.primary {
                 blocked.push(format!("不能删除主键列 {}。", original.name));
             }
-            if original.generated {
-                blocked.push(format!("不能删除生成列 {}。", original.name));
-            }
+            // 生成列和普通列一样可以删除：DROP COLUMN 对两种列是同一条语句。
+            // 只有当别的生成列还引用它、服务端才可能拒绝，这类情况交给服务器的原始错误，
+            // 不在客户端按"生成列"整体阻断。
             if snapshot.foreign_keys.iter().any(|key| key.columns.iter().any(|name| name == &original.name)) {
                 blocked.push(format!("外键引用列 {}，删除它不能保留该约束。", original.name));
             }
@@ -1815,5 +1817,82 @@ pub(crate) fn finish(engine: Engine, rebuild: bool, target: String, blocked: Vec
         rule: rule_text(engine, rebuild && !blocked_now),
         rebuild: rebuild && !blocked_now,
         target,
+    }
+}
+
+#[cfg(test)]
+mod literal_quoting_tests {
+    use super::*;
+    use crate::ddl::model::{Column, DefaultSpec, EnumSetDraft, EnumSetKind};
+
+    /// 一张已有 id 列的 MySQL 表；sql_mode 由调用方给出。
+    fn snapshot(sql_mode: &str) -> Snapshot {
+        let mut snapshot = Snapshot::bare(Engine::Mysql, "app", "app", "t");
+        snapshot.server_version = "8.4.13".to_owned();
+        snapshot.sql_mode = sql_mode.to_owned();
+        snapshot.row_count = Some(0);
+        snapshot.columns.push(Column {
+            name: "id".to_owned(),
+            type_name: "bigint".to_owned(),
+            nullable: false,
+            default_sql: None,
+            primary: true,
+            auto: false,
+            generated: false,
+            default_constraint: None,
+        });
+        snapshot
+    }
+
+    fn drafts(value: &str) -> Vec<ColumnDraft> {
+        vec![
+            ColumnDraft {
+                original: Some("id".to_owned()),
+                name: "id".to_owned(),
+                type_name: "bigint".to_owned(),
+                nullable: false,
+                default: DefaultSpec::None,
+                comment: String::new(),
+                primary: true,
+                auto: false,
+                dropped: false,
+                ..ColumnDraft::default()
+            },
+            ColumnDraft {
+                original: None,
+                name: "note".to_owned(),
+                type_name: "enum".to_owned(),
+                nullable: true,
+                default: DefaultSpec::None,
+                comment: String::new(),
+                primary: false,
+                auto: false,
+                dropped: false,
+                enum_set: Some(EnumSetDraft { kind: EnumSetKind::Enum, values: vec![value.to_owned()] }),
+                ..ColumnDraft::default()
+            },
+        ]
+    }
+
+    /// 新增字段与修改字段一样按会话的转义方式写 ENUM/SET 候选值：
+    /// NO_BACKSLASH_ESCAPES 会话下反斜杠不是转义符，不能再翻倍。
+    #[test]
+    fn added_enum_column_follows_the_session_backslash_mode() {
+        let one = char::from(92);
+        let value = format!("a{one}b");
+        let action = Action::AlterColumns { table: "t".to_owned(), columns: drafts(&value) };
+        // MySQL 家族的标识符不额外加引号：语句里就是裸列名。
+        let prefix = "ALTER TABLE app.t ADD COLUMN note enum(";
+
+        let unescaped = plan(&snapshot("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"), &action);
+        assert!(unescaped.blocked.is_empty(), "{:?}", unescaped.blocked);
+        let added = unescaped.steps.iter().find(|step| step.label.contains("note")).expect("add column step");
+        // 反斜杠原样写出：一个反斜杠，不是两个。
+        assert_eq!(added.sql, format!("{prefix}'a{one}b');"), "{:?}", unescaped.steps);
+
+        // 默认 sql_mode（反斜杠是转义符）下同一个值要翻倍。
+        let plain = plan(&snapshot(""), &action);
+        let added = plain.steps.iter().find(|step| step.label.contains("note")).expect("add column step");
+        assert_eq!(added.sql, format!("{prefix}'a{one}{one}b');"));
     }
 }

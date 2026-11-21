@@ -2091,3 +2091,315 @@ fn suggested_index_names_respect_the_dialect_limit() {
     assert!(sqlite.len() > 128, "SQLite 不截断");
     assert_eq!(suggested_index_name(&naming, "postgres", "orders", false, &[]), "");
 }
+
+// ---- ENUM/SET、生成列与分区（T2） ----
+
+use crate::ddl::model::{
+    EnumSetState, GeneratedStorage, GenerationState, PartitionDef, PartitionDefState, PartitionMethod, PartitionOp, PartitionState,
+};
+
+fn mysql_target(table: &str) -> GridTarget {
+    GridTarget {
+        connection_id: String::new(),
+        connection_name: String::new(),
+        database: "app".into(),
+        schema: "app".into(),
+        table: table.into(),
+        engine: "mysql".into(),
+        environment: "dev".into(),
+    }
+}
+
+/// 一张有 ENUM 字段与生成列的 MySQL 表，带着读回的专有形态。
+fn mysql_snapshot(engine: DdlEngine) -> Snapshot {
+    let mut snapshot = Snapshot::bare(engine, "app", "app", "orders");
+    snapshot.server_version = "8.4.13".to_owned();
+    snapshot.columns = vec![column("id", "bigint", true), column("status", "enum('draft','done')", false), column("total", "int", false)];
+    snapshot.enum_sets.insert(
+        "status".to_owned(),
+        EnumSetState { kind: EnumSetKind::Enum, values: vec!["draft".to_owned(), "done".to_owned()] },
+    );
+    snapshot.generation.insert(
+        "total".to_owned(),
+        GenerationState { expression: "id * 2".to_owned(), storage: GeneratedStorage::Virtual, reported_storage: "VIRTUAL".to_owned() },
+    );
+    snapshot.columns[2].generated = true;
+    snapshot
+}
+
+fn pane_with_mysql(services: std::sync::Arc<crate::application::AppServices>, engine: DdlEngine) -> StructurePane {
+    let mut pane = StructurePane::new(services);
+    pane.bind(mysql_target("orders"));
+    let snapshot = mysql_snapshot(engine);
+    pane.session.object_kind = snapshot.kind.clone();
+    pane.session.kept_columns = column_drafts(&snapshot);
+    pane.drafts_ready = true;
+    pane.snapshot = Some(snapshot);
+    pane
+}
+
+/// 读回的 ENUM 候选值要进草稿：只改候选值也能生成完整定义，不会退化成缺类型的普通列。
+#[test]
+fn enum_set_drafts_keep_read_back_values_and_changes_reach_the_statement() {
+    let snapshot = mysql_snapshot(DdlEngine::Mysql);
+    let mut drafts = column_drafts(&snapshot);
+    assert_eq!(drafts[1].enum_set.as_ref().map(|state| state.values.clone()), Some(vec!["draft".to_owned(), "done".to_owned()]));
+    assert_eq!(drafts[2].generated.as_ref().map(|state| state.expression.clone()), Some("id * 2".to_owned()));
+
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = drafts.clone();
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty(), "原样读回不该生成语句：{:?}", session.preview_sql());
+
+    // 候选值改成含空串、单引号、反斜杠、逗号与中文，顺序就是写入顺序。
+    let one = char::from(92);
+    drafts[1].enum_set.as_mut().unwrap().values =
+        vec![String::new(), "it's".to_owned(), format!("a{one}b"), "a,b".to_owned(), "中文".to_owned()];
+    session.kept_columns = drafts;
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("CHANGE COLUMN status"), "{sql}");
+    let quoted = format!("enum('','it''s','a{one}{one}b','a,b','中文')");
+    assert!(sql.contains(&quoted), "{sql}");
+    assert!(session.blocked().is_empty(), "{:?}", session.blocked());
+}
+
+/// 生成列：改表达式与存储方式都进语句；MariaDB 的持久化写法用 PERSISTENT。
+#[test]
+fn generated_column_edits_use_the_dialect_storage_keyword() {
+    for (engine, keyword) in [(DdlEngine::Mysql, "STORED"), (DdlEngine::Mariadb, "PERSISTENT")] {
+        let snapshot = mysql_snapshot(engine);
+        let mut drafts = column_drafts(&snapshot);
+        let generated = drafts[2].generated.as_mut().expect("生成列草稿");
+        generated.expression = "id * 3".to_owned();
+        generated.storage = GeneratedStorage::Stored;
+        let mut session = StructureSession::new(mysql_target("orders"));
+        session.kept_columns = drafts;
+        session.arm_fixture(&snapshot);
+        let sql = session.preview_sql().join("\n");
+        assert!(sql.contains(&format!("GENERATED ALWAYS AS (id * 3) {keyword}")), "{engine:?}: {sql}");
+        assert!(session.blocked().is_empty(), "{engine:?}: {:?}", session.blocked());
+    }
+}
+
+/// 表达式默认值不是生成列：草稿里没有生成属性，也不会被锁成只读。
+#[test]
+fn expression_defaults_do_not_become_generated_columns() {
+    let mut snapshot = Snapshot::bare(DdlEngine::Mysql, "app", "app", "orders");
+    snapshot.server_version = "8.4.13".to_owned();
+    let mut created = column("created_at", "datetime", false);
+    created.default_sql = Some("CURRENT_TIMESTAMP".to_owned());
+    snapshot.columns = vec![column("id", "bigint", true), created];
+    let drafts = column_drafts(&snapshot);
+    assert!(drafts[1].generated.is_none(), "表达式默认值不能变成生成列");
+    assert!(drafts[1].enum_set.is_none());
+    assert!(!snapshot.columns[1].generated);
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = drafts;
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_unchanged(), "{:?}", session.blocked());
+}
+
+/// 四类分区都能从会话草稿走到语句；不适用的操作被阻断而不是生成语句。
+#[test]
+fn partition_drafts_cover_the_four_methods_and_block_what_does_not_apply() {
+    let snapshot = mysql_snapshot(DdlEngine::Mysql);
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![
+            PartitionDef { name: "p0".to_owned(), description: "100".to_owned() },
+            PartitionDef { name: "p1".to_owned(), description: "MAXVALUE".to_owned() },
+        ],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY RANGE(id)"), "{sql}");
+    assert!(sql.contains("PARTITION p1 VALUES LESS THAN (MAXVALUE)"), "{sql}");
+
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Hash,
+        expression: "id".to_owned(),
+        count: "4".to_owned(),
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().join("\n").contains("PARTITION BY HASH(id) PARTITIONS 4"));
+
+    session.partition_columns = "id, status".to_owned();
+    session.partition = PartitionDraft { op: PartitionOp::Replace, method: PartitionMethod::Key, count: "8".to_owned(), ..PartitionDraft::default() };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY KEY(id, status) PARTITIONS 8"), "{sql}");
+
+    // LIST 方案也走得通：取值列表原样进 VALUES IN。
+    session.partition_columns.clear();
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::List,
+        expression: "status".to_owned(),
+        definitions: vec![PartitionDef { name: "p_draft".to_owned(), description: "'draft'".to_owned() }],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY LIST(status)"), "{sql}");
+    assert!(sql.contains("VALUES IN ('draft')"), "{sql}");
+
+    // 未分区的表不能新增/删除/重组/移除：预览阻断而不是给一条会被服务器拒绝的语句。
+    session.partition = PartitionDraft {
+        op: PartitionOp::Add,
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![PartitionDef { name: "p2".to_owned(), description: "300".to_owned() }],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty(), "{:?}", session.preview_sql());
+    assert!(session.blocked().iter().any(|text| text.contains("还没有分区方案")), "{:?}", session.blocked());
+}
+
+/// 已有分区方案的表：维护操作按现状走，读回的分区名才可选。
+#[test]
+fn partition_maintenance_follows_the_read_back_scheme() {
+    let mut snapshot = mysql_snapshot(DdlEngine::Mysql);
+    snapshot.partitions = Some(PartitionState {
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![
+            PartitionDefState { name: "p0".to_owned(), description: "100".to_owned() },
+            PartitionDefState { name: "p1".to_owned(), description: "MAXVALUE".to_owned() },
+        ],
+    });
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+
+    // 起稿值与读回一致。
+    let dir = std::env::temp_dir().join(format!("rillsql-partition-seed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+        crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+    )));
+    let mut pane = StructurePane::new(services);
+    pane.seed_partition_draft(&snapshot);
+    assert_eq!(pane.session.partition.method, PartitionMethod::Range);
+    assert_eq!(pane.session.partition.definitions.len(), 2);
+
+    session.partition = PartitionDraft { op: PartitionOp::Drop, method: PartitionMethod::Range, targets: vec!["p0".to_owned()], ..PartitionDraft::default() };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().join("\n").contains("DROP PARTITION p0"), "{:?}", session.preview_sql());
+
+    // 删除一个读不到的分区名：预览阻断。
+    session.partition.targets = vec!["p9".to_owned()];
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty());
+    assert!(session.blocked().iter().any(|text| text.contains("没有读到分区 p9")), "{:?}", session.blocked());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 界面：ENUM 行下面出现候选值面板，增删与排序都落在草稿上；生成列面板给出存储方式。
+#[gpui_kit::test]
+fn enum_and_generated_panels_edit_the_draft(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("special");
+    let (window, pane) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = pane_with_mysql(services.clone(), DdlEngine::Mysql);
+                    // 第 1 行是 ENUM 字段，进入编辑后行下面挂候选值面板。
+                    pane.begin_edit_row(1);
+                    pane
+                })
+            },
+        )
+        .expect("structure pane")
+    });
+    let visible = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("structure-special-1").visible(), window.find("structure-enum-add-1").visible())
+        })
+        .unwrap();
+    assert!(visible.0, "ENUM 字段的编辑行下面要有候选值面板");
+    assert!(visible.1, "面板要有添加候选值的按钮");
+
+    cx.update_window(window, |_, _, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.add_enum_value(1);
+            assert_eq!(pane.session.kept_columns[1].enum_set.as_ref().unwrap().values.len(), 3);
+            pane.move_enum_value(1, 2, -1);
+            assert_eq!(
+                pane.session.kept_columns[1].enum_set.as_ref().unwrap().values,
+                vec!["draft".to_owned(), String::new(), "done".to_owned()]
+            );
+            pane.remove_enum_value(1, 1);
+            assert_eq!(pane.session.kept_columns[1].enum_set.as_ref().unwrap().values, vec!["draft".to_owned(), "done".to_owned()]);
+            // 生成列面板：切到存储方式后草稿跟着变。
+            pane.set_generated_storage(2, GeneratedStorage::Stored);
+            assert_eq!(pane.session.kept_columns[2].generated.as_ref().unwrap().storage, GeneratedStorage::Stored);
+            pane.begin_edit_row(2);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    let generated = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("structure-special-2").visible(), window.find("structure-generated-storage-2").visible())
+        })
+        .unwrap();
+    assert!(generated.0 && generated.1, "生成列行要有表达式与存储方式");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 界面：MySQL 表有分区页签，点开后是分区表单；PostgreSQL 表没有这一段。
+#[gpui_kit::test]
+fn partition_section_only_exists_for_the_mysql_family(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("partition-tab");
+    let (window, pane) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| cx.new(|_| pane_with_mysql(services.clone(), DdlEngine::Mysql)),
+        )
+        .expect("structure pane")
+    });
+    let has_tab = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("structure.section.partitions").visible()
+        })
+        .unwrap();
+    assert!(has_tab, "MySQL 表要有分区页签");
+    let form = cx
+        .update_window(window, |_, window, cx| {
+            window.click("structure.section.partitions", cx);
+            window.render_frame(cx);
+            (window.find("structure-partition-form").visible(), window.find("structure-partition-op").visible())
+        })
+        .unwrap();
+    assert!(form.0 && form.1, "分区页签打开后是分区表单");
+    let _ = pane;
+    let mut postgres = StructurePane::new(services.clone());
+    postgres.bind(target("postgres", "orders"));
+    assert!(!postgres.session.visible_sections().contains(&Section::Partitions), "PostgreSQL 表没有分区这一段");
+    let _ = std::fs::remove_dir_all(&dir);
+}

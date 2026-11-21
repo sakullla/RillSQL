@@ -84,6 +84,9 @@ fn key_columns(draft: &PartitionDraft) -> Result<String, String> {
 
 fn count_of(draft: &PartitionDraft) -> Result<u32, String> {
     let text = draft.count.trim();
+    if text.is_empty() {
+        return Err("HASH/KEY 分区要写明分区数量。".to_owned());
+    }
     let count: u32 = text.parse().map_err(|_| format!("分区数量 {text} 不是正整数。"))?;
     if count == 0 {
         return Err("分区数量要大于 0。".to_owned());
@@ -128,8 +131,25 @@ pub(super) fn partition_problem(draft: &PartitionDraft) -> Option<String> {
         }
         PartitionOp::Remove => {}
     }
-    if draft.method.named() && matches!(draft.op, PartitionOp::Replace | PartitionOp::Add | PartitionOp::Reorganize) && draft.expression.trim().is_empty() {
+    // 分区表达式只出现在 PARTITION BY 里：新增、删除与重组都不用它，别在这里无谓地拦人。
+    // KEY 分区用列清单而不是表达式，那一项由上面的 Replace 分支检查。
+    if draft.op == PartitionOp::Replace && draft.method != PartitionMethod::Key && draft.expression.trim().is_empty() {
         return Some(format!("{} 分区要一个表达式或列。", draft.method.keyword()));
+    }
+    // HASH/KEY 没有命名分区，只能按数量增删；数量必须在预览前就是正整数。
+    let needs_count = match draft.op {
+        PartitionOp::Replace => matches!(draft.method, PartitionMethod::Hash | PartitionMethod::Key),
+        PartitionOp::Add | PartitionOp::Drop => !draft.method.named(),
+        PartitionOp::Reorganize | PartitionOp::Remove => false,
+    };
+    if needs_count {
+        let text = draft.count.trim();
+        if text.is_empty() {
+            return Some("HASH/KEY 分区要写明分区数量。".to_owned());
+        }
+        if text.parse::<u32>().map(|count| count == 0).unwrap_or(true) {
+            return Some(format!("分区数量 {text} 不是正整数。"));
+        }
     }
     None
 }
@@ -215,9 +235,17 @@ pub(super) fn plan_partition(snapshot: &Snapshot, table: &str, draft: &Partition
     if !valid_name(table) {
         blocked.push("表名无效。".to_owned());
     }
+    // 版本能力取自方言档案：没读到版本时不生成会被服务器拒绝的语句。
+    let profile = crate::adapters::mysql::profile::MysqlProfile::new(snapshot.engine, &snapshot.server_version, &snapshot.sql_mode);
+    let features = profile.features();
+    if !features.partitions {
+        let banner = if snapshot.server_version.is_empty() { "未知版本".to_owned() } else { snapshot.server_version.clone() };
+        blocked.push(format!("服务器 {banner} 没有确认支持分区，这里不生成语句。"));
+    }
     if let Some(problem) = partition_problem(draft) {
         blocked.push(problem);
     }
+    blocked.extend(partition_applicability(snapshot, table, draft));
     if !blocked.is_empty() {
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
@@ -225,6 +253,55 @@ pub(super) fn plan_partition(snapshot: &Snapshot, table: &str, draft: &Partition
         Ok(steps) => finish(snapshot.engine, true, target, Vec::new(), risks, steps),
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
+}
+
+/// 当前表的分区现状与草稿是否相容：不适用的操作在这里阻断，不生成服务器会拒绝的语句。
+/// 读失败（partition_error）时不猜现状，只保留能由草稿本身判断的问题。
+fn partition_applicability(snapshot: &Snapshot, table: &str, draft: &PartitionDraft) -> Vec<String> {
+    let mut blocked = Vec::new();
+    if snapshot.partition_error.is_some() {
+        return blocked;
+    }
+    let Some(current) = snapshot.partitions.as_ref() else {
+        // 还没有分区方案：只有“建立方案”在这一步有意义，新增/删除/重组/移除都无从下手。
+        if draft.op != PartitionOp::Replace {
+            let op = match draft.op {
+                PartitionOp::Add => "新增分区",
+                PartitionOp::Drop => "删除分区",
+                PartitionOp::Reorganize => "重组分区",
+                PartitionOp::Remove => "移除分区方案",
+                PartitionOp::Replace => "",
+            };
+            blocked.push(format!("表 {table} 还没有分区方案，不能{op}；先用“建立分区方案”分区。"));
+        }
+        return blocked;
+    };
+    if draft.op == PartitionOp::Replace {
+        return blocked;
+    }
+    // 在有分区方案的表上，新增/删除/重组/移除都必须按现有方式操作：方式不符时语句会被服务器拒绝。
+    if draft.method != current.method {
+        blocked.push(format!(
+            "表 {table} 现在是 {} 分区，不能按 {} 的规则{}。",
+            current.method.keyword(),
+            draft.method.keyword(),
+            match draft.op {
+                PartitionOp::Add => "新增分区",
+                PartitionOp::Drop => "删除分区",
+                PartitionOp::Reorganize => "重组分区",
+                PartitionOp::Remove => "移除分区方案",
+                PartitionOp::Replace => "",
+            }
+        ));
+        return blocked;
+    }
+    let known = |name: &str| current.definitions.iter().any(|def| def.name.eq_ignore_ascii_case(name.trim()));
+    for name in &draft.targets {
+        if !name.trim().is_empty() && !known(name) {
+            blocked.push(format!("表 {table} 没有读到分区 {}。", name.trim()));
+        }
+    }
+    blocked
 }
 
 #[cfg(test)]
@@ -235,8 +312,25 @@ mod tests {
         LiteralQuoting { backslash_escapes }
     }
 
+    /// 版本要显式写：没读到版本时档案保守，分区变更会被阻断（R1）。
     fn snapshot(name: &str) -> Snapshot {
-        Snapshot::bare(Engine::Mysql, "app", "app", name)
+        let mut snapshot = Snapshot::bare(Engine::Mysql, "app", "app", name);
+        snapshot.server_version = "8.4.13".to_owned();
+        snapshot
+    }
+
+    /// 已经按 RANGE 分区的表：用于新增/删除/重组/移除的现状判断。
+    fn ranged(name: &str) -> Snapshot {
+        let mut snapshot = snapshot(name);
+        snapshot.partitions = Some(crate::ddl::model::PartitionState {
+            method: PartitionMethod::Range,
+            expression: "created".to_owned(),
+            definitions: vec![
+                crate::ddl::model::PartitionDefState { name: "p0".to_owned(), description: "100".to_owned() },
+                crate::ddl::model::PartitionDefState { name: "p1".to_owned(), description: "MAXVALUE".to_owned() },
+            ],
+        });
+        snapshot
     }
 
     fn def(name: &str, description: &str) -> PartitionDef {
@@ -352,22 +446,66 @@ mod tests {
         assert!(plan.steps.is_empty());
 
         let bad_count = PartitionDraft { count: "0".to_owned(), ..draft(PartitionMethod::Hash, PartitionOp::Add) };
-        assert!(plan_partition(&snapshot("t"), "t", &bad_count, true).blocked.iter().any(|text| text.contains("大于 0")));
+        assert!(plan_partition(&snapshot("t"), "t", &bad_count, true).blocked.iter().any(|text| text.contains("不是正整数")));
+        let no_count = PartitionDraft { count: String::new(), ..draft(PartitionMethod::Key, PartitionOp::Add) };
+        assert!(plan_partition(&snapshot("t"), "t", &no_count, true).blocked.iter().any(|text| text.contains("分区数量")));
 
         let mut bad_name = draft(PartitionMethod::Range, PartitionOp::Add);
         bad_name.definitions = vec![def("  ", "10")];
-        assert!(plan_partition(&snapshot("t"), "t", &bad_name, true).blocked.iter().any(|text| text.contains("分区名")));
+        assert!(plan_partition(&ranged("t"), "t", &bad_name, true).blocked.iter().any(|text| text.contains("分区名")));
 
         // 删除分区是危险操作：风险文案要说清数据一起消失。
         let mut drop = draft(PartitionMethod::Range, PartitionOp::Drop);
         drop.targets = vec!["p0".to_owned()];
-        let plan = plan_partition(&snapshot("t"), "t", &drop, true);
+        let plan = plan_partition(&ranged("t"), "t", &drop, true);
         assert!(plan.blocked.is_empty());
         assert!(plan.risks.iter().any(|risk| risk.level == "danger" && risk.text.contains("删除")));
 
         // 别的引擎请求时只给拒绝原因，不生成语句。
-        let plan = plan_partition(&snapshot("t"), "t", &drop, false);
+        let plan = plan_partition(&ranged("t"), "t", &drop, false);
         assert!(plan.steps.is_empty());
         assert!(plan.blocked.iter().any(|text| text.contains("MySQL")));
+    }
+
+    /// 不适用的操作要阻断而不是伪装可用：未分区的表不能新增/删除/重组/移除，
+    /// 已有分区方案时方式必须与现状一致，被指定的分区必须真的读到过。
+    #[test]
+    fn partition_operations_that_do_not_apply_are_blocked() {
+        let mut add = draft(PartitionMethod::Range, PartitionOp::Add);
+        add.definitions = vec![def("p2", "300")];
+        let plan = plan_partition(&snapshot("t"), "t", &add, true);
+        assert!(plan.steps.is_empty());
+        assert!(plan.blocked.iter().any(|text| text.contains("还没有分区方案")), "{:?}", plan.blocked);
+
+        let remove = draft(PartitionMethod::Range, PartitionOp::Remove);
+        assert!(plan_partition(&snapshot("t"), "t", &remove, true).blocked.iter().any(|text| text.contains("还没有分区方案")));
+
+        // 现状是 RANGE，按 LIST 删除分区没有意义：阻断并说明现在的分区方式。
+        let mut mismatched = draft(PartitionMethod::List, PartitionOp::Drop);
+        mismatched.targets = vec!["p0".to_owned()];
+        let plan = plan_partition(&ranged("t"), "t", &mismatched, true);
+        assert!(plan.steps.is_empty());
+        assert!(plan.blocked.iter().any(|text| text.contains("现在是 RANGE 分区")), "{:?}", plan.blocked);
+
+        // 删除一个没读到的分区名：语句会被服务器拒绝，先在预览前阻断。
+        let mut unknown = draft(PartitionMethod::Range, PartitionOp::Drop);
+        unknown.targets = vec!["p9".to_owned()];
+        assert!(plan_partition(&ranged("t"), "t", &unknown, true).blocked.iter().any(|text| text.contains("没有读到分区 p9")));
+
+        // 删除读到的分区：生成语句。
+        let mut known = draft(PartitionMethod::Range, PartitionOp::Drop);
+        known.targets = vec!["p0".to_owned()];
+        let plan = plan_partition(&ranged("t"), "t", &known, true);
+        assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+        assert_eq!(plan.steps[0].sql, "ALTER TABLE app.t DROP PARTITION p0;");
+
+        // 读不到版本时不猜分区能力。
+        let mut unknown_version = Snapshot::bare(Engine::Mysql, "app", "app", "t");
+        unknown_version.server_version.clear();
+        let mut replace = draft(PartitionMethod::Hash, PartitionOp::Replace);
+        replace.count = "4".to_owned();
+        let plan = plan_partition(&unknown_version, "t", &replace, true);
+        assert!(plan.steps.is_empty());
+        assert!(plan.blocked.iter().any(|text| text.contains("未知版本")), "{:?}", plan.blocked);
     }
 }

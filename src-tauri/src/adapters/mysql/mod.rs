@@ -18,6 +18,8 @@ mod plan;
 pub(in crate::adapters) mod profile;
 pub(in crate::adapters) mod table_ddl;
 pub(in crate::adapters) mod table_read;
+#[cfg(test)]
+mod table_live_tests;
 pub(in crate::adapters) mod syntax;
 pub(in crate::adapters) mod transfer;
 pub(in crate::adapters) mod types;
