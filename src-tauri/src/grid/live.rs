@@ -254,15 +254,15 @@ pub async fn commit_with_preview(
                 if change.sets.is_empty() {
                     return Ok(fail(applied, &change.id, sql, "没有要修改的列", pending));
                 }
-                if let Err(message) = expect_one(session, &schema, &change.locator).await {
-                    return Ok(fail(applied, &change.id, sql, message, pending));
+                if let Err((message, database_error)) = expect_one(session, &schema, &change.locator).await {
+                    return Ok(fail_with(applied, &change.id, sql, message, pending, database_error));
                 }
                 match execute_sql(session, &sql).await {
                     Ok(1) => applied.push(Applied { id: change.id.clone(), sql }),
                     Ok(affected) => {
                         return Ok(fail(applied, &change.id, sql, format!("影响 {affected} 行，已停止。已成功的语句不撤销。"), pending));
                     }
-                    Err(message) => return Ok(fail(applied, &change.id, sql, message, pending)),
+                    Err(message) => return Ok(fail_database(applied, &change.id, sql, message, pending)),
                 }
             }
             MutationKind::Delete => {
@@ -270,15 +270,15 @@ pub async fn commit_with_preview(
                     Ok(locator) => sql::delete_sql(&schema, locator),
                     Err(message) => return Ok(fail(applied, &change.id, String::new(), message, pending)),
                 };
-                if let Err(message) = expect_one(session, &schema, &change.locator).await {
-                    return Ok(fail(applied, &change.id, sql, message, pending));
+                if let Err((message, database_error)) = expect_one(session, &schema, &change.locator).await {
+                    return Ok(fail_with(applied, &change.id, sql, message, pending, database_error));
                 }
                 match execute_sql(session, &sql).await {
                     Ok(1) => applied.push(Applied { id: change.id.clone(), sql }),
                     Ok(affected) => {
                         return Ok(fail(applied, &change.id, sql, format!("影响 {affected} 行，已停止。已成功的语句不撤销。"), pending));
                     }
-                    Err(message) => return Ok(fail(applied, &change.id, sql, message, pending)),
+                    Err(message) => return Ok(fail_database(applied, &change.id, sql, message, pending)),
                 }
             }
             MutationKind::Insert => {
@@ -289,7 +289,7 @@ pub async fn commit_with_preview(
                 match execute_sql(session, &sql).await {
                     Ok(0) => return Ok(fail(applied, &change.id, sql, "新增没有写入行，已停止。已成功的语句不撤销。", pending)),
                     Ok(_) => applied.push(Applied { id: change.id.clone(), sql }),
-                    Err(message) => return Ok(fail(applied, &change.id, sql, message, pending)),
+                    Err(message) => return Ok(fail_database(applied, &change.id, sql, message, pending)),
                 }
             }
         }
@@ -298,9 +298,18 @@ pub async fn commit_with_preview(
 }
 
 fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>, pending: Vec<String>) -> CommitReport {
+    fail_with(applied, id, sql, message, pending, false)
+}
+
+/// 数据库/驱动拒绝的语句：事务效果要按真实结果登记，不能当成写入前的本地拒绝。
+fn fail_database(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>, pending: Vec<String>) -> CommitReport {
+    fail_with(applied, id, sql, message, pending, true)
+}
+
+fn fail_with(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>, pending: Vec<String>, database_error: bool) -> CommitReport {
     CommitReport {
         applied,
-        failed: Some(Failed { id: id.to_owned(), sql, message: message.into() }),
+        failed: Some(Failed { id: id.to_owned(), sql, message: message.into(), database_error }),
         pending_ids: pending,
         rolled_back: false,
         rule: COMMIT_RULE,
@@ -328,7 +337,9 @@ fn located_sql<'a>(schema: &'a TableSchema, locator: &'a [(String, Cell)], updat
     Ok(locator)
 }
 
-async fn expect_one(session: &CatalogSession, schema: &TableSchema, locator: &[(String, Cell)]) -> Result<(), String> {
+/// 写入前确认定位仍只命中一行。返回 `(原因, 是否来自数据库)`：数据库错误要按真实事务结果登记，
+/// “找不到这一行”“命中多行”只是本地拒绝，不会改变事务状态。
+async fn expect_one(session: &CatalogSession, schema: &TableSchema, locator: &[(String, Cell)]) -> Result<(), (String, bool)> {
     let where_sql = locator
         .iter()
         .map(|(name, value)| {
@@ -338,13 +349,13 @@ async fn expect_one(session: &CatalogSession, schema: &TableSchema, locator: &[(
         .collect::<Vec<_>>()
         .join(" AND ");
     let sql = format!("SELECT COUNT(*) FROM {} WHERE {where_sql}", sql::qualified_name(schema));
-    let count = fetch_count(session, &sql).await?;
+    let count = fetch_count(session, &sql).await.map_err(|message| (message, true))?;
     if count == 1 {
         Ok(())
     } else if count == 0 {
-        Err("数据库里已找不到这一行，不能修改或删除".to_owned())
+        Err(("数据库里已找不到这一行，不能修改或删除".to_owned(), false))
     } else {
-        Err(format!("影响 {count} 行，已停止。已成功的语句不撤销。"))
+        Err((format!("影响 {count} 行，已停止。已成功的语句不撤销。"), false))
     }
 }
 

@@ -152,14 +152,20 @@ pub struct ReceiptDto {
     steps: Vec<ReceiptStepDto>,
     target: String,
     rebuild: bool,
+    /// 这次执行对共享事务的效果：活动事务里是 `still_active`，不是最终提交（R4）。
+    effect: crate::transaction::TransactionEffect,
+    /// 执行结束后的同连接共享快照；非关系型连接没有事务面时为 `None`。
+    transaction: Option<crate::transaction::TransactionSnapshot>,
+    /// 这次执行命中 MySQL/MariaDB 的隐式提交（R9）。
+    implicit_commit: bool,
+    /// 步骤只应用到当前事务、尚未提交。
+    applied_not_committed: bool,
+    /// 步骤已经是数据库的最终结果（没有活动事务）。
+    committed: bool,
 }
 
 fn request_from(database: String, schema: String, engine: &str, action: Action) -> Result<Request, String> {
     Ok(Request { database, schema, engine: Engine::parse(engine)?, action })
-}
-
-fn require_session(state: &ConnectionsState, id: &str) -> Result<crate::connections::CatalogSession, String> {
-    state.service.catalog_session(id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
 }
 
 fn describe_dto(snapshot: &Snapshot) -> DescribeDto {
@@ -243,13 +249,19 @@ fn step_dto(step: Step) -> StepDto {
     StepDto { sql: step.sql, label: step.label }
 }
 
-fn receipt_dto(receipt: Receipt) -> ReceiptDto {
+fn receipt_dto(executed: crate::application::ddl::Executed) -> ReceiptDto {
     ReceiptDto {
-        blocked: receipt.blocked,
-        rule: receipt.rule,
-        target: receipt.target,
-        rebuild: receipt.rebuild,
-        steps: receipt
+        blocked: executed.receipt.blocked,
+        rule: executed.receipt.rule,
+        target: executed.receipt.target,
+        rebuild: executed.receipt.rebuild,
+        effect: executed.effect,
+        transaction: executed.transaction,
+        implicit_commit: executed.implicit_commit,
+        applied_not_committed: executed.applied_not_committed,
+        committed: executed.committed,
+        steps: executed
+            .receipt
             .steps
             .into_iter()
             .map(|step| ReceiptStepDto { sql: step.sql, label: step.label, status: step.status, message: step.message })
@@ -263,19 +275,20 @@ pub async fn ddl_describe(state: &ConnectionsState, request: DescribeBody) -> Re
 }
 
 pub async fn ddl_preview(state: &ConnectionsState, request: PreviewBody) -> Result<PlanDto, String> {
-    let session = require_session(state, &request.connection_id)?;
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
-    Ok(plan_dto(exec::preview(&session, &loaded).await?))
+    Ok(plan_dto(crate::application::ddl::preview_request(&state.service, &request.connection_id, &loaded).await?))
 }
 
-pub(crate) async fn execute_saved(
+/// 在调用方已经取得的结构业务会话上执行，并按新开关更新连接记下的 foreign_keys。
+pub(crate) async fn execute_on(
     service: &crate::connections::Service,
     connection_id: &str,
+    session: &crate::connections::CatalogSession,
     request: &Request,
     confirmed_sql: &[String],
+    state: crate::transaction::TransactionState,
 ) -> Result<Receipt, String> {
-    let session = service.catalog_session(connection_id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
-    let receipt = exec::execute(&session, request, confirmed_sql).await?;
+    let receipt = exec::execute_in(session, request, confirmed_sql, state).await?;
     if let Some(enabled) = exec::committed_foreign_keys(request.engine, &request.action, &receipt) {
         service.set_catalog_foreign_keys(connection_id, Some(enabled));
     }
@@ -284,6 +297,6 @@ pub(crate) async fn execute_saved(
 
 pub async fn ddl_execute(state: &ConnectionsState, request: ExecuteBody) -> Result<ReceiptDto, String> {
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
-    let receipt = crate::application::ddl::execute_request(&state.service, &request.connection_id, &loaded, &request.confirmed_sql, true).await?;
-    Ok(receipt_dto(receipt))
+    let executed = crate::application::ddl::execute_request_tracked(&state.service, &request.connection_id, &loaded, &request.confirmed_sql, true).await?;
+    Ok(receipt_dto(executed))
 }

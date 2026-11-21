@@ -120,6 +120,9 @@ pub struct Failed {
     pub id: String,
     pub sql: String,
     pub message: String,
+    /// 失败来自数据库/驱动（语句被拒绝、连接中断），而不是写入前的本地校验。
+    /// 只有这种情况才会改变当前事务状态（R4、R8）。
+    pub database_error: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -153,7 +156,7 @@ pub fn touch_api() -> usize {
     ];
     let page = Page { rows: Vec::new(), matched: 0, truncated: false, sql: String::new() };
     let applied = Applied { id: String::new(), sql: String::new() };
-    let failed = Failed { id: String::new(), sql: String::new(), message: String::new() };
+    let failed = Failed { id: String::new(), sql: String::new(), message: String::new(), database_error: false };
     let report = CommitReport { applied: Vec::new(), failed: None, pending_ids: Vec::new(), rolled_back: false, rule: COMMIT_RULE };
     let _changes = [
         Change::Update { id: String::new(), row_id: String::new(), sets: BTreeMap::new() },
@@ -373,7 +376,7 @@ pub fn query_page(store: &TableStore, filters: &[Filter], sort: Option<&Sort>, o
 }
 
 fn fail(applied: Vec<Applied>, id: String, sql: String, message: String, pending: Vec<String>) -> CommitReport {
-    CommitReport { applied, failed: Some(Failed { id, sql, message }), pending_ids: pending, rolled_back: false, rule: COMMIT_RULE }
+    CommitReport { applied, failed: Some(Failed { id, sql, message, database_error: false }), pending_ids: pending, rolled_back: false, rule: COMMIT_RULE }
 }
 
 fn unique_conflict(schema: &TableSchema, rows: &[Row], cells: &BTreeMap<String, Cell>, ignore: Option<&str>) -> Option<String> {

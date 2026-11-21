@@ -226,6 +226,20 @@ const PATTERNS: &[(&str, &str)] = &[
     ("读取库表失败：{p}", "Could not read the catalog: {0}"),
     ("读取{p}失败：{p}", "Could not read {0}: {1}"),
     ("元数据列是空值", "A metadata column is null"),
+    // 结构业务加入共享用户事务（ADR-4）：中止/未知时不执行、结果落在事务里还是已提交。
+    (
+        "当前事务已中止：只能回滚或回滚到保存点，不能执行结构变更。",
+        "The current transaction is aborted: only rollback or rollback to a savepoint is allowed, so the structure change was not run.",
+    ),
+    (
+        "事务结果未知：不能执行结构变更，需先独立核对或回滚事务。",
+        "The transaction outcome is unknown: the structure change was not run; verify it independently or roll back first.",
+    ),
+    ("这些步骤已应用到当前事务，尚未提交。", "These steps are applied to the current transaction and are not committed yet."),
+    (
+        "这些结构语句触发了隐式提交：此前未提交的修改已经随隐式提交结束，不能再通过回滚撤销。",
+        "These structure statements caused an implicit commit: earlier uncommitted changes ended with it and can no longer be undone by a rollback.",
+    ),
 ];
 
 /// 重建的建表定义“未包含”清单里的项（`ddl::rebuilt_definition` 返回的 `missing`）。查看器横幅逐项显示；

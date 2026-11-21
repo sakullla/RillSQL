@@ -221,6 +221,14 @@ pub struct CommitDto {
     pub pending_ids: Vec<String>,
     pub rolled_back: bool,
     pub rule: String,
+    /// 这次写入对共享事务的效果：活动事务里是 `still_active`，不是最终提交（R4）。
+    pub effect: crate::transaction::TransactionEffect,
+    /// 写入结束后的同连接共享快照；非关系型连接没有事务面时为 `None`。
+    pub transaction: Option<crate::transaction::TransactionSnapshot>,
+    /// 已应用的变更只进入到当前事务、尚未提交，需要提交事务才会成为最终结果。
+    pub applied_not_committed: bool,
+    /// 已应用的变更已经是数据库的最终结果（没有活动事务，沿用自动提交）。
+    pub committed: bool,
 }
 
 #[derive(Serialize)]

@@ -10,7 +10,7 @@ pub(crate) mod plan;
 pub(crate) mod sql;
 pub(crate) mod templates;
 
-pub(crate) use exec::{preview, Receipt};
+pub(crate) use exec::Receipt;
 pub(crate) use introspect::{load, load_comments, load_partial};
 #[allow(unused_imports)]
 pub(crate) use model::{

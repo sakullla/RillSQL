@@ -4,7 +4,9 @@ use crate::adapters::ddl::{AdminSections, DdlDialect, TableOptionSpec};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
-use crate::ddl::model::{Action, Column, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, Step, TableOptions};
+use crate::ddl::model::{
+    Action, Column, ColumnDraft, ForeignKey, Plan, Request, Risk, Snapshot, Step, TableOptions, SQLITE_REBUILD_RELEASE_SQL, SQLITE_REBUILD_SAVEPOINT_SQL,
+};
 use crate::ddl::plan::{
     changed_names, column_referenced, column_sql, create_statement, drafts_change_shape, finish, identity_drafts, index_touches_change, default_changed,
     preservable_indexes, push_fk_status, recreate_index_sql, renamed_any, same_type, Change,
@@ -241,6 +243,18 @@ impl DdlDialect for SqliteDdl {
 
 /// SQLite 的库级动作。`supported` 为假时是别的引擎请求了它：给出同一个动作的拒绝计划。
 fn object_action(snapshot: &Snapshot, action: &Action, supported: bool) -> Option<Plan> {
+    // 活动外层事务里不能执行的动作先明确拒绝：不另开会话，也不用一条“成功”的 no-op 冒充完成。
+    if snapshot.transaction == crate::transaction::TransactionState::Active {
+        if let Some(reason) = transaction_refusal(action) {
+            let target = match action {
+                Action::Vacuum => "sqlite / vacuum".to_owned(),
+                Action::SetForeignKeys { .. } => "sqlite / foreign_keys".to_owned(),
+                Action::SetPragma { pragma, .. } => format!("sqlite / pragma {}", pragma.trim().to_ascii_lowercase()),
+                _ => String::new(),
+            };
+            return Some(finish(snapshot.engine, false, target, vec![reason.to_owned()], Vec::new(), Vec::new()));
+        }
+    }
     Some(match action {
         Action::SetForeignKeys { enabled } => plan_set_fk(snapshot, *enabled, supported),
         Action::SetPragma { pragma, value } => plan_set_pragma(snapshot, pragma, value, supported),
@@ -249,6 +263,18 @@ fn object_action(snapshot: &Snapshot, action: &Action, supported: bool) -> Optio
         Action::Reindex { target } => plan_reindex(snapshot, target.as_deref(), supported),
         _ => return None,
     })
+}
+
+/// 活动外层事务里 SQLite 不能执行的结构动作：明确拒绝，不另开会话绕过（R4）。
+fn transaction_refusal(action: &Action) -> Option<&'static str> {
+    match action {
+        Action::Vacuum => Some("SQLite 不能在事务里执行 VACUUM：先在当前标签提交或回滚事务，不会另开会话绕过。"),
+        Action::SetForeignKeys { .. } => Some("活动事务里 PRAGMA foreign_keys 不生效：先提交或回滚事务再改外键开关，不会另开会话绕过。"),
+        Action::SetPragma { pragma, .. } if pragma.trim().eq_ignore_ascii_case("journal_mode") => {
+            Some("活动事务里不能改变 journal_mode：先提交或回滚事务，不会另开会话绕过。")
+        }
+        _ => None,
+    }
 }
 
 fn plan_set_fk(snapshot: &Snapshot, enabled: bool, supported: bool) -> Plan {
@@ -507,9 +533,11 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
         Some(count) => format!("复制 {count} 行"),
         None => "复制保留列的数据".to_owned(),
     };
+    let in_transaction = snapshot.transaction == crate::transaction::TransactionState::Active;
     let restore = match snapshot.live_foreign_keys {
         Some(true) => "ON",
         Some(false) => "OFF",
+        None if in_transaction => "ON",
         None => {
             return finish(
                 snapshot.engine,
@@ -521,17 +549,21 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
             );
         }
     };
-    let mut steps = vec![
-        Step { sql: "PRAGMA foreign_keys = OFF;".to_owned(), label: "在事务外关闭外键检查".to_owned() },
-        Step { sql: "BEGIN;".to_owned(), label: "开始重建事务".to_owned() },
-        Step { sql: create, label: "按新定义创建新表".to_owned() },
-        Step {
-            sql: format!("INSERT INTO {qualified_temp} ({insert_cols}) SELECT {select_cols} FROM {qualified_old};"),
-            label: copy_label,
-        },
-        Step { sql: format!("DROP TABLE {qualified_old};"), label: "删除旧表".to_owned() },
-        Step { sql: format!("ALTER TABLE {qualified_temp} RENAME TO {qualified_old};"), label: "新表改回原名".to_owned() },
-    ];
+    let mut steps = Vec::new();
+    if in_transaction {
+        // 活动外层事务里不能另开事务，也不能在事务内改 foreign_keys：重建边界改用内部保存点。
+        steps.push(Step { sql: SQLITE_REBUILD_SAVEPOINT_SQL.to_owned(), label: "开始重建保存点".to_owned() });
+    } else {
+        steps.push(Step { sql: "PRAGMA foreign_keys = OFF;".to_owned(), label: "在事务外关闭外键检查".to_owned() });
+        steps.push(Step { sql: "BEGIN;".to_owned(), label: "开始重建事务".to_owned() });
+    }
+    steps.push(Step { sql: create, label: "按新定义创建新表".to_owned() });
+    steps.push(Step {
+        sql: format!("INSERT INTO {qualified_temp} ({insert_cols}) SELECT {select_cols} FROM {qualified_old};"),
+        label: copy_label,
+    });
+    steps.push(Step { sql: format!("DROP TABLE {qualified_old};"), label: "删除旧表".to_owned() });
+    steps.push(Step { sql: format!("ALTER TABLE {qualified_temp} RENAME TO {qualified_old};"), label: "新表改回原名".to_owned() });
     for index in &kept_indexes {
         match recreate_index_sql(snapshot, index, drafts) {
             Ok(sql) => steps.push(Step { sql, label: format!("重建索引 {}", index.name) }),
@@ -548,18 +580,30 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
         sql: format!("PRAGMA foreign_key_check({qualified_old});"),
         label: "检查外键；有违规则停止并回滚这次重建".to_owned(),
     });
-    steps.push(Step { sql: "COMMIT;".to_owned(), label: "提交重建事务".to_owned() });
-    steps.push(Step {
-        sql: format!("PRAGMA foreign_keys = {restore};"),
-        label: format!("恢复会话原来的 foreign_keys = {restore}"),
-    });
-    if snapshot.live_foreign_keys == Some(false) {
+    if in_transaction {
+        steps.push(Step { sql: SQLITE_REBUILD_RELEASE_SQL.to_owned(), label: "释放重建保存点（外层事务仍未提交）".to_owned() });
         risks.push(Risk {
-            level: "info".to_owned(),
-            text: "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成强制检查。".to_owned(),
+            level: "warn".to_owned(),
+            text: "活动事务里不能在事务内关闭外键检查：重建按当前外键设置执行；被其他表引用时数据库可能拒绝删除旧表。失败只回滚到重建保存点，不会撤销此前已经应用的修改。".to_owned(),
         });
+    } else {
+        steps.push(Step { sql: "COMMIT;".to_owned(), label: "提交重建事务".to_owned() });
+        steps.push(Step {
+            sql: format!("PRAGMA foreign_keys = {restore};"),
+            label: format!("恢复会话原来的 foreign_keys = {restore}"),
+        });
+        if snapshot.live_foreign_keys == Some(false) {
+            risks.push(Risk {
+                level: "info".to_owned(),
+                text: "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成强制检查。".to_owned(),
+            });
+        }
     }
-    finish(snapshot.engine, true, target, Vec::new(), risks, steps)
+    let mut plan = finish(snapshot.engine, true, target, Vec::new(), risks, steps);
+    if in_transaction {
+        plan.rule = "活动事务里的 SQLite 重建：在内部保存点里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。不能关闭外键检查；失败只回滚到这个保存点，不会撤销此前已经应用的修改。重建结果随当前事务一起提交或回滚。".to_owned();
+    }
+    plan
 }
 
 fn rebuild_blocker(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Option<String> {

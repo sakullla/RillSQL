@@ -142,6 +142,37 @@ pub(in crate::adapters) const MESSAGES_EN: &[(&str, &str)] = &[
     ("SQLite 没有函数或存储过程", "SQLite has no functions or stored procedures"),
     ("SQLite 没有序列、枚举或域", "SQLite has no sequences, enums or domains"),
     ("只有表、视图和触发器可以读取只读定义", "Only tables, views and triggers have a read-only definition"),
+    // 活动外层事务里的重建（ADR-4）：内部事务换成保存点边界。
+    (
+        "SQLite 不能在事务里执行 VACUUM：先在当前标签提交或回滚事务，不会另开会话绕过。",
+        "SQLite can't run VACUUM inside a transaction: commit or roll back the transaction first; no other session is opened to bypass it.",
+    ),
+    (
+        "活动事务里 PRAGMA foreign_keys 不生效：先提交或回滚事务再改外键开关，不会另开会话绕过。",
+        "PRAGMA foreign_keys has no effect inside an active transaction: commit or roll back first, then change the switch; no other session is opened to bypass it.",
+    ),
+    (
+        "活动事务里不能改变 journal_mode：先提交或回滚事务，不会另开会话绕过。",
+        "journal_mode can't be changed inside an active transaction: commit or roll back first; no other session is opened to bypass it.",
+    ),
+    ("开始重建保存点", "Begin the rebuild savepoint"),
+    ("释放重建保存点（外层事务仍未提交）", "Release the rebuild savepoint (the outer transaction is still not committed)"),
+    (
+        "活动事务里不能在事务内关闭外键检查：重建按当前外键设置执行；被其他表引用时数据库可能拒绝删除旧表。失败只回滚到重建保存点，不会撤销此前已经应用的修改。",
+        "Foreign key checks can't be turned off inside an active transaction: the rebuild runs with the current setting and the database may refuse to drop a table that other tables reference. A failure only rolls back to the rebuild savepoint and doesn't undo changes already applied.",
+    ),
+    (
+        "活动事务里的 SQLite 重建：在内部保存点里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。不能关闭外键检查；失败只回滚到这个保存点，不会撤销此前已经应用的修改。重建结果随当前事务一起提交或回滚。",
+        "SQLite rebuild inside an active transaction: a savepoint creates the new table, copies the data, drops the old table and renames the new one back, followed by foreign_key_check (a foreign key integrity check). Foreign key checks can't be turned off; a failure only rolls back to this savepoint and doesn't undo changes already applied. The rebuild is committed or rolled back with the current transaction.",
+    ),
+    (
+        "已回滚到重建保存点：这条语句没有保留，此前已经应用的修改仍在当前事务里。",
+        "Rolled back to the rebuild savepoint: this statement was not kept, and changes already applied remain in the current transaction.",
+    ),
+    (
+        "回滚到重建保存点失败，结果未知：{}",
+        "Rolling back to the rebuild savepoint failed, so the result is unknown: {0}",
+    ),
 ];
 
 /// 重建定义“未包含”清单里这个引擎专属的项。

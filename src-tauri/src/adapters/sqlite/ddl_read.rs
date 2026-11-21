@@ -11,6 +11,7 @@ use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
 use crate::ddl::model::{
     Action, AttachedDatabase, Column, DependentSql, ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus,
+    SQLITE_REBUILD_RELEASE_SQL, SQLITE_REBUILD_SAVEPOINT, SQLITE_REBUILD_SAVEPOINT_SQL,
 };
 use crate::ddl::sql::{mentions, valid_name};
 
@@ -421,7 +422,8 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
     let mut results = Vec::new();
     let mut stop = false;
     let mut unknown = false;
-    let mut txn_from: Option<usize> = None;
+    // 失败补偿的边界：内部重建事务，或活动外层事务里的重建保存点（ADR-4）。
+    let mut boundary: Option<Boundary> = None;
     for step in steps {
         if stop {
             results.push(receipt(step, StepStatus::Skipped, "前面的语句没有成功，这条没有执行。"));
@@ -457,11 +459,13 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
         };
         match executed {
             Ok(note) => {
+                // 记下边界步骤在 results 里的位置（本条回执还没有推进）。
                 if kind == StmtKind::Begin {
-                    txn_from = Some(results.len());
-                }
-                if kind == StmtKind::Commit {
-                    txn_from = None;
+                    boundary = Some(Boundary::Transaction { step: results.len() });
+                } else if kind == StmtKind::Savepoint {
+                    boundary = Some(Boundary::Savepoint { step: results.len() });
+                } else if kind == StmtKind::Commit || kind == StmtKind::Release {
+                    boundary = None;
                 }
                 results.push(receipt(step, StepStatus::Ok, note.as_deref().unwrap_or("")));
             }
@@ -473,8 +477,8 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
             Err(message) => {
                 stop = true;
                 results.push(receipt(step, StepStatus::Failed, &message));
-                if let Some(start) = txn_from {
-                    match sqlx::query(sqlx::AssertSqlSafe("ROLLBACK".to_owned())).execute(&mut *conn).await {
+                match boundary.take() {
+                    Some(Boundary::Transaction { step: start }) => match sqlx::query(sqlx::AssertSqlSafe("ROLLBACK".to_owned())).execute(&mut *conn).await {
                         Ok(_) => {
                             for item in results.iter_mut().skip(start) {
                                 if item.status == StepStatus::Ok {
@@ -482,7 +486,6 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
                                     item.message = "重建事务已回滚，这条语句没有保留。".to_owned();
                                 }
                             }
-                            txn_from = None;
                         }
                         Err(err) => {
                             unknown = true;
@@ -493,7 +496,11 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
                                 }
                             }
                         }
+                    },
+                    Some(Boundary::Savepoint { step: start }) => {
+                        unknown = !rollback_rebuild_savepoint(&mut conn, &mut results, start).await;
                     }
+                    None => {}
                 }
             }
         }
@@ -502,6 +509,50 @@ pub(in crate::adapters) async fn run_steps(pool: &sqlx::SqlitePool, steps: &[Ste
         restore_foreign_keys(&mut conn, &mut results, restore).await;
     }
     Ok(results)
+}
+
+/// 重建失败时的补偿边界。
+#[derive(Clone, Copy)]
+enum Boundary {
+    /// 没有外层事务：原有内部重建事务，可整体 `ROLLBACK`。
+    Transaction { step: usize },
+    /// 活动外层事务里的保存点：只 `ROLLBACK TO` 并释放，不撤销此前已经应用的修改。
+    Savepoint { step: usize },
+}
+
+/// 只回滚到重建保存点并释放它。返回 false 表示补偿本身失败（结果未知）。
+async fn rollback_rebuild_savepoint(conn: &mut sqlx::SqliteConnection, results: &mut [StepReceipt], start: usize) -> bool {
+    let rollback = format!("ROLLBACK TO SAVEPOINT {SQLITE_REBUILD_SAVEPOINT};");
+    let outcome = async {
+        sqlx::query(sqlx::AssertSqlSafe(rollback)).execute(&mut *conn).await.map_err(|err| crate::error_text::chain(&err))?;
+        sqlx::query(sqlx::AssertSqlSafe(SQLITE_REBUILD_RELEASE_SQL.to_owned()))
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|err| crate::error_text::chain(&err))
+    }
+    .await;
+    match outcome {
+        Ok(()) => {
+            // 保存点本身保留 Ok：它确实建立过。之后的步骤都没有保留。
+            for item in results.iter_mut().skip(start + 1) {
+                if item.status == StepStatus::Ok {
+                    item.status = StepStatus::RolledBack;
+                    item.message = "已回滚到重建保存点：这条语句没有保留，此前已经应用的修改仍在当前事务里。".to_owned();
+                }
+            }
+            true
+        }
+        Err(err) => {
+            for item in results.iter_mut().skip(start + 1) {
+                if item.status == StepStatus::Ok {
+                    item.status = StepStatus::Unknown;
+                    item.message = format!("回滚到重建保存点失败，结果未知：{err}");
+                }
+            }
+            false
+        }
+    }
 }
 
 async fn restore_foreign_keys(conn: &mut sqlx::SqliteConnection, results: &mut Vec<StepReceipt>, restore: Option<bool>) {
@@ -543,6 +594,10 @@ async fn restore_foreign_keys(conn: &mut sqlx::SqliteConnection, results: &mut V
 enum StmtKind {
     Begin,
     Commit,
+    /// 活动外层事务里的重建保存点边界（ADR-4），由执行层生成。
+    Savepoint,
+    /// 重建保存点的释放边界。
+    Release,
     Check,
     /// 会带回结果的 PRAGMA：execute 会因为“返回了结果”报错，必须用 fetch_all。
     Probe,
@@ -555,6 +610,10 @@ fn statement_kind(sql: &str) -> StmtKind {
         StmtKind::Begin
     } else if text == "commit" {
         StmtKind::Commit
+    } else if text.eq_ignore_ascii_case(SQLITE_REBUILD_SAVEPOINT_SQL.trim_end_matches(';')) {
+        StmtKind::Savepoint
+    } else if text.eq_ignore_ascii_case(SQLITE_REBUILD_RELEASE_SQL.trim_end_matches(';')) {
+        StmtKind::Release
     } else if text.starts_with("pragma foreign_key_check") {
         StmtKind::Check
     } else if text.starts_with("pragma ") {

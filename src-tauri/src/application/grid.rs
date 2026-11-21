@@ -1,6 +1,14 @@
 //! 网格读取、导出和提交。筛选、导出范围和确认在打开会话之前完成。
+//!
+//! 网格是连接级用户事务的消费者（ADR-1、ADR-4）：describe/page/count/export/commit 都从
+//! `Service::query_session` 取业务会话并持有串行执行租约，所以活动事务里既能读到同连接其他标签
+//! 的未提交修改，也不会让元数据连接替业务操作执行。提交回执区分“已应用到当前事务”与
+//! “已经是最终结果”，并附共享事务快照。
 
-use crate::connections::Service;
+use std::sync::Arc;
+
+use crate::connections::transaction::{ExecutionLease, TransactionCoordinator};
+use crate::connections::{CatalogSession, Service};
 use crate::grid::commands::{
     ChangeArg, ColumnDto, CommitDto, CommitRequest, CountDto, CountRequest, ExportDto, ExportRequest, FailedDto, FilterArg, ForeignKeyDto, PageDto, PageRequest, RowDto, SchemaDto, SortArg, StepDto,
     TableRef,
@@ -9,6 +17,9 @@ use crate::grid::{
     commit_mutations_with_preview, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
     Mutation, MutationKind, Sort, TableSchema,
 };
+use crate::transaction::{StatementOutcome, TransactionEffect, TransactionSnapshot, TransactionState, UnknownReason};
+
+const NOT_OPEN: &str = "这条连接还没有打开，没有另开新的连接。";
 
 pub fn require_commit(confirmed: bool) -> Result<(), String> {
     if !confirmed {
@@ -17,16 +28,70 @@ pub fn require_commit(confirmed: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 一次网格业务操作的业务会话：共享用户事务句柄、串行执行租约与协调器。
+struct Business {
+    session: CatalogSession,
+    /// 租约持有到这个值被丢弃为止：同连接的业务执行因此不会并发驱动同一条事务连接。
+    _lease: Option<ExecutionLease>,
+    coordinator: Option<Arc<TransactionCoordinator>>,
+}
+
+impl Business {
+    /// 当前事务状态；非关系型连接没有事务面，按没有活动事务处理。
+    fn state(&self) -> TransactionState {
+        self.snapshot().map(|snapshot| snapshot.state).unwrap_or(TransactionState::Idle)
+    }
+
+    fn snapshot(&self) -> Option<TransactionSnapshot> {
+        self.coordinator.as_ref().and_then(|coordinator| coordinator.snapshot())
+    }
+
+    /// 数据库拒绝的读取也要按真实事务结果登记：PostgreSQL 的事务内错误会把事务置为中止（R8）。
+    /// 写入前的本地拒绝不经过这里。
+    fn note_read_failure(&self, message: &str) {
+        let Some(coordinator) = &self.coordinator else { return };
+        if coordinator.snapshot().is_none() {
+            return;
+        }
+        let outcome = if coordinator.error_may_have_ended_transaction(None, message) {
+            // 数据库可能自行回滚了整个事务（死锁、磁盘错误）：不继续宣称事务活动（R10）。
+            StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)
+        } else {
+            StatementOutcome::Failed(coordinator.statement_failure(None, message))
+        };
+        coordinator.observe_statement(outcome);
+    }
+}
+
+/// 打开网格业务会话并占住串行执行租约。失败时不另开连接、也不回退到元数据会话。
+async fn business(service: &Service, id: &str) -> Result<Business, String> {
+    let coordinator = service.transaction_coordinator(id);
+    let query = service.query_session(id).await?.ok_or_else(|| NOT_OPEN.to_owned())?;
+    Ok(Business { session: query.session, _lease: query.lease, coordinator })
+}
+
 pub async fn describe(service: &Service, request: &TableRef) -> Result<SchemaDto, String> {
     let _busy = service.busy_scope(&request.connection_id);
     if request.table.is_empty() {
         return Err("没有表名".to_owned());
     }
-    let session = session_of(service, &request.connection_id)?;
-    let schema = describe_table(&session, &request.database, &request.schema, &request.table, &request.engine).await?;
+    let business = business(service, &request.connection_id).await?;
+    let schema = match describe_table(&business.session, &request.database, &request.schema, &request.table, &request.engine).await {
+        Ok(schema) => schema,
+        Err(message) => {
+            business.note_read_failure(&message);
+            return Err(message);
+        }
+    };
     let keys = if request.include_foreign_keys {
-        // 外键失败只让这一项为空，不影响表结构本身。
-        Some(foreign_keys(&session, &request.database, &request.schema, &request.table, &request.engine).await.unwrap_or_default())
+        // 外键失败只让这一项为空，不影响表结构本身；失败的语句仍要登记事务结果。
+        match foreign_keys(&business.session, &request.database, &request.schema, &request.table, &request.engine).await {
+            Ok(keys) => Some(keys),
+            Err(message) => {
+                business.note_read_failure(&message);
+                Some(Vec::new())
+            }
+        }
     } else {
         None
     };
@@ -38,9 +103,9 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
     let filters = filters_of(&request.filters)?;
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
-    let session = session_of(service, &request.table.connection_id)?;
-    let page = query_page_search_preview(
-        &session,
+    let business = business(service, &request.table.connection_id).await?;
+    let page = match query_page_search_preview(
+        &business.session,
         &request.table.database,
         &request.table.schema,
         &request.table.table,
@@ -53,7 +118,14 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
         request.limit,
         usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
     )
-    .await?;
+    .await
+    {
+        Ok(page) => page,
+        Err(message) => {
+            business.note_read_failure(&message);
+            return Err(message);
+        }
+    };
     Ok(page_dto(page))
 }
 
@@ -62,9 +134,26 @@ pub async fn page_described(service: &Service, request: &PageRequest, schema: &c
     let filters = filters_of(&request.filters)?;
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
-    let session = session_of(service, &request.table.connection_id)?;
-    let page = crate::grid::query_page_with_schema(&session, schema, &filters, sort.as_ref(), request.search.as_deref(), expression.as_deref(), request.offset, request.limit,
-        usize::try_from(request.preview_bytes).unwrap_or(1024).max(1)).await?;
+    let business = business(service, &request.table.connection_id).await?;
+    let page = match crate::grid::query_page_with_schema(
+        &business.session,
+        schema,
+        &filters,
+        sort.as_ref(),
+        request.search.as_deref(),
+        expression.as_deref(),
+        request.offset,
+        request.limit,
+        usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(message) => {
+            business.note_read_failure(&message);
+            return Err(message);
+        }
+    };
     Ok(page_dto(page))
 }
 
@@ -100,9 +189,9 @@ pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto
     let _busy = service.busy_scope(&request.table.connection_id);
     let filters = filters_of(&request.filters)?;
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
-    let session = session_of(service, &request.table.connection_id)?;
-    let matched = count_rows_search(
-        &session,
+    let business = business(service, &request.table.connection_id).await?;
+    let matched = match count_rows_search(
+        &business.session,
         &request.table.database,
         &request.table.schema,
         &request.table.table,
@@ -111,7 +200,14 @@ pub async fn count(service: &Service, request: &CountRequest) -> Result<CountDto
         request.search.as_deref(),
         expression.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(matched) => matched,
+        Err(message) => {
+            business.note_read_failure(&message);
+            return Err(message);
+        }
+    };
     Ok(CountDto { matched })
 }
 
@@ -120,7 +216,7 @@ pub async fn export(service: &Service, request: &ExportRequest) -> Result<Export
     let filters = filters_of(&request.filters)?;
     let expression = expression_of(&request.table.engine, request.filter_expression.as_deref())?;
     let sort = sort_of(request.sort.as_ref());
-    let session = session_of(service, &request.table.connection_id)?;
+    let business = business(service, &request.table.connection_id).await?;
     let spec = ExportSpec {
         id: request.id.clone(),
         mode,
@@ -145,7 +241,7 @@ pub async fn export(service: &Service, request: &ExportRequest) -> Result<Export
         fail_after_rows: None,
         cancel_after_rows: None,
     };
-    let outcome = run_export(&session, &spec).await;
+    let outcome = run_export(&business.session, &spec).await;
     Ok(ExportDto {
         status: outcome.status.to_owned(),
         success: outcome.success,
@@ -160,9 +256,13 @@ pub async fn export(service: &Service, request: &ExportRequest) -> Result<Export
 pub async fn commit(service: &Service, request: &CommitRequest, confirmed: bool) -> Result<CommitDto, String> {
     require_commit(confirmed)?;
     let changes = map_changes(&request.changes)?;
-    let session = session_of(service, &request.table.connection_id)?;
-    let report = commit_mutations_with_preview(
-        &session,
+    let business = business(service, &request.table.connection_id).await?;
+    let state = business.state();
+    if !state.allows_statements() {
+        return Err(commit_blocked(state));
+    }
+    let report = match commit_mutations_with_preview(
+        &business.session,
         &request.table.database,
         &request.table.schema,
         &request.table.table,
@@ -170,18 +270,64 @@ pub async fn commit(service: &Service, request: &CommitRequest, confirmed: bool)
         &changes,
         usize::try_from(request.preview_bytes).unwrap_or(usize::MAX),
     )
-    .await?;
+    .await
+    {
+        Ok(report) => report,
+        Err(message) => {
+            business.note_read_failure(&message);
+            return Err(message);
+        }
+    };
+    // 成功的语句先登记，再登记数据库拒绝的那一条：某条失败不会让之前已应用的语句变成没执行（R8）。
+    let mut effect = TransactionEffect::Unchanged;
+    if let Some(coordinator) = &business.coordinator {
+        if !report.applied.is_empty() {
+            effect = coordinator.observe_statement(StatementOutcome::Succeeded);
+        }
+        if let Some(failed) = &report.failed {
+            if failed.database_error {
+                let outcome = if coordinator.error_may_have_ended_transaction(None, &failed.message) {
+                    // 数据库可能自行回滚了整个事务（死锁、磁盘错误）：不继续宣称事务活动（R10）。
+                    StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)
+                } else {
+                    StatementOutcome::Failed(coordinator.statement_failure(None, &failed.message))
+                };
+                effect = coordinator.observe_statement(outcome);
+            }
+        }
+    }
+    let snapshot = business.snapshot();
+    let applied = !report.applied.is_empty();
+    let state = snapshot.as_ref().map(|snapshot| snapshot.state).unwrap_or(TransactionState::Idle);
     Ok(CommitDto {
         applied: report.applied.into_iter().map(|step| StepDto { label: step_label(&step.id), id: step.id, sql: step.sql }).collect(),
         failed: report.failed.map(|step| FailedDto { label: step_label(&step.id), id: step.id, sql: step.sql, message: step.message }),
         pending_ids: report.pending_ids,
         rolled_back: report.rolled_back,
-        rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不会自动撤销。".to_owned(),
+        rule: commit_rule(state),
+        effect,
+        transaction: snapshot,
+        applied_not_committed: applied && state == TransactionState::Active,
+        committed: applied && state == TransactionState::Idle,
     })
 }
 
-fn session_of(service: &Service, id: &str) -> Result<crate::connections::CatalogSession, String> {
-    service.catalog_session(id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
+/// 中止或未知事务里不再发送写入：先让使用者回滚或核对，不能把新写入塞进无法确认的事务（R8、R10）。
+fn commit_blocked(state: TransactionState) -> String {
+    match state {
+        TransactionState::Aborted => "当前事务已中止：先回滚或回滚到保存点，再应用网格变更；没有自动回滚或重放。".to_owned(),
+        TransactionState::Unknown => "事务结果未知：先核对或回滚事务再应用网格变更；不会把写入塞进无法确认的事务。".to_owned(),
+        TransactionState::Idle | TransactionState::Active => String::new(),
+    }
+}
+
+fn commit_rule(state: TransactionState) -> String {
+    match state {
+        TransactionState::Active => "按顺序把变更应用到当前事务，遇到错误即停止；这些变更尚未提交，提交事务后才会成为最终结果。".to_owned(),
+        TransactionState::Aborted => "当前事务已中止：已应用的变更只有回滚事务或回滚到保存点后才会撤销。".to_owned(),
+        TransactionState::Unknown => "事务结果未知：已应用的变更是否保留无法确认，需独立核对；不会自动重放。".to_owned(),
+        TransactionState::Idle => "按顺序逐条提交，遇到错误即停止；已成功的语句不会自动撤销。".to_owned(),
+    }
 }
 
 fn export_mode(mode: &str) -> Result<ExportMode, String> {

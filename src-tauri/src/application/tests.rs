@@ -4,10 +4,12 @@ use super::{run_blocking, AppServices, TaskOutcome};
 use crate::application::grid::require_commit;
 use crate::application::redis;
 use crate::connections::Service;
+use crate::connections::transaction::TransactionCoordinator;
 use crate::compare::{DataRequest, DataTableRequest, SideRequest, StructureRequest};
 use crate::connections::commands::ConnectionsState;
 use crate::connections::model::{ConnectionDraft, Engine as ConnEngine};
 use crate::ddl::{Action, StepStatus};
+use crate::ddl::model::{ColumnDraft, DefaultSpec};
 use crate::dump::dump::DumpRequest;
 use crate::migrate::migrate::{MigrateRequest, MigrateTableRef};
 use crate::query::commands::StartRequest;
@@ -15,6 +17,7 @@ use crate::query::{RenameRequest, SaveRequest};
 use crate::state::{AppState, Platform, SessionState, ShellSettings};
 use crate::grid::commands::{ChangeArg, CommitRequest, CountRequest, ExportRequest, FilterArg, PageRequest, TableRef, ValueArg};
 use crate::adapters::mongodb::docs;
+use crate::transaction::{ControlOutcome, ControlSql, StatementOutcome, TransactionEffect, TransactionState, UnknownReason};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("rillsql-app-{name}-{}", uuid::Uuid::new_v4()));
@@ -235,6 +238,335 @@ async fn confirmed_grid_update_and_ddl_execute_hit_sqlite_and_reject_a_stale_pre
     };
     assert!(stale.contains("没有执行") || stale.contains("不一致"), "{stale}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 建一个真实 SQLite 文件并作为 `notes` 连接打开，返回临时目录、服务与数据库文件路径。
+async fn open_sqlite_notes(name: &str, setup: &[&str]) -> (std::path::PathBuf, Arc<Service>, std::path::PathBuf) {
+    let dir = temp_dir(name);
+    let database = dir.join("notes.sqlite");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    for sql in setup {
+        sqlx::query(sqlx::AssertSqlSafe((*sql).to_owned())).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    (dir, service, database)
+}
+
+/// 在业务会话上开始共享事务并登记到协调器：按钮/手写 SQL 走的是同一条连接。
+async fn begin_shared(service: &Service) -> Arc<TransactionCoordinator> {
+    let coordinator = service.transaction_coordinator("notes").expect("事务协调器");
+    let command = coordinator.begin(None).expect("开始事务");
+    if let ControlSql::Statement(sql) = &command.sql {
+        let query = service.query_session("notes").await.unwrap().expect("业务会话");
+        query.session.grid_execute(sql).await.expect("执行 BEGIN");
+    }
+    coordinator.acknowledge(&command.statement, ControlOutcome::Confirmed).unwrap();
+    coordinator
+}
+
+/// 提交或回滚共享事务，与界面命令一样先在业务会话上执行再登记结果。
+async fn finish_shared(service: &Service, commit: bool) {
+    let coordinator = service.transaction_coordinator("notes").expect("事务协调器");
+    let command = if commit { coordinator.commit().expect("提交") } else { coordinator.rollback().expect("回滚") };
+    if let ControlSql::Statement(sql) = &command.sql {
+        let query = service.query_session("notes").await.unwrap().expect("业务会话");
+        query.session.grid_execute(sql).await.expect("执行 COMMIT/ROLLBACK");
+    }
+    coordinator.acknowledge(&command.statement, ControlOutcome::Confirmed).unwrap();
+}
+
+/// 另一条独立连接读到的值：用来证明未提交修改没有离开当前事务（R2）。
+async fn name_on_disk(database: &std::path::Path, id: i64) -> String {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(database).read_only(true))
+        .await
+        .unwrap();
+    let name = sqlx::query_scalar("SELECT name FROM customers WHERE id = ?1").bind(id).fetch_one(&pool).await.unwrap();
+    pool.close().await;
+    name
+}
+
+/// 独立连接读到的表定义原文：结构变更提交前不应出现在这里。
+async fn table_sql_on_disk(database: &std::path::Path, table: &str) -> String {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(database).read_only(true))
+        .await
+        .unwrap();
+    let sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1").bind(table).fetch_optional(&pool).await.unwrap();
+    pool.close().await;
+    sql.unwrap_or_default()
+}
+
+fn notes_table_ref() -> TableRef {
+    TableRef {
+        connection_id: "notes".to_owned(),
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "notes".to_owned(),
+        engine: "sqlite".to_owned(),
+        include_foreign_keys: false,
+    }
+}
+
+fn customers_page() -> PageRequest {
+    PageRequest {
+        table: TableRef {
+            connection_id: "notes".to_owned(),
+            database: "main".to_owned(),
+            schema: String::new(),
+            table: "customers".to_owned(),
+            engine: "sqlite".to_owned(),
+            include_foreign_keys: false,
+        },
+        filters: Vec::new(),
+        sort: None,
+        offset: 0,
+        limit: 10,
+        preview_bytes: 1024,
+        search: None,
+        filter_expression: None,
+    }
+}
+
+fn name_of(dto: &crate::grid::commands::PageDto, id: &str) -> Option<String> {
+    dto.rows.iter().find(|row| row.cells.get("id").is_some_and(|value| value.as_deref() == Some(id))).and_then(|row| row.cells.get("name").cloned().flatten())
+}
+
+#[tokio::test]
+async fn grid_changes_join_the_shared_transaction_until_it_is_rolled_back() {
+    let (dir, service, database) = open_sqlite_notes(
+        "shared-grid",
+        &["CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)", "INSERT INTO customers (id, name) VALUES (1, '甲')"],
+    )
+    .await;
+    let coordinator = begin_shared(&service).await;
+    let active = coordinator.snapshot().expect("事务快照");
+    assert_eq!(active.state, TransactionState::Active);
+
+    let committed = crate::application::grid::commit(&service, &commit_request("notes", "customers"), true).await.unwrap();
+    assert_eq!(committed.applied.len(), 1);
+    assert!(committed.applied_not_committed, "活动事务里的写入不是最终保存：{:?}", committed.rule);
+    assert!(!committed.committed);
+    assert_eq!(committed.effect, TransactionEffect::StillActive);
+    assert_eq!(committed.transaction.as_ref().map(|snapshot| snapshot.state), Some(TransactionState::Active));
+
+    // 同连接业务页读到未提交值。
+    let page = crate::application::grid::page(&service, &customers_page()).await.unwrap();
+    assert_eq!(name_of(&page, "1"), Some("乙".to_owned()));
+    // 独立连接读不到。
+    assert_eq!(name_on_disk(&database, 1).await, "甲");
+
+    finish_shared(&service, false).await;
+    let after = service.transaction_snapshot("notes").expect("事务快照");
+    assert_eq!(after.state, TransactionState::Idle);
+    assert!(after.generation > active.generation, "回滚推进事务代次：{} -> {}", active.generation, after.generation);
+    let page = crate::application::grid::page(&service, &customers_page()).await.unwrap();
+    assert_eq!(name_of(&page, "1"), Some("甲".to_owned()));
+    assert_eq!(name_on_disk(&database, 1).await, "甲");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sqlite_rebuild_uses_a_savepoint_inside_the_shared_transaction() {
+    let (dir, service, database) = open_sqlite_notes(
+        "shared-rebuild",
+        &["CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)", "INSERT INTO notes (id, note) VALUES (1, '甲')"],
+    )
+    .await;
+    let coordinator = begin_shared(&service).await;
+    let columns = vec![
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
+        ColumnDraft { original: Some("note".to_owned()), name: "note".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+    ];
+    let request = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "notes".to_owned(), columns }).unwrap();
+    let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
+    assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+    let sql: Vec<&str> = plan.steps.iter().map(|step| step.sql.as_str()).collect();
+    assert!(sql.iter().any(|item| item.eq_ignore_ascii_case("SAVEPOINT rillsql_rebuild;")), "重建保存点：{sql:?}");
+    assert!(sql.iter().any(|item| item.eq_ignore_ascii_case("RELEASE SAVEPOINT rillsql_rebuild;")), "释放重建保存点：{sql:?}");
+    assert!(sql.iter().all(|item| !item.trim().eq_ignore_ascii_case("BEGIN;") && !item.trim().eq_ignore_ascii_case("COMMIT;")), "活动事务里不再另开事务：{sql:?}");
+    assert!(sql.iter().all(|item| !item.to_ascii_lowercase().starts_with("pragma foreign_keys")), "事务内不改外键开关：{sql:?}");
+
+    let confirmed: Vec<String> = plan.steps.iter().map(|step| step.sql.clone()).collect();
+    let executed = crate::application::ddl::execute_request_tracked(&service, "notes", &request, &confirmed, true).await.unwrap();
+    assert!(executed.receipt.blocked.is_empty(), "{:?}", executed.receipt.blocked);
+    assert!(executed.receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", executed.receipt.steps);
+    assert!(executed.applied_not_committed, "结构变更不是最终保存：{}", executed.receipt.rule);
+    assert!(!executed.committed);
+    assert_eq!(executed.effect, TransactionEffect::StillActive);
+    assert_eq!(coordinator.snapshot().expect("事务快照").state, TransactionState::Active);
+
+    // 同连接看到新结构；独立连接仍看到旧结构。
+    let described = crate::application::grid::describe(&service, &notes_table_ref()).await.unwrap();
+    assert_eq!(described.columns.iter().find(|column| column.name == "note").map(|column| column.type_name.as_str()), Some("INTEGER"));
+    assert!(table_sql_on_disk(&database, "notes").await.contains("note TEXT"));
+
+    finish_shared(&service, false).await;
+    let described = crate::application::grid::describe(&service, &notes_table_ref()).await.unwrap();
+    assert_eq!(described.columns.iter().find(|column| column.name == "note").map(|column| column.type_name.as_str()), Some("TEXT"));
+    assert!(table_sql_on_disk(&database, "notes").await.contains("note TEXT"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_sqlite_rebuild_rolls_back_only_its_savepoint() {
+    let (dir, service, _database) = open_sqlite_notes(
+        "shared-rebuild-failure",
+        &[
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)",
+            "INSERT INTO notes (id, note) VALUES (1, NULL), (2, 'x')",
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), label TEXT)",
+            // sqlx 默认开启 foreign_keys；先关掉才能留下一条检查时才会被发现的孤立引用。
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO child (id, parent_id, label) VALUES (1, 99, 'x')",
+        ],
+    )
+    .await;
+    let _coordinator = begin_shared(&service).await;
+    // 先在同一事务里应用一条用户修改：重建失败不能撤销它。
+    let mut request = commit_request("notes", "notes");
+    request.changes = vec![ChangeArg { id: "u:2".to_owned(), kind: "update".to_owned(), sets: vec![value("note", "乙")], locator: vec![value("id", "2")], values: Vec::new() }];
+    let applied = crate::application::grid::commit(&service, &request, true).await.unwrap();
+    assert_eq!(applied.applied.len(), 1);
+
+    // 重建 child 的 label 列：复制本身成功，最后的 foreign_key_check 发现孤立引用而失败。
+    let columns = vec![
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
+        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+    ];
+    let ddl = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "child".to_owned(), columns }).unwrap();
+    let plan = crate::application::ddl::preview_request(&service, "notes", &ddl).await.unwrap();
+    assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+    let confirmed: Vec<String> = plan.steps.iter().map(|step| step.sql.clone()).collect();
+    let executed = crate::application::ddl::execute_request_tracked(&service, "notes", &ddl, &confirmed, true).await.unwrap();
+    // 重建失败，但只回滚到保存点：事务仍活动，之前的网格修改还在。
+    assert_eq!(executed.effect, TransactionEffect::StillActive);
+    assert!(executed.receipt.steps.iter().any(|step| step.status == StepStatus::Failed), "{:?}", executed.receipt.steps);
+    assert!(executed.receipt.steps.iter().any(|step| step.status == StepStatus::RolledBack && step.message.contains("保存点")), "{:?}", executed.receipt.steps);
+
+    let note = read_note(&service, 2).await;
+    assert_eq!(note.as_deref(), Some("乙"));
+    // 重建的表结构回到保存点之前。
+    let described = crate::application::grid::describe(
+        &service,
+        &TableRef { connection_id: "notes".to_owned(), database: "main".to_owned(), schema: String::new(), table: "child".to_owned(), engine: "sqlite".to_owned(), include_foreign_keys: false },
+    )
+    .await
+    .unwrap();
+    assert_eq!(described.columns.iter().find(|column| column.name == "label").map(|column| column.type_name.as_str()), Some("TEXT"));
+
+    finish_shared(&service, false).await;
+    assert_eq!(read_note(&service, 2).await.as_deref(), Some("x"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn read_note(service: &Service, id: i64) -> Option<String> {
+    let query = service.query_session("notes").await.unwrap().expect("业务会话");
+    let sql = format!("SELECT note FROM notes WHERE id = {id}");
+    let rows = query.session.grid_fetch_cells(&sql, 1).await.expect("读取 note");
+    match rows.first().and_then(|row| row.first()) {
+        Some(crate::grid::Cell::Text(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn sqlite_actions_that_cannot_run_inside_a_transaction_are_refused() {
+    let (dir, service, _database) = open_sqlite_notes("shared-blocked", &["CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)"]).await;
+    let _coordinator = begin_shared(&service).await;
+    for action in [Action::Vacuum, Action::SetForeignKeys { enabled: true }, Action::SetPragma { pragma: "journal_mode".to_owned(), value: "wal".to_owned() }] {
+        let request = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", action.clone()).unwrap();
+        let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
+        assert!(!plan.blocked.is_empty(), "{action:?} 活动事务里必须明确拒绝");
+        assert!(plan.steps.is_empty(), "{action:?} 不生成语句：{:?}", plan.steps);
+        let receipt = crate::application::ddl::execute_request(&service, "notes", &request, &[], true).await.unwrap();
+        assert!(receipt.steps.is_empty(), "{action:?}");
+        assert!(!receipt.blocked.is_empty(), "{action:?}");
+    }
+    finish_shared(&service, false).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_unknown_transaction_blocks_grid_and_structure_writes() {
+    let (dir, service, database) = open_sqlite_notes(
+        "shared-unknown",
+        &["CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)", "INSERT INTO customers (id, name) VALUES (1, '甲')"],
+    )
+    .await;
+    let coordinator = begin_shared(&service).await;
+    // 结果未知：不能在无法确认的事务里继续写入（R10）。
+    coordinator.observe_statement(StatementOutcome::Unconfirmed(UnknownReason::ConnectionLost));
+    assert_eq!(coordinator.snapshot().expect("事务快照").state, TransactionState::Unknown);
+    let refused = match crate::application::grid::commit(&service, &commit_request("notes", "customers"), true).await {
+        Err(message) => message,
+        Ok(_) => panic!("未知事务里不应执行网格写入"),
+    };
+    assert!(refused.contains("未知"), "{refused}");
+    assert_eq!(name_on_disk(&database, 1).await, "甲", "未知状态不会把写入发出去");
+
+    let ddl = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::Vacuum).unwrap();
+    let plan = crate::application::ddl::preview_request(&service, "notes", &ddl).await.unwrap();
+    assert!(!plan.blocked.is_empty(), "未知事务里不执行结构变更");
+    assert!(plan.steps.is_empty());
+    let receipt = crate::application::ddl::execute_request(&service, "notes", &ddl, &[], true).await.unwrap();
+    assert!(!receipt.blocked.is_empty());
+    assert!(receipt.steps.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn dialected(engine: crate::connections::model::Engine) -> Arc<TransactionCoordinator> {
+    Arc::new(TransactionCoordinator::new("c", crate::adapters::adapter(engine).transaction()))
+}
+
+fn staged_receipt(steps: Vec<(&str, StepStatus, &str)>) -> crate::ddl::Receipt {
+    crate::ddl::Receipt {
+        blocked: Vec::new(),
+        rule: String::new(),
+        steps: steps
+            .into_iter()
+            .map(|(sql, status, message)| crate::ddl::model::StepReceipt { sql: sql.to_owned(), label: String::new(), status, message: message.to_owned() })
+            .collect(),
+        target: String::new(),
+        rebuild: false,
+    }
+}
+
+#[test]
+fn ddl_steps_report_aborted_or_implicitly_committed_transactions() {
+    // MySQL/MariaDB：DDL 直接执行，命中隐式提交后事务结束（R9）。
+    let mysql = dialected(ConnEngine::Mysql);
+    let begin = mysql.begin(None).unwrap();
+    mysql.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
+    let receipt = staged_receipt(vec![("ALTER TABLE t ADD c INT;", StepStatus::Ok, "")]);
+    let (effect, implicit) = super::ddl::observe_steps(&mysql, &receipt);
+    assert_eq!(effect, TransactionEffect::ImplicitCommit);
+    assert!(implicit, "命中的是隐式提交");
+    assert_eq!(mysql.snapshot().unwrap().state, TransactionState::Idle);
+
+    // PostgreSQL：事务内的结构语句失败把事务置为中止，不自动回滚外层（R4、R8）。
+    let postgres = dialected(ConnEngine::Postgres);
+    let begin = postgres.begin(None).unwrap();
+    postgres.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
+    let failed = staged_receipt(vec![(
+        "ALTER TABLE t ADD c INT;",
+        StepStatus::Failed,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )]);
+    let (effect, implicit) = super::ddl::observe_steps(&postgres, &failed);
+    assert_eq!(effect, TransactionEffect::Aborted);
+    assert!(!implicit);
+    assert_eq!(postgres.snapshot().unwrap().state, TransactionState::Aborted);
 }
 
 #[test]

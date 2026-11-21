@@ -140,6 +140,9 @@ pub struct Snapshot {
     pub column_comments: BTreeMap<String, String>,
     /// 注释查询失败。定义仍可重建，但要说明注释没读到。
     pub comment_error: Option<String>,
+    /// 生成这份计划时同连接的用户事务状态。适配器据此把事务内不能执行或要改写边界的步骤
+    /// 在计划里说明清楚（例如 SQLite 重建改用保存点）。默认 `Idle`，表示没有活动事务。
+    pub transaction: crate::transaction::TransactionState,
 }
 
 impl Snapshot {
@@ -184,6 +187,7 @@ impl Snapshot {
             table_comment: None,
             column_comments: BTreeMap::new(),
             comment_error: None,
+            transaction: crate::transaction::TransactionState::Idle,
         }
     }
 }
@@ -422,6 +426,18 @@ pub enum StepStatus {
     Unknown,
     RolledBack,
 }
+
+/// 活动外层事务里 SQLite 重建的保存点边界（ADR-4）。
+///
+/// 有外层事务时不能另开内部事务：执行层把重建计划里的 `BEGIN`/`COMMIT` 换成这两条语句，
+/// 适配器的逐条执行据此只回滚到保存点，不撤销此前已经应用的修改。无外层事务时仍用原有重建事务。
+pub(crate) const SQLITE_REBUILD_SAVEPOINT: &str = "rillsql_rebuild";
+
+/// 重建保存点的开始语句（执行层与适配器共用同一份文本）。
+pub(crate) const SQLITE_REBUILD_SAVEPOINT_SQL: &str = "SAVEPOINT rillsql_rebuild;";
+
+/// 重建保存点的释放语句。
+pub(crate) const SQLITE_REBUILD_RELEASE_SQL: &str = "RELEASE SAVEPOINT rillsql_rebuild;";
 
 #[derive(Clone, Debug)]
 pub struct StepReceipt {

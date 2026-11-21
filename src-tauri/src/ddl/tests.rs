@@ -558,7 +558,8 @@ async fn open_notes(setup: &[&str]) -> (PathBuf, Service, CatalogSession) {
     pool.close().await;
     let service = Service::new_for_test(dir.join("connections.sqlite"));
     service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
-    let session = service.catalog_session("notes").expect("已打开会话");
+    // 结构业务走连接级用户事务的业务会话（ADR-1）：这里与生产路径一致，不用元数据会话。
+    let session = service.query_session("notes").await.unwrap().expect("已打开会话").session;
     (dir, service, session)
 }
 
@@ -902,6 +903,10 @@ fn recorded_foreign_keys(session: &CatalogSession) -> Option<bool> {
     }
 }
 
+async fn business_session(service: &Service) -> CatalogSession {
+    service.query_session("notes").await.unwrap().expect("会话仍在").session
+}
+
 #[tokio::test]
 async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
     let (dir, service, session) = open_notes(&[
@@ -914,7 +919,7 @@ async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
     let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
     sqlx::query("PRAGMA foreign_keys = OFF").execute(pool).await.unwrap();
     assert!(service.set_catalog_foreign_keys("notes", Some(false)));
-    let session = service.catalog_session("notes").expect("会话仍在");
+    let session = business_session(&service).await;
     assert_eq!(recorded_foreign_keys(&session), Some(false));
     let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
     let live_off: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
@@ -924,13 +929,13 @@ async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
     assert_eq!(preview.steps.len(), 1);
     assert_eq!(preview.steps[0].sql, "PRAGMA foreign_keys = ON;");
     let confirmed: Vec<String> = preview.steps.iter().map(|step| step.sql.clone()).collect();
-    let turned_on = commands::execute_saved(&service, "notes", &request(enable), &confirmed).await.unwrap();
+    let turned_on = commands::execute_on(&service, "notes", &session, &request(enable), &confirmed, crate::transaction::TransactionState::Idle).await.unwrap();
     assert!(turned_on.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", turned_on.steps);
-    let enabled = service.catalog_session("notes").expect("会话仍在");
+    let enabled = business_session(&service).await;
     assert_eq!(recorded_foreign_keys(&enabled), Some(true));
 
     assert!(service.set_catalog_foreign_keys("notes", Some(false)));
-    let stale = service.catalog_session("notes").expect("会话仍在");
+    let stale = business_session(&service).await;
     assert_eq!(recorded_foreign_keys(&stale), Some(false));
     let CatalogSession::Sqlite { pool, .. } = &stale else { panic!("sqlite") };
     let live_before: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
@@ -953,7 +958,7 @@ async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
     assert_eq!(live_after, 1);
     let sql = master_sql(&stale, "notes").await.unwrap_or_default();
     assert!(sql.to_ascii_lowercase().contains("note text"), "{sql}");
-    assert_eq!(recorded_foreign_keys(&service.catalog_session("notes").expect("会话仍在")), Some(false));
+    assert_eq!(recorded_foreign_keys(&business_session(&service).await), Some(false));
     let _ = fs::remove_dir_all(dir);
 }
 
