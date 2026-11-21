@@ -228,6 +228,14 @@ fn caps_without_settings() -> TransactionCapabilities {
     capabilities
 }
 
+/// PostgreSQL 的“忽略重复开始”加上 MySQL/MariaDB 的隐式提交能力：
+/// 只用于验证模型在 Ignored BEGIN 之后遇到隐式提交时的身份判断。
+fn caps_with_ignored_begin_and_implicit_commit() -> TransactionCapabilities {
+    let mut capabilities = mysql_dialect().capabilities();
+    capabilities.duplicate_begin = DuplicateBegin::Ignored;
+    capabilities
+}
+
 fn machine(capabilities: TransactionCapabilities) -> TransactionMachine {
     TransactionMachine::new("conn-1", capabilities)
 }
@@ -586,10 +594,100 @@ fn begin_in_unknown_keeps_dialect_semantics() {
     assert_eq!(postgres.snapshot().generation, generation, "不伪造新事务代次");
     assert_eq!(postgres.snapshot().savepoints.len(), 1, "仍有效的保存点不能被清空");
     assert!(postgres.snapshot().unresolved.is_some(), "事务身份仍未确认，保留未知记录");
+}
 
-    // 结束时确认的就是这条未知事务：提交成功后记录才能关闭（P3）。
-    assert_eq!(confirmed(&mut postgres, &commit()), TransactionEffect::Committed);
-    assert!(postgres.snapshot().unresolved.is_none());
+#[test]
+fn ignored_begin_in_unknown_does_not_make_the_old_record_current() {
+    // PostgreSQL 的 BEGIN 可能只是开始了一个新空事务（丢失的回滚若已成功）。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::StillActive);
+    assert_eq!(machine.state(), TransactionState::Active);
+
+    // 这条 COMMIT 结束的可能只是新事务：不得清记录或宣称旧事务已提交。
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some(), "旧事务结局仍然未知");
+    assert!(machine.resolve_unknown(UnknownResolution::RolledBack).is_some());
+
+    // 隐式提交同理（用“忽略重复开始 + 支持隐式提交”的方言组合验证模型语义）。
+    let mut machine = TransactionMachine::new("conn-1", caps_with_ignored_begin_and_implicit_commit());
+    confirmed(&mut machine, &begin());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::StillActive);
+    assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 探针确认身份后，同样的结束就能给出确定结论。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Committed));
+    assert!(machine.snapshot().unresolved.is_none());
+}
+
+#[test]
+fn repeated_losses_with_conflicting_directions_keep_the_unknown() {
+    // 丢失 COMMIT 后又丢失 ROLLBACK：方向不再唯一，任何同向确认都不能宣称结局。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Commit));
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(
+        machine.snapshot().unresolved.as_ref().map(|record| record.pending),
+        Some(PendingControl::Other),
+        "相反方向的丢失让方向无法确定"
+    );
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.state(), TransactionState::Idle);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 镜像序列不会误报回滚。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&rollback(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Other));
+    assert_eq!(machine.acknowledge(&rollback(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 未知期间再丢失一条普通语句（方向不明）也降级方向。
+    let mut machine = started(postgres_dialect().capabilities());
+    machine.acknowledge(&commit(), ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Other));
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| !record.identity_confirmed));
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+}
+
+#[test]
+fn unrecognized_control_direction_is_not_recorded() {
+    let mut machine = started(postgres_dialect().capabilities());
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Unrecognized), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Other));
+    // 同向确认不能据此宣称已提交。
+    assert_eq!(machine.acknowledge(&commit(), ControlOutcome::Confirmed), Ok(TransactionEffect::Unknown));
+    assert!(machine.snapshot().unresolved.is_some());
+
+    let mut machine = started(mysql_dialect().capabilities());
+    assert_eq!(machine.acknowledge(&rollback(), ControlOutcome::Unrecognized), Ok(TransactionEffect::Unknown));
+    assert_eq!(machine.snapshot().unresolved.as_ref().map(|record| record.pending), Some(PendingControl::Other));
+    assert_eq!(machine.observe_implicit_commit(), Ok(TransactionEffect::Unknown));
+}
+
+#[test]
+fn duplicate_begin_implicit_commit_closes_a_probe_confirmed_unknown() {
+    let mut machine = started(mysql_dialect().capabilities());
+    machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+    assert!(machine.snapshot().unresolved.as_ref().is_some_and(|record| record.identity_confirmed));
+
+    // 已确认身份时，重复 BEGIN 的隐式提交就是这条未知事务的结局。
+    assert_eq!(confirmed(&mut machine, &begin()), TransactionEffect::ImplicitCommit);
+    assert_eq!(machine.state(), TransactionState::Active);
+    assert!(machine.snapshot().unresolved.is_none());
 }
 
 #[test]

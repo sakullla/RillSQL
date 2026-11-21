@@ -117,7 +117,11 @@ pub struct UnknownTransaction {
     /// 失去确认前的最后状态；`Idle` 表示无法确认是否已经开始了事务。
     pub state: TransactionState,
     /// 失去确认的那条控制语句的方向；解决未知时必须与后续确认结果一致。
+    /// 连续丢失相反方向或无法识别的效果时降级为 [`PendingControl::Other`]。
     pub pending: PendingControl,
+    /// 是否已经确认这条记录描述的就是当前事务。只有探针直接观测到同一事务时才为 true；
+    /// “可能开了新事务”的观察（如 PostgreSQL 忽略式 `BEGIN`）必须保持 false。
+    pub identity_confirmed: bool,
 }
 
 /// 独立核对（用户确认或另一条连接上的查询结果）给出的旧事务结局。
@@ -485,6 +489,10 @@ impl TransactionMachine {
                     self.lose_confirmation(reason, PendingControl::Other);
                     TransactionEffect::Unknown
                 }
+                StatementOutcome::Failed(StatementFailure::ConnectionLost) => {
+                    self.lose_confirmation(UnknownReason::ConnectionLost, PendingControl::Other);
+                    TransactionEffect::Unknown
+                }
                 _ => TransactionEffect::Unknown,
             },
         }
@@ -500,16 +508,9 @@ impl TransactionMachine {
             self.record(TransactionEffect::Unchanged);
             return Ok(TransactionEffect::Unchanged);
         }
-        // 未知状态下只有丢失的就是提交类控制时，隐式提交才能确认旧事务的结局；
-        // 丢失的是回滚（可能已在服务器成功）时，这里只是普通语句，不能宣称隐式提交。
-        let unknown_direction = self.snapshot.state == TransactionState::Unknown;
-        let confirmed = !unknown_direction || self.pending_matches(PendingControl::Commit);
-        let effect = if confirmed { TransactionEffect::ImplicitCommit } else { TransactionEffect::Unknown };
-        if confirmed {
-            // 未知状态要求方向一致；活动/中止时按“当前事务就是这条未知记录”判断。
-            self.clear_current_unknown(unknown_direction.then_some(PendingControl::Commit));
-        }
-        self.end_transaction(effect, false);
+        // 未知状态下只有丢失的就是提交类控制才能确认；活动/中止状态下必须已确认身份，
+        // 否则隐式提交可能只是针对一个替换掉旧事务的新事务。
+        let effect = self.end_with_unknown(TransactionEffect::ImplicitCommit, false, PendingControl::Commit);
         Ok(effect)
     }
 
@@ -529,6 +530,7 @@ impl TransactionMachine {
                         generation: self.snapshot.generation,
                         state: previous,
                         pending: PendingControl::Other,
+                        identity_confirmed: false,
                     });
                 }
                 self.snapshot.state = TransactionState::Idle;
@@ -548,6 +550,8 @@ impl TransactionMachine {
                     self.snapshot.generation = self.snapshot.generation.saturating_add(1);
                     self.snapshot.savepoints.clear();
                 }
+                // 探针直接观测到了事务本身：同一代次的未知记录可以确认身份。
+                self.mark_unknown_identity();
                 self.record(TransactionEffect::StillActive);
                 TransactionEffect::StillActive
             }
@@ -558,6 +562,7 @@ impl TransactionMachine {
             }
             (TransactionProbe::Aborted, _) => {
                 self.snapshot.state = TransactionState::Aborted;
+                self.mark_unknown_identity();
                 self.record(TransactionEffect::Aborted);
                 TransactionEffect::Aborted
             }
@@ -593,7 +598,12 @@ impl TransactionMachine {
                 generation: self.snapshot.generation,
                 state: previous,
                 pending: PendingControl::Other,
+                identity_confirmed: false,
             });
+        }
+        // 新会话里不存在“当前未知事务”的身份依据。
+        if let Some(record) = self.snapshot.unresolved.as_mut() {
+            record.identity_confirmed = false;
         }
         if previous != TransactionState::Idle {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
@@ -619,7 +629,8 @@ impl TransactionMachine {
             }
             ControlOutcome::Unrecognized => {
                 self.mark_depth_unverified();
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Begin);
+                // 实际效果无法识别：不能把请求方向当成丢失的方向。
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
@@ -656,6 +667,10 @@ impl TransactionMachine {
         match self.capabilities.duplicate_begin {
             DuplicateBegin::EndsPrevious => {
                 // 旧事务被隐式提交，新事务立即开始；两者合起来只推进一次代次。
+                // 若已由探针确认这条未知记录就是当前事务，这次隐式提交直接给出了它的结局。
+                if self.unresolved_is_current_confirmed() {
+                    self.snapshot.unresolved = None;
+                }
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(1);
                 self.snapshot.savepoints.clear();
@@ -711,13 +726,20 @@ impl TransactionMachine {
             DuplicateBegin::Nests => {
                 // @@TRANCOUNT 的实际层数无法核实：保持未知，要求探针核对后再判断提交是否结束事务。
                 self.snapshot.depth = None;
+                if let Some(record) = self.snapshot.unresolved.as_mut() {
+                    record.identity_confirmed = false;
+                }
                 self.record(TransactionEffect::Unknown);
                 Ok(TransactionEffect::Unknown)
             }
             DuplicateBegin::Ignored => {
-                // 事务现在确定存在，但无法区分是新事务还是原来的未知事务：不伪造代次，也不清保存点。
+                // PostgreSQL：BEGIN 在无事务时开新事务、有事务时只是 warning。无法区分这两种情况，
+                // 因此不能把未知记录当成当前事务，也不能伪造代次或清空保存点。
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(self.snapshot.depth.map_or(1, |depth| depth.max(1)));
+                if let Some(record) = self.snapshot.unresolved.as_mut() {
+                    record.identity_confirmed = false;
+                }
                 self.record(TransactionEffect::StillActive);
                 Ok(TransactionEffect::StillActive)
             }
@@ -742,7 +764,8 @@ impl TransactionMachine {
             }
             ControlOutcome::Unrecognized => {
                 self.mark_depth_unverified();
-                self.lose_confirmation(UnknownReason::UnrecognizedEffect, pending);
+                // 实际效果无法识别：不能把请求方向当成丢失的方向。
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Rejected => Err(self.rejection()),
@@ -784,15 +807,9 @@ impl TransactionMachine {
                     }
                     // 未知状态下丢失的控制方向不同（例如丢失 ROLLBACK，这里却确认了 COMMIT）：
                     // 事务确实结束，但结局可能是提交或回滚，只能保留未知并报告不确定。
-                    TransactionState::Unknown if !self.pending_matches(direction) => {
-                        self.end_transaction(TransactionEffect::Unknown, chain);
-                        Ok(TransactionEffect::Unknown)
-                    }
                     TransactionState::Active | TransactionState::Aborted | TransactionState::Unknown => {
-                        // 未知状态方向一致，或活动/中止事务直接确认了结局：这是观测而不是推测。
-                        self.clear_current_unknown(if self.snapshot.state == TransactionState::Unknown { Some(direction) } else { None });
-                        self.end_transaction(effect, chain);
-                        Ok(effect)
+                        // 未知状态要求方向一致；活动/中止状态要求身份已确认，否则可能是被替换的新事务。
+                        Ok(self.end_with_unknown(effect, chain, direction))
                     }
                 }
             }
@@ -1063,23 +1080,69 @@ impl TransactionMachine {
         }
     }
 
+    /// 探针直接观测到了事务本身：把同一代次的未知记录标记为“就是当前事务”。
+    fn mark_unknown_identity(&mut self) {
+        if self.unresolved_is_current() {
+            if let Some(record) = self.snapshot.unresolved.as_mut() {
+                record.identity_confirmed = true;
+            }
+        }
+    }
+
     /// 丢失的控制方向是否与后续确认结果一致。
     fn pending_matches(&self, direction: PendingControl) -> bool {
         matches!(self.snapshot.unresolved.as_ref(), Some(record) if record.pending == direction)
     }
 
-    /// 确认结束后关闭“当前事务”的未知记录。
+    /// 这条未知记录描述的就是当前事务，而且身份已由探针一类直接观测确认。
+    fn unresolved_is_current_confirmed(&self) -> bool {
+        match self.snapshot.unresolved.as_ref() {
+            Some(record) => record.identity_confirmed && self.snapshot.generation == record.generation.saturating_add(1),
+            None => false,
+        }
+    }
+
+    /// 这条未知记录与当前事务处于同一代次，但身份没有确认（例如 PostgreSQL 忽略式 `BEGIN`
+    /// 可能只是开始了一个新事务）：结束当前事务不能据此断言旧事务的结局。
+    fn unresolved_maybe_current(&self) -> bool {
+        match self.snapshot.unresolved.as_ref() {
+            Some(record) => !record.identity_confirmed && self.snapshot.generation == record.generation.saturating_add(1),
+            None => false,
+        }
+    }
+
+    /// 结束事务并处理未知记录，返回应报告的效果。
     ///
-    /// - `Some(direction)`（未知状态）：只有丢失的控制方向与后续结果一致才算确认结局；
-    /// - `None`（活动/中止状态）：事务是否存在已经确认，结束结果就是直接观测；
-    /// - 更早事务的未知记录（代次不匹配）不会被新事务的结束清除。
-    fn clear_current_unknown(&mut self, direction: Option<PendingControl>) {
-        let confirmed = match direction {
-            Some(direction) => self.pending_matches(direction),
-            None => self.unresolved_is_current(),
-        };
-        if confirmed {
-            self.snapshot.unresolved = None;
+    /// 未知状态下要求方向一致；活动/中止状态要求身份已确认。身份不明（可能是当前事务，
+    /// 也可能是被 `BEGIN` 替换掉的旧事务）时只结束事务并报告未知，保留记录待核对。
+    fn end_with_unknown(&mut self, effect: TransactionEffect, chain: bool, direction: PendingControl) -> TransactionEffect {
+        match self.snapshot.state {
+            TransactionState::Unknown => {
+                if self.pending_matches(direction) {
+                    self.snapshot.unresolved = None;
+                    self.end_transaction(effect, chain);
+                    effect
+                } else {
+                    self.end_transaction(TransactionEffect::Unknown, chain);
+                    TransactionEffect::Unknown
+                }
+            }
+            TransactionState::Active | TransactionState::Aborted => {
+                let (reported, clear) = if self.unresolved_is_current_confirmed() {
+                    (effect, true)
+                } else if self.unresolved_maybe_current() {
+                    (TransactionEffect::Unknown, false)
+                } else {
+                    // 确定是更早的事务：本次结束的结局仍可报告。
+                    (effect, false)
+                };
+                if clear {
+                    self.snapshot.unresolved = None;
+                }
+                self.end_transaction(reported, chain);
+                reported
+            }
+            TransactionState::Idle => effect,
         }
     }
 
@@ -1093,13 +1156,19 @@ impl TransactionMachine {
         TransactionEffect::Aborted
     }
 
-    /// 失去确认：第一次转为未知时记下原因、方向与事务代次，之后保持不变直到被一致的结果或核对解决。
+    /// 失去确认：第一次转为未知时记下原因、方向与事务代次；已经在未知时合并新丢失：
+    /// 出现相反方向或无法识别的效果就把方向降级为 `Other`，之后任何同向确认都不能据此宣称结局。
     fn lose_confirmation(&mut self, reason: UnknownReason, pending: PendingControl) {
         if self.snapshot.state != TransactionState::Unknown {
             let state = self.snapshot.state;
-            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state, pending });
+            self.snapshot.unresolved = Some(UnknownTransaction { reason, generation: self.snapshot.generation, state, pending, identity_confirmed: false });
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
             self.snapshot.state = TransactionState::Unknown;
+        } else if let Some(record) = self.snapshot.unresolved.as_mut() {
+            if record.pending != pending || pending == PendingControl::Other {
+                record.pending = PendingControl::Other;
+            }
+            record.identity_confirmed = false;
         }
         self.record(TransactionEffect::Unknown);
     }
