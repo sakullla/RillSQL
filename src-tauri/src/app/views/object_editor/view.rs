@@ -167,8 +167,20 @@ impl ObjectEditorPane {
         cx.notify();
     }
 
-    /// 读回对象当前状态。读失败只让这一份表单空着并显示原始原因，不动服务器。
+    /// 首次打开时读回对象定义并填进表单。执行后不要走这条路径：seed 会覆盖草稿并清掉回执。
     pub fn load(&mut self, cx: &mut Context<Self>) {
+        self.read_detail(true, cx);
+    }
+
+    /// 执行结束后读回对象真实状态：只更新 detail，不清表单、不清回执、不动提示、不关窗口。
+    pub fn refresh_detail(&mut self, cx: &mut Context<Self>) {
+        self.read_detail(false, cx);
+    }
+
+    /// 读回对象当前状态。读失败只把原始原因记进 detail_error，不动服务器。
+    ///
+    /// `seed_form` 决定读回之后要不要用服务器状态填表单：首次打开要，执行后不要。
+    fn read_detail(&mut self, seed_form: bool, cx: &mut Context<Self>) {
         if self.session.name.trim().is_empty() {
             return;
         }
@@ -205,9 +217,13 @@ impl ObjectEditorPane {
                     }
                     this.loading = false;
                     match result {
-                        Ok(detail) => {
-                            // 读回的结构化状态填进表单；主体由编辑器在下一帧按模型同步。
+                        Ok(detail) if seed_form => {
+                            // 首次打开：读回的结构化状态填进表单；主体由编辑器在下一帧按模型同步。
                             this.session.seed(&detail);
+                        }
+                        Ok(detail) => {
+                            // 执行后：只记下服务器现状用来核对，表单、回执与提示都保持原样。
+                            this.session.apply_detail(detail);
                         }
                         Err(message) => {
                             this.session.detail = None;
@@ -385,33 +401,25 @@ impl ObjectEditorPane {
                         return;
                     }
                     this.executing = false;
+                    let verb = this.session.verb;
+                    this.session.plan = None;
+                    let target = (changed_connection, database, kind, name);
                     match result {
                         Ok(receipt) => {
-                            let verb = this.session.verb;
-                            this.session.plan = None;
-                            this.session.receipt = Some(receipt.clone());
-                            let done = receipt.blocked.is_empty() && super::receipt_all_ok(&receipt);
-                            this.session.note = if done { i18n::text(this.session.locale, "structure.preview.done") } else { String::new() };
-                            if done {
-                                this.changed = Some((changed_connection, database, kind, name));
-                                if verb == EditorVerb::Drop {
-                                    this.close();
-                                } else {
-                                    // 成功后按服务器上的定义重新读回：表单显示的就是实际生效的值。
-                                    this.session.detail = None;
-                                    this.load(cx);
-                                }
+                            let decision = super::after_execute(verb, Some(&receipt));
+                            this.session.receipt = Some(receipt);
+                            // 结局自带的文案直接写进提示，读回真实状态时不会被冲掉。
+                            if let Some(key) = decision.outcome.note_key() {
+                                this.session.note = i18n::text(this.session.locale, key);
                             }
+                            this.settle_after_execute(decision, target, cx);
                         }
                         Err(message) => {
-                            // 失败保留草稿：原始错误留在 note，随后再读一次真实状态。
-                            this.session.plan = None;
+                            // 执行链直接报错：一份输入都不丢，原始错误原样留在提示里。
+                            let decision = super::after_execute(verb, None);
                             this.session.receipt = None;
                             this.session.note = message;
-                            if !this.session.name.trim().is_empty() {
-                                this.session.detail = None;
-                                this.load(cx);
-                            }
+                            this.settle_after_execute(decision, target, cx);
                         }
                     }
                     cx.notify();
@@ -419,6 +427,23 @@ impl ObjectEditorPane {
             });
         })
         .detach();
+    }
+
+    /// 执行后收尾：留草稿、收窗口、读回真实定义，只在这里落地。
+    ///
+    /// 决策来自 after_execute（纯函数，单测覆盖）：草稿不该留就意味着窗口收起，
+    /// 其余情况一律保留表单与回执，只是再读一次服务器现状。
+    fn settle_after_execute(&mut self, decision: super::AfterExecute, target: (String, String, ObjectKind, String), cx: &mut Context<Self>) {
+        if decision.changed {
+            self.changed = Some(target);
+        }
+        if !decision.keep_draft {
+            self.close();
+            return;
+        }
+        if decision.refresh_detail && !self.session.name.trim().is_empty() {
+            self.refresh_detail(cx);
+        }
     }
 
     // ---------------------------------------------------------------- 渲染

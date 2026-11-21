@@ -60,6 +60,7 @@ dict! {
     "objectEditor.trigger" => "触发器", "Trigger";
     "objectEditor.schedulerOff" => "事件调度器已关闭：启用这个事件也不会让它运行。", "The event scheduler is off: enabling this event will not make it run.";
     "objectEditor.replaceRisk" => "替换会先删除再创建：中途失败时原对象可能已经不存在。", "Replacing drops and creates again: if the second step fails the original object may already be gone.";
+    "objectEditor.partial" => "部分完成：下面的逐步回执里标出了没有成功的语句，表单还是你提交的那份。", "Partly done: the step receipts below mark the statements that did not succeed, and the form still holds what you submitted.";
     "structure.enumSetValues" => "候选值", "Values";
     "structure.enumSetOrderHint" => "顺序就是定义顺序，空串、引号、反斜杠、逗号与中文都按原样保留。", "The order is the definition order; empty strings, quotes, backslashes, commas and non-ASCII text are kept as typed.";
     "structure.generatedExpression" => "生成表达式", "Generated expression";

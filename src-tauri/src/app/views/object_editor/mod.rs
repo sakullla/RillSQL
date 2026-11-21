@@ -371,10 +371,18 @@ impl ObjectEditorSession {
                 self.event_kind = state.event;
             }
         }
-        self.detail = Some(detail.clone());
-        self.detail_error.clear();
+        self.apply_detail(detail.clone());
         self.cancel();
         self.note.clear();
+    }
+
+    /// 只把读回的对象状态记下来：表单、回执与提示都不动。
+    ///
+    /// 执行之后的刷新走这条路径——服务器状态用来核对，不是用来覆盖用户刚提交的那份草稿，
+    /// 也不会把成功提示或失败原因冲掉。首次打开仍走 seed()，那时才要把定义填进表单。
+    pub fn apply_detail(&mut self, detail: crate::catalog::objects::ObjectDetail) {
+        self.detail = Some(detail);
+        self.detail_error.clear();
     }
 
     /// 把表单变成动作。动作名与目标名都来自这份草稿，SQL 由 ddl 计划层生成。
@@ -536,6 +544,58 @@ pub fn keeps_draft(verb: EditorVerb, receipt: Option<&crate::ddl::Receipt>) -> b
     }
 }
 
+/// 一次执行的结局。只有这三种，界面据此决定留什么、读什么、关不关。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecuteOutcome {
+    /// 全部步骤 Ok：这次改动已经在服务器上生效。
+    Done,
+    /// 执行链直接返回错误，连逐步回执都没有。
+    Failed,
+    /// 有回执但没全部成功：可能做了一半（例如 DROP 成功、CREATE 失败）。
+    Partial,
+}
+
+impl ExecuteOutcome {
+    /// 这个结局自带的说明文案键。失败没有：原始错误由调用方原样写进提示。
+    pub fn note_key(self) -> Option<&'static str> {
+        match self {
+            ExecuteOutcome::Done => Some("structure.preview.done"),
+            ExecuteOutcome::Partial => Some("objectEditor.partial"),
+            ExecuteOutcome::Failed => None,
+        }
+    }
+}
+
+/// 执行结束后界面该做什么。纯决策：不碰会话、不发起 IO，可以直接单测。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AfterExecute {
+    pub outcome: ExecuteOutcome,
+    /// 读回对象真实定义，且只更新 detail：不清表单、不清回执、不动提示。
+    pub refresh_detail: bool,
+    /// 表单草稿留着：失败后还能改了再试。为 false 时窗口收起——那是对象已经不存在的删除成功。
+    pub keep_draft: bool,
+    /// 让外壳刷新这个对象：对象树与定义页跟着变。
+    pub changed: bool,
+}
+
+/// 执行后的决策。`receipt` 为 None 表示执行链直接报错，没有逐步回执。
+///
+/// 留不留草稿只由 keeps_draft 推出来，界面不再另写一套「什么时候算失败」，
+/// 免得两处判断各说一套、一半成功时窗口照样被收掉。
+pub fn after_execute(verb: EditorVerb, receipt: Option<&crate::ddl::Receipt>) -> AfterExecute {
+    let keep_draft = keeps_draft(verb, receipt);
+    let Some(receipt) = receipt else {
+        // 服务器或连接层直接拒绝：一行输入都没丢，读回真实状态用来核对，不关窗口。
+        return AfterExecute { outcome: ExecuteOutcome::Failed, refresh_detail: true, keep_draft, changed: false };
+    };
+    if receipt_all_ok(receipt) {
+        // 全部成功：保存要读回生效后的定义；删除后对象已经不在，读了只会得到错误。
+        return AfterExecute { outcome: ExecuteOutcome::Done, refresh_detail: keep_draft, keep_draft, changed: true };
+    }
+    // 没全部成功：回执和草稿都留着，还要读回真实状态——可能只做了一半。
+    AfterExecute { outcome: ExecuteOutcome::Partial, refresh_detail: true, keep_draft, changed: true }
+}
+
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
@@ -574,6 +634,87 @@ mod receipt_tests {
         assert!(!keeps_draft(EditorVerb::Drop, Some(&ok)));
         assert!(keeps_draft(EditorVerb::Save, Some(&ok)), "保存成功后表单留着，继续改同一份定义");
         assert!(keeps_draft(EditorVerb::Drop, None), "还没执行，草稿当然留着");
+    }
+
+    /// 执行后的决策：成功只读回不回填，失败留草稿，部分完成留回执并读回真实状态。
+    #[test]
+    fn the_outcome_decides_what_survives_the_execution() {
+        let ok = receipt(vec![step(StepStatus::Ok)]);
+        let half = receipt(vec![step(StepStatus::Ok), step(StepStatus::Failed)]);
+        let mut blocked = receipt(Vec::new());
+        blocked.blocked.push("目标表不存在".to_owned());
+
+        // 保存成功：提示与回执留着，只读回真实定义；窗口不收，外壳刷新。
+        let saved = after_execute(EditorVerb::Save, Some(&ok));
+        assert_eq!(saved.outcome, ExecuteOutcome::Done);
+        assert!(saved.keep_draft, "保存成功后表单留着继续改同一份定义");
+        assert!(saved.refresh_detail && saved.changed, "保存后读回生效后的定义");
+
+        // 删除成功：对象已经不在，草稿不该留（界面据此收窗口），也不用再读。
+        let dropped = after_execute(EditorVerb::Drop, Some(&ok));
+        assert_eq!(dropped.outcome, ExecuteOutcome::Done);
+        assert!(!dropped.keep_draft, "只有删除成功才收起表单");
+        assert!(!dropped.refresh_detail);
+
+        // 执行链直接报错：没有回执，草稿全留，读回真实状态核对。
+        let failed = after_execute(EditorVerb::Save, None);
+        assert_eq!(failed.outcome, ExecuteOutcome::Failed);
+        assert!(failed.keep_draft && failed.refresh_detail);
+        assert_eq!(failed.outcome.note_key(), None, "原始错误由调用方写进提示，不换文案");
+        assert!(after_execute(EditorVerb::Drop, None).keep_draft, "没执行过当然留着草稿");
+        assert!(after_execute(EditorVerb::Drop, None).refresh_detail);
+
+        // 没全部成功：回执与草稿都留，窗口不收，照样读回真实状态。
+        for (label, failing) in [("第二步失败", &half), ("被拦下", &blocked)] {
+            let partial = after_execute(EditorVerb::Save, Some(failing));
+            assert_eq!(partial.outcome, ExecuteOutcome::Partial, "{label}");
+            assert!(partial.keep_draft && partial.refresh_detail, "{label}");
+            let partial_drop = after_execute(EditorVerb::Drop, Some(failing));
+            assert!(partial_drop.keep_draft, "{label} 删除失败也留草稿");
+        }
+
+        // 结局自带的文案在两种语言里都有，不会把键名显示给用户。
+        for outcome in [ExecuteOutcome::Done, ExecuteOutcome::Partial] {
+            let key = outcome.note_key().expect("有文案键");
+            for locale in [Locale::ZhCn, Locale::En] {
+                let text = i18n::text(locale, key);
+                assert!(!text.is_empty(), "{key}");
+                assert_ne!(text, key, "{key} 缺文案");
+            }
+        }
+    }
+
+    /// 执行后读回只更新 detail：成功提示、回执与用户刚提交的草稿都不动。
+    #[test]
+    fn reading_back_after_execute_keeps_form_receipt_and_note() {
+        use crate::catalog::objects::ObjectDetail;
+        use crate::ddl::model::EventSchedule;
+        let mut session = ObjectEditorSession {
+            kind: ObjectKind::Event,
+            name: "purge".to_owned(),
+            database: "app".to_owned(),
+            body: "DELETE FROM sessions".to_owned(),
+            note: "已按预览执行。".to_owned(),
+            receipt: Some(receipt(vec![step(StepStatus::Ok)])),
+            ..ObjectEditorSession::default()
+        };
+        // 服务器改写过的定义（主体、注释都不同）只进 detail，不进表单。
+        let state = crate::ddl::model::EventState {
+            name: "purge".to_owned(),
+            schedule: EventSchedule::OneTime { at: "2026-01-01 00:00:00".to_owned() },
+            body: "DELETE FROM sessions WHERE 1".to_owned(),
+            enabled: false,
+            on_completion: crate::ddl::model::EventCompletion::Preserve,
+            comment: "服务器上的注释".to_owned(),
+            definer: String::new(),
+            scheduler_running: None,
+        };
+        session.apply_detail(ObjectDetail::Event(state));
+        assert_eq!(session.body, "DELETE FROM sessions", "表单是用户刚提交的那份");
+        assert_eq!(session.note, "已按预览执行。", "成功提示不能被读回清掉");
+        assert!(session.receipt.is_some(), "回执不能被读回清掉");
+        assert!(session.is_edit(), "读回之后按改已有对象处理");
+        assert!(session.detail_error.is_empty());
     }
 
     /// 每类回执状态都有可读文本，不会把枚举名直接扔给用户。
