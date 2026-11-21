@@ -4,7 +4,7 @@ use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
-use crate::ddl::model::{Column, ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus};
+use crate::ddl::model::{ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus};
 use crate::ddl::sql::qualified_table;
 
 /// 改名前查新名字：MySQL 看同库的表与视图（名字逐字节比较，排除被改名的表自身）。
@@ -65,15 +65,28 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     let mut snapshot = Snapshot::bare(engine, database, database, table);
     snapshot.kind = if mysql_string(&kind_row, 0).eq_ignore_ascii_case("VIEW") { "view" } else { "table" }.to_owned();
     snapshot.storage = Some(mysql_string(&kind_row, 1));
+    // 版本与 sql_mode 决定方言能力与字面量转义。读不到时只记原因：表结构本身仍然可用。
+    match super::profile::read_profile_from(&mut conn, engine).await {
+        Ok(profile) => {
+            snapshot.server_version = profile.raw_version.clone();
+            snapshot.sql_mode = profile.sql_mode.clone();
+        }
+        Err(message) => snapshot.profile_error = Some(message),
+    }
     let columns: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
         &mut conn,
-        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION",
+        super::table_read::COLUMNS_SQL,
         (database.to_owned(), table.to_owned()),
     )
     .await
     .map_err(|err| crate::error_text::chain(&err))?;
     for row in &columns {
-        snapshot.columns.push(mysql_column(row, 0));
+        super::table_read::push_column(&mut snapshot, row, 0);
+    }
+    // 分区读取失败只影响分区：字段、索引与外键照常可用。
+    match super::table_read::load_partitions(&mut conn, database, table).await {
+        Ok(partitions) => snapshot.partitions = partitions,
+        Err(message) => snapshot.partition_error = Some(message),
     }
     let indexes: Vec<mysql_async::Row> = keep_rows(
         &mut snapshot.index_error,
@@ -147,29 +160,6 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     Ok(snapshot)
 }
 
-fn mysql_column(row: &mysql_async::Row, at: usize) -> Column {
-    let extra = mysql_string(row, at + 4).to_ascii_lowercase();
-    // MySQL 8 给表达式默认值（CURRENT_TIMESTAMP 等）标 DEFAULT_GENERATED，那不是生成列。
-    let generated = !mysql_string(row, at + 5).is_empty() || super::grid_read::extra_marks_generated(&extra);
-    Column {
-        name: mysql_string(row, at),
-        type_name: mysql_string(row, at + 1),
-        nullable: mysql_string(row, at + 2).eq_ignore_ascii_case("YES"),
-        // SQL NULL 是无默认值；空串是 DEFAULT ''。表达式、含引号文本规整见 reported_default。
-        default_sql: {
-            let raw = match row.as_ref(at + 3) {
-                None | Some(mysql_async::Value::NULL) => None,
-                Some(_) => Some(mysql_string(row, at + 3)),
-            };
-            super::types::reported_default(raw.as_deref(), &extra)
-        },
-        primary: false,
-        auto: extra.contains("auto_increment"),
-        generated,
-        default_constraint: None,
-    }
-}
-
 /// statistics 的一行（INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION 从 `at` 起）并入索引列表。
 fn push_mysql_index(indexes: &mut Vec<Index>, row: &mysql_async::Row, at: usize) {
     let name = mysql_string(row, at);
@@ -238,7 +228,9 @@ pub(super) async fn load_mysql_tables(pool: &mysql_async::Pool, engine: Engine, 
         .map_err(|err| crate::error_text::chain(&err))?;
     for row in &columns {
         if let Some(snapshot) = snapshots.get_mut(&mysql_string(row, 0)) {
-            snapshot.columns.push(mysql_column(row, 1));
+            // 批量对比路径只要列本身；ENUM/SET 候选值与生成列不参与对比。
+            let read = super::table_read::column(snapshot.literal_quoting(), row, 1);
+            snapshot.columns.push(read.column);
         }
     }
     let mut index_error = None;
@@ -364,7 +356,7 @@ async fn count_nulls_mysql_count(conn: &mut mysql_async::Conn, database: &str, t
     Ok(estimate.map(|row| mysql_i64(&row, 0)).unwrap_or(0).max(1))
 }
 
-fn mysql_string(row: &mysql_async::Row, index: usize) -> String {
+pub(super) fn mysql_string(row: &mysql_async::Row, index: usize) -> String {
     match row.as_ref(index).unwrap_or(&mysql_async::Value::NULL) {
         mysql_async::Value::NULL => String::new(),
         mysql_async::Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),

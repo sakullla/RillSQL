@@ -925,6 +925,15 @@ mod tests {
         cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
     }
 
+    /// 复制快捷键跟随平台的 secondary 修饰键：macOS 是 ⌘，其它平台是 Ctrl。
+    fn copy_keystroke() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        }
+    }
+
     #[gpui_kit::test]
     fn click_shift_click_and_cmd_c_copy_the_block(cx: &mut TestAppContext) {
         let (window, table, events) = open(cx, rows());
@@ -936,13 +945,13 @@ mod tests {
             let focus = table.read(cx).focus_handle(cx);
             focus.focus(window, cx);
         });
-        step(cx, window, |window, cx| window.press("cmd-c", cx));
+        step(cx, window, |window, cx| window.press(copy_keystroke(), cx));
         assert_eq!(clipboard(cx).as_deref(), Some("id\tname\n1\t甲\n2\t乙"));
         step(cx, window, |window, cx| window.press("shift-down", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((0, 0), (2, 1)), "Shift+方向键扩展");
         step(cx, window, |window, cx| window.click("table-cell-2:1", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((2, 1), (2, 1)), "普通点击重新开始选区");
-        step(cx, window, |window, cx| window.press("cmd-c", cx));
+        step(cx, window, |window, cx| window.press(copy_keystroke(), cx));
         assert_eq!(clipboard(cx).as_deref(), Some("丙"), "单格复制值本身");
         step(cx, window, |window, cx| window.press("left", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((2, 0), (2, 0)), "方向键移动并重新开始选区");

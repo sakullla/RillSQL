@@ -50,6 +50,7 @@ fn draft_for(engine: Engine, column: &Column) -> ColumnDraft {
         primary: column.primary,
         auto: column.auto,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -624,6 +625,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -635,6 +637,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: None,
@@ -646,6 +649,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -670,6 +674,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -681,6 +686,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: None,
@@ -692,6 +698,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -717,6 +724,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -728,6 +736,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("extra".to_owned()),
@@ -739,6 +748,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -804,6 +814,7 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 primary: true,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             },
             ColumnDraft {
                 original: Some("note".to_owned()),
@@ -815,6 +826,7 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             },
         ],
     };
@@ -892,6 +904,7 @@ fn kept_column(name: &str, type_name: &str, primary: bool) -> ColumnDraft {
         primary,
         auto: false,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -1121,6 +1134,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
                 primary: true,
                 auto: true,
                 dropped: false,
+                ..ColumnDraft::default()
             }],
             options: TableOptions::default(),
         },
@@ -1878,7 +1892,18 @@ fn untouched_postgres_defaults_do_not_block_other_column_changes() {
 
 /// ADR-7：默认值四态在建表路径上按方言生成（MySQL / PostgreSQL / SQLite / SQL Server）。
 fn new_column(name: &str, type_name: &str, nullable: bool, default: DefaultSpec) -> ColumnDraft {
-    ColumnDraft { original: None, name: name.to_owned(), type_name: type_name.to_owned(), nullable, default, comment: String::new(), primary: false, auto: false, dropped: false }
+    ColumnDraft {
+        original: None,
+        name: name.to_owned(),
+        type_name: type_name.to_owned(),
+        nullable,
+        default,
+        comment: String::new(),
+        primary: false,
+        auto: false,
+        dropped: false,
+        ..ColumnDraft::default()
+    }
 }
 
 fn fresh(engine: Engine) -> Snapshot {

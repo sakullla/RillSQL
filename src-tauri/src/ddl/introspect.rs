@@ -78,6 +78,16 @@ pub fn is_object_action(action: &Action) -> bool {
             | Action::AttachDatabase { .. }
             | Action::Vacuum
             | Action::Reindex { .. }
+            // 事件、例程与触发器是库级对象，读它们自己的定义，不读某张表的结构。
+            | Action::CreateEvent { .. }
+            | Action::AlterEvent { .. }
+            | Action::DropEvent { .. }
+            | Action::CreateRoutine { .. }
+            | Action::ReplaceRoutine { .. }
+            | Action::DropRoutine { .. }
+            | Action::CreateTrigger { .. }
+            | Action::ReplaceTrigger { .. }
+            | Action::DropTrigger { .. }
     )
 }
 
@@ -92,7 +102,17 @@ pub fn table_of(action: &Action) -> Option<&str> {
         | Action::SetPragma { .. }
         | Action::AttachDatabase { .. }
         | Action::Vacuum
-        | Action::Reindex { .. } => None,
+        | Action::Reindex { .. }
+        // 事件、例程与触发器没有目标表；它们的状态由 object_snapshot 读。
+        | Action::CreateEvent { .. }
+        | Action::AlterEvent { .. }
+        | Action::DropEvent { .. }
+        | Action::CreateRoutine { .. }
+        | Action::ReplaceRoutine { .. }
+        | Action::DropRoutine { .. }
+        | Action::CreateTrigger { .. }
+        | Action::ReplaceTrigger { .. }
+        | Action::DropTrigger { .. } => None,
         Action::AlterColumns { table, .. }
         | Action::CreateIndex { table, .. }
         | Action::DropIndex { table, .. }
@@ -101,6 +121,7 @@ pub fn table_of(action: &Action) -> Option<&str> {
         | Action::DropTable { table }
         | Action::TruncateTable { table }
         | Action::RenameTable { table, .. }
+        | Action::AlterPartitions { table, .. }
         | Action::ReplaceView { table, .. } => Some(table.as_str()),
         Action::DropView { view } => Some(view.as_str()),
     }

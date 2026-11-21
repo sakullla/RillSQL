@@ -53,6 +53,19 @@ macro_rules! dict {
 }
 
 dict! {
+    "objectEditor.title" => "对象编辑器", "Object editor";
+    "objectEditor.event" => "事件", "Event";
+    "objectEditor.function" => "函数", "Function";
+    "objectEditor.procedure" => "存储过程", "Stored procedure";
+    "objectEditor.trigger" => "触发器", "Trigger";
+    "objectEditor.schedulerOff" => "事件调度器已关闭：启用这个事件也不会让它运行。", "The event scheduler is off: enabling this event will not make it run.";
+    "objectEditor.replaceRisk" => "替换会先删除再创建：中途失败时原对象可能已经不存在。", "Replacing drops and creates again: if the second step fails the original object may already be gone.";
+    "structure.enumSetValues" => "候选值", "Values";
+    "structure.enumSetOrderHint" => "顺序就是定义顺序，空串、引号、反斜杠、逗号与中文都按原样保留。", "The order is the definition order; empty strings, quotes, backslashes, commas and non-ASCII text are kept as typed.";
+    "structure.generatedExpression" => "生成表达式", "Generated expression";
+    "structure.generatedStorage" => "存储方式", "Storage";
+    "structure.partitionMethod" => "分区方式", "Partitioning";
+    "structure.partitionExpression" => "分区表达式或列", "Partition expression or column";
     "shell.command.newQuery" => "新建查询", "New query";
     "shell.command.execute" => "执行", "Execute";
     "shell.command.newStructure" => "新建表结构", "New table structure";

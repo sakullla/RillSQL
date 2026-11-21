@@ -6,11 +6,13 @@ use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
-use crate::ddl::model::{Action, ColumnDraft, Plan, Request, Risk, Snapshot, Step, TableOptions};
-use crate::ddl::plan::{column_sql, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
+use crate::ddl::model::{
+    Action, ColumnDraft, EnumSetDraft, GeneratedColumnDraft, LiteralQuoting, Plan, Request, Risk, Snapshot, Step, TableOptions,
+};
+use crate::ddl::plan::{column_sql_for, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
 use crate::ddl::sql::{qualified_table, valid_name};
 
-use super::ddl_read;
+use super::{ddl_read, object_ddl, object_read, profile::MysqlProfile, table_ddl};
 
 pub(in crate::adapters) struct MysqlDdl {
     pub engine: Engine,
@@ -88,11 +90,15 @@ impl DdlDialect for MysqlDdl {
         }
     }
 
-    fn alter_plan(&self, snapshot: &Snapshot, table: &str, _drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
+    fn alter_plan(&self, snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
         let engine = self.engine;
+        // 服务器版本不支持草稿里的专有形态时在预览前阻断，不生成会被服务器拒绝的语句。
+        if let Some(problem) = self.shape_capability_problem(snapshot, drafts) {
+            return finish(engine, false, target, vec![problem], risks, Vec::new());
+        }
         statement_alter_plan(snapshot, table, changes, target, risks, "ADD COLUMN", &|qualified, original, draft| {
-            // CHANGE COLUMN 按完整的新定义一次改名、改类型、改可空与默认值。
-            let definition = column_sql(engine, draft, false)?;
+            // CHANGE COLUMN 按完整的新定义一次改名、改类型、改可空、默认值与专有形态。
+            let definition = column_sql_for(engine, draft, false, snapshot.literal_quoting())?;
             Ok(vec![Step {
                 sql: format!("ALTER TABLE {qualified} CHANGE COLUMN {} {definition};", quote_ident(engine, &original.name)),
                 label: format!("修改字段 {}", original.name),
@@ -175,6 +181,20 @@ impl DdlDialect for MysqlDdl {
         " AUTO_INCREMENT"
     }
 
+    /// ENUM/SET 的类型写法与字面量编码：候选值的引号与反斜杠都按会话 sql_mode 处理。
+    fn enum_set_type_sql(&self, draft: &EnumSetDraft, quoting: LiteralQuoting) -> Result<String, String> {
+        table_ddl::enum_set_type(draft, quoting)
+    }
+
+    /// 生成列：存储方式关键字按家族写法（MySQL 用 STORED，MariaDB 用 PERSISTENT 并接受 STORED）。
+    fn generated_column_sql(&self, draft: &GeneratedColumnDraft) -> Result<String, String> {
+        let keyword = match self.engine {
+            Engine::Mariadb => "PERSISTENT",
+            _ => "STORED",
+        };
+        table_ddl::generated_clause(draft, keyword)
+    }
+
     fn plan_object_action(&self, snapshot: &Snapshot, action: &Action) -> Option<Plan> {
         object_action(snapshot, action, true)
     }
@@ -213,14 +233,65 @@ impl DdlDialect for MysqlDdl {
     }
 
     async fn read_object_state(&self, session: &CatalogSession, request: &Request, snapshot: &mut Snapshot) -> Result<(), String> {
-        let Action::SetEventEnabled { event, .. } = &request.action else {
-            return Ok(());
-        };
+        // 事件、例程与触发器的现状在计划之前读出来：修改与删除都要以读到的实际定义为依据，
+        // 读不到时给出原因，不用空值覆盖服务器对象。
         let CatalogSession::Mysql(pool) = session else {
             return Err(SESSION_MISMATCH.to_owned());
         };
-        snapshot.event_enabled = ddl_read::mysql_event_enabled(pool, &request.database, event).await?;
+        match &request.action {
+            Action::SetEventEnabled { event, .. } => {
+                snapshot.event_enabled = ddl_read::mysql_event_enabled(pool, &request.database, event).await?;
+                if let Ok(state) = object_read::load_event(pool, &request.database, event).await {
+                    snapshot.event = Some(state);
+                }
+            }
+            Action::AlterEvent { event } => {
+                let name = event.original.clone().unwrap_or_else(|| event.name.clone());
+                snapshot.event = Some(object_read::load_event(pool, &request.database, &name).await?);
+            }
+            Action::DropEvent { event } => {
+                snapshot.event = Some(object_read::load_event(pool, &request.database, event).await?);
+            }
+            Action::ReplaceRoutine { routine } => {
+                let name = routine.original.clone().unwrap_or_else(|| routine.name.clone());
+                snapshot.routine = Some(object_read::load_routine(pool, &request.database, routine.kind, &name).await?);
+            }
+            Action::DropRoutine { routine_kind, name } => {
+                snapshot.routine = Some(object_read::load_routine(pool, &request.database, *routine_kind, name).await?);
+            }
+            Action::ReplaceTrigger { trigger } => {
+                let name = trigger.original.clone().unwrap_or_else(|| trigger.name.clone());
+                snapshot.trigger = Some(object_read::load_trigger(pool, &request.database, &name).await?);
+            }
+            Action::DropTrigger { trigger } => {
+                snapshot.trigger = Some(object_read::load_trigger(pool, &request.database, trigger).await?);
+            }
+            _ => {}
+        }
         Ok(())
+    }
+}
+
+impl MysqlDdl {
+    /// 服务器版本不支持草稿里的专有形态时给出可识别的原因（R1）。
+    ///
+    /// 能力取自方言档案（版本 + sql_mode），不按"版本号较新"推断。没读到版本时档案是保守的，
+    /// 这里只在草稿确实用到该能力时才阻断；普通字段的修改不受影响。
+    fn shape_capability_problem(&self, snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Option<String> {
+        let profile = MysqlProfile::new(self.engine, &snapshot.server_version, &snapshot.sql_mode);
+        let features = profile.features();
+        if features.generated_columns && features.enum_set {
+            return None;
+        }
+        let version = profile.version.map(|version| version.short()).unwrap_or_else(|| "未知版本".to_owned());
+        let banner = if profile.raw_version.is_empty() { version } else { profile.raw_version.clone() };
+        if !features.generated_columns && drafts.iter().any(|draft| draft.generated.is_some()) {
+            return Some(format!("服务器 {banner} 不支持生成列，这里不生成语句。"));
+        }
+        if !features.enum_set && drafts.iter().any(|draft| draft.enum_set.is_some()) {
+            return Some(format!("服务器 {banner} 不支持 ENUM/SET 字段类型，这里不生成语句。"));
+        }
+        None
     }
 }
 
@@ -233,6 +304,17 @@ pub(in crate::adapters) fn mysql_text(value: &str) -> String {
 fn object_action(snapshot: &Snapshot, action: &Action, supported: bool) -> Option<Plan> {
     match action {
         Action::SetEventEnabled { event, enabled } => Some(plan_set_event_enabled(snapshot, event, *enabled, supported)),
+        // 表的专有结构继续在 table_ddl 里判定；对象生命周期在 object_ddl 里。
+        Action::AlterPartitions { table, partition } => Some(table_ddl::plan_partition(snapshot, table, partition, supported)),
+        action @ (Action::CreateEvent { .. }
+        | Action::AlterEvent { .. }
+        | Action::DropEvent { .. }
+        | Action::CreateRoutine { .. }
+        | Action::ReplaceRoutine { .. }
+        | Action::DropRoutine { .. }
+        | Action::CreateTrigger { .. }
+        | Action::ReplaceTrigger { .. }
+        | Action::DropTrigger { .. }) => object_ddl::plan(snapshot, action, supported),
         _ => None,
     }
 }

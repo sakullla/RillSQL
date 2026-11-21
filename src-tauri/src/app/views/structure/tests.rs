@@ -282,6 +282,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: true,
             auto: true,
             dropped: false,
+            ..ColumnDraft::default()
         },
         ColumnDraft {
             original: Some("name".into()),
@@ -293,6 +294,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         },
         ColumnDraft {
             original: None,
@@ -304,6 +306,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         },
     ];
     let request = session.request().unwrap();

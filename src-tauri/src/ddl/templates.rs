@@ -34,6 +34,7 @@ impl TemplateColumn {
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         }
     }
 }

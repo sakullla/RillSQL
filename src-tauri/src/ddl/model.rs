@@ -140,6 +140,28 @@ pub struct Snapshot {
     pub column_comments: BTreeMap<String, String>,
     /// 注释查询失败。定义仍可重建，但要说明注释没读到。
     pub comment_error: Option<String>,
+    /// 服务器版本原文（连接读到的 VERSION()）。空表示没读到；方言能力要按它判断，不能默认当最新版。
+    pub server_version: String,
+    /// 会话 sql_mode 原文。字面量转义方式据此选择；空表示没读到。
+    pub sql_mode: String,
+    /// 版本或 sql_mode 读取失败的原因。表结构仍然可用，但方言判断不能当成已知。
+    pub profile_error: Option<String>,
+    /// ENUM/SET 字段的候选值，按列名。只收集读回里确实是 enum/set 的列。
+    pub enum_sets: BTreeMap<String, EnumSetState>,
+    /// 生成列的表达式与存储方式，按列名。普通表达式默认值不在里面。
+    pub generation: BTreeMap<String, GenerationState>,
+    /// 分区方案。None 表示这张表没有分区或没读到；读失败的原因在 `partition_error`。
+    pub partitions: Option<PartitionState>,
+    /// 分区查询失败。表结构本身仍然读到，不能因此把整表当成没读到。
+    pub partition_error: Option<String>,
+    /// 事件快照。只有事件对象会填。
+    pub event: Option<EventState>,
+    /// 例程（函数/存储过程）快照。只有例程对象会填。
+    pub routine: Option<RoutineState>,
+    /// 触发器快照。只有触发器对象会填。
+    pub trigger: Option<TriggerState>,
+    /// 对象元数据读取失败的原因。与表结构读取分开，互不阻断。
+    pub object_error: Option<String>,
 }
 
 impl Snapshot {
@@ -184,7 +206,24 @@ impl Snapshot {
             table_comment: None,
             column_comments: BTreeMap::new(),
             comment_error: None,
+            server_version: String::new(),
+            sql_mode: String::new(),
+            profile_error: None,
+            enum_sets: BTreeMap::new(),
+            generation: BTreeMap::new(),
+            partitions: None,
+            partition_error: None,
+            event: None,
+            routine: None,
+            trigger: None,
+            object_error: None,
         }
+    }
+
+    /// 字面量转义方式：会话 sql_mode 含 NO_BACKSLASH_ESCAPES 时反斜杠不是转义符。
+    /// 没读到 sql_mode 时按服务器默认（反斜杠是转义符），这与连接的实际默认一致。
+    pub fn literal_quoting(&self) -> LiteralQuoting {
+        LiteralQuoting::from_sql_mode(&self.sql_mode)
     }
 }
 
@@ -304,7 +343,377 @@ pub struct TableOptions {
     pub strict: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// 字面量转义方式。MySQL 默认把反斜杠当转义符；sql_mode 含 NO_BACKSLASH_ESCAPES 时反斜杠是普通字符，
+/// 只能靠把单引号写成两个来转义。两种写法不能混用，所以编码与解析都要带上这个模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiteralQuoting {
+    pub backslash_escapes: bool,
+}
+
+impl Default for LiteralQuoting {
+    fn default() -> Self {
+        Self { backslash_escapes: true }
+    }
+}
+
+impl LiteralQuoting {
+    pub fn from_sql_mode(sql_mode: &str) -> Self {
+        let backslash_escapes = !sql_mode.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES");
+        Self { backslash_escapes }
+    }
+}
+
+/// ENUM / SET 两种专有字段类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum EnumSetKind {
+    #[default]
+    Enum,
+    Set,
+}
+
+impl EnumSetKind {
+    pub const ALL: [EnumSetKind; 2] = [EnumSetKind::Enum, EnumSetKind::Set];
+
+    /// 写进语句的类型关键字。
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            EnumSetKind::Enum => "enum",
+            EnumSetKind::Set => "set",
+        }
+    }
+}
+
+/// 读回的 ENUM/SET 候选值，按定义顺序。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumSetState {
+    pub kind: EnumSetKind,
+    pub values: Vec<String>,
+}
+
+/// 草稿里的 ENUM/SET 候选值。顺序就是用户看到的顺序，写进语句时保持原样。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumSetDraft {
+    pub kind: EnumSetKind,
+    pub values: Vec<String>,
+}
+
+/// 生成列的存储方式。MariaDB 的 PERSISTENT 与 STORED 同义，读回时归一为 Stored。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum GeneratedStorage {
+    #[default]
+    Virtual,
+    Stored,
+}
+
+/// 读回的生成列：表达式与存储方式。普通表达式默认值不是生成列，不会出现在这里。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationState {
+    pub expression: String,
+    pub storage: GeneratedStorage,
+    /// 服务器读回时的原文写法（MariaDB 可能写 PERSISTENT）。展示用，不影响生成的语句。
+    pub reported_storage: String,
+}
+
+/// 草稿里的生成列定义。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedColumnDraft {
+    pub expression: String,
+    pub storage: GeneratedStorage,
+}
+
+/// 分区方式。RANGE COLUMNS / LIST COLUMNS 与子分区不在本轮范围内。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PartitionMethod {
+    #[default]
+    Range,
+    List,
+    Hash,
+    Key,
+}
+
+impl PartitionMethod {
+    pub const ALL: [PartitionMethod; 4] = [PartitionMethod::Range, PartitionMethod::List, PartitionMethod::Hash, PartitionMethod::Key];
+
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            PartitionMethod::Range => "RANGE",
+            PartitionMethod::List => "LIST",
+            PartitionMethod::Hash => "HASH",
+            PartitionMethod::Key => "KEY",
+        }
+    }
+
+    /// RANGE / LIST 有命名分区与边界；HASH / KEY 只按数量分。
+    pub fn named(&self) -> bool {
+        matches!(self, PartitionMethod::Range | PartitionMethod::List)
+    }
+}
+
+/// 读回的一个分区：名字、顺序与边界原文（RANGE 是 VALUES LESS THAN 的值，LIST 是 VALUES IN 的值列表）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionDefState {
+    pub name: String,
+    pub description: String,
+}
+
+/// 读回的分区方案。expression 对 RANGE/LIST 是表达式，对 KEY 是键列清单。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionState {
+    pub method: PartitionMethod,
+    pub expression: String,
+    pub definitions: Vec<PartitionDefState>,
+}
+
+/// 草稿里的一个分区定义。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionDef {
+    pub name: String,
+    /// RANGE 写边界值（如 \`100\` 或 \`MAXVALUE\`），LIST 写逗号分隔的取值。
+    pub description: String,
+}
+
+/// 分区草稿上的操作。哪些操作适用于哪种方式由方言判断，不适用的只给阻断原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PartitionOp {
+    /// 重建整张表的分区方案（ALTER TABLE ... PARTITION BY ...）。会重写数据。
+    #[default]
+    Replace,
+    /// 新增分区：RANGE/LIST 追加命名分区，HASH/KEY 增加数量。
+    Add,
+    /// 删除分区：RANGE/LIST 删命名分区，HASH/KEY 减少数量。
+    Drop,
+    /// 重组分区：把若干现有分区的数据重新分到新的分区定义里。
+    Reorganize,
+    /// 移除分区方案，表恢复成未分区。
+    Remove,
+}
+
+/// 分区方案草稿。没用到的方式相关字段留空即可，由方言只取适用的部分。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionDraft {
+    pub op: PartitionOp,
+    pub method: PartitionMethod,
+    /// RANGE/LIST/HASH 的表达式。KEY 用 \`columns\`。
+    pub expression: String,
+    /// KEY 分区的列名清单；HASH/KEY 的数量放 \`count\`。
+    pub columns: Vec<String>,
+    /// HASH/KEY 的分区数量。空表示没改或没填。
+    pub count: String,
+    /// Replace / Add / Reorganize 用的分区定义。
+    pub definitions: Vec<PartitionDef>,
+    /// Drop / Reorganize 指定的现有分区名。Reorganize 的目标写在 \`definitions\`。
+    pub targets: Vec<String>,
+}
+
+/// 事件的调度：单次在某个时间点，周期按间隔重复。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum EventSchedule {
+    /// \`AT\` 的时间表达式原文（如 \`CURRENT_TIMESTAMP + INTERVAL 1 HOUR\`）。
+    OneTime { at: String },
+    /// \`EVERY <every> <unit>\`，可带 STARTS / ENDS。
+    Recurring { every: String, unit: String, starts: String, ends: String },
+}
+
+impl Default for EventSchedule {
+    fn default() -> Self {
+        EventSchedule::OneTime { at: String::new() }
+    }
+}
+
+/// ON COMPLETION [NOT] PRESERVE。PRESERVE 是服务器默认。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum EventCompletion {
+    #[default]
+    Preserve,
+    NotPreserve,
+}
+
+/// 事件快照：调度、主体与保留属性。\`scheduler_running\` 是服务器 event_scheduler 的实际状态，
+/// None 表示没读到；关闭时启用事件不会让它运行，界面必须照实说明。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventState {
+    pub name: String,
+    pub enabled: bool,
+    pub schedule: EventSchedule,
+    pub body: String,
+    pub on_completion: EventCompletion,
+    pub comment: String,
+    pub definer: String,
+    pub scheduler_running: Option<bool>,
+}
+
+/// 事件草稿。\`original\` 有值表示在改已有事件。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDraft {
+    pub original: Option<String>,
+    pub name: String,
+    pub schedule: EventSchedule,
+    pub body: String,
+    pub enabled: bool,
+    pub on_completion: EventCompletion,
+    pub comment: String,
+}
+
+/// 例程类型。函数与存储过程不能互相替换。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineKind {
+    Function,
+    #[default]
+    Procedure,
+}
+
+impl RoutineKind {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            RoutineKind::Function => "FUNCTION",
+            RoutineKind::Procedure => "PROCEDURE",
+        }
+    }
+}
+
+/// 参数模式。函数参数只有输入，存储过程可以 OUT / INOUT。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ParamMode {
+    #[default]
+    In,
+    Out,
+    InOut,
+}
+
+impl ParamMode {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            ParamMode::In => "IN",
+            ParamMode::Out => "OUT",
+            ParamMode::InOut => "INOUT",
+        }
+    }
+}
+
+/// 读回的一个参数。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineParamState {
+    pub position: u32,
+    pub mode: ParamMode,
+    pub name: String,
+    pub type_name: String,
+}
+
+/// 例程快照：按 PARAMETERS 与 SHOW CREATE 组合。未开放编辑的属性也要读出来，修改时才能保留。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineState {
+    pub kind: RoutineKind,
+    pub name: String,
+    pub params: Vec<RoutineParamState>,
+    /// 函数的返回类型；存储过程为空。
+    pub returns: String,
+    pub body: String,
+    pub definer: String,
+    pub comment: String,
+    /// SHOW CREATE 原文。读不到时为空，此时不许编辑提交。
+    pub create_sql: String,
+}
+
+/// 例程草稿里的一个参数。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineParamDraft {
+    pub mode: ParamMode,
+    pub name: String,
+    pub type_name: String,
+}
+
+/// 例程草稿。\`original\` 有值表示在改已有例程。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineDraft {
+    pub kind: RoutineKind,
+    pub original: Option<String>,
+    pub name: String,
+    pub params: Vec<RoutineParamDraft>,
+    /// 函数的返回类型；存储过程留空。
+    pub returns: String,
+    pub body: String,
+    pub comment: String,
+}
+
+/// 触发时机。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TriggerTiming {
+    #[default]
+    Before,
+    After,
+}
+
+impl TriggerTiming {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            TriggerTiming::Before => "BEFORE",
+            TriggerTiming::After => "AFTER",
+        }
+    }
+}
+
+/// 触发事件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TriggerEvent {
+    #[default]
+    Insert,
+    Update,
+    Delete,
+}
+
+impl TriggerEvent {
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            TriggerEvent::Insert => "INSERT",
+            TriggerEvent::Update => "UPDATE",
+            TriggerEvent::Delete => "DELETE",
+        }
+    }
+}
+
+/// 触发器快照：目标表、时机、事件与主体。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerState {
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub body: String,
+    pub definer: String,
+    /// SHOW CREATE 原文。读不到时为空，此时不许编辑提交。
+    pub create_sql: String,
+}
+
+/// 触发器草稿。\`original\` 有值表示在改已有触发器。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerDraft {
+    pub original: Option<String>,
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnDraft {
     pub original: Option<String>,
@@ -319,6 +728,12 @@ pub struct ColumnDraft {
     pub primary: bool,
     pub auto: bool,
     pub dropped: bool,
+    /// ENUM/SET 字段的候选值。None 表示这列不是 ENUM/SET，类型仍按 `type_name` 原文。
+    #[serde(default)]
+    pub enum_set: Option<EnumSetDraft>,
+    /// 生成列的表达式与存储方式。None 表示普通列；表达式默认值不算生成列。
+    #[serde(default)]
+    pub generated: Option<GeneratedColumnDraft>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -381,6 +796,27 @@ pub enum Action {
     Vacuum,
     /// SQLite 维护：重建索引。不带名字时重建整个库的索引。
     Reindex { target: Option<String> },
+    /// 改 MySQL/MariaDB 表的分区方案。RANGE/LIST 有命名分区，HASH/KEY 按数量；不适用时只给阻断原因。
+    AlterPartitions { table: String, partition: PartitionDraft },
+    /// 创建事件。调度器关闭时启用事件只说明它仍然不会运行，不改服务器级状态。
+    CreateEvent { event: EventDraft },
+    /// 改已有事件（ALTER EVENT）。启用状态另走 `SetEventEnabled`。
+    AlterEvent { event: EventDraft },
+    /// 删除事件。
+    DropEvent { event: String },
+    /// 创建函数或存储过程。
+    CreateRoutine { routine: RoutineDraft },
+    /// 替换函数或存储过程：DROP + CREATE，中途失败时对象可能已经不存在。
+    ReplaceRoutine { routine: RoutineDraft },
+    /// 删除函数或存储过程。函数与存储过程不能互相替换，所以要带类型。
+    /// 动作本身的标签已经叫 kind（见 Action 的 serde tag），这里的字段换名字避免冲突。
+    DropRoutine { routine_kind: RoutineKind, name: String },
+    /// 创建触发器。
+    CreateTrigger { trigger: TriggerDraft },
+    /// 替换触发器：DROP + CREATE，中途失败时触发器可能已经不存在。
+    ReplaceTrigger { trigger: TriggerDraft },
+    /// 删除触发器。
+    DropTrigger { trigger: String },
 }
 
 #[derive(Clone, Debug)]

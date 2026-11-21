@@ -2923,6 +2923,8 @@ mod token_tests {
         ("app/views/grid", 135),
         ("app/views/history", 0),
         ("app/views/mongo", 41),
+        // 2026-11-21（T1）对象编辑器只登记模块与草稿状态，还没有 GPUI 视图，裸 px 为 0。
+        ("app/views/object_editor", 0),
         ("app/views/overview", 0),
         ("app/views/query", 155),
         ("app/views/redis", 174),

@@ -54,6 +54,7 @@ fn default_id(engine: &str) -> ColumnDraft {
         primary: true,
         auto: true,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -71,6 +72,7 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             primary: column.primary,
             auto: column.auto,
             dropped: false,
+            ..ColumnDraft::default()
         })
         .collect()
 }
@@ -528,6 +530,7 @@ impl StructureSession {
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             });
         }
         if columns.is_empty() {
@@ -541,6 +544,7 @@ impl StructureSession {
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             });
         }
         columns
@@ -1574,6 +1578,7 @@ impl StructurePane {
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         });
         self.session.column_name.clear();
         self.only_changed_columns = false;

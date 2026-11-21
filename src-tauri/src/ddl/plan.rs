@@ -4,7 +4,9 @@
 use crate::adapters::ddl::{ddl_of, no_structure_editing, DdlDialect, ViewModifier};
 use crate::adapters::adapter;
 
-use super::model::{fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, Snapshot, Step, TableOptions};
+use super::model::{
+    fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, LiteralQuoting, Plan, Risk, Snapshot, Step, TableOptions,
+};
 use super::sql::{default_problem, default_sql, existing_default, mentions, qualified_table, quote_ident, valid_name, valid_type};
 
 pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
@@ -29,7 +31,17 @@ pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
         | Action::SetPragma { .. }
         | Action::AttachDatabase { .. }
         | Action::Vacuum
-        | Action::Reindex { .. } => crate::adapters::ddl::plan_object_action(snapshot, action).unwrap_or_else(|| {
+        | Action::Reindex { .. }
+        | Action::AlterPartitions { .. }
+        | Action::CreateEvent { .. }
+        | Action::AlterEvent { .. }
+        | Action::DropEvent { .. }
+        | Action::CreateRoutine { .. }
+        | Action::ReplaceRoutine { .. }
+        | Action::DropRoutine { .. }
+        | Action::CreateTrigger { .. }
+        | Action::ReplaceTrigger { .. }
+        | Action::DropTrigger { .. } => crate::adapters::ddl::plan_object_action(snapshot, action).unwrap_or_else(|| {
             let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name);
             finish(snapshot.engine, false, target, vec![no_structure_editing(snapshot.engine)], Vec::new(), Vec::new())
         }),
@@ -58,10 +70,21 @@ pub fn display_sql(snapshot: &Snapshot) -> String {
             primary: column.primary,
             auto: column.auto,
             dropped: false,
-        })
+            ..ColumnDraft::default()
+})
         .collect();
     let options = TableOptions { without_rowid: snapshot.without_rowid, strict: snapshot.strict, ..TableOptions::default() };
-    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name, &columns, &snapshot.foreign_keys, snapshot.autoincrement, &options) {
+    match create_statement_for(
+        snapshot.engine,
+        &snapshot.database,
+        &snapshot.schema,
+        &snapshot.name,
+        &columns,
+        &snapshot.foreign_keys,
+        snapshot.autoincrement,
+        &options,
+        snapshot.literal_quoting(),
+    ) {
         Ok(sql) => sql,
         Err(message) => message,
     }
@@ -102,7 +125,17 @@ fn plan_create(snapshot: &Snapshot, name: &str, columns: &[ColumnDraft], options
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
     let autoincrement = columns.iter().any(|column| !column.dropped && column.primary && column.auto);
-    match create_statement(snapshot.engine, &snapshot.database, &snapshot.schema, name.trim(), columns, &[], autoincrement, options) {
+    match create_statement_for(
+        snapshot.engine,
+        &snapshot.database,
+        &snapshot.schema,
+        name.trim(),
+        columns,
+        &[],
+        autoincrement,
+        options,
+        snapshot.literal_quoting(),
+    ) {
         Ok(sql) => {
             let mut steps = vec![Step { label: format!("创建 {name}"), sql }];
             steps.extend(create_comment_steps(snapshot, name.trim(), columns, options));
@@ -680,7 +713,8 @@ fn diff_columns<'a>(snapshot: &'a Snapshot, drafts: &'a [ColumnDraft]) -> Vec<Ch
                 let changed = draft.name.trim() != original.name
                     || !same_type(&draft.type_name, &original.type_name)
                     || draft.nullable != original.nullable
-                    || default_changed(snapshot.engine, original, draft);
+                    || default_changed(snapshot.engine, original, draft)
+                    || shape_changed(snapshot, original, draft);
                 if changed {
                     changes.push(Change::Modify { original, draft });
                 }
@@ -688,6 +722,26 @@ fn diff_columns<'a>(snapshot: &'a Snapshot, drafts: &'a [ColumnDraft]) -> Vec<Ch
         }
     }
     changes
+}
+
+/// 专有形态是否变了：ENUM/SET 候选值（含顺序）与生成列的表达式/存储方式。
+///
+/// 草稿里没有专有形态（None）表示“这一列不是 ENUM/SET 或不是生成列”，也用于还没带这些字段的旧调用方：
+/// 此时完全按原有规则判断变化，不会给普通列凭空生成 MODIFY。
+pub(crate) fn shape_changed(snapshot: &Snapshot, original: &Column, draft: &ColumnDraft) -> bool {
+    if let Some(wanted) = draft.enum_set.as_ref() {
+        match snapshot.enum_sets.get(&original.name) {
+            Some(current) if current.kind == wanted.kind && current.values == wanted.values => {}
+            _ => return true,
+        }
+    }
+    if let Some(wanted) = draft.generated.as_ref() {
+        match snapshot.generation.get(&original.name) {
+            Some(current) if current.expression.trim() == wanted.expression.trim() && current.storage == wanted.storage => {}
+            _ => return true,
+        }
+    }
+    false
 }
 
 fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
@@ -736,6 +790,10 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
         };
         if original.generated && (draft.name.trim() != original.name || !same_type(&draft.type_name, &original.type_name) || draft.nullable != original.nullable) {
             blocked.push(format!("生成列 {} 不能这样修改。", original.name));
+        }
+        // 普通列改成生成列要重建数据，MySQL 的 MODIFY 不接受；这里阻断而不是生成会被拒绝的语句。
+        if !original.generated && draft.generated.is_some() {
+            blocked.push(format!("字段 {} 是普通列，不能直接改成生成列；请新增一个生成列。", original.name));
         }
         if original.primary && !same_type(&draft.type_name, &original.type_name) {
             blocked.push(format!("不能在这里修改主键列 {} 的类型。", original.name));
@@ -789,6 +847,29 @@ fn alter_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
                 text: format!("重命名 {} → {}。仍使用旧列名的查询或应用需要同步修改。", original.name, draft.name.trim()),
             });
         }
+        // ENUM/SET 去掉候选值后，已有行里那些值会变成空串或写入被拒；这是数据层面的后果，要先说清楚。
+        if let (Some(current), Some(wanted)) = (snapshot.enum_sets.get(&original.name), draft.enum_set.as_ref()) {
+            let removed: Vec<&str> = current.values.iter().filter(|value| !wanted.values.contains(value)).map(String::as_str).collect();
+            if !removed.is_empty() {
+                risks.push(Risk {
+                    level: "warn".to_owned(),
+                    text: format!(
+                        "字段 {} 去掉了候选值 {}。已有的这些值会被替换或写入失败，取决于服务器的严格模式。",
+                        original.name,
+                        removed.join("、")
+                    ),
+                });
+            }
+        }
+        // 生成表达式变了但存储方式没变，会重算整列数据。
+        if let (Some(current), Some(wanted)) = (snapshot.generation.get(&original.name), draft.generated.as_ref()) {
+            if current.expression.trim() != wanted.expression.trim() {
+                risks.push(Risk {
+                    level: "warn".to_owned(),
+                    text: format!("字段 {} 的生成表达式会改变，已有行要按新表达式重新计算。", original.name),
+                });
+            }
+        }
     }
     risks
 }
@@ -815,7 +896,8 @@ fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) 
         let original = if create { None } else { original_of(snapshot, column) };
         let type_kept = original.is_some_and(|original| same_type(&column.type_name, &original.type_name));
         let default_kept = original.is_some_and(|original| !default_changed(engine, original, column));
-        if !type_kept && !valid_type(engine, &column.type_name) {
+        // ENUM/SET 的类型写法由方言按候选值生成，不再按手输类型文本校验。
+        if !type_kept && column.enum_set.is_none() && !valid_type(engine, &column.type_name) {
             blocked.push(format!("字段 {name} 的类型 {} 不能按 {} 规则生成。", column.type_name.trim(), engine.as_str()));
         }
         if !default_kept {
@@ -825,6 +907,23 @@ fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) 
         }
         if create && column.auto && !column.primary {
             blocked.push(format!("字段 {name} 只有主键才能自增。"));
+        }
+        // 专有形态在预览前就能判断的问题：生成列缺表达式、生成列同时自增或带默认值、ENUM/SET 没有候选值。
+        if let Some(generated) = &column.generated {
+            if generated.expression.trim().is_empty() {
+                blocked.push(format!("字段 {name} 是生成列，但表达式为空。"));
+            }
+            if column.auto {
+                blocked.push(format!("字段 {name} 是生成列，不能同时自增。"));
+            }
+            if column.default.has_value() {
+                blocked.push(format!("字段 {name} 是生成列，不能同时有默认值。"));
+            }
+        }
+        if let Some(enum_set) = &column.enum_set {
+            if enum_set.values.is_empty() {
+                blocked.push(format!("字段 {name} 是 {}，至少要有一个候选值。", enum_set.kind.keyword().to_uppercase()));
+            }
         }
     }
     blocked
@@ -922,6 +1021,22 @@ pub(crate) fn create_statement(
     autoincrement: bool,
     options: &TableOptions,
 ) -> Result<String, String> {
+    create_statement_for(engine, database, schema, table, drafts, foreign_keys, autoincrement, options, LiteralQuoting::default())
+}
+
+/// 建表语句，带字面量转义方式（ENUM/SET 候选值与字面量默认值都要按会话 sql_mode 编码）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_statement_for(
+    engine: Engine,
+    database: &str,
+    schema: &str,
+    table: &str,
+    drafts: &[ColumnDraft],
+    foreign_keys: &[ForeignKey],
+    autoincrement: bool,
+    options: &TableOptions,
+    quoting: LiteralQuoting,
+) -> Result<String, String> {
     let dialect = dialect_of(engine)?;
     let qualified = dialect.create_table_name(database, schema, table)?;
     let kept: Vec<&ColumnDraft> = drafts.iter().filter(|draft| !draft.dropped).collect();
@@ -932,7 +1047,7 @@ pub(crate) fn create_statement(
         && pk[0].type_name.to_ascii_lowercase().contains("int");
     let mut lines = Vec::new();
     for draft in &kept {
-        let mut sql = column_sql(engine, draft, single_auto && draft.primary)?;
+        let mut sql = column_sql_for(engine, draft, single_auto && draft.primary, quoting)?;
         if single_auto && draft.primary {
             dialect.finish_inline_autoincrement(&mut sql);
         }
@@ -965,21 +1080,43 @@ pub(crate) fn create_statement(
 }
 
 /// 字段定义。`inline_auto` 为真时这一列是内联的自增主键，不再单独写 NOT NULL。
+/// 字面量按服务器默认的转义方式；已知会话 sql_mode 时用 [`column_sql_for`] 传进来。
 pub(crate) fn column_sql(engine: Engine, draft: &ColumnDraft, inline_auto: bool) -> Result<String, String> {
-    if !valid_type(engine, &draft.type_name) {
-        return Err(format!("类型 {} 无效。", draft.type_name.trim()));
-    }
-    let default = default_sql(engine, draft).map_err(|_| format!("默认值 {} 无效。", draft.default.label().trim()))?;
+    column_sql_for(engine, draft, inline_auto, LiteralQuoting::default())
+}
+
+/// 字段定义，带字面量转义方式。ENUM/SET 与生成列的写法由方言给出：
+/// 没有这两种类型的引擎在这里给出原因，不生成半条定义。
+pub(crate) fn column_sql_for(engine: Engine, draft: &ColumnDraft, inline_auto: bool, quoting: LiteralQuoting) -> Result<String, String> {
     let dialect = dialect_of(engine)?;
-    let mut sql = format!("{} {}", quote_ident(engine, draft.name.trim()), draft.type_name.trim());
-    sql.push_str(dialect.auto_clause_before_null(draft));
-    if !draft.nullable && !inline_auto {
-        sql.push_str(" NOT NULL");
-    }
-    sql.push_str(dialect.auto_clause_after_null(draft));
-    if let Some(default) = default.filter(|_| !draft.auto) {
-        sql.push_str(" DEFAULT ");
-        sql.push_str(&default);
+    // ENUM/SET 的类型写法由方言用统一的字面量编码器生成；其余类型仍按手输原文校验。
+    let type_sql = match &draft.enum_set {
+        Some(enum_set) => dialect.enum_set_type_sql(enum_set, quoting)?,
+        None => {
+            if !valid_type(engine, &draft.type_name) {
+                return Err(format!("类型 {} 无效。", draft.type_name.trim()));
+            }
+            draft.type_name.trim().to_owned()
+        }
+    };
+    let mut sql = format!("{} {type_sql}", quote_ident(engine, draft.name.trim()));
+    if let Some(generated) = &draft.generated {
+        // 生成列不能自增，也不能带默认值：只写表达式、存储方式、空值约束与注释。
+        sql.push_str(&dialect.generated_column_sql(generated)?);
+        if !draft.nullable && !inline_auto {
+            sql.push_str(" NOT NULL");
+        }
+    } else {
+        let default = default_sql(engine, draft).map_err(|_| format!("默认值 {} 无效。", draft.default.label().trim()))?;
+        sql.push_str(dialect.auto_clause_before_null(draft));
+        if !draft.nullable && !inline_auto {
+            sql.push_str(" NOT NULL");
+        }
+        sql.push_str(dialect.auto_clause_after_null(draft));
+        if let Some(default) = default.filter(|_| !draft.auto) {
+            sql.push_str(" DEFAULT ");
+            sql.push_str(&default);
+        }
     }
     if let Some(comment) = Some(draft.comment.trim()).filter(|text| !text.is_empty()).and_then(|text| dialect.inline_column_comment(text)) {
         sql.push_str(&comment);
@@ -1111,7 +1248,8 @@ pub(crate) fn identity_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             primary: column.primary,
             auto: column.auto,
             dropped: false,
-        })
+            ..ColumnDraft::default()
+})
         .collect()
 }
 

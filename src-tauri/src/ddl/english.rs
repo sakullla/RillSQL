@@ -226,6 +226,22 @@ const PATTERNS: &[(&str, &str)] = &[
     ("读取库表失败：{p}", "Could not read the catalog: {0}"),
     ("读取{p}失败：{p}", "Could not read {0}: {1}"),
     ("元数据列是空值", "A metadata column is null"),
+    // 专有字段形态与对象：ENUM/SET 候选值、生成列、服务器能力不足时的原因。
+    ("这个引擎没有 ENUM/SET 字段类型，不能生成。", "This engine has no ENUM/SET column type, so no statement is generated."),
+    ("这个引擎在这里不支持生成列，不能生成。", "This engine does not support generated columns here, so no statement is generated."),
+    ("服务器 {} 不支持 ENUM/SET 字段类型，这里不生成语句。", "Server {0} has no ENUM/SET column type, so no statement is generated."),
+    ("服务器 {} 不支持生成列，这里不生成语句。", "Server {0} does not support generated columns, so no statement is generated."),
+    ("未知版本", "an unknown version"),
+    ("字段 {} 是 {}，至少要有一个候选值。", "Column {0} is {1} and needs at least one value."),
+    ("字段 {} 是生成列，但表达式为空。", "Column {0} is a generated column but its expression is empty."),
+    ("字段 {} 是生成列，不能同时自增。", "Column {0} is a generated column, so it can't be auto-increment."),
+    ("字段 {} 是生成列，不能同时有默认值。", "Column {0} is a generated column, so it can't have a default value."),
+    ("字段 {} 是普通列，不能直接改成生成列；请新增一个生成列。", "Column {0} is a plain column and can't be turned into a generated column; add a new generated column instead."),
+    (
+        "字段 {} 去掉了候选值 {}。已有的这些值会被替换或写入失败，取决于服务器的严格模式。",
+        "Column {0} drops the values {1}: existing rows with those values are replaced or rejected, depending on the server's strict mode.",
+    ),
+    ("字段 {} 的生成表达式会改变，已有行要按新表达式重新计算。", "The generated expression of column {0} changes, so existing rows are recomputed."),
 ];
 
 /// 重建的建表定义“未包含”清单里的项（`ddl::rebuilt_definition` 返回的 `missing`）。查看器横幅逐项显示；

@@ -6,6 +6,7 @@ pub mod export;
 pub mod grid;
 pub mod history;
 pub mod mongo;
+pub mod object_editor;
 pub mod overview;
 pub mod query;
 pub mod redis;
