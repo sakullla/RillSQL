@@ -218,7 +218,7 @@ impl LogPanel<'_> {
                                     div()
                                         .flex()
                                         .items_start()
-                                        .gap(px(6.))
+                                        .gap(px(kit::Space::SM))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -259,7 +259,7 @@ impl LogPanel<'_> {
                                         div()
                                             .flex()
                                             .items_start()
-                                            .gap(px(6.))
+                                            .gap(px(kit::Space::SM))
                                             .child(
                                                 div()
                                                     .id(SharedString::from(format!("query-log-sent-{index}")))

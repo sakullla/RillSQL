@@ -483,8 +483,8 @@ fn object(
                 div()
                     .id("query-side-column-filter-wrap")
                     .flex_none()
-                    .px(px(8.))
-                    .pb(px(6.))
+                    .px(px(kit::Space::MD))
+                    .pb(px(kit::Space::SM))
                     .child(
                         kit::text_input("query-side-column-filter", filter_state, SharedString::from(i18n::text(locale, "query.side.filterColumns")))
                             .prefix(kit::input_prefix(IconName::Search, 12., p.text_faint))
@@ -506,8 +506,8 @@ fn object(
                 div()
                     .id("query-side-columns-empty")
                     .test_support()
-                    .px(px(12.))
-                    .py(px(6.))
+                    .px(px(kit::Space::LG))
+                    .py(px(kit::Space::SM))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(i18n::text(locale, "query.side.noMatchingColumns"))),

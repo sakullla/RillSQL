@@ -491,7 +491,7 @@ pub fn popover(
         .children(search.map(|input| div().flex_none().p(px(8.)).border_b_1().border_color(p.line).child(input)))
         .child(div().flex_1().min_h_0().flex().child(left).child(right))
         .child(footer);
-    Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(div().pt(px(4.)).child(panel))).with_priority(2).into_any_element())
+    Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(kit::Space::MD)).child(div().pt(px(kit::Space::XS)).child(panel))).with_priority(2).into_any_element())
 }
 
 trait TooltipOpt: Sized {

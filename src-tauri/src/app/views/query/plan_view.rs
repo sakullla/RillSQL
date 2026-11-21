@@ -15,6 +15,9 @@ use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
+/// 诊断建议区最大高度：多条建议时内部滚动，不把下方的执行计划树挤出可视区。
+const FINDINGS_MAX_H: f32 = 120.;
+
 pub struct PlanView<'a> {
     pub plan: &'a Plan,
     pub selected: usize,
@@ -172,7 +175,7 @@ impl PlanView<'_> {
                 .id("query-plan-findings")
                 .test_support()
                 .flex_none()
-                .max_h(px(120.))
+                .max_h(px(FINDINGS_MAX_H))
                 .scroll_area_y()
                 .flex()
                 .flex_col()
