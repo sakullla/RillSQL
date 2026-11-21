@@ -1172,11 +1172,20 @@ async fn lost_session_without_saved_password_stays_lost_without_dialing() {
         save_password: false,
     };
     assert!(service.open("pg", typed).await.unwrap().connected);
+    // 活动事务中探活确认断线：旧事务结果无法确认，必须登记为未知而不是继续宣称活动（R10）。
+    let coordinator = service.transaction_coordinator("pg").expect("事务协调器");
+    coordinator
+        .acknowledge(&crate::transaction::ControlStatement::Begin { mode: None }, crate::transaction::ControlOutcome::Confirmed)
+        .unwrap();
+    assert_eq!(service.transaction_snapshot("pg").unwrap().state, crate::transaction::TransactionState::Active);
     service.session_health("pg").unwrap().rewind_idle(std::time::Duration::from_secs(60));
 
     let statuses = Arc::clone(&service).session_statuses().await;
     assert_eq!(statuses[0].status, "lost");
     assert!(statuses[0].reason.as_deref().unwrap_or_default().contains("手动重连"), "{:?}", statuses[0]);
+    let snapshot = service.transaction_snapshot("pg").expect("断线后仍能读到旧事务记录");
+    assert_eq!(snapshot.state, crate::transaction::TransactionState::Idle, "断线后不再显示旧事务活动");
+    assert!(snapshot.unresolved.is_some(), "旧事务结果保留为未知");
     // 没有保存密码：一次重连拨号都没有，等手动入口
     assert_eq!(db.auth_calls.load(Ordering::SeqCst), 1);
     // lost 会话不再提供执行句柄：重连期间不重发写语句
@@ -1672,3 +1681,79 @@ async fn mysql_large_catalog_fast_path_fixture() {
     opened.pool.disconnect().await.unwrap();
 }
 
+
+/// 关系型业务入口同时给出用户会话与串行执行租约（ADR-1、R2）。
+#[tokio::test]
+async fn query_session_hands_out_one_business_lease_per_connection() {
+    use std::time::Duration;
+
+    let dir = temp_workspace();
+    let database = dir.join("notes.sqlite");
+    sqlite_fixture(&database).await;
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+
+    let first = service.query_session("notes").await.unwrap().expect("业务会话");
+    assert!(first.lease.is_some(), "关系型连接必须有串行执行租约");
+    let waiting = tokio::time::timeout(Duration::from_millis(40), service.query_session("notes")).await;
+    assert!(waiting.is_err(), "第二个业务执行必须等待第一个租约");
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(2), service.query_session("notes")).await.unwrap().unwrap().unwrap();
+    assert!(second.lease.is_some());
+    assert!(!service.transaction_snapshot("notes").unwrap().state.needs_recovery());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 重连形成新会话：旧事务结果保留为未知，新会话不显示旧事务仍活动、不重放（R10）。
+#[tokio::test]
+async fn reopening_keeps_the_previous_transaction_unknown_and_starts_idle() {
+    use crate::transaction::{ControlOutcome, ControlStatement, TransactionState};
+
+    let dir = temp_workspace();
+    let database = dir.join("notes.sqlite");
+    sqlite_fixture(&database).await;
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+
+    let coordinator = service.transaction_coordinator("notes").expect("事务协调器");
+    coordinator.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+    assert_eq!(service.transaction_snapshot("notes").unwrap().state, TransactionState::Active);
+
+    // 重新打开同一个连接：新会话从无活动事务开始，旧事务结果保留为未知。
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let snapshot = service.transaction_snapshot("notes").unwrap();
+    assert_eq!(snapshot.state, TransactionState::Idle, "新会话不继承旧事务活动标记");
+    assert!(snapshot.unresolved.is_some(), "旧事务结果未知必须保留");
+
+    // 断开后仍能读到旧事务的未知记录；旧协调器不随会话表一起消失。
+    service.disconnect("notes");
+    assert_eq!(service.transaction_snapshot("notes").unwrap().state, TransactionState::Idle);
+    assert!(service.transaction_snapshot("notes").unwrap().unresolved.is_some());
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// 业务会话的物理连接在两次语句之间保留：活动事务跨操作有效，元数据会话看不到未提交结构（R2）。
+#[tokio::test]
+async fn sqlite_business_pool_keeps_an_open_transaction_between_statements() {
+    let dir = temp_workspace();
+    let database = dir.join("notes.sqlite");
+    sqlite_fixture(&database).await;
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+
+    let query = service.query_session("notes").await.unwrap().expect("业务会话");
+    let CatalogSession::Sqlite { pool, .. } = &query.session else { panic!("sqlite") };
+    sqlx::query("BEGIN").execute(pool).await.unwrap();
+    sqlx::query("CREATE TABLE kept (id INTEGER)").execute(pool).await.unwrap();
+    let inside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'kept'").fetch_one(pool).await.unwrap();
+    assert_eq!(inside, 1, "同一业务会话能读到未提交结构");
+
+    let catalog = service.catalog_session("notes").expect("目录会话");
+    let CatalogSession::Sqlite { pool: meta, .. } = &catalog else { panic!("sqlite") };
+    let outside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'kept'").fetch_one(meta).await.unwrap();
+    assert_eq!(outside, 0, "目录元数据会话不加入用户事务，看不到未提交结构");
+
+    sqlx::query("ROLLBACK").execute(pool).await.unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'kept'").fetch_one(pool).await.unwrap();
+    assert_eq!(after, 0, "回滚撤销事务中的结构变更");
+    let _ = std::fs::remove_dir_all(dir);
+}

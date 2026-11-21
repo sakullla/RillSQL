@@ -20,6 +20,8 @@ use crate::connections::route::{self, Route};
 use crate::connections::secrets::SecretStore;
 use crate::connections::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestReport, TestStatus};
 use crate::connections::store::{self, Store};
+use crate::connections::transaction::{ExecutionLease, TransactionCoordinator};
+use crate::transaction::{TransactionDialect, TransactionSnapshot, UnknownReason};
 
 pub use crate::adapters::session::{CancelTransport, CatalogSession};
 
@@ -125,6 +127,15 @@ struct LiveEntry {
     health: Arc<SessionHealth>,
     /// 连接阶段读到的服务器版本说明；没有读到时为 None。
     server_version: Option<String>,
+    /// 连接级事务协调器：共享快照、业务执行租约与重连后的旧事务未知信息。
+    transaction: Arc<TransactionCoordinator>,
+}
+
+/// 业务查询句柄与它的串行执行租约。租约持有到丢弃为止。
+pub struct QuerySession {
+    pub session: CatalogSession,
+    /// 关系型连接才有；Redis/MongoDB 保持原有的并发语义（R12）。
+    pub lease: Option<ExecutionLease>,
 }
 
 /// 会话健康状态（R4）。执行路径通过 `CancelTransport` 报告断线类错误（suspect），
@@ -265,6 +276,9 @@ pub struct Service {
     /// 选择不保存密码或系统钥匙串不可用时，同一次运行里切换数据库、手动重连不必再问一遍；
     /// 自动重连仍只用凭据库里的密码（没保存就等手动入口）。删除或重新保存这条连接时作废，进程退出即消失。
     typed: Mutex<HashMap<String, Secret>>,
+    /// 已断开连接保留的事务协调器：连接不在了，旧事务的未知结果仍要能读到（R10）。
+    /// 重新打开同一连接时取回并按新会话处理；删除连接时清掉。
+    retired: Mutex<HashMap<String, Arc<TransactionCoordinator>>>,
 }
 
 impl Service {
@@ -286,6 +300,7 @@ impl Service {
             probes,
             reconnects: Mutex::new(HashMap::new()),
             typed: Mutex::new(HashMap::new()),
+            retired: Mutex::new(HashMap::new()),
         }
     }
 
@@ -559,6 +574,8 @@ impl Service {
 
     pub async fn delete(&self, id: &str) -> Result<DeleteOutcome, String> {
         self.disconnect(id);
+        // 连接配置删除后不再保留它的事务记录。
+        self.retired.lock().expect("retired transactions").remove(id);
         let store = self.store().await?;
         let existing = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
         let _ = self.secrets.delete(&password_account(id));
@@ -678,6 +695,12 @@ impl Service {
             session
         };
         if let Some(session) = session {
+            // 断开后旧事务的最终结果无法从数据库确认：保留为未知，重连/重开后仍能看到（R10）。
+            session.transaction.reconnect(UnknownReason::ConnectionLost);
+            self.retired
+                .lock()
+                .expect("retired transactions")
+                .insert(id.to_owned(), Arc::clone(&session.transaction));
             if let Some(shutdown) = session.shutdown {
                 let _ = shutdown.send(());
             }
@@ -939,6 +962,8 @@ impl Service {
                 Some(opened) => (opened.session, CancelTransport::new(opened.canceller, Arc::clone(&health))),
                 None => (Arc::new(ScriptedSession), CancelTransport::default()),
             };
+            // 重连或手动重开沿用同一个协调器：新会话从无活动事务开始，旧事务的未知记录保留（R10）。
+            let transaction = self.take_transaction(session_id, adapter(config.engine).transaction());
             self.sessions.lock().expect("sessions").insert(
                 session_id.to_owned(),
                 LiveEntry {
@@ -948,6 +973,7 @@ impl Service {
                     cancel,
                     health,
                     server_version,
+                    transaction,
                 },
             );
             // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
@@ -1031,6 +1057,13 @@ impl Service {
         })
     }
 
+    /// 探活确认断线：旧事务的最终结果无法再从数据库确认，登记为未知（R10）。
+    fn note_transaction_lost(&self, id: &str) {
+        if let Some(entry) = self.sessions.lock().expect("sessions").get(id) {
+            entry.transaction.reconnect(UnknownReason::ConnectionLost);
+        }
+    }
+
     /// 打开会话时读到的服务器版本说明（如 `8.0.36`）；会话未打开或没有读到时为 None。
     pub fn server_version(&self, id: &str) -> Option<String> {
         self.sessions.lock().expect("sessions").get(id).and_then(|session| session.server_version.clone())
@@ -1052,27 +1085,57 @@ impl Service {
     }
 
     /// 查询批次使用的句柄：需要独占执行连接的引擎（MySQL 执行池、Redis 独占命令连接）由适配器另给。
-    pub async fn query_session(&self, id: &str) -> Result<Option<CatalogSession>, String> {
-        let (session, foreign_keys) = {
+    /// 关系型连接同时返回串行执行租约：同一连接的业务执行不会并发驱动同一条事务连接。
+    pub async fn query_session(&self, id: &str) -> Result<Option<QuerySession>, String> {
+        let (session, foreign_keys, transaction) = {
             let sessions = self.sessions.lock().expect("sessions");
             let Some(entry) = sessions.get(id).filter(|entry| !entry.health.is_lost()) else {
                 return Ok(None);
             };
             entry.health.note_activity();
-            (Arc::clone(&entry.session), entry.foreign_keys)
+            (Arc::clone(&entry.session), entry.foreign_keys, Arc::clone(&entry.transaction))
         };
-        session.query(foreign_keys).await.map(Some)
+        let lease = if transaction.is_transactional() {
+            Some(transaction.lease().await)
+        } else {
+            // Redis/MongoDB 不在用户事务范围内（R12）：保持原有的并发语义。
+            None
+        };
+        let handle = session.query(foreign_keys).await?;
+        Ok(Some(QuerySession { session: handle, lease }))
     }
 
-    /// MySQL / MariaDB 已认证的目录连接池：当独立执行连接受限于 max_user_connections、
-    /// 代理并发上限或跳板机通道限制而无法新建时，回退复用这条已连通的池，不让 SQL 永远挂起。
-    pub fn mysql_fallback_pool(&self, id: &str) -> Option<mysql_async::Pool> {
-        let sessions = self.sessions.lock().expect("sessions");
-        let session = sessions.get(id)?;
-        if session.health.is_lost() {
-            return None;
+    /// 同连接共享的事务快照；连接已断开但上一事务结果未知时仍返回旧记录（R10）。
+    pub fn transaction_snapshot(&self, id: &str) -> Option<TransactionSnapshot> {
+        if let Some(entry) = self.sessions.lock().expect("sessions").get(id) {
+            return entry.transaction.snapshot();
         }
-        session.session.shared_pool()
+        self.retired
+            .lock()
+            .expect("retired transactions")
+            .get(id)
+            .and_then(|coordinator| coordinator.snapshot())
+    }
+
+    /// 连接级事务协调器：控制命令、探针登记与快照都从这里进入。
+    pub fn transaction_coordinator(&self, id: &str) -> Option<Arc<TransactionCoordinator>> {
+        if let Some(entry) = self.sessions.lock().expect("sessions").get(id) {
+            return Some(Arc::clone(&entry.transaction));
+        }
+        self.retired.lock().expect("retired transactions").get(id).cloned()
+    }
+
+    /// 取回这条连接已有的事务协调器；没有时新建。新会话一律从无活动事务开始。
+    fn take_transaction(&self, id: &str, dialect: Option<&'static dyn TransactionDialect>) -> Arc<TransactionCoordinator> {
+        let previous = self.sessions.lock().expect("sessions").remove(id).map(|entry| entry.transaction);
+        let retired = self.retired.lock().expect("retired transactions").remove(id);
+        let coordinator = match previous.or(retired) {
+            Some(coordinator) if same_dialect(coordinator.dialect(), dialect) => coordinator,
+            // 引擎变了：旧方言不能再驱动新会话；旧事务记录只剩“未知”意义，不再暴露为当前连接。
+            _ => Arc::new(TransactionCoordinator::new(id.to_owned(), dialect)),
+        };
+        coordinator.reconnect(UnknownReason::ConnectionLost);
+        coordinator
     }
 
     /// Redis 会话句柄：键浏览、值读取与命令行共用的连接（多路复用，调用方克隆后并发使用）。
@@ -1171,6 +1234,7 @@ impl Service {
             Ok(Err(reason)) => {
                 let text = format!("探活失败：{reason}");
                 target.health.mark_lost(text);
+                self.note_transaction_lost(&target.id);
                 self.reconnects
                     .lock()
                     .expect("reconnects")
@@ -1375,6 +1439,15 @@ struct SessionHealthProbe {
 
 fn clone_catalog_handle(entry: &LiveEntry) -> CatalogSession {
     entry.session.catalog(entry.foreign_keys)
+}
+
+/// 两个方言是不是同一份静态实现（连接引擎没变）。
+fn same_dialect(a: Option<&'static dyn TransactionDialect>, b: Option<&'static dyn TransactionDialect>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 #[derive(Default)]

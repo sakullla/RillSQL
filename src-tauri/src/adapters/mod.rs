@@ -16,7 +16,6 @@ pub mod query;
 pub mod registry;
 pub mod session;
 pub mod transfer;
-
 mod mariadb;
 pub(crate) mod mongodb;
 pub(crate) mod mysql;
@@ -34,6 +33,7 @@ use crate::connections::model::{Engine, SavedConnection, TlsMode};
 use crate::query::exec::{CappedSql, DatabaseGate};
 use crate::query::functions::FunctionSig;
 use crate::query::plan::PlanNode;
+use crate::transaction::TransactionDialect;
 
 pub use catalog::{catalog_of, CatalogDialect};
 pub use ddl::{DdlDialect, TypeRules};
@@ -64,6 +64,8 @@ pub struct Capabilities {
     pub connector_group: bool,
     /// 对比、全库导出、迁移与导出的方言组（A5）。
     pub transfer_group: bool,
+    /// 事务控制方言组：关系型引擎提供，专项引擎没有。
+    pub transaction_group: bool,
     /// 会话绑定到单个库：切换库要改连，跨库读取要另开临时会话（不替换当前会话）。
     pub database_scoped_session: bool,
     /// 对象树有“库”这一层（单文件引擎没有，对象直接挂在连接下）。
@@ -560,6 +562,10 @@ pub trait EngineAdapter: Sync {
         None
     }
     fn transfer(&self) -> Option<&'static dyn TransferDialect> {
+        None
+    }
+    /// 事务控制方言：控制 SQL、保存点、隔离与错误/探针识别。非关系型引擎没有。
+    fn transaction(&self) -> Option<&'static dyn TransactionDialect> {
         None
     }
 }

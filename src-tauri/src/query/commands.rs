@@ -192,10 +192,9 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         started_at: started_at.clone(),
         elapsed_ms: 0,
     };
-    let mysql_fallback = service.mysql_fallback_pool(&request.connection_id);
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
-    let session = service.query_session(&request.connection_id).await?.ok_or_else(|| {
+    let query = service.query_session(&request.connection_id).await?.ok_or_else(|| {
         // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
         if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
             "连接已断开，自动重连成功后才能执行。没有把这次语句排队重发。".to_owned()
@@ -203,19 +202,11 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             "这条连接还没有打开，没有另开新的连接。".to_owned()
         }
     })?;
-    if session.is_scripted() {
+    if query.session.is_scripted() {
         return Err("这个连接没有连着可查询的数据库".to_owned());
     }
-    let mut driver = match exec::LiveDriver::attach_with_fallback(
-        session,
-        mysql_fallback,
-        &request.engine,
-        &request.database,
-        transport,
-        request.timeout_ms,
-    )
-    .await
-    {
+    let lease = query.lease;
+    let mut driver = match exec::LiveDriver::attach(query.session, &request.engine, &request.database, transport, request.timeout_ms).await {
         Ok(driver) => driver,
         Err(err) => return Err(err),
     };
@@ -242,9 +233,11 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     let history_state = state.clone();
     let pace = Arc::clone(&slot.pace);
     tokio::spawn(async move {
+        // 批次从 attach 到复位一直持有业务执行租约：同连接的其他业务执行必须等待（ADR-1）。
+        let _lease = lease;
         let _finish_pace = FinishPace(Arc::clone(&pace));
         let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
-        // 目录连接是共享会话，整批结束后把语句超时设置复位，不泄漏到这一批之外。
+        // 整批结束后在业务会话上把语句超时设置复位，不泄漏到这一批之外。
         let _ = driver.finish().await;
         let summary = summary_of(&batch);
         let status = history_status(batch.status);

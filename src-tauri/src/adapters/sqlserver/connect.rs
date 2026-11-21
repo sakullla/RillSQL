@@ -13,6 +13,8 @@ use crate::connections::stages::{self, StageError};
 
 pub(crate) struct SqlserverOpen {
     pub client: TdsClient,
+    /// 目录、补全与探活专用的独立连接：不加入用户事务（ADR-1）。
+    pub meta_client: TdsClient,
     pub version: String,
     /// 会话的 SPID。取消时另开一条连接执行 KILL <spid>。
     pub spid: u32,
@@ -25,14 +27,9 @@ pub const SQLSERVER_MIN_MAJOR: u32 = 11;
 
 pub(crate) async fn open_sqlserver(config: &SavedConnection, route: &Route, password: &str) -> Result<SqlserverOpen, StageError> {
     let kill_config = sqlserver_tds_config(config, route, password)?;
-    let tcp = tokio::net::TcpStream::connect(kill_config.get_addr())
-        .await
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
-    tcp.set_nodelay(true)
-        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
-    let mut client = tiberius::Client::connect(kill_config.clone(), tcp.compat())
-        .await
-        .map_err(|err| sqlserver_stage(route.tls_mode, &err))?;
+    let mut client = connect_client(kill_config.clone(), route.tls_mode).await?;
+    // 元数据会话是同一服务器上的第二条物理连接：目录读取、补全与探活不进入用户事务。
+    let meta_client = connect_client(kill_config.clone(), route.tls_mode).await?;
     let mut stream = client
         .simple_query("SELECT @@SPID AS spid, @@VERSION AS version")
         .await
@@ -59,10 +56,23 @@ pub(crate) async fn open_sqlserver(config: &SavedConnection, route: &Route, pass
     }
     Ok(SqlserverOpen {
         client,
+        meta_client,
         version: banner.lines().next().unwrap_or("SQL Server").to_owned(),
         spid,
         kill_config,
     })
+}
+
+/// 拨一条 TDS 连接。错误分类与连接建立阶段一致：TCP / 登录 / TLS 分开报，不自动降级。
+async fn connect_client(config: tiberius::Config, mode: TlsMode) -> Result<TdsClient, StageError> {
+    let tcp = tokio::net::TcpStream::connect(config.get_addr())
+        .await
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
+    tcp.set_nodelay(true)
+        .map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_NETWORK_FAILED, crate::error_text::chain(&err), "网络连接失败，没有改用加密连接重试。"))?;
+    tiberius::Client::connect(config, tcp.compat())
+        .await
+        .map_err(|err| sqlserver_stage(mode, &err))
 }
 
 /// 把现有 TLS 三档映射到 TDS 加密级别：
@@ -163,7 +173,10 @@ impl Connector for SqlserverConnector {
         let opened = open_sqlserver(config, route, password).await?;
         Ok(Opened {
             version: opened.version,
-            session: Arc::new(SqlserverSession(Arc::new(tokio::sync::Mutex::new(opened.client)))),
+            session: Arc::new(SqlserverSession {
+                exec: Arc::new(tokio::sync::Mutex::new(opened.client)),
+                meta: Arc::new(tokio::sync::Mutex::new(opened.meta_client)),
+            }),
             canceller: Arc::new(SqlserverKill {
                 spid: AtomicU32::new(opened.spid),
                 config: opened.kill_config,
@@ -175,16 +188,26 @@ impl Connector for SqlserverConnector {
     }
 }
 
-struct SqlserverSession(Arc<tokio::sync::Mutex<TdsClient>>);
+struct SqlserverSession {
+    /// 用户事务会话：SQL 查询、网格写入与结构业务页面共用这一条物理连接。
+    exec: Arc<tokio::sync::Mutex<TdsClient>>,
+    /// 元数据会话：目录、补全与探活，不进入用户事务。
+    meta: Arc<tokio::sync::Mutex<TdsClient>>,
+}
 
 #[async_trait::async_trait]
 impl Session for SqlserverSession {
     fn catalog(&self, _foreign_keys: Option<bool>) -> CatalogSession {
-        CatalogSession::Sqlserver(Arc::clone(&self.0))
+        CatalogSession::Sqlserver(Arc::clone(&self.meta))
     }
 
+    async fn query(&self, _foreign_keys: Option<bool>) -> Result<CatalogSession, String> {
+        Ok(CatalogSession::Sqlserver(Arc::clone(&self.exec)))
+    }
+
+    /// 探活走元数据会话：用户事务中的长语句不会让探活误判，探活也不进入用户事务。
     async fn ping(&self) -> Result<(), String> {
-        let mut client = self.0.lock().await;
+        let mut client = self.meta.lock().await;
         use futures::TryStreamExt;
         let mut stream = client.simple_query("SELECT 1").await.map_err(|err| crate::error_text::chain(&err))?;
         while let Some(item) = stream.try_next().await.map_err(|err| crate::error_text::chain(&err))? {

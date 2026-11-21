@@ -16,6 +16,8 @@ use crate::connections::verify::EncryptWithoutVerify;
 
 pub(crate) struct PostgresOpen {
     pub client: tokio_postgres::Client,
+    /// 目录、补全与探活专用的独立连接：不加入用户事务（ADR-1）。
+    pub meta_client: tokio_postgres::Client,
     pub version: String,
     pub cancel: tokio_postgres::CancelToken,
     pub tls: Option<MakeRustlsConnect>,
@@ -45,19 +47,9 @@ pub(crate) async fn open_postgres(config: &SavedConnection, route: &Route, passw
     pg.port(plan.port);
     pg.connect_timeout(Duration::from_secs(15));
     let tls_for_cancel = if plan.use_tls { Some(postgres_tls(config, &plan)?) } else { None };
-    let client = if let Some(tls) = tls_for_cancel.clone() {
-        let (client, connection) = pg.connect(tls).await.map_err(|err| postgres_connect_error(&err, route.tls_mode, true))?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-    } else {
-        let (client, connection) = pg.connect(NoTls).await.map_err(|err| postgres_connect_error(&err, route.tls_mode, false))?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-    };
+    let client = connect_client(&pg, tls_for_cancel.clone(), route.tls_mode).await?;
+    // 元数据会话是同一服务器上的第二条物理连接：目录读取、补全与探活不进入用户事务。
+    let meta_client = connect_client(&pg, tls_for_cancel.clone(), route.tls_mode).await?;
     let cancel = client.cancel_token();
     let messages = client
         .simple_query("SELECT version()")
@@ -72,10 +64,33 @@ pub(crate) async fn open_postgres(config: &SavedConnection, route: &Route, passw
         .unwrap_or_else(|| "未知版本".to_owned());
     Ok(PostgresOpen {
         client,
+        meta_client,
         version,
         cancel,
         tls: tls_for_cancel,
     })
+}
+
+/// 打开一条 PostgreSQL 物理连接；连接任务在后台运行到连接结束。
+async fn connect_client(
+    config: &tokio_postgres::Config,
+    tls: Option<MakeRustlsConnect>,
+    mode: TlsMode,
+) -> Result<tokio_postgres::Client, StageError> {
+    let client = if let Some(tls) = tls {
+        let (client, connection) = config.connect(tls).await.map_err(|err| postgres_connect_error(&err, mode, true))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    } else {
+        let (client, connection) = config.connect(NoTls).await.map_err(|err| postgres_connect_error(&err, mode, false))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    };
+    Ok(client)
 }
 
 fn postgres_tls(config: &SavedConnection, plan: &PostgresTlsPlan) -> Result<MakeRustlsConnect, StageError> {
@@ -181,7 +196,7 @@ impl Connector for PostgresConnector {
         let opened = open_postgres(config, route, password).await?;
         Ok(Opened {
             version: opened.version,
-            session: Arc::new(PostgresSession(Arc::new(opened.client))),
+            session: Arc::new(PostgresSession { exec: Arc::new(opened.client), meta: Arc::new(opened.meta_client) }),
             canceller: Arc::new(PostgresCancel { token: opened.cancel, tls: opened.tls, via_ssh: config.ssh.is_some() }),
             schema_note: None,
             foreign_keys: None,
@@ -189,16 +204,26 @@ impl Connector for PostgresConnector {
     }
 }
 
-struct PostgresSession(Arc<tokio_postgres::Client>);
+struct PostgresSession {
+    /// 用户事务会话：SQL 查询、网格写入与结构业务页面共用同一条物理连接。
+    exec: Arc<tokio_postgres::Client>,
+    /// 元数据会话：目录、补全与探活，不进入用户事务。
+    meta: Arc<tokio_postgres::Client>,
+}
 
 #[async_trait::async_trait]
 impl Session for PostgresSession {
     fn catalog(&self, _foreign_keys: Option<bool>) -> CatalogSession {
-        CatalogSession::Postgres(Arc::clone(&self.0))
+        CatalogSession::Postgres(Arc::clone(&self.meta))
     }
 
+    async fn query(&self, _foreign_keys: Option<bool>) -> Result<CatalogSession, String> {
+        Ok(CatalogSession::Postgres(Arc::clone(&self.exec)))
+    }
+
+    /// 探活走元数据会话：用户事务中的语句不会让探活误判，探活也不会进入用户事务。
     async fn ping(&self) -> Result<(), String> {
-        self.0.simple_query("SELECT 1").await.map(|_| ()).map_err(|err| crate::error_text::chain(&err))
+        self.meta.simple_query("SELECT 1").await.map(|_| ()).map_err(|err| crate::error_text::chain(&err))
     }
 }
 

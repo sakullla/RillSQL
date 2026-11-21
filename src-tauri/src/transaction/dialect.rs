@@ -4,7 +4,7 @@
 //! 由适配器与协调器完成。能力表是界面入口、模型校验和适配器实现的同一份事实来源：
 //! 未列出的隔离级别、保存点释放、隐式提交与链式事务都必须明确拒绝，不能静默替换。
 
-use super::model::{ControlStatement, SavepointName};
+use super::model::{ControlOutcome, ControlStatement, SavepointName, StatementFailure, TransactionProbe, UnknownReason};
 
 /// 标准隔离级别的稳定 id。
 pub const READ_UNCOMMITTED: &str = "read_uncommitted";
@@ -277,6 +277,47 @@ pub trait TransactionDialect: Sync {
             ImplicitCommitSupport::NotApplicable => ImplicitCommitVerdict::NotApplicable,
             ImplicitCommitSupport::MysqlFamily => ImplicitCommitVerdict::Uncertain,
         }
+    }
+
+    // ---- 错误状态识别与状态观测（ADR-2） ----
+
+    /// 读取当前事务状态的状态探针语句。返回 `None` 表示方言没有可靠的通用探针：
+    /// 调用方只能按已确认的控制结果推进，不能靠猜测填补（R10）。
+    fn probe_sql(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 解析探针结果。`columns` 与 `rows[0]` 是探针语句的结果；列名大小写不敏感。
+    /// 认不出、缺列或数值无法解释时返回 `None`（按未知处理）。
+    fn read_probe(&self, _columns: &[String], _rows: &[Vec<Option<String>>]) -> Option<TransactionProbe> {
+        None
+    }
+
+    /// 一条普通语句失败后事务是否仍可使用。默认按“语句被拒绝、事务不变”处理；
+    /// 需要按错误码区分的方言覆盖（如 PostgreSQL 的错误会把事务置为中止）。
+    fn statement_failure(&self, _code: Option<&str>, _message: &str) -> StatementFailure {
+        StatementFailure::TransactionUsable
+    }
+
+    /// 语句失败是否可能已经让数据库自行回滚整个事务（如 MySQL 死锁、SQLite 的部分错误）。
+    /// 为 true 时调用方必须按结果未知登记，不能继续宣称事务活动。
+    fn error_may_have_ended_transaction(&self, _code: Option<&str>, _message: &str) -> bool {
+        false
+    }
+
+    /// 控制语句失败时的结果。默认按 [`Self::statement_failure`] 的分类推断。
+    fn control_failure(&self, failure: StatementFailure, _statement: &ControlStatement) -> ControlOutcome {
+        match failure {
+            StatementFailure::ConnectionLost => ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+            StatementFailure::TransactionAborted => ControlOutcome::Aborted,
+            StatementFailure::TransactionUsable => ControlOutcome::Rejected,
+        }
+    }
+
+    /// 控制语句成功时数据库实际做了什么。默认确认成功；PostgreSQL 中止事务中的 `COMMIT`
+    /// 会以 `ROLLBACK` 命令标签成功返回，需要按实际回滚登记。
+    fn control_success(&self, _statement: &ControlStatement, _command_tag: Option<&str>) -> ControlOutcome {
+        ControlOutcome::Confirmed
     }
 }
 

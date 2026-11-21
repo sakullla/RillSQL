@@ -74,17 +74,15 @@ impl CatalogSession {
 /// 一条已打开的会话。由适配器的 [`Connector`] 产出，连接服务按连接 id 持有 `Arc<dyn Session>`。
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {
-    /// 目录、结构、表浏览与补全使用的句柄。`foreign_keys` 是连接阶段读到的外键开关（文件型引擎用）。
+    /// 目录、对象树、补全、探活与其他元数据读取使用的句柄。`foreign_keys` 是连接阶段读到的外键开关
+    /// （文件型引擎用）。它不加入用户事务：元数据读取不能误提交、回滚或阻塞业务会话（R2）。
     fn catalog(&self, foreign_keys: Option<bool>) -> CatalogSession;
 
-    /// 查询批次使用的句柄。默认与目录句柄相同；需要独占执行连接的引擎另给。
+    /// 关系型用户业务会话使用的句柄：SQL 查询、网格读取/写入与结构业务页面都从这里取得。
+    /// 默认与目录句柄相同；需要业务/元数据分离的引擎返回自己的业务句柄（MySQL 执行池、
+    /// PG/SQL Server 的业务连接、SQLite 的读写池），元数据连接只由 [`Session::catalog`] 返回。
     async fn query(&self, foreign_keys: Option<bool>) -> Result<CatalogSession, String> {
         Ok(self.catalog(foreign_keys))
-    }
-
-    /// 已认证的共享连接池：独立执行连接受限（max_user_connections、代理并发、跳板机通道）时回退复用。
-    fn shared_pool(&self) -> Option<mysql_async::Pool> {
-        None
     }
 
     /// 本地文件会话：没有“断线”可言，免探活。

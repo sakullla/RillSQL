@@ -44,9 +44,11 @@ pub(crate) fn to_hex(bytes: Vec<u8>) -> String {
 impl CatalogSession {
     /// 接成整批执行的句柄：按引擎切库或拒绝跨库、下发会话级超时 `setup`。
     /// 返回句柄，以及超时设置是否真的生效（整批结束要复位）。
+    ///
+    /// 关系型用户查询固定使用业务会话。不再回退复用 MySQL 元数据池：事务归属不能随资源情况改变，
+    /// 专用业务连接建立失败时明确失败（ADR-1）。
     pub async fn attach_query(
         self,
-        mysql_fallback: Option<mysql_async::Pool>,
         engine: &str,
         database: &str,
         transport: &CancelTransport,
@@ -85,7 +87,8 @@ impl CatalogSession {
                 _ => Attached::Sqlite(pool),
             },
             Self::Mysql(pool) => {
-                let mut conn = mysql::exec::acquire_mysql_conn(&pool, mysql_fallback.as_ref())
+                // 回退池已移除（用户查询不回退元数据会话）；这里固定只借业务执行池。
+                let mut conn = mysql::exec::acquire_mysql_conn(&pool, None)
                     .await
                     .map_err(|err| attach_failure(transport, err))?;
                 conn.reset_connection(false);
@@ -167,7 +170,7 @@ impl Attached {
         }
     }
 
-    /// 整批结束后执行复位语句（会话级超时），避免泄漏到共享的目录连接。
+    /// 整批结束后执行复位语句（会话级超时），避免泄漏到这一批之外的业务会话。
     pub async fn reset(&mut self, statements: &[String]) -> Result<(), String> {
         match self {
             Self::Mysql(conn) => mysql::exec::run_mysql_statements(conn, statements).await,

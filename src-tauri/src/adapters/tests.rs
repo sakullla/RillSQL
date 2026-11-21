@@ -51,8 +51,10 @@ fn every_engine_has_a_consistent_adapter() {
         assert_eq!(caps.error_rules_group, adapter.errors().is_some(), "{engine:?} ErrorRules 声明与提供不一致");
         assert_eq!(caps.connector_group, adapter.connector().is_some(), "{engine:?} Connector 声明与提供不一致");
         assert_eq!(caps.transfer_group, adapter.transfer().is_some(), "{engine:?} TransferDialect 声明与提供不一致");
+        assert_eq!(caps.transaction_group, adapter.transaction().is_some(), "{engine:?} TransactionDialect 声明与提供不一致");
         // 关系型引擎有对比/导出方言与冲突识别；专项引擎没有。
         assert_eq!(caps.relational, caps.transfer_group, "{engine:?} 关系面与对比/导出组应一致");
+        assert_eq!(caps.relational, caps.transaction_group, "{engine:?} 关系面与事务方言组应一致");
         assert_eq!(caps.relational, caps.error_rules_group, "{engine:?} 关系面与错误规则组应一致");
 
         // 关系型引擎一定有 SQL 语法，并使用关系型工作台；非关系型反之。

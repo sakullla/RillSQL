@@ -13,6 +13,7 @@ mod functions;
 pub(crate) mod grid_read;
 mod plan;
 pub(in crate::adapters) mod syntax;
+pub(crate) mod transaction;
 pub(in crate::adapters) mod transfer;
 pub(in crate::adapters) mod types;
 
@@ -118,6 +119,10 @@ impl EngineAdapter for MysqlAdapter {
     fn transfer(&self) -> Option<&'static dyn TransferDialect> {
         Some(&transfer::MYSQL_TRANSFER)
     }
+
+    fn transaction(&self) -> Option<&'static dyn crate::transaction::TransactionDialect> {
+        Some(&transaction::MYSQL_TRANSACTION)
+    }
 }
 
 /// MySQL 家族共用的能力声明：按库分的对象树，先读库名、对象按分组分页。
@@ -131,6 +136,7 @@ pub(in crate::adapters) fn family_capabilities() -> Capabilities {
         ddl_group: true,
         error_rules_group: true,
         transfer_group: true,
+        transaction_group: true,
         shows_databases: true,
         outline_navigation: true,
         ..Capabilities::default()

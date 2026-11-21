@@ -14,6 +14,7 @@ pub(crate) mod grid_read;
 mod plan;
 pub(crate) mod file_page;
 mod syntax;
+pub(crate) mod transaction;
 pub(in crate::adapters) mod transfer;
 mod types;
 
@@ -105,6 +106,7 @@ impl EngineAdapter for SqliteAdapter {
             ddl_group: true,
             error_rules_group: true,
             transfer_group: true,
+            transaction_group: true,
             shows_foreign_keys: true,
             ..Capabilities::default()
         }
@@ -136,5 +138,9 @@ impl EngineAdapter for SqliteAdapter {
 
     fn transfer(&self) -> Option<&'static dyn TransferDialect> {
         Some(&transfer::SqliteTransfer)
+    }
+
+    fn transaction(&self) -> Option<&'static dyn crate::transaction::TransactionDialect> {
+        Some(&transaction::SQLITE_TRANSACTION)
     }
 }

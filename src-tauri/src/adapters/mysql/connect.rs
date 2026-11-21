@@ -213,10 +213,6 @@ impl Session for MysqlSession {
         Ok(CatalogSession::Mysql(self.exec.clone()))
     }
 
-    fn shared_pool(&self) -> Option<Pool> {
-        Some(self.meta.clone())
-    }
-
     async fn ping(&self) -> Result<(), String> {
         let mut conn = self.meta.get_conn().await.map_err(|err| crate::error_text::chain(&err))?;
         conn.ping().await.map_err(|err| crate::error_text::chain(&err))

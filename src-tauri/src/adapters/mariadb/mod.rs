@@ -103,4 +103,8 @@ impl EngineAdapter for MariadbAdapter {
     fn transfer(&self) -> Option<&'static dyn TransferDialect> {
         Some(&mysql::transfer::MARIADB_TRANSFER)
     }
+
+    fn transaction(&self) -> Option<&'static dyn crate::transaction::TransactionDialect> {
+        Some(&mysql::transaction::MYSQL_TRANSACTION)
+    }
 }

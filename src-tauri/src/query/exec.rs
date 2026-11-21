@@ -581,24 +581,13 @@ pub(crate) fn attach_failure(transport: &CancelTransport, message: String) -> St
 impl LiveDriver {
     /// 整批只借出池里已有的那条连接。MySQL / MariaDB 归还时不发 COM_RESET_CONNECTION。
     pub async fn attach(session: CatalogSession, engine: &str, database: &str, transport: CancelTransport, timeout_ms: Option<u64>) -> Result<Self, String> {
-        Self::attach_with_fallback(session, None, engine, database, transport, timeout_ms).await
-    }
-
-    pub async fn attach_with_fallback(
-        session: CatalogSession,
-        mysql_fallback: Option<mysql_async::Pool>,
-        engine: &str,
-        database: &str,
-        transport: CancelTransport,
-        timeout_ms: Option<u64>,
-    ) -> Result<Self, String> {
         // 从借连接和会话初始化开始保护探活；高延迟握手也属于正在执行。
         let busy = transport.health().map(|health| {
             health.note_busy();
             BusyGuard(Arc::clone(health))
         });
         let setup = timeout_statements(engine, timeout_ms);
-        let (attached, timeout_applied) = session.attach_query(mysql_fallback, engine, database, &transport, &setup).await?;
+        let (attached, timeout_applied) = session.attach_query(engine, database, &transport, &setup).await?;
         Ok(Self {
             session: tokio::sync::Mutex::new(attached),
             transport,
