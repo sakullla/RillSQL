@@ -14316,3 +14316,99 @@ fn query_mod_s_saves_in_place_and_f6_routes_to_query_pane(cx: &mut gpui_kit::Tes
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R8：表结构 DDL 预览弹窗由外壳全窗口遮罩托管，覆盖顶栏/侧栏/标签栏，同步 `ShellOverlayOpen`，
+/// 且遮罩外点只取消预览、不误触背景外壳。
+#[gpui_kit::test]
+fn structure_preview_uses_full_window_shell_scrim_and_sets_overlay_flag(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-struct-overlay-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1100., 760.);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.page = AppPage::Structure;
+            view.model.tool = WorkTool::Structure;
+            view.structure.update(cx, |pane, cx| {
+                let target = crate::app::views::grid::GridTarget {
+                    connection_id: "c1".into(),
+                    connection_name: "local".into(),
+                    engine: "postgres".into(),
+                    database: "app".into(),
+                    schema: "public".into(),
+                    table: "orders".into(),
+                    environment: "local".into(),
+                };
+                pane.bind(target);
+                let mut snapshot = crate::ddl::Snapshot::bare(crate::ddl::DdlEngine::Postgres, "app", "public", "orders");
+                snapshot.kind = "table".into();
+                snapshot.columns = vec![
+                    crate::ddl::Column {
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        nullable: false,
+                        default_sql: None,
+                        default_constraint: None,
+                        primary: true,
+                        auto: true,
+                        generated: false,
+                    },
+                    crate::ddl::Column {
+                        name: "title".into(),
+                        type_name: "text".into(),
+                        nullable: true,
+                        default_sql: None,
+                        default_constraint: None,
+                        primary: false,
+                        auto: false,
+                        generated: false,
+                    },
+                ];
+                pane.session.kept_columns = vec![
+                    crate::ddl::ColumnDraft {
+                        original: Some("id".into()),
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        nullable: false,
+                        default: crate::ddl::DefaultSpec::None,
+                        comment: String::new(),
+                        primary: true,
+                        auto: true,
+                        dropped: false,
+                    },
+                    crate::ddl::ColumnDraft {
+                        original: Some("title".into()),
+                        name: "title_v2".into(),
+                        type_name: "text".into(),
+                        nullable: true,
+                        default: crate::ddl::DefaultSpec::None,
+                        comment: String::new(),
+                        primary: false,
+                        auto: false,
+                        dropped: false,
+                    },
+                ];
+                pane.session.arm_fixture(&snapshot);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        window.render_frame(cx);
+
+        assert!(crate::ui::ShellOverlayOpen::is_covered(window, cx), "预览打开时应同步 ShellOverlayOpen");
+        let scrim = window.try_find("structure-preview-scrim").expect("应渲染全窗口遮罩");
+        let scrim_bounds = scrim.bounds();
+        assert!(f32::from(scrim_bounds.origin.x) <= 1.0 && f32::from(scrim_bounds.origin.y) <= 1.0, "遮罩应从窗口左上角起覆盖顶栏与侧栏: {scrim_bounds:?}");
+        assert!(f32::from(scrim_bounds.size.width) >= 1099.0 && f32::from(scrim_bounds.size.height) >= 759.0, "遮罩应覆盖整个窗口尺寸: {scrim_bounds:?}");
+
+        // Esc 通过外壳关闭预览并清除 ShellOverlayOpen。
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).structure.read(cx).preview_open(), "Esc 应关闭预览弹窗");
+        assert!(!crate::ui::ShellOverlayOpen::is_covered(window, cx), "关闭预览后 ShellOverlayOpen 应复位");
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

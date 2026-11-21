@@ -336,6 +336,13 @@ impl Workbench {
             covered = true;
             root = root.child(self.password_layer(window, cx));
         }
+        if self.model.shell.page == AppPage::Structure && self.model.tool == WorkTool::Structure {
+            let overlay = self.structure.update(cx, |pane, cx| pane.render_shell_overlay(window, cx));
+            if let Some(overlay) = overlay {
+                covered = true;
+                root = root.child(overlay);
+            }
+        }
         crate::ui::ShellOverlayOpen::set(window, covered, cx);
         root.into_any_element()
     }
@@ -449,6 +456,7 @@ impl Workbench {
                     closed
                 })
             {
+                self.restore_focus(window, cx);
                 return;
             }
             // 查询结果全屏时 Esc 退出全屏（正在原位编辑单元格时 Esc 仍归那一格）。
@@ -489,7 +497,10 @@ impl Workbench {
             || self.model.shell.help_open
             || self.model.danger.is_some()
             || self.model.password_prompt.is_some()
-            || self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only);
+            || self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only)
+            || (self.model.shell.page == AppPage::Structure
+                && self.model.tool == WorkTool::Structure
+                && self.structure.read(cx).has_modal_overlay());
         if self.model.menu.is_none()
             && self.model.close_prompt.is_none()
             && !self.model.shell.palette_open

@@ -11,14 +11,14 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, ScrollStrategy,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollStrategy,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
-use super::{ColumnChange, FieldWidths, MenuEntry, RowAction, StructurePane, row_menu};
+use super::{ColumnChange, FieldWidths, MenuEntry, RowAction, Section, StructureMode, StructurePane, create, row_menu};
 use crate::ddl::{ColumnDraft, IndexColumnDraft};
 use crate::i18n;
-use crate::ui::kit::{self, ControlSize, IconSize, Palette, Radius, Space, Tip as _, TypeScale};
+use crate::ui::kit::{self, ControlSize, IconSize, Palette, Radius, ScrollAreaExt as _, Space, Tip as _, TypeScale};
 use crate::ui::picker::{Picker, PickerEvent, PickerItem, PickerMode};
 
 /// 浏览态字段表的可见列与列宽。
@@ -69,6 +69,21 @@ impl BrowseColumns {
         let all = Self::of(content_w, false);
         !(all.default && all.comment)
     }
+
+    /// 所有可见列加上间隙与左右内边距所需的最小宽度（用于“显示全部列”时触发横向滚动，避免裁切右侧操作按钮）。
+    pub fn min_total(&self) -> f32 {
+        let mut total = self.widths.name_min + self.widths.kind + self.widths.nullable + self.widths.drop;
+        let mut cols = 4usize;
+        if self.default {
+            total += self.widths.default;
+            cols += 1;
+        }
+        if self.comment {
+            total += self.widths.comment;
+            cols += 1;
+        }
+        total + (cols.saturating_sub(1) as f32) * FieldWidths::GAP + FieldWidths::PAD_LEFT + FieldWidths::PAD_RIGHT
+    }
 }
 
 impl StructurePane {
@@ -77,9 +92,34 @@ impl StructurePane {
         self.editing_row
     }
 
+    /// 已有表字段列表中当前键盘选中的行（`kept_columns` 下标）。
+    pub fn focused_row(&self) -> Option<usize> {
+        self.focused_row
+    }
+
+    /// 选中某一行用于键盘浏览（Up/Down/Enter/F2/Delete）。
+    pub fn focus_row(&mut self, index: Option<usize>) {
+        self.focused_row = index.filter(|i| *i < self.session.kept_columns.len());
+    }
+
+    /// 当前筛选条件下可见的字段行下标列表（与虚拟列表渲染顺序一致）。
+    pub(super) fn visible_column_indices(&self) -> Vec<usize> {
+        self.session
+            .kept_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| self.column_matches_filter(column, self.column_change(column)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// 点击或双击某一行：这一行换成输入控件，焦点落在字段名上。点其他行即切换，草稿都保留。
     pub fn begin_edit_row(&mut self, index: usize) {
-        if index >= self.session.kept_columns.len() || self.editing_row == Some(index) {
+        if index >= self.session.kept_columns.len() {
+            return;
+        }
+        self.focused_row = Some(index);
+        if self.editing_row == Some(index) {
             return;
         }
         self.editing_row = Some(index);
@@ -88,16 +128,89 @@ impl StructurePane {
 
     /// 退出编辑（Esc）：只换回文本显示，草稿不动。
     pub fn end_edit_row(&mut self) -> bool {
-        self.editing_row.take().is_some()
+        if let Some(row) = self.editing_row.take() {
+            self.focused_row = Some(row);
+            return true;
+        }
+        false
     }
 
-    /// 删除一条未落库的新增行后，编辑行下标跟着前移。
+    /// 删除一条未落库的新增行后，编辑行与选中行下标跟着前移。
     pub(super) fn forget_row(&mut self, removed: usize) {
         self.editing_row = match self.editing_row {
             Some(row) if row == removed => None,
             Some(row) if row > removed => Some(row - 1),
             other => other,
         };
+        let len = self.session.kept_columns.len();
+        self.focused_row = match self.focused_row {
+            Some(row) if row == removed => (len > 0).then(|| removed.min(len - 1)),
+            Some(row) if row > removed => Some(row - 1),
+            other => other.filter(|row| *row < len),
+        };
+    }
+
+    /// 已有表字段列表的键盘流：Up/Down 选行、Enter/F2 进入编辑、Delete 标记/撤销删除。
+    pub(super) fn handle_browse_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.session.mode != StructureMode::Existing
+            || self.session.section != Section::Columns
+            || self.session.object_kind == "view"
+            || self.session.preview_open()
+            || self.template_manager.is_some()
+            || self.editing_row.is_some()
+        {
+            return false;
+        }
+        if self.fields.is_focused("column_filter", window, cx) {
+            return false;
+        }
+        let mods = &event.keystroke.modifiers;
+        if mods.control || mods.platform || mods.alt {
+            return false;
+        }
+        let visible = self.visible_column_indices();
+        if visible.is_empty() {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "up" => {
+                let next = match self.focused_row.and_then(|row| visible.iter().position(|&idx| idx == row)) {
+                    Some(pos) => visible[pos.saturating_sub(1)],
+                    None => visible[0],
+                };
+                self.focused_row = Some(next);
+                self.scroll_to_column = Some(next);
+                true
+            }
+            "down" => {
+                let next = match self.focused_row.and_then(|row| visible.iter().position(|&idx| idx == row)) {
+                    Some(pos) => visible[(pos + 1).min(visible.len() - 1)],
+                    None => visible[0],
+                };
+                self.focused_row = Some(next);
+                self.scroll_to_column = Some(next);
+                true
+            }
+            "enter" | "f2" => {
+                let Some(row) = self.focused_row.filter(|row| visible.contains(row)) else {
+                    return false;
+                };
+                self.begin_edit_row(row);
+                self.scroll_to_column = Some(row);
+                true
+            }
+            "delete" => {
+                let Some(row) = self.focused_row.filter(|row| visible.contains(row)) else {
+                    return false;
+                };
+                let generated = self.session.kept_columns.get(row).is_some_and(|col| self.original_flags(col, false).1);
+                if !generated {
+                    self.toggle_column(row, "drop");
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 字段行的右键菜单项：复制名称、还原、新增字段、删除（或撤销删除）。
@@ -163,7 +276,14 @@ impl StructurePane {
     }
 
     /// 已有表的字段列表：表头 + 虚拟列表 + 末尾“添加字段”。只有可见行进入元素树。
-    pub(super) fn column_browser(&mut self, visible: Vec<usize>, cols: BrowseColumns, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn column_browser(
+        &mut self,
+        visible: Vec<usize>,
+        cols: BrowseColumns,
+        show_presets_in_footer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let _ = window;
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
@@ -201,6 +321,7 @@ impl StructurePane {
 
         // 每帧只算一次：行问题、索引成员，交给虚拟列表的行回调按下标取。
         let issues: HashMap<usize, String> = self.draft_issues().into_iter().filter_map(|issue| issue.row.map(|row| (row, issue.text))).collect();
+        let editing_issue = self.editing_row.and_then(|row| issues.get(&row).cloned());
         let count = visible.len();
         let list = gpui_kit::uniform_list(
             "structure-columns-list",
@@ -222,12 +343,35 @@ impl StructurePane {
             .min_h(px(metrics.row_h))
             .child(list)
             .child(kit::scrollbar_overlay("structure-columns-bar", &self.columns_scroll, kit::ScrollbarAxis::Vertical));
+        let table_area: AnyElement = if self.show_all_columns {
+            div()
+                .id("structure-columns-hscroll")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .scroll_area_x()
+                .child(
+                    div()
+                        .min_w(px(cols.min_total()))
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(head)
+                        .child(body),
+                )
+                .into_any_element()
+        } else {
+            div().flex_1().min_h_0().flex().flex_col().child(head).child(body).into_any_element()
+        };
         let add_entity = entity.clone();
+        let footer_presets = show_presets_in_footer.then(|| self.templates_button(&entity));
         let add = div()
             .id("structure-add-column-row")
             .flex()
             .flex_none()
             .items_center()
+            .gap(px(Space::XS))
             .h(px(metrics.row_h + Space::XS))
             .px(px(Space::SM))
             .border_t_1()
@@ -238,8 +382,27 @@ impl StructurePane {
                     pane.add_column();
                     cx.notify();
                 });
-            }));
-        kit::card(&p).overflow_hidden().flex().flex_col().flex_1().min_h_0().child(head).child(body).child(add).into_any_element()
+            }))
+            .children(footer_presets);
+        kit::card(&p)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(table_area)
+            .when_some(editing_issue, |this, text| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(p.line_soft)
+                        .bg(p.danger_soft.opacity(0.35))
+                        .child(create::issue_line("structure-editing-row-issue", &text, &p)),
+                )
+            })
+            .child(add)
+            .into_any_element()
     }
 
     fn column_list_row(&mut self, index: usize, cols: BrowseColumns, issue: Option<&str>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -256,7 +419,7 @@ impl StructurePane {
             if !cols.comment {
                 widths.comment = 0.;
             }
-            return self.column_row(index, &column, change, false, &engine, row_h, widths, &p, &entity, window, cx);
+            return self.column_row(index, &column, change, false, &engine, row_h, widths, issue, &p, &entity, window, cx);
         }
         self.browse_row(index, &column, change, cols, issue, &p, &entity, cx)
     }
@@ -380,12 +543,14 @@ impl StructurePane {
             })
             .xsmall()
         });
+        let is_focused = self.focused_row == Some(index);
         let edit_owner = entity.clone();
         div()
             .id(SharedString::from(format!("structure-row-columns-{index}")))
             .test_support()
             .role(gpui_kit::Role::Row)
             .aria_label(SharedString::from(column.name.clone()))
+            .aria_selected(is_focused)
             .flex()
             .items_center()
             .gap(px(FieldWidths::GAP))
@@ -398,6 +563,7 @@ impl StructurePane {
             .cursor_pointer()
             .text_size(px(TypeScale::SM))
             .when_some(tint, |this, tint| this.bg(tint))
+            .when(is_focused, |this| this.bg(p.selection))
             .hover(|style| style.bg(p.hover))
             .on_click(move |_, _, cx| {
                 edit_owner.update(cx, |pane, cx| {
@@ -406,7 +572,9 @@ impl StructurePane {
                 });
             })
             .context_menu(move |menu, _, _| row_menu(&menu_owner, &menu_entries, menu))
-            .when_some(bar, |this, color| this.child(div().absolute().left_0().top_0().bottom_0().w(px(Space::XXS + 1.)).bg(color)))
+            .when_some(bar.or_else(|| is_focused.then_some(p.accent)), |this, color| {
+                this.child(div().absolute().left_0().top_0().bottom_0().w(px(Space::XXS + 1.)).bg(color))
+            })
             .child(
                 div()
                     .flex_1()

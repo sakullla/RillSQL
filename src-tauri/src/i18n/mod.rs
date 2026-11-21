@@ -2019,7 +2019,7 @@ dict! {
     "structure.field.pkNullLocked" => "主键列必须非空，不能改为可空", "Primary key columns must be NOT NULL";
     "structure.field.pkTypeLocked" => "主键列的类型不能在此修改", "Primary key column types can't be changed here";
     "structure.columns.showAll" => "显示全部列", "Show all columns";
-    "structure.columns.browseHint" => "字段只读浏览。点击某一行进入编辑，改动后可预览 SQL。", "Browsing columns. Click a row to edit it; preview SQL appears once something changes.";
+    "structure.columns.browseHint" => "字段只读浏览。点击或方向键选行后按 Enter / F2 编辑，Delete 标记删除，改动后可预览 SQL。", "Browsing columns. Click or select a row and press Enter / F2 to edit, Delete to mark for removal; preview SQL appears once something changes.";
     "structure.field.badgeGen" => "生成", "GEN";
     "structure.field.badgeFk" => "外键 → {target}", "FK → {target}";
     "structure.field.changedFrom" => "原定义：{detail}", "Original: {detail}";

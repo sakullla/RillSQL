@@ -274,6 +274,7 @@ impl Workbench {
         let struct_nav_owner = cx.entity().downgrade();
         let structure = cx.new(|_| {
             let mut pane = StructurePane::new(Arc::clone(&services));
+            pane.set_shell_overlay_host(true);
             pane.set_data_sink(Arc::new(move |cx: &mut App| {
                 if let Some(owner) = data_owner.upgrade() {
                     owner.update(cx, |view, cx| view.perform("switch-to-data", cx));

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -782,11 +783,21 @@ pub struct StructurePane {
     index_picker: Option<(Entity<Picker>, Subscription)>,
     /// 字段页（已有表）正在编辑的那一行（`kept_columns` 下标）。其余行以文本浏览。
     editing_row: Option<usize>,
+    /// 字段页（已有表）键盘选中的行（`kept_columns` 下标），用于 Up/Down/Enter/F2/Delete。
+    focused_row: Option<usize>,
     /// 下一帧把字段列表滚到这一行（`kept_columns` 下标）。
     scroll_to_column: Option<usize>,
     /// 窄窗口里被按优先级隐藏的列（注释、默认值）强制显示。
     show_all_columns: bool,
     columns_scroll: UniformListScrollHandle,
+    /// DDL 预览弹窗的焦点句柄与焦点陷阱载体。
+    preview_focus: Option<FocusHandle>,
+    /// 预览弹窗打开后是否已执行过首次自动聚焦（避免每帧抢夺输入框焦点）。
+    preview_focused: bool,
+    /// 下一帧将焦点还给 StructurePane 根节点（如退出编辑或关闭弹窗后）。
+    pending_focus_pane: bool,
+    /// 由外壳 Workbench 托管全窗口遮罩与浮层（独立渲染测试时保持 false）。
+    shell_overlay_host: bool,
 }
 
 impl StructurePane {
@@ -840,9 +851,14 @@ impl StructurePane {
             index_naming: IndexNaming::default(),
             index_picker: None,
             editing_row: None,
+            focused_row: None,
             scroll_to_column: None,
             show_all_columns: false,
             columns_scroll: UniformListScrollHandle::new(),
+            preview_focus: None,
+            preview_focused: false,
+            pending_focus_pane: false,
+            shell_overlay_host: false,
         }
     }
 
@@ -853,6 +869,38 @@ impl StructurePane {
     /// 结构页根焦点句柄，供外壳在关闭浮层后把键盘焦点还原回表结构视图。
     pub fn focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
         self.focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
+    /// 预览弹窗焦点句柄（焦点陷阱与非生产回车确认载体）。
+    pub fn preview_focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.preview_focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
+    /// 声明外壳将负责渲染全窗口遮罩层（覆盖顶栏/侧栏/标签栏并同步 `ShellOverlayOpen`）。
+    pub fn set_shell_overlay_host(&mut self, hosted: bool) {
+        self.shell_overlay_host = hosted;
+    }
+
+    /// 预览弹窗或模板管理弹窗是否处于打开状态。
+    pub fn has_modal_overlay(&self) -> bool {
+        self.session.preview_open() || self.template_manager.is_some()
+    }
+
+    /// DDL 预览弹窗是否打开。
+    pub fn preview_open(&self) -> bool {
+        self.session.preview_open()
+    }
+
+    /// 供外壳在根容器顶层渲染全窗口遮罩与结构模态（预览弹窗或模板管理弹窗）。
+    pub fn render_shell_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
+        let section = self.session.section;
+        let entity = cx.entity();
+        if let Some(preview) = self.render_preview_dialog(&entity, &p, metrics, section, window, cx) {
+            return Some(preview);
+        }
+        self.render_template_manager(&entity, &p, metrics, window, cx)
     }
 
     /// 设置页改了索引命名模板：自动命名中的索引名立即按新模板重算，手动名称不动。
@@ -1021,8 +1069,10 @@ impl StructurePane {
         self.pending_focus_draft = None;
         self.index_picker = None;
         self.editing_row = None;
+        self.focused_row = None;
         self.scroll_to_column = None;
         self.show_all_columns = false;
+        self.preview_focused = false;
         if target.table.is_empty() && !target.connection_id.is_empty() {
             self.enter_create();
         }
@@ -1319,6 +1369,7 @@ impl StructurePane {
             self.drafts_ready = true;
             self.session.kept_columns = column_drafts(snapshot);
             self.editing_row = None;
+            self.focused_row = None;
             if self.session.view_sql.is_empty() {
                 self.session.view_sql = snapshot.table_sql.clone();
             }
@@ -1585,6 +1636,7 @@ impl StructurePane {
         if self.session.mode != StructureMode::Create {
             // 已有表：新增的这一行直接进入编辑，并滚到可见处。
             self.editing_row = Some(new_index);
+            self.focused_row = Some(new_index);
             self.scroll_to_column = Some(new_index);
         }
         self.pending_focus_draft = Some(10_000 + new_index as u32);
@@ -1633,6 +1685,7 @@ impl StructurePane {
             self.session.view_sql = snapshot.table_sql.clone();
         }
         self.editing_row = None;
+        self.focused_row = None;
     }
 
     fn sync_auto_index_name(&mut self) {
@@ -2399,6 +2452,11 @@ impl StructurePane {
         self.session.mode == StructureMode::Create && self.session.section == Section::Columns && !self.draft_issues().is_empty()
     }
 
+    /// 新建表或已有表字段草稿存在阻塞性校验错误时，禁用“预览 SQL”。
+    pub fn preview_blocked(&self) -> bool {
+        self.session.section == Section::Columns && !self.draft_issues().is_empty()
+    }
+
     fn changes_breakdown_text(&self, locale: Locale) -> (usize, String) {
         if self.session.mode == StructureMode::Create {
             return (0, String::new());
@@ -2497,7 +2555,7 @@ impl StructurePane {
         } else {
             kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click)
                 .loading(self.previewing)
-                .disabled(self.create_blocked())
+                .disabled(self.preview_blocked())
                 .tooltip(tip)
                 .into_any_element()
         };
@@ -2958,10 +3016,22 @@ impl StructurePane {
             self.composer_open = false;
             return true;
         }
-        if self.end_edit_row() {
+        self.end_edit_row()
+    }
+
+    pub fn preview_enter(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.session.preview_open() || self.executing {
+            return false;
+        }
+        // 生产环境禁止回车执行，避免误触；吞掉按键不向底层透传。
+        if self.session.production() {
             return true;
         }
-        false
+        if self.session.confirm_blocked() || self.session.preview_sql().join("\n").trim().is_empty() {
+            return true;
+        }
+        self.confirm(cx);
+        true
     }
 
     pub fn trigger_preview_shortcut(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2974,8 +3044,8 @@ impl StructurePane {
 
     fn preview_current(&mut self, cx: &mut Context<Self>) {
         self.session.intent = EditIntent::Apply;
-        if self.create_blocked() {
-            // 新建表草稿有就近标出的问题：不发起预览，也就不能执行。
+        if self.preview_blocked() {
+            // 新建表或已有表字段草稿有就近标出的问题：不发起预览，也就不能执行。
             self.session.note = Note::Key("structure.diag.fixFirst");
             cx.notify();
             return;
@@ -3104,6 +3174,7 @@ impl StructurePane {
         let browse_cols = browse::BrowseColumns::of(content_w, self.show_all_columns);
         let hides_columns = !create && (self.show_all_columns || browse::BrowseColumns::hides_any(content_w));
 
+        let mut toolbar_has_presets = false;
         let issues = self.draft_issues();
         if create {
             let name_placeholder = i18n::text(locale, "structure.create.tableNamePlaceholder");
@@ -3161,6 +3232,7 @@ impl StructurePane {
                 |this: &mut Self, field, value, _| this.set_field(field, value),
             );
             let show_toolbar = total_cols >= 5 || !filter_val.is_empty() || self.only_changed_columns || pending > 0 || hides_columns;
+            toolbar_has_presets = show_toolbar && content_w >= 560.;
             if show_toolbar {
                 let clear_entity = entity.clone();
                 let changed_entity = entity.clone();
@@ -3283,7 +3355,7 @@ impl StructurePane {
                     )))
                     .into_any_element();
             }
-            let browser = self.column_browser(visible, browse_cols, window, cx);
+            let browser = self.column_browser(visible, browse_cols, !toolbar_has_presets, window, cx);
             return editor.flex_1().min_h_0().child(browser).into_any_element();
         }
 
@@ -3348,7 +3420,7 @@ impl StructurePane {
         let mut rows = div().flex().flex_col();
         for (index, column, change) in &visible_indices {
             rows = rows.child(stack_frame(|| {
-                self.column_row(*index, column, *change, create, &engine, row_h, widths, &p, &entity, window, cx)
+                self.column_row(*index, column, *change, create, &engine, row_h, widths, None, &p, &entity, window, cx)
             }));
             if let Some(issue) = self.row_issue(&issues, *index, &p) {
                 rows = rows.child(issue);
@@ -3412,6 +3484,7 @@ impl StructurePane {
         engine: &str,
         row_h: f32,
         widths: FieldWidths,
+        issue: Option<&str>,
         p: &Palette,
         entity: &Entity<StructurePane>,
         window: &mut Window,
@@ -3454,7 +3527,7 @@ impl StructurePane {
         });
 
         let name = self.draft_input_enter(10_000 + index as u32, &column.name, "name", window, cx);
-        let kind = self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
+        let kind = self.draft_input_enter(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
         // 已有字段的注释本轮只读（修改注释不在需求内）：编辑行里仍以文本显示，悬停看全文。
         let comment_input = (widths.comment > 0.).then(|| {
             if create {
@@ -3584,7 +3657,9 @@ impl StructurePane {
 
         let row_menu_entries = self.column_menu_entries(index, column, change, create);
 
-        let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if column.primary {
+        let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if let Some(issue) = issue {
+            Some((IconName::TriangleAlert, p.danger, issue.to_owned()))
+        } else if column.primary {
             let mut tip = i18n::text(locale, "structure.field.primary");
             if orig_auto || (create && column.auto) {
                 tip = format!("{tip} · {}", i18n::text(locale, "structure.field.auto"));
@@ -3654,6 +3729,7 @@ impl StructurePane {
                                 this.child(
                                     div()
                                         .id(SharedString::from(format!("structure-col-mark-{index}")))
+                                        .test_support()
                                         .tooltip_text(SharedString::from(tip))
                                         .child(kit::icon(ic, 12., color)),
                                 )
@@ -4479,11 +4555,19 @@ impl Render for StructurePane {
                 }
             }
         }
+        if std::mem::take(&mut self.pending_focus_pane) {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
         let section = self.session.section;
         let entity = cx.entity();
-        let preview = self.render_preview_dialog(&entity, &p, metrics, section, window, cx);
+        let preview = if self.shell_overlay_host {
+            None
+        } else {
+            self.render_preview_dialog(&entity, &p, metrics, section, window, cx)
+        };
         self.render_page(form, preview, window, cx)
     }
 }
@@ -4508,7 +4592,15 @@ impl StructurePane {
             (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len())
         });
         let pending_cols = self.pending_changes();
-        let mut tabs = div().id("structure-tabs").role(gpui_kit::Role::TabList).flex().items_end().gap(px(4.));
+        let mut tabs = div()
+            .id("structure-tabs")
+            .test_support()
+            .role(gpui_kit::Role::TabList)
+            .w_full()
+            .overflow_x_scroll()
+            .flex()
+            .items_end()
+            .gap(px(4.));
         for value in self.session.visible_sections() {
             if value == Section::Danger && section != Section::Danger {
                 continue;
@@ -4537,6 +4629,8 @@ impl StructurePane {
                     .role(gpui_kit::Role::Tab)
                     .aria_label(t(key))
                     .aria_selected(selected)
+                    .flex_none()
+                    .whitespace_nowrap()
                     .h(px(metrics.tabs_h))
                     .px(px(10.))
                     .flex()
@@ -4598,6 +4692,9 @@ impl StructurePane {
                 .join(".")
         };
 
+        let effective_w = if self.content_width > 0. { self.content_width } else { f32::from(window.viewport_size().width) };
+        let compact_header = effective_w > 0. && effective_w < 680.;
+
         let more = (self.session.mode != StructureMode::Create && self.session.visible_sections().contains(&Section::Danger)).then(|| {
             let owner = entity.clone();
             let view = self.session.object_kind == "view";
@@ -4605,12 +4702,16 @@ impl StructurePane {
             let target_for_menu = self.session.target.clone();
             let qualified_for_menu = qualified.clone();
             let ddl_for_menu = self.snapshot.as_ref().map(|snap| definition_text(snap).0).unwrap_or_default();
-            Button::new("structure-more")
+            let btn = Button::new("structure-more")
                 .ghost()
                 .small()
-                .icon(IconName::Ellipsis)
-                .label(t("structure.action.more"))
-                .dropdown_menu(move |mut menu, _, cx| {
+                .icon(IconName::Ellipsis);
+            let btn = if compact_header {
+                btn.tooltip(t("structure.action.more"))
+            } else {
+                btn.label(t("structure.action.more"))
+            };
+            btn.dropdown_menu(move |mut menu, _, cx| {
                     let pal = Palette::of(cx);
                     menu = menu.min_w(px(200.));
                     if let (Some(sink), Some(sql)) = (query_sink.clone(), select_sample_sql(&target_for_menu)) {
@@ -4797,12 +4898,32 @@ impl StructurePane {
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
+                if key == "escape" && this.handle_escape() {
+                    let handle = this.focus_handle(cx);
+                    window.focus(&handle, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if key == "enter"
+                    && this.session.preview_open()
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.shift
+                {
+                    if this.preview_enter(cx) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
                 if this.handle_create_key(event, window, cx) {
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
-                if key == "escape" && this.handle_escape() {
+                if this.handle_browse_key(event, window, cx) {
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -4834,16 +4955,24 @@ impl StructurePane {
                             .items_center()
                             .gap(px(10.))
                             .child(kit::engine_badge(&self.session.target.engine, 28.))
-                            .child(div().flex_1().min_w(px(120.)).flex().flex_col().child(title_row).child(banner_row))
+                            .child(div().flex_1().min_w_0().flex().flex_col().child(title_row).child(banner_row))
                             .children(refresh_btn)
                             .when_some(
                                 self.data_sink
                                     .clone()
                                     .filter(|_| self.session.mode != StructureMode::Create && !self.session.target.table.is_empty()),
                                 |this, sink| {
-                                    this.child(kit::secondary_button("structure-open-data", Some(IconName::Table), t("ui.table.switchData"), move |_, _, cx| {
-                                        sink(cx);
-                                    }))
+                                    if compact_header {
+                                        this.child(
+                                            kit::icon_button("structure-open-data", IconName::Table, t("ui.table.switchData"), move |_, _, cx| {
+                                                sink(cx);
+                                            }),
+                                        )
+                                    } else {
+                                        this.child(kit::secondary_button("structure-open-data", Some(IconName::Table), t("ui.table.switchData"), move |_, _, cx| {
+                                            sink(cx);
+                                        }))
+                                    }
                                 },
                             )
                             .children(more),
@@ -4960,8 +5089,10 @@ impl StructurePane {
         if let Some(preview) = preview {
             column = column.child(preview);
         }
-        if let Some(manager) = self.render_template_manager(&entity, &p, metrics, window, cx) {
-            column = column.child(manager);
+        if !self.shell_overlay_host {
+            if let Some(manager) = self.render_template_manager(&entity, &p, metrics, window, cx) {
+                column = column.child(manager);
+            }
         }
         column
     }
@@ -4979,8 +5110,10 @@ impl StructurePane {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.session.preview_open() {
+            self.preview_focused = false;
             return None;
         }
+        let preview_focus = self.preview_focus_handle(cx);
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let dangerous = self.session.preview_dangerous();
@@ -5012,7 +5145,8 @@ impl StructurePane {
         let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
         let cancel_label = t("structure.action.cancel");
         let typed_hint = (section == Section::Danger && self.session.production() && confirm_blocked).then(|| t("structure.danger.typeHint"));
-        let danger_field = if section == Section::Danger && self.session.production() {
+        let prod_danger_input = section == Section::Danger && self.session.production();
+        let danger_field = if prod_danger_input {
             Some(kit::form_row(
                 t("structure.danger.typeName"),
                 self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
@@ -5021,6 +5155,14 @@ impl StructurePane {
         } else {
             None
         };
+        if !self.preview_focused {
+            self.preview_focused = true;
+            if prod_danger_input && self.draft_fields.contains(6) {
+                self.draft_fields.focus(6, window, cx);
+            } else {
+                window.focus(&preview_focus, cx);
+            }
+        }
         let confirm = {
             let entity = entity.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
@@ -5031,6 +5173,7 @@ impl StructurePane {
                 entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 })
@@ -5042,12 +5185,14 @@ impl StructurePane {
                 entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 })
             }
         };
         let scrim_entity = entity.clone();
+        let key_entity = entity.clone();
         let copy_entity = entity.clone();
         let copy_sql_text = sql_raw.clone();
         let copied = self.preview_copied;
@@ -5058,6 +5203,7 @@ impl StructurePane {
 
         let dialog = div()
             .id("structure-preview-scrim")
+            .test_support()
             .absolute()
             .inset_0()
             .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
@@ -5068,6 +5214,7 @@ impl StructurePane {
                 scrim_entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 });
@@ -5079,7 +5226,45 @@ impl StructurePane {
                     .role(gpui_kit::Role::Dialog)
                     .aria_label(preview_title.clone())
                     .occlude()
+                    .track_focus(&preview_focus)
+                    .focus_trap("structure-preview-dialog", &preview_focus)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let key = event.keystroke.key.as_str();
+                        if key == "escape" {
+                            let closed = key_entity.update(cx, |pane, cx| {
+                                if pane.handle_escape() {
+                                    let handle = pane.focus_handle(cx);
+                                    window.focus(&handle, cx);
+                                    cx.notify();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if closed {
+                                cx.stop_propagation();
+                            }
+                            return;
+                        }
+                        if key == "enter"
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.platform
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.shift
+                        {
+                            let handled = key_entity.update(cx, |pane, cx| {
+                                let ok = pane.preview_enter(cx);
+                                if ok {
+                                    cx.notify();
+                                }
+                                ok
+                            });
+                            if handled {
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
                     .w(px(640.))
                     .max_w(relative(0.92))
                     .max_h(relative(0.92))

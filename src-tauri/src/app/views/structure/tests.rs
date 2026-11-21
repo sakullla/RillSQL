@@ -2088,3 +2088,234 @@ fn suggested_index_names_respect_the_dialect_limit() {
     assert!(sqlite.len() > 128, "SQLite 不截断");
     assert_eq!(suggested_index_name(&naming, "postgres", "orders", false, &[]), "");
 }
+
+/// R8：已有表字段列表支持 Up/Down 选行、Enter/F2 进入编辑、回车确认推进，以及 Delete 标记/撤销删除。
+#[gpui_kit::test]
+fn existing_table_keyboard_flow_selects_edits_advances_and_marks_delete(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-keyboard");
+    let (window, pane) = open_pane(cx, 1000., 700., move || pane_with_snapshot(services, 3));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = pane.update(cx, |pane, cx| pane.focus_handle(cx));
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+
+        // Down 选行：None -> 0 -> 1；Up 回到 0。
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(0));
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(1));
+        window.press("up", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(0));
+
+        // F2 进入第 0 行编辑，输入框出现。
+        window.press("f2", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(0));
+        assert!(window.try_find("structure-draft-10000").is_some());
+
+        // 回车确认并推进到下一行（row 1）。
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_000);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(1));
+        assert_eq!(pane.read(cx).focused_row(), Some(1));
+
+        // 推进到末行（row 2），再回车退出编辑并保留末行焦点。
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_001);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(2));
+
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_002);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), None);
+        assert_eq!(pane.read(cx).focused_row(), Some(2));
+
+        // Delete 标记第 2 行删除，再次 Delete 撤销删除。
+        window.press("delete", cx);
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.kept_columns[2].dropped, "Delete 标记删除");
+        window.press("delete", cx);
+        window.render_frame(cx);
+        assert!(!pane.read(cx).session.kept_columns[2].dropped, "再次 Delete 撤销删除");
+
+        // Enter 同样可以进入当前选中行编辑。
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(2));
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R8：已有表编辑态保留就近校验错误提示，且存在阻塞错误时禁用“预览 SQL”按钮。
+#[gpui_kit::test]
+fn existing_table_editing_keeps_inline_issue_and_blocks_preview(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-inline-issue");
+    let (window, pane) = open_pane(cx, 1000., 700., move || pane_with_snapshot(services, 3));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-row-columns-1", cx);
+        window.render_frame(cx);
+        // 把第 1 行改名成与第 0 行重名，触发阻塞错误。
+        pane.update(cx, |pane, cx| {
+            pane.write_draft(10_001, "col_0".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+
+        assert_eq!(pane.read(cx).editing_row(), Some(1));
+        assert!(pane.read(cx).preview_blocked(), "已有表存在校验错误时阻塞预览");
+        assert!(window.try_find("structure-col-mark-1").is_some(), "编辑行保留错误标记");
+        assert!(window.try_find("structure-editing-row-issue").is_some(), "编辑态保留就近校验错误文本");
+
+        // 试图预览会被拦下，不会打开预览弹窗。
+        pane.update(cx, |pane, cx| pane.preview_current(cx));
+        window.render_frame(cx);
+        assert!(!pane.read(cx).session.preview_open());
+
+        // 修正重名后恢复正常，错误提示消失、预览解锁。
+        pane.update(cx, |pane, cx| {
+            pane.write_draft(10_001, "col_1_fixed".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(!pane.read(cx).preview_blocked());
+        assert!(window.try_find("structure-editing-row-issue").is_none());
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R8：DDL 预览弹窗在非生产环境支持 Enter 触发确认；生产环境禁止 Enter 并自动聚焦表名确认框。
+#[gpui_kit::test]
+fn ddl_preview_enter_executes_non_prod_and_prod_auto_focuses_without_enter(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+
+    // 1. 非生产环境：打开预览后自动聚焦弹窗焦点陷阱，按 Enter 触发确认流程（危险操作先进入二段确认武装）。
+    let (services, dir) = offline_services("r8-preview-enter");
+    let (window, pane) = open_pane(cx, 1000., 700., move || {
+        let mut pane = pane_with_snapshot(services, 3);
+        pane.session.target.environment = "local".into();
+        pane.set_prod_target(false);
+        pane.session.section = Section::Danger;
+        pane.session.danger = DangerKind::Drop;
+        let snap = pane.snapshot.clone().unwrap();
+        pane.session.arm_fixture(&snap);
+        pane
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.preview_open());
+        assert!(window.try_find("structure-preview-dialog").is_some(), "预览弹窗应渲染");
+        assert!(!pane.read(cx).session.armed(), "初始尚未进入二段确认");
+
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.armed(), "非生产环境预览弹窗按 Enter 应触发 confirm()");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 2. 生产环境危险操作：打开预览后自动聚焦表名确认框，且按 Enter 禁止执行或武装。
+    let (prod_services, prod_dir) = offline_services("r8-prod-preview");
+    let (prod_window, prod_pane) = open_pane(cx, 1000., 700., move || {
+        let mut pane = pane_with_snapshot(prod_services, 3);
+        pane.session.target.environment = "prod".into();
+        pane.set_prod_target(true);
+        pane.session.section = Section::Danger;
+        pane.session.danger = DangerKind::Drop;
+        let snap = pane.snapshot.clone().unwrap();
+        pane.session.arm_fixture(&snap);
+        pane
+    });
+
+    cx.update_window(prod_window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(prod_pane.read(cx).session.preview_open());
+        assert!(prod_pane.read(cx).draft_fields.is_focused(6, window, cx), "生产危险预览打开后应自动聚焦表名确认输入框");
+
+        // 即使输完表名，按 Enter 也绝不执行或进入二段确认。
+        prod_pane.update(cx, |pane, cx| {
+            pane.write_draft(6, "orders".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(prod_pane.read(cx).session.preview_open(), "生产环境按 Enter 不能执行或关闭预览");
+        assert!(!prod_pane.read(cx).session.armed(), "生产环境按 Enter 不能触发二段武装");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&prod_dir);
+}
+
+/// R8：字段少于 5 个及 640px–900px 窄宽下，字段预设可达、“显示全部列”提供横向滚动、
+/// 子页签与页头紧凑适配不溢出，模板管理弹窗响应式堆叠且字段表可横向滚动。
+#[gpui_kit::test]
+fn small_table_and_narrow_viewport_keep_presets_hscroll_and_stacked_templates(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-narrow");
+    let (window, pane) = open_pane(cx, 640., 640., move || {
+        let mut pane = pane_with_snapshot(services, 3);
+        pane.set_content_width(640.);
+        pane.set_data_sink(Arc::new(|_| {}));
+        pane
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 少于 5 列的小表在底部行仍可直接访问字段预设。
+        assert!(window.try_find("structure-column-presets").is_some(), "小表(<5列)也必须保留字段预设入口");
+        // 页头紧凑按钮与子页签栏均可见且不超出 640px 右边界。
+        let tabs_bounds = window.find("structure-tabs").bounds();
+        let data_bounds = window.find("structure-open-data").bounds();
+        assert!(tabs_bounds.right() <= px(640.5), "子页签栏不能超出窗口右边界: {tabs_bounds:?}");
+        assert!(data_bounds.right() <= px(640.5), "窄屏页头数据按钮不能超出窗口右边界: {data_bounds:?}");
+
+        // 开启“显示全部列”：出现横向滚动容器，右缘按钮不裁切。
+        pane.update(cx, |pane, cx| {
+            pane.show_all_columns = true;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("structure-columns-hscroll").is_some(), "显示全部列时应提供横向滚动容器");
+        let cols = browse::BrowseColumns::of(500., true);
+        assert!(cols.min_total() > 500., "强制显示全部列时最小总宽应保留完整列宽");
+
+        // 打开模板管理弹窗并新建草稿：在 <=900px 下上下堆叠（列表在编辑器上方），字段表带横向滚动容器。
+        pane.update(cx, |pane, cx| {
+            pane.open_template_manager();
+            pane.new_template();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let dialog_bounds = window.find("structure-templates-dialog").bounds();
+        let list_bounds = window.find("structure-templates-list").bounds();
+        let editor_bounds = window.find("structure-template-editor").bounds();
+        assert!(dialog_bounds.right() <= px(640.5), "模板管理弹窗不超出窄屏右边界: {dialog_bounds:?}");
+        assert!(list_bounds.bottom() <= editor_bounds.top() + px(4.), "窄屏(<=900px)下模板列表应堆叠在编辑器上方: list={list_bounds:?}, editor={editor_bounds:?}");
+        assert!(window.try_find("structure-template-columns-hscroll").is_some(), "模板字段表应支持横向滚动");
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
