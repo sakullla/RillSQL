@@ -13896,12 +13896,21 @@ fn the_query_head_shows_the_statement_transaction_effect(cx: &mut gpui_kit::Test
     );
     // 收尾：回滚，避免把活动事务留给后面的用例。
     cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-rollback", cx)));
-    assert!(pump_until(cx, window, &view, |view, _| {
-        view.services
-            .connections
-            .transaction_snapshot("notes")
-            .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Idle)
-    }));
+    let tab = cx.update(|cx| view.read(cx).model.active_tab.clone()).expect("查询标签");
+    assert!(
+        pump_until(cx, window, &view, |view, cx| view.query.read(cx).results_stale(&tab)),
+        "事务结束后查询结果被标记为可能过期"
+    );
+    assert_eq!(
+        cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.state)),
+        Some(crate::transaction::TransactionState::Idle),
+        "回滚结束共享事务"
+    );
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| window.try_find("query-stale-results").is_some()).unwrap(),
+        "查询结果显示可能过期"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -13942,6 +13951,44 @@ fn an_unknown_transaction_blocks_closing_without_an_escape_hatch(cx: &mut gpui_k
         "界面说明为什么不能关闭"
     );
     cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    // 断线/重连把当前快照置为 Idle、旧事务结果保留为未知：共享条仍要显示并给出核对入口，
+    // 关闭也必须继续被拦下，直到使用者独立核对（R10、R11）。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.services
+                .connections
+                .transaction_coordinator("notes")
+                .expect("协调器")
+                .reconnect(crate::transaction::UnknownReason::ConnectionLost);
+        });
+    });
+    assert!(cx.update(|cx| {
+        view.read(cx)
+            .services
+            .connections
+            .transaction_snapshot("notes")
+            .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Idle && snapshot.unresolved.is_some())
+    }));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| window.try_find("tx-resolve:committed").is_some()).unwrap(),
+        "Idle + 旧事务未知仍显示独立核对入口"
+    );
+    let allowed = cx.update(|cx| view.update(cx, |view, cx| view.allow_close(cx)));
+    assert!(!allowed, "旧事务结果未核对的连接不能直接关闭");
+    assert!(cx.update(|cx| view.read(cx).model.transaction_guard.is_none()), "旧未知不打开可绕过对话框");
+    assert_eq!(cx.update(|cx| view.read(cx).model.notice_key), Some("transaction.guard.unknown"));
+
+    // 独立核对关闭旧记录后，事务不再阻止关闭。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("tx-resolve:committed", cx)));
+    assert!(pump_until(cx, window, &view, |view, _| {
+        view.services
+            .connections
+            .transaction_snapshot("notes")
+            .is_some_and(|snapshot| snapshot.unresolved.is_none())
+    }));
+    assert!(cx.update(|cx| view.update(cx, |view, cx| view.allow_close(cx))), "核对后事务不再拦截关闭");
     let _ = std::fs::remove_dir_all(dir);
 }
 

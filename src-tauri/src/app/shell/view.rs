@@ -99,6 +99,8 @@ pub struct Workbench {
     update_timer: Option<gpui_kit::Task<()>>,
     /// 正在执行的一条事务命令；同一时刻只排一条，执行期间控件显示忙碌。
     transaction_task: Option<gpui_kit::Task<()>>,
+    /// 在途事务命令针对的连接：切到别的连接时不把忙碌状态挂到新连接的控件上。
+    transaction_task_connection: Option<String>,
     /// 轮询兜底：每条连接上一次看到的共享事务快照修订；变化时通知各业务页重绘同一状态。
     transaction_revisions: std::collections::BTreeMap<String, u64>,
     /// 状态栏提示的时效：同一句提示显示一段时间后自动退场，不让“已连接”“清空历史？”一直挂着。
@@ -439,6 +441,7 @@ impl Workbench {
             applied_mongo: None,
             services,
             transaction_task: None,
+            transaction_task_connection: None,
             transaction_revisions: std::collections::BTreeMap::new(),
             focus: cx.focus_handle().tab_stop(true),
             nav_focus: cx.focus_handle().tab_stop(true),
@@ -2490,10 +2493,11 @@ impl Workbench {
                     return None;
                 }
                 let snapshot = self.services.connections.transaction_snapshot(&connection_id)?;
-                if snapshot.state == TransactionState::Idle {
+                let unresolved = snapshot.unresolved.is_some();
+                if snapshot.state == TransactionState::Idle && !unresolved {
                     return None;
                 }
-                Some(GuardFact { connection_id, connection_name, engine, database, state: snapshot.state })
+                Some(GuardFact { connection_id, connection_name, engine, database, state: snapshot.state, unresolved })
             })
             .collect()
     }
@@ -2513,9 +2517,11 @@ impl Workbench {
         blocked
     }
 
-    /// 共享事务控件是否正在执行一条命令（与顶部事务条的忙碌状态同源）。
+    /// 共享事务控件是否正在执行一条命令（只对命令所属连接显示忙碌）。
     pub(super) fn transaction_busy(&self) -> bool {
-        self.model.transactions.busy || self.transaction_task.is_some()
+        let active = self.model.transaction_target().map(|target| target.connection_id);
+        let in_flight = self.transaction_task_connection.is_some() && self.transaction_task_connection.as_deref() == active.as_deref();
+        self.model.transactions.busy || in_flight
     }
 
     /// 窗口关闭与“退出”动作：先处理未结束事务，再走原有草稿/暂存守卫。
@@ -2532,6 +2538,7 @@ impl Workbench {
             return;
         }
         let Some(request) = self.model.transaction_request.take() else { return };
+        self.transaction_task_connection = Some(request.target.connection_id.clone());
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         self.transaction_task = Some(cx.spawn(async move |_, cx| {
@@ -2547,6 +2554,7 @@ impl Workbench {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
                     this.transaction_task = None;
+                    this.transaction_task_connection = None;
                     this.finish_transaction(request, result, cx);
                 });
             });
@@ -2555,13 +2563,7 @@ impl Workbench {
 
     /// 一条事务命令的结果：先写控件回执，再由关闭保护或业务页消费。
     fn finish_transaction(&mut self, request: TransactionRequest, result: Result<TransactionEffect, String>, cx: &mut Context<Self>) {
-        match &result {
-            Ok(effect) => {
-                let key = super::transaction::command_effect_key(&request.command, *effect);
-                self.model.transactions.note(*effect, key, String::new());
-            }
-            Err(message) => self.model.transactions.note_error(message.clone()),
-        }
+        self.model.apply_transaction_result(&request.target, &request.command, &result);
         // 事务结束后业务结果与目录代次都要更新；活动事务里的中间结果不需要重读。
         if let Ok(effect) = result {
             self.refresh_after_transaction(&request, effect, cx);
@@ -2604,6 +2606,7 @@ impl Workbench {
             return;
         }
         let connection = request.target.connection_id.clone();
+        self.query.update(cx, |pane, cx| pane.transaction_settled(&connection, cx));
         self.table.update(cx, |pane, cx| pane.transaction_settled(&connection, cx));
         self.structure.update(cx, |pane, cx| {
             pane.transaction_settled(&connection);

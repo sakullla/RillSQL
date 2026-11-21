@@ -2349,8 +2349,12 @@ impl WorkbenchModel {
 
     pub fn dismiss(&mut self) -> Effect {
         // 事务保护层优先：Esc 只取消它，不顺手关掉下面的菜单或标签。
+        // 提交/回滚已经发出时取消不生效：后台结果仍会写回，界面必须继续显示这笔请求。
         if self.transaction_guard.is_some() {
-            self.transaction_guard = None;
+            let in_flight = self.transaction_guard.as_ref().is_some_and(|guard| guard.busy || guard.pending.is_some());
+            if !in_flight {
+                self.transaction_guard = None;
+            }
             return Effect::None;
         }
         // 筛选浮层也归外点/Esc 关闭，不留一个悬着的下拉。
@@ -4892,7 +4896,11 @@ impl WorkbenchModel {
                 true
             }
             transaction::GUARD_CANCEL => {
-                self.transaction_guard = None;
+                // 提交/回滚已经发出：取消不能假装请求没发生，后台结果仍会写回。
+                let in_flight = self.transaction_guard.as_ref().is_some_and(|guard| guard.busy || guard.pending.is_some());
+                if !in_flight {
+                    self.transaction_guard = None;
+                }
                 true
             }
             transaction::GUARD_COMMIT => {
@@ -4915,10 +4923,11 @@ impl WorkbenchModel {
 
     /// 关闭、断开或安装更新前，把活动事务纳入保护。
     ///
-    /// 返回 true 表示流程被拦下：有活动事务就打开逐连接的选择层；存在结果未知的事务时直接中止，
-    /// 要求先独立核对——未知状态不提供“直接离开”的旁路。
+    /// 返回 true 表示流程被拦下：有活动/中止事务就打开逐连接的选择层；存在结果未知的当前事务，
+    /// 或更早事务的结果仍未核对（`state` 可能已是 Idle）时直接中止，要求先独立核对——这两种情况
+    /// 都不提供“直接离开”的旁路（R10、R11）。
     pub fn open_transaction_guard(&mut self, cause: GuardCause, facts: Vec<GuardFact>) -> bool {
-        if let Some(unknown) = facts.iter().find(|fact| fact.state == TransactionState::Unknown) {
+        if let Some(unknown) = facts.iter().find(|fact| fact.state == TransactionState::Unknown || fact.unresolved) {
             self.notice_key = Some("transaction.guard.unknown");
             self.notice_detail = unknown.connection_name.clone();
             self.transaction_guard = None;
@@ -4936,6 +4945,28 @@ impl WorkbenchModel {
 
     pub fn guard_open(&self) -> bool {
         self.transaction_guard.is_some()
+    }
+
+    /// 保护层里已有提交/回滚在途：取消不生效，按钮也必须禁用。
+    pub fn guard_in_flight(&self) -> bool {
+        self.transaction_guard.as_ref().is_some_and(|guard| guard.busy || guard.pending.is_some())
+    }
+
+    /// 一条普通事务命令的可见回执。只在结果属于当前活动业务标签的连接时写入共享控件：
+    /// 执行期间切到别的连接时，旧连接的结果不能挂到新连接的控件上（R5）。
+    pub fn apply_transaction_result(&mut self, target: &TransactionTarget, command: &TransactionCommand, result: &Result<TransactionEffect, String>) {
+        let active = self.transaction_target().map(|target| target.connection_id);
+        if active.as_deref() != Some(target.connection_id.as_str()) {
+            return;
+        }
+        self.transactions.align(&target.connection_id);
+        match result {
+            Ok(effect) => {
+                let key = transaction::command_effect_key(command, *effect);
+                self.transactions.note(*effect, key, String::new());
+            }
+            Err(message) => self.transactions.note_error(message.clone()),
+        }
     }
 
     fn guard_decide(&mut self, decision: GuardDecision) {

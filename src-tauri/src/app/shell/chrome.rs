@@ -1827,8 +1827,14 @@ impl Workbench {
             .border_b_1()
             .border_color(p.line)
             .child(kit::pill(t(transaction::state_key(state)), state_fg, state_bg))
-            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).whitespace_nowrap().child(SharedString::from(owner)))
-            .child(kit::vline(&p));
+            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).whitespace_nowrap().child(SharedString::from(owner)));
+        if snapshot.unresolved.is_some() {
+            // 旧事务的最终结果还没核对：即使当前会话已回到自动提交，也必须一直可见（R10）。
+            let state = transaction::unresolved_state_key(&snapshot).map(|key| i18n::text(locale, key)).unwrap_or_default();
+            let label = i18n::fill(&i18n::text(locale, "transaction.unresolved.state"), &[("state", &state)]);
+            row = row.child(kit::pill(SharedString::from(label), p.warn, p.warn_soft));
+        }
+        row = row.child(kit::vline(&p));
 
         if actions.begin {
             row = row.child(
@@ -1912,7 +1918,12 @@ impl Workbench {
                 format!("{}：{}", self.model.text(key), ui.message_detail.trim())
             };
             row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(text)));
-        } else if let Some(hint) = transaction::state_hint_key(state) {
+        } else if let Some(hint) = snapshot
+            .unresolved
+            .as_ref()
+            .map(|_| transaction::unresolved_hint_key())
+            .or_else(|| transaction::state_hint_key(state))
+        {
             row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t(hint)));
         }
 
@@ -2035,17 +2046,23 @@ impl Workbench {
         let cancel = act(transaction::GUARD_CANCEL, cx);
         let commit = act(transaction::GUARD_COMMIT, cx);
         let rollback = act(transaction::GUARD_ROLLBACK, cx);
-        let mut buttons = div().flex().justify_end().gap(px(Space::MD)).child(kit::secondary_button(transaction::GUARD_CANCEL, None, self.t("transaction.guard.cancel"), cancel));
+        // 提交/回滚已经发出：取消不生效，按钮也必须禁用，避免界面与后台结果不一致。
+        let in_flight = guard.busy || guard.pending.is_some();
+        let mut buttons = div()
+            .flex()
+            .justify_end()
+            .gap(px(Space::MD))
+            .child(kit::secondary_button(transaction::GUARD_CANCEL, None, self.t("transaction.guard.cancel"), cancel).disabled(in_flight));
         if guard.allows(GuardDecision::Rollback) {
             buttons = buttons.child(
                 kit::danger_button(transaction::GUARD_ROLLBACK, Some(IconName::RotateCcw), self.t("transaction.guard.rollback"), rollback)
-                    .disabled(guard.busy),
+                    .disabled(in_flight),
             );
         }
         if guard.allows(GuardDecision::Commit) {
             buttons = buttons.child(
                 kit::primary_button(transaction::GUARD_COMMIT, Some(IconName::Check), self.t("transaction.guard.commit"), commit)
-                    .disabled(guard.busy),
+                    .disabled(in_flight),
             );
         }
         let mut dialog = dialog_card(

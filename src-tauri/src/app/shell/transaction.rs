@@ -15,7 +15,8 @@ use crate::connections::Service;
 use crate::query::exec::LiveDriver;
 use crate::query::transaction::{attempt, StatementPlan};
 use crate::transaction::{
-    ControlSql, SavepointName, SettingChange, TransactionCapabilities, TransactionEffect, TransactionSnapshot, TransactionState, UnknownResolution,
+    ControlSql, SavepointName, SettingChange, TransactionCapabilities, TransactionEffect,
+    TransactionSnapshot, TransactionState, UnknownResolution,
 };
 
 /// 没有打开的业务会话：不另开连接，也不改用元数据会话。
@@ -149,7 +150,16 @@ impl TransactionActions {
     /// 按状态与方言能力给出可用动作。没有显式事务控制的方言没有任何动作。
     pub fn of(snapshot: &TransactionSnapshot, capabilities: TransactionCapabilities) -> Self {
         if !capabilities.explicit_control {
-            return Self { begin: false, commit: false, rollback: false, savepoints: false, savepoint_recovery: false, resolve: false, isolation: false, mode: false };
+            return Self {
+                begin: false,
+                commit: false,
+                rollback: false,
+                savepoints: false,
+                savepoint_recovery: false,
+                resolve: false,
+                isolation: false,
+                mode: false,
+            };
         }
         let mut actions = Self {
             begin: false,
@@ -171,7 +181,9 @@ impl TransactionActions {
             TransactionState::Aborted => {
                 // 中止事务里提交与数据库规则矛盾：只提供回滚，或方言允许的回滚到保存点。
                 actions.rollback = true;
-                actions.savepoint_recovery = capabilities.savepoints && capabilities.aborted == crate::transaction::AbortedRecovery::SavepointRecovery;
+                actions.savepoint_recovery = capabilities.savepoints
+                    && capabilities.aborted
+                        == crate::transaction::AbortedRecovery::SavepointRecovery;
             }
             TransactionState::Unknown => {
                 // 未知状态不提供开始：先用回滚或独立核对把结果说清楚。
@@ -179,6 +191,9 @@ impl TransactionActions {
                 actions.resolve = true;
             }
         }
+        // 旧事务的最终结果仍未核对（断线/重连/引擎切换后保留在快照里）：即使当前会话回到自动提交，
+        // 也必须给出独立核对入口，不能把旧未知结果藏起来（R10）。
+        actions.resolve = actions.resolve || snapshot.unresolved.is_some();
         actions
     }
 }
@@ -203,6 +218,19 @@ pub fn state_hint_key(state: TransactionState) -> Option<&'static str> {
     }
 }
 
+/// 当前会话已经没有活动事务、但上一事务结果仍未核对时的提示（R10、R11）。
+pub fn unresolved_hint_key() -> &'static str {
+    "transaction.unresolved.hint"
+}
+
+/// 旧事务失去确认时的最后状态，用于提示文案里的 `{state}`。
+pub fn unresolved_state_key(snapshot: &TransactionSnapshot) -> Option<&'static str> {
+    snapshot
+        .unresolved
+        .as_ref()
+        .map(|record| state_key(record.state))
+}
+
 pub fn effect_key(effect: TransactionEffect) -> Option<&'static str> {
     match effect {
         TransactionEffect::Began => Some("transaction.effect.began"),
@@ -217,9 +245,14 @@ pub fn effect_key(effect: TransactionEffect) -> Option<&'static str> {
 }
 
 /// 命令执行后显示的那一句：设置类命令在自动提交下报“已生效/下一次生效”，不再借用事务效果。
-pub fn command_effect_key(command: &TransactionCommand, effect: TransactionEffect) -> Option<&'static str> {
+pub fn command_effect_key(
+    command: &TransactionCommand,
+    effect: TransactionEffect,
+) -> Option<&'static str> {
     if effect == TransactionEffect::Unchanged {
-        return command.is_setting().then_some("transaction.settings.applied");
+        return command
+            .is_setting()
+            .then_some("transaction.settings.applied");
     }
     effect_key(effect)
 }
@@ -237,7 +270,11 @@ pub fn mode_label_key(id: &str) -> String {
 pub fn suggested_savepoint(snapshot: &TransactionSnapshot) -> String {
     for serial in 1u32.. {
         let name = format!("sp{serial}");
-        if snapshot.savepoints.iter().all(|existing| existing.as_str() != name) {
+        if snapshot
+            .savepoints
+            .iter()
+            .all(|existing| existing.as_str() != name)
+        {
             return name;
         }
     }
@@ -346,6 +383,8 @@ pub struct GuardFact {
     pub engine: String,
     pub database: String,
     pub state: TransactionState,
+    /// 这条连接上还有更早事务的最终结果没有核对（断线/重连后 state 可能是 Idle）。
+    pub unresolved: bool,
 }
 
 impl GuardFact {
@@ -434,7 +473,10 @@ impl TransactionGuard {
     pub fn allows(&self, decision: GuardDecision) -> bool {
         match decision {
             GuardDecision::Commit => self.current.state == TransactionState::Active,
-            GuardDecision::Rollback => matches!(self.current.state, TransactionState::Active | TransactionState::Aborted),
+            GuardDecision::Rollback => matches!(
+                self.current.state,
+                TransactionState::Active | TransactionState::Aborted
+            ),
         }
     }
 
@@ -466,7 +508,11 @@ impl TransactionGuard {
         match self.cause {
             GuardCause::Quit => GuardFollowup::Quit,
             GuardCause::Update => GuardFollowup::Update,
-            GuardCause::Disconnect => GuardFollowup::Disconnect(self.disconnect.clone().unwrap_or_else(|| self.current.connection_id.clone())),
+            GuardCause::Disconnect => GuardFollowup::Disconnect(
+                self.disconnect
+                    .clone()
+                    .unwrap_or_else(|| self.current.connection_id.clone()),
+            ),
         }
     }
 }
@@ -477,8 +523,14 @@ impl TransactionGuard {
 ///
 /// 一条命令只在一个租约里执行；活动事务期间不会并发驱动同一条事务连接。提交/回滚的结果没有返回时
 /// 返回 [`TransactionEffect::Unknown`]，调用方据此中止关闭并保留可见状态，绝不重放。
-pub async fn execute(service: &Arc<Service>, target: &TransactionTarget, command: &TransactionCommand) -> Result<TransactionEffect, String> {
-    let coordinator = service.transaction_coordinator(&target.connection_id).ok_or_else(|| NOT_OPEN.to_owned())?;
+pub async fn execute(
+    service: &Arc<Service>,
+    target: &TransactionTarget,
+    command: &TransactionCommand,
+) -> Result<TransactionEffect, String> {
+    let coordinator = service
+        .transaction_coordinator(&target.connection_id)
+        .ok_or_else(|| NOT_OPEN.to_owned())?;
     if !coordinator.is_transactional() {
         return Err("这条连接没有事务控制".to_owned());
     }
@@ -495,21 +547,56 @@ pub async fn execute(service: &Arc<Service>, target: &TransactionTarget, command
     let control = control_command(coordinator.as_ref(), command)?;
     if matches!(control.sql, ControlSql::NoStatement) {
         return coordinator
-            .acknowledge(&control.statement, crate::transaction::ControlOutcome::Confirmed)
+            .acknowledge(
+                &control.statement,
+                crate::transaction::ControlOutcome::Confirmed,
+            )
             .map_err(|error| error.to_string());
     }
-    let sql = match &control.sql {
-        ControlSql::Statement(sql) => sql.clone(),
-        ControlSql::Unsupported => return Err("这条事务控制在当前数据库上没有对应的执行方式".to_owned()),
-        ControlSql::NoStatement => unreachable!("上面已经处理过不下发语句的设置"),
-    };
-    let query = service.query_session(&target.connection_id).await?.ok_or_else(|| NOT_OPEN.to_owned())?;
+    if matches!(control.sql, ControlSql::Unsupported) {
+        return Err("这条事务控制在当前数据库上没有对应的执行方式".to_owned());
+    }
+    let query = service
+        .query_session(&target.connection_id)
+        .await?
+        .ok_or_else(|| NOT_OPEN.to_owned())?;
     // 租约持有到这条命令结束；业务会话与查询批次共用同一条事务连接。
     let lease = query.lease;
-    let transport = service.cancel_transport(&target.connection_id).unwrap_or_default();
-    let driver = LiveDriver::attach(query.session, &target.engine, &target.database, transport, None).await?;
+    // 预检发生在拿到租约之前，同连接的其他业务执行可能已经改变事务状态：拿到租约后按最新状态重新预检。
+    let control = control_command(coordinator.as_ref(), command)?;
+    let sql = match &control.sql {
+        ControlSql::Statement(sql) => sql.clone(),
+        ControlSql::NoStatement => {
+            let effect = coordinator
+                .acknowledge(
+                    &control.statement,
+                    crate::transaction::ControlOutcome::Confirmed,
+                )
+                .map_err(|error| error.to_string())?;
+            drop(lease);
+            return Ok(effect);
+        }
+        ControlSql::Unsupported => {
+            drop(lease);
+            return Err("这条事务控制在当前数据库上没有对应的执行方式".to_owned());
+        }
+    };
+    let transport = service
+        .cancel_transport(&target.connection_id)
+        .unwrap_or_default();
+    let driver = LiveDriver::attach(
+        query.session,
+        &target.engine,
+        &target.database,
+        transport,
+        None,
+    )
+    .await?;
     let cancel = Arc::new(AtomicBool::new(false));
-    let plan = StatementPlan::Control { statement: control.statement.clone(), sql: control.sql.clone() };
+    let plan = StatementPlan::Control {
+        statement: control.statement.clone(),
+        sql: control.sql.clone(),
+    };
     let trial = attempt(Some(coordinator.as_ref()), plan, &driver, 1, &cancel, &sql).await;
     let _ = driver.finish().await;
     drop(lease);
@@ -517,7 +604,11 @@ pub async fn execute(service: &Arc<Service>, target: &TransactionTarget, command
         ("ok", Some(effect)) => Ok(effect),
         // 结果没有返回：事务结局未知，交给调用方中止关闭并显示未知。
         ("unknown", Some(effect)) => Ok(effect),
-        _ => Err(if trial.message.trim().is_empty() { "事务命令没有完成".to_owned() } else { trial.message }),
+        _ => Err(if trial.message.trim().is_empty() {
+            "事务命令没有完成".to_owned()
+        } else {
+            trial.message
+        }),
     }
 }
 
@@ -526,26 +617,44 @@ fn control_command(
     command: &TransactionCommand,
 ) -> Result<ControlCommand, String> {
     let parsed = match command {
-        TransactionCommand::Begin => return coordinator.begin(None).map_err(|error| error.to_string()),
-        TransactionCommand::Commit => return coordinator.commit().map_err(|error| error.to_string()),
-        TransactionCommand::Rollback => return coordinator.rollback().map_err(|error| error.to_string()),
+        TransactionCommand::Begin => {
+            return coordinator.begin(None).map_err(|error| error.to_string())
+        }
+        TransactionCommand::Commit => {
+            return coordinator.commit().map_err(|error| error.to_string())
+        }
+        TransactionCommand::Rollback => {
+            return coordinator.rollback().map_err(|error| error.to_string())
+        }
         TransactionCommand::Savepoint(name) => Some(ControlStatementKind::Savepoint(name)),
-        TransactionCommand::RollbackToSavepoint(name) => Some(ControlStatementKind::RollbackToSavepoint(name)),
-        TransactionCommand::ReleaseSavepoint(name) => Some(ControlStatementKind::ReleaseSavepoint(name)),
-        TransactionCommand::Isolation(_) | TransactionCommand::Mode(_) | TransactionCommand::Resolve(_) => None,
+        TransactionCommand::RollbackToSavepoint(name) => {
+            Some(ControlStatementKind::RollbackToSavepoint(name))
+        }
+        TransactionCommand::ReleaseSavepoint(name) => {
+            Some(ControlStatementKind::ReleaseSavepoint(name))
+        }
+        TransactionCommand::Isolation(_)
+        | TransactionCommand::Mode(_)
+        | TransactionCommand::Resolve(_) => None,
     };
     if let Some(parsed) = parsed {
         let name = SavepointName::parse(parsed.name()).map_err(|error| error.to_string())?;
         return match parsed {
             ControlStatementKind::Savepoint(_) => coordinator.savepoint(&name),
-            ControlStatementKind::RollbackToSavepoint(_) => coordinator.rollback_to_savepoint(&name),
+            ControlStatementKind::RollbackToSavepoint(_) => {
+                coordinator.rollback_to_savepoint(&name)
+            }
             ControlStatementKind::ReleaseSavepoint(_) => coordinator.release_savepoint(&name),
         }
         .map_err(|error| error.to_string());
     }
     match command {
-        TransactionCommand::Isolation(level) => coordinator.set_isolation(level.as_deref()).map_err(|error| error.to_string()),
-        TransactionCommand::Mode(mode) => coordinator.set_mode(mode.as_deref()).map_err(|error| error.to_string()),
+        TransactionCommand::Isolation(level) => coordinator
+            .set_isolation(level.as_deref())
+            .map_err(|error| error.to_string()),
+        TransactionCommand::Mode(mode) => coordinator
+            .set_mode(mode.as_deref())
+            .map_err(|error| error.to_string()),
         _ => Err("不支持的事务命令".to_owned()),
     }
 }
@@ -559,7 +668,9 @@ enum ControlStatementKind<'a> {
 impl ControlStatementKind<'_> {
     fn name(&self) -> &str {
         match self {
-            Self::Savepoint(name) | Self::RollbackToSavepoint(name) | Self::ReleaseSavepoint(name) => name,
+            Self::Savepoint(name)
+            | Self::RollbackToSavepoint(name)
+            | Self::ReleaseSavepoint(name) => name,
         }
     }
 }
@@ -569,10 +680,16 @@ mod tests {
     use super::*;
     use crate::adapters::adapter;
     use crate::connections::model::Engine;
-    use crate::transaction::{AbortedRecovery, DuplicateBegin, ImplicitCommitSupport, SettingOption, TransactionSettings};
+    use crate::transaction::{
+        AbortedRecovery, DuplicateBegin, ImplicitCommitSupport, PendingControl, SettingOption,
+        TransactionSettings, UnknownReason, UnknownTransaction,
+    };
 
     fn capabilities(engine: Engine) -> TransactionCapabilities {
-        adapter(engine).transaction().map(|dialect| dialect.capabilities()).unwrap_or(TransactionCapabilities::UNSUPPORTED)
+        adapter(engine)
+            .transaction()
+            .map(|dialect| dialect.capabilities())
+            .unwrap_or(TransactionCapabilities::UNSUPPORTED)
     }
 
     fn snapshot(state: TransactionState) -> TransactionSnapshot {
@@ -591,24 +708,57 @@ mod tests {
 
     #[test]
     fn every_control_action_has_a_stable_id_round_trip() {
-        assert_eq!(TransactionCommand::parse(BEGIN), Some(TransactionCommand::Begin));
-        assert_eq!(TransactionCommand::parse(COMMIT), Some(TransactionCommand::Commit));
-        assert_eq!(TransactionCommand::parse(ROLLBACK), Some(TransactionCommand::Rollback));
-        assert_eq!(TransactionCommand::parse(RESOLVE_COMMITTED), Some(TransactionCommand::Resolve(UnknownResolution::Committed)));
-        assert_eq!(TransactionCommand::parse(RESOLVE_ROLLED_BACK), Some(TransactionCommand::Resolve(UnknownResolution::RolledBack)));
+        assert_eq!(
+            TransactionCommand::parse(BEGIN),
+            Some(TransactionCommand::Begin)
+        );
+        assert_eq!(
+            TransactionCommand::parse(COMMIT),
+            Some(TransactionCommand::Commit)
+        );
+        assert_eq!(
+            TransactionCommand::parse(ROLLBACK),
+            Some(TransactionCommand::Rollback)
+        );
+        assert_eq!(
+            TransactionCommand::parse(RESOLVE_COMMITTED),
+            Some(TransactionCommand::Resolve(UnknownResolution::Committed))
+        );
+        assert_eq!(
+            TransactionCommand::parse(RESOLVE_ROLLED_BACK),
+            Some(TransactionCommand::Resolve(UnknownResolution::RolledBack))
+        );
         let rollback = TransactionCommand::savepoint_rollback_id("sp 1");
         assert_eq!(rollback, "tx-savepoint-rollback:sp 1");
-        assert_eq!(TransactionCommand::parse(&rollback), Some(TransactionCommand::RollbackToSavepoint("sp 1".to_owned())));
+        assert_eq!(
+            TransactionCommand::parse(&rollback),
+            Some(TransactionCommand::RollbackToSavepoint("sp 1".to_owned()))
+        );
         let release = TransactionCommand::savepoint_release_id("sp1");
-        assert_eq!(TransactionCommand::parse(&release), Some(TransactionCommand::ReleaseSavepoint("sp1".to_owned())));
-        assert_eq!(TransactionCommand::parse(&TransactionCommand::isolation_id(Some("serializable"))), Some(TransactionCommand::Isolation(Some("serializable".to_owned()))));
+        assert_eq!(
+            TransactionCommand::parse(&release),
+            Some(TransactionCommand::ReleaseSavepoint("sp1".to_owned()))
+        );
+        assert_eq!(
+            TransactionCommand::parse(&TransactionCommand::isolation_id(Some("serializable"))),
+            Some(TransactionCommand::Isolation(Some(
+                "serializable".to_owned()
+            )))
+        );
         assert_eq!(
             TransactionCommand::parse(&TransactionCommand::isolation_id(None)),
             Some(TransactionCommand::Isolation(None)),
             "默认项用稳定标记表示服务器默认"
         );
-        assert_eq!(TransactionCommand::parse(&TransactionCommand::mode_id(None)), Some(TransactionCommand::Mode(None)));
-        assert_eq!(TransactionCommand::parse("tx-savepoint"), None, "菜单动作不是命令");
+        assert_eq!(
+            TransactionCommand::parse(&TransactionCommand::mode_id(None)),
+            Some(TransactionCommand::Mode(None))
+        );
+        assert_eq!(
+            TransactionCommand::parse("tx-savepoint"),
+            None,
+            "菜单动作不是命令"
+        );
         assert_eq!(TransactionCommand::parse("not-a-command"), None);
     }
 
@@ -616,23 +766,76 @@ mod tests {
     fn idle_and_active_actions_follow_the_shared_state() {
         let pg = capabilities(Engine::Postgres);
         let idle = TransactionActions::of(&snapshot(TransactionState::Idle), pg);
-        assert!(idle.begin && !idle.commit && !idle.rollback, "自动提交下没有可提交/回滚的事务");
-        assert!(idle.isolation && idle.mode, "PostgreSQL 的隔离级别与只读/读写模式都可选");
+        assert!(
+            idle.begin && !idle.commit && !idle.rollback,
+            "自动提交下没有可提交/回滚的事务"
+        );
+        assert!(
+            idle.isolation && idle.mode,
+            "PostgreSQL 的隔离级别与只读/读写模式都可选"
+        );
         let sqlserver = capabilities(Engine::Sqlserver);
         let idle = TransactionActions::of(&snapshot(TransactionState::Idle), sqlserver);
         assert!(idle.isolation && !idle.mode, "SQL Server 没有事务模式选项");
 
         let active = TransactionActions::of(&snapshot(TransactionState::Active), pg);
-        assert!(!active.begin, "活动事务中不再提供开始入口（部分回滚用保存点）");
+        assert!(
+            !active.begin,
+            "活动事务中不再提供开始入口（部分回滚用保存点）"
+        );
         assert!(active.commit && active.rollback && active.savepoints);
 
         let aborted = TransactionActions::of(&snapshot(TransactionState::Aborted), pg);
         assert!(!aborted.commit, "中止事务不能提交");
-        assert!(aborted.rollback && aborted.savepoint_recovery, "PostgreSQL 可以回滚到保存点恢复");
+        assert!(
+            aborted.rollback && aborted.savepoint_recovery,
+            "PostgreSQL 可以回滚到保存点恢复"
+        );
 
         let unknown = TransactionActions::of(&snapshot(TransactionState::Unknown), pg);
-        assert!(!unknown.begin && !unknown.commit, "未知状态不据此开始或提交");
-        assert!(unknown.rollback && unknown.resolve, "未知状态下可以回滚或独立核对");
+        assert!(
+            !unknown.begin && !unknown.commit,
+            "未知状态不据此开始或提交"
+        );
+        assert!(
+            unknown.rollback && unknown.resolve,
+            "未知状态下可以回滚或独立核对"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_old_transaction_stays_visible_on_an_idle_session() {
+        let mut idle = snapshot(TransactionState::Idle);
+        idle.unresolved = Some(UnknownTransaction {
+            reason: UnknownReason::ConnectionLost,
+            generation: 2,
+            state: TransactionState::Active,
+            pending: PendingControl::Commit,
+            identity_confirmed: false,
+            identity_ambiguous: false,
+        });
+        let actions = TransactionActions::of(&idle, capabilities(Engine::Postgres));
+        assert!(actions.begin, "新会话仍可开始自己的事务");
+        assert!(
+            actions.resolve,
+            "旧事务的未知结果必须给出独立核对入口（R10）"
+        );
+        assert_eq!(
+            unresolved_state_key(&idle),
+            Some("transaction.state.active")
+        );
+        assert_eq!(unresolved_hint_key(), "transaction.unresolved.hint");
+        for locale in [crate::i18n::Locale::ZhCn, crate::i18n::Locale::En] {
+            let hint = crate::i18n::text(locale, unresolved_hint_key());
+            assert_ne!(hint, unresolved_hint_key(), "旧事务提示需要两种语言");
+            let state = crate::i18n::text(locale, unresolved_state_key(&idle).unwrap());
+            assert_ne!(state, "transaction.state.active");
+        }
+        assert_eq!(
+            unresolved_state_key(&snapshot(TransactionState::Idle)),
+            None,
+            "没有旧记录时不显示提示"
+        );
     }
 
     #[test]
@@ -671,7 +874,12 @@ mod tests {
 
     #[test]
     fn state_and_effect_labels_never_echo_the_key() {
-        for state in [TransactionState::Idle, TransactionState::Active, TransactionState::Aborted, TransactionState::Unknown] {
+        for state in [
+            TransactionState::Idle,
+            TransactionState::Active,
+            TransactionState::Aborted,
+            TransactionState::Unknown,
+        ] {
             for locale in [crate::i18n::Locale::ZhCn, crate::i18n::Locale::En] {
                 let key = state_key(state);
                 let text = crate::i18n::text(locale, key);
@@ -697,10 +905,22 @@ mod tests {
 
     #[test]
     fn every_setting_option_has_translated_labels() {
-        let engines = [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite, Engine::Sqlserver];
+        let engines = [
+            Engine::Postgres,
+            Engine::Mysql,
+            Engine::Mariadb,
+            Engine::Sqlite,
+            Engine::Sqlserver,
+        ];
         for engine in engines {
             let capabilities = capabilities(engine);
-            let groups = [(isolation_label_key as fn(&str) -> String, capabilities.isolation), (mode_label_key, capabilities.mode)];
+            let groups = [
+                (
+                    isolation_label_key as fn(&str) -> String,
+                    capabilities.isolation,
+                ),
+                (mode_label_key, capabilities.mode),
+            ];
             for (label_key, support) in groups {
                 for SettingOption { id, .. } in support.options {
                     let key = label_key(id);
@@ -716,10 +936,18 @@ mod tests {
     fn bar_state_keeps_receipts_with_their_own_connection() {
         let mut bar = TransactionBarState::default();
         bar.align("c1");
-        bar.note(TransactionEffect::Committed, Some("transaction.effect.committed"), String::new());
+        bar.note(
+            TransactionEffect::Committed,
+            Some("transaction.effect.committed"),
+            String::new(),
+        );
         bar.toggle_menu(TransactionMenu::Savepoints);
         bar.align("c1");
-        assert_eq!(bar.effect, Some(TransactionEffect::Committed), "同一连接继续显示回执");
+        assert_eq!(
+            bar.effect,
+            Some(TransactionEffect::Committed),
+            "同一连接继续显示回执"
+        );
         assert_eq!(bar.menu, Some(TransactionMenu::Savepoints));
         bar.align("c2");
         assert_eq!(bar.effect, None, "切换连接不把上一连接的回执挂到新连接上");
@@ -729,7 +957,10 @@ mod tests {
     #[test]
     fn the_suggested_savepoint_skips_names_already_in_the_transaction() {
         let mut snapshot = snapshot(TransactionState::Active);
-        snapshot.savepoints = vec![SavepointName::parse("sp1").unwrap(), SavepointName::parse("sp2").unwrap()];
+        snapshot.savepoints = vec![
+            SavepointName::parse("sp1").unwrap(),
+            SavepointName::parse("sp2").unwrap(),
+        ];
         assert_eq!(suggested_savepoint(&snapshot), "sp3");
         snapshot.savepoints.clear();
         assert_eq!(suggested_savepoint(&snapshot), "sp1");
@@ -737,55 +968,114 @@ mod tests {
 
     #[test]
     fn the_model_blocks_closing_unknown_transactions_and_asks_one_connection_at_a_time() {
-        use crate::app::Shell;
         use crate::app::shell::WorkbenchModel;
+        use crate::app::Shell;
 
         let mut model = WorkbenchModel::new(Shell::default());
         let unknown = vec![fact("a", TransactionState::Unknown)];
-        assert!(model.open_transaction_guard(GuardCause::Quit, unknown), "未知事务也要拦下关闭");
-        assert!(model.transaction_guard.is_none(), "未知状态不打开可以提交/回滚绕过的对话框");
+        assert!(
+            model.open_transaction_guard(GuardCause::Quit, unknown),
+            "未知事务也要拦下关闭"
+        );
+        assert!(
+            model.transaction_guard.is_none(),
+            "未知状态不打开可以提交/回滚绕过的对话框"
+        );
         assert_eq!(model.notice_key, Some("transaction.guard.unknown"));
         assert_eq!(model.notice_detail, "a");
 
-        let facts = vec![fact("idle", TransactionState::Idle), fact("b", TransactionState::Active), fact("c", TransactionState::Aborted)];
-        assert!(model.open_transaction_guard(GuardCause::Quit, facts), "活动与中止事务都要保护");
-        assert_eq!(model.transaction_guard.as_ref().map(|guard| guard.current.connection_id.as_str()), Some("b"));
-        assert_eq!(model.transaction_guard.as_ref().map(TransactionGuard::remaining), Some(1));
+        let facts = vec![
+            fact("idle", TransactionState::Idle),
+            fact("b", TransactionState::Active),
+            fact("c", TransactionState::Aborted),
+        ];
+        assert!(
+            model.open_transaction_guard(GuardCause::Quit, facts),
+            "活动与中止事务都要保护"
+        );
+        assert_eq!(
+            model
+                .transaction_guard
+                .as_ref()
+                .map(|guard| guard.current.connection_id.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            model
+                .transaction_guard
+                .as_ref()
+                .map(TransactionGuard::remaining),
+            Some(1)
+        );
 
         assert!(model.dispatch("tx-guard-commit").is_some());
         let request = model.transaction_request.take().expect("提交请求");
         assert_eq!(request.guard, Some(GuardDecision::Commit));
-        assert_eq!(model.guard_finished(Err("connection lost".to_owned())), GuardOutcome::Stopped);
+        assert_eq!(
+            model.guard_finished(Err("connection lost".to_owned())),
+            GuardOutcome::Stopped
+        );
         assert!(model.guard_open(), "失败后对话框保留");
         assert_eq!(
-            model.transaction_guard.as_ref().and_then(|guard| guard.error.clone()).as_deref(),
+            model
+                .transaction_guard
+                .as_ref()
+                .and_then(|guard| guard.error.clone())
+                .as_deref(),
             Some("connection lost")
         );
 
         assert!(model.dispatch("tx-guard-commit").is_some());
         let request = model.transaction_request.take().expect("重试提交");
         assert_eq!(request.guard, Some(GuardDecision::Commit));
-        assert_eq!(model.guard_finished(Ok(TransactionEffect::Committed)), GuardOutcome::Pending, "确认后轮到下一条连接");
-        assert_eq!(model.transaction_guard.as_ref().map(|guard| guard.current.connection_id.as_str()), Some("c"));
-        assert!(!model.transaction_guard.as_ref().unwrap().allows(GuardDecision::Commit), "中止连接只能回滚后继续");
+        assert_eq!(
+            model.guard_finished(Ok(TransactionEffect::Committed)),
+            GuardOutcome::Pending,
+            "确认后轮到下一条连接"
+        );
+        assert_eq!(
+            model
+                .transaction_guard
+                .as_ref()
+                .map(|guard| guard.current.connection_id.as_str()),
+            Some("c")
+        );
+        assert!(
+            !model
+                .transaction_guard
+                .as_ref()
+                .unwrap()
+                .allows(GuardDecision::Commit),
+            "中止连接只能回滚后继续"
+        );
 
         assert!(model.dispatch("tx-guard-rollback").is_some());
         let request = model.transaction_request.take().expect("回滚请求");
         assert_eq!(request.guard, Some(GuardDecision::Rollback));
-        assert_eq!(model.guard_finished(Ok(TransactionEffect::RolledBack)), GuardOutcome::Continue(GuardFollowup::Quit));
+        assert_eq!(
+            model.guard_finished(Ok(TransactionEffect::RolledBack)),
+            GuardOutcome::Continue(GuardFollowup::Quit)
+        );
         assert!(!model.guard_open());
     }
 
     #[test]
     fn the_guard_does_not_close_when_the_control_outcome_is_unknown() {
-        use crate::app::Shell;
         use crate::app::shell::WorkbenchModel;
+        use crate::app::Shell;
 
         let mut model = WorkbenchModel::new(Shell::default());
-        assert!(model.open_transaction_guard(GuardCause::Disconnect, vec![fact("a", TransactionState::Active)]));
+        assert!(model.open_transaction_guard(
+            GuardCause::Disconnect,
+            vec![fact("a", TransactionState::Active)]
+        ));
         assert!(model.dispatch("tx-guard-rollback").is_some());
         let _request = model.transaction_request.take().expect("回滚请求");
-        assert_eq!(model.guard_finished(Ok(TransactionEffect::Unknown)), GuardOutcome::Stopped, "结果未知不显示正常结束");
+        assert_eq!(
+            model.guard_finished(Ok(TransactionEffect::Unknown)),
+            GuardOutcome::Stopped,
+            "结果未知不显示正常结束"
+        );
         assert!(model.guard_open());
         assert!(model.dispatch("tx-guard-cancel").is_some());
         assert!(!model.guard_open(), "取消后保持原状");
@@ -793,9 +1083,114 @@ mod tests {
     }
 
     #[test]
+    fn an_old_unresolved_transaction_blocks_closing_even_when_the_session_is_idle() {
+        use crate::app::shell::WorkbenchModel;
+        use crate::app::Shell;
+
+        let mut model = WorkbenchModel::new(Shell::default());
+        let blocked = model.open_transaction_guard(
+            GuardCause::Quit,
+            vec![unresolved_fact("a", TransactionState::Idle)],
+        );
+        assert!(blocked, "Idle + 旧事务未知也必须拦下关闭（R10、R11）");
+        assert!(
+            model.transaction_guard.is_none(),
+            "旧未知不能打开可绕过的提交/回滚对话框"
+        );
+        assert_eq!(model.notice_key, Some("transaction.guard.unknown"));
+        assert_eq!(model.notice_detail, "a");
+    }
+
+    #[test]
+    fn cancelling_during_an_in_flight_guard_commit_is_ignored() {
+        use crate::app::shell::WorkbenchModel;
+        use crate::app::Shell;
+
+        let mut model = WorkbenchModel::new(Shell::default());
+        assert!(model
+            .open_transaction_guard(GuardCause::Quit, vec![fact("a", TransactionState::Active)]));
+        assert!(model.dispatch("tx-guard-commit").is_some());
+        let request = model.transaction_request.take().expect("提交请求");
+        assert_eq!(request.guard, Some(GuardDecision::Commit));
+        assert!(model.guard_in_flight());
+
+        // 提交已经发出：取消与 Esc 都不能把保护层关掉，否则后台结果会被静默丢弃。
+        assert!(model.dispatch("tx-guard-cancel").is_some());
+        assert!(model.guard_open(), "在途提交期间取消不生效");
+        assert_eq!(model.dismiss(), crate::app::Effect::None);
+        assert!(model.guard_open(), "Esc 同样不能绕开在途提交");
+
+        assert_eq!(
+            model.guard_finished(Ok(TransactionEffect::Committed)),
+            GuardOutcome::Continue(GuardFollowup::Quit)
+        );
+        assert!(!model.guard_open());
+    }
+
+    #[test]
+    fn a_transaction_result_is_only_shown_on_the_connection_it_belongs_to() {
+        use crate::app::shell::WorkbenchModel;
+        use crate::app::Shell;
+
+        let mut model = WorkbenchModel::new(Shell::default());
+        model.open_bound_query(
+            String::new(),
+            Some("a".into()),
+            Some("A".into()),
+            Some("main".into()),
+            Some("postgres".into()),
+        );
+        let target = |id: &str| TransactionTarget {
+            connection_id: id.to_owned(),
+            connection_name: id.to_owned(),
+            engine: "postgres".to_owned(),
+            database: "main".to_owned(),
+        };
+        model.apply_transaction_result(
+            &target("b"),
+            &TransactionCommand::Begin,
+            &Ok(TransactionEffect::Began),
+        );
+        assert_eq!(
+            model.transactions.effect, None,
+            "别的连接的结果不能挂到当前事务条"
+        );
+        assert!(model.transactions.message_key.is_none());
+
+        model.apply_transaction_result(
+            &target("a"),
+            &TransactionCommand::Begin,
+            &Ok(TransactionEffect::Began),
+        );
+        assert_eq!(model.transactions.connection.as_deref(), Some("a"));
+        assert_eq!(model.transactions.effect, Some(TransactionEffect::Began));
+        assert_eq!(
+            model.transactions.message_key,
+            Some("transaction.effect.began")
+        );
+
+        model.apply_transaction_result(
+            &target("a"),
+            &TransactionCommand::Commit,
+            &Err("lost".into()),
+        );
+        assert_eq!(
+            model.transactions.message_key,
+            Some("transaction.command.failed")
+        );
+        assert_eq!(model.transactions.message_detail, "lost");
+    }
+
+    #[test]
     fn guard_requests_only_continue_on_a_confirmed_outcome() {
-        assert_eq!(GuardDecision::Commit.confirmed(), TransactionEffect::Committed);
-        assert_eq!(GuardDecision::Rollback.confirmed(), TransactionEffect::RolledBack);
+        assert_eq!(
+            GuardDecision::Commit.confirmed(),
+            TransactionEffect::Committed
+        );
+        assert_eq!(
+            GuardDecision::Rollback.confirmed(),
+            TransactionEffect::RolledBack
+        );
         // 未知、仍活动、中止与隐式提交都不是“已按选择结束”：关闭保护必须中止。
         for effect in [
             TransactionEffect::Unknown,
@@ -817,6 +1212,14 @@ mod tests {
             engine: "sqlite".to_owned(),
             database: "main".to_owned(),
             state,
+            unresolved: false,
+        }
+    }
+
+    fn unresolved_fact(connection: &str, state: TransactionState) -> GuardFact {
+        GuardFact {
+            unresolved: true,
+            ..fact(connection, state)
         }
     }
 
@@ -834,28 +1237,57 @@ mod tests {
 
     #[test]
     fn the_guard_walks_connections_one_by_one_and_only_continues_after_confirmation() {
-        let mut flow = guard(GuardCause::Quit, fact("a", TransactionState::Active), vec![fact("b", TransactionState::Active)]);
+        let mut flow = guard(
+            GuardCause::Quit,
+            fact("a", TransactionState::Active),
+            vec![fact("b", TransactionState::Active)],
+        );
         assert_eq!(flow.remaining(), 1);
         flow.pending = Some(GuardDecision::Commit);
-        assert_eq!(flow.accept(TransactionEffect::StillActive), GuardStep::Mismatch, "未结束的事务不能继续关闭");
+        assert_eq!(
+            flow.accept(TransactionEffect::StillActive),
+            GuardStep::Mismatch,
+            "未结束的事务不能继续关闭"
+        );
         flow.pending = Some(GuardDecision::Commit);
-        assert_eq!(flow.accept(TransactionEffect::Unknown), GuardStep::Mismatch, "结果未知不显示正常结束");
+        assert_eq!(
+            flow.accept(TransactionEffect::Unknown),
+            GuardStep::Mismatch,
+            "结果未知不显示正常结束"
+        );
         flow.pending = Some(GuardDecision::Commit);
-        assert_eq!(flow.accept(TransactionEffect::Committed), GuardStep::Next, "第一条连接确认后轮到下一条");
+        assert_eq!(
+            flow.accept(TransactionEffect::Committed),
+            GuardStep::Next,
+            "第一条连接确认后轮到下一条"
+        );
         assert_eq!(flow.current.connection_id, "b");
         flow.pending = Some(GuardDecision::Rollback);
-        assert_eq!(flow.accept(TransactionEffect::RolledBack), GuardStep::Complete(GuardFollowup::Quit));
+        assert_eq!(
+            flow.accept(TransactionEffect::RolledBack),
+            GuardStep::Complete(GuardFollowup::Quit)
+        );
     }
 
     #[test]
     fn an_aborted_transaction_can_only_roll_back_out_of_the_guard() {
-        let flow = guard(GuardCause::Disconnect, fact("a", TransactionState::Aborted), Vec::new());
+        let flow = guard(
+            GuardCause::Disconnect,
+            fact("a", TransactionState::Aborted),
+            Vec::new(),
+        );
         assert!(flow.allows(GuardDecision::Rollback));
-        assert!(!flow.allows(GuardDecision::Commit), "中止事务里提交与数据库规则矛盾");
+        assert!(
+            !flow.allows(GuardDecision::Commit),
+            "中止事务里提交与数据库规则矛盾"
+        );
         assert_eq!(flow.remaining(), 0);
         let mut flow = flow;
         flow.pending = Some(GuardDecision::Rollback);
-        assert_eq!(flow.accept(TransactionEffect::RolledBack), GuardStep::Complete(GuardFollowup::Disconnect("a".to_owned())));
+        assert_eq!(
+            flow.accept(TransactionEffect::RolledBack),
+            GuardStep::Complete(GuardFollowup::Disconnect("a".to_owned()))
+        );
     }
 
     /// 真实 SQLite 文件：开始、保存点、回滚到保存点、提交都经控件入口执行并登记同一快照。
@@ -867,13 +1299,23 @@ mod tests {
         let database = dir.join("notes.sqlite");
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&database)
+                    .create_if_missing(true),
+            )
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
-        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        service
+            .open_sqlite_for_test("notes", "笔记", &database)
+            .await
+            .unwrap();
         let target = TransactionTarget {
             connection_id: "notes".to_owned(),
             connection_name: "笔记".to_owned(),
@@ -881,40 +1323,99 @@ mod tests {
             database: "main".to_owned(),
         };
 
-        assert_eq!(execute(&service, &target, &TransactionCommand::Begin).await.unwrap(), TransactionEffect::Began);
+        assert_eq!(
+            execute(&service, &target, &TransactionCommand::Begin)
+                .await
+                .unwrap(),
+            TransactionEffect::Began
+        );
         let snapshot = service.transaction_snapshot("notes").unwrap();
         assert_eq!(snapshot.state, TransactionState::Active);
         assert_eq!(snapshot.generation, 1);
 
         assert_eq!(
-            execute(&service, &target, &TransactionCommand::Savepoint("sp1".to_owned())).await.unwrap(),
+            execute(
+                &service,
+                &target,
+                &TransactionCommand::Savepoint("sp1".to_owned())
+            )
+            .await
+            .unwrap(),
             TransactionEffect::StillActive
         );
-        assert_eq!(service.transaction_snapshot("notes").unwrap().savepoints.len(), 1);
+        assert_eq!(
+            service
+                .transaction_snapshot("notes")
+                .unwrap()
+                .savepoints
+                .len(),
+            1
+        );
 
         assert_eq!(
-            execute(&service, &target, &TransactionCommand::RollbackToSavepoint("sp1".to_owned())).await.unwrap(),
+            execute(
+                &service,
+                &target,
+                &TransactionCommand::RollbackToSavepoint("sp1".to_owned())
+            )
+            .await
+            .unwrap(),
             TransactionEffect::StillActive
         );
-        assert_eq!(execute(&service, &target, &TransactionCommand::Rollback).await.unwrap(), TransactionEffect::RolledBack);
+        assert_eq!(
+            execute(&service, &target, &TransactionCommand::Rollback)
+                .await
+                .unwrap(),
+            TransactionEffect::RolledBack
+        );
         let snapshot = service.transaction_snapshot("notes").unwrap();
         assert_eq!(snapshot.state, TransactionState::Idle);
         assert!(snapshot.savepoints.is_empty());
 
         // 事务模式设置：SQLite 的模式随下一次 BEGIN 生效，不发语句但登记到共享快照。
         assert_eq!(
-            execute(&service, &target, &TransactionCommand::Mode(Some("immediate".to_owned()))).await.unwrap(),
+            execute(
+                &service,
+                &target,
+                &TransactionCommand::Mode(Some("immediate".to_owned()))
+            )
+            .await
+            .unwrap(),
             TransactionEffect::Unchanged
         );
-        assert_eq!(service.transaction_snapshot("notes").unwrap().settings.mode.as_deref(), Some("immediate"));
-        assert_eq!(execute(&service, &target, &TransactionCommand::Begin).await.unwrap(), TransactionEffect::Began);
-        assert_eq!(service.transaction_snapshot("notes").unwrap().settings.mode.as_deref(), Some("immediate"));
+        assert_eq!(
+            service
+                .transaction_snapshot("notes")
+                .unwrap()
+                .settings
+                .mode
+                .as_deref(),
+            Some("immediate")
+        );
+        assert_eq!(
+            execute(&service, &target, &TransactionCommand::Begin)
+                .await
+                .unwrap(),
+            TransactionEffect::Began
+        );
+        assert_eq!(
+            service
+                .transaction_snapshot("notes")
+                .unwrap()
+                .settings
+                .mode
+                .as_deref(),
+            Some("immediate")
+        );
         let _ = execute(&service, &target, &TransactionCommand::Rollback).await;
 
         // 没有活动事务时提交不得伪造成功；控件显示失败而快照保持 Idle。
         let refused = execute(&service, &target, &TransactionCommand::Commit).await;
         assert!(refused.is_err(), "无活动事务时提交必须失败：{refused:?}");
-        assert_eq!(service.transaction_snapshot("notes").unwrap().state, TransactionState::Idle);
+        assert_eq!(
+            service.transaction_snapshot("notes").unwrap().state,
+            TransactionState::Idle
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

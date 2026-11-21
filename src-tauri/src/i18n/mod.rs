@@ -2098,6 +2098,8 @@ dict! {
     "transaction.state.activeHint" => "同一连接的查询、网格与结构共享这个事务；提交前修改只在同连接可见", "Queries, grids and structure on this connection share this transaction; uncommitted changes stay visible only to this connection";
     "transaction.state.abortedHint" => "数据库已把事务置为中止：只能回滚，或回滚到保存点", "The database aborted the transaction: roll back, or roll back to a savepoint";
     "transaction.state.unknownHint" => "无法确认数据库中的事务状态；不会自动重放写入，请用独立查询核对", "The transaction state cannot be confirmed; writes are never replayed, verify with an independent query";
+    "transaction.unresolved.state" => "上一事务：{state}", "Previous transaction: {state}";
+    "transaction.unresolved.hint" => "上一事务的最终结果无法确认；独立查询核对后才能关闭", "The previous transaction outcome cannot be confirmed; verify it independently before closing";
     "transaction.action.begin" => "开始事务", "Begin transaction";
     "transaction.action.commit" => "提交事务", "Commit transaction";
     "transaction.action.rollback" => "回滚事务", "Roll back transaction";
@@ -2142,7 +2144,7 @@ dict! {
     "transaction.guard.cancel" => "取消", "Cancel";
     "transaction.guard.commit" => "提交后继续", "Commit and continue";
     "transaction.guard.rollback" => "回滚后继续", "Roll back and continue";
-    "transaction.guard.unknown" => "连接“{name}”的事务结果未知：先独立核对，再关闭", "The transaction outcome on “{name}” is unknown: verify it independently before closing";
+    "transaction.guard.unknown" => "事务结果未知：先独立核对，再关闭", "The transaction outcome is unknown: verify it independently before closing";
     "transaction.guard.unconfirmed" => "提交/回滚没有确认成功，关闭已中止；事务状态保留在界面上", "Commit or rollback was not confirmed, so closing stopped; the transaction state stays visible";
     "transaction.guard.notAllowed" => "这个事务状态下不能这样结束事务", "The transaction cannot end this way in its current state";
     "transaction.guard.blocksUpdate" => "仍有未结束的事务，安装更新已中止；处理事务后再试", "An unfinished transaction is still open, so the update install stopped; handle it and retry";
@@ -2156,6 +2158,8 @@ dict! {
     "grid.tx.hint" => "应用不等于提交：提交事务才结束这次事务", "Applying is not committing: committing ends this transaction";
     "grid.tx.draftsKept" => "事务已结束；未应用的本地草稿仍在这里，不会当成数据库变更。", "The transaction ended; unapplied local drafts remain here and are not database changes.";
     "query.transaction.statement" => "语句", "Statement";
+    "query.transaction.stale" => "结果可能已过期", "Results may be stale";
+    "query.transaction.staleHint" => "同连接的事务已提交或回滚；重新执行这个标签即可刷新", "A transaction on this connection was committed or rolled back; run this tab again to refresh";
     "structure.execute.appliedNotCommitted" => "这些步骤已应用到当前事务，尚未提交。", "These steps are applied to the current transaction and are not committed yet.";
     "structure.execute.committed" => "这些步骤已经是数据库的最终结果。", "These steps are already the final database result.";
     "structure.execute.implicitCommit" => "这些结构语句触发了隐式提交：此前未提交的修改已经结束，不能再通过回滚撤销。", "These structure statements triggered an implicit commit: earlier uncommitted changes are finished and can no longer be rolled back.";

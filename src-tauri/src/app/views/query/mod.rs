@@ -126,6 +126,10 @@ pub struct QueryPane {
     run_transactions: HashMap<String, crate::query::commands::TransactionReport>,
     /// 每个查询标签最近一次执行里每条语句的事务效果（StatementDto.transaction）。
     run_effects: HashMap<String, Vec<Option<crate::transaction::TransactionEffect>>>,
+    /// 每个查询标签绑定的连接：事务提交/回滚后按连接把对应结果标记为可能过期。
+    tab_connections: HashMap<String, String>,
+    /// 事务结束后结果可能已过期的查询标签；重新执行该标签后清除。
+    stale_results: HashSet<String>,
     /// 执行中按固定间隔重绘耗时；没有执行时自己结束。
     run_ticker: Option<gpui_kit::Task<()>>,
     links: HashMap<String, DraftLink>,
@@ -566,6 +570,8 @@ impl QueryPane {
             run_clock: HashMap::new(),
             run_transactions: HashMap::new(),
             run_effects: HashMap::new(),
+            tab_connections: HashMap::new(),
+            stale_results: HashSet::new(),
             run_ticker: None,
             links: HashMap::new(),
             grid,
@@ -1296,6 +1302,7 @@ impl QueryPane {
         let ids: Vec<String> = tabs.iter().map(|tab| tab.id.clone()).collect();
         for tab in tabs {
             self.desk.import_tab(&tab.id, &tab.draft, target_of(tab));
+            self.tab_connections.insert(tab.id.clone(), tab.connection_id.clone().unwrap_or_default());
             if !self.links.contains_key(&tab.id) {
                 self.links.insert(
                     tab.id.clone(),
@@ -1337,6 +1344,8 @@ impl QueryPane {
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.run_transactions.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.run_effects.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.tab_connections.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.stale_results.retain(|id| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.result_layout.retain(|id, _| ids.iter().any(|keep| keep == id));
@@ -1871,6 +1880,8 @@ impl QueryPane {
         match effects {
             Some(effects) => {
                 self.run_effects.insert(ticket.tab_id.clone(), effects);
+                // 这个标签刚重新执行过：旧事务留下的“可能过期”不再成立。
+                self.stale_results.remove(&ticket.tab_id);
             }
             None => {
                 self.run_effects.remove(&ticket.tab_id);
@@ -1879,6 +1890,24 @@ impl QueryPane {
         self.rebind_grid(cx);
         cx.notify();
         pending
+    }
+
+    /// 事务提交/回滚之后：这条连接上的查询结果可能已过期。只做标记，不自动重放用户 SQL；
+    /// 使用者重新执行该标签即清除（R4、R5）。
+    pub fn transaction_settled(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for (tab, connection) in &self.tab_connections {
+            if connection == connection_id && self.run_effects.contains_key(tab) && self.stale_results.insert(tab.clone()) {
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn results_stale(&self, tab: &str) -> bool {
+        self.stale_results.contains(tab)
     }
 
     /// 结果被读取上限截断时，再执行一次同一条只读语句并放大窗口。
@@ -3573,6 +3602,21 @@ impl QueryPane {
                         .into_any_element(),
                 );
             }
+        }
+        // 事务已在同连接的其他标签提交/回滚：这份结果是旧快照，明确标记而不是静默留在原处。
+        if self.desk.active_id().is_some_and(|id| self.results_stale(id)) {
+            items.push(
+                div()
+                    .id("query-stale-results")
+                    .test_support()
+                    .debug_selector(|| "query-stale-results".to_owned())
+                    .px(px(Space::SM))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.warn)
+                    .tooltip_text(t("query.transaction.staleHint"))
+                    .child(t("query.transaction.stale"))
+                    .into_any_element(),
+            );
         }
         if let Some(failure) = self.failure_view() {
             // 正在看的就是这条失败语句时，下面的语句面板里已经有“定位到出错位置”：头部只留短状态，不重复按钮。
