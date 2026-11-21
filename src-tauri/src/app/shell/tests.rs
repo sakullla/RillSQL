@@ -803,6 +803,37 @@ fn tab_context_menu_targets_right_clicked_item_without_activating_it() {
     assert!(model.is_pinned(&table_id), "右键目标标签应被固定");
     assert!(!model.is_pinned(&structure_id), "原激活标签不应被误固定");
     assert_eq!(model.active_tab.as_deref(), Some(structure_id.as_str()));
+    assert!(model.tab_menu_target.is_none(), "执行标签菜单命令后应清空右键目标");
+}
+
+#[test]
+fn tab_context_menu_copy_targets_inactive_tab_and_does_not_leak_to_close_tab() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    let first = model.active_tab.clone().expect("first query");
+    if let Some(tab) = model.tabs.iter_mut().find(|t| t.id == first) {
+        tab.draft = "SELECT 'from_inactive'".into();
+    }
+    assert!(model.dispatch("new-query").is_some());
+    let second = model.active_tab.clone().expect("second query");
+    if let Some(tab) = model.tabs.iter_mut().find(|t| t.id == second) {
+        tab.draft = "SELECT 'from_active'".into();
+        tab.last_executed_sql = Some("SELECT 'from_active'".into());
+    }
+    assert_eq!(model.active_tab.as_deref(), Some(second.as_str()));
+
+    // 右键非激活查询标签并执行复制：复制的是非激活标签的 SQL，且清空 tab_menu_target。
+    assert!(model.tab_menu_for(&first));
+    assert_eq!(model.active_tab.as_deref(), Some(second.as_str()));
+    assert!(model.dispatch("history-copy").is_some());
+    assert_eq!(model.copied, "SELECT 'from_inactive'", "应复制右键目标标签的 SQL");
+    assert_eq!(model.clipboard_out.as_deref(), Some("SELECT 'from_inactive'"));
+    assert!(model.tab_menu_target.is_none(), "复制后应清空右键目标，避免泄漏给后续命令");
+
+    // 紧接着按 Ctrl+W（close-tab）应关闭当前激活标签 second，而非之前右键过的 first。
+    assert!(model.dispatch("close-tab").is_some());
+    assert!(model.tabs.iter().any(|t| t.id == first), "原非激活标签 first 不应被误关闭");
+    assert!(!model.tabs.iter().any(|t| t.id == second), "当前激活标签 second 应被关闭");
 }
 
 #[test]

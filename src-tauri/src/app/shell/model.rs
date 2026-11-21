@@ -5535,7 +5535,13 @@ impl WorkbenchModel {
     }
 
     fn copy_selected_sql(&mut self) {
-        let sql = if self.shell.page == AppPage::History && self.history.multi_selected() {
+        let sql = if let Some(target_id) = self.tab_menu_target.take() {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == target_id)
+                .map(|tab| tab.draft.clone())
+                .unwrap_or_default()
+        } else if self.shell.page == AppPage::History && self.history.multi_selected() {
             // 多选时 ⌘C / 复制得到含表头的 TSV（SQL 在第一列，其余为连接、库、状态、时间等）。
             self.history.copy_text(|key| self.text(key), None).unwrap_or_default()
         } else if self.history.section == HistorySection::Saved {

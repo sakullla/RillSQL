@@ -637,6 +637,7 @@ impl Workbench {
                 if let Some(id) = id {
                     self.perform(&id, cx);
                 }
+                self.model.tab_menu_target = None;
                 self.restore_if_closed(overlay_was_open, window, cx);
                 cx.notify();
                 return;
@@ -6889,6 +6890,7 @@ impl Workbench {
                         this.model.menu = None;
                         this.model.shell.focus = this.model.menu_return;
                         this.perform(&id, cx);
+                        this.model.tab_menu_target = None;
                         this.restore_focus(window, cx);
                     })),
             );

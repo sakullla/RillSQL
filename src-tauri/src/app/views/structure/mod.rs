@@ -850,6 +850,11 @@ impl StructurePane {
         &self.index_naming
     }
 
+    /// 结构页根焦点句柄，供外壳在关闭浮层后把键盘焦点还原回表结构视图。
+    pub fn focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
     /// 设置页改了索引命名模板：自动命名中的索引名立即按新模板重算，手动名称不动。
     pub fn set_index_naming(&mut self, naming: IndexNaming) {
         if self.index_naming == naming {
