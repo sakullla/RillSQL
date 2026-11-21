@@ -14,6 +14,56 @@ use gpui_kit::{
 };
 
 impl Workbench {
+    pub(super) fn bundle_unlock_page(
+        &mut self,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = Palette::of(cx);
+        let label = self.model.text("connections.profile.bundlePassphrase");
+        let input = self.input_for(DraftField::BundlePassphrase, &label, true, window, cx);
+        div()
+            .id("connection-bundle-unlock")
+            .size_full()
+            .p(px(self.metrics().page_pad))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(kit::title(
+                self.t("connections.page.importRillSql"),
+                TypeScale::LG,
+                &p,
+            ))
+            .child(self.t(message))
+            .child(
+                div()
+                    .max_w(px(540.))
+                    .child(kit::form_row(SharedString::from(label), input, &p)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(kit::secondary_button(
+                        "bundle-unlock-cancel",
+                        None,
+                        self.t("common.cancel"),
+                        act("conn-cancel-unlock", cx),
+                    ))
+                    .child(
+                        kit::primary_button(
+                            "bundle-unlock-confirm",
+                            None,
+                            self.t("connections.profile.bundleUnlock"),
+                            act("conn-unlock-import", cx),
+                        )
+                        .disabled(self.model.bundle_passphrase.trim().is_empty()),
+                    ),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn import_profiles_page(
         &mut self,
         window: &mut Window,
@@ -71,13 +121,16 @@ impl Workbench {
                 "connections.profile.report",
                 self.profile_report(&report, &p),
                 Some(
-                    kit::primary_button(
-                        "profile-import-close",
-                        None,
-                        self.t("common.close"),
-                        act("profile-import-close", cx),
-                    )
-                    .into_any_element(),
+                    div()
+                        .flex()
+                        .justify_end()
+                        .child(kit::primary_button(
+                            "profile-import-close",
+                            None,
+                            self.t("common.close"),
+                            act("profile-import-close", cx),
+                        ))
+                        .into_any_element(),
                 ),
             ),
             ImportState::Error(error) => (
@@ -90,13 +143,16 @@ impl Workbench {
                     .child(self.t("connections.profile.noSaved"))
                     .into_any_element(),
                 Some(
-                    kit::secondary_button(
-                        "profile-import-close",
-                        None,
-                        self.t("common.close"),
-                        act("profile-import-close", cx),
-                    )
-                    .into_any_element(),
+                    div()
+                        .flex()
+                        .justify_end()
+                        .child(kit::secondary_button(
+                            "profile-import-close",
+                            None,
+                            self.t("common.close"),
+                            act("profile-import-close", cx),
+                        ))
+                        .into_any_element(),
                 ),
             ),
             _ => {
@@ -200,7 +256,7 @@ impl Workbench {
             if let Some(draft) = &row.draft {
                 card = card.child(self.profile_target(draft, p));
                 if row.source.blockers.is_empty() {
-                    card = card.child(kit::subtle_button(
+                    card = card.child(div().flex().child(kit::subtle_button(
                         SharedString::from(format!("profile-row-edit-{index}")),
                         None,
                         self.t(if edit {
@@ -209,7 +265,7 @@ impl Workbench {
                             "connections.profile.edit"
                         }),
                         act(format!("profile-import-edit:{index}"), cx),
-                    ));
+                    )));
                 }
                 if edit {
                     card =
@@ -298,7 +354,9 @@ impl Workbench {
         let mut fields = vec![ImportField::Name];
         let original = source.draft.as_ref().unwrap_or(draft);
         if crate::app::views::connections::file_based(draft.engine) {
-            fields.push(ImportField::File);
+            if !crate::connections::profile_import::absolute_path(&original.file_path) {
+                fields.push(ImportField::File);
+            }
         } else {
             fields.extend(
                 [

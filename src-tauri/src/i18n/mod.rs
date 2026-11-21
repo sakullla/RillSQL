@@ -260,6 +260,10 @@ dict! {
     "connections.profile.tlsOff" => "关闭", "Off";
     "connections.profile.tlsRequire" => "要求加密", "Required";
     "connections.profile.tlsVerify" => "校验证书", "Verify certificate";
+    "connections.profile.bundlePassphrase" => "导出口令", "Export passphrase";
+    "connections.profile.bundlePrompt" => "请输入导出此加密文件时设置的口令。", "Enter the passphrase used to export this encrypted file.";
+    "connections.profile.bundleBad" => "口令错误或文件损坏。已保存 0 条连接。", "The passphrase is incorrect or the file is damaged. 0 connections saved.";
+    "connections.profile.bundleUnlock" => "导入", "Import";
     "connections.page.exportButton" => "导出连接", "Export connections";
     "connections.page.localFile" => "本地文件", "Local file";
     "connections.page.tlsVerify" => "TLS · 核对证书", "TLS · verified";

@@ -444,6 +444,7 @@ pub struct WorkbenchModel {
     pub export_path: Option<String>,
     pub import_path: Option<String>,
     pub bundle_passphrase: String,
+    pub(super) bundle_unlock: Option<&'static str>,
     pub(super) profile_import: super::conn_import::ImportState,
     pub import_notes: Vec<String>,
     pub grid_writable: bool,
@@ -628,6 +629,7 @@ impl WorkbenchModel {
             export_path: None,
             import_path: None,
             bundle_passphrase: String::new(),
+            bundle_unlock: None,
             profile_import: super::conn_import::ImportState::Idle,
             import_notes: Vec::new(),
             grid_writable: false,
@@ -1160,6 +1162,17 @@ impl WorkbenchModel {
                 } else {
                     self.notice_key = Some("connections.page.exportButton");
                 }
+            }
+            "conn-unlock-import" => {
+                if self.bundle_unlock.is_some() && self.import_path.is_some() && !self.bundle_passphrase.trim().is_empty() {
+                    self.bundle_unlock = None;
+                    self.enqueue(PendingJob::ImportConnections);
+                }
+            }
+            "conn-cancel-unlock" => {
+                self.bundle_unlock = None;
+                self.import_path = None;
+                self.bundle_passphrase.clear();
             }
             "conn-import" => {
                 if self.import_path.is_some() {

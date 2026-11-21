@@ -31,7 +31,7 @@ fn request_of(model: &mut WorkbenchModel, token: crate::application::tasks::Task
 }
 
 #[tokio::test]
-async fn dbeaver_desktop_jobs_preview_cancel_select_and_report() {
+async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
     use super::conn_import::{ImportResult, ImportState};
 
     let dir = std::env::temp_dir().join(format!("rillsql-import-preview-{}", uuid::Uuid::new_v4()));
@@ -119,6 +119,47 @@ async fn finish_import_job(model: &mut WorkbenchModel, services: &AppServices) {
     let request = request_of(model, token);
     let done = jobs::execute_job(services, request).await;
     apply_done(model, services, "profile-import", done);
+    model.finish_job();
+}
+
+#[tokio::test]
+async fn encrypted_bundle_import_prompts_and_retries_from_the_connections_entry() {
+    let dir = std::env::temp_dir().join(format!("rillsql-bundle-unlock-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let path = dir.join("locked.rillsqlcx");
+    let row = crate::connections::model::normalize(&sample_draft(Engine::Sqlite), "source".into()).unwrap();
+    let bytes = crate::connections::export::encode_export(&[row], Some("fixture-unlock")).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    model.import_path = Some(path.display().to_string());
+
+    let _ = model.dispatch("conn-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert_eq!(model.bundle_unlock, Some("connections.profile.bundlePrompt"));
+    assert!(services.list_connections().await.unwrap().is_empty());
+
+    model.set_field(DraftField::BundlePassphrase, "wrong-fixture-unlock".into());
+    let _ = model.dispatch("conn-unlock-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert_eq!(model.bundle_unlock, Some("connections.profile.bundleBad"));
+    assert!(model.bundle_passphrase.is_empty());
+    assert!(services.list_connections().await.unwrap().is_empty());
+
+    model.set_field(DraftField::BundlePassphrase, "fixture-unlock".into());
+    let _ = model.dispatch("conn-unlock-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert!(model.bundle_unlock.is_none() && model.bundle_passphrase.is_empty());
+    assert_eq!(services.list_connections().await.unwrap().len(), 1);
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn finish_bundle_import(model: &mut WorkbenchModel, services: &AppServices) {
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(model, token);
+    let done = jobs::execute_job(services, request).await;
+    apply_done(model, services, "connections", done);
     model.finish_job();
 }
 

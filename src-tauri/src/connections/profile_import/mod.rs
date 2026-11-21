@@ -43,6 +43,9 @@ impl ProfileRow {
         if draft.id.is_some() || draft.save_password || source.engine != draft.engine {
             errors.push(issue("source", "导入必须使用原引擎新建无凭据配置"));
         }
+        if draft.name.trim().is_empty() {
+            errors.push(issue("name", "请填写连接名称"));
+        }
         if source.env == "prod" && draft.env != "prod" {
             errors.push(issue("env", "必须保留生产环境标记"));
         }
@@ -94,8 +97,12 @@ impl ProfileRow {
                 _ => (),
             }
         }
-        if draft.engine == Engine::Sqlite && !absolute_path(&draft.file_path) {
-            errors.push(issue("file_path", "请定位 SQLite 数据库的绝对路径"));
+        if draft.engine == Engine::Sqlite {
+            if !absolute_path(&draft.file_path) {
+                errors.push(issue("file_path", "请定位 SQLite 数据库的绝对路径"));
+            } else if absolute_path(&source.file_path) && draft.file_path != source.file_path {
+                errors.push(issue("file_path", "必须保留来源已经确定的 SQLite 文件"));
+            }
         }
         errors
     }
@@ -108,7 +115,7 @@ fn issue(field: &str, message: &str) -> FieldError {
     }
 }
 
-fn absolute_path(path: &str) -> bool {
+pub(crate) fn absolute_path(path: &str) -> bool {
     // Never resolve a source-relative name against RillSQL's current directory.
     std::path::Path::new(path).is_absolute() && !path.contains("${")
 }

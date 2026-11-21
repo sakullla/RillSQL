@@ -29,6 +29,9 @@ pub(super) const TONES: [&str; 5] = ["dev", "test", "prod", "info", "local"];
 
 impl Workbench {
     pub(super) fn connections_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(message) = self.model.bundle_unlock {
+            return self.bundle_unlock_page(message, window, cx);
+        }
         if !matches!(self.model.profile_import, super::conn_import::ImportState::Idle | super::conn_import::ImportState::Picking) {
             return self.import_profiles_page(window, cx);
         }

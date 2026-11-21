@@ -262,9 +262,9 @@ fn port_text(value: &Value) -> String {
     let port = match value {
         Value::String(s) => parse_port(s),
         Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u16::try_from(n).ok())
-            .filter(|p| *p > 0),
+            .as_f64()
+            .filter(|port| port.fract() == 0.0 && (1.0..=f64::from(u16::MAX)).contains(port))
+            .map(|port| port as u16),
         _ => None,
     };
     port.map(|p| p.to_string()).unwrap_or_default()
@@ -364,7 +364,7 @@ fn ssh(handler: &Value, draft: &mut ConnectionDraft) -> Result<(), &'static str>
             | "authType" | "keyPath" | "implementation" | "aliveInterval" | "sshConnectTimeout"
             | "shareTunnels" => (),
             "bypassHostVerification" if enabled(val) == Some(false) => (),
-            "jumpServer.count" if val.as_i64() == Some(0) || val.as_str() == Some("0") => (),
+            "jumpServer.count" if val.as_f64() == Some(0.0) || val.as_str() == Some("0") => (),
             _ if !active(val) => (),
             _ => return Err("SSH 额外跳板、转发或主机校验设置无法等价还原"),
         }

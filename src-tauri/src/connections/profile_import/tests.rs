@@ -109,6 +109,18 @@ fn sqlite_paths_are_explicit_and_relative_paths_can_be_repaired() {
         let draft = rows[0].draft.as_ref().unwrap();
         assert_eq!(draft.file_path, absolute);
         assert!(rows[0].issues(draft).is_empty());
+        let mut replaced = draft.clone();
+        replaced.file_path.push_str(".other");
+        assert!(rows[0]
+            .issues(&replaced)
+            .iter()
+            .any(|error| error.field == "file_path"));
+        replaced.file_path = draft.file_path.clone();
+        replaced.name.clear();
+        assert!(rows[0]
+            .issues(&replaced)
+            .iter()
+            .any(|error| error.field == "name"));
     }
     let rows = parse(
         json!({"connections":{"x":{"name":"local","provider":"sqlite","driver":"sqlite_jdbc","configuration":{"database":"relative.db"}}}}),
@@ -124,7 +136,7 @@ fn checks_inherited_restrictions_and_missing_ssh_identity() {
     let config = json!({"host":"db","user":"app","type":"prod",
         "provider-properties":{"@dbeaver-show-non-default-db@":"false"},
         "handlers":{"ssh_tunnel":{"type":"TUNNEL","enabled":true,"save-password":true,
-        "properties":{"host":"bastion","port":22,"authType":"PASSWORD","jumpServer.count":0,
+        "properties":{"host":"bastion","port":22.0,"authType":"PASSWORD","jumpServer.count":0.0,
             "implementation":"sshj","shareTunnels":true,"localHost":"","remoteHost":""}}}});
     let rows = parse(json!({"connections":{"p":postgres(config.clone())},
         "connection-types":{"prod":{"security":{"permission-restrictions":["data-edit"]}}}}));
@@ -141,6 +153,7 @@ fn checks_inherited_restrictions_and_missing_ssh_identity() {
     let row = single(config);
     let mut draft = row.draft.clone().unwrap();
     assert_eq!(draft.env, "prod");
+    assert_eq!(draft.ssh_port, "22");
     assert!(row.issues(&draft).iter().any(|e| e.field == "ssh_user"));
     draft.ssh_user = "tunnel-user".into();
     assert!(row.issues(&draft).is_empty());

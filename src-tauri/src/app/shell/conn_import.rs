@@ -277,6 +277,9 @@ pub(super) async fn save(services: &AppServices, mut preview: ImportPreview) -> 
                 Ok(ImportInsert::MissingEnvironment) => {
                     ImportResult::Invalid(vec!["环境标签不存在或已改变".into()])
                 }
+                Err(crate::connections::ServiceError::Fields(fields)) => {
+                    ImportResult::Invalid(fields.into_iter().map(|field| field.message).collect())
+                }
                 Err(_) => ImportResult::Failed,
             }
         } else {
