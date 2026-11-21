@@ -124,14 +124,26 @@ pub(crate) fn problems(receipt: &Receipt) -> Vec<String> {
 /// id_prefix 决定测试与无障碍用的元素 id（{prefix}-receipt、{prefix}-step-{label}），
 /// 各页面沿用自己原来的前缀，行为不变。
 pub(crate) fn panel(id_prefix: &str, receipt: &Receipt, p: &Palette, locale: Locale) -> AnyElement {
+    panel_rows(id_prefix, &receipt.blocked, &rows(receipt), p, locale)
+}
+
+/// 已经取好原因与逐步行时的同一套渲染：危险操作层从自己的回执读出这些行再交给它，
+/// 渲染代码仍然只有这一份。
+pub(crate) fn panel_rows(
+    id_prefix: &str,
+    blocked: &[String],
+    rows: &[ReceiptRow],
+    p: &Palette,
+    locale: Locale,
+) -> AnyElement {
     let mut panel = div()
         .id(SharedString::from(format!("{id_prefix}-receipt")))
         .test_support()
         .flex()
         .flex_col()
         .gap(px(Space::XS));
-    if !receipt.blocked.is_empty() {
-        let blocked: Vec<String> = receipt.blocked.iter().map(|text| localize(text, locale)).collect();
+    if !blocked.is_empty() {
+        let blocked: Vec<String> = blocked.iter().map(|text| localize(text, locale)).collect();
         panel = panel.child(
             div()
                 .id(SharedString::from(format!("{id_prefix}-receipt-blocked")))
@@ -144,7 +156,7 @@ pub(crate) fn panel(id_prefix: &str, receipt: &Receipt, p: &Palette, locale: Loc
                 .child(SharedString::from(blocked.join(" "))),
         );
     }
-    for row in rows(receipt) {
+    for row in rows {
         let (fg, bg) = if row.status == StepStatus::Ok {
             (p.text_muted, p.hover)
         } else {

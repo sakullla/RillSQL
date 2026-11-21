@@ -9,6 +9,7 @@ use crate::catalog::hierarchy::ObjectKey;
 use crate::catalog::model::{Engine, ObjectKind};
 use crate::connections::model::{EnvTag, ENV_NONE};
 use crate::app::views::structure::receipt as receipt_view;
+use crate::app::views::structure::receipt::ReceiptRow;
 use crate::ddl::{Action, Plan, Receipt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +197,16 @@ impl DangerPrompt {
     /// 最近一次执行的逐步回执（被拦下、部分成功、全部成功都有）。
     pub fn receipt(&self) -> Option<&Receipt> {
         self.receipt.as_ref()
+    }
+
+    /// 逐步回执的行：label、SQL、状态、原始 message。确认层按它逐条渲染，不再只给一句合并后的错误。
+    pub(crate) fn receipt_rows(&self) -> Vec<ReceiptRow> {
+        self.receipt.as_ref().map(receipt_view::rows).unwrap_or_default()
+    }
+
+    /// 回执里被拦下的原因（确认层与逐步行一起显示）。
+    pub(crate) fn receipt_blocked(&self) -> Vec<String> {
+        self.receipt.as_ref().map(|receipt| receipt.blocked.clone()).unwrap_or_default()
     }
 
     /// 标签表到了：按 tone 重新判断是否生产。
