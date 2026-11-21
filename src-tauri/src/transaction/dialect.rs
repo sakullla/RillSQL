@@ -302,6 +302,13 @@ pub trait TransactionDialect: Sync {
         StatementFailure::TransactionUsable
     }
 
+    /// 一条普通语句是否可能在不经过控制分类的情况下改变事务状态：过程调用、动态 SQL 与
+    /// （T-SQL 的）`BEGIN…END` 块都可能内含 `COMMIT`/`ROLLBACK`/`BEGIN TRAN`。为 true 时，
+    /// 调用方在语句执行后不能沿用旧的层数判断，必须由探针核对（R8、R10）。默认没有这种语句。
+    fn statement_may_change_transaction(&self, _body: &str) -> bool {
+        false
+    }
+
     /// 语句失败是否可能已经让数据库自行回滚整个事务（如 MySQL 死锁、SQLite 的部分错误）。
     /// 为 true 时调用方必须按结果未知登记，不能继续宣称事务活动。
     fn error_may_have_ended_transaction(&self, _code: Option<&str>, _message: &str) -> bool {

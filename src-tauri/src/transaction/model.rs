@@ -501,6 +501,56 @@ impl TransactionMachine {
         }
     }
 
+    /// 一条以事务控制关键字开头、但形态无法确认的手写语句执行之后的登记。
+    ///
+    /// 与 [`Self::observe_statement`] 分开：普通语句在自动提交下（`Idle`）不构成事务，结果一律
+    /// `Unchanged`；而无法确认形态的手写控制语句（`START TRANSACTION READ ONLY`、
+    /// T-SQL `BEGIN TRAN <name>`、`SET autocommit = 0` 等）可能刚刚开始了事务，
+    /// 若仍报 `Unchanged`，界面会停留在“无活动事务”而数据库里已经有事务（R3、R10）。
+    pub fn observe_ambiguous_control(&mut self) -> TransactionEffect {
+        match self.snapshot.state {
+            TransactionState::Idle => {
+                // 语句可能已经开始了事务：不能宣称仍无活动事务，也不能猜测层数与保存点。
+                self.mark_depth_unverified();
+                self.snapshot.unresolved = Some(UnknownTransaction {
+                    reason: UnknownReason::UnrecognizedEffect,
+                    generation: self.snapshot.generation,
+                    state: TransactionState::Idle,
+                    pending: PendingControl::Other,
+                    identity_confirmed: false,
+                    identity_ambiguous: false,
+                });
+                self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+                self.snapshot.state = TransactionState::Unknown;
+                self.snapshot.savepoints.clear();
+                self.record(TransactionEffect::Unknown);
+                TransactionEffect::Unknown
+            }
+            // 其余状态按“无法识别的效果”失去确认，合并与身份规则和普通语句一致。
+            _ => {
+                self.mark_depth_unverified_for(UnknownReason::UnrecognizedEffect);
+                self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
+                TransactionEffect::Unknown
+            }
+        }
+    }
+
+    /// 一条未分类语句成功执行，但它的效果可能包含过程/动态 SQL 内部的事务边界变化（T-SQL 的
+    /// `EXEC`/`EXECUTE` 与 `BEGIN…END` 块）。不猜测边界是否变化：保留活动状态，只把层数标为
+    /// 不可信并交给探针核对；不提交、不回滚、也不推进代次（R8、R10）。
+    pub fn observe_opaque_statement(&mut self) -> TransactionEffect {
+        self.mark_depth_unverified();
+        match self.snapshot.state {
+            TransactionState::Idle => TransactionEffect::Unchanged,
+            TransactionState::Active => {
+                self.record(TransactionEffect::StillActive);
+                TransactionEffect::StillActive
+            }
+            TransactionState::Aborted => TransactionEffect::Aborted,
+            TransactionState::Unknown => TransactionEffect::Unknown,
+        }
+    }
+
     /// 报告本连接上的隐式提交（MySQL/MariaDB）。只有方言确认该语句会隐式提交时才调用。
     pub fn observe_implicit_commit(&mut self) -> Result<TransactionEffect, TransactionError> {
         if self.capabilities.implicit_commit == ImplicitCommitSupport::NotApplicable {

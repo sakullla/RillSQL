@@ -118,6 +118,27 @@ impl TransactionCoordinator {
         self.dialect.map(|dialect| dialect.statement_failure(code, message)).unwrap_or(StatementFailure::TransactionUsable)
     }
 
+    /// 这条未分类语句是否可能在过程/动态 SQL 内部改变事务边界（T-SQL）。
+    pub fn statement_may_change_transaction(&self, body: &str) -> bool {
+        self.dialect.is_some_and(|dialect| dialect.statement_may_change_transaction(body))
+    }
+
+    /// 无法确认形态的手写控制语句执行后的登记：可能已经开始或结束了事务（R3、R10）。
+    pub fn observe_ambiguous_control(&self) -> TransactionEffect {
+        match self.dialect {
+            Some(_) => self.machine().observe_ambiguous_control(),
+            None => TransactionEffect::Unchanged,
+        }
+    }
+
+    /// 未分类语句成功执行后的登记：保留活动状态，层数交给探针核对（T-SQL 过程/动态 SQL）。
+    pub fn observe_opaque_statement(&self) -> TransactionEffect {
+        match self.dialect {
+            Some(_) => self.machine().observe_opaque_statement(),
+            None => TransactionEffect::Unchanged,
+        }
+    }
+
     pub fn error_may_have_ended_transaction(&self, code: Option<&str>, message: &str) -> bool {
         self.dialect.is_some_and(|dialect| dialect.error_may_have_ended_transaction(code, message))
     }

@@ -498,6 +498,65 @@ fn unrecognized_effects_mark_sqlserver_depth_unverified() {
 }
 
 #[test]
+fn ambiguous_handwritten_control_is_unknown_instead_of_unchanged() {
+    // 自动提交下普通未分类语句仍是 Unchanged：没有事务可失去确认。
+    let mut machine = postgres_machine();
+    assert_eq!(machine.observe_statement(StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)), TransactionEffect::Unchanged);
+    assert_eq!(machine.state(), TransactionState::Idle);
+
+    // 形态无法确认的手写控制语句可能已经开始了事务：执行后必须进入未知，不能停在 Idle。
+    let mut machine = postgres_machine();
+    assert_eq!(machine.observe_ambiguous_control(), TransactionEffect::Unknown);
+    {
+        let snapshot = machine.snapshot();
+        assert_eq!(snapshot.state, TransactionState::Unknown, "数据库里可能已经有事务");
+        assert_eq!(snapshot.generation, 1);
+        let record = snapshot.unresolved.as_ref().expect("必须留下可核对的未知记录");
+        assert_eq!(record.reason, UnknownReason::UnrecognizedEffect);
+        assert_eq!(record.state, TransactionState::Idle, "失去确认前的最后状态");
+        assert_eq!(record.pending, PendingControl::Other);
+        assert!(!record.identity_confirmed && !record.identity_ambiguous);
+    }
+    // 未知状态下提交/回滚不再被本地预检拒绝：这两条语句必须真的发给数据库。
+    assert_eq!(machine.precheck(&commit()), Ok(()));
+    assert_eq!(machine.precheck(&rollback()), Ok(()));
+    // 再次登记不会重复推进代次，也不会清除未知记录。
+    assert_eq!(machine.observe_ambiguous_control(), TransactionEffect::Unknown);
+    assert_eq!(machine.snapshot().generation, 1);
+    assert!(machine.snapshot().unresolved.is_some());
+
+    // 活动事务里按“无法识别的效果”失去确认，保留最后状态。
+    let mut machine = started(postgres_dialect().capabilities());
+    assert_eq!(machine.observe_ambiguous_control(), TransactionEffect::Unknown);
+    assert_eq!(machine.state(), TransactionState::Unknown);
+    assert_eq!(machine.snapshot().unresolved.as_ref().expect("未知记录").state, TransactionState::Active);
+    assert_eq!(machine.snapshot().generation, 2);
+}
+
+#[test]
+fn opaque_procedure_calls_distrust_the_nesting_depth() {
+    // T-SQL 的 EXEC 可能在内部 COMMIT/BEGIN TRAN：成功后层数不可信，但仍保留活动状态。
+    let mut machine = started(sqlserver_dialect().capabilities());
+    assert_eq!(machine.observe_opaque_statement(), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, None, "过程调用后不能再沿用旧层数");
+    assert_eq!(machine.state(), TransactionState::Active, "没有证据表明事务已经结束");
+    // 探针给出真实层数后，一次提交只减少一层，不能宣称事务结束。
+    assert_eq!(machine.observe_probe(TransactionProbe::Active { depth: 2 }), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, Some(2));
+    assert_eq!(confirmed(&mut machine, &commit()), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, Some(1));
+    assert_eq!(machine.state(), TransactionState::Active);
+
+    // 自动提交下不产生未知；没有层概念的方言也不受影响。
+    let mut machine = postgres_machine();
+    assert_eq!(machine.observe_opaque_statement(), TransactionEffect::Unchanged);
+    assert_eq!(machine.state(), TransactionState::Idle);
+    let mut machine = started(postgres_dialect().capabilities());
+    assert_eq!(machine.observe_opaque_statement(), TransactionEffect::StillActive);
+    assert_eq!(machine.snapshot().depth, Some(1), "非 Nests 方言没有层数含义");
+}
+
+#[test]
 fn probe_confirmed_current_transaction_is_resolved_by_a_confirmed_end() {
     let mut machine = started(postgres_dialect().capabilities());
     machine.observe_statement(StatementOutcome::Failed(StatementFailure::ConnectionLost));
@@ -865,6 +924,8 @@ fn manual_control_is_classified_by_dialect_syntax() {
     assert_eq!(sqlite.classify_control("START TRANSACTION"), ControlMatch::Ordinary, "SQLite 只认 BEGIN");
     assert_eq!(sqlite.classify_control("COMMIT AND CHAIN"), ControlMatch::Ambiguous, "SQLite 不支持链式事务");
     assert_eq!(sqlite.classify_control("SAVEPOINT 'sp'"), control(savepoint("sp")));
+    // `BEGIN` 后带多个模式词超出可确认范围：由调用方按未知登记。
+    assert_eq!(sqlite.classify_control("BEGIN EXCLUSIVE TRANSACTION"), ControlMatch::Ambiguous);
 
     let sqlserver = sqlserver_dialect();
     assert_eq!(sqlserver.classify_control("BEGIN"), ControlMatch::Ordinary, "T-SQL 的 BEGIN 是块开始");
@@ -894,6 +955,8 @@ fn manual_control_is_classified_by_dialect_syntax() {
     assert_eq!(sqlserver.classify_control("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"), control(isolation(Some(SNAPSHOT))));
     assert_eq!(sqlserver.classify_control("END"), ControlMatch::Ordinary);
     assert_eq!(sqlserver.classify_control("COMMIT AND CHAIN"), ControlMatch::Ambiguous);
+    // 改变事务边界的会话设置不在控制模型内：执行后由调用方按未知登记。
+    assert_eq!(sqlserver.classify_control("SET IMPLICIT_TRANSACTIONS ON"), ControlMatch::Ambiguous);
     // SAVE TRAN 只属于 T-SQL：其他方言仍是普通语句，不会被登记成保存点。
     assert_eq!(postgres.classify_control("SAVE TRAN sp"), ControlMatch::Ordinary);
     assert_eq!(mysql.classify_control("SAVE TRAN sp"), ControlMatch::Ordinary);

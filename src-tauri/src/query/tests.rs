@@ -661,6 +661,116 @@ async fn the_sqlserver_probe_reconciles_an_unconfirmed_control_without_losing_th
     );
 }
 
+/// P1 复现：无活动事务时执行无法确认形态的手写控制语句，界面不能停在 Idle。
+#[tokio::test]
+async fn ambiguous_control_statements_do_not_leave_the_snapshot_idle() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{TransactionEffect, TransactionState, UnknownReason};
+
+    for (engine, sql, follow_up) in [
+        (Engine::Mysql, "START TRANSACTION READ ONLY", "COMMIT"),
+        (Engine::Postgres, "BEGIN READ WRITE", "ROLLBACK"),
+    ] {
+        let transactions = coordinator(engine);
+        let driver = scripted(vec![Ok(ok_count())]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let report = run_batch(&[piece(sql)], 100, &flag, false, &driver, Some(&transactions)).await;
+        assert_eq!(report.statements[0].status, "ok", "{engine:?}");
+        assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown), "{engine:?}");
+        assert_eq!(report.status, "unknown");
+        let snapshot = transactions.snapshot().unwrap();
+        assert_eq!(snapshot.state, TransactionState::Unknown, "{engine:?} 不能停在 Idle：数据库里可能已经有事务");
+        assert_eq!(snapshot.unresolved.expect("未知记录").reason, UnknownReason::UnrecognizedEffect);
+
+        // 后续普通语句不再被当成“无事务”的自动提交结果。
+        let driver = scripted(vec![Ok(ok_count())]);
+        let report = run_batch(&[piece("INSERT INTO item (n) VALUES (1)")], 100, &flag, false, &driver, Some(&transactions)).await;
+        assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown), "{engine:?}");
+
+        // 结束语句不再被本地预检拒绝：它必须真的发给数据库。
+        let driver = scripted(vec![Ok(ok_count())]);
+        let report = run_batch(&[piece(follow_up)], 100, &flag, false, &driver, Some(&transactions)).await;
+        assert_eq!(driver.calls.lock().expect("calls").as_slice(), [follow_up], "{engine:?}");
+        assert_eq!(report.statements[0].status, "unknown", "{engine:?}");
+        assert_eq!(transactions.snapshot().unwrap().state, TransactionState::Idle, "结束语句已执行，结局仍未知");
+    }
+}
+
+/// T-SQL 的 `BEGIN TRAN <name>` 不在可确认形态内：这一批按未知登记，下一批开始前由
+/// `@@TRANCOUNT` 核对，之后 COMMIT 才能如实结束事务。
+#[tokio::test]
+async fn sqlserver_named_begin_is_unknown_until_the_depth_probe_confirms_it() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{TransactionEffect, TransactionState, UnknownReason};
+
+    let transactions = coordinator(Engine::Sqlserver);
+    let driver = scripted(vec![Ok(ok_count())]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("BEGIN TRAN sp")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Unknown));
+    assert_eq!(driver.calls.lock().expect("calls").as_slice(), ["BEGIN TRAN sp"], "这一批不追加探针，先按未知登记");
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Unknown, "不能停在 Idle：数据库里可能已经有事务");
+    assert_eq!(snapshot.depth, None, "层数不可信");
+    let record = snapshot.unresolved.expect("必须留下可核对的未知记录");
+    assert_eq!(record.reason, UnknownReason::UnrecognizedEffect);
+
+    // 下一批开始前核对：探针确认事务活动（T-SQL 的 BEGIN TRAN <name> 确实开始了事务）。
+    let probe_active = StatementValue {
+        columns: vec!["trancount".to_owned(), "state".to_owned()],
+        column_types: vec!["int".to_owned(), "int".to_owned()],
+        rows: vec![vec![Some("1".to_owned()), Some("1".to_owned())]],
+        truncated: false,
+        affected: None,
+    };
+    let driver = scripted(vec![Ok(probe_active), Ok(ok_count())]);
+    let report = run_batch(&[piece("COMMIT TRAN")], 100, &flag, false, &driver, Some(&transactions)).await;
+    let calls = driver.calls.lock().expect("calls").clone();
+    assert!(calls.len() == 2 && calls[0].contains("XACT_STATE"), "COMMIT 之前先核对状态：{calls:?}");
+    assert_eq!(calls[1], "COMMIT TRANSACTION", "探针确认后 COMMIT 真的发给数据库");
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::Committed));
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Idle);
+    assert_eq!(snapshot.depth, Some(0));
+    assert!(snapshot.unresolved.is_none(), "确认过的未知记录随提交关闭");
+}
+
+/// P3：T-SQL 过程调用可能在内部改变 `@@TRANCOUNT`，成功后层数必须由探针重新核对。
+#[tokio::test]
+async fn sqlserver_procedure_calls_verify_the_nesting_depth() {
+    use crate::connections::model::Engine;
+    use crate::transaction::{TransactionEffect, TransactionState};
+
+    let probe_depth_two = StatementValue {
+        columns: vec!["trancount".to_owned(), "state".to_owned()],
+        column_types: vec!["int".to_owned(), "int".to_owned()],
+        rows: vec![vec![Some("2".to_owned()), Some("1".to_owned())]],
+        truncated: false,
+        affected: None,
+    };
+    let transactions = coordinator(Engine::Sqlserver);
+    let driver = scripted(vec![Ok(ok_count()), Ok(ok_count()), Ok(probe_depth_two)]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let report = run_batch(&[piece("BEGIN TRAN"), piece("EXEC dbo.rotate_notes")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.status, "done", "{:?}", report.statements);
+    assert_eq!(report.statements[1].transaction, Some(TransactionEffect::StillActive));
+    let calls = driver.calls.lock().expect("calls").clone();
+    assert_eq!(calls[0], "BEGIN TRANSACTION");
+    assert_eq!(calls[1], "EXEC dbo.rotate_notes");
+    assert!(calls[2].contains("XACT_STATE"), "过程调用后必须核对层数：{calls:?}");
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active);
+    assert_eq!(snapshot.depth, Some(2), "过程内部的 BEGIN 由探针发现");
+
+    // 一次 COMMIT 只减少一层：不能因为旧层数把事务报成已结束。
+    let driver = scripted(vec![Ok(ok_count())]);
+    let report = run_batch(&[piece("COMMIT TRAN")], 100, &flag, false, &driver, Some(&transactions)).await;
+    assert_eq!(report.statements[0].transaction, Some(TransactionEffect::StillActive));
+    let snapshot = transactions.snapshot().unwrap();
+    assert_eq!(snapshot.state, TransactionState::Active);
+    assert_eq!(snapshot.depth, Some(1));
+}
+
 #[tokio::test]
 async fn an_unconfirmed_commit_is_reported_unknown_and_not_replayed() {
     use crate::connections::model::Engine;

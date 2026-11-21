@@ -136,6 +136,42 @@ impl TransactionDialect for SqlserverTransaction {
     fn error_may_have_ended_transaction(&self, code: Option<&str>, message: &str) -> bool {
         code == Some("1205") || message.to_ascii_lowercase().contains("deadlock victim")
     }
+
+    /// T-SQL 的过程调用、动态 SQL 与 `BEGIN…END` 块可能在内部 `COMMIT`/`ROLLBACK`/`BEGIN TRAN`：
+    /// 它们不经过控制分类，执行后层数必须重新核对。
+    fn statement_may_change_transaction(&self, body: &str) -> bool {
+        let (word, rest) = next_code_word(body);
+        match word.as_deref() {
+            Some("EXEC" | "EXECUTE") => true,
+            // `BEGIN TRAN[SACTION]` 是事务开始，已经由控制分类处理；单独的 `BEGIN` 是块开始。
+            Some("BEGIN") => !matches!(next_code_word(rest).0.as_deref(), Some("TRAN" | "TRANSACTION" | "WORK")),
+            _ => false,
+        }
+    }
+}
+
+/// 取语句的下一个代码词（大写）与词后剩余的文本：跳过空白、`--` 行注释与 `/* */` 块注释。
+/// 首个非空白字符不是词（引号、括号等）时返回 None，交给上层按未分类语句处理。
+fn next_code_word(text: &str) -> (Option<String>, &str) {
+    let mut rest = text.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map(|(_, tail)| tail).unwrap_or("").trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map(|(_, tail)| tail).unwrap_or("").trim_start();
+            continue;
+        }
+        break;
+    }
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '@' | '#' | '$')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return (None, rest);
+    }
+    (Some(rest[..end].to_ascii_uppercase()), &rest[end..])
 }
 
 fn read_number(value: &str) -> Option<i64> {
@@ -232,6 +268,31 @@ mod tests {
         // 按钮与手写使用同一套 T-SQL 写法。
         assert_eq!(dialect.savepoint_sql(&SavepointName::parse("sp").unwrap()), "SAVE TRANSACTION [sp]");
         assert_eq!(dialect.rollback_to_savepoint_sql(&SavepointName::parse("sp").unwrap()), "ROLLBACK TRANSACTION [sp]");
+    }
+
+    #[test]
+    fn procedure_calls_and_blocks_may_change_the_transaction() {
+        let dialect = SqlserverTransaction;
+        for sql in [
+            "EXEC dbo.rotate_notes",
+            "execute rotate_notes @days = 3",
+            "-- 说明\nEXEC('COMMIT')",
+            "/* 批处理 */ EXEC sp_executesql N'BEGIN TRAN'",
+            "BEGIN\n  COMMIT\nEND",
+            "BEGIN TRY\n  SELECT 1\nEND TRY",
+        ] {
+            assert!(dialect.statement_may_change_transaction(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "UPDATE t SET n = 1",
+            "'EXEC x'",
+            "BEGIN TRAN",
+            "BEGIN TRANSACTION",
+            "WAITFOR DELAY '00:00:01'",
+        ] {
+            assert!(!dialect.statement_may_change_transaction(sql), "{sql}");
+        }
     }
 
     #[test]

@@ -66,6 +66,8 @@ pub(crate) struct StatementTrial {
     pub transaction: Option<TransactionEffect>,
     /// 语句是否真的交给驱动执行（本地拒绝与不需要下发的控制语句不计）。
     pub attempted: bool,
+    /// 语句是“形态无法确认的手写控制语句”：这一批不再用探针改写它的未知结果（R10）。
+    pub ambiguous_control: bool,
     /// 这一步之后不能再发送后续语句。
     pub stop: bool,
     /// 后续语句没有发送的原因。
@@ -184,6 +186,7 @@ impl StatementTrial {
             error_code,
             transaction: None,
             attempted: true,
+            ambiguous_control: false,
             stop: status != "ok",
             remaining: "未执行",
         }
@@ -202,6 +205,7 @@ fn refused(message: String) -> StatementTrial {
         error_code: None,
         transaction: None,
         attempted: false,
+        ambiguous_control: false,
         stop: true,
         remaining: "未执行",
     }
@@ -254,7 +258,12 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
             }
         }
         ImplicitCommitVerdict::NotApplicable => {
-            trial.transaction = Some(transactions.observe_statement(outcome));
+            // 过程调用/动态 SQL 可能已经在内部提交、回滚或开始了事务：活动状态保留，
+            // 但层数不能再沿用旧值，交给批次前后的探针核对（R8、R10）。
+            let opaque = transactions.statement_may_change_transaction(body)
+                && matches!(outcome, StatementOutcome::Succeeded | StatementOutcome::Failed(StatementFailure::TransactionUsable));
+            let observed = if opaque { transactions.observe_opaque_statement() } else { transactions.observe_statement(outcome) };
+            trial.transaction = Some(observed);
             if outcome == StatementOutcome::Failed(StatementFailure::TransactionAborted) {
                 append_note(&mut trial.message, ABORTED_STATEMENT_NOTE);
             } else if outcome == StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect) {
@@ -266,16 +275,19 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
     trial
 }
 
-/// 以事务控制关键字开头、但形态无法确认的手写语句：执行后只能按未知登记。
+/// 以事务控制关键字开头、但形态无法确认的手写语句：执行后进入未知。
+///
+/// 不能走普通语句的登记（自动提交下普通语句一律 `Unchanged`）：这类语句可能刚刚开始了事务，
+/// 报 `Unchanged` 会让界面停在“无活动事务”而数据库里已有事务，后续 `COMMIT` 还会被
+/// 本地预检拒绝、永远发不出去（R3、R10）。
 fn ambiguous(transactions: Option<&TransactionCoordinator>, ran: Ran) -> StatementTrial {
     let mut trial = StatementTrial::new(ran);
+    trial.ambiguous_control = true;
     let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
         return trial;
     };
-    trial.transaction = Some(transactions.observe_statement(StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)));
-    if trial.transaction == Some(TransactionEffect::Unknown) {
-        append_note(&mut trial.message, AMBIGUOUS_CONTROL_NOTE);
-    }
+    trial.transaction = Some(transactions.observe_ambiguous_control());
+    append_note(&mut trial.message, AMBIGUOUS_CONTROL_NOTE);
     settle(&mut trial, transactions);
     trial
 }
@@ -321,6 +333,7 @@ fn acknowledge(
             error_code: None,
             transaction: None,
             attempted: false,
+            ambiguous_control: false,
             stop: false,
             remaining: "未执行",
         },
@@ -409,7 +422,9 @@ pub(crate) async fn reconcile(transactions: Option<&TransactionCoordinator>, dri
     let Some(snapshot) = transactions.snapshot() else {
         return;
     };
-    let needs_probe = snapshot.state == TransactionState::Unknown || (snapshot.state == TransactionState::Active && snapshot.depth.is_none());
+    // `depth == None` 表示层数不可信：未知状态、过程/动态 SQL 之后，都要用探针重新核对。
+    let needs_probe = snapshot.state == TransactionState::Unknown
+        || (matches!(snapshot.state, TransactionState::Idle | TransactionState::Active) && snapshot.depth.is_none());
     if !needs_probe {
         return;
     }

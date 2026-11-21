@@ -307,6 +307,9 @@ pub async fn run_batch(
     };
     let mut status = "done";
     let mut effect = None;
+    // 形态无法确认的手写控制语句刚登记了未知：不在这里用探针改写它，
+    // 下一批开始前再核对（模型要求“执行后按未知处理”，R10）。
+    let mut defer_reconcile = false;
     // 上一批留下的未知/层数不明先核对一次：确认后这一批的语句才能按真实状态登记（R10）。
     super::transaction::reconcile(transactions, driver).await;
     for (index, piece) in parts.iter().enumerate() {
@@ -335,6 +338,7 @@ pub async fn run_batch(
         }
         let statement_status = trial.status;
         let (stop, remaining) = (trial.stop, trial.remaining);
+        defer_reconcile |= trial.ambiguous_control;
         statements.push(statement_report(piece.text.clone(), trial));
         // 取消不等于回滚：事务效果已按方言登记，这里只收尾取消状态与未执行语句（R8）。
         if statement_status == "cancelled" {
@@ -370,7 +374,9 @@ pub async fn run_batch(
         status = "error";
     }
     // 这一批留下了未知或层数不明时再核对一次：能确认的立即显示真实状态，不把猜测留给界面。
-    super::transaction::reconcile(transactions, driver).await;
+    if !defer_reconcile {
+        super::transaction::reconcile(transactions, driver).await;
+    }
     BatchReport {
         status,
         statements,
