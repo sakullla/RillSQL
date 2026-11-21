@@ -198,7 +198,7 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
         }
-        PendingJob::ReadProfiles(path) => JobDone::ProfilesPreview(token, conn_import::load(services, &path).await),
+        PendingJob::ReadProfiles(format, path) => JobDone::ProfilesPreview(token, conn_import::load(services, format, &path).await),
         PendingJob::SaveProfiles(preview) => JobDone::ProfilesReport(token, conn_import::save(services, *preview).await),
         PendingJob::ImportConnections => {
             let Some(path) = request.import_path else {

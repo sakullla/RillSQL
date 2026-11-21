@@ -579,9 +579,10 @@ impl Workbench {
             cx.notify();
             return;
         }
-        if id == "conn-import-dbeaver" {
+        if matches!(id, "conn-import-dbeaver" | "conn-import-navicat") {
             if self.model.close_prompt.is_none() && matches!(self.model.profile_import, super::conn_import::ImportState::Idle) {
-                self.prompt_dbeaver_import(cx);
+                use super::conn_import::ProfileFormat;
+                self.prompt_profile_import(if id == "conn-import-navicat" { ProfileFormat::Navicat } else { ProfileFormat::DBeaver }, cx);
             }
             return;
         }
@@ -2638,7 +2639,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
-            PendingJob::ReadProfiles(_) | PendingJob::SaveProfiles(_) => "profile-import",
+            PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
         let token = if owner == "connections" {
@@ -2776,14 +2777,14 @@ impl Workbench {
             .unwrap_or_else(std::env::temp_dir)
     }
 
-    fn prompt_dbeaver_import(&mut self, cx: &mut Context<Self>) {
+    fn prompt_profile_import(&mut self, format: super::conn_import::ProfileFormat, cx: &mut Context<Self>) {
         use super::conn_import::ImportState;
         self.model.profile_import = ImportState::Picking;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(self.t("connections.profile.entry")),
+            prompt: Some(self.t(format.entry())),
         });
         cx.spawn(async move |this, cx| {
             let result = receiver.await;
@@ -2792,7 +2793,7 @@ impl Workbench {
                     match result {
                         Ok(Ok(Some(paths))) => {
                             if let Some(path) = paths.into_iter().next() {
-                                view.model.queue_profile_preview(path);
+                                view.model.queue_profile_preview(format, path);
                                 view.pump_jobs(cx);
                             } else {
                                 view.model.profile_import = ImportState::Idle;

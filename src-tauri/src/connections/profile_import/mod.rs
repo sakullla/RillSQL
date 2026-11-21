@@ -7,8 +7,10 @@ use crate::connections::model::{
 
 mod dbeaver;
 mod jdbc;
+mod navicat;
 
 pub(crate) use dbeaver::parse_dbeaver;
+pub(crate) use navicat::parse_navicat;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileRow {

@@ -233,12 +233,13 @@ dict! {
     "connections.page.note" => "连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。", "Connection settings stay on this machine. Passwords live in the OS credential store; deleting a connection never deletes the database or the SQLite file.";
     "connections.page.importRillSql" => "导入 RillSQL 文件", "Import RillSQL file";
     "connections.profile.entry" => "导入 DBeaver 配置", "Import DBeaver profiles";
-    "connections.profile.preview" => "预览 DBeaver 连接", "Preview DBeaver connections";
+    "connections.profile.navicat" => "导入 Navicat (.ncx)", "Import Navicat (.ncx)";
+    "connections.profile.preview" => "预览连接配置", "Preview connection profiles";
     "connections.profile.selected" => "已选 {selected} / {total}", "{selected} of {total} selected";
     "connections.profile.confirm" => "保存所选连接", "Save selected connections";
     "connections.profile.report" => "连接导入报告", "Connection import report";
-    "connections.profile.error" => "无法预览 DBeaver 配置", "Unable to preview DBeaver profiles";
-    "connections.profile.loading" => "正在读取 DBeaver 配置…", "Reading DBeaver profiles…";
+    "connections.profile.error" => "无法预览连接配置", "Unable to preview connection profiles";
+    "connections.profile.loading" => "正在读取连接配置…", "Reading connection profiles…";
     "connections.profile.noSaved" => "已保存 0 条连接", "0 connections saved";
     "connections.profile.credentials" => "保存后可在连接编辑器中补填凭据。", "Enter credentials in the connection editor after saving.";
     "connections.profile.saving" => "正在保存所选连接…", "Saving selected connections…";

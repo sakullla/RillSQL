@@ -32,7 +32,7 @@ fn request_of(model: &mut WorkbenchModel, token: crate::application::tasks::Task
 
 #[tokio::test]
 async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
-    use super::conn_import::{ImportResult, ImportState};
+    use super::conn_import::{ImportResult, ImportState, ProfileFormat};
 
     let dir = std::env::temp_dir().join(format!("rillsql-import-preview-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -56,7 +56,7 @@ async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
     });
     std::fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
 
-    model.queue_profile_preview(file.clone());
+    model.queue_profile_preview(ProfileFormat::DBeaver, file.clone());
     finish_import_job(&mut model, &services).await;
     assert!(matches!(model.profile_import, ImportState::Preview(_)));
     let _ = model.dispatch("profile-import-close");
@@ -72,7 +72,7 @@ async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
         .execute(&pool)
         .await
         .unwrap();
-    model.queue_profile_preview(file.clone());
+    model.queue_profile_preview(ProfileFormat::DBeaver, file.clone());
     finish_import_job(&mut model, &services).await;
     let _ = model.dispatch("profile-import-toggle:1");
     let _ = model.dispatch("profile-import-confirm");
@@ -94,7 +94,7 @@ async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
     sqlx::query("DROP TRIGGER fail_row").execute(&pool).await.unwrap();
     pool.close().await;
     let _ = model.dispatch("profile-import-close");
-    model.queue_profile_preview(file);
+    model.queue_profile_preview(ProfileFormat::DBeaver, file);
     finish_import_job(&mut model, &services).await;
     let ImportState::Preview(preview) = &model.profile_import else {
         panic!("missing repeat import preview");
@@ -120,6 +120,39 @@ async fn finish_import_job(model: &mut WorkbenchModel, services: &AppServices) {
     let done = jobs::execute_job(services, request).await;
     apply_done(model, services, "profile-import", done);
     model.finish_job();
+}
+
+#[tokio::test]
+async fn navicat_jobs_preserve_the_selected_subset_and_skip_existing_profiles() {
+    use super::conn_import::{ImportState, ProfileFormat};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-ncx-preview-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let path = dir.join("connections.ncx");
+    std::fs::write(&path, r#"<Connections Ver="1.5">
+        <Connection ConnectionName="PG" ConnType="POSTGRESQL" Host="db.example.invalid" Port="5432" Database="sales" UserName="a" SSL="false" SSH="false" HTTP="false"/>
+        <Connection ConnectionName="Another" ConnType="MYSQL" Host="other.example.invalid" Port="3306" UserName="b" SSL="false" SSH="false" HTTP="false"/>
+        <Connection ConnectionName="Unavailable" ConnType="ORACLE"/>
+    </Connections>"#).unwrap();
+    for (pass, expected) in [(0, (1, 2, 0)), (1, (0, 3, 0))] {
+        model.queue_profile_preview(ProfileFormat::Navicat, path.clone());
+        finish_import_job(&mut model, &services).await;
+        let ImportState::Preview(preview) = &model.profile_import else { panic!("missing NCX preview"); };
+        assert_eq!(preview.rows[0].conflict.is_some(), pass == 1);
+        let _ = model.dispatch("profile-import-toggle:1");
+        let _ = model.dispatch("profile-import-confirm");
+        finish_import_job(&mut model, &services).await;
+        let ImportState::Report(report) = &model.profile_import else { panic!("missing NCX report"); };
+        assert_eq!(report.counts(), expected);
+        let _ = model.dispatch("profile-import-close");
+    }
+    let saved = services.list_connections().await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].saved.database.as_deref(), Some("sales"));
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]

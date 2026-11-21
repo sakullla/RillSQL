@@ -328,7 +328,7 @@ pub enum PendingJob {
     Disconnect,
     ExportConnections,
     ImportConnections,
-    ReadProfiles(std::path::PathBuf),
+    ReadProfiles(super::conn_import::ProfileFormat, std::path::PathBuf),
     SaveProfiles(Box<super::conn_import::ImportPreview>),
     RefreshHistory,
     SaveNamed,
@@ -1716,9 +1716,9 @@ impl WorkbenchModel {
         }
     }
 
-    pub(super) fn queue_profile_preview(&mut self, path: std::path::PathBuf) {
+    pub(super) fn queue_profile_preview(&mut self, format: super::conn_import::ProfileFormat, path: std::path::PathBuf) {
         self.profile_import = super::conn_import::ImportState::Loading;
-        self.enqueue(PendingJob::ReadProfiles(path));
+        self.enqueue(PendingJob::ReadProfiles(format, path));
     }
 
     fn profile_import_action(&mut self, id: &str) -> bool {

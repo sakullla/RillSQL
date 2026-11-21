@@ -5,8 +5,23 @@ use crate::application::AppServices;
 use crate::connections::model::{
     normalize, ConnectionDraft, EnvTag, FieldError, SavedConnection, ENV_NONE,
 };
-use crate::connections::profile_import::{parse_dbeaver, ProfileRow};
+use crate::connections::profile_import::{parse_dbeaver, parse_navicat, ProfileRow};
 use crate::connections::store::{import_conflict, ImportConflict, ImportInsert};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileFormat {
+    DBeaver,
+    Navicat,
+}
+
+impl ProfileFormat {
+    pub(super) fn entry(self) -> &'static str {
+        match self {
+            Self::DBeaver => "connections.profile.entry",
+            Self::Navicat => "connections.profile.navicat",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(super) enum ImportState {
@@ -235,11 +250,18 @@ impl ImportReport {
     }
 }
 
-pub(super) async fn load(services: &AppServices, path: &Path) -> Result<ImportPreview, String> {
+pub(super) async fn load(
+    services: &AppServices,
+    format: ProfileFormat,
+    path: &Path,
+) -> Result<ImportPreview, String> {
     let contents = tokio::fs::read(path)
         .await
-        .map_err(|_| "无法读取 DBeaver 配置文件".to_owned())?;
-    let rows = parse_dbeaver(&contents)?;
+        .map_err(|_| "无法读取连接配置文件".to_owned())?;
+    let rows = match format {
+        ProfileFormat::DBeaver => parse_dbeaver(&contents),
+        ProfileFormat::Navicat => parse_navicat(&contents),
+    }?;
     let existing = services
         .list_connections()
         .await?

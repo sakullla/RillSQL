@@ -165,6 +165,11 @@ impl Workbench {
                 .small()
                 .into_any_element(),
         );
+        secondary.push(
+            kit::tool_button("launcher-import-navicat", None, self.t("connections.profile.navicat"), act("conn-import-navicat", cx))
+                .small()
+                .into_any_element(),
+        );
         secondary.push(icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx));
 
         let focus = self.conn_launcher_focus.clone();
