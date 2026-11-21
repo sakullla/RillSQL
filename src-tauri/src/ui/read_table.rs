@@ -495,6 +495,9 @@ pub struct ReadTable {
     extend_next: bool,
     /// `select` / `select_row` 已直接应用的选中；表格随后发回的同一事件跳过，不把扩展选区重置。
     echo: Option<(SelectionMode, usize, usize)>,
+    /// 鼠标按下时的横向滚动位置。表格选中格/列时会把它滚到可见，宽列（比视口还宽的值列）会因此左右跳；
+    /// 鼠标点到的格本来就在眼前，所以点击引起的选中恢复这个位置，只有键盘移动才自动滚。
+    click_scroll_x: Option<Pixels>,
     menu: Option<OpenMenu>,
     _subscriptions: Vec<Subscription>,
 }
@@ -508,7 +511,7 @@ impl ReadTable {
             TableState::new(delegate, window, cx).cell_selectable(true).row_selectable(true).col_selectable(true).col_resizable(true).row_header(true)
         });
         let subscription = cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| this.on_table_event(event, window, cx));
-        Self { table, extend_next: false, echo: None, menu: None, _subscriptions: vec![subscription] }
+        Self { table, extend_next: false, echo: None, click_scroll_x: None, menu: None, _subscriptions: vec![subscription] }
     }
 
     /// 换数据：选区超出新数据时清掉，其余保留（刷新诊断页时选中行不丢）。
@@ -578,6 +581,18 @@ impl ReadTable {
     fn on_table_event(&mut self, event: &TableEvent, window: &mut Window, cx: &mut Context<Self>) {
         let extend = std::mem::take(&mut self.extend_next);
         let echo = self.echo.take();
+        if matches!(event, TableEvent::SelectCell(..) | TableEvent::SelectColumn(_)) {
+            if let Some(x) = self.click_scroll_x.take() {
+                self.table.update(cx, |state, cx| {
+                    let mut offset = state.horizontal_scroll_handle.offset();
+                    if offset.x != x {
+                        offset.x = x;
+                        state.horizontal_scroll_handle.set_offset(offset);
+                        cx.notify();
+                    }
+                });
+            }
+        }
         match event {
             TableEvent::SelectCell(row, col) if echo == Some((SelectionMode::Cells, *row, *col)) => {}
             TableEvent::SelectRow(row) if echo == Some((SelectionMode::Rows, *row, 0)) => {}
@@ -685,6 +700,7 @@ impl ReadTable {
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // 只有 Shift+方向键扩展；其余按键（含表格自己的方向键）都按新选区处理。
         self.extend_next = false;
+        self.click_scroll_x = None;
         let keystroke = &event.keystroke;
         let key = keystroke.key.as_str();
         let mods = keystroke.modifiers;
@@ -750,9 +766,10 @@ impl Render for ReadTable {
             .test_support()
             .size_full()
             .relative()
-            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 // 选中事件在松开时才到；按下时先记住是否按着 Shift，决定那次选中是新建还是扩展。
                 this.extend_next = event.button == MouseButton::Left && event.modifiers.shift;
+                this.click_scroll_x = (event.button == MouseButton::Left).then(|| this.table.read(cx).horizontal_scroll_handle.offset().x);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.on_key(event, window, cx)))
             .child(DataTable::new(&self.table).stripe(false).bordered(false))
@@ -930,6 +947,40 @@ mod tests {
         step(cx, window, |window, cx| window.press("left", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((2, 0), (2, 0)), "方向键移动并重新开始选区");
         assert!(events.borrow().contains(&ReadTableEvent::Copied(CopyKind::Tsv)));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_column_wider_than_the_view_does_not_scroll_sideways(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        // 值列比 800 宽的窗口还宽：点它不该把视图横向跳到列尾，点回别的列也不该跳回来。
+        let wide = vec![ReadColumn::new("id").width(60.), ReadColumn::new("value").width(1200.), ReadColumn::new("note").width(200.)];
+        let (window, table) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(800.), px(400.)) };
+            gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+                cx.new(|cx| ReadTable::new(wide, rows(), Locale::ZhCn, window, cx))
+            })
+            .expect("read table window")
+        });
+        let scroll_x = |cx: &mut TestAppContext| cx.update(|cx| table.read(cx).table().read(cx).horizontal_scroll_handle.offset().x);
+        step(cx, window, |_, _| {});
+        let start = scroll_x(cx);
+        step(cx, window, |window, cx| window.click("table-cell-0:1", cx));
+        step(cx, window, |_, _| {});
+        assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((0, 1), (0, 1)));
+        assert_eq!(scroll_x(cx), start, "点击宽列不横向滚动");
+        step(cx, window, |window, cx| window.click("table-cell-1:0", cx));
+        step(cx, window, |_, _| {});
+        assert_eq!(scroll_x(cx), start, "点回左边的列也不滚动");
+        // 键盘移到屏外的列仍然自动滚到可见。
+        step(cx, window, |window, cx| {
+            let focus = table.read(cx).focus_handle(cx);
+            focus.focus(window, cx);
+        });
+        step(cx, window, |window, cx| window.press("right", cx));
+        step(cx, window, |window, cx| window.press("right", cx));
+        step(cx, window, |_, _| {});
+        assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((1, 2), (1, 2)));
+        assert!(scroll_x(cx) < start, "键盘移到屏外的列时仍然滚到可见");
     }
 
     #[gpui_kit::test]

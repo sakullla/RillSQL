@@ -20,31 +20,36 @@ pub(super) struct TableSlot {
     _subscriptions: Vec<Subscription>,
 }
 
-/// 截断时保留尾部：放不下就用「…」加上能放下的最长后缀（键名的尾部最能区分同前缀的键）。
-/// `measure` 返回一段文字的实际宽度；放得下时原样返回。
-pub(crate) fn tail_fit(text: &str, available: f32, measure: impl Fn(&str) -> f32) -> String {
+/// 中间截断：放不下时保留开头（键的命名空间）和结尾（区分同前缀键的部分），中间用「…」。
+/// 开头约占保留字数的四成，其余给结尾。`measure` 返回一段文字的实际宽度。
+pub(crate) fn middle_fit(text: &str, available: f32, measure: impl Fn(&str) -> f32) -> String {
     if available <= 0. {
         return String::new();
     }
     if measure(text) <= available {
         return text.to_owned();
     }
-    let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
-    // 二分找最小的起点：后缀越短越容易放下。
-    let (mut lo, mut hi) = (1usize, starts.len());
+    let chars: Vec<char> = text.chars().collect();
+    let candidate = |keep: usize| -> String {
+        let head = (keep * 2).div_ceil(5);
+        let tail = keep - head;
+        let mut out: String = chars[..head].iter().collect();
+        out.push('…');
+        out.extend(chars[chars.len() - tail..].iter());
+        out
+    };
+    // 二分找能放下的最多保留字数。
+    let (mut lo, mut hi) = (0usize, chars.len().saturating_sub(1));
     while lo < hi {
-        let mid = (lo + hi) / 2;
-        let candidate = format!("…{}", &text[starts[mid]..]);
-        if measure(&candidate) <= available {
-            hi = mid;
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&candidate(mid)) <= available {
+            lo = mid;
         } else {
-            lo = mid + 1;
+            hi = mid - 1;
         }
     }
-    if lo >= starts.len() {
-        return "…".to_owned();
-    }
-    format!("…{}", &text[starts[lo]..])
+    let fitted = candidate(lo);
+    if measure(&fitted) <= available { fitted } else { String::new() }
 }
 
 impl RedisPane {
@@ -145,9 +150,9 @@ impl RedisPane {
                 self.command(&id, cx);
             }
             "slowlog" => {
-                if let Some(entry) = self.diag.slowlog.get(row) {
-                    self.console_open = true;
-                    self.command_input = entry.command.clone();
+                if let Some(command) = self.diag.slowlog.get(row).map(|entry| entry.command.clone()) {
+                    self.show_console();
+                    self.command_input = command;
                     self.complete_open = false;
                     self.history_at = None;
                     self.focus_request = Some(Field::Command);
@@ -167,7 +172,7 @@ impl RedisPane {
         f32::from(window.text_system().shape_line(SharedString::from(text.to_owned()), px(size), &[run], None).width)
     }
 
-    /// 键名按实际宽度截断（保留尾部），结果按（键名, 宽度）缓存。
+    /// 键名按实际宽度截断（保留开头和结尾），结果按（键名, 宽度）缓存。
     pub(super) fn fit_key_name(&mut self, window: &Window, font: &Font, size: f32, text: &str, available: f32) -> String {
         let bucket = available.max(0.).round() as u32;
         if let Some(hit) = self.fit_cache.get(&(text.to_owned(), bucket)) {
@@ -176,7 +181,7 @@ impl RedisPane {
         if self.fit_cache.len() > 4096 {
             self.fit_cache.clear();
         }
-        let fitted = tail_fit(text, bucket as f32, |candidate| Self::measure_ui(window, font, size, candidate));
+        let fitted = middle_fit(text, bucket as f32, |candidate| Self::measure_ui(window, font, size, candidate));
         self.fit_cache.insert((text.to_owned(), bucket), fitted.clone());
         fitted
     }
@@ -187,15 +192,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tail_fit_keeps_the_end_of_long_keys() {
+    fn middle_fit_keeps_both_ends_of_long_keys() {
         let measure = |text: &str| text.chars().count() as f32 * 7.;
-        assert_eq!(tail_fit("user:1", 100., measure), "user:1", "放得下原样显示");
-        let fitted = tail_fit("session:tenant-a:user:12345", 70., measure);
-        assert!(fitted.starts_with('…') && "session:tenant-a:user:12345".ends_with(&fitted[3..]), "{fitted}");
-        assert!(measure(&fitted) <= 70.);
-        assert_eq!(fitted, "…ser:12345", "取能放下的最长后缀");
-        assert_eq!(tail_fit("中文键名很长很长", 30., |text| text.chars().count() as f32 * 12.), "…长");
-        assert_eq!(tail_fit("abc", 0., measure), "");
-        assert_eq!(tail_fit("abcdef", 5., measure), "…");
+        assert_eq!(middle_fit("user:1", 100., measure), "user:1", "放得下原样显示");
+        let key = "gpsdroppedtask_alarm_9582544418737_9582544418737240";
+        let fitted = middle_fit(key, 140., measure);
+        assert!(measure(&fitted) <= 140., "{fitted}");
+        let (head, tail) = fitted.split_once('…').expect("中间有省略号");
+        assert!(key.starts_with(head) && key.ends_with(tail), "{fitted}");
+        assert!(head.starts_with("gpsdr") && tail.ends_with("7240"), "开头和结尾都在：{fitted}");
+        assert_eq!(middle_fit("中文键名很长很长", 30., |text| text.chars().count() as f32 * 12.), "中…");
+        assert_eq!(middle_fit("abc", 0., measure), "");
+        assert_eq!(middle_fit("abcdef", 5., measure), "");
     }
 }

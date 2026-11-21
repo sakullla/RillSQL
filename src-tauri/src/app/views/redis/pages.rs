@@ -90,6 +90,7 @@ impl RedisPane {
                 this.child(div().id("redis-cluster-fallback").test_support().child(kit::pill(SharedString::from(self.text("redis.cluster.fallbackChip")), p.warn, p.warn_soft)))
             })
             .child(tabs)
+            .child(self.render_status(p))
             .into_any_element()
     }
 
@@ -104,6 +105,7 @@ impl RedisPane {
             Page::Clients => self.render_clients(p, m, entity, window, cx),
             Page::PubSub => self.render_pubsub(p, m, entity, &mono, window, cx),
             Page::Nodes => self.render_nodes(p, m, entity, window, cx),
+            Page::Console => self.render_console(p, m, entity, window, cx),
             Page::Keys => div().into_any_element(),
         };
         let error = (!self.diag.error.is_empty()).then(|| {
@@ -123,8 +125,8 @@ impl RedisPane {
             .into_any_element()
     }
 
-    /// 页内工具条：标题、集群节点选择、右侧操作。
-    fn diag_toolbar(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, title_key: &str, node_all: bool, actions: Vec<AnyElement>) -> gpui_kit::Div {
+    /// 页内工具条：左边是这一页的用法提示（页签已经写了页名，不再重复标题）和集群节点选择，右边是操作。
+    pub(super) fn diag_toolbar(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, hint: Option<String>, node_all: bool, actions: Vec<AnyElement>) -> gpui_kit::Div {
         let mut nodes = div().flex().items_center().gap(px(Space::XS)).flex_wrap();
         if self.topology.cluster {
             if node_all {
@@ -148,14 +150,15 @@ impl RedisPane {
         }
         let mut bar = div()
             .flex_none()
+            .min_h(px(m.bar_h() + Space::SM))
             .px(px(m.pane_pad()))
-            .py(px(Space::MD))
+            .py(px(Space::XS))
             .flex()
             .items_center()
             .gap(px(Space::MD))
             .border_b_1()
             .border_color(p.line_soft)
-            .child(kit::title(SharedString::from(self.text(title_key)), TypeScale::MD, p))
+            .when_some(hint, |this, hint| this.child(div().flex_none().max_w(px(420.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(hint))))
             .child(div().flex_1().min_w(px(0.)).child(nodes))
             .when(self.diag.busy, |this| this.child(kit::inline_loading(SharedString::from(self.text("redis.diag.loading")), m, p)));
         for item in actions {
@@ -182,7 +185,7 @@ impl RedisPane {
             action("redis-slow-sort:duration", Some(IconName::Timer), &format!("{}{}", self.text("redis.slowlog.duration"), arrow(false)), Kind::Tool, entity).small().into_any_element();
         let reset = action("redis-slow-reset", Some(IconName::Trash), &self.text("redis.slowlog.reset"), Kind::DangerSoft, entity).small().into_any_element();
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.slowlog", true, vec![sort_time, sort_duration, refresh, reset]);
+        let toolbar = self.diag_toolbar(p, m, entity, Some(self.text("redis.slowlog.hint")), true, vec![sort_time, sort_duration, refresh, reset]);
         let cluster = self.topology.cluster;
         let stamp = {
             let rows: Vec<(i64, i64, i64, &str, &str, &str)> =
@@ -217,13 +220,12 @@ impl RedisPane {
             window,
             cx,
         );
-        let hint = div().flex_none().px(px(m.pane_pad())).py(px(Space::XS)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.slowlog.hint")));
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(hint).child(Self::table_area("redis-slowlog-rows", table)).into_any_element()
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(Self::table_area("redis-slowlog-rows", table)).into_any_element()
     }
 
     fn render_info(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.info", false, vec![refresh]);
+        let toolbar = self.diag_toolbar(p, m, entity, None, false, vec![refresh]);
         let metrics = crate::adapters::redis::diag::key_metrics(&self.diag.info);
         // 顶部关键指标卡片。
         let mut cards = div().flex().flex_wrap().gap(px(Space::MD)).px(px(m.pane_pad())).py(px(Space::MD));
@@ -240,55 +242,67 @@ impl RedisPane {
                     .child(kit::metric_value(SharedString::from(value), p)),
             );
         }
-        // 下方按 section 分组、可以折叠的只读表格。
-        let mut sections = div().flex().flex_col().gap(px(Space::MD)).px(px(m.pane_pad())).pb(px(Space::XL));
-        let info = self.diag.info.clone();
-        let header_h = m.table_row_h();
-        for (index, section) in info.iter().enumerate() {
-            let name = if section.name.is_empty() { "—".to_owned() } else { section.name.clone() };
-            let collapsed = self.info_collapsed.contains(&name);
-            let toggle_id = format!("redis-info-section:{name}");
-            let head = kit::interactive_states(div().id(SharedString::from(toggle_id.clone())), p, false)
-                .test_support()
-                .role(gpui_kit::Role::Button)
-                .aria_expanded(!collapsed)
-                .aria_label(SharedString::from(name.clone()))
-                .flex()
-                .items_center()
-                .gap(px(Space::SM))
-                .h(px(m.row_h))
-                .child(kit::icon(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }, IconSize::INLINE, p.text_faint))
-                .child(kit::eyebrow(SharedString::from(name.clone()), p))
-                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(section.items.len().to_string())))
-                .on_click(cmd_click(entity, toggle_id));
-            let mut block = div().flex().flex_col().gap(px(Space::XS)).child(head);
-            if !collapsed {
-                let items = section.items.clone();
-                let stamp = hash_of(&items);
-                let height = header_h * (items.len().max(1) + 1) as f32 + Space::XS;
-                let table = self.table_slot(
-                    &format!("info:{index}:{name}"),
-                    stamp,
-                    move |this| {
-                        let columns = vec![ReadColumn::new(this.text("redis.info.key")).width(260.).mono(), ReadColumn::new(this.text("redis.info.value")).width(360.).mono()];
-                        let rows = items.into_iter().map(|(key, value)| vec![SharedString::from(key), SharedString::from(value)]).collect();
-                        (columns, rows)
-                    },
-                    None,
-                    window,
-                    cx,
-                );
-                block = block.child(div().h(px(height)).border_1().border_color(p.line_soft).rounded(px(Radius::CONTROL)).overflow_hidden().child(table));
-            }
-            sections = sections.child(block);
-        }
+        // 下方是一张虚拟化的只读表（分组 / 指标 / 值）：只有这一层滚动，滚轮不会被嵌套表格截走。
+        let hint = self.text("redis.info.filter");
+        let query_input = self.redis_input(Field::InfoQuery, "redis-info-filter", "redis.info.filter", &hint, window, cx);
+        let query = self.info_query.trim().to_lowercase();
+        let rows: Vec<Vec<SharedString>> = self
+            .diag
+            .info
+            .iter()
+            .flat_map(|section| {
+                let group = if section.name.is_empty() { "—".to_owned() } else { section.name.clone() };
+                section.items.iter().map(move |(key, value)| (group.clone(), key.clone(), value.clone()))
+            })
+            .filter(|(group, key, value)| query.is_empty() || [group, key, value].iter().any(|text| text.to_lowercase().contains(&query)))
+            .map(|(group, key, value)| vec![SharedString::from(group), SharedString::from(key), SharedString::from(value)])
+            .collect();
+        let empty = if self.diag.info.is_empty() { None } else { Some(SharedString::from(self.text("redis.info.noMatch"))) };
+        let table = self.table_slot(
+            "info",
+            hash_of(&rows),
+            move |this| {
+                let columns = vec![
+                    ReadColumn::new(this.text("redis.info.group")).width(140.),
+                    ReadColumn::new(this.text("redis.info.key")).width(280.).mono(),
+                    ReadColumn::new(this.text("redis.info.value")).width(420.).mono(),
+                ];
+                (columns, rows)
+            },
+            empty,
+            window,
+            cx,
+        );
+        let filter = div().flex_none().px(px(m.pane_pad())).pb(px(Space::SM)).child(
+            div().w(px(ControlSize::PICKER_MIN_W)).max_w_full().child(
+                kit::text_input("redis-info-filter", &query_input, self.text("redis.info.filter"))
+                    .small()
+                    .cleanable(true)
+                    .prefix(kit::input_prefix(IconName::Search, IconSize::INLINE, p.text_faint)),
+            ),
+        );
         div()
+            .id("redis-info-scroll")
+            .test_support()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(div().id("redis-info-scroll").test_support().flex_1().min_h(px(0.)).scroll_area_y().child(cards).child(sections))
+            .child(cards.flex_none())
+            .child(filter)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .mx(px(m.pane_pad()))
+                    .mb(px(m.pane_pad()))
+                    .border_1()
+                    .border_color(p.line_soft)
+                    .rounded(px(Radius::CONTROL))
+                    .overflow_hidden()
+                    .child(table),
+            )
             .into_any_element()
     }
 
@@ -313,7 +327,7 @@ impl RedisPane {
         } else {
             actions.push(action("redis-big-start", Some(IconName::Play), &self.text("redis.bigkeys.start"), Kind::Primary, entity).small().into_any_element());
         }
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.bigkeys", false, actions);
+        let toolbar = self.diag_toolbar(p, m, entity, None, false, actions);
         let progress = (self.diag.big_running || self.diag.big_scanned > 0).then(|| {
             let text = match self.diag.big_total {
                 Some(total) => i18n::fill(&self.text("redis.scan.progress"), &[("n", &self.diag.big_scanned.to_string()), ("total", &total.to_string())]),
@@ -374,7 +388,7 @@ impl RedisPane {
         .small()
         .disabled(selected.is_none())
         .into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.clients", true, vec![refresh, kill]);
+        let toolbar = self.diag_toolbar(p, m, entity, Some(self.text("redis.clients.hint")), true, vec![refresh, kill]);
         let cluster = self.topology.cluster;
         let stamp = hash_of(&(
             self.diag.clients.iter().map(|c| (c.id.as_str(), c.addr.as_str(), c.name.as_str(), c.age.as_str(), c.idle.as_str(), c.db.as_str(), c.cmd.as_str(), c.node.as_str())).collect::<Vec<_>>(),
@@ -414,68 +428,100 @@ impl RedisPane {
         div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(Self::table_area("redis-client-rows", table)).into_any_element()
     }
 
+    /// Pub/Sub：上面订阅（专用连接），中间是收到的消息，下面发布。没有消息时给出下一步，而不是一个空框。
     fn render_pubsub(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: &SharedString, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let channels = self.redis_input(Field::SubChannels, "redis-sub-channels", "redis.pubsub.channels", "news.* alerts", window, cx);
-        let pub_channel = self.redis_input(Field::PubChannel, "redis-pub-channel", "redis.pubsub.channel", "alerts", window, cx);
-        let pub_message = self.redis_input(Field::PubMessage, "redis-pub-message", "redis.pubsub.message", "hello", window, cx);
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.pubsub", false, Vec::new());
-        let subscribe = div()
-            .px(px(m.pane_pad()))
-            .py(px(8.))
+        let channels_hint = self.text("redis.pubsub.channelsHint");
+        let channel_hint = self.text("redis.pubsub.channel");
+        let message_hint = self.text("redis.pubsub.message");
+        let channels = self.redis_input(Field::SubChannels, "redis-sub-channels", "redis.pubsub.channels", &channels_hint, window, cx);
+        let pub_channel = self.redis_input(Field::PubChannel, "redis-pub-channel", "redis.pubsub.channel", &channel_hint, window, cx);
+        let pub_message = self.redis_input(Field::PubMessage, "redis-pub-message", "redis.pubsub.message", &message_hint, window, cx);
+        let (status_text, status_color) = if self.diag.sub_running && self.diag.sub_ready {
+            (i18n::fill(&self.text("redis.pubsub.listening"), &[("n", &self.diag.messages.len().to_string())]), p.ok)
+        } else if self.diag.sub_running {
+            (self.text("redis.pubsub.connecting"), p.warn)
+        } else {
+            (self.text("redis.pubsub.idle"), p.text_faint)
+        };
+        let status = div()
+            .flex_none()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .child(div().flex_1().min_w(px(160.)).child(kit::text_input("redis-sub-channels", &channels, self.text("redis.pubsub.channels")).small()))
+            .gap(px(Space::XS))
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_muted)
+            .child(div().size(px(8.)).rounded_full().bg(status_color))
+            .child(SharedString::from(status_text));
+        let subscribe = div()
+            .flex_none()
+            .px(px(m.pane_pad()))
+            .py(px(Space::SM))
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .border_b_1()
+            .border_color(p.line_soft)
+            .child(div().flex_1().min_w(px(160.)).child(kit::text_input("redis-sub-channels", &channels, self.text("redis.pubsub.channels")).small().prefix(kit::input_prefix(IconName::Radio, IconSize::INLINE, p.text_faint))))
             .child(if self.diag.sub_running {
                 action("redis-sub-stop", Some(IconName::CircleStop), &self.text("redis.pubsub.stop"), Kind::Secondary, entity).small()
             } else {
                 action("redis-sub-start", Some(IconName::Radio), &self.text("redis.pubsub.subscribe"), Kind::Primary, entity).small()
             })
-            .child(icon_btn("redis-sub-clear", IconName::Trash, &self.text("redis.console.clear"), entity));
-        let status = div().px(px(m.pane_pad())).pb(px(6.)).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(
-            if self.diag.sub_running && self.diag.sub_ready {
-                i18n::fill(&self.text("redis.pubsub.listening"), &[("n", &self.diag.messages.len().to_string())])
-            } else if self.diag.sub_running {
-                self.text("redis.pubsub.connecting")
-            } else {
-                self.text("redis.pubsub.idle")
-            },
-        ));
-        let mut list = div().id("redis-pubsub-messages").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col().mx(px(m.pane_pad())).rounded(px(Radius::PANEL)).border_1().border_color(p.line);
-        for (index, message) in self.diag.messages.iter().enumerate() {
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("redis-pubsub-msg:{index}")))
-                    .flex_none()
-                    .px(px(10.))
-                    .py(px(4.))
-                    .flex()
-                    .gap(px(10.))
-                    .border_b_1()
-                    .border_color(p.line_soft)
-                    .font_family(mono.clone())
-                    .text_size(px(TypeScale::XS))
-                    .child(div().flex_none().w(px(180.)).truncate().text_color(p.accent_text).child(SharedString::from(message.channel.clone())))
-                    .child(div().flex_1().min_w(px(0.)).text_color(p.text).child(SharedString::from(one_line(&message.payload)))),
-            );
-        }
+            .child(status)
+            .child(div().flex_1())
+            .child(icon_btn("redis-sub-clear", IconName::Trash, &self.text("redis.console.clear"), entity).disabled(self.diag.messages.is_empty()));
+        let body = if self.diag.messages.is_empty() {
+            div()
+                .id("redis-pubsub-messages")
+                .test_support()
+                .flex_1()
+                .min_h(px(0.))
+                .p(px(m.pane_pad() * 2.))
+                .child(kit::empty_state(
+                    IconName::Radio,
+                    SharedString::from(self.text(if self.diag.sub_running { "redis.pubsub.waiting" } else { "redis.pubsub.emptyHeading" })),
+                    SharedString::from(self.text("redis.pubsub.emptyDetail")),
+                    p,
+                ))
+                .into_any_element()
+        } else {
+            let mut list = div().id("redis-pubsub-messages").test_support().flex_1().min_h(px(0.)).scroll_area_y().flex().flex_col().px(px(m.pane_pad())).py(px(Space::XS));
+            for (index, message) in self.diag.messages.iter().enumerate() {
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("redis-pubsub-msg:{index}")))
+                        .flex_none()
+                        .py(px(Space::XS))
+                        .flex()
+                        .gap(px(Space::MD))
+                        .when(index > 0, |this| this.border_t_1().border_color(p.line_soft))
+                        .font_family(mono.clone())
+                        .text_size(px(TypeScale::SM))
+                        .child(div().flex_none().w(px(180.)).truncate().text_color(p.accent_text).child(SharedString::from(message.channel.clone())))
+                        .child(div().flex_1().min_w(px(0.)).text_color(p.text).child(SharedString::from(one_line(&message.payload)))),
+                );
+            }
+            list.into_any_element()
+        };
         let publish = div()
+            .flex_none()
             .px(px(m.pane_pad()))
-            .py(px(8.))
+            .py(px(Space::SM))
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(Space::SM))
             .border_t_1()
-            .border_color(p.line_soft)
+            .border_color(p.line)
+            .bg(p.chrome)
             .child(div().w(px(180.)).child(kit::text_input("redis-pub-channel", &pub_channel, self.text("redis.pubsub.channel")).small()))
             .child(div().flex_1().min_w(px(160.)).child(kit::text_input("redis-pub-message", &pub_message, self.text("redis.pubsub.message")).small()))
             .child(action("redis-pub-send", Some(IconName::Send), &self.text("redis.pubsub.publish"), Kind::Primary, entity).small());
-        div().flex_1().min_h(px(0.)).flex().flex_col().child(toolbar).child(subscribe).child(status).child(list).child(publish).into_any_element()
+        div().flex_1().min_h(px(0.)).flex().flex_col().child(subscribe).child(body).child(publish).into_any_element()
     }
 
     fn render_nodes(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let refresh = icon_btn("redis-diag-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).into_any_element();
-        let toolbar = self.diag_toolbar(p, m, entity, "redis.page.nodes", false, vec![refresh]);
+        let toolbar = self.diag_toolbar(p, m, entity, None, false, vec![refresh]);
         let rows: Vec<Vec<String>> = self
             .topology
             .nodes

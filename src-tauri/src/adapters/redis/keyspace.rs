@@ -41,6 +41,8 @@ pub struct KeyspacePrefs {
     pub memory_samples: usize,
     /// 值区左栏（条目表）的宽度，像素；0 表示按默认比例。分隔条拖动后保存。
     pub value_split: u32,
+    /// 集合类键右侧的值面板是否收起。
+    pub inspector_hidden: bool,
 }
 
 impl Default for KeyspacePrefs {
@@ -52,6 +54,7 @@ impl Default for KeyspacePrefs {
             scan_cap: DEFAULT_SCAN_CAP,
             memory_samples: DEFAULT_MEMORY_SAMPLES,
             value_split: 0,
+            inspector_hidden: false,
         }
     }
 }

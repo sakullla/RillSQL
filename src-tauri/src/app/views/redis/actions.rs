@@ -95,10 +95,6 @@ impl RedisPane {
                 self.confirm_prompt = i18n::fill(&self.text("redis.confirm.pending"), &[("command", &format!("CLIENT KILL ID {}", client.id))]);
                 self.confirm = Some(Confirm::ClientKill { node: client.node.clone(), id: client.id.clone(), addr: client.addr.clone() });
             }
-        } else if let Some(name) = id.strip_prefix("redis-info-section:") {
-            if !self.info_collapsed.remove(name) {
-                self.info_collapsed.insert(name.to_owned());
-            }
         } else if id == "redis-client-kill-none" {
             self.diag.error = self.text("redis.clients.pickFirst");
         } else if id == "redis-big-start" {
@@ -136,6 +132,10 @@ impl RedisPane {
             return;
         }
         self.page = page;
+        if page == Page::Console {
+            // 切到控制台就可以直接打字。
+            self.focus_request = Some(Field::Command);
+        }
         self.load_page(page, false, cx);
     }
 

@@ -37,24 +37,27 @@ pub(super) fn type_tone(kind: &str) -> ChipTone {
     }
 }
 
-/// 类型的三字母代码（键列表与详情头部共用）。
-pub(crate) fn type_code(kind: &str) -> &'static str {
+/// 类型的显示名（Hash、String…），未知类型原样显示。
+fn type_display(kind: &str, pane: &RedisPane) -> String {
     match kind {
-        "string" => "STR",
-        "hash" => "HSH",
-        "list" => "LST",
-        "set" => "SET",
-        "zset" => "ZST",
-        "stream" => "STM",
-        keys::JSON_TYPE => "JSN",
-        "none" => "—",
-        _ => "?",
+        "string" => pane.text("redis.type.string"),
+        "hash" => pane.text("redis.type.hash"),
+        "list" => pane.text("redis.type.list"),
+        "set" => pane.text("redis.type.set"),
+        "zset" => pane.text("redis.type.zset"),
+        "stream" => pane.text("redis.type.stream"),
+        other => other.to_owned(),
     }
 }
 
-/// 定宽类型 chip（kit token）：同一列里所有键名左缘对齐。
-fn type_badge(kind: &str, m: &kit::Metrics, p: &Palette) -> AnyElement {
-    kit::type_badge(type_code(kind), type_tone(kind), m, p)
+/// 键行的类型圆点：颜色与顶部类型筛选的圆点一致，类型全名在无障碍标签和悬停里。
+const TYPE_DOT: f32 = 8.;
+/// 键列表行右侧留白：让开浮动滚动条拇指（ADR-8 的 gutter），计数和 TTL 不被压住。
+const KEY_ROW_PR: f32 = kit::SCROLLBAR_GUTTER + Space::SM;
+
+fn type_dot(kind: &str, p: &Palette) -> AnyElement {
+    let (color, _) = type_tone(kind).colors(p);
+    div().flex_none().size(px(TYPE_DOT)).rounded_full().bg(color).into_any_element()
 }
 
 pub(super) fn cmd_click(entity: &Entity<RedisPane>, id: impl Into<String>) -> impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static {
@@ -196,7 +199,8 @@ impl Render for RedisPane {
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
         let entity = cx.entity();
-        let viewport_w = f32::from(window.viewport_size().width);
+        // 面板宽度：用上一帧量到的实际宽度（不含应用侧栏）；第一帧还没量到时退回窗口宽度。
+        let viewport_w = self.pane_w.get().unwrap_or_else(|| f32::from(window.viewport_size().width));
         let viewport_h = f32::from(window.viewport_size().height);
         self.viewport_w = viewport_w;
         let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
@@ -218,7 +222,7 @@ impl Render for RedisPane {
         } else {
             None
         };
-        let console = stack_frame(|| self.render_console(&p, &m, &entity, window, cx));
+        let command_error = self.render_command_error(&p, &m, &entity);
         let new_layer = if self.new_open { Some(stack_frame(|| self.render_new_key_dialog(&p, &m, &entity, window, cx))) } else { None };
         let mono = cx.theme().mono_font_family.clone();
         let confirm_layer = if self.confirm.is_some() { Some(stack_frame(|| self.render_confirm_dialog(&p, &m, &entity, mono, window, cx))) } else { None };
@@ -245,7 +249,8 @@ impl Render for RedisPane {
                     cx.listener(|this, _, _, cx| {
                         let menu = this.context_menu.take().is_some();
                         let db = std::mem::take(&mut this.db_picker_open);
-                        if menu || db {
+                        let types = std::mem::take(&mut this.type_picker_open);
+                        if menu || db || types {
                             cx.notify();
                         }
                     }),
@@ -281,7 +286,7 @@ impl Render for RedisPane {
                 .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| this.key_down(event, cx)));
 
             if let Some(page) = diag_page {
-                body = body.flex_col().child(page).child(console);
+                body = body.flex_col().child(page);
             } else if narrow {
                 let (toggle_icon, toggle_label) = if show_keys {
                     (IconName::ChevronRight, self.text("redis.nav.value"))
@@ -317,8 +322,7 @@ impl Render for RedisPane {
                 body = body
                     .flex_col()
                     .child(strip)
-                    .child(div().id("redis-narrow-body").flex_1().min_h(px(0.)).flex().children(content))
-                    .child(console);
+                    .child(div().id("redis-narrow-body").flex_1().min_h(px(0.)).flex().children(content));
             } else {
                 let dragging = self.sidebar_drag_start.is_some();
                 let splitter = div()
@@ -356,9 +360,28 @@ impl Render for RedisPane {
                 body = body
                     .children(sidebar)
                     .child(splitter)
-                    .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().children(detail).child(console));
+                    .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().children(detail));
             }
-            root.child(top_bar).child(body).children(new_layer).children(confirm_layer).children(menu_layer).into_any_element()
+            // 量面板宽度：宽度变了就重画一次，分栏比例、窄屏切换都按面板自己的宽度算。
+            let probe = {
+                let cell = Rc::clone(&self.pane_w);
+                let owner = entity.downgrade();
+                gpui_kit::canvas(
+                    move |area, _, cx| {
+                        let width = f32::from(area.size.width);
+                        if cell.get().is_none_or(|seen| (seen - width).abs() > 0.5) {
+                            cell.set(Some(width));
+                            owner.update(cx, |_, cx| cx.notify()).ok();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+            };
+            root.child(probe).child(top_bar).children(command_error).child(body).children(new_layer).children(confirm_layer).children(menu_layer).into_any_element()
         })
     }
 }
@@ -440,7 +463,8 @@ impl RedisPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pattern = self.redis_input(Field::Pattern, "redis-pattern", "redis.tab.patternLabel", "user:*", window, cx);
+        let hint = self.text("redis.tab.patternHint");
+        let pattern = self.redis_input(Field::Pattern, "redis-pattern", "redis.tab.patternLabel", &hint, window, cx);
         let max_side = (viewport_w * 0.5).clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W);
         let side_w = if narrow { viewport_w } else { self.sidebar_w.clamp(SIDEBAR_MIN_W, max_side) };
         let pad = m.pane_pad();
@@ -461,9 +485,7 @@ impl RedisPane {
                         .prefix(kit::input_prefix(IconName::Search, IconSize::INLINE, p.text_faint)),
                 ),
             )
-            .child(icon_btn("redis-filter", IconName::ListFilter, &self.text("redis.tab.filter"), entity))
-            .child(icon_btn("redis-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity))
-            .child(icon_btn("redis-prefs-toggle", IconName::Settings2, &self.text("redis.prefs.title"), entity).selected(self.prefs_open))
+            .child(icon_btn("redis-filter", IconName::CornerDownLeft, &self.text("redis.tab.filter"), entity))
             .child(icon_btn("redis-new-key", IconName::Plus, &self.text("redis.action.newKey"), entity).primary());
         let prefs = if self.prefs_open { Some(self.render_prefs_panel(p, entity, window, cx)) } else { None };
         let batch_ttl = if self.batch_ttl_for.is_some() { Some(self.render_batch_ttl_bar(p, entity, window, cx)) } else { None };
@@ -480,7 +502,7 @@ impl RedisPane {
             .border_color(p.line)
             .child(search)
             .children(prefs)
-            .child(self.render_type_bar(p, m, entity))
+            .child(self.render_type_bar(p, entity))
             .children(self.render_batch_banner(p, entity))
             .children(batch_ttl);
 
@@ -756,8 +778,9 @@ impl RedisPane {
     }
 
     /// 第二行：可横向滚动的类型分段（只列出已读到的类型，加「全部」，每项带计数）+ 视图切换。不折行。
-    fn render_type_bar(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
-        let mut counts: Vec<(&str, &str, usize)> = vec![
+    /// 每种类型在已读到的键里的个数（按固定顺序，含 0）。
+    fn type_counts(&self) -> Vec<(&'static str, &'static str, usize)> {
+        let mut counts: Vec<(&'static str, &'static str, usize)> = vec![
             ("string", "redis.type.string", 0),
             ("hash", "redis.type.hash", 0),
             ("list", "redis.type.list", 0),
@@ -770,57 +793,116 @@ impl RedisPane {
                 slot.2 += 1;
             }
         }
-        let mut chips = div().flex().flex_nowrap().items_center().gap(px(Space::XS));
-        chips = chips.child(kit::filter_chip(
-            "redis-type-all",
-            self.text("redis.type.all"),
-            None,
-            None,
-            Some(self.keys.len()),
-            self.type_filter.is_empty(),
-            p,
-            cmd_click(entity, "redis-type-all"),
-        ));
-        for (kind, label_key, n) in counts {
-            let active = self.type_filter == kind;
-            if n == 0 && !active {
-                continue;
-            }
-            let id = format!("redis-type-{kind}");
-            let (dot, _) = type_tone(kind).colors(p);
-            chips = chips.child(kit::filter_chip(
-                SharedString::from(id.clone()),
-                self.text(label_key),
-                None,
-                Some(dot),
-                Some(n),
-                active,
-                p,
-                cmd_click(entity, id),
-            ));
-        }
-        let toggle = div()
-            .flex_none()
+        counts
+    }
+
+    /// 键列表的第二行：类型下拉（选中立即生效）、视图切换、刷新、偏好、新建键。一行放下，不折行。
+    fn render_type_bar(&self, p: &Palette, entity: &Entity<Self>) -> AnyElement {
+        let open = self.type_picker_open;
+        let counts = self.type_counts();
+        let (label, dot, count) = match counts.iter().find(|(kind, _, _)| *kind == self.type_filter) {
+            Some((kind, key, n)) => (self.text(key), Some(type_tone(kind).colors(p).0), *n),
+            None => (self.text("redis.type.all"), None, self.keys.len()),
+        };
+        let filtered = !self.type_filter.is_empty();
+        let button = kit::interactive_states(div().id("redis-type-toggle"), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(SharedString::from(format!("{} {label}", self.text("redis.type.filter"))))
+            .aria_expanded(open)
+            .tooltip_text(SharedString::from(self.text("redis.type.filter")))
+            .h(px(24.))
+            .px(px(Space::SM))
             .flex()
             .items_center()
-            .p(px(Space::XXS))
-            .gap(px(Space::XXS))
+            .gap(px(Space::XS))
             .rounded(px(Radius::CONTROL))
-            .bg(p.sunken)
-            .child(icon_btn("redis-view-tree", IconName::ListTree, &self.text("redis.view.tree"), entity).xsmall().selected(self.view_mode == ViewMode::Tree))
-            .child(icon_btn("redis-view-template", IconName::Shapes, &self.text("redis.view.template"), entity).xsmall().selected(self.view_mode == ViewMode::Template))
-            .child(icon_btn("redis-view-flat", IconName::List, &self.text("redis.view.flat"), entity).xsmall().selected(self.view_mode == ViewMode::Flat));
+            .border_1()
+            .when(open || filtered, |this| this.border_color(p.accent.opacity(0.5)).bg(p.accent_soft).text_color(p.accent_text))
+            .when(!open && !filtered, |this| {
+                this.border_color(p.line).bg(if p.dark { p.raised } else { p.surface }).text_color(p.text).hover(|s| s.bg(p.hover).border_color(p.line_strong))
+            })
+            .text_size(px(TypeScale::XS))
+            .font_weight(FontWeight::MEDIUM)
+            .when_some(dot, |this, color| this.child(div().size(px(TYPE_DOT)).rounded_full().bg(color)))
+            .when(dot.is_none(), |this| this.child(kit::icon(IconName::ListFilter, 12., p.text_muted)))
+            .child(SharedString::from(label))
+            .child(div().font_features(kit::tabular_figures()).text_color(if filtered { p.accent_text } else { p.text_faint }).child(SharedString::from(count.to_string())))
+            .child(kit::icon(IconName::ChevronDown, 11., if open || filtered { p.accent_text } else { p.text_muted }))
+            .on_click(cmd_click(entity, "redis-type-toggle"));
+        let picker = div()
+            .relative()
+            .flex_none()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(button)
+            .when(open, |this| {
+                this.child(
+                    div().absolute().top_full().left_0().child(
+                        deferred(anchored().anchor(Anchor::TopLeft).snap_to_window_with_margin(px(8.)).child(self.type_picker_panel(p, entity, &counts))).with_priority(15),
+                    ),
+                )
+            });
         div()
             .id("redis-tools-types")
             .test_support()
             .flex()
             .flex_nowrap()
             .items_center()
-            .gap(px(Space::SM))
-            .h(px(m.chip_h() + Space::SM))
-            .child(div().id("redis-type-scroll").test_support().flex_1().min_w(px(0.)).scroll_area_x().child(chips))
-            .child(toggle)
+            .gap(px(Space::XXS))
+            .child(picker)
+            .child(div().flex_1())
+            .child(self.render_view_toggle(p, entity))
+            .child(div().flex_none().w(px(DIVIDER_W)).h(px(IconSize::INLINE)).mx(px(Space::XXS)).bg(p.line))
+            .child(icon_btn("redis-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity).xsmall())
+            .child(icon_btn("redis-prefs-toggle", IconName::Settings2, &self.text("redis.prefs.title"), entity).xsmall().selected(self.prefs_open))
             .into_any_element()
+    }
+
+    /// 类型下拉面板：每行圆点 + 类型名 + 个数，当前项打勾；没有键的类型变淡但仍可选。
+    fn type_picker_panel(&self, p: &Palette, entity: &Entity<Self>, counts: &[(&'static str, &'static str, usize)]) -> AnyElement {
+        let row = |id: String, dot: Option<gpui_kit::Hsla>, label: String, n: usize, active: bool| {
+            kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
+                .test_support()
+                .role(gpui_kit::Role::MenuItem)
+                .aria_label(SharedString::from(label.clone()))
+                .aria_selected(active)
+                .h(px(28.))
+                .px(px(Space::SM))
+                .flex()
+                .items_center()
+                .gap(px(Space::SM))
+                .rounded(px(Radius::CONTROL))
+                .text_size(px(TypeScale::SM))
+                .text_color(if n == 0 && !active { p.text_faint } else { p.text })
+                .when(active, |this| this.bg(p.selection))
+                .when(!active, |this| this.hover(|s| s.bg(p.hover)))
+                .child(div().flex_none().w(px(TYPE_DOT)).h(px(TYPE_DOT)).rounded_full().when_some(dot, |this, color| this.bg(color)))
+                .child(div().flex_1().child(SharedString::from(label)))
+                .child(div().flex_none().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_faint).child(SharedString::from(n.to_string())))
+                .child(div().flex_none().w(px(12.)).when(active, |this| this.child(kit::icon(IconName::Check, 12., p.accent_text))))
+                .on_click(cmd_click(entity, id))
+        };
+        let mut panel = div()
+            .id("redis-type-picker")
+            .test_support()
+            .occlude()
+            .mt(px(4.))
+            .w(px(200.))
+            .p(px(4.))
+            .rounded(px(Radius::PANEL))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.line_strong)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(row("redis-type-all".into(), None, self.text("redis.type.all"), self.keys.len(), self.type_filter.is_empty()));
+        for (kind, key, n) in counts {
+            panel = panel.child(row(format!("redis-type-{kind}"), Some(type_tone(kind).colors(p).0), self.text(key), *n, self.type_filter == *kind));
+        }
+        panel.into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -985,9 +1067,10 @@ impl RedisPane {
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(prefix.clone()))
                     .aria_expanded(*open)
+                    .w_full()
                     .h(px(row_h))
                     .pl(px(indent(*depth)))
-                    .pr(px(Space::MD))
+                    .pr(px(KEY_ROW_PR))
                     .flex()
                     .items_center()
                     .gap(px(Space::SM))
@@ -1032,9 +1115,10 @@ impl RedisPane {
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(format!("{template} {}", item.count)))
                     .aria_expanded(*open)
+                    .w_full()
                     .h(px(row_h))
                     .pl(px(Space::SM))
-                    .pr(px(Space::MD))
+                    .pr(px(KEY_ROW_PR))
                     .flex()
                     .items_center()
                     .gap(px(Space::SM))
@@ -1043,7 +1127,7 @@ impl RedisPane {
                     .text_color(p.text)
                     .hover(|style| style.bg(p.hover))
                     .child(kit::icon(if *open { IconName::ChevronDown } else { IconName::ChevronRight }, IconSize::INLINE, p.text_faint))
-                    .child(type_badge(&dominant, &m, &p))
+                    .child(type_dot(&dominant, &p))
                     .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(template.clone())))
                     .when_some(memory, |this, memory| {
                         this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(memory)))
@@ -1078,8 +1162,8 @@ impl RedisPane {
                 // 键名用界面字体，按实际文字宽度截断并保留尾部；悬停显示完整键名。
                 let font = gpui_kit::Font { family: cx.theme().font_family.clone(), ..Default::default() };
                 let ttl_w = ttl_text.as_deref().map(|text| Self::measure_ui(window, &font, TypeScale::XS, text) + Space::MD).unwrap_or(0.);
-                let fixed = Space::SM * 2. + Space::MD * 2. + ControlSize::BADGE_W + Space::MD;
-                let available = (side_w - fixed - indent(*depth) + Space::SM - ttl_w).max(0.);
+                let fixed = Space::SM * 2. + KEY_ROW_PR + TYPE_DOT + Space::SM + Space::XS;
+                let available = (side_w - fixed - indent(*depth) - ttl_w).max(0.);
                 let shown = self.fit_key_name(window, &font, TypeScale::SM, display, available);
                 let open_entity = entity.clone();
                 kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
@@ -1087,17 +1171,18 @@ impl RedisPane {
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(label))
                     .aria_selected(selected)
-                    .tooltip_text(SharedString::from(key.name.clone()))
+                    .tooltip_text(SharedString::from(format!("{} · {}", key.name, key.key_type)))
+                    .w_full()
                     .h(px(row_h))
                     .pl(px(indent(*depth)))
-                    .pr(px(Space::MD))
+                    .pr(px(KEY_ROW_PR))
                     .flex()
                     .items_center()
-                    .gap(px(Space::MD))
+                    .gap(px(Space::SM))
                     .rounded(px(Radius::CONTROL))
                     .when(selected, |this| this.bg(p.selection))
                     .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-                    .child(type_badge(&key.key_type, &m, &p))
+                    .child(type_dot(&key.key_type, &p))
                     .child(
                         div()
                             .flex_1()
@@ -1137,6 +1222,22 @@ impl RedisPane {
                     .into_any_element()
             }
         }
+    }
+
+    /// 列表视图切换（树 / 模板 / 平铺）：放在列表底栏右端，不和类型筛选抢一行。
+    fn render_view_toggle(&self, p: &Palette, entity: &Entity<Self>) -> AnyElement {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .p(px(Space::XXS))
+            .gap(px(Space::XXS))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.sunken)
+            .child(icon_btn("redis-view-tree", IconName::ListTree, &self.text("redis.view.tree"), entity).xsmall().selected(self.view_mode == ViewMode::Tree))
+            .child(icon_btn("redis-view-template", IconName::Shapes, &self.text("redis.view.template"), entity).xsmall().selected(self.view_mode == ViewMode::Template))
+            .child(icon_btn("redis-view-flat", IconName::List, &self.text("redis.view.flat"), entity).xsmall().selected(self.view_mode == ViewMode::Flat))
+            .into_any_element()
     }
 
     /// 页脚：扫描进度（已读取 / DBSIZE）、取消、上限提示与继续扫描。
@@ -1210,18 +1311,8 @@ impl RedisPane {
     fn render_detail(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, detail_w: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let col = div().flex().flex_col().flex_1().min_w(px(0.)).min_h(px(0.)).bg(p.surface);
         if self.selected.is_empty() {
-            let create = action("redis-new-key-value", Some(IconName::Plus), &self.text("redis.action.newKey"), Kind::Primary, entity).into_any_element();
-            return col
-                .child(
-                    div().flex_1().min_w(px(0.)).p(px(m.pane_pad() * 2.)).child(kit::empty_state_with_action(
-                        IconName::Key,
-                        SharedString::from(self.text("redis.empty.pick.heading")),
-                        SharedString::from(self.text("redis.tab.pickKey")),
-                        create,
-                        p,
-                    )),
-                )
-                .into_any_element();
+            let mono = cx.theme().mono_font_family.clone();
+            return col.child(self.render_keyspace_overview(p, m, entity, mono)).into_any_element();
         }
 
         let header = self.render_detail_header(p, m, entity, detail_w, cx);
@@ -1254,9 +1345,158 @@ impl RedisPane {
             .into_any_element()
     }
 
+    /// 没有选中键时的值区：当前库的概览（类型分布、过期、主要键模式），点一下就能筛选；
+    /// 还没有读到任何键时退回原来的空态。
+    fn render_keyspace_overview(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, mono: SharedString) -> AnyElement {
+        let create = action("redis-new-key-value", Some(IconName::Plus), &self.text("redis.action.newKey"), Kind::Primary, entity).into_any_element();
+        if self.keys.is_empty() {
+            return div()
+                .flex_1()
+                .min_w(px(0.))
+                .p(px(m.pane_pad() * 2.))
+                .child(kit::empty_state_with_action(
+                    IconName::Key,
+                    SharedString::from(self.text("redis.empty.pick.heading")),
+                    SharedString::from(self.text("redis.tab.pickKey")),
+                    create,
+                    p,
+                ))
+                .into_any_element();
+        }
+        let read = self.keys.len();
+        let counts: Vec<_> = self.type_counts().into_iter().filter(|(_, _, n)| *n > 0).collect();
+        let expiring = self.keys.iter().filter(|key| key.ttl_ms.is_some_and(|ttl| ttl >= 0)).count();
+        let templates = self.templates();
+        let total = self.scan.total.map(|n| n as usize).unwrap_or(read).max(read);
+        let section = |title: String| div().text_size(px(TypeScale::XS)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(SharedString::from(title));
+
+        // 类型分布：一条按比例着色的条，下面是可点的图例。
+        let mut bar = div().h(px(8.)).w_full().flex().rounded(px(Radius::TAG)).overflow_hidden().bg(p.sunken);
+        for (kind, _, n) in &counts {
+            bar = bar.child(div().h_full().flex_basis(relative(*n as f32 / read as f32)).flex_shrink_0().bg(type_tone(kind).colors(p).0));
+        }
+        let mut legend = div().flex().flex_wrap().gap(px(Space::XS));
+        for (kind, key, n) in &counts {
+            let id = format!("redis-type-{kind}");
+            let share = *n as f32 * 100. / read as f32;
+            let percent = if share > 0. && share < 1. { "<1%".to_owned() } else { format!("{}%", share.round()) };
+            legend = legend.child(
+                kit::interactive_states(div().id(SharedString::from(format!("redis-overview-{kind}"))), p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(format!("{} {n}", self.text(key))))
+                    .h(px(28.))
+                    .px(px(Space::SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::SM))
+                    .rounded(px(Radius::CONTROL))
+                    .border_1()
+                    .border_color(p.line_soft)
+                    .hover(|s| s.bg(p.hover).border_color(p.line))
+                    .text_size(px(TypeScale::SM))
+                    .child(type_dot(kind, p))
+                    .child(div().text_color(p.text).child(SharedString::from(self.text(key))))
+                    .child(div().font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(n.to_string())))
+                    .child(div().font_features(kit::tabular_figures()).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(percent)))
+                    .on_click(cmd_click(entity, id)),
+            );
+        }
+
+        // 主要键模式：前几个模板，点一下按模式重新扫描。
+        let mut patterns = div().flex().flex_col();
+        // 只有一个键的「模式」不算模式，不列出来。
+        let groups: Vec<_> = templates.iter().filter(|group| group.count > 1).take(6).collect();
+        for group in &groups {
+            let id = format!("redis-tpl-filter:{}", group.template);
+            let dominant = group.types.first().map(|(kind, _)| kind.clone()).unwrap_or_default();
+            let share = group.count as f32 / read as f32;
+            patterns = patterns.child(
+                kit::interactive_states(div().id(SharedString::from(format!("redis-overview-tpl:{}", group.template))), p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(group.template.clone()))
+                    .tooltip_text(SharedString::from(self.text("redis.tpl.filter")))
+                    .h(px(30.))
+                    .px(px(Space::SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::SM))
+                    .rounded(px(Radius::CONTROL))
+                    .hover(|s| s.bg(p.hover))
+                    .child(type_dot(&dominant, p))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text)
+                            .child(SharedString::from(group.template.clone())),
+                    )
+                    .child(div().flex_none().w(px(80.)).h(px(4.)).rounded_full().bg(p.sunken).child(div().h_full().w(relative(share.min(1.))).rounded_full().bg(p.accent.opacity(0.55))))
+                    .child(div().flex_none().w(px(48.)).flex().justify_end().font_features(kit::tabular_figures()).text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(group.count.to_string())))
+                    .on_click(cmd_click(entity, id)),
+            );
+        }
+
+        let stat = |label: String, value: String| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(Space::XXS))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(label)))
+                .child(div().text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).font_features(kit::tabular_figures()).text_color(p.text).child(SharedString::from(value)))
+        };
+        let stats = div()
+            .flex()
+            .gap(px(Space::XL))
+            .child(stat(self.text("redis.overview.total"), total.to_string()))
+            .child(stat(self.text("redis.overview.read"), read.to_string()))
+            .child(stat(self.text("redis.overview.expiring"), expiring.to_string()));
+        let console = action("redis-console", Some(IconName::SquareTerminal), &self.text("redis.page.console"), Kind::Secondary, entity).into_any_element();
+        div()
+            .id("redis-overview")
+            .test_support()
+            .flex_1()
+            .min_h(px(0.))
+            .scroll_area_y()
+            .child(
+                div()
+                    .max_w(px(720.))
+                    .px(px(m.pane_pad() * 2.))
+                    .py(px(Space::XL))
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::XL))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::MD))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(Space::XXS))
+                                    .child(div().text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(format!("db{}", self.database))))
+                                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("redis.overview.hint")))),
+                            )
+                            .child(console)
+                            .child(create),
+                    )
+                    .child(stats)
+                    .child(div().flex().flex_col().gap(px(Space::SM)).child(section(self.text("redis.overview.types"))).child(bar).child(legend))
+                    .when(!groups.is_empty(), |this| this.child(div().flex().flex_col().gap(px(Space::XS)).child(section(self.text("redis.overview.patterns"))).child(patterns))),
+            )
+            .into_any_element()
+    }
+
     /// 两行头部：键名与类型 chip、右侧主要操作（刷新、TTL、删除、更多）；第二行是 TTL、大小、长度等元信息。
     /// 读取中只在底边画一条细进度线。窄窗口下 TTL 与删除也收进「更多」。
-    fn render_detail_header(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, detail_w: f32, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_detail_header(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, detail_w: f32, cx: &mut Context<Self>) -> AnyElement {
         // 头部总是描述当前选中的键：类型来自键索引；元信息只在详情已经属于这个键时显示。
         let current = (self.detail_key == self.selected).then_some(self.detail.as_deref()).flatten();
         let type_name = current
@@ -1276,7 +1516,14 @@ impl RedisPane {
             more_entity.update(cx, |pane, cx| pane.open_more_menu(at, overflow, cx));
         })
         .small();
-        let mut actions = div().flex_none().flex().items_center().gap(px(Space::XXS)).child(icon_btn("redis-refresh-key", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity));
+        // 复制键名和其他键操作放在同一组、同一尺寸，图标排成一条线。
+        let mut actions = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(Space::XXS))
+            .child(icon_btn("redis-copy-key", IconName::Copy, &self.text("redis.copy.keyName"), entity))
+            .child(icon_btn("redis-refresh-key", IconName::RefreshCw, &self.text("redis.tab.refresh"), entity));
         if !overflow {
             actions = actions
                 // 编辑条开着时它的提交按钮占用 `redis-ttl`，头部按钮改为收起。
@@ -1285,10 +1532,13 @@ impl RedisPane {
         }
         actions = actions.child(more);
 
+        // 键名完整显示（最多两行），右侧是键操作（第一个是复制键名）；类型用和列表一致的圆点 + 全名。
+        let mono = cx.theme().mono_font_family.clone();
+        let type_label = type_display(&type_name, self);
         let title = div()
             .flex()
-            .items_center()
-            .gap(px(Space::MD))
+            .items_start()
+            .gap(px(Space::SM))
             .min_w(px(0.))
             .child(
                 div()
@@ -1296,19 +1546,34 @@ impl RedisPane {
                     .test_support()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(TypeScale::LG))
+                    .line_clamp(2)
+                    .font_family(mono)
+                    .text_size(px(TypeScale::MD))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if gone { p.text_faint } else { p.text })
                     .when(gone, |this| this.line_through())
                     .tooltip_text(SharedString::from(self.selected.clone()))
-                    .cursor_pointer()
-                    .on_click(cmd_click(entity, "redis-copy-key"))
                     .child(SharedString::from(self.selected.clone())),
             )
-            .when(!type_name.is_empty(), |this| this.child(type_badge(&type_name, m, p)))
-            .child(div().flex_1())
             .child(actions);
+        let type_chip = (!type_name.is_empty()).then(|| {
+            div()
+                .id("redis-type-chip")
+                .test_support()
+                .flex_none()
+                .h(px(m.chip_h()))
+                .px(px(Space::SM))
+                .flex()
+                .items_center()
+                .gap(px(Space::XS))
+                .rounded(px(Radius::TAG))
+                .bg(p.sunken)
+                .text_size(px(TypeScale::XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text)
+                .child(type_dot(&type_name, p))
+                .child(SharedString::from(type_label))
+        });
 
         let (ttl_fg, ttl_bg) = if urgent {
             (p.warn, p.warn_soft)
@@ -1356,7 +1621,8 @@ impl RedisPane {
             .flex_nowrap()
             .overflow_hidden()
             .items_center()
-            .gap(px(Space::MD))
+            .gap(px(Space::SM))
+            .children(type_chip)
             .when(current.is_some(), |this| this.child(ttl_chip))
             .when(!size.is_empty(), |this| this.child(weak(size)))
             .when(gone, |this| this.child(kit::chip(SharedString::from(self.text("redis.keys.missing")), ChipTone::Danger, m, p)))
@@ -1580,7 +1846,8 @@ impl RedisPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let query = self.redis_input(Field::HashQuery, "redis-hash-filter", "redis.entry.filter", "", window, cx);
+        let hint = self.text("redis.entry.filter");
+        let query = self.redis_input(Field::HashQuery, "redis-hash-filter", "redis.entry.filter", &hint, window, cx);
         let (columns, lines, add_label) = self.entry_lines(detail);
         let total_loaded = match &detail.value {
             RedisValue::Hash { entries } => entries.len(),
@@ -1664,6 +1931,16 @@ impl RedisPane {
             .child(
                 icon_btn("redis-entry-form", if self.entry_form_open { IconName::ChevronUp } else { IconName::Plus }, &add_label, entity)
                     .selected(self.entry_form_open),
+            )
+            .child(div().flex_none().w(px(DIVIDER_W)).h(px(IconSize::INLINE)).bg(p.line))
+            .child(
+                icon_btn(
+                    "redis-inspector-toggle",
+                    IconName::PanelRight,
+                    &self.text(if self.prefs.inspector_hidden { "redis.inspector.show" } else { "redis.inspector.hide" }),
+                    entity,
+                )
+                .selected(!self.prefs.inspector_hidden),
             );
         let footer = div()
             .id("redis-entry-count")
@@ -1712,6 +1989,10 @@ impl RedisPane {
             .child(div().flex_1().min_h(px(0.)).child(table))
             .child(footer);
 
+        if self.prefs.inspector_hidden {
+            // 值面板收起：条目表占满整个值区。
+            return div().id("redis-value-split").test_support().flex_1().min_h(px(0.)).flex().child(left.flex_1()).into_any_element();
+        }
         let inspected = self.inspected_entry(detail);
         let right = self.render_entry_inspector(inspected, p, window, cx);
 
@@ -1907,6 +2188,7 @@ impl RedisPane {
                         viewer.update(cx, |viewer, cx| viewer.set_truncation(TruncationState::Loading, cx));
                         this.load_full_string(cx);
                     }
+                    FormatViewerEvent::Close => {}
                 });
                 self.string_sub = Some(sub);
                 self.string_viewer = Some(viewer);
@@ -1944,14 +2226,20 @@ impl RedisPane {
             locale: self.locale,
         };
         let title = Some(SharedString::from(title.to_owned()));
+        let close_label = SharedString::from(self.text("redis.inspector.hide"));
         match self.entry_viewer.clone() {
             None => {
                 let viewer = cx.new(|cx| {
                     let mut viewer = FormatViewer::new(spec, window, cx);
                     viewer.set_title(title, cx);
+                    viewer.set_closable(Some(close_label.clone()), cx);
                     viewer
                 });
                 let sub = cx.subscribe(&viewer, |this, viewer, event, cx| {
+                    if matches!(event, FormatViewerEvent::Close) {
+                        this.command("redis-inspector-toggle", cx);
+                        return;
+                    }
                     let FormatViewerEvent::Commit(value) = event else { return };
                     let key = this.selected.clone();
                     let original = viewer.read(cx).source().to_owned();
@@ -1976,6 +2264,7 @@ impl RedisPane {
                         viewer.set_title(title, cx);
                     });
                 }
+                viewer.update(cx, |viewer, cx| viewer.set_closable(Some(close_label), cx));
             }
         }
         self.entry_viewer_tag = tag.to_owned();
@@ -1988,10 +2277,8 @@ impl RedisPane {
     fn command_field(&self, command: &Entity<InputState>, p: &Palette, mono: &SharedString, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::component::input::HighlightStyleResolver as _;
         let text = self.command_input.clone();
-        let narrow = self.viewport_w < kit::NARROW_PAGE_WIDTH;
-        let side = if narrow { 0. } else { self.sidebar_w };
-        // 可用宽度：视口 − 侧栏 − 两侧边距 − 收起按钮与执行按钮。
-        let available = self.viewport_w - side - Space::XL * 2. - IconSize::RAIL * 2. - ControlSize::PICKER_MIN_W / 2.;
+        // 可用宽度：控制台占满整页，减去两侧边距、提示符与执行按钮。
+        let available = self.viewport_w - Space::XL * 2. - IconSize::RAIL * 2. - ControlSize::PICKER_MIN_W / 2.;
         let fits = !text.is_empty() && !text.contains('\n') && text.chars().count() as f32 * TypeScale::SM * MONO_ADVANCE < available;
         let tokens = if fits { crate::ui::redis_highlight::lex(&text) } else { Vec::new() };
         let theme = &cx.theme().highlight_theme;
@@ -2029,121 +2316,159 @@ impl RedisPane {
         div().id("redis-command-field").test_support().relative().flex_1().min_w(px(0.)).child(input).children(overlay).into_any_element()
     }
 
-    fn render_console(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let command = self.redis_input(Field::Command, "redis-command", "redis.tab.commandLabel", "GET key", window, cx);
-        let mono = cx.theme().mono_font_family.clone();
-        let pad = m.pane_pad();
-        let spec = complete::lookup_command(&self.command_input);
-        // 状态行常驻（读屏与测试都按它取当前状态）；没有语法提示时它占满整行并靠右，有提示时只留最小宽。
-        let status = div()
+    /// 状态行：最近一次操作的提示（读屏与测试按 `redis-status` 取当前状态）。放在顶部栏右端。
+    pub(super) fn render_status(&self, p: &Palette) -> AnyElement {
+        div()
             .id("redis-status")
             .test_support()
             .role(gpui_kit::Role::Status)
             .aria_label(SharedString::from(self.status_line()))
+            .flex_none()
+            .min_w(px(16.))
+            .max_w(px(280.))
             .min_h(px(16.))
-            .when(spec.is_none() || !self.console_open, |this| this.flex_1().min_w(px(0.)).justify_end())
-            .when(spec.is_some() && self.console_open, |this| this.flex_none().min_w(px(16.)).max_w(px(320.)))
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(Space::XS))
             .text_size(px(TypeScale::XS))
             .text_color(p.text_muted)
             .when(!self.note.is_empty(), |this| this.child(kit::icon(IconName::CircleCheck, 12., p.ok)))
-            .child(div().min_w(px(0.)).truncate().child(SharedString::from(self.note.clone())));
+            .child(div().min_w(px(0.)).truncate().child(SharedString::from(self.note.clone())))
+            .into_any_element()
+    }
 
-        let error = if self.error_source == ErrorSource::Command && !self.error.is_empty() && !self.new_open {
-            let keys_blocked = self.error.contains("KEYS");
-            let actions = div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .when(keys_blocked, |this| this.child(action("redis-use-scan", Some(IconName::Search), &self.text("redis.console.useScan"), Kind::Primary, entity).small()))
-                .child(icon_btn("redis-error-dismiss", IconName::X, &self.text("redis.error.dismiss"), entity))
-                .into_any_element();
-            Some(
-                div().id("error-state").test_support().mx(px(pad)).mt(px(8.)).child(kit::banner(
-                    kit::BannerTone::Danger,
-                    IconName::CircleAlert,
-                    format!("{} · {}", self.text("redis.error.command.heading"), self.error),
-                    Some(actions),
-                    p,
-                )),
-            )
-        } else {
-            None
-        };
-
-        let mut console = div().flex_none().flex().flex_col().border_t_1().border_color(p.line).bg(p.chrome).children(error);
-
-        if !self.console_open {
-            return console
-                .child(
-                    div()
-                        .h(px(m.bar_h()))
-                        .px(px(pad))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(action("redis-console", Some(IconName::SquareTerminal), &self.text("redis.console.toggle"), Kind::Tool, entity).small())
-                        .child(status),
-                )
-                .child(
-                    div()
-                        .hidden()
-                        .child(kit::text_input("redis-command", &command, self.text("redis.tab.commandLabel")))
-                        .child(action("redis-exec", Some(IconName::Play), &self.text("redis.tab.execute"), Kind::Primary, entity)),
-                )
-                .into_any_element();
+    /// 键页上的操作错误（删除、改 TTL 等失败）：统一的错误块，可关闭。
+    pub(super) fn render_command_error(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> Option<AnyElement> {
+        if self.error_source != ErrorSource::Command || self.error.is_empty() || self.new_open {
+            return None;
         }
+        let keys_blocked = self.error.contains("KEYS");
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .when(keys_blocked, |this| this.child(action("redis-use-scan", Some(IconName::Search), &self.text("redis.console.useScan"), Kind::Primary, entity).small()))
+            .child(icon_btn("redis-error-dismiss", IconName::X, &self.text("redis.error.dismiss"), entity))
+            .into_any_element();
+        Some(
+            div()
+                .id("error-state")
+                .test_support()
+                .flex_none()
+                .px(px(m.pane_pad()))
+                .pt(px(Space::SM))
+                .child(kit::banner(kit::BannerTone::Danger, IconName::CircleAlert, format!("{} · {}", self.text("redis.error.command.heading"), self.error), Some(actions), p))
+                .into_any_element(),
+        )
+    }
 
-        if !self.reply.is_empty() {
-            let shown = if self.pretty_reply.is_empty() { self.reply.clone() } else { self.pretty_reply.clone() };
-            console = console.child(
+    /// 控制台页：上面是执行记录（提示符 + 命令 + 输出，和 redis-cli 一样从上往下排，新结果自动滚到底），
+    /// 下面是命令输入。错误直接写在对应命令下面。
+    pub(super) fn render_console(&mut self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let command = self.redis_input(Field::Command, "redis-command", "redis.tab.commandLabel", "GET key", window, cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let pad = m.pane_pad();
+        let spec = complete::lookup_command(&self.command_input);
+        let prompt = |db: &str| format!("db{db}>");
+
+        let mut log = div()
+            .id("redis-console-output")
+            .test_support()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .px(px(pad))
+            .py(px(Space::SM))
+            .font_family(mono.clone())
+            .text_size(px(TypeScale::SM));
+        if self.console_log.is_empty() {
+            log = log.child(
                 div()
-                    .mx(px(pad))
-                    .mt(px(8.))
-                    .rounded(px(Radius::PANEL))
-                    .border_1()
-                    .border_color(p.line)
-                    .bg(p.sunken)
+                    .id("redis-console-empty")
+                    .test_support()
+                    .py(px(Space::LG))
+                    .font_family(cx.theme().font_family.clone())
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .child(SharedString::from(self.text("redis.console.emptyHint"))),
+            );
+        }
+        for (index, entry) in self.console_log.iter().enumerate() {
+            let elapsed = entry.elapsed.map(|d| if d.as_millis() >= 1 { format!("{} ms", d.as_millis()) } else { format!("{} µs", d.as_micros()) });
+            let tokens = crate::ui::redis_highlight::lex(&entry.line);
+            let theme = &cx.theme().highlight_theme;
+            let highlights: Vec<(std::ops::Range<usize>, gpui_kit::HighlightStyle)> = tokens
+                .iter()
+                .filter_map(|token| theme.style(token.kind.highlight()?).map(|style| (token.range.clone(), style)))
+                .collect();
+            let group = SharedString::from(format!("redis-console-entry-{index}"));
+            log = log.child(
+                div()
+                    .id(SharedString::from(format!("redis-console-entry:{index}")))
+                    .test_support()
+                    .group(group.clone())
+                    .flex_none()
                     .flex()
                     .flex_col()
+                    .gap(px(Space::XXS))
+                    .py(px(Space::XS))
+                    .when(index > 0, |this| this.border_t_1().border_color(p.line_soft))
                     .child(
                         div()
-                            .h(px(26.))
-                            .pl(px(10.))
-                            .pr(px(4.))
                             .flex()
                             .items_center()
-                            .gap(px(2.))
-                            .child(div().flex_1().text_size(px(TypeScale::XS)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(SharedString::from(self.text("redis.console.output"))))
-                            .child(icon_btn("redis-console-copy", IconName::Copy, &self.text("redis.console.copyOutput"), entity).xsmall())
-                            .child(icon_btn("redis-console-clear", IconName::Trash, &self.text("redis.console.clear"), entity).xsmall()),
+                            .gap(px(Space::SM))
+                            .min_h(px(m.chip_h()))
+                            .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(prompt(&entry.db))))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(p.text)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(gpui_kit::StyledText::new(SharedString::from(entry.line.clone())).with_highlights(highlights)),
+                            )
+                            .when_some(elapsed, |this, text| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .font_family(cx.theme().font_family.clone())
+                                        .text_size(px(TypeScale::XS))
+                                        .font_features(kit::tabular_figures())
+                                        .text_color(p.text_faint)
+                                        .child(SharedString::from(text)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .invisible()
+                                    .group_hover(group.clone(), |s| s.visible())
+                                    .child(icon_btn(format!("redis-console-copy:{index}"), IconName::Copy, &self.text("redis.console.copyOutput"), entity).xsmall()),
+                            ),
                     )
                     .child(
                         div()
-                            .id("redis-console-output")
-                            .test_support()
-                            .max_h(px(160.))
-                            .scroll_area_y()
-                            .px(px(10.))
-                            .pb(px(8.))
-                            .font_family(mono.clone())
-                            .text_size(px(TypeScale::XS))
-                            .text_color(p.text)
-                            .child(SharedString::from(shown)),
+                            .pl(px(Space::MD))
+                            .border_l_2()
+                            .border_color(if entry.ok { p.line } else { p.danger.opacity(0.6) })
+                            .text_color(if entry.ok { p.text_muted } else { p.danger })
+                            .child(SharedString::from(if entry.output.is_empty() { "(empty)".to_owned() } else { entry.output.clone() })),
                     ),
             );
         }
+        let log = div().relative().flex_1().min_h(px(0.)).flex().flex_col().child(log.scroll_area_y().scroll_handle(&self.console_scroll));
 
         let (_, _, completions) = self.current_completions();
-        if !completions.is_empty() {
+        let popup = (!completions.is_empty()).then(|| {
             let active = self.complete_index.min(completions.len() - 1);
             let mut popup = div()
                 .id("redis-complete-list")
                 .test_support()
                 .mx(px(pad))
-                .mt(px(8.))
+                .mb(px(Space::XS))
                 .max_h(px(176.))
                 .scroll_area_y()
                 .p(px(4.))
@@ -2190,46 +2515,72 @@ impl RedisPane {
                         .on_click(cmd_click(entity, pick_id)),
                 );
             }
-            popup = popup.child(div().px(px(8.)).pt(px(2.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.console.completeHint"))));
-            console = console.child(popup);
-        }
+            popup.child(div().px(px(8.)).pt(px(2.)).text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(self.text("redis.console.completeHint"))))
+        });
 
-        console = console.child(
-            div()
-                .px(px(pad))
-                .pt(px(8.))
-                .pb(px(4.))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(icon_btn("redis-console", IconName::PanelBottomClose, &self.text("redis.console.hide"), entity))
-                .child(self.command_field(&command, p, &mono, cx))
-                .child(action("redis-exec", Some(IconName::Play), &self.text("redis.tab.execute"), Kind::Primary, entity).small()),
-        );
+        let input_row = div()
+            .flex_none()
+            .px(px(pad))
+            .pt(px(Space::SM))
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .child(div().flex_none().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(prompt(&self.database))))
+            .child(self.command_field(&command, p, &mono, cx))
+            .child(action("redis-exec", Some(IconName::Play), &self.text("redis.tab.execute"), Kind::Primary, entity).small());
+        let hint_row = div()
+            .flex_none()
+            .min_h(px(22.))
+            .px(px(pad))
+            .pt(px(Space::XS))
+            .pb(px(Space::SM))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint)
+            .when_some(spec, |this, spec| {
+                let (fg, bg, label) = if spec.is_write() { (p.warn, p.warn_soft, "WRITE") } else { (p.ok, p.ok_soft, "READ") };
+                this.child(kit::pill(SharedString::from(label), fg, bg)).child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .font_family(mono.clone())
+                        .text_color(p.text_muted)
+                        .child(SharedString::from(format!("{} — {}", spec.syntax, spec.summary(self.locale)))),
+                )
+            })
+            .when(spec.is_none(), |this| this.child(div().flex_1()))
+            .child(div().flex_none().child(SharedString::from(self.text("redis.console.keysHint"))));
 
-        console
+        let tools = div()
+            .flex()
+            .items_center()
+            .gap(px(Space::XXS))
+            .child(icon_btn("redis-console-copy", IconName::Copy, &self.text("redis.console.copyAll"), entity))
+            .child(icon_btn("redis-console-clear", IconName::Trash, &self.text("redis.console.clear"), entity))
+            .into_any_element();
+        div()
+            .id("redis-console")
+            .test_support()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.diag_toolbar(p, m, entity, None, false, vec![tools]))
+            .child(log)
             .child(
                 div()
-                    .min_h(px(22.))
-                    .px(px(pad))
-                    .pb(px(6.))
+                    .flex_none()
                     .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .when_some(spec, |this, spec| {
-                        let (fg, bg, label) = if spec.is_write() { (p.warn, p.warn_soft, "WRITE") } else { (p.ok, p.ok_soft, "READ") };
-                        this.child(kit::pill(SharedString::from(label), fg, bg)).child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .font_family(mono.clone())
-                                .text_size(px(TypeScale::XS))
-                                .text_color(p.text_muted)
-                                .child(SharedString::from(format!("{} — {}", spec.syntax, spec.summary(self.locale)))),
-                        )
-                    })
-                    .child(status),
+                    .flex_col()
+                    .border_t_1()
+                    .border_color(p.line)
+                    .bg(p.chrome)
+                    .children(popup)
+                    .child(input_row)
+                    .child(hint_row),
             )
             .into_any_element()
     }
@@ -2549,6 +2900,7 @@ impl RedisPane {
             Field::SubChannels => self.diag.sub_input.clone(),
             Field::PubChannel => self.diag.pub_channel.clone(),
             Field::PubMessage => self.diag.pub_message.clone(),
+            Field::InfoQuery => self.info_query.clone(),
         };
         let _ = label_key;
         self.fields.bind_enter(
@@ -2597,6 +2949,7 @@ impl RedisPane {
                     Field::SubChannels => this.diag.sub_input = value,
                     Field::PubChannel => this.diag.pub_channel = value,
                     Field::PubMessage => this.diag.pub_message = value,
+                    Field::InfoQuery => this.info_query = value,
                 }
             },
             Some(|this: &mut Self, field, cx: &mut Context<Self>| {
@@ -2626,7 +2979,7 @@ impl RedisPane {
                     Field::Separators | Field::ScanCap => "redis-prefs-save".into(),
                     Field::BatchTtl => "redis-batch-ttl-apply".into(),
                     // 生产库的确认只能点按钮，回车不提交。
-                    Field::ConfirmTyped => return,
+                    Field::ConfirmTyped | Field::InfoQuery => return,
                     Field::SubChannels => "redis-sub-start".into(),
                     Field::PubChannel | Field::PubMessage => "redis-pub-send".into(),
                 };

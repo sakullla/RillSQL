@@ -147,6 +147,8 @@ pub struct ViewerSpec {
 pub enum FormatViewerEvent {
     LoadFull,
     Commit(String),
+    /// 标题行右端的关闭按钮（`set_closable` 打开后才有）。
+    Close,
 }
 
 /// JSON 树的可见节点（或解析错误），按草稿哈希、折叠状态和过滤词缓存：render 不再每帧重新解析。
@@ -199,6 +201,8 @@ pub struct FormatViewer {
     filter_input: Entity<InputState>,
     /// 嵌入方给的标题（Redis 右栏：当前字段名或成员名），与工具条合为一行。
     title: Option<SharedString>,
+    /// 有值时标题行右端画一个关闭按钮，文字是它的提示。
+    close_label: Option<SharedString>,
     tree_cache: Option<TreeCache>,
     /// 解析 JSON 的次数（测试用：同一内容重复渲染不应再解析）。
     tree_parses: usize,
@@ -261,6 +265,7 @@ impl FormatViewer {
             editor,
             filter_input,
             title: None,
+            close_label: None,
             tree_cache: None,
             tree_parses: 0,
             tree_scroll: UniformListScrollHandle::new(),
@@ -288,6 +293,14 @@ impl FormatViewer {
     #[cfg(test)]
     pub fn title(&self) -> Option<&SharedString> {
         self.title.as_ref()
+    }
+
+    /// 标题行右端的关闭按钮；点它发出 `FormatViewerEvent::Close`，由嵌入方决定收起什么。
+    pub fn set_closable(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.close_label != label {
+            self.close_label = label;
+            cx.notify();
+        }
     }
 
     /// 工具条左端的标题；None 时不画。
@@ -629,7 +642,7 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
     let choices = format_choices(viewer.detected, viewer.manual, viewer.bytes.is_some());
     let mut formats = div()
         .flex()
-        .flex_wrap()
+        .flex_none()
         .items_center()
         .p(px(2.))
         .gap(px(2.))
@@ -667,9 +680,29 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
                 }),
         );
     }
-    let mut actions = div().flex().flex_wrap().items_center().gap(px(4.));
+    // 工具条：一行放下。左边是「看什么」（格式、树 / 代码、折行），右边是图标操作；
+    // 只有可编辑时才有「应用」，有未应用修改时才出现「已修改 / 放弃」。
+    let icon = |id: &'static str, name: IconName, label: SharedString, disabled: bool, action: fn(&mut FormatViewer, &mut Context<FormatViewer>)| {
+        let target = entity.clone();
+        kit::icon_button(id, name, label, move |_, _, cx| target.update(cx, action)).xsmall().disabled(disabled).into_any_element()
+    };
+    let mut left = div().flex().flex_none().items_center().gap(px(Space::XS));
+    if choices.len() > 1 {
+        left = left.child(formats);
+    } else if viewer.title.is_none() {
+        // 只有一种视图时不给切换器，只标出这是什么。
+        left = left.child(
+            div()
+                .id("format-kind")
+                .test_support()
+                .text_size(px(TypeScale::XS))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(p.text_muted)
+                .child(viewer.text(format_key(viewer.format()))),
+        );
+    }
     if viewer.format() == DataFormat::Json {
-        actions = actions.child(
+        left = left.child(
             div()
                 .flex()
                 .items_center()
@@ -680,31 +713,34 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
                 .child(mode_chip(entity, viewer, p, false))
                 .child(mode_chip(entity, viewer, p, true)),
         );
-        actions = actions.child(text_button(entity, "format-pretty", Some(IconName::Sparkles), viewer.text("format.action.pretty"), locked, |this, cx| this.pretty(cx)));
-        actions = actions.child(text_button(entity, "format-minify", None, viewer.text("format.action.minify"), locked, |this, cx| this.minify(cx)));
-        if !viewer.code_view {
-            actions = actions.child(text_button(entity, "format-expand", None, viewer.text("format.action.expandAll"), false, |this, cx| this.expand_all(cx)));
-            actions = actions.child(text_button(entity, "format-collapse", None, viewer.text("format.action.collapseAll"), false, |this, cx| this.collapse_all(cx)));
-        }
-    } else if !matches!(viewer.format(), DataFormat::Hex | DataFormat::Text) {
-        actions = actions.child(text_button(entity, "format-reformat", Some(IconName::Sparkles), viewer.text("format.action.pretty"), locked, |this, cx| this.reformat(cx)));
     }
+    let mut actions = div().flex().flex_none().items_center().gap(px(Space::XXS));
     if viewer.format() != DataFormat::Hex && (viewer.format() != DataFormat::Json || viewer.code_view) {
         actions = actions.child(wrap_chip(entity, viewer, p));
     }
-    actions = actions.child(text_button(entity, "format-copy", Some(IconName::Copy), viewer.text("format.action.copyAll"), false, |this, cx| {
+    if viewer.format() == DataFormat::Json {
+        if !viewer.code_view {
+            actions = actions.child(icon("format-expand", IconName::ChevronsUpDown, viewer.text("format.action.expandAll"), false, |this, cx| this.expand_all(cx)));
+            actions = actions.child(icon("format-collapse", IconName::ChevronsDownUp, viewer.text("format.action.collapseAll"), false, |this, cx| this.collapse_all(cx)));
+        }
+        actions = actions.child(icon("format-pretty", IconName::Sparkles, viewer.text("format.action.pretty"), locked, |this, cx| this.pretty(cx)));
+        actions = actions.child(icon("format-minify", IconName::Minimize2, viewer.text("format.action.minify"), locked, |this, cx| this.minify(cx)));
+    } else if !matches!(viewer.format(), DataFormat::Hex | DataFormat::Text) {
+        actions = actions.child(icon("format-reformat", IconName::Sparkles, viewer.text("format.action.pretty"), locked, |this, cx| this.reformat(cx)));
+    }
+    actions = actions.child(icon("format-copy", IconName::Copy, viewer.text("format.action.copyAll"), false, |this, cx| {
         let text = if this.format() == DataFormat::Hex { hex_dump_source(&this.draft, this.bytes.as_deref()) } else { this.draft.clone() };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }));
     let apply_locked = apply_block(viewer.format(), viewer.mode, &viewer.truncation, &viewer.draft).is_some();
     let dirty_ready = !apply_locked && viewer.draft != viewer.source;
-    // 有未应用的修改时：标记 + 「放弃」，和「应用」一起固定在工具条右端。
     if viewer.mode == EditMode::Editable && viewer.dirty() {
         actions = actions.child(
             div()
                 .id("format-dirty")
                 .test_support()
                 .flex_none()
+                .ml(px(Space::XS))
                 .px(px(Space::SM))
                 .rounded(px(Radius::TAG))
                 .bg(p.warn_soft)
@@ -712,64 +748,62 @@ fn toolbar(viewer: &FormatViewer, entity: &Entity<FormatViewer>, p: &Palette, me
                 .text_size(px(TypeScale::XS))
                 .child(viewer.text("format.dirty")),
         );
-        actions = actions.child(text_button(entity, "format-discard", Some(IconName::Undo2), viewer.text("format.action.discard"), false, |this, cx| this.discard(cx)));
+        actions = actions.child(icon("format-discard", IconName::Undo2, viewer.text("format.action.discard"), false, |this, cx| this.discard(cx)));
     }
-    let apply_target = entity.clone();
-    let apply_btn = if dirty_ready {
-        kit::primary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), move |_, _, cx| {
+    if viewer.mode == EditMode::Editable {
+        let apply_target = entity.clone();
+        let commit = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
             apply_target.update(cx, |this, cx| {
                 let _ = this.commit(cx);
             });
-        })
-    } else {
-        kit::secondary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), move |_, _, cx| {
-            apply_target.update(cx, |this, cx| {
-                let _ = this.commit(cx);
-            });
-        })
-        .disabled(apply_locked)
-    };
-    actions = actions.child(apply_btn);
-    let title = viewer.title.clone().map(|title| {
-        div()
-            .id("format-title")
-            .test_support()
-            .flex_1()
-            .min_w(px(0.))
-            .truncate()
-            .text_size(px(TypeScale::SM))
-            .font_weight(gpui_kit::FontWeight::MEDIUM)
-            .text_color(p.text)
-            .child(title)
+        };
+        let apply_btn = if dirty_ready {
+            kit::primary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), commit).small()
+        } else {
+            kit::secondary_button("format-apply", Some(IconName::Check), viewer.text("format.action.apply"), commit).small().disabled(true)
+        };
+        actions = actions.child(div().flex_none().ml(px(Space::XS)).child(apply_btn));
+    }
+    let close = viewer.close_label.clone().map(|label| {
+        let target = entity.clone();
+        kit::icon_button("format-close", IconName::X, label, move |_, _, cx| target.update(cx, |_, cx| cx.emit(FormatViewerEvent::Close))).xsmall().into_any_element()
     });
-    let has_title = title.is_some();
+    // 有标题（Redis 右栏的字段名）或关闭按钮时，标题单独一行，关闭按钮在右上角。
+    let header = (viewer.title.is_some() || close.is_some()).then(|| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .min_h(px(24.))
+            .child(
+                div()
+                    .id("format-title")
+                    .test_support()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(TypeScale::SM))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(p.text)
+                    .children(viewer.title.clone()),
+            )
+            .children(close)
+    });
     div()
         .flex_none()
         .px(px(metrics.pane_pad()))
         .py(px(Space::SM))
         .flex()
-        .flex_wrap()
-        .items_center()
-        .when(!has_title, |this| this.justify_between())
-        .gap(px(Space::MD))
+        .flex_col()
+        .gap(px(Space::SM))
         .border_b_1()
         .border_color(p.line)
         .bg(p.chrome)
-        .children(title)
-        .when(choices.len() > 1, |this| this.child(formats))
-        .when(choices.len() <= 1, |this| {
-            // 只有一种视图时不给切换器，只标出这是什么：少一排没有意义的按钮。
-            this.child(
-                div()
-                    .id("format-kind")
-                    .test_support()
-                    .text_size(px(TypeScale::XS))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(p.text_muted)
-                    .child(viewer.text(format_key(viewer.format()))),
-            )
-        })
-        .child(actions)
+        .children(header)
+        .child(
+            // 窄栏里放不下时整组折到下一行（左边看什么、右边做什么），不会互相压住。
+            div().flex().flex_wrap().items_center().justify_between().gap_x(px(Space::SM)).gap_y(px(Space::XS)).child(left).child(actions),
+        )
         .into_any_element()
 }
 
@@ -810,42 +844,17 @@ fn mode_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette, 
         .into_any_element()
 }
 
-fn wrap_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, p: &Palette) -> AnyElement {
-    let selected = viewer.wrap;
-    let label = viewer.text("format.action.wrap");
+fn wrap_chip(entity: &Entity<FormatViewer>, viewer: &FormatViewer, _p: &Palette) -> AnyElement {
     let target = entity.clone();
-    kit::interactive_states(div().id("format-wrap"), p, false)
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .aria_selected(selected)
-        .px(px(8.))
-        .h(px(24.))
-        .flex()
-        .items_center()
-        .rounded(px(Radius::CONTROL))
-        .border_1()
-        .text_size(px(TypeScale::SM))
-        .when(selected, |this| {
-            this.border_color(p.accent.opacity(0.32))
-                .bg(p.accent_soft)
-                .text_color(p.accent_text)
-                .font_weight(gpui_kit::FontWeight::MEDIUM)
-        })
-        .when(!selected, |this| {
-            this.border_color(p.line)
-                .bg(if p.dark { p.raised } else { p.surface })
-                .text_color(p.text_muted)
-                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
-        })
-        .child(label)
-        .on_click(move |_, window, cx| {
-            target.update(cx, |this, cx| {
-                let next = !this.wrap;
-                this.set_wrap(next, window, cx);
-            });
-        })
-        .into_any_element()
+    kit::icon_button("format-wrap", IconName::TextWrap, viewer.text("format.action.wrap"), move |_, window, cx| {
+        target.update(cx, |this, cx| {
+            let next = !this.wrap;
+            this.set_wrap(next, window, cx);
+        });
+    })
+    .xsmall()
+    .selected(viewer.wrap)
+    .into_any_element()
 }
 
 fn text_button(

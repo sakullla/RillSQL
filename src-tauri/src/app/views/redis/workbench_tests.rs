@@ -296,6 +296,7 @@ fn cluster_crossslot_is_explained_and_key_placement_is_shown(cx: &mut gpui_kit::
             pane.command("redis-exec", cx);
             assert!(pane.confirm_open(), "同槽的写命令照常确认");
             pane.command("redis-cancel", cx);
+            pane.page = Page::Keys;
         });
     });
     let (chip, nodes_tab, placement) = cx

@@ -78,8 +78,12 @@ fn type_filter_applies_immediately_after_the_first_render(cx: &mut gpui_kit::Tes
     assert_eq!(cx.update(|cx| view.update(cx, |pane, _| listed(pane).len())), 5, "首次渲染后缓存里是全部键");
     for (chip, expected) in [("redis-type-string", vec!["s:1", "s:2"]), ("redis-type-hash", vec!["h:1", "h:2"]), ("redis-type-all", vec!["s:1", "h:1", "s:2", "l:1", "h:2"])] {
         cx.update_window(window, |_, window, cx| {
+            // 类型筛选是一个下拉：先展开，再点类型；选中即生效并收起。
+            window.click("redis-type-toggle", cx);
+            window.render_frame(cx);
             window.click(chip, cx);
             window.render_frame(cx);
+            assert!(window.try_find("redis-type-picker").is_none(), "选中后下拉收起");
         })
         .unwrap();
         let (names, footer) = cx
@@ -201,9 +205,10 @@ fn a_key_found_missing_is_explained_and_struck_through(cx: &mut gpui_kit::TestAp
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R10/R18：键行是固定宽度的类型 chip + 界面字体键名（实测截断、保留尾部、悬停全名）；工具区两行不折行。
+/// R10/R18：键行是类型圆点 + 界面字体键名（实测中间截断、保留开头和结尾、悬停全名）；
+/// 搜索一行在上，类型筛选在下，类型多时折行而不是被横向裁掉。
 #[gpui_kit::test]
-fn key_rows_use_kit_chips_and_tail_truncation(cx: &mut gpui_kit::TestAppContext) {
+fn key_rows_use_type_dots_and_middle_truncation(cx: &mut gpui_kit::TestAppContext) {
     let long = "session:tenant-alpha:region-east:user:0000000000000000000000000000000123456789";
     let (window, view, dir) = open(cx, 1280., move |pane| {
         pane.set_keys(vec![key(long, "hash"), key("short", "zset")]);
@@ -215,13 +220,13 @@ fn key_rows_use_kit_chips_and_tail_truncation(cx: &mut gpui_kit::TestAppContext)
             (window.find("redis-tools-search").bounds(), window.find("redis-tools-types").bounds(), window.find("redis-select:0").label().map(str::to_owned))
         })
         .unwrap();
-    assert!(search.origin.y < types.origin.y, "搜索与图标按钮一行，类型分段与视图切换一行");
-    assert!(f32::from(types.size.height) < 40., "类型分段不折行：{:?}", types.size);
+    assert!(search.origin.y < types.origin.y, "搜索与图标按钮一行，类型筛选与视图切换在下面");
     assert!(row_label.unwrap_or_default().contains(long), "无障碍标签与悬停给完整键名");
     let fitted: Vec<String> = cx.update(|cx| view.read(cx).fit_cache.values().cloned().collect());
-    assert!(fitted.iter().any(|text| text.starts_with('…') && long.ends_with(&text['…'.len_utf8()..])), "长键名截断时保留尾部：{fitted:?}");
-    assert_eq!(super::view::type_code("hash"), "HSH");
-    assert_eq!(super::view::type_code("stream"), "STM");
+    assert!(
+        fitted.iter().any(|text| text.split_once('…').is_some_and(|(head, tail)| !head.is_empty() && long.starts_with(head) && long.ends_with(tail))),
+        "长键名截断时保留开头和结尾：{fitted:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -438,7 +443,7 @@ fn diagnostic_tables_select_copy_and_activate(cx: &mut gpui_kit::TestAppContext)
     cx.update(|cx| {
         let pane = view.read(cx);
         assert_eq!(pane.command_input(), "HGETALL user:1", "双击慢日志把命令填进命令栏");
-        assert!(pane.console_open);
+        assert_eq!(pane.page(), Page::Console, "双击慢日志切到控制台");
     });
     for page in ["clients", "info", "bigkeys"] {
         cx.update(|cx| view.update(cx, |pane, cx| pane.command(&format!("redis-page:{page}"), cx)));
@@ -492,6 +497,7 @@ fn double_click_or_enter_requests_a_pinned_tab(cx: &mut gpui_kit::TestAppContext
 #[gpui_kit::test]
 fn command_bar_highlights_and_completes_redis_commands(cx: &mut gpui_kit::TestAppContext) {
     let (window, view, dir) = open(cx, 1280., |pane| pane.set_command("HGETALL user:1"));
+    // set_command 切到控制台页：命令栏在那里。
     let overlay = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
@@ -655,3 +661,67 @@ fn entry_table_selection_follows_the_detail_across_same_shaped_keys(cx: &mut gpu
     assert_eq!(selected_row, Some(0), "表里高亮的行与右栏显示的条目一致");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// 用户反馈：集合类键右侧的值面板可以关掉（工具栏按钮或面板右上角的关闭），关掉后条目表占满，状态随偏好保存。
+#[gpui_kit::test]
+fn value_panel_can_be_closed_and_reopened(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1360., |pane| {
+        // 不连库：偏好只改内存，不在后台写连接库。
+        pane.connection_id.clear();
+        pane.set_keys(vec![key("h", "hash")]);
+        pane.done = true;
+        pane.selected = "h".into();
+        pane.detail_key = "h".into();
+        pane.entry_focus = Some(0);
+        pane.detail = Some(Arc::new(hash_detail(&[("name", "ada")])));
+    });
+    let probe = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            (window.try_find("redis-entry-inspector").is_some(), window.try_find("redis-inspector-toggle").is_some())
+        })
+        .unwrap()
+    };
+    assert_eq!(probe(cx), (true, true), "默认显示值面板，工具栏有开关");
+    // 面板自己的关闭按钮发出 Close。
+    cx.update(|cx| {
+        let viewer = view.read(cx).entry_viewer.clone().expect("右栏查看器");
+        viewer.update(cx, |_, cx| cx.emit(FormatViewerEvent::Close));
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|cx| view.read(cx).prefs.inspector_hidden), "关闭后记进偏好");
+    assert_eq!(probe(cx), (false, true), "值面板收起，条目表占满，开关还在");
+    cx.update(|cx| view.update(cx, |pane, cx| pane.command("redis-inspector-toggle", cx)));
+    assert_eq!(probe(cx), (true, true), "再点开关恢复");
+    let prefs = keyspace::KeyspacePrefs { inspector_hidden: true, ..Default::default() };
+    assert!(keyspace::KeyspacePrefs::from_json(Some(&prefs.to_json())).inspector_hidden);
+    assert!(!keyspace::KeyspacePrefs::from_json(Some("{}")).inspector_hidden, "旧偏好默认显示");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 用户反馈：信息页只有一张虚拟化的表（分组 / 指标 / 值），不再是一堆嵌在滚动区里的小表；可以按文字过滤。
+#[gpui_kit::test]
+fn info_page_is_one_filterable_table(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.page = Page::Info;
+        pane.diag.info = vec![
+            crate::adapters::redis::diag::InfoSection { name: "Server".into(), items: vec![("redis_version".into(), "7.2.4".into()), ("tcp_port".into(), "6379".into())] },
+            crate::adapters::redis::diag::InfoSection { name: "Memory".into(), items: vec![("used_memory".into(), "1048576".into())] },
+        ];
+    });
+    let rows = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = view.read(cx);
+            assert_eq!(pane.tables.keys().filter(|key| key.starts_with("info")).count(), 1, "只有一张信息表");
+            let table = pane.tables.get("info").map(|slot| slot.table.clone()).expect("信息表");
+            table.read(cx).rows_len(cx)
+        })
+    };
+    assert_eq!(rows(cx), 3, "所有分组的指标都在同一张表里");
+    cx.update(|cx| view.update(cx, |pane, _| pane.info_query = "memory".into()));
+    assert_eq!(rows(cx), 1, "按分组 / 指标 / 值过滤");
+    let _ = std::fs::remove_dir_all(dir);
+}
+

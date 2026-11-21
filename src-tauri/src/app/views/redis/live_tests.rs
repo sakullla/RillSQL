@@ -25,12 +25,15 @@ fn rendered_controls_refuse_keys_and_keep_unconfirmed_input(cx: &mut TestAppCont
         assert_eq!(window.find("redis-more").label(), Some("继续扫描"));
         assert_eq!(window.find("redis-ttl").label(), Some("设置 TTL"));
         assert_eq!(window.find("redis-delete").label(), Some("删除"));
-        assert_eq!(window.find("redis-exec").label(), Some("执行"));
         // 重命名、复制值是次要操作，收在「更多」里。
         assert_eq!(window.find("redis-more-actions").label(), Some("更多操作"));
         assert!(window.try_find("redis-rename").is_none() && window.try_find("redis-copy").is_none());
         window.click("redis-pattern", cx);
         window.input("ab", cx);
+        // 命令输入在控制台页（顶部页签），不再常驻键页底部。
+        window.click("redis-page:console", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("redis-exec").label(), Some("执行"));
         window.click("redis-command", cx);
         window.input("KEYS", cx);
     })
@@ -48,7 +51,8 @@ fn rendered_controls_refuse_keys_and_keep_unconfirmed_input(cx: &mut TestAppCont
     .unwrap();
     cx.update(|app| {
         let pane = view.read(app);
-        assert!(pane.error().contains("KEYS") || pane.error().contains("禁用"), "{}", pane.error());
+        let refused = pane.console_error().unwrap_or_default();
+        assert!(refused.contains("KEYS") || refused.contains("禁用"), "拒绝写在控制台记录里：{refused}");
         assert!(pane.note().is_empty(), "{}", pane.note());
         assert!(!pane.confirm_open());
         assert_eq!(pane.command_input(), "KEYS *");
@@ -75,6 +79,8 @@ fn rendered_controls_refuse_keys_and_keep_unconfirmed_input(cx: &mut TestAppCont
     });
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_ttl("nope"));
+        window.render_frame(cx);
+        window.click("redis-page:keys", cx);
         window.render_frame(cx);
         window.click("redis-ttl", cx);
     })
@@ -187,6 +193,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_pattern("rillsql:string:*"));
         window.render_frame(cx);
+        window.click("redis-page:keys", cx);
+        window.render_frame(cx);
         window.click("redis-filter", cx);
     })
     .unwrap();
@@ -249,6 +257,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_pattern(&key));
         window.render_frame(cx);
+        window.click("redis-page:keys", cx);
+        window.render_frame(cx);
         window.click("redis-filter", cx);
     })
     .unwrap();
@@ -256,6 +266,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     read_key(cx, window, &view, &key, "hello-t8");
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_ttl("90"));
+        window.render_frame(cx);
+        window.click("redis-page:keys", cx);
         window.render_frame(cx);
         window.click("redis-ttl", cx);
         window.render_frame(cx);
@@ -266,6 +278,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     assert_quiet(cx, &view);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_ttl(""));
+        window.render_frame(cx);
+        window.click("redis-page:keys", cx);
         window.render_frame(cx);
         window.click("redis-ttl", cx);
         window.render_frame(cx);
@@ -314,10 +328,10 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
         window.click("redis-exec", cx);
     })
     .unwrap();
-    assert!(pump(cx, window, &view, |pane| !pane.running() && !pane.error().is_empty()), "断线后的 PING 没有失败");
+    assert!(pump(cx, window, &view, |pane| !pane.running() && pane.console_error().is_some()), "断线后的 PING 没有失败");
     cx.update(|app| {
         let pane = view.read(app);
-        assert!(pane.error().contains("还没有打开") || !pane.error().is_empty(), "{}", pane.error());
+        assert!(pane.console_error().is_some_and(|error| !error.is_empty()), "失败写在控制台记录里");
         assert!(pane.note().is_empty(), "{}", pane.note());
         assert_eq!(pane.command_input(), "PING");
     });
@@ -371,6 +385,8 @@ fn confirm_keeps_the_target_opened_with(cx: &mut TestAppContext) {
     assert_quiet(cx, &view);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |pane, _| pane.set_pattern(&format!("{prefix}*")));
+        window.render_frame(cx);
+        window.click("redis-page:keys", cx);
         window.render_frame(cx);
         window.click("redis-filter", cx);
     })
@@ -1034,5 +1050,61 @@ fn live_cluster_with_unreachable_announced_nodes_falls_back_to_the_seed() {
     .expect("单节点会话可用");
     assert_eq!(pong.command, "PING");
     services.connections.disconnect(&id);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 用户反馈：控制台连续执行。回车执行后输入框清空，下一条命令照样回车执行，结果按顺序追加；
+/// 出错的命令留在输入框里方便改。
+#[gpui_kit::test]
+fn console_runs_commands_back_to_back(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-console-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    if let Err(err) = block(open_redis(Arc::clone(&services), "live-console")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if fixture_unreachable(&err) {
+            eprintln!("跳过：Redis 夹具没有连上：{err}");
+            return;
+        }
+        panic!("Redis 夹具没有连上：{err}");
+    }
+    let (window, view) = open_pane(cx, Arc::clone(&services));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |pane, cx| {
+            pane.open_spec("live-console|夹具 Redis|0", cx);
+            pane.command("redis-page:console", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    for (round, (command, ok)) in [("PING", true), ("TIME", true), ("NOSUCHCOMMAND x", false), ("DBSIZE", true)].into_iter().enumerate() {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("redis-command", cx);
+            if !ok || round == 3 {
+                // 上一条失败的命令还在输入框里：先清掉。
+                view.update(cx, |pane, _| pane.set_command(""));
+                window.render_frame(cx);
+            }
+            window.input(command, cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(pump(cx, window, &view, |pane| !pane.running() && pane.console_log().len() > round), "第 {} 条命令回车后没有执行", round + 1);
+        cx.update(|cx| {
+            let pane = view.read(cx);
+            let entry = pane.console_log().back().unwrap();
+            assert_eq!(entry.line, command);
+            assert_eq!(entry.ok, ok, "{}", entry.output);
+            if ok {
+                assert_eq!(pane.command_input(), "", "执行成功后输入框清空");
+            } else {
+                assert_eq!(pane.command_input(), command, "失败的命令留着方便改");
+            }
+        });
+    }
+    services.disconnect("live-console");
     let _ = std::fs::remove_dir_all(&dir);
 }

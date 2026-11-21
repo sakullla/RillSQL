@@ -66,6 +66,7 @@ enum Field {
     SubChannels,
     PubChannel,
     PubMessage,
+    InfoQuery,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +89,7 @@ enum Confirm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Keys,
+    Console,
     Slowlog,
     Info,
     BigKeys,
@@ -96,12 +98,46 @@ pub enum Page {
     Nodes,
 }
 
+/// 服务端错误按 redis-cli 的样子显示：`(error) <原因>`，去掉驱动加的长前缀。
+/// 本地拒绝（例如禁用 KEYS）等不是服务端错误的提示原样保留。
+pub(crate) fn console_error_text(message: &str) -> String {
+    let message = message.trim();
+    let reason = ["ResponseError: ", "An error was signalled by the server - "]
+        .iter()
+        .find_map(|prefix| message.find(prefix).map(|at| &message[at + prefix.len()..]));
+    match reason {
+        Some(reason) => format!("(error) {}", reason.trim()),
+        None => message.to_owned(),
+    }
+}
+
+/// 控制台保留的执行记录条数。
+const CONSOLE_LOG_MAX: usize = 300;
+
+/// 控制台的一条执行记录。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsoleEntry {
+    pub db: String,
+    pub line: String,
+    pub output: String,
+    pub ok: bool,
+    pub elapsed: Option<std::time::Duration>,
+}
+
+impl ConsoleEntry {
+    /// 复制全部记录时的文字：和 redis-cli 一样，提示符 + 命令，下面是输出。
+    fn transcript(&self) -> String {
+        format!("db{}> {}\n{}", self.db, self.line, self.output)
+    }
+}
+
 impl Page {
-    pub(crate) const ALL: [Page; 7] = [Page::Keys, Page::Slowlog, Page::Info, Page::BigKeys, Page::Clients, Page::PubSub, Page::Nodes];
+    pub(crate) const ALL: [Page; 8] = [Page::Keys, Page::Console, Page::Slowlog, Page::Info, Page::BigKeys, Page::Clients, Page::PubSub, Page::Nodes];
 
     pub(crate) fn id(self) -> &'static str {
         match self {
             Page::Keys => "keys",
+            Page::Console => "console",
             Page::Slowlog => "slowlog",
             Page::Info => "info",
             Page::BigKeys => "bigkeys",
@@ -118,6 +154,7 @@ impl Page {
     pub(crate) fn label_key(self) -> &'static str {
         match self {
             Page::Keys => "redis.page.keys",
+            Page::Console => "redis.page.console",
             Page::Slowlog => "redis.page.slowlog",
             Page::Info => "redis.page.info",
             Page::BigKeys => "redis.page.bigkeys",
@@ -299,6 +336,7 @@ pub struct RedisPane {
     connection_name: String,
     database: String,
     db_picker_open: bool,
+    type_picker_open: bool,
     db_counts: Vec<KeyspaceDb>,
     sidebar_w: f32,
     sidebar_drag_start: Option<(f32, f32)>,
@@ -337,7 +375,11 @@ pub struct RedisPane {
     rename_open: bool,
     command_input: String,
     reply: String,
-    pretty_reply: String,
+    /// 控制台的执行记录（最新在最后），超过上限丢最早的。
+    console_log: VecDeque<ConsoleEntry>,
+    /// 正在执行的那条命令：结果回来时连同耗时写进记录。
+    console_pending: Option<(String, String, std::time::Instant)>,
+    console_scroll: gpui_kit::ScrollHandle,
     note: String,
     error: String,
     confirm: Option<Confirm>,
@@ -353,9 +395,10 @@ pub struct RedisPane {
     type_filter: String,
     nav_choice: Option<bool>,
     viewport_w: f32,
+    /// 本面板实际占的宽度（上一帧量到的）。窗口宽度包含应用侧栏，不能直接当面板宽度用。
+    pane_w: Rc<std::cell::Cell<Option<f32>>>,
     error_source: ErrorSource,
     expanded: BTreeSet<String>,
-    console_open: bool,
     complete_open: bool,
     complete_index: usize,
     history: Vec<String>,
@@ -424,7 +467,7 @@ pub struct RedisPane {
     /// 键名截断缓存：(键名, 可用宽度) → 显示文本。
     fit_cache: HashMap<(String, u32), String>,
     /// 诊断信息页收起的分组。
-    info_collapsed: BTreeSet<String>,
+    info_query: String,
     /// 请求外壳在新标签中固定打开的键（规格 `连接|名称|库|键`）。
     open_requests: Vec<String>,
 }
@@ -438,6 +481,7 @@ impl RedisPane {
             connection_name: String::new(),
             database: "0".into(),
             db_picker_open: false,
+            type_picker_open: false,
             db_counts: Vec::new(),
             sidebar_w: SIDEBAR_DEFAULT_W,
             sidebar_drag_start: None,
@@ -476,7 +520,9 @@ impl RedisPane {
             rename_open: false,
             command_input: String::new(),
             reply: String::new(),
-            pretty_reply: String::new(),
+            console_log: VecDeque::new(),
+            console_pending: None,
+            console_scroll: gpui_kit::ScrollHandle::new(),
             note: String::new(),
             error: String::new(),
             confirm: None,
@@ -492,9 +538,9 @@ impl RedisPane {
             type_filter: String::new(),
             nav_choice: None,
             viewport_w: 1200.,
+            pane_w: Rc::new(std::cell::Cell::new(None)),
             error_source: ErrorSource::Command,
             expanded: BTreeSet::new(),
-            console_open: true,
             complete_open: false,
             complete_index: 0,
             history: Vec::new(),
@@ -545,7 +591,7 @@ impl RedisPane {
             guard_generation: 0,
             stale_value: false,
             fit_cache: HashMap::new(),
-            info_collapsed: BTreeSet::new(),
+            info_query: String::new(),
             open_requests: Vec::new(),
         }
     }
@@ -623,8 +669,15 @@ impl RedisPane {
         self.rename_open = true;
     }
 
+    /// 填命令（测试与「填入命令」用）：命令只在控制台页里，所以顺带切过去。
     pub fn set_command(&mut self, value: &str) {
         self.command_input = value.to_owned();
+        self.page = Page::Console;
+    }
+
+    /// 控制台最后一条记录是失败时的输出。
+    pub fn console_error(&self) -> Option<&str> {
+        self.console_log.back().filter(|entry| !entry.ok).map(|entry| entry.output.as_str())
     }
 
     pub fn pattern(&self) -> &str {
@@ -748,7 +801,8 @@ impl RedisPane {
         self.rename_open = false;
         self.command_input.clear();
         self.reply.clear();
-        self.pretty_reply.clear();
+        self.console_log.clear();
+        self.console_pending = None;
         self.copied.clear();
         self.note.clear();
         self.error.clear();
@@ -762,7 +816,6 @@ impl RedisPane {
         self.nav_choice = None;
         self.error_source = ErrorSource::Command;
         self.expanded.clear();
-        self.console_open = true;
         self.complete_open = false;
         self.complete_index = 0;
         self.history.clear();
@@ -803,7 +856,7 @@ impl RedisPane {
         self.value_drag_start = None;
         self.guard_generation = self.guard_generation.wrapping_add(1);
         self.stale_value = false;
-        self.info_collapsed.clear();
+        self.info_query.clear();
     }
 
     fn clear_entry_drafts(&mut self) {
@@ -1060,7 +1113,7 @@ impl RedisPane {
     }
 
     fn current_completions(&self) -> (usize, usize, Vec<RedisCompletion>) {
-        if !self.console_open || !self.complete_open || self.command_input.trim().is_empty() {
+        if self.page != Page::Console || !self.complete_open || self.command_input.trim().is_empty() {
             return (0, 0, Vec::new());
         }
         // 键名补全只取索引前一部分：全量索引可达数十万键，逐帧复制会拖慢输入。
@@ -1150,6 +1203,8 @@ impl RedisPane {
             || id.starts_with("redis-select:")
             || id.starts_with("redis-open-tab:")
             || id == "redis-entry-sort"
+            || id.starts_with("redis-console-copy:")
+            || id == "redis-inspector-toggle"
             || id == "redis-open-tab";
 
         if self.busy && !local {
@@ -1282,7 +1337,7 @@ impl RedisPane {
                         "stream" => format!("XRANGE {quoted} - + COUNT 50"),
                         _ => format!("GET {quoted}"),
                     };
-                    self.console_open = true;
+                    self.show_console();
                     self.command_input = cmd_str;
                     self.complete_open = false;
                 }
@@ -1349,14 +1404,23 @@ impl RedisPane {
         } else if id == "redis-copy" {
             self.copy_value(cx);
         } else if id == "redis-console" {
-            self.console_open = !self.console_open;
+            if self.page == Page::Console {
+                self.page = Page::Keys;
+            } else {
+                self.show_console();
+            }
         } else if id == "redis-console-clear" {
+            self.console_log.clear();
             self.reply.clear();
-            self.pretty_reply.clear();
             self.note.clear();
         } else if id == "redis-console-copy" {
-            let out = if !self.pretty_reply.is_empty() { self.pretty_reply.clone() } else { self.reply.clone() };
+            let out = self.console_log.iter().map(ConsoleEntry::transcript).collect::<Vec<_>>().join("\n\n");
             self.copy_text(out, "redis.copied.value", cx);
+        } else if let Some(index) = id.strip_prefix("redis-console-copy:") {
+            if let Some(entry) = index.parse::<usize>().ok().and_then(|index| self.console_log.get(index)) {
+                let out = entry.output.clone();
+                self.copy_text(out, "redis.copied.value", cx);
+            }
         } else if id == "redis-view-flat" {
             self.view_mode = ViewMode::Flat;
             self.invalidate_rows();
@@ -1369,8 +1433,11 @@ impl RedisPane {
                 self.expand_top_level();
             }
             self.invalidate_rows();
+        } else if id == "redis-type-toggle" {
+            self.type_picker_open = !self.type_picker_open;
         } else if let Some(kind) = id.strip_prefix("redis-type-") {
             self.type_filter = if kind == "all" { String::new() } else { kind.to_owned() };
+            self.type_picker_open = false;
             self.invalidate_rows();
         } else if let Some(prefix) = id.strip_prefix("redis-folder:") {
             if !self.expanded.remove(prefix) {
@@ -1386,6 +1453,10 @@ impl RedisPane {
             self.request_open_tab(&name, cx);
         } else if id == "redis-entry-sort" {
             self.entry_sort = (self.entry_sort + 1) % 3;
+        } else if id == "redis-inspector-toggle" {
+            self.prefs.inspector_hidden = !self.prefs.inspector_hidden;
+            self.value_drag_start = None;
+            self.persist_prefs(cx);
         } else if id == "redis-stale-refresh" {
             self.stale_value = false;
             self.error.clear();
@@ -1849,7 +1920,13 @@ impl RedisPane {
             return;
         }
         match exec::command_risk(&command) {
-            CommandRisk::Blocked => self.show_error(self.text("redis.tab.keysRefused")),
+            CommandRisk::Blocked => {
+                // 拒绝写在控制台记录里，紧跟这条命令。
+                let line = self.command_input.clone();
+                let message = self.text("redis.tab.keysRefused");
+                self.note.clear();
+                self.push_console(line, message, false, None);
+            }
             _ if self.topology.cluster && self.crossslot_refused(&command, &args) => {}
             CommandRisk::Dangerous => {
                 let line = self.command_input.clone();
@@ -2047,7 +2124,7 @@ impl RedisPane {
             } else {
                 message
             };
-            self.show_error(refused);
+            self.push_console(line, refused, false, None);
             return;
         }
         if command.eq_ignore_ascii_case("SELECT") {
@@ -2065,7 +2142,8 @@ impl RedisPane {
                 }
             }
         }
-        self.remember_command(line);
+        self.remember_command(line.clone());
+        self.console_pending = Some((line, self.database.clone(), std::time::Instant::now()));
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         self.spawn(
@@ -2080,7 +2158,14 @@ impl RedisPane {
         match result {
             Ok(outcome) => {
                 self.reply = reply_text(&outcome.reply);
-                self.pretty_reply = reply_pretty(&outcome.reply, 0);
+                let pending = self.console_pending.take();
+                let elapsed = pending.as_ref().map(|(_, _, at)| at.elapsed());
+                let (line, db) = pending.map(|(line, db, _)| (line, db)).unwrap_or_default();
+                self.push_console_in(db, line, reply_pretty(&outcome.reply, 0), true, elapsed);
+                // 和 redis-cli 一样：执行成功后输入框清空，↑ 可以取回刚才的命令。
+                self.command_input.clear();
+                self.history_at = None;
+                self.complete_open = false;
                 self.note = self.text("redis.tab.executed");
                 self.error.clear();
                 self.refresh_keyspace_counts(cx);
@@ -2090,8 +2175,40 @@ impl RedisPane {
                     self.rescan(cx);
                 }
             }
-            Err(message) => self.show_error(message),
+            Err(message) => match self.console_pending.take() {
+                // 命令出错写进控制台记录，紧跟在命令下面，不再弹到别处。
+                Some((line, db, at)) => {
+                    self.note.clear();
+                    self.push_console_in(db, line, message, false, Some(at.elapsed()));
+                }
+                None => self.show_error(message),
+            },
         }
+    }
+
+    /// 切到控制台页并把焦点放进命令输入框。
+    fn show_console(&mut self) {
+        self.page = Page::Console;
+        self.focus_request = Some(Field::Command);
+    }
+
+    fn push_console(&mut self, line: String, output: String, ok: bool, elapsed: Option<std::time::Duration>) {
+        let db = self.database.clone();
+        self.push_console_in(db, line, output, ok, elapsed);
+    }
+
+    /// 追加一条执行记录并滚到底部；超过上限丢掉最早的。
+    fn push_console_in(&mut self, db: String, line: String, output: String, ok: bool, elapsed: Option<std::time::Duration>) {
+        if self.console_log.len() >= CONSOLE_LOG_MAX {
+            self.console_log.pop_front();
+        }
+        let output = if ok { output } else { console_error_text(&output) };
+        self.console_log.push_back(ConsoleEntry { db, line: line.trim().to_owned(), output, ok, elapsed });
+        self.console_scroll.scroll_to_bottom();
+    }
+
+    pub fn console_log(&self) -> &VecDeque<ConsoleEntry> {
+        &self.console_log
     }
 
     fn copy_value(&mut self, cx: &mut Context<Self>) {
@@ -2979,6 +3096,12 @@ mod tests {
         let prompt = danger_prompt(Locale::ZhCn, "flushall");
         assert!(prompt.contains("FLUSHALL"), "{prompt}");
         assert_ne!(i18n::text(Locale::En, "redis.tab.keysRefused"), "redis.tab.keysRefused");
+        assert_eq!(
+            console_error_text("An error was signalled by the server - ResponseError: wrong number of arguments for 'ping' command"),
+            "(error) wrong number of arguments for 'ping' command",
+            "控制台错误去掉驱动前缀"
+        );
+        assert_eq!(console_error_text("KEYS 已禁用"), "KEYS 已禁用");
     }
 
     #[test]
@@ -3116,9 +3239,11 @@ mod tests {
                 assert_eq!(pane.command_input(), "GET b");
                 pane.history_step(false);
                 assert_eq!(pane.command_input(), "PING");
-                assert!(pane.console_open);
+                pane.page = Page::Keys;
                 pane.command("redis-console", cx);
-                assert!(!pane.console_open);
+                assert_eq!(pane.page(), Page::Console, "控制台是一个独立页面");
+                pane.command("redis-console", cx);
+                assert_eq!(pane.page(), Page::Keys, "再按一次回到键");
             });
         });
         let _ = std::fs::remove_dir_all(&dir);

@@ -3349,6 +3349,7 @@ impl GridPane {
             FormatViewerEvent::LoadFull => {
                 let _ = this.command("grid-value-retry", cx);
             }
+            FormatViewerEvent::Close => {}
             FormatViewerEvent::Commit(text) => {
                 let Some((row, column)) = this.session.viewer_cell() else {
                     return;
