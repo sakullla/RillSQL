@@ -579,6 +579,12 @@ impl Workbench {
             cx.notify();
             return;
         }
+        if id == "conn-import-dbeaver" {
+            if self.model.close_prompt.is_none() && matches!(self.model.profile_import, super::conn_import::ImportState::Idle) {
+                self.prompt_dbeaver_import(cx);
+            }
+            return;
+        }
         if id == "conn-import" || id == "conn-export" {
             if self.model.close_prompt.is_some() {
                 let _ = self.model.dispatch(id);
@@ -2632,6 +2638,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
+            PendingJob::ReadProfiles(_) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
         let token = if owner == "connections" {
@@ -2658,6 +2665,9 @@ impl Workbench {
                     view.update(cx, |this, cx| {
                         if let Ok(done) = done {
                             apply_done(&mut this.model, &this.services, owner, done);
+                            if owner == "profile-import" {
+                                this.pump_jobs(cx);
+                            }
                         }
                         this.model.finish_job();
                         this.persist_if_needed(cx);
@@ -2764,6 +2774,38 @@ impl Workbench {
             .map(|path| path.to_path_buf())
             .filter(|path| path.is_dir())
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn prompt_dbeaver_import(&mut self, cx: &mut Context<Self>) {
+        use super::conn_import::ImportState;
+        self.model.profile_import = ImportState::Picking;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.t("connections.profile.entry")),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                view.model.queue_profile_preview(path);
+                                view.pump_jobs(cx);
+                            } else {
+                                view.model.profile_import = ImportState::Idle;
+                            }
+                        }
+                        Ok(Err(error)) => view.model.profile_import = ImportState::Error(error.to_string()),
+                        _ => view.model.profile_import = ImportState::Idle,
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn prompt_import(&mut self, cx: &mut Context<Self>) {

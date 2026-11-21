@@ -29,6 +29,9 @@ pub(super) const TONES: [&str; 5] = ["dev", "test", "prod", "info", "local"];
 
 impl Workbench {
     pub(super) fn connections_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if !matches!(self.model.profile_import, super::conn_import::ImportState::Idle | super::conn_import::ImportState::Picking) {
+            return self.import_profiles_page(window, cx);
+        }
         let p = Palette::of(cx);
         let wide = f32::from(window.viewport_size().width) >= DETAIL_MIN_WIDTH;
         // 列表非空却没有选中：默认选第一条，详情栏不空着。
@@ -154,6 +157,11 @@ impl Workbench {
             secondary.push(icon("launcher-tags", IconName::Tag, "conn.page.manageTags", "tags-manage", cx));
         }
         secondary.push(icon("launcher-import", IconName::Download, "ui.conn.import", "conn-import", cx));
+        secondary.push(
+            kit::tool_button("launcher-import-dbeaver", None, self.t("connections.profile.entry"), act("conn-import-dbeaver", cx))
+                .small()
+                .into_any_element(),
+        );
         secondary.push(icon("launcher-export", IconName::Upload, "ui.conn.export", "conn-export", cx));
 
         let focus = self.conn_launcher_focus.clone();

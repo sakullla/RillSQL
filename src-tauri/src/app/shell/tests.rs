@@ -30,6 +30,98 @@ fn request_of(model: &mut WorkbenchModel, token: crate::application::tasks::Task
     job_request(model, job, token)
 }
 
+#[tokio::test]
+async fn dbeaver_desktop_jobs_preview_cancel_select_and_report() {
+    use super::conn_import::{ImportResult, ImportState};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-import-preview-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let file = dir.join("data-sources.json");
+    let a = dir.join("a.sqlite");
+    let b = dir.join("b.sqlite");
+    let c = dir.join("c.sqlite");
+    let fixture = serde_json::json!({
+        "connections": {
+            "1": {"provider":"sqlite","driver":"sqlite_jdbc","name":"First",
+                "configuration":{"database":a}},
+            "2": {"provider":"sqlite","driver":"sqlite_jdbc","name":"Second",
+                "configuration":{"database":b}},
+            "3": {"provider":"oracle","driver":"oracle_thin","name":"Unsupported",
+                "configuration":{}},
+            "4": {"provider":"sqlite","driver":"sqlite_jdbc","name":"Retry",
+                "configuration":{"database":c}}
+        }
+    });
+    std::fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+    model.queue_profile_preview(file.clone());
+    finish_import_job(&mut model, &services).await;
+    assert!(matches!(model.profile_import, ImportState::Preview(_)));
+    let _ = model.dispatch("profile-import-close");
+    assert!(matches!(model.profile_import, ImportState::Idle));
+    assert!(services.list_connections().await.unwrap().is_empty());
+    assert!(model.take_pending().is_none());
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("connections.sqlite")))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_row BEFORE INSERT ON connections WHEN NEW.name = 'Retry' BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+        .execute(&pool)
+        .await
+        .unwrap();
+    model.queue_profile_preview(file.clone());
+    finish_import_job(&mut model, &services).await;
+    let _ = model.dispatch("profile-import-toggle:1");
+    let _ = model.dispatch("profile-import-confirm");
+    let _ = model.dispatch("profile-import-confirm");
+    assert_eq!(model.pending_len(), 1);
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Report(report) = &model.profile_import else {
+        panic!("missing per-row import report");
+    };
+    assert_eq!(report.counts(), (1, 2, 1));
+    assert!(matches!(report.rows[1].result, ImportResult::Unchecked));
+    assert!(matches!(report.rows[2].result, ImportResult::Invalid(_)));
+    assert!(matches!(report.rows[3].result, ImportResult::Failed));
+    assert_eq!(model.take_pending(), Some(PendingJob::RefreshConnections));
+    let saved = services.list_connections().await.unwrap();
+    assert_eq!(saved[0].saved.file_path.as_deref(), a.to_str());
+    assert!(!a.exists() && !b.exists() && !c.exists(), "import opened a target SQLite database");
+
+    sqlx::query("DROP TRIGGER fail_row").execute(&pool).await.unwrap();
+    pool.close().await;
+    let _ = model.dispatch("profile-import-close");
+    model.queue_profile_preview(file);
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Preview(preview) = &model.profile_import else {
+        panic!("missing repeat import preview");
+    };
+    assert!(preview.rows[0].conflict.is_some());
+    assert!(!preview.rows[0].checked);
+    let _ = model.dispatch("profile-import-toggle:1");
+    let _ = model.dispatch("profile-import-confirm");
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Report(report) = &model.profile_import else {
+        panic!("missing import report on retry");
+    };
+    assert_eq!(report.counts(), (1, 3, 0));
+    assert!(matches!(report.rows[0].result, ImportResult::Conflict(_)));
+    assert_eq!(services.list_connections().await.unwrap().len(), 2);
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn finish_import_job(model: &mut WorkbenchModel, services: &AppServices) {
+    let token = model.begin_owner(&services.tasks, "profile-import");
+    let request = request_of(model, token);
+    let done = jobs::execute_job(services, request).await;
+    apply_done(model, services, "profile-import", done);
+    model.finish_job();
+}
+
 /// 表 / 结构 / 专用页面也会占用工作项，查询项不一定在索引 0。
 fn query_item(model: &mut WorkbenchModel) -> &mut super::model::WorkItem {
     model.tabs.iter_mut().find(|tab| tab.kind.is_query()).expect("query item")

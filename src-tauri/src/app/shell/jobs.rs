@@ -14,6 +14,7 @@ use crate::connections::model::ConnectionDraft;
 use crate::query::{HistoryEntry, RenameRequest, SaveRequest, SavedQuery};
 use crate::state::AppState;
 
+use super::conn_import::{self, ImportPreview, ImportReport, ImportState};
 use super::model::{GroupOp, PendingJob, WorkbenchModel};
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,8 @@ pub enum JobDone {
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
     Notice(TaskToken, Result<String, String>),
+    ProfilesPreview(TaskToken, Result<ImportPreview, String>),
+    ProfilesReport(TaskToken, ImportReport),
     Imported(TaskToken, Result<(connections::ConnectionSnapshot, usize, Vec<String>), String>),
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
     /// 分组与成员关系的快照：(分组, 连接 id → 分组 id)。
@@ -195,6 +198,8 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
         }
+        PendingJob::ReadProfiles(path) => JobDone::ProfilesPreview(token, conn_import::load(services, &path).await),
+        PendingJob::SaveProfiles(preview) => JobDone::ProfilesReport(token, conn_import::save(services, *preview).await),
         PendingJob::ImportConnections => {
             let Some(path) = request.import_path else {
                 return JobDone::Notice(token, Err("connections.page.importRillSql".into()));
@@ -344,6 +349,20 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
             if accepted(services, owner, token) {
                 model.notice_detail = detail;
                 model.notice_key = Some("common.save");
+            }
+        }
+        JobDone::ProfilesPreview(token, result) => {
+            if accepted(services, owner, token) && matches!(model.profile_import, ImportState::Loading) {
+                model.profile_import = match result {
+                    Ok(preview) => ImportState::Preview(preview),
+                    Err(error) => ImportState::Error(error),
+                };
+            }
+        }
+        JobDone::ProfilesReport(token, report) => {
+            if accepted(services, owner, token) {
+                model.profile_import = ImportState::Report(report);
+                model.enqueue(PendingJob::RefreshConnections);
             }
         }
         JobDone::Imported(token, Ok((snapshot, count, skipped))) => {

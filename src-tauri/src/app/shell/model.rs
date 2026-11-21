@@ -210,6 +210,7 @@ pub enum DraftField {
     /// 对象概览的关键字过滤（名称或注释）。
     OverviewFilter,
     BundlePassphrase,
+    ImportProfile(usize, super::conn_import::ImportField),
     /// 危险操作确认层：生产环境要求输入的对象名。
     DangerConfirm,
     /// 危险操作确认层：重命名的新名字。
@@ -327,6 +328,8 @@ pub enum PendingJob {
     Disconnect,
     ExportConnections,
     ImportConnections,
+    ReadProfiles(std::path::PathBuf),
+    SaveProfiles(Box<super::conn_import::ImportPreview>),
     RefreshHistory,
     SaveNamed,
     ClearHistory,
@@ -441,6 +444,7 @@ pub struct WorkbenchModel {
     pub export_path: Option<String>,
     pub import_path: Option<String>,
     pub bundle_passphrase: String,
+    pub(super) profile_import: super::conn_import::ImportState,
     pub import_notes: Vec<String>,
     pub grid_writable: bool,
     /// 打开网格菜单那一刻从活动网格读到的现场事实。
@@ -624,6 +628,7 @@ impl WorkbenchModel {
             export_path: None,
             import_path: None,
             bundle_passphrase: String::new(),
+            profile_import: super::conn_import::ImportState::Idle,
             import_notes: Vec::new(),
             grid_writable: false,
             grid_menu: super::menus::GridMenuFacts::default(),
@@ -762,6 +767,9 @@ impl WorkbenchModel {
     pub fn dispatch(&mut self, id: &str) -> Option<Effect> {
         self.commands.push(id.to_owned());
         if self.close_prompt.is_some() && !matches!(id, "close-stay" | "close-leave") {
+            return Some(Effect::None);
+        }
+        if id.starts_with("profile-import-") && self.profile_import_action(id) {
             return Some(Effect::None);
         }
         let page_before = self.shell.page;
@@ -1695,7 +1703,47 @@ impl WorkbenchModel {
         }
     }
 
-    fn enqueue(&mut self, job: PendingJob) {
+    pub(super) fn queue_profile_preview(&mut self, path: std::path::PathBuf) {
+        self.profile_import = super::conn_import::ImportState::Loading;
+        self.enqueue(PendingJob::ReadProfiles(path));
+    }
+
+    fn profile_import_action(&mut self, id: &str) -> bool {
+        use super::conn_import::ImportState;
+        match id {
+            "profile-import-close" => {
+                if !matches!(self.profile_import, ImportState::Saving | ImportState::Picking) {
+                    self.profile_import = ImportState::Idle;
+                }
+            }
+            "profile-import-confirm" => {
+                if matches!(self.profile_import, ImportState::Preview(_)) {
+                    let ImportState::Preview(preview) = std::mem::replace(&mut self.profile_import, ImportState::Saving) else {
+                        unreachable!("profile preview just checked")
+                    };
+                    self.enqueue(PendingJob::SaveProfiles(Box::new(preview)));
+                }
+            }
+            action => {
+                let Some((command, index)) = action.split_once(':') else { return false; };
+                let Ok(index) = index.parse::<usize>() else { return false; };
+                if let ImportState::Preview(preview) = &mut self.profile_import {
+                    if let Some(row) = preview.rows.get_mut(index) {
+                        match command {
+                            "profile-import-toggle" if row.eligible() => row.checked = !row.checked,
+                            "profile-import-edit" if row.draft.is_some() && row.source.blockers.is_empty() => {
+                                preview.editing = (preview.editing != Some(index)).then_some(index);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub(super) fn enqueue(&mut self, job: PendingJob) {
         // 读历史是本机库的一次异步读取：排队即进入读取态，读到结果或失败才离开。
         if matches!(&job, PendingJob::RefreshHistory) {
             self.history.begin_load();
@@ -5873,6 +5921,16 @@ impl WorkbenchModel {
                 self.conn_touched();
             }
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
+            DraftField::ImportProfile(index, field) => {
+                if let super::conn_import::ImportState::Preview(preview) = &mut self.profile_import {
+                    if preview.editing == Some(index) {
+                        if let Some(draft) = preview.rows.get_mut(index).and_then(|row| row.draft.as_mut()) {
+                            field.set(draft, value);
+                            preview.refresh();
+                        }
+                    }
+                }
+            }
             DraftField::Url => {
                 // 一次多出好几个字符基本就是粘贴：能完整解析就直接填好下面的字段，省掉再点“解析”。
                 // 逐字输入时不解析，半截地址不会把已经填好的字段冲掉。
@@ -5988,6 +6046,11 @@ impl WorkbenchModel {
             DraftField::SshPassword => self.connections.secrets.ssh_password.clone(),
             DraftField::Passphrase => self.connections.secrets.ssh_passphrase.clone(),
             DraftField::BundlePassphrase => self.bundle_passphrase.clone(),
+            DraftField::ImportProfile(index, field) => match &self.profile_import {
+                super::conn_import::ImportState::Preview(preview) => preview.rows.get(index)
+                    .and_then(|row| row.draft.as_ref()).map(|draft| field.get(draft).to_owned()).unwrap_or_default(),
+                _ => String::new(),
+            },
             DraftField::Url => self.url_buffer.clone(),
             DraftField::Filter => self.connections.filter_text.clone(),
             DraftField::ObjectFilter => self.object_filter.clone(),
