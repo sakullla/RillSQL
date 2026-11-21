@@ -73,11 +73,19 @@ pub(crate) fn import_conflict(candidate: &SavedConnection, existing: &SavedConne
 }
 
 fn import_display_value(value: &str) -> String {
-    if let Some((_, uri)) = value.split_once("://") {
-        let authority = uri.split(['/', '?', '#', ';']).next().unwrap_or_default();
-        let host = authority.rsplit('@').next().unwrap_or_default();
-        if !host.is_empty() && host.chars().all(|ch| ch.is_ascii_alphanumeric() || ".-_:[],".contains(ch)) {
-            return host.to_owned();
+    if let Some((scheme, uri)) = value.split_once("://") {
+        let (authority, rest) = uri.split_at(uri.find(['/', '?', '#']).unwrap_or(uri.len()));
+        let hosts = authority.rsplit_once('@').map_or(authority, |(_, hosts)| hosts);
+        // 分号可在 userinfo 中出现。验证每个 host:port 后才展示；可疑的 @ 位置一律隐藏。
+        if matches!(scheme, "mongodb" | "mongodb+srv") && !rest.contains('@')
+            && authority.matches('@').count() <= 1
+            && hosts.split(',').all(|host| {
+                !host.is_empty()
+                    && host.chars().all(|ch| ch.is_ascii_alphanumeric() || ".-_:[]".contains(ch))
+                    && mongodb::options::ServerAddress::parse(host).is_ok()
+            })
+        {
+            return hosts.to_owned();
         }
         return "（已隐藏连接参数）".to_owned();
     }

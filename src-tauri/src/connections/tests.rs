@@ -220,6 +220,29 @@ async fn imported_profile_conflicts_protect_existing_route_and_credentials() {
     assert_eq!(service.insert_imported_connection(&draft).await.unwrap(), ImportInsert::Inserted);
 }
 
+#[test]
+fn imported_profile_conflict_never_displays_legacy_uri_userinfo() {
+    use super::store::import_conflict;
+
+    let mut candidate = model::normalize(&remote_draft(Engine::Mongodb), String::new()).unwrap();
+    let mut existing = candidate.clone();
+    for (uri, expected) in [
+        ("mongodb://reader:secret-sentinel;part@db.example.test:27017/db", "db.example.test:27017"),
+        ("mongodb://reader:secret-sentinel;part@db.example.test:not-a-port/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel/part@db.example.test/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel?part@db.example.test/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel;part", "（已隐藏连接参数）"),
+    ] {
+        candidate.name = uri.to_owned();
+        existing.name = uri.to_owned();
+        existing.host = Some(uri.to_owned());
+        let conflict = import_conflict(&candidate, &existing).unwrap();
+        assert_eq!(conflict.existing_name, expected);
+        assert_eq!(conflict.existing_target, format!("{expected}/app"));
+        assert!(!format!("{conflict:?}").contains("secret-sentinel"));
+    }
+}
+
 #[tokio::test]
 async fn imported_profiles_from_concurrent_services_commit_once() {
     use super::store::{ImportConflictKind, ImportInsert};
