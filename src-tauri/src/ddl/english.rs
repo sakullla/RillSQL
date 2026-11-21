@@ -739,6 +739,8 @@ mod tests {
             ("catalog/definition.rs", include_str!("../catalog/definition.rs")),
             ("app/shell/danger.rs", include_str!("../app/shell/danger.rs")),
             ("app/views/structure/mod.rs", include_str!("../app/views/structure/mod.rs")),
+            // 逐步回执的共用文案与原因在这里：结构页、管理页、对象编辑器和危险操作层都显示它。
+            ("app/views/structure/receipt.rs", include_str!("../app/views/structure/receipt.rs")),
         ]
         .into_iter()
         .map(|(file, source)| (file.to_owned(), non_test(source)))
@@ -806,7 +808,12 @@ mod tests {
             }
         }
         assert!(seen.len() > 200, "扫描没有读到源码字面量：{}", seen.len());
-        for file in ["catalog/definition.rs", "adapters/sqlserver/catalog_read.rs::read_sqlserver_definition", "app/shell/danger.rs"] {
+        // danger.rs 的显示文案已经搬进 structure/receipt.rs，扫描范围跟着换到那个文件。
+        for file in [
+            "catalog/definition.rs",
+            "adapters/sqlserver/catalog_read.rs::read_sqlserver_definition",
+            "app/views/structure/receipt.rs",
+        ] {
             let (_, code) = sources.iter().find(|(name, _)| name == file).unwrap();
             assert!(!chinese_literals(code).is_empty(), "{file} 没有读到中文字面量，扫描范围可能失效");
         }

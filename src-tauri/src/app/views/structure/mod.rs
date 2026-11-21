@@ -443,6 +443,8 @@ pub struct StructureSession {
     armed: bool,
     pub locale: Locale,
     note: Note,
+    /// 最近一次执行的逐步回执。回执留着，成功收起预览后也能回看每一步做了什么。
+    receipt: Option<crate::ddl::Receipt>,
     /// 外壳按连接当前标签与标签表色调算出的生产判断；没有下发时按环境 id 判断。
     pub prod: Option<bool>,
 }
@@ -484,12 +486,18 @@ impl StructureSession {
             armed: false,
             locale: Locale::ZhCn,
             note: Note::Empty,
+            receipt: None,
             prod: None,
         }
     }
 
     pub fn note(&self) -> String {
         self.note.text(self.locale)
+    }
+
+    /// 最近一次执行的逐步回执（被拦下、部分成功、全部成功都会留着）。
+    pub fn receipt(&self) -> Option<&crate::ddl::Receipt> {
+        self.receipt.as_ref()
     }
 
     pub fn banner(&self) -> String {
@@ -651,6 +659,8 @@ impl StructureSession {
         self.live = true;
         self.open = true;
         self.armed = false;
+        // 新的一次预览：上一次的逐步回执不再对应当前计划。
+        self.receipt = None;
     }
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
@@ -660,6 +670,7 @@ impl StructureSession {
         self.live = false;
         self.open = true;
         self.armed = false;
+        self.receipt = None;
     }
 
     pub fn preview_open(&self) -> bool {
@@ -733,6 +744,30 @@ impl StructureSession {
     pub fn cancel(&mut self) {
         self.open = false;
         self.armed = false;
+    }
+
+    /// 落一次执行回执：算结局、留着回执、写提示；只有全部成功才收起预览。
+    ///
+    /// 回执的目标必须还是这份预览的目标：目标换了（用户切了表或重新预览）就只提示过期，
+    /// 不覆盖当前目标上的回执与提示。返回 None 表示已按过期处理。
+    pub(crate) fn apply_receipt(&mut self, receipt: crate::ddl::Receipt) -> Option<receipt::ReceiptOutcome> {
+        self.armed = false;
+        if self.preview_target() != receipt.target {
+            self.note = Note::Key("structure.execute.stale");
+            return None;
+        }
+        let outcome = receipt::ReceiptOutcome::of(&receipt);
+        let problems = receipt::problems(&receipt);
+        self.receipt = Some(receipt);
+        if outcome.is_success() {
+            self.open = false;
+        }
+        self.note = match outcome.note_key() {
+            // 部分成功也有一条说明，后面紧跟逐步回执里的原始错误。
+            Some(key) => Note::Key(key),
+            None => Note::Raw(problems),
+        };
+        Some(outcome)
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
@@ -1235,12 +1270,10 @@ impl StructurePane {
                                 cx.notify();
                                 return;
                             }
-                            this.session.note = match result {
-                                Ok(receipt) if receipt.blocked.is_empty() => {
-                                    this.session.open = false;
-                                    this.session.armed = false;
-                                    let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
-                                    if all_ok && !receipt.steps.is_empty() {
+                            match result {
+                                Ok(receipt) => match this.session.apply_receipt(receipt) {
+                                    Some(outcome) if outcome.is_success() => {
+                                        // 只有每一条都 Ok 才收起预览：部分成功留着看逐步状态。
                                         if let Some(dropped_view) = drop_kind {
                                             this.dropped = Some((this.session.target.clone(), dropped_view));
                                         } else if let Some(new_name) = renamed_to.filter(|name| !name.is_empty()) {
@@ -1267,17 +1300,16 @@ impl StructurePane {
                                             this.reload_after_execute();
                                         }
                                     }
-                                    Note::Key("structure.preview.done")
-                                }
-                                Ok(receipt) => {
-                                    this.session.armed = false;
-                                    Note::Raw(receipt.blocked)
-                                }
+                                    // 部分成功：服务器上可能只改了一半，读回真实结构；草稿和已填输入不动。
+                                    Some(outcome) if outcome.rereads_target() => this.reread_after_partial(),
+                                    _ => {}
+                                },
                                 Err(message) => {
+                                    // 执行链直接报错：逐步回执没有，草稿和已填输入一份都不丢。
                                     this.session.armed = false;
-                                    Note::raw(message)
+                                    this.session.note = Note::raw(message);
                                 }
-                            };
+                            }
                             cx.notify();
                         });
                     }
@@ -2383,6 +2415,15 @@ impl StructurePane {
 
     fn reload_after_execute(&mut self) {
         self.drafts_ready = false;
+        self.loaded_for.clear();
+        self.snapshot = None;
+        self.ddl_view = None;
+        self.ddl_text.clear();
+    }
+
+    /// 部分成功：只重新读回服务器现状，不重置草稿的起稿状态——用户填的草稿、
+    /// 分区方案和视图定义都还在，能对照逐步回执改了再试。
+    fn reread_after_partial(&mut self) {
         self.loaded_for.clear();
         self.snapshot = None;
         self.ddl_view = None;
@@ -5120,6 +5161,10 @@ impl StructurePane {
                     .child(SharedString::from(self.session.note())),
             );
         }
+        // 逐步回执：成功、部分成功、被拦下都逐条列出 label、SQL、状态与原始 message。
+        if let Some(receipt) = self.session.receipt() {
+            body = body.child(receipt::panel("structure", receipt, &p, self.session.locale));
+        }
         let body = if virtual_columns {
             div()
                 .id("structure-body")
@@ -5443,6 +5488,10 @@ impl StructurePane {
                                     this.child(kit::muted(SharedString::from(note_text), p))
                                 }
                             })
+                            // 部分成功时预览不收起：逐步回执就显示在这张卡片里，一眼看清哪一步没过。
+                            .when_some(self.session.receipt(), |this, receipt| {
+                                this.child(receipt::panel("structure-dialog", receipt, p, locale))
+                            })
                             .when_some(danger_field, |this, field| this.child(field))
                             .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
                     )
@@ -5478,6 +5527,7 @@ impl StructurePane {
 
 mod browse;
 mod create;
+pub(crate) mod receipt;
 mod special;
 
 #[cfg(test)]

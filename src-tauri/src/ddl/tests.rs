@@ -1838,7 +1838,7 @@ async fn object_actions_refuse_sql_that_differs_from_the_preview() {
         // 预览本身不写入。
         assert_eq!(notes_rows(&session).await, 2);
         let tampered = exec::execute(&session, &request(action.clone()), &[format!("{sql} -- changed")]).await;
-        let message = tampered.err().expect("SQL changed since preview");
+        let message = tampered.expect_err("SQL changed since preview");
         assert!(message.contains("预览已过期"), "{message}");
         assert!(exec::execute(&session, &request(action.clone()), &[]).await.is_err(), "{action:?}");
     }

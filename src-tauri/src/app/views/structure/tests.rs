@@ -2451,3 +2451,127 @@ fn partition_section_only_exists_for_the_mysql_family(cx: &mut gpui_kit::TestApp
     assert!(!postgres.session.visible_sections().contains(&Section::Partitions), "PostgreSQL 表没有分区这一段");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------- 逐步回执（T5）
+
+fn partial_receipt(target: &str, steps: Vec<(&str, crate::ddl::StepStatus, &str)>) -> crate::ddl::Receipt {
+    crate::ddl::Receipt {
+        blocked: Vec::new(),
+        rule: String::new(),
+        steps: steps
+            .into_iter()
+            .map(|(label, status, message)| crate::ddl::model::StepReceipt {
+                sql: format!("ALTER TABLE orders {label};"),
+                label: label.to_owned(),
+                status,
+                message: message.to_owned(),
+            })
+            .collect(),
+        target: target.to_owned(),
+        rebuild: false,
+    }
+}
+
+fn blocked_receipt(target: &str, reasons: &[&str]) -> crate::ddl::Receipt {
+    crate::ddl::Receipt {
+        blocked: reasons.iter().map(|reason| (*reason).to_owned()).collect(),
+        rule: String::new(),
+        steps: Vec::new(),
+        target: target.to_owned(),
+        rebuild: false,
+    }
+}
+
+/// 只有每一条都 Ok 才收起预览；被拦下、没有语句、部分成功都留着预览并写原始原因。
+#[test]
+fn only_all_ok_receipt_closes_the_preview_and_other_outcomes_keep_it() {
+    let mut session = StructureSession::new(target("postgres", "orders"));
+    let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+    snapshot.columns = vec![column("id", "bigint", true)];
+    session.kept_columns = column_drafts(&snapshot);
+    session.arm_fixture(&snapshot);
+    let label = session.preview_target();
+    assert!(!label.is_empty(), "预览有目标");
+
+    // 被拦下：不收起预览，提示就是原始原因，没有逐步行。
+    let outcome = session.apply_receipt(blocked_receipt(&label, &["没有可执行的改动。"])).expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::Blocked);
+    assert!(session.preview_open(), "被拦下不收起预览");
+    assert_eq!(session.note(), "没有可执行的改动。");
+    assert!(receipt::rows(session.receipt().expect("回执留着")).is_empty());
+
+    // 没有被拦下也没有语句：同样不算完成。
+    let outcome = session.apply_receipt(partial_receipt(&label, Vec::new())).expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::NothingRun);
+    assert!(session.preview_open());
+    assert_eq!(session.note(), "没有执行任何语句");
+
+    // 部分成功：预览留着，提示是部分完成，逐步回执行里带着原始错误。
+    let outcome = session
+        .apply_receipt(partial_receipt(
+            &label,
+            vec![("改名", crate::ddl::StepStatus::Ok, ""), ("加列", crate::ddl::StepStatus::Failed, "syntax error near ADD")],
+        ))
+        .expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::Partial);
+    assert!(session.preview_open(), "部分成功不收起预览");
+    assert!(session.note().contains("部分完成"), "{}", session.note());
+    let rows = receipt::rows(session.receipt().unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, crate::ddl::StepStatus::Ok);
+    assert_eq!(rows[1].status, crate::ddl::StepStatus::Failed);
+    assert_eq!(rows[1].message, "syntax error near ADD");
+    assert!(rows[1].sql.contains("ALTER TABLE orders"), "{}", rows[1].sql);
+
+    // 全部成功：收起预览并显示统一的完成。
+    let outcome = session
+        .apply_receipt(partial_receipt(&label, vec![("改名", crate::ddl::StepStatus::Ok, "")]))
+        .expect("同一目标");
+    assert!(outcome.is_success());
+    assert!(!session.preview_open(), "全部成功才收起预览");
+    assert_eq!(session.note(), "已按预览执行。");
+}
+
+/// 目标换了以后的旧回执只提示过期：不覆盖当前目标上的回执，也不关掉当前预览。
+#[test]
+fn a_receipt_for_another_target_only_reports_stale() {
+    let mut session = StructureSession::new(target("postgres", "orders"));
+    let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+    snapshot.columns = vec![column("id", "bigint", true)];
+    session.kept_columns = column_drafts(&snapshot);
+    session.arm_fixture(&snapshot);
+    let stale = partial_receipt("postgres / app.public.customers", vec![("加列", crate::ddl::StepStatus::Ok, "")]);
+    assert!(session.apply_receipt(stale).is_none(), "目标不同的回执不落地");
+    assert_eq!(session.note(), "目标已切换，本次执行结果已丢弃。");
+    assert!(session.receipt().is_none(), "过期回执不覆盖当前目标");
+    assert!(session.preview_open(), "过期回执不动当前预览");
+}
+
+/// 结局参数：只有全部成功不收草稿，其余都要重新读回、留着用户填的草稿。
+#[test]
+fn outcome_rules_for_rereading_and_draft_keeping() {
+    use receipt::ReceiptOutcome;
+    let cases = [
+        (blocked_receipt("t", &["原因"]), ReceiptOutcome::Blocked),
+        (partial_receipt("t", Vec::new()), ReceiptOutcome::NothingRun),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Ok, "")]), ReceiptOutcome::Done),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Skipped, "跳过")]), ReceiptOutcome::Partial),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Unknown, "")]), ReceiptOutcome::Partial),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::RolledBack, "回滚")]), ReceiptOutcome::Partial),
+    ];
+    for (receipt, expected) in cases {
+        let outcome = ReceiptOutcome::of(&receipt);
+        assert_eq!(outcome, expected);
+        assert_eq!(outcome.rereads_target(), expected == ReceiptOutcome::Done || expected == ReceiptOutcome::Partial);
+        assert_eq!(outcome.keeps_draft(), !outcome.is_success());
+        if outcome.is_success() {
+            assert_eq!(receipt::problems(&receipt), Vec::<String>::new(), "全部成功没有原因");
+        } else {
+            assert!(!receipt::problems(&receipt).is_empty(), "{expected:?} 必须有原因");
+        }
+    }
+    // Failed 步骤没有 message 时退回 SQL，界面不会只剩一个空状态。
+    let bare = partial_receipt("t", vec![("加列", crate::ddl::StepStatus::Failed, "")]);
+    assert!(receipt::problems(&bare)[0].contains("ALTER TABLE"));
+}
+

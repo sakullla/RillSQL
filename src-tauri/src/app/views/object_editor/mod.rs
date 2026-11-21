@@ -520,18 +520,13 @@ pub fn parse_params(text: &str, kind: crate::ddl::model::RoutineKind) -> Result<
 ///
 /// 只有全部 Ok 才允许显示统一的“已执行”，与结构页、管理页一致。
 pub fn receipt_all_ok(receipt: &crate::ddl::Receipt) -> bool {
-    receipt.blocked.is_empty() && !receipt.steps.is_empty() && receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok)
+    // 和结构页、管理页、危险操作层同一处判定：只有每一条都 Ok 才算完成。
+    crate::app::views::structure::receipt::ReceiptOutcome::of(receipt).is_success()
 }
 
 /// 一步的执行状态：用固定的技术标识，不跟着界面语言变，免得和服务端原文混在一起看不懂。
-pub fn step_status_text(status: crate::ddl::StepStatus, _locale: Locale) -> &'static str {
-    match status {
-        crate::ddl::StepStatus::Ok => "ok",
-        crate::ddl::StepStatus::Failed => "failed",
-        crate::ddl::StepStatus::Skipped => "skipped",
-        crate::ddl::StepStatus::Unknown => "unknown",
-        crate::ddl::StepStatus::RolledBack => "rolled back",
-    }
+pub fn step_status_text(status: crate::ddl::StepStatus, locale: Locale) -> &'static str {
+    crate::app::views::structure::receipt::step_text(status, locale)
 }
 
 /// 执行失败后要不要保留草稿：除了“只删除成功”，其它结果都留着。
@@ -539,7 +534,9 @@ pub fn step_status_text(status: crate::ddl::StepStatus, _locale: Locale) -> &'st
 /// 删除成功时对象已经不在了，草稿再留着只会让人以为还能再删一次。
 pub fn keeps_draft(verb: EditorVerb, receipt: Option<&crate::ddl::Receipt>) -> bool {
     match (verb, receipt) {
-        (EditorVerb::Drop, Some(receipt)) => !receipt_all_ok(receipt),
+        (EditorVerb::Drop, Some(receipt)) => {
+            crate::app::views::structure::receipt::ReceiptOutcome::of(receipt).keeps_draft()
+        }
         _ => true,
     }
 }

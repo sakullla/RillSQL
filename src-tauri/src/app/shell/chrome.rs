@@ -7055,6 +7055,11 @@ impl Workbench {
                     .child(banner(IconName::TriangleAlert, SharedString::from(error), p.danger, p.danger_soft)),
             );
         }
+        // 逐步回执：和结构页、管理页、对象编辑器同一个组件，逐条给出 label、SQL、状态与原始 message。
+        // 算不算完成由共享 ReceiptOutcome 判定（只有全部 Ok 才算），这里不再另写一套“完成”。
+        if let Some(receipt) = prompt.receipt() {
+            content = content.child(crate::app::views::structure::receipt::panel("danger", receipt, &p, locale));
+        }
         if prompt.prod {
             let hint = i18n::fill(&self.model.text("catalog.danger.prodHint"), &[("name", &prompt.object.name)]);
             let input = self.input_for(DraftField::DangerConfirm, &prompt.object.name, false, window, cx);

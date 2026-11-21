@@ -835,42 +835,10 @@ impl ObjectEditorPane {
         panel.into_any_element()
     }
 
+    /// 逐步回执：与结构页、管理页、危险操作层同一个组件，前缀保持 object-editor。
     fn receipt_panel(&self, p: &Palette, locale: Locale) -> Option<AnyElement> {
         let receipt = self.session.receipt.as_ref()?;
-        let mut panel = div().id("object-editor-receipt").test_support().flex().flex_col().gap(px(Space::XS));
-        if !receipt.blocked.is_empty() {
-            panel = panel.child(
-                div()
-                    .p(px(Space::MD))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.danger_soft)
-                    .text_color(p.danger)
-                    .text_size(px(TypeScale::SM))
-                    .child(SharedString::from(receipt.blocked.join(" "))),
-            );
-        }
-        for step in &receipt.steps {
-            let (fg, bg) = match step.status {
-                crate::ddl::StepStatus::Ok => (p.text_muted, p.hover),
-                _ => (p.danger, p.danger_soft),
-            };
-            panel = panel.child(
-                div()
-                    .id(SharedString::from(format!("object-editor-step-{}", step.label)))
-                    .flex()
-                    .flex_col()
-                    .gap(px(Space::XXS))
-                    .px(px(Space::SM))
-                    .py(px(Space::XS))
-                    .rounded(px(Radius::PANEL))
-                    .bg(bg)
-                    .text_color(fg)
-                    .text_size(px(TypeScale::SM))
-                    .child(SharedString::from(format!("{} · {}", step.label, super::step_status_text(step.status, locale))))
-                    .when(!step.message.is_empty(), |this| this.child(SharedString::from(step.message.clone()))),
-            );
-        }
-        Some(panel.into_any_element())
+        Some(crate::app::views::structure::receipt::panel("object-editor", receipt, p, locale))
     }
 
     fn panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

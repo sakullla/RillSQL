@@ -7166,6 +7166,101 @@ fn danger_confirm_layer_gates_prod_by_tone_and_keeps_the_tree_on_failure() {
     assert!(dev.take_danger_request().is_none());
 }
 
+/// 危险操作层的逐步回执：多步部分失败时确认层留着每一行，错误只写没成功的步骤，
+/// 渲染入口是 chrome.rs 的 danger_confirm_layer（danger-step-* 元素）。
+#[test]
+fn danger_layer_keeps_every_step_of_a_partial_receipt() {
+    use crate::app::shell::danger::DangerStep;
+    use crate::ddl::{DdlEngine, Snapshot, StepStatus};
+    let (mut model, orders) = pg_orders_model();
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-truncate-table");
+    let (step, prompt) = model.take_danger_request().expect("打开即预览");
+    assert_eq!(step, DangerStep::Preview);
+    let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "shop", "public", "orders");
+    snapshot.kind = "table".to_owned();
+    let plan = crate::ddl::preview_plan(&snapshot, &prompt.action());
+    model.danger_planned(prompt.epoch, None, Ok(plan));
+    let _ = model.dispatch("danger-execute");
+    let _ = model.dispatch("danger-execute");
+    let (_, prompt) = model.take_danger_request().expect("第二次执行");
+
+    let step_of = |label: &str, status: StepStatus, message: &str| crate::ddl::model::StepReceipt {
+        sql: format!("{label};"),
+        label: label.to_owned(),
+        status,
+        message: message.to_owned(),
+    };
+    let receipt = crate::ddl::Receipt {
+        blocked: Vec::new(),
+        rule: String::new(),
+        steps: vec![step_of("删除", StepStatus::Ok, ""), step_of("清理", StepStatus::RolledBack, "deadlock found")],
+        target: String::new(),
+        rebuild: false,
+    };
+    assert!(!model.danger_finished(prompt.epoch, Ok(receipt)), "没全部 Ok 不算通过");
+    let current = model.danger.as_ref().expect("确认层还开着");
+    assert_eq!(current.error.as_deref(), Some("deadlock found"), "只有没成功的步骤进错误");
+    let kept = current.receipt().expect("确认层留着整份回执供逐条渲染");
+    assert_eq!(kept.steps.len(), 2);
+    assert_eq!(kept.steps[1].status, StepStatus::RolledBack);
+    assert_eq!(kept.steps[1].message, "deadlock found");
+}
+
+/// 危险操作确认层真的把逐步回执画出来：chrome 的 danger 卡片里有 danger-receipt 与每一步的元素，
+/// 合并后的 danger-error 仍在。判定只有全部 Ok 才算通过（这里给的是部分失败）。
+#[gpui_kit::test]
+fn danger_layer_renders_each_receipt_step(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::shell::danger::{DangerKind, DangerPrompt};
+    use crate::catalog::hierarchy::ObjectKey;
+    use crate::catalog::model::{Engine, ObjectKind};
+    use crate::ddl::StepStatus;
+    let dir = std::env::temp_dir().join(format!("rillsql-danger-receipt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, services, false, 1200., 900.);
+    let object = ObjectKey {
+        connection_id: "c1".into(),
+        connection_name: "shop".into(),
+        engine: Engine::Postgres,
+        database: "shop".into(),
+        schema: "public".into(),
+        name: "orders".into(),
+        kind: ObjectKind::Table,
+    };
+    let mut prompt = DangerPrompt::new(DangerKind::DropTable, "node", object, "");
+    let step_of = |label: &str, status: StepStatus, message: &str| crate::ddl::model::StepReceipt {
+        sql: format!("-- {label}"),
+        label: label.to_owned(),
+        status,
+        message: message.to_owned(),
+    };
+    let receipt = crate::ddl::Receipt {
+        blocked: Vec::new(),
+        rule: String::new(),
+        steps: vec![step_of("drop", StepStatus::Ok, ""), step_of("verify", StepStatus::RolledBack, "deadlock found")],
+        target: String::new(),
+        rebuild: false,
+    };
+    assert!(!prompt.apply_receipt(Ok(receipt)), "没全部 Ok 不算通过");
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.danger = Some(prompt);
+            cx.notify();
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("danger-receipt").visible(), "危险操作层要显示逐步回执");
+        assert!(window.find("danger-step-drop").visible(), "成功的步骤也要列出");
+        assert!(window.find("danger-step-verify").visible(), "失败的步骤要列出");
+        assert!(window.find("danger-error").visible(), "合并后的错误仍在");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 查看 DDL：读不到定义的对象不开查看器；“复制 DDL”只在读到后写剪贴板。
 #[test]
 fn definition_requests_only_for_readable_objects() {

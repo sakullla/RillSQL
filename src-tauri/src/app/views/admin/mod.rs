@@ -15,6 +15,7 @@ use crate::ui::kit::ScrollAreaExt as _;
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
+use crate::app::views::structure::receipt;
 use crate::ddl::english::localize;
 use crate::ddl::{preview_plan, Action, Plan, Request, Snapshot};
 use crate::i18n::{self, Locale};
@@ -178,6 +179,8 @@ pub struct AdminSession {
     open: bool,
     pub locale: Locale,
     pub note: Note,
+    /// 最近一次执行的逐步回执。成功收起预览后也留着，方便回看每一步。
+    receipt: Option<crate::ddl::Receipt>,
 }
 
 impl AdminSession {
@@ -212,11 +215,17 @@ impl AdminSession {
             open: false,
             locale: Locale::ZhCn,
             note: Note::Empty,
+            receipt: None,
         }
     }
 
     pub fn note_text(&self) -> String {
         self.note.text(self.locale)
+    }
+
+    /// 最近一次执行的逐步回执（被拦下、部分成功、全部成功都会留着）。
+    pub fn receipt(&self) -> Option<&crate::ddl::Receipt> {
+        self.receipt.as_ref()
     }
 
     pub fn apply_draft(&mut self, kind: &str) {
@@ -289,6 +298,8 @@ impl AdminSession {
         self.live = true;
         self.open = true;
         self.note = Note::Empty;
+        // 新的一次预览：上一次的逐步回执不再对应当前计划。
+        self.receipt = None;
     }
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
@@ -297,6 +308,7 @@ impl AdminSession {
         self.live = false;
         self.open = true;
         self.note = Note::Key("admin.preview.unconnected");
+        self.receipt = None;
     }
 
     pub fn preview_open(&self) -> bool {
@@ -334,6 +346,26 @@ impl AdminSession {
 
     pub fn cancel(&mut self) {
         self.open = false;
+    }
+
+    /// 落一次执行回执：算结局、留着回执、写提示；只有全部成功才收起预览。
+    /// 回执的目标不是这份预览的目标时只提示过期，不覆盖当前目标。
+    pub(crate) fn apply_receipt(&mut self, receipt: crate::ddl::Receipt) -> Option<receipt::ReceiptOutcome> {
+        if self.preview_target() != receipt.target {
+            self.note = Note::Key("admin.note.executeDropped");
+            return None;
+        }
+        let outcome = receipt::ReceiptOutcome::of(&receipt);
+        let problems = receipt::problems(&receipt);
+        self.receipt = Some(receipt);
+        if outcome.is_success() {
+            self.open = false;
+        }
+        self.note = match outcome.note_key() {
+            Some(key) => Note::Key(key),
+            None => Note::Raw(problems),
+        };
+        Some(outcome)
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
@@ -634,18 +666,22 @@ impl AdminPane {
                                 cx.notify();
                                 return;
                             }
-                            this.session.note = match result {
-                                Ok(receipt) if receipt.blocked.is_empty() => {
-                                    this.session.open = false;
-                                    Note::Key("structure.preview.done")
-                                }
-                                Ok(receipt) => Note::Raw(receipt.blocked),
+                            match result {
+                                Ok(receipt) => match this.session.apply_receipt(receipt) {
+                                    // 部分成功：按服务器实际结果重新读清单，表单里填的输入不动。
+                                    Some(outcome) if outcome.rereads_target() && !outcome.is_success() => this.refresh(cx),
+                                    _ => {}
+                                },
                                 Err(message) => {
                                     let zh = i18n::text(Locale::ZhCn, "admin.note.unconfirmed");
                                     let en = i18n::text(Locale::En, "admin.note.unconfirmed");
-                                    if message == zh || message == en { Note::Key("admin.note.unconfirmed") } else { Note::raw(message) }
+                                    this.session.note = if message == zh || message == en {
+                                        Note::Key("admin.note.unconfirmed")
+                                    } else {
+                                        Note::raw(message)
+                                    };
                                 }
-                            };
+                            }
                             cx.notify();
                         });
                     }
@@ -1060,6 +1096,8 @@ impl Render for AdminPane {
         });
         let mut column = div().id("admin-pane").relative().size_full().flex().flex_col().child(header);
         let note = self.session.note.text(locale);
+        // 逐步回执：成功、部分成功、被拦下都逐条列出 label、SQL、状态与原始 message。
+        let receipt = self.session.receipt.clone();
         // 首屏读取给骨架、刷新已读内容只给一行增量指示、读完而未连接给带"立即连接"的空态；
         // 三者都排在卡片之前，卡片本身（表单与预览入口）在任何状态下都保留，管理能力不因状态而消失。
         let mut states = div().flex().flex_col().gap(px(metrics.section_gap()));
@@ -1088,9 +1126,10 @@ impl Render for AdminPane {
             )));
         }
         column = column
-            .child(div().id("admin-body").flex_1().min_h(px(0.)).scroll_area_y().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(states).child(cards).when(!note.is_empty(), |this| {
+            .child(div().id("admin-body").flex_1().min_h(px(0.)).scroll_area_y().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(states).child(cards)            .when(!note.is_empty(), |this| {
                 this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(note)))
-            })))
+            })
+            .when_some(receipt.as_ref(), |this, receipt| this.child(receipt::panel("admin", receipt, &p, locale)))))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
         if self.session.open {
             let dialog = stack_frame(|| {
@@ -1142,6 +1181,8 @@ impl Render for AdminPane {
                         })
                         .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
                         .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" ")))))
+                        // 部分成功时预览不收起：逐步回执就显示在这张卡片里，一眼看清哪一步没过。
+                        .when_some(self.session.receipt(), |this, receipt| this.child(receipt::panel("admin-dialog", receipt, &p, locale)))
                         // 危险操作说明固定占一行：有 danger 级风险用危险色，其余用提醒色，措辞不同。
                         .child(
                             div()
@@ -1932,5 +1973,81 @@ mod tests {
         }
         assert_ne!(i18n::text(Locale::ZhCn, "admin.section.none"), i18n::text(Locale::ZhCn, "admin.section.noneHint"));
         assert_ne!(i18n::text(Locale::ZhCn, "admin.empty.attachedHint"), i18n::text(Locale::ZhCn, "admin.offline.detail"));
+    }
+
+    fn receipt_with(target: &str, steps: Vec<(&str, crate::ddl::StepStatus, &str)>) -> crate::ddl::Receipt {
+        crate::ddl::Receipt {
+            blocked: Vec::new(),
+            rule: String::new(),
+            steps: steps
+                .into_iter()
+                .map(|(label, status, message)| crate::ddl::model::StepReceipt {
+                    sql: format!("ALTER EVENT sweep {label};"),
+                    label: label.to_owned(),
+                    status,
+                    message: message.to_owned(),
+                })
+                .collect(),
+            target: target.to_owned(),
+            rebuild: false,
+        }
+    }
+
+    /// 管理页与结构页同一套结局：部分成功不收起预览、留原始错误，只有全部 Ok 才算完成，过期回执不落地。
+    #[test]
+    fn admin_receipts_use_the_shared_outcome_and_keep_the_form() {
+        let mut session = AdminSession::new(target("postgres"));
+        session.operation = AdminOp::Vacuum;
+        let snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "customers");
+        session.arm_fixture(&snapshot);
+        let label = session.preview_target();
+        assert!(!label.is_empty(), "预览有目标");
+
+        let outcome = session
+            .apply_receipt(receipt_with(&label, vec![("启用", crate::ddl::StepStatus::Ok, ""), ("调度器", crate::ddl::StepStatus::Failed, "permission denied")]))
+            .expect("同一目标");
+        assert_eq!(outcome, crate::app::views::structure::receipt::ReceiptOutcome::Partial);
+        assert!(session.preview_open(), "部分成功不收起预览");
+        assert!(session.note_text().contains("部分完成"), "{}", session.note_text());
+        let rows = crate::app::views::structure::receipt::rows(session.receipt().expect("回执留着"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].message, "permission denied");
+
+        let outcome = session.apply_receipt(receipt_with(&label, vec![("启用", crate::ddl::StepStatus::Ok, "")])).expect("同一目标");
+        assert!(outcome.is_success());
+        assert!(!session.preview_open(), "全部成功才收起预览");
+        assert_eq!(session.note_text(), "已按预览执行。");
+
+        let stale = receipt_with("postgres / app.public.other", vec![("启用", crate::ddl::StepStatus::Ok, "")]);
+        assert!(session.apply_receipt(stale).is_none(), "目标不同的回执不落地");
+        assert_eq!(session.note_text(), "目标已切换，本次执行结果已丢弃。");
+    }
+
+    /// 某一节对象读取失败只影响该节：其它节的清单与普通表操作照旧可用。
+    #[test]
+    fn a_fault_in_one_object_section_does_not_block_the_others() {
+        let extras = crate::catalog::ExtrasBody {
+            extensions: Default::default(),
+            sequences: Default::default(),
+            events: crate::catalog::objects::ExtrasList { items: Vec::new(), error: Some("SELECT command denied for table events".into()) },
+            partitions: Default::default(),
+            pragmas: Default::default(),
+            attached: Default::default(),
+        };
+        let inventory = inventory_from_extras(&target("mysql"), &extras);
+        assert!(inventory.connected && inventory.probed);
+        assert_eq!(inventory.faults.len(), 1, "{:?}", inventory.faults);
+        assert_eq!(inventory.faults[0].title_key, "catalog.kind.event");
+        assert!(inventory.faults[0].message.contains("denied"));
+        for key in ["admin.section.partitions", "catalog.kind.sequence", "admin.section.attached", "admin.action.pragma"] {
+            assert!(inventory.faults.iter().all(|fault| fault.title_key != key), "{key}");
+        }
+        // 事件这一节失败不影响另一类对象的管理计划：会话仍能正常预览它自己的动作。
+        let mut session = AdminSession::new(target("mysql"));
+        session.operation = AdminOp::SetEvent { event: "sweep".into(), enabled: false };
+        let mut snapshot = Snapshot::bare(DdlEngine::Mysql, "app", "", "sweep");
+        snapshot.event_enabled = Some(true);
+        session.arm_fixture(&snapshot);
+        assert!(session.blocked().is_empty(), "{:?}", session.blocked());
     }
 }
