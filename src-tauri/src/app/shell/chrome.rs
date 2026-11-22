@@ -2396,11 +2396,18 @@ impl Workbench {
         let overview_view = page == AppPage::Workspace && tool == WorkTool::Overview;
         let tool_view = table_view || redis_view || mongo_view || overview_view || matches!(page, AppPage::Structure | AppPage::Compare | AppPage::Diagram);
         let welcome = self.model.show_welcome() && !tool_view;
-        // 结构页的字段表按内容区真实宽度排版。这个宽度只有布局知道（视口减活动栏、
-        // 停靠侧栏和根内边距），不能由面板拿视口宽冒充：900 开着侧栏只剩 614。
+        // 结构页的字段表与查询页的顶部控制条按内容区真实宽度排版。这个宽度只有布局知道
+        // （视口减停靠侧栏），不能由面板拿视口宽冒充：900 开着侧栏只剩 666。
         if page == AppPage::Structure {
             let content_width = self.model.layout().content_width as f32;
             self.structure.update(cx, |pane, cx| {
+                if pane.set_content_width(content_width) {
+                    cx.notify();
+                }
+            });
+        } else if !welcome && !tool_view {
+            let content_width = self.model.layout().content_width as f32;
+            self.query.update(cx, |pane, cx| {
                 if pane.set_content_width(content_width) {
                     cx.notify();
                 }

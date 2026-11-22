@@ -14845,3 +14845,68 @@ fn zero_rail_overlay_sidebar_and_integrated_topbar_tabs(cx: &mut gpui_kit::TestA
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[gpui_kit::test]
+fn query_toolbar_compacts_for_docked_sidebar_at_900px(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench_sized(cx, false, 900., 720.);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.sidebar_open = true;
+            view.model.open_bound_query(
+                "SELECT 1".into(),
+                Some("notes".into()),
+                Some("笔记".into()),
+                Some("main".into()),
+                Some("sqlite".into()),
+            );
+            view.perform("tx-begin", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active)
+        }),
+        "900px 停靠侧栏测试需进入活动事务态"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let content_width = view.read(cx).model.layout().content_width;
+        assert_eq!(content_width, 666, "900px 视口扣除 234px 停靠侧栏后内容宽应为 666px");
+        assert!(
+            window.try_find("query-act-run-script").is_none(),
+            "QueryPane 收到 666px 内容宽后应进入 narrow 紧凑模式（隐藏运行全部）"
+        );
+        let content = window.find("workbench-content").bounds();
+        let content_left = f32::from(content.origin.x);
+        let content_right = f32::from(content.origin.x + content.size.width);
+        assert!((content_right - content_left - 666.).abs() <= 1.5, "实际内容列宽应约为 666px");
+        for id in [
+            "query-act-execute-query",
+            "query-connection",
+            "query-tx-controls",
+            "query-tx-rollback",
+            "query-tx-commit",
+            "query-act-format",
+            "query-act-explain",
+            "query-side-toggle",
+            "query-more",
+        ] {
+            let el = window.find(id);
+            assert!(el.visible(), "900px 停靠侧栏下查询工具栏控件 {id} 应可见");
+            let b = el.bounds();
+            let left = f32::from(b.origin.x);
+            let right = f32::from(b.origin.x + b.size.width);
+            assert!(left >= content_left - 0.5, "{id} 左侧越出内容区 ({left} < {content_left})");
+            assert!(right <= content_right + 0.5, "{id} 右侧被裁切 ({right} > {content_right})");
+        }
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
