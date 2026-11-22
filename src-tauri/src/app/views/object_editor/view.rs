@@ -85,6 +85,8 @@ pub struct ObjectEditorPane {
     body_sub: Option<Subscription>,
     focus: Option<FocusHandle>,
     focused_on_open: bool,
+    previous_focus: Option<FocusHandle>,
+    restore_focus: Option<FocusHandle>,
     open: bool,
     loading: bool,
     previewing: bool,
@@ -106,6 +108,8 @@ impl ObjectEditorPane {
             body_sub: None,
             focus: None,
             focused_on_open: false,
+            previous_focus: None,
+            restore_focus: None,
             open: false,
             loading: false,
             previewing: false,
@@ -131,6 +135,9 @@ impl ObjectEditorPane {
     pub fn close(&mut self) {
         self.open = false;
         self.focused_on_open = false;
+        if let Some(prev) = self.previous_focus.take() {
+            self.restore_focus = Some(prev);
+        }
         self.epoch += 1;
         self.loading = false;
         self.previewing = false;
@@ -140,6 +147,14 @@ impl ObjectEditorPane {
         self.body_editor = None;
         self.body_sync.clear();
         self.body_sub = None;
+    }
+
+    /// 在窗口上下文里关闭编辑器，并立即把焦点归还给打开模态前的控件。
+    fn close_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close();
+        if let Some(prev) = self.restore_focus.take() {
+            window.focus(&prev, cx);
+        }
     }
 
     /// 打开编辑器。已有对象先从服务器读回真实状态；新建只起一份空草稿。
@@ -162,6 +177,8 @@ impl ObjectEditorPane {
         };
         self.open = true;
         self.focused_on_open = false;
+        self.previous_focus = None;
+        self.restore_focus = None;
         self.epoch += 1;
         self.previewing = false;
         self.executing = false;
@@ -487,9 +504,9 @@ impl ObjectEditorPane {
                     "object-editor-header-close",
                     IconName::X,
                     SharedString::from(i18n::text(locale, "common.close")),
-                    move |_, _, cx| {
+                    move |_, window, cx| {
                         close_owner.update(cx, |pane, cx| {
-                            pane.close();
+                            pane.close_in_window(window, cx);
                             cx.notify();
                         });
                     },
@@ -771,9 +788,9 @@ impl ObjectEditorPane {
             "object-editor-close",
             None,
             SharedString::from(i18n::text(locale, "common.close")),
-            move |_, _, cx| {
+            move |_, window, cx| {
                 owner.update(cx, |pane, cx| {
-                    pane.close();
+                    pane.close_in_window(window, cx);
                     cx.notify();
                 })
             },
@@ -903,6 +920,7 @@ impl ObjectEditorPane {
         let dialog_focus = self.dialog_focus_handle(cx);
         if !self.focused_on_open {
             self.focused_on_open = true;
+            self.previous_focus = window.focused(cx).filter(|prev| prev != &dialog_focus);
             window.focus(&dialog_focus, cx);
         }
         let p = Palette::of(cx);
@@ -972,11 +990,11 @@ impl ObjectEditorPane {
             .items_center()
             .justify_center()
             .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 scrim_owner.update(cx, |pane, cx| {
                     if !pane.executing {
-                        pane.close();
+                        pane.close_in_window(window, cx);
                         cx.notify();
                     }
                 });
@@ -991,11 +1009,11 @@ impl ObjectEditorPane {
                     .track_focus(&dialog_focus)
                     .focus_trap("object-editor", &dialog_focus)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                    .on_key_down(move |event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key.as_str() == "escape" {
                             let closed = key_owner.update(cx, |pane, cx| {
                                 if !pane.executing {
-                                    pane.close();
+                                    pane.close_in_window(window, cx);
                                     cx.notify();
                                     true
                                 } else {
@@ -1029,6 +1047,9 @@ impl ObjectEditorPane {
 impl Render for ObjectEditorPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
+            if let Some(prev) = self.restore_focus.take() {
+                window.focus(&prev, cx);
+            }
             return div().into_any_element();
         }
         self.panel(window, cx)

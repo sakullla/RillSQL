@@ -858,8 +858,8 @@ mod receipt_tests {
     fn object_editor_scrim_occludes_background_and_escape_closes(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt;
         use gpui_kit::{
-            AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Styled as _,
-            TestSupportExt as _, Window, div, px,
+            AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
+            Styled as _, TestSupportExt as _, Window, div, px,
         };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -867,6 +867,7 @@ mod receipt_tests {
 
         struct Host {
             editor: Entity<ObjectEditorPane>,
+            bg_focus: FocusHandle,
             bg_hits: Arc<AtomicUsize>,
         }
 
@@ -880,6 +881,7 @@ mod receipt_tests {
                         div()
                             .id("object-editor-bg-target")
                             .test_support()
+                            .track_focus(&self.bg_focus)
                             .absolute()
                             .top_0()
                             .left_0()
@@ -911,31 +913,42 @@ mod receipt_tests {
                 gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
                 cx,
                 |_window, cx| {
-                    let editor = cx.new(|cx| {
-                        let mut pane = ObjectEditorPane::new(services.clone());
-                        pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
-                        pane
-                    });
-                    cx.new(|_| Host { editor, bg_hits: hits })
+                    let editor = cx.new(|_| ObjectEditorPane::new(services.clone()));
+                    cx.new(|cx| Host { editor, bg_focus: cx.focus_handle(), bg_hits: hits })
                 },
             )
             .expect("host window")
         });
-        let editor = cx.update(|cx| host.read(cx).editor.clone());
+        let (editor, bg_focus) = cx.update(|cx| {
+            let h = host.read(cx);
+            (h.editor.clone(), h.bg_focus.clone())
+        });
 
-        // 1. 打开后自动聚焦弹窗，按 Esc 直接关闭。
+        // 1. 先聚焦底层控件，再打开弹窗：弹窗接管焦点；按 Esc 关闭后焦点精确回到原底层控件。
         cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.focus(&bg_focus, cx);
+            window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "打开弹窗前底层控件应持有焦点");
+
+            editor.update(cx, |pane, cx| {
+                pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+            });
             window.render_frame(cx);
             assert!(window.try_find("object-editor-scrim").is_some(), "遮罩应渲染");
             assert!(window.try_find("object-editor").is_some(), "弹窗应渲染");
+            assert!(!bg_focus.is_focused(window), "打开弹窗后焦点应移入弹窗");
+
             window.press("escape", cx);
             window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "Esc 关闭后焦点应归还给原底层控件");
         })
         .unwrap();
         assert!(!cx.update(|cx| editor.read(cx).is_open()), "Esc 应关闭对象编辑器");
 
-        // 2. 重新打开：点弹窗内部不关闭，点遮罩覆盖的底层区域只关闭弹窗且不穿透底层按钮。
+        // 2. 重新打开：点弹窗内部不关闭，点遮罩覆盖的底层区域关闭且不穿透底层按钮，并归还焦点。
         cx.update_window(window, |_, window, cx| {
+            assert!(bg_focus.is_focused(window));
             editor.update(cx, |pane, cx| {
                 pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
             });
@@ -950,10 +963,39 @@ mod receipt_tests {
         cx.update_window(window, |_, window, cx| {
             window.click("object-editor-bg-target", cx);
             window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "点击遮罩关闭后焦点应归还给原底层控件");
         })
         .unwrap();
         assert!(!cx.update(|cx| editor.read(cx).is_open()), "点击遮罩外部应关闭对象编辑器");
         assert_eq!(bg_hits.load(Ordering::SeqCst), 0, "遮罩应阻断点击穿透到底层视图");
+
+        // 3. 重新打开并通过页头关闭按钮关闭：同样归还焦点。
+        cx.update_window(window, |_, window, cx| {
+            assert!(bg_focus.is_focused(window));
+            editor.update(cx, |pane, cx| {
+                pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+            });
+            window.render_frame(cx);
+            window.click("object-editor-header-close", cx);
+            window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "点击页头关闭按钮后焦点应归还给原底层控件");
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| editor.read(cx).is_open()), "点击页头关闭按钮应关闭对象编辑器");
+
+        // 4. 重新打开并通过底部关闭按钮关闭：同样归还焦点。
+        cx.update_window(window, |_, window, cx| {
+            assert!(bg_focus.is_focused(window));
+            editor.update(cx, |pane, cx| {
+                pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+            });
+            window.render_frame(cx);
+            window.click("object-editor-close", cx);
+            window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "点击底部关闭按钮后焦点应归还给原底层控件");
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| editor.read(cx).is_open()), "点击底部关闭按钮应关闭对象编辑器");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
