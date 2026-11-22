@@ -13,7 +13,7 @@ use gpui_kit::{
     TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette, Radius, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, Space, TypeScale};
 
 use crate::application::AppServices;
 use crate::export::{
@@ -1079,6 +1079,17 @@ impl ExchangePane {
         }
     }
 
+    /// “暂不可用”那一块的共同原因：按来源状态给一句，不按动作重复。
+    fn blocked_summary_key(&self) -> &'static str {
+        match (self.source_state(), self.source.kind) {
+            (SourceState::Running, _) => "ui.exchange.blocked.running",
+            (SourceState::NoTable, _) => "ui.exchange.blocked.noTable",
+            (SourceState::NoResult, ExchangeSourceKind::Query) => "ui.exchange.next.runQuery",
+            (SourceState::NoResult, ExchangeSourceKind::Table) => "ui.exchange.next.refresh",
+            (SourceState::Ready, ExchangeSourceKind::Query) => "ui.exchange.blocked.query",
+            (SourceState::Ready, ExchangeSourceKind::Table) => "ui.exchange.blocked.running",
+        }
+    }
     /// 同一个行动作的下一步（然后能做什么）。原因与下一步在界面上分开呈现（S8.5）。
     fn blocked_next(&self, _action: BlockedAction) -> &'static str {
         match (self.source_state(), self.source.kind) {
@@ -1316,15 +1327,7 @@ impl Render for ExchangePane {
                         .text_color(p.text_muted)
                         .child(SharedString::from(i18n::fill(&i18n::text(locale, "ui.exchange.loadedRows"), &[("count", &self.source.rows.len().to_string()), ("partial", &partial)]))),
                 );
-                // 查询结果已经读到末尾时，已读取的行就是完整结果，不再说“全量导出不可用”。
-                if self.source.kind.is_query() && self.source.truncated {
-                    source_body = source_body.child(
-                        div()
-                            .text_size(px(TypeScale::XS))
-                            .text_color(p.text_faint)
-                            .child(t("ui.exchange.loadedOnly")),
-                    );
-                }
+                // “全量导出不可用”由导出区的“暂不可用”统一说明，这里不再重复。
             }
         }
         (kinds, source_body)
@@ -1395,6 +1398,8 @@ impl Render for ExchangePane {
         // 查询结果已全部读取：已读取的行就是整个结果，入口直接叫“导出结果”，也不再摆一条
         // 不可用的“导出全部结果”——那条说的限制在这里并不存在。
         let complete_query = self.source.kind.is_query() && !self.source.truncated;
+        // 现在做不了的动作不再各占一行：收进下面同一块“暂不可用”，原因只说一次。
+        let mut blocked: Vec<(&'static str, SharedString, BlockedAction)> = Vec::new();
         if loaded_ready {
             let (title, hint) = if complete_query {
                 (t("ui.exchange.exportResult"), "ui.exchange.resultCount")
@@ -1410,14 +1415,7 @@ impl Render for ExchangePane {
                 act("exchange-export-loaded"),
             ));
         } else {
-            export = export.child(blocked_row(
-                "exchange-exchange-export-loaded",
-                IconName::FileDown,
-                t("export.export.loaded"),
-                &i18n::text(locale, self.blocked_reason(BlockedAction::ExportLoaded)),
-                &i18n::text(locale, self.blocked_next(BlockedAction::ExportLoaded)),
-                &p,
-            ));
+            blocked.push(("exchange-exchange-export-loaded", t("export.export.loaded"), BlockedAction::ExportLoaded));
         }
         if complete_query && loaded_ready {
             // 见上：完整的查询结果没有“更全”的版本可导。
@@ -1431,51 +1429,42 @@ impl Render for ExchangePane {
                 act("exchange-export-full"),
             ));
         } else {
-            export = export.child(blocked_row(
-                "exchange-exchange-export-full",
-                IconName::Download,
-                t("export.export.full"),
-                &i18n::text(locale, self.blocked_reason(BlockedAction::ExportFull)),
-                &i18n::text(locale, self.blocked_next(BlockedAction::ExportFull)),
-                &p,
-            ));
+            blocked.push(("exchange-exchange-export-full", t("export.export.full"), BlockedAction::ExportFull));
         }
         // 全库导出与跨库迁移都要有当前表；来源还在执行时迁移也要等。
-        if self.source.kind.is_query() || self.source.table.is_none() {
-            export = export
-                .child(blocked_row(
-                    "exchange-exchange-dump",
-                    IconName::DatabaseBackup,
-                    t("export.dump.start"),
-                    &i18n::text(locale, self.blocked_reason(BlockedAction::Dump)),
-                    &i18n::text(locale, self.blocked_next(BlockedAction::Dump)),
-                    &p,
-                ))
-                .child(blocked_row(
-                    "exchange-exchange-migrate",
-                    IconName::ArrowRightLeft,
-                    t("export.migrate.start"),
-                    &i18n::text(locale, self.blocked_reason(BlockedAction::Migrate)),
-                    &i18n::text(locale, self.blocked_next(BlockedAction::Migrate)),
-                    &p,
-                ));
-        } else if self.source.running {
-            export = export
-                .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
-                .child(blocked_row(
-                    "exchange-exchange-migrate",
-                    IconName::ArrowRightLeft,
-                    t("export.migrate.start"),
-                    &i18n::text(locale, self.blocked_reason(BlockedAction::Migrate)),
-                    &i18n::text(locale, self.blocked_next(BlockedAction::Migrate)),
-                    &p,
-                ));
+        let has_table = !self.source.kind.is_query() && self.source.table.is_some();
+        if has_table {
+            export = export.child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")));
         } else {
-            export = export
-                .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
-                .child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
+            blocked.push(("exchange-exchange-dump", t("export.dump.start"), BlockedAction::Dump));
         }
-        panel = panel.child(section(t("ui.exchange.export"), export.into_any_element()));
+        if has_table && !self.source.running {
+            export = export.child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
+        } else {
+            blocked.push(("exchange-exchange-migrate", t("export.migrate.start"), BlockedAction::Migrate));
+        }
+        if !blocked.is_empty() {
+            // 来源是查询结果时，切到当前表数据就能解锁：直接给这一步的按钮。
+            let switch = self.source.kind.is_query().then(|| {
+                let entity = entity.clone();
+                kit::secondary_button("exchange-blocked-use-table", Some(IconName::Table), t("ui.exchange.useTable"), move |_, _, cx: &mut gpui_kit::App| {
+                    let entity = entity.clone();
+                    entity.update(cx, |pane, cx| pane.request_source("exchange-source:table", cx));
+                })
+                .small()
+                .into_any_element()
+            });
+            let items = blocked
+                .iter()
+                .map(|(id, title, action)| {
+                    let reason = i18n::text(locale, self.blocked_reason(*action));
+                    let next = i18n::text(locale, self.blocked_next(*action));
+                    (*id, title.clone(), format!("{reason} {next}"))
+                })
+                .collect::<Vec<_>>();
+            let summary = i18n::text(locale, self.blocked_summary_key());
+            export = export.child(blocked_group(t("ui.exchange.unavailable"), items, summary, switch, &p));
+        }        panel = panel.child(section(t("ui.exchange.export"), export.into_any_element()));
         panel
         });
 
@@ -1500,15 +1489,19 @@ impl Render for ExchangePane {
                     entity.update(cx, |pane, cx| pane.request_source("exchange-source:table", cx));
                 })
             };
+            // 一行说明加一个切换按钮：不用整块空态占掉半个抽屉。
             import = import.child(
-                kit::empty_state_with_action(
-                    IconName::FileUp,
-                    t("ui.exchange.importNeedsTable"),
-                    t("ui.exchange.importNeedsTableHint"),
-                    action,
-                    &p,
-                )
-                .into_any_element(),
+                div()
+                    .id("exchange-import-needs-table")
+                    .test_support()
+                    .aria_label(t("ui.exchange.importNeedsTableHint"))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(Space::MD))
+                    .child(kit::icon(IconName::FileUp, 14., p.text_faint))
+                    .child(div().flex_1().min_w_0().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.exchange.importNeedsTable")))
+                    .child(action.small()),
             );
         } else {
         match &self.preview {
@@ -1587,19 +1580,17 @@ impl Render for ExchangePane {
         let mut panel = panel;
         let mut tasks = kit::card(&p).id("exchange-tasks").test_support().flex().flex_col().min_w(px(0.)).max_w_full();
         if self.log.tasks.is_empty() {
-            let empty = if loaded_ready {
-                kit::empty_state_with_action(
-                    IconName::ListOrdered,
-                    t("ui.exchange.state.tasksTitle"),
-                    t("ui.exchange.state.tasksDetail"),
-                    kit::secondary_button("exchange-tasks-export", Some(IconName::FileDown), t("export.export.loaded"), act("exchange-export-loaded")),
-                    &p,
-                )
-                .into_any_element()
-            } else {
-                kit::empty_state(IconName::ListOrdered, t("ui.exchange.state.tasksTitle"), t("ui.exchange.state.tasksDetail"), &p).into_any_element()
-            };
-            tasks = tasks.child(empty);
+            // 没有任务时只留一行说明；导出入口就在上面，不再重复一个按钮。
+            tasks = tasks.child(
+                div()
+                    .id("exchange-tasks-empty")
+                    .test_support()
+                    .px(px(Space::LG + Space::XXS))
+                    .py(px(Space::MD + Space::XXS))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .child(t("ui.exchange.state.tasksDetail")),
+            );
         }
         let count = self.log.tasks.len();
         for (index, task) in self.log.tasks.iter().enumerate() {
@@ -1641,7 +1632,8 @@ impl Render for ExchangePane {
                 .flex_col()
                 .gap(px(8.))
                 .child(tasks)
-                .child(
+                // 没有任务时两个按钮都只能是禁用态，不画出来。
+                .when(!self.log.tasks.is_empty(), |this| this.child(
                     div()
                         .flex()
                         .flex_wrap()
@@ -1657,7 +1649,7 @@ impl Render for ExchangePane {
                             kit::tool_button("exchange-exchange-clear", Some(IconName::BrushCleaning), t("export.task.clear"), act("exchange-clear"))
                                 .disabled(!self.log.tasks.iter().any(|task| !task.running_now())),
                         ),
-                )
+                ))
                 .into_any_element(),
         ));
         panel
@@ -1666,45 +1658,49 @@ impl Render for ExchangePane {
     }
 }
 
-/// 现在不能做的行动作：保留标题，分开给出原因（为什么不能做）与下一步（然后做什么），
-/// 并走统一禁用语义（不可聚焦、无 hover/active、not-allowed 光标）而不是只调低不透明度。
-fn blocked_row(id: &'static str, icon: IconName, title: SharedString, reason: &str, next: &str, p: &Palette) -> gpui_kit::AnyElement {
-    // 可访问名称带上原因与下一步：读屏用户听到的和屏幕上看到的是同一句话。
-    let label = SharedString::from(format!("{title}：{reason} {next}"));
-    kit::interactive_states(div().id(id), p, true)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label)
+/// 现在做不了的动作：标题排成一行，原因与下一步只说一次。每个标题仍是禁用按钮，
+/// 可访问名称里带着它自己的原因与下一步，读屏用户听到的和看到的是同一件事。
+fn blocked_group(heading: SharedString, items: Vec<(&'static str, SharedString, String)>, summary: String, action: Option<gpui_kit::AnyElement>, p: &Palette) -> gpui_kit::AnyElement {
+    let mut titles = div().flex().flex_wrap().items_center().gap(px(Space::SM)).min_w(px(0.));
+    for (id, title, detail) in items {
+        titles = titles.child(
+            kit::interactive_states(div().id(id), p, true)
+                .role(gpui_kit::Role::Button)
+                .aria_label(SharedString::from(format!("{title}：{detail}")))
+                .test_support()
+                .px(px(Space::MD))
+                .py(px(Space::XXS))
+                .rounded(px(Radius::TAG))
+                .bg(p.hover)
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_muted)
+                .child(title),
+        );
+    }
+    div()
+        .id("exchange-blocked")
         .test_support()
-        .p(px(10.))
+        .mt(px(Space::XS))
+        .p(px(Space::MD + Space::XXS))
         .flex()
-        .items_center()
-        .gap(px(12.))
+        .flex_col()
+        .gap(px(Space::SM))
         .rounded(px(Radius::PANEL))
-        .border_1()
-        .border_color(p.line)
+        .bg(p.chrome)
         .min_w(px(0.))
-        .child(div().flex_none().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.hover).flex().items_center().justify_center().child(kit::icon(icon, 15., p.text_faint)))
+        .child(div().flex().items_center().gap(px(Space::SM)).child(kit::icon(IconName::Lock, 12., p.text_faint)).child(kit::eyebrow(heading, p)))
+        .child(titles)
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.))
                 .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(div().text_color(p.text_muted).child(title))
-                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(reason.to_owned())))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .min_w(px(0.))
-                        .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
-                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(next.to_owned()))),
-                ),
+                .flex_wrap()
+                .items_center()
+                .gap(px(Space::MD))
+                .child(div().flex_1().min_w_0().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(summary)))
+                .children(action),
         )
         .into_any_element()
 }
-
 fn action_row(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static) -> gpui_kit::AnyElement {
     kit::interactive_states(div().id(id), p, false)
         .role(gpui_kit::Role::Button)
@@ -2395,14 +2391,13 @@ mod unified_state_tests {
                 }
                 {
                     let tasks = window.within("exchange-tasks");
-                    assert!(tasks.try_find("empty-state").is_some(), "{tag}：没有任务时是空态");
-                    assert!(tasks.try_find("exchange-tasks-export").is_some(), "{tag}：任务空态给出导出这一步");
+                    // 没有任务时只留一行说明；导出入口就在上面，不再重复按钮。
+                    assert!(tasks.try_find("exchange-tasks-empty").is_some(), "{tag}：没有任务时给一行说明");
+                    assert!(tasks.try_find("exchange-tasks-export").is_none(), "{tag}：任务区不重复导出按钮");
                 }
-                // 任务区底部两个工具按钮在空态卡片之外，按 id 单独查。
-                let cancel = window.try_find("exchange-exchange-task-cancel").expect("取消任务按钮");
-                assert_eq!(cancel.disabled(), Some(true), "{tag}：没有运行中的任务时取消不可用");
-                let clear = window.try_find("exchange-exchange-clear").expect("清除按钮");
-                assert_eq!(clear.disabled(), Some(true), "{tag}：没有已结束的任务时清除不可用");
+                // 没有任务时取消与清除只能是禁用态，干脆不画。
+                assert!(window.try_find("exchange-exchange-task-cancel").is_none(), "{tag}：没有任务时不显示取消");
+                assert!(window.try_find("exchange-exchange-clear").is_none(), "{tag}：没有任务时不显示清除");
             })
             .unwrap();
             assert_inside_drawer(cx, window, &action_ids, &tag);
@@ -2453,7 +2448,7 @@ mod unified_state_tests {
                 }
                 {
                     let import = window.within("exchange-import-card");
-                    assert!(import.try_find("empty-state").is_some(), "{tag}：查询来源的导入要说明原因");
+                    assert!(import.try_find("exchange-import-needs-table").is_some(), "{tag}：查询来源的导入要说明原因");
                     assert!(import.try_find("exchange-import-use-table").is_some(), "{tag}：查询来源的导入要给出切换动作");
                 }
                 let blocked = window.within("exchange-export-card").try_find("exchange-exchange-export-loaded").expect("被挡住的导出");
@@ -2489,7 +2484,7 @@ mod unified_state_tests {
         frame(cx, window);
         cx.update_window(window, |_, window, _cx| {
             let tasks = window.within("exchange-tasks");
-            assert!(tasks.try_find("empty-state").is_some());
+            assert!(tasks.try_find("exchange-tasks-empty").is_some());
             assert!(tasks.try_find("exchange-tasks-export").is_none(), "来源没就绪时任务空态不提供导出动作");
         })
         .unwrap();

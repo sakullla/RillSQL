@@ -119,6 +119,8 @@ pub struct SettingsForm {
     pub auto_check_updates: bool,
     pub empty_display: String,
     pub index_naming: IndexNaming,
+    pub transaction_manual: bool,
+    pub transaction_advanced: bool,
 }
 
 /// 空字符串的两种画法：弱化提示（默认）或留空。
@@ -151,6 +153,8 @@ impl SettingsForm {
             auto_check_updates: settings.auto_check_updates,
             empty_display: normalize_empty_display(&settings.empty_display).to_owned(),
             index_naming: settings.index_naming.clone(),
+            transaction_manual: settings.transaction_manual,
+            transaction_advanced: settings.transaction_advanced,
         }
     }
 
@@ -170,6 +174,8 @@ impl SettingsForm {
             auto_check_updates: self.auto_check_updates,
             empty_display: normalize_empty_display(&self.empty_display).to_owned(),
             index_naming: self.index_naming.clone(),
+            transaction_manual: self.transaction_manual,
+            transaction_advanced: self.transaction_advanced,
         }
     }
 
@@ -189,6 +195,8 @@ impl SettingsForm {
             auto_check_updates: form.auto_check_updates,
             empty_display: form.empty_display,
             index_naming: form.index_naming,
+            transaction_manual: form.transaction_manual,
+            transaction_advanced: form.transaction_advanced,
         }
     }
 
@@ -467,6 +475,8 @@ mod tests {
             auto_check_updates: true,
             empty_display: "hint".into(),
             index_naming: IndexNaming::default(),
+            transaction_manual: false,
+            transaction_advanced: false,
         };
         let mut form = SettingsForm::from_settings(&illegal);
         assert_eq!(form.theme, "system");

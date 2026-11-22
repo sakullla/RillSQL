@@ -271,7 +271,6 @@ impl StructurePane {
         let drop_owner = entity.clone();
         head = head
             .child(kit::eyebrow(t("structure.enumSetValues"), p))
-            .child(kit::muted(t("structure.enumSetOrderHint"), p))
             .child(div().flex_1())
             .child(
                 kit::icon_button(
@@ -371,7 +370,7 @@ impl StructurePane {
                 });
             },
         );
-        div().flex().flex_col().gap(px(Space::SM)).child(head).child(list).child(add).into_any_element()
+        div().flex().flex_col().gap(px(Space::SM)).child(head).child(kit::muted(t("structure.enumSetOrderHint"), p)).child(list).child(add).into_any_element()
     }
 
     fn generated_section(
@@ -477,10 +476,13 @@ impl StructurePane {
         let current_text = match (&current, &partition_error) {
             (Some(state), _) => {
                 let expression = if state.expression.trim().is_empty() { method_columns_hint(state.method) } else { state.expression.clone() };
-                format!("{} ({expression}) · {} 个分区", state.method.keyword(), state.definitions.len())
+                i18n::fill(
+                    &i18n::text(locale, "structure.partitionSummary"),
+                    &[("method", state.method.keyword()), ("expression", &expression), ("count", &state.definitions.len().to_string())],
+                )
             }
-            (None, Some(error)) => format!("没有读到：{error}"),
-            (None, None) => "未分区".to_owned(),
+            (None, Some(error)) => i18n::fill(&i18n::text(locale, "structure.partitionUnreadable"), &[("error", error)]),
+            (None, None) => i18n::text(locale, "structure.partitionNone"),
         };
         form = form.child(
             div()
@@ -621,7 +623,7 @@ impl StructurePane {
             }
             let add_owner = entity.clone();
             form = form
-                .child(kit::form_row(t("structure.partitionDefinitions"), div().into_any_element(), &p))
+                .child(kit::eyebrow(t("structure.partitionDefinitions"), &p))
                 .child(rows)
                 .child(kit::tool_button(
                     "structure-partition-def-add",

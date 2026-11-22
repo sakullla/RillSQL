@@ -1365,6 +1365,10 @@ impl WorkbenchModel {
             "null-prev" => self.settings.cycle_null_step(-1),
             "timeout-cycle" => self.settings.cycle_timeout(),
             "timeout-prev" => self.settings.cycle_timeout_step(-1),
+            "tx-default-auto" => self.settings.transaction_manual = false,
+            "tx-default-manual" => self.settings.transaction_manual = true,
+            "tx-adv-off" => self.settings.transaction_advanced = false,
+            "tx-adv-on" => self.settings.transaction_advanced = true,
             "timeout-0" => self.settings.query_timeout_sec = 0,
             "timeout-15" => self.settings.query_timeout_sec = 15,
             "timeout-60" => self.settings.query_timeout_sec = 60,
@@ -5129,8 +5133,17 @@ impl WorkbenchModel {
             Ok(effect) => {
                 let key = transaction::command_effect_key(command, *effect);
                 self.transactions.note(*effect, key, String::new());
+                // 事务结束后横幅会收起：回执同时写进状态栏，用户仍能看到“已提交/已回滚”。
+                if effect.ends_transaction() {
+                    self.notice_key = key;
+                    self.notice_detail.clear();
+                }
             }
-            Err(message) => self.transactions.note_error(message.clone()),
+            Err(message) => {
+                self.transactions.note_error(message.clone());
+                self.notice_key = Some("transaction.command.failed");
+                self.notice_detail = message.clone();
+            }
         }
     }
 

@@ -758,7 +758,8 @@ impl Workbench {
         let controls = |child: AnyElement| div().flex().items_center().gap(px(8.)).occlude().child(child);
         let top_target = self.active_target_summary().and_then(|(_, engine, name, database, env, missing)| {
             let is_prod = super::danger::env_is_prod(&env, Some(&self.model.env_tags));
-            if narrow && !is_prod {
+            // 普通环境的目标已经在查询工具条和状态栏里，顶栏只为生产环境保留一个醒目的提醒。
+            if !is_prod {
                 return None;
             }
             let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
@@ -1954,124 +1955,149 @@ impl Workbench {
             crate::transaction::TransactionState::Aborted => (p.warn, p.warn_soft),
             crate::transaction::TransactionState::Unknown => (p.danger, p.danger_soft),
         };
-        let owner = if target.connection_name.trim().is_empty() { target.connection_id.clone() } else { target.connection_name.clone() };
+        let advanced = self.model.settings.transaction_advanced;
+        let idle = state == crate::transaction::TransactionState::Idle;
+        // 自动提交且没有待核对的旧事务时不占一整行：入口在状态栏（见 `status_transaction`）。
+        // 只有打开“高级事务选项”才在空闲时保留这一行，用来改隔离级别与事务模式。
+        if idle && snapshot.unresolved.is_none() && !advanced {
+            return None;
+        }
+        let banner_bg = if idle { p.raised } else { state_bg };
         let mut row = div()
             .id("transaction-bar")
             .test_support()
             .debug_selector(|| "transaction-bar".to_owned())
             .flex_none()
-            .min_h(px(metrics.toolbar_h()))
+            .min_h(px(metrics.strip_h()))
             .px(px(Space::LG))
+            .py(px(Space::XXS))
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(Space::SM))
-            .bg(p.raised)
+            .bg(banner_bg)
             .border_b_1()
             .border_color(p.line)
-            .child(kit::pill(t(transaction::state_key(state)), state_fg, state_bg))
-            .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).whitespace_nowrap().child(SharedString::from(owner)));
+            .text_size(px(TypeScale::SM))
+            .child(kit::status_dot(if idle { p.line_strong } else { state_fg }))
+            .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(if idle { p.text_muted } else { state_fg }).child(t(transaction::state_key(state))));
         if snapshot.unresolved.is_some() {
             // 旧事务的最终结果还没核对：即使当前会话已回到自动提交，也必须一直可见（R10）。
             let state = transaction::unresolved_state_key(&snapshot).map(|key| i18n::text(locale, key)).unwrap_or_default();
             let label = i18n::fill(&i18n::text(locale, "transaction.unresolved.state"), &[("state", &state)]);
             row = row.child(kit::pill(SharedString::from(label), p.warn, p.warn_soft));
         }
-        row = row.child(kit::vline(&p));
-
-        if actions.begin {
+        // 一句说明：命令回执优先，其次是状态提示。它占掉中间的剩余宽度，按钮固定在右侧。
+        let note: Option<SharedString> = if ui.busy {
+            Some(t("transaction.busy"))
+        } else if let Some(key) = ui.message_key.filter(|key| *key != "transaction.effect.began" && *key != "transaction.effect.stillActive") {
+            // “事务已开始”和左侧状态说的是同一件事，不重复；改为显示状态提示。
+            Some(SharedString::from(if ui.message_detail.trim().is_empty() {
+                self.model.text(key)
+            } else {
+                format!("{}：{}", self.model.text(key), ui.message_detail.trim())
+            }))
+        } else {
+            snapshot
+                .unresolved
+                .as_ref()
+                .map(|_| transaction::unresolved_hint_key())
+                .or_else(|| transaction::banner_hint_key(state))
+                .map(t)
+        };
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_muted)
+                .children(note),
+        );
+        if advanced {
+            if let Some(isolation) = snapshot.settings.isolation.as_ref() {
+                row = row.child(kit::pill(t(&transaction::isolation_label_key(isolation)), p.text_muted, p.hover));
+            }
+            if let Some(mode) = snapshot.settings.mode.as_ref() {
+                row = row.child(kit::pill(t(&transaction::mode_label_key(mode)), p.text_muted, p.hover));
+            }
+            // 已有保存点：每个都可就地部分回滚；支持释放的方言再给一个释放按钮。
+            for name in &snapshot.savepoints {
+                let rollback = transaction::TransactionCommand::savepoint_rollback_id(name.as_str());
+                row = row.child(
+                    kit::tool_button(rollback.clone(), Some(IconName::CornerDownLeft), SharedString::from(name.as_str()), act(rollback, cx))
+                        .small()
+                        .tooltip(t("transaction.savepoint.rollback"))
+                        .disabled(busy || !(state == crate::transaction::TransactionState::Active || actions.savepoint_recovery)),
+                );
+                if capabilities.release_savepoint {
+                    let release = transaction::TransactionCommand::savepoint_release_id(name.as_str());
+                    row = row.child(
+                        kit::icon_button(release.clone(), IconName::X, t("transaction.savepoint.release"), act(release, cx))
+                            .xsmall()
+                            .disabled(busy || state != crate::transaction::TransactionState::Active),
+                    );
+                }
+            }
+            if actions.savepoints || actions.savepoint_recovery {
+                let open = ui.menu == Some(TransactionMenu::Savepoints);
+                row = row.child(
+                    kit::tool_button(transaction::SAVEPOINT_MENU, Some(IconName::Bookmark), t("transaction.action.savepoint"), act(transaction::SAVEPOINT_MENU, cx))
+                        .small()
+                        .selected(open)
+                        .disabled(busy),
+                );
+            }
+            if actions.isolation {
+                let open = ui.menu == Some(TransactionMenu::Isolation);
+                row = row.child(
+                    kit::tool_button(transaction::ISOLATION_MENU, Some(IconName::Layers), t("transaction.action.isolation"), act(transaction::ISOLATION_MENU, cx))
+                        .small()
+                        .selected(open)
+                        .disabled(busy),
+                );
+            }
+            if actions.mode {
+                let open = ui.menu == Some(TransactionMenu::Mode);
+                row = row.child(
+                    kit::tool_button(transaction::MODE_MENU, Some(IconName::SlidersHorizontal), t("transaction.action.mode"), act(transaction::MODE_MENU, cx))
+                        .small()
+                        .selected(open)
+                        .disabled(busy),
+                );
+            }
+        }
+        if actions.resolve {
+            row = row
+                .child(
+                    kit::secondary_button(transaction::RESOLVE_COMMITTED, Some(IconName::Check), t("transaction.resolve.committed"), act(transaction::RESOLVE_COMMITTED, cx))
+                        .small()
+                        .disabled(busy),
+                )
+                .child(
+                    kit::secondary_button(transaction::RESOLVE_ROLLED_BACK, Some(IconName::RotateCcw), t("transaction.resolve.rolledBack"), act(transaction::RESOLVE_ROLLED_BACK, cx))
+                        .small()
+                        .disabled(busy),
+                );
+        }
+        // 开始事务的入口在状态栏（status_transaction），这里不重复。
+        // 回滚在左、提交在右：提交是这一行唯一的主操作。
+        if actions.rollback {
             row = row.child(
-                kit::primary_button(transaction::BEGIN, Some(IconName::Play), t("transaction.action.begin"), act(transaction::BEGIN, cx))
+                kit::secondary_button(transaction::ROLLBACK, Some(IconName::RotateCcw), t("transaction.action.rollback"), act(transaction::ROLLBACK, cx))
+                    .small()
                     .disabled(busy),
             );
         }
         if actions.commit {
             row = row.child(
                 kit::primary_button(transaction::COMMIT, Some(IconName::Check), t("transaction.action.commit"), act(transaction::COMMIT, cx))
+                    .small()
                     .disabled(busy),
             );
         }
-        if actions.rollback {
-            row = row.child(
-                kit::danger_button(transaction::ROLLBACK, Some(IconName::RotateCcw), t("transaction.action.rollback"), act(transaction::ROLLBACK, cx))
-                    .disabled(busy),
-            );
-        }
-        if actions.savepoints || actions.savepoint_recovery {
-            let open = ui.menu == Some(TransactionMenu::Savepoints);
-            let button = kit::tool_button(transaction::SAVEPOINT_MENU, Some(IconName::Bookmark), t("transaction.action.savepoint"), act(transaction::SAVEPOINT_MENU, cx))
-                .disabled(busy);
-            row = row.child(if open { button.selected(true) } else { button });
-        }
-        if actions.resolve {
-            row = row
-                .child(
-                    kit::secondary_button(transaction::RESOLVE_COMMITTED, Some(IconName::Check), t("transaction.resolve.committed"), act(transaction::RESOLVE_COMMITTED, cx))
-                        .disabled(busy),
-                )
-                .child(
-                    kit::secondary_button(transaction::RESOLVE_ROLLED_BACK, Some(IconName::RotateCcw), t("transaction.resolve.rolledBack"), act(transaction::RESOLVE_ROLLED_BACK, cx))
-                        .disabled(busy),
-                );
-        }
-        if actions.isolation {
-            let open = ui.menu == Some(TransactionMenu::Isolation);
-            let button = kit::tool_button(transaction::ISOLATION_MENU, Some(IconName::Layers), t("transaction.action.isolation"), act(transaction::ISOLATION_MENU, cx))
-                .disabled(busy);
-            row = row.child(if open { button.selected(true) } else { button });
-        }
-        if actions.mode {
-            let open = ui.menu == Some(TransactionMenu::Mode);
-            let button = kit::tool_button(transaction::MODE_MENU, Some(IconName::SlidersHorizontal), t("transaction.action.mode"), act(transaction::MODE_MENU, cx))
-                .disabled(busy);
-            row = row.child(if open { button.selected(true) } else { button });
-        }
-
-        // 已有保存点：每个都可就地部分回滚；支持释放的方言再给一个释放按钮。
-        for name in &snapshot.savepoints {
-            let rollback = transaction::TransactionCommand::savepoint_rollback_id(name.as_str());
-            row = row.child(
-                kit::tool_button(rollback.clone(), Some(IconName::CornerDownLeft), SharedString::from(name.as_str()), act(rollback, cx))
-                    .tooltip(t("transaction.savepoint.rollback"))
-                    .disabled(busy || !(state == crate::transaction::TransactionState::Active || actions.savepoint_recovery)),
-            );
-            if capabilities.release_savepoint {
-                let release = transaction::TransactionCommand::savepoint_release_id(name.as_str());
-                row = row.child(
-                    kit::icon_button(release.clone(), IconName::X, t("transaction.savepoint.release"), act(release, cx))
-                        .xsmall()
-                        .disabled(busy || state != crate::transaction::TransactionState::Active),
-                );
-            }
-        }
-
-        row = row.child(div().flex_1());
-        if let Some(isolation) = &snapshot.settings.isolation {
-            row = row.child(kit::muted(t(&transaction::isolation_label_key(isolation)), &p));
-        }
-        if let Some(mode) = &snapshot.settings.mode {
-            row = row.child(kit::muted(t(&transaction::mode_label_key(mode)), &p));
-        }
-        if ui.busy {
-            row = row.child(kit::muted(t("transaction.busy"), &p));
-        } else if let Some(key) = ui.message_key {
-            let text = if ui.message_detail.trim().is_empty() {
-                self.model.text(key)
-            } else {
-                format!("{}：{}", self.model.text(key), ui.message_detail.trim())
-            };
-            row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(text)));
-        } else if let Some(hint) = snapshot
-            .unresolved
-            .as_ref()
-            .map(|_| transaction::unresolved_hint_key())
-            .or_else(|| transaction::state_hint_key(state))
-        {
-            row = row.child(div().min_w_0().max_w(px(ControlSize::PICKER_MAX_W)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t(hint)));
-        }
-
         let mut column = div().id("transaction-frame").flex().flex_col().child(row);
-        if let Some(menu) = ui.menu {
+        if let Some(menu) = ui.menu.filter(|_| advanced) {
             let options = match menu {
                 TransactionMenu::Savepoints => self.transaction_savepoint_menu(&snapshot, actions, busy, &p, cx),
                 TransactionMenu::Isolation => self.transaction_setting_menu(true, &snapshot, &capabilities, busy, &p, cx),
@@ -2082,6 +2108,55 @@ impl Workbench {
         Some(column.into_any_element())
     }
 
+    /// 状态栏里的事务入口：自动提交时点一下开启手动事务；事务中只显示状态，提交与回滚在横幅上。
+    fn status_transaction(&self, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure) {
+            return None;
+        }
+        let target = self.model.transaction_target()?;
+        let snapshot = self.services.connections.transaction_snapshot(&target.connection_id)?;
+        let capabilities = self
+            .services
+            .connections
+            .transaction_coordinator(&target.connection_id)
+            .map(|coordinator| coordinator.capabilities())
+            .unwrap_or(TransactionCapabilities::UNSUPPORTED);
+        if !capabilities.explicit_control {
+            return None;
+        }
+        let actions = TransactionActions::of(&snapshot, capabilities);
+        let busy = self.model.transactions.busy || self.transaction_busy();
+        let idle = snapshot.state == crate::transaction::TransactionState::Idle;
+        let (dot, key) = if busy {
+            (p.accent, "transaction.status.busy")
+        } else if idle {
+            (p.line_strong, "transaction.status.auto")
+        } else {
+            (p.accent, "transaction.status.active")
+        };
+        let label = self.t(key);
+        let chip = div()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(Radius::CONTROL))
+            .px(px(4.))
+            .child(kit::status_dot(dot))
+            .child(label.clone());
+        if idle && actions.begin && !busy {
+            return Some(
+                kit::interactive_states(chip.id(transaction::BEGIN), p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(label)
+                    .tooltip_text(self.t("transaction.status.autoTip"))
+                    .hover(|style| style.bg(p.hover).text_color(p.text))
+                    .on_click(act(transaction::BEGIN, cx))
+                    .into_any_element(),
+            );
+        }
+        Some(chip.id("status-transaction").test_support().when(!idle && !busy, |this| this.text_color(p.accent_text)).into_any_element())
+    }
     fn transaction_savepoint_menu(
         &self,
         snapshot: &crate::transaction::TransactionSnapshot,
@@ -2814,6 +2889,7 @@ impl Workbench {
             .text_size(px(TypeScale::XS))
             .text_color(p.text_muted)
             .child(target)
+            .children(self.status_transaction(&p, cx))
             .child(div().flex_1().min_w_0().truncate().child(SharedString::from(notice)))
             .when(running, |this| {
                 this.child(
@@ -6085,10 +6161,30 @@ impl Workbench {
                 }
                 object_page = object_page.child(object_page_step);
                 let naming_rows = self.index_naming_rows(&s.index_naming, &p, window, cx);
+                let tx_default_seg = seg(
+                    self,
+                    &[("tx-default-auto", "ui.settings.txAuto", !s.transaction_manual), ("tx-default-manual", "ui.settings.txManual", s.transaction_manual)],
+                    cx,
+                );
+                let tx_adv_seg = seg(
+                    self,
+                    &[("tx-adv-off", "ui.settings.txAdvancedOff", !s.transaction_advanced), ("tx-adv-on", "ui.settings.txAdvancedOn", s.transaction_advanced)],
+                    cx,
+                );
+                let tx_manual_hint = s.transaction_manual.then(|| self.t("ui.settings.txManualHint"));
                 div()
                 .flex()
                 .flex_col()
                 .gap(px(m.section_gap()))
+                .child(group(
+                    "settings-group-transaction",
+                    self.t("ui.settings.transaction"),
+                    vec![
+                        (self.t("ui.settings.txDefault"), tx_manual_hint, tx_default_seg),
+                        (self.t("ui.settings.txAdvanced"), Some(self.t("ui.settings.txAdvancedHint")), tx_adv_seg),
+                    ],
+                    &p,
+                ))
                 .child(group("settings-group-index-naming", self.t("ui.settings.indexNaming"), naming_rows, &p))
                 .child(group(
                     "settings-group-data",

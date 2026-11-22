@@ -63,6 +63,12 @@ pub struct ShellSettings {
     /// 索引命名模板（R8）。旧文件没有这一项时取默认，与原来的固定命名一致。
     #[serde(default)]
     pub index_naming: crate::ddl::naming::IndexNaming,
+    /// 事务默认方式：true 时连接空闲后自动开启手动事务，提交或回滚后继续开启下一个。
+    #[serde(default)]
+    pub transaction_manual: bool,
+    /// 在事务栏显示保存点、隔离级别与事务模式等高级入口。
+    #[serde(default)]
+    pub transaction_advanced: bool,
 }
 
 fn default_empty_display() -> String {
@@ -85,6 +91,8 @@ impl Default for ShellSettings {
             auto_check_updates: true,
             empty_display: default_empty_display(),
             index_naming: crate::ddl::naming::IndexNaming::default(),
+            transaction_manual: false,
+            transaction_advanced: false,
         }
     }
 }

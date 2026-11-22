@@ -3750,6 +3750,8 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         auto_check_updates: true,
         empty_display: "hint".into(),
         index_naming: crate::ddl::naming::IndexNaming::default(),
+        transaction_manual: false,
+        transaction_advanced: false,
     };
     model.apply_settings(&illegal);
     assert_eq!(model.settings.theme, "system");
@@ -3881,6 +3883,8 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         auto_check_updates: true,
         empty_display: "hint".into(),
         index_naming: crate::ddl::naming::IndexNaming::default(),
+        transaction_manual: false,
+        transaction_advanced: false,
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -14092,9 +14096,19 @@ fn the_shared_transaction_bar_begins_commits_and_reads_one_snapshot(cx: &mut gpu
     let find = |cx: &mut gpui_kit::TestAppContext, id: &'static str| {
         cx.update_window(window, |_, window, _| window.try_find(id).is_some()).unwrap()
     };
-    assert!(find(cx, "transaction-bar"), "查询工作区有共享事务条");
-    assert!(find(cx, "tx-begin"), "自动提交下可以开始事务");
+    assert!(!find(cx, "transaction-bar"), "自动提交时不再单独占一行事务条");
+    assert!(find(cx, "tx-begin"), "自动提交下状态栏可以开始事务");
     assert!(!find(cx, "tx-commit"), "没有活动事务时不显示提交");
+    assert!(!find(cx, "tx-isolation-menu"), "默认不显示隔离级别等高级入口");
+    assert!(!find(cx, "tx-savepoint-menu"), "默认不显示保存点入口");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("tx-adv-on", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(find(cx, "transaction-bar"), "打开高级选项后空闲时保留事务条");
     assert!(find(cx, "tx-isolation-menu"), "隔离级别入口可到达");
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| view.perform("tx-isolation-menu", cx));
@@ -14174,6 +14188,7 @@ fn the_shared_transaction_bar_begins_commits_and_reads_one_snapshot(cx: &mut gpu
         }),
         "提交结束共享事务"
     );
+    assert!(pump_until(cx, window, &view, |view, _| !view.transaction_busy()), "提交命令收尾完成");
     cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
     assert!(find(cx, "tx-begin"), "提交后回到自动提交入口");
     assert!(!find(cx, "tx-commit"), "提交后不再显示提交");
@@ -14489,6 +14504,7 @@ fn topbar_context_status_no_target_picker_and_unified_tab_dirty_dots(cx: &mut gp
         view.update(cx, |view, cx| {
             let mut rec = record_for("prod-1", "ProdDB", Engine::Postgres);
             rec.saved.env = "prod".into();
+            view.model.env_tags.push(crate::connections::model::EnvTag { id: "prod".into(), label: "生产".into(), tone: "prod".into(), position: 9 });
             view.model.connections.rows.push(rec);
             if let Some(tab) = view.model.active_mut() {
                 tab.connection_id = Some("prod-1".into());
@@ -14852,4 +14868,38 @@ fn connections_header_consolidates_transfer_menu_and_modal_stops_stay_synced(cx:
     .unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 默认方式设为手动提交后，连接空闲就自动开启事务；提交后自动开启下一个。
+#[gpui_kit::test]
+fn manual_default_starts_a_transaction_and_restarts_after_commit(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("tx-default-manual", cx);
+            view.model.open_bound_query("SELECT 1".into(), Some("notes".into()), Some("笔记".into()), Some("main".into()), Some("sqlite".into()));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services
+                .connections
+                .transaction_snapshot("notes")
+                .is_some_and(|snapshot| snapshot.state == crate::transaction::TransactionState::Active)
+        }),
+        "手动提交默认下自动开启事务"
+    );
+    let before = cx.update(|cx| view.read(cx).services.connections.transaction_snapshot("notes").map(|snapshot| snapshot.generation));
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("tx-commit", cx))).unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| {
+            view.services.connections.transaction_snapshot("notes").is_some_and(|snapshot| {
+                snapshot.state == crate::transaction::TransactionState::Active && Some(snapshot.generation) > before
+            })
+        }),
+        "提交后自动开启下一个事务"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

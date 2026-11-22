@@ -3602,6 +3602,8 @@ impl QueryPane {
     #[inline(never)]
     fn render_results_head(&mut self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
         let tabs = self.render_result_tabs(p, metrics, entity);
+        let [log_tab, pin, maximize, collapse] = self.render_head_actions(p, metrics, entity);
+        let view_actions = [pin, maximize, collapse];
         div()
             .id("query-results-head")
             .test_support()
@@ -3618,8 +3620,10 @@ impl QueryPane {
             // 页签条按内容取宽、空间不够时再收缩并横向滚动：消息页签紧跟在结果页签之后，
             // 不会被一段弹性留白推到页签头中间。
             .child(div().flex_initial().min_w_0().h_full().child(tabs))
-            .children(self.render_head_actions(p, metrics, entity))
+            .child(log_tab)
             .children(self.render_head_status(running, p, metrics, entity))
+            .child(div().flex_none().w(px(1.)).h(px(14.)).mx(px(4.)).bg(p.line))
+            .children(view_actions)
             .into_any_element()
     }
 
@@ -3670,18 +3674,18 @@ impl QueryPane {
                 // 跳过的语句没有结果可看：状态写进标题，不只靠颜色表达。
                 let label = if skipped { format!("{semantic} {}", i18n::text(locale, "query.log.skipped")) } else { semantic };
                 let dot = match statement_progress(self.desk.results(), index, running) {
-                    Progress::Running => p.accent,
-                    Progress::Queued => p.text_faint,
-                    Progress::Done if statement_failed(result) => p.danger,
-                    Progress::Done if skipped => p.text_faint,
-                    Progress::Done if result.status == "cancelled" => p.warn,
-                    Progress::Done => p.ok,
+                    Progress::Running => Some(p.accent),
+                    Progress::Queued => Some(p.text_faint),
+                    Progress::Done if statement_failed(result) => Some(p.danger),
+                    Progress::Done if skipped => Some(p.text_faint),
+                    Progress::Done if result.status == "cancelled" => Some(p.warn),
+                    Progress::Done => None,
                 };
                 let entity = entity.clone();
                 let click = format!("statement:{index}");
                 items.push(
                     tabs::tab(TabSpec::new(format!("query-act-statement-{index}"), IconName::Table, label).active(selected), p)
-                        .child(kit::status_dot(dot))
+                        .children(dot.map(kit::status_dot))
                         .on_click(move |_, _, cx| {
                             let id = click.clone();
                             entity.update(cx, |pane, cx| pane.command(&id, cx));
@@ -3812,7 +3816,7 @@ impl QueryPane {
         // 还没执行完的语句没有行数可报：“0 行”会被读成“查询结果为空”。
         let summary = active_result.filter(|result| !(statement_failed(result) && result.columns.is_empty()) && !statement_pending(result)).map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
-                format!("{} ✓", crate::app::views::grid::group_digits(affected as i64))
+                i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &crate::app::views::grid::group_digits(affected as i64))])
             } else {
                 format!("{} {}", crate::app::views::grid::group_digits(result.rows.len() as i64), i18n::text(locale, "ui.grid.rows"))
             }
@@ -4491,6 +4495,21 @@ fn statement_outcome(
     let color = if failed { p.danger } else if skipped || cancelled { p.warn } else { p.ok };
     let message = if result.message.is_empty() && !skipped { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
     let message = if message.is_empty() { result.status.clone() } else { message };
+    // 成功语句的标题统一为“执行成功”，影响行数跟在后面；驱动只回了 ok 之类的原文时不再照搬。
+    let message = if failed || skipped || cancelled {
+        message
+    } else {
+        let mut parts = vec![i18n::text(locale, "query.log.ok")];
+        if let Some(affected) = result.affected {
+            let count = crate::app::views::grid::group_digits(affected as i64);
+            parts.push(i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &count)]));
+        }
+        let raw = message.trim();
+        if !raw.is_empty() && !raw.eq_ignore_ascii_case("ok") && raw != result.status {
+            parts.push(raw.to_owned());
+        }
+        parts.join(" · ")
+    };
     let icon = if failed {
         kit::icon(IconName::CircleAlert, 16., p.danger).into_any_element()
     } else if skipped || cancelled {

@@ -209,10 +209,11 @@ pub fn state_key(state: TransactionState) -> &'static str {
     }
 }
 
-pub fn state_hint_key(state: TransactionState) -> Option<&'static str> {
+/// 事务横幅上的一句短说明。空闲时不需要说明，活动事务只提醒提交前别人看不到。
+pub fn banner_hint_key(state: TransactionState) -> Option<&'static str> {
     match state {
         TransactionState::Idle => None,
-        TransactionState::Active => Some("transaction.state.activeHint"),
+        TransactionState::Active => Some("transaction.banner.active"),
         TransactionState::Aborted => Some("transaction.state.abortedHint"),
         TransactionState::Unknown => Some("transaction.state.unknownHint"),
     }

@@ -106,6 +106,8 @@ pub struct Workbench {
     transaction_task: Option<gpui_kit::Task<()>>,
     /// 在途事务命令针对的连接：切到别的连接时不把忙碌状态挂到新连接的控件上。
     transaction_task_connection: Option<String>,
+    /// 手动提交默认方式下已为哪个连接的哪一代事务尝试过自动开启，避免失败后反复重试。
+    auto_begin_attempt: Option<(String, u64)>,
     /// 轮询兜底：每条连接上一次看到的共享事务快照修订；变化时通知各业务页重绘同一状态。
     transaction_revisions: std::collections::BTreeMap<String, u64>,
     /// 状态栏提示的时效：同一句提示显示一段时间后自动退场，不让“已连接”“清空历史？”一直挂着。
@@ -452,6 +454,7 @@ impl Workbench {
             services,
             transaction_task: None,
             transaction_task_connection: None,
+            auto_begin_attempt: None,
             transaction_revisions: std::collections::BTreeMap::new(),
             focus: cx.focus_handle().tab_stop(true),
             nav_focus: cx.focus_handle().tab_stop(true),
@@ -2644,11 +2647,38 @@ impl Workbench {
         self.model.allow_system_close()
     }
 
+    /// 默认方式为手动提交时：连接空闲就自动开启事务。同一连接同一代事务只尝试一次。
+    fn auto_begin_transaction(&mut self) {
+        if !self.model.settings.transaction_manual
+            || self.model.transaction_request.is_some()
+            || self.model.transaction_guard.is_some()
+        {
+            return;
+        }
+        let Some(target) = self.model.transaction_target() else { return };
+        let Some(snapshot) = self.services.connections.transaction_snapshot(&target.connection_id) else { return };
+        let explicit = self
+            .services
+            .connections
+            .transaction_coordinator(&target.connection_id)
+            .is_some_and(|coordinator| coordinator.capabilities().explicit_control);
+        if !explicit || snapshot.state != crate::transaction::TransactionState::Idle || snapshot.unresolved.is_some() {
+            return;
+        }
+        let key = (target.connection_id.clone(), snapshot.generation);
+        if self.auto_begin_attempt.as_ref() == Some(&key) {
+            return;
+        }
+        self.auto_begin_attempt = Some(key);
+        self.model.request_transaction(super::transaction::TransactionCommand::Begin);
+    }
+
     /// 取走并执行一条事务命令；结果写回共享控件，关闭保护会按结果决定是否继续。
     fn pump_transactions(&mut self, cx: &mut Context<Self>) {
         if self.transaction_task.is_some() {
             return;
         }
+        self.auto_begin_transaction();
         let Some(request) = self.model.transaction_request.take() else { return };
         self.transaction_task_connection = Some(request.target.connection_id.clone());
         let services = Arc::clone(&self.services);
