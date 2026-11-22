@@ -162,6 +162,8 @@ pub struct QueryPane {
     /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
     narrow: bool,
     viewport_width: f32,
+    /// 外壳下发的可用内容区宽度（已扣除停靠侧栏）；为 None 时回退到窗口视口宽度。
+    content_width: Option<f32>,
     /// 测试用：消息页/右侧面板最近一次绘制时用的底色 (surface, chrome)。
     #[cfg(test)]
     drawn_colors: Option<(gpui_kit::Hsla, gpui_kit::Hsla)>,
@@ -649,6 +651,7 @@ impl QueryPane {
             density: Density::Compact,
             narrow: false,
             viewport_width: 1200.,
+            content_width: None,
             #[cfg(test)]
             drawn_colors: None,
             pending_completion: false,
@@ -743,6 +746,20 @@ impl QueryPane {
         let changed = self.density != density;
         self.density = density;
         changed
+    }
+
+    /// 外壳下发的可用内容区宽度（已扣除停靠侧栏）；变化达到 0.5px 时返回 true。
+    pub fn set_content_width(&mut self, width: f32) -> bool {
+        if !width.is_finite() || width <= 0. {
+            return false;
+        }
+        if self.content_width.is_some_and(|current| (current - width).abs() < 0.5) {
+            return false;
+        }
+        self.content_width = Some(width);
+        self.viewport_width = width;
+        self.narrow = width < side::NARROW_WIDTH;
+        true
     }
 
     /// 活动查询标签的右侧面板状态。
@@ -3284,9 +3301,9 @@ impl Render for QueryPane {
             }
         }
         self.ensure_target_search(window, cx);
-        let vw = f32::from(window.viewport_size().width);
-        self.viewport_width = vw;
-        self.narrow = vw < side::NARROW_WIDTH;
+        let width = self.content_width.filter(|w| *w > 0.0).unwrap_or_else(|| f32::from(window.viewport_size().width));
+        self.viewport_width = width;
+        self.narrow = width < side::NARROW_WIDTH;
         self.ensure_side_column_filter(window, cx);
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
@@ -8216,6 +8233,68 @@ mod tests {
 
             services.connections.disconnect("prod-long");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn t3_content_width_drives_narrow_layout_and_toolbar_fit_in_900px_window(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-t3-content-width-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("content_width.sqlite");
+        std::fs::File::create(&db_path).unwrap();
+
+        // 900px 窗口内停靠 234px 侧栏时，外壳下发 content_width = 666px。
+        let (window, pane) = open_sized(cx, 900., 720.);
+        let services = pane.read_with(cx, |pane, _| pane.services.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            services.connections.open_sqlite_for_test("prod-long", "Production Analytics Primary Cluster", &db_path).await.unwrap();
+        });
+        let coordinator = services.connections.transaction_coordinator("prod-long").expect("SQLite 会话应有事务协调器");
+        coordinator
+            .acknowledge(&crate::transaction::ControlStatement::Begin { mode: None }, crate::transaction::ControlOutcome::Confirmed)
+            .unwrap();
+
+        let tab = TabSnap {
+            id: "q".into(),
+            draft: "SELECT 1;".into(),
+            connection_id: Some("prod-long".into()),
+            connection_name: Some("Production Analytics Primary Cluster".into()),
+            database: Some("enterprise_warehouse_reporting".into()),
+            engine: Some("sqlite".into()),
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.remember_environments(vec![("prod-long".into(), "prod".into())]);
+                assert!(pane.set_content_width(666.0), "首次设置可用宽度应返回 true");
+                assert!(!pane.set_content_width(666.2), "小于 0.5px 波动不应重复触发重绘");
+                let _ = pane.sync(std::slice::from_ref(&tab), Some("q"), Locale::En, window, cx);
+            });
+            window.render_frame(cx);
+
+            assert!(pane.read(cx).narrow, "666px 可用宽度应触发 narrow 模式");
+            assert!(!pane.read(cx).side_open(), "narrow 模式下右侧面板应默认收起");
+            assert!(window.try_find("query-side-panel").is_none(), "右侧面板默认收起时不渲染");
+            assert!(window.try_find("query-act-run-script").is_none(), "narrow 模式下隐藏运行全部");
+
+            let tx_bounds = window.find("query-tx-controls").bounds();
+            let format_bounds = window.find("query-act-format").bounds();
+            let side_bounds = window.find("query-side-toggle").bounds();
+            let right_group_w = f32::from(side_bounds.right()) - f32::from(format_bounds.left());
+            let required_w = f32::from(tx_bounds.right()) + right_group_w + 18.0;
+            assert!(
+                required_w <= 666.0,
+                "666px 可用宽度下工具栏总占用 {:.1}px 不应溢出 666px（左段右边界={:.1}，右段宽={:.1}）",
+                required_w,
+                f32::from(tx_bounds.right()),
+                right_group_w
+            );
+        })
+        .unwrap();
+
+        services.connections.disconnect("prod-long");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
