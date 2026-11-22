@@ -20,7 +20,7 @@ use gpui_kit::{
 
 use gpui_kit::prelude::FluentBuilder as _;
 
-use super::kit::{ControlSize, Palette, Space, TypeScale};
+use super::kit::{ControlSize, Palette, Space, Tip as _, TypeScale};
 use crate::i18n::{self, Locale};
 
 // ---------------------------------------------------------------- 纯数据与复制文本
@@ -411,6 +411,17 @@ impl ReadDelegate {
     }
 }
 
+fn read_cell_may_clip(text: &str, col_width: f32) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if text.contains('\n') || text.chars().count() > 80 {
+        return true;
+    }
+    let width: f32 = text.chars().map(|ch| if ch.is_ascii() { 7.8 } else { 14.0 }).sum();
+    width * 1.1 + Space::MD * 2.0 + 4.0 > col_width
+}
+
 impl TableDelegate for ReadDelegate {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
@@ -435,7 +446,10 @@ impl TableDelegate for ReadDelegate {
         let spec = &self.columns[col_ix];
         let selected = self.selection.is_some_and(|s| s.contains(row_ix, col_ix, self.rows.len(), self.cols()));
         let mono = spec.mono.then(|| cx.theme().mono_font_family.clone());
+        let text = self.rows.cell(row_ix, col_ix);
+        let clipped = read_cell_may_clip(&text, spec.width);
         div()
+            .id(("read-table-td", row_ix * self.cols().max(1) + col_ix))
             .size_full()
             .px(px(Space::MD))
             .flex()
@@ -446,7 +460,8 @@ impl TableDelegate for ReadDelegate {
             .text_size(px(TypeScale::SM))
             .text_color(p.text)
             .overflow_hidden()
-            .child(div().truncate().child(self.rows.cell(row_ix, col_ix)))
+            .when(clipped, |this| this.tooltip_text(text.clone()))
+            .child(div().truncate().child(text))
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
@@ -598,7 +613,7 @@ impl ReadTable {
             TableEvent::SelectRow(row) if echo == Some((SelectionMode::Rows, *row, 0)) => {}
             TableEvent::SelectCell(row, col) => self.apply_selection(*row, *col, SelectionMode::Cells, extend, cx),
             TableEvent::SelectRow(row) => self.apply_selection(*row, 0, SelectionMode::Rows, extend, cx),
-            TableEvent::SelectColumn(col) => self.apply_selection(0, *col, SelectionMode::Column, false, cx),
+            TableEvent::SelectColumn(col) => self.apply_selection(0, *col, SelectionMode::Column, extend, cx),
             TableEvent::ClearSelection => {
                 self.table.update(cx, |state, _| state.delegate_mut().selection = None);
                 cx.notify();
@@ -652,12 +667,15 @@ impl ReadTable {
 
     /// ⌘C：单格复制值，多格复制含表头的 TSV。
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        let text = {
+        let (kind, text) = {
             let delegate = self.table.read(cx).delegate();
-            clipboard_text(&delegate.columns, &delegate.rows, delegate.selection)
-        }?;
+            let (r, c) = delegate.selection?.region(delegate.rows.len(), delegate.cols())?;
+            let kind = if r.start() == r.end() && c.start() == c.end() { CopyKind::Value } else { CopyKind::Tsv };
+            let text = copy_text(&delegate.columns, &delegate.rows, delegate.selection, kind)?;
+            (kind, text)
+        };
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-        cx.emit(ReadTableEvent::Copied(CopyKind::Tsv));
+        cx.emit(ReadTableEvent::Copied(kind));
         Some(text)
     }
 
@@ -736,6 +754,8 @@ impl ReadTable {
             cx.stop_propagation();
             if selection.mode == SelectionMode::Rows {
                 self.select_row(next.0, true, cx);
+            } else if selection.mode == SelectionMode::Column {
+                self.apply_selection(0, next.1, SelectionMode::Column, true, cx);
             } else {
                 self.select(next.0, next.1, true, cx);
             }
@@ -925,17 +945,8 @@ mod tests {
         cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
     }
 
-    /// 复制快捷键跟随平台的 secondary 修饰键：macOS 是 ⌘，其它平台是 Ctrl。
-    fn copy_keystroke() -> &'static str {
-        if cfg!(target_os = "macos") {
-            "cmd-c"
-        } else {
-            "ctrl-c"
-        }
-    }
-
     #[gpui_kit::test]
-    fn click_shift_click_and_cmd_c_copy_the_block(cx: &mut TestAppContext) {
+    fn click_shift_click_and_shortcut_copy_the_block(cx: &mut TestAppContext) {
         let (window, table, events) = open(cx, rows());
         step(cx, window, |window, cx| window.click("table-cell-0:0", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((0, 0), (0, 0)));
@@ -945,17 +956,55 @@ mod tests {
             let focus = table.read(cx).focus_handle(cx);
             focus.focus(window, cx);
         });
-        step(cx, window, |window, cx| window.press(copy_keystroke(), cx));
+        let copy = if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" };
+        step(cx, window, |window, cx| window.press(copy, cx));
         assert_eq!(clipboard(cx).as_deref(), Some("id\tname\n1\t甲\n2\t乙"));
         step(cx, window, |window, cx| window.press("shift-down", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((0, 0), (2, 1)), "Shift+方向键扩展");
         step(cx, window, |window, cx| window.click("table-cell-2:1", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((2, 1), (2, 1)), "普通点击重新开始选区");
-        step(cx, window, |window, cx| window.press(copy_keystroke(), cx));
+        step(cx, window, |window, cx| window.press(copy, cx));
         assert_eq!(clipboard(cx).as_deref(), Some("丙"), "单格复制值本身");
         step(cx, window, |window, cx| window.press("left", cx));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), block((2, 0), (2, 0)), "方向键移动并重新开始选区");
         assert!(events.borrow().contains(&ReadTableEvent::Copied(CopyKind::Tsv)));
+        assert!(events.borrow().contains(&ReadTableEvent::Copied(CopyKind::Value)), "单格复制发出 CopyKind::Value");
+    }
+
+    #[gpui_kit::test]
+    fn shift_select_column_extends_columns_and_clip_detects_long_cells(cx: &mut TestAppContext) {
+        assert!(!read_cell_may_clip("", 60.));
+        assert!(!read_cell_may_clip("id", 60.));
+        assert!(read_cell_may_clip("a very long description that overflows column width", 60.));
+        assert!(read_cell_may_clip("line1\nline2", 200.));
+
+        let (window, table, events) = open(cx, rows());
+        step(cx, window, |window, cx| {
+            table.update(cx, |this, cx| {
+                this.on_table_event(&TableEvent::SelectColumn(0), window, cx);
+                this.extend_next = true;
+                this.on_table_event(&TableEvent::SelectColumn(2), window, cx);
+            });
+        });
+        assert_eq!(
+            cx.update(|cx| table.read(cx).selection(cx)),
+            Some(ReadSelection { anchor: (0, 0), focus: (0, 2), mode: SelectionMode::Column }),
+            "Shift 选列应扩展多列选区"
+        );
+        step(cx, window, |_, cx| {
+            let copied = table.update(cx, |this, cx| this.copy_selection(cx));
+            assert_eq!(copied.as_deref(), Some("id\tname\tnote\n1\t甲\t\"a\tb\"\n2\t乙\t\"say \"\"hi\"\"\"\n3\t丙\t"));
+        });
+        assert_eq!(events.borrow().last(), Some(&ReadTableEvent::Copied(CopyKind::Tsv)));
+        // 单格复制只发 Value
+        step(cx, window, |_, cx| {
+            table.update(cx, |this, cx| {
+                this.select(0, 1, false, cx);
+                let copied = this.copy_selection(cx);
+                assert_eq!(copied.as_deref(), Some("甲"));
+            });
+        });
+        assert_eq!(events.borrow().last(), Some(&ReadTableEvent::Copied(CopyKind::Value)));
     }
 
     #[gpui_kit::test]

@@ -30,6 +30,177 @@ fn request_of(model: &mut WorkbenchModel, token: crate::application::tasks::Task
     job_request(model, job, token)
 }
 
+#[tokio::test]
+async fn dbeaver_import_jobs_preview_cancel_select_and_report() {
+    use super::conn_import::{ImportResult, ImportState, ProfileFormat};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-import-preview-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let file = dir.join("data-sources.json");
+    let a = dir.join("a.sqlite");
+    let b = dir.join("b.sqlite");
+    let c = dir.join("c.sqlite");
+    let fixture = serde_json::json!({
+        "connections": {
+            "1": {"provider":"sqlite","driver":"sqlite_jdbc","name":"First",
+                "configuration":{"database":a}},
+            "2": {"provider":"sqlite","driver":"sqlite_jdbc","name":"Second",
+                "configuration":{"database":b}},
+            "3": {"provider":"oracle","driver":"oracle_thin","name":"Unsupported",
+                "configuration":{}},
+            "4": {"provider":"sqlite","driver":"sqlite_jdbc","name":"Retry",
+                "configuration":{"database":c}}
+        }
+    });
+    std::fs::write(&file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+    model.queue_profile_preview(ProfileFormat::DBeaver, file.clone());
+    finish_import_job(&mut model, &services).await;
+    assert!(matches!(model.profile_import, ImportState::Preview(_)));
+    let _ = model.dispatch("profile-import-close");
+    assert!(matches!(model.profile_import, ImportState::Idle));
+    assert!(services.list_connections().await.unwrap().is_empty());
+    assert!(model.take_pending().is_none());
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(dir.join("connections.sqlite")))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_row BEFORE INSERT ON connections WHEN NEW.name = 'Retry' BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+        .execute(&pool)
+        .await
+        .unwrap();
+    model.queue_profile_preview(ProfileFormat::DBeaver, file.clone());
+    finish_import_job(&mut model, &services).await;
+    let _ = model.dispatch("profile-import-toggle:1");
+    let _ = model.dispatch("profile-import-confirm");
+    let _ = model.dispatch("profile-import-confirm");
+    assert_eq!(model.pending_len(), 1);
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Report(report) = &model.profile_import else {
+        panic!("missing per-row import report");
+    };
+    assert_eq!(report.counts(), (1, 2, 1));
+    assert!(matches!(report.rows[1].result, ImportResult::Unchecked));
+    assert!(matches!(report.rows[2].result, ImportResult::Invalid(_)));
+    assert!(matches!(report.rows[3].result, ImportResult::Failed));
+    assert_eq!(model.take_pending(), Some(PendingJob::RefreshConnections));
+    let saved = services.list_connections().await.unwrap();
+    assert_eq!(saved[0].saved.file_path.as_deref(), a.to_str());
+    assert!(!a.exists() && !b.exists() && !c.exists(), "import opened a target SQLite database");
+
+    sqlx::query("DROP TRIGGER fail_row").execute(&pool).await.unwrap();
+    pool.close().await;
+    let _ = model.dispatch("profile-import-close");
+    model.queue_profile_preview(ProfileFormat::DBeaver, file);
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Preview(preview) = &model.profile_import else {
+        panic!("missing repeat import preview");
+    };
+    assert!(preview.rows[0].conflict.is_some());
+    assert!(!preview.rows[0].checked);
+    let _ = model.dispatch("profile-import-toggle:1");
+    let _ = model.dispatch("profile-import-confirm");
+    finish_import_job(&mut model, &services).await;
+    let ImportState::Report(report) = &model.profile_import else {
+        panic!("missing import report on retry");
+    };
+    assert_eq!(report.counts(), (1, 3, 0));
+    assert!(matches!(report.rows[0].result, ImportResult::Conflict(_)));
+    assert_eq!(services.list_connections().await.unwrap().len(), 2);
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn finish_import_job(model: &mut WorkbenchModel, services: &AppServices) {
+    let token = model.begin_owner(&services.tasks, "profile-import");
+    let request = request_of(model, token);
+    let done = jobs::execute_job(services, request).await;
+    apply_done(model, services, "profile-import", done);
+    model.finish_job();
+}
+
+#[tokio::test]
+async fn navicat_jobs_preserve_the_selected_subset_and_skip_existing_profiles() {
+    use super::conn_import::{ImportState, ProfileFormat};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-ncx-preview-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let path = dir.join("connections.ncx");
+    std::fs::write(&path, r#"<Connections Ver="1.5">
+        <Connection ConnectionName="PG" ConnType="POSTGRESQL" Host="db.example.invalid" Port="5432" Database="sales" UserName="a" SSL="false" SSH="false" HTTP="false"/>
+        <Connection ConnectionName="Another" ConnType="MYSQL" Host="other.example.invalid" Port="3306" UserName="b" SSL="false" SSH="false" HTTP="false"/>
+        <Connection ConnectionName="Unavailable" ConnType="ORACLE"/>
+    </Connections>"#).unwrap();
+    for (pass, expected) in [(0, (1, 2, 0)), (1, (0, 3, 0))] {
+        model.queue_profile_preview(ProfileFormat::Navicat, path.clone());
+        finish_import_job(&mut model, &services).await;
+        let ImportState::Preview(preview) = &model.profile_import else {
+            panic!("missing NCX preview: {:?}", model.profile_import);
+        };
+        assert_eq!(preview.rows[0].conflict.is_some(), pass == 1);
+        let _ = model.dispatch("profile-import-toggle:1");
+        let _ = model.dispatch("profile-import-confirm");
+        finish_import_job(&mut model, &services).await;
+        let ImportState::Report(report) = &model.profile_import else {
+            panic!("missing NCX report: {:?}", model.profile_import);
+        };
+        assert_eq!(report.counts(), expected);
+        assert_eq!(model.take_pending(), Some(PendingJob::RefreshConnections));
+        let _ = model.dispatch("profile-import-close");
+    }
+    let saved = services.list_connections().await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].saved.database.as_deref(), Some("sales"));
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn encrypted_bundle_import_prompts_and_retries_from_the_connections_entry() {
+    let dir = std::env::temp_dir().join(format!("rillsql-bundle-unlock-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let path = dir.join("locked.rillsqlcx");
+    let row = crate::connections::model::normalize(&sample_draft(Engine::Sqlite), "source".into()).unwrap();
+    let bytes = crate::connections::export::encode_export(&[row], Some("fixture-unlock")).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    model.import_path = Some(path.display().to_string());
+
+    let _ = model.dispatch("conn-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert_eq!(model.bundle_unlock, Some("connections.profile.bundlePrompt"));
+    assert!(services.list_connections().await.unwrap().is_empty());
+
+    model.set_field(DraftField::BundlePassphrase, "wrong-fixture-unlock".into());
+    let _ = model.dispatch("conn-unlock-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert_eq!(model.bundle_unlock, Some("connections.profile.bundleBad"));
+    assert!(model.bundle_passphrase.is_empty());
+    assert!(services.list_connections().await.unwrap().is_empty());
+
+    model.set_field(DraftField::BundlePassphrase, "fixture-unlock".into());
+    let _ = model.dispatch("conn-unlock-import");
+    finish_bundle_import(&mut model, &services).await;
+    assert!(model.bundle_unlock.is_none() && model.bundle_passphrase.is_empty());
+    assert_eq!(services.list_connections().await.unwrap().len(), 1);
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn finish_bundle_import(model: &mut WorkbenchModel, services: &AppServices) {
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(model, token);
+    let done = jobs::execute_job(services, request).await;
+    apply_done(model, services, "connections", done);
+    model.finish_job();
+}
+
 /// 表 / 结构 / 专用页面也会占用工作项，查询项不一定在索引 0。
 fn query_item(model: &mut WorkbenchModel) -> &mut super::model::WorkItem {
     model.tabs.iter_mut().find(|tab| tab.kind.is_query()).expect("query item")
@@ -610,20 +781,59 @@ fn targetless_structure_command_explains_instead_of_showing_stale_page() {
 }
 
 #[test]
-fn tab_context_menu_targets_the_activated_item() {
+fn tab_context_menu_targets_right_clicked_item_without_activating_it() {
     let mut model = WorkbenchModel::new(Shell::default());
     let customers = "notes|笔记|main||customers|sqlite|dev";
     assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
     let table_id = model.active_tab.clone().expect("table");
     assert!(model.dispatch(&format!("open-structure-for:{customers}")).is_some());
+    let structure_id = model.active_tab.clone().expect("structure");
     assert_eq!(model.tool, WorkTool::Structure);
 
+    // 右键非激活标签：不切换当前激活标签与页面，菜单以右键标签为目标。
     assert!(model.tab_menu_for(&table_id));
-    assert_eq!(model.active_tab.as_deref(), Some(table_id.as_str()));
-    assert_eq!(model.tool, WorkTool::Table);
-    assert_eq!(model.shell.page, AppPage::Workspace);
-    assert_eq!(model.table_spec.as_deref(), Some(customers));
-    assert!(model.menu.is_some(), "右键应打开以当前项为基准的标签菜单");
+    assert_eq!(model.active_tab.as_deref(), Some(structure_id.as_str()));
+    assert_eq!(model.tool, WorkTool::Structure);
+    assert_eq!(model.shell.page, AppPage::Structure);
+    assert_eq!(model.tab_menu_target.as_deref(), Some(table_id.as_str()));
+    assert!(model.menu.is_some(), "右键应打开以被点中标签为基准的标签菜单");
+
+    // 执行“固定标签”作用在右键标签上，当前激活页仍保持为结构页。
+    assert!(model.dispatch("tab-pin").is_some());
+    assert!(model.is_pinned(&table_id), "右键目标标签应被固定");
+    assert!(!model.is_pinned(&structure_id), "原激活标签不应被误固定");
+    assert_eq!(model.active_tab.as_deref(), Some(structure_id.as_str()));
+    assert!(model.tab_menu_target.is_none(), "执行标签菜单命令后应清空右键目标");
+}
+
+#[test]
+fn tab_context_menu_copy_targets_inactive_tab_and_does_not_leak_to_close_tab() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    let first = model.active_tab.clone().expect("first query");
+    if let Some(tab) = model.tabs.iter_mut().find(|t| t.id == first) {
+        tab.draft = "SELECT 'from_inactive'".into();
+    }
+    assert!(model.dispatch("new-query").is_some());
+    let second = model.active_tab.clone().expect("second query");
+    if let Some(tab) = model.tabs.iter_mut().find(|t| t.id == second) {
+        tab.draft = "SELECT 'from_active'".into();
+        tab.last_executed_sql = Some("SELECT 'from_active'".into());
+    }
+    assert_eq!(model.active_tab.as_deref(), Some(second.as_str()));
+
+    // 右键非激活查询标签并执行复制：复制的是非激活标签的 SQL，且清空 tab_menu_target。
+    assert!(model.tab_menu_for(&first));
+    assert_eq!(model.active_tab.as_deref(), Some(second.as_str()));
+    assert!(model.dispatch("history-copy").is_some());
+    assert_eq!(model.copied, "SELECT 'from_inactive'", "应复制右键目标标签的 SQL");
+    assert_eq!(model.clipboard_out.as_deref(), Some("SELECT 'from_inactive'"));
+    assert!(model.tab_menu_target.is_none(), "复制后应清空右键目标，避免泄漏给后续命令");
+
+    // 紧接着按 Ctrl+W（close-tab）应关闭当前激活标签 second，而非之前右键过的 first。
+    assert!(model.dispatch("close-tab").is_some());
+    assert!(model.tabs.iter().any(|t| t.id == first), "原非激活标签 first 不应被误关闭");
+    assert!(!model.tabs.iter().any(|t| t.id == second), "当前激活标签 second 应被关闭");
 }
 
 #[test]
@@ -1418,7 +1628,10 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
     std::fs::write(&import_file, b"{}").unwrap();
     let opened = import_file.canonicalize().unwrap();
     cx.update_window(window, |_, _, cx| {
-        view.update(cx, |view, cx| view.perform("conn-import", cx));
+        view.update(cx, |view, cx| {
+            view.model.bundle_passphrase.clear();
+            view.perform("conn-import", cx);
+        });
     })
     .unwrap();
     assert!(cx.did_prompt_for_paths());
@@ -1433,7 +1646,7 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
             let path = view.model.import_path.clone().expect("import path");
             assert_eq!(path, opened.display().to_string());
             let request = job_request(&view.model, PendingJob::ImportConnections, token);
-            assert_eq!(request.bundle_passphrase.as_deref(), Some("correct-horse"));
+            assert!(request.bundle_passphrase.is_none());
             assert_eq!(request.import_path.as_deref(), Some(path.as_str()));
         });
     });
@@ -10702,15 +10915,19 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
         .unwrap();
         let remaining = cx.update(|cx| view.read(cx).model.tabs.len());
         assert_eq!(remaining, 2, "{width}: 中键关闭该工作项");
-        // 右键先激活该工作项再弹出页签菜单，菜单随后收起，后面的点击才落在页签上。
+        // 右键非激活标签只打开该标签的上下文菜单，不切换当前激活页。
+        let active_before_menu = cx.update(|cx| view.read(cx).model.active_tab.clone());
         cx.update_window(window, |_, window, cx| window.right_click(SharedString::from(format!("tab-{first}")), cx)).unwrap();
-        let (active, place) = cx.update(|cx| {
+        let (active, target, place) = cx.update(|cx| {
             let model = &view.read(cx).model;
-            (model.active_tab.clone(), model.menu.as_ref().map(|menu| menu.place))
+            (model.active_tab.clone(), model.tab_menu_target.clone(), model.menu.as_ref().map(|menu| menu.place))
         });
-        assert_eq!(active.as_deref(), Some(first.as_str()), "{width}: 右键先激活该工作项");
+        assert_eq!(active, active_before_menu, "{width}: 右键非激活标签不切换激活页");
+        assert_eq!(target.as_deref(), Some(first.as_str()), "{width}: 右键菜单目标指向被点中的标签");
         assert_eq!(place, Some(MenuPlace::TabBar), "{width}: 右键弹出页签菜单");
-        cx.update(|cx| view.update(cx, |view, _| view.model.menu = None));
+        cx.update(|cx| view.update(cx, |view, _| {
+            view.model.close_menu();
+        }));
         let close_id = cx.update(|cx| view.read(cx).model.tabs[0].id.clone());
         cx.update_window(window, |_, window, cx| window.click(SharedString::from(format!("tab-close-{close_id}")), cx)).unwrap();
         let closed = cx.update(|cx| view.read(cx).model.tabs.len());
@@ -13857,4 +14074,482 @@ fn tab_rename_confirms_when_the_input_loses_focus(cx: &mut gpui_kit::TestAppCont
     let found = cx.update_window(window, |_, window, _| window.try_find("tab-rename").is_some()).unwrap();
     assert!(!found, "输入框不再显示");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tab_reorder_respects_pinned_boundary_and_alt_1_to_9_switches_tabs() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    let a = model.active_tab.clone().unwrap();
+    assert!(model.dispatch("new-query").is_some());
+    let b = model.active_tab.clone().unwrap();
+    assert!(model.dispatch("new-query").is_some());
+    let c = model.active_tab.clone().unwrap();
+
+    // 普通标签拖拽重排。
+    assert!(model.reorder_tab(&c, &a));
+    let ids: Vec<&str> = model.tabs.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec![c.as_str(), a.as_str(), b.as_str()]);
+    assert!(!model.reorder_tab(&a, &a), "同标签拖放不改动");
+    assert!(!model.reorder_tab(&a, "missing"), "未知标签忽略");
+
+    // 固定区与普通区之间不可跨区拖放。
+    assert!(model.set_pinned(&c, true));
+    assert!(!model.reorder_tab(&c, &a), "固定标签不能拖入普通区");
+    assert!(!model.reorder_tab(&a, &c), "普通标签不能拖入固定区");
+
+    // Alt+1..9 切换对应序号标签，越界静默忽略。
+    assert!(model.dispatch("select-tab-1").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(c.as_str()));
+    assert!(model.dispatch("select-tab-2").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(a.as_str()));
+    assert!(model.dispatch("select-tab-3").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(b.as_str()));
+    assert!(model.dispatch("select-tab-9").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(b.as_str()), "越界序号保持当前标签不变");
+
+    // keymap 注册了 9 条 Alt+1..9 绑定。
+    let nth = crate::app::keymap::shortcut("nth-tab").expect("nth-tab");
+    assert_eq!(crate::app::keymap::bindings_of(nth, false).len(), 9);
+    assert_eq!(crate::app::keymap::bindings_of(nth, true).len(), 9);
+}
+
+#[test]
+fn blend_opaque_produces_fully_opaque_selection_surface() {
+    for p in [crate::ui::kit::Palette::light(), crate::ui::kit::Palette::dark()] {
+        let blended = crate::ui::kit::blend_opaque(p.chrome, p.selection);
+        assert!((blended.a - 1.0).abs() < 1e-5, "合成后的选中底色必须完全不透明，避免悬停按钮透字");
+    }
+}
+
+#[test]
+fn palette_ranks_by_match_score_before_group_rank_when_query_is_non_empty() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    // 放入一个表名精确匹配 "settings" 的对象，与命令组的设置相关项竞争；有查询词时精确匹配应排在最前。
+    let exact = tree_object("pg", "Prod", "postgres", "app", "public", "settings", "table");
+    let sub = tree_object("pg", "Prod", "postgres", "app", "public", "user_settings_log", "table");
+    assert!(model.set_catalog(&[exact, sub], ""));
+    model.shell.dispatch("command-palette");
+    model.set_field(DraftField::PaletteQuery, "settings".into());
+    let entries = model.palette_entries();
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0].label, "settings", "精确匹配应优先于低匹配度的其他分组条目");
+}
+
+#[gpui_kit::test]
+fn topbar_context_status_no_target_picker_and_unified_tab_dirty_dots(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-r1-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            view.perform("new-query", cx);
+            let q_id = view.model.tabs[0].id.clone();
+            if let Some(tab) = view.model.tabs.iter_mut().find(|t| t.id == q_id) {
+                tab.draft = "SELECT 42".into();
+            }
+            // 第二个查询标签保持无目标，验证状态栏“无目标”点击可打开目标选择器。
+            let second_id = view.model.tabs[1].id.clone();
+            let _ = view.model.activate_item(&second_id);
+            if let Some(tab) = view.model.tabs.iter_mut().find(|t| t.id == second_id) {
+                tab.connection_id = None;
+                tab.connection_name = None;
+                tab.database = None;
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 顶栏 aria_label 修正且标签计数可见。
+    let (toolbar_label, picker_count) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.find("toolbar").label().map(str::to_owned),
+                window.try_find("tab-picker-count").is_some(),
+            )
+        })
+        .unwrap();
+    assert_ne!(toolbar_label.as_deref(), Some("新建查询"), "顶栏 aria_label 不再误写为新建查询");
+    assert!(picker_count, "多标签时标签列表按钮显示计数");
+
+    // 点击“无目标”状态栏按钮应打开查询目标选择器。
+    cx.update_window(window, |_, window, cx| {
+        window.click("status-target", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let popover_open = cx.update_window(window, |_, window, _| window.try_find("query-target-popover").is_some()).unwrap();
+    assert!(popover_open, "状态栏无目标分支点击应打开目标选择器");
+
+    // 绑定生产连接后顶栏呈现活动目标 pill。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let mut rec = record_for("prod-1", "ProdDB", Engine::Postgres);
+            rec.saved.env = "prod".into();
+            view.model.connections.rows.push(rec);
+            if let Some(tab) = view.model.active_mut() {
+                tab.connection_id = Some("prod-1".into());
+                tab.connection_name = Some("ProdDB".into());
+                tab.database = Some("app".into());
+                tab.engine = Some("postgres".into());
+            }
+            cx.notify();
+        });
+    });
+    let top_target = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("top-target").and_then(|el| el.label().map(str::to_owned))
+        })
+        .unwrap();
+    assert_eq!(top_target.as_deref(), Some("ProdDB / app"), "顶栏应呈现当前活动目标");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn object_tree_filter_focus_protection_skipped_notice_and_shift_enter_structure(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir, ids) = object_tree_workbench(cx, 1200., false);
+    // 添加一条未连接连接，验证搜索时给出跳过提示。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows.push(record_for("offline-1", "OfflineDB", Engine::Postgres));
+            cx.notify();
+        });
+    });
+
+    // Mod+Shift+L (explorer-search) 打开侧栏并聚焦对象树搜索框。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("explorer-search", cx)));
+    let filter_focused = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| view.fields.is_focused(DraftField::ObjectFilter, window, cx))
+        })
+        .unwrap();
+    assert!(filter_focused, "explorer-search 快捷键应聚焦对象树搜索框");
+
+    // 聚焦搜索框时按方向键/回车不触发对象树导航或打开表。
+    let before_tabs = cx.update(|cx| view.read(cx).model.tabs.len());
+    let before_current = cx.update(|cx| view.read(cx).model.explorer_current.clone());
+    cx.update_window(window, |_, window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (after_tabs, after_current) = cx.update(|cx| (view.read(cx).model.tabs.len(), view.read(cx).model.explorer_current.clone()));
+    assert_eq!(after_tabs, before_tabs, "搜索框聚焦时按回车不应误打开表");
+    assert_eq!(after_current, before_current, "搜索框聚焦时按方向键不应移动对象树行");
+
+    // 输入过滤词后提示跳过的未连接连接。
+    cx.update(|cx| view.update(cx, |view, cx| {
+        view.model.set_field(DraftField::ObjectFilter, "zzz_no_hit".into());
+        cx.notify();
+    }));
+    let (skipped_count, has_skipped_banner) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (view.read(cx).model.nav_search_skipped_count(), window.try_find("explorer-search-skipped").is_some())
+        })
+        .unwrap();
+    assert!(skipped_count >= 1, "应统计被跳过的未连接连接");
+    assert!(has_skipped_banner, "应渲染跳过未连接连接的明确提示");
+
+    // 清除过滤，焦点停在表节点，按 Shift+Enter 直接打开表结构。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.set_field(DraftField::ObjectFilter, String::new());
+            view.model.shell.focus = crate::app::FocusTarget::Sidebar;
+            view.model.explorer_current = Some(super::explorer::ExplorerRow::Node(ids.orders.clone()));
+            cx.notify();
+        });
+        let nav_focus = view.read(cx).nav_focus.clone();
+        window.focus(&nav_focus, cx);
+        window.render_frame(cx);
+        window.press("shift-enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let active_kind = cx.update(|cx| view.read(cx).model.active_tab().map(|t| t.kind));
+    assert_eq!(active_kind, Some(WorkItemKind::Structure), "对象树表节点按 Shift+Enter 应直接打开表结构");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn palette_highlights_cycles_scopes_with_tab_and_restores_focus_to_structure_pane(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-r3-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform(&format!("open-structure-for:{spec}"), cx);
+            view.perform("command-palette", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 输入查询词后渲染命中高亮。
+    cx.update(|cx| view.update(cx, |view, cx| {
+        view.model.set_field(DraftField::PaletteQuery, "查询".into());
+        cx.notify();
+    }));
+    let has_highlight = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("pal-match-0").is_some()
+        })
+        .unwrap();
+    assert!(has_highlight, "命令面板命中项应渲染高亮片段");
+
+    // Tab / Shift+Tab 切换命令面板分组。
+    cx.update_window(window, |_, window, cx| {
+        window.press("tab", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let scope_after_tab = cx.update(|cx| view.read(cx).model.effective_palette_scope());
+    assert_eq!(scope_after_tab, super::model::PaletteScope::Objects, "Tab 应切到下一个分组");
+
+    cx.update_window(window, |_, window, cx| {
+        window.press("shift-tab", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let scope_after_shift_tab = cx.update(|cx| view.read(cx).model.effective_palette_scope());
+    assert_eq!(scope_after_shift_tab, super::model::PaletteScope::All, "Shift+Tab 应切回上一个分组");
+
+    // Esc 关闭浮层后焦点正确还原到 StructurePane 的 FocusHandle。
+    cx.update_window(window, |_, window, cx| {
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let structure_focused = cx
+        .update_window(window, |_, window, cx| {
+            let structure = view.read(cx).structure.clone();
+            let handle = structure.update(cx, |pane, cx| pane.focus_handle(cx));
+            handle.is_focused(window)
+        })
+        .unwrap();
+    assert!(structure_focused, "关闭命令面板后焦点应还原到活动表结构视图 StructurePane");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn query_mod_s_saves_in_place_and_f6_routes_to_query_pane(cx: &mut gpui_kit::TestAppContext) {
+    assert_eq!(crate::app::keymap::command_chord("switch-pane-focus"), Some("F6"));
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-r4-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sql_path = dir.join("workbench_query.sql");
+    let services = Arc::new(AppServices::from_state(&crate::connections::commands::ConnectionsState::new()));
+    let (window, view) = open_workbench(cx, services, false);
+
+    let mut tab_id = String::new();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.open_sql_file(&sql_path, "SELECT 99;".into());
+            if let Some(id) = view.model.active_tab.clone() {
+                tab_id = id.clone();
+                view.query.update(cx, |pane, _| pane.set_tab_file_path(&id, sql_path.clone()));
+            }
+        });
+        window.render_frame(cx);
+        // 保存前：未执行也未落盘，脏点为真且 last_executed_sql 保持 None。
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert!(tab.last_executed_sql.is_none());
+        assert!(tab.is_draft_dirty(), "保存前应显示未保存脏状态");
+        assert!(view.read(cx).model.tab_facts(&tab_id).draft, "保存前关闭守卫应标记草稿待确认");
+
+        view.update(cx, |view, cx| {
+            // Mod+S 在查询页触发原位保存 SQL。
+            view.perform("commit", cx);
+            // F6 在外壳路由到查询页，无结果时安全忽略不崩溃。
+            view.perform("switch-pane-focus", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while (!sql_path.exists() || cx.update(|cx| view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).is_some_and(|t| t.saved_sql.is_none())))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        cx.run_until_parked();
+    }
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&sql_path).unwrap(), "SELECT 99;");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert_eq!(tab.saved_sql.as_deref(), Some("SELECT 99;"), "保存后应同步 saved_sql 基线");
+        assert!(tab.last_executed_sql.is_none(), "保存文件不应破坏 last_executed_sql 语义");
+        assert!(!tab.is_draft_dirty(), "Mod+S 保存后脏状态应清除");
+        assert!(!view.read(cx).model.tab_facts(&tab_id).draft, "已保存草稿关闭标签不应误报未保存");
+
+        // 再次编辑草稿后，脏状态与关闭守卫应重新激活。
+        view.update(cx, |view, cx| {
+            if let Some(tab) = view.model.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.draft = "SELECT 100;".into();
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let tab = view.read(cx).model.tabs.iter().find(|t| t.id == tab_id).unwrap();
+        assert!(tab.is_draft_dirty(), "继续编辑后脏状态应重新出现");
+        assert!(view.read(cx).model.tab_facts(&tab_id).draft, "继续编辑后关闭守卫应再次提示未保存草稿");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R8：表结构 DDL 预览弹窗由外壳全窗口遮罩托管，覆盖顶栏/侧栏/标签栏，同步 `ShellOverlayOpen`，
+/// 且遮罩外点只取消预览、不误触背景外壳。
+#[gpui_kit::test]
+fn structure_preview_uses_full_window_shell_scrim_and_sets_overlay_flag(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-struct-overlay-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 1100., 760.);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.page = AppPage::Structure;
+            view.model.tool = WorkTool::Structure;
+            view.structure.update(cx, |pane, cx| {
+                let target = crate::app::views::grid::GridTarget {
+                    connection_id: "c1".into(),
+                    connection_name: "local".into(),
+                    engine: "postgres".into(),
+                    database: "app".into(),
+                    schema: "public".into(),
+                    table: "orders".into(),
+                    environment: "local".into(),
+                };
+                pane.bind(target);
+                let mut snapshot = crate::ddl::Snapshot::bare(crate::ddl::DdlEngine::Postgres, "app", "public", "orders");
+                snapshot.kind = "table".into();
+                snapshot.columns = vec![
+                    crate::ddl::Column {
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        nullable: false,
+                        default_sql: None,
+                        default_constraint: None,
+                        primary: true,
+                        auto: true,
+                        generated: false,
+                    },
+                    crate::ddl::Column {
+                        name: "title".into(),
+                        type_name: "text".into(),
+                        nullable: true,
+                        default_sql: None,
+                        default_constraint: None,
+                        primary: false,
+                        auto: false,
+                        generated: false,
+                    },
+                ];
+                pane.session.kept_columns = vec![
+                    crate::ddl::ColumnDraft {
+                        original: Some("id".into()),
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        nullable: false,
+                        default: crate::ddl::DefaultSpec::None,
+                        comment: String::new(),
+                        primary: true,
+                        auto: true,
+                        dropped: false,
+                        ..crate::ddl::ColumnDraft::default()
+                    },
+                    crate::ddl::ColumnDraft {
+                        original: Some("title".into()),
+                        name: "title_v2".into(),
+                        type_name: "text".into(),
+                        nullable: true,
+                        default: crate::ddl::DefaultSpec::None,
+                        comment: String::new(),
+                        primary: false,
+                        auto: false,
+                        dropped: false,
+                        ..crate::ddl::ColumnDraft::default()
+                    },
+                ];
+                pane.session.arm_fixture(&snapshot);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        window.render_frame(cx);
+
+        assert!(crate::ui::ShellOverlayOpen::is_covered(window, cx), "预览打开时应同步 ShellOverlayOpen");
+        let scrim = window.try_find("structure-preview-scrim").expect("应渲染全窗口遮罩");
+        let scrim_bounds = scrim.bounds();
+        assert!(f32::from(scrim_bounds.origin.x) <= 1.0 && f32::from(scrim_bounds.origin.y) <= 1.0, "遮罩应从窗口左上角起覆盖顶栏与侧栏: {scrim_bounds:?}");
+        assert!(f32::from(scrim_bounds.size.width) >= 1099.0 && f32::from(scrim_bounds.size.height) >= 759.0, "遮罩应覆盖整个窗口尺寸: {scrim_bounds:?}");
+
+        // Esc 通过外壳关闭预览并清除 ShellOverlayOpen。
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).structure.read(cx).preview_open(), "Esc 应关闭预览弹窗");
+        assert!(!crate::ui::ShellOverlayOpen::is_covered(window, cx), "关闭预览后 ShellOverlayOpen 应复位");
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn connections_header_consolidates_transfer_menu_and_modal_stops_stay_synced(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-conn-redesign-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("activity-connections", cx));
+        window.render_frame(cx);
+
+        assert!(window.find("launcher-group-new").visible(), "保留新建分组入口");
+        assert!(window.find("launcher-open-file").visible(), "保留打开文件入口");
+        assert!(window.find("launcher-transfer-menu").visible(), "所有导入/导出收拢进统一下拉入口");
+        assert!(window.find("conn-new").visible(), "保留新建连接主按钮");
+        for scattered in ["launcher-import", "launcher-import-dbeaver", "launcher-import-navicat", "launcher-export"] {
+            assert!(window.try_find(scattered).is_none(), "顶栏不再平铺分散的导入/导出按钮: {scattered}");
+        }
+
+        // 打开新建连接模态：URL 切换移至页头后，rendered 与 modal_stops 保持完全一致。
+        view.update(cx, |view, cx| view.perform("conn-new-launcher", cx));
+        window.render_frame(cx);
+        let (rendered, stops) = view.read_with(cx, |view, _| {
+            let stop_controls: Vec<String> = view
+                .model
+                .modal_stops()
+                .into_iter()
+                .filter_map(|stop| stop.control_id().map(str::to_owned))
+                .collect();
+            (view.model.conn_modal.rendered.clone(), stop_controls)
+        });
+        assert_eq!(rendered, stops, "重排模态头部后，实际绘制控件与 Tab 停靠点序列必须一致");
+        assert_eq!(rendered.first().map(String::as_str), Some(super::conn_modal::URL_TOGGLE));
+        assert_eq!(rendered.get(1).map(String::as_str), Some(super::conn_modal::CLOSE));
+
+        // 校验分栏错误圆点识别：SSH / TLS / General 互不误报。
+        let ssh_issue = vec![crate::app::views::connections::FieldIssue::new("ssh_host", "connections.editor.required")];
+        assert!(super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::Ssh, &ssh_issue));
+        assert!(!super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::Tls, &ssh_issue));
+        assert!(!super::conn_modal::ConnectionModal::tab_has_issue(super::conn_modal::ModalTab::General, &ssh_issue));
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

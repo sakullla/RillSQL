@@ -14,9 +14,10 @@ use crate::connections::model::ConnectionDraft;
 use crate::query::{HistoryEntry, RenameRequest, SaveRequest, SavedQuery};
 use crate::state::AppState;
 
+use super::conn_import::{self, ImportPreview, ImportReport, ImportState};
 use super::model::{GroupOp, PendingJob, WorkbenchModel};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JobRequest {
     pub job: PendingJob,
     pub token: TaskToken,
@@ -45,6 +46,8 @@ pub enum JobDone {
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
     Notice(TaskToken, Result<String, String>),
+    ProfilesPreview(TaskToken, Result<ImportPreview, String>),
+    ProfilesReport(TaskToken, ImportReport),
     Imported(TaskToken, Result<(connections::ConnectionSnapshot, usize, Vec<String>), String>),
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
     /// 分组与成员关系的快照：(分组, 连接 id → 分组 id)。
@@ -195,6 +198,8 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
         }
+        PendingJob::ReadProfiles(format, path) => JobDone::ProfilesPreview(token, conn_import::load(services, format, &path).await),
+        PendingJob::SaveProfiles(preview) => JobDone::ProfilesReport(token, conn_import::save(services, *preview).await),
         PendingJob::ImportConnections => {
             let Some(path) = request.import_path else {
                 return JobDone::Notice(token, Err("connections.page.importRillSql".into()));
@@ -202,9 +207,9 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
             match connections::import_rows(services, PathBuf::from(path).as_path(), request.bundle_passphrase.as_deref()).await {
                 Ok((count, skipped)) => match connections::list_rows(services).await {
                     Ok(rows) => JobDone::Imported(token, Ok((rows, count, skipped))),
-                    Err(err) => JobDone::Notice(token, Err(err)),
+                    Err(err) => JobDone::Imported(token, Err(err)),
                 },
-                Err(err) => JobDone::Notice(token, Err(err)),
+                Err(err) => JobDone::Imported(token, Err(err)),
             }
         }
         PendingJob::RefreshGroups => JobDone::Groups(token, services.connections.groups().await),
@@ -346,11 +351,27 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_key = Some("common.save");
             }
         }
+        JobDone::ProfilesPreview(token, result) => {
+            if accepted(services, owner, token) && matches!(model.profile_import, ImportState::Loading) {
+                model.profile_import = match result {
+                    Ok(preview) => ImportState::Preview(preview),
+                    Err(error) => ImportState::Error(error),
+                };
+            }
+        }
+        JobDone::ProfilesReport(token, report) => {
+            if accepted(services, owner, token) {
+                model.profile_import = ImportState::Report(report);
+                model.enqueue(PendingJob::RefreshConnections);
+            }
+        }
         JobDone::Imported(token, Ok((snapshot, count, skipped))) => {
             if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
                 model.connections.recent_ids = snapshot.recent;
                 model.welcome.has_connections = !model.connections.rows.is_empty();
                 model.import_notes = skipped.clone();
+                model.bundle_unlock = None;
+                model.bundle_passphrase.clear();
                 if skipped.is_empty() {
                     model.notice_key = Some("connections.page.importRillSql");
                     model.notice_detail = count.to_string();
@@ -362,6 +383,14 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
         }
         JobDone::Imported(token, Err(detail)) => {
             if owner == "connections" && model.connections.accept_notice(&services.tasks, token, detail.clone()) {
+                use crate::connections::error_codes::{IMPORT_BAD_PASSPHRASE, IMPORT_PASSPHRASE_REQUIRED};
+                let code = detail.strip_prefix('[').and_then(|detail| detail.split_once(']')).map(|(code, _)| code);
+                model.bundle_unlock = match code {
+                    Some(IMPORT_PASSPHRASE_REQUIRED) => Some("connections.profile.bundlePrompt"),
+                    Some(IMPORT_BAD_PASSPHRASE) => Some("connections.profile.bundleBad"),
+                    _ => None,
+                };
+                model.bundle_passphrase.clear();
                 model.notice_key = Some(static_notice(&detail));
                 model.notice_detail = model.connections.message_detail.clone();
             }

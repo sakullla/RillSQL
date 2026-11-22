@@ -8,9 +8,9 @@ use gpui_kit::component::input;
 use gpui_kit::KeyBinding;
 
 use super::{
-    CloseTab, CommandPalette, CommitEdit, Dismiss, ExecuteCurrent, ExecuteQuery, ExecuteScript, ExplainSql, FormatSql, NewQuery,
-    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, ShowAutocomplete, ShowHelp, ToggleBlockComment, ToggleComment, ToggleResults,
-    ToggleSidebar,
+    CloseTab, CommandPalette, CommitEdit, Dismiss, ExecuteCurrent, ExecuteQuery, ExecuteScript, ExplainSql, FocusExplorerSearch, FormatSql, NewQuery,
+    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, ShowAutocomplete, ShowHelp, SwitchPaneFocus, ToggleBlockComment, ToggleComment, ToggleResults, ToggleSidebar,
 };
 
 /// 由组合键的一个按法（gpui 记法，如 `cmd-shift-f`）生成绑定；第二个参数是“是否按 macOS 生成”。
@@ -123,6 +123,9 @@ pub const SHORTCUTS: &[Shortcut] = &[
         .command("format")
         .binds(&[global!(FormatSql), |key, mac| mac.then(|| KeyBinding::new(key, FormatSql, Some(EDITOR_CONTEXT)))]),
     Shortcut::new("explain", "editor", "Mod+Shift+E", "shell.shortcuts.explain").command("explain").binds(&[global!(ExplainSql)]),
+    Shortcut::new("switch-pane-focus", "editor", "F6", "shell.shortcuts.switchPaneFocus")
+        .command("switch-pane-focus")
+        .binds(&[global!(SwitchPaneFocus)]),
     Shortcut::new("leave-editor", "editor", "Tab", "shell.shortcuts.leaveEditor"),
     Shortcut::new("move-cells", "table", "↑ ↓ ← →", "shell.shortcuts.moveCells"),
     Shortcut::new("select-all-cells", "table", "Mod+A", "shell.shortcuts.selectAllCells"),
@@ -145,6 +148,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut::new("explorer-move", "explorer", "↑ ↓", "shell.shortcuts.explorerMove"),
     Shortcut::new("explorer-expand", "explorer", "← →", "shell.shortcuts.explorerExpand"),
     Shortcut::new("explorer-open", "explorer", "Enter", "shell.shortcuts.explorerOpen"),
+    Shortcut::new("explorer-open-structure", "explorer", "Shift+Enter", "shell.shortcuts.explorerOpenStructure"),
+    Shortcut::new("explorer-search", "explorer", "Mod+Shift+L", "shell.shortcuts.explorerSearch")
+        .command("explorer-search")
+        .binds(&[global!(FocusExplorerSearch)]),
+    Shortcut::new("explorer-quick-search", "explorer", "/", "shell.shortcuts.explorerQuickSearch"),
     Shortcut::new("explorer-clear-search", "explorer", "Esc", "shell.shortcuts.explorerClearSearch"),
     // 键空间工作台（R4）：由工作台自己的按键处理与输入框回车解析，这里只登记用于面板展示。
     Shortcut::new("keyspace-filter", "keyspace", "Enter", "shell.shortcuts.keyspaceFilter"),
@@ -214,6 +222,19 @@ fn intern(key: String) -> &'static str {
 
 /// 一条快捷键在指定平台上生成的全部绑定。
 pub fn bindings_of(shortcut: &Shortcut, mac: bool) -> Vec<KeyBinding> {
+    if shortcut.id == "nth-tab" {
+        return vec![
+            KeyBinding::new("alt-1", SelectTab1, None),
+            KeyBinding::new("alt-2", SelectTab2, None),
+            KeyBinding::new("alt-3", SelectTab3, None),
+            KeyBinding::new("alt-4", SelectTab4, None),
+            KeyBinding::new("alt-5", SelectTab5, None),
+            KeyBinding::new("alt-6", SelectTab6, None),
+            KeyBinding::new("alt-7", SelectTab7, None),
+            KeyBinding::new("alt-8", SelectTab8, None),
+            KeyBinding::new("alt-9", SelectTab9, None),
+        ];
+    }
     let keys: Vec<&'static str> = keystrokes(shortcut.chord_for(mac), mac).into_iter().map(intern).collect();
     shortcut.bind.iter().flat_map(|bind| keys.iter().filter_map(move |key| bind(key, mac))).collect()
 }

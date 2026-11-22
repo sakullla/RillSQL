@@ -50,6 +50,16 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        SelectTab1,
+        SelectTab2,
+        SelectTab3,
+        SelectTab4,
+        SelectTab5,
+        SelectTab6,
+        SelectTab7,
+        SelectTab8,
+        SelectTab9,
+        FocusExplorerSearch,
         RequestCancel,
         ShowAutocomplete,
         ToggleComment,
@@ -58,6 +68,7 @@ actions!(
         FormatSql,
         ExplainSql,
         LeaveEditor,
+        SwitchPaneFocus,
         SelectAllCells,
         EditCell,
         CancelEdit,
@@ -238,6 +249,16 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(CloseTab, "close-tab");
     bind!(NextTab, "next-tab");
     bind!(PrevTab, "prev-tab");
+    bind!(SelectTab1, "select-tab-1");
+    bind!(SelectTab2, "select-tab-2");
+    bind!(SelectTab3, "select-tab-3");
+    bind!(SelectTab4, "select-tab-4");
+    bind!(SelectTab5, "select-tab-5");
+    bind!(SelectTab6, "select-tab-6");
+    bind!(SelectTab7, "select-tab-7");
+    bind!(SelectTab8, "select-tab-8");
+    bind!(SelectTab9, "select-tab-9");
+    bind!(FocusExplorerSearch, "explorer-search");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
@@ -246,6 +267,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");
     bind!(LeaveEditor, "leave-editor");
+    bind!(SwitchPaneFocus, "switch-pane-focus");
     bind!(SelectAllCells, "select-all-cells");
     bind!(EditCell, "edit-cell");
     bind!(CancelEdit, "cancel-edit");
@@ -322,6 +344,16 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(CloseTab, "close-tab");
     bind!(NextTab, "next-tab");
     bind!(PrevTab, "prev-tab");
+    bind!(SelectTab1, "select-tab-1");
+    bind!(SelectTab2, "select-tab-2");
+    bind!(SelectTab3, "select-tab-3");
+    bind!(SelectTab4, "select-tab-4");
+    bind!(SelectTab5, "select-tab-5");
+    bind!(SelectTab6, "select-tab-6");
+    bind!(SelectTab7, "select-tab-7");
+    bind!(SelectTab8, "select-tab-8");
+    bind!(SelectTab9, "select-tab-9");
+    bind!(FocusExplorerSearch, "explorer-search");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
@@ -330,6 +362,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(FormatSql, "format");
     bind!(ExplainSql, "explain");
     bind!(LeaveEditor, "leave-editor");
+    bind!(SwitchPaneFocus, "switch-pane-focus");
     bind!(SelectAllCells, "select-all-cells");
     bind!(EditCell, "edit-cell");
     bind!(CancelEdit, "cancel-edit");

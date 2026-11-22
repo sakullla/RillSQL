@@ -318,6 +318,18 @@ pub fn tab_strip(
     tab_strip_with_double_click(id, aria_label, list_id, tabs, actions, scroll, reveal, layout, p, None)
 }
 
+/// 页签列表当前是否向左侧或右侧溢出，用于展示溢出提示。
+pub fn tab_overflow(scroll: &gpui_kit::ScrollHandle) -> (bool, bool) {
+    let max_x = f32::from(scroll.max_offset().x);
+    if max_x <= 1.0 {
+        return (false, false);
+    }
+    let offset_x = f32::from(scroll.offset().x);
+    let left = offset_x < -1.0;
+    let right = (-offset_x) < (max_x - 1.0);
+    (left, right)
+}
+
 /// 页签条（支持双击右侧空白区域新建查询）。
 #[allow(clippy::too_many_arguments)]
 pub fn tab_strip_with_double_click(
@@ -351,6 +363,45 @@ pub fn tab_strip_with_double_click(
     for tab in tabs {
         list = list.child(tab);
     }
+    let (overflow_left, overflow_right) = tab_overflow(scroll);
+    let list_wrap = div()
+        .relative()
+        .flex()
+        .items_end()
+        .h_full()
+        .flex_shrink(1.)
+        .min_w(px(0.))
+        .child(list)
+        .when(overflow_left, |this| {
+            this.child(
+                div()
+                    .id("tab-overflow-left")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(14.))
+                    .bg(p.chrome.opacity(0.85))
+                    .border_l_2()
+                    .border_color(p.accent.opacity(0.75)),
+            )
+        })
+        .when(overflow_right, |this| {
+            this.child(
+                div()
+                    .id("tab-overflow-right")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(14.))
+                    .bg(p.chrome.opacity(0.85))
+                    .border_r_2()
+                    .border_color(p.accent.opacity(0.75)),
+            )
+        });
     let mut trailing = div().h_full().flex_none().flex().items_center().gap(px(2.)).px(px(4.));
     for action in actions {
         trailing = trailing.child(action);
@@ -384,7 +435,7 @@ pub fn tab_strip_with_double_click(
         .bg(p.chrome)
         .border_b_1()
         .border_color(p.line)
-        .child(list)
+        .child(list_wrap)
         .child(trailing)
         .child(filler)
         .into_any_element()
@@ -855,5 +906,39 @@ mod tab_tests {
             f32::from(close.origin.x + close.size.width) <= f32::from(new_tab.origin.x) + 0.5,
             "新建动作不压住关闭动作"
         );
+    }
+
+    #[gpui_kit::test]
+    fn tab_overflow_reports_left_and_right_scroll_edges(cx: &mut TestAppContext) {
+        let layout = Metrics::compact();
+        let (window, view) = open(cx, 640., layout, false, 12);
+        // 首帧测量后，再画一帧使 overflow 指示器读到最新的 max_offset。
+        let (left_init, right_init, has_left_init, has_right_init) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+                let (l, r) = tab_overflow(&view.read(cx).scroll);
+                (l, r, window.try_find("tab-overflow-left").is_some(), window.try_find("tab-overflow-right").is_some())
+            })
+            .unwrap();
+        assert!(!left_init && right_init, "初始位置应只向右侧溢出");
+        assert!(!has_left_init && has_right_init, "右侧溢出提示应可见");
+
+        cx.update(|cx| {
+            view.update(cx, |probe, cx| {
+                probe.active = probe.count - 1;
+                cx.notify();
+            })
+        });
+        let (left_end, right_end, has_left_end, has_right_end) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+                let (l, r) = tab_overflow(&view.read(cx).scroll);
+                (l, r, window.try_find("tab-overflow-left").is_some(), window.try_find("tab-overflow-right").is_some())
+            })
+            .unwrap();
+        assert!(left_end && !right_end, "滚到最右端后应只向左侧溢出");
+        assert!(has_left_end && !has_right_end, "左侧溢出提示应可见");
     }
 }

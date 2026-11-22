@@ -71,6 +71,8 @@ pub struct SyncEffect {
     pub running: Vec<String>,
     /// 每个标签最近一次真正执行过的 SQL。
     pub executed: Vec<(String, String)>,
+    /// 每个标签刚刚成功落盘保存的 SQL 基线。
+    pub saved: Vec<(String, String)>,
     pub opens: Vec<OpenRequest>,
     pub targets: Vec<TargetRequest>,
     pub selected_object: Option<String>,
@@ -142,6 +144,11 @@ pub struct QueryPane {
     side: HashMap<String, SideState>,
     side_width: f32,
     side_dragging: bool,
+    side_column_filter: Option<Entity<InputState>>,
+    /// 每个查询标签关联的本地 SQL 文件路径与最近保存目录。
+    file_paths: HashMap<String, std::path::PathBuf>,
+    last_save_dir: Option<std::path::PathBuf>,
+    pending_saved: Vec<(String, String)>,
     /// 外壳密度；消息页和右侧面板的行高与控件高度跟它走。
     density: Density,
     /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
@@ -160,6 +167,7 @@ pub struct QueryPane {
     /// 外壳当前活动工作项是否是查询；为 false 时执行类命令只能拒绝。
     context_active: bool,
     focus_editor: bool,
+    pending_pane_focus_switch: bool,
     seen_active: Option<String>,
     fold_key: Option<(String, String)>,
     fold_wait: Option<(String, String)>,
@@ -241,10 +249,35 @@ fn count_sql(sql: &str) -> String {
     format!("SELECT COUNT(*) FROM (\n{body}\n) rillsql_count")
 }
 
+/// SQL 保存弹窗的默认目录：优先记住的上次保存目录，其次用户文档/主目录或当前工作目录，避免每次落在临时目录。
+pub(crate) fn default_save_dir(last_save_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(dir) = last_save_dir.filter(|dir| dir.is_dir()) {
+        return dir.to_path_buf();
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from) {
+        let documents = home.join("Documents");
+        if documents.is_dir() {
+            return documents;
+        }
+        if home.is_dir() {
+            return home;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.is_dir() {
+            return cwd;
+        }
+    }
+    std::env::temp_dir()
+}
+
 struct PinRename {
     id: u64,
+    original: Option<String>,
     input: Entity<InputState>,
+    painted: bool,
     _keep: gpui_kit::Subscription,
+    _blur: gpui_kit::Subscription,
 }
 
 /// 失败语句在草稿里要标的范围。偏移标到那个词（至少一个字符，不跨行）；行号标整行；
@@ -531,22 +564,43 @@ impl QueryPane {
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         let weak = cx.entity().downgrade();
-        let target_tab_sub = cx.intercept_keystrokes(move |event, _, cx| {
-            if event.keystroke.key != "tab" {
+        let target_tab_sub = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = event.keystroke.key.as_str();
+            let mods = &event.keystroke.modifiers;
+            if mods.control || mods.alt || mods.platform {
                 return;
             }
-            if event.keystroke.modifiers.control || event.keystroke.modifiers.alt || event.keystroke.modifiers.platform {
-                return;
-            }
-            let backward = event.keystroke.modifiers.shift;
             let Some(pane) = weak.upgrade() else {
                 return;
             };
-            if pane.read(cx).target_picker.anchor.is_none() {
+            if !pane.read(cx).context_active || crate::ui::ShellOverlayOpen::is_covered(window, cx) {
                 return;
             }
-            cx.stop_propagation();
-            pane.update(cx, |pane, cx| pane.cycle_target_connection(backward, cx));
+            if pane.read(cx).target_picker.anchor.is_some() {
+                if key == "tab" {
+                    let backward = mods.shift;
+                    cx.stop_propagation();
+                    pane.update(cx, |pane, cx| pane.cycle_target_connection(backward, cx));
+                    return;
+                }
+                if !mods.shift && matches!(key, "left" | "right") && pane.read(cx).target_filter(cx).is_empty() {
+                    let col = if key == "left" { target::TargetColumn::Connections } else { target::TargetColumn::Databases };
+                    cx.stop_propagation();
+                    pane.update(cx, |pane, cx| pane.switch_target_column(col, cx));
+                    return;
+                }
+            }
+            if !mods.shift && key == "escape" {
+                if pane.read(cx).pin_rename.is_some() {
+                    cx.stop_propagation();
+                    pane.update(cx, |pane, cx| pane.cancel_pin_rename(cx));
+                    return;
+                }
+                if pane.read(cx).narrow && pane.read(cx).side_open() && pane.read(cx).target_picker.anchor.is_none() {
+                    cx.stop_propagation();
+                    pane.update(cx, |pane, cx| pane.command("close-side", cx));
+                }
+            }
         });
         Self {
             desk: Desk::new(),
@@ -575,6 +629,10 @@ impl QueryPane {
             side: HashMap::new(),
             side_width: side::PANEL_WIDTH,
             side_dragging: false,
+            side_column_filter: None,
+            file_paths: HashMap::new(),
+            last_save_dir: None,
+            pending_saved: Vec::new(),
             row_count: None,
             density: Density::Compact,
             narrow: false,
@@ -590,6 +648,7 @@ impl QueryPane {
             last_timeout: None,
             context_active: false,
             focus_editor: false,
+            pending_pane_focus_switch: false,
             seen_active: None,
             fold_key: None,
             fold_wait: None,
@@ -1223,6 +1282,14 @@ impl QueryPane {
                 self.update_side(|state, narrow| state.open = Some(!state.is_open(narrow)));
                 cx.notify();
             }
+            "close-side" => {
+                self.update_side(|state, _| state.open = Some(false));
+                cx.notify();
+            }
+            "switch-pane-focus" => {
+                self.pending_pane_focus_switch = true;
+                cx.notify();
+            }
             // 旧入口：“语句大纲”开关。打开时固定在大纲页。
             "toggle-outline" => {
                 self.update_side(|state, narrow| {
@@ -1258,7 +1325,7 @@ impl QueryPane {
                     self.prompt_open(cx);
                 }
             }
-            "save-sql-file" => self.prompt_save(cx),
+            "save-sql-file" => self.save_sql_file(cx),
             _ => {}
         }
     }
@@ -1338,6 +1405,7 @@ impl QueryPane {
         self.run_clock.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.file_paths.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.result_layout.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.splits.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.desk.refresh_outline();
@@ -1362,6 +1430,7 @@ impl QueryPane {
             drafts,
             running: self.desk.running_ids(),
             executed,
+            saved: std::mem::take(&mut self.pending_saved),
             opens: std::mem::take(&mut self.opens),
             targets: std::mem::take(&mut self.targets),
             selected_object: self.selected_object.take(),
@@ -1547,7 +1616,8 @@ impl QueryPane {
         let Some(pin) = self.desk.pinned().iter().find(|pin| pin.id == id) else {
             return;
         };
-        let initial = SharedString::from(pin.custom_title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_default());
+        let original = pin.custom_title.clone();
+        let initial = SharedString::from(original.clone().filter(|title| !title.trim().is_empty()).unwrap_or_default());
         let placeholder = SharedString::from(i18n::text(self.locale, "query.results.rename"));
         let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial));
         let pane = cx.weak_entity();
@@ -1556,23 +1626,38 @@ impl QueryPane {
                 let text = input.read(cx).value().to_string();
                 let _ = this.desk.rename_pin(id, &text);
             }
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => {
                 // 回调里不能立刻丢掉订阅，等这一轮结束再收起输入框。
                 let pane = pane.clone();
                 cx.defer(move |cx| {
                     if let Some(pane) = pane.upgrade() {
-                        pane.update(cx, |this, cx| {
-                            this.pin_rename = None;
-                            cx.notify();
-                        });
+                        pane.update(cx, |this, cx| this.finish_pin_rename(cx));
                     }
                 });
             }
             _ => {}
         });
+        let handle = gpui_kit::Focusable::focus_handle(state.read(cx), cx);
+        let blur = cx.on_blur(&handle, window, |this, _, cx| {
+            this.finish_pin_rename(cx);
+        });
+        self.focus_editor = false;
         state.update(cx, |input, cx| input.focus(window, cx));
-        self.pin_rename = Some(PinRename { id, input: state, _keep: subscription });
+        self.pin_rename = Some(PinRename { id, original, input: state, painted: false, _keep: subscription, _blur: blur });
         cx.notify();
+    }
+
+    fn finish_pin_rename(&mut self, cx: &mut Context<Self>) {
+        if self.pin_rename.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_pin_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(rename) = self.pin_rename.take() {
+            let _ = self.desk.rename_pin(rename.id, rename.original.as_deref().unwrap_or(""));
+            cx.notify();
+        }
     }
 
     /// 消息页里点一条记录：成功的切到它的结果；失败的跳到编辑器里的错误位置。
@@ -2190,6 +2275,7 @@ impl QueryPane {
         let conn_id = current.as_ref().map(|target| target.connection_id.clone()).filter(|id| !id.is_empty());
         let db_name = current.as_ref().map(|target| target.database.as_str()).unwrap_or("");
         self.target_picker.focus = conn_id.clone();
+        self.target_picker.column = target::TargetColumn::Databases;
         self.target_picker.db_index = conn_id
             .as_deref()
             .and_then(|id| self.target_choices.iter().find(|choice| choice.id == id))
@@ -2223,12 +2309,36 @@ impl QueryPane {
         self.target_picker.anchor = None;
         self.target_picker.search = None;
         self.target_picker.db_index = 0;
+        self.target_picker.column = target::TargetColumn::Databases;
+        self.focus_editor = true;
         cx.notify();
     }
 
     pub fn focus_target_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         self.target_picker.focus = Some(id.to_owned());
         self.target_picker.db_index = 0;
+        cx.notify();
+    }
+
+    /// 左右方向键在连接栏与数据库栏之间切换键盘导航焦点。
+    pub fn switch_target_column(&mut self, column: target::TargetColumn, cx: &mut Context<Self>) {
+        match column {
+            target::TargetColumn::Connections => {
+                self.target_picker.column = target::TargetColumn::Connections;
+            }
+            target::TargetColumn::Databases => {
+                let filter = self.target_filter(cx);
+                let current_conn = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
+                let focus = target::resolved_focus(&self.target_picker, &self.target_choices, &current_conn, &filter);
+                let has_dbs = focus
+                    .as_deref()
+                    .and_then(|id| self.target_choices.iter().find(|c| c.id == id))
+                    .is_some_and(|c| c.connected && !target::filtered_databases(c, &filter).is_empty());
+                if has_dbs {
+                    self.target_picker.column = target::TargetColumn::Databases;
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -2242,6 +2352,7 @@ impl QueryPane {
     /// 选择器里一条连接都没有时的出口：关掉弹层，请外壳打开“新建连接”。
     pub fn new_connection_from_target(&mut self, cx: &mut Context<Self>) {
         self.close_target_picker(cx);
+        self.focus_editor = false;
         let Some(owner) = self.owner.clone() else { return };
         cx.defer(move |cx| {
             if let Some(owner) = owner.upgrade() {
@@ -2264,8 +2375,12 @@ impl QueryPane {
         self.close_target_picker(cx);
     }
 
-    /// 上下方向键：当前连接已打开且有库时在右栏库列表里循环移动；未打开连接时在左栏连接列表里移动。
+    /// 上下方向键：当左栏聚焦时在连接列表移动；当右栏聚焦且当前连接已打开且有库时在库列表里循环移动。
     pub fn step_target_picker(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.target_picker.column == target::TargetColumn::Connections {
+            self.cycle_target_connection(delta < 0, cx);
+            return;
+        }
         let filter = self.target_filter(cx);
         let current_conn = self.desk.target().map(|target| target.connection_id).unwrap_or_default();
         let focus = target::resolved_focus(&self.target_picker, &self.target_choices, &current_conn, &filter);
@@ -2584,6 +2699,7 @@ impl QueryPane {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 if let Some(path) = paths.into_iter().next() {
+                    let opened_path = path.clone();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     runtime().spawn(async move {
                         let loaded = crate::application::run_blocking(move || assist::read_sql_file(&path)).await;
@@ -2591,7 +2707,7 @@ impl QueryPane {
                     });
                     if let Ok(loaded) = rx.await {
                         cx.update(|cx| {
-                            let _ = this.update(cx, |pane, cx| pane.finish_open(loaded, cx));
+                            let _ = this.update(cx, |pane, cx| pane.finish_open(Some(opened_path), loaded, cx));
                         });
                     }
                 }
@@ -2600,7 +2716,7 @@ impl QueryPane {
         .detach();
     }
 
-    fn finish_open(&mut self, loaded: Result<assist::FileLoad, String>, cx: &mut Context<Self>) {
+    fn finish_open(&mut self, path: Option<std::path::PathBuf>, loaded: Result<assist::FileLoad, String>, cx: &mut Context<Self>) {
         match loaded {
             Ok(file) => {
                 if file.execute {
@@ -2618,6 +2734,9 @@ impl QueryPane {
                     cx.notify();
                     return;
                 };
+                if let Some(path) = path {
+                    self.set_tab_file_path(&id, path);
+                }
                 self.desk.replace_draft(&id, &file.sql, &self.services.tasks);
                 self.pending_text = Some(file.sql.clone());
                 if let Some(link) = self.links.get_mut(&id) {
@@ -2632,30 +2751,91 @@ impl QueryPane {
         cx.notify();
     }
 
+    /// 记录指定查询标签关联的本地 SQL 文件路径及目录，供后续 Mod+S 原位保存与默认目录记忆。
+    pub fn set_tab_file_path(&mut self, tab_id: &str, path: std::path::PathBuf) {
+        if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            self.last_save_dir = Some(parent.to_path_buf());
+        }
+        self.file_paths.insert(tab_id.to_owned(), path);
+    }
+
+    pub fn active_file_path(&self) -> Option<&std::path::Path> {
+        self.desk.active_id().and_then(|id| self.file_paths.get(id)).map(std::path::PathBuf::as_path)
+    }
+
+    pub fn last_save_dir(&self) -> Option<&std::path::Path> {
+        self.last_save_dir.as_deref()
+    }
+
+    /// 保存当前 SQL 草稿：已有关联文件时原位写盘，否则弹出保存对话框并默认定位到最近目录或用户文档/工作目录。
+    pub fn save_sql_file(&mut self, cx: &mut Context<Self>) {
+        self.capture(cx);
+        let tab_id = self.desk.active_id().map(str::to_owned);
+        if let Some(path) = tab_id.as_deref().and_then(|id| self.file_paths.get(id)).cloned() {
+            let sql = self.desk.draft();
+            self.write_sql_to_path(tab_id, path, sql, cx);
+            return;
+        }
+        self.prompt_save(cx);
+    }
+
+    fn write_sql_to_path(&mut self, tab_id: Option<String>, path: std::path::PathBuf, sql: String, cx: &mut Context<Self>) {
+        let saved_path = path.clone();
+        let written_sql = sql.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime().spawn(async move {
+            let wrote = crate::application::run_blocking(move || assist::write_sql_file(&path, &sql)).await;
+            let _ = tx.send(wrote);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(wrote) = rx.await {
+                let _ = cx.update(|cx| {
+                    this.update(cx, |pane, cx| {
+                        match wrote {
+                            Ok(()) => {
+                                if let Some(parent) = saved_path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                                    pane.last_save_dir = Some(parent.to_path_buf());
+                                }
+                                if let Some(id) = tab_id {
+                                    pane.file_paths.insert(id.clone(), saved_path);
+                                    pane.pending_saved.push((id.clone(), written_sql.clone()));
+                                    if let Some(owner) = pane.owner.clone() {
+                                        let sql_for_owner = written_sql.clone();
+                                        cx.defer(move |cx| {
+                                            if let Some(owner) = owner.upgrade() {
+                                                owner.update(cx, |view, cx| view.mark_query_saved(&id, sql_for_owner, cx));
+                                            }
+                                        });
+                                    }
+                                }
+                                pane.desk.set_active_note(&i18n::text(pane.locale, "query.fileIo.saved"));
+                            }
+                            Err(error) => {
+                                pane.desk.set_active_note(&error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                });
+            }
+        })
+        .detach();
+    }
+
     fn prompt_save(&mut self, cx: &mut Context<Self>) {
         self.capture(cx);
+        let tab_id = self.desk.active_id().map(str::to_owned);
         let sql = self.desk.draft();
-        let directory = std::env::temp_dir();
+        let directory = default_save_dir(self.last_save_dir.as_deref());
         let name = assist::sql_save_name();
         let receiver = cx.prompt_for_new_path(&directory, Some(&name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = receiver.await {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                runtime().spawn(async move {
-                    let wrote = crate::application::run_blocking(move || assist::write_sql_file(&path, &sql)).await;
-                    let _ = tx.send(wrote);
+                let _ = cx.update(|cx| {
+                    this.update(cx, |pane, cx| {
+                        pane.write_sql_to_path(tab_id, path, sql, cx);
+                    })
                 });
-                if let Ok(wrote) = rx.await {
-                    let _ = cx.update(|cx| {
-                        this.update(cx, |pane, cx| {
-                            pane.desk.set_active_note(&match wrote {
-                                Ok(()) => i18n::text(pane.locale, "query.fileIo.saved"),
-                                Err(error) => error,
-                            });
-                            cx.notify();
-                        })
-                    });
-                }
             }
         })
         .detach();
@@ -2891,6 +3071,26 @@ impl QueryPane {
     }
 
     fn take_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_pane_focus_switch {
+            self.pending_pane_focus_switch = false;
+            if self.result_layout() == ResultLayout::Normal && self.has_result_content() {
+                let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
+                let in_editor = editor.as_ref().is_some_and(|editor| editor.read(cx).is_focused(window, cx));
+                if in_editor {
+                    if !self.plan_raw && self.plan_len > 0 {
+                        window.focus(&self.plan_focus, cx);
+                    } else {
+                        self.grid.update(cx, |grid, cx| {
+                            grid.request_focus();
+                            cx.notify();
+                        });
+                    }
+                } else if let Some(editor) = editor {
+                    editor.update(cx, |editor, cx| editor.focus(window, cx));
+                }
+            }
+            return;
+        }
         if !self.focus_editor {
             return;
         }
@@ -2899,6 +3099,29 @@ impl QueryPane {
         };
         self.focus_editor = false;
         editor.update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    fn ensure_side_column_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side_state = self.side_state();
+        if !side_state.is_open(self.narrow) || side_state.mode != SideMode::Object || self.side_column_filter.is_some() {
+            return;
+        }
+        let placeholder = SharedString::from(i18n::text(self.locale, "query.side.filterColumns"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        cx.subscribe(&state, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.side_column_filter = Some(state);
+    }
+
+    fn side_column_query(&self, cx: &App) -> String {
+        self.side_column_filter
+            .as_ref()
+            .map(|state| state.read(cx).value().to_string().trim().to_lowercase())
+            .unwrap_or_default()
     }
 
     fn queue_object(&mut self, object: &TreeObject) {
@@ -2968,10 +3191,19 @@ impl Render for QueryPane {
         self.drop_stale_format_failure(cx);
         self.sync_grid(cx);
         self.take_focus(window, cx);
+        if let Some(rename) = self.pin_rename.as_mut() {
+            let focused = gpui_kit::Focusable::focus_handle(rename.input.read(cx), cx).is_focused(window);
+            if rename.painted && !focused {
+                self.pin_rename = None;
+            } else {
+                rename.painted = true;
+            }
+        }
         self.ensure_target_search(window, cx);
         let vw = f32::from(window.viewport_size().width);
         self.viewport_width = vw;
         self.narrow = vw < side::NARROW_WIDTH;
+        self.ensure_side_column_filter(window, cx);
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
         let mono = cx.theme().mono_font_family.clone();
@@ -3055,16 +3287,32 @@ impl QueryPane {
             .border_b_1()
             .border_color(p.line)
             .child(run)
-            // 第二个按钮是“运行全部”：没有选区时“运行”已经只跑当前语句，再放一个“执行当前语句”就是重复。
-            .when(!running && !self.narrow, |this| {
+            // 第二个按钮是“运行全部”：执行期间保持占位并禁用，避免工具栏按钮横向跳动。
+            .when(!self.narrow, |this| {
+                let chord = crate::app::keymap::command_chord("run-script").unwrap_or("Mod+Alt+Enter");
                 this.child(
                     kit::secondary_button("query-act-run-script", Some(IconName::ListOrdered), t("query.run.all"), pane_act("run-script", entity))
-                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.run.allTip"), kit::shortcut("Ctrl+Alt+Enter")))),
+                        .disabled(running)
+                        .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.run.allTip"), kit::shortcut(chord)))),
                 )
             })
             .child(kit::vline(p))
-            .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity)))
-            .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity)))
+            .child(
+                kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity))
+                    .tooltip(SharedString::from(format!(
+                        "{} · {}",
+                        i18n::text(locale, "query.editor.menu.format"),
+                        kit::shortcut(crate::app::keymap::command_chord("format").unwrap_or("Mod+Shift+F"))
+                    ))),
+            )
+            .child(
+                kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity))
+                    .tooltip(SharedString::from(format!(
+                        "{} · {}",
+                        i18n::text(locale, "query.editor.menu.plan"),
+                        kit::shortcut(crate::app::keymap::command_chord("explain").unwrap_or("Mod+Shift+E"))
+                    ))),
+            )
             .when(!self.narrow, |this| {
                 this.child(
                     kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
@@ -3082,6 +3330,7 @@ impl QueryPane {
             // 右侧面板开关：命中范围、图标与四态走共享的纯图标动作；面板打开时是选中态。
             .child(
                 kit::icon_button("query-side-toggle", IconName::PanelRight, t("query.side.toggle"), pane_act("toggle-side", entity))
+                    .tooltip(t("query.side.toggle"))
                     .selected(self.side_open()),
             )
             .into_any_element()
@@ -3119,7 +3368,7 @@ impl QueryPane {
                     .item(item("toggle-outline", IconName::ListOrdered, "query.outline.heading", None))
                     .separator()
                     .item(item("open-sql-file", IconName::FolderOpen, "shell.command.openFile", crate::app::keymap::command_chord("open-file")))
-                    .item(item("save-sql-file", IconName::Download, "query.fileIo.save", None))
+                    .item(item("save-sql-file", IconName::Download, "query.fileIo.save", Some("Mod+S")))
             })
             .into_any_element()
     }
@@ -3213,7 +3462,7 @@ impl QueryPane {
                     });
                 }));
             }
-            editor_row = editor_row.child(self.render_side(side_state, cursor_text, p, metrics, mono, entity));
+            editor_row = editor_row.child(self.render_side(cursor_text, p, metrics, mono, entity, cx));
             #[cfg(test)]
             {
                 self.drawn_colors = Some((p.surface, p.chrome));
@@ -3223,7 +3472,8 @@ impl QueryPane {
     }
 
     #[inline(never)]
-    fn render_side(&self, side_state: SideState, cursor_text: Option<(String, usize)>, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
+    fn render_side(&self, cursor_text: Option<(String, usize)>, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, cx: &App) -> AnyElement {
+        let side_state = self.side_state();
         let outline = self.desk.outline();
         let active_statement = cursor_text.as_ref().and_then(|(_, cursor)| {
             outline
@@ -3238,6 +3488,7 @@ impl QueryPane {
             SideMode::Object => side::SideBody::Object(info.as_ref()),
         };
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
+        let column_query = self.side_column_query(cx);
         let panel = side::SidePanel {
             mode: side_state.mode,
             body,
@@ -3248,6 +3499,8 @@ impl QueryPane {
             active_statement,
             mono: mono.clone(),
             engine: &engine,
+            column_filter: self.side_column_filter.as_ref(),
+            column_query: &column_query,
         };
         panel.render(p, entity)
     }
@@ -3495,7 +3748,7 @@ impl QueryPane {
         // 还没执行完的语句没有行数可报：“0 行”会被读成“查询结果为空”。
         let summary = active_result.filter(|result| !(statement_failed(result) && result.columns.is_empty()) && !statement_pending(result)).map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
-                format!("{affected} ✓")
+                format!("{} ✓", crate::app::views::grid::group_digits(affected as i64))
             } else {
                 format!("{} {}", crate::app::views::grid::group_digits(result.rows.len() as i64), i18n::text(locale, "ui.grid.rows"))
             }
@@ -3596,18 +3849,19 @@ impl QueryPane {
             return div().id("query-row-summary").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)).into_any_element();
         }
         let loaded = results[0].rows.len() as i64;
+        let loaded_text = crate::app::views::grid::group_digits(loaded);
         let unit = i18n::text(locale, "ui.grid.rows");
         let identity = self.count_identity();
         let state = self.row_count.as_ref().filter(|(key, _)| Some(key) == identity.as_ref()).map(|(_, state)| state.clone());
         let (label, tip, tone) = match &state {
             Some(RowCount::Done(total)) => (
-                format!("{} / {} {unit}", crate::app::views::grid::group_digits(loaded), crate::app::views::grid::group_digits(*total)),
+                format!("{loaded_text} / {} {unit}", crate::app::views::grid::group_digits(*total)),
                 i18n::text(locale, "query.count.recount"),
                 p.text_muted,
             ),
-            Some(RowCount::Running) => (format!("{loaded}+ {unit}"), i18n::text(locale, "query.count.running"), p.text_faint),
-            Some(RowCount::Failed(message)) => (format!("{loaded}+ {unit}"), format!("{}: {message}", i18n::text(locale, "query.count.failed")), p.danger),
-            None => (format!("{loaded}+ {unit}"), i18n::text(locale, "query.count.hint"), p.text_muted),
+            Some(RowCount::Running) => (format!("{loaded_text}+ {unit}"), i18n::text(locale, "query.count.running"), p.text_faint),
+            Some(RowCount::Failed(message)) => (format!("{loaded_text}+ {unit}"), format!("{}: {message}", i18n::text(locale, "query.count.failed")), p.danger),
+            None => (format!("{loaded_text}+ {unit}"), i18n::text(locale, "query.count.hint"), p.text_muted),
         };
         let running = matches!(state, Some(RowCount::Running));
         let click = entity.clone();
@@ -3898,9 +4152,20 @@ fn pinned_tab(
     };
     let mut tab = tabs::tab(TabSpec::new(format!("query-pinned-{pin_id}"), IconName::Bookmark, title).active(selected), p);
     if let Some(input) = renaming {
+        let cancel = entity.clone();
         tab = tab.child(
             div()
                 .w(px(148.))
+                .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform
+                    {
+                        cx.stop_propagation();
+                        cancel.update(cx, |pane, cx| pane.cancel_pin_rename(cx));
+                    }
+                })
                 .child(kit::text_input(SharedString::from(format!("query-pinned-rename-{pin_id}")), input, SharedString::from(i18n::text(locale, "query.results.rename"))).small()),
         );
     }
@@ -7087,5 +7352,407 @@ mod tests {
         assert_eq!(plan_view::step(9, 3, "up"), Some(1), "旧选中越界时按末节点起步");
         assert_eq!(plan_view::step(1, 3, "end"), Some(2));
         assert_eq!(plan_view::step(2, 3, "home"), Some(0));
+    }
+
+    #[gpui_kit::test]
+    fn r4_toolbar_keeps_run_script_placeholder_while_running(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1; select 2;")), Some("q"), Locale::ZhCn, window, cx);
+                let _ = pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-act-request-cancel").is_some(), "执行中主按钮切为停止");
+            let run_all = window.try_find("query-act-run-script").expect("执行期间运行全部仍应保留占位不跳动");
+            assert_eq!(run_all.disabled(), Some(true), "执行期间运行全部应为禁用态");
+            assert!(window.try_find("query-act-format").is_some());
+            assert!(window.try_find("query-act-explain").is_some());
+            assert!(window.try_find("query-side-toggle").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn r4_sql_save_remembers_path_and_preserves_draft_on_error(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-r4-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("saved.sql");
+        assert_eq!(default_save_dir(Some(&dir)), dir, "记住上次保存目录");
+        assert_ne!(default_save_dir(None), std::env::temp_dir(), "首次保存默认目录不应硬编码临时目录");
+
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT 42;")), Some("q"), Locale::ZhCn, window, cx);
+                pane.set_tab_file_path("q", file.clone());
+                pane.save_sql_file(cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 等待后台写盘线程完成。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cx.run_until_parked();
+        }
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "SELECT 42;");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.active_file_path(), Some(file.as_path()));
+            assert_eq!(pane.last_save_dir(), Some(dir.as_path()));
+            assert_eq!(pane.desk.active_note(), i18n::text(Locale::ZhCn, "query.fileIo.saved"));
+        });
+
+        // 写入目录路径失败时保留草稿并展示错误提示。
+        let bad_file = dir.clone();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.set_tab_file_path("q", bad_file.clone());
+                pane.save_sql_file(cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while cx.update(|cx| pane.read(cx).desk.active_note() == i18n::text(Locale::ZhCn, "query.fileIo.saved"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cx.run_until_parked();
+        }
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.desk.draft(), "SELECT 42;", "保存失败应保留草稿");
+            assert!(!pane.desk.active_note().is_empty());
+            assert_ne!(pane.desk.active_note(), i18n::text(Locale::ZhCn, "query.fileIo.saved"));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn r4_target_picker_aligns_switches_columns_and_restores_editor_focus(cx: &mut TestAppContext) {
+        let bounds = gpui_kit::Bounds {
+            origin: gpui_kit::point(px(200.), px(10.)),
+            size: gpui_kit::size(px(180.), px(28.)),
+        };
+        assert_eq!(target::anchor_for(Some(bounds)), gpui_kit::point(px(380.), px(38.)), "锚点贴齐按钮右下边界");
+
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.target_choices = vec![
+                    target::TargetChoice {
+                        id: "pg".into(),
+                        name: "Postgres".into(),
+                        engine: "postgres".into(),
+                        connected: true,
+                        databases: vec!["app".into(), "analytics".into()],
+                    },
+                    target::TargetChoice {
+                        id: "my".into(),
+                        name: "MySQL".into(),
+                        engine: "mysql".into(),
+                        connected: true,
+                        databases: vec!["shop".into(), "logs".into()],
+                    },
+                ];
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.open_target_picker(cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-target-popover").is_some());
+            assert_eq!(pane.read(cx).target_picker.column, target::TargetColumn::Databases);
+
+            // 左键切到连接栏，下键切换连接；右键切回数据库栏，下键切换数据库。
+            window.press("left", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).target_picker.column, target::TargetColumn::Connections);
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).target_picker.focus.as_deref(), Some("my"));
+
+            window.press("right", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).target_picker.column, target::TargetColumn::Databases);
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).target_picker.db_index, 1);
+
+            // Esc 关闭弹层后，焦点自动回到 SQL 编辑器。
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-target-popover").is_none());
+            let editor = pane.read(cx).editors.get("q").cloned().expect("editor");
+            assert!(editor.read(cx).is_focused(window, cx), "关闭目标选择器后焦点应回到编辑器");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn r4_f6_switches_focus_between_editor_and_results(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.request_focus();
+            });
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().expect("editor");
+            assert!(editor.read(cx).is_focused(window, cx));
+
+            // 无结果时 F6 安全忽略，焦点留在编辑器。
+            pane.update(cx, |pane, cx| pane.command("switch-pane-focus", cx));
+            window.render_frame(cx);
+            assert!(editor.read(cx).is_focused(window, cx), "无结果时切换焦点应安全忽略");
+
+            // 有结果时 F6 在编辑器与结果网格间来回切换。
+            pane.update(cx, |pane, _| {
+                pane.desk.plant_run(vec![result("select 1", "ok", &["id"], &["1"], None, "")]);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("switch-pane-focus", cx));
+            window.render_frame(cx);
+            let grid_handle = pane.read(cx).grid.read(cx).focus_handle();
+            assert!(grid_handle.is_focused(window), "F6 应把焦点切到结果网格");
+
+            pane.update(cx, |pane, cx| pane.command("switch-pane-focus", cx));
+            window.render_frame(cx);
+            assert!(editor.read(cx).is_focused(window, cx), "再按 F6 焦点应切回编辑器");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn r5_narrow_overlay_side_panel_closes_on_backdrop_and_esc(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 680., 640.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(pane.read(cx).narrow, "680px 为窄屏");
+            assert!(window.try_find("query-side-overlay").is_none(), "窄屏默认收起右侧面板");
+
+            pane.update(cx, |pane, cx| pane.command("toggle-side", cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_some(), "窄屏打开后以浮层遮罩呈现");
+            assert!(window.try_find("query-side-backdrop").is_some());
+
+            // 按 Esc 关闭浮层。
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_none(), "Esc 应关闭窄屏浮层侧栏");
+
+            // 再次打开后点击外部遮罩关闭。
+            pane.update(cx, |pane, cx| pane.command("toggle-side", cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-backdrop").is_some());
+            window.click("query-side-backdrop", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_none(), "点击外部遮罩应关闭窄屏浮层侧栏");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn r5_object_inspector_filters_columns(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_customers();
+                pane.desk.remember_table_columns(
+                    "notes",
+                    "main",
+                    "",
+                    "customers",
+                    vec![
+                        assist::ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new(), primary: true, foreign_key: false },
+                        assist::ColumnMeta { name: "name".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "客户名称".to_owned(), primary: false, foreign_key: false },
+                    ],
+                );
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select * from customers")), Some("q"), Locale::ZhCn, window, cx);
+                pane.command("side-mode:object", cx);
+                if let Some(editor) = pane.editors.get("q").cloned() {
+                    editor.update(cx, |editor, cx| editor.select_range(14..23, cx));
+                }
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-column-0").is_some());
+            assert!(window.try_find("query-side-column-1").is_some());
+
+            let filter = pane.read(cx).side_column_filter.clone().expect("column filter input");
+            filter.update(cx, |input, cx| input.set_value("name", window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-column-0").is_none(), "id 列应被过滤掉");
+            assert!(window.try_find("query-side-column-1").is_some(), "name 列应匹配显示");
+
+            filter.update(cx, |input, cx| input.set_value("no_such_col", window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-columns-empty").is_some(), "无匹配列时展示空态提示");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn r5_pin_rename_cancels_on_esc_and_exits_on_blur(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("select 1", "ok", &["id"], &["1"], None, "")]);
+                let _ = pane.desk.pin_current();
+                let _ = pane.desk.rename_pin(1, "原始名称");
+                pane.begin_pin_rename(1, window, cx);
+            });
+            window.render_frame(cx);
+            let input = pane.read(cx).pin_rename.as_ref().expect("renaming").input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("临时改动", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.pinned()[0].custom_title.as_deref(), Some("临时改动"));
+
+            // Esc 取消并还原原始名称。
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).pin_rename.is_none(), "Esc 应退出重命名");
+            assert_eq!(pane.read(cx).desk.pinned()[0].custom_title.as_deref(), Some("原始名称"), "Esc 应还原原名");
+
+            // 再次进入重命名，修改后失焦退出并保留新名称。
+            pane.update(cx, |pane, cx| pane.begin_pin_rename(1, window, cx));
+            window.render_frame(cx);
+            let input = pane.read(cx).pin_rename.as_ref().expect("renaming").input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("失焦保存名", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            let input_handle = gpui_kit::Focusable::focus_handle(pane.read(cx).pin_rename.as_ref().expect("renaming").input.read(cx), cx);
+            assert!(input_handle.is_focused(window), "重命名输入框应持有焦点");
+            let editor = pane.read(cx).editors.get("q").cloned().expect("editor");
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(pane.read(cx).pin_rename.is_none(), "失焦后应退出重命名输入框");
+            assert_eq!(pane.read(cx).desk.pinned()[0].custom_title.as_deref(), Some("失焦保存名"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn r5_log_uses_thousands_separators_accurate_roles_and_copy_buttons(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            let mut failed_stmt = result("SELECT * FROM orders", "error", &[], &[], None, "syntax error near FROM");
+            failed_stmt.rewrite = Some(AutoRewrite { kind: "limit".to_owned(), at: 20, replaced: 0, added: " LIMIT 100".to_owned() });
+            failed_stmt.sent_sql = Some("SELECT * FROM orders LIMIT 100".to_owned());
+            let mut big_ok = result("UPDATE orders SET a = 1", "ok", &[], &[], Some(1250), "");
+            big_ok.rows = Vec::new();
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM orders")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![failed_stmt, big_ok]);
+                pane.command("query-view:messages", cx);
+            });
+            window.render_frame(cx);
+            // 可点击语句行是 Button。
+            assert_eq!(window.find("query-log-0").role(), Some(gpui_kit::Role::Button));
+            let row1 = window.find("query-log-1");
+            let label1 = row1.label().unwrap_or_default();
+            assert!(label1.contains("1,250"), "消息日志行数应使用千分位: {label1}");
+
+            // 点击复制错误消息与实际执行 SQL 按钮。
+            assert!(window.try_find("query-log-copy-sql-0").is_some());
+            assert!(window.try_find("query-log-copy-msg-0").is_some());
+            assert!(window.try_find("query-log-copy-sent-0").is_some());
+            window.click("query-log-copy-msg-0", cx);
+            assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("syntax error near FROM".to_owned()));
+            window.click("query-log-copy-sent-0", cx);
+            assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("SELECT * FROM orders LIMIT 100".to_owned()));
+        })
+        .unwrap();
+
+        // 不可点击日志条目（statement == None）不应标 Role::Button，且千分位对 rows 生效。
+        let whole_run = desk::LogEntry {
+            statement: None,
+            sql: String::new(),
+            sent_sql: None,
+            rewrite: None,
+            status: "cancelled".into(),
+            rows: Some(2500),
+            affected: None,
+            elapsed_ms: Some(12),
+            message: "cancelled".into(),
+        };
+        assert!(log::entry_text(Locale::En, &whole_run).contains("2,500 rows"));
+    }
+
+    #[test]
+    fn r5_plan_cost_share_is_unified_and_safe_for_non_positive_totals() {
+        assert_eq!(plan_view::cost_share(Some(25.0), Some(100.0)), Some(0.25));
+        assert_eq!(plan_view::cost_share(Some(150.0), Some(100.0)), Some(1.0));
+        assert_eq!(plan_view::cost_share(Some(10.0), Some(0.0)), None);
+        assert_eq!(plan_view::cost_share(Some(10.0), Some(-5.0)), None);
+        assert_eq!(plan_view::cost_share(None, Some(100.0)), None);
+        assert_eq!(plan_view::cost_share(Some(10.0), None), None);
+    }
+
+    #[gpui_kit::test]
+    fn r5_intercept_keystrokes_respects_context_active_and_shell_overlay_and_prunes_file_paths(cx: &mut TestAppContext) {
+        let (window, pane) = open_sized(cx, 680., 640.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.set_tab_file_path("q", std::path::PathBuf::from("/tmp/example.sql"));
+                pane.command("toggle-side", cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_some());
+
+            // 外壳前景浮层（如命令面板）打开时，QueryPane 不能吞掉 Esc。
+            crate::ui::ShellOverlayOpen::set(window, true, cx);
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-overlay").is_some(), "外壳浮层打开时 QueryPane 不应拦截 Esc");
+            crate::ui::ShellOverlayOpen::set(window, false, cx);
+
+            // 切到其它非查询标签（context_active == false）时，QueryPane 不能吞掉 Esc。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, false, cx);
+            });
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).side_open(), "查询页非激活时不应拦截 Esc");
+
+            // 恢复激活且无外壳浮层时，Esc 正常关闭窄屏侧栏浮层。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, true, cx);
+            });
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).side_open(), "查询页激活且无外壳浮层时 Esc 应关闭窄屏侧栏");
+
+            // 关闭标签后 prepare 应清理该标签的 file_paths 记录。
+            assert_eq!(pane.read(cx).file_paths.len(), 1);
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(&[], None, Locale::ZhCn, false, cx);
+            });
+            assert!(pane.read(cx).file_paths.is_empty(), "关闭标签后应清理 file_paths");
+        })
+        .unwrap();
     }
 }

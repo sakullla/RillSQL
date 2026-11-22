@@ -8201,7 +8201,7 @@ dependencies = [
 
 [[package]]
 name = "rillsql"
-version = "0.3.1"
+version = "0.4.2"
 dependencies = [
  "argon2 0.5.3",
  "async-trait",
@@ -8226,6 +8226,7 @@ dependencies = [
  "mongodb",
  "mysql_async",
  "redis",
+ "roxmltree 0.21.2",
  "russh",
  "rust_xlsxwriter",
  "rustls 0.23.45",

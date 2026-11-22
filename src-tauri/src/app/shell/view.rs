@@ -75,6 +75,8 @@ pub struct Workbench {
     pub(super) overview_focus: FocusHandle,
     /// 就地重命名的输入框已拿到焦点（只在打开时聚焦一次）。
     pub(super) tab_rename_focused: bool,
+    /// 通过快捷键请求聚焦对象树搜索框；渲染对象树时消费一次。
+    pub(super) focus_explorer_filter: bool,
     /// 重命名输入框失焦即确认（点到编辑器或别的区域时不让输入框一直挂在标签栏上）。
     pub(super) tab_rename_blur: Option<gpui_kit::Subscription>,
     /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
@@ -275,6 +277,7 @@ impl Workbench {
         let struct_nav_owner = cx.entity().downgrade();
         let structure = cx.new(|_| {
             let mut pane = StructurePane::new(Arc::clone(&services));
+            pane.set_shell_overlay_host(true);
             pane.set_data_sink(Arc::new(move |cx: &mut App| {
                 if let Some(owner) = data_owner.upgrade() {
                     owner.update(cx, |view, cx| view.perform("switch-to-data", cx));
@@ -333,6 +336,7 @@ impl Workbench {
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
         let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
+        super::chrome::bind_palette_keys(cx);
         let palette_owner = cx.entity().downgrade();
         let child_subscriptions = vec![
             cx.observe(&query, |_, _, cx| cx.notify()),
@@ -434,6 +438,7 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             overview_focus: cx.focus_handle(),
             tab_rename_focused: false,
+            focus_explorer_filter: false,
             tab_rename_blur: None,
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
@@ -562,6 +567,9 @@ impl Workbench {
     }
 
     fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id == "explorer-search" {
+            self.focus_explorer_filter = true;
+        }
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
             let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
@@ -632,6 +640,13 @@ impl Workbench {
                 cx.quit();
             }
             cx.notify();
+            return;
+        }
+        if matches!(id, "conn-import-dbeaver" | "conn-import-navicat") {
+            if self.model.close_prompt.is_none() && matches!(self.model.profile_import, super::conn_import::ImportState::Idle) {
+                use super::conn_import::ProfileFormat;
+                self.prompt_profile_import(if id == "conn-import-navicat" { ProfileFormat::Navicat } else { ProfileFormat::DBeaver }, cx);
+            }
             return;
         }
         if id == "conn-import" || id == "conn-export" {
@@ -857,6 +872,21 @@ impl Workbench {
                 self.diagram.update(cx, |pane, _| pane.set_locale(locale));
                 self.ensure_diagram(cx);
             }
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        if id == "commit"
+            && self.model.shell.page == AppPage::Workspace
+            && self.model.tool == WorkTool::Query
+            && !self.query.read(cx).grid_uncommitted(cx)
+        {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            self.forward_query("save-sql-file", cx);
             self.persist_if_needed(cx);
             cx.notify();
             return;
@@ -1196,6 +1226,18 @@ impl Workbench {
                 tab.last_executed_sql = Some(sql);
             }
         }
+        for (id, sql) in effect.saved {
+            if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.saved_sql = Some(sql);
+            }
+        }
+    }
+
+    pub(crate) fn mark_query_saved(&mut self, tab_id: &str, sql: String, cx: &mut Context<Self>) {
+        if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.saved_sql = Some(sql);
+            cx.notify();
+        }
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
@@ -1221,6 +1263,8 @@ impl Workbench {
         }
         let table_dirty = self.table.read(cx).uncommitted();
         let query_dirty = self.query.read(cx).grid_uncommitted(cx);
+        let structure_dirty = self.structure.read(cx).pending_changes() > 0;
+        let structure_target = self.structure.read(cx).session.target.clone();
         self.model.grid_dirty = table_dirty || query_dirty;
         self.model.grid_writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
         let active = self.model.active_tab.clone();
@@ -1240,6 +1284,19 @@ impl Workbench {
                         }
                     } else {
                         tab.uncommitted_cells = false;
+                    }
+                }
+                WorkItemKind::Structure => {
+                    let matches_active = active.as_deref() == Some(tab.id.as_str()) && self.model.tool == WorkTool::Structure;
+                    let matches_spec = !structure_target.connection_id.is_empty()
+                        && tab.spec.as_deref().and_then(parse_target).is_some_and(|t| {
+                            t.connection_id == structure_target.connection_id
+                                && t.database == structure_target.database
+                                && t.schema == structure_target.schema
+                                && t.table == structure_target.table
+                        });
+                    if matches_active || matches_spec {
+                        tab.structure_dirty = structure_dirty;
                     }
                 }
                 _ => {}
@@ -2687,6 +2744,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
+            PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
         let token = if owner == "connections" {
@@ -2713,6 +2771,9 @@ impl Workbench {
                     view.update(cx, |this, cx| {
                         if let Ok(done) = done {
                             apply_done(&mut this.model, &this.services, owner, done);
+                            if owner == "profile-import" {
+                                this.pump_jobs(cx);
+                            }
                         }
                         this.model.finish_job();
                         this.persist_if_needed(cx);
@@ -2819,6 +2880,38 @@ impl Workbench {
             .map(|path| path.to_path_buf())
             .filter(|path| path.is_dir())
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn prompt_profile_import(&mut self, format: super::conn_import::ProfileFormat, cx: &mut Context<Self>) {
+        use super::conn_import::ImportState;
+        self.model.profile_import = ImportState::Picking;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.t(format.entry())),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                view.model.queue_profile_preview(format, path);
+                                view.pump_jobs(cx);
+                            } else {
+                                view.model.profile_import = ImportState::Idle;
+                            }
+                        }
+                        Ok(Err(error)) => view.model.profile_import = ImportState::Error(error.to_string()),
+                        _ => view.model.profile_import = ImportState::Idle,
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn prompt_import(&mut self, cx: &mut Context<Self>) {
@@ -3203,6 +3296,9 @@ impl Workbench {
                             Ok(file) => {
                                 view.model.shell.note_opened(path.clone());
                                 view.model.open_sql_file(&path, file.sql);
+                                if let Some(tab_id) = view.model.active_tab.clone() {
+                                    view.query.update(cx, |pane, _| pane.set_tab_file_path(&tab_id, path.clone()));
+                                }
                                 view.query.update(cx, |pane, _| pane.request_focus());
                             }
                             Err(error) => {
@@ -3612,6 +3708,8 @@ fn query_command(id: &str) -> bool {
             | "expand-star"
             | "toggle-outline"
             | "toggle-side"
+            | "close-side"
+            | "switch-pane-focus"
             | "pin-result"
             | "refresh-tree"
             | "confirm-variables"
