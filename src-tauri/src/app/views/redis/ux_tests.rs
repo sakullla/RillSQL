@@ -722,6 +722,172 @@ fn info_page_is_one_filterable_table(cx: &mut gpui_kit::TestAppContext) {
     assert_eq!(rows(cx), 3, "所有分组的指标都在同一张表里");
     cx.update(|cx| view.update(cx, |pane, _| pane.info_query = "memory".into()));
     assert_eq!(rows(cx), 1, "按分组 / 指标 / 值过滤");
+    // 点击分组筛选芯片，只看 Server 分组。
+    cx.update(|cx| view.update(cx, |pane, cx| {
+        pane.info_query.clear();
+        pane.command("redis-info-section:Server", cx);
+    }));
+    assert_eq!(rows(cx), 2, "按分组芯片过滤只保留 Server 分组");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 过期值冲突提示条给出「重试读取」按钮；Escape 能逐层关闭类型下拉、键空间设置与批量 TTL 条。
+#[gpui_kit::test]
+fn stale_value_banner_shows_refresh_action_and_escape_dismisses_all_popovers(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.plant_key("user:1");
+        pane.stale_value = true;
+        pane.error_source = ErrorSource::Command;
+        pane.error = pane.text("redis.value.stale");
+    });
+    let has_refresh = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("redis-stale-refresh").is_some()
+        })
+        .unwrap();
+    assert!(has_refresh, "值已被修改的错误条必须带「重试读取」入口");
+
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            let esc = gpui_kit::KeyDownEvent {
+                keystroke: gpui_kit::Keystroke::parse("escape").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            pane.type_picker_open = true;
+            pane.key_down(&esc, cx);
+            assert!(!pane.type_picker_open, "Escape 应关闭类型下拉");
+
+            pane.prefs_open = true;
+            pane.key_down(&esc, cx);
+            assert!(!pane.prefs_open, "Escape 应关闭键空间设置");
+
+            pane.batch_ttl_for = Some("order:*".into());
+            pane.key_down(&esc, cx);
+            assert!(pane.batch_ttl_for.is_none(), "Escape 应关闭批量 TTL 条");
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 模板展开超过抽样上限时显示截断提示行；树模式支持全部展开与全部折叠。
+#[gpui_kit::test]
+fn template_truncation_row_and_tree_expand_collapse_all(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        let mut keys: Vec<_> = (0..120).map(|i| key(&format!("order:{i}"), "hash")).collect();
+        keys.push(key("app:prod:cache:v1", "string"));
+        pane.set_keys(keys);
+        pane.done = true;
+        pane.view_mode = ViewMode::Template;
+        pane.open_templates.insert("order:*".into());
+    });
+    let has_more = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |pane, _| pane.key_rows().iter().any(|row| matches!(row, KeyRow::TemplateMore { shown: 100, total: 120, .. })))
+        })
+        .unwrap();
+    assert!(has_more, "超过 100 条成员时应给出截断提示行，引导服务端按模板扫描");
+
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.command("redis-view-tree", cx);
+            pane.command("redis-tree-expand-all", cx);
+            assert!(pane.expanded.contains("app:prod:cache"), "全部展开应展开多层命名空间");
+            pane.command("redis-tree-collapse-all", cx);
+            assert!(pane.expanded.is_empty(), "全部折叠应清空展开集合");
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 控制台空态提供快捷只读命令；历史条目可一键回填到输入框。
+#[gpui_kit::test]
+fn console_empty_quick_commands_and_rerun_fill_input(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.page = Page::Console;
+    });
+    let has_quick = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("redis-console-quick:PING").is_some()
+        })
+        .unwrap();
+    assert!(has_quick, "控制台空态应展示常用只读快捷命令");
+
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.console_log.push_back(ConsoleEntry {
+                db: "0".into(),
+                line: "HGETALL user:42".into(),
+                output: "1) name\n2) ada".into(),
+                ok: true,
+                elapsed: None,
+            });
+            pane.command("redis-console-rerun:0", cx);
+            assert_eq!(pane.command_input(), "HGETALL user:42", "回填按钮应把历史命令填入输入框");
+        });
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 客户端页按关键词过滤后仍精准命中真实客户端 ID；Pub/Sub 消息支持点击频道回填与复制消息体。
+#[gpui_kit::test]
+fn clients_filter_maps_kill_index_and_pubsub_supports_channel_reply(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.page = Page::Clients;
+        pane.diag.clients_loaded = true;
+        pane.diag.clients = vec![
+            crate::adapters::redis::diag::ClientInfo {
+                id: "10".into(),
+                addr: "10.0.0.1:5000".into(),
+                name: "worker-a".into(),
+                age: "120".into(),
+                idle: "5".into(),
+                db: "0".into(),
+                cmd: "get".into(),
+                flags: "N".into(),
+                node: String::new(),
+            },
+            crate::adapters::redis::diag::ClientInfo {
+                id: "20".into(),
+                addr: "10.0.0.2:6000".into(),
+                name: "billing-svc".into(),
+                age: "3600".into(),
+                idle: "10".into(),
+                db: "1".into(),
+                cmd: "hgetall".into(),
+                flags: "N".into(),
+                node: String::new(),
+            },
+        ];
+        pane.diag.clients_query = "billing".into();
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| view.update(cx, |pane, cx| pane.select_table_row("clients", 0, cx)));
+    let kill_id = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("redis-client-kill:1").is_some()
+        })
+        .unwrap();
+    assert!(kill_id, "过滤后选中第 0 行应映射到真实客户端索引 1（id=20）");
+
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.page = Page::PubSub;
+            pane.diag.messages.push_front(ReceivedMessage {
+                channel: "orders.created".into(),
+                payload: "{\"id\":99}".into(),
+                at: "14:00:00".into(),
+            });
+            pane.command("redis-pubsub-fill-channel:0", cx);
+            assert_eq!(pane.diag.pub_channel, "orders.created", "点击消息频道应回填发布频道");
+            pane.command("redis-pubsub-copy:0", cx);
+            assert_eq!(pane.copied(), "{\"id\":99}", "复制按钮应复制完整消息体");
+        });
+    });
     let _ = std::fs::remove_dir_all(dir);
 }
 

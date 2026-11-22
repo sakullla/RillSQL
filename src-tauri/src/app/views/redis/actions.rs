@@ -97,7 +97,7 @@ impl RedisPane {
             }
         } else if id == "redis-client-kill-none" {
             self.diag.error = self.text("redis.clients.pickFirst");
-        } else if id == "redis-big-start" {
+        } else if id == "redis-big-start" || id == "redis-big-start-empty" {
             self.start_big_keys(cx);
         } else if id == "redis-big-cancel" {
             if let Some(cancel) = &self.diag.big_cancel {
@@ -117,6 +117,17 @@ impl RedisPane {
             self.stop_subscribe();
         } else if id == "redis-sub-clear" {
             self.diag.messages.clear();
+        } else if let Some(index) = id.strip_prefix("redis-pubsub-copy:") {
+            if let Some(payload) = index.parse::<usize>().ok().and_then(|ix| self.diag.messages.get(ix)).map(|msg| msg.payload.clone()) {
+                self.copy_text(payload, "redis.copied.value", cx);
+            }
+        } else if let Some(index) = id.strip_prefix("redis-pubsub-fill-channel:") {
+            if let Some(channel) = index.parse::<usize>().ok().and_then(|ix| self.diag.messages.get(ix)).map(|msg| msg.channel.clone()) {
+                self.diag.pub_channel = channel;
+                self.focus_request = Some(Field::PubMessage);
+            }
+        } else if let Some(section) = id.strip_prefix("redis-info-section:") {
+            self.diag.info_section = if section == "*" { String::new() } else { section.to_owned() };
         } else if id == "redis-pub-send" {
             self.ask_publish(cx);
         } else {
@@ -355,7 +366,8 @@ impl RedisPane {
                     match event {
                         Ok(message) if message.channel.is_empty() => pane.diag.sub_ready = true,
                         Ok(message) => {
-                            pane.diag.messages.push_front(message);
+                            let at = chrono::Local::now().format("%H:%M:%S").to_string();
+                            pane.diag.messages.push_front(ReceivedMessage { channel: message.channel, payload: message.payload, at });
                             pane.diag.messages.truncate(PUBSUB_KEEP);
                         }
                         Err(message) => {
@@ -401,6 +413,7 @@ impl RedisPane {
             |pane, result, _| match result {
                 Ok(receivers) => {
                     pane.note = i18n::fill(&pane.text("redis.pubsub.published"), &[("n", &receivers.to_string())]);
+                    pane.diag.pub_message.clear();
                     pane.diag.error.clear();
                 }
                 Err(message) => pane.diag.error = message,

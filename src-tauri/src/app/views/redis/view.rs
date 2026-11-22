@@ -387,7 +387,7 @@ impl Render for RedisPane {
 }
 
 impl RedisPane {
-    fn key_down(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
+    pub(super) fn key_down(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
         let key = match event.keystroke.key.as_str() {
             "arrowup" => "up",
             "arrowdown" => "down",
@@ -395,10 +395,11 @@ impl RedisPane {
         };
         if key == "escape" {
             // 由近及远逐层收起：浮层 → 确认 → 对话框 → 表单 → 编辑条。
-            let handled = if self.context_menu.is_some() || self.complete_open || self.db_picker_open {
+            let handled = if self.context_menu.is_some() || self.complete_open || self.db_picker_open || self.type_picker_open {
                 self.context_menu = None;
                 self.complete_open = false;
                 self.db_picker_open = false;
+                self.type_picker_open = false;
                 true
             } else if self.confirm.is_some() {
                 self.command("redis-cancel", cx);
@@ -409,9 +410,11 @@ impl RedisPane {
             } else if self.entry_form_open {
                 self.command("redis-entry-form-close", cx);
                 true
-            } else if self.ttl_open || self.rename_open {
+            } else if self.ttl_open || self.rename_open || self.prefs_open || self.batch_ttl_for.is_some() {
                 self.ttl_open = false;
                 self.rename_open = false;
+                self.prefs_open = false;
+                self.batch_ttl_for = None;
                 true
             } else {
                 false
@@ -469,7 +472,9 @@ impl RedisPane {
         let side_w = if narrow { viewport_w } else { self.sidebar_w.clamp(SIDEBAR_MIN_W, max_side) };
         let pad = m.pane_pad();
 
-        // 第一行：搜索框 + 图标按钮（不折行）。
+        // 第一行：搜索框 + 图标按钮（不折行）。模式改动但未执行 SCAN 时高亮过滤按钮提示回车/点击执行。
+        let pattern_dirty = self.pattern.trim() != self.scanned_pattern;
+        let filter_btn = icon_btn("redis-filter", IconName::CornerDownLeft, &self.text("redis.tab.filter"), entity).selected(pattern_dirty);
         let search = div()
             .id("redis-tools-search")
             .test_support()
@@ -485,7 +490,7 @@ impl RedisPane {
                         .prefix(kit::input_prefix(IconName::Search, IconSize::INLINE, p.text_faint)),
                 ),
             )
-            .child(icon_btn("redis-filter", IconName::CornerDownLeft, &self.text("redis.tab.filter"), entity))
+            .child(filter_btn)
             .child(icon_btn("redis-new-key", IconName::Plus, &self.text("redis.action.newKey"), entity).primary());
         let prefs = if self.prefs_open { Some(self.render_prefs_panel(p, entity, window, cx)) } else { None };
         let batch_ttl = if self.batch_ttl_for.is_some() { Some(self.render_batch_ttl_bar(p, entity, window, cx)) } else { None };
@@ -842,6 +847,7 @@ impl RedisPane {
                     ),
                 )
             });
+        let has_active_filter = filtered || !self.scanned_pattern.is_empty();
         div()
             .id("redis-tools-types")
             .test_support()
@@ -850,6 +856,9 @@ impl RedisPane {
             .items_center()
             .gap(px(Space::XXS))
             .child(picker)
+            .when(has_active_filter, |this| {
+                this.child(icon_btn("redis-clear-filter", IconName::X, &self.text("redis.noMatch.clear"), entity).xsmall())
+            })
             .child(div().flex_1())
             .child(self.render_view_toggle(p, entity))
             .child(div().flex_none().w(px(DIVIDER_W)).h(px(IconSize::INLINE)).mx(px(Space::XXS)).bg(p.line))
@@ -1021,7 +1030,7 @@ impl RedisPane {
         .into_any_element()
     }
 
-    /// 键列表的键盘：回车在新标签中固定打开选中的键；上下方向键在可见行里移动选中。
+    /// 键列表的键盘：回车在新标签中固定打开选中的键；上下 / Home / End 移动选中并滚入视口；Delete 删除选中键。
     pub(super) fn key_list_key(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.modified() {
@@ -1032,20 +1041,32 @@ impl RedisPane {
                 cx.stop_propagation();
                 self.command("redis-open-tab", cx);
             }
-            "up" | "down" => {
+            "delete" | "backspace" if !self.selected.is_empty() && self.confirm.is_none() => {
+                cx.stop_propagation();
+                self.command("redis-delete", cx);
+            }
+            "up" | "down" | "home" | "end" => {
                 let rows = self.key_rows();
-                let keys: Vec<usize> = rows.iter().filter_map(|row| if let KeyRow::Key { index, .. } = row { Some(*index) } else { None }).collect();
+                let keys: Vec<(usize, usize)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_ix, row)| if let KeyRow::Key { index, .. } = row { Some((row_ix, *index)) } else { None })
+                    .collect();
                 if keys.is_empty() {
                     return;
                 }
-                let at = keys.iter().position(|index| self.keys.get(*index).is_some_and(|k| k.name == self.selected));
+                let at = keys.iter().position(|(_, index)| self.keys.get(*index).is_some_and(|k| k.name == self.selected));
                 let next = match (at, key) {
+                    (_, "home") => 0,
+                    (_, "end") => keys.len() - 1,
                     (None, _) => 0,
                     (Some(at), "up") => at.saturating_sub(1),
                     (Some(at), _) => (at + 1).min(keys.len() - 1),
                 };
+                let (row_ix, key_ix) = keys[next];
+                self.key_scroll.scroll_to_item(row_ix, gpui_kit::ScrollStrategy::Nearest);
                 cx.stop_propagation();
-                self.command(&format!("redis-select:{}", keys[next]), cx);
+                self.command(&format!("redis-select:{key_ix}"), cx);
             }
             _ => {}
         }
@@ -1128,13 +1149,24 @@ impl RedisPane {
                     .hover(|style| style.bg(p.hover))
                     .child(kit::icon(if *open { IconName::ChevronDown } else { IconName::ChevronRight }, IconSize::INLINE, p.text_faint))
                     .child(type_dot(&dominant, &p))
-                    .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(template.clone())))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(SharedString::from(template.clone())),
+                    )
                     .when_some(memory, |this, memory| {
                         this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(memory)))
                     })
                     .child(
                         div()
                             .flex_none()
+                            .px(px(Space::XS))
+                            .rounded(px(Radius::TAG))
+                            .bg(p.sunken)
                             .text_size(px(TypeScale::XS))
                             .font_features(kit::tabular_figures())
                             .text_color(p.text_muted)
@@ -1146,6 +1178,29 @@ impl RedisPane {
                         let pos = event.position;
                         menu_entity.update(cx, |pane, cx| pane.open_template_context_menu(template, pos, cx));
                     })
+                    .on_click(cmd_click(entity, id))
+                    .into_any_element()
+            }
+            KeyRow::TemplateMore { template, shown, total } => {
+                let id = format!("redis-tpl-filter:{template}");
+                let label = i18n::fill(&self.text("redis.tpl.more"), &[("shown", &shown.to_string()), ("total", &total.to_string())]);
+                kit::interactive_states(div().id(SharedString::from(format!("redis-tpl-more:{template}"))), &p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(label.clone()))
+                    .w_full()
+                    .h(px(row_h))
+                    .pl(px(indent(1)))
+                    .pr(px(KEY_ROW_PR))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.accent_text)
+                    .hover(|style| style.bg(p.hover))
+                    .child(kit::icon(IconName::ListFilter, IconSize::INLINE, p.accent_text))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(label)))
                     .on_click(cmd_click(entity, id))
                     .into_any_element()
             }
@@ -1180,8 +1235,9 @@ impl RedisPane {
                     .items_center()
                     .gap(px(Space::SM))
                     .rounded(px(Radius::CONTROL))
-                    .when(selected, |this| this.bg(p.selection))
-                    .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+                    .border_l_2()
+                    .when(selected, |this| this.border_color(p.accent).bg(p.selection))
+                    .when(!selected, |this| this.border_color(gpui_kit::transparent_black()).hover(|style| style.bg(p.hover)))
                     .child(type_dot(&key.key_type, &p))
                     .child(
                         div()
@@ -1441,21 +1497,47 @@ impl RedisPane {
             );
         }
 
-        let stat = |label: String, value: String| {
-            div()
+        let stat_card = |label: String, value: String, tone: Option<gpui_kit::Hsla>| {
+            kit::card(p)
+                .flex_1()
+                .min_w(px(ControlSize::PICKER_MIN_W / 2.))
+                .px(px(Space::LG))
+                .py(px(Space::MD))
                 .flex()
                 .flex_col()
                 .gap(px(Space::XXS))
-                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(label)))
-                .child(div().text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).font_features(kit::tabular_figures()).text_color(p.text).child(SharedString::from(value)))
+                .child(kit::eyebrow(SharedString::from(label), p))
+                .child(
+                    div()
+                        .text_size(px(TypeScale::LG))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_features(kit::tabular_figures())
+                        .text_color(tone.unwrap_or(p.text))
+                        .child(SharedString::from(value)),
+                )
         };
+        let persistent = read.saturating_sub(expiring);
         let stats = div()
             .flex()
-            .gap(px(Space::XL))
-            .child(stat(self.text("redis.overview.total"), total.to_string()))
-            .child(stat(self.text("redis.overview.read"), read.to_string()))
-            .child(stat(self.text("redis.overview.expiring"), expiring.to_string()));
+            .flex_wrap()
+            .gap(px(Space::MD))
+            .child(stat_card(self.text("redis.overview.total"), total.to_string(), None))
+            .child(stat_card(self.text("redis.overview.read"), read.to_string(), None))
+            .child(stat_card(self.text("redis.overview.expiring"), expiring.to_string(), (expiring > 0).then_some(p.info)))
+            .child(stat_card(self.text("redis.overview.neverExpire"), persistent.to_string(), None));
+        let heading = if self.topology.cluster {
+            i18n::fill(&self.text("redis.overview.cluster"), &[("n", &self.topology.masters().len().to_string())])
+        } else {
+            format!("db{}", self.database)
+        };
         let console = action("redis-console", Some(IconName::SquareTerminal), &self.text("redis.page.console"), Kind::Secondary, entity).into_any_element();
+        let quick_pages = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(Space::SM))
+            .child(action("redis-page:info", Some(IconName::Gauge), &self.text("redis.page.info"), Kind::Tool, entity).small())
+            .child(action("redis-page:slowlog", Some(IconName::Clock), &self.text("redis.page.slowlog"), Kind::Tool, entity).small())
+            .child(action("redis-page:bigkeys", Some(IconName::ChartBar), &self.text("redis.page.bigkeys"), Kind::Tool, entity).small());
         div()
             .id("redis-overview")
             .test_support()
@@ -1481,7 +1563,7 @@ impl RedisPane {
                                     .flex()
                                     .flex_col()
                                     .gap(px(Space::XXS))
-                                    .child(div().text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(format!("db{}", self.database))))
+                                    .child(div().text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(heading)))
                                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("redis.overview.hint")))),
                             )
                             .child(console)
@@ -1489,7 +1571,8 @@ impl RedisPane {
                     )
                     .child(stats)
                     .child(div().flex().flex_col().gap(px(Space::SM)).child(section(self.text("redis.overview.types"))).child(bar).child(legend))
-                    .when(!groups.is_empty(), |this| this.child(div().flex().flex_col().gap(px(Space::XS)).child(section(self.text("redis.overview.patterns"))).child(patterns))),
+                    .when(!groups.is_empty(), |this| this.child(div().flex().flex_col().gap(px(Space::XS)).child(section(self.text("redis.overview.patterns"))).child(patterns)))
+                    .child(quick_pages),
             )
             .into_any_element()
     }
@@ -1682,8 +1765,13 @@ impl RedisPane {
         let hint = self.text("redis.ttl.hint");
         let ttl = self.redis_input(Field::Ttl, "redis-ttl-field", "redis.tab.ttlLabel", &hint, window, cx);
         let expiring = self.detail_ttl().is_some_and(|ms| ms >= 0);
-        let mut presets = div().flex().items_center().gap(px(2.));
-        for (secs, key) in [(60, "redis.ttl.1m"), (3600, "redis.ttl.1h"), (86_400, "redis.ttl.1d")] {
+        let preview = match parse_ttl(&self.ttl_input) {
+            Ok(Some(secs)) => Some((i18n::fill(&self.text("redis.ttl.preview"), &[("t", &long_ttl(secs.saturating_mul(1000)))]), p.info)),
+            Ok(None) => Some((self.text("redis.keys.neverExpire"), p.text_faint)),
+            Err(()) => Some((self.text("redis.tab.ttlInvalid"), p.warn)),
+        };
+        let mut presets = div().flex().items_center().gap(px(Space::XXS));
+        for (secs, key) in [(60, "redis.ttl.1m"), (300, "redis.ttl.5m"), (3600, "redis.ttl.1h"), (86_400, "redis.ttl.1d"), (604_800, "redis.ttl.7d")] {
             presets = presets.child(action(format!("redis-ttl-preset:{secs}"), None, &self.text(key), Kind::Tool, entity).small());
         }
         if expiring {
@@ -1691,7 +1779,10 @@ impl RedisPane {
         }
         Self::edit_bar(p, m)
             .child(div().text_size(px(TypeScale::XS)).font_weight(FontWeight::MEDIUM).text_color(p.text_muted).child(SharedString::from(self.text("redis.tab.ttlLabel"))))
-            .child(div().w(px(180.)).child(kit::text_input("redis-ttl-field", &ttl, self.text("redis.tab.ttlLabel")).small()))
+            .child(div().w(px(ControlSize::PICKER_MIN_W * 0.7)).child(kit::text_input("redis-ttl-field", &ttl, self.text("redis.tab.ttlLabel")).small()))
+            .when_some(preview, |this, (text, color)| {
+                this.child(div().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(color).child(SharedString::from(text)))
+            })
             .child(presets)
             .child(div().flex_1())
             .child(action("redis-ttl", Some(IconName::Check), &self.text("redis.tab.setTtl"), Kind::Primary, entity).small())
@@ -2059,34 +2150,42 @@ impl RedisPane {
     }
 
     fn render_entry_form(&mut self, detail: &RedisKeyDetail, p: &Palette, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let form = div()
-            .id("redis-entry-form")
-            .test_support()
-            .flex_none()
-            .p(px(Space::MD))
-            .bg(p.sunken)
-            .border_b_1()
-            .border_color(p.line_soft)
+        let mode_label = match &detail.value {
+            RedisValue::Hash { entries } if !self.entry_field.is_empty() && entries.iter().any(|e| e.field == self.entry_field) => {
+                i18n::fill(&self.text("redis.entry.editing"), &[("name", &self.entry_field)])
+            }
+            RedisValue::List { .. } if self.entry_index.trim().parse::<usize>().is_ok() => {
+                i18n::fill(&self.text("redis.entry.editing"), &[("name", &format!("#{}", self.entry_index.trim()))])
+            }
+            RedisValue::ZSet { entries } if !self.entry_member.is_empty() && entries.iter().any(|e| e.member == self.entry_member) => {
+                i18n::fill(&self.text("redis.entry.editing"), &[("name", &self.entry_member)])
+            }
+            _ => self.text("redis.entry.adding"),
+        };
+        let header = div()
+            .w_full()
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap(px(Space::MD));
-        let close = icon_btn("redis-entry-form-close", IconName::X, &self.text("redis.entry.close"), entity);
+            .gap(px(Space::SM))
+            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(SharedString::from(mode_label)))
+            .child(icon_btn("redis-entry-form-close", IconName::X, &self.text("redis.entry.close"), entity).xsmall());
+        let fields_row = div().w_full().flex().flex_wrap().items_center().gap(px(Space::SM));
         let field_w = |w: f32| div().w(px(w)).min_w(px(0.));
         let grow = || div().flex_1().min_w(px(VALUE_TABLE_MIN_W / 2.));
-        let form = match &detail.value {
+        let fields_row = match &detail.value {
             RedisValue::Hash { .. } => {
                 let field = self.redis_input(Field::EntryField, "redis-hash-field", "redis.value.field", &self.text("redis.value.field"), window, cx);
                 let value = self.redis_input(Field::EntryValue, "redis-hash-value", "redis.value.value", &self.text("redis.value.value"), window, cx);
-                form.child(field_w(VALUE_TABLE_MIN_W * 0.6).child(kit::text_input("redis-hash-field", &field, self.text("redis.value.field")).small()))
+                fields_row
+                    .child(field_w(VALUE_TABLE_MIN_W * 0.6).child(kit::text_input("redis-hash-field", &field, self.text("redis.value.field")).small()))
                     .child(grow().child(kit::text_input("redis-hash-value", &value, self.text("redis.value.value")).small()))
                     .child(action("redis-hash-add", Some(IconName::Check), &self.text("redis.hash.save"), Kind::Primary, entity).small())
             }
             RedisValue::List { .. } => {
                 let value = self.redis_input(Field::EntryValue, "redis-list-value", "redis.value.value", &self.text("redis.value.value"), window, cx);
-                let form = form.child(grow().child(kit::text_input("redis-list-value", &value, self.text("redis.value.value")).small()));
+                let fields_row = fields_row.child(grow().child(kit::text_input("redis-list-value", &value, self.text("redis.value.value")).small()));
                 match self.entry_index.trim().parse::<usize>() {
-                    Ok(index) => form.child(
+                    Ok(index) => fields_row.child(
                         action(
                             format!("redis-list-set:{index}"),
                             Some(IconName::Check),
@@ -2096,20 +2195,22 @@ impl RedisPane {
                         )
                         .small(),
                     ),
-                    Err(_) => form
+                    Err(_) => fields_row
                         .child(action("redis-list-lpush", Some(IconName::ArrowUp), &self.text("redis.list.lpush"), Kind::Secondary, entity).small())
                         .child(action("redis-list-rpush", Some(IconName::ArrowDown), &self.text("redis.list.rpush"), Kind::Primary, entity).small()),
                 }
             }
             RedisValue::Set { .. } => {
                 let member = self.redis_input(Field::EntryMember, "redis-set-member", "redis.value.member", &self.text("redis.value.member"), window, cx);
-                form.child(grow().child(kit::text_input("redis-set-member", &member, self.text("redis.value.member")).small()))
+                fields_row
+                    .child(grow().child(kit::text_input("redis-set-member", &member, self.text("redis.value.member")).small()))
                     .child(action("redis-set-add", Some(IconName::Check), &self.text("redis.set.add"), Kind::Primary, entity).small())
             }
             RedisValue::ZSet { .. } => {
                 let score = self.redis_input(Field::EntryScore, "redis-zset-score", "redis.value.score", &self.text("redis.value.score"), window, cx);
                 let member = self.redis_input(Field::EntryMember, "redis-zset-member", "redis.value.member", &self.text("redis.value.member"), window, cx);
-                form.child(field_w(VALUE_TABLE_MIN_W * 0.4).child(kit::text_input("redis-zset-score", &score, self.text("redis.value.score")).small()))
+                fields_row
+                    .child(field_w(VALUE_TABLE_MIN_W * 0.4).child(kit::text_input("redis-zset-score", &score, self.text("redis.value.score")).small()))
                     .child(grow().child(kit::text_input("redis-zset-member", &member, self.text("redis.value.member")).small()))
                     .child(action("redis-zadd", Some(IconName::Check), &self.text("redis.zset.add"), Kind::Primary, entity).small())
             }
@@ -2117,14 +2218,29 @@ impl RedisPane {
                 let id = self.redis_input(Field::StreamId, "redis-stream-id", "redis.stream.id", "*", window, cx);
                 let field = self.redis_input(Field::StreamField, "redis-stream-field", "redis.value.field", &self.text("redis.value.field"), window, cx);
                 let value = self.redis_input(Field::StreamValue, "redis-stream-value", "redis.value.value", &self.text("redis.value.value"), window, cx);
-                form.child(field_w(VALUE_TABLE_MIN_W * 0.5).child(kit::text_input("redis-stream-id", &id, self.text("redis.stream.id")).small()))
+                fields_row
+                    .child(field_w(VALUE_TABLE_MIN_W * 0.5).child(kit::text_input("redis-stream-id", &id, self.text("redis.stream.id")).small()))
                     .child(field_w(VALUE_TABLE_MIN_W * 0.6).child(kit::text_input("redis-stream-field", &field, self.text("redis.value.field")).small()))
                     .child(grow().child(kit::text_input("redis-stream-value", &value, self.text("redis.value.value")).small()))
                     .child(action("redis-xadd", Some(IconName::Check), &self.text("redis.stream.add"), Kind::Primary, entity).small())
             }
-            RedisValue::String { .. } | RedisValue::Json { .. } | RedisValue::None {} => form,
+            RedisValue::String { .. } | RedisValue::Json { .. } | RedisValue::None {} => fields_row,
         };
-        form.child(close).into_any_element()
+        div()
+            .id("redis-entry-form")
+            .test_support()
+            .flex_none()
+            .px(px(Space::MD))
+            .py(px(Space::SM))
+            .bg(p.sunken)
+            .border_b_1()
+            .border_color(p.line_soft)
+            .flex()
+            .flex_col()
+            .gap(px(Space::XS))
+            .child(header)
+            .child(fields_row)
+            .into_any_element()
     }
 
     /// 右栏：FormatViewer 的工具条就是右栏头部（标题 = 当前字段名或成员名），没有单独的「结构化值查看器」标题。
@@ -2346,7 +2462,10 @@ impl RedisPane {
         let actions = div()
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(Space::SM))
+            .when(self.stale_value, |this| {
+                this.child(action("redis-stale-refresh", Some(IconName::RefreshCw), &self.text("redis.retry.read"), Kind::Primary, entity).small())
+            })
             .when(keys_blocked, |this| this.child(action("redis-use-scan", Some(IconName::Search), &self.text("redis.console.useScan"), Kind::Primary, entity).small()))
             .child(icon_btn("redis-error-dismiss", IconName::X, &self.text("redis.error.dismiss"), entity))
             .into_any_element();
@@ -2382,16 +2501,47 @@ impl RedisPane {
             .py(px(Space::SM))
             .font_family(mono.clone())
             .text_size(px(TypeScale::SM));
-        if self.console_log.is_empty() {
+        if self.console_log.is_empty() && self.console_pending.is_none() {
+            let mut chips = div().flex().flex_wrap().gap(px(Space::XS));
+            for cmd in ["PING", "DBSIZE", "INFO server", "SLOWLOG GET 10", "CLIENT LIST", "CONFIG GET maxmemory"] {
+                let id = format!("redis-console-quick:{cmd}");
+                chips = chips.child(
+                    kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(SharedString::from(cmd))
+                        .px(px(Space::SM))
+                        .py(px(Space::XS))
+                        .rounded(px(Radius::CONTROL))
+                        .border_1()
+                        .border_color(p.line)
+                        .bg(p.chrome)
+                        .hover(|s| s.bg(p.hover).border_color(p.line_strong))
+                        .font_family(mono.clone())
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text)
+                        .child(SharedString::from(cmd))
+                        .on_click(cmd_click(entity, id)),
+                );
+            }
             log = log.child(
                 div()
                     .id("redis-console-empty")
                     .test_support()
-                    .py(px(Space::LG))
+                    .py(px(Space::XL))
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::MD))
                     .font_family(cx.theme().font_family.clone())
-                    .text_size(px(TypeScale::SM))
-                    .text_color(p.text_faint)
-                    .child(SharedString::from(self.text("redis.console.emptyHint"))),
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("redis.console.emptyHint"))))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(Space::XS))
+                            .child(kit::eyebrow(SharedString::from(self.text("redis.console.quickTitle")), p))
+                            .child(chips),
+                    ),
             );
         }
         for (index, entry) in self.console_log.iter().enumerate() {
@@ -2444,8 +2594,12 @@ impl RedisPane {
                             .child(
                                 div()
                                     .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Space::XXS))
                                     .invisible()
                                     .group_hover(group.clone(), |s| s.visible())
+                                    .child(icon_btn(format!("redis-console-rerun:{index}"), IconName::CornerDownLeft, &self.text("redis.console.rerun"), entity).xsmall())
                                     .child(icon_btn(format!("redis-console-copy:{index}"), IconName::Copy, &self.text("redis.console.copyOutput"), entity).xsmall()),
                             ),
                     )
@@ -2456,6 +2610,29 @@ impl RedisPane {
                             .border_color(if entry.ok { p.line } else { p.danger.opacity(0.6) })
                             .text_color(if entry.ok { p.text_muted } else { p.danger })
                             .child(SharedString::from(if entry.output.is_empty() { "(empty)".to_owned() } else { entry.output.clone() })),
+                    ),
+            );
+        }
+        if let Some((pending_line, pending_db, _)) = &self.console_pending {
+            log = log.child(
+                div()
+                    .id("redis-console-pending")
+                    .test_support()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::XXS))
+                    .py(px(Space::XS))
+                    .when(!self.console_log.is_empty(), |this| this.border_t_1().border_color(p.line_soft))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::SM))
+                            .min_h(px(m.chip_h()))
+                            .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(prompt(pending_db))))
+                            .child(div().flex_1().min_w(px(0.)).truncate().text_color(p.text).font_weight(FontWeight::MEDIUM).child(SharedString::from(pending_line.clone())))
+                            .child(kit::inline_loading(SharedString::from(self.text("redis.console.running")), m, p)),
                     ),
             );
         }
@@ -2558,8 +2735,8 @@ impl RedisPane {
             .flex()
             .items_center()
             .gap(px(Space::XXS))
-            .child(icon_btn("redis-console-copy", IconName::Copy, &self.text("redis.console.copyAll"), entity))
-            .child(icon_btn("redis-console-clear", IconName::Trash, &self.text("redis.console.clear"), entity))
+            .child(icon_btn("redis-console-copy", IconName::Copy, &self.text("redis.console.copyAll"), entity).disabled(self.console_log.is_empty()))
+            .child(icon_btn("redis-console-clear", IconName::Trash, &self.text("redis.console.clear"), entity).disabled(self.console_log.is_empty()))
             .into_any_element();
         div()
             .id("redis-console")
@@ -2733,13 +2910,26 @@ impl RedisPane {
         let exists = self.error_source == ErrorSource::Command && (self.error.contains("已存在") || self.error.to_ascii_lowercase().contains("exist"));
         let error = (self.error_source == ErrorSource::Command && !self.error.is_empty()).then(|| kit::banner(kit::BannerTone::Danger, IconName::CircleAlert, self.error.clone(), None, p));
 
+        let new_ttl_preview = (!self.new_ttl.trim().is_empty()).then(|| match parse_ttl(&self.new_ttl) {
+            Ok(Some(secs)) => (i18n::fill(&self.text("redis.ttl.preview"), &[("t", &long_ttl(secs.saturating_mul(1000)))]), p.info),
+            Ok(None) => (self.text("redis.keys.neverExpire"), p.text_faint),
+            Err(()) => (self.text("redis.tab.ttlInvalid"), p.warn),
+        });
+        let ttl_control = div()
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .child(div().flex_1().min_w(px(0.)).child(kit::text_input("redis-new-ttl", &ttl, self.text("redis.tab.ttlLabel"))))
+            .when_some(new_ttl_preview, |this, (text, color)| {
+                this.child(div().flex_none().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(color).child(SharedString::from(text)))
+            });
         let mut form = div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .child(kit::form_row(self.text("redis.new.type"), kit::segmented_sized(types, p, m.control_h - 4.), p))
+            .gap(px(Space::LG))
+            .child(kit::form_row(self.text("redis.new.type"), kit::segmented_sized(types, p, m.control_h - Space::XS), p))
             .child(kit::form_row(self.text("redis.key.name"), kit::text_input("redis-new-name", &key, self.text("redis.key.name")), p))
-            .child(kit::form_row(self.text("redis.new.ttlOptional"), kit::text_input("redis-new-ttl", &ttl, self.text("redis.tab.ttlLabel")), p));
+            .child(kit::form_row(self.text("redis.new.ttlOptional"), ttl_control, p));
         if let Some(stream_id) = stream_id {
             form = form.child(kit::form_row(self.text("redis.stream.id"), kit::text_input("redis-stream-id", &stream_id, self.text("redis.stream.id")), p));
         }
@@ -2901,6 +3091,7 @@ impl RedisPane {
             Field::PubChannel => self.diag.pub_channel.clone(),
             Field::PubMessage => self.diag.pub_message.clone(),
             Field::InfoQuery => self.info_query.clone(),
+            Field::ClientsQuery => self.diag.clients_query.clone(),
         };
         let _ = label_key;
         self.fields.bind_enter(
@@ -2950,6 +3141,7 @@ impl RedisPane {
                     Field::PubChannel => this.diag.pub_channel = value,
                     Field::PubMessage => this.diag.pub_message = value,
                     Field::InfoQuery => this.info_query = value,
+                    Field::ClientsQuery => this.diag.clients_query = value,
                 }
             },
             Some(|this: &mut Self, field, cx: &mut Context<Self>| {
@@ -2979,7 +3171,7 @@ impl RedisPane {
                     Field::Separators | Field::ScanCap => "redis-prefs-save".into(),
                     Field::BatchTtl => "redis-batch-ttl-apply".into(),
                     // 生产库的确认只能点按钮，回车不提交。
-                    Field::ConfirmTyped | Field::InfoQuery => return,
+                    Field::ConfirmTyped | Field::InfoQuery | Field::ClientsQuery => return,
                     Field::SubChannels => "redis-sub-start".into(),
                     Field::PubChannel | Field::PubMessage => "redis-pub-send".into(),
                 };

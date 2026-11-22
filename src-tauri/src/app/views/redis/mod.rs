@@ -67,6 +67,7 @@ enum Field {
     PubChannel,
     PubMessage,
     InfoQuery,
+    ClientsQuery,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,6 +201,14 @@ struct BatchRun {
     cancel: Arc<AtomicBool>,
 }
 
+/// Pub/Sub 收到的单条消息（附带本地接收时间）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReceivedMessage {
+    pub(super) channel: String,
+    pub(super) payload: String,
+    pub(super) at: String,
+}
+
 /// 诊断页的数据。每页第一次打开时读取，之后按刷新重读。
 #[derive(Default)]
 struct DiagState {
@@ -211,8 +220,11 @@ struct DiagState {
     slow_asc: bool,
     slow_loaded: bool,
     info: Vec<InfoSection>,
+    info_section: String,
     info_loaded: bool,
     clients: Vec<ClientInfo>,
+    clients_query: String,
+    clients_rows: Vec<usize>,
     clients_loaded: bool,
     big: Vec<BigKey>,
     big_running: bool,
@@ -225,7 +237,7 @@ struct DiagState {
     sub_running: bool,
     sub_ready: bool,
     sub_cancel: Option<Arc<AtomicBool>>,
-    messages: VecDeque<PubSubMessage>,
+    messages: VecDeque<ReceivedMessage>,
     pub_channel: String,
     pub_message: String,
     node_sizes: Vec<(String, u64)>,
@@ -306,6 +318,11 @@ enum KeyRow {
         group: usize,
         open: bool,
     },
+    TemplateMore {
+        template: String,
+        shown: usize,
+        total: usize,
+    },
 }
 
 /// 结构化查看器里可以直接写回的条目：Hash 字段值、List 指定下标的元素。其余条目只读。
@@ -341,6 +358,7 @@ pub struct RedisPane {
     sidebar_w: f32,
     sidebar_drag_start: Option<(f32, f32)>,
     pattern: String,
+    scanned_pattern: String,
     keys: Vec<RedisKeyInfo>,
     key_pos: HashMap<String, usize>,
     done: bool,
@@ -486,6 +504,7 @@ impl RedisPane {
             sidebar_w: SIDEBAR_DEFAULT_W,
             sidebar_drag_start: None,
             pattern: String::new(),
+            scanned_pattern: String::new(),
             keys: Vec::new(),
             key_pos: HashMap::new(),
             done: false,
@@ -791,6 +810,7 @@ impl RedisPane {
         self.db_picker_open = false;
         self.db_counts.clear();
         self.pattern.clear();
+        self.scanned_pattern.clear();
         self.set_keys(Vec::new());
         self.done = false;
         self.selected.clear();
@@ -1204,8 +1224,12 @@ impl RedisPane {
             || id.starts_with("redis-open-tab:")
             || id == "redis-entry-sort"
             || id.starts_with("redis-console-copy:")
+            || id.starts_with("redis-console-rerun:")
             || id == "redis-inspector-toggle"
-            || id == "redis-open-tab";
+            || id == "redis-open-tab"
+            || id == "redis-detail-fill-cmd"
+            || id == "redis-tree-expand-all"
+            || id == "redis-tree-collapse-all";
 
         if self.busy && !local {
             self.show_error_from(ErrorSource::Command, self.text("redis.tab.busy"));
@@ -1323,25 +1347,27 @@ impl RedisPane {
             }
         } else if let Some(index) = id.strip_prefix("redis-key-fill-cmd:") {
             if let Ok(index) = index.parse::<usize>() {
-                if let Some(key) = self.keys.get(index) {
-                    let quoted = if key.name.chars().any(char::is_whitespace) {
-                        format!("\"{}\"", key.name)
-                    } else {
-                        key.name.clone()
-                    };
-                    let cmd_str = match key.key_type.as_str() {
-                        "hash" => format!("HGETALL {quoted}"),
-                        "list" => format!("LRANGE {quoted} 0 -1"),
-                        "set" => format!("SMEMBERS {quoted}"),
-                        "zset" => format!("ZRANGE {quoted} 0 -1 WITHSCORES"),
-                        "stream" => format!("XRANGE {quoted} - + COUNT 50"),
-                        _ => format!("GET {quoted}"),
-                    };
-                    self.show_console();
-                    self.command_input = cmd_str;
-                    self.complete_open = false;
+                if let Some(key) = self.keys.get(index).cloned() {
+                    self.fill_command_for_key(&key.name, &key.key_type);
                 }
             }
+        } else if id == "redis-detail-fill-cmd" {
+            if !self.selected.is_empty() {
+                let name = self.selected.clone();
+                let key_type = self
+                    .detail
+                    .as_deref()
+                    .filter(|_| self.detail_key == name)
+                    .map(|detail| detail.key_type.clone())
+                    .or_else(|| self.key_pos.get(&name).and_then(|&ix| self.keys.get(ix)).map(|key| key.key_type.clone()))
+                    .unwrap_or_default();
+                self.fill_command_for_key(&name, &key_type);
+            }
+        } else if id == "redis-tree-expand-all" {
+            self.expand_all_folders();
+        } else if id == "redis-tree-collapse-all" {
+            self.expanded.clear();
+            self.invalidate_rows();
         } else if id == "redis-copy-key" {
             if !self.selected.is_empty() {
                 let key = self.selected.clone();
@@ -1421,6 +1447,18 @@ impl RedisPane {
                 let out = entry.output.clone();
                 self.copy_text(out, "redis.copied.value", cx);
             }
+        } else if let Some(index) = id.strip_prefix("redis-console-rerun:") {
+            if let Some(line) = index.parse::<usize>().ok().and_then(|index| self.console_log.get(index)).map(|entry| entry.line.clone()) {
+                self.command_input = line;
+                self.complete_open = false;
+                self.history_at = None;
+                self.focus_request = Some(Field::Command);
+            }
+        } else if let Some(cmd) = id.strip_prefix("redis-console-quick:") {
+            self.command_input = cmd.to_owned();
+            self.complete_open = false;
+            self.history_at = None;
+            self.ask_exec(cx);
         } else if id == "redis-view-flat" {
             self.view_mode = ViewMode::Flat;
             self.invalidate_rows();
@@ -1490,6 +1528,9 @@ impl RedisPane {
         } else if let Some(kind) = id.strip_prefix("redis-new-type-") {
             self.new_type = kind.to_owned();
             self.new_open = true;
+            if self.error_source == ErrorSource::Command {
+                self.error.clear();
+            }
         } else if id == "redis-create" {
             self.ask_create();
         } else if id == "redis-overwrite" {
@@ -1581,6 +1622,7 @@ impl RedisPane {
 
     /// 清空索引后重扫，保留当前提示（写命令执行后的“已执行”不被扫描冲掉）。
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        self.scanned_pattern = self.pattern.trim().to_owned();
         self.set_keys(Vec::new());
         self.done = false;
         self.scan.resume = ScanResume::default();
@@ -2294,6 +2336,13 @@ impl RedisPane {
                         for &index in item.members.iter().take(TEMPLATE_MEMBERS_SHOWN) {
                             rows.push(KeyRow::Key { index, display: self.keys[index].name.clone(), depth: 1 });
                         }
+                        if item.members.len() > TEMPLATE_MEMBERS_SHOWN {
+                            rows.push(KeyRow::TemplateMore {
+                                template: item.template.clone(),
+                                shown: TEMPLATE_MEMBERS_SHOWN,
+                                total: item.members.len(),
+                            });
+                        }
                     }
                 }
                 rows
@@ -2337,6 +2386,13 @@ impl RedisPane {
                             for &index in item.members.iter().take(TEMPLATE_MEMBERS_SHOWN) {
                                 rows.push(KeyRow::Key { index, display: self.keys[index].name.clone(), depth: 1 });
                             }
+                            if item.members.len() > TEMPLATE_MEMBERS_SHOWN {
+                                rows.push(KeyRow::TemplateMore {
+                                    template: item.template.clone(),
+                                    shown: TEMPLATE_MEMBERS_SHOWN,
+                                    total: item.members.len(),
+                                });
+                            }
                         }
                     }
                     rows
@@ -2367,6 +2423,42 @@ impl RedisPane {
             }
         }
         self.invalidate_rows();
+    }
+
+    fn expand_all_folders(&mut self) {
+        let separators = self.prefs.separators.clone();
+        for key in &self.keys {
+            let segments = keyspace::split_segments(&key.name, &separators);
+            if segments.len() < 2 {
+                continue;
+            }
+            let mut prefix = String::new();
+            for segment in &segments[..segments.len() - 1] {
+                if !prefix.is_empty() {
+                    prefix.push_str(segment.sep);
+                }
+                prefix.push_str(segment.text);
+                if !prefix.is_empty() {
+                    self.expanded.insert(prefix.clone());
+                }
+            }
+        }
+        self.invalidate_rows();
+    }
+
+    fn fill_command_for_key(&mut self, name: &str, key_type: &str) {
+        let quoted = if name.chars().any(char::is_whitespace) { format!("\"{name}\"") } else { name.to_owned() };
+        let cmd_str = match key_type {
+            "hash" => format!("HGETALL {quoted}"),
+            "list" => format!("LRANGE {quoted} 0 -1"),
+            "set" => format!("SMEMBERS {quoted}"),
+            "zset" => format!("ZRANGE {quoted} 0 -1 WITHSCORES"),
+            "stream" => format!("XRANGE {quoted} - + COUNT 50"),
+            _ => format!("GET {quoted}"),
+        };
+        self.show_console();
+        self.command_input = cmd_str;
+        self.complete_open = false;
     }
 
     fn ask_create(&mut self) {
@@ -2721,6 +2813,8 @@ impl RedisPane {
             at,
             items: vec![
                 ContextItem { id: format!("redis-folder:{prefix}"), icon: IconName::FolderOpen, label: self.text("redis.menu.expandCollapse"), danger: false },
+                ContextItem { id: "redis-tree-expand-all".into(), icon: IconName::ChevronsDown, label: self.text("redis.menu.expandAll"), danger: false },
+                ContextItem { id: "redis-tree-collapse-all".into(), icon: IconName::ChevronUp, label: self.text("redis.menu.collapseAll"), danger: false },
                 ContextItem { id: format!("redis-folder-filter:{prefix}"), icon: IconName::ListFilter, label: self.text("redis.menu.filterPrefix"), danger: false },
                 ContextItem { id: format!("redis-folder-copy:{prefix}"), icon: IconName::Copy, label: self.text("redis.copy.prefix"), danger: false },
                 ContextItem { id: format!("redis-folder-new:{prefix}"), icon: IconName::Plus, label: self.text("redis.menu.newInPrefix"), danger: false },
@@ -2741,6 +2835,7 @@ impl RedisPane {
         items.push(ContextItem { id: "redis-rename-toggle".into(), icon: IconName::Pencil, label: self.text("redis.tab.rename"), danger: false });
         items.push(ContextItem { id: "redis-copy".into(), icon: IconName::Copy, label: self.text("redis.copy.keyValue"), danger: false });
         items.push(ContextItem { id: "redis-copy-key".into(), icon: IconName::Tag, label: self.text("redis.copy.keyName"), danger: false });
+        items.push(ContextItem { id: "redis-detail-fill-cmd".into(), icon: IconName::SquareTerminal, label: self.text("redis.menu.fillCommand"), danger: false });
         items.push(ContextItem { id: "redis-open-tab".into(), icon: IconName::Pin, label: self.text("redis.menu.openInTab"), danger: false });
         if overflow {
             items.push(ContextItem { id: "redis-delete".into(), icon: IconName::Trash, label: self.text("redis.tab.remove"), danger: true });
