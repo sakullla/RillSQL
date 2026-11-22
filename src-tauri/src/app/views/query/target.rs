@@ -133,7 +133,7 @@ pub fn target_missing(known: bool, choices: &[TargetChoice], connection_id: &str
 
 /// 目标按钮：引擎徽标 + 连接名 › 库名 + 可选生产徽标 + 下拉箭头。没有目标时提示选择。
 #[allow(clippy::too_many_arguments)]
-pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: &str, connection_name: &str, database: &str, engine: &str, env: &str, bounds: &ButtonBounds, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: &str, connection_name: &str, database: &str, engine: &str, env: &str, max_width: f32, bounds: &ButtonBounds, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let has_target = !connection_id.is_empty();
     let connected = choices.iter().any(|choice| choice.id == connection_id && choice.connected);
@@ -151,7 +151,10 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
         .aria_label(if missing { t("ui.query.targetMissing") } else { t("ui.query.chooseTarget") })
         .tooltip_text_opt(tooltip.filter(|_| !open))
         .h(px(metrics.control_h))
-        .max_w(px(380.))
+        .min_w_0()
+        .flex_shrink(1.)
+        .max_w(px(max_width))
+        .overflow_hidden()
         .px(px(kit::Space::MD))
         .flex()
         .items_center()
@@ -177,38 +180,41 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
         .hover(|style| style.border_color(if prod { p.danger.opacity(0.65) } else { p.line }).bg(p.hover))
         .text_size(px(TypeScale::SM))
         .when(has_target, |this| {
-            this.child(kit::engine_badge(engine, 16.))
+            this.child(div().flex_none().child(kit::engine_badge(engine, 16.)))
                 .child(
                     div()
                         .min_w_0()
+                        .flex_shrink(1.)
                         .truncate()
                         .font_weight(FontWeight::MEDIUM)
                         .when(missing, |this| this.text_color(p.warn).line_through())
                         .child(SharedString::from(if connection_name.is_empty() { connection_id.to_owned() } else { connection_name.to_owned() })),
                 )
-                .child(if missing {
+                .child(div().flex_none().child(if missing {
                     kit::icon(IconName::TriangleAlert, 12., p.warn).into_any_element()
                 } else {
                     kit::status_dot(if connected { p.ok } else { p.line_strong }).into_any_element()
-                })
-                .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
+                }))
+                .child(div().flex_none().child(kit::icon(IconName::ChevronRight, 12., p.text_faint)))
                 .child(
                     div()
-                        .flex_none()
+                        .min_w_0()
+                        .flex_shrink(1.)
                         .flex()
                         .items_center()
                         .gap(px(kit::Space::XS))
-                        .child(kit::icon(IconName::Database, 12., p.text_muted))
-                        .child(div().max_w(px(140.)).truncate().text_color(if database.is_empty() { p.text_faint } else { p.text }).child(if database.is_empty() { t("ui.query.chooseDatabase") } else { SharedString::from(database.to_owned()) })),
+                        .child(div().flex_none().child(kit::icon(IconName::Database, 12., p.text_muted)))
+                        .child(div().min_w_0().flex_shrink(1.).max_w(px(140.)).truncate().text_color(if database.is_empty() { p.text_faint } else { p.text }).child(if database.is_empty() { t("ui.query.chooseDatabase") } else { SharedString::from(database.to_owned()) })),
                 )
                 .when(prod, |this| {
-                    this.child(kit::env_tag("prod", t("connections.env.prod"), p))
+                    this.child(div().flex_none().child(kit::env_tag("prod", t("connections.env.prod"), p)))
                 })
         })
         .when(!has_target, |this| {
-            this.child(kit::icon(IconName::Database, 14., p.text_muted)).child(div().text_color(p.text_muted).child(t("ui.query.chooseTarget")))
+            this.child(div().flex_none().child(kit::icon(IconName::Database, 14., p.text_muted)))
+                .child(div().min_w_0().truncate().text_color(p.text_muted).child(t("ui.query.chooseTarget")))
         })
-        .child(kit::icon(IconName::ChevronDown, 12., p.text_faint))
+        .child(div().flex_none().child(kit::icon(IconName::ChevronDown, 12., p.text_faint)))
         // 记下按钮在窗口里的位置：状态栏点目标、或执行时发现目标已不存在，都从这里弹出同一个选择器。
         .child({
             let bounds = bounds.clone();

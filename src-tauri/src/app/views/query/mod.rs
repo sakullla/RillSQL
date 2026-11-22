@@ -3339,6 +3339,14 @@ impl Render for QueryPane {
 impl QueryPane {
     /// 主运行按钮固定最小槽位宽度：空闲（运行）与执行中（停止）切换时不引发工具栏横向跳动。
     const RUN_SLOT_MIN_W: f32 = 76.;
+    /// 视口窄于它时次要工具收成纯图标（保留完整快捷键提示），避免 900px 中窄屏顶栏溢出。
+    const COMPACT_TOOLS_WIDTH: f32 = 980.;
+    /// 活动事务直出时提前收敛次要工具为纯图标，保证 900px 视口下所有右侧控件完整可见。
+    const COMPACT_TX_TOOLS_WIDTH: f32 = 1120.;
+    const TARGET_MAX_W_WIDE: f32 = 360.;
+    const TARGET_MAX_W_MEDIUM: f32 = 220.;
+    const TARGET_MAX_W_NARROW: f32 = 240.;
+    const TARGET_MAX_W_NARROW_TX: f32 = 160.;
 
     /// 单行高信噪比控制条：
     /// 左侧主动作（溪流青蓝运行/停止 + 运行全部）+ 紧凑目标选择胶囊（含生产标）+ 活动事务显式控件；
@@ -3372,8 +3380,20 @@ impl QueryPane {
             .items_center()
             .child(run);
         let more = self.render_more_menu(entity);
-        let pickers = self.render_target_pickers(p, entity, cx);
         let tx_controls = self.render_active_transaction(running, p, metrics, entity);
+        let has_active_tx = tx_controls.is_some();
+        let compact_tools = self.narrow
+            || (self.viewport_width > 0.
+                && (self.viewport_width < Self::COMPACT_TOOLS_WIDTH
+                    || (has_active_tx && self.viewport_width < Self::COMPACT_TX_TOOLS_WIDTH)));
+        let target_max_w = if self.narrow {
+            if has_active_tx { Self::TARGET_MAX_W_NARROW_TX } else { Self::TARGET_MAX_W_NARROW }
+        } else if has_active_tx && self.viewport_width > 0. && self.viewport_width < Self::COMPACT_TX_TOOLS_WIDTH {
+            Self::TARGET_MAX_W_MEDIUM
+        } else {
+            Self::TARGET_MAX_W_WIDE
+        };
+        let pickers = self.render_target_pickers(target_max_w, p, entity, cx);
         let format_tip = SharedString::from(format!(
             "{} · {}",
             i18n::text(locale, "query.editor.menu.format"),
@@ -3384,7 +3404,7 @@ impl QueryPane {
             i18n::text(locale, "query.editor.menu.plan"),
             kit::shortcut(crate::app::keymap::command_chord("explain").unwrap_or("Mod+Shift+E"))
         ));
-        let format_btn: AnyElement = if self.narrow {
+        let format_btn: AnyElement = if compact_tools {
             kit::icon_button("query-act-format", IconName::WandSparkles, t("query.editor.menu.format"), pane_act("format", entity))
                 .tooltip(format_tip)
                 .into_any_element()
@@ -3393,7 +3413,7 @@ impl QueryPane {
                 .tooltip(format_tip)
                 .into_any_element()
         };
-        let explain_btn: AnyElement = if self.narrow {
+        let explain_btn: AnyElement = if compact_tools {
             kit::icon_button("query-act-explain", IconName::ChartNetwork, t("query.editor.menu.plan"), pane_act("explain", entity))
                 .tooltip(explain_tip)
                 .into_any_element()
@@ -3426,25 +3446,29 @@ impl QueryPane {
             .children(pickers)
             .children(tx_controls)
             .child(div().flex_1().min_w(px(Space::XS)))
-            .child(format_btn)
-            .child(explain_btn)
-            .when(!self.narrow, |this| {
+            .child(div().flex_none().child(format_btn))
+            .child(div().flex_none().child(explain_btn))
+            .when(!compact_tools, |this| {
                 this.child(
-                    kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
-                        .tooltip(SharedString::from(format!(
-                            "{} · {}",
-                            i18n::text(locale, "shell.command.openFile"),
-                            kit::shortcut(crate::app::keymap::command_chord("open-file").unwrap_or_default())
-                        ))),
+                    div().flex_none().child(
+                        kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
+                            .tooltip(SharedString::from(format!(
+                                "{} · {}",
+                                i18n::text(locale, "shell.command.openFile"),
+                                kit::shortcut(crate::app::keymap::command_chord("open-file").unwrap_or_default())
+                            ))),
+                    ),
                 )
             })
-            .child(more)
+            .child(div().flex_none().child(more))
             .child(kit::vline(p))
             // 右侧面板开关：命中范围、图标与四态走共享的纯图标动作；面板打开时是选中态。
             .child(
-                kit::icon_button("query-side-toggle", IconName::PanelRight, t("query.side.toggle"), pane_act("toggle-side", entity))
-                    .tooltip(t("query.side.toggle"))
-                    .selected(self.side_open()),
+                div().flex_none().child(
+                    kit::icon_button("query-side-toggle", IconName::PanelRight, t("query.side.toggle"), pane_act("toggle-side", entity))
+                        .tooltip(t("query.side.toggle"))
+                        .selected(self.side_open()),
+                ),
             )
             .into_any_element()
     }
@@ -3495,20 +3519,37 @@ impl QueryPane {
                     .child(t(crate::app::shell::transaction::state_key(state))),
             );
         if can_rollback {
-            group = group.child(
-                kit::subtle_button("query-tx-rollback", Some(IconName::RotateCcw), t("transaction.action.rollback"), pane_act("query-tx-rollback", entity))
+            let rollback_btn: AnyElement = if self.narrow {
+                kit::icon_button("query-tx-rollback", IconName::RotateCcw, t("transaction.action.rollback"), pane_act("query-tx-rollback", entity))
+                    .xsmall()
+                    .disabled(running)
+                    .tooltip(t("transaction.action.rollback"))
+                    .into_any_element()
+            } else {
+                kit::secondary_button("query-tx-rollback", Some(IconName::RotateCcw), t("transaction.action.rollback"), pane_act("query-tx-rollback", entity))
                     .small()
                     .disabled(running)
-                    .tooltip(t("transaction.action.rollback")),
-            );
+                    .tooltip(t("transaction.action.rollback"))
+                    .into_any_element()
+            };
+            group = group.child(rollback_btn);
         }
         if can_commit {
-            group = group.child(
+            let commit_btn: AnyElement = if self.narrow {
+                kit::icon_button("query-tx-commit", IconName::Check, t("transaction.action.commit"), pane_act("query-tx-commit", entity))
+                    .xsmall()
+                    .selected(true)
+                    .disabled(running)
+                    .tooltip(t("transaction.action.commit"))
+                    .into_any_element()
+            } else {
                 kit::primary_button("query-tx-commit", Some(IconName::Check), t("transaction.action.commit"), pane_act("query-tx-commit", entity))
                     .small()
                     .disabled(running)
-                    .tooltip(t("transaction.action.commit")),
-            );
+                    .tooltip(t("transaction.action.commit"))
+                    .into_any_element()
+            };
+            group = group.child(commit_btn);
         }
         Some(group.into_any_element())
     }
@@ -3552,7 +3593,7 @@ impl QueryPane {
 
     /// 紧凑目标选择胶囊：引擎徽标、连接名 › 库名与生产环境提醒；点开双栏弹层。
     #[inline(never)]
-    fn render_target_pickers(&self, p: &Palette, entity: &Entity<QueryPane>, cx: &App) -> Vec<AnyElement> {
+    fn render_target_pickers(&self, max_width: f32, p: &Palette, entity: &Entity<QueryPane>, cx: &App) -> Vec<AnyElement> {
         // 一个“实例 › 库”按钮，点开是双栏弹层（连接 | 库）；弹层是 deferred 浮层，挂在哪儿都画在最上面。
         let metrics = self.density.metrics();
         let target = self.desk.target();
@@ -3561,7 +3602,7 @@ impl QueryPane {
             .map(|target| (target.connection_id.clone(), target.connection_name.clone(), target.database.clone(), target.engine.clone()))
             .unwrap_or_default();
         let env = self.desk.environment_of(&connection_id);
-        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, self.targets_known, &connection_id, &connection_name, &database, &engine, &env, &self.target_button, self.locale, metrics, p, entity)];
+        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, self.targets_known, &connection_id, &connection_name, &database, &engine, &env, max_width, &self.target_button, self.locale, metrics, p, entity)];
         let filter = self.target_filter(cx);
         if let Some(popover) = target::popover(
             &self.target_picker,
@@ -8098,6 +8139,83 @@ mod tests {
         .unwrap();
 
         services.connections.disconnect("notes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn t3_toolbar_fits_at_640_and_900_with_active_transaction_and_long_target(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-t3-query-bounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("bounds.sqlite");
+        std::fs::File::create(&db_path).unwrap();
+
+        for width in [640.0_f32, 900.0_f32] {
+            let (window, pane) = open_sized(cx, width, 720.);
+            let services = pane.read_with(cx, |pane, _| pane.services.clone());
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                services.connections.open_sqlite_for_test("prod-long", "Production Analytics Primary Cluster", &db_path).await.unwrap();
+            });
+            let coordinator = services.connections.transaction_coordinator("prod-long").expect("SQLite 会话应有事务协调器");
+            coordinator
+                .acknowledge(&crate::transaction::ControlStatement::Begin { mode: None }, crate::transaction::ControlOutcome::Confirmed)
+                .unwrap();
+
+            let tab = TabSnap {
+                id: "q".into(),
+                draft: "SELECT 1;".into(),
+                connection_id: Some("prod-long".into()),
+                connection_name: Some("Production Analytics Primary Cluster".into()),
+                database: Some("enterprise_warehouse_reporting".into()),
+                engine: Some("sqlite".into()),
+            };
+
+            cx.update_window(window, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.remember_environments(vec![("prod-long".into(), "prod".into())]);
+                    let _ = pane.sync(std::slice::from_ref(&tab), Some("q"), Locale::En, window, cx);
+                });
+                window.render_frame(cx);
+
+                for id in [
+                    "query-run-slot",
+                    "query-connection",
+                    "query-tx-controls",
+                    "query-tx-rollback",
+                    "query-tx-commit",
+                    "query-act-format",
+                    "query-act-explain",
+                    "query-side-toggle",
+                ] {
+                    let bounds = window.find(id).bounds();
+                    assert!(f32::from(bounds.size.width) > 0., "{width}px: {id} 宽度应大于 0");
+                    assert!(f32::from(bounds.left()) >= 0., "{width}px: {id} 不应左溢出 ({:?})", bounds);
+                    assert!(
+                        f32::from(bounds.right()) <= width + 0.5,
+                        "{width}px: {id} 右边界 {:.1} 超出视口 {width}",
+                        f32::from(bounds.right())
+                    );
+                }
+
+                let tx_bounds = window.find("query-tx-controls").bounds();
+                let format_bounds = window.find("query-act-format").bounds();
+                let side_bounds = window.find("query-side-toggle").bounds();
+                assert!(
+                    f32::from(format_bounds.left()) >= f32::from(tx_bounds.right()) - 0.5,
+                    "{width}px: 格式化按钮不应与活动事务控件重叠 (tx right={:.1}, format left={:.1})",
+                    f32::from(tx_bounds.right()),
+                    f32::from(format_bounds.left())
+                );
+                assert!(
+                    f32::from(side_bounds.left()) >= f32::from(format_bounds.right()),
+                    "{width}px: 侧栏按钮应在格式化按钮右侧且不重叠"
+                );
+            })
+            .unwrap();
+
+            services.connections.disconnect("prod-long");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
