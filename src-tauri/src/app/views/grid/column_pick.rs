@@ -260,6 +260,8 @@ impl GridPane {
         let names = self.session.column_names();
         let needle = query.trim().to_lowercase();
         let hidden_count = self.session.hidden_columns().len();
+        let total = ordered.len();
+        let visible_count = total.saturating_sub(hidden_count);
         let reordered = self.session.has_custom_column_order();
 
         let mut list = div()
@@ -272,7 +274,6 @@ impl GridPane {
             .flex_col()
             .gap(px(Space::XXS));
         let mut matched = 0usize;
-        let total = ordered.len();
         for (pos_ix, logical) in ordered.into_iter().enumerate() {
             let Some(name) = names.get(logical) else { continue };
             let type_name = self.session.column_type(logical).unwrap_or("");
@@ -317,7 +318,7 @@ impl GridPane {
                             .size(px(Space::XL))
                             .rounded(px(Radius::TAG))
                             .border_1()
-                            .border_color(if hidden { p.line } else { p.accent })
+                            .border_color(if hidden { p.line_strong } else { p.accent })
                             .bg(if hidden { p.surface } else { p.accent })
                             .flex()
                             .items_center()
@@ -403,13 +404,13 @@ impl GridPane {
                         .test_support()
                         .occlude()
                         .w(px(MANAGER_W))
-                        .p(px(Space::SM))
+                        .p(px(Space::MD))
                         .flex()
                         .flex_col()
                         .gap(px(Space::SM))
                         .bg(p.raised)
                         .border_1()
-                        .border_color(p.line)
+                        .border_color(p.line_soft)
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
                         .on_key_down(move |event: &KeyDownEvent, window, cx| {
@@ -418,6 +419,25 @@ impl GridPane {
                                 key_owner.update(cx, |pane, cx| pane.close_column_manager(window, cx));
                             }
                         })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(Space::SM))
+                                .child(
+                                    div()
+                                        .text_size(px(TypeScale::SM))
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(p.text)
+                                        .child(t("grid.column.manage")),
+                                )
+                                .child(kit::pill(
+                                    SharedString::from(format!("{visible_count}/{total}")),
+                                    if hidden_count > 0 { p.accent_text } else { p.text_muted },
+                                    if hidden_count > 0 { p.accent_soft } else { p.badge },
+                                )),
+                        )
                         .child(
                             kit::text_input("grid-column-manager-search", &search, t("grid.column.search"))
                                 .small()

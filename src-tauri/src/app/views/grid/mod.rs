@@ -3684,17 +3684,16 @@ impl GridPane {
         let table_mode = self.session.mode == GridMode::Table;
         // 每帧对齐连接状态：失去连接的整表筛选退回已读取行（查找栏收起时同样要对齐）。
         let _ = self.sync_find_scope();
-        // 查找栏默认收起（R10）：工具栏只放一个查找按钮。展开时按钮高亮；收起但仍有生效的关键字或筛选时
+        // 查找栏默认收起（R10）：工具栏只放一个紧凑查找图标按钮。展开时按钮高亮；收起但仍有生效的关键字或筛选时
         // 按钮带计数徽标并说明“显示的不是全部行”，免得把筛过的结果当成全部数据。
         let active = self.active_conditions();
-        let mut find_button = kit::tool_button("grid-find-toggle", Some(IconName::Search), t("grid.action.search"), pane_click(entity, "grid-find-toggle"))
-            .tooltip(SharedString::from(match crate::app::keymap::shortcut("grid-find") {
-                Some(shortcut) => format!("{}  {}", i18n::text(locale, "grid.find.toggle"), crate::app::keymap::display_chord(shortcut.chord())),
-                None => i18n::text(locale, "grid.find.toggle"),
-            }));
-        if self.find_open {
-            find_button = find_button.selected(true);
-        }
+        let find_tip = SharedString::from(match crate::app::keymap::shortcut("grid-find") {
+            Some(shortcut) => format!("{}  {}", i18n::text(locale, "grid.find.toggle"), crate::app::keymap::display_chord(shortcut.chord())),
+            None => i18n::text(locale, "grid.find.toggle"),
+        });
+        let find_button = kit::icon_button("grid-find-toggle", IconName::Search, t("grid.action.search"), pane_click(entity, "grid-find-toggle"))
+            .tooltip(find_tip)
+            .selected(self.find_open);
         let mut find_slot = div().id("grid-find-slot").debug_selector(|| "grid-find-slot".to_owned()).relative().flex_none().child(find_button);
         if active > 0 {
             find_slot = find_slot.child(
@@ -3719,7 +3718,7 @@ impl GridPane {
                     .child(SharedString::from(active.to_string())),
             );
         }
-        let mut left = div().id("grid-tools-left").flex().flex_wrap().items_center().gap(px(4.)).min_w(px(0.)).child(find_slot);
+        let mut left = div().id("grid-tools-left").flex().flex_wrap().items_center().gap(px(Space::XS)).min_w(px(0.)).child(find_slot);
         let visual_filters = self.session.filters().len();
         let sql_filter = self.has_sql_filter();
         let has_filter = visual_filters > 0 || sql_filter;
@@ -3767,7 +3766,7 @@ impl GridPane {
             );
         }
         left = left.child(filter_slot);
-        // 跳到列（R4）与列管理（R7）：跳到列按名字快速定位；列管理集中控制显隐与顺序，隐藏列时显示计数提示。
+        // 跳到列（R4）与列管理（R7）：跳到列收束为紧凑图标按名字快速定位；列管理集中控制显隐与顺序，隐藏列时显示计数提示。
         if !self.session.column_names().is_empty() {
             let jumping = self.column_picker_target() == Some(column_pick::ColumnPickTarget::Jump);
             let jump = {
@@ -3776,10 +3775,9 @@ impl GridPane {
                     entity.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Jump, window, cx));
                 }
             };
-            let mut jump_button = kit::tool_button("grid-jump-column", Some(IconName::Columns3), t("grid.action.jumpColumn"), jump).tooltip(t("grid.action.jumpColumnHint"));
-            if jumping {
-                jump_button = jump_button.selected(true);
-            }
+            let jump_button = kit::icon_button("grid-jump-column", IconName::Columns3, t("grid.action.jumpColumn"), jump)
+                .tooltip(t("grid.action.jumpColumnHint"))
+                .selected(jumping);
             left = left.child(
                 div()
                     .id("grid-jump-column-slot")
@@ -3819,11 +3817,11 @@ impl GridPane {
                         .debug_selector(|| "grid-hidden-columns-badge".to_owned())
                         .test_support()
                         .absolute()
-                        .top(px(-3.))
-                        .right(px(-3.))
-                        .min_w(px(14.))
-                        .h(px(14.))
-                        .px(px(3.))
+                        .top(px(-Space::XXS))
+                        .right(px(-Space::XXS))
+                        .min_w(px(TOOLBAR_BADGE_SIZE))
+                        .h(px(TOOLBAR_BADGE_SIZE))
+                        .px(px(Space::XXS))
                         .rounded_full()
                         .flex()
                         .items_center()
@@ -3844,10 +3842,10 @@ impl GridPane {
                     .debug_selector(|| "grid-sort-chip".to_owned())
                     .flex()
                     .items_center()
-                    .gap(px(2.))
+                    .gap(px(Space::XXS))
                     .h(px(22.))
-                    .pl(px(8.))
-                    .pr(px(2.))
+                    .pl(px(Space::MD))
+                    .pr(px(Space::XXS))
                     .rounded(px(Radius::CONTROL))
                     .bg(p.accent_soft)
                     .text_size(px(TypeScale::XS))
@@ -3870,14 +3868,15 @@ impl GridPane {
             .id("grid-tools")
             .flex_none()
             .min_h(px(m.tools_h()))
-            .py(px(3.))
-            .px(px(8.))
+            .py(px(Space::XS))
+            .px(px(Space::MD))
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(6.))
+            .gap(px(Space::SM))
+            .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .child(left)
             .child(self.render_tools_status(loading, p, entity))
             .child(self.render_tools_actions(table_mode, p, entity));
@@ -3905,13 +3904,13 @@ impl GridPane {
             .test_support()
             .flex_none()
             .h(px(m.strip_h()))
-            .px(px(8.))
+            .px(px(Space::MD))
             .flex()
             .items_center()
-            .gap(px(6.))
-            .bg(p.raised)
+            .gap(px(Space::SM))
+            .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .child(
                 div().w(px(260.)).child(
                     kit::text_input("grid-search", &search, t("grid.action.searchHint"))
@@ -4049,13 +4048,14 @@ impl GridPane {
                 div()
                     .id("grid-readonly-reason")
                     .debug_selector(|| "grid-readonly-reason".to_owned())
+                    .test_support()
                     .flex()
                     .items_center()
-                    .gap(px(4.))
-                    .px(px(6.))
+                    .gap(px(Space::XS))
+                    .px(px(Space::SM))
                     .h(px(20.))
                     .rounded(px(Radius::TAG))
-                    .bg(p.hover)
+                    .bg(p.badge)
                     .text_size(px(TypeScale::XS))
                     .text_color(p.text_muted)
                     .tooltip_text(reason)
@@ -4072,7 +4072,7 @@ impl GridPane {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let writable = self.session.writable();
-        let mut actions = div().id("grid-tools-actions").flex_none().ml_auto().flex().items_center().gap(px(2.));
+        let mut actions = div().id("grid-tools-actions").flex_none().ml_auto().flex().items_center().gap(px(Space::XS));
         // 连接没打开、一行都没读到时，翻页、统计、新增和刷新都无从谈起：正文里已有“连接并读取”，这里不再摆一排点了也没用的按钮。
         let offline_empty = !self.session.target.connection_id.is_empty() && !self.live_target() && self.session.source_len() == 0;
         if table_mode && !offline_empty {
@@ -4095,29 +4095,40 @@ impl GridPane {
                 next_btn = next_btn.tooltip(t("grid.state.noMorePages"));
             }
             actions = actions
-                .child(prev_btn)
                 .child(
                     div()
-                        .id("grid-range-label")
-                        .test_support()
-                        .role(gpui_kit::Role::Button)
-                        .cursor_pointer()
-                        .tooltip_text(if counted { t("grid.range.hint") } else { t("grid.count.hint") })
+                        .id("grid-pager")
                         .flex()
                         .items_center()
-                        .whitespace_nowrap()
-                        .h(px(22.))
-                        .px(px(6.))
+                        .gap(px(Space::XXS))
+                        .px(px(Space::XXS))
                         .rounded(px(Radius::CONTROL))
-                        .hover(|style| style.bg(p.hover))
-                        .text_size(px(TypeScale::SM))
-                        .text_color(p.text_muted)
-                        .child(range)
-                        .when(!counted, |this| this.child(div().ml(px(4.)).text_color(p.accent_text).child(t("grid.count.action"))))
-                        .on_click(pane_click(entity, "grid-count")),
-                )
-                .child(next_btn)
-                .child(div().w(px(6.)));
+                        .bg(p.surface)
+                        .border_1()
+                        .border_color(p.line_soft)
+                        .child(prev_btn)
+                        .child(
+                            div()
+                                .id("grid-range-label")
+                                .test_support()
+                                .role(gpui_kit::Role::Button)
+                                .cursor_pointer()
+                                .tooltip_text(if counted { t("grid.range.hint") } else { t("grid.count.hint") })
+                                .flex()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .h(px(22.))
+                                .px(px(Space::SM))
+                                .rounded(px(Radius::TAG))
+                                .hover(|style| style.bg(p.hover))
+                                .text_size(px(TypeScale::SM))
+                                .text_color(p.text_muted)
+                                .child(range)
+                                .when(!counted, |this| this.child(div().ml(px(Space::XS)).text_color(p.accent_text).child(t("grid.count.action"))))
+                                .on_click(pane_click(entity, "grid-count")),
+                        )
+                        .child(next_btn),
+                );
             if writable {
                 actions = actions.child(kit::tool_button("grid-insert", Some(IconName::Plus), t("grid.action.insertShort"), pane_click(entity, "grid-insert")));
                 if self.session.has_selection() {
@@ -4188,20 +4199,21 @@ impl GridPane {
                 .id("grid-staged-summary")
                 .debug_selector(|| "grid-staged-summary".to_owned())
                 .flex_none()
-                .min_h(px(m.strip_h() + 8.))
-                .px(px(10.))
-                .py(px(3.))
+                .min_h(px(m.strip_h() + Space::MD))
+                .px(px(Space::MD))
+                .py(px(Space::XS))
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .bg(p.warn_soft)
+                .border_l_2()
                 .border_b_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .child(kit::icon(IconName::CircleDot, 13., p.warn))
                 .child(div().text_size(px(TypeScale::SM)).font_weight(gpui_kit::FontWeight::MEDIUM).text_color(p.text).child(count("grid.changes.total", total)))
                 .when(summary.inserts > 0, |this| this.child(kit::pill(count("grid.write.stagedInserts", summary.inserts), p.ok, p.ok_soft)))
-                .when(summary.updates > 0, |this| this.child(kit::pill(count("grid.write.stagedUpdates", summary.updates), p.warn, p.surface)))
+                .when(summary.updates > 0, |this| this.child(kit::pill(count("grid.write.stagedUpdates", summary.updates), p.warn, p.raised)))
                 .when(summary.deletes > 0, |this| this.child(kit::pill(count("grid.write.stagedDeletes", summary.deletes), p.danger, p.danger_soft)))
                 .child(div().flex_1())
                 .child(kit::tool_button("grid-jump-staged", Some(IconName::LocateFixed), t("grid.changes.locate"), pane_click(entity, "grid-jump-staged")))
@@ -4320,7 +4332,7 @@ impl GridPane {
                 .flex_1()
                 .min_w(px(220.))
                 .h(px(28.))
-                .pl(px(Space::MD))
+                .pl(px(Space::SM))
                 .pr(px(Space::XS))
                 .flex()
                 .items_center()
@@ -4328,13 +4340,17 @@ impl GridPane {
                 .rounded(px(Radius::CONTROL))
                 .border_1()
                 // 改了还没应用时边框用强调色，与可视化条件块同一个意思。
-                .border_color(if unapplied { p.accent } else { p.line_strong })
+                .border_color(if unapplied { p.accent } else { p.line })
                 .bg(p.surface)
                 .child(
                     div()
                         .flex_none()
+                        .px(px(Space::SM))
+                        .py(px(Space::XXS))
+                        .rounded(px(Radius::TAG))
+                        .bg(p.accent_soft)
                         .font_family(mono.clone())
-                        .text_size(px(TypeScale::SM))
+                        .text_size(px(TypeScale::XS))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(p.accent_text)
                         .child(SharedString::from("WHERE")),
@@ -4410,13 +4426,13 @@ impl GridPane {
             .id("grid-filters")
             .debug_selector(|| "grid-filters".to_owned())
             .flex_none()
-            .px(px(10.))
+            .px(px(Space::MD))
             .py(px(Space::SM))
             .flex()
             .flex_col()
             .gap(px(Space::XS))
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .bg(p.chrome)
             .child(header);
         if let Some(error) = filter_error {
@@ -4489,7 +4505,7 @@ impl GridPane {
             .rounded(px(Radius::CONTROL))
             .border_1()
             // 正在编辑、尚未应用的条件用强调边框标出来，避免把旧结果当成新条件的结果。
-            .border_color(if unapplied { p.accent } else { p.line })
+            .border_color(if unapplied { p.accent } else { p.line_soft })
             .bg(p.raised)
             .max_w(px(420.))
             .child(
@@ -4877,18 +4893,18 @@ impl GridPane {
             .debug_selector(|| "grid-edit-panel".to_owned())
             .test_support()
             .occlude()
-            .mt(px(2.))
+            .mt(px(Space::XXS))
             .min_w(px(220.))
             .max_w(px(360.))
-            .p(px(6.))
+            .p(px(Space::MD))
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(Space::SM))
             .bg(p.raised)
             .border_1()
-            .border_color(p.line)
-            .rounded(px(Radius::CONTROL))
-            .shadow_md();
+            .border_color(p.line_soft)
+            .rounded(px(Radius::PANEL))
+            .shadow_lg();
         if let Some(error) = error {
             panel = panel.child(
                 div()
@@ -5117,24 +5133,33 @@ impl GridPane {
             .flex_none()
             .max_h(px(if embed.is_some() { 460. } else { 180. }))
             .scroll_area_y()
-            .px(px(14.))
-            .py(px(10.))
+            .px(px(Space::LG))
+            .py(px(Space::MD))
             .border_t_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .bg(p.chrome)
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(Space::SM))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     // 列名与类型放在最前面：用户先确认看的是哪一格；完整值不再挂“完整”标签，只有预览 / 加载 / 失败才标出来。
                     .when(phase != CellPhase::Full, |this| this.child(kit::eyebrow(tag, p)))
                     .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(p.text).child(SharedString::from(column_name.clone())))
                     .when(!column_type.is_empty(), |this| {
-                        this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(column_type.clone())))
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px(px(Space::XS))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.badge)
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_faint)
+                                .child(SharedString::from(column_type.clone())),
+                        )
                     })
                     .child(div().id("grid-value-source").flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).tooltip_text(source.clone()).child(source))
                     .child(kit::icon_button("grid-value-copy", IconName::Copy, t("grid.value.copyValue"), copy))
@@ -5210,13 +5235,13 @@ impl GridPane {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(620.))
                         .max_w(relative(0.92))
-                        .p(px(18.))
+                        .p(px(Space::XL))
                         .flex()
                         .flex_col()
-                        .gap(px(12.))
+                        .gap(px(Space::LG))
                         .bg(p.raised)
                         .border_1()
-                        .border_color(p.line)
+                        .border_color(p.line_soft)
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
                         .child(
@@ -5243,13 +5268,14 @@ impl GridPane {
                                 .id("grid-preview-sql")
                                 .max_h(px(280.))
                                 .scroll_area_y()
-                                .p(px(12.))
-                                .rounded(px(Radius::PANEL))
-                                .bg(p.chrome)
+                                .p(px(Space::LG))
+                                .rounded(px(Radius::CONTROL))
+                                .bg(p.sunken)
                                 .border_1()
-                                .border_color(p.line)
+                                .border_color(p.line_soft)
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(px(TypeScale::SM))
+                                .text_color(p.text)
                                 .child(SharedString::from(sql)),
                         )
                         .child(
@@ -5838,9 +5864,10 @@ impl TableDelegate for SheetDelegate {
                     .size_full()
                     .flex()
                     .items_center()
-                    .bg(p.surface)
+                    .bg(p.raised)
                     .border_1()
                     .border_color(p.accent)
+                    .shadow(vec![kit::focus_ring(p.accent.opacity(0.45), 1.)])
                     // 输入框在表格里面：Esc 绑定的是表格的 Cancel 动作，动作先于按键监听分发。
                     // 在格子这一层接住它，取消编辑而不是让表格当成清除选择。
                     .when_some(self.owner.clone(), |this, owner| {
@@ -5896,14 +5923,12 @@ impl TableDelegate for SheetDelegate {
                 this.justify_end()
                     .text_right()
                     .font_features(kit::tabular_figures())
-                    .when(!row_number, |this| this.pr(px(4.)))
+                    .when(!row_number, |this| this.pr(px(Space::XS)))
             })
             .when(row_number, |this| this.text_color(p.text_faint))
-            .when(null, |this| this.text_color(p.text_faint).italic())
             .when(empty, |this| this.text_color(p.text_faint).opacity(0.6).text_size(px(TypeScale::XS)))
-            .when(pending, |this| this.text_color(p.text_faint))
             .when(mark == 3, |this| this.line_through())
-            .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
+            .when_some(tone_line, |this, color| this.border_l_2().border_color(color))
             .when_some(tooltip, |this, tip| this.tooltip_text(tip))
             // 键盘焦点环：只有键盘刚动过、焦点还在网格里时才画（和 kit 的 focus-visible 同一条判据），
             // 宽度取设计 token 的 2px，颜色取强调色，深浅两套主题都够清楚。
@@ -5913,7 +5938,27 @@ impl TableDelegate for SheetDelegate {
             // 选中时保留选择色；未选中的暂存格用新增/修改/删除底色。
             .when(!selected, |this| this.when_some(tone_bg, |this, color| this.bg(color)))
             .when(selected, |this| this.bg(p.selection))
-            .child(div().min_w(px(0.)).truncate().child(SharedString::from(text)))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .when(null, |this| {
+                        this.px(px(Space::XS))
+                            .rounded(px(Radius::TAG))
+                            .bg(p.badge)
+                            .text_size(px(TypeScale::XS))
+                            .italic()
+                            .text_color(p.text_faint)
+                    })
+                    .when(pending, |this| {
+                        this.px(px(Space::XS))
+                            .rounded(px(Radius::TAG))
+                            .bg(p.hover)
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                    })
+                    .child(SharedString::from(text)),
+            )
             .when_some(owner, move |this, owner| {
                 let drag = owner.clone();
                 let release = owner.clone();
@@ -5989,34 +6034,55 @@ impl TableDelegate for SheetDelegate {
     fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let p = Palette::of(cx);
         let name = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
+        let Some(logical) = self.logical(col_ix) else {
+            return div()
+                .id(("grid-th", col_ix))
+                .debug_selector(move || format!("grid-th-{col_ix}"))
+                .relative()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_end()
+                .overflow_hidden()
+                .text_color(p.text_faint)
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(div().min_w(px(0.)).truncate().child(SharedString::from(name)))
+                .test_support()
+                .into_any_element();
+        };
+        // 表头自己带方向标记：焦点移到工具栏或别的格子后，仍然看得出按哪一列、哪个方向排的。
+        let sorted = self.sort.filter(|(index, _)| *index == logical).map(|(_, descending)| descending);
         // 表头也留稳定选择器：测试点击真实表头坐标，区分 # 列头和第一列数据。
-        let header = div()
+        let mut header = div()
             .id(("grid-th", col_ix))
             .debug_selector(move || format!("grid-th-{col_ix}"))
             .relative()
             .size_full()
             .flex()
             .items_center()
+            .gap(px(Space::XS))
             .overflow_hidden()
             // 列窄时先让出类型缩写（收缩权重大），列名最后才省略。
-            .child(div().min_w(px(0.)).flex_shrink(1.).truncate().child(SharedString::from(name)))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex_shrink(1.)
+                    .truncate()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(if sorted.is_some() { p.accent_text } else { p.text })
+                    .child(SharedString::from(name)),
+            )
             .test_support();
-        let Some(logical) = self.logical(col_ix) else {
-            return header.into_any_element();
-        };
-        // 表头自己带方向标记：焦点移到工具栏或别的格子后，仍然看得出按哪一列、哪个方向排的。
-        let sorted = self.sort.filter(|(index, _)| *index == logical).map(|(_, descending)| descending);
         let meta = self.headers.get(logical);
         let primary = meta.is_some_and(|item| item.primary);
         let foreign = meta.is_some_and(|item| item.foreign);
         let abbr = meta.map(|item| item.abbr.clone()).unwrap_or_default();
         let frozen = self.columns.get(col_ix).is_some_and(|(_, _, fixed)| *fixed);
-        let mut header = header;
         if primary {
-            header = header.child(div().id(("grid-th-pk", col_ix)).debug_selector(move || format!("grid-th-pk-{col_ix}")).flex_none().child(kit::icon(IconName::Key, 12., p.accent)));
+            header = header.child(div().id(("grid-th-pk", col_ix)).debug_selector(move || format!("grid-th-pk-{col_ix}")).flex_none().child(kit::icon(IconName::Key, 12., p.accent_text)));
         }
         if foreign {
-            header = header.child(div().id(("grid-th-fk", col_ix)).debug_selector(move || format!("grid-th-fk-{col_ix}")).flex_none().child(kit::icon(IconName::Link, 12., p.accent)));
+            header = header.child(div().id(("grid-th-fk", col_ix)).debug_selector(move || format!("grid-th-fk-{col_ix}")).flex_none().child(kit::icon(IconName::Link, 12., p.info)));
         }
         if !abbr.is_empty() {
             header = header.child(
@@ -6026,7 +6092,7 @@ impl TableDelegate for SheetDelegate {
                     .min_w(px(0.))
                     .flex_shrink(1000.)
                     .overflow_hidden()
-                    .px(px(4.))
+                    .px(px(Space::XXS))
                     .text_size(px(TypeScale::XS))
                     .text_color(p.text_faint)
                     .child(SharedString::from(abbr)),
@@ -6068,14 +6134,14 @@ impl TableDelegate for SheetDelegate {
                 .mt(px(-9.))
                 .size(px(18.))
                 .rounded(px(Radius::CONTROL))
-                .bg(head_bg)
+                .bg(if sorted.is_some() { p.accent_soft } else { head_bg })
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
                 .when(sorted.is_none(), |this| this.opacity(0.).group_hover(group, |style| style.opacity(1.)))
                 .hover(|style| style.bg(p.hover))
-                .child(kit::icon(sort_icon, 12., if sorted.is_some() { p.accent } else { p.text_faint }))
+                .child(kit::icon(sort_icon, 12., if sorted.is_some() { p.accent_text } else { p.text_faint }))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
@@ -11421,6 +11487,80 @@ mod filter_ui_tests {
             assert!(pane.read(cx).filters_shown());
             assert_eq!(pane.read(cx).session.filter_sql(), "id > 2");
             assert!(window.try_find("grid-filter-collapsed-badge").is_none(), "展开后隐藏折叠徽标");
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui_kit::test]
+    fn t4_streamlined_toolbar_readonly_guard_and_prod_preview_guard(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-t4-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(640.), px(560.)) };
+            gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+                cx.new(|cx| GridPane::new(services, window, cx))
+            })
+            .expect("grid pane")
+        });
+        cx.update_window(window, |_, window, cx| {
+            for dark in [false, true] {
+                crate::ui::kit::apply_theme(dark, cx);
+                // 1) 可写表：精简工具栏核心控件完整可见，NULL 与脏改行均可正常渲染。
+                pane.update(cx, |pane, cx| {
+                    pane.plant_writable(
+                        target_of("items"),
+                        vec![("id", "integer"), ("name", "text"), ("note", "text")],
+                        vec![vec![Some("1"), Some("alpha"), None], vec![Some("2"), Some("beta"), Some("ok")]],
+                        "id",
+                        cx,
+                    );
+                    pane.session.set_target_live(true);
+                    pane.set_prod_target(true);
+                });
+                window.render_frame(cx);
+                for id in ["grid-find-toggle", "grid-filter-add", "grid-jump-column", "grid-columns-manage", "grid-range-label", "grid-insert", "grid-refresh", "grid-record-toggle"] {
+                    let el = window.find(id);
+                    assert!(el.visible(), "dark={dark} {id} 应可见");
+                    let b = el.bounds();
+                    assert!(f32::from(b.origin.x) >= -0.5 && f32::from(b.origin.x + b.size.width) <= 640.5, "dark={dark} {id} 被裁切：{b:?}");
+                }
+                // 2) 暂存修改并打开生产环境预览：回车不得直接确认写入，必须显式点按。
+                pane.update(cx, |pane, cx| {
+                    let _ = pane.command("grid-insert", cx);
+                    let _ = pane.command("grid-preview", cx);
+                });
+                window.render_frame(cx);
+                assert!(pane.read(cx).preview_open(), "预览浮层应打开");
+                assert!(window.try_find("grid-preview-confirm").is_some());
+                pane.update(cx, |pane, cx| pane.preview_enter(cx));
+                window.render_frame(cx);
+                assert!(pane.read(cx).preview_open(), "生产环境按 Enter 必须保持预览打开、不自动写入");
+                pane.update(cx, |pane, cx| pane.cancel_preview(cx));
+                pane.update(cx, |pane, cx| {
+                    let _ = pane.command("grid-discard", cx);
+                });
+
+                // 3) 只读结果：隐藏写入按钮，保留只读锁徽标。
+                pane.update(cx, |pane, cx| {
+                    pane.session.show_query_sheet(
+                        "SELECT id, name FROM items GROUP BY id, name",
+                        vec!["id".into(), "name".into()],
+                        vec![vec![Some("1".into()), None]],
+                        false,
+                        Some(1),
+                    );
+                    pane.sync_table(cx);
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                assert!(window.try_find("grid-insert").is_none(), "只读表必须隐藏新增按钮");
+                assert!(window.try_find("mark-delete").is_none(), "只读表必须隐藏删除按钮");
+                assert!(window.try_find("grid-readonly-reason").is_some(), "只读表应显示只读标识");
+            }
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(dir);

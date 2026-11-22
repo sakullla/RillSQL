@@ -8,7 +8,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window};
 
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Radius, Space, Tip as _, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::FormatViewer;
 
@@ -156,13 +156,13 @@ pub fn render_record(
     let header = div()
         .flex_none()
         .h(px(m.bar_h()))
-        .px(px(8.))
+        .px(px(Space::MD))
         .flex()
         .items_center()
-        .gap(px(4.))
+        .gap(px(Space::XS))
         .border_b_1()
-        .border_color(p.line)
-        .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(title))
+        .border_color(p.line_soft)
+        .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).font_weight(gpui_kit::FontWeight::MEDIUM).text_color(p.text).child(title))
         // 排序/筛选状态写在标题旁边：记录视图逐行看数据时也清楚当前结果是被什么条件筛过的。
         .when_some(edit.scope.clone(), |this, scope| this.child(kit::pill(scope, p.accent_text, p.accent_soft)))
         .child(kit::icon_button("grid-record-prev", IconName::ChevronUp, t("grid.record.prev"), pane_command(entity, "grid-record-prev")).disabled(!can_prev))
@@ -193,13 +193,14 @@ pub fn render_record(
                         .debug_selector(move || format!("grid-record-field-{column}"))
                         .flex_none()
                         .min_h(px(m.row_h))
-                        .px(px(8.))
+                        .px(px(Space::MD))
                         .py(px((m.row_pad_y - 1.).max(2.)))
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(Space::MD))
                         .border_b_1()
                         .border_color(p.line_soft)
+                        .hover(|style| style.bg(p.hover))
                         .child(
                             div()
                                 .id(("grid-record-name", column))
@@ -207,7 +208,7 @@ pub fn render_record(
                                 .flex_none()
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
+                                .gap(px(Space::XS))
                                 .tooltip_text(col_tip)
                                 .child(div().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
                                 .when(!abbr.is_empty(), |this| {
@@ -216,9 +217,9 @@ pub fn render_record(
                                             .id(("grid-record-badge", column))
                                             .debug_selector(move || format!("grid-record-badge-{column}"))
                                             .flex_none()
-                                            .px(px(4.))
+                                            .px(px(Space::XS))
                                             .rounded(px(Radius::TAG))
-                                            .bg(p.hover)
+                                            .bg(p.badge)
                                             .text_size(px(TypeScale::XS))
                                             .text_color(p.text_faint)
                                             .child(SharedString::from(abbr.clone())),
@@ -245,7 +246,7 @@ pub fn render_record(
                                     .min_w_0()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(kit::Space::XS))
+                                    .gap(px(Space::XS))
                                     .child(kit::text_input("grid-record-input", input, t("grid.record.editHint")).small());
                                 if edit.can_null || edit.can_default {
                                     editor = editor.child(
@@ -253,7 +254,7 @@ pub fn render_record(
                                             .flex()
                                             .flex_wrap()
                                             .items_center()
-                                            .gap(px(kit::Space::XS))
+                                            .gap(px(Space::XS))
                                             .when(edit.can_null, |this| {
                                                 this.child(kit::tool_button("grid-record-set-null", None, t("grid.value.setNull"), set_null).xsmall())
                                             })
@@ -270,7 +271,7 @@ pub fn render_record(
                                             .test_support()
                                             .flex()
                                             .items_center()
-                                            .gap(px(kit::Space::XS))
+                                            .gap(px(Space::XS))
                                             .text_size(px(TypeScale::XS))
                                             .text_color(p.danger)
                                             .child(kit::icon(IconName::CircleAlert, 12., p.danger))
@@ -294,13 +295,27 @@ pub fn render_record(
                                     .min_w_0()
                                     .max_h(px(RECORD_VALUE_MAX_H))
                                     .overflow_hidden()
+                                    .flex()
+                                    .items_center()
                                     .font_family(mono.clone())
                                     .text_size(px(TypeScale::SM))
                                     .cursor_pointer()
                                     .tooltip_text(if edit.writable { t("grid.record.editValue") } else { t("grid.status.readonly") })
-                                    .when(field.null, |this| this.italic().text_color(p.text_faint))
                                     .when(!field.null, |this| this.text_color(p.text))
-                                    .child(SharedString::from(field.label.clone()))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .when(field.null, |this| {
+                                                this.px(px(Space::XS))
+                                                    .rounded(px(Radius::TAG))
+                                                    .bg(p.badge)
+                                                    .text_size(px(TypeScale::XS))
+                                                    .italic()
+                                                    .text_color(p.text_faint)
+                                            })
+                                            .child(SharedString::from(field.label.clone())),
+                                    )
                                     .on_click(press)
                                     .into_any_element()
                             }
@@ -322,7 +337,7 @@ pub fn render_record(
             }
         }
         None => {
-            body = body.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("grid.record.empty")));
+            body = body.child(div().p(px(Space::LG)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("grid.record.empty")));
         }
     }
     let mut panel = div()
@@ -336,7 +351,7 @@ pub fn render_record(
         .flex()
         .flex_col()
         .border_l_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .bg(p.chrome)
         .child(header)
         .child(body);
@@ -353,13 +368,14 @@ pub fn render_record(
                 .id("grid-record-batch")
                 .debug_selector(|| "grid-record-batch".to_owned())
                 .flex_none()
-                .px(px(8.))
-                .py(px(6.))
+                .px(px(Space::MD))
+                .py(px(Space::SM))
                 .flex()
                 .items_center()
-                .gap(px(4.))
+                .gap(px(Space::XS))
+                .bg(p.raised)
                 .border_t_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .child(kit::pill(count, p.accent_text, p.accent_soft))
                 .child(kit::tool_button("grid-selection-set", Some(IconName::Pencil), t("grid.write.setValue"), pane_command(entity, "grid-selection-set")))
                 .child(kit::tool_button("grid-selection-null", Some(IconName::X), t("grid.write.setNull"), pane_command(entity, "grid-selection-null")))
@@ -367,7 +383,7 @@ pub fn render_record(
         );
     }
     if let Some(viewer) = viewer {
-        panel = panel.child(div().flex_1().min_h(px(180.)).min_w(px(0.)).border_t_1().border_color(p.line).child(viewer));
+        panel = panel.child(div().flex_1().min_h(px(180.)).min_w(px(0.)).bg(p.surface).border_t_1().border_color(p.line_soft).child(viewer));
     }
     panel.into_any_element()
 }
