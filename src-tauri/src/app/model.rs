@@ -199,9 +199,9 @@ impl ObjectTarget {
     }
 }
 
-/// 固定活动栏只保留这三个顶层入口；低频能力走命令面板与上下文菜单。
+/// 融合顶栏保留的轻量全局导航入口；低频能力走命令面板与上下文菜单。
 pub const RAIL_TOP: [&str; 3] = ["activity-workspace", "activity-connections", "activity-history"];
-/// 底部最多一个设置入口。
+/// 全局设置入口（同样收敛在顶栏导航区）。
 pub const RAIL_BOTTOM: [&str; 1] = ["activity-settings"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -168,26 +168,26 @@ impl Workbench {
             .flex_none()
             .px(px(m.page_pad))
             .pt(px(m.page_pad_y))
-            .pb(px(10.))
+            .pb(px(Space::MD))
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(Space::MD))
+            .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .when(!self.model.tabs.is_empty() && self.model.viewport_width >= 760, |this| {
                         this.child(kit::tool_button("conn-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)).small())
-                            .child(kit::vline(&p))
                     })
                     .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
                     .child(
                         div()
-                            .px(px(6.))
+                            .px(px(Space::SM))
                             .py(px(1.))
                             .rounded(px(Radius::TAG))
                             .bg(p.hover)
@@ -199,13 +199,13 @@ impl Workbench {
                         let online_text = crate::i18n::fill(&self.model.text("conn.page.onlineCount"), &[("count", &online.to_string())]);
                         this.child(
                             div()
-                                .px(px(7.))
+                                .px(px(Space::SM))
                                 .py(px(1.))
                                 .rounded(px(Radius::TAG))
                                 .bg(p.ok_soft)
                                 .flex()
                                 .items_center()
-                                .gap(px(5.))
+                                .gap(px(Space::XS))
                                 .text_size(px(TypeScale::XS))
                                 .text_color(p.ok)
                                 .child(kit::status_dot(p.ok))
@@ -214,7 +214,6 @@ impl Workbench {
                     })
                     .child(div().flex_1())
                     .children(secondary)
-                    .child(kit::vline(&p))
                     .child(self.launcher_action("conn-new", IconName::Plus, self.t("common.newConnection"), Some(&focus), "conn-new-launcher", true, &p, cx)),
             )
             .when(total > 0, |this| {
@@ -229,13 +228,12 @@ impl Workbench {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(Space::MD))
                         .child(search_box)
                         .child(self.filter_button("conn-filter-engine", IconName::Database, SharedString::from(engine), engine_open, "conn-filter-engine", &p, cx))
                         .when(filtering, |this| {
                             this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)).small())
                         })
-                        .when(compact_search, |this| this.child(kit::vline(&p)))
                         .child(self.tag_chips(&p, cx))
                         .child(div().flex_1())
                         .when(self.model.viewport_width >= 680, |this| this.child(layout_toggle)),
@@ -764,11 +762,11 @@ impl Workbench {
             .gap(px(8.))
             .rounded(px(Radius::PANEL))
             .border_1()
-            .when(selected, |this| this.border_color(p.accent).bg(if p.dark { p.raised } else { p.surface }).shadow_sm())
+            .when(selected, |this| this.border_color(p.accent.opacity(0.6)).bg(if p.dark { p.raised } else { p.surface }).shadow_sm())
             .when(!selected, |this| {
-                this.border_color(p.line)
-                    .bg(if p.dark { p.raised } else { p.surface })
-                    .hover(|style| style.border_color(p.line_strong).bg(p.hover))
+                this.border_color(p.line_soft)
+                    .bg(if p.dark { p.raised } else { p.chrome })
+                    .hover(|style| style.border_color(p.line).bg(p.hover))
             })
             .child(
                 div()
@@ -982,7 +980,7 @@ impl Workbench {
     /// 详情栏：所选连接的身份、状态（含失败原因与一键重试）、常用操作、分组切换与配置摘要。
     fn connection_detail_panel(&mut self, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let detail_w = if self.model.viewport_width >= 1080 { 340. } else { DETAIL_W };
-        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(detail_w)).h_full().border_l_1().border_color(p.line).bg(p.chrome).scroll_area_y();
+        let mut panel = div().id("conn-detail").test_support().flex_none().w(px(detail_w)).h_full().border_l_1().border_color(p.line_soft).bg(p.chrome).scroll_area_y();
         let Some(row) = self.model.connections.selected.as_ref().and_then(|id| self.model.connections.rows.iter().find(|row| &row.saved.id == id)).cloned() else {
             return panel.child(div().p(px(20.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("conn.page.pickHint"))).into_any_element();
         };

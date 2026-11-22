@@ -1702,7 +1702,11 @@ fn structure_row_actions_stay_inside_the_real_content_column(cx: &mut gpui_kit::
                 })
                 .unwrap();
             assert!((content_width - layout_width).abs() < 0.5, "{note}: 面板内容宽 {content_width} 应来自布局 {layout_width}");
-            assert!(content_width < viewport - 1., "{note}: 内容宽不能是窗口视口宽 {viewport}");
+            if width > 640. {
+                assert!(content_width < viewport - 1., "{note}: 停靠侧栏时内容宽应小于窗口视口宽 {viewport}");
+            } else {
+                assert!((content_width - viewport).abs() < 0.5, "{note}: 零活动栏覆盖侧栏时内容宽等于视口宽 {viewport}");
+            }
             let row_right = f32::from(row.origin.x + row.size.width);
             let body_right = f32::from(body.origin.x + body.size.width);
             assert!(row_right <= body_right + 0.5, "{note}: 整行越出滚动内容（{row_right} > {body_right}）");
@@ -3963,10 +3967,10 @@ fn settings_and_history_breakpoints_follow_content_width(cx: &mut gpui_kit::Test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for (width, content, side_by_side, stacks) in [
-        (1360f32, 1074, true, false),
-        (900f32, 848, true, false),
-        (760f32, 708, false, true),
-        (640f32, 588, false, true),
+        (1360f32, 1126, true, false),
+        (900f32, 900, true, false),
+        (760f32, 760, false, true),
+        (640f32, 640, false, true),
     ] {
         let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 800.);
         cx.update_window(window, |_, window, cx| {
@@ -4928,13 +4932,16 @@ fn narrow_window_keeps_the_four_entry_rail_and_low_frequency_commands(cx: &mut g
             view.model.set_width(640);
             assert_eq!(
                 view.model.painted().activity_width,
-                super::layout::RAIL_WIDTH,
-                "窄窗口活动栏与绘制同宽，不再挤压内容列"
+                0,
+                "零活动栏模式：不再占用左侧固定宽度"
             );
+            assert_eq!(super::layout::RAIL_WIDTH, 0);
             assert!(view.model.painted().occupied_width() <= 640);
         });
     });
     cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("activity").is_none(), "常驻左侧活动栏已移除");
+        assert!(window.try_find("topbar-nav").is_some(), "全局导航轻入口已并入融合顶栏");
         let expected: Vec<String> = crate::app::model::RAIL_TOP
             .iter()
             .chain(crate::app::model::RAIL_BOTTOM.iter())
@@ -6151,20 +6158,21 @@ fn display_matrix_keeps_primary_controls_visible_and_unoverlapped(cx: &mut gpui_
                 assert!(bottom <= height + 0.5, "{width}: {label} 下方越界 {bottom}");
             };
 
-            for id in ["toolbar", "activity", "workbench-content", "status", "top-new-query"] {
+            assert!(window.try_find("activity").is_none(), "{width}: 常驻活动栏已移除");
+            for id in ["toolbar", "topbar-nav", "tabs", "tab-new", "workbench-content", "status"] {
                 inside(id, rect(id));
             }
             let toolbar = rect("toolbar");
-            let activity = rect("activity");
+            let tabs = rect("tabs");
             let content = rect("workbench-content");
             let status = rect("status");
-            // 上中下四段只相接不重叠：控件不会被另一段盖住。
-            assert!(f32::from(toolbar.origin.y + toolbar.size.height) <= f32::from(activity.origin.y) + 0.5, "{width}");
-            assert!(f32::from(activity.origin.x + activity.size.width) <= f32::from(content.origin.x) + 0.5, "{width}");
+            // 融合顶栏包含工作区页签条，内容区直接紧接顶栏下方且左缘不受活动栏挤压。
+            assert!(f32::from(tabs.origin.y) >= f32::from(toolbar.origin.y) - 0.5, "{width}: 页签条落在融合顶栏内");
+            assert!(f32::from(tabs.origin.y + tabs.size.height) <= f32::from(toolbar.origin.y + toolbar.size.height) + 0.5, "{width}: 页签条未超出顶栏");
+            assert!(f32::from(toolbar.origin.y + toolbar.size.height) <= f32::from(content.origin.y) + 0.5, "{width}");
             assert!(f32::from(content.origin.x + content.size.width) <= width + 0.5, "{width}");
             assert!(f32::from(content.origin.y + content.size.height) <= f32::from(status.origin.y) + 0.5, "{width}");
-            assert!(f32::from(content.size.width) >= 160., "{width}: 工作区被活动栏/侧栏挤到 {}", f32::from(content.size.width));
-            assert!(f32::from(activity.size.width) >= 52. - 0.5, "{width}: 活动栏保持完整宽度");
+            assert!(f32::from(content.size.width) >= 160., "{width}: 工作区被侧栏挤到 {}", f32::from(content.size.width));
 
             let tab = view.read(cx).model.tabs.last().expect("查询标签").id.clone();
             format!("tab-close-{tab}")
@@ -8010,9 +8018,10 @@ fn connections_empty_state_wraps_inside_its_panel_at_every_width(cx: &mut gpui_k
                 window.render_frame(cx);
                 let details: Vec<_> = window.find_all("empty-state-detail").into_iter().filter(|detail| detail.visible()).collect();
                 assert_eq!(details.len(), 1, "{width}: 启动台应只有一个空态说明");
-                // 启动台是单栏：空态整块落在页面主体里，左缘对齐活动栏右侧。
-                let rail = window.find("activity").bounds();
-                (details[0].bounds(), f32::from(rail.origin.x + rail.size.width), f32::from(window.find("workbench").bounds().size.width))
+                // 零活动栏启动台：空态整块落在页面主体里，左缘对齐工作区内容起点（0px）。
+                let content = window.find("workbench-content").bounds();
+                assert!(f32::from(content.origin.x) <= 0.5, "{width}: 零活动栏下内容区从 0px 起算");
+                (details[0].bounds(), f32::from(content.origin.x), f32::from(window.find("workbench").bounds().size.width))
             })
             .unwrap();
         let left = f32::from(detail.origin.x);
@@ -10736,10 +10745,11 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
             )
         });
         assert_eq!(ids.len(), 3, "{note}: 三个工作项");
-        let (content, strip, chips, news) = cx
+        let topbar_h = cx.update(|cx| view.read(cx).model.shell.density.metrics().topbar_h);
+        let (toolbar, strip, chips, news) = cx
             .update_window(window, |_, window, cx| {
                 window.render_frame(cx);
-                let content = window.find("workbench-content").bounds();
+                let toolbar = window.find("toolbar").bounds();
                 let strip = window.find("tabs").bounds();
                 let chips = ids
                     .iter()
@@ -10752,21 +10762,25 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
                         )
                     })
                     .collect::<Vec<_>>();
-                (content, strip, chips, window.find("tab-new").bounds())
+                (toolbar, strip, chips, window.find("tab-new").bounds())
             })
             .unwrap();
-        assert!((f32::from(strip.size.height) - tabs_h).abs() < 0.5, "{note}: 页签条高度跟随密度");
+        let _ = tabs_h;
+        assert!((f32::from(strip.size.height) - topbar_h).abs() < 1.5, "{note}: 融合页签条高度跟随顶栏密度");
         assert!(
-            (f32::from(strip.size.width) - f32::from(content.size.width)).abs() <= 1.5,
-            "{note}: 页签条占满工作区宽度（strip {} content {} x {}）",
-            f32::from(strip.size.width),
-            f32::from(content.origin.x),
-            f32::from(content.size.width)
+            f32::from(strip.origin.x) >= f32::from(toolbar.origin.x) - 0.5
+                && f32::from(strip.origin.x + strip.size.width) <= f32::from(toolbar.origin.x + toolbar.size.width) + 0.5,
+            "{note}: 融合页签条落在顶栏内部（strip {}..{} toolbar {}..{}）",
+            f32::from(strip.origin.x),
+            f32::from(strip.origin.x + strip.size.width),
+            f32::from(toolbar.origin.x),
+            f32::from(toolbar.origin.x + toolbar.size.width)
         );
         assert!(f32::from(strip.origin.x + strip.size.width) <= width + 0.5, "{note}: 页签条不越出视口");
+        let expected_chip_h = f32::from(strip.size.height) - 2. * crate::ui::kit::Space::XS;
         for (index, (chip, icon, title, close)) in chips.iter().enumerate() {
             let chip_bounds = chip.bounds();
-            assert!((f32::from(chip_bounds.size.height) - f32::from(strip.size.height)).abs() < 1.5, "{note}: 页签撑满条高");
+            assert!((f32::from(chip_bounds.size.height) - expected_chip_h).abs() < 1.5, "{note}: 融合页签高度贴合顶栏内边距");
             assert!(f32::from(chip_bounds.size.width) <= crate::ui::tabs::TAB_MAX_W + 0.5, "{note}: 长标题不撑破页签");
             let middle = center(chip_bounds);
             for (name, bounds) in [("类型图标", *icon), ("标题", *title), ("关闭", *close)] {
@@ -14782,5 +14796,50 @@ fn manual_default_starts_a_transaction_and_restarts_after_commit(cx: &mut gpui_k
         }),
         "提交后自动开启下一个事务"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+fn zero_rail_overlay_sidebar_and_integrated_topbar_tabs(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-zero-rail-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 640., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.sidebar_open = true;
+            view.perform("new-query", cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("activity").is_none(), "常驻活动栏已移除");
+        let scrim = window.find("sidebar-scrim").bounds();
+        let overlay = window.find("sidebar-overlay").bounds();
+        assert!(f32::from(scrim.origin.x).abs() <= 0.5, "窄窗遮罩左缘应从 0px 起算，实际 {}", f32::from(scrim.origin.x));
+        assert!(f32::from(overlay.origin.x).abs() <= 0.5, "窄窗覆盖侧栏左缘应从 0px 起算，实际 {}", f32::from(overlay.origin.x));
+        let toolbar = window.find("toolbar").bounds();
+        let tabs = window.find("tabs").bounds();
+        assert!(f32::from(tabs.origin.y) >= f32::from(toolbar.origin.y) - 0.5);
+        assert!(f32::from(tabs.origin.y + tabs.size.height) <= f32::from(toolbar.origin.y + toolbar.size.height) + 0.5);
+        for id in ["top-sidebar", "cmd-activity-connections", "cmd-activity-history", "cmd-activity-settings", "top-search", "top-open-file", "top-theme"] {
+            assert!(window.find(id).visible(), "融合顶栏控件 {id} 在 640px 下仍可见");
+        }
+    })
+    .unwrap();
+    // 轻导航入口可切换连接、历史、设置并回到工作区。
+    for (cmd, expected_page) in [
+        ("cmd-activity-connections", crate::app::AppPage::Connections),
+        ("cmd-activity-history", crate::app::AppPage::History),
+        ("cmd-activity-settings", crate::app::AppPage::Settings),
+        ("cmd-activity-workspace", crate::app::AppPage::Workspace),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(cmd, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|cx| view.read(cx).model.shell.page), expected_page, "点击 {cmd} 应切到 {expected_page:?}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }

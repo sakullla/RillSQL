@@ -3,9 +3,8 @@
 
 use crate::ui::kit::Metrics;
 
-/// 活动栏的固定宽度。绘制（chrome 模块的 rail）与几何（这里）共用一个值；
-/// 38px 图标加两侧留白与选中标记，52 才不会挤掉内容列。
-pub const RAIL_WIDTH: i32 = 52;
+/// 零活动栏极简外壳：常驻左侧活动栏已移除，全局导航轻入口并入统一顶栏。
+pub const RAIL_WIDTH: i32 = 0;
 
 /// 对象树侧栏宽度。双击拖拽条回到默认值。
 pub const SIDEBAR_DEFAULT: f32 = 234.;
@@ -55,7 +54,7 @@ pub struct ChromeLayout {
 }
 
 pub fn layout_with_sidebar(width: i32, sidebar_open: bool, sidebar_width: i32) -> ChromeLayout {
-    // 活动栏宽度不随窗口变化：变窄会让图标和选中标记被裁掉，反而挤压内容列。
+    // 零活动栏模式：不再占用左侧固定宽度，内容区从 0px 起算。
     let activity_width = RAIL_WIDTH;
     let sidebar_width = clamp_sidebar(sidebar_width as f32) as i32;
     let (sidebar_width, sidebar_mode) = if width <= 640 {
@@ -206,7 +205,8 @@ mod tests {
 
     #[test]
     fn rail_width_is_reserved_once_so_the_workspace_is_not_squeezed() {
-        // 绘制用同一个 52px 活动栏；模型里的内容宽必须正好是扣除它之后的宽度。
+        // 零活动栏模式：RAIL_WIDTH 与 activity_width 均为 0，内容宽等于扣除停靠侧栏后的全部宽度。
+        assert_eq!(RAIL_WIDTH, 0);
         for width in [1360, 900, 640] {
             for open in [true, false] {
                 for density in [crate::app::Density::Compact, crate::app::Density::Standard, crate::app::Density::Relaxed] {
@@ -217,9 +217,8 @@ mod tests {
                     assert_eq!(frame.sidebar_overlay, open && width <= 640);
                     assert!(!frame.toolbar_wrap);
                     assert_eq!(frame.toolbar_height, Metrics::standard().topbar_h as i32);
-                    assert_eq!(frame.activity_width, RAIL_WIDTH, "{width} open={open}");
+                    assert_eq!(frame.activity_width, 0, "{width} open={open}");
                     let expected = frame.body_width
-                        - RAIL_WIDTH
                         - if frame.sidebar_in_flex { frame.sidebar_width } else { 0 };
                     assert_eq!(frame.content_width, expected.max(0), "{width} {density:?}");
                     // 行宽加两侧 padding 正好等于视口，没有留白也没有被裁掉的列。

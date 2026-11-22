@@ -38,11 +38,6 @@ use crate::transaction::TransactionCapabilities;
 
 use crate::ui::kit::stack_frame;
 
-/// 活动栏宽度来自布局模块，绘制与几何只保留一份。
-const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
-/// 活动栏激活指示条（3px 宽的竖线）两端的圆角。线条不是控件，不取 `Radius` token；见扫描测试例外清单。
-const RAIL_INDICATOR_RADIUS: f32 = 2.;
-
 /// 拖拽连接时的拖动图形：不画内容，避免挡住目标分组标题。
 pub(super) struct ConnectionDragGhost;
 
@@ -221,7 +216,6 @@ impl Workbench {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(self.rail(cx))
                     .when_some(if docked_sidebar { sidebar } else { None }, |this, sidebar| this.child(sidebar))
                     .child(
                         div()
@@ -233,22 +227,21 @@ impl Workbench {
                             .flex_1()
                             .min_w_0()
                             .bg(p.surface)
-                            .border_l_1()
-                            .border_color(p.line)
+                            .when(docked_sidebar, |this| this.border_l_1().border_color(p.line_soft))
                             .overflow_hidden()
                             .child(content),
                     )
                     .when(overlay_sidebar, |this| {
                         let sidebar = self.explorer(window, cx);
                         let entity = cx.entity();
-                        // 覆盖式侧栏下面压一层轻遮罩：看得出侧栏浮在内容上方，点遮罩收起侧栏。
+                        // 覆盖式侧栏下面压一层轻遮罩：零活动栏下从左缘 0px 起铺满，点遮罩收起侧栏。
                         let scrim = div()
                             .id("sidebar-scrim")
                             .test_support()
                             .absolute()
                             .top_0()
                             .bottom_0()
-                            .left(px(RAIL_W))
+                            .left_0()
                             .right_0()
                             .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.18 }))
                             .occlude()
@@ -262,10 +255,11 @@ impl Workbench {
                         this.child(scrim).child(
                             div()
                                 .id("sidebar-overlay")
+                                .test_support()
                                 .absolute()
                                 .top_0()
                                 .bottom_0()
-                                .left(px(RAIL_W))
+                                .left_0()
                                 .shadow_lg()
                                 // 覆盖式侧栏盖在工作区上方：鼠标事件只到侧栏，不能穿透到下面的编辑器/表格
                                 // （否则右键树节点会弹出编辑器菜单，点击也会落到编辑器上）。
@@ -751,40 +745,123 @@ impl Workbench {
     fn topbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
+        let page = self.model.shell.page;
+        let tool = self.model.tool;
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
         let theme_next = if dark { "theme-light" } else { "theme-dark" };
         let narrow = self.model.viewport_width <= 760;
+        let compact_search = self.model.viewport_width < 960;
         let entity = cx.entity();
-        // 顶栏就是窗口标题栏：空白处拖动窗口、双击最大化，Windows/Linux 在右侧画最小化/最大化/关闭。
-        // 按钮包在 occlude 里，命中测试才不会把点击当成拖动标题栏。
-        let controls = |child: AnyElement| div().flex().items_center().gap(px(8.)).occlude().child(child);
+        let tool_view = (page == AppPage::Workspace && matches!(tool, WorkTool::Table | WorkTool::Redis | WorkTool::Mongo | WorkTool::Overview))
+            || matches!(page, AppPage::Structure | AppPage::Compare | AppPage::Diagram);
+        let in_workspace = !matches!(page, AppPage::Connections | AppPage::History | AppPage::Settings);
+        let show_tabs = in_workspace && (!self.model.show_welcome() || tool_view || !self.model.tabs.is_empty());
+
+        // 融合顶栏即窗口标题栏：空白处可拖动窗口与双击最大化，所有交互控件均包在 occlude() 内。
+        let controls = |child: AnyElement| div().flex_none().flex().items_center().gap(px(Space::XS)).occlude().child(child);
+
+        // 左侧区：侧栏开关 + 紧凑全局导航轻入口（工作区、连接、历史、设置），替代原 52px 常驻活动栏。
+        let mut nav_cluster = div()
+            .id("topbar-nav")
+            .test_support()
+            .role(gpui_kit::Role::Navigation)
+            .aria_label(self.t("shell.nav.main"))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(Space::XXS))
+            .occlude();
+        for id in crate::app::model::RAIL_TOP.iter().chain(crate::app::model::RAIL_BOTTOM.iter()) {
+            if let Some((icon, key, active)) = rail_entry(id, page) {
+                nav_cluster = nav_cluster.child(topbar_nav_item(id, icon, self.t(key), active, &p, cx));
+            }
+        }
+
+        let left_cluster = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .child(controls(
+                kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx))
+                    .selected(self.model.shell.sidebar_open)
+                    .into_any_element(),
+            ))
+            .child(nav_cluster);
+
+        // 中央区：工作区态直接嵌入缓存化的融合工作区页签条；非工作区或空欢迎态展示极简页面标识与拖拽留白。
+        let center: AnyElement = if show_tabs {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .occlude()
+                .child(
+                    gpui_kit::AnyView::from(self.tab_strip_host.clone())
+                        .cached(gpui_kit::StyleRefinement::default().flex_1().min_w_0().w_full().h_full()),
+                )
+                .into_any_element()
+        } else {
+            let page_label: Option<SharedString> = match page {
+                AppPage::Connections => Some(self.t("connections.page.title")),
+                AppPage::History => Some(self.t("history.page.titleRuns")),
+                AppPage::Settings => Some(self.t("shell.settings.title")),
+                _ => None,
+            };
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(Space::SM))
+                .child(brand_mark(18., &p))
+                .when(!narrow, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(TypeScale::SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child("RillSQL"),
+                    )
+                })
+                .when_some(page_label.filter(|_| !narrow), |this, label| {
+                    this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child("/"))
+                        .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(label))
+                })
+                .into_any_element()
+        };
+
+        // 生产环境目标醒目紧凑提醒（普通环境的目标已在查询条与状态栏里，不重复占据顶栏）。
         let top_target = self.active_target_summary().and_then(|(_, engine, name, database, env, missing)| {
             let is_prod = super::danger::env_is_prod(&env, Some(&self.model.env_tags));
-            // 普通环境的目标已经在查询工具条和状态栏里，顶栏只为生产环境保留一个醒目的提醒。
             if !is_prod {
                 return None;
             }
             let label = SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") });
-            let max_w = if narrow { 140. } else { 240. };
+            let max_w = if narrow { 116. } else { 196. };
             Some(controls(
                 kit::interactive_states(div().id("top-target"), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(if missing { SharedString::from(format!("{label} · {}", self.t("ui.query.targetMissing"))) } else { label.clone() })
                     .tooltip_text(if missing { self.t("ui.query.targetMissing") } else { self.t("ui.status.switchTargetHint") })
-                    .h(px(m.control_h))
+                    .h(px(m.control_h - 2.))
                     .max_w(px(max_w))
-                    .px(px(Space::MD))
+                    .px(px(Space::SM))
                     .flex()
                     .items_center()
-                    .gap(px(Space::SM))
+                    .gap(px(Space::XS))
                     .rounded(px(Radius::CONTROL))
                     .border_1()
-                    .border_color(if is_prod { p.danger.opacity(0.45) } else { p.line })
-                    .bg(if is_prod { p.danger_soft } else { p.surface })
+                    .border_color(p.danger.opacity(0.45))
+                    .bg(p.danger_soft)
                     .text_size(px(TypeScale::XS))
-                    .text_color(if missing { p.warn } else if is_prod { p.danger } else { p.text_muted })
-                    .hover(|style| style.bg(if is_prod { p.danger_soft } else { p.hover }).text_color(if is_prod { p.danger } else { p.text }))
+                    .text_color(if missing { p.warn } else { p.danger })
+                    .hover(|style| style.bg(p.danger_soft))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w_0().truncate().child(label))
                     .when(missing, |this| this.child(kit::icon(IconName::TriangleAlert, 12., p.warn)))
@@ -797,65 +874,53 @@ impl Workbench {
                     .into_any_element(),
             ))
         });
-        let row = div()
-            .id("toolbar")
-            .test_support()
-            .role(gpui_kit::Role::Toolbar)
-            .aria_label(self.t("ui.topbar.label"))
-            .h_full()
-            .flex_1()
-            .min_w_0()
-            .pr(px(10.))
+
+        // 命令面板触发器：宽屏紧凑胶囊（带快捷键），窄屏退化为搜索图标按钮，给页签条留出空间。
+        let search_trigger: AnyElement = if compact_search {
+            kit::icon_button(
+                "top-search",
+                IconName::Search,
+                SharedString::from(format!("{} ({})", self.t("shell.palette.title"), kit::shortcut("Ctrl+K"))),
+                act("command-palette", cx),
+            )
+            .into_any_element()
+        } else {
+            kit::interactive_states(div().id("top-search"), &p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(self.t("shell.palette.title"))
+                .tooltip_text(self.t("shell.palette.title"))
+                .h(px(m.control_h - 2.))
+                .px(px(Space::MD))
+                .flex()
+                .items_center()
+                .gap(px(Space::SM))
+                .rounded(px(Radius::CONTROL))
+                .border_1()
+                .border_color(p.line_soft)
+                .bg(p.sunken)
+                .hover(|style| style.bg(p.surface).border_color(p.line))
+                .child(kit::icon(IconName::Search, kit::IconSize::INLINE, p.text_faint))
+                .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
+                .on_click(act("command-palette", cx))
+                .into_any_element()
+        };
+
+        let right_cluster = div()
+            .flex_none()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .child(controls(
-                kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx))
-                    .selected(self.model.shell.sidebar_open)
-                    .into_any_element(),
-            ))
+            .gap(px(Space::XS))
+            .children(top_target)
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(brand_mark(22., &p))
-                    .when(!narrow, |this| this.child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).child("RillSQL"))),
-            )
-            .child(div().flex_1())
-            .children(top_target)
-            .child(controls(
-                kit::interactive_states(div().id("top-search"), &p, false)
-                    .test_support()
-                    .role(gpui_kit::Role::Button)
-                    .aria_label(self.t("shell.palette.title"))
-                    .w(px(if narrow { 176. } else { 320. }))
-                    .h(px(m.control_h))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(Radius::CONTROL))
-                    .border_1()
-                    .border_color(p.line)
-                    .bg(p.sunken)
-                    .hover(|style| style.bg(p.surface).border_color(p.line_strong))
-                    .child(kit::icon(IconName::Search, 13., p.text_faint))
-                    .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.search.placeholder")))
-                    .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
-                    .on_click(act("command-palette", cx))
-                    .into_any_element(),
-            ))
-            .child(div().flex_1())
-            .child(
-                // 唯一的“打开文件”入口：.sql 进编辑器，SQLite 文件建连接，认不出时询问。
-                controls(kit::icon_button("top-open-file", IconName::FolderOpen, self.t("shell.command.openFile"), act("open-file", cx)).into_any_element())
-                    .when(!narrow, |this| {
-                        this.child(
-                            kit::icon_button("top-exchange", IconName::ArrowDownUp, self.t("shell.command.openExchange"), act("open-exchange", cx))
-                                .selected(self.model.exchange_open || self.model.exchange_running),
-                        )
-                    })
+                    .gap(px(Space::XXS))
+                    .occlude()
+                    .child(search_trigger)
+                    .child(kit::icon_button("top-open-file", IconName::FolderOpen, self.t("shell.command.openFile"), act("open-file", cx)))
                     .child(kit::icon_button(
                         "top-theme",
                         if dark { IconName::Sun } else { IconName::Moon },
@@ -864,59 +929,37 @@ impl Workbench {
                         self.t("shell.command.toggleTheme"),
                         act(theme_next, cx),
                     ))
-                    .child(if narrow {
-                        kit::icon_button("top-new-query", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).primary().into_any_element()
-                    } else {
-                        kit::subtle_button("top-new-query", Some(IconName::Plus), self.t("shell.command.newQuery"), act("new-query", cx)).into_any_element()
+                    .when(!show_tabs, |this| {
+                        this.child(kit::icon_button("top-new-query", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)))
                     }),
             );
+
+        let row = div()
+            .id("toolbar")
+            .test_support()
+            .role(gpui_kit::Role::Toolbar)
+            .aria_label(self.t("ui.topbar.label"))
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .pr(px(Space::MD))
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .child(left_cluster)
+            .child(center)
+            .child(right_cluster);
+
         TitleBar::new()
             .h(px(m.topbar_h))
-            .when(!cfg!(target_os = "macos"), |this| this.pl(px(10.)))
+            .when(!cfg!(target_os = "macos"), |this| this.pl(px(Space::MD)))
             .bg(p.chrome)
-            .border_color(p.line)
+            .border_color(p.line_soft)
             // Linux 自绘的关闭按钮走与系统关闭相同的未保存守卫。
             .on_close_window(move |_, _, cx| {
                 entity.update(cx, |this, cx| this.perform("quit-window", cx));
             })
             .child(row)
-            .into_any_element()
-    }
-
-    // ------------------------------------------------------------ 活动栏
-
-    fn rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let p = Palette::of(cx);
-        let page = self.model.shell.page;
-        // 固定活动栏只留工作台、连接、历史与底部设置；对比、导入导出和帮助
-        // 走命令面板与对象/结果上下文菜单，不再占固定位置。
-        let mut top = div().flex().flex_col().items_center().gap(px(4.));
-        let rail = crate::app::model::RAIL_TOP;
-        for id in rail {
-            if let Some((icon, key, active)) = rail_entry(id, page) {
-                top = top.child(rail_item(id, icon, self.t(key), active, &p, cx));
-            }
-        }
-        let mut bottom = div().flex().flex_col().items_center().gap(px(4.));
-        for id in crate::app::model::RAIL_BOTTOM {
-            if let Some((icon, key, active)) = rail_entry(id, page) {
-                bottom = bottom.child(rail_item(id, icon, self.t(key), active, &p, cx));
-            }
-        }
-        div()
-            .id("activity")
-            .test_support()
-            .role(gpui_kit::Role::Navigation)
-            .aria_label(self.t("shell.nav.main"))
-            .flex_none()
-            .w(px(RAIL_W))
-            .py(px(8.))
-            .flex()
-            .flex_col()
-            .justify_between()
-            .bg(p.rail)
-            .child(top)
-            .child(bottom)
             .into_any_element()
     }
 
@@ -1008,6 +1051,54 @@ impl Workbench {
             }
         }
         let dragging = self.model.sidebar_dragging;
+        let has_connections = !self.model.connections.rows.is_empty();
+        let explorer_actions = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(Space::XXS))
+            .when(has_connections, |this| {
+                this.child(
+                    kit::icon_button("explorer-collapse", IconName::ChevronsUp, self.t("ui.explorer.collapseAll"), act("collapse-tree", cx))
+                        .xsmall()
+                        .disabled(!self.model.nav.has_expanded()),
+                )
+                .child(
+                    kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx))
+                        .xsmall()
+                        .disabled(!self.model.has_connected()),
+                )
+            })
+            // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
+            .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
+            .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("conn-new-sidebar", cx)).xsmall());
+        let explorer_header = if has_connections {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(Space::XS))
+                .px(px(Space::MD))
+                .py(px(Space::SM))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(filter.prefix(kit::input_prefix(IconName::Search, kit::IconSize::INLINE, p.text_faint)).cleanable(true)),
+                )
+                .child(explorer_actions)
+        } else {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h(px(m.tabs_h))
+                .pl(px(Space::XL))
+                .pr(px(Space::SM))
+                .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
+                .child(explorer_actions)
+        };
         div()
             .id("sidebar")
             .test_support()
@@ -1019,8 +1110,6 @@ impl Workbench {
             .h_full()
             .flex()
             .bg(p.chrome)
-            .border_l_1()
-            .border_color(p.line)
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
                 if event.drag(cx).key.as_ref() != "sidebar-resize" {
                     return;
@@ -1043,38 +1132,7 @@ impl Workbench {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .h(px(m.tabs_h))
-                            .pl(px(14.))
-                            .pr(px(6.))
-                            .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(2.))
-                                    .child(
-                                        kit::icon_button("explorer-collapse", IconName::ChevronsUp, self.t("ui.explorer.collapseAll"), act("collapse-tree", cx))
-                                            .xsmall()
-                                            .disabled(!self.model.nav.has_expanded()),
-                                    )
-                                    .child(
-                                        kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx))
-                                            .xsmall()
-                                            .disabled(!self.model.has_connected()),
-                                    )
-                                    // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
-                                    .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
-                                    .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("conn-new-sidebar", cx)).xsmall()),
-                            ),
-                    )
-                    // 没有连接时没有可筛的对象，筛选框不出现。
-                    .when(!self.model.connections.rows.is_empty(), |this| {
-                        this.child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::input_prefix(IconName::Search, 13., p.text_faint)).cleanable(true)))
-                    })
+                    .child(explorer_header)
                     .when(search_skipped > 0, |this| {
                         let msg = i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &search_skipped.to_string())]);
                         this.child(
@@ -2384,19 +2442,13 @@ impl Workbench {
                 .child(self.query.clone())
                 .into_any_element()
         };
-        // 页签条是缓存视图（见 `TabStripHost`）：光标闪烁等只标脏工作台的重绘不再重排几百个页签。
-        let tabs_h = self.metrics().tabs_h;
-        let strip = (!welcome || !self.model.tabs.is_empty()).then(|| {
-            gpui_kit::AnyView::from(self.tab_strip_host.clone())
-                .cached(gpui_kit::StyleRefinement::default().flex_none().w_full().h(px(tabs_h)))
-        });
+        // 工作区页签条已融合进顶栏（`topbar` 中的 `TabStripHost`），这里不再渲染第二层标签栏。
         let _ = window;
         let transaction = self.transaction_bar(cx);
         div()
             .flex()
             .flex_col()
             .size_full()
-            .children(strip)
             .children(transaction)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .into_any_element()
@@ -2425,7 +2477,7 @@ impl Workbench {
             .test_support()
             .flex_none()
             .w(px(ControlSize::PICKER_MIN_W - 60.))
-            .h(px(m.tabs_h))
+            .h(px(m.control_h))
             .px(px(Space::XS))
             .flex()
             .items_center()
@@ -2446,7 +2498,6 @@ impl Workbench {
         #[cfg(test)]
         self.strip_count.set(self.strip_count.get() + 1);
         let p = Palette::of(cx);
-        let m = self.metrics();
         // 页签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达，
         // 并且切过去之后列表自己把当前项滚进视口，不用手动横向拖。
         // 新建按钮紧跟最后一个标签（浏览器式），标签多到放不下时列表自己横向滚动。
@@ -2558,6 +2609,7 @@ impl Workbench {
             let spinner = tab.running.then(|| self.spinners.view(format!("tab-{id}"), Size::XSmall, Some(p.accent), cx));
             let chip = tabs::tab(
                 tabs::TabSpec::new(SharedString::from(format!("tab-{id}")), item_icon(tab.kind), title)
+                    .workspace()
                     .active(active)
                     .running(tab.running)
                     .spinner(spinner)
@@ -2684,7 +2736,7 @@ impl Workbench {
                     .size_full(),
             )
             .into_any_element();
-        let strip = tabs::tab_strip_with_double_click(
+        let strip = tabs::tab_strip_integrated(
             "tabs",
             self.t("shell.tabs.tablist"),
             "tab-list",
@@ -2692,13 +2744,13 @@ impl Workbench {
             vec![list_action, new_action],
             &self.tab_scroll,
             reveal,
-            &m,
             &p,
             Some(kit::click(act("new-query", cx))),
         );
+        let host = div().size_full().min_w_0().flex().items_center().child(strip);
         match self.render_tab_picker(window, cx) {
-            Some(overlay) => div().size_full().child(strip).child(overlay).into_any_element(),
-            None => strip,
+            Some(overlay) => host.child(overlay).into_any_element(),
+            None => host.into_any_element(),
         }
     }
 
@@ -2887,12 +2939,19 @@ impl Workbench {
             .gap(px(14.))
             .bg(p.chrome)
             .border_t_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .text_size(px(TypeScale::XS))
             .text_color(p.text_muted)
             .child(target)
             .children(self.status_transaction(&p, cx))
-            .child(div().flex_1().min_w_0().truncate().child(SharedString::from(notice)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(notice_key.is_none(), |this| this.text_color(p.text_faint))
+                    .child(SharedString::from(notice)),
+            )
             .when(running, |this| {
                 this.child(
                     kit::interactive_states(div().id("status-jobs"), &p, false)
@@ -3032,35 +3091,45 @@ impl Workbench {
                 .aria_label(heading.clone())
                 .flex_1()
                 .min_w(px(190.))
-                .p(px(m.card_pad() + 2.))
+                .px(px(m.card_pad()))
+                .py(px(m.card_pad() - 2.))
                 .flex()
-                .flex_col()
-                .gap(px(8.))
+                .items_center()
+                .gap(px(Space::LG))
                 .rounded(px(Radius::PANEL))
                 .border_1()
-                .border_color(p.line)
-                .bg(if p.dark { p.raised } else { p.surface })
-                .hover(|style| style.border_color(p.accent).bg(p.hover))
+                .border_color(p.line_soft)
+                .bg(if p.dark { p.raised } else { p.chrome })
+                .hover(|style| style.border_color(p.accent.opacity(0.45)).bg(if p.dark { p.hover } else { p.surface }))
                 .child(
                     div()
+                        .flex_none()
+                        .size(px(32.))
+                        .rounded(px(Radius::CONTROL))
+                        .bg(p.accent_soft)
                         .flex()
                         .items_center()
-                        .justify_between()
-                        .gap(px(8.))
+                        .justify_center()
+                        .child(kit::icon(icon, kit::IconSize::CONTROL, p.accent_text)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::XXS))
                         .child(
                             div()
-                                .size(px(32.))
-                                .rounded(px(Radius::CONTROL))
-                                .bg(p.accent_soft)
                                 .flex()
                                 .items_center()
-                                .justify_center()
-                                .child(kit::icon(icon, 16., p.accent_text)),
+                                .justify_between()
+                                .gap(px(Space::SM))
+                                .child(div().truncate().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
+                                .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(chord), &p))),
                         )
-                        .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(chord), &p))),
+                        .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(desc)),
                 )
-                .child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
-                .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(desc))
                 .on_click(act(command, cx))
                 .into_any_element()
         };
@@ -3212,15 +3281,16 @@ impl Workbench {
                 .into_any_element()
         });
 
-        let history_section = (!recent_runs.is_empty()).then(|| {
-            let mut history_rows = div().flex().flex_col().gap(px(2.));
+        let saved_queries: Vec<_> = self.model.history.saved.iter().take(4).cloned().collect();
+        let history_section = (!recent_runs.is_empty() || !saved_queries.is_empty()).then(|| {
+            let mut history_rows = div().flex().flex_col().gap(px(Space::XXS));
             for entry in recent_runs.iter() {
                 let id = entry.id.clone();
                 let menu_id = id.clone();
                 history_rows = history_rows.child(
                     list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
                         .test_support()
-                        .child(kit::icon(IconName::Clock, 14., p.text_faint))
+                        .child(kit::icon(IconName::Clock, kit::IconSize::CONTROL, p.text_faint))
                         .child(
                             div()
                                 .flex_1()
@@ -3254,20 +3324,45 @@ impl Workbench {
                         })),
                 );
             }
+            for saved in saved_queries.iter() {
+                let id = saved.id.clone();
+                let title = if saved.name.trim().is_empty() { one_line(&saved.sql) } else { saved.name.clone() };
+                history_rows = history_rows.child(
+                    list_row(SharedString::from(format!("welcome-saved-{id}")), &p, m.row_pad_y)
+                        .test_support()
+                        .child(kit::icon(IconName::Bookmark, kit::IconSize::CONTROL, p.accent_text))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(title)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(px(120.))
+                                .truncate()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_faint)
+                                .child(self.t("history.page.saved")),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.model.history.selected_saved = Some(id.clone());
+                            this.model.history.section = HistorySection::Saved;
+                            this.perform("history-load", cx);
+                        })),
+                );
+            }
+            let total_items = recent_runs.len() + saved_queries.len();
             kit::card(&p)
                 .flex_1()
                 .min_w(px(260.))
                 .p(px(m.card_pad()))
                 .flex()
                 .flex_col()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
                         .child(kit::eyebrow(self.t("shell.welcome.recent"), &p))
-                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(recent_runs.len().to_string()))),
+                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(total_items.to_string()))),
                 )
                 .child(div().id("welcome-recent-runs").max_h(px(240.)).scroll_area_y().child(history_rows))
                 .into_any_element()
@@ -3323,9 +3418,9 @@ impl Workbench {
                                     .px(px(10.))
                                     .rounded(px(Radius::CONTROL))
                                     .border_1()
-                                    .border_color(p.line)
-                                    .bg(if p.dark { p.raised } else { p.surface })
-                                    .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+                                    .border_color(p.line_soft)
+                                    .bg(if p.dark { p.raised } else { p.chrome })
+                                    .hover(|style| style.bg(p.hover).border_color(p.line))
                                     .text_size(px(TypeScale::SM))
                                     .text_color(p.text_muted)
                                     .child(kit::icon(IconName::Clock, 13., p.text_faint))
@@ -3583,7 +3678,7 @@ impl Workbench {
                 .px(px(pad))
                 .py(px(Space::LG))
                 .border_b_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .child(kit::engine_badge(engine.as_str(), 30.))
                 .child(
                     div()
@@ -4168,12 +4263,12 @@ impl Workbench {
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .px(px(pad))
-                .py(px(10.))
+                .py(px(Space::MD))
                 .border_t_1()
-                .border_color(p.line)
-                .bg(p.surface)
+                .border_color(p.line_soft)
+                .bg(p.chrome)
                 .child(
                     div()
                         .flex()
@@ -4231,9 +4326,9 @@ impl Workbench {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(p.surface)
+                .bg(if p.dark { p.raised } else { p.surface })
                 .border_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .rounded(px(Radius::PANEL))
                 .shadow_lg()
                 .child(content);
@@ -5775,18 +5870,19 @@ impl Workbench {
                 div()
                     .px(px(m.page_pad))
                     .pt(px(m.page_pad_y))
-                    .pb(px(12.))
+                    .pb(px(Space::LG))
+                    .bg(p.chrome)
                     .border_b_1()
-                    .border_color(p.line)
+                    .border_color(p.line_soft)
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
+                    .gap(px(Space::LG))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap(px(8.))
+                            .gap(px(Space::MD))
                             .child(kit::title(self.t("history.page.titleRuns"), TypeScale::LG, &p))
                             .when(!self.model.tabs.is_empty(), |this| {
                                 this.child(kit::tool_button("history-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
@@ -5850,7 +5946,8 @@ impl Workbench {
             .min_h_0()
             .when(narrow, |this| this.h_full().w_full().border_t_1())
             .when(!narrow, |this| this.w(px(preview_width)).border_l_1())
-            .border_color(p.line)
+            .border_color(p.line_soft)
+            .bg(p.chrome)
             .flex()
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
                 if event.drag(cx).key.as_ref() != "history-preview-resize" {
@@ -6264,11 +6361,12 @@ impl Workbench {
                 .w(px(180.))
                 .py(px(m.page_pad_y))
                 .px(px(m.page_pad))
+                .bg(p.chrome)
                 .border_r_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .flex()
                 .flex_col()
-                .gap(px(2.));
+                .gap(px(Space::XXS));
             for (id, label, selected, click) in nav_items {
                 column = column.child(
                     kit::interactive_states(div().id(id), &p, false)
@@ -6277,12 +6375,12 @@ impl Workbench {
                         .aria_label(label.clone())
                         .aria_selected(selected)
                         .h(px(m.row_h + 6.))
-                        .px(px(10.))
+                        .px(px(Space::MD))
                         .flex()
                         .items_center()
                         .rounded(px(Radius::CONTROL))
                         .text_size(px(TypeScale::SM))
-                        .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent).font_weight(FontWeight::MEDIUM))
+                        .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text).font_weight(FontWeight::MEDIUM))
                         .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
                         .child(label)
                         .on_click(click),
@@ -6325,14 +6423,15 @@ impl Workbench {
                 div()
                     .px(px(m.page_pad))
                     .pt(px(m.page_pad_y))
-                    .pb(px(12.))
+                    .pb(px(Space::LG))
+                    .bg(p.chrome)
                     .border_b_1()
-                    .border_color(p.line)
+                    .border_color(p.line_soft)
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p))
                     .when(!self.model.tabs.is_empty(), |this| {
                         this.child(kit::tool_button("settings-back", Some(IconName::ArrowLeft), self.t("ui.page.backWorkspace"), act("back-workspace", cx)))
@@ -8056,11 +8155,11 @@ fn brand_mark(size: f32, p: &Palette) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .child(kit::icon(IconName::Database, size * 0.56, gpui_kit::hsla(0., 0., 1., 1.)))
+        .child(kit::icon(IconName::Database, size * 0.56, p.on_accent))
         .into_any_element()
 }
 
-/// 活动栏条目的图标、文案与选中态；固定项之外不再画任何按钮。
+/// 顶栏轻导航条目的图标、文案与选中态；固定项之外不再画任何按钮。
 fn rail_entry(id: &'static str, page: AppPage) -> Option<(IconName, &'static str, bool)> {
     Some(match id {
         "activity-workspace" => (
@@ -8075,24 +8174,22 @@ fn rail_entry(id: &'static str, page: AppPage) -> Option<(IconName, &'static str
     })
 }
 
-fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool, p: &Palette, cx: &mut Context<Workbench>) -> AnyElement {
-    let accent = p.accent;
+fn topbar_nav_item(id: &'static str, icon: IconName, label: SharedString, active: bool, p: &Palette, cx: &mut Context<Workbench>) -> AnyElement {
     kit::interactive_states(div().id(SharedString::from(format!("cmd-{id}"))), p, false)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
         .aria_selected(active)
         .tooltip_text(label)
-        .relative()
-        .size(px(38.))
+        .flex_none()
+        .size(px(kit::HitArea::CONTROL))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(Radius::CONTROL))
         .when(active, |this| this.bg(p.accent_soft))
         .when(!active, |this| this.hover(|style| style.bg(p.hover)))
-        .child(kit::icon(icon, 18., if active { p.accent_text } else { p.text_muted }))
-        .when(active, |this| this.child(div().absolute().left(px(-7.)).top(px(9.)).w(px(3.)).h(px(20.)).rounded(px(RAIL_INDICATOR_RADIUS)).bg(accent)))
+        .child(kit::icon(icon, kit::IconSize::CONTROL, if active { p.accent_text } else { p.text_muted }))
         .on_click(act(id, cx))
         .into_any_element()
 }
