@@ -127,19 +127,20 @@ impl PlanView<'_> {
             .id("query-plan-head")
             .flex_none()
             .min_h(px(self.metrics.bar_h()))
-            .px(px(10.))
-            .py(px(3.))
+            .px(px(kit::Space::LG))
+            .py(px(kit::Space::XS))
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(10.))
+            .gap(px(kit::Space::MD))
+            .bg(p.surface)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(kit::Space::SM))
                     .child(kit::icon(IconName::Route, 14., p.accent_text))
                     .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::SEMIBOLD).child(t("query.plan.title"))),
             )
@@ -179,12 +180,12 @@ impl PlanView<'_> {
                 .scroll_area_y()
                 .flex()
                 .flex_col()
-                .gap(px(2.))
-                .px(px(8.))
-                .py(px(6.))
+                .gap(px(kit::Space::XXS))
+                .px(px(kit::Space::MD))
+                .py(px(kit::Space::SM))
                 .bg(p.warn_soft)
                 .border_b_1()
-                .border_color(p.line);
+                .border_color(p.line_soft);
             for (at, (issue, object)) in findings.iter().enumerate() {
                 let place = object.clone().unwrap_or_default();
                 let target = lines
@@ -285,7 +286,7 @@ impl PlanView<'_> {
                     select.update(cx, |pane, cx| pane.command(&format!("plan-select:{index}"), cx));
                 });
             if line.depth > 0 {
-                row = row.relative().child(div().absolute().top_0().bottom_0().left(px(indent - 12.)).w(px(1.)).bg(p.line));
+                row = row.relative().child(div().absolute().top_0().bottom_0().left(px(indent - 12.)).w(px(1.)).bg(p.line_soft));
             }
             let mut head = div()
                 .flex()
@@ -335,7 +336,7 @@ impl PlanView<'_> {
                                 .flex_1()
                                 .h(px(6.))
                                 .rounded(px(Radius::TAG))
-                                .bg(p.hover)
+                                .bg(p.sunken)
                                 .overflow_hidden()
                                 .child(div().h_full().w(relative(share.max(0.02))).rounded(px(Radius::TAG)).bg(if share > 0.6 { p.warn } else { p.accent })),
                         )
@@ -357,14 +358,14 @@ impl PlanView<'_> {
             .aria_label(SharedString::from(node_label(&lines, selected)))
             .flex_none()
             .scroll_area_y()
-            .p(px(12.))
+            .p(px(kit::Space::LG))
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(kit::Space::MD))
             .bg(p.chrome)
             .when(self.narrow, |this| this.w_full().max_h(px(220.)).border_t_1())
             .when(!self.narrow, |this| this.w(px(300.)).h_full().border_l_1())
-            .border_color(p.line);
+            .border_color(p.line_soft);
         if let Some(node) = node {
             let metric = |label: SharedString, value: String| {
                 div()

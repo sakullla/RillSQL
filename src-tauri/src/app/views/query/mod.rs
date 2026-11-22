@@ -407,17 +407,17 @@ pub fn rewrite_note(locale: Locale, rewrite: &AutoRewrite) -> String {
     i18n::fill(&i18n::text(locale, "query.rewrite.note"), &[("clause", &rewrite_clause(locale, rewrite))])
 }
 
-/// 语句文本的代码块：等宽、浅底、细边框，与说明文字分得开，长语句自动换行。
+/// 语句文本的代码块：等宽、凹陷底、柔和细边框，与说明文字分得开，长语句自动换行。
 fn sql_block(id: &'static str, sql: String, mono: &SharedString, p: &Palette) -> AnyElement {
     div()
         .id(id)
         .test_support()
         .aria_label(SharedString::from(sql.clone()))
-        .px(px(10.))
-        .py(px(8.))
+        .px(px(Space::MD))
+        .py(px(Space::MD))
         .rounded(px(Radius::CONTROL))
         .border_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .bg(p.sunken)
         .font_family(mono.clone())
         .text_size(px(TypeScale::SM))
@@ -1076,6 +1076,18 @@ impl QueryPane {
         true
     }
 
+    /// 把事务提交/回滚等共享控制命令交给外壳统一执行，不在面板里复制第二套事务状态机。
+    fn delegate_shell_command(&self, id: &str, cx: &mut Context<Self>) {
+        if let Some(owner) = self.owner.clone() {
+            let id = id.to_owned();
+            cx.defer(move |cx| {
+                if let Some(owner) = owner.upgrade() {
+                    owner.update(cx, |view, cx| view.perform(&id, cx));
+                }
+            });
+        }
+    }
+
     /// 工具条、更多菜单与编辑器快捷键都从这里进；运行类命令交回外壳统一按需连接。
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
         if runs_query(id) && self.delegate_run(id, cx) {
@@ -1138,6 +1150,14 @@ impl QueryPane {
         if let Some(connection) = id.strip_prefix("bind-connection:") {
             self.queue_connection(connection);
             cx.notify();
+            return;
+        }
+        if id == "query-tx-commit" {
+            self.delegate_shell_command(crate::app::shell::transaction::COMMIT, cx);
+            return;
+        }
+        if id == "query-tx-rollback" {
+            self.delegate_shell_command(crate::app::shell::transaction::ROLLBACK, cx);
             return;
         }
         if let Some(database) = id.strip_prefix("database:") {
@@ -3317,7 +3337,12 @@ impl Render for QueryPane {
 }
 
 impl QueryPane {
-    /// 工具条：执行/停止、格式化、计划、更多、连接与数据库选择、右侧面板开关。
+    /// 主运行按钮固定最小槽位宽度：空闲（运行）与执行中（停止）切换时不引发工具栏横向跳动。
+    const RUN_SLOT_MIN_W: f32 = 76.;
+
+    /// 单行高信噪比控制条：
+    /// 左侧主动作（溪流青蓝运行/停止 + 运行全部）+ 紧凑目标选择胶囊（含生产标）+ 活动事务显式控件；
+    /// 右侧次要工具（格式化、执行计划、打开文件、更多折叠菜单）+ 右侧面板开关。
     #[inline(never)]
     fn render_toolbar(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>, cx: &App) -> AnyElement {
         let locale = self.locale;
@@ -3338,19 +3363,57 @@ impl QueryPane {
                 .tooltip(SharedString::from(format!("{tip} · {}", kit::shortcut("Ctrl+Enter"))))
                 .into_any_element()
         };
+        let run_slot = div()
+            .id("query-run-slot")
+            .test_support()
+            .flex_none()
+            .min_w(px(Self::RUN_SLOT_MIN_W))
+            .flex()
+            .items_center()
+            .child(run);
         let more = self.render_more_menu(entity);
         let pickers = self.render_target_pickers(p, entity, cx);
+        let tx_controls = self.render_active_transaction(running, p, metrics, entity);
+        let format_tip = SharedString::from(format!(
+            "{} · {}",
+            i18n::text(locale, "query.editor.menu.format"),
+            kit::shortcut(crate::app::keymap::command_chord("format").unwrap_or("Mod+Shift+F"))
+        ));
+        let explain_tip = SharedString::from(format!(
+            "{} · {}",
+            i18n::text(locale, "query.editor.menu.plan"),
+            kit::shortcut(crate::app::keymap::command_chord("explain").unwrap_or("Mod+Shift+E"))
+        ));
+        let format_btn: AnyElement = if self.narrow {
+            kit::icon_button("query-act-format", IconName::WandSparkles, t("query.editor.menu.format"), pane_act("format", entity))
+                .tooltip(format_tip)
+                .into_any_element()
+        } else {
+            kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity))
+                .tooltip(format_tip)
+                .into_any_element()
+        };
+        let explain_btn: AnyElement = if self.narrow {
+            kit::icon_button("query-act-explain", IconName::ChartNetwork, t("query.editor.menu.plan"), pane_act("explain", entity))
+                .tooltip(explain_tip)
+                .into_any_element()
+        } else {
+            kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity))
+                .tooltip(explain_tip)
+                .into_any_element()
+        };
         div()
             .id("query-toolbar")
             .flex_none()
             .h(px(metrics.toolbar_h()))
-            .px(px(10.))
+            .px(px(Space::LG))
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(Space::SM))
+            .bg(p.surface)
             .border_b_1()
-            .border_color(p.line)
-            .child(run)
+            .border_color(p.line_soft)
+            .child(run_slot)
             // 第二个按钮是“运行全部”：执行期间保持占位并禁用，避免工具栏按钮横向跳动。
             .when(!self.narrow, |this| {
                 let chord = crate::app::keymap::command_chord("run-script").unwrap_or("Mod+Alt+Enter");
@@ -3360,23 +3423,11 @@ impl QueryPane {
                         .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.run.allTip"), kit::shortcut(chord)))),
                 )
             })
-            .child(kit::vline(p))
-            .child(
-                kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity))
-                    .tooltip(SharedString::from(format!(
-                        "{} · {}",
-                        i18n::text(locale, "query.editor.menu.format"),
-                        kit::shortcut(crate::app::keymap::command_chord("format").unwrap_or("Mod+Shift+F"))
-                    ))),
-            )
-            .child(
-                kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity))
-                    .tooltip(SharedString::from(format!(
-                        "{} · {}",
-                        i18n::text(locale, "query.editor.menu.plan"),
-                        kit::shortcut(crate::app::keymap::command_chord("explain").unwrap_or("Mod+Shift+E"))
-                    ))),
-            )
+            .children(pickers)
+            .children(tx_controls)
+            .child(div().flex_1().min_w(px(Space::XS)))
+            .child(format_btn)
+            .child(explain_btn)
             .when(!self.narrow, |this| {
                 this.child(
                     kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
@@ -3388,8 +3439,6 @@ impl QueryPane {
                 )
             })
             .child(more)
-            .child(div().flex_1())
-            .children(pickers)
             .child(kit::vline(p))
             // 右侧面板开关：命中范围、图标与四态走共享的纯图标动作；面板打开时是选中态。
             .child(
@@ -3398,6 +3447,70 @@ impl QueryPane {
                     .selected(self.side_open()),
             )
             .into_any_element()
+    }
+
+    /// 活动事务直出控件：仅在当前连接处于非自动提交事务态（Active / Aborted / Unknown）时显示，
+    /// 让提交与回滚在查询顶栏触手可及，空闲态完全隐身以保持高信噪比。
+    #[inline(never)]
+    fn render_active_transaction(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Option<AnyElement> {
+        let target = self.desk.target()?;
+        let snapshot = self.services.connections.transaction_snapshot(&target.connection_id)?;
+        let state = snapshot.state;
+        if state == crate::transaction::TransactionState::Idle {
+            return None;
+        }
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let (fg, bg) = match state {
+            crate::transaction::TransactionState::Active => (p.accent_text, p.accent_soft),
+            crate::transaction::TransactionState::Aborted => (p.warn, p.warn_soft),
+            crate::transaction::TransactionState::Unknown => (p.danger, p.danger_soft),
+            crate::transaction::TransactionState::Idle => (p.text_muted, p.chrome),
+        };
+        let can_commit = state == crate::transaction::TransactionState::Active;
+        let can_rollback = matches!(state, crate::transaction::TransactionState::Active | crate::transaction::TransactionState::Aborted);
+        let mut group = div()
+            .id("query-tx-controls")
+            .test_support()
+            .flex_none()
+            .h(px(metrics.control_h))
+            .px(px(Space::XS))
+            .flex()
+            .items_center()
+            .gap(px(Space::XS))
+            .rounded(px(Radius::CONTROL))
+            .bg(bg)
+            .child(
+                div()
+                    .id("query-tx-status")
+                    .test_support()
+                    .px(px(Space::XS))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .text_size(px(TypeScale::XS))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(fg)
+                    .child(kit::status_dot(fg))
+                    .child(t(crate::app::shell::transaction::state_key(state))),
+            );
+        if can_rollback {
+            group = group.child(
+                kit::subtle_button("query-tx-rollback", Some(IconName::RotateCcw), t("transaction.action.rollback"), pane_act("query-tx-rollback", entity))
+                    .small()
+                    .disabled(running)
+                    .tooltip(t("transaction.action.rollback")),
+            );
+        }
+        if can_commit {
+            group = group.child(
+                kit::primary_button("query-tx-commit", Some(IconName::Check), t("transaction.action.commit"), pane_act("query-tx-commit", entity))
+                    .small()
+                    .disabled(running)
+                    .tooltip(t("transaction.action.commit")),
+            );
+        }
+        Some(group.into_any_element())
     }
 
     #[inline(never)]
@@ -3437,7 +3550,7 @@ impl QueryPane {
             .into_any_element()
     }
 
-    /// 工具条右侧：引擎徽标（有目标时）、连接选择、分隔箭头、数据库选择。
+    /// 紧凑目标选择胶囊：引擎徽标、连接名 › 库名与生产环境提醒；点开双栏弹层。
     #[inline(never)]
     fn render_target_pickers(&self, p: &Palette, entity: &Entity<QueryPane>, cx: &App) -> Vec<AnyElement> {
         // 一个“实例 › 库”按钮，点开是双栏弹层（连接 | 库）；弹层是 deferred 浮层，挂在哪儿都画在最上面。
@@ -3447,7 +3560,8 @@ impl QueryPane {
             .as_ref()
             .map(|target| (target.connection_id.clone(), target.connection_name.clone(), target.database.clone(), target.engine.clone()))
             .unwrap_or_default();
-        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, self.targets_known, &connection_id, &connection_name, &database, &engine, &self.target_button, self.locale, metrics, p, entity)];
+        let env = self.desk.environment_of(&connection_id);
+        let mut items = vec![target::button(self.target_picker.anchor.is_some(), &self.target_choices, self.targets_known, &connection_id, &connection_name, &database, &engine, &env, &self.target_button, self.locale, metrics, p, entity)];
         let filter = self.target_filter(cx);
         if let Some(popover) = target::popover(
             &self.target_picker,
@@ -3611,18 +3725,19 @@ impl QueryPane {
             .h(px(metrics.tabs_h))
             .flex()
             .items_center()
-            .gap(px(2.))
+            .gap(px(Space::XXS))
             // 右端的耗时、行数和运行态不贴着窗口边缘。
-            .pr(px(6.))
+            .pr(px(Space::SM))
             .bg(p.chrome)
+            .border_t_1()
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             // 页签条按内容取宽、空间不够时再收缩并横向滚动：消息页签紧跟在结果页签之后，
             // 不会被一段弹性留白推到页签头中间。
             .child(div().flex_initial().min_w_0().h_full().child(tabs))
             .child(log_tab)
             .children(self.render_head_status(running, p, metrics, entity))
-            .child(div().flex_none().w(px(1.)).h(px(14.)).mx(px(4.)).bg(p.line))
+            .child(div().flex_none().w(px(1.)).h(px(14.)).mx(px(Space::XS)).bg(p.line_soft))
             .children(view_actions)
             .into_any_element()
     }
@@ -3742,7 +3857,7 @@ impl QueryPane {
             .gap(px(kit::Space::SM))
             .bg(p.chrome)
             .border_t_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .text_size(px(TypeScale::SM))
             .text_color(p.text_muted)
             .child(kit::icon(IconName::ChevronUp, 12., p.text_muted))
@@ -3845,11 +3960,12 @@ impl QueryPane {
             items.push(
                 div()
                     .id("query-elapsed")
-                    .px(px(6.))
+                    .px(px(Space::SM))
                     .flex()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(px(Space::XS))
                     .text_size(px(TypeScale::SM))
+                    .font_features(kit::tabular_figures())
                     .text_color(p.text_faint)
                     .child(kit::icon(IconName::Clock, 12., p.text_faint))
                     .child(SharedString::from(elapsed_label(ms)))
@@ -4103,14 +4219,14 @@ impl QueryPane {
         let mut row = div()
             .id("query-variables")
             .flex_none()
-            .p(px(10.))
+            .p(px(Space::MD))
             .flex()
             .flex_wrap()
             .items_end()
-            .gap(px(10.))
+            .gap(px(Space::MD))
             .bg(p.accent_soft)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
@@ -7603,7 +7719,7 @@ mod tests {
             origin: gpui_kit::point(px(200.), px(10.)),
             size: gpui_kit::size(px(180.), px(28.)),
         };
-        assert_eq!(target::anchor_for(Some(bounds)), gpui_kit::point(px(380.), px(38.)), "锚点贴齐按钮右下边界");
+        assert_eq!(target::anchor_for(Some(bounds)), gpui_kit::point(px(200.), px(38.)), "锚点贴齐按钮左下边界");
 
         let (window, pane) = open(cx);
         cx.update_window(window, |_, window, cx| {
@@ -7917,5 +8033,71 @@ mod tests {
             assert!(pane.read(cx).file_paths.is_empty(), "关闭标签后应清理 file_paths");
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn t3_toolbar_shows_explicit_active_transaction_controls_and_keeps_run_slot_stable(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-t3-query-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("tx.sqlite");
+        std::fs::File::create(&db_path).unwrap();
+        let (window, pane) = open_sized(cx, 1280., 720.);
+
+        // 打开真实 SQLite 会话以验证空闲态隐藏、活动事务直出提交/回滚控件。
+        let services = pane.read_with(cx, |pane, _| pane.services.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            services.connections.open_sqlite_for_test("notes", "Notes", &db_path).await.unwrap();
+        });
+
+        let tab = TabSnap {
+            id: "q".into(),
+            draft: "SELECT 1;".into(),
+            connection_id: Some("notes".into()),
+            connection_name: Some("Notes".into()),
+            database: Some("main".into()),
+            engine: Some("sqlite".into()),
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.remember_environments(vec![("notes".into(), "prod".into())]);
+                let _ = pane.sync(std::slice::from_ref(&tab), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+
+            // 空闲态：主运行按钮就绪、无事务直出控件。
+            assert!(window.try_find("query-act-execute-query").is_some());
+            assert!(window.try_find("query-tx-controls").is_none(), "空闲态不显示活动事务控件");
+            let idle_slot = window.find("query-run-slot").bounds();
+
+            // 模拟进入活动事务：顶栏直接出现状态、回滚、提交控件。
+            let coordinator = services.connections.transaction_coordinator("notes").expect("SQLite 会话应有事务协调器");
+            coordinator
+                .acknowledge(&crate::transaction::ControlStatement::Begin { mode: None }, crate::transaction::ControlOutcome::Confirmed)
+                .unwrap();
+            window.render_frame(cx);
+
+            assert!(window.try_find("query-tx-controls").is_some(), "活动事务时顶栏应直出事务控件");
+            assert!(window.try_find("query-tx-status").is_some());
+            assert!(window.try_find("query-tx-commit").is_some());
+            assert!(window.try_find("query-tx-rollback").is_some());
+
+            // 执行中：主按钮切为停止，但运行槽位宽度与左边界保持稳定不跳动。
+            pane.update(cx, |pane, _| {
+                let _ = pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None);
+            });
+            window.render_frame(cx);
+
+            assert!(window.try_find("query-act-request-cancel").is_some());
+            let running_slot = window.find("query-run-slot").bounds();
+            assert_eq!(idle_slot.origin.x, running_slot.origin.x, "运行槽位左边界不应跳动");
+            assert_eq!(idle_slot.size.width, running_slot.size.width, "运行与停止切换时槽位宽度应保持稳定");
+        })
+        .unwrap();
+
+        services.connections.disconnect("notes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

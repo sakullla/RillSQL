@@ -90,14 +90,14 @@ impl LogPanel<'_> {
             .flex()
             .flex_col()
             .bg(p.surface)
-            .child(div().flex_none().px(px(12.)).pt(px(8.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(heading), p)));
+            .child(div().flex_none().px(px(kit::Space::LG)).pt(px(kit::Space::MD)).pb(px(kit::Space::XS)).child(kit::eyebrow(SharedString::from(heading), p)));
         if self.entries.is_empty() {
             list = list.child(
                 div()
                     .id("query-log-empty")
                     .test_support()
-                    .px(px(12.))
-                    .py(px(8.))
+                    .px(px(kit::Space::LG))
+                    .py(px(kit::Space::MD))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(i18n::text(locale, "query.log.empty"))),
@@ -144,13 +144,14 @@ impl LogPanel<'_> {
                     .aria_label(SharedString::from(label))
                     .flex_none()
                     .min_h(px(self.metrics.row_h))
-                    .px(px(12.))
+                    .px(px(kit::Space::LG))
                     .py(px(self.metrics.row_pad_y.min(6.)))
                     .flex()
                     .items_start()
-                    .gap(px(8.))
+                    .gap(px(kit::Space::MD))
                     .border_b_1()
-                    .border_color(p.line)
+                    .border_color(p.line_soft)
+                    .when(failed, |this| this.bg(p.danger_soft.opacity(0.45)))
                     .text_size(px(TypeScale::SM))
                     .when(clickable, |this| {
                         kit::interactive(this, p, false).on_click(move |_, _, cx| {
@@ -165,12 +166,12 @@ impl LogPanel<'_> {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .gap(px(kit::Space::XXS))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(px(kit::Space::MD))
                                     .child(div().flex_none().text_color(p.text).child(SharedString::from(title)))
                                     .child(
                                         div()
@@ -180,8 +181,24 @@ impl LogPanel<'_> {
                                             .text_color(color)
                                             .child(SharedString::from(status_text(locale, entry))),
                                     )
-                                    .when(!counts.is_empty(), |this| this.child(div().flex_none().text_color(p.text_muted).child(SharedString::from(counts))))
-                                    .when_some(entry.elapsed_ms, |this, ms| this.child(div().flex_none().text_color(p.text_faint).child(SharedString::from(elapsed_label(ms)))))
+                                    .when(!counts.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .font_features(kit::tabular_figures())
+                                                .text_color(p.text_muted)
+                                                .child(SharedString::from(counts)),
+                                        )
+                                    })
+                                    .when_some(entry.elapsed_ms, |this, ms| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .font_features(kit::tabular_figures())
+                                                .text_color(p.text_faint)
+                                                .child(SharedString::from(elapsed_label(ms))),
+                                        )
+                                    })
                                     // 单行截断的 SQL 悬停显示全文（保留原始换行）。
                                     .child(
                                         div()

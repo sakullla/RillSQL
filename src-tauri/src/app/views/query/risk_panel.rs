@@ -202,7 +202,14 @@ pub fn render(
             .child(SharedString::from(target_text(locale, prompt))),
     );
     for statement in &prompt.statements {
-        let mut block = div().flex().flex_col().gap(px(kit::Space::XS)).min_w_0();
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(px(kit::Space::XS))
+            .min_w_0()
+            .p(px(kit::Space::MD))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.surface);
         block = block.child(
             div()
                 .text_size(px(TypeScale::XS))
@@ -216,8 +223,6 @@ pub fn render(
                 .py(px(kit::Space::SM))
                 .rounded(px(Radius::CONTROL))
                 .bg(p.sunken)
-                .border_1()
-                .border_color(p.line)
                 .font_family(mono.clone())
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text)
@@ -260,7 +265,7 @@ pub fn render(
             .items_center()
             .gap(px(kit::Space::MD))
             .min_h(px(metrics.control_h))
-            .child(kit::primary_button(
+            .child(kit::danger_button(
                 "query-act-confirm-risks",
                 Some(gpui_kit::assets::IconName::Play),
                 SharedString::from(confirm_label(locale)),
@@ -283,7 +288,7 @@ pub fn render(
         .gap(px(kit::Space::MD))
         .bg(p.danger_soft)
         .border_b_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .on_key_down({
             let entity = entity.clone();
             move |event: &gpui_kit::KeyDownEvent, _, cx| {

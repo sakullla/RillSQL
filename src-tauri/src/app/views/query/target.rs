@@ -117,10 +117,10 @@ pub fn resolved_focus(
 /// 目标按钮上一帧的位置（窗口坐标）。没有点击坐标时（键盘、状态栏、执行被拦下）选择器贴着它弹出。
 pub type ButtonBounds = std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<Pixels>>>>;
 
-/// 选择器的锚点：紧贴按钮右下角边界，鼠标点按钮与键盘/状态栏打开保持一致对齐。
+/// 选择器的锚点：紧贴按钮左下角边界，鼠标点按钮与键盘/状态栏打开保持一致对齐。
 pub fn anchor_for(bounds: Option<gpui_kit::Bounds<Pixels>>) -> Point<Pixels> {
     match bounds {
-        Some(area) => gpui_kit::point(area.origin.x + area.size.width, area.origin.y + area.size.height),
+        Some(area) => gpui_kit::point(area.origin.x, area.origin.y + area.size.height),
         None => gpui_kit::point(px(0.), px(0.)),
     }
 }
@@ -131,13 +131,14 @@ pub fn target_missing(known: bool, choices: &[TargetChoice], connection_id: &str
     known && !connection_id.is_empty() && !choices.iter().any(|choice| choice.id == connection_id)
 }
 
-/// 目标按钮：引擎徽标 + 连接名 › 库名 + 下拉箭头。没有目标时提示选择。
+/// 目标按钮：引擎徽标 + 连接名 › 库名 + 可选生产徽标 + 下拉箭头。没有目标时提示选择。
 #[allow(clippy::too_many_arguments)]
-pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: &str, connection_name: &str, database: &str, engine: &str, bounds: &ButtonBounds, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: &str, connection_name: &str, database: &str, engine: &str, env: &str, bounds: &ButtonBounds, locale: Locale, metrics: Metrics, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let has_target = !connection_id.is_empty();
     let connected = choices.iter().any(|choice| choice.id == connection_id && choice.connected);
     let missing = target_missing(known, choices, connection_id);
+    let prod = has_target && !missing && env.eq_ignore_ascii_case("prod");
     let owner = entity.clone();
     let tooltip = if missing {
         Some(t("ui.query.targetMissing"))
@@ -151,15 +152,29 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
         .tooltip_text_opt(tooltip.filter(|_| !open))
         .h(px(metrics.control_h))
         .max_w(px(380.))
-        .px(px(8.))
+        .px(px(kit::Space::MD))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(px(kit::Space::SM))
         .rounded(px(Radius::CONTROL))
         .border_1()
-        .border_color(if open { p.accent } else if missing { p.warn } else { p.line })
-        .bg(if open { p.accent_soft } else if p.dark { p.raised } else { p.surface })
-        .hover(|style| style.border_color(p.line_strong).bg(p.hover))
+        .border_color(if open {
+            p.accent
+        } else if missing {
+            p.warn
+        } else if prod {
+            p.danger.opacity(0.45)
+        } else {
+            p.line_soft
+        })
+        .bg(if open {
+            p.accent_soft
+        } else if prod {
+            p.danger_soft
+        } else {
+            p.chrome
+        })
+        .hover(|style| style.border_color(if prod { p.danger.opacity(0.65) } else { p.line }).bg(p.hover))
         .text_size(px(TypeScale::SM))
         .when(has_target, |this| {
             this.child(kit::engine_badge(engine, 16.))
@@ -182,10 +197,13 @@ pub fn button(open: bool, choices: &[TargetChoice], known: bool, connection_id: 
                         .flex_none()
                         .flex()
                         .items_center()
-                        .gap(px(4.))
+                        .gap(px(kit::Space::XS))
                         .child(kit::icon(IconName::Database, 12., p.text_muted))
                         .child(div().max_w(px(140.)).truncate().text_color(if database.is_empty() { p.text_faint } else { p.text }).child(if database.is_empty() { t("ui.query.chooseDatabase") } else { SharedString::from(database.to_owned()) })),
                 )
+                .when(prod, |this| {
+                    this.child(kit::env_tag("prod", t("connections.env.prod"), p))
+                })
         })
         .when(!has_target, |this| {
             this.child(kit::icon(IconName::Database, 14., p.text_muted)).child(div().text_color(p.text_muted).child(t("ui.query.chooseTarget")))
@@ -238,14 +256,15 @@ pub fn popover(
         .flex_none()
         .h_full()
         .scroll_area_y()
+        .bg(p.chrome)
         .border_r_1()
-        .border_color(p.line)
-        .py(px(4.));
+        .border_color(p.line_soft)
+        .py(px(kit::Space::XS));
     let conn_col_active = picker.column == TargetColumn::Connections;
     left = left.child(
         div()
-            .px(px(10.))
-            .py(px(4.))
+            .px(px(kit::Space::MD))
+            .py(px(kit::Space::XS))
             .text_size(px(TypeScale::XS))
             .text_color(if conn_col_active { p.accent_text } else { p.text_faint })
             .when(conn_col_active, |this| this.font_weight(FontWeight::SEMIBOLD))
@@ -254,9 +273,9 @@ pub fn popover(
     // 一条连接都没有和“筛选后没有匹配”是两回事：前者要给出新建连接的出口，而不是让人对着空列表找。
     let no_connections = choices.is_empty();
     if no_connections {
-        left = left.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoConnections")));
+        left = left.child(div().px(px(kit::Space::MD)).py(px(kit::Space::SM)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoConnections")));
     } else if shown.is_empty() {
-        left = left.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoMatch")));
+        left = left.child(div().px(px(kit::Space::MD)).py(px(kit::Space::SM)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoMatch")));
     }
     for choice in &shown {
         let selected = focused.is_some_and(|focused| focused.id == choice.id);
@@ -269,12 +288,12 @@ pub fn popover(
                 .role(gpui_kit::Role::ListItem)
                 .aria_label(SharedString::from(choice.name.clone()))
                 .aria_selected(selected)
-                .mx(px(4.))
+                .mx(px(kit::Space::XS))
                 .h(px(row_h))
-                .px(px(6.))
+                .px(px(kit::Space::SM))
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(kit::Space::SM))
                 .rounded(px(Radius::CONTROL))
                 .when(selected, |this| this.bg(p.selection))
                 .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
@@ -296,7 +315,7 @@ pub fn popover(
         .min_w_0()
         .h_full()
         .scroll_area_y()
-        .py(px(4.));
+        .py(px(kit::Space::XS));
     match focused {
         None if no_connections => {
             let owner = entity.clone();
@@ -304,11 +323,11 @@ pub fn popover(
                 div()
                     .id("query-target-empty")
                     .test_support()
-                    .p(px(14.))
+                    .p(px(kit::Space::LG))
                     .flex()
                     .flex_col()
                     .items_start()
-                    .gap(px(8.))
+                    .gap(px(kit::Space::MD))
                     .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(t("ui.query.targetNoConnections")))
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.query.targetNoConnectionsHint")))
                     .child(kit::primary_button("query-target-new-connection", Some(IconName::Plus), t("shell.command.newConnection"), move |_, _, cx| {
@@ -323,11 +342,11 @@ pub fn popover(
             let id = choice.id.clone();
             right = right.child(
                 div()
-                    .p(px(14.))
+                    .p(px(kit::Space::LG))
                     .flex()
                     .flex_col()
                     .items_start()
-                    .gap(px(8.))
+                    .gap(px(kit::Space::MD))
                     .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).child(SharedString::from(choice.name.clone())))
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("ui.query.targetNotOpen")))
                     .child(if pending {
@@ -348,15 +367,15 @@ pub fn popover(
             let db_col_active = picker.column == TargetColumn::Databases;
             right = right.child(
                 div()
-                    .px(px(10.))
-                    .py(px(4.))
+                    .px(px(kit::Space::MD))
+                    .py(px(kit::Space::XS))
                     .text_size(px(TypeScale::XS))
                     .text_color(if db_col_active { p.accent_text } else { p.text_faint })
                     .when(db_col_active, |this| this.font_weight(FontWeight::SEMIBOLD))
                     .child(SharedString::from(i18n::fill(&i18n::text(locale, "ui.query.targetDatabases"), &[("name", &choice.name)]))),
             );
             if databases.is_empty() {
-                right = right.child(div().px(px(10.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoDatabase")));
+                right = right.child(div().px(px(kit::Space::MD)).py(px(kit::Space::SM)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("ui.query.targetNoDatabase")));
             }
             for (ix, database) in databases.into_iter().enumerate() {
                 let current = choice.id == current_connection && database == current_database;
@@ -369,12 +388,12 @@ pub fn popover(
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(database.clone()))
                         .aria_selected(highlighted)
-                        .mx(px(4.))
+                        .mx(px(kit::Space::XS))
                         .h(px(row_h))
-                        .px(px(8.))
+                        .px(px(kit::Space::MD))
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(kit::Space::MD))
                         .rounded(px(Radius::CONTROL))
                         .when(current && !highlighted, |this| this.bg(p.accent_soft))
                         .when(highlighted && !current, |this| this.bg(p.selection))
@@ -405,18 +424,18 @@ pub fn popover(
     let search = picker.search.clone().map(|state| {
         kit::borderless_input("query-target-search", &state, t("ui.query.targetSearch")).prefix(kit::input_prefix(IconName::Search, 14., p.text_faint)).cleanable(true)
     });
-    let hint = |keys: &'static str, label: SharedString| div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, p)).child(label);
+    let hint = |keys: &'static str, label: SharedString| div().flex().items_center().gap(px(kit::Space::XS)).child(kit::kbd(keys, p)).child(label);
     let footer = div()
         .id("query-target-footer")
         .flex_none()
-        .px(px(10.))
-        .py(px(5.))
+        .px(px(kit::Space::MD))
+        .py(px(kit::Space::SM))
         .flex()
         .flex_wrap()
         .items_center()
-        .gap(px(10.))
+        .gap(px(kit::Space::MD))
         .border_t_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .bg(p.chrome)
         .text_size(px(TypeScale::XS))
         .text_color(p.text_faint)
@@ -449,7 +468,7 @@ pub fn popover(
         .flex_col()
         .bg(p.raised)
         .border_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .rounded(px(Radius::PANEL))
         .shadow_lg()
         .overflow_hidden()
@@ -488,10 +507,10 @@ pub fn popover(
                 _ => {}
             }
         })
-        .children(search.map(|input| div().flex_none().p(px(8.)).border_b_1().border_color(p.line).child(input)))
+        .children(search.map(|input| div().flex_none().p(px(kit::Space::MD)).border_b_1().border_color(p.line_soft).child(input)))
         .child(div().flex_1().min_h_0().flex().child(left).child(right))
         .child(footer);
-    Some(deferred(anchored().position(anchor).anchor(Anchor::TopRight).snap_to_window_with_margin(px(kit::Space::MD)).child(div().pt(px(kit::Space::XS)).child(panel))).with_priority(2).into_any_element())
+    Some(deferred(anchored().position(anchor).anchor(Anchor::TopLeft).snap_to_window_with_margin(px(kit::Space::MD)).child(div().pt(px(kit::Space::XS)).child(panel))).with_priority(2).into_any_element())
 }
 
 trait TooltipOpt: Sized {

@@ -89,13 +89,13 @@ impl SidePanel<'_> {
         let header = div()
             .id("query-side-head")
             .flex_none()
-            .px(px(8.))
-            .py(px(6.))
+            .px(px(kit::Space::MD))
+            .py(px(kit::Space::SM))
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(kit::Space::SM))
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .child(kit::segmented_sized(
                 vec![
                     mode_item("query-side-mode-outline", "ui.query.outline", SideMode::Outline),
@@ -128,7 +128,7 @@ impl SidePanel<'_> {
             .flex_col()
             .bg(p.chrome)
             .border_l_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .when(self.overlay, |this| {
                 this.occlude().shadow_lg().on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape"
@@ -180,17 +180,17 @@ fn outline(items: &[OutlineItem], active_statement: Option<usize>, locale: Local
         .flex_1()
         .min_h_0()
         .scroll_area_y()
-        .p(px(8.))
+        .p(px(kit::Space::MD))
         .flex()
         .flex_col()
-        .gap(px(2.));
+        .gap(px(kit::Space::XXS));
     if items.is_empty() {
         list = list.child(
             div()
                 .id("query-outline-empty")
                 .test_support()
-                .px(px(6.))
-                .py(px(4.))
+                .px(px(kit::Space::SM))
+                .py(px(kit::Space::XS))
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(SharedString::from(i18n::text(locale, "query.side.noStatements"))),
@@ -431,11 +431,16 @@ fn object(
         .child(
             div()
                 .flex_none()
-                .px(px(12.))
-                .py(px(8.))
+                .mx(px(kit::Space::MD))
+                .mt(px(kit::Space::MD))
+                .mb(px(kit::Space::SM))
+                .px(px(kit::Space::MD))
+                .py(px(kit::Space::SM))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.surface)
                 .flex()
                 .flex_col()
-                .gap(px(2.))
+                .gap(px(kit::Space::XXS))
                 .child(
                     kit::interactive_states(div().id("query-side-object-name"), p, false)
                         .test_support()
@@ -444,7 +449,7 @@ fn object(
                         .tooltip_text(SharedString::from(format!("{} {}", i18n::text(locale, "catalog.menu.insertEditor"), qualified)))
                         .flex()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(px(kit::Space::SM))
                         .rounded(px(Radius::CONTROL))
                         .hover(|style| style.bg(p.hover))
                         .on_click({
