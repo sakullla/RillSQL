@@ -36,7 +36,8 @@ pub struct Palette {
     pub surface: Hsla,
     /// 外壳底色（顶栏、侧栏、状态栏、标签条）。
     pub chrome: Hsla,
-    /// 比外壳再深/浅一档，用于活动栏。
+    /// 比外壳再深/浅一档的深沉表面令牌（零活动栏外壳后保留供色板层级与对比度测试引用）。
+    #[allow(dead_code)]
     pub rail: Hsla,
     /// 浮层与卡片。
     pub raised: Hsla,
@@ -2828,7 +2829,6 @@ mod token_tests {
         ("ui/kit.rs", "px(size)", "kit::title 与 kit::control_text 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
         ("ui/editor_proto.rs", "px(self.font_size)", "SQL 编辑器字号来自用户设置（规范 S4.1：编辑器字号由设置控制）"),
         ("app/shell/chrome.rs", "px(size * 0.28)", "品牌标记的圆角随尺寸等比缩放，属于图形"),
-        ("app/shell/chrome.rs", "px(RAIL_INDICATOR_RADIUS)", "活动栏激活指示条只有 3px 宽，是线条而非控件；只认这一个具名常量"),
     ];
 
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
