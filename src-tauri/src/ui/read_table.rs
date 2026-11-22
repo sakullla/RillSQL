@@ -20,7 +20,7 @@ use gpui_kit::{
 
 use gpui_kit::prelude::FluentBuilder as _;
 
-use super::kit::{ControlSize, Palette, Space, Tip as _, TypeScale};
+use super::kit::{self, ControlSize, Palette, Space, Tip as _, TypeScale};
 use crate::i18n::{self, Locale};
 
 // ---------------------------------------------------------------- 纯数据与复制文本
@@ -445,6 +445,7 @@ impl TableDelegate for ReadDelegate {
         let p = Palette::of(cx);
         let spec = &self.columns[col_ix];
         let selected = self.selection.is_some_and(|s| s.contains(row_ix, col_ix, self.rows.len(), self.cols()));
+        let focused = selected && self.selection.is_some_and(|s| s.mode == SelectionMode::Cells && s.focus == (row_ix, col_ix));
         let mono = spec.mono.then(|| cx.theme().mono_font_family.clone());
         let text = self.rows.cell(row_ix, col_ix);
         let clipped = read_cell_may_clip(&text, spec.width);
@@ -456,6 +457,7 @@ impl TableDelegate for ReadDelegate {
             .items_center()
             .when(spec.align_right, |this| this.justify_end())
             .when(selected, |this| this.bg(p.selection))
+            .when(focused, |this| this.shadow(vec![kit::focus_ring(p.accent.opacity(0.65), 1.)]))
             .when_some(mono, |this, family| this.font_family(family))
             .text_size(px(TypeScale::SM))
             .text_color(p.text)
@@ -792,7 +794,7 @@ impl Render for ReadTable {
                 this.click_scroll_x = (event.button == MouseButton::Left).then(|| this.table.read(cx).horizontal_scroll_handle.offset().x);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.on_key(event, window, cx)))
-            .child(DataTable::new(&self.table).stripe(false).bordered(false))
+            .child(DataTable::new(&self.table).stripe(true).bordered(false))
             .children(menu)
     }
 }

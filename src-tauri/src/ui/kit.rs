@@ -85,79 +85,82 @@ fn alpha(value: u32, a: f32) -> Hsla {
 impl Palette {
     pub fn light() -> Self {
         Self {
-            surface: hex(0xffffff),
-            chrome: hex(0xf7f8fa),
-            rail: hex(0xf0f2f6),
+            // 四级中性表面层次：sunken < chrome < surface < raised，用柔和明度差替代硬框线。
+            surface: hex(0xfcfdfe),
+            chrome: hex(0xf3f6f9),
+            rail: hex(0xebf0f4),
             raised: hex(0xffffff),
-            // 比外壳再沉一档的清冷凹陷底，和纯白表面、外壳、浮层都形成细腻层次。
-            sunken: hex(0xebf0f7),
-            hover: hex(0xeceff5),
-            active: hex(0xe1e6f0),
-            line: hex(0xe4e8f0),
-            line_soft: hex(0xf0f2f7),
-            line_strong: hex(0xcdd4e0),
-            text: hex(0x111827),
+            sunken: hex(0xe5ebf1),
+            hover: hex(0xe8eef4),
+            active: hex(0xdde6ee),
+            line: hex(0xe1e8ef),
+            line_soft: hex(0xedf1f6),
+            line_strong: hex(0xc5d0dc),
+            text: hex(0x0f172a),
             // 次级文字必须比 faint 更强一档，避免 token 层级倒置。
-            text_muted: hex(0x475467),
-            // 弱文用于 11–12px 的提示与分区标题；保持在白底、chrome 和选中/悬停底上都过 4.5:1。
-            text_faint: hex(0x535d6e),
-            accent: hex(0x4f46e5),
-            accent_hover: hex(0x4338ca),
-            accent_active: hex(0x3730a3),
-            accent_soft: hex(0xeef0ff),
-            accent_text: hex(0x3730a3),
+            text_muted: hex(0x475569),
+            // 弱文用于 11–12px 的提示与分区标题；保持在工作区、外壳与选中/悬停底上都过 4.5:1。
+            text_faint: hex(0x505e70),
+            // Rill 溪流青蓝主色：清透冷静、实心按钮白字过 4.5:1、焦点环在各表面过 3:1。
+            accent: hex(0x0a7b8a),
+            accent_hover: hex(0x086875),
+            accent_active: hex(0x065560),
+            accent_soft: hex(0xe5f4f6),
+            accent_text: hex(0x075c68),
             on_accent: hex(0xffffff),
-            selection: alpha(0x4f46e5, 0.13),
-            zebra: hex(0xfafbfd),
+            selection: alpha(0x0a7b8a, 0.12),
+            zebra: hex(0xf7f9fb),
             // 状态色同时作为小号文字使用，压深到 soft 底也过 4.5:1。
             ok: hex(0x087443),
             warn: hex(0x935310),
             danger: hex(0xbd2828),
-            info: hex(0x1d5fb8),
+            info: hex(0x0b6588),
             ok_soft: hex(0xe6f7ef),
             warn_soft: hex(0xfef3e2),
             danger_soft: hex(0xfeecec),
-            badge: hex(0xeef1f6),
+            badge: hex(0xeaf0f5),
             dark: false,
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            surface: hex(0x14161c),
-            chrome: hex(0x191c24),
-            rail: hex(0x101217),
-            raised: hex(0x20242e),
-            // 比工作区更深的黑曜石底，避免和外壳、浮层挤在同一档明度上。
-            sunken: hex(0x0d0f14),
+            // 深邃黑曜石中性底（去紫灰）：sunken < surface < chrome < raised 四级清晰抬升。
+            surface: hex(0x13171d),
+            chrome: hex(0x181d24),
+            rail: hex(0x0f1318),
+            raised: hex(0x1f2630),
+            sunken: hex(0x0c0f13),
             // 深色单独校准（不取浅色反转）：悬停、分隔线比工作区多拉开一档，
-            // 表格行在 #14161c 上悬停与分隔一眼可见，又不抢正文。
-            hover: hex(0x282e3b),
-            active: hex(0x313848),
-            line: hex(0x2c3240),
-            line_soft: hex(0x222632),
-            line_strong: hex(0x3b4353),
-            text: hex(0xeceef4),
-            text_muted: hex(0xa5aec0),
+            // 表格行在 #13171d 上悬停与分隔一眼可见，又不抢正文。
+            hover: hex(0x242d38),
+            active: hex(0x2d3846),
+            line: hex(0x2a3340),
+            line_soft: hex(0x202732),
+            line_strong: hex(0x3c485a),
+            text: hex(0xeaf0f6),
+            text_muted: hex(0xa5b1c2),
             // 深色主题的选中/悬停底同样按 4.5:1 校准。
-            text_faint: hex(0x9aa3b4),
-            accent: hex(0x7580ff),
-            accent_hover: hex(0x8c96ff),
-            accent_active: hex(0x5f6bf2),
-            accent_soft: hex(0x222744),
-            accent_text: hex(0xb0b8ff),
+            text_faint: hex(0x9ca9ba),
+            // Rill 溪流青蓝深色版：实心强调底保证白字 ≥ 4.5:1 且焦点环在悬停底 ≥ 3:1，
+            // 文本与选中态用高明度清澈青蓝提亮。
+            accent: hex(0x138291),
+            accent_hover: hex(0x107381),
+            accent_active: hex(0x0d626e),
+            accent_soft: hex(0x132b32),
+            accent_text: hex(0x5cd6e6),
             on_accent: hex(0xffffff),
-            // 选中底比浅色更浓一档：深底上 0.22 的强调色几乎和悬停分不开。
-            selection: alpha(0x7580ff, 0.28),
-            zebra: hex(0x171920),
+            // 选中底比浅色更浓一档，采用高明度溪流青蓝柔透，避免在黑曜石底上发闷。
+            selection: alpha(0x28b5c8, 0.24),
+            zebra: hex(0x161b22),
             ok: hex(0x34d399),
             warn: hex(0xf5b841),
             danger: hex(0xf87171),
-            info: hex(0x60a5fa),
+            info: hex(0x58c4dc),
             ok_soft: hex(0x133227),
             warn_soft: hex(0x382b14),
             danger_soft: hex(0x3a1c20),
-            badge: hex(0x272c38),
+            badge: hex(0x212934),
             dark: true,
         }
     }
@@ -271,7 +274,7 @@ pub struct SqlTokenColor {
 /// RillSQL 自有 SQL 配色。标识符（variable）用接近正文的颜色，其余各类都换色相，
 /// 关键字另外加粗、注释斜体，色觉差异的人也能靠字形区分。
 pub const SQL_TOKEN_COLORS: &[SqlTokenColor] = &[
-    SqlTokenColor { scope: "keyword", light: 0x0b4fb3, dark: 0x79b8ff, bold: true, italic: false },
+    SqlTokenColor { scope: "keyword", light: 0x095f75, dark: 0x67d0e8, bold: true, italic: false },
     SqlTokenColor { scope: "function", light: 0x6a2bb8, dark: 0xd2a8ff, bold: false, italic: false },
     SqlTokenColor { scope: "type", light: 0x8a4600, dark: 0xf0b46a, bold: false, italic: false },
     SqlTokenColor { scope: "string", light: 0x0a6636, dark: 0x7ee787, bold: false, italic: false },
@@ -365,11 +368,11 @@ pub fn editor_gutter_background(cx: &App) -> Option<Hsla> {
     cx.theme().highlight_theme.style.editor_gutter_background
 }
 
-fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
+fn brand(theme: &mut Theme, p: &Palette, _white: Hsla, clear: Hsla) {
     let dark = p.dark;
     theme.font_size = px(TypeScale::MD);
     theme.mono_font_size = px(TypeScale::MD);
-    // 组件库按钮、输入框用 radius（控件 4px），对话框、通知等浮层用 radius_lg（面板 6px）。
+    // 组件库按钮、输入框用 radius（控件 6px），对话框、通知等浮层用 radius_lg（面板 10px）。
     theme.radius = px(Radius::CONTROL);
     // 桌面工具的滚动条常驻：表格、树、长列表一眼看得出还能往哪儿滚，不必先滚一下才出现。
     theme.scrollbar_mode = gpui_kit::component::scroll::ScrollbarMode::Always;
@@ -383,11 +386,11 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     c.primary = p.accent;
     c.primary_hover = p.accent_hover;
     c.primary_active = p.accent_active;
-    c.primary_foreground = white;
+    c.primary_foreground = p.on_accent;
     c.button_primary = p.accent;
     c.button_primary_hover = p.accent_hover;
     c.button_primary_active = p.accent_active;
-    c.button_primary_foreground = white;
+    c.button_primary_foreground = p.on_accent;
     c.secondary = if dark { p.raised } else { p.surface };
     c.secondary_hover = p.hover;
     c.secondary_active = p.active;
@@ -408,16 +411,16 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     c.warning = p.warn;
     c.info = p.info;
     c.sidebar = p.chrome;
-    c.sidebar_border = p.line;
+    c.sidebar_border = p.line_soft;
     c.sidebar_foreground = p.text;
     c.sidebar_accent = p.hover;
     c.sidebar_accent_foreground = p.text;
     c.sidebar_primary = p.accent;
-    c.sidebar_primary_foreground = white;
+    c.sidebar_primary_foreground = p.on_accent;
     c.title_bar = p.chrome;
-    c.title_bar_border = p.line;
+    c.title_bar_border = p.line_soft;
     c.status_bar = p.chrome;
-    c.status_bar_border = p.line;
+    c.status_bar_border = p.line_soft;
     c.tab_bar = p.chrome;
     c.tab = clear;
     c.tab_active = p.surface;
@@ -1002,14 +1005,18 @@ pub fn muted(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
     div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(text.into()).into_any_element()
 }
 
-/// 白底圆角卡片，带发丝线边框。
+/// 抬升圆角卡片：以表面层级区分背景，配柔和发丝线边框。
 pub fn card(p: &Palette) -> gpui_kit::Div {
-    div().bg(p.surface).border_1().border_color(p.line).rounded(px(Radius::PANEL))
+    div()
+        .bg(p.raised)
+        .border_1()
+        .border_color(if p.dark { p.line_soft } else { p.line })
+        .rounded(px(Radius::PANEL))
 }
 
 /// 凹陷表面：圆角面板，底色比工作区、外壳和浮层都收进去一档。
 pub fn sunken(p: &Palette) -> gpui_kit::Div {
-    div().bg(p.sunken).border_1().border_color(p.line).rounded(px(Radius::PANEL))
+    div().bg(p.sunken).border_1().border_color(p.line_soft).rounded(px(Radius::PANEL))
 }
 
 /// 等宽数字。行号、计数、耗时、分值走这里，避免位数变化时左右跳动。
@@ -1044,7 +1051,7 @@ pub fn page_header(title_text: impl Into<SharedString>, metrics: &[MetricCell], 
         .items_center()
         .gap(px(layout.section_gap()))
         .border_b_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .bg(p.surface)
         .child(title(title_text, TypeScale::LG, p));
     for cell in metrics {
@@ -1087,7 +1094,7 @@ pub fn resize_handle(
     let key = id.into();
     let group = key.clone();
     let accent = p.accent;
-    let line = if dragging { p.accent } else { p.line };
+    let line = if dragging { p.accent } else { p.line_soft };
     div()
         .group(group.clone())
         .id(ElementId::Name(key.clone()))
@@ -1101,7 +1108,7 @@ pub fn resize_handle(
         .justify_center()
         .role(gpui_kit::Role::Button)
         .aria_label(label)
-        .child(div().w(px(2.)).h_full().bg(line).group_hover(group, move |style| style.bg(accent)))
+        .child(div().w(px(if dragging { 2. } else { 1. })).h_full().bg(line).group_hover(group, move |style| style.w(px(2.)).bg(accent)))
         .on_drag(ResizeDrag { key }, |_drag, _offset, _window, cx| cx.new(|_| ResizeGhost))
         .on_click(move |event, window, cx| {
             if click_count(event) >= 2 {
@@ -1329,10 +1336,10 @@ pub fn kbd_element(content: impl IntoElement, p: &Palette) -> AnyElement {
         .flex_none()
         .px(px(5.))
         .h(px(18.))
-        .rounded(px(Radius::CONTROL))
+        .rounded(px(Radius::TAG))
         .border_1()
-        .border_color(p.line_strong)
-        .bg(p.surface)
+        .border_color(p.line)
+        .bg(if p.dark { p.raised } else { p.chrome })
         .text_size(px(TypeScale::XS))
         .text_color(p.text_muted)
         .flex()
@@ -1355,7 +1362,7 @@ pub fn shortcut(key: &str) -> String {
 pub const AUTOCOMPLETE_CHORD: &str = if cfg!(target_os = "macos") { "Alt+Space" } else { "Control+Space" };
 
 pub fn vline(p: &Palette) -> AnyElement {
-    div().flex_none().w(px(1.)).h(px(18.)).mx(px(4.)).bg(p.line).into_any_element()
+    div().flex_none().w(px(1.)).h(px(14.)).mx(px(4.)).bg(p.line_soft).into_any_element()
 }
 
 // ---------------------------------------------------------------- 按钮
@@ -1717,9 +1724,9 @@ impl RenderOnce for ActionButton {
             ActionVariant::Subtle => el
                 .bg(p.accent_soft)
                 .border_1()
-                .border_color(p.accent.opacity(0.28))
+                .border_color(p.accent.opacity(0.22))
                 .when(!inert, |this| {
-                    this.hover(|s| s.border_color(p.accent))
+                    this.hover(|s| s.border_color(p.accent.opacity(0.55)))
                         .active(|s| s.bg(p.selection))
                 }),
             ActionVariant::Ghost => el.when(!inert, |this| {
@@ -1735,9 +1742,9 @@ impl RenderOnce for ActionButton {
             ActionVariant::DangerSoft => el
                 .bg(p.danger_soft)
                 .border_1()
-                .border_color(p.danger.opacity(0.28))
+                .border_color(p.danger.opacity(0.22))
                 .when(!inert, |this| {
-                    this.hover(|s| s.border_color(p.danger))
+                    this.hover(|s| s.border_color(p.danger.opacity(0.6)))
                         .active(|s| s.opacity(0.88))
                 }),
         };
@@ -1885,16 +1892,16 @@ pub fn filter_chip(
         .border_1()
         .text_size(px(TypeScale::XS))
         .when(selected, |this| {
-            this.border_color(p.accent)
+            this.border_color(p.accent.opacity(0.45))
                 .bg(p.accent_soft)
                 .text_color(p.accent_text)
                 .font_weight(FontWeight::MEDIUM)
         })
         .when(!selected, |this| {
-            this.border_color(p.line)
+            this.border_color(p.line_soft)
                 .bg(if p.dark { p.chrome } else { p.surface })
                 .text_color(p.text_muted)
-                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line_strong))
+                .hover(|style| style.bg(p.hover).text_color(p.text).border_color(p.line))
         })
         .when_some(dot, |this, color| this.child(div().size(px(7.)).rounded_full().bg(color)))
         .child(label)
@@ -2067,10 +2074,10 @@ pub enum BannerTone {
 impl BannerTone {
     pub fn colors(self, p: &Palette) -> (Hsla, Hsla, Hsla) {
         match self {
-            BannerTone::Info => (p.accent_text, p.accent_soft, p.accent.opacity(0.26)),
-            BannerTone::Success => (p.ok, p.ok_soft, p.ok.opacity(0.28)),
-            BannerTone::Warn => (p.warn, p.warn_soft, p.warn.opacity(0.30)),
-            BannerTone::Danger => (p.danger, p.danger_soft, p.danger.opacity(0.30)),
+            BannerTone::Info => (p.accent_text, p.accent_soft, p.accent.opacity(0.22)),
+            BannerTone::Success => (p.ok, p.ok_soft, p.ok.opacity(0.24)),
+            BannerTone::Warn => (p.warn, p.warn_soft, p.warn.opacity(0.26)),
+            BannerTone::Danger => (p.danger, p.danger_soft, p.danger.opacity(0.26)),
         }
     }
 }
@@ -2485,7 +2492,32 @@ mod palette_tests {
             assert_ne!(p.sunken, p.chrome, "凹陷面和外壳不是同一色");
             assert_ne!(p.sunken, p.raised, "凹陷面和浮层不是同一色");
             assert!(luminance(p.sunken) < luminance(p.surface), "凹陷面比工作区更沉");
+            // 实心主按钮文字在强调底上满足 WCAG AA（≥ 4.5:1）。
+            let on_accent_ratio = contrast(p.on_accent, p.accent);
+            assert!(on_accent_ratio >= 4.5, "on_accent on accent: {on_accent_ratio:.2} (dark={})", p.dark);
+            // Rill 溪流青蓝主色色相落在青蓝区间（约 175°–205°，即 0.48..=0.57）。
+            assert!(
+                (0.48..=0.57).contains(&p.accent.h),
+                "accent 应落在溪流青蓝色相区间（实际 h={:.3}, dark={}）",
+                p.accent.h,
+                p.dark
+            );
         }
+        // 浅/深两套主题的四级表面层级各自清晰可分。
+        let light = Palette::light();
+        assert!(
+            luminance(light.sunken) < luminance(light.chrome)
+                && luminance(light.chrome) < luminance(light.surface)
+                && luminance(light.surface) < luminance(light.raised),
+            "浅色四级表面明度应严格递增：sunken < chrome < surface < raised"
+        );
+        let dark = Palette::dark();
+        assert!(
+            luminance(dark.sunken) < luminance(dark.surface)
+                && luminance(dark.surface) < luminance(dark.chrome)
+                && luminance(dark.chrome) < luminance(dark.raised),
+            "深色四级表面明度应严格递增：sunken < surface < chrome < raised"
+        );
     }
 
     /// 关键图标、焦点环与状态标记在实际背景上至少 3:1（WCAG 非文本对比度，需求 R2）：

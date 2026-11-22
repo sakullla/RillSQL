@@ -11,7 +11,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div, px,
 };
 
-use super::kit::{self, HitArea, IconSize, Metrics, Palette, Radius, Tip as _, TypeScale};
+use super::kit::{self, HitArea, IconSize, Metrics, Palette, Radius, Space, Tip as _, TypeScale};
 
 /// 页签最大宽度：长标题在这里截断，完整标题留在 tooltip 与无障碍名称上。
 pub const TAB_MAX_W: f32 = 220.;
@@ -20,11 +20,21 @@ pub const TAB_MIN_W: f32 = 96.;
 /// 类型图标、标题与未保存标记之间的间距。
 pub const TAB_GAP: f32 = 7.;
 /// 左侧内边距：图标不贴边。
-pub const TAB_PAD_L: f32 = 12.;
+pub const TAB_PAD_L: f32 = 10.;
 /// 右侧内边距：关闭动作与相邻页签之间留出呼吸。
 pub const TAB_PAD_R: f32 = 5.;
-/// 当前页签顶部的选中指示条高度（线条，不是控件）。
+/// 当前页签选中指示条高度（线条，不是控件）。
 const TAB_MARK_H: f32 = 2.;
+
+/// 页签呈现形态：区分顶部融合工作区页签与面板内子页签，均去除厚重竖向分隔线。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabStyle {
+    /// 面板内结果子页签（查询结果、固定结果、消息日志）：平滑底线指示条，贴合内容区。
+    #[default]
+    Panel,
+    /// 融合顶栏工作区页签：轻抬升药丸卡片，透明底色自然融入标题栏。
+    Workspace,
+}
 
 /// 一个页签的表现数据。点击后做什么由调用方挂事件，组件不持有业务语义。
 #[derive(Clone)]
@@ -36,7 +46,7 @@ pub struct TabSpec {
     pub active: bool,
     pub running: bool,
     pub dirty: bool,
-    /// 是否关联生产环境连接：顶部标记条改用危险色，防止跨环境误操作。
+    /// 是否关联生产环境连接：指示条与图标改用危险色，防止跨环境误操作。
     pub prod: bool,
     /// 连接/库上下文说明（例如 `Atlas / orders · PROD`）：进入 tooltip，不占页签宽度。
     pub context: Option<SharedString>,
@@ -49,6 +59,8 @@ pub struct TabSpec {
     /// 运行中的转圈：调用方持有的隔离实体（`ui::spinner_view`），动画帧只通知它自己。
     /// 没给时运行态只把类型图标改成强调色，不在页签里直接画动画。
     pub spinner: Option<AnyView>,
+    /// 页签形态：面板子页签或融合顶栏工作区页签。
+    pub style: TabStyle,
 }
 
 impl TabSpec {
@@ -66,7 +78,22 @@ impl TabSpec {
             preview: false,
             pinned: None,
             spinner: None,
+            style: TabStyle::Panel,
         }
+    }
+
+    /// 切换为融合顶栏工作区页签样式。
+    #[allow(dead_code)] // 由 T2 融合顶栏工作区标签条接入。
+    pub fn workspace(mut self) -> Self {
+        self.style = TabStyle::Workspace;
+        self
+    }
+
+    /// 显式指定页签样式。
+    #[allow(dead_code)]
+    pub fn style(mut self, style: TabStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// 运行中的转圈视图；只在 `running` 时画出来。
@@ -166,6 +193,9 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
     } else {
         slot(kit::icon(spec.icon, IconSize::CONTROL, icon_tone).into_any_element())
     };
+    let workspace = spec.style == TabStyle::Workspace;
+    let active_bg = if workspace && p.dark { p.raised } else { p.surface };
+    let active_border = if spec.prod { p.danger.opacity(0.45) } else { p.line_soft };
     kit::interactive_states(div().id(ElementId::Name(spec.id.clone())), p, false)
         .test_support()
         .role(gpui_kit::Role::Tab)
@@ -183,22 +213,31 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
         .flex()
         .items_center()
         .gap(px(TAB_GAP))
-        .border_r_1()
-        .border_color(if spec.active { p.line } else { p.line_soft })
-        .when(spec.active, |this| this.bg(p.surface).text_color(p.text))
-        .when(!spec.active, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
-        .when(spec.active || spec.prod, |this| {
+        .rounded(px(Radius::CONTROL))
+        .when(workspace && spec.active, |this| {
+            this.bg(active_bg)
+                .border_1()
+                .border_color(active_border)
+                .text_color(p.text)
+                .shadow_xs()
+        })
+        .when(!workspace && spec.active, |this| this.bg(active_bg).text_color(p.text))
+        .when(!spec.active, |this| {
+            this.text_color(p.text_muted)
+                .hover(|style| style.bg(p.hover).text_color(p.text))
+        })
+        .when((!workspace && (spec.active || spec.prod)) || (workspace && spec.prod), |this| {
             let mark_color = if spec.prod {
-                if spec.active { p.danger } else { p.danger.opacity(0.45) }
+                if spec.active { p.danger } else { p.danger.opacity(0.5) }
             } else {
                 p.accent
             };
             this.child(
                 div()
                     .absolute()
-                    .top_0()
-                    .left(px(6.))
-                    .right(px(6.))
+                    .bottom_0()
+                    .left(px(Space::MD))
+                    .right(px(Space::MD))
                     .h(px(TAB_MARK_H))
                     .rounded(px(Radius::TAG))
                     .bg(mark_color),
@@ -344,15 +383,50 @@ pub fn tab_strip_with_double_click(
     p: &Palette,
     on_empty_double_click: Option<kit::Click>,
 ) -> AnyElement {
+    tab_strip_inner(id, aria_label, list_id, tabs, actions, scroll, reveal, Some(layout.tabs_h), p, on_empty_double_click, false)
+}
+
+/// 融合顶栏工作区页签条：透明底色、无底边硬线，自适应嵌入标题栏中央区域，
+/// 保持横向滚动、溢出提示、尾部动作与双击空白新建。
+#[allow(clippy::too_many_arguments, dead_code)] // 由 T2 融合顶栏工作区标签条接入。
+pub fn tab_strip_integrated(
+    id: impl Into<SharedString>,
+    aria_label: impl Into<SharedString>,
+    list_id: impl Into<SharedString>,
+    tabs: Vec<AnyElement>,
+    actions: Vec<AnyElement>,
+    scroll: &gpui_kit::ScrollHandle,
+    reveal: Option<usize>,
+    p: &Palette,
+    on_empty_double_click: Option<kit::Click>,
+) -> AnyElement {
+    tab_strip_inner(id, aria_label, list_id, tabs, actions, scroll, reveal, None, p, on_empty_double_click, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tab_strip_inner(
+    id: impl Into<SharedString>,
+    aria_label: impl Into<SharedString>,
+    list_id: impl Into<SharedString>,
+    tabs: Vec<AnyElement>,
+    actions: Vec<AnyElement>,
+    scroll: &gpui_kit::ScrollHandle,
+    reveal: Option<usize>,
+    fixed_height: Option<f32>,
+    p: &Palette,
+    on_empty_double_click: Option<kit::Click>,
+    integrated: bool,
+) -> AnyElement {
     let mut list = div()
         .id(ElementId::Name(list_id.into()))
         .flex()
-        .items_end()
+        .items_center()
+        .gap(px(Space::XXS))
         .h_full()
         .test_support()
         .flex_shrink(1.)
         .min_w(px(0.))
-        // 标签条高度只够一行标签，浮动横条会压住标签文字与激活下划线；溢出靠滚轮/触控板横滑，
+        // 标签条高度只够一行标签，浮动横条会压住标签文字与激活指示条；溢出靠滚轮/触控板横滑，
         // 当前标签总由 reveal 滚进视野。滚动条例外：页签条不画横向滚动条。
         .overflow_x_scroll()
         .track_scroll(scroll);
@@ -367,7 +441,7 @@ pub fn tab_strip_with_double_click(
     let list_wrap = div()
         .relative()
         .flex()
-        .items_end()
+        .items_center()
         .h_full()
         .flex_shrink(1.)
         .min_w(px(0.))
@@ -402,7 +476,7 @@ pub fn tab_strip_with_double_click(
                     .border_color(p.accent.opacity(0.75)),
             )
         });
-    let mut trailing = div().h_full().flex_none().flex().items_center().gap(px(2.)).px(px(4.));
+    let mut trailing = div().h_full().flex_none().flex().items_center().gap(px(Space::XXS)).px(px(Space::XS));
     for action in actions {
         trailing = trailing.child(action);
     }
@@ -426,15 +500,18 @@ pub fn tab_strip_with_double_click(
         .test_support()
         .role(gpui_kit::Role::TabList)
         .aria_label(aria_label.into())
-        .flex_none()
-        .w_full()
         .min_w(px(0.))
-        .h(px(layout.tabs_h))
         .flex()
-        .items_end()
-        .bg(p.chrome)
-        .border_b_1()
-        .border_color(p.line)
+        .items_center()
+        .when(integrated, |this| this.flex_1().h_full().py(px(Space::XS)))
+        .when(!integrated, |this| {
+            this.flex_none()
+                .w_full()
+                .when_some(fixed_height, |el, h| el.h(px(h)))
+                .bg(p.chrome)
+                .border_b_1()
+                .border_color(p.line_soft)
+        })
         .child(list_wrap)
         .child(trailing)
         .child(filler)
@@ -940,5 +1017,139 @@ mod tab_tests {
             .unwrap();
         assert!(left_end && !right_end, "滚到最右端后应只向左侧溢出");
         assert!(has_left_end && !has_right_end, "左侧溢出提示应可见");
+    }
+
+    struct WorkspaceStripProbe {
+        layout: Metrics,
+        running: bool,
+        spinner: AnyView,
+        clicks: usize,
+    }
+
+    impl Render for WorkspaceStripProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            let active_tab = tab(
+                TabSpec::new("ws-tab-0", IconName::Code, "orders.sql")
+                    .workspace()
+                    .active(true)
+                    .prod(true)
+                    .dirty(true, Some(SharedString::from("未保存")))
+                    .pinned(Some(SharedString::from("已固定")))
+                    .running(self.running)
+                    .spinner(Some(self.spinner.clone())),
+                &p,
+            )
+            .child(close_action("ws-close-0", "关闭", true, &p, cx.listener(|this: &mut Self, _, _, cx| {
+                this.clicks += 1;
+                cx.notify();
+            })))
+            .into_any_element();
+            let preview_tab = tab(
+                TabSpec::new("ws-tab-1", IconName::Table, "users")
+                    .workspace()
+                    .preview(true),
+                &p,
+            )
+            .into_any_element();
+            let new_btn = kit::icon_action(
+                "ws-new",
+                IconName::Plus,
+                "新建查询",
+                HitArea::CONTROL,
+                p.text_muted,
+                &p,
+                false,
+                false,
+                cx.listener(|this: &mut Self, _, _, cx| {
+                    this.clicks += 10;
+                    cx.notify();
+                }),
+            )
+            .into_any_element();
+            let scroll = gpui_kit::ScrollHandle::new();
+            div()
+                .id("ws-topbar")
+                .test_support()
+                .w_full()
+                .h(px(self.layout.topbar_h))
+                .bg(p.chrome)
+                .flex()
+                .items_center()
+                .child(tab_strip_integrated(
+                    "ws-tabs",
+                    "工作区标签",
+                    "ws-tab-list",
+                    vec![active_tab, preview_tab],
+                    vec![new_btn],
+                    &scroll,
+                    None,
+                    &p,
+                    None,
+                ))
+        }
+    }
+
+    /// 融合顶栏工作区页签在浅/深主题下与顶栏垂直居中对齐，运行态切换 spinner 时标题位置稳定不跳动。
+    #[gpui_kit::test]
+    fn integrated_workspace_tabs_align_cleanly_and_keep_title_stable_while_running(cx: &mut TestAppContext) {
+        for dark in [false, true] {
+            cx.update(|cx| {
+                gpui_kit::init(cx);
+                kit::apply_theme(dark, cx);
+            });
+            let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(900.), px(200.)) };
+            let (window, view) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                    cx,
+                    |_, cx| {
+                        let spinner = cx.new(|_| crate::ui::spinner_view::SpinnerView::new(gpui_kit::component::Size::XSmall));
+                        cx.new(|_| WorkspaceStripProbe {
+                            layout: Metrics::compact(),
+                            running: false,
+                            spinner: AnyView::from(spinner),
+                            clicks: 0,
+                        })
+                    },
+                )
+                .expect("workspace strip window")
+            });
+            let (chip, icon, title_idle, close, new_btn, pinned_exists) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (
+                        window.find("ws-tab-0").bounds(),
+                        window.find("ws-tab-0-icon").bounds(),
+                        window.find("ws-tab-0-title").bounds(),
+                        window.find("ws-close-0").bounds(),
+                        window.find("ws-new").bounds(),
+                        window.try_find("ws-tab-0-pinned").is_some(),
+                    )
+                })
+                .unwrap();
+            assert!(pinned_exists, "固定图钉标记保留");
+            let center = center_y(chip);
+            for (name, b) in [("图标", icon), ("标题", title_idle), ("关闭", close), ("新建", new_btn)] {
+                assert!((center_y(b) - center).abs() < 0.5, "dark={dark}: {name} 与工作区页签垂直居中");
+            }
+            // 切到运行态（挂载 spinner）：图标槽宽度不变，标题左缘不跳动。
+            cx.update(|cx| {
+                view.update(cx, |probe, cx| {
+                    probe.running = true;
+                    cx.notify();
+                });
+            });
+            let title_running = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.find("ws-tab-0-title").bounds()
+                })
+                .unwrap();
+            assert!(
+                (f32::from(title_running.origin.x) - f32::from(title_idle.origin.x)).abs() < 0.5,
+                "dark={dark}: 运行态切换 spinner 时标题不左右跳动"
+            );
+        }
     }
 }
