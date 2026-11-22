@@ -54,10 +54,6 @@ pub struct ChromeLayout {
     pub overflow: i32,
 }
 
-pub fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
-    layout_with_sidebar(width, sidebar_open, SIDEBAR_DEFAULT as i32)
-}
-
 pub fn layout_with_sidebar(width: i32, sidebar_open: bool, sidebar_width: i32) -> ChromeLayout {
     // 活动栏宽度不随窗口变化：变窄会让图标和选中标记被裁掉，反而挤压内容列。
     let activity_width = RAIL_WIDTH;
@@ -153,14 +149,6 @@ pub fn painted_frame_with_sidebar(viewport: i32, sidebar_open: bool, pad: i32, s
     }
 }
 
-/// 旧视图把打开的侧栏一律放进 flex，body 又用整段视口宽，再加上根 padding。
-#[allow(dead_code)]
-pub fn flex_sidebar_row_width(viewport: i32, sidebar_open: bool, pad: i32) -> i32 {
-    let layout = layout_for(viewport, sidebar_open);
-    let sidebar = if sidebar_open { layout.sidebar_width } else { 0 };
-    pad.max(0) * 2 + layout.activity_width + sidebar + layout.content_width
-}
-
 /// 中文按字折行，英文按空白折行。返回无法折开的最长片段宽度。
 pub fn unbreakable_px(text: &str) -> i32 {
     let mut best = 0;
@@ -182,6 +170,10 @@ pub fn unbreakable_px(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
+        layout_with_sidebar(width, sidebar_open, SIDEBAR_DEFAULT as i32)
+    }
 
     #[test]
     fn three_widths_do_not_overflow() {
@@ -213,32 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_flex_row_exceeds_the_viewport_and_the_painted_frame_does_not() {
-        for width in [1360, 900, 640] {
-            for open in [true, false] {
-                for pad in [4, 8, 12] {
-                    let buggy = flex_sidebar_row_width(width, open, pad);
-                    let frame = painted_frame(width, open, pad);
-                    assert!(buggy > width, "old flex layout {width} open={open} pad={pad} -> {buggy}");
-                    assert!(frame.occupied_width() <= width, "{width} occupied={}", frame.occupied_width());
-                    assert_eq!(frame.body_width, width - pad * 2);
-                    assert_eq!(frame.sidebar_in_flex, open && width > 640);
-                }
-            }
-        }
-        let narrow = painted_frame(640, true, 8);
-        assert!(narrow.sidebar_overlay);
-        assert!(!narrow.sidebar_in_flex);
-        // 顶栏不换行：任何宽度都只占一个顶栏高度，避免和内容或状态栏重叠。
-        for width in [1360, 900, 640] {
-            let frame = painted_frame(width, false, 8);
-            assert!(!frame.toolbar_wrap, "{width}");
-            assert_eq!(frame.toolbar_height, Metrics::standard().topbar_h as i32, "{width}");
-        }
-        assert!(painted_frame(1360, true, 8).sidebar_in_flex);
-    }
-
-    #[test]
     fn rail_width_is_reserved_once_so_the_workspace_is_not_squeezed() {
         // 绘制用同一个 52px 活动栏；模型里的内容宽必须正好是扣除它之后的宽度。
         for width in [1360, 900, 640] {
@@ -246,6 +212,11 @@ mod tests {
                 for density in [crate::app::Density::Compact, crate::app::Density::Standard, crate::app::Density::Relaxed] {
                     let pad = density.metrics().pad as i32;
                     let frame = painted_frame(width, open, pad);
+                    assert_eq!(frame.body_width, width - pad * 2);
+                    assert_eq!(frame.sidebar_in_flex, open && width > 640);
+                    assert_eq!(frame.sidebar_overlay, open && width <= 640);
+                    assert!(!frame.toolbar_wrap);
+                    assert_eq!(frame.toolbar_height, Metrics::standard().topbar_h as i32);
                     assert_eq!(frame.activity_width, RAIL_WIDTH, "{width} open={open}");
                     let expected = frame.body_width
                         - RAIL_WIDTH

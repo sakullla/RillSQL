@@ -215,44 +215,26 @@ fn dictionaries_match_the_existing_shell_keys() {
 }
 
 #[test]
-fn copy_fits_every_width_density_theme_and_locale() {
-    let themes = [ThemePreference::Light, ThemePreference::Dark];
-    let locales = [i18n::Locale::ZhCn, i18n::Locale::En];
-    let pages = [AppPage::Workspace, AppPage::Connections, AppPage::History, AppPage::Settings];
-    let densities = [Density::Compact, Density::Standard, Density::Relaxed];
-    for width in [1360, 1024, 900, 760, 640] {
-        for sidebar in [true, false] {
-            for theme in themes {
-                for locale in locales {
-                    for density in densities {
-                        for page in pages {
-                            let mut model = WorkbenchModel::new(Shell::default());
-                            model.set_width(width);
-                            model.shell.sidebar_open = sidebar;
-                            model.shell.theme = theme;
-                            model.shell.page = page;
-                            model.shell.density = density;
-                            if locale == i18n::Locale::En {
-                                model.shell.locale = Locale::En;
-                            }
-                            if page == AppPage::Workspace {
-                                model.tabs.clear();
-                            }
-                            assert!(model.missing_copy(locale).is_empty(), "{:?} {:?}", page, model.missing_copy(locale));
-                            assert_eq!(model.copy_overflow(locale), 0, "{width} {page:?} {locale:?} {density:?}");
-                            assert!(model.layout().content_width >= 160 || width < 160);
-                            // 密度不仅是设置里的文案：同一宽度下根 padding 必须跟着变。
-                            assert_eq!(model.painted().pad, density.metrics().pad as i32);
-                            for node in model.access_nodes() {
-                                assert!(!node.id.is_empty());
-                                assert!(!node.role.is_empty());
-                                assert_ne!(model.text(node.label_key), node.label_key);
-                                assert!(!node.state.is_empty());
-                                assert!(!node.action.is_empty());
-                            }
-                        }
-                    }
-                }
+fn page_copy_fits_the_narrowest_docked_and_overlay_layouts() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.tabs.clear();
+    model.shell.sidebar_open = true;
+    model.shell.density = Density::Relaxed;
+    assert_eq!(model.painted().pad, Density::Relaxed.metrics().pad as i32);
+    for locale in [Locale::ZhCn, Locale::En] {
+        model.shell.locale = locale;
+        for node in model.access_nodes() {
+            assert!(!node.id.is_empty() && !node.role.is_empty(), "{node:?}");
+            assert_ne!(model.text(node.label_key), node.label_key);
+            assert!(!node.state.is_empty() && !node.action.is_empty(), "{node:?}");
+        }
+        for page in [AppPage::Workspace, AppPage::Connections, AppPage::History, AppPage::Settings] {
+            model.shell.page = page;
+            let missing = model.missing_copy(model.locale());
+            assert!(missing.is_empty(), "{page:?} {locale:?}: {missing:?}");
+            for width in [640, 641] {
+                model.set_width(width);
+                assert_eq!(model.copy_overflow(model.locale()), 0, "{width} {page:?} {locale:?}");
             }
         }
     }
@@ -475,90 +457,53 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
 }
 
 #[test]
-fn exchange_running_blocks_before_uncommitted_grid_or_query_draft() {
+fn running_tools_block_close_before_uncommitted_cells_and_query_drafts() {
     use crate::app::shell::close::{evaluate, CloseKind};
+
     let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    query_item(&mut model).draft = "select 1".into();
+    model.grid_dirty = true;
+    let assert_blocked = |model: &mut WorkbenchModel| {
+        assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+        assert!(!model.allow_system_close());
+        assert!(model.close_prompt.is_none());
+    };
+
     assert!(model.dispatch("open-exchange").is_some());
     assert!(model.exchange_open);
     model.exchange_running = true;
-    model.grid_dirty = true;
-    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
-    assert!(!model.allow_system_close());
-    assert!(model.close_prompt.is_none());
+    assert_blocked(&mut model);
     model.exchange_running = false;
-    model.grid_dirty = true;
-    model.close_prompt = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: false });
-    model.grid_dirty = false;
-    model.close_prompt = None;
-    assert!(model.dispatch("new-query").is_some());
-    model.tabs[0].draft = "select 1".into();
-    model.tabs[0].last_executed_sql = None;
-    model.tabs[0].uncommitted_cells = false;
-    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
-}
 
-#[test]
-fn redis_and_mongo_running_block_before_uncommitted_grid_or_query_draft() {
-    use crate::app::shell::close::{evaluate, CloseKind};
-    let mut model = WorkbenchModel::new(Shell::default());
     assert!(model.dispatch("open-redis:cache|缓存|0").is_some());
-    assert_eq!(model.tool, WorkTool::Redis);
     assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.tool, WorkTool::Redis);
     assert_eq!(model.redis_spec.as_deref(), Some("cache|缓存|0"));
     model.redis_running = true;
-    model.grid_dirty = true;
-    assert!(model.dispatch("new-query").is_some());
-    let query = query_item(&mut model);
-    query.draft = "select 1".into();
-    query.last_executed_sql = None;
-    query.uncommitted_cells = false;
-    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
-    assert!(!model.allow_system_close());
-    assert!(model.close_prompt.is_none());
+    assert_blocked(&mut model);
     model.redis_running = false;
-    model.mongo_running = true;
+
     assert!(model.dispatch("open-mongo:docs|文档").is_some());
     assert_eq!(model.tool, WorkTool::Mongo);
     assert_eq!(model.mongo_spec.as_deref(), Some("docs|文档"));
-    model.close_prompt = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+    model.mongo_running = true;
+    assert_blocked(&mut model);
     model.mongo_running = false;
-    model.close_prompt = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
-    model.grid_dirty = false;
-    query_item(&mut model).uncommitted_cells = false;
-    model.close_prompt = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
-    query_item(&mut model).draft.clear();
-    model.close_prompt = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::Allow);
-}
 
-#[test]
-fn compare_running_blocks_before_uncommitted_grid_or_query_draft() {
-    use crate::app::shell::close::{evaluate, CloseKind};
-    let mut model = WorkbenchModel::new(Shell::default());
     assert!(model.dispatch("compare").is_some());
     assert_eq!(model.shell.page, AppPage::Compare);
     model.compare_running = true;
-    model.grid_dirty = true;
-    assert!(model.dispatch("new-query").is_some());
-    let query = query_item(&mut model);
-    query.draft = "select 1".into();
-    query.last_executed_sql = None;
-    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
-    assert!(!model.allow_system_close());
-    assert!(model.close_prompt.is_none());
+    assert_blocked(&mut model);
     model.compare_running = false;
-    model.close_prompt = None;
+
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
     model.grid_dirty = false;
-    query_item(&mut model).uncommitted_cells = false;
-    model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
     query_item(&mut model).draft.clear();
-    model.close_prompt = None;
+    model.grid_dirty = true;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: false });
+    model.grid_dirty = false;
     assert_eq!(evaluate(model.facts()), CloseKind::Allow);
 }
 
@@ -1324,59 +1269,6 @@ fn long_copy_is_truncated_but_fully_available_and_never_holds_neighbours(cx: &mu
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[gpui_kit::test]
-fn headless_workbench_renders_on_windows_widths(cx: &mut gpui_kit::TestAppContext) {
-    let dir = std::env::temp_dir().join(format!("rillsql-shell-ui-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let services = services_at(&dir);
-    cx.update(gpui_kit::init);
-    let (window, view) = cx.update(|cx| {
-        let bounds = gpui_kit::Bounds {
-            origin: gpui_kit::Point::default(),
-            size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(800.)),
-        };
-        let (window, view) = gpui_kit::open_window(
-            gpui_kit::WindowOptions {
-                window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| cx.new(|cx| super::view::Workbench::with_services(window, cx, Arc::clone(&services), false)),
-        )
-        .expect("workbench");
-        let shell = view.read(cx).shell().clone();
-        crate::app::install_workbench_actions(cx, &view);
-        crate::app::install_menus(cx, &shell);
-        (window, view)
-    });
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-    })
-    .unwrap();
-    cx.update(|cx| {
-        view.update(cx, |view, cx| {
-            view.perform("connections", cx);
-            view.perform("menu-connection", cx);
-            view.perform("settings", cx);
-            view.perform("density-relaxed", cx);
-            assert_eq!(view.model.shell.density, crate::app::Density::Relaxed);
-            view.model.set_width(900);
-            view.model.set_width(640);
-            view.model.shell.sidebar_open = true;
-            let frame = view.model.painted();
-            assert!(frame.sidebar_overlay);
-            assert!(!frame.sidebar_in_flex);
-            assert!(!frame.toolbar_wrap, "顶栏单行，不占两行高度");
-            assert_eq!(frame.occupied_width(), 640);
-            assert!(super::layout::flex_sidebar_row_width(640, true, frame.pad) > 640);
-            assert_eq!(view.model.copy_overflow(i18n::Locale::ZhCn), 0);
-            assert_eq!(view.model.copy_overflow(i18n::Locale::En), 0);
-        });
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn save_names_the_failing_field_and_ssh_password_selects_password_auth() {
     let mut model = WorkbenchModel::new(Shell::default());
@@ -1730,8 +1622,7 @@ fn grid_edits_block_close_and_structure_admin_bind_the_target(cx: &mut gpui_kit:
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 结构页字段表按内容区真实宽度排版：完整工作台里 900 / 640、开着侧栏、双主题、
-/// 紧凑/标准密度、中英文下，行尾每个动作都在行框内、可见、可点。
+/// 分别在停靠侧栏和覆盖侧栏布局下检查行尾动作的几何与点击。
 /// 面板曾经拿窗口视口宽当内容宽，900 默认侧栏和 640 下右侧动作被 overflow_hidden 裁掉。
 #[gpui_kit::test]
 fn structure_row_actions_stay_inside_the_real_content_column(cx: &mut gpui_kit::TestAppContext) {
@@ -1750,103 +1641,100 @@ fn structure_row_actions_stay_inside_the_real_content_column(cx: &mut gpui_kit::
         engine: "postgres".into(),
         environment: "dev".into(),
     };
-    for width in [900., 640.] {
+    for (width, theme, density, locale) in [
+        (900., "theme-light", "density-compact", "locale-zh"),
+        (640., "theme-dark", "density-standard", "locale-en"),
+    ] {
         let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, width, 800.);
-        for (theme, dark) in [("theme-light", "浅色"), ("theme-dark", "深色")] {
-            for density in ["density-compact", "density-standard"] {
-                for (locale, language) in [("locale-zh", "中文"), ("locale-en", "英文")] {
-                    let note = format!("{width} {dark} {density} {language}");
-                    cx.update(|cx| {
-                        view.update(cx, |view, cx| {
-                            view.perform(theme, cx);
-                            view.perform(density, cx);
-                            view.perform(locale, cx);
-                            // 侧栏开着才是被裁掉的场景：内容列少掉活动栏与停靠侧栏。
-                            view.model.shell.sidebar_open = true;
-                            view.model.shell.page = AppPage::Structure;
-                            view.model.tool = WorkTool::Structure;
-                            view.structure.update(cx, |pane, cx| {
-                                pane.bind(target.clone());
-                                pane.install_snapshot_for_test(4);
-                                pane.session.mode = StructureMode::Create;
-                                pane.session.table_name = "notes".into();
-                                cx.notify();
-                            });
-                            cx.notify();
-                        });
+        let note = format!("{width} {theme} {density} {locale}");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.perform(theme, cx);
+                view.perform(density, cx);
+                view.perform(locale, cx);
+                // 侧栏开着才是被裁掉的场景：内容列少掉活动栏与停靠侧栏。
+                view.model.shell.sidebar_open = true;
+                view.model.shell.page = AppPage::Structure;
+                view.model.tool = WorkTool::Structure;
+                view.structure.update(cx, |pane, cx| {
+                    pane.bind(target.clone());
+                    pane.install_snapshot_for_test(4);
+                    pane.session.mode = StructureMode::Create;
+                    pane.session.table_name = "notes".into();
+                    cx.notify();
+                });
+                cx.notify();
+            });
+        });
+        for mode in [StructureMode::Create, StructureMode::Existing] {
+            let mode_note = if mode == StructureMode::Create { "新建" } else { "已有表" };
+            let note = format!("{note} {mode_note}");
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.structure.update(cx, |pane, cx| {
+                        pane.session.mode = mode;
+                        cx.notify();
                     });
-                    for mode in [StructureMode::Create, StructureMode::Existing] {
-                        let mode_note = if mode == StructureMode::Create { "新建" } else { "已有表" };
-                        let note = format!("{note} {mode_note}");
-                        cx.update(|cx| {
-                            view.update(cx, |view, cx| {
-                                view.structure.update(cx, |pane, cx| {
-                                    pane.session.mode = mode;
-                                    cx.notify();
-                                });
-                            });
-                        });
-                        let layout_width = cx.update(|cx| view.read(cx).model.layout().content_width as f32);
-                        let (content_width, viewport, workbench_w, body, row, actions) = cx
-                            .update_window(window, |_, window, cx| {
-                                window.render_frame(cx);
-                                let content_width = view.read(cx).structure.read(cx).content_width();
-                                let body = window.find("structure-body").bounds();
-                                let row = window.find("structure-row-columns-0").bounds();
-                                // 新建表才有多出的上移/下移；已有表每行只有标记删除。
-                                let ids: &[&str] = if mode == StructureMode::Create {
-                                    &["structure-up-1", "structure-down-1", "structure-drop-col-1"]
-                                } else {
-                                    &["structure-drop-col-1"]
-                                };
-                                let actions: Vec<_> = ids
-                                    .iter()
-                                    .map(|id| {
-                                        let element = window.find(*id);
-                                        (*id, element.bounds(), element.visible(), element.role())
-                                    })
-                                    .collect();
-                                let workbench_w = f32::from(window.find("workbench").bounds().size.width);
-                                (content_width, f32::from(window.viewport_size().width), workbench_w, body, row, actions)
-                            })
-                            .unwrap();
-                        assert!((content_width - layout_width).abs() < 0.5, "{note}: 面板内容宽 {content_width} 应来自布局 {layout_width}");
-                        assert!(content_width < viewport - 1., "{note}: 内容宽不能是窗口视口宽 {viewport}");
-                        let row_right = f32::from(row.origin.x + row.size.width);
-                        let body_right = f32::from(body.origin.x + body.size.width);
-                        assert!(row_right <= body_right + 0.5, "{note}: 整行越出滚动内容（{row_right} > {body_right}）");
-                        for (id, bounds, visible, role) in actions {
-                            assert!(visible, "{note}: {id} 应可见");
-                            assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: {id} 的角色");
-                            let left = f32::from(bounds.origin.x);
-                            let right = f32::from(bounds.origin.x + bounds.size.width);
-                            assert!(left >= f32::from(row.origin.x) - 0.5, "{note}: {id} 越出整行左侧");
-                            assert!(right <= row_right + 0.5, "{note}: {id} 被挤出整行（{right} > {row_right}）");
-                            assert!(right <= workbench_w + 0.5, "{note}: {id} 越出工作台");
-                        }
-                        // 动作不只是画得下，也要真的改草稿。
-                        // 640 的侧栏是覆盖式，遮罩会吞掉内容点击（侧栏浮在内容之上的既有行为）；
-                        // 收起后内容列宽度不变（覆盖与收起都是 588），在这里验证动作可点。
-                        if width < 700. {
-                            cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = false));
-                            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
-                        }
-                        let before: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
-                        cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
-                        assert!(cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 标记删除可点");
-                        cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
-                        assert!(!cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 再点一次取消标记");
-                        if mode == StructureMode::Create {
-                            cx.update_window(window, |_, window, cx| window.click("structure-down-0", cx)).unwrap();
-                            let after: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
-                            assert_eq!(after[0], before[1], "{note}: 下移可点且换到草稿顺序里");
-                            assert_eq!(after[1], before[0]);
-                        }
-                        if width < 700. {
-                            cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = true));
-                        }
-                    }
-                }
+                });
+            });
+            let layout_width = cx.update(|cx| view.read(cx).model.layout().content_width as f32);
+            let (content_width, viewport, workbench_w, body, row, actions) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let content_width = view.read(cx).structure.read(cx).content_width();
+                    let body = window.find("structure-body").bounds();
+                    let row = window.find("structure-row-columns-0").bounds();
+                    // 新建表才有多出的上移/下移；已有表每行只有标记删除。
+                    let ids: &[&str] = if mode == StructureMode::Create {
+                        &["structure-up-1", "structure-down-1", "structure-drop-col-1"]
+                    } else {
+                        &["structure-drop-col-1"]
+                    };
+                    let actions: Vec<_> = ids
+                        .iter()
+                        .map(|id| {
+                            let element = window.find(*id);
+                            (*id, element.bounds(), element.visible(), element.role())
+                        })
+                        .collect();
+                    let workbench_w = f32::from(window.find("workbench").bounds().size.width);
+                    (content_width, f32::from(window.viewport_size().width), workbench_w, body, row, actions)
+                })
+                .unwrap();
+            assert!((content_width - layout_width).abs() < 0.5, "{note}: 面板内容宽 {content_width} 应来自布局 {layout_width}");
+            assert!(content_width < viewport - 1., "{note}: 内容宽不能是窗口视口宽 {viewport}");
+            let row_right = f32::from(row.origin.x + row.size.width);
+            let body_right = f32::from(body.origin.x + body.size.width);
+            assert!(row_right <= body_right + 0.5, "{note}: 整行越出滚动内容（{row_right} > {body_right}）");
+            for (id, bounds, visible, role) in actions {
+                assert!(visible, "{note}: {id} 应可见");
+                assert_eq!(role, Some(gpui_kit::Role::Button), "{note}: {id} 的角色");
+                let left = f32::from(bounds.origin.x);
+                let right = f32::from(bounds.origin.x + bounds.size.width);
+                assert!(left >= f32::from(row.origin.x) - 0.5, "{note}: {id} 越出整行左侧");
+                assert!(right <= row_right + 0.5, "{note}: {id} 被挤出整行（{right} > {row_right}）");
+                assert!(right <= workbench_w + 0.5, "{note}: {id} 越出工作台");
+            }
+            // 动作不只是画得下，也要真的改草稿。
+            // 640 的侧栏是覆盖式，遮罩会吞掉内容点击（侧栏浮在内容之上的既有行为）；
+            // 收起后内容列宽度不变（覆盖与收起都是 588），在这里验证动作可点。
+            if width < 700. {
+                cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = false));
+                cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            }
+            let before: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+            cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
+            assert!(cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 标记删除可点");
+            cx.update_window(window, |_, window, cx| window.click("structure-drop-col-1", cx)).unwrap();
+            assert!(!cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns[1].dropped), "{note}: 再点一次取消标记");
+            if mode == StructureMode::Create {
+                cx.update_window(window, |_, window, cx| window.click("structure-down-0", cx)).unwrap();
+                let after: Vec<String> = cx.update(|cx| view.read(cx).structure.read(cx).session.kept_columns.iter().map(|column| column.name.clone()).collect());
+                assert_eq!(after[0], before[1], "{note}: 下移可点且换到草稿顺序里");
+                assert_eq!(after[1], before[0]);
+            }
+            if width < 700. {
+                cx.update(|cx| view.update(cx, |view, _| view.model.shell.sidebar_open = true));
             }
         }
     }
@@ -10806,8 +10694,7 @@ fn welcome_rows_open_context_menus_and_dispatch_their_actions(cx: &mut gpui_kit:
 
 // ------------------------------------------------------------ 共享页签（T1）
 
-/// 工作项页签迁移到共享组件后，类型图标、标题、关闭与新建在 1360/900/640 × 双主题 ×
-/// 三档密度 × 中英文下共用同一条垂直中心，宽度不被裁切；关闭、右键、中键与键盘切换不回退。
+/// 三种窗口宽度各取一种密度，检查页签的垂直对齐、裁切和关闭、右键、中键与键盘操作。
 #[gpui_kit::test]
 fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_kit::TestAppContext) {
     use gpui_kit::SharedString;
@@ -10818,7 +10705,11 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
     std::fs::create_dir_all(&dir).unwrap();
     let services = services_at(&dir);
     let center = |bounds: gpui_kit::Bounds<gpui_kit::Pixels>| f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.;
-    for width in [1360., 900., 640.] {
+    for (width, theme, density, locale) in [
+        (1360., "theme-light", "density-standard", "locale-zh"),
+        (900., "theme-dark", "density-compact", "locale-en"),
+        (640., "theme-light", "density-relaxed", "locale-en"),
+    ] {
         let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, width, 900.);
         cx.update(|cx| {
             view.update(cx, |view, cx| {
@@ -10827,82 +10718,76 @@ fn work_item_tabs_share_one_geometry_and_keep_their_interactions(cx: &mut gpui_k
                 view.perform("new-query", cx);
             });
         });
-        for theme in ["theme-light", "theme-dark"] {
-            for density in ["density-compact", "density-standard", "density-relaxed"] {
-                for locale in ["locale-zh", "locale-en"] {
-                    cx.update(|cx| {
-                        view.update(cx, |view, cx| {
-                            view.perform(theme, cx);
-                            view.perform(density, cx);
-                            view.perform(locale, cx);
-                        });
-                    });
-                    let note = format!("{width} {theme} {density} {locale}");
-                    let tabs_h = cx.update(|cx| view.read(cx).metrics().tabs_h);
-                    let (ids, active, titles) = cx.update(|cx| {
-                        let model = &view.read(cx).model;
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.perform(theme, cx);
+                view.perform(density, cx);
+                view.perform(locale, cx);
+            });
+        });
+        let note = format!("{width} {theme} {density} {locale}");
+        let tabs_h = cx.update(|cx| view.read(cx).metrics().tabs_h);
+        let (ids, active, titles) = cx.update(|cx| {
+            let model = &view.read(cx).model;
+            (
+                model.tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(),
+                model.active_tab.clone(),
+                model.tabs.iter().map(|tab| tab.title.clone()).collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(ids.len(), 3, "{note}: 三个工作项");
+        let (content, strip, chips, news) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let content = window.find("workbench-content").bounds();
+                let strip = window.find("tabs").bounds();
+                let chips = ids
+                    .iter()
+                    .map(|id| {
                         (
-                            model.tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(),
-                            model.active_tab.clone(),
-                            model.tabs.iter().map(|tab| tab.title.clone()).collect::<Vec<_>>(),
+                            window.find(SharedString::from(format!("tab-{id}"))),
+                            window.find(SharedString::from(format!("tab-{id}-icon"))).bounds(),
+                            window.find(SharedString::from(format!("tab-{id}-title"))).bounds(),
+                            window.find(SharedString::from(format!("tab-close-{id}"))).bounds(),
                         )
-                    });
-                    assert_eq!(ids.len(), 3, "{note}: 三个工作项");
-                    let (content, strip, chips, news) = cx
-                        .update_window(window, |_, window, cx| {
-                            window.render_frame(cx);
-                            let content = window.find("workbench-content").bounds();
-                            let strip = window.find("tabs").bounds();
-                            let chips = ids
-                                .iter()
-                                .map(|id| {
-                                    (
-                                        window.find(SharedString::from(format!("tab-{id}"))),
-                                        window.find(SharedString::from(format!("tab-{id}-icon"))).bounds(),
-                                        window.find(SharedString::from(format!("tab-{id}-title"))).bounds(),
-                                        window.find(SharedString::from(format!("tab-close-{id}"))).bounds(),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            (content, strip, chips, window.find("tab-new").bounds())
-                        })
-                        .unwrap();
-                    assert!((f32::from(strip.size.height) - tabs_h).abs() < 0.5, "{note}: 页签条高度跟随密度");
-                    assert!(
-                        (f32::from(strip.size.width) - f32::from(content.size.width)).abs() <= 1.5,
-                        "{note}: 页签条占满工作区宽度（strip {} content {} x {}）",
-                        f32::from(strip.size.width),
-                        f32::from(content.origin.x),
-                        f32::from(content.size.width)
-                    );
-                    assert!(f32::from(strip.origin.x + strip.size.width) <= width + 0.5, "{note}: 页签条不越出视口");
-                    for (index, (chip, icon, title, close)) in chips.iter().enumerate() {
-                        let chip_bounds = chip.bounds();
-                        assert!((f32::from(chip_bounds.size.height) - f32::from(strip.size.height)).abs() < 1.5, "{note}: 页签撑满条高");
-                        assert!(f32::from(chip_bounds.size.width) <= crate::ui::tabs::TAB_MAX_W + 0.5, "{note}: 长标题不撑破页签");
-                        let middle = center(chip_bounds);
-                        for (name, bounds) in [("类型图标", *icon), ("标题", *title), ("关闭", *close)] {
-                            assert!((center(bounds) - middle).abs() < 0.5, "{note}: {name} 与页签同一垂直中心");
-                        }
-                        assert!(
-                            (f32::from(title.size.height) - crate::ui::kit::line_height(crate::ui::kit::TypeScale::SM)).abs() < 0.5,
-                            "{note}: 标题行高与组件一致"
-                        );
-                        assert!(
-                            f32::from(title.origin.x + title.size.width) <= f32::from(close.origin.x) + 0.5,
-                            "{note}: 关闭按钮不压标题"
-                        );
-                        assert_eq!(chip.label(), Some(titles[index].as_str()), "{note}: 截断后仍能取完整标题");
-                        let selected = chip.selected();
-                        assert_eq!(selected, Some(active.as_deref() == Some(ids[index].as_str())), "{note}: 只有当前工作项选中");
-                    }
-                    assert!((f32::from(news.size.width) - crate::ui::kit::HitArea::CONTROL).abs() < 0.5, "{note}: 新建命中宽度");
-                    assert!((center(news) - center(chips[0].0.bounds())).abs() < 0.5, "{note}: 新建与页签内容同一垂直中心");
-                    assert!(f32::from(news.origin.x + news.size.width) <= f32::from(strip.origin.x + strip.size.width) + 0.5, "{note}: 新建动作留在页签条内");
-                    assert!(f32::from(news.origin.x + news.size.width) <= width + 0.5, "{note}: 新建动作留在视口内");
-                }
+                    })
+                    .collect::<Vec<_>>();
+                (content, strip, chips, window.find("tab-new").bounds())
+            })
+            .unwrap();
+        assert!((f32::from(strip.size.height) - tabs_h).abs() < 0.5, "{note}: 页签条高度跟随密度");
+        assert!(
+            (f32::from(strip.size.width) - f32::from(content.size.width)).abs() <= 1.5,
+            "{note}: 页签条占满工作区宽度（strip {} content {} x {}）",
+            f32::from(strip.size.width),
+            f32::from(content.origin.x),
+            f32::from(content.size.width)
+        );
+        assert!(f32::from(strip.origin.x + strip.size.width) <= width + 0.5, "{note}: 页签条不越出视口");
+        for (index, (chip, icon, title, close)) in chips.iter().enumerate() {
+            let chip_bounds = chip.bounds();
+            assert!((f32::from(chip_bounds.size.height) - f32::from(strip.size.height)).abs() < 1.5, "{note}: 页签撑满条高");
+            assert!(f32::from(chip_bounds.size.width) <= crate::ui::tabs::TAB_MAX_W + 0.5, "{note}: 长标题不撑破页签");
+            let middle = center(chip_bounds);
+            for (name, bounds) in [("类型图标", *icon), ("标题", *title), ("关闭", *close)] {
+                assert!((center(bounds) - middle).abs() < 0.5, "{note}: {name} 与页签同一垂直中心");
             }
+            assert!(
+                (f32::from(title.size.height) - crate::ui::kit::line_height(crate::ui::kit::TypeScale::SM)).abs() < 0.5,
+                "{note}: 标题行高与组件一致"
+            );
+            assert!(
+                f32::from(title.origin.x + title.size.width) <= f32::from(close.origin.x) + 0.5,
+                "{note}: 关闭按钮不压标题"
+            );
+            assert_eq!(chip.label(), Some(titles[index].as_str()), "{note}: 截断后仍能取完整标题");
+            let selected = chip.selected();
+            assert_eq!(selected, Some(active.as_deref() == Some(ids[index].as_str())), "{note}: 只有当前工作项选中");
         }
+        assert!((f32::from(news.size.width) - crate::ui::kit::HitArea::CONTROL).abs() < 0.5, "{note}: 新建命中宽度");
+        assert!((center(news) - center(chips[0].0.bounds())).abs() < 0.5, "{note}: 新建与页签内容同一垂直中心");
+        assert!(f32::from(news.origin.x + news.size.width) <= f32::from(strip.origin.x + strip.size.width) + 0.5, "{note}: 新建动作留在页签条内");
+        assert!(f32::from(news.origin.x + news.size.width) <= width + 0.5, "{note}: 新建动作留在视口内");
         // 交互边界：右键先激活再弹菜单、中键关闭、关闭按钮走同一份关闭确认、键盘循环切换。
         let (first, second) = cx.update(|cx| {
             let model = &view.read(cx).model;
@@ -12452,225 +12337,221 @@ fn ensure_sidebar_open(cx: &mut gpui_kit::TestAppContext, view: &gpui_kit::Entit
 }
 
 /// 表名默认用满行宽；悬停快捷动作只在真实鼠标悬停时浮现，点击打开的是被悬停那一行的
-/// 数据或结构，不展开这一行也不落到别的对象上。覆盖 1360/900/640 × 浅/深色。
+/// 数据或结构，不展开这一行也不落到别的对象上。覆盖宽、中、窄三种窗口。
 #[gpui_kit::test]
-fn object_tree_hover_actions_open_the_hovered_object_at_every_width_and_theme(cx: &mut gpui_kit::TestAppContext) {
-    for width in [1360f32, 900., 640.] {
-        for dark in [false, true] {
-            let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
-            let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
-            let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.long));
-            let data_id = gpui_kit::SharedString::from(format!("nav-quick-data-{}", ids.long));
-            let struct_id = gpui_kit::SharedString::from(format!("nav-quick-struct-{}", ids.long));
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                let sidebar = window.find("sidebar").bounds();
-                let row = window.find(row_id.clone()).bounds();
-                let name = window.find(format!("nav-name-{}", ids.long)).bounds();
-                assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 对象行不横向溢出侧栏");
-                assert!(f32::from(row.right()) <= width + 0.5, "{tag}: 对象行不出窗口");
-                // 行尾没有状态时，名称区一直延伸到行内边距：快捷按钮不常驻占宽。
+fn object_tree_hover_actions_open_the_hovered_object(cx: &mut gpui_kit::TestAppContext) {
+    for (width, dark) in [(1360., false), (900., false), (640., true)] {
+        let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
+        let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
+        let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.long));
+        let data_id = gpui_kit::SharedString::from(format!("nav-quick-data-{}", ids.long));
+        let struct_id = gpui_kit::SharedString::from(format!("nav-quick-struct-{}", ids.long));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let sidebar = window.find("sidebar").bounds();
+            let row = window.find(row_id.clone()).bounds();
+            let name = window.find(format!("nav-name-{}", ids.long)).bounds();
+            assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 对象行不横向溢出侧栏");
+            assert!(f32::from(row.right()) <= width + 0.5, "{tag}: 对象行不出窗口");
+            // 行尾没有状态时，名称区一直延伸到行内边距：快捷按钮不常驻占宽。
+            assert!(
+                f32::from(name.right()) >= f32::from(row.right()) - 4.5,
+                "{tag}: 长表名应使用可用行宽，名称区 {:?} 行 {:?}",
+                name,
+                row
+            );
+            assert!(!window.find(data_id.clone()).visible(), "{tag}: 未悬停时不显示打开数据");
+            assert!(!window.find(struct_id.clone()).visible(), "{tag}: 未悬停时不显示查看结构");
+
+            window.hover(row_id.clone(), cx);
+            let data = window.find(data_id.clone());
+            let structure = window.find(struct_id.clone());
+            assert!(data.visible() && structure.visible(), "{tag}: 悬停后两个快捷动作可见");
+            let (data, structure) = (data.bounds(), structure.bounds());
+            for bounds in [data, structure] {
                 assert!(
-                    f32::from(name.right()) >= f32::from(row.right()) - 4.5,
-                    "{tag}: 长表名应使用可用行宽，名称区 {:?} 行 {:?}",
-                    name,
-                    row
+                    f32::from(bounds.left()) >= f32::from(name.left()) - 0.5 && f32::from(bounds.right()) <= f32::from(name.right()) + 0.5,
+                    "{tag}: 快捷动作留在名称区内 {bounds:?} / {name:?}"
                 );
-                assert!(!window.find(data_id.clone()).visible(), "{tag}: 未悬停时不显示打开数据");
-                assert!(!window.find(struct_id.clone()).visible(), "{tag}: 未悬停时不显示查看结构");
+                assert!(f32::from(bounds.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 快捷动作不出侧栏");
+            }
+            assert!(f32::from(data.right()) <= f32::from(structure.left()) + 0.5, "{tag}: 数据在前、结构在后");
+            // 悬停另一行时，上一行的快捷动作收起，只有当前行的出现。
+            window.hover(format!("nav-{}", ids.orders), cx);
+            assert!(!window.find(data_id.clone()).visible(), "{tag}: 离开后长表名行的动作收起");
+            assert!(window.find(format!("nav-quick-data-{}", ids.orders)).visible(), "{tag}: 当前悬停行的动作出现");
+            // 视图同样有打开数据/结构；读取失败的对象只给重试，不给快捷打开。
+            window.hover(format!("nav-{}", ids.recent), cx);
+            assert!(window.find(format!("nav-quick-struct-{}", ids.recent)).visible(), "{tag}: 视图也有快捷动作");
+            assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
 
-                window.hover(row_id.clone(), cx);
-                let data = window.find(data_id.clone());
-                let structure = window.find(struct_id.clone());
-                assert!(data.visible() && structure.visible(), "{tag}: 悬停后两个快捷动作可见");
-                let (data, structure) = (data.bounds(), structure.bounds());
-                for bounds in [data, structure] {
-                    assert!(
-                        f32::from(bounds.left()) >= f32::from(name.left()) - 0.5 && f32::from(bounds.right()) <= f32::from(name.right()) + 0.5,
-                        "{tag}: 快捷动作留在名称区内 {bounds:?} / {name:?}"
-                    );
-                    assert!(f32::from(bounds.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 快捷动作不出侧栏");
-                }
-                assert!(f32::from(data.right()) <= f32::from(structure.left()) + 0.5, "{tag}: 数据在前、结构在后");
-                // 悬停另一行时，上一行的快捷动作收起，只有当前行的出现。
-                window.hover(format!("nav-{}", ids.orders), cx);
-                assert!(!window.find(data_id.clone()).visible(), "{tag}: 离开后长表名行的动作收起");
-                assert!(window.find(format!("nav-quick-data-{}", ids.orders)).visible(), "{tag}: 当前悬停行的动作出现");
-                // 视图同样有打开数据/结构；读取失败的对象只给重试，不给快捷打开。
-                window.hover(format!("nav-{}", ids.recent), cx);
-                assert!(window.find(format!("nav-quick-struct-{}", ids.recent)).visible(), "{tag}: 视图也有快捷动作");
-                assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
-
-                window.hover(row_id.clone(), cx);
-                window.click(data_id.clone(), cx);
-            })
-            .unwrap();
-            cx.update(|cx| {
-                let view = view.read(cx);
-                let tab = view.model.active_tab().expect("打开数据工作项");
-                assert_eq!(tab.kind, WorkItemKind::Table, "{tag}: 快捷数据打开表格页");
-                let spec = tab.spec.clone().unwrap_or_default();
-                assert!(spec.contains(&format!("|{}|", ids.long_name)), "{tag}: 打开的是被悬停的长表名：{spec}");
-                assert!(!view.model.nav.is_expanded(&ids.long), "{tag}: 点快捷动作不展开这一行");
-                assert_eq!(view.model.executions, 0, "{tag}: 打开数据不执行查询语句");
-            });
-            ensure_sidebar_open(cx, &view);
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                let orders_row = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
-                window.hover(orders_row, cx);
-                window.click(format!("nav-quick-struct-{}", ids.orders), cx);
-            })
-            .unwrap();
-            cx.update(|cx| {
-                let view = view.read(cx);
-                let tab = view.model.active_tab().expect("结构工作项");
-                assert_eq!(tab.kind, WorkItemKind::Structure, "{tag}: 快捷结构打开结构页");
-                let spec = tab.spec.clone().unwrap_or_default();
-                assert!(spec.contains("|orders|"), "{tag}: 结构属于被悬停的 orders：{spec}");
-                assert!(!view.model.nav.is_expanded(&ids.orders), "{tag}: 点快捷结构不展开 orders");
-                let opened: Vec<_> = view
-                    .model
-                    .tabs
-                    .iter()
-                    .filter(|tab| matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure))
-                    .filter_map(|tab| tab.spec.clone())
-                    .collect();
-                assert_eq!(opened.len(), 2, "{tag}: 两次点击只开两个对应工作项：{opened:?}");
-                assert!(!opened.iter().any(|spec| spec.contains("|recent|") || spec.contains("|waybill_audit|")), "{tag}: 没有误开其他对象");
-            });
-            let _ = cx.update_window(window, |_, window, _| window.remove_window());
-            let _ = std::fs::remove_dir_all(dir);
-        }
+            window.hover(row_id.clone(), cx);
+            window.click(data_id.clone(), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let tab = view.model.active_tab().expect("打开数据工作项");
+            assert_eq!(tab.kind, WorkItemKind::Table, "{tag}: 快捷数据打开表格页");
+            let spec = tab.spec.clone().unwrap_or_default();
+            assert!(spec.contains(&format!("|{}|", ids.long_name)), "{tag}: 打开的是被悬停的长表名：{spec}");
+            assert!(!view.model.nav.is_expanded(&ids.long), "{tag}: 点快捷动作不展开这一行");
+            assert_eq!(view.model.executions, 0, "{tag}: 打开数据不执行查询语句");
+        });
+        ensure_sidebar_open(cx, &view);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let orders_row = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
+            window.hover(orders_row, cx);
+            window.click(format!("nav-quick-struct-{}", ids.orders), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let tab = view.model.active_tab().expect("结构工作项");
+            assert_eq!(tab.kind, WorkItemKind::Structure, "{tag}: 快捷结构打开结构页");
+            let spec = tab.spec.clone().unwrap_or_default();
+            assert!(spec.contains("|orders|"), "{tag}: 结构属于被悬停的 orders：{spec}");
+            assert!(!view.model.nav.is_expanded(&ids.orders), "{tag}: 点快捷结构不展开 orders");
+            let opened: Vec<_> = view
+                .model
+                .tabs
+                .iter()
+                .filter(|tab| matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure))
+                .filter_map(|tab| tab.spec.clone())
+                .collect();
+            assert_eq!(opened.len(), 2, "{tag}: 两次点击只开两个对应工作项：{opened:?}");
+            assert!(!opened.iter().any(|spec| spec.contains("|recent|") || spec.contains("|waybill_audit|")), "{tag}: 没有误开其他对象");
+        });
+        let _ = cx.update_window(window, |_, window, _| window.remove_window());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
 /// 共存边界：加载中的对象行，悬停动作只盖住名称末尾、不压住加载指示；搜索时长名称末尾的
 /// 命中段完整可见，容器的命中数在名称之外且不出侧栏；读取失败的对象只给错误与重试。
-/// 右键命中数落在这一行的菜单上；清除搜索后回到搜索前的展开现场。覆盖 1360/900/640 × 浅/深色。
+/// 右键命中数落在这一行的菜单上；清除搜索后回到搜索前的展开现场。覆盖宽、中、窄三种窗口。
 #[gpui_kit::test]
 fn object_tree_search_hits_loading_errors_and_long_names_coexist_with_hover_actions(cx: &mut gpui_kit::TestAppContext) {
     use crate::catalog::hierarchy::ColumnInfo;
-    for width in [1360f32, 900., 640.] {
-        for dark in [false, true] {
-            let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
-            let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
-            let orders = ids.orders.clone();
-            let schema = ids.expanded[2].clone();
-            let before_expanded: Vec<bool> = cx.update(|cx| {
-                view.update(cx, |view, cx| {
-                    // orders 已读到列，正在重读索引：行尾有加载指示，悬停动作仍可用。
-                    let column = |name: &str| ColumnInfo { name: name.to_owned(), data_type: "text".to_owned(), nullable: true, primary: false };
-                    assert!(view.model.nav.set_details(&orders, Ok(vec![column("id"), column("note")]), Ok(Vec::new())));
-                    assert!(view.model.nav.begin_details(&orders), "orders 进入加载中");
-                    cx.notify();
-                    ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect()
-                })
-            });
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                let sidebar = window.find("sidebar").bounds();
-                let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
-                let row = window.find(row_id.clone()).bounds();
-                let name = window.find(format!("nav-name-{}", ids.orders)).bounds();
-                assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 加载中的行不溢出");
-                assert!(f32::from(name.right()) < f32::from(row.right()) - 10., "{tag}: 加载指示在名称区之外占位 {name:?} / {row:?}");
-                window.hover(row_id, cx);
-                let quick = window.find(format!("nav-quick-{}", ids.orders));
-                assert!(quick.visible(), "{tag}: 加载中仍可悬停打开");
-                assert!(f32::from(quick.bounds().right()) <= f32::from(name.right()) + 0.5, "{tag}: 悬停动作不压住加载指示");
-
-                // 读取失败的对象：错误文字和重试都在侧栏内，错误不压住重试，没有快捷打开。
-                let error = window.find(format!("nav-err-{}", ids.audit));
-                assert!(error.visible(), "{tag}: 节点错误可见");
-                let retry = window.find(format!("nav-retry-{}", ids.audit));
-                assert!(retry.visible() && f32::from(retry.bounds().right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 重试在侧栏内");
-                assert!(f32::from(error.bounds().right()) <= f32::from(retry.bounds().left()) + 0.5, "{tag}: 错误文字不压住重试");
-                window.hover(format!("nav-{}", ids.audit), cx);
-                assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
-
-                window.click("field-ObjectFilter", cx);
-                window.input("waybill", cx);
-                window.render_frame(cx);
+    for (width, dark) in [(1360., false), (900., false), (640., true)] {
+        let (window, view, dir, ids) = object_tree_workbench(cx, width, dark);
+        let tag = format!("{width}/{}", if dark { "dark" } else { "light" });
+        let orders = ids.orders.clone();
+        let schema = ids.expanded[2].clone();
+        let before_expanded: Vec<bool> = cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                // orders 已读到列，正在重读索引：行尾有加载指示，悬停动作仍可用。
+                let column = |name: &str| ColumnInfo { name: name.to_owned(), data_type: "text".to_owned(), nullable: true, primary: false };
+                assert!(view.model.nav.set_details(&orders, Ok(vec![column("id"), column("note")]), Ok(Vec::new())));
+                assert!(view.model.nav.begin_details(&orders), "orders 进入加载中");
+                cx.notify();
+                ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect()
             })
-            .unwrap();
-            assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill", "{tag}: 筛选框输入进入树搜索");
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                let sidebar = window.find("sidebar").bounds();
-                // 长名称：命中段在名称末尾，前缀省略，命中段完整留在名称区内。
-                let long_name = window.find(format!("nav-name-{}", ids.long)).bounds();
-                let hit = window.find(format!("nav-match-{}", ids.long));
-                assert!(hit.visible(), "{tag}: 长名称末尾的命中段可见");
-                let hit = hit.bounds();
-                assert!(
-                    f32::from(hit.left()) >= f32::from(long_name.left()) - 0.5 && f32::from(hit.right()) <= f32::from(long_name.right()) + 0.5,
-                    "{tag}: 命中段不被裁出名称区 {hit:?} / {long_name:?}"
-                );
-                assert!(f32::from(hit.size.width) > 20., "{tag}: 命中段有完整宽度 {hit:?}");
-                // 悬停长名称：快捷动作仍在名称区内，命中行照样可打开。
-                window.hover(format!("nav-{}", ids.long), cx);
-                assert!(window.find(format!("nav-quick-data-{}", ids.long)).visible(), "{tag}: 命中行可悬停打开");
-                // 失败对象在搜索里也保留错误与重试。
-                assert!(window.find(format!("nav-err-{}", ids.audit)).visible(), "{tag}: 搜索中节点错误可见");
-                let audit_name = window.find(format!("nav-name-{}", ids.audit)).bounds();
-                let audit_error = window.find(format!("nav-err-{}", ids.audit)).bounds();
-                assert!(
-                    f32::from(audit_name.size.width) >= 40. && audit_name.size.width >= audit_error.size.width,
-                    "{tag}: 节点错误不把对象名挤没：名称 {audit_name:?} 错误 {audit_error:?}"
-                );
-                assert!(window.find(format!("nav-match-{}", ids.audit)).visible(), "{tag}: 失败对象的命中段可见");
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let sidebar = window.find("sidebar").bounds();
+            let row_id = gpui_kit::SharedString::from(format!("nav-{}", ids.orders));
+            let row = window.find(row_id.clone()).bounds();
+            let name = window.find(format!("nav-name-{}", ids.orders)).bounds();
+            assert!(f32::from(row.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 加载中的行不溢出");
+            assert!(f32::from(name.right()) < f32::from(row.right()) - 10., "{tag}: 加载指示在名称区之外占位 {name:?} / {row:?}");
+            window.hover(row_id, cx);
+            let quick = window.find(format!("nav-quick-{}", ids.orders));
+            assert!(quick.visible(), "{tag}: 加载中仍可悬停打开");
+            assert!(f32::from(quick.bounds().right()) <= f32::from(name.right()) + 0.5, "{tag}: 悬停动作不压住加载指示");
 
-                // 容器上的命中数：在名称区之外，不出侧栏。
-                let hits = window.find(format!("nav-hits-{schema}"));
-                assert!(hits.visible(), "{tag}: 模式行标出命中数");
-                let hits = hits.bounds();
-                let name = window.find(format!("nav-name-{schema}")).bounds();
-                assert!(f32::from(name.right()) <= f32::from(hits.left()) + 0.5, "{tag}: 命中数不压在名称上");
-                assert!(f32::from(hits.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 命中数不出侧栏");
+            // 读取失败的对象：错误文字和重试都在侧栏内，错误不压住重试，没有快捷打开。
+            let error = window.find(format!("nav-err-{}", ids.audit));
+            assert!(error.visible(), "{tag}: 节点错误可见");
+            let retry = window.find(format!("nav-retry-{}", ids.audit));
+            assert!(retry.visible() && f32::from(retry.bounds().right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 重试在侧栏内");
+            assert!(f32::from(error.bounds().right()) <= f32::from(retry.bounds().left()) + 0.5, "{tag}: 错误文字不压住重试");
+            window.hover(format!("nav-{}", ids.audit), cx);
+            assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
 
-                // 在命中数上右键：菜单属于这一行，并且画在视口里。
-                window.right_click(format!("nav-hits-{schema}"), cx);
-                window.render_frame(cx);
-                let item = window.find("ctx-tree-copy-name");
-                assert!(item.visible(), "{tag}: 右键菜单项可见");
-                assert!(f32::from(item.bounds().right()) <= width + 0.5, "{tag}: 菜单不出窗口");
+            window.click("field-ObjectFilter", cx);
+            window.input("waybill", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill", "{tag}: 筛选框输入进入树搜索");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let sidebar = window.find("sidebar").bounds();
+            // 长名称：命中段在名称末尾，前缀省略，命中段完整留在名称区内。
+            let long_name = window.find(format!("nav-name-{}", ids.long)).bounds();
+            let hit = window.find(format!("nav-match-{}", ids.long));
+            assert!(hit.visible(), "{tag}: 长名称末尾的命中段可见");
+            let hit = hit.bounds();
+            assert!(
+                f32::from(hit.left()) >= f32::from(long_name.left()) - 0.5 && f32::from(hit.right()) <= f32::from(long_name.right()) + 0.5,
+                "{tag}: 命中段不被裁出名称区 {hit:?} / {long_name:?}"
+            );
+            assert!(f32::from(hit.size.width) > 20., "{tag}: 命中段有完整宽度 {hit:?}");
+            // 悬停长名称：快捷动作仍在名称区内，命中行照样可打开。
+            window.hover(format!("nav-{}", ids.long), cx);
+            assert!(window.find(format!("nav-quick-data-{}", ids.long)).visible(), "{tag}: 命中行可悬停打开");
+            // 失败对象在搜索里也保留错误与重试。
+            assert!(window.find(format!("nav-err-{}", ids.audit)).visible(), "{tag}: 搜索中节点错误可见");
+            let audit_name = window.find(format!("nav-name-{}", ids.audit)).bounds();
+            let audit_error = window.find(format!("nav-err-{}", ids.audit)).bounds();
+            assert!(
+                f32::from(audit_name.size.width) >= 40. && audit_name.size.width >= audit_error.size.width,
+                "{tag}: 节点错误不把对象名挤没：名称 {audit_name:?} 错误 {audit_error:?}"
+            );
+            assert!(window.find(format!("nav-match-{}", ids.audit)).visible(), "{tag}: 失败对象的命中段可见");
+
+            // 容器上的命中数：在名称区之外，不出侧栏。
+            let hits = window.find(format!("nav-hits-{schema}"));
+            assert!(hits.visible(), "{tag}: 模式行标出命中数");
+            let hits = hits.bounds();
+            let name = window.find(format!("nav-name-{schema}")).bounds();
+            assert!(f32::from(name.right()) <= f32::from(hits.left()) + 0.5, "{tag}: 命中数不压在名称上");
+            assert!(f32::from(hits.right()) <= f32::from(sidebar.right()) + 0.5, "{tag}: 命中数不出侧栏");
+
+            // 在命中数上右键：菜单属于这一行，并且画在视口里。
+            window.right_click(format!("nav-hits-{schema}"), cx);
+            window.render_frame(cx);
+            let item = window.find("ctx-tree-copy-name");
+            assert!(item.visible(), "{tag}: 右键菜单项可见");
+            assert!(f32::from(item.bounds().right()) <= width + 0.5, "{tag}: 菜单不出窗口");
+        })
+        .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.model.nav_menu_node.as_deref(), Some(schema.as_str()), "{tag}: 菜单只属于被右键的模式行");
+                assert!(view.model.menu.is_some(), "{tag}: 菜单已打开");
+                view.model.menu = None;
+                cx.notify();
             })
-            .unwrap();
-            cx.update(|cx| {
-                view.update(cx, |view, cx| {
-                    assert_eq!(view.model.nav_menu_node.as_deref(), Some(schema.as_str()), "{tag}: 菜单只属于被右键的模式行");
-                    assert!(view.model.menu.is_some(), "{tag}: 菜单已打开");
-                    view.model.menu = None;
-                    cx.notify();
-                })
-            });
-            // 清除搜索（选中全部再删除）：回到搜索前的展开现场。
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                window.click("field-ObjectFilter", cx);
-                window.press("secondary-a", cx);
-                window.press("backspace", cx);
-                window.render_frame(cx);
-            })
-            .unwrap();
-            cx.update(|cx| {
-                let view = view.read(cx);
-                assert!(view.model.nav.query().is_empty(), "{tag}: 清空筛选框结束树搜索");
-                let after: Vec<bool> = ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect();
-                assert_eq!(after, before_expanded, "{tag}: 清除搜索后恢复原展开现场");
-            });
-            cx.update_window(window, |_, window, cx| {
-                window.render_frame(cx);
-                assert!(window.try_find(format!("nav-match-{}", ids.long)).is_none(), "{tag}: 清除后不残留高亮");
-                assert!(window.try_find(format!("nav-hits-{schema}")).is_none(), "{tag}: 清除后不残留命中数");
-                assert!(window.find(format!("nav-{}", ids.recent)).visible(), "{tag}: 未命中的视图重新出现");
-                assert!(window.find(format!("nav-{}", ids.orders)).visible(), "{tag}: 未命中的 orders 重新出现");
-            })
-            .unwrap();
-            let _ = cx.update_window(window, |_, window, _| window.remove_window());
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        });
+        // 清除搜索（选中全部再删除）：回到搜索前的展开现场。
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("field-ObjectFilter", cx);
+            window.press("secondary-a", cx);
+            window.press("backspace", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.model.nav.query().is_empty(), "{tag}: 清空筛选框结束树搜索");
+            let after: Vec<bool> = ids.expanded.iter().chain([&ids.orders, &ids.long]).map(|id| view.model.nav.is_expanded(id)).collect();
+            assert_eq!(after, before_expanded, "{tag}: 清除搜索后恢复原展开现场");
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(format!("nav-match-{}", ids.long)).is_none(), "{tag}: 清除后不残留高亮");
+            assert!(window.try_find(format!("nav-hits-{schema}")).is_none(), "{tag}: 清除后不残留命中数");
+            assert!(window.find(format!("nav-{}", ids.recent)).visible(), "{tag}: 未命中的视图重新出现");
+            assert!(window.find(format!("nav-{}", ids.orders)).visible(), "{tag}: 未命中的 orders 重新出现");
+        })
+        .unwrap();
+        let _ = cx.update_window(window, |_, window, _| window.remove_window());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

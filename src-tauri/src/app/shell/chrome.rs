@@ -91,7 +91,9 @@ fn field_changed(this: &mut Workbench, field: DraftField, value: String, cx: &mu
 
 impl Workbench {
     pub(super) fn t(&self, key: &str) -> SharedString {
-        SharedString::from(self.model.text(key))
+        i18n::static_text(self.model.locale(), key)
+            .map(SharedString::new_static)
+            .unwrap_or_else(|| SharedString::from(key))
     }
 
     /// 连接的环境标签文字。存过的标签用它的名称，不用原始 id。

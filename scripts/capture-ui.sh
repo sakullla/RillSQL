@@ -20,7 +20,8 @@
 #   SESSION_JSON   一个 JSON 文件，内容是 app-state 里的 "session" 对象（tabs / activeId / pinned）。
 #   SQLITE_DB      一个 SQLite 文件：登记为连接 demo（名称「演示库」），会话里可以用 demo|演示库|main||<表>|sqlite|dev 打开。
 #   EXTRA_CONN_SQL 追加执行到 connections.sqlite 的 SQL（例如登记开发库 MySQL / Redis 连接）。
-#   WAIT           窗口出现后等多少秒再截（默认 4）。
+#   WAIT           调整窗口后额外等待的秒数，可显式设为 0。默认等窗口位置与尺寸稳定；
+#                  指定会话、演示库或额外连接时默认等 4 秒，留出异步加载时间。
 #   INTERACTIVE=1  截图前停下，等你在窗口里操作到目标场景后按回车（右键菜单、悬停等手动场景）。
 #   KEEP=1         截完不退出应用。
 #   RILLSQL_DEBUG_DATA_DIR  资料目录；默认每次新建一个临时目录（不碰你的正式数据）。
@@ -57,7 +58,9 @@ HEIGHT="${HEIGHT:-820}"
 THEME="${THEME:-light}"
 LOCALE="${LOCALE:-zh-CN}"
 DENSITY="${DENSITY:-compact}"
-WAIT="${WAIT:-4}"
+if [[ -n "${SESSION_JSON:-}${SQLITE_DB:-}${EXTRA_CONN_SQL:-}" ]]; then
+    WAIT="${WAIT:-4}"
+fi
 
 [[ -x "$BIN" ]] || { echo "找不到 rillsql 可执行文件：$BIN（先 cargo build --manifest-path src-tauri/Cargo.toml --bin rillsql）" >&2; exit 2; }
 mkdir -p "$OUT_DIR"
@@ -145,11 +148,12 @@ cleanup() {
 trap cleanup EXIT
 
 WINDOW=""
-for _ in $(seq 1 60); do
+for attempt in $(seq 1 64); do
+    kill -0 "$PID" 2>/dev/null || break
     if WINDOW="$("$HELPER" "$PID" 2>/dev/null)"; then
         break
     fi
-    sleep 0.5
+    if (( attempt <= 5 )); then sleep 0.1; else sleep 0.5; fi
 done
 [[ -n "$WINDOW" ]] || { echo "没有找到 RillSQL 窗口（pid $PID）。日志：$DATA_DIR/rillsql.log" >&2; exit 1; }
 
@@ -165,13 +169,33 @@ tell application "System Events"
 end tell
 OSA
 
+WINDOW=""
 if [[ "${INTERACTIVE:-0}" == "1" ]]; then
     read -r -p "在 RillSQL 窗口里操作到「$STATE」场景后按回车截图……" _
-else
+elif [[ -n "${WAIT:-}" ]]; then
     sleep "$WAIT"
+else
+    # System Events 返回时窗口可能还在移动或缩放。用两次相同的窗口号和边界确认稳定。
+    previous=""
+    for _ in $(seq 1 20); do
+        kill -0 "$PID" 2>/dev/null || break
+        current="$("$HELPER" "$PID" 2>/dev/null)" || current=""
+        if [[ -n "$current" && "$current" == "$previous" ]]; then
+            WINDOW="$current"
+            break
+        fi
+        previous="$current"
+        sleep 0.2
+    done
+    if [[ -z "$WINDOW" ]]; then
+        echo "窗口仍在变化，按截图时的实际尺寸取景。" >&2
+    fi
 fi
 
-read -r WINDOW_ID ACTUAL_W ACTUAL_H WIN_X WIN_Y <<<"$("$HELPER" "$PID")"
+if [[ -z "$WINDOW" ]]; then
+    WINDOW="$("$HELPER" "$PID")" || { echo "截图前未找到 RillSQL 窗口。日志：$DATA_DIR/rillsql.log" >&2; exit 1; }
+fi
+read -r WINDOW_ID ACTUAL_W ACTUAL_H WIN_X WIN_Y <<<"$WINDOW"
 FILE="$OUT_DIR/$NN-$STATE-$ACTUAL_W-$THEME-$LOCALE.png"
 # 按窗口号截；个别系统版本对 GPU 窗口报「could not create image from window」时，退回按窗口矩形截（窗口须在最前）。
 if ! screencapture -x -o -l "$WINDOW_ID" "$FILE" 2>/dev/null; then
