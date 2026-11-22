@@ -789,7 +789,8 @@ impl Workbench {
             ))
             .child(nav_cluster);
 
-        // 中央区：工作区态直接嵌入缓存化的融合工作区页签条；非工作区或空欢迎态展示极简页面标识与拖拽留白。
+        // 中央区：工作区态直接嵌入缓存化的融合工作区页签条；各页签与操作按钮单独 occlude，
+        // 右侧留白区（tabs-empty）保持透传以便原生标题栏拖拽窗口。
         let center: AnyElement = if show_tabs {
             div()
                 .flex_1()
@@ -797,7 +798,6 @@ impl Workbench {
                 .h_full()
                 .flex()
                 .items_center()
-                .occlude()
                 .child(
                     gpui_kit::AnyView::from(self.tab_strip_host.clone())
                         .cached(gpui_kit::StyleRefinement::default().flex_1().min_w_0().w_full().h_full()),
@@ -1072,7 +1072,7 @@ impl Workbench {
             // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
             .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
             .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("conn-new-sidebar", cx)).xsmall());
-        let explorer_header = if has_connections {
+        let explorer_header = if has_connections && width >= 260. {
             div()
                 .flex_none()
                 .flex()
@@ -1087,6 +1087,26 @@ impl Workbench {
                         .child(filter.prefix(kit::input_prefix(IconName::Search, kit::IconSize::INLINE, p.text_faint)).cleanable(true)),
                 )
                 .child(explorer_actions)
+        } else if has_connections {
+            // 侧栏较窄（200–259px）时将筛选框独占整行，避免四个动作按钮挤压搜索输入区。
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(Space::XS))
+                .px(px(Space::MD))
+                .pt(px(Space::SM))
+                .pb(px(Space::SM))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .pl(px(Space::XS))
+                        .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
+                        .child(explorer_actions),
+                )
+                .child(filter.prefix(kit::input_prefix(IconName::Search, kit::IconSize::INLINE, p.text_faint)).cleanable(true))
         } else {
             div()
                 .flex_none()
@@ -2475,6 +2495,7 @@ impl Workbench {
         div()
             .id("tab-rename")
             .test_support()
+            .occlude()
             .flex_none()
             .w(px(ControlSize::PICKER_MIN_W - 60.))
             .h(px(m.control_h))
@@ -2621,6 +2642,7 @@ impl Workbench {
                 &p,
             )
             .on_drag(TabDrag { id: drag_id }, |_, _, _, cx| cx.new(|_| ConnectionDragGhost))
+            .occlude()
             .drag_over::<TabDrag>(move |style, _, _, _| style.border_l_2().border_color(drop_accent))
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
                 if this.model.reorder_tab(&drag.id, &drop_id) {
@@ -2670,25 +2692,29 @@ impl Workbench {
             }));
             items.push(chip.into_any_element());
         }
-        // 新建入口与页签同一垂直中心、命中范围不小于控件档，不再用被压小的图标按钮。
-        let new_action = kit::icon_action(
-            "tab-new",
-            IconName::Plus,
-            self.t("shell.command.newQuery"),
-            kit::HitArea::CONTROL,
-            p.text_muted,
-            &p,
-            false,
-            false,
-            act("new-query", cx),
-        )
-        .into_any_element();
+        // 新建入口与页签同一垂直中心、命中范围不小于控件档，单独 occlude 以保留标题栏其余留白可拖拽。
+        let new_action = div()
+            .flex_none()
+            .occlude()
+            .child(kit::icon_action(
+                "tab-new",
+                IconName::Plus,
+                self.t("shell.command.newQuery"),
+                kit::HitArea::CONTROL,
+                p.text_muted,
+                &p,
+                false,
+                false,
+                act("new-query", cx),
+            ))
+            .into_any_element();
         // 标签列表：标签多到放不下时也一直在右侧，带计数入口，可按标题、连接、库搜索后切过去。
         let anchor = self.tab_picker_anchor.clone();
         let tab_count = self.model.tabs.len();
         let list_action = div()
             .relative()
             .flex_none()
+            .occlude()
             .child(
                 kit::interactive_states(div().id("tab-picker"), &p, self.model.tabs.is_empty())
                     .test_support()
@@ -2745,7 +2771,17 @@ impl Workbench {
             &self.tab_scroll,
             reveal,
             &p,
-            Some(kit::click(act("new-query", cx))),
+            Some(kit::click({
+                let entity = cx.entity().downgrade();
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    // 双击页签条右侧空白新建查询时阻止继续冒泡到标题栏双击缩放，
+                    // 同时保持单次按住拖动可拖拽原生窗口。
+                    cx.stop_propagation();
+                    if let Some(entity) = entity.upgrade() {
+                        entity.update(cx, |this, cx| this.perform("new-query", cx));
+                    }
+                }
+            })),
         );
         let host = div().size_full().min_w_0().flex().items_center().child(strip);
         match self.render_tab_picker(window, cx) {

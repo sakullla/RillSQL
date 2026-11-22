@@ -14819,8 +14819,10 @@ fn zero_rail_overlay_sidebar_and_integrated_topbar_tabs(cx: &mut gpui_kit::TestA
         assert!(f32::from(overlay.origin.x).abs() <= 0.5, "窄窗覆盖侧栏左缘应从 0px 起算，实际 {}", f32::from(overlay.origin.x));
         let toolbar = window.find("toolbar").bounds();
         let tabs = window.find("tabs").bounds();
+        let tabs_empty = window.find("tabs-empty").bounds();
         assert!(f32::from(tabs.origin.y) >= f32::from(toolbar.origin.y) - 0.5);
         assert!(f32::from(tabs.origin.y + tabs.size.height) <= f32::from(toolbar.origin.y + toolbar.size.height) + 0.5);
+        assert!(f32::from(tabs_empty.size.width) >= 24., "融合顶栏右侧留白（tabs-empty）保持可拖拽宽度，实际 {}", f32::from(tabs_empty.size.width));
         for id in ["top-sidebar", "cmd-activity-connections", "cmd-activity-history", "cmd-activity-settings", "top-search", "top-open-file", "top-theme"] {
             assert!(window.find(id).visible(), "融合顶栏控件 {id} 在 640px 下仍可见");
         }
