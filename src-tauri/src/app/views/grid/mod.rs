@@ -819,20 +819,31 @@ impl GridPane {
     pub fn menu_facts(&self) -> GridMenuFacts {
         let focus = self.session.focus_cell();
         let writable = self.session.writable();
-        let needs_full_viewer = focus.is_some_and(|(row, column)| {
-            let shown = self.session.show_cell(row, column, false);
-            if shown.preview || matches!(shown.kind, CellKind::Large | CellKind::Binary) {
-                return true;
-            }
-            if shown.kind != CellKind::Text {
-                return false;
-            }
-            let text = shown.body.as_str();
-            let trimmed = text.trim();
-            let looks_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                || (trimmed.starts_with('[') && trimmed.ends_with(']'));
-            text.contains('\n') || text.chars().count() > 48 || looks_json
-        });
+        let (needs_full_viewer, cell_unresolved) = focus
+            .map(|(row, column)| {
+                let shown = self.session.show_cell(row, column, false);
+                if shown.preview {
+                    return (true, true);
+                }
+                if matches!(shown.kind, CellKind::Large | CellKind::Binary) {
+                    return (true, false);
+                }
+                if shown.kind != CellKind::Text {
+                    return (false, false);
+                }
+                let text = shown.body.as_str();
+                let trimmed = text.trim();
+                let looks_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                    || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+                (text.contains('\n') || text.chars().count() > 48 || looks_json, false)
+            })
+            .unwrap_or((false, false));
+        let unresolved = match self.menu_area {
+            GridMenuArea::Cell => cell_unresolved,
+            GridMenuArea::RowHeader => focus.is_some_and(|(row, _)| {
+                (0..self.session.column_names().len()).any(|column| self.session.show_cell(row, column, false).preview)
+            }),
+        };
         GridMenuFacts {
             table: self.session.mode == GridMode::Table,
             writable,
@@ -844,7 +855,7 @@ impl GridPane {
             readonly_reason: if writable { String::new() } else { self.readonly_text() },
             has_selection: self.session.has_selection(),
             dirty: self.session.uncommitted(),
-            unresolved: self.session.unresolved_previews() > 0,
+            unresolved,
             needs_full_viewer,
         }
     }

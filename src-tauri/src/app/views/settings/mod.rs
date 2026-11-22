@@ -374,16 +374,16 @@ pub fn editor_theme_key(theme: &str) -> &'static str {
 /// 代码配色，深色主题下再取一组更暗的底和更亮的字。
 pub fn editor_theme_colors(theme: &str, dark: bool) -> (u32, u32) {
     match (normalize_editor_theme(theme), dark) {
-        ("contrast", false) => (0xffffff, 0x111110),
-        ("contrast", true) => (0x0d0e10, 0xf7f6f2),
-        ("warm", false) => (0xfbf6ee, 0x352f28),
-        ("warm", true) => (0x1e1b18, 0xeae4da),
-        ("cool", false) => (0xf2f6fa, 0x1a2634),
-        ("cool", true) => (0x141a22, 0xdce6f2),
-        ("mono", false) => (0xf5f5f4, 0x1f2022),
-        ("mono", true) => (0x1b1c1e, 0xe6e7e9),
-        (_, false) => (0xfbfaf8, 0x1c1b18),
-        (_, true) => (0x18191b, 0xedece8),
+        ("contrast", false) => (0xffffff, 0x0b0e17),
+        ("contrast", true) => (0x0b0d12, 0xf8fafc),
+        ("warm", false) => (0xfbf7f0, 0x352f28),
+        ("warm", true) => (0x1c1a18, 0xeae4da),
+        ("cool", false) => (0xf1f5fb, 0x162234),
+        ("cool", true) => (0x111724, 0xdce6f5),
+        ("mono", false) => (0xf4f5f7, 0x1c1f26),
+        ("mono", true) => (0x18191e, 0xe6e8ee),
+        (_, false) => (0xfafbfd, 0x141824),
+        (_, true) => (0x13151c, 0xf1f3f9),
     }
 }
 
