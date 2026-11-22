@@ -86,82 +86,81 @@ fn alpha(value: u32, a: f32) -> Hsla {
 impl Palette {
     pub fn light() -> Self {
         Self {
-            // 纯净中性铂金灰四级表面（去冷青/发灰感）：sunken < chrome < surface < raised。
-            surface: hex(0xfcfcfc),
-            chrome: hex(0xf5f5f7),
-            rail: hex(0xededf0),
+            // 温润宣纸白与建筑石膏四级表面：sunken < chrome < surface < raised，去冷灰与塑料感。
+            surface: hex(0xfbfaf8),
+            chrome: hex(0xf2f0ec),
+            rail: hex(0xeae7e1),
             raised: hex(0xffffff),
-            sunken: hex(0xebebef),
-            hover: hex(0xe8e8ed),
-            active: hex(0xdcdce3),
-            line: hex(0xe4e4e9),
-            line_soft: hex(0xefeff3),
-            line_strong: hex(0xcacbd4),
-            text: hex(0x14151a),
-            // 次级文字必须比 faint 更强一档，避免 token 层级倒置。
-            text_muted: hex(0x525560),
-            // 弱文用于 11–12px 的提示与分区标题；保持在工作区、外壳与选中/悬停底上都过 4.5:1。
-            text_faint: hex(0x5c606d),
-            // Rill 宝石蓝品牌主色（与蓝色应用图标高度统一）：清澈明快、实心按钮白字过 4.5:1、焦点环在各表面过 3:1。
-            accent: hex(0x2563eb),
-            accent_hover: hex(0x1d4ed8),
-            accent_active: hex(0x1e40af),
-            accent_soft: hex(0xedf4ff),
-            accent_text: hex(0x1d4ed8),
+            sunken: hex(0xe8e5de),
+            hover: hex(0xe5e1d9),
+            active: hex(0xd9d4ca),
+            line: hex(0xdcd8cf),
+            line_soft: hex(0xeae6df),
+            line_strong: hex(0xc3bdb2),
+            text: hex(0x1c1b18),
+            // 次级文字比 faint 更沉稳一档，形成清晰的阅读层级。
+            text_muted: hex(0x4a4740),
+            // 弱文用于 11–12px 的提示与分区标题；在工作区、外壳与选中/悬停底上均满足 WCAG AA 4.5:1。
+            text_faint: hex(0x59554d),
+            // Rill 溪青（深松石青）品牌主色：呼应“Rill 溪流”意象，沉静克制且极具辨识度；
+            // 实心主按钮白字过 5.6:1、焦点环在各表面过 3:1。
+            accent: hex(0x0d746e),
+            accent_hover: hex(0x0a605b),
+            accent_active: hex(0x084e4a),
+            accent_soft: hex(0xe4f3f1),
+            accent_text: hex(0x09625d),
             on_accent: hex(0xffffff),
-            selection: alpha(0x2563eb, 0.11),
-            zebra: hex(0xf8f8fa),
-            // 状态色同时作为小号文字使用，在各自柔底与工作区均过 4.5:1。
-            ok: hex(0x127447),
-            warn: hex(0x9e5408),
-            danger: hex(0xc92a2a),
-            info: hex(0x1d5fd8),
-            ok_soft: hex(0xeaf8f1),
-            warn_soft: hex(0xfff5e6),
-            danger_soft: hex(0xfff0f0),
-            badge: hex(0xededf2),
+            selection: alpha(0x0d746e, 0.12),
+            zebra: hex(0xf6f4f0),
+            // 状态色与温润石膏底协调，同时作为小号文字在各自柔底与工作区均过 4.5:1。
+            ok: hex(0x147347),
+            warn: hex(0x9a5204),
+            danger: hex(0xbe2b2b),
+            info: hex(0x1c5ea6),
+            ok_soft: hex(0xe7f6ee),
+            warn_soft: hex(0xfdf3e3),
+            danger_soft: hex(0xfcebeb),
+            badge: hex(0xe9e6df),
             dark: false,
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            // 纯净碳灰黑曜石中性底（去浑浊蓝紫灰）：sunken < surface < chrome < raised 四级清晰抬升。
-            surface: hex(0x111216),
-            chrome: hex(0x17181d),
-            rail: hex(0x0e0f13),
-            raised: hex(0x1f2128),
-            sunken: hex(0x0b0c0f),
-            // 深色单独校准（不取浅色反转）：悬停、分隔线比工作区多拉开一档，
-            // 表格行在碳灰底上悬停与分隔一眼可见，又不抢正文。
-            hover: hex(0x252831),
-            active: hex(0x2e323d),
-            line: hex(0x2a2d36),
-            line_soft: hex(0x20222a),
-            line_strong: hex(0x3d424f),
-            text: hex(0xf2f3f5),
-            text_muted: hex(0xa4a7b2),
-            // 深色主题的选中/悬停底同样按 4.5:1 校准。
-            text_faint: hex(0x989ca8),
-            // Rill 宝石蓝深色版：与蓝色图标统一，实心主按钮白字 ≥ 4.5:1 且焦点环在悬停底 ≥ 3:1，
-            // 文本与选中态用通透亮蓝提亮。
-            accent: hex(0x2e6ef2),
-            accent_hover: hex(0x2560dc),
-            accent_active: hex(0x1e4fc0),
-            accent_soft: hex(0x18243c),
-            accent_text: hex(0x78b0ff),
-            on_accent: hex(0xffffff),
-            // 选中底比浅色更浓一档，通透亮蓝柔透，在碳灰底上干净利落。
-            selection: alpha(0x3b82f6, 0.22),
-            zebra: hex(0x15161b),
-            ok: hex(0x34d399),
-            warn: hex(0xf5b841),
-            danger: hex(0xf87171),
-            info: hex(0x60a5fa),
-            ok_soft: hex(0x122d23),
-            warn_soft: hex(0x332713),
-            danger_soft: hex(0x361b1e),
-            badge: hex(0x22242c),
+            // 温润哑光石墨黑四级表面（去刺眼纯黑与浑浊紫灰）：sunken < surface < chrome < raised 层次分明。
+            surface: hex(0x18191b),
+            chrome: hex(0x1f2023),
+            rail: hex(0x151618),
+            raised: hex(0x27292d),
+            sunken: hex(0x121314),
+            // 深色单独校准（非浅色反色）：悬停、分隔线与工作区清晰拉开，长列表一眼可辨。
+            hover: hex(0x2e3136),
+            active: hex(0x373b42),
+            line: hex(0x33363d),
+            line_soft: hex(0x26282e),
+            line_strong: hex(0x4a4f59),
+            text: hex(0xedece8),
+            text_muted: hex(0xbcbab3),
+            // 深色弱文在悬停与按下底上同样按 4.5:1 校准。
+            text_faint: hex(0xa8a69f),
+            // Rill 莹润溪青深色版：明澈松石绿配深墨前景，主按钮与危险按钮均过 6:1，焦点环通透醒目。
+            accent: hex(0x2ec4b6),
+            accent_hover: hex(0x25b0a3),
+            accent_active: hex(0x1e9b8f),
+            accent_soft: hex(0x152c2a),
+            accent_text: hex(0x5eead4),
+            on_accent: hex(0x081918),
+            // 深色选中底单独加浓，在石墨底上干净利落。
+            selection: alpha(0x2ec4b6, 0.20),
+            zebra: hex(0x1c1d20),
+            ok: hex(0x3dd68c),
+            warn: hex(0xf5b942),
+            danger: hex(0xf26d6d),
+            info: hex(0x63a9f8),
+            ok_soft: hex(0x142c22),
+            warn_soft: hex(0x312613),
+            danger_soft: hex(0x351b1d),
+            badge: hex(0x282b30),
             dark: true,
         }
     }
@@ -275,19 +274,19 @@ pub struct SqlTokenColor {
 /// RillSQL 自有 SQL 配色。标识符（variable）用接近正文的颜色，其余各类都换色相，
 /// 关键字另外加粗、注释斜体，色觉差异的人也能靠字形区分。
 pub const SQL_TOKEN_COLORS: &[SqlTokenColor] = &[
-    SqlTokenColor { scope: "keyword", light: 0x1d4ed8, dark: 0x79b8ff, bold: true, italic: false },
-    SqlTokenColor { scope: "function", light: 0x6a2bb8, dark: 0xd2a8ff, bold: false, italic: false },
-    SqlTokenColor { scope: "type", light: 0x8a4600, dark: 0xf0b46a, bold: false, italic: false },
-    SqlTokenColor { scope: "string", light: 0x0a6636, dark: 0x7ee787, bold: false, italic: false },
-    SqlTokenColor { scope: "number", light: 0xa33200, dark: 0xffab70, bold: false, italic: false },
-    SqlTokenColor { scope: "boolean", light: 0xa33200, dark: 0xffab70, bold: false, italic: false },
-    SqlTokenColor { scope: "comment", light: 0x5a6470, dark: 0x96a0ab, bold: false, italic: true },
-    SqlTokenColor { scope: "operator", light: 0x3b4350, dark: 0xc3cad3, bold: false, italic: false },
-    SqlTokenColor { scope: "punctuation", light: 0x4b5563, dark: 0xb4bcc6, bold: false, italic: false },
-    SqlTokenColor { scope: "variable", light: 0x1f2937, dark: 0xe6edf3, bold: false, italic: false },
-    SqlTokenColor { scope: "property", light: 0x1f2937, dark: 0xe6edf3, bold: false, italic: false },
-    SqlTokenColor { scope: "attribute", light: 0x8a4600, dark: 0xf0b46a, bold: false, italic: false },
-    SqlTokenColor { scope: "variable.special", light: 0x9c1d6b, dark: 0xff8fc8, bold: false, italic: false },
+    SqlTokenColor { scope: "keyword", light: 0x0b6478, dark: 0x5eead4, bold: true, italic: false },
+    SqlTokenColor { scope: "function", light: 0x6b32b8, dark: 0xc4a1ff, bold: false, italic: false },
+    SqlTokenColor { scope: "type", light: 0x944b06, dark: 0xf2b56b, bold: false, italic: false },
+    SqlTokenColor { scope: "string", light: 0x266e28, dark: 0x86e088, bold: false, italic: false },
+    SqlTokenColor { scope: "number", light: 0xb03a18, dark: 0xff9e75, bold: false, italic: false },
+    SqlTokenColor { scope: "boolean", light: 0xb03a18, dark: 0xff9e75, bold: false, italic: false },
+    SqlTokenColor { scope: "comment", light: 0x5e5b54, dark: 0x9c9990, bold: false, italic: true },
+    SqlTokenColor { scope: "operator", light: 0x3d3a34, dark: 0xc9c6be, bold: false, italic: false },
+    SqlTokenColor { scope: "punctuation", light: 0x4f4c45, dark: 0xb8b5ad, bold: false, italic: false },
+    SqlTokenColor { scope: "variable", light: 0x1c1b18, dark: 0xedece8, bold: false, italic: false },
+    SqlTokenColor { scope: "property", light: 0x1c1b18, dark: 0xedece8, bold: false, italic: false },
+    SqlTokenColor { scope: "attribute", light: 0x944b06, dark: 0xf2b56b, bold: false, italic: false },
+    SqlTokenColor { scope: "variable.special", light: 0x9e1f65, dark: 0xff8dc7, bold: false, italic: false },
 ];
 
 /// 一种记号在当前明暗下的颜色。
@@ -964,6 +963,8 @@ pub fn pill(label: impl Into<SharedString>, fg: Hsla, bg: Hsla) -> AnyElement {
         .h(px(18.))
         .rounded(px(Radius::TAG))
         .bg(bg)
+        .border_1()
+        .border_color(fg.opacity(0.18))
         .text_color(fg)
         .text_size(px(TypeScale::XS))
         .font_weight(FontWeight::MEDIUM)
@@ -1006,13 +1007,14 @@ pub fn muted(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
     div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(text.into()).into_any_element()
 }
 
-/// 抬升圆角卡片：以表面层级区分背景，配柔和发丝线边框。
+/// 抬升圆角卡片：以表面层级区分背景，配柔和发丝线边框与浅色轻阴影。
 pub fn card(p: &Palette) -> gpui_kit::Div {
     div()
         .bg(p.raised)
         .border_1()
         .border_color(if p.dark { p.line_soft } else { p.line })
         .rounded(px(Radius::PANEL))
+        .when(!p.dark, |this| this.shadow_xs())
 }
 
 /// 凹陷表面：圆角面板，底色比工作区、外壳和浮层都收进去一档。
@@ -1196,6 +1198,8 @@ fn state_block(kind: StateKind, icon_name: IconName, heading: impl Into<SharedSt
                 .size(px(STATE_ICON_BOX))
                 .rounded(px(Radius::CONTROL))
                 .bg(bg)
+                .border_1()
+                .border_color(fg.opacity(0.2))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1340,7 +1344,8 @@ pub fn kbd_element(content: impl IntoElement, p: &Palette) -> AnyElement {
         .rounded(px(Radius::TAG))
         .border_1()
         .border_color(p.line)
-        .bg(if p.dark { p.raised } else { p.chrome })
+        .bg(if p.dark { p.sunken } else { p.raised })
+        .when(!p.dark, |this| this.shadow_xs())
         .text_size(px(TypeScale::XS))
         .text_color(p.text_muted)
         .flex()
@@ -1710,14 +1715,16 @@ impl RenderOnce for ActionButton {
                 .bg(p.accent)
                 .border_1()
                 .border_color(p.accent)
+                .when(!p.dark, |this| this.shadow_xs())
                 .when(!inert, |this| {
                     this.hover(|s| s.bg(p.accent_hover).border_color(p.accent_hover))
                         .active(|s| s.bg(p.accent_active).border_color(p.accent_active))
                 }),
             ActionVariant::Secondary => el
-                .bg(if p.dark { p.raised } else { p.surface })
+                .bg(p.raised)
                 .border_1()
                 .border_color(p.line)
+                .when(!p.dark, |this| this.shadow_xs())
                 .when(!inert, |this| {
                     this.hover(|s| s.bg(p.hover).border_color(p.line_strong))
                         .active(|s| s.bg(p.active))
@@ -1725,7 +1732,7 @@ impl RenderOnce for ActionButton {
             ActionVariant::Subtle => el
                 .bg(p.accent_soft)
                 .border_1()
-                .border_color(p.accent.opacity(0.22))
+                .border_color(p.accent.opacity(0.28))
                 .when(!inert, |this| {
                     this.hover(|s| s.border_color(p.accent.opacity(0.55)))
                         .active(|s| s.bg(p.selection))
@@ -1852,10 +1859,12 @@ pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p:
                 .rounded(px(Radius::CONTROL))
                 .text_size(px(TypeScale::SM))
                 .when(selected, |this| {
-                    this.bg(if p.dark { p.raised } else { p.surface })
+                    this.bg(p.raised)
+                        .border_1()
+                        .border_color(if p.dark { p.line } else { p.line_soft })
                         .text_color(p.text)
                         .font_weight(FontWeight::MEDIUM)
-                        .shadow_sm()
+                        .shadow_xs()
                 })
                 .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.text_color(p.text)))
                 .child(label)
@@ -2496,10 +2505,10 @@ mod palette_tests {
             // 实心主按钮文字在强调底上满足 WCAG AA（≥ 4.5:1）。
             let on_accent_ratio = contrast(p.on_accent, p.accent);
             assert!(on_accent_ratio >= 4.5, "on_accent on accent: {on_accent_ratio:.2} (dark={})", p.dark);
-            // Rill 钴蓝品牌主色色相落在现代蓝区间（约 210°–232°，即 0.58..=0.65），与蓝色应用图标统一。
+            // Rill 溪青（深松石青）品牌主色色相落在青绿区间（约 162°–191°，即 0.45..=0.53）。
             assert!(
-                (0.58..=0.65).contains(&p.accent.h),
-                "accent 应落在钴蓝色相区间（实际 h={:.3}, dark={}）",
+                (0.45..=0.53).contains(&p.accent.h),
+                "accent 应落在溪青色相区间（实际 h={:.3}, dark={}）",
                 p.accent.h,
                 p.dark
             );

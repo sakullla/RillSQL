@@ -1546,6 +1546,8 @@ dict! {
     "catalog.tree.compareObject" => "对比此对象", "Compare this object";
     "catalog.menu.danger" => "危险操作", "Dangerous actions";
     "grid.menu.rowOps" => "行操作", "Row actions";
+    "grid.menu.setValue" => "设值", "Set value";
+    "grid.menu.filterSort" => "筛选与排序", "Filter & sort";
     "grid.menu.copyAs" => "复制为", "Copy as";
     "grid.menu.moreTools" => "更多工具", "More tools";
     "grid.menu.viewEdit" => "打开方式", "Open with";

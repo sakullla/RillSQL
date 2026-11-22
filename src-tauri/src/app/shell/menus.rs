@@ -367,20 +367,58 @@ fn grid_copy_as(facts: &GridMenuFacts, row_only: bool) -> MenuItem {
     branch("submenu-copy-as", "grid.menu.copyAs", IconName::ClipboardList, copy_as)
 }
 
-/// 行操作：新增、复制为新行、批量设值、撤销这一行、标记删除、撤销全部暂存。
-fn grid_row_ops(facts: &GridMenuFacts, items: &mut Vec<MenuItem>) {
-    items.push(sep(with_icon(writable_only(item("grid-insert", "grid.action.insert"), facts), IconName::Plus)));
-    items.push(with_icon(writable_only(item("grid-clone-row", "grid.write.clone"), facts), IconName::CopyPlus));
-    items.push(writable_only(item("grid-selection-set", "grid.write.setValue"), facts));
-    if facts.row_dirty {
-        items.push(with_icon(item("grid-undo-row", "grid.write.undoRow"), IconName::RotateCcw));
+/// 行操作子菜单：新增、复制为新行、记录视图、撤销此行、撤销全部暂存。
+fn grid_row_ops_submenu(facts: &GridMenuFacts, include_record: bool) -> MenuItem {
+    let mut children = vec![
+        with_icon(writable_only(item("grid-insert", "grid.action.insert"), facts), IconName::Plus),
+        with_icon(writable_only(item("grid-clone-row", "grid.write.clone"), facts), IconName::CopyPlus),
+    ];
+    if include_record {
+        children.push(sep(with_icon(item("grid-record-toggle", "grid.record.open"), IconName::PanelRight)));
     }
+    if facts.row_dirty {
+        children.push(sep(with_icon(item("grid-undo-row", "grid.write.undoRow"), IconName::RotateCcw)));
+    }
+    if facts.dirty {
+        children.push(with_icon(item("grid-undo", "grid.menu.undo"), IconName::Undo2));
+    }
+    branch("submenu-row-ops", "grid.menu.rowOps", IconName::Rows3, children)
+}
+
+/// 设值子菜单：收拢设为 NULL、空字符串、默认值与批量选区设值，避免低频设值动作铺满一级菜单。
+fn grid_set_value_submenu(facts: &GridMenuFacts) -> MenuItem {
+    let chord = |id: &str| crate::app::keymap::shortcut(id).map(crate::app::keymap::Shortcut::chord);
+    let valued = |entry: MenuItem, id: &str| match chord(id) {
+        Some(found) => keyed(entry, found),
+        None => entry,
+    };
+    let children = vec![
+        valued(with_icon(writable_only(item("grid-set-null", "grid.menu.setNull"), facts), IconName::Eraser), "grid-set-null"),
+        valued(with_icon(writable_only(item("grid-set-empty", "grid.value.setEmpty"), facts), IconName::Space), "grid-set-empty"),
+        valued(with_icon(writable_only(item("grid-set-default", "grid.value.setDefault"), facts), IconName::RotateCcw), "grid-set-default"),
+        sep(with_icon(writable_only(item("grid-selection-set", "grid.write.setValue"), facts), IconName::ListChecks)),
+    ];
+    branch("submenu-set-value", "grid.menu.setValue", IconName::SlidersHorizontal, children)
+}
+
+/// 筛选与排序子菜单：一级保留高频“按此值筛选”，排除与排序收进二级菜单保持精炼。
+fn grid_filter_sort_submenu(facts: &GridMenuFacts) -> MenuItem {
+    let mut children = vec![
+        with_icon(item("grid-filter-exclude", "grid.menu.filterExclude"), IconName::Ban),
+        sep(with_icon(item("grid-column:column-sort-asc", "grid.menu.sortAsc"), IconName::ArrowUpNarrowWide)),
+        with_icon(item("grid-column:column-sort-desc", "grid.menu.sortDesc"), IconName::ArrowDownWideNarrow),
+    ];
+    if facts.conditions {
+        children.push(sep(with_icon(item("grid-clear-conditions", "grid.menu.clearConditions"), IconName::FunnelX)));
+    }
+    branch("submenu-filter-sort", "grid.menu.filterSort", IconName::ListFilter, children)
+}
+
+/// 删除行条目：可写时标红并带 Delete 快捷键，只读时禁用且说明原因。
+fn grid_delete_row_item(facts: &GridMenuFacts) -> MenuItem {
     let mut delete = keyed(with_icon(writable_only(item("mark-delete", "grid.menu.markDelete"), facts), IconName::Trash), "Delete");
     delete.danger = facts.writable;
-    items.push(delete);
-    if facts.dirty {
-        items.push(with_icon(item("grid-undo", "grid.menu.undo"), IconName::Undo2));
-    }
+    delete
 }
 
 /// 生成 SQL 子菜单：单元格菜单带按格、按列的 WHERE，行头菜单只有整行。
@@ -397,50 +435,44 @@ fn grid_sql(row_only: bool) -> MenuItem {
 }
 
 /// 网格（表数据与查询结果共用）唯一的一套右键菜单。按落点分两种：
-/// - 单元格：复制 → 查看/编辑这一格 → 按这一格筛选/排序 → 行操作 → 生成 SQL → 记录视图；
-/// - 行头（行号列、行尾空白）：整行复制 → 记录视图 → 行操作 → 生成 SQL。
+/// - 单元格：复制 → 编辑/设值（长值/预览才显示“查看完整值”）→ 筛选/排序 → 行操作/删除 → 生成 SQL/刷新；
+/// - 行头（行号列、行尾空白）：整行复制 → 记录视图 → 行操作/删除 → 生成 SQL。
 ///
 /// 列头菜单由表头自己处理（排序、筛选、适配列宽、复制列名、冻结与隐藏）。
 /// 不可写时写入项保留但禁用，并显示会话给出的具体原因。
 pub fn grid_items(facts: &GridMenuFacts) -> Vec<MenuItem> {
     let row_only = facts.area == GridMenuArea::RowHeader;
-    let chord = |id: &str| crate::app::keymap::shortcut(id).map(crate::app::keymap::Shortcut::chord);
-    let valued = |entry: MenuItem, id: &str| match chord(id) {
-        Some(found) => keyed(entry, found),
-        None => entry,
-    };
     let mut items = vec![keyed(with_icon(item("copy-region", "grid.menu.copy"), IconName::Copy), "Mod+C"), grid_copy_as(facts, row_only)];
     if row_only {
         items.push(sep(with_icon(item("grid-record-toggle", "grid.record.open"), IconName::PanelRight)));
-        grid_row_ops(facts, &mut items);
+        items.push(sep(grid_row_ops_submenu(facts, false)));
+        items.push(with_icon(writable_only(item("grid-selection-set", "grid.write.setValue"), facts), IconName::ListChecks));
+        items.push(grid_delete_row_item(facts));
         items.push(sep(grid_sql(true)));
     } else {
-        items.push(sep(keyed(with_icon(item("grid-value-open", "grid.value.openFull"), IconName::Eye), "Mod+Enter")));
-        // 编辑与三种明确设值（R7/R20）：可写时可用，只读时禁用并说明原因。组合键来自快捷键注册表。
-        items.push(keyed(with_icon(writable_only(item("edit-cell", "grid.menu.editCell"), facts), IconName::SquarePen), "Enter"));
-        items.push(valued(with_icon(writable_only(item("grid-set-null", "grid.menu.setNull"), facts), IconName::Eraser), "grid-set-null"));
-        items.push(valued(writable_only(item("grid-set-empty", "grid.value.setEmpty"), facts), "grid-set-empty"));
-        items.push(valued(writable_only(item("grid-set-default", "grid.value.setDefault"), facts), "grid-set-default"));
+        let mut first_edit = true;
+        if facts.needs_full_viewer {
+            items.push(sep(keyed(with_icon(item("grid-value-open", "grid.value.openFull"), IconName::Eye), "Mod+Enter")));
+            first_edit = false;
+        }
+        let edit_cell = keyed(with_icon(writable_only(item("edit-cell", "grid.menu.editCell"), facts), IconName::SquarePen), "Enter");
+        items.push(if first_edit { sep(edit_cell) } else { edit_cell });
+        items.push(grid_set_value_submenu(facts));
         if facts.cell_dirty {
             items.push(with_icon(item("grid-undo-cell", "grid.write.undoCell"), IconName::Undo2));
         }
         items.push(sep(with_icon(item("grid-filter-value", "grid.menu.filterByValue"), IconName::Funnel)));
-        items.push(with_icon(item("grid-filter-exclude", "grid.menu.filterExclude"), IconName::Ban));
-        items.push(with_icon(item("grid-column:column-sort-asc", "grid.menu.sortAsc"), IconName::ArrowUpNarrowWide));
-        items.push(with_icon(item("grid-column:column-sort-desc", "grid.menu.sortDesc"), IconName::ArrowDownWideNarrow));
-        if facts.conditions {
-            items.push(with_icon(item("grid-clear-conditions", "grid.menu.clearConditions"), IconName::FunnelX));
-        }
+        items.push(grid_filter_sort_submenu(facts));
         if facts.foreign_key {
-            items.push(with_icon(item("grid-fk-jump", "grid.fk.jump"), IconName::Link));
-            items.push(item("grid-fk-select", "grid.fk.select"));
+            items.push(sep(with_icon(item("grid-fk-jump", "grid.fk.jump"), IconName::Link)));
+            items.push(with_icon(item("grid-fk-select", "grid.fk.select"), IconName::Search));
         }
-        grid_row_ops(facts, &mut items);
+        items.push(sep(grid_row_ops_submenu(facts, true)));
+        items.push(grid_delete_row_item(facts));
         items.push(sep(grid_sql(false)));
-        items.push(with_icon(item("grid-record-toggle", "grid.record.open"), IconName::PanelRight));
     }
     if facts.unresolved {
-        items.push(item("grid-full-values", "grid.action.readFull"));
+        items.push(with_icon(item("grid-full-values", "grid.action.readFull"), IconName::Download));
     }
     if facts.table {
         items.push(with_icon(item("grid-refresh", "grid.menu.refresh"), IconName::RefreshCw));
@@ -1042,23 +1074,25 @@ mod tests {
     }
 
     /// 网格菜单按现场事实生成：只读（含只读查询结果）的写入项保留但禁用，悬停说明会话给出的具体原因；
-    /// 撤销、清除条件、外键跳转只在真有其事时出现；单元格与行头各是一套菜单。
+    /// 查看完整值仅在长值/预览/多行/JSON 时出现，低频设值/排序/行操作收拢到二级菜单保持精炼。
     #[test]
     fn grid_menu_follows_the_cell_it_was_opened_on() {
         let reason = "结果来自聚合查询，不能写回。".to_owned();
         let query = grid_items(&GridMenuFacts { readonly_reason: reason.clone(), has_selection: true, ..GridMenuFacts::default() });
         let query_ids = ids(&query);
         assert!(query_ids.contains(&"copy-region") && query_ids.contains(&"grid-filter-value"));
+        // 短值单元格不展示“查看完整值”，避免无意义的菜单项。
+        assert!(!query_ids.contains(&"grid-value-open"), "短值单元格不显示查看完整值");
+        let query_leaves = flatten_items(&query);
         for id in ["edit-cell", "grid-set-null", "grid-set-empty", "grid-set-default", "grid-insert", "grid-clone-row", "grid-selection-set", "mark-delete"] {
-            let entry = query.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("只读查询结果也列出 {id}"));
+            let entry = query_leaves.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("只读查询结果也列出 {id}"));
             assert!(!entry.enabled, "{id}");
             assert_eq!(entry.reason.as_deref(), Some(reason.as_str()), "{id} 说明具体原因");
         }
         for id in ["grid-refresh", "grid-undo-cell", "grid-undo-row", "grid-undo", "grid-clear-conditions", "grid-fk-jump", "grid-full-values"] {
             assert!(!query_ids.contains(&id), "查询结果不该有 {id}");
         }
-        // 原来只在表格组件菜单里的条目都并进了这一套菜单。
-        let all: Vec<&str> = flatten_items(&query).iter().map(|item| item.id).collect();
+        let all: Vec<&str> = query_leaves.iter().map(|item| item.id).collect();
         for id in [
             "grid-copy-row",
             "grid-copy-column",
@@ -1074,14 +1108,14 @@ mod tests {
             "grid-sql-select",
             "grid-sql-update",
             "grid-record-toggle",
-            "grid-value-open",
         ] {
             assert!(all.contains(&id), "{id}");
         }
 
         let readonly = grid_items(&GridMenuFacts { table: true, ..GridMenuFacts::default() });
+        let readonly_leaves = flatten_items(&readonly);
         for id in ["edit-cell", "grid-set-null", "grid-set-empty", "grid-set-default", "grid-insert", "grid-clone-row", "mark-delete"] {
-            let item = readonly.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{id}"));
+            let item = readonly_leaves.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{id}"));
             assert!(!item.enabled && item.reason_key == Some("grid.errors.viewReadonly") && item.reason.is_none(), "{id}");
         }
         assert!(!readonly.iter().find(|item| item.id == "mark-delete").unwrap().danger, "禁用的删除不标红");
@@ -1100,15 +1134,19 @@ mod tests {
             dirty: true,
             unresolved: true,
             has_selection: true,
+            needs_full_viewer: true,
             ..GridMenuFacts::default()
         });
         let busy_ids = ids(&busy);
-        for id in ["grid-undo-cell", "grid-undo-row", "grid-undo", "grid-clear-conditions", "grid-fk-jump", "grid-fk-select", "grid-full-values", "grid-refresh"] {
+        for id in ["grid-value-open", "grid-undo-cell", "grid-undo-row", "grid-undo", "grid-clear-conditions", "grid-fk-jump", "grid-fk-select", "grid-full-values", "grid-refresh"] {
             assert!(busy_ids.contains(&id), "{id}");
         }
         let delete = busy.iter().find(|item| item.id == "mark-delete").unwrap();
         assert!(delete.enabled && delete.danger && delete.shortcut == Some("Delete"));
         assert_eq!(busy.first().map(|item| (item.id, item.shortcut)), Some(("copy-region", Some("Mod+C"))));
+        // 一级菜单保持精简，不铺开 20 项杂乱条目。
+        let clean_cell = grid_items(&GridMenuFacts { table: true, writable: true, has_selection: true, ..GridMenuFacts::default() });
+        assert!(clean_cell.len() <= 11, "普通单元格一级菜单应精炼（实际 {} 项）", clean_cell.len());
 
         // 行头：整行的操作；没有按格编辑、按值筛选和排序，生成 SQL 只有整行。
         let row = grid_items(&GridMenuFacts { area: GridMenuArea::RowHeader, table: true, writable: true, has_selection: true, ..GridMenuFacts::default() });

@@ -770,6 +770,11 @@ impl Workbench {
             .flex()
             .items_center()
             .gap(px(Space::XXS))
+            .p(px(Space::XXS))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.sunken)
+            .border_1()
+            .border_color(p.line_soft)
             .occlude();
         for id in crate::app::model::RAIL_TOP.iter().chain(crate::app::model::RAIL_BOTTOM.iter()) {
             if let Some((icon, key, active)) = rail_entry(id, page) {
@@ -875,7 +880,7 @@ impl Workbench {
             ))
         });
 
-        // 命令面板触发器：宽屏紧凑胶囊（带快捷键），窄屏退化为搜索图标按钮，给页签条留出空间。
+        // 命令面板触发器：宽屏紧凑胶囊（带标题与快捷键），窄屏退化为搜索图标按钮，给页签条留出空间。
         let search_trigger: AnyElement = if compact_search {
             kit::icon_button(
                 "top-search",
@@ -890,17 +895,18 @@ impl Workbench {
                 .role(gpui_kit::Role::Button)
                 .aria_label(self.t("shell.palette.title"))
                 .tooltip_text(self.t("shell.palette.title"))
-                .h(px(m.control_h - 2.))
+                .h(px(m.control_h - Space::XXS))
                 .px(px(Space::MD))
                 .flex()
                 .items_center()
-                .gap(px(Space::SM))
+                .gap(px(Space::MD))
                 .rounded(px(Radius::CONTROL))
                 .border_1()
                 .border_color(p.line_soft)
                 .bg(p.sunken)
-                .hover(|style| style.bg(p.surface).border_color(p.line))
+                .hover(|style| style.bg(p.raised).border_color(p.line))
                 .child(kit::icon(IconName::Search, kit::IconSize::INLINE, p.text_faint))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("shell.palette.title")))
                 .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
                 .on_click(act("command-palette", cx))
                 .into_any_element()
@@ -1152,7 +1158,13 @@ impl Workbench {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(explorer_header)
+                    .child(
+                        div()
+                            .flex_none()
+                            .border_b_1()
+                            .border_color(p.line_soft)
+                            .child(explorer_header),
+                    )
                     .when(search_skipped > 0, |this| {
                         let msg = i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &search_skipped.to_string())]);
                         this.child(
@@ -1763,7 +1775,18 @@ impl Workbench {
             .items_center()
             .gap(px(5.))
             .rounded(px(Radius::CONTROL))
-            .when(row.focused || row.selected, |this| this.bg(p.selection))
+            .when(row.focused || row.selected, |this| {
+                this.bg(p.selection).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(Space::XS))
+                        .bottom(px(Space::XS))
+                        .w(px(Space::XXS))
+                        .rounded(px(Radius::TAG))
+                        .bg(p.accent),
+                )
+            })
             .when(!row.focused && !row.selected, |this| this.hover(|style| style.bg(p.hover)))
             .children(guides)
             .child(
@@ -2987,6 +3010,7 @@ impl Workbench {
             .text_color(p.text_muted)
             .child(target)
             .children(self.status_transaction(&p, cx))
+            .child(kit::vline(&p))
             .child(
                 div()
                     .flex_1()
@@ -3082,6 +3106,7 @@ impl Workbench {
                         .flex_none()
                         .px(px(Space::XS))
                         .rounded(px(Radius::CONTROL))
+                        .font_features(kit::tabular_figures())
                         .text_size(px(TypeScale::XS))
                         .text_color(p.text_faint)
                         .hover(|style| style.bg(p.hover).text_color(p.text))
@@ -3141,15 +3166,18 @@ impl Workbench {
                 .gap(px(Space::LG))
                 .rounded(px(Radius::PANEL))
                 .border_1()
-                .border_color(p.line_soft)
-                .bg(if p.dark { p.raised } else { p.chrome })
-                .hover(|style| style.border_color(p.accent.opacity(0.45)).bg(if p.dark { p.hover } else { p.surface }))
+                .border_color(if p.dark { p.line_soft } else { p.line })
+                .bg(p.raised)
+                .when(!p.dark, |s| s.shadow_xs())
+                .hover(|style| style.border_color(p.accent.opacity(0.55)).bg(if p.dark { p.hover } else { p.raised }))
                 .child(
                     div()
                         .flex_none()
                         .size(px(32.))
                         .rounded(px(Radius::CONTROL))
                         .bg(p.accent_soft)
+                        .border_1()
+                        .border_color(p.accent.opacity(0.2))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -3450,25 +3478,55 @@ impl Workbench {
                                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("ui.welcome.subtitle"))),
                             )
                             .child(
-                                kit::interactive_states(div().id("welcome-history"), &p, false)
-                                    .test_support()
-                                    .role(gpui_kit::Role::Button)
-                                    .aria_label(self.t("ui.welcome.allHistory"))
+                                div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(6.))
-                                    .h(px(m.control_h))
-                                    .px(px(10.))
-                                    .rounded(px(Radius::CONTROL))
-                                    .border_1()
-                                    .border_color(p.line_soft)
-                                    .bg(if p.dark { p.raised } else { p.chrome })
-                                    .hover(|style| style.bg(p.hover).border_color(p.line))
-                                    .text_size(px(TypeScale::SM))
-                                    .text_color(p.text_muted)
-                                    .child(kit::icon(IconName::Clock, 13., p.text_faint))
-                                    .child(self.t("ui.welcome.allHistory"))
-                                    .on_click(act("history", cx)),
+                                    .gap(px(Space::SM))
+                                    .child(
+                                        kit::interactive_states(div().id("welcome-palette"), &p, false)
+                                            .test_support()
+                                            .role(gpui_kit::Role::Button)
+                                            .aria_label(self.t("shell.palette.title"))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Space::SM))
+                                            .h(px(m.control_h))
+                                            .px(px(Space::MD))
+                                            .rounded(px(Radius::CONTROL))
+                                            .border_1()
+                                            .border_color(p.line)
+                                            .bg(p.raised)
+                                            .when(!p.dark, |s| s.shadow_xs())
+                                            .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+                                            .text_size(px(TypeScale::SM))
+                                            .text_color(p.text_muted)
+                                            .child(kit::icon(IconName::Search, kit::IconSize::INLINE, p.text_faint))
+                                            .child(self.t("shell.palette.title"))
+                                            .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
+                                            .on_click(act("command-palette", cx)),
+                                    )
+                                    .child(
+                                        kit::interactive_states(div().id("welcome-history"), &p, false)
+                                            .test_support()
+                                            .role(gpui_kit::Role::Button)
+                                            .aria_label(self.t("ui.welcome.allHistory"))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(Space::SM))
+                                            .h(px(m.control_h))
+                                            .px(px(Space::MD))
+                                            .rounded(px(Radius::CONTROL))
+                                            .border_1()
+                                            .border_color(p.line)
+                                            .bg(p.raised)
+                                            .when(!p.dark, |s| s.shadow_xs())
+                                            .hover(|style| style.bg(p.hover).border_color(p.line_strong))
+                                            .text_size(px(TypeScale::SM))
+                                            .text_color(p.text_muted)
+                                            .child(kit::icon(IconName::Clock, kit::IconSize::INLINE, p.text_faint))
+                                            .child(self.t("ui.welcome.allHistory"))
+                                            .on_click(act("history", cx)),
+                                    ),
                             ),
                     )
                     .children(retry_banner)
@@ -6214,6 +6272,112 @@ impl Workbench {
                     .map(|(name, id)| (id.as_str(), crate::app::views::settings::editor_theme_key(name), s.editor_theme == *name))
                     .collect();
                 let editor_theme = seg(self, &editor_theme_items, cx);
+                // 实时 SQL 配色预览：切换编辑器配色或主题时所见即所得，无需切回查询页验证。
+                let (preview_bg, preview_fg) = crate::app::views::settings::editor_theme_colors(&s.editor_theme, p.dark);
+                let token_fg = |scope: &str| -> gpui_kit::Hsla {
+                    kit::SQL_TOKEN_COLORS
+                        .iter()
+                        .find(|t| t.scope == scope)
+                        .map(|t| gpui_kit::rgb(if p.dark { t.dark } else { t.light }).into())
+                        .unwrap_or_else(|| gpui_kit::rgb(preview_fg).into())
+                };
+                let mono = cx.theme().mono_font_family.clone();
+                let preview_line = |line_no: &'static str, spans: Vec<(&'static str, gpui_kit::Hsla, bool)>| {
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Space::MD))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_features(kit::tabular_figures())
+                                .text_color(p.text_faint)
+                                .child(line_no),
+                        );
+                    let mut code = div().flex().flex_wrap().items_center();
+                    for (text, color, bold) in spans {
+                        code = code.child(
+                            div()
+                                .text_color(color)
+                                .when(bold, |s| s.font_weight(FontWeight::BOLD))
+                                .child(text),
+                        );
+                    }
+                    row = row.child(code);
+                    row
+                };
+                let kw = token_fg("keyword");
+                let var = token_fg("variable");
+                let func = token_fg("function");
+                let str_c = token_fg("string");
+                let num = token_fg("number");
+                let op = token_fg("operator");
+                let cmt = token_fg("comment");
+                let editor_preview = div()
+                    .id("settings-editor-preview")
+                    .test_support()
+                    .w_full()
+                    .rounded(px(Radius::PANEL))
+                    .border_1()
+                    .border_color(p.line)
+                    .bg(gpui_kit::rgb(preview_bg))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px(px(Space::LG))
+                            .py(px(Space::SM))
+                            .border_b_1()
+                            .border_color(p.line_soft)
+                            .bg(p.chrome)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                            .child(self.t(crate::app::views::settings::editor_theme_key(&s.editor_theme)))
+                            .child(
+                                div()
+                                    .font_features(kit::tabular_figures())
+                                    .text_color(p.text_faint)
+                                    .child(SharedString::from(format!("{} px", s.editor_font))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(Space::LG))
+                            .py(px(Space::MD))
+                            .flex()
+                            .flex_col()
+                            .gap(px(Space::XS))
+                            .font_family(mono)
+                            .text_size(px(TypeScale::SM))
+                            .child(preview_line("1", vec![("-- Active users summary", cmt, false)]))
+                            .child(preview_line(
+                                "2",
+                                vec![
+                                    ("SELECT ", kw, true),
+                                    ("id, ", var, false),
+                                    ("COUNT", func, false),
+                                    ("(*) ", op, false),
+                                    ("FROM ", kw, true),
+                                    ("users ", var, false),
+                                    ("WHERE ", kw, true),
+                                    ("status ", var, false),
+                                    ("= ", op, false),
+                                    ("'active'", str_c, false),
+                                ],
+                            ))
+                            .child(preview_line(
+                                "3",
+                                vec![
+                                    ("GROUP BY ", kw, true),
+                                    ("id ", var, false),
+                                    ("LIMIT ", kw, true),
+                                    ("50", num, false),
+                                    (";", op, false),
+                                ],
+                            )),
+                    );
                 div()
                 .flex()
                 .flex_col()
@@ -6236,7 +6400,9 @@ impl Workbench {
                         (self.t("shell.settings.editorTheme"), None, editor_theme.into_any_element()),
                     ],
                     &p,
-                )).into_any_element()
+                ))
+                .child(editor_preview)
+                .into_any_element()
             }),
             SettingsSection::Data => stack_frame(|| {
                 let timeout_seg = seg(
@@ -7197,8 +7363,8 @@ impl Workbench {
                 .items_center()
                 .gap(px(14.))
                 .border_t_1()
-                .border_color(p.line)
-                .bg(p.chrome)
+                .border_color(p.line_soft)
+                .bg(p.sunken)
                 .text_size(px(TypeScale::XS))
                 .text_color(p.text_faint)
                 .child(hint("↑↓", self.t("shell.palette.hintMove")))
@@ -7266,6 +7432,7 @@ impl Workbench {
                 .role(gpui_kit::Role::MenuItem)
                 .aria_label(SharedString::from(entry.label.clone()))
                 .aria_selected(selected)
+                .relative()
                 .flex_none()
                 .h(px(m.row_h + 4.))
                 .px(px(10.))
@@ -7273,7 +7440,21 @@ impl Workbench {
                 .items_center()
                 .gap(px(10.))
                 .rounded(px(Radius::CONTROL))
-                .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
+                .when(selected, |this| {
+                    this.bg(p.selection)
+                        .text_color(p.text)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(px(Space::XS))
+                                .bottom(px(Space::XS))
+                                .w(px(Space::XXS))
+                                .rounded(px(Radius::TAG))
+                                .bg(p.accent),
+                        )
+                })
                 .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                 .child(
                     div()
@@ -7361,9 +7542,19 @@ impl Workbench {
         if let Some((parent, child)) = menu.submenu {
             if let Some(parent_item) = menu.items.get(parent) {
                 if !parent_item.children.is_empty() {
-                    let sub_w = 232.;
+                    let sub_w = 224.;
                     let sub_h = menu_block_height(&parent_item.children, row_h);
-                    let parent_y = y + 4. + parent as f32 * (row_h + 2.);
+                    let mut offset_y = 4.;
+                    for (idx, it) in menu.items.iter().take(parent).enumerate() {
+                        if it.separator_before || (idx > 0 && it.danger && !menu.items[idx - 1].danger) {
+                            offset_y += 9.;
+                        }
+                        offset_y += row_h;
+                    }
+                    if parent_item.separator_before || (parent > 0 && parent_item.danger && !menu.items[parent - 1].danger) {
+                        offset_y += 9.;
+                    }
+                    let parent_y = y + offset_y;
                     let (sub_x, sub_y) = super::menus::place_submenu(x, parent_y, width, sub_w, sub_h, view_w, view_h);
                     layer = layer.child(self.context_menu_box(
                         "context-submenu",
@@ -7419,9 +7610,10 @@ impl Workbench {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // 菜单自己身上的右键不算“点在外面”，不关菜单。
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        let has_any_icon = items.iter().any(|it| it.icon.is_some());
         for (index, item) in items.iter().enumerate() {
             if item.separator_before || (index > 0 && item.danger && !items[index - 1].danger) {
-                list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line));
+                list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line_soft));
             }
             let id = item.command();
             let has_children = !item.children.is_empty();
@@ -7440,6 +7632,13 @@ impl Workbench {
             } else {
                 p.text
             };
+            let icon_fg = if !enabled {
+                p.text_faint
+            } else if item.danger {
+                p.danger
+            } else {
+                p.text_muted
+            };
             let element = if parent.is_some() { format!("ctx-sub-{id}") } else { format!("ctx-{id}") };
             // 禁用原因：会话给出的具体文案优先，其次是固定的说明键。
             let disabled_reason: Option<SharedString> = item.reason.clone().map(SharedString::from).or_else(|| item.reason_key.map(|key| self.t(key)));
@@ -7452,19 +7651,30 @@ impl Workbench {
                     .aria_selected(selected)
                     .aria_description(SharedString::from(format!("{state} {}", item.reason_key.unwrap_or(item.id))))
                     .h(px(m.menu_row_h))
-                    .px(px(8.))
+                    .px(px(Space::MD))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
                     .text_color(fg)
                     .when(enabled, |this| this.cursor_pointer())
-                    .when(enabled && selected, |this| this.bg(p.hover))
+                    .when(enabled && selected, |this| this.bg(if item.danger { p.danger_soft } else { p.selection }))
                     .when(enabled, |this| this.hover(|style| style.bg(if item.danger { p.danger_soft } else { p.hover })))
-                    .when_some(item.icon, |this, icon| this.child(kit::icon(icon, 14., fg)))
+                    .when(has_any_icon, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .w(px(kit::IconSize::CONTROL))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when_some(item.icon, |slot, icon| slot.child(kit::icon(icon, kit::IconSize::CONTROL, icon_fg))),
+                        )
+                    })
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .when_some(shortcut, |this, shortcut| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(shortcut)))
-                    .when(has_children, |this| this.child(kit::icon(IconName::ChevronRight, 12., p.text_faint)))
+                    .when(has_children, |this| this.child(kit::icon(IconName::ChevronRight, kit::IconSize::INLINE, p.text_faint)))
                     .when_some(disabled_reason.filter(|_| !enabled), |this, reason| this.tooltip_text(reason))
                     .on_mouse_move(cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
                         let Some(menu) = this.model.menu.as_mut() else { return };
@@ -8230,7 +8440,12 @@ fn topbar_nav_item(id: &'static str, icon: IconName, label: SharedString, active
         .items_center()
         .justify_center()
         .rounded(px(Radius::CONTROL))
-        .when(active, |this| this.bg(p.accent_soft))
+        .when(active, |this| {
+            this.bg(p.raised)
+                .border_1()
+                .border_color(if p.dark { p.line } else { p.line_soft })
+                .when(!p.dark, |s| s.shadow_xs())
+        })
         .when(!active, |this| this.hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, kit::IconSize::CONTROL, if active { p.accent_text } else { p.text_muted }))
         .on_click(act(id, cx))

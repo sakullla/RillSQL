@@ -28,8 +28,12 @@ pub(in crate::adapters) async fn describe(pool: &sqlx::SqlitePool, database: &st
 }
 
 pub(in crate::adapters) async fn fetch_cells(pool: &sqlx::SqlitePool, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
-    let rows = sqlx::query(audited(sql)).fetch_all(pool).await.map_err(db_err)?;
-    rows.iter().map(|row| read_width(row, width, sqlite_cell)).collect()
+    let mut stream = sqlx::query(audited(sql)).fetch(pool);
+    let mut out = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(db_err)? {
+        out.push(read_width(&row, width, sqlite_cell)?);
+    }
+    Ok(out)
 }
 
 pub(in crate::adapters) async fn fetch_count(pool: &sqlx::SqlitePool, sql: &str) -> Result<i64, String> {

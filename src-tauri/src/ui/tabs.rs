@@ -194,8 +194,8 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
         slot(kit::icon(spec.icon, IconSize::CONTROL, icon_tone).into_any_element())
     };
     let workspace = spec.style == TabStyle::Workspace;
-    let active_bg = if workspace && p.dark { p.raised } else { p.surface };
-    let active_border = if spec.prod { p.danger.opacity(0.45) } else { p.line_soft };
+    let active_bg = if workspace { p.raised } else { p.surface };
+    let active_border = if spec.prod { p.danger.opacity(0.45) } else { p.line };
     kit::interactive_states(div().id(ElementId::Name(spec.id.clone())), p, false)
         .test_support()
         .role(gpui_kit::Role::Tab)
@@ -226,7 +226,7 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
             this.text_color(p.text_muted)
                 .hover(|style| style.bg(p.hover).text_color(p.text))
         })
-        .when((!workspace && (spec.active || spec.prod)) || (workspace && spec.prod), |this| {
+        .when(spec.active || spec.prod, |this| {
             let mark_color = if spec.prod {
                 if spec.active { p.danger } else { p.danger.opacity(0.5) }
             } else {

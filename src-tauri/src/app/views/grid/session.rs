@@ -689,6 +689,18 @@ impl SharedGrid {
         self.mode = GridMode::Table;
         self.columns = merge_widths(&self.columns, columns, &rows);
         self.source = rows.into_iter().map(Arc::new).collect();
+        self.source.shrink_to_fit();
+        // 清理已离开当前页且未被暂存引用的大字段完整值缓存，避免翻页后内存持续上涨。
+        if !self.full.is_empty() {
+            let live_ids: HashSet<&str> = self
+                .source
+                .iter()
+                .chain(self.retained.iter())
+                .map(|row| row.id.as_str())
+                .collect();
+            self.full.retain(|row_id, _| live_ids.contains(row_id.as_str()));
+            self.full.shrink_to_fit();
+        }
         self.schema = schema;
         self.full_count = full_count;
         self.truncated = full_count.is_some_and(|count| count > self.source.len() as i64);
@@ -718,6 +730,18 @@ impl SharedGrid {
         self.retain_staged_rows();
         self.columns = merge_widths(&self.columns, columns, &rows);
         self.source = rows.into_iter().map(Arc::new).collect();
+        self.source.shrink_to_fit();
+        // 清理已离开当前页且未被暂存引用的大字段完整值缓存，避免翻页后内存持续上涨。
+        if !self.full.is_empty() {
+            let live_ids: HashSet<&str> = self
+                .source
+                .iter()
+                .chain(self.retained.iter())
+                .map(|row| row.id.as_str())
+                .collect();
+            self.full.retain(|row_id, _| live_ids.contains(row_id.as_str()));
+            self.full.shrink_to_fit();
+        }
         self.schema = schema;
         self.offset = offset;
         self.full_count = full_count;
@@ -1012,6 +1036,7 @@ impl SharedGrid {
             && self.target.table == target.table;
         if !same {
             self.overlays.clear();
+            self.overlays.shrink_to_fit();
             self.batches.clear();
             self.cloned.clear();
             self.pristine.clear();
@@ -1019,6 +1044,7 @@ impl SharedGrid {
             self.hidden.clear();
             self.frozen = None;
             self.retained.clear();
+            self.retained.shrink_to_fit();
             self.failures.clear();
             self.search.clear();
             self.find_scope = FindScope::Loaded;
@@ -1028,6 +1054,7 @@ impl SharedGrid {
             self.selected = false;
             // 换了目标：查看面板和按定位读到的原值都不属于新表，代次一并换代。
             self.invalidate_previews();
+            self.full.shrink_to_fit();
             self.keys.clear();
             self.anchor_id.clear();
             self.focus_id.clear();
@@ -5252,6 +5279,27 @@ pub fn columns_from_schema(schema: &TableSchema, editable: bool) -> Vec<GridColu
         .collect()
 }
 
+/// 消费式转换分页结果：直接移交单元格与定位字符串所有权，避免开表/翻页时整页二次深拷贝。
+pub fn rows_into_page(columns: &[GridColumn], page: PageDto) -> Vec<GridRow> {
+    let mut out = Vec::with_capacity(page.rows.len());
+    for mut row in page.rows {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            values.push(row.cells.remove(&column.name).flatten());
+        }
+        let locator = row.locator_columns.into_iter().zip(row.locator_values).collect();
+        out.push(GridRow {
+            id: row.id,
+            values,
+            located: row.located,
+            locator,
+            inserted: false,
+        });
+    }
+    out
+}
+
+#[allow(dead_code)]
 pub fn rows_from_page(columns: &[GridColumn], page: &PageDto) -> Vec<GridRow> {
     page.rows
         .iter()

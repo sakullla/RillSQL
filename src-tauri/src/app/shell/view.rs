@@ -26,7 +26,6 @@ use crate::app::{AppPage, Effect};
 use crate::connections::model::Engine;
 use crate::state::Platform;
 use crate::application::AppServices;
-use crate::ui::Foundation;
 
 use super::jobs::{self, apply_done, job_request};
 use super::menus::NavKey;
@@ -43,7 +42,6 @@ enum ExchangeStamp {
 
 pub struct Workbench {
     pub model: WorkbenchModel,
-    foundation: Entity<Foundation>,
     pub(super) query: Entity<QueryPane>,
     pub(super) table: Entity<GridPane>,
     pub(super) structure: Entity<StructurePane>,
@@ -241,7 +239,6 @@ impl Workbench {
 
     fn build(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
         let metadata_gate = Arc::clone(&services.metadata_gate);
-        let foundation = cx.new(|cx| Foundation::new(window, cx));
         let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
         let table = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         // 外键跳转的出口：网格只算出目标和定位查询，真正打开工作项由外壳负责。
@@ -422,14 +419,9 @@ impl Workbench {
         let weak_self = cx.entity().downgrade();
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
-        let shell = model.shell.clone();
-        foundation.update(cx, |view, cx| {
-            view.show_chrome = false;
-            view.adopt(shell, Effect::ApplyTheme, cx);
-        });
+        crate::ui::kit::apply_theme(matches!(model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark), cx);
         Self {
             model,
-            foundation,
             query,
             table,
             structure,
@@ -1650,8 +1642,14 @@ impl Workbench {
     }
 
     fn adopt_shell(&mut self, effect: Effect, cx: &mut Context<Self>) {
-        let shell = self.model.shell.clone();
-        self.foundation.update(cx, |view, cx| view.adopt(shell, effect, cx));
+        match effect {
+            Effect::ApplyTheme => {
+                let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
+                crate::ui::kit::apply_theme(dark, cx);
+            }
+            Effect::RefreshMenus => crate::app::install_menus(cx, &self.model.shell),
+            _ => {}
+        }
     }
 
     pub(crate) fn apply_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {

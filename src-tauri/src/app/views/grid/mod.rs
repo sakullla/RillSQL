@@ -264,7 +264,7 @@ use crate::grid::commands::{CountDto, CountRequest, FilterArg, PageDto, PageRequ
 use crate::i18n::{self, Locale};
 
 use session::{
-    cell_of, columns_from_schema, rows_from_page, schema_from_dto, BatchReject, CellPhase, Continuation, CopyBlock, CopyFormat, CopyScope, FindScope,
+    cell_of, columns_from_schema, rows_into_page, schema_from_dto, BatchReject, CellKind, CellPhase, Continuation, CopyBlock, CopyFormat, CopyScope, FindScope,
     ForeignKeyInfo, FullRead, Gate, GridAction, Reference, SheetEmptiness,
 };
 
@@ -311,6 +311,9 @@ pub struct GridMenuFacts {
     pub dirty: bool,
     /// 窗口里还有没读到原值的预览格：给出“读取完整值”。
     pub unresolved: bool,
+    /// 焦点格的值确实需要完整值查看器（截断预览、大字段/二进制、多行、长文本或 JSON）：
+    /// 短整数/短文本/NULL 不必在右键菜单里永远占一行“查看完整值”。
+    pub needs_full_viewer: bool,
 }
 
 /// 网格右键的落点。
@@ -816,6 +819,20 @@ impl GridPane {
     pub fn menu_facts(&self) -> GridMenuFacts {
         let focus = self.session.focus_cell();
         let writable = self.session.writable();
+        let needs_full_viewer = focus.is_some_and(|(row, column)| {
+            let shown = self.session.show_cell(row, column, false);
+            if shown.preview || matches!(shown.kind, CellKind::Large | CellKind::Binary) {
+                return true;
+            }
+            if shown.kind != CellKind::Text {
+                return false;
+            }
+            let text = shown.body.as_str();
+            let trimmed = text.trim();
+            let looks_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+            text.contains('\n') || text.chars().count() > 48 || looks_json
+        });
         GridMenuFacts {
             table: self.session.mode == GridMode::Table,
             writable,
@@ -828,6 +845,7 @@ impl GridPane {
             has_selection: self.session.has_selection(),
             dirty: self.session.uncommitted(),
             unresolved: self.session.unresolved_previews() > 0,
+            needs_full_viewer,
         }
     }
 
@@ -939,6 +957,13 @@ impl GridPane {
         self.scheduled = 0;
         self.edit_target = None;
         self.pending_edit = None;
+        self.calendar = None;
+        self._calendar_subscription = None;
+        self.sql_input = None;
+        self.sql_subscription = None;
+        self.sql_tab_subscription = None;
+        self.column_picker = None;
+        self.column_manager = None;
         self.record_row_changed();
         self.press = None;
         self.filter_input_reset();
@@ -3258,8 +3283,8 @@ impl GridPane {
             }))
         };
         self.next_offset = end;
-        self.schema_cache = Some((self.session.target.clone(), None, schema_dto.clone()));
-        let rows = rows_from_page(&columns, &page);
+        self.schema_cache = Some((self.session.target.clone(), None, schema_dto));
+        let rows = rows_into_page(&columns, page);
         if replace {
             // 整页替换：行内容与行集合都换了一套，记录面板的就地暂存不能跨过这次重读。
             self.record_row_changed();
@@ -6268,6 +6293,8 @@ impl TableDelegate for SheetDelegate {
                         this.px(px(Space::XS))
                             .rounded(px(Radius::TAG))
                             .bg(p.badge)
+                            .border_1()
+                            .border_color(p.line_soft)
                             .text_size(px(TypeScale::XS))
                             .italic()
                             .text_color(p.text_faint)
@@ -6276,6 +6303,8 @@ impl TableDelegate for SheetDelegate {
                         this.px(px(Space::XS))
                             .rounded(px(Radius::TAG))
                             .bg(p.hover)
+                            .border_1()
+                            .border_color(p.line)
                             .text_size(px(TypeScale::XS))
                             .text_color(p.text_muted)
                     })
