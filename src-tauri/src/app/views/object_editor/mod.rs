@@ -853,4 +853,108 @@ mod receipt_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[gpui_kit::test]
+    fn object_editor_scrim_occludes_background_and_escape_closes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::{
+            AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Styled as _,
+            TestSupportExt as _, Window, div, px,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Host {
+            editor: Entity<ObjectEditorPane>,
+            bg_hits: Arc<AtomicUsize>,
+        }
+
+        impl Render for Host {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let hits = self.bg_hits.clone();
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("object-editor-bg-target")
+                            .test_support()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size(px(40.))
+                            .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                            }),
+                    )
+                    .child(self.editor.clone())
+            }
+        }
+
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rillsql-object-editor-modal-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let services = Arc::new(crate::application::AppServices::new(Arc::new(
+            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+        )));
+        let bg_hits = Arc::new(AtomicUsize::new(0));
+
+        cx.update(gpui_kit::init);
+        let (window, host) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(px(900.), px(700.)),
+            };
+            let hits = bg_hits.clone();
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| {
+                    let editor = cx.new(|cx| {
+                        let mut pane = ObjectEditorPane::new(services.clone());
+                        pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+                        pane
+                    });
+                    cx.new(|_| Host { editor, bg_hits: hits })
+                },
+            )
+            .expect("host window")
+        });
+        let editor = cx.update(|cx| host.read(cx).editor.clone());
+
+        // 1. 打开后自动聚焦弹窗，按 Esc 直接关闭。
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("object-editor-scrim").is_some(), "遮罩应渲染");
+            assert!(window.try_find("object-editor").is_some(), "弹窗应渲染");
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| editor.read(cx).is_open()), "Esc 应关闭对象编辑器");
+
+        // 2. 重新打开：点弹窗内部不关闭，点遮罩覆盖的底层区域只关闭弹窗且不穿透底层按钮。
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |pane, cx| {
+                pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+            });
+            window.render_frame(cx);
+            window.click("object-editor", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(cx.update(|cx| editor.read(cx).is_open()), "点击弹窗内部不应关闭对象编辑器");
+        assert_eq!(bg_hits.load(Ordering::SeqCst), 0, "点击弹窗内部不应穿透到底层");
+
+        cx.update_window(window, |_, window, cx| {
+            window.click("object-editor-bg-target", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| editor.read(cx).is_open()), "点击遮罩外部应关闭对象编辑器");
+        assert_eq!(bg_hits.load(Ordering::SeqCst), 0, "遮罩应阻断点击穿透到底层视图");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -6,12 +6,14 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
+    AnyElement, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window, div, px, relative,
 };
 
 use crate::app::model::ObjectTarget;
@@ -81,6 +83,8 @@ pub struct ObjectEditorPane {
     body_editor: Option<Entity<EditorState>>,
     body_sync: String,
     body_sub: Option<Subscription>,
+    focus: Option<FocusHandle>,
+    focused_on_open: bool,
     open: bool,
     loading: bool,
     previewing: bool,
@@ -100,6 +104,8 @@ impl ObjectEditorPane {
             body_editor: None,
             body_sync: String::new(),
             body_sub: None,
+            focus: None,
+            focused_on_open: false,
             open: false,
             loading: false,
             previewing: false,
@@ -124,6 +130,7 @@ impl ObjectEditorPane {
     /// 关闭编辑器：草稿与预览一起丢掉，不留半份状态给下一次打开。
     pub fn close(&mut self) {
         self.open = false;
+        self.focused_on_open = false;
         self.epoch += 1;
         self.loading = false;
         self.previewing = false;
@@ -154,6 +161,7 @@ impl ObjectEditorPane {
             ..ObjectEditorSession::default()
         };
         self.open = true;
+        self.focused_on_open = false;
         self.epoch += 1;
         self.previewing = false;
         self.executing = false;
@@ -887,7 +895,16 @@ impl ObjectEditorPane {
         Some(crate::app::views::structure::receipt::panel("object-editor", receipt, p, locale))
     }
 
+    fn dialog_focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
     fn panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let dialog_focus = self.dialog_focus_handle(cx);
+        if !self.focused_on_open {
+            self.focused_on_open = true;
+            window.focus(&dialog_focus, cx);
+        }
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
         let locale = self.session.locale;
@@ -943,19 +960,53 @@ impl ObjectEditorPane {
         if let Some(receipt) = self.receipt_panel(&p, locale) {
             body = body.child(receipt);
         }
+        let scrim_owner = entity.clone();
+        let key_owner = entity.clone();
         div()
+            .id("object-editor-scrim")
+            .test_support()
+            .occlude()
             .absolute()
             .inset_0()
             .flex()
             .items_center()
             .justify_center()
             .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                scrim_owner.update(cx, |pane, cx| {
+                    if !pane.executing {
+                        pane.close();
+                        cx.notify();
+                    }
+                });
+            })
             .child(
                 div()
                     .id("object-editor")
+                    .test_support()
                     .role(gpui_kit::Role::Dialog)
                     .aria_label(title)
                     .occlude()
+                    .track_focus(&dialog_focus)
+                    .focus_trap("object-editor", &dialog_focus)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            let closed = key_owner.update(cx, |pane, cx| {
+                                if !pane.executing {
+                                    pane.close();
+                                    cx.notify();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if closed {
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
                     .w(px(Space::XXL * 30.))
                     .max_w(relative(0.92))
                     .max_h(relative(0.88))
