@@ -69,6 +69,20 @@ pub struct PlanNode {
     pub cost: Option<f64>,
     /// 预估行数。
     pub rows: Option<f64>,
+    /// 实际耗时（毫秒，EXPLAIN ANALYZE / MariaDB ANALYZE）。
+    pub actual_time_ms: Option<f64>,
+    /// 实际返回行数（EXPLAIN ANALYZE / MariaDB ANALYZE）。
+    pub actual_rows: Option<f64>,
+    /// 循环执行次数（EXPLAIN ANALYZE / MariaDB ANALYZE）。
+    pub loops: Option<u64>,
+    /// 过滤率百分比（0..=100）。
+    pub filtered: Option<f64>,
+    /// 访问类型（如 const / eq_ref / ref / range / index / ALL）。
+    pub access_type: Option<String>,
+    /// 实际使用的索引名。
+    pub key_used: Option<String>,
+    /// 是否命中覆盖索引（Using index / Covering index）。
+    pub covering_index: bool,
     /// 引擎给出的全部原始属性，详情面板逐条列出。
     pub props: Vec<(String, String)>,
     pub issues: Vec<Issue>,
@@ -82,13 +96,28 @@ impl PlanNode {
 
     pub fn kind(&self) -> OpKind {
         let op = self.op.to_ascii_lowercase();
-        if op.contains("join") || op.contains("nested loop") || op.contains("merge") && !op.contains("append") {
+        if op.contains("join") || op.contains("nested loop") || (op.contains("merge") && !op.contains("append") && !op.contains("index_merge")) {
             OpKind::Join
-        } else if op.contains("sort") || op.contains("temp b-tree") || op.contains("filesort") {
+        } else if op.contains("sort") || op.contains("temp b-tree") || op.contains("filesort") || op.contains("ordering") {
             OpKind::Sort
-        } else if op.contains("aggregate") || op.contains("group") || op.contains("hash match") {
+        } else if op.contains("aggregate") || op.contains("group") || op.contains("hash match") || op.contains("duplicates removal") {
             OpKind::Aggregate
-        } else if op.contains("search") || op.contains("seek") || op.contains("lookup") || op.contains("index scan") || op.contains("index only") || op.contains("ref") || op.contains("eq_ref") || op.contains("const") {
+        } else if op.contains("search")
+            || op.contains("seek")
+            || op.contains("lookup")
+            || op.contains("index scan")
+            || op.contains("index only")
+            || op.contains("covering index")
+            || op.contains("index range")
+            || op.contains("ref")
+            || op.contains("eq_ref")
+            || op.contains("const")
+            || op == "system"
+            || op == "range"
+            || op == "index"
+            || op == "index_merge"
+            || op == "fulltext"
+        {
             OpKind::Seek
         } else if op.contains("scan") || op == "all" {
             OpKind::Scan
@@ -142,6 +171,29 @@ impl Plan {
         self.roots.first().and_then(|root| root.rows)
     }
 
+    /// 根节点的实际返回行数（EXPLAIN ANALYZE / MariaDB ANALYZE）。
+    pub fn result_actual_rows(&self) -> Option<f64> {
+        self.roots.first().and_then(|root| root.actual_rows)
+    }
+
+    /// 整个计划的实际耗时（毫秒）：根节点之和；根节点没有时退回最大单节点耗时。
+    pub fn total_actual_time_ms(&self) -> Option<f64> {
+        let times: Vec<f64> = self.roots.iter().filter_map(|node| node.actual_time_ms).collect();
+        if !times.is_empty() {
+            Some(times.iter().sum())
+        } else {
+            self.max_actual_time_ms()
+        }
+    }
+
+    /// 最大的单节点实际耗时（毫秒）：耗时占比条按它归一。
+    pub fn max_actual_time_ms(&self) -> Option<f64> {
+        self.lines()
+            .iter()
+            .filter_map(|line| line.node.actual_time_ms)
+            .fold(None, |best: Option<f64>, time| Some(best.map_or(time, |best| best.max(time))))
+    }
+
     /// 全部问题：（问题, 所在节点的对象）。同一对象同一问题只列一次。
     pub fn findings(&self) -> Vec<(Issue, Option<String>)> {
         let mut out: Vec<(Issue, Option<String>)> = Vec::new();
@@ -157,10 +209,20 @@ impl Plan {
     }
 }
 
+fn starts_with_keyword(upper: &str, keyword: &str) -> bool {
+    upper
+        .strip_prefix(keyword)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_ascii_whitespace() || ch == '('))
+}
+
 /// 这条语句的结果是不是执行计划；是就解析，不是或认不出返回 None。各引擎的结果形态由适配器认。
 pub fn parse(engine: &str, sql: &str, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Plan> {
     let upper = sql.trim_start().to_ascii_uppercase();
-    let explained = upper.starts_with("EXPLAIN") || upper.starts_with("SET SHOWPLAN");
+    let explained = starts_with_keyword(&upper, "EXPLAIN")
+        || upper.starts_with("SET SHOWPLAN")
+        || (starts_with_keyword(&upper, "ANALYZE") && !upper.starts_with("ANALYZE TABLE"))
+        || starts_with_keyword(&upper, "DESC")
+        || starts_with_keyword(&upper, "DESCRIBE");
     let roots = crate::adapters::query::syntax_named(engine)?.parse_plan(sql, explained, columns, rows)?;
     let plan = Plan { engine: engine.to_owned(), roots };
     if plan.roots.is_empty() {
@@ -453,5 +515,186 @@ mod tests {
         assert!(parse("mysql", "SELECT 'x'", &columns(&["EXPLAIN"]), &rows(&[&["-> Table scan on t"]])).is_none());
         assert!(parse("sqlite", "SELECT 1", &columns(&["a"]), &rows(&[&["1"]])).is_none());
         assert!(parse("postgres", "EXPLAIN select", &columns(&["QUERY PLAN"]), &rows(&[&["{not json"]])).is_none());
+    }
+
+    #[test]
+    fn mysql8_json_plan_extracts_cost_info_without_spurious_child_nodes() {
+        let json = r#"{
+          "query_block": {
+            "select_id": 1,
+            "cost_info": { "query_cost": "125.50" },
+            "ordering_operation": {
+              "using_temporary_table": true,
+              "using_filesort": true,
+              "cost_info": { "sort_cost": "12.00" },
+              "nested_loop": [
+                {
+                  "table": {
+                    "table_name": "orders",
+                    "access_type": "range",
+                    "possible_keys": ["idx_created"],
+                    "key": "idx_created",
+                    "used_key_parts": ["created_at"],
+                    "rows_examined_per_scan": 400,
+                    "rows_produced_per_join": 200,
+                    "filtered": "50.00",
+                    "using_index": true,
+                    "attached_condition": "(orders.status = 'paid')",
+                    "cost_info": { "read_cost": "40.25", "eval_cost": "20.00", "prefix_cost": "60.25" },
+                    "used_columns": ["id", "customer_id", "status"]
+                  }
+                },
+                {
+                  "table": {
+                    "table_name": "customers",
+                    "access_type": "eq_ref",
+                    "key": "PRIMARY",
+                    "used_key_parts": ["id"],
+                    "rows_examined_per_scan": 1,
+                    "filtered": "100.00",
+                    "cost_info": { "read_cost": "50.00", "eval_cost": "15.25", "prefix_cost": "125.50" }
+                  }
+                }
+              ]
+            }
+          }
+        }"#;
+        let plan = parse("mysql", "EXPLAIN FORMAT=JSON SELECT * FROM orders JOIN customers", &columns(&["EXPLAIN"]), &rows(&[&[json]])).expect("plan");
+        let lines = plan.lines();
+        assert!(!lines.iter().any(|line| line.node.op == "cost_info"), "cost_info 不能作为子节点出现");
+        assert!(!lines.iter().any(|line| line.node.op == "used_columns"), "used_columns 不能作为子节点出现");
+        assert_eq!(plan.total_cost(), Some(125.50));
+        assert_eq!(lines[0].node.op, "Query block #1");
+        assert_eq!(lines[0].node.cost, Some(125.50));
+        assert!(lines[0].node.props.iter().any(|(k, v)| k == "cost_info.query_cost" && v == "125.50"));
+
+        assert_eq!(lines[1].node.op, "ordering operation");
+        assert_eq!(lines[1].node.cost, Some(12.0));
+        assert_eq!(lines[1].node.issues, vec![Issue::TempSort, Issue::TempTable]);
+
+        let orders = lines[2].node;
+        assert_eq!(orders.object.as_deref(), Some("orders"));
+        assert_eq!(orders.access_type.as_deref(), Some("range"));
+        assert_eq!(orders.key_used.as_deref(), Some("idx_created"));
+        assert!(orders.covering_index);
+        assert_eq!(orders.rows, Some(400.0));
+        assert_eq!(orders.filtered, Some(50.0));
+        assert_eq!(orders.cost, Some(60.25));
+
+        let customers = lines[3].node;
+        assert_eq!(customers.object.as_deref(), Some("customers"));
+        assert_eq!(customers.access_type.as_deref(), Some("eq_ref"));
+        assert_eq!(customers.key_used.as_deref(), Some("PRIMARY"));
+        assert!(!customers.covering_index);
+        assert_eq!(customers.cost, Some(125.50));
+    }
+
+    #[test]
+    fn mysql8_explain_analyze_parses_actual_metrics_and_never_executed() {
+        let tree = "\
+-> Nested loop inner join  (cost=2250.25 rows=5000) (actual time=0.120..18.450 rows=420 loops=1)
+    -> Table scan on o  (cost=500.25 rows=5000) (actual time=0.032..4.567 rows=5000 loops=1)
+    -> Covering index lookup on c using idx_cust (id=o.customer_id)  (cost=0.25 rows=1) (actual time=0.002..0.003 rows=1 loops=420)
+    -> Index lookup on d using idx_dead (id=o.id)  (cost=1.10 rows=2) (never executed)";
+        let plan = parse("mysql", "EXPLAIN ANALYZE SELECT * FROM o JOIN c", &columns(&["EXPLAIN"]), &rows(&[&[tree]])).expect("plan");
+        assert_eq!(plan.total_cost(), Some(2250.25));
+        assert_eq!(plan.total_actual_time_ms(), Some(18.45));
+        assert_eq!(plan.max_actual_time_ms(), Some(18.45));
+        assert_eq!(plan.result_actual_rows(), Some(420.0));
+
+        let lines = plan.lines();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].node.loops, Some(1));
+
+        let scan = lines[1].node;
+        assert_eq!(scan.access_type.as_deref(), Some("ALL"));
+        assert_eq!(scan.actual_time_ms, Some(4.567));
+        assert_eq!(scan.actual_rows, Some(5000.0));
+        assert_eq!(scan.loops, Some(1));
+        assert_eq!(scan.issues, vec![Issue::FullScan]);
+
+        let cov = lines[2].node;
+        assert_eq!(cov.access_type.as_deref(), Some("ref"));
+        assert_eq!(cov.key_used.as_deref(), Some("idx_cust"));
+        assert!(cov.covering_index);
+        assert_eq!(cov.actual_time_ms, Some(0.003));
+        assert_eq!(cov.actual_rows, Some(1.0));
+        assert_eq!(cov.loops, Some(420));
+
+        let dead = lines[3].node;
+        assert_eq!(dead.cost, Some(1.10));
+        assert_eq!(dead.rows, Some(2.0));
+        assert_eq!(dead.loops, Some(0));
+        assert_eq!(dead.actual_rows, Some(0.0));
+        assert_eq!(dead.actual_time_ms, Some(0.0));
+    }
+
+    #[test]
+    fn mariadb_analyze_json_parses_runtime_metrics() {
+        let json = r#"{
+          "query_block": {
+            "select_id": 1,
+            "r_loops": 1,
+            "r_total_time_ms": 9.82,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "orders",
+                  "access_type": "index",
+                  "key": "idx_status",
+                  "rows": 1200,
+                  "r_loops": 1,
+                  "r_rows": 980,
+                  "r_total_time_ms": 6.45,
+                  "filtered": 100,
+                  "r_filtered": 42.5,
+                  "using_index": true,
+                  "attached_condition": "orders.status = 'open'"
+                }
+              }
+            ]
+          }
+        }"#;
+        let plan = parse("mariadb", "ANALYZE FORMAT=JSON SELECT * FROM orders", &columns(&["ANALYZE"]), &rows(&[&[json]])).expect("plan");
+        assert_eq!(plan.total_actual_time_ms(), Some(9.82));
+        let lines = plan.lines();
+        assert_eq!(lines.len(), 2);
+        let tbl = lines[1].node;
+        assert_eq!(tbl.object.as_deref(), Some("orders"));
+        assert_eq!(tbl.access_type.as_deref(), Some("index"));
+        assert_eq!(tbl.key_used.as_deref(), Some("idx_status"));
+        assert!(tbl.covering_index);
+        assert_eq!(tbl.rows, Some(1200.0));
+        assert_eq!(tbl.actual_rows, Some(980.0));
+        assert_eq!(tbl.loops, Some(1));
+        assert_eq!(tbl.actual_time_ms, Some(6.45));
+        assert_eq!(tbl.filtered, Some(42.5));
+    }
+
+    #[test]
+    fn mysql_traditional_multiblock_explain_builds_hierarchy() {
+        let cols = columns(&["id", "select_type", "table", "type", "possible_keys", "key", "rows", "filtered", "Extra"]);
+        let data = vec![
+            vec![Some("1".into()), Some("PRIMARY".into()), Some("<derived2>".into()), Some("ALL".into()), None, None, Some("100".into()), Some("100.00".into()), None],
+            vec![Some("1".into()), Some("PRIMARY".into()), Some("c".into()), Some("eq_ref".into()), Some("PRIMARY".into()), Some("PRIMARY".into()), Some("1".into()), Some("100.00".into()), Some("Using index".into())],
+            vec![Some("2".into()), Some("DERIVED".into()), Some("orders".into()), Some("range".into()), Some("idx_dt".into()), Some("idx_dt".into()), Some("100".into()), Some("25.00".into()), Some("Using index condition".into())],
+            vec![Some("3".into()), Some("SUBQUERY".into()), Some("vip".into()), Some("ref".into()), Some("idx_vip".into()), Some("idx_vip".into()), Some("10".into()), Some("50.00".into()), Some("Using index".into())],
+        ];
+        let plan = parse("mysql", "DESC SELECT * FROM (SELECT * FROM orders) d JOIN c", &cols, &data).expect("plan");
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].op, "PRIMARY #1");
+        let lines = plan.lines();
+        // PRIMARY #1 -> <derived2> -> DERIVED #2 -> orders; c; SUBQUERY #3 -> vip
+        assert_eq!(lines[1].node.object.as_deref(), Some("<derived2>"));
+        assert_eq!(lines[2].node.op, "DERIVED #2");
+        assert_eq!(lines[2].depth, 2);
+        assert_eq!(lines[3].node.object.as_deref(), Some("orders"));
+        assert_eq!(lines[3].node.filtered, Some(25.0));
+        assert!(!lines[3].node.covering_index, "Using index condition 不是覆盖索引");
+        let c_node = lines.iter().find(|l| l.node.object.as_deref() == Some("c")).unwrap().node;
+        assert!(c_node.covering_index, "Using index 是覆盖索引");
+        assert_eq!(c_node.key_used.as_deref(), Some("PRIMARY"));
+        assert_eq!(c_node.access_type.as_deref(), Some("eq_ref"));
+        assert!(lines.iter().any(|l| l.node.op == "SUBQUERY #3" && l.depth == 1));
     }
 }

@@ -465,6 +465,11 @@ pub trait SqlSyntax: Sync {
         self.explain(body)
     }
 
+    /// 是否允许把带 ANALYZE 的执行计划语句放行给当前引擎（例如 MySQL 8.0.18+ `EXPLAIN ANALYZE`、MariaDB `ANALYZE SELECT`）。
+    fn allows_explain_analyze(&self, _first: Option<&str>, _second: Option<&str>, _server_version: Option<&str>) -> bool {
+        false
+    }
+
     /// 解析执行计划结果；`explained` 表示语句以 EXPLAIN / SET SHOWPLAN 开头。认不出返回 None。
     fn parse_plan(&self, _sql: &str, _explained: bool, _columns: &[String], _rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
         None

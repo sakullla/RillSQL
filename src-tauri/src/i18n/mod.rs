@@ -723,6 +723,9 @@ dict! {
     "query.plan.title" => "执行计划", "Execution plan";
     "query.plan.cost" => "代价", "Cost";
     "query.plan.estRows" => "预估 {rows} 行", "~{rows} rows";
+    "query.plan.actualTime" => "实际耗时", "Actual time";
+    "query.plan.actualRows" => "实际行数", "Actual rows";
+    "query.plan.actualRowsSummary" => "实际 {rows} 行", "{rows} actual rows";
     "query.plan.noIssues" => "未发现明显问题", "No obvious issues";
     "query.plan.issues" => "{count} 个问题", "{count} issues";
     "query.plan.viewTree" => "计划", "Plan";
@@ -730,6 +733,13 @@ dict! {
     "query.plan.colOperation" => "操作", "Operation";
     "query.plan.colRows" => "预估行数", "Est. rows";
     "query.plan.colShare" => "代价占比", "Cost share";
+    "query.plan.colTimeShare" => "耗时占比", "Time share";
+    "query.plan.loops" => "循环次数", "Loops";
+    "query.plan.filtered" => "过滤率", "Filtered";
+    "query.plan.accessType" => "访问方式", "Access";
+    "query.plan.keyUsed" => "索引", "Index";
+    "query.plan.coveringIndex" => "覆盖索引", "Covering";
+    "query.plan.condition" => "条件与详情", "Condition & detail";
     "query.plan.rawProps" => "引擎原始属性", "Engine attributes";
     "query.plan.issue.fullScan" => "全表扫描", "Full scan";
     "query.plan.issue.tempSort" => "临时排序", "Extra sort";

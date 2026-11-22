@@ -89,7 +89,8 @@ impl SqlSyntax for MysqlSyntax {
 
     /// MySQL 8 用 TREE 格式；MariaDB 没有 TREE，用 JSON。
     fn explain(&self, body: &str) -> String {
-        if body.to_ascii_uppercase().starts_with("EXPLAIN") {
+        let upper = body.trim_start().to_ascii_uppercase();
+        if upper.starts_with("EXPLAIN") || (self.mariadb && upper.starts_with("ANALYZE")) {
             body.to_owned()
         } else if self.mariadb {
             format!("EXPLAIN FORMAT=JSON {body}")
@@ -100,12 +101,23 @@ impl SqlSyntax for MysqlSyntax {
 
     /// MySQL 8.0.16 起才有 `FORMAT=TREE`；更低版本或版本未知时用传统表格格式。MariaDB 始终用 JSON。
     fn explain_for(&self, body: &str, server_version: Option<&str>) -> String {
-        if self.mariadb || body.to_ascii_uppercase().starts_with("EXPLAIN") {
+        let upper = body.trim_start().to_ascii_uppercase();
+        if self.mariadb || upper.starts_with("EXPLAIN") {
             return self.explain(body);
         }
         match server_version.and_then(version_triple) {
             Some(version) if version >= (8, 0, 16) => self.explain(body),
             _ => format!("EXPLAIN {body}"),
+        }
+    }
+
+    fn allows_explain_analyze(&self, first: Option<&str>, second: Option<&str>, server_version: Option<&str>) -> bool {
+        if self.mariadb {
+            first == Some("ANALYZE") && second.is_some_and(|next| next != "TABLE")
+        } else {
+            first == Some("EXPLAIN")
+                && second == Some("ANALYZE")
+                && server_version.and_then(version_triple).is_some_and(|version| version >= (8, 0, 18))
         }
     }
 

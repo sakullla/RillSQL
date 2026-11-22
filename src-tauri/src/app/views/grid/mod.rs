@@ -6,12 +6,14 @@ mod session;
 mod temporal;
 pub use session::group_digits;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub use session::{display_banner, operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{CompletionProvider, Editor, EditorState, InputEvent, InputState, Rope};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableSelection, TableState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -20,6 +22,7 @@ use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
     relative, DragMoveEvent,
 };
+use lsp_types::{CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, TextEdit};
 
 use crate::ui::kit::{self, Palette, Tip as _, Radius, Space, TypeScale};
 
@@ -27,6 +30,231 @@ use crate::ui::kit::{self, Palette, Tip as _, Radius, Space, TypeScale};
 const TOOLBAR_BADGE_SIZE: f32 = 14.;
 /// 工具栏单行提示消息最大宽度（超出截断并在悬停提示展示全文）。
 const NOTICE_MAX_W: f32 = 360.;
+/// SQL WHERE 筛选输入框的补全弹层最大宽度。
+const SQL_FILTER_COMPLETION_MAX_W: f32 = 360.;
+
+/// SQL WHERE 筛选补全里的一列元数据（来自当前表结构或结果列）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SqlFilterColumn {
+    name: String,
+    type_name: String,
+    primary: bool,
+    nullable: bool,
+}
+
+impl SqlFilterColumn {
+    fn detail(&self) -> String {
+        let mut parts = Vec::new();
+        let ty = self.type_name.trim();
+        if !ty.is_empty() {
+            parts.push(ty.to_owned());
+        }
+        if self.primary {
+            parts.push("PK".to_owned());
+        } else if !self.nullable {
+            parts.push("NOT NULL".to_owned());
+        } else {
+            parts.push("NULL".to_owned());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// SQL WHERE 条件常用关键字与运算符。
+const SQL_WHERE_KEYWORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "IS NULL",
+    "IS NOT NULL",
+    "LIKE",
+    "NOT LIKE",
+    "BETWEEN",
+    "REGEXP",
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "COALESCE",
+    "LOWER",
+    "UPPER",
+    "LENGTH",
+    "CAST",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+];
+
+struct SqlFilterSuggest {
+    columns: Rc<RefCell<Vec<SqlFilterColumn>>>,
+}
+
+impl SqlFilterSuggest {
+    fn suggest(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
+        let (start, end, prefix) = sql_filter_word_bounds(text, offset);
+        let range = lsp_types::Range {
+            start: sql_filter_offset_to_position(text, start),
+            end: sql_filter_offset_to_position(text, end),
+        };
+        let query_lower = prefix.to_ascii_lowercase();
+        let mut ranked: Vec<(u8, u8, usize, CompletionItem)> = Vec::new();
+
+        for (idx, col) in self.columns.borrow().iter().enumerate() {
+            if let Some(rank) = sql_filter_match_rank(&col.name, &query_lower) {
+                let detail = col.detail();
+                ranked.push((
+                    rank,
+                    0,
+                    idx,
+                    CompletionItem {
+                        label: col.name.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: (!detail.is_empty()).then_some(detail),
+                        insert_text: Some(col.name.clone()),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range,
+                            new_text: col.name.clone(),
+                        })),
+                        ..CompletionItem::default()
+                    },
+                ));
+            }
+        }
+
+        for (idx, kw) in SQL_WHERE_KEYWORDS.iter().enumerate() {
+            if let Some(rank) = sql_filter_match_rank(kw, &query_lower) {
+                ranked.push((
+                    rank,
+                    1,
+                    idx,
+                    CompletionItem {
+                        label: (*kw).to_owned(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        detail: Some("SQL".to_owned()),
+                        insert_text: Some((*kw).to_owned()),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range,
+                            new_text: (*kw).to_owned(),
+                        })),
+                        ..CompletionItem::default()
+                    },
+                ));
+            }
+        }
+
+        ranked.sort_by_key(|(rank, group, idx, _)| (*rank, *group, *idx));
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(order, (_, _, _, mut item))| {
+                item.sort_text = Some(format!("{order:04}"));
+                item
+            })
+            .collect()
+    }
+}
+
+impl CompletionProvider for SqlFilterSuggest {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _trigger: CompletionContext,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> gpui_kit::Task<gpui_kit::Result<CompletionResponse>> {
+        gpui_kit::Task::ready(Ok(CompletionResponse::Array(self.suggest(text, offset))))
+    }
+
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
+        new_text.chars().any(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+}
+
+fn sql_filter_match_rank(candidate: &str, query_lower: &str) -> Option<u8> {
+    if query_lower.is_empty() {
+        return Some(0);
+    }
+    let lower = candidate.to_ascii_lowercase();
+    if lower.starts_with(query_lower) {
+        Some(0)
+    } else if lower.contains(query_lower) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn sql_filter_word_bounds(text: &Rope, offset: usize) -> (usize, usize, String) {
+    let offset = offset.min(text.len());
+    let head = text.slice(0..offset).to_string();
+    let prefix: String = head
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let start = offset.saturating_sub(prefix.len());
+    let tail = text.slice(offset..text.len()).to_string();
+    let tail_len: usize = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(char::len_utf8)
+        .sum();
+    (start, offset + tail_len, prefix)
+}
+
+fn sql_filter_offset_to_position(text: &Rope, offset: usize) -> lsp_types::Position {
+    let offset = offset.min(text.len());
+    let prefix = text.slice(0..offset).to_string();
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let character = prefix
+        .rsplit_once('\n')
+        .map(|(_, rest)| rest.encode_utf16().count())
+        .unwrap_or_else(|| prefix.encode_utf16().count()) as u32;
+    lsp_types::Position { line, character }
+}
+
+/// WHERE 补全项匹配高亮：优先高亮连续子串（词首或下划线后优先），避免未命中整段染蓝。
+fn highlight_sql_filter_completion(query: &str, item: &CompletionItem) -> Vec<std::ops::Range<usize>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let q_chars: Vec<char> = q.chars().collect();
+    let h_chars: Vec<(usize, char)> = item.label.char_indices().collect();
+    if let Some(last_start) = h_chars.len().checked_sub(q_chars.len()) {
+        let eq_at = |start: usize| {
+            q_chars
+                .iter()
+                .zip(h_chars[start..].iter())
+                .all(|(qc, (_, hc))| qc.eq_ignore_ascii_case(hc) || qc.to_lowercase().eq(hc.to_lowercase()))
+        };
+        let span_at = |start: usize| {
+            let byte_start = h_chars[start].0;
+            let (last_ix, last_ch) = h_chars[start + q_chars.len() - 1];
+            byte_start..(last_ix + last_ch.len_utf8())
+        };
+        if eq_at(0) {
+            return vec![span_at(0)];
+        }
+        for start in 1..=last_start {
+            if h_chars[start - 1].1 == '_' && eq_at(start) {
+                return vec![span_at(start)];
+            }
+        }
+        for start in 1..=last_start {
+            if eq_at(start) {
+                return vec![span_at(start)];
+            }
+        }
+    }
+    gpui_kit::base::input::highlight_characters(q, item)
+}
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -234,8 +462,10 @@ pub struct GridPane {
     /// 触发按钮上一帧在窗口里的位置。
     picker_anchors: column_pick::PickerAnchors,
     /// 直接 SQL 条件输入框与它的订阅：与结构化条件的输入框分开保存，切换形态不丢文本。
-    sql_input: Option<Entity<InputState>>,
+    sql_input: Option<Entity<EditorState>>,
     sql_subscription: Option<gpui_kit::Subscription>,
+    sql_tab_subscription: Option<gpui_kit::Subscription>,
+    sql_columns: Rc<RefCell<Vec<SqlFilterColumn>>>,
     search: Option<Entity<InputState>>,
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
     clear_search: bool,
@@ -446,6 +676,8 @@ impl GridPane {
             picker_anchors: Default::default(),
             sql_input: None,
             sql_subscription: None,
+            sql_tab_subscription: None,
+            sql_columns: Rc::new(RefCell::new(Vec::new())),
             filters_open: false,
             filters_collapsed: false,
             search: None,
@@ -2179,9 +2411,46 @@ impl GridPane {
         self.filter_subscriptions = subscriptions;
     }
 
-    /// 直接 SQL 条件的输入框：按需创建一次，之后每帧把会话里的文本（模式切换生成、
-    /// 清除条件）同步回来；输入变化只改草稿，回车才应用。
+    fn sql_filter_columns(&self) -> Vec<SqlFilterColumn> {
+        if let Some(schema) = self.session.schema() {
+            if !schema.columns.is_empty() {
+                return schema
+                    .columns
+                    .iter()
+                    .map(|col| SqlFilterColumn {
+                        name: col.name.clone(),
+                        type_name: col.type_name.clone(),
+                        primary: col.primary,
+                        nullable: col.nullable,
+                    })
+                    .collect();
+            }
+        }
+        self.session
+            .column_names()
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| SqlFilterColumn {
+                name,
+                type_name: self.session.column_type(index).unwrap_or_default().to_owned(),
+                primary: false,
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn sync_sql_columns(&self) {
+        let next = self.sql_filter_columns();
+        let mut slot = self.sql_columns.borrow_mut();
+        if *slot != next {
+            *slot = next;
+        }
+    }
+
+    /// 直接 SQL 条件的输入框：按需创建一次，带 SQL 语法高亮与列/关键字智能补全；
+    /// 之后每帧把会话里的文本（模式切换生成、清除条件）同步回来；输入变化只改草稿，回车才应用。
     fn ensure_sql_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_sql_columns();
         if let Some(state) = self.sql_input.clone() {
             let current = state.read(cx).value().to_string();
             let wanted = self.session.filter_sql().to_owned();
@@ -2191,7 +2460,21 @@ impl GridPane {
             return;
         }
         let placeholder = SharedString::from(i18n::text(self.locale, "grid.filter.sqlPlaceholder"));
-        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let columns = self.sql_columns.clone();
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("sql")
+                .line_number(false)
+                .folding(false)
+                .soft_wrap(false)
+                .searchable(false)
+                .submit_on_enter(true)
+                .placeholder(placeholder);
+            state.lsp_mut().completion_menu.max_width = px(SQL_FILTER_COMPLETION_MAX_W);
+            state.lsp_mut().set_completion_highlighter(Rc::new(highlight_sql_filter_completion));
+            state.lsp_mut().completion_provider = Some(Rc::new(SqlFilterSuggest { columns }));
+            state
+        });
         state.update(cx, |state, cx| state.set_value(self.session.filter_sql().to_owned(), window, cx));
         let subscription = cx.subscribe(&state, |this, state, event: &InputEvent, cx| match event {
             InputEvent::Change => {
@@ -2200,14 +2483,37 @@ impl GridPane {
                     cx.notify();
                 }
             }
-            // 只有显式应用才发查询；非法表达式停在这里。
-            InputEvent::PressEnter { .. } => {
+            // 补全弹层打开时 Enter 会先被编辑器消费；弹层关闭时 Enter 才应用筛选。
+            InputEvent::PressEnter { shift: false, .. } if !state.read(cx).completion_menu_state().open => {
                 let _ = this.apply_filters(cx);
             }
             _ => {}
         });
+        // 补全弹层打开时把 Tab 映射成接受当前补全项，关闭时保持默认焦点遍历。
+        let tab_subscription = cx.intercept_keystrokes({
+            let state = state.downgrade();
+            move |event, window, cx| {
+                if event.keystroke.key != "tab" || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let ours = state
+                    .update(cx, |state, cx| {
+                        state.completion_menu_state().open && state.focus_handle(cx).is_focused(window)
+                    })
+                    .unwrap_or(false);
+                if !ours {
+                    return;
+                }
+                cx.stop_propagation();
+                window.dispatch_action(
+                    Box::new(gpui_kit::base::input::Enter { secondary: false, shift: false }),
+                    cx,
+                );
+            }
+        });
         self.sql_input = Some(state);
         self.sql_subscription = Some(subscription);
+        self.sql_tab_subscription = Some(tab_subscription);
     }
 
     /// 切换条件写法：只换编辑形态，不读取、不丢另一种写法的草稿；被拒绝时说明原因。
@@ -3116,6 +3422,7 @@ impl GridPane {
     }
 
     fn sync_table(&mut self, cx: &mut App) {
+        self.sync_sql_columns();
         let names = self.session.column_names();
         let widths = self.session.widths();
         let row_count = self.session.loaded_len();
@@ -4324,14 +4631,15 @@ impl GridPane {
             rows.child(kit::tool_button("grid-filter-add-strip", Some(IconName::Plus), t("grid.filter.add"), add).into_any_element())
                 .into_any_element()
         } else {
-            // SQL 条件是一个看得出边界的输入框：前面固定写 WHERE，说明这里只填条件；等宽字体与编辑器一致。
+            // SQL 条件是一个看得出边界的单行 SQL 编辑器：前面固定写 WHERE，带 SQL 语法高亮与列/关键字补全。
+            let m = kit::Metrics::of(cx);
             let mono = cx.theme().mono_font_family.clone();
             let mut row = div()
                 .id("grid-filter-sql-row")
                 .debug_selector(|| "grid-filter-sql-row".to_owned())
                 .flex_1()
                 .min_w(px(220.))
-                .h(px(28.))
+                .h(px(m.control_h))
                 .pl(px(Space::SM))
                 .pr(px(Space::XS))
                 .flex()
@@ -4358,11 +4666,25 @@ impl GridPane {
             if let Some(state) = self.sql_input.clone() {
                 row = row.child(
                     div()
+                        .id("grid-filter-sql-input")
+                        .debug_selector(|| "grid-filter-sql-input".to_owned())
                         .flex_1()
                         .min_w_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
                         .font_family(mono)
                         // 输入框的可读名字用"直接写 WHERE 表达式"；示例长句留在占位符里。
-                        .child(kit::inline_input("grid-filter-sql-input", &state, t("grid.filter.sqlTitle"))),
+                        .child(
+                            Editor::new(&state)
+                                .small()
+                                .h(relative(1.))
+                                .appearance(false)
+                                .bordered(false)
+                                .aria_label(t("grid.filter.sqlTitle"))
+                                .text_size(px(TypeScale::SM))
+                                .line_height(relative(1.2)),
+                        ),
                 );
             }
             row.child(
@@ -11489,6 +11811,112 @@ mod filter_ui_tests {
             assert!(window.try_find("grid-filter-collapsed-badge").is_none(), "展开后隐藏折叠徽标");
         })
         .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui_kit::test]
+    async fn sql_filter_editor_highlights_sql_and_completes_table_columns(cx: &mut TestAppContext) {
+        use gpui_kit::EntityInputHandler as _;
+        use gpui_kit::test::TestAppContextExt as _;
+        cx.executor().allow_parking();
+        let (dir, services) = sqlite_services(
+            "sql-filter-suggest",
+            &[
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, level TEXT NOT NULL, target TEXT NOT NULL, message TEXT)".to_owned(),
+                "INSERT INTO logs (id, level, target, message) VALUES (1, 'DEBUG', 'rillsql::grid', 'hello')".to_owned(),
+            ],
+        );
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, _, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(target_of("logs"), 100, cx));
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| pane.read(cx).loaded_len() == 1).await;
+
+        let sql_editor = cx
+            .update_window(window, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    assert!(pane.pick_filter_mode(session::FilterMode::Sql, cx));
+                });
+                window.render_frame(cx);
+                let state = pane.read(cx).sql_input.clone().expect("SQL WHERE 编辑器已创建");
+                assert_eq!(state.read(cx).language_name(), "sql", "WHERE 编辑器启用 SQL 语法高亮");
+                state
+            })
+            .unwrap();
+
+        // 输入 `level = 'DEBUG' and tar` 并触发补全，验证 `target` 列与类型详情被优先返回。
+        cx.update_window(window, |_, window, cx| {
+            let input = "level = 'DEBUG' and tar";
+            sql_editor.update(cx, |state, cx| {
+                state.focus_handle(cx).focus(window, cx);
+                state.replace_text_in_range(None, input, window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(sql_editor.read(cx).value().as_str(), "level = 'DEBUG' and tar");
+            assert_eq!(pane.read(cx).session.filter_sql(), "level = 'DEBUG' and tar");
+            let menu = sql_editor.read(cx).completion_menu_state();
+            assert!(menu.open, "输入列名前缀后应自动打开补全弹层");
+            assert_eq!(menu.items.first().map(|item| item.label.as_str()), Some("target"), "补全弹层首位应是表列 target");
+        })
+        .unwrap();
+
+        // 直接查询附着在 EditorState 上的 CompletionProvider，验证列补全与类型详情。
+        let items = cx
+            .update_window(window, |_, window, cx| {
+                let provider = sql_editor
+                    .read(cx)
+                    .lsp()
+                    .completion_provider
+                    .clone()
+                    .expect("WHERE 编辑器已挂载补全提供者");
+                let text = sql_editor.read(cx).text().clone();
+                let offset = sql_editor.read(cx).cursor();
+                let trigger = CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                };
+                provider.completions(&text, offset, trigger, window, cx)
+            })
+            .unwrap()
+            .await
+            .expect("补全返回成功");
+        let list = match items {
+            CompletionResponse::Array(list) => list,
+            CompletionResponse::List(list) => list.items,
+        };
+        let target_item = list.iter().find(|item| item.label == "target").expect("应补全表列 target");
+        assert_eq!(target_item.kind, Some(CompletionItemKind::FIELD));
+        let detail = target_item.detail.as_deref().unwrap_or("");
+        assert!(detail.to_ascii_lowercase().contains("text"), "列补全详情应含列类型：{detail}");
+        assert!(detail.contains("NOT NULL"), "列补全详情应含可空性：{detail}");
+        assert_eq!(list.first().map(|item| item.label.as_str()), Some("target"), "前缀匹配的表列应排在首位");
+
+        // 同时验证 SQL WHERE 关键字补全（输入 `and` 片段也能命中 AND）。
+        let kw_items = cx
+            .update_window(window, |_, window, cx| {
+                let provider = sql_editor.read(cx).lsp().completion_provider.clone().unwrap();
+                let rope = Rope::from("level = 'DEBUG' li");
+                let trigger = CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                };
+                provider.completions(&rope, rope.len(), trigger, window, cx)
+            })
+            .unwrap()
+            .await
+            .expect("关键字补全返回成功");
+        let kw_list = match kw_items {
+            CompletionResponse::Array(list) => list,
+            CompletionResponse::List(list) => list.items,
+        };
+        let like_item = kw_list.iter().find(|item| item.label == "LIKE").expect("应补全 SQL 关键字 LIKE");
+        assert_eq!(like_item.kind, Some(CompletionItemKind::KEYWORD));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

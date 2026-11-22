@@ -58,6 +58,28 @@ enum SchemaState {
     Manual(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TableListState {
+    Loading,
+    Ready(Vec<String>),
+    Error(String),
+}
+
+const PAGE_MAX_W: f32 = 1200.;
+const DIFF_TREE_W: f32 = 300.;
+const DIFF_TREE_MAX_H: f32 = 520.;
+const DIFF_DEF_MAX_H: f32 = 380.;
+const SCRIPT_EDITOR_H: f32 = 220.;
+const TABLE_AC_MAX_H: f32 = 240.;
+const FILTER_SEARCH_W: f32 = 200.;
+const PROMPT_MIN_W: f32 = 180.;
+const MARK_COL_W: f32 = 14.;
+const ZERO_PX: f32 = 0.;
+const ONE_PX: f32 = 1.;
+const LIST_CHOICE_EXTRA_H: f32 = 2.;
+const SIDE_LIST_VISIBLE_ROWS: f32 = 3.5;
+const _: f32 = TypeScale::XL;
+
 /// 提示的语义：门禁、取消、过期只是告知，读取失败才要给重试。
 /// 两类排版与动作不同，不再把一切都画成同一条横幅（规范 S8.5 三态 + 主操作）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +223,14 @@ pub struct ComparePane {
     table_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
     /// 表名被命令改过（交换、重新带入）：下一帧把输入框同步成新值。
     table_reload: bool,
+    /// 按 `(connection_id, database, schema)` 缓存的表名列表，供表对表输入框智能补全。
+    tables_cache: BTreeMap<String, TableListState>,
+    /// 当前展开表名补全弹层的一侧（`"baseline"` / `"target"`）。
+    table_ac_side: Option<&'static str>,
+    /// 补全弹层当前键盘高亮索引。
+    table_ac_index: usize,
+    /// 有报告时可一键收起/展开顶部对比配置卡片，把视口留给差异审阅。
+    sources_collapsed: bool,
     /// 下钻表的行级差异表格（共享只读表：可选中、⌘C 与右键复制）。戳 = (报告指针, 表名, 语言)。
     rows_table: Option<(u64, Entity<ReadTable>)>,
     #[cfg(test)]
@@ -257,6 +287,10 @@ impl ComparePane {
             pair_pending: None,
             table_inputs: BTreeMap::new(),
             table_reload: false,
+            tables_cache: BTreeMap::new(),
+            table_ac_side: None,
+            table_ac_index: 0,
+            sources_collapsed: false,
             rows_table: None,
             #[cfg(test)]
             armed_pause: false,
@@ -405,6 +439,8 @@ impl ComparePane {
         self.context_note = self.pair_note();
         self.ensure_schemas(true, cx);
         self.ensure_schemas(false, cx);
+        self.ensure_tables(true, cx);
+        self.ensure_tables(false, cx);
     }
 
     /// 改表对表对比的一侧表名；旧报告不再属于新的这对表。
@@ -552,19 +588,36 @@ impl ComparePane {
         } else if let Some(name) = id.strip_prefix("compare-schema:baseline:") {
             self.baseline.schema = name.to_owned();
             self.invalidate_results();
+            self.ensure_tables(true, cx);
         } else if let Some(name) = id.strip_prefix("compare-schema:target:") {
             self.target.schema = name.to_owned();
             self.invalidate_results();
+            self.ensure_tables(false, cx);
         } else if let Some(name) = id.strip_prefix("compare-table-name:baseline:") {
             self.set_table_name(true, name);
         } else if let Some(name) = id.strip_prefix("compare-table-name:target:") {
             self.set_table_name(false, name);
-        } else if id == "compare-table-exit" {
+        } else if id == "compare-mode:table" {
+            if self.table_pair.is_none() {
+                self.table_pair = Some((String::new(), String::new()));
+                self.table_reload = true;
+                self.table_ac_side = None;
+                self.sources_collapsed = false;
+                self.invalidate_results();
+                self.context_note = self.pair_note();
+                self.ensure_tables(true, cx);
+                self.ensure_tables(false, cx);
+            }
+        } else if id == "compare-table-exit" || id == "compare-mode:database" {
             // 回到整库对比：两侧连接与库保留。
             self.table_pair = None;
             self.pair_pending = None;
+            self.table_ac_side = None;
             self.context_note.clear();
             self.invalidate_results();
+        } else if id == "compare-toggle-sources" {
+            self.sources_collapsed = !self.sources_collapsed;
+            self.table_ac_side = None;
         } else if let Some(name) = id.strip_prefix("compare-toggle:") {
             let selected = self.selected.get(name).copied().unwrap_or(false);
             self.selected.insert(name.to_owned(), !selected);
@@ -592,6 +645,8 @@ impl ComparePane {
             self.place_prompt.clear();
         } else if id == "compare-swap" {
             self.swap_sides();
+            self.ensure_tables(true, cx);
+            self.ensure_tables(false, cx);
         } else if id == "compare-select-all" {
             self.select_all_tables();
         } else if id == "compare-clear" {
@@ -671,6 +726,7 @@ impl ComparePane {
             self.invalidate_results();
         }
         self.ensure_schemas(baseline, cx);
+        self.ensure_tables(baseline, cx);
     }
 
     fn set_database(&mut self, baseline: bool, name: &str, cx: &mut Context<Self>) {
@@ -682,6 +738,7 @@ impl ComparePane {
             self.invalidate_results();
         }
         self.ensure_schemas(baseline, cx);
+        self.ensure_tables(baseline, cx);
     }
 
     /// 清掉提示，连同它的语义与重试入口。
@@ -759,6 +816,7 @@ impl ComparePane {
         self.pending_place = None;
         self.pending_item_sql = None;
         self.place_prompt.clear();
+        self.sources_collapsed = false;
         self.clear_error();
     }
 
@@ -814,6 +872,172 @@ impl ComparePane {
                 Err(message) => SchemaState::Manual(message),
             },
         );
+    }
+
+    fn side_table_scope(&self, baseline: bool) -> Option<(String, String, String)> {
+        let slot = if baseline { &self.baseline } else { &self.target };
+        let connection_id = slot.connection_id.trim();
+        if connection_id.is_empty() {
+            return None;
+        }
+        let engine = self.engine_of(connection_id)?;
+        let database = match crate::adapters::fixed_database_named(&engine) {
+            Some(fixed) => fixed.to_owned(),
+            None => slot.database.trim().to_owned(),
+        };
+        if database.is_empty() {
+            return None;
+        }
+        let schema = if crate::adapters::shows_schemas_named(&engine) {
+            let s = slot.schema.trim();
+            if s.is_empty() {
+                return None;
+            }
+            s.to_owned()
+        } else {
+            String::new()
+        };
+        Some((connection_id.to_owned(), database, schema))
+    }
+
+    fn ensure_tables(&mut self, baseline: bool, cx: &mut Context<Self>) {
+        if self.table_pair.is_none() {
+            return;
+        }
+        let Some((connection_id, database, schema)) = self.side_table_scope(baseline) else {
+            return;
+        };
+        let key = table_cache_key(&connection_id, &database, &schema);
+        if self.tables_cache.contains_key(&key) {
+            return;
+        }
+        self.tables_cache.insert(key.clone(), TableListState::Loading);
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::app::views::grid::runtime_for_views().spawn(async move {
+                let result = match crate::application::work::catalog_page(&services.connections, &connection_id, &database, &schema, 0, 500).await {
+                    Ok(page) => {
+                        let mut names: Vec<String> = page
+                            .objects
+                            .into_iter()
+                            .filter(|obj| obj.kind == "table")
+                            .map(|obj| obj.name)
+                            .filter(|name| !name.trim().is_empty())
+                            .collect();
+                        names.sort();
+                        names.dedup();
+                        if names.is_empty() {
+                            if let Some(error) = page.error {
+                                Err(error)
+                            } else {
+                                Ok(names)
+                            }
+                        } else {
+                            Ok(names)
+                        }
+                    }
+                    Err(message) => Err(message),
+                };
+                let _ = tx.send(result);
+            });
+            if let Ok(result) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |pane, cx| {
+                            pane.finish_tables(&key, result);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn finish_tables(&mut self, key: &str, result: Result<Vec<String>, String>) {
+        if !matches!(self.tables_cache.get(key), Some(TableListState::Loading)) {
+            return;
+        }
+        self.tables_cache.insert(
+            key.to_owned(),
+            match result {
+                Ok(names) => TableListState::Ready(names),
+                Err(message) => TableListState::Error(message),
+            },
+        );
+    }
+
+    fn table_list_state(&self, baseline: bool) -> Option<&TableListState> {
+        let (connection_id, database, schema) = self.side_table_scope(baseline)?;
+        self.tables_cache.get(&table_cache_key(&connection_id, &database, &schema))
+    }
+
+    fn table_candidates_for_side(&self, baseline: bool) -> Vec<String> {
+        let query = self
+            .table_pair
+            .as_ref()
+            .map(|(left, right)| if baseline { left.as_str() } else { right.as_str() })
+            .unwrap_or("");
+        match self.table_list_state(baseline) {
+            Some(TableListState::Ready(tables)) => filter_table_candidates(tables, query),
+            _ => Vec::new(),
+        }
+    }
+
+    fn step_table_ac(&mut self, baseline: bool, delta: isize) {
+        let count = self.table_candidates_for_side(baseline).len();
+        if count == 0 {
+            self.table_ac_index = 0;
+            return;
+        }
+        let next = (self.table_ac_index as isize + delta).rem_euclid(count as isize) as usize;
+        self.table_ac_index = next;
+    }
+
+    fn accept_table_candidate(&mut self, side: &'static str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let baseline = side == "baseline";
+        self.set_table_name(baseline, name);
+        self.table_ac_side = None;
+        self.table_ac_index = 0;
+        if let Some((input, _)) = self.table_inputs.get(side) {
+            let wanted = name.trim().to_owned();
+            input.update(cx, |state, cx| {
+                if state.value().as_ref() != wanted {
+                    state.set_value(wanted, window, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    fn side_summary_label(&self, baseline: bool) -> String {
+        let side = if baseline { &self.baseline } else { &self.target };
+        let conn = self
+            .choices
+            .iter()
+            .find(|choice| choice.id == side.connection_id)
+            .map(|choice| choice.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("—");
+        let mut path = conn.to_owned();
+        if !side.database.trim().is_empty() {
+            path.push('/');
+            path.push_str(side.database.trim());
+        }
+        if !side.schema.trim().is_empty() {
+            path.push('.');
+            path.push_str(side.schema.trim());
+        }
+        if let Some((left, right)) = &self.table_pair {
+            let tbl = if baseline { left.trim() } else { right.trim() };
+            if !tbl.is_empty() {
+                path.push('.');
+                path.push_str(tbl);
+            }
+        }
+        path
     }
 
     fn refresh_choices(&mut self, cx: &mut Context<Self>) {
@@ -1628,6 +1852,30 @@ fn schema_key(id: &str, database: &str) -> String {
     format!("{id}\u{0}{database}")
 }
 
+fn table_cache_key(id: &str, database: &str, schema: &str) -> String {
+    format!("{id}\u{0}{database}\u{0}{schema}")
+}
+
+/// 表名补全筛选：前缀匹配优先（不区分大小写），其次子串匹配；输入为空时返回全部可用表。
+fn filter_table_candidates(tables: &[String], query: &str) -> Vec<String> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return tables.to_vec();
+    }
+    let mut prefix = Vec::new();
+    let mut contains = Vec::new();
+    for name in tables {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with(&q) {
+            prefix.push(name.clone());
+        } else if lower.contains(&q) {
+            contains.push(name.clone());
+        }
+    }
+    prefix.extend(contains);
+    prefix
+}
+
 /// 失败的那次比较属于哪一边：重试就重发同一边，而不是另起一次比较。
 fn retry_for(kind: Option<RunKind>) -> RetryAction {
     match kind {
@@ -1675,141 +1923,243 @@ impl Render for ComparePane {
         let viewport = f32::from(window.viewport_size().width);
         let stacked = sides_stacked(viewport);
         let page_pad = m.page_pad_for(viewport);
-        let baseline_card = self.side_card(true, window, cx);
-        let target_card = self.side_card(false, window, cx);
-        self.schema_reload = false;
-        let swap = kit::icon_button("compare-swap", IconName::ArrowRightLeft, t(self, "compare.action.swap"), compare_act("compare-swap", &entity));
-        // 窄窗口里两侧竖排：并排会把每侧压到只剩图标；竖排后卡片各占整行，交换按钮居中（R6 900/640）。
-        let sides = stack_frame(|| if stacked {
+        let guide_open = self.show_empty_guide();
+        let has_report = self.structure.is_some() || self.data.is_some();
+        let table_mode = self.table_pair.is_some();
+
+        // 顶部统一操作栏：标题 + 紧凑模式切换（对比表/对比库）+ 对比结构/对比数据 + 运行态/取消 + 返回工作项。
+        let header = stack_frame(|| {
+            let mode_items = vec![
+                (
+                    SharedString::from("compare-mode:database"),
+                    t(self, "compare.dialog.title"),
+                    !table_mode,
+                    kit::click({
+                        let entity = entity.clone();
+                        move |_, _, cx| entity.update(cx, |pane, cx| pane.command("compare-mode:database", cx))
+                    }),
+                ),
+                (
+                    SharedString::from("compare-mode:table"),
+                    t(self, "compare.table.title"),
+                    table_mode,
+                    kit::click({
+                        let entity = entity.clone();
+                        move |_, _, cx| entity.update(cx, |pane, cx| pane.command("compare-mode:table", cx))
+                    }),
+                ),
+            ];
+            let structure_btn = if guide_open {
+                kit::secondary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
+            } else {
+                kit::primary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
+            };
+            let mut right = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(Space::SM))
+                .child(structure_btn)
+                .child(kit::secondary_button("compare-data", Some(IconName::Rows3), t(self, "compare.dialog.compareData"), compare_act("compare-data", &entity)));
+            if self.running {
+                right = right
+                    .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
+                    .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p));
+            }
+            right = right
+                .child(kit::vline(&p))
+                .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity)));
+
             div()
+                .id("compare-title")
+                .tooltip_text(t(self, "compare.dialog.subtitle"))
+                .flex_none()
+                .min_h(px(m.header_h()))
+                .px(px(page_pad))
+                .py(px(Space::SM))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(Space::MD))
+                .border_b_1()
+                .border_color(p.line_soft)
+                .bg(p.surface)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Space::MD))
+                        .child(kit::title(t(self, if table_mode { "compare.table.title" } else { "compare.dialog.title" }), TypeScale::LG, &p))
+                        .child(kit::segmented_sized(mode_items, &p, m.control_h)),
+                )
+                .child(right)
+        });
+
+        // 统一来源配置卡：有报告时可一键收起成单行摘要胶囊，把 75%+ 视口留给差异审阅。
+        let sources_card = if has_report && self.sources_collapsed {
+            self.collapsed_sources_bar(&entity, &p)
+        } else {
+            let baseline_card = self.side_card(true, window, cx);
+            let target_card = self.side_card(false, window, cx);
+            self.schema_reload = false;
+            let pair_row = table_mode.then(|| self.pair_card(&entity, window, cx));
+            let swap = kit::icon_button("compare-swap", IconName::ArrowRightLeft, t(self, "compare.action.swap"), compare_act("compare-swap", &entity)).outline();
+            let sides = stack_frame(|| {
+                if stacked {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::MD))
+                        .child(div().w_full().min_w_0().child(baseline_card))
+                        .child(div().flex().justify_center().child(swap))
+                        .child(div().w_full().min_w_0().child(target_card))
+                } else {
+                    div()
+                        .flex()
+                        .gap(px(Space::MD))
+                        .items_start()
+                        .child(div().flex_1().flex_basis(px(ZERO_PX)).min_w_0().child(baseline_card))
+                        .child(div().flex_none().pt(px(m.control_h)).child(swap))
+                        .child(div().flex_1().flex_basis(px(ZERO_PX)).min_w_0().child(target_card))
+                }
+            });
+            let collapse_label = if self.locale == Locale::En { "Collapse" } else { "收起配置" };
+            let show_top_bar = !self.context_note.is_empty() || table_mode || has_report;
+            let mut card = kit::card(&p)
+                .id("compare-sources")
+                .test_support()
+                .p(px(m.card_pad()))
                 .flex()
                 .flex_col()
-                .gap(px(m.pane_pad()))
-                .child(div().w_full().min_w_0().child(baseline_card))
-                .child(div().flex().justify_center().child(swap))
-                .child(div().w_full().min_w_0().child(target_card))
-        } else {
-            div()
-                .flex()
-                .gap(px(m.pane_pad()))
-                .items_start()
-                .child(div().flex_1().flex_basis(px(0.)).min_w_0().child(baseline_card))
-                .child(div().flex_none().pt(px(m.header_h() / 2.)).child(swap))
-                .child(div().flex_1().flex_basis(px(0.)).min_w_0().child(target_card))
-        });
-
-        let guide_open = self.show_empty_guide();
-        let actions = stack_frame(|| {
-        let structure_btn = if guide_open {
-            kit::secondary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
-        } else {
-            kit::primary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity))
+                .gap(px(Space::MD));
+            if show_top_bar {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(Space::SM))
+                        .child(
+                            div()
+                                .id("compare-context")
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_muted)
+                                .child(SharedString::from(self.context_note.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(Space::XS))
+                                .when(table_mode, |this| {
+                                    this.child(
+                                        kit::tool_button("compare-table-exit", Some(IconName::Database), t(self, "compare.table.exit"), compare_act("compare-table-exit", &entity))
+                                            .xsmall(),
+                                    )
+                                })
+                                .when(has_report, |this| {
+                                    this.child(
+                                        kit::tool_button("compare-toggle-sources", Some(IconName::ChevronUp), SharedString::from(collapse_label), compare_act("compare-toggle-sources", &entity))
+                                            .xsmall(),
+                                    )
+                                }),
+                        ),
+                );
+            }
+            card = card.when_some(pair_row, |this, row| this.child(row)).child(sides);
+            card.into_any_element()
         };
-        let mut actions = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(8.))
-            .child(structure_btn)
-            .child(kit::secondary_button("compare-data", Some(IconName::Rows3), t(self, "compare.dialog.compareData"), compare_act("compare-data", &entity)));
-        if self.running {
-            actions = actions
-                .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
-                .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p));
-        } else {
-            actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
-        }
-        actions
-        });
 
-        let pair_card = self.table_pair.is_some().then(|| self.pair_card(&entity, window, cx));
         // 表对表：数据对比做不了时说明原因，只做结构对比。
         let data_block = self.table_data_block().filter(|_| self.structure.as_ref().is_some_and(|report| report.refused.is_none()));
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(px(m.section_gap()))
-            .when_some(pair_card, |this, card| this.child(card))
-            .child(sides)
-            .child(actions)
+            .gap(px(Space::LG))
+            .child(sources_card)
             .when_some(data_block, |this, reason| this.child(note_banner(IconName::Info, reason, p.warn, p.warn_soft)));
         body = stack_frame(|| {
-        let mut body = body;
-        // 正在比较且还没有报告：给骨架占位与一条局部加载，不让详情区空着。
-        if self.running && self.structure.is_none() && self.data.is_none() {
-            body = body.child(
-                kit::card(&p)
-                    .p(px(m.card_pad()))
-                    .flex()
-                    .flex_col()
-                    .gap(px(m.pane_pad()))
-                    .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p))
-                    .child(kit::skeleton_state(5, &m, &p)),
-            );
-        }
-        match self.error_kind {
-            // 失败：统一错误态 + 重试，重试只重发失败的那一步。
-            ErrorKind::Failure(_) => {
-                let entity = entity.clone();
-                let retry = kit::secondary_button("compare-retry", Some(IconName::RefreshCw), t(self, "common.retry"), move |_, _, cx| {
-                    entity.update(cx, |pane, cx| pane.command("compare-retry", cx));
-                });
-                body = body.child(kit::error_state_with_action(
-                    SharedString::from(self.error_heading()),
-                    SharedString::from(self.error_detail()),
-                    retry,
+            let mut body = body;
+            // 正在比较且还没有报告：给骨架占位与一条局部加载，不让详情区空着。
+            if self.running && self.structure.is_none() && self.data.is_none() {
+                body = body.child(
+                    kit::card(&p)
+                        .p(px(m.card_pad()))
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::MD))
+                        .child(kit::inline_loading(SharedString::from(self.progress_text()), &m, &p))
+                        .child(kit::skeleton_state(5, &m, &p)),
+                );
+            }
+            match self.error_kind {
+                // 失败：统一错误态 + 重试，重试只重发失败的那一步。
+                ErrorKind::Failure(_) => {
+                    let entity = entity.clone();
+                    let retry = kit::secondary_button("compare-retry", Some(IconName::RefreshCw), t(self, "common.retry"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("compare-retry", cx));
+                    });
+                    body = body.child(kit::error_state_with_action(
+                        SharedString::from(self.error_heading()),
+                        SharedString::from(self.error_detail()),
+                        retry,
+                        &p,
+                    ));
+                }
+                // 提示：门禁、取消、过期。横幅说原因，不提供重试。
+                ErrorKind::Notice => {
+                    body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
+                }
+                ErrorKind::None => {}
+            }
+            if self.structure_status == Status::Cancelled || self.data_status == Status::Cancelled {
+                body = body.child(note_banner(IconName::Info, self.text("compare.status.cancelled"), p.warn, p.warn_soft));
+            }
+            if self.pending_place.is_some() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(Space::MD))
+                        .px(px(Space::LG))
+                        .py(px(Space::MD))
+                        .rounded(px(Radius::PANEL))
+                        .bg(p.warn_soft)
+                        .text_color(p.warn)
+                        .child(kit::icon(IconName::TriangleAlert, kit::IconSize::CONTROL, p.warn))
+                        .child(div().flex_1().min_w(px(PROMPT_MIN_W)).text_size(px(TypeScale::SM)).child(SharedString::from(self.place_prompt.clone())))
+                        .child(kit::secondary_button("compare-place-cancel", None, t(self, "common.cancel"), compare_act("compare-place-cancel", &entity)))
+                        .child(kit::primary_button(
+                            "compare-place-confirm",
+                            Some(IconName::Check),
+                            SharedString::from(if self.locale == Locale::En { "Confirm" } else { "确认放入" }),
+                            compare_act("compare-place-confirm", &entity),
+                        )),
+                );
+            }
+
+            if guide_open {
+                body = body.child(kit::empty_state_with_action(
+                    IconName::GitCompare,
+                    t(self, "compare.empty.guide"),
+                    t(self, "compare.dialog.subtitle"),
+                    kit::primary_button(
+                        "compare-guide-start",
+                        Some(IconName::Columns3),
+                        t(self, "compare.dialog.compareStructure"),
+                        compare_act("compare-structure", &entity),
+                    ),
                     &p,
                 ));
             }
-            // 提示：门禁、取消、过期。横幅说原因，不提供重试。
-            ErrorKind::Notice => {
-                body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
-            }
-            ErrorKind::None => {}
-        }
-        if self.structure_status == Status::Cancelled || self.data_status == Status::Cancelled {
-            body = body.child(note_banner(IconName::Info, self.text("compare.status.cancelled"), p.warn, p.warn_soft));
-        }
-        if self.pending_place.is_some() {
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(12.))
-                    .py(px(10.))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.warn_soft)
-                    .text_color(p.warn)
-                    .child(kit::icon(IconName::TriangleAlert, 15., p.warn))
-                    .child(div().flex_1().min_w(px(180.)).text_size(px(TypeScale::SM)).child(SharedString::from(self.place_prompt.clone())))
-                    .child(kit::secondary_button("compare-place-cancel", None, t(self, "common.cancel"), compare_act("compare-place-cancel", &entity)))
-                    .child(kit::primary_button(
-                        "compare-place-confirm",
-                        Some(IconName::Check),
-                        SharedString::from(if self.locale == Locale::En { "Confirm" } else { "确认放入" }),
-                        compare_act("compare-place-confirm", &entity),
-                    )),
-            );
-        }
-
-        if self.show_empty_guide() {
-            // 初始指导：说清对比产出什么，并把主操作直接放进空态（38px 内缩，与标题对齐）。
-            body = body.child(kit::empty_state_with_action(
-                IconName::GitCompare,
-                t(self, "compare.empty.guide"),
-                t(self, "compare.dialog.subtitle"),
-                kit::primary_button(
-                    "compare-guide-start",
-                    Some(IconName::Columns3),
-                    t(self, "compare.dialog.compareStructure"),
-                    compare_act("compare-structure", &entity),
-                ),
-                &p,
-            ));
-        }
-        body
+            body
         });
 
         if let Some(report) = self.structure.clone() {
@@ -1826,52 +2176,79 @@ impl Render for ComparePane {
         if self.structure.is_none() {
             body = body.child(div().hidden().child(kit::tool_button("compare-place:structure", None, t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity))));
         }
-        // 带入的上下文或缺失条件：说明这次对比用的是哪个对象，缺的是哪一侧。
-        let context_note = (!self.context_note.is_empty()).then(|| {
-            div()
-                .id("compare-context")
-                .text_size(px(TypeScale::SM))
-                .text_color(p.text_muted)
-                .child(SharedString::from(self.context_note.clone()))
-        });
 
-        stack_frame(|| div()
-            .id("compare-pane")
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(
-                div().id("compare-title").tooltip_text(t(self, "compare.dialog.subtitle")).child(
-                    kit::page_header(t(self, if self.table_pair.is_some() { "compare.table.title" } else { "compare.dialog.title" }), &[], &m, &p)
-                        .child(div().flex_1())
-                        .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
-                ),
-            )
-            .child(
-                div()
-                    .id("compare-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .scroll_area_y()
-                    .child(
-                        div()
-                            .max_w(px(1080.))
-                            .mx_auto()
-                            .px(px(page_pad))
-                            .py(px(m.page_pad_y))
-                            .flex()
-                            .flex_col()
-                            .gap(px(m.section_gap()))
-                            .when_some(context_note, |this, note| this.child(note))
-                            .child(body),
-                    ),
-            )
-        )
+        stack_frame(|| {
+            div()
+                .id("compare-pane")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(p.chrome)
+                .child(header)
+                .child(
+                    div()
+                        .id("compare-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .scroll_area_y()
+                        .child(
+                            div()
+                                .max_w(px(PAGE_MAX_W))
+                                .mx_auto()
+                                .px(px(page_pad))
+                                .py(px(Space::LG))
+                                .flex()
+                                .flex_col()
+                                .gap(px(Space::LG))
+                                .child(body),
+                        ),
+                )
+        })
     }
 }
 
 impl ComparePane {
+    fn collapsed_sources_bar(&self, entity: &Entity<Self>, p: &Palette) -> AnyElement {
+        let base_label = self.text("compare.dialog.baseline");
+        let target_label = self.text("compare.dialog.target");
+        let base_path = self.side_summary_label(true);
+        let target_path = self.side_summary_label(false);
+        let expand_label = if self.locale == Locale::En { "Configure" } else { "展开配置" };
+        let swap_label = SharedString::from(self.text("compare.action.swap"));
+        kit::card(p)
+            .id("compare-sources-collapsed")
+            .test_support()
+            .px(px(Space::LG))
+            .py(px(Space::MD))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(Space::MD))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(Space::SM))
+                    .min_w_0()
+                    .child(kit::pill(SharedString::from(format!("{base_label}: {base_path}")), p.ok, p.ok_soft))
+                    .child(kit::icon(IconName::ArrowRightLeft, kit::IconSize::INLINE, p.text_faint))
+                    .child(kit::pill(SharedString::from(format!("{target_label}: {target_path}")), p.info, p.accent_soft)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .child(kit::icon_button("compare-swap", IconName::ArrowRightLeft, swap_label, compare_act("compare-swap", entity)).xsmall())
+                    .child(kit::tool_button("compare-toggle-sources", Some(IconName::ChevronDown), SharedString::from(expand_label), compare_act("compare-toggle-sources", entity)).xsmall()),
+            )
+            .into_any_element()
+    }
+
     fn side_card(&mut self, baseline: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
@@ -1882,35 +2259,48 @@ impl ComparePane {
         let side_connection = side.connection_id.clone();
         let side_database = side.database.clone();
         let side_schema = side.schema.clone();
-        let mut card = kit::card(&p)
+        let summary = self.side_summary_label(baseline);
+        let mut card = div()
             .id(SharedString::from(format!("compare-side:{which}")))
             .test_support()
-            .p(px(m.card_pad()))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.chrome)
+            .border_1()
+            .border_color(p.line_soft)
+            .p(px(Space::MD))
             .flex()
             .flex_col()
-            .gap(px(m.pane_pad()))
+            .gap(px(Space::MD))
             .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(kit::pill(SharedString::from(title.clone()), if baseline { p.ok } else { p.info }, if baseline { p.ok_soft } else { p.accent_soft }))
-                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p)),
-        );
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(Space::SM))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::SM))
+                            .child(kit::pill(SharedString::from(title.clone()), if baseline { p.ok } else { p.info }, if baseline { p.ok_soft } else { p.accent_soft }))
+                            .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().text_right().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(summary))),
+            );
         let mut connections = kit::sunken(&p)
             .id(SharedString::from(format!("compare-connections:{which}")))
-            .p(px(3.))
-            .gap(px(2.))
+            .p(px(Space::XS))
+            .gap(px(Space::XXS))
             .flex()
             .flex_col()
-            .max_h(px(m.control_h * 4.5))
+            .max_h(px(m.control_h * SIDE_LIST_VISIBLE_ROWS))
             .scroll_area_y();
         if self.choices.is_empty() {
             // 清单还在读：骨架占位，不先写一句“选择连接”；读完了还是空才提示选连接。
             connections = if self.choices_loading {
                 connections.child(kit::skeleton_state(3, &m, &p))
             } else {
-                connections.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p)))
+                connections.child(div().flex_none().px(px(Space::MD)).py(px(Space::SM)).child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p)))
             };
         }
         for choice in self.choices.clone() {
@@ -1932,11 +2322,11 @@ impl ComparePane {
                 let database_label = self.text("compare.dialog.database");
                 let mut list = kit::sunken(&p)
                     .id(SharedString::from(format!("compare-databases:{which}")))
-                    .p(px(3.))
-                    .gap(px(2.))
+                    .p(px(Space::XS))
+                    .gap(px(Space::XXS))
                     .flex()
                     .flex_col()
-                    .max_h(px(m.control_h * 4.5))
+                    .max_h(px(m.control_h * SIDE_LIST_VISIBLE_ROWS))
                     .scroll_area_y();
                 for name in &choice.databases {
                     let id = format!("compare-database:{which}:{name}");
@@ -1945,7 +2335,7 @@ impl ComparePane {
                             .on_click(compare_act(id, &entity)),
                     );
                 }
-                card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(SharedString::from(database_label), &p)).child(list));
+                card = card.child(div().flex().flex_col().gap(px(Space::XS)).child(kit::eyebrow(SharedString::from(database_label), &p)).child(list));
             }
             if crate::adapters::shows_schemas_named(&choice.engine) {
                 let schema_label = self.text("compare.dialog.chooseSchema");
@@ -1953,11 +2343,11 @@ impl ComparePane {
                     Some(SchemaState::Ready(names)) => {
                         let mut list = kit::sunken(&p)
                             .id(SharedString::from(format!("compare-schemas:{which}")))
-                            .p(px(3.))
-                            .gap(px(2.))
+                            .p(px(Space::XS))
+                            .gap(px(Space::XXS))
                             .flex()
                             .flex_col()
-                            .max_h(px(m.control_h * 4.5))
+                            .max_h(px(m.control_h * SIDE_LIST_VISIBLE_ROWS))
                             .scroll_area_y();
                         for name in names {
                             let id = format!("compare-schema:{which}:{name}");
@@ -1966,7 +2356,7 @@ impl ComparePane {
                                     .on_click(compare_act(id, &entity)),
                             );
                         }
-                        card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(SharedString::from(schema_label), &p)).child(list));
+                        card = card.child(div().flex().flex_col().gap(px(Space::XS)).child(kit::eyebrow(SharedString::from(schema_label), &p)).child(list));
                     }
                     Some(SchemaState::Manual(reason)) => {
                         let input = self.schema_input(which, window, cx);
@@ -1977,7 +2367,7 @@ impl ComparePane {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(6.))
+                                .gap(px(Space::XS))
                                 .child(kit::eyebrow(SharedString::from(schema_label), &p))
                                 .when(!reason.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.warn).child(SharedString::from(reason.clone()))))
                                 .child(
@@ -2011,51 +2401,287 @@ impl ComparePane {
         card.into_any_element()
     }
 
-    /// 表对表对比的头部：两侧表名（可改）与“改为整库对比”。
+    /// 表对表对比的表名行：左右对齐基准表与对照表，附智能表名补全浮层。
     fn pair_card(&mut self, entity: &Entity<Self>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
-        let baseline = self.table_input("baseline", window, cx);
-        let target = self.table_input("target", window, cx);
+        let baseline_input = self.table_input("baseline", window, cx);
+        let target_input = self.table_input("target", window, cx);
         self.table_reload = false;
-        let field = |which: &'static str, label: String, input: Entity<InputState>, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla| {
-            div()
-                .flex_1()
-                .min_w(px(kit::ControlSize::PICKER_MIN_W))
-                .flex()
-                .flex_col()
-                .gap(px(Space::SM))
-                .child(kit::pill(SharedString::from(label.clone()), tone, soft))
-                .child(kit::text_input(SharedString::from(format!("compare-table-input:{which}")), &input, label))
-        };
-        kit::card(&p)
+        let baseline_field = self.table_pair_field("baseline", self.text("compare.table.baselineTable"), baseline_input, p.ok, p.ok_soft, entity, &p, &m);
+        let target_field = self.table_pair_field("target", self.text("compare.table.targetTable"), target_input, p.info, p.accent_soft, entity, &p, &m);
+        div()
             .id("compare-table-pair")
             .test_support()
-            .p(px(m.card_pad()))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.chrome)
+            .border_1()
+            .border_color(p.line_soft)
+            .p(px(Space::MD))
+            .flex()
+            .flex_wrap()
+            .gap(px(Space::MD))
+            .child(baseline_field)
+            .child(target_field)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn table_pair_field(
+        &self,
+        which: &'static str,
+        label: String,
+        input: Entity<InputState>,
+        tone: gpui_kit::Hsla,
+        soft: gpui_kit::Hsla,
+        entity: &Entity<Self>,
+        p: &Palette,
+        m: &kit::Metrics,
+    ) -> AnyElement {
+        let baseline = which == "baseline";
+        let ac_open = self.table_ac_side == Some(which);
+        let ac_panel = ac_open.then(|| self.table_ac_panel(which, entity, p, m));
+        let keys_entity = entity.clone();
+        div()
+            .flex_1()
+            .min_w(px(kit::ControlSize::PICKER_MIN_W))
             .flex()
             .flex_col()
-            .gap(px(m.pane_pad()))
+            .gap(px(Space::XS))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(Space::MD))
-                    .child(kit::icon(IconName::Table, TypeScale::LG, p.text_muted))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.text("compare.table.hint"))))
-                    .child(kit::tool_button("compare-table-exit", Some(IconName::Database), SharedString::from(self.text("compare.table.exit")), compare_act("compare-table-exit", entity))),
+                    .gap(px(Space::SM))
+                    .child(kit::pill(SharedString::from(label.clone()), tone, soft))
+                    .child(
+                        div()
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from(if self.locale == Locale::En { "Type or pick from catalog" } else { "输入或从库中选择" })),
+                    ),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(m.pane_pad()))
-                    .child(field("baseline", self.text("compare.table.baselineTable"), baseline, p.ok, p.ok_soft))
-                    .child(field("target", self.text("compare.table.targetTable"), target, p.info, p.accent_soft)),
+                    .relative()
+                    .capture_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let key = event.keystroke.key.as_str();
+                        match key {
+                            "down" | "up" | "enter" | "tab" | "escape" => {}
+                            _ => return,
+                        }
+                        let is_open = keys_entity.read(cx).table_ac_side == Some(which);
+                        if !is_open {
+                            return;
+                        }
+                        match key {
+                            "down" => {
+                                cx.stop_propagation();
+                                keys_entity.update(cx, |pane, cx| {
+                                    pane.step_table_ac(baseline, 1);
+                                    cx.notify();
+                                });
+                            }
+                            "up" => {
+                                cx.stop_propagation();
+                                keys_entity.update(cx, |pane, cx| {
+                                    pane.step_table_ac(baseline, -1);
+                                    cx.notify();
+                                });
+                            }
+                            "enter" | "tab" => {
+                                let picked = {
+                                    let pane = keys_entity.read(cx);
+                                    let list = pane.table_candidates_for_side(baseline);
+                                    list.get(pane.table_ac_index).or_else(|| list.first()).cloned()
+                                };
+                                if let Some(name) = picked {
+                                    cx.stop_propagation();
+                                    keys_entity.update(cx, |pane, cx| pane.accept_table_candidate(which, &name, window, cx));
+                                } else {
+                                    keys_entity.update(cx, |pane, cx| {
+                                        pane.table_ac_side = None;
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                            "escape" => {
+                                cx.stop_propagation();
+                                keys_entity.update(cx, |pane, cx| {
+                                    pane.table_ac_side = None;
+                                    cx.notify();
+                                });
+                            }
+                            _ => {}
+                        }
+                    })
+                    .child(kit::text_input(SharedString::from(format!("compare-table-input:{which}")), &input, label))
+                    .when_some(ac_panel, |this, panel| {
+                        this.child(
+                            div().absolute().top_full().left_0().w_full().pt(px(Space::XS)).child(
+                                gpui_kit::deferred(
+                                    gpui_kit::anchored()
+                                        .anchor(gpui_kit::Anchor::TopLeft)
+                                        .snap_to_window_with_margin(px(kit::ControlSize::POPOVER_MARGIN))
+                                        .child(panel),
+                                )
+                                .with_priority(10),
+                            ),
+                        )
+                    }),
             )
             .into_any_element()
     }
 
-    /// 表名输入：改动即生效（旧报告作废），交换或重新带入时同步成新值。
+    fn table_ac_panel(&self, which: &'static str, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics) -> AnyElement {
+        let baseline = which == "baseline";
+        let state = self.table_list_state(baseline);
+        let candidates = self.table_candidates_for_side(baseline);
+        let active = if candidates.is_empty() { 0 } else { self.table_ac_index.min(candidates.len() - 1) };
+        let close_entity = entity.clone();
+
+        let body: AnyElement = match state {
+            None => div()
+                .flex_none()
+                .px(px(Space::MD))
+                .py(px(Space::MD))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_muted)
+                .child(SharedString::from(if self.locale == Locale::En {
+                    "Select a connection and database to browse tables."
+                } else {
+                    "请先选择连接与数据库以加载表名，也可直接手动输入。"
+                }))
+                .into_any_element(),
+            Some(TableListState::Loading) => div()
+                .flex_none()
+                .px(px(Space::MD))
+                .py(px(Space::SM))
+                .child(kit::inline_loading(
+                    SharedString::from(if self.locale == Locale::En { "Loading tables…" } else { "正在读取表列表…" }),
+                    m,
+                    p,
+                ))
+                .into_any_element(),
+            Some(TableListState::Error(reason)) => div()
+                .flex_none()
+                .px(px(Space::MD))
+                .py(px(Space::MD))
+                .flex()
+                .flex_col()
+                .gap(px(Space::XXS))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(SharedString::from(reason.clone())))
+                .child(
+                    div()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(if self.locale == Locale::En { "Manual entry is still supported." } else { "仍可直接手动输入表名。" })),
+                )
+                .into_any_element(),
+            Some(TableListState::Ready(_)) if candidates.is_empty() => div()
+                .flex_none()
+                .px(px(Space::MD))
+                .py(px(Space::MD))
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_muted)
+                .child(SharedString::from(if self.locale == Locale::En {
+                    "No matching tables — manual entry is supported."
+                } else {
+                    "没有匹配的表，可直接手动输入。"
+                }))
+                .into_any_element(),
+            Some(TableListState::Ready(_)) => {
+                let mut list = div()
+                    .id(SharedString::from(format!("compare-table-ac-list:{which}")))
+                    .max_h(px(TABLE_AC_MAX_H))
+                    .p(px(Space::XS))
+                    .pr(px(kit::SCROLLBAR_GUTTER))
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::XXS))
+                    .scroll_area_y();
+                for (ix, name) in candidates.into_iter().enumerate() {
+                    let highlighted = ix == active;
+                    let item_entity = entity.clone();
+                    let name_for_click = name.clone();
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!("compare-table-ac:{which}:{name}")))
+                            .test_support()
+                            .flex_none()
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(SharedString::from(name.clone()))
+                            .aria_selected(highlighted)
+                            .h(px(m.menu_row_h))
+                            .px(px(Space::MD))
+                            .rounded(px(Radius::CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::SM))
+                            .text_size(px(TypeScale::SM))
+                            .cursor_pointer()
+                            .when(highlighted, |this| this.bg(p.accent_soft).text_color(p.accent_text).font_weight(gpui_kit::FontWeight::MEDIUM))
+                            .when(!highlighted, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .on_click(move |_, window, cx| {
+                                item_entity.update(cx, |pane, cx| pane.accept_table_candidate(which, &name_for_click, window, cx));
+                            })
+                            .child(kit::icon(IconName::Table, kit::IconSize::INLINE, if highlighted { p.accent_text } else { p.text_faint }))
+                            .child(div().flex_1().min_w_0().truncate().child(SharedString::from(name))),
+                    );
+                }
+                list.into_any_element()
+            }
+        };
+
+        let footer_hint = if self.locale == Locale::En {
+            "↑↓ Navigate · Enter/Tab Accept · Esc Close"
+        } else {
+            "↑↓ 选择 · Enter/Tab 确认 · Esc 关闭"
+        };
+
+        div()
+            .id(SharedString::from(format!("compare-table-ac:{which}")))
+            .test_support()
+            .occlude()
+            .w_full()
+            .min_w(px(kit::ControlSize::PICKER_MIN_W))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.line)
+            .rounded(px(Radius::PANEL))
+            .shadow_lg()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(move |_, _, cx| {
+                close_entity.update(cx, |pane, cx| {
+                    if pane.table_ac_side == Some(which) {
+                        pane.table_ac_side = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .child(body)
+            .child(
+                div()
+                    .flex_none()
+                    .bg(p.chrome)
+                    .border_t_1()
+                    .border_color(p.line_soft)
+                    .px(px(Space::MD))
+                    .py(px(Space::XS))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(SharedString::from(footer_hint)),
+            )
+            .into_any_element()
+    }
+
+    /// 表名输入：改动即生效（旧报告作废），聚焦或输入时打开智能补全，交换或重新带入时同步成新值。
     fn table_input(&mut self, side: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         let wanted = self.table_pair.as_ref().map(|(left, right)| if side == "baseline" { left.clone() } else { right.clone() }).unwrap_or_default();
         if let Some((state, _)) = self.table_inputs.get(side) {
@@ -2070,12 +2696,28 @@ impl ComparePane {
         }
         let placeholder = SharedString::from(self.text("compare.table.namePlaceholder"));
         let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(SharedString::from(wanted)));
-        let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let text = state.read(cx).value().to_string();
-                this.set_table_name(side == "baseline", &text);
+        let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| match event {
+            InputEvent::Focus => {
+                this.table_ac_side = Some(side);
+                this.table_ac_index = 0;
+                this.ensure_tables(side == "baseline", cx);
                 cx.notify();
             }
+            InputEvent::Blur => {
+                if this.table_ac_side == Some(side) {
+                    this.table_ac_side = None;
+                    cx.notify();
+                }
+            }
+            InputEvent::Change => {
+                let text = state.read(cx).value().to_string();
+                this.set_table_name(side == "baseline", &text);
+                this.table_ac_side = Some(side);
+                this.table_ac_index = 0;
+                this.ensure_tables(side == "baseline", cx);
+                cx.notify();
+            }
+            _ => {}
         });
         self.table_inputs.insert(side, (state.clone(), subscription));
         state
@@ -2146,7 +2788,7 @@ impl ComparePane {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(m.pane_pad()))
+            .gap(px(Space::MD))
             .child(kit::segmented_sized(filters, p, m.control_h))
             .child(
                 kit::interactive_states(div().id("compare-only-diffs"), p, false)
@@ -2156,15 +2798,15 @@ impl ComparePane {
                     .aria_selected(self.only_diffs)
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .px(px(4.))
+                    .gap(px(Space::SM))
+                    .px(px(Space::XS))
                     .rounded(px(Radius::CONTROL))
                     .text_size(px(TypeScale::SM))
                     .child(kit::switch_visual(self.only_diffs, p))
                     .child(SharedString::from(self.text("compare.filter.onlyDiffs")))
                     .on_click(compare_act("compare-only-diffs", entity)),
             )
-            .child(div().w(px(200.)).child(kit::text_input("compare-filter-search", &search, self.text("compare.filter.search")).small()))
+            .child(div().w(px(FILTER_SEARCH_W)).child(kit::text_input("compare-filter-search", &search, self.text("compare.filter.search")).small()))
             .into_any_element()
     }
 
@@ -2195,7 +2837,7 @@ impl ComparePane {
         let state = entry.0.clone();
         div()
             .id(id)
-            .h(px(200.))
+            .h(px(SCRIPT_EDITOR_H))
             .overflow_hidden()
             .child(
                 kit::sunken(p).size_full().overflow_hidden().child(
@@ -2429,36 +3071,31 @@ impl ComparePane {
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
         let t = |this: &Self, key: &str| SharedString::from(this.text(key));
-        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad()));
+        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(Space::MD));
         let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
-        card = card.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(kit::title(t(self, "compare.dialog.structureScript"), TypeScale::LG, &p))
-                .when(can_place, |this| {
-                    this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", entity)))
-                }),
-        );
         if let Some(refused) = &report.refused {
-            return card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft)).into_any_element();
+            return card
+                .child(kit::title(t(self, "compare.dialog.structureScript"), TypeScale::LG, &p))
+                .child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft))
+                .into_any_element();
         }
-        // 摘要：四类计数 + 按种类的细分。
-        card = card.child(
-            div()
-                .flex()
-                .gap(px(8.))
-                .child(stat(self.text("compare.summary.added"), report.only_baseline.len(), p.ok, &p))
-                .child(stat(self.text("compare.summary.removed"), report.only_target.len(), p.danger, &p))
-                .child(stat(self.text("compare.summary.changed"), report.changed.len(), p.warn, &p))
-                .child(stat(self.text("compare.summary.same"), report.same.len(), p.text_muted, &p)),
-        );
+        // 紧凑内联摘要条：色标计数胶囊 + 按种类细分 + 放入新查询主按钮。
         let summary = kind_summary(report);
+        let mut summary_left = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(Space::SM))
+            .child(summary_pill("+", report.only_baseline.len(), self.text("compare.summary.added"), p.ok, p.ok_soft))
+            .child(summary_pill("−", report.only_target.len(), self.text("compare.summary.removed"), p.danger, p.danger_soft))
+            .child(summary_pill("~", report.changed.len(), self.text("compare.summary.changed"), p.warn, p.warn_soft))
+            .child(summary_pill("=", report.same.len(), self.text("compare.summary.same"), p.text_muted, p.badge));
         if summary.is_empty() {
-            card = card.child(note_banner(IconName::Check, self.text("compare.summary.noDiff"), p.ok, p.ok_soft));
+            summary_left = summary_left
+                .child(kit::vline(&p))
+                .child(kit::pill(SharedString::from(self.text("compare.summary.noDiff")), p.ok, p.ok_soft));
         } else {
-            let mut kinds = div().id("compare-kind-summary").flex().flex_wrap().gap(px(6.));
+            let mut kinds = div().id("compare-kind-summary").flex().flex_wrap().items_center().gap(px(Space::XS));
             for (kind, plus, minus, changed) in summary {
                 let mut parts = Vec::new();
                 if plus > 0 {
@@ -2470,22 +3107,40 @@ impl ComparePane {
                 if changed > 0 {
                     parts.push(format!("~{changed}"));
                 }
-                kinds = kinds.child(kit::pill(SharedString::from(format!("{kind} {}", parts.join(" "))), p.text, p.chrome));
+                kinds = kinds.child(kit::pill(SharedString::from(format!("{kind} {}", parts.join(" "))), p.text_muted, p.surface));
             }
-            card = card.child(kinds);
+            summary_left = summary_left.child(kit::vline(&p)).child(kinds);
         }
+        card = card.child(
+            div()
+                .px(px(Space::MD))
+                .py(px(Space::SM))
+                .rounded(px(Radius::CONTROL))
+                .bg(p.chrome)
+                .border_1()
+                .border_color(p.line_soft)
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(Space::MD))
+                .child(summary_left)
+                .when(can_place, |this| {
+                    this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", entity)))
+                }),
+        );
         card = card.child(self.diff_toolbar(report, entity, &p, &m, window, cx));
-        // 差异树 + 选中项的并排定义与同步 SQL。
+        // 宽敞的双栏差异工作区：左侧差异树 + 右侧并排 DDL 与单对象同步 SQL。
         let tree = self.diff_tree(report, entity, &p, &m);
         let detail = self.diff_detail(entity, &p, &m, window, cx);
         let split = if stacked {
-            div().flex().flex_col().gap(px(m.pane_pad())).child(tree).child(detail)
+            div().flex().flex_col().gap(px(Space::MD)).child(tree).child(detail)
         } else {
             div()
                 .flex()
                 .items_start()
-                .gap(px(m.pane_pad()))
-                .child(div().w(px(300.)).flex_none().child(tree))
+                .gap(px(Space::MD))
+                .child(div().w(px(DIFF_TREE_W)).flex_none().child(tree))
                 .child(div().flex_1().min_w_0().child(detail))
         };
         card = card.child(split);
@@ -2501,7 +3156,7 @@ impl ComparePane {
             let mut tables = div()
                 .flex()
                 .flex_wrap()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .child(kit::tool_button("compare-select-all", Some(IconName::SquareCheck), t(self, "compare.action.selectAll"), compare_act("compare-select-all", entity)))
                 .child(kit::tool_button("compare-clear", Some(IconName::Square), t(self, "compare.action.clear"), compare_act("compare-clear", entity)));
             for table in report.tables.iter().filter(|table| name_matches(&table.name, &self.diff_query)) {
@@ -2512,9 +3167,19 @@ impl ComparePane {
                         .on_click(compare_act(format!("compare-toggle:{}", table.name), entity)),
                 );
             }
-            card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p)).child(tables));
+            card = card.child(
+                div()
+                    .pt(px(Space::SM))
+                    .border_t_1()
+                    .border_color(p.line_soft)
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::SM))
+                    .child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p))
+                    .child(tables),
+            );
             for table in report.tables.iter().filter(|table| table.needs_key_choice) {
-                let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
+                let mut keys = div().flex().flex_wrap().items_center().gap(px(Space::SM)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
                 for key in &table.keys {
                     let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
                     let mark = if chosen { "chosen" } else { "key" };
@@ -2530,6 +3195,9 @@ impl ComparePane {
         if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
             card = card.child(
                 div()
+                    .pt(px(Space::SM))
+                    .border_t_1()
+                    .border_color(p.line_soft)
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2542,16 +3210,31 @@ impl ComparePane {
     }
 
     fn diff_tree(&self, report: &StructureReport, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics) -> AnyElement {
-        let mut tree = kit::sunken(p).id("compare-diff-tree").p(px(4.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().gap(px(1.)).max_h(px(420.)).scroll_area_y();
+        let mut tree = kit::sunken(p)
+            .id("compare-diff-tree")
+            .p(px(Space::XS))
+            .pr(px(kit::SCROLLBAR_GUTTER))
+            .flex()
+            .flex_col()
+            .gap(px(Space::XXS))
+            .max_h(px(DIFF_TREE_MAX_H))
+            .scroll_area_y();
         let visible = self.visible_entries(report);
         if visible.is_empty() {
-            tree = tree.child(div().px(px(8.)).py(px(6.)).child(kit::muted(SharedString::from(self.text("compare.tree.empty")), p)));
+            tree = tree.child(div().flex_none().px(px(Space::MD)).py(px(Space::SM)).child(kit::muted(SharedString::from(self.text("compare.tree.empty")), p)));
         }
         let mut current: Option<String> = None;
         for entry in visible {
             if current.as_deref() != Some(entry.item.kind.as_str()) {
                 current = Some(entry.item.kind.clone());
-                tree = tree.child(div().px(px(8.)).pt(px(6.)).pb(px(2.)).child(kit::eyebrow(SharedString::from(entry.item.kind.clone()), p)));
+                tree = tree.child(
+                    div()
+                        .flex_none()
+                        .px(px(Space::MD))
+                        .pt(px(Space::SM))
+                        .pb(px(Space::XXS))
+                        .child(kit::eyebrow(SharedString::from(entry.item.kind.clone()), p)),
+                );
             }
             let tone = match entry.class {
                 EntryClass::Baseline => p.ok,
@@ -2563,26 +3246,28 @@ impl ComparePane {
             let id = format!("compare-pick:{}", entry.key);
             let row = kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
                 .test_support()
+                .flex_none()
                 .role(gpui_kit::Role::Button)
                 .aria_label(SharedString::from(format!("{} {} {}", entry.class.mark(), entry.item.kind, entry.item.name)))
                 .aria_selected(picked)
                 .min_h(px(m.tree_row_h))
-                .px(px(8.))
-                .py(px(2.))
+                .px(px(Space::MD))
+                .py(px(Space::XS))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .rounded(px(Radius::CONTROL))
                 .text_size(px(TypeScale::SM))
                 .when(picked, |this| this.bg(p.accent_soft).text_color(p.accent_text))
                 .when(!picked, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
-                .child(div().w(px(12.)).flex_none().font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(entry.class.mark()))
+                .child(div().w(px(MARK_COL_W)).flex_none().font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(entry.class.mark()))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .flex()
                         .flex_col()
+                        .gap(px(Space::XXS))
                         .child(div().truncate().child(SharedString::from(entry.item.name.clone())))
                         .when(entry.class != EntryClass::Same, |this| {
                             this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(entry.item.detail.clone())))
@@ -2594,20 +3279,30 @@ impl ComparePane {
         tree.into_any_element()
     }
 
-    fn diff_detail(&mut self, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn diff_detail(&mut self, entity: &Entity<Self>, p: &Palette, _m: &kit::Metrics, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(item) = self.picked_item().cloned() else {
-            return kit::sunken(p).p(px(12.)).child(kit::muted(SharedString::from(self.text("compare.detail.pick")), p)).into_any_element();
+            return kit::sunken(p).p(px(Space::LG)).child(kit::muted(SharedString::from(self.text("compare.detail.pick")), p)).into_any_element();
         };
         let mono = gpui_kit::component::ActiveTheme::theme(&**cx).mono_font_family.clone();
         let side = |label: String, tone: gpui_kit::Hsla, soft: gpui_kit::Hsla, mine: &str, other: &str, missing: String| {
-            let mut block = kit::sunken(p).id(SharedString::from(format!("compare-def:{label}"))).p(px(6.)).pr(px(kit::SCROLLBAR_GUTTER)).flex().flex_col().max_h(px(320.)).scroll_area_y().font_family(mono.clone()).text_size(px(TypeScale::XS));
+            let mut block = kit::sunken(p)
+                .id(SharedString::from(format!("compare-def:{label}")))
+                .p(px(Space::SM))
+                .pr(px(kit::SCROLLBAR_GUTTER))
+                .flex()
+                .flex_col()
+                .max_h(px(DIFF_DEF_MAX_H))
+                .scroll_area_y()
+                .font_family(mono.clone())
+                .text_size(px(TypeScale::XS));
             if mine.trim().is_empty() {
-                block = block.child(div().px(px(4.)).text_color(p.text_faint).child(SharedString::from(missing)));
+                block = block.child(div().flex_none().px(px(Space::XS)).text_color(p.text_faint).child(SharedString::from(missing)));
             } else {
                 for (line, differs) in line_marks(mine, other) {
                     block = block.child(
                         div()
-                            .px(px(4.))
+                            .flex_none()
+                            .px(px(Space::XS))
                             .whitespace_nowrap()
                             .when(differs, |this| this.bg(soft).text_color(tone))
                             .when(!differs, |this| this.text_color(p.text))
@@ -2615,7 +3310,7 @@ impl ComparePane {
                     );
                 }
             }
-            div().flex_1().flex_basis(px(0.)).min_w_0().flex().flex_col().gap(px(4.)).child(kit::eyebrow(SharedString::from(label), p)).child(block)
+            div().flex_1().flex_basis(px(ZERO_PX)).min_w_0().flex().flex_col().gap(px(Space::XS)).child(kit::eyebrow(SharedString::from(label), p)).child(block)
         };
         let missing = self.text("compare.detail.missing");
         let baseline = side(self.text("compare.dialog.baseline"), p.ok, p.ok_soft, &item.baseline_definition, &item.target_definition, missing.clone());
@@ -2625,29 +3320,29 @@ impl ComparePane {
             .id("compare-diff-detail")
             .flex()
             .flex_col()
-            .gap(px(m.pane_pad()))
+            .gap(px(Space::MD))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(px(Space::XXS))
                     .child(div().text_size(px(TypeScale::MD)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child(SharedString::from(title)))
                     .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", item.detail, self.text("compare.detail.legend"))))),
             )
-            .child(div().flex().gap(px(8.)).child(baseline).child(target));
+            .child(div().flex().gap(px(Space::MD)).child(baseline).child(target));
         let can_place = self.structure_status != Status::Cancelled && !item.sql.trim().is_empty();
         detail = detail.child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .child(kit::eyebrow(SharedString::from(self.text("compare.detail.itemSql")), p))
                 .when(can_place, |this| {
                     this.child(
                         div()
                             .flex()
-                            .gap(px(6.))
+                            .gap(px(Space::SM))
                             .child(kit::tool_button("compare-copy:item", Some(IconName::Copy), SharedString::from(self.text("compare.detail.copyItem")), compare_act("compare-copy:item", entity)))
                             .child(kit::tool_button("compare-place:item", Some(IconName::SquareTerminal), SharedString::from(self.text("compare.detail.placeItem")), compare_act("compare-place:item", entity))),
                     )
@@ -2666,7 +3361,7 @@ impl ComparePane {
         let m = kit::Metrics::of(cx);
         let t = |this: &Self, key: &str| SharedString::from(this.text(key));
         let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
-        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
+        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(Space::MD)).child(
             div()
                 .flex()
                 .items_center()
@@ -2688,7 +3383,7 @@ impl ComparePane {
         } else {
             card = card.child(kit::muted(t(self, "compare.data.drillHint"), &p));
         }
-        let mut list = kit::sunken(&p).id("compare-data-tables").p(px(4.)).flex().flex_col().gap(px(1.));
+        let mut list = kit::sunken(&p).id("compare-data-tables").p(px(Space::XS)).flex().flex_col().gap(px(ONE_PX));
         for table in &report.tables {
             let id = format!("compare-data-table:{}", table.table);
             let open = self.data_table.as_deref() == Some(table.table.as_str());
@@ -2696,7 +3391,7 @@ impl ComparePane {
                 &self.text("compare.data.summary"),
                 &[("{insert}", &table.inserts.to_string()), ("{update}", &table.updates.to_string()), ("{delete}", &table.deletes.to_string())],
             );
-            let mut info = div().flex_1().min_w_0().flex().flex_col().gap(px(1.)).child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())));
+            let mut info = div().flex_1().min_w_0().flex().flex_col().gap(px(ONE_PX)).child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())));
             let sub = if let Some(reason) = &table.skipped {
                 reason.clone()
             } else if !table.key.is_empty() {
@@ -2707,7 +3402,7 @@ impl ComparePane {
             if !sub.is_empty() {
                 info = info.child(div().truncate().text_size(px(TypeScale::XS)).text_color(if table.skipped.is_some() { p.warn } else { p.text_muted }).child(SharedString::from(sub)));
             }
-            let mut stats = div().flex_none().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM));
+            let mut stats = div().flex_none().flex().items_center().gap(px(Space::SM)).text_size(px(TypeScale::SM));
             if table.skipped.is_none() {
                 if table.inserts + table.updates + table.deletes == 0 && table.rejected == 0 {
                     stats = stats.child(div().text_color(p.ok).child(SharedString::from(self.text("compare.data.same"))));
@@ -2720,19 +3415,20 @@ impl ComparePane {
             }
             let row = kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
                 .test_support()
+                .flex_none()
                 .role(gpui_kit::Role::Button)
                 .aria_label(SharedString::from(format!("{} {}", table.table, self.text("compare.data.drillHint"))))
                 .aria_selected(open)
-                .px(px(8.))
-                .py(px(6.))
+                .px(px(Space::MD))
+                .py(px(Space::SM))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .rounded(px(Radius::CONTROL))
                 .text_size(px(TypeScale::SM))
                 .when(open, |this| this.bg(p.accent_soft))
                 .when(!open, |this| this.hover(|style| style.bg(p.hover)))
-                .child(kit::icon(if open { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
+                .child(kit::icon(if open { IconName::ChevronDown } else { IconName::ChevronRight }, kit::IconSize::INLINE, p.text_faint))
                 .child(info)
                 .child(stats)
                 .on_click(compare_act(id, entity));
@@ -2748,6 +3444,9 @@ impl ComparePane {
         if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
             card = card.child(
                 div()
+                    .pt(px(Space::SM))
+                    .border_t_1()
+                    .border_color(p.line_soft)
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2883,14 +3582,15 @@ fn list_choice(
 ) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
     kit::interactive_states(div().id(id), p, false)
         .test_support()
+        .flex_none()
         .role(gpui_kit::Role::Button)
         .aria_label(label)
         .aria_selected(selected)
-        .h(px(m.tree_row_h + 2.))
-        .px(px(8.))
+        .h(px(m.tree_row_h + LIST_CHOICE_EXTRA_H))
+        .px(px(Space::MD))
         .flex()
         .items_center()
-        .gap(px(7.))
+        .gap(px(Space::SM))
         .rounded(px(Radius::CONTROL))
         .text_size(px(TypeScale::SM))
         .when(selected, |this| {
@@ -2899,9 +3599,9 @@ fn list_choice(
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
         })
         .when(!selected, |this| this.text_color(p.text).hover(|style| style.bg(p.hover)))
-        .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint }))
+        .child(kit::icon(icon, kit::IconSize::INLINE, if selected { p.accent_text } else { p.text_faint }))
         .child(div().flex_1().min_w_0().truncate().child(text))
-        .when(selected, |this| this.child(kit::icon(IconName::Check, 13., p.accent_text)))
+        .when(selected, |this| this.child(kit::icon(IconName::Check, kit::IconSize::INLINE, p.accent_text)))
 }
 
 /// 可选中的小块：显示文字与无障碍名称分开，测试按名称找。
@@ -2912,44 +3612,48 @@ fn chip(id: SharedString, label: SharedString, text: SharedString, selected: boo
         .aria_label(label)
         .aria_selected(selected)
         .h(px(m.tree_row_h))
-        .px(px(10.))
+        .px(px(Space::MD))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(px(Space::SM))
         .rounded(px(Radius::CONTROL))
         .border_1()
         .text_size(px(TypeScale::SM))
         .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong).bg(p.hover)))
-        .when_some(icon, |this, icon| this.child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint })))
+        .when_some(icon, |this, icon| this.child(kit::icon(icon, kit::IconSize::INLINE, if selected { p.accent_text } else { p.text_faint })))
         .child(text)
 }
 
-fn stat(label: String, value: usize, tone: gpui_kit::Hsla, p: &Palette) -> AnyElement {
+fn summary_pill(mark: &'static str, value: usize, label: String, fg: gpui_kit::Hsla, bg: gpui_kit::Hsla) -> AnyElement {
     div()
-        .flex_1()
-        .p(px(10.))
-        .rounded(px(Radius::PANEL))
-        .bg(p.chrome)
+        .flex_none()
+        .px(px(Space::MD))
+        .py(px(Space::XS))
+        .rounded(px(Radius::TAG))
+        .bg(bg)
+        .text_color(fg)
         .flex()
-        .flex_col()
-        .gap(px(2.))
-        .child(div().text_size(px(TypeScale::XL)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(tone).child(SharedString::from(value.to_string())))
-        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(label)))
+        .items_center()
+        .gap(px(Space::XS))
+        .text_size(px(TypeScale::XS))
+        .child(div().font_weight(gpui_kit::FontWeight::BOLD).font_features(kit::tabular_figures()).child(SharedString::from(format!("{mark}{value}"))))
+        .child(SharedString::from(label))
         .into_any_element()
 }
 
 fn note_banner(icon: IconName, text: String, fg: gpui_kit::Hsla, bg: gpui_kit::Hsla) -> AnyElement {
     div()
-        .px(px(12.))
-        .py(px(8.))
+        .px(px(Space::LG))
+        .py(px(Space::MD))
         .flex()
-        .gap(px(8.))
+        .items_center()
+        .gap(px(Space::MD))
         .rounded(px(Radius::PANEL))
         .bg(bg)
         .text_color(fg)
         .text_size(px(TypeScale::SM))
-        .child(kit::icon(icon, 15., fg))
+        .child(kit::icon(icon, kit::IconSize::CONTROL, fg))
         .child(div().flex_1().min_w_0().child(SharedString::from(text)))
         .into_any_element()
 }
@@ -3132,7 +3836,7 @@ mod tests {
         assert!(pane.show_empty_guide(), "清掉提示后回到初始指导");
     }
 
-    fn sqlite_pair(pane: &mut ComparePane) {
+    pub(super) fn sqlite_pair(pane: &mut ComparePane) {
         pane.choices = vec![
             Choice { id: "left".into(), name: "左".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
             Choice { id: "right".into(), name: "右".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
@@ -3199,7 +3903,7 @@ mod tests {
         assert_eq!(pane.error_kind, ErrorKind::Failure(RetryAction::Data));
     }
 
-    fn annotated(name: &str, detail: &str, sql: &str) -> DiffItem {
+    pub(super) fn annotated(name: &str, detail: &str, sql: &str) -> DiffItem {
         DiffItem {
             kind: "表".into(),
             name: name.into(),
@@ -4146,6 +4850,147 @@ mod workbench {
             let _ = tx.send((note, rows));
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(30)).expect("read target"), ("b".to_owned(), 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 表名智能补全：前缀匹配优先于子串匹配，空输入返回全部表；选中候选项更新 `table_pair` 并收起弹层。
+    #[gpui_kit::test]
+    fn table_autocomplete_filters_prefix_first_and_selects_into_table_pair(cx: &mut TestAppContext) {
+        let all: Vec<String> = vec![
+            "audit_orders".into(),
+            "customers".into(),
+            "order_items".into(),
+            "orders".into(),
+            "pre_order_log".into(),
+        ];
+        assert_eq!(filter_table_candidates(&all, ""), all, "空输入返回全部表");
+        assert_eq!(
+            filter_table_candidates(&all, "ord"),
+            vec!["order_items".to_owned(), "orders".to_owned(), "audit_orders".to_owned(), "pre_order_log".to_owned()],
+            "前缀匹配排在子串匹配前面"
+        );
+        assert_eq!(
+            filter_table_candidates(&all, "ORD"),
+            vec!["order_items".to_owned(), "orders".to_owned(), "audit_orders".to_owned(), "pre_order_log".to_owned()],
+            "大小写不敏感"
+        );
+        assert!(filter_table_candidates(&all, "nonexistent").is_empty());
+
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-ac-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(900.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, cx| {
+                    cx.new(|_| {
+                        let mut pane = ComparePane::new(Arc::clone(&services));
+                        tests::sqlite_pair(&mut pane);
+                        pane.table_pair = Some(("ord".into(), String::new()));
+                        pane.table_reload = true;
+                        pane.tables_cache.insert(table_cache_key("left", "main", ""), TableListState::Ready(all.clone()));
+                        pane.tables_cache.insert(table_cache_key("right", "main", ""), TableListState::Ready(all.clone()));
+                        pane.table_ac_side = Some("baseline");
+                        pane
+                    })
+                },
+            )
+            .expect("compare pane")
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("compare-table-ac:baseline").is_some(), "补全弹层应当渲染");
+            assert!(window.try_find("compare-table-ac:baseline:order_items").is_some());
+            assert!(window.try_find("compare-table-ac:baseline:orders").is_some());
+            assert!(window.try_find("compare-table-ac:baseline:customers").is_none(), "不匹配的表不应出现");
+            // 点击候选项 `orders` 更新 `table_pair.0` 并关闭弹层。
+            window.click("compare-table-ac:baseline:orders", cx);
+            window.render_frame(cx);
+            view.update(cx, |pane, _| {
+                assert_eq!(pane.table_pair(), Some(("orders".into(), String::new())));
+                assert_eq!(pane.table_ac_side, None, "选中后关闭弹层");
+            });
+            assert!(window.try_find("compare-table-ac:baseline").is_none());
+
+            // 对照侧：空输入时列出全部表，键盘步进后接受第 2 项。
+            view.update(cx, |pane, cx| {
+                pane.table_ac_side = Some("target");
+                pane.table_ac_index = 0;
+                pane.step_table_ac(false, 1);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("compare-table-ac:target:customers").is_some());
+            view.update(cx, |pane, cx| {
+                let picked = pane.table_candidates_for_side(false)[pane.table_ac_index].clone();
+                pane.accept_table_candidate("target", &picked, window, cx);
+            });
+            view.update(cx, |pane, _| {
+                assert_eq!(pane.table_pair(), Some(("orders".into(), "customers".into())));
+                assert_eq!(pane.table_ac_side, None);
+            });
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归测试：`compare-diff-tree` 放 25 条两行差异项时，行高必须为正且纵向绝不重叠。
+    #[gpui_kit::test]
+    fn diff_tree_rows_never_overlap_vertically_with_many_items(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-overlap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let (window, _view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(900.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, cx| {
+                    cx.new(|_| {
+                        let mut pane = ComparePane::new(Arc::clone(&services));
+                        tests::sqlite_pair(&mut pane);
+                        let mut report = empty_structure(None);
+                        for i in 0..25 {
+                            report.changed.push(tests::annotated(
+                                &format!("table_{i:02}"),
+                                "列类型不同，索引定义不一致",
+                                &format!("ALTER TABLE table_{i:02} ALTER COLUMN note TYPE text;"),
+                            ));
+                        }
+                        pane.install_structure(report);
+                        pane
+                    })
+                },
+            )
+            .expect("compare pane")
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let mut prev: Option<gpui_kit::Bounds<gpui_kit::Pixels>> = None;
+            for i in 0..25 {
+                let id = format!("compare-pick:c:{i}");
+                let bounds = window.find(SharedString::from(id)).bounds();
+                assert!(bounds.size.height > px(20.), "第 {i} 行高度应容纳两行文字，实际 {:?}", bounds);
+                if let Some(prev_bounds) = prev {
+                    assert!(
+                        prev_bounds.origin.y + prev_bounds.size.height <= bounds.origin.y + px(0.5),
+                        "第 {} 行与第 {} 行发生纵向重叠：prev={:?}, curr={:?}",
+                        i - 1,
+                        i,
+                        prev_bounds,
+                        bounds
+                    );
+                }
+                prev = Some(bounds);
+            }
+        })
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

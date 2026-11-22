@@ -657,7 +657,7 @@ fn explain_synonym_rest<'a>(engine: &str, statement: &'a str) -> Option<&'a str>
 /// 按服务器版本把语句包成只看执行计划的语句；`server_version` 未知时由方言选择保守格式。
 /// `DESC SELECT …` 这类同义写法改成 `EXPLAIN SELECT …` 原样发送，不再包一层 EXPLAIN。
 pub fn explain_sql_for(engine: &str, statement: &str, server_version: Option<&str>) -> Result<String, String> {
-    let body = checked_explain_body(engine, statement)?;
+    let body = checked_explain_body(engine, statement, server_version)?;
     let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
         return Err(key_text("query.errors.unknownDialect"));
     };
@@ -667,7 +667,7 @@ pub fn explain_sql_for(engine: &str, statement: &str, server_version: Option<&st
     Ok(syntax.explain_for(body, server_version))
 }
 
-fn checked_explain_body<'a>(engine: &str, statement: &'a str) -> Result<&'a str, String> {
+fn checked_explain_body<'a>(engine: &str, statement: &'a str, server_version: Option<&str>) -> Result<&'a str, String> {
     if !known_sql_engine(engine) {
         return Err(key_text("query.errors.unknownDialect"));
     }
@@ -675,13 +675,24 @@ fn checked_explain_body<'a>(engine: &str, statement: &'a str) -> Result<&'a str,
     if body.is_empty() {
         return Err(key_text("query.plan.empty"));
     }
-    if has_analyze(body, engine) {
+    if has_analyze(body, engine) && !allows_dialect_explain_analyze(engine, body, server_version) {
         return Err(key_text("query.plan.noAnalyze"));
     }
     if let Some(reason) = unexplainable(engine, body) {
         return Err(reason);
     }
     Ok(body)
+}
+
+/// 由对应方言适配器决定是否放行带 ANALYZE 的执行计划语句。
+fn allows_dialect_explain_analyze(engine: &str, body: &str, server_version: Option<&str>) -> bool {
+    let Some(syntax) = crate::adapters::query::syntax_named(engine) else {
+        return false;
+    };
+    let (words, _) = split::top_level_words(engine, body);
+    let first = words.first().map(|(word, _, _)| word.as_str());
+    let second = words.get(1).map(|(word, _, _)| word.as_str());
+    syntax.allows_explain_analyze(first, second, server_version)
 }
 
 pub fn sql_save_name() -> String {
@@ -1872,6 +1883,12 @@ mod tests {
         );
         assert_eq!(explain_sql_for("mariadb", "SELECT 1", Some("10.11.6-MariaDB")).unwrap(), "EXPLAIN FORMAT=JSON SELECT 1");
         assert_eq!(explain_sql_for("mariadb", "SELECT 1", None).unwrap(), "EXPLAIN FORMAT=JSON SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "EXPLAIN ANALYZE SELECT 1", Some("8.0.18")).unwrap(), "EXPLAIN ANALYZE SELECT 1");
+        assert_eq!(explain_sql_for("mysql", "EXPLAIN ANALYZE SELECT 1", Some("8.4.3")).unwrap(), "EXPLAIN ANALYZE SELECT 1");
+        assert!(explain_sql_for("mysql", "EXPLAIN ANALYZE SELECT 1", Some("8.0.17")).is_err());
+        assert!(explain_sql_for("mysql", "EXPLAIN ANALYZE SELECT 1", Some("5.7.44")).is_err());
+        assert_eq!(explain_sql_for("mariadb", "ANALYZE FORMAT=JSON SELECT 1", Some("10.11.6-MariaDB")).unwrap(), "ANALYZE FORMAT=JSON SELECT 1");
+        assert!(explain_sql_for("mariadb", "ANALYZE TABLE orders", Some("10.11.6-MariaDB")).is_err());
         assert!(explain_sql_for("sqlite", "SELECT 1", Some("3.45")).unwrap().starts_with("EXPLAIN QUERY PLAN"));
     }
 

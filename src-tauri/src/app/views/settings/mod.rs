@@ -382,8 +382,8 @@ pub fn editor_theme_colors(theme: &str, dark: bool) -> (u32, u32) {
         ("cool", true) => (0x101620, 0xdbe6f3),
         ("mono", false) => (0xf6f7f8, 0x1f2328),
         ("mono", true) => (0x18191c, 0xe5e7eb),
-        (_, false) => (0xffffff, 0x111827),
-        (_, true) => (0x14161c, 0xeceef4),
+        (_, false) => (0xfcfcfc, 0x14151a),
+        (_, true) => (0x111216, 0xf2f3f5),
     }
 }
 
