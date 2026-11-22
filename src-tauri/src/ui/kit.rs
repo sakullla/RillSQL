@@ -239,11 +239,17 @@ pub fn set_editor_surface(editor_theme: &str, cx: &mut App) {
 /// 编辑器正文用的是配色设置里的底色，两者不一致时行号栏会变成一条突兀的深色带。
 fn paint_editor_surface(dark: bool, cx: &mut App) {
     let name = cx.try_global::<EditorSurface>().map(|current| current.0).unwrap_or("auto");
-    let (background, _) = crate::app::views::settings::editor_theme_colors(name, dark);
+    let (background, foreground) = crate::app::views::settings::editor_theme_colors(name, dark);
     let background = hex(background);
+    let foreground = hex(foreground);
+    let p = if dark { Palette::dark() } else { Palette::light() };
+    let active_line = if dark { alpha(0x5b82f5, 0.08) } else { alpha(0x2b54c6, 0.06) };
     let theme_name = sql_theme_name(name, dark);
     let current = &cx.theme().highlight_theme;
-    if current.style.editor_background == Some(background) && current.name == theme_name {
+    if current.style.editor_background == Some(background)
+        && current.style.editor_foreground == Some(foreground)
+        && current.name == theme_name
+    {
         return;
     }
     Theme::update(cx, |theme| {
@@ -251,6 +257,10 @@ fn paint_editor_surface(dark: bool, cx: &mut App) {
         highlight.name = theme_name;
         highlight.style.editor_background = Some(background);
         highlight.style.editor_gutter_background = Some(background);
+        highlight.style.editor_foreground = Some(foreground);
+        highlight.style.editor_active_line = Some(active_line);
+        highlight.style.editor_line_number = Some(p.text_faint);
+        highlight.style.editor_active_line_number = Some(p.text);
         apply_sql_syntax(&mut highlight.style.syntax, dark);
         theme.highlight_theme = Arc::new(highlight);
     });
@@ -272,22 +282,23 @@ pub struct SqlTokenColor {
     pub italic: bool,
 }
 
-/// RillSQL 自有 SQL 配色。标识符（variable）用接近正文的颜色，其余各类都换色相，
-/// 关键字另外加粗、注释斜体，色觉差异的人也能靠字形区分。
+/// RillSQL 自有 SQL 配色（浅色对标 JetBrains DataGrip Light / GitHub Light 高对比度方案，
+/// 所有记号 6:1–17:1 清晰锐利；深色对标 GitHub Dark / One Dark Pro 7:1–16:1）。
+/// 关键字加粗、注释斜体，色觉差异也能靠字形区分。
 pub const SQL_TOKEN_COLORS: &[SqlTokenColor] = &[
-    SqlTokenColor { scope: "keyword", light: 0x264ec2, dark: 0x89a8ff, bold: true, italic: false },
-    SqlTokenColor { scope: "function", light: 0x6d35b8, dark: 0xc7a4ff, bold: false, italic: false },
-    SqlTokenColor { scope: "type", light: 0x944b06, dark: 0xf2b56b, bold: false, italic: false },
-    SqlTokenColor { scope: "string", light: 0x136f41, dark: 0x6ee7a0, bold: false, italic: false },
-    SqlTokenColor { scope: "number", light: 0xb03a18, dark: 0xffa07a, bold: false, italic: false },
-    SqlTokenColor { scope: "boolean", light: 0xb03a18, dark: 0xffa07a, bold: false, italic: false },
-    SqlTokenColor { scope: "comment", light: 0x596275, dark: 0x9aa3b8, bold: false, italic: true },
-    SqlTokenColor { scope: "operator", light: 0x3b4354, dark: 0xc6cddc, bold: false, italic: false },
-    SqlTokenColor { scope: "punctuation", light: 0x4b5468, dark: 0xb4bdd0, bold: false, italic: false },
-    SqlTokenColor { scope: "variable", light: 0x141824, dark: 0xf1f3f9, bold: false, italic: false },
-    SqlTokenColor { scope: "property", light: 0x141824, dark: 0xf1f3f9, bold: false, italic: false },
-    SqlTokenColor { scope: "attribute", light: 0x944b06, dark: 0xf2b56b, bold: false, italic: false },
-    SqlTokenColor { scope: "variable.special", light: 0x9e1f65, dark: 0xff8dc7, bold: false, italic: false },
+    SqlTokenColor { scope: "keyword", light: 0x0033b3, dark: 0x7aa2ff, bold: true, italic: false },
+    SqlTokenColor { scope: "function", light: 0x6d28d9, dark: 0xd2a8ff, bold: false, italic: false },
+    SqlTokenColor { scope: "type", light: 0x9a3412, dark: 0xffb86c, bold: false, italic: false },
+    SqlTokenColor { scope: "string", light: 0x0b6623, dark: 0x7ee787, bold: false, italic: false },
+    SqlTokenColor { scope: "number", light: 0xb91c1c, dark: 0xff9b71, bold: false, italic: false },
+    SqlTokenColor { scope: "boolean", light: 0xb91c1c, dark: 0xff9b71, bold: false, italic: false },
+    SqlTokenColor { scope: "comment", light: 0x525c6e, dark: 0x9aa4ba, bold: false, italic: true },
+    SqlTokenColor { scope: "operator", light: 0x273042, dark: 0xc8d0e0, bold: false, italic: false },
+    SqlTokenColor { scope: "punctuation", light: 0x374151, dark: 0xb4bdd0, bold: false, italic: false },
+    SqlTokenColor { scope: "variable", light: 0x111827, dark: 0xf1f3f9, bold: false, italic: false },
+    SqlTokenColor { scope: "property", light: 0x111827, dark: 0xf1f3f9, bold: false, italic: false },
+    SqlTokenColor { scope: "attribute", light: 0x9a3412, dark: 0xffb86c, bold: false, italic: false },
+    SqlTokenColor { scope: "variable.special", light: 0xa21caf, dark: 0xff85c0, bold: false, italic: false },
 ];
 
 /// 一种记号在当前明暗下的颜色。
@@ -329,13 +340,17 @@ fn apply_sql_syntax(syntax: &mut gpui_kit::component::highlighter::SyntaxColors,
         };
         *slot = style;
     }
+    syntax.constant = syntax.number;
     // 子类回退到父类时不能被组件库默认主题里的同名子项截走。
     syntax.punctuation_bracket = None;
     syntax.punctuation_delimiter = None;
+    syntax.punctuation_list_marker = None;
     syntax.punctuation_special = None;
     syntax.comment_doc = None;
     syntax.string_escape = None;
+    syntax.string_regex = None;
     syntax.string_special = None;
+    syntax.string_special_symbol = None;
 }
 
 /// WCAG 2.x 相对亮度。
