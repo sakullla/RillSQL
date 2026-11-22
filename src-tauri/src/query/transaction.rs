@@ -15,18 +15,24 @@ use std::time::{Duration, Instant};
 
 use crate::connections::transaction::TransactionCoordinator;
 use crate::transaction::{
-    ControlMatch, ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict, StatementFailure, StatementOutcome, TransactionEffect, TransactionState,
-    UnknownReason,
+    ControlMatch, ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict,
+    StatementFailure, StatementOutcome, TransactionEffect, TransactionState, UnknownReason,
 };
 
-use super::exec::{elapsed_ms, AutoRewrite, DriverReport, ErrorAt, Failure, StatementDriver, StatementStop, StatementValue};
+use super::exec::{
+    elapsed_ms, AutoRewrite, DriverReport, ErrorAt, Failure, StatementDriver, StatementStop,
+    StatementValue,
+};
 
 /// 隐式提交已经发生：此前的修改不能再由原事务回滚（R9）。
-const IMPLICIT_COMMIT_NOTE: &str = "这条语句执行前，数据库已隐式提交当前事务；此前的修改不能再通过原事务回滚。";
+const IMPLICIT_COMMIT_NOTE: &str =
+    "这条语句执行前，数据库已隐式提交当前事务；此前的修改不能再通过原事务回滚。";
 /// 无法静态确认这条语句是否隐式提交：不宣称发生，也不宣称事务仍然活动（R9、R10）。
-const UNCERTAIN_IMPLICIT_COMMIT_NOTE: &str = "无法确认这条语句是否让数据库隐式提交；事务状态标为未知。";
+const UNCERTAIN_IMPLICIT_COMMIT_NOTE: &str =
+    "无法确认这条语句是否让数据库隐式提交；事务状态标为未知。";
 /// 会隐式提交的语句在结果未知时：既不能宣称已经提交，也不能宣称仍可回滚。
-const UNCONFIRMED_IMPLICIT_COMMIT_NOTE: &str = "无法确认这条语句是否已隐式提交当前事务；事务结果未知。";
+const UNCONFIRMED_IMPLICIT_COMMIT_NOTE: &str =
+    "无法确认这条语句是否已隐式提交当前事务；事务结果未知。";
 /// 控制语句的结果没有返回。
 const CONTROL_UNCONFIRMED_NOTE: &str = "控制语句的结果没有返回，事务结果未知；没有重放这条语句。";
 /// 控制语句执行了，但事务结局仍无法确认（例如更早的未知事务）。
@@ -34,18 +40,23 @@ const CONTROL_UNRESOLVED_NOTE: &str = "事务结果仍无法确认；没有重�
 /// 控制语句失败并把事务置为中止。
 const CONTROL_ABORTED_NOTE: &str = "控制语句失败，事务被数据库置为中止；只能回滚或回滚到保存点。";
 /// 以事务控制关键字开头、但形态无法确认的手写语句。
-const AMBIGUOUS_CONTROL_NOTE: &str = "这条语句以事务控制关键字开头，但实际效果无法确认；事务状态标为未知。";
+const AMBIGUOUS_CONTROL_NOTE: &str =
+    "这条语句以事务控制关键字开头，但实际效果无法确认；事务状态标为未知。";
 /// 普通语句失败并把事务置为中止（PostgreSQL 类）。
 const ABORTED_STATEMENT_NOTE: &str = "语句失败，事务已被数据库置为中止；只能回滚或回滚到保存点。";
 /// 数据库在语句期间自行回滚了整个事务（MySQL 死锁、SQLite 部分错误）。
-const SERVER_ROLLBACK_NOTE: &str = "数据库可能已自行回滚整个事务，最终结果无法确认；请用独立查询核对。";
+const SERVER_ROLLBACK_NOTE: &str =
+    "数据库可能已自行回滚整个事务，最终结果无法确认；请用独立查询核对。";
 
 /// 发送前为一条语句定下的执行方式。
 pub(crate) enum StatementPlan {
     /// 普通语句（或连接没有事务面）：按用户文本发送，按方言登记事务效果。
     Ordinary,
     /// 明确的事务控制语句：发送方言映射后的 SQL，执行后登记控制结果。
-    Control { statement: ControlStatement, sql: ControlSql },
+    Control {
+        statement: ControlStatement,
+        sql: ControlSql,
+    },
     /// 以控制关键字开头但形态无法确认：执行后只能按未知登记，不能当成普通语句忽略。
     Ambiguous,
     /// 本地拒绝：不发送，批次以失败结束。
@@ -76,7 +87,8 @@ pub(crate) struct StatementTrial {
 
 /// 按方言决定一条语句怎么执行。预检拒绝的控制语句在这里就被拦下，不会下发（R3）。
 pub(crate) fn plan(transactions: Option<&TransactionCoordinator>, body: &str) -> StatementPlan {
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return StatementPlan::Ordinary;
     };
     match transactions.classify_control(body) {
@@ -102,8 +114,12 @@ pub(crate) async fn attempt(
         StatementPlan::Refused(message) => refused(message),
         StatementPlan::Control { statement, sql } => match sql {
             // 不需要单独下发（SQLite 的事务模式随下一次 BEGIN 生效）：只登记设置。
-            ControlSql::NoStatement => acknowledge(transactions, statement, ControlOutcome::Confirmed, None),
-            ControlSql::Unsupported => refused("这条事务控制语句在当前数据库上没有对应的执行方式（这条语句没有发送）".to_owned()),
+            ControlSql::NoStatement => {
+                acknowledge(transactions, statement, ControlOutcome::Confirmed, None)
+            }
+            ControlSql::Unsupported => refused(
+                "这条事务控制语句在当前数据库上没有对应的执行方式（这条语句没有发送）".to_owned(),
+            ),
             ControlSql::Statement(sql) => {
                 let ran = run(driver, limit, cancel, &sql).await;
                 let outcome = control_result(transactions, &statement, &ran);
@@ -145,7 +161,11 @@ impl Ran {
     fn message(&self) -> String {
         match &self.outcome {
             Ok(_) => String::new(),
-            Err(StatementStop::Error { message, .. } | StatementStop::Unknown { message } | StatementStop::Cancelled { message }) => message.clone(),
+            Err(
+                StatementStop::Error { message, .. }
+                | StatementStop::Unknown { message }
+                | StatementStop::Cancelled { message },
+            ) => message.clone(),
         }
     }
 
@@ -153,14 +173,26 @@ impl Ran {
     fn failure_parts(&self) -> (Option<&str>, &str) {
         let stop_message = match &self.outcome {
             Ok(_) => "",
-            Err(StatementStop::Error { message, .. } | StatementStop::Unknown { message } | StatementStop::Cancelled { message }) => message.as_str(),
+            Err(
+                StatementStop::Error { message, .. }
+                | StatementStop::Unknown { message }
+                | StatementStop::Cancelled { message },
+            ) => message.as_str(),
         };
-        let message = self.failure.as_ref().map(|failure| failure.message.as_str()).unwrap_or(stop_message);
+        let message = self
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+            .unwrap_or(stop_message);
         let stop_code = match &self.outcome {
             Err(StatementStop::Error { code, .. }) => code.as_deref(),
             _ => None,
         };
-        let code = self.failure.as_ref().and_then(|failure| failure.code.as_deref()).or(stop_code);
+        let code = self
+            .failure
+            .as_ref()
+            .and_then(|failure| failure.code.as_deref())
+            .or(stop_code);
         (code, message)
     }
 }
@@ -172,7 +204,9 @@ impl StatementTrial {
         let (error_at, error_code, value) = match ran.outcome {
             Ok(value) => (None, None, Some(value)),
             Err(StatementStop::Error { at, code, .. }) => (at, code, None),
-            Err(StatementStop::Unknown { .. } | StatementStop::Cancelled { .. }) => (None, None, None),
+            Err(StatementStop::Unknown { .. } | StatementStop::Cancelled { .. }) => {
+                (None, None, None)
+            }
         };
         Self {
             status,
@@ -181,7 +215,11 @@ impl StatementTrial {
             rewrite: ran.rewrite,
             value,
             // 被取消的语句只标“已取消”，不报一个不完整的耗时。
-            elapsed_ms: if status == "cancelled" { None } else { Some(elapsed_ms(ran.spent)) },
+            elapsed_ms: if status == "cancelled" {
+                None
+            } else {
+                Some(elapsed_ms(ran.spent))
+            },
             error_at,
             error_code,
             transaction: None,
@@ -211,12 +249,23 @@ fn refused(message: String) -> StatementTrial {
     }
 }
 
-async fn run(driver: &dyn StatementDriver, limit: usize, cancel: &Arc<AtomicBool>, sql: &str) -> Ran {
+async fn run(
+    driver: &dyn StatementDriver,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sql: &str,
+) -> Ran {
     let paused_before = driver.paused();
     let started = Instant::now();
     let report = driver.run(sql, limit, cancel).await;
-    let spent = started.elapsed().saturating_sub(driver.paused().saturating_sub(paused_before));
-    let DriverReport { sent, outcome, failure } = report;
+    let spent = started
+        .elapsed()
+        .saturating_sub(driver.paused().saturating_sub(paused_before));
+    let DriverReport {
+        sent,
+        outcome,
+        failure,
+    } = report;
     Ran {
         sent: sent.sql,
         rewrite: sent.rewrite,
@@ -228,7 +277,8 @@ async fn run(driver: &dyn StatementDriver, limit: usize, cancel: &Arc<AtomicBool
 
 /// 普通语句：成功/失败按方言登记，MySQL/MariaDB 的隐式提交单独报告（R9）。
 fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran) -> StatementTrial {
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return StatementTrial::new(ran);
     };
     let outcome = statement_outcome(transactions, &ran);
@@ -237,11 +287,14 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
         // 隐式提交发生在语句执行之前：即使语句本身随后失败，此前的修改也已经被提交。
         ImplicitCommitVerdict::Yes => match outcome {
             StatementOutcome::Unconfirmed(reason) => {
-                trial.transaction = Some(transactions.observe_statement(StatementOutcome::Unconfirmed(reason)));
+                trial.transaction =
+                    Some(transactions.observe_statement(StatementOutcome::Unconfirmed(reason)));
                 append_note(&mut trial.message, UNCONFIRMED_IMPLICIT_COMMIT_NOTE);
             }
             _ => {
-                let effect = transactions.observe_implicit_commit().unwrap_or(TransactionEffect::Unknown);
+                let effect = transactions
+                    .observe_implicit_commit()
+                    .unwrap_or(TransactionEffect::Unknown);
                 trial.transaction = Some(effect);
                 if effect == TransactionEffect::ImplicitCommit {
                     append_note(&mut trial.message, IMPLICIT_COMMIT_NOTE);
@@ -251,7 +304,9 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
         // 过程体、动态 SQL 与未分类语句可能隐式提交：不宣称发生，也不宣称事务仍然活动。
         // 没有活动事务（自动提交）时同一条语句不改变任何事务状态，不留下未知提示。
         ImplicitCommitVerdict::Uncertain => {
-            let effect = transactions.observe_statement(StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect));
+            let effect = transactions.observe_statement(StatementOutcome::Unconfirmed(
+                UnknownReason::UnrecognizedEffect,
+            ));
             trial.transaction = Some(effect);
             if effect == TransactionEffect::Unknown {
                 append_note(&mut trial.message, UNCERTAIN_IMPLICIT_COMMIT_NOTE);
@@ -261,8 +316,16 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
             // 过程调用/动态 SQL 可能已经在内部提交、回滚或开始了事务：活动状态保留，
             // 但层数不能再沿用旧值，交给批次前后的探针核对（R8、R10）。
             let opaque = transactions.statement_may_change_transaction(body)
-                && matches!(outcome, StatementOutcome::Succeeded | StatementOutcome::Failed(StatementFailure::TransactionUsable));
-            let observed = if opaque { transactions.observe_opaque_statement() } else { transactions.observe_statement(outcome) };
+                && matches!(
+                    outcome,
+                    StatementOutcome::Succeeded
+                        | StatementOutcome::Failed(StatementFailure::TransactionUsable)
+                );
+            let observed = if opaque {
+                transactions.observe_opaque_statement()
+            } else {
+                transactions.observe_statement(outcome)
+            };
             trial.transaction = Some(observed);
             if outcome == StatementOutcome::Failed(StatementFailure::TransactionAborted) {
                 append_note(&mut trial.message, ABORTED_STATEMENT_NOTE);
@@ -283,7 +346,8 @@ fn ordinary(transactions: Option<&TransactionCoordinator>, body: &str, ran: Ran)
 fn ambiguous(transactions: Option<&TransactionCoordinator>, ran: Ran) -> StatementTrial {
     let mut trial = StatementTrial::new(ran);
     trial.ambiguous_control = true;
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return trial;
     };
     trial.transaction = Some(transactions.observe_ambiguous_control());
@@ -293,15 +357,24 @@ fn ambiguous(transactions: Option<&TransactionCoordinator>, ran: Ran) -> Stateme
 }
 
 /// 控制语句的驱动结果按方言翻译成模型能登记的结果（控制失败方向由方言判定）。
-fn control_result(transactions: Option<&TransactionCoordinator>, statement: &ControlStatement, ran: &Ran) -> ControlOutcome {
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+fn control_result(
+    transactions: Option<&TransactionCoordinator>,
+    statement: &ControlStatement,
+    ran: &Ran,
+) -> ControlOutcome {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return ControlOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect);
     };
     match &ran.outcome {
         // 驱动没有公开命令标签：中止事务里的 PostgreSQL COMMIT 由预检拒绝，不会走到这里。
         Ok(_) => transactions.control_success(statement, None),
-        Err(StatementStop::Cancelled { .. }) => ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
-        Err(StatementStop::Unknown { .. }) => ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+        Err(StatementStop::Cancelled { .. }) => {
+            ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)
+        }
+        Err(StatementStop::Unknown { .. }) => {
+            ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost)
+        }
         Err(StatementStop::Error { .. }) => {
             let (code, message) = ran.failure_parts();
             // 数据库可能已自行回滚整个事务（死锁牺牲品）：控制结果同样无法按请求方向确认。
@@ -338,7 +411,8 @@ fn acknowledge(
             remaining: "未执行",
         },
     };
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return trial;
     };
     match transactions.acknowledge(&statement, outcome) {
@@ -366,7 +440,10 @@ fn acknowledge(
             // 数据库可能已经执行了这条控制语句，但状态不能据此推进：按失败报告并保持原状态。
             trial.status = "error";
             trial.transaction = None;
-            append_note(&mut trial.message, &format!("{error}；事务状态没有按这条语句推进"));
+            append_note(
+                &mut trial.message,
+                &format!("{error}；事务状态没有按这条语句推进"),
+            );
         }
     }
     settle(&mut trial, transactions);
@@ -376,9 +453,13 @@ fn acknowledge(
 /// 数据库确认了控制语句之后，效果本身也要说清楚（R3、R9）。
 fn effect_note(effect: TransactionEffect, statement: &ControlStatement) -> Option<&'static str> {
     match effect {
-        TransactionEffect::ImplicitCommit => Some("数据库把这次开始之前的修改隐式提交了；新事务已经活动。"),
+        TransactionEffect::ImplicitCommit => {
+            Some("数据库把这次开始之前的修改隐式提交了；新事务已经活动。")
+        }
         // PostgreSQL 中止事务里的 COMMIT 会以回滚返回；正常预检不会把 COMMIT 发给中止事务。
-        TransactionEffect::RolledBack if matches!(statement, ControlStatement::Commit { .. }) => Some("事务已中止，数据库把这条 COMMIT 执行成回滚。"),
+        TransactionEffect::RolledBack if matches!(statement, ControlStatement::Commit { .. }) => {
+            Some("事务已中止，数据库把这条 COMMIT 执行成回滚。")
+        }
         _ => None,
     }
 }
@@ -388,13 +469,19 @@ fn statement_outcome(transactions: &TransactionCoordinator, ran: &Ran) -> Statem
     match &ran.outcome {
         Ok(_) => StatementOutcome::Succeeded,
         // 执行层已经判定“连接中断、写入结果无法确认”：旧事务的最终结果不再可从这条连接确认（R10）。
-        Err(StatementStop::Unknown { .. }) => StatementOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+        Err(StatementStop::Unknown { .. }) => {
+            StatementOutcome::Unconfirmed(UnknownReason::ConnectionLost)
+        }
         Err(_) => {
             let (code, message) = ran.failure_parts();
             match transactions.statement_failure(code, message) {
-                StatementFailure::ConnectionLost => StatementOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+                StatementFailure::ConnectionLost => {
+                    StatementOutcome::Unconfirmed(UnknownReason::ConnectionLost)
+                }
                 // 数据库可能已经自行回滚整个事务：不能继续宣称事务活动，也不重放这条语句。
-                _ if transactions.error_may_have_ended_transaction(code, message) => StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect),
+                _ if transactions.error_may_have_ended_transaction(code, message) => {
+                    StatementOutcome::Unconfirmed(UnknownReason::UnrecognizedEffect)
+                }
                 failure => StatementOutcome::Failed(failure),
             }
         }
@@ -415,8 +502,12 @@ fn settle(trial: &mut StatementTrial, transactions: &TransactionCoordinator) {
 ///
 /// 探针不是用户语句：不进入结果区、不占语句序号，也不重放任何写入。没有探针的方言（MySQL、
 /// PostgreSQL、SQLite）在这里什么都不做，状态保持未知直到使用者核对或回滚。
-pub(crate) async fn reconcile(transactions: Option<&TransactionCoordinator>, driver: &dyn StatementDriver) {
-    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional()) else {
+pub(crate) async fn reconcile(
+    transactions: Option<&TransactionCoordinator>,
+    driver: &dyn StatementDriver,
+) {
+    let Some(transactions) = transactions.filter(|transactions| transactions.is_transactional())
+    else {
         return;
     };
     let Some(snapshot) = transactions.snapshot() else {
@@ -424,7 +515,10 @@ pub(crate) async fn reconcile(transactions: Option<&TransactionCoordinator>, dri
     };
     // `depth == None` 表示层数不可信：未知状态、过程/动态 SQL 之后，都要用探针重新核对。
     let needs_probe = snapshot.state == TransactionState::Unknown
-        || (matches!(snapshot.state, TransactionState::Idle | TransactionState::Active) && snapshot.depth.is_none());
+        || (matches!(
+            snapshot.state,
+            TransactionState::Idle | TransactionState::Active
+        ) && snapshot.depth.is_none());
     if !needs_probe {
         return;
     }

@@ -17,7 +17,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::dialect::{AbortedRecovery, DuplicateBegin, ImplicitCommitSupport, SettingChange, SettingSupport, TransactionCapabilities};
+use super::dialect::{
+    AbortedRecovery, DuplicateBegin, ImplicitCommitSupport, SettingChange, SettingSupport,
+    TransactionCapabilities,
+};
 
 /// 连接级事务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +77,10 @@ impl TransactionEffect {
 
     /// 该效果表示事务已经结束（含隐式提交）。
     pub fn ends_transaction(self) -> bool {
-        matches!(self, Self::Committed | Self::RolledBack | Self::ImplicitCommit)
+        matches!(
+            self,
+            Self::Committed | Self::RolledBack | Self::ImplicitCommit
+        )
     }
 }
 
@@ -253,16 +259,26 @@ pub enum TransactionError {
 /// 事务控制语句（来自按钮或手写 SQL）。它只是意图，本身不改变状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlStatement {
-    Begin { mode: Option<String> },
-    Commit { chain: bool },
-    Rollback { chain: bool },
+    Begin {
+        mode: Option<String>,
+    },
+    Commit {
+        chain: bool,
+    },
+    Rollback {
+        chain: bool,
+    },
     Savepoint(SavepointName),
     RollbackToSavepoint(SavepointName),
     ReleaseSavepoint(SavepointName),
     /// `None` 表示恢复服务器默认隔离级别。
-    SetIsolation { level: Option<String> },
+    SetIsolation {
+        level: Option<String>,
+    },
     /// `None` 表示恢复方言默认事务模式。
-    SetMode { mode: Option<String> },
+    SetMode {
+        mode: Option<String>,
+    },
 }
 
 /// 数据库对一次控制语句的确认结果。
@@ -358,7 +374,9 @@ impl TransactionMachine {
                         // 数据库会隐式提交旧事务并开始新事务：允许，但结果必须报告隐式提交。
                         DuplicateBegin::EndsPrevious => Ok(()),
                         // 其余方言的重复开始只会被拒绝、被忽略或增加层数，界面一律先引导到保存点。
-                        DuplicateBegin::Nests | DuplicateBegin::Ignored | DuplicateBegin::Rejected => Err(TransactionError::AlreadyActive),
+                        DuplicateBegin::Nests
+                        | DuplicateBegin::Ignored
+                        | DuplicateBegin::Rejected => Err(TransactionError::AlreadyActive),
                     },
                     TransactionState::Aborted => Err(TransactionError::TransactionAborted),
                 }
@@ -380,7 +398,9 @@ impl TransactionMachine {
                 }
                 match self.snapshot.state {
                     TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
-                    TransactionState::Active | TransactionState::Aborted | TransactionState::Unknown => Ok(()),
+                    TransactionState::Active
+                    | TransactionState::Aborted
+                    | TransactionState::Unknown => Ok(()),
                 }
             }
             ControlStatement::Savepoint(_) => {
@@ -402,7 +422,9 @@ impl TransactionMachine {
                     TransactionState::Active => self.known_savepoint(name),
                     TransactionState::Aborted => match self.capabilities.aborted {
                         AbortedRecovery::SavepointRecovery => self.known_savepoint(name),
-                        AbortedRecovery::NotApplicable | AbortedRecovery::RollbackOnly => Err(TransactionError::RecoveryRequiresFullRollback),
+                        AbortedRecovery::NotApplicable | AbortedRecovery::RollbackOnly => {
+                            Err(TransactionError::RecoveryRequiresFullRollback)
+                        }
                     },
                     TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
                     TransactionState::Unknown => Err(TransactionError::UnknownOutcome),
@@ -422,15 +444,23 @@ impl TransactionMachine {
                     TransactionState::Unknown => Err(TransactionError::UnknownOutcome),
                 }
             }
-            ControlStatement::SetIsolation { level } => self.check_setting(SettingKind::Isolation, level.as_deref()),
-            ControlStatement::SetMode { mode } => self.check_setting(SettingKind::Mode, mode.as_deref()),
+            ControlStatement::SetIsolation { level } => {
+                self.check_setting(SettingKind::Isolation, level.as_deref())
+            }
+            ControlStatement::SetMode { mode } => {
+                self.check_setting(SettingKind::Mode, mode.as_deref())
+            }
         }
     }
 
     /// 确认一条控制语句的执行结果并推进状态。按钮路径与手写 SQL 路径共用这一个入口。
     ///
     /// 无法确认的结果只会进入 `Unknown`；被数据库拒绝的结果返回错误并保持原状态。
-    pub fn acknowledge(&mut self, statement: &ControlStatement, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    pub fn acknowledge(
+        &mut self,
+        statement: &ControlStatement,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if !self.capabilities.explicit_control {
             return Err(TransactionError::TransactionsUnsupported);
         }
@@ -439,10 +469,16 @@ impl TransactionMachine {
             ControlStatement::Commit { chain } => self.finish(true, *chain, outcome),
             ControlStatement::Rollback { chain } => self.finish(false, *chain, outcome),
             ControlStatement::Savepoint(name) => self.create_savepoint(name, outcome),
-            ControlStatement::RollbackToSavepoint(name) => self.rollback_to_savepoint(name, outcome),
+            ControlStatement::RollbackToSavepoint(name) => {
+                self.rollback_to_savepoint(name, outcome)
+            }
             ControlStatement::ReleaseSavepoint(name) => self.release_savepoint(name, outcome),
-            ControlStatement::SetIsolation { level } => self.set_setting(SettingKind::Isolation, level.as_deref(), outcome),
-            ControlStatement::SetMode { mode } => self.set_setting(SettingKind::Mode, mode.as_deref(), outcome),
+            ControlStatement::SetIsolation { level } => {
+                self.set_setting(SettingKind::Isolation, level.as_deref(), outcome)
+            }
+            ControlStatement::SetMode { mode } => {
+                self.set_setting(SettingKind::Mode, mode.as_deref(), outcome)
+            }
         }
     }
 
@@ -452,11 +488,14 @@ impl TransactionMachine {
             // 自动提交：语句结果不构成事务，失败也不产生需要确认的事务。
             TransactionState::Idle => TransactionEffect::Unchanged,
             TransactionState::Active => match outcome {
-                StatementOutcome::Succeeded | StatementOutcome::Failed(StatementFailure::TransactionUsable) => {
+                StatementOutcome::Succeeded
+                | StatementOutcome::Failed(StatementFailure::TransactionUsable) => {
                     self.record(TransactionEffect::StillActive);
                     TransactionEffect::StillActive
                 }
-                StatementOutcome::Failed(StatementFailure::TransactionAborted) => self.abort_in_place(),
+                StatementOutcome::Failed(StatementFailure::TransactionAborted) => {
+                    self.abort_in_place()
+                }
                 StatementOutcome::Failed(StatementFailure::ConnectionLost) => {
                     self.lose_confirmation(UnknownReason::ConnectionLost, PendingControl::Other);
                     TransactionEffect::Unknown
@@ -472,10 +511,15 @@ impl TransactionMachine {
                 StatementOutcome::Succeeded => {
                     // 中止事务里普通语句成功与数据库规则矛盾：不据此认为事务已恢复可用。
                     self.mark_depth_unverified_for(UnknownReason::UnrecognizedEffect);
-                    self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
+                    self.lose_confirmation(
+                        UnknownReason::UnrecognizedEffect,
+                        PendingControl::Other,
+                    );
                     TransactionEffect::Unknown
                 }
-                StatementOutcome::Failed(StatementFailure::TransactionUsable | StatementFailure::TransactionAborted) => TransactionEffect::Aborted,
+                StatementOutcome::Failed(
+                    StatementFailure::TransactionUsable | StatementFailure::TransactionAborted,
+                ) => TransactionEffect::Aborted,
                 StatementOutcome::Failed(StatementFailure::ConnectionLost) => {
                     self.lose_confirmation(UnknownReason::ConnectionLost, PendingControl::Other);
                     TransactionEffect::Unknown
@@ -563,7 +607,11 @@ impl TransactionMachine {
         }
         // 未知状态下只有丢失的就是提交类控制才能确认；活动/中止状态下必须已确认身份，
         // 否则隐式提交可能只是针对一个替换掉旧事务的新事务。
-        let effect = self.end_with_unknown(TransactionEffect::ImplicitCommit, false, PendingControl::Commit);
+        let effect = self.end_with_unknown(
+            TransactionEffect::ImplicitCommit,
+            false,
+            PendingControl::Commit,
+        );
         Ok(effect)
     }
 
@@ -645,7 +693,11 @@ impl TransactionMachine {
     /// 该操作不重放任何写入或事务控制语句。
     pub fn reconnect(&mut self, reason: UnknownReason) -> TransactionEffect {
         let previous = self.snapshot.state;
-        let effect = if previous == TransactionState::Idle { TransactionEffect::Unchanged } else { TransactionEffect::Unknown };
+        let effect = if previous == TransactionState::Idle {
+            TransactionEffect::Unchanged
+        } else {
+            TransactionEffect::Unknown
+        };
         if previous != TransactionState::Idle && self.snapshot.unresolved.is_none() {
             self.snapshot.unresolved = Some(UnknownTransaction {
                 reason,
@@ -671,7 +723,11 @@ impl TransactionMachine {
         effect
     }
 
-    fn begin(&mut self, mode: Option<&str>, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn begin(
+        &mut self,
+        mode: Option<&str>,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if let Some(mode) = mode {
             self.require_mode(mode)?;
         }
@@ -692,7 +748,10 @@ impl TransactionMachine {
                 TransactionState::Active => self.restarted(mode),
                 // 中止事务里确认开始与数据库规则矛盾：不据此认为事务已恢复可用。
                 TransactionState::Aborted => {
-                    self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
+                    self.lose_confirmation(
+                        UnknownReason::UnrecognizedEffect,
+                        PendingControl::Other,
+                    );
                     Ok(TransactionEffect::Unknown)
                 }
                 TransactionState::Idle => {
@@ -739,7 +798,10 @@ impl TransactionMachine {
             }
             DuplicateBegin::Nests => {
                 // T-SQL：@@TRANCOUNT 加一，一次 COMMIT 不会结束外层事务。
-                self.snapshot.depth = self.snapshot.depth.map(|depth| depth.max(1).saturating_add(1));
+                self.snapshot.depth = self
+                    .snapshot
+                    .depth
+                    .map(|depth| depth.max(1).saturating_add(1));
                 self.record(TransactionEffect::StillActive);
                 Ok(TransactionEffect::StillActive)
             }
@@ -757,13 +819,17 @@ impl TransactionMachine {
     }
 
     /// 未知状态下确认了开始语句：不能假设层数从 1 重新开始，也不能凭空推进代次。
-    fn begin_while_unknown(&mut self, mode: Option<&str>) -> Result<TransactionEffect, TransactionError> {
+    fn begin_while_unknown(
+        &mut self,
+        mode: Option<&str>,
+    ) -> Result<TransactionEffect, TransactionError> {
         match self.capabilities.duplicate_begin {
             DuplicateBegin::EndsPrevious => {
                 // 旧事务若仍活动，会被这条语句隐式提交；但丢失的控制方向可能不是提交
                 // （例如 ROLLBACK 已在服务器成功），或此前已经出现身份歧义时，
                 // 都不能宣称隐式提交，也不能清除未知记录。
-                let confirmed = self.pending_matches(PendingControl::Commit) && !self.unresolved_is_ambiguous();
+                let confirmed =
+                    self.pending_matches(PendingControl::Commit) && !self.unresolved_is_ambiguous();
                 self.snapshot.state = TransactionState::Active;
                 self.snapshot.depth = Some(1);
                 self.snapshot.savepoints.clear();
@@ -777,7 +843,11 @@ impl TransactionMachine {
                     // 新事务已经替换旧事务：之后的状态探针不能再证明旧事务身份。
                     self.mark_identity_ambiguous();
                 }
-                let effect = if confirmed { TransactionEffect::ImplicitCommit } else { TransactionEffect::Unknown };
+                let effect = if confirmed {
+                    TransactionEffect::ImplicitCommit
+                } else {
+                    TransactionEffect::Unknown
+                };
                 self.snapshot.last_effect = effect;
                 self.touch();
                 Ok(effect)
@@ -805,11 +875,20 @@ impl TransactionMachine {
         }
     }
 
-    fn finish(&mut self, commit: bool, chain: bool, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn finish(
+        &mut self,
+        commit: bool,
+        chain: bool,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if chain && !self.capabilities.chained_transactions {
             return Err(TransactionError::ChainedTransactionUnsupported);
         }
-        let pending = if commit { PendingControl::Commit } else { PendingControl::Rollback };
+        let pending = if commit {
+            PendingControl::Commit
+        } else {
+            PendingControl::Rollback
+        };
         match outcome {
             ControlOutcome::Unconfirmed(reason) => {
                 // Nests 方言：丢失的提交可能已经结束事务，层数不能再凭旧值判断。
@@ -832,18 +911,31 @@ impl TransactionMachine {
             },
             ControlOutcome::Confirmed | ControlOutcome::RolledBack => {
                 let committed = commit && outcome == ControlOutcome::Confirmed;
-                let effect = if committed { TransactionEffect::Committed } else { TransactionEffect::RolledBack };
-                let direction = if committed { PendingControl::Commit } else { PendingControl::Rollback };
+                let effect = if committed {
+                    TransactionEffect::Committed
+                } else {
+                    TransactionEffect::RolledBack
+                };
+                let direction = if committed {
+                    PendingControl::Commit
+                } else {
+                    PendingControl::Rollback
+                };
                 match self.snapshot.state {
                     // 没有活动事务时提交/回滚不得伪造成功结果。
                     TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
                     // 中止事务里的成功提交与数据库规则矛盾：只能按未知处理。
                     TransactionState::Aborted if committed => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
+                        self.lose_confirmation(
+                            UnknownReason::UnrecognizedEffect,
+                            PendingControl::Other,
+                        );
                         Ok(TransactionEffect::Unknown)
                     }
                     // 已知还有外层事务：一次 COMMIT 只减少层数，不能结束事务、也不能关闭未知记录。
-                    TransactionState::Active | TransactionState::Unknown if committed && matches!(self.snapshot.depth, Some(depth) if depth > 1) => {
+                    TransactionState::Active | TransactionState::Unknown
+                        if committed && matches!(self.snapshot.depth, Some(depth) if depth > 1) =>
+                    {
                         if let Some(depth) = self.snapshot.depth {
                             self.snapshot.depth = Some(depth - 1);
                         }
@@ -857,12 +949,17 @@ impl TransactionMachine {
                     }
                     // 活动状态却缺少层数：与模型不变量矛盾，按未知处理而不是猜测结束。
                     TransactionState::Active if committed && self.snapshot.depth.is_none() => {
-                        self.lose_confirmation(UnknownReason::ObservationFailed, PendingControl::Other);
+                        self.lose_confirmation(
+                            UnknownReason::ObservationFailed,
+                            PendingControl::Other,
+                        );
                         Ok(TransactionEffect::Unknown)
                     }
                     // 未知状态下丢失的控制方向不同（例如丢失 ROLLBACK，这里却确认了 COMMIT）：
                     // 事务确实结束，但结局可能是提交或回滚，只能保留未知并报告不确定。
-                    TransactionState::Active | TransactionState::Aborted | TransactionState::Unknown => {
+                    TransactionState::Active
+                    | TransactionState::Aborted
+                    | TransactionState::Unknown => {
                         // 未知状态要求方向一致；活动/中止状态要求身份已确认，否则可能是被替换的新事务。
                         Ok(self.end_with_unknown(effect, chain, direction))
                     }
@@ -871,7 +968,11 @@ impl TransactionMachine {
         }
     }
 
-    fn create_savepoint(&mut self, name: &SavepointName, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn create_savepoint(
+        &mut self,
+        name: &SavepointName,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if !self.capabilities.savepoints {
             return Err(TransactionError::SavepointsUnsupported);
         }
@@ -904,7 +1005,11 @@ impl TransactionMachine {
         }
     }
 
-    fn rollback_to_savepoint(&mut self, name: &SavepointName, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn rollback_to_savepoint(
+        &mut self,
+        name: &SavepointName,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if !self.capabilities.savepoints {
             return Err(TransactionError::SavepointsUnsupported);
         }
@@ -918,20 +1023,25 @@ impl TransactionMachine {
                 Ok(TransactionEffect::Unknown)
             }
             ControlOutcome::Confirmed => match self.snapshot.state {
-                TransactionState::Active | TransactionState::Aborted => match self.savepoint_index(name) {
-                    Some(index) => {
-                        // 回滚到保存点保留该保存点本身及其之前的状态，外层事务继续活动。
-                        self.snapshot.savepoints.truncate(index + 1);
-                        self.snapshot.state = TransactionState::Active;
-                        self.record(TransactionEffect::StillActive);
-                        Ok(TransactionEffect::StillActive)
+                TransactionState::Active | TransactionState::Aborted => {
+                    match self.savepoint_index(name) {
+                        Some(index) => {
+                            // 回滚到保存点保留该保存点本身及其之前的状态，外层事务继续活动。
+                            self.snapshot.savepoints.truncate(index + 1);
+                            self.snapshot.state = TransactionState::Active;
+                            self.record(TransactionEffect::StillActive);
+                            Ok(TransactionEffect::StillActive)
+                        }
+                        // 数据库确认了一个没有登记的保存点：保存点位置不可知。
+                        None => {
+                            self.lose_confirmation(
+                                UnknownReason::UnrecognizedEffect,
+                                PendingControl::Other,
+                            );
+                            Ok(TransactionEffect::Unknown)
+                        }
                     }
-                    // 数据库确认了一个没有登记的保存点：保存点位置不可知。
-                    None => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
-                        Ok(TransactionEffect::Unknown)
-                    }
-                },
+                }
                 TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
                 TransactionState::Unknown => Ok(TransactionEffect::Unknown),
             },
@@ -942,7 +1052,9 @@ impl TransactionMachine {
                 TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
             },
             ControlOutcome::Rejected => {
-                if self.savepoint_index(name).is_none() && self.snapshot.state != TransactionState::Idle {
+                if self.savepoint_index(name).is_none()
+                    && self.snapshot.state != TransactionState::Idle
+                {
                     Err(TransactionError::UnknownSavepoint(name.to_string()))
                 } else {
                     Err(self.rejection())
@@ -952,7 +1064,11 @@ impl TransactionMachine {
         }
     }
 
-    fn release_savepoint(&mut self, name: &SavepointName, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn release_savepoint(
+        &mut self,
+        name: &SavepointName,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         if !self.capabilities.savepoints {
             return Err(TransactionError::SavepointsUnsupported);
         }
@@ -978,7 +1094,10 @@ impl TransactionMachine {
                         Ok(TransactionEffect::StillActive)
                     }
                     None => {
-                        self.lose_confirmation(UnknownReason::UnrecognizedEffect, PendingControl::Other);
+                        self.lose_confirmation(
+                            UnknownReason::UnrecognizedEffect,
+                            PendingControl::Other,
+                        );
                         Ok(TransactionEffect::Unknown)
                     }
                 },
@@ -993,7 +1112,9 @@ impl TransactionMachine {
                 TransactionState::Idle => Err(TransactionError::NoActiveTransaction),
             },
             ControlOutcome::Rejected => {
-                if self.savepoint_index(name).is_none() && self.snapshot.state != TransactionState::Idle {
+                if self.savepoint_index(name).is_none()
+                    && self.snapshot.state != TransactionState::Idle
+                {
                     Err(TransactionError::UnknownSavepoint(name.to_string()))
                 } else {
                     Err(self.rejection())
@@ -1003,11 +1124,20 @@ impl TransactionMachine {
         }
     }
 
-    fn set_setting(&mut self, kind: SettingKind, value: Option<&str>, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    fn set_setting(
+        &mut self,
+        kind: SettingKind,
+        value: Option<&str>,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         self.check_setting(kind, value)?;
         match outcome {
             ControlOutcome::Confirmed => {
-                let effect = if self.snapshot.state == TransactionState::Active { TransactionEffect::StillActive } else { TransactionEffect::Unchanged };
+                let effect = if self.snapshot.state == TransactionState::Active {
+                    TransactionEffect::StillActive
+                } else {
+                    TransactionEffect::Unchanged
+                };
                 let changed = {
                     let slot = match kind {
                         SettingKind::Isolation => &mut self.snapshot.settings.isolation,
@@ -1024,7 +1154,9 @@ impl TransactionMachine {
                 Ok(effect)
             }
             ControlOutcome::Unconfirmed(reason) => self.setting_unconfirmed(reason),
-            ControlOutcome::Unrecognized => self.setting_unconfirmed(UnknownReason::UnrecognizedEffect),
+            ControlOutcome::Unrecognized => {
+                self.setting_unconfirmed(UnknownReason::UnrecognizedEffect)
+            }
             ControlOutcome::Rejected => Err(match self.snapshot.state {
                 TransactionState::Aborted => TransactionError::TransactionAborted,
                 TransactionState::Unknown => TransactionError::UnknownOutcome,
@@ -1042,7 +1174,10 @@ impl TransactionMachine {
     }
 
     /// 没有活动事务时设置失败不改变已生效设置；有事务时失去确认按未知处理。
-    fn setting_unconfirmed(&mut self, reason: UnknownReason) -> Result<TransactionEffect, TransactionError> {
+    fn setting_unconfirmed(
+        &mut self,
+        reason: UnknownReason,
+    ) -> Result<TransactionEffect, TransactionError> {
         if self.snapshot.state == TransactionState::Idle {
             return Err(TransactionError::ControlUnconfirmed);
         }
@@ -1050,7 +1185,11 @@ impl TransactionMachine {
         Ok(TransactionEffect::Unknown)
     }
 
-    fn check_setting(&self, kind: SettingKind, value: Option<&str>) -> Result<(), TransactionError> {
+    fn check_setting(
+        &self,
+        kind: SettingKind,
+        value: Option<&str>,
+    ) -> Result<(), TransactionError> {
         let support = kind.support(self.capabilities);
         if support.change == SettingChange::Unsupported {
             return Err(kind.unsupported(value.unwrap_or("default")));
@@ -1060,7 +1199,8 @@ impl TransactionMachine {
                 return Err(kind.unsupported(value));
             }
         }
-        if self.snapshot.state != TransactionState::Idle && support.change != SettingChange::AnyTime {
+        if self.snapshot.state != TransactionState::Idle && support.change != SettingChange::AnyTime
+        {
             // 不为应用设置而提交或结束当前事务。
             return Err(TransactionError::SettingLocked(kind.label()));
         }
@@ -1069,7 +1209,9 @@ impl TransactionMachine {
 
     fn require_mode(&self, mode: &str) -> Result<(), TransactionError> {
         let support = self.capabilities.mode;
-        if support.change == SettingChange::Unsupported || !support.options.iter().any(|option| option.id == mode) {
+        if support.change == SettingChange::Unsupported
+            || !support.options.iter().any(|option| option.id == mode)
+        {
             return Err(TransactionError::ModeUnsupported(mode.to_owned()));
         }
         Ok(())
@@ -1106,7 +1248,11 @@ impl TransactionMachine {
     fn end_transaction(&mut self, effect: TransactionEffect, chain: bool) {
         self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         self.snapshot.savepoints.clear();
-        self.snapshot.state = if chain { TransactionState::Active } else { TransactionState::Idle };
+        self.snapshot.state = if chain {
+            TransactionState::Active
+        } else {
+            TransactionState::Idle
+        };
         self.snapshot.depth = Some(if chain { 1 } else { 0 });
         self.snapshot.last_effect = effect;
         self.touch();
@@ -1163,7 +1309,9 @@ impl TransactionMachine {
     fn unresolved_is_current_confirmed(&self) -> bool {
         match self.snapshot.unresolved.as_ref() {
             Some(record) => {
-                record.identity_confirmed && !record.identity_ambiguous && self.snapshot.generation == record.generation.saturating_add(1)
+                record.identity_confirmed
+                    && !record.identity_ambiguous
+                    && self.snapshot.generation == record.generation.saturating_add(1)
             }
             None => false,
         }
@@ -1173,7 +1321,10 @@ impl TransactionMachine {
     /// 可能只是开始了一个新事务）：结束当前事务不能据此断言旧事务的结局。
     fn unresolved_maybe_current(&self) -> bool {
         match self.snapshot.unresolved.as_ref() {
-            Some(record) => !self.unresolved_is_current_confirmed() && self.snapshot.generation == record.generation.saturating_add(1),
+            Some(record) => {
+                !self.unresolved_is_current_confirmed()
+                    && self.snapshot.generation == record.generation.saturating_add(1)
+            }
             None => false,
         }
     }
@@ -1190,7 +1341,12 @@ impl TransactionMachine {
     ///
     /// 未知状态下要求方向一致；活动/中止状态要求身份已确认。身份不明（可能是当前事务，
     /// 也可能是被 `BEGIN` 替换掉的旧事务）时只结束事务并报告未知，保留记录待核对。
-    fn end_with_unknown(&mut self, effect: TransactionEffect, chain: bool, direction: PendingControl) -> TransactionEffect {
+    fn end_with_unknown(
+        &mut self,
+        effect: TransactionEffect,
+        chain: bool,
+        direction: PendingControl,
+    ) -> TransactionEffect {
         match self.snapshot.state {
             TransactionState::Unknown => {
                 if self.pending_matches(direction) && !self.unresolved_is_ambiguous() {
@@ -1261,13 +1417,18 @@ impl TransactionMachine {
 
     fn register_savepoint(&mut self, name: &SavepointName) {
         // 同名保存点只保留最新边界：回滚与释放都只作用于它。
-        self.snapshot.savepoints.retain(|existing| !existing.matches(name));
+        self.snapshot
+            .savepoints
+            .retain(|existing| !existing.matches(name));
         self.snapshot.savepoints.push(name.clone());
         self.touch();
     }
 
     fn savepoint_index(&self, name: &SavepointName) -> Option<usize> {
-        self.snapshot.savepoints.iter().rposition(|existing| existing.matches(name))
+        self.snapshot
+            .savepoints
+            .iter()
+            .rposition(|existing| existing.matches(name))
     }
 
     fn record(&mut self, effect: TransactionEffect) {

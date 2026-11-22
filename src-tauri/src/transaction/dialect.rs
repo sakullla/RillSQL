@@ -4,7 +4,10 @@
 //! 由适配器与协调器完成。能力表是界面入口、模型校验和适配器实现的同一份事实来源：
 //! 未列出的隔离级别、保存点释放、隐式提交与链式事务都必须明确拒绝，不能静默替换。
 
-use super::model::{ControlOutcome, ControlStatement, SavepointName, StatementFailure, TransactionProbe, UnknownReason};
+use super::model::{
+    ControlOutcome, ControlStatement, SavepointName, StatementFailure, TransactionProbe,
+    UnknownReason,
+};
 
 /// 标准隔离级别的稳定 id。
 pub const READ_UNCOMMITTED: &str = "read_uncommitted";
@@ -45,7 +48,10 @@ pub struct SettingSupport {
 
 impl SettingSupport {
     /// 完全不支持这类设置。
-    pub const NONE: Self = Self { options: &[], change: SettingChange::Unsupported };
+    pub const NONE: Self = Self {
+        options: &[],
+        change: SettingChange::Unsupported,
+    };
 }
 
 /// 隐式提交能力。只有 MySQL/MariaDB 家族会把 DDL 等语句变成隐式提交。
@@ -214,7 +220,10 @@ pub trait TransactionDialect: Sync {
         if !self.capabilities().release_savepoint {
             return ControlSql::Unsupported;
         }
-        ControlSql::Statement(format!("RELEASE SAVEPOINT {}", self.quote_identifier(name.as_str())))
+        ControlSql::Statement(format!(
+            "RELEASE SAVEPOINT {}",
+            self.quote_identifier(name.as_str())
+        ))
     }
 
     /// 设置隔离级别的语句。`None` 表示恢复服务器默认。
@@ -263,8 +272,16 @@ pub trait TransactionDialect: Sync {
                 }
             }
             ControlStatement::ReleaseSavepoint(name) => self.release_savepoint_sql(name),
-            ControlStatement::SetIsolation { level } => setting_sql(capabilities.isolation, level.as_deref(), |level| self.isolation_sql(level)),
-            ControlStatement::SetMode { mode } => setting_sql(capabilities.mode, mode.as_deref(), |mode| self.mode_sql(mode)),
+            ControlStatement::SetIsolation { level } => {
+                setting_sql(capabilities.isolation, level.as_deref(), |level| {
+                    self.isolation_sql(level)
+                })
+            }
+            ControlStatement::SetMode { mode } => {
+                setting_sql(capabilities.mode, mode.as_deref(), |mode| {
+                    self.mode_sql(mode)
+                })
+            }
         }
     }
 
@@ -292,7 +309,11 @@ pub trait TransactionDialect: Sync {
 
     /// 解析探针结果。`columns` 与 `rows[0]` 是探针语句的结果；列名大小写不敏感。
     /// 认不出、缺列或数值无法解释时返回 `None`（按未知处理）。
-    fn read_probe(&self, _columns: &[String], _rows: &[Vec<Option<String>>]) -> Option<TransactionProbe> {
+    fn read_probe(
+        &self,
+        _columns: &[String],
+        _rows: &[Vec<Option<String>>],
+    ) -> Option<TransactionProbe> {
         None
     }
 
@@ -316,9 +337,15 @@ pub trait TransactionDialect: Sync {
     }
 
     /// 控制语句失败时的结果。默认按 [`Self::statement_failure`] 的分类推断。
-    fn control_failure(&self, failure: StatementFailure, _statement: &ControlStatement) -> ControlOutcome {
+    fn control_failure(
+        &self,
+        failure: StatementFailure,
+        _statement: &ControlStatement,
+    ) -> ControlOutcome {
         match failure {
-            StatementFailure::ConnectionLost => ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost),
+            StatementFailure::ConnectionLost => {
+                ControlOutcome::Unconfirmed(UnknownReason::ConnectionLost)
+            }
             StatementFailure::TransactionAborted => ControlOutcome::Aborted,
             StatementFailure::TransactionUsable => ControlOutcome::Rejected,
         }
@@ -326,17 +353,26 @@ pub trait TransactionDialect: Sync {
 
     /// 控制语句成功时数据库实际做了什么。默认确认成功；PostgreSQL 中止事务中的 `COMMIT`
     /// 会以 `ROLLBACK` 命令标签成功返回，需要按实际回滚登记。
-    fn control_success(&self, _statement: &ControlStatement, _command_tag: Option<&str>) -> ControlOutcome {
+    fn control_success(
+        &self,
+        _statement: &ControlStatement,
+        _command_tag: Option<&str>,
+    ) -> ControlOutcome {
         ControlOutcome::Confirmed
     }
 }
 
 fn supports_option(support: SettingSupport, value: &str) -> bool {
-    support.change != SettingChange::Unsupported && support.options.iter().any(|option| option.id == value)
+    support.change != SettingChange::Unsupported
+        && support.options.iter().any(|option| option.id == value)
 }
 
 /// 设置语句只在方言声明了这类设置、且值在选项内时生成。
-fn setting_sql(support: SettingSupport, value: Option<&str>, sql: impl FnOnce(Option<&str>) -> ControlSql) -> ControlSql {
+fn setting_sql(
+    support: SettingSupport,
+    value: Option<&str>,
+    sql: impl FnOnce(Option<&str>) -> ControlSql,
+) -> ControlSql {
     if support.change == SettingChange::Unsupported {
         return ControlSql::Unsupported;
     }
@@ -363,7 +399,9 @@ pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
     if multiple {
         return ControlMatch::Ambiguous;
     }
-    let Some(first) = tokens.first() else { return ControlMatch::Ordinary };
+    let Some(first) = tokens.first() else {
+        return ControlMatch::Ordinary;
+    };
     if first.quoted || first.text.is_empty() {
         return ControlMatch::Ordinary;
     }
@@ -371,10 +409,12 @@ pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
     let rest = &tokens[1..];
     match head {
         "BEGIN" => classify_begin(rest, syntax),
-        "START" if syntax.start_transaction && keyword(rest.first(), "TRANSACTION") => match rest.len() {
-            1 => ControlMatch::Control(ControlStatement::Begin { mode: None }),
-            _ => ControlMatch::Ambiguous,
-        },
+        "START" if syntax.start_transaction && keyword(rest.first(), "TRANSACTION") => {
+            match rest.len() {
+                1 => ControlMatch::Control(ControlStatement::Begin { mode: None }),
+                _ => ControlMatch::Ambiguous,
+            }
+        }
         "COMMIT" => match finish_tail(rest, syntax) {
             Some(chain) => ControlMatch::Control(ControlStatement::Commit { chain }),
             None => ControlMatch::Ambiguous,
@@ -395,7 +435,11 @@ pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
         // T-SQL 的保存点写法：`SAVE {TRAN | TRANSACTION} <name>`。
         "SAVE" if syntax.save_transaction => classify_save(rest),
         "RELEASE" => {
-            let name = if keyword(rest.first(), "SAVEPOINT") { savepoint_name(&rest[1..]) } else { savepoint_name(rest) };
+            let name = if keyword(rest.first(), "SAVEPOINT") {
+                savepoint_name(&rest[1..])
+            } else {
+                savepoint_name(rest)
+            };
             match name {
                 Some(name) => ControlMatch::Control(ControlStatement::ReleaseSavepoint(name)),
                 None => ControlMatch::Ambiguous,
@@ -408,17 +452,30 @@ pub fn classify_control(body: &str, syntax: ControlSyntax) -> ControlMatch {
 
 fn classify_begin(rest: &[Token], syntax: ControlSyntax) -> ControlMatch {
     let Some(first) = rest.first() else {
-        return if syntax.bare_begin { ControlMatch::Control(ControlStatement::Begin { mode: None }) } else { ControlMatch::Ordinary };
+        return if syntax.bare_begin {
+            ControlMatch::Control(ControlStatement::Begin { mode: None })
+        } else {
+            ControlMatch::Ordinary
+        };
     };
     if first.quoted {
         return ControlMatch::Ordinary;
     }
     match first.upper.as_str() {
-        "WORK" | "TRANSACTION" | "TRAN" if rest.len() == 1 => ControlMatch::Control(ControlStatement::Begin { mode: None }),
+        "WORK" | "TRANSACTION" | "TRAN" if rest.len() == 1 => {
+            ControlMatch::Control(ControlStatement::Begin { mode: None })
+        }
         "WORK" | "TRANSACTION" | "TRAN" => ControlMatch::Ambiguous,
-        mode if syntax.bare_begin && syntax.begin_modes.iter().any(|known| known.eq_ignore_ascii_case(mode)) => {
+        mode if syntax.bare_begin
+            && syntax
+                .begin_modes
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(mode)) =>
+        {
             if rest.len() == 1 {
-                ControlMatch::Control(ControlStatement::Begin { mode: Some(mode.to_ascii_lowercase()) })
+                ControlMatch::Control(ControlStatement::Begin {
+                    mode: Some(mode.to_ascii_lowercase()),
+                })
             } else {
                 ControlMatch::Ambiguous
             }
@@ -435,7 +492,11 @@ fn classify_rollback(rest: &[Token], syntax: ControlSyntax) -> ControlMatch {
         return ControlMatch::Control(ControlStatement::Rollback { chain: false });
     }
     if keyword(rest.first(), "TO") {
-        let tail = if keyword(rest.get(1), "SAVEPOINT") { &rest[2..] } else { &rest[1..] };
+        let tail = if keyword(rest.get(1), "SAVEPOINT") {
+            &rest[2..]
+        } else {
+            &rest[1..]
+        };
         return match savepoint_name(tail) {
             Some(name) => ControlMatch::Control(ControlStatement::RollbackToSavepoint(name)),
             None => ControlMatch::Ambiguous,
@@ -447,7 +508,9 @@ fn classify_rollback(rest: &[Token], syntax: ControlSyntax) -> ControlMatch {
             None => ControlMatch::Ambiguous,
         };
     }
-    if syntax.rollback_transaction_name && (keyword(rest.first(), "TRANSACTION") || keyword(rest.first(), "TRAN")) {
+    if syntax.rollback_transaction_name
+        && (keyword(rest.first(), "TRANSACTION") || keyword(rest.first(), "TRAN"))
+    {
         // `ROLLBACK TRAN` 没有名字才是整体回滚；带了名字就是回滚到保存点，
         // 认不出名字（变量、多个词）时既不能当成整体回滚，也不能猜一个保存点名。
         return match &rest[1..] {
@@ -465,10 +528,12 @@ fn classify_rollback(rest: &[Token], syntax: ControlSyntax) -> ControlMatch {
 /// T-SQL 的 `SAVE {TRAN | TRANSACTION} <name>`：只有字面量名字可以登记成保存点。
 fn classify_save(rest: &[Token]) -> ControlMatch {
     match rest {
-        [unit, name] if keyword(Some(unit), "TRANSACTION") || keyword(Some(unit), "TRAN") => match savepoint_name(std::slice::from_ref(name)) {
-            Some(name) => ControlMatch::Control(ControlStatement::Savepoint(name)),
-            None => ControlMatch::Ambiguous,
-        },
+        [unit, name] if keyword(Some(unit), "TRANSACTION") || keyword(Some(unit), "TRAN") => {
+            match savepoint_name(std::slice::from_ref(name)) {
+                Some(name) => ControlMatch::Control(ControlStatement::Savepoint(name)),
+                None => ControlMatch::Ambiguous,
+            }
+        }
         _ => ControlMatch::Ambiguous,
     }
 }
@@ -478,8 +543,17 @@ fn finish_tail(rest: &[Token], syntax: ControlSyntax) -> Option<bool> {
     match rest {
         [] => Some(false),
         [single] if is_work_unit(single) => Some(false),
-        [and, chain] if syntax.chained && keyword(Some(and), "AND") && keyword(Some(chain), "CHAIN") => Some(true),
-        [and, no, chain] if syntax.chained && keyword(Some(and), "AND") && keyword(Some(no), "NO") && keyword(Some(chain), "CHAIN") => {
+        [and, chain]
+            if syntax.chained && keyword(Some(and), "AND") && keyword(Some(chain), "CHAIN") =>
+        {
+            Some(true)
+        }
+        [and, no, chain]
+            if syntax.chained
+                && keyword(Some(and), "AND")
+                && keyword(Some(no), "NO")
+                && keyword(Some(chain), "CHAIN") =>
+        {
             Some(false)
         }
         _ => None,
@@ -489,7 +563,9 @@ fn finish_tail(rest: &[Token], syntax: ControlSyntax) -> Option<bool> {
 fn classify_set(rest: &[Token]) -> ControlMatch {
     let words: Vec<&str> = rest.iter().map(|token| token.upper.as_str()).collect();
     let level_tail = match words.as_slice() {
-        ["SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION", "LEVEL", ..] => Some(&words[6..]),
+        ["SESSION", "CHARACTERISTICS", "AS", "TRANSACTION", "ISOLATION", "LEVEL", ..] => {
+            Some(&words[6..])
+        }
         ["SESSION", "TRANSACTION", "ISOLATION", "LEVEL", ..] => Some(&words[4..]),
         ["TRANSACTION", "ISOLATION", "LEVEL", ..] => Some(&words[3..]),
         _ => None,
@@ -502,16 +578,23 @@ fn classify_set(rest: &[Token]) -> ControlMatch {
         };
     }
     let mode = match words.as_slice() {
-        ["SESSION", "TRANSACTION", "READ", "ONLY"] | ["TRANSACTION", "READ", "ONLY"] => Some(READ_ONLY),
-        ["SESSION", "TRANSACTION", "READ", "WRITE"] | ["TRANSACTION", "READ", "WRITE"] => Some(READ_WRITE),
+        ["SESSION", "TRANSACTION", "READ", "ONLY"] | ["TRANSACTION", "READ", "ONLY"] => {
+            Some(READ_ONLY)
+        }
+        ["SESSION", "TRANSACTION", "READ", "WRITE"] | ["TRANSACTION", "READ", "WRITE"] => {
+            Some(READ_WRITE)
+        }
         _ => None,
     };
     if let Some(mode) = mode {
-        return ControlMatch::Control(ControlStatement::SetMode { mode: Some(mode.to_owned()) });
+        return ControlMatch::Control(ControlStatement::SetMode {
+            mode: Some(mode.to_owned()),
+        });
     }
     // 改变事务边界（autocommit、隐式事务）的设置不在本控制模型内：执行后只能按未知处理。
     let changes_boundary = rest.iter().any(|token| {
-        !token.quoted && (token.upper.contains("AUTOCOMMIT") || token.upper == "IMPLICIT_TRANSACTIONS")
+        !token.quoted
+            && (token.upper.contains("AUTOCOMMIT") || token.upper == "IMPLICIT_TRANSACTIONS")
     });
     if changes_boundary {
         ControlMatch::Ambiguous
@@ -571,31 +654,61 @@ fn tokenize(code: &str, quotes: &[(char, char)]) -> (Vec<Token>, bool) {
         let first = rest.chars().next().unwrap();
         if let Some((open, close)) = quotes.iter().copied().find(|(open, _)| *open == first) {
             let (value, used) = read_quoted(&rest[open.len_utf8()..], close);
-            tokens.push(Token { upper: value.to_uppercase(), text: value, quoted: true });
+            tokens.push(Token {
+                upper: value.to_uppercase(),
+                text: value,
+                quoted: true,
+            });
             rest = &rest[open.len_utf8()..][used..];
         } else if first == '\'' {
             let (value, used) = read_quoted(&rest[1..], '\'');
-            tokens.push(Token { upper: value.to_uppercase(), text: value, quoted: true });
+            tokens.push(Token {
+                upper: value.to_uppercase(),
+                text: value,
+                quoted: true,
+            });
             rest = &rest[1..][used..];
-        } else if let Some(end) = if first == '$' { dollar_quote_end(rest) } else { None } {
+        } else if let Some(end) = if first == '$' {
+            dollar_quote_end(rest)
+        } else {
+            None
+        } {
             // dollar-quote 的内容里可以出现分号与注释，不能当成语句分隔符。
-            tokens.push(Token { upper: String::new(), text: rest[..end].to_owned(), quoted: true });
+            tokens.push(Token {
+                upper: String::new(),
+                text: rest[..end].to_owned(),
+                quoted: true,
+            });
             rest = &rest[end..];
         } else if first == ';' {
             multiple = true;
             rest = &rest[1..];
         } else if matches!(first, '(' | ')' | ',' | '=') {
-            tokens.push(Token { upper: first.to_string(), text: first.to_string(), quoted: true });
+            tokens.push(Token {
+                upper: first.to_string(),
+                text: first.to_string(),
+                quoted: true,
+            });
             rest = &rest[first.len_utf8()..];
         } else {
-            let end = rest.find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '(' | ')' | ',' | '=')).unwrap_or(rest.len());
+            let end = rest
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '(' | ')' | ',' | '='))
+                .unwrap_or(rest.len());
             if end == 0 {
                 // 理论上不会发生（上面的分支已覆盖分隔符）；仍然显式消费一个字符，保证不挂死。
-                tokens.push(Token { upper: first.to_string(), text: first.to_string(), quoted: true });
+                tokens.push(Token {
+                    upper: first.to_string(),
+                    text: first.to_string(),
+                    quoted: true,
+                });
                 rest = &rest[first.len_utf8()..];
             } else {
                 let value = &rest[..end];
-                tokens.push(Token { upper: value.to_ascii_uppercase(), text: value.to_owned(), quoted: false });
+                tokens.push(Token {
+                    upper: value.to_ascii_uppercase(),
+                    text: value.to_owned(),
+                    quoted: false,
+                });
                 rest = &rest[end..];
             }
         }
@@ -615,7 +728,9 @@ fn dollar_quote_end(text: &str) -> Option<usize> {
     }
     let body_start = 1 + tag_len + 1;
     let closing = format!("${tag}$");
-    text.get(body_start..)?.find(&closing).map(|offset| body_start + offset + closing.len())
+    text.get(body_start..)?
+        .find(&closing)
+        .map(|offset| body_start + offset + closing.len())
 }
 
 /// 读取引号内文本，返回去转义后的值与消耗的字节数（含结束引号）。
@@ -644,7 +759,15 @@ fn strip_comments(code: &str, hash: bool, quotes: &[(char, char)]) -> String {
     let mut out = String::with_capacity(code.len());
     let mut chars = code.char_indices();
     while let Some((index, ch)) = chars.next() {
-        let close = if ch == '\'' { Some('\'') } else { quotes.iter().copied().find(|(open, _)| *open == ch).map(|(_, close)| close) };
+        let close = if ch == '\'' {
+            Some('\'')
+        } else {
+            quotes
+                .iter()
+                .copied()
+                .find(|(open, _)| *open == ch)
+                .map(|(_, close)| close)
+        };
         if let Some(close) = close {
             out.push(ch);
             for (_, inner) in chars.by_ref() {

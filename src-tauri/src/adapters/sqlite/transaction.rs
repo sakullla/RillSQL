@@ -6,14 +6,27 @@
 //! 因此按“可能已结束事务”报告，交由调用方登记未知。
 
 use crate::transaction::{
-    AbortedRecovery, ControlSql, ControlSyntax, DuplicateBegin, ImplicitCommitSupport, ImplicitCommitVerdict, SavepointName, SettingChange, SettingOption,
-    SettingSupport, StatementFailure, TransactionCapabilities, TransactionDialect, READ_UNCOMMITTED,
+    AbortedRecovery, ControlSql, ControlSyntax, DuplicateBegin, ImplicitCommitSupport,
+    ImplicitCommitVerdict, SavepointName, SettingChange, SettingOption, SettingSupport,
+    StatementFailure, TransactionCapabilities, TransactionDialect, READ_UNCOMMITTED,
 };
 
-const DEFERRED_OPTION: SettingOption = SettingOption { id: "deferred", label: "Deferred" };
-const IMMEDIATE_OPTION: SettingOption = SettingOption { id: "immediate", label: "Immediate" };
-const EXCLUSIVE_OPTION: SettingOption = SettingOption { id: "exclusive", label: "Exclusive" };
-const READ_UNCOMMITTED_OPTION: SettingOption = SettingOption { id: READ_UNCOMMITTED, label: "Read uncommitted" };
+const DEFERRED_OPTION: SettingOption = SettingOption {
+    id: "deferred",
+    label: "Deferred",
+};
+const IMMEDIATE_OPTION: SettingOption = SettingOption {
+    id: "immediate",
+    label: "Immediate",
+};
+const EXCLUSIVE_OPTION: SettingOption = SettingOption {
+    id: "exclusive",
+    label: "Exclusive",
+};
+const READ_UNCOMMITTED_OPTION: SettingOption = SettingOption {
+    id: READ_UNCOMMITTED,
+    label: "Read uncommitted",
+};
 
 const MODE_OPTIONS: &[SettingOption] = &[DEFERRED_OPTION, IMMEDIATE_OPTION, EXCLUSIVE_OPTION];
 const ISOLATION_OPTIONS: &[SettingOption] = &[READ_UNCOMMITTED_OPTION];
@@ -48,8 +61,14 @@ impl TransactionDialect for SqliteTransaction {
             duplicate_begin: DuplicateBegin::Rejected,
             aborted: AbortedRecovery::NotApplicable,
             // 只表达 SQLite 自己的 read_uncommitted 设置，不伪装成四种标准隔离级别。
-            isolation: SettingSupport { options: ISOLATION_OPTIONS, change: SettingChange::WhileIdle },
-            mode: SettingSupport { options: MODE_OPTIONS, change: SettingChange::WhileIdle },
+            isolation: SettingSupport {
+                options: ISOLATION_OPTIONS,
+                change: SettingChange::WhileIdle,
+            },
+            mode: SettingSupport {
+                options: MODE_OPTIONS,
+                change: SettingChange::WhileIdle,
+            },
             implicit_commit: ImplicitCommitSupport::NotApplicable,
         }
     }
@@ -83,13 +102,18 @@ impl TransactionDialect for SqliteTransaction {
     }
 
     fn rollback_to_savepoint_sql(&self, name: &SavepointName) -> String {
-        format!("ROLLBACK TO SAVEPOINT {}", self.quote_identifier(name.as_str()))
+        format!(
+            "ROLLBACK TO SAVEPOINT {}",
+            self.quote_identifier(name.as_str())
+        )
     }
 
     fn isolation_sql(&self, level: Option<&str>) -> ControlSql {
         match level {
             None => ControlSql::Statement("PRAGMA read_uncommitted = 0".to_owned()),
-            Some(READ_UNCOMMITTED) => ControlSql::Statement("PRAGMA read_uncommitted = 1".to_owned()),
+            Some(READ_UNCOMMITTED) => {
+                ControlSql::Statement("PRAGMA read_uncommitted = 1".to_owned())
+            }
             Some(_) => ControlSql::Unsupported,
         }
     }
@@ -98,7 +122,9 @@ impl TransactionDialect for SqliteTransaction {
     fn mode_sql(&self, mode: Option<&str>) -> ControlSql {
         match mode {
             None => ControlSql::NoStatement,
-            Some(mode) if MODE_OPTIONS.iter().any(|option| option.id == mode) => ControlSql::NoStatement,
+            Some(mode) if MODE_OPTIONS.iter().any(|option| option.id == mode) => {
+                ControlSql::NoStatement
+            }
             Some(_) => ControlSql::Unsupported,
         }
     }
@@ -129,7 +155,9 @@ impl TransactionDialect for SqliteTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::{classify_control, ControlMatch, ControlStatement, TransactionDialect, TransactionError};
+    use crate::transaction::{
+        classify_control, ControlMatch, ControlStatement, TransactionDialect, TransactionError,
+    };
 
     #[test]
     fn control_sql_uses_sqlite_native_forms() {
@@ -140,10 +168,24 @@ mod tests {
         assert_eq!(dialect.commit_sql(false), "COMMIT");
         let name = SavepointName::parse("sp").unwrap();
         assert_eq!(dialect.savepoint_sql(&name), "SAVEPOINT \"sp\"");
-        assert_eq!(dialect.rollback_to_savepoint_sql(&name), "ROLLBACK TO SAVEPOINT \"sp\"");
-        assert_eq!(dialect.isolation_sql(Some(READ_UNCOMMITTED)), ControlSql::Statement("PRAGMA read_uncommitted = 1".to_owned()));
-        assert_eq!(dialect.isolation_sql(Some("serializable")), ControlSql::Unsupported, "SQLite 不伪装标准隔离级别");
-        assert_eq!(dialect.mode_sql(Some("immediate")), ControlSql::NoStatement, "模式随 BEGIN 下发");
+        assert_eq!(
+            dialect.rollback_to_savepoint_sql(&name),
+            "ROLLBACK TO SAVEPOINT \"sp\""
+        );
+        assert_eq!(
+            dialect.isolation_sql(Some(READ_UNCOMMITTED)),
+            ControlSql::Statement("PRAGMA read_uncommitted = 1".to_owned())
+        );
+        assert_eq!(
+            dialect.isolation_sql(Some("serializable")),
+            ControlSql::Unsupported,
+            "SQLite 不伪装标准隔离级别"
+        );
+        assert_eq!(
+            dialect.mode_sql(Some("immediate")),
+            ControlSql::NoStatement,
+            "模式随 BEGIN 下发"
+        );
     }
 
     #[test]
@@ -151,28 +193,57 @@ mod tests {
         let dialect = SqliteTransaction;
         assert_eq!(
             classify_control("BEGIN IMMEDIATE", dialect.syntax()),
-            ControlMatch::Control(ControlStatement::Begin { mode: Some("immediate".to_owned()) })
+            ControlMatch::Control(ControlStatement::Begin {
+                mode: Some("immediate".to_owned())
+            })
         );
-        assert_eq!(classify_control("END TRANSACTION", dialect.syntax()), ControlMatch::Control(ControlStatement::Commit { chain: false }));
-        assert_eq!(classify_control("START TRANSACTION", dialect.syntax()), ControlMatch::Ordinary, "SQLite 不认 START TRANSACTION");
+        assert_eq!(
+            classify_control("END TRANSACTION", dialect.syntax()),
+            ControlMatch::Control(ControlStatement::Commit { chain: false })
+        );
+        assert_eq!(
+            classify_control("START TRANSACTION", dialect.syntax()),
+            ControlMatch::Ordinary,
+            "SQLite 不认 START TRANSACTION"
+        );
         assert_eq!(
             classify_control("RELEASE sp", dialect.syntax()),
-            ControlMatch::Control(ControlStatement::ReleaseSavepoint(SavepointName::parse("sp").unwrap()))
+            ControlMatch::Control(ControlStatement::ReleaseSavepoint(
+                SavepointName::parse("sp").unwrap()
+            ))
         );
     }
 
     #[test]
     fn duplicate_begin_is_rejected_and_auto_rollback_errors_are_flagged() {
         let dialect = SqliteTransaction;
-        assert_eq!(dialect.capabilities().duplicate_begin, DuplicateBegin::Rejected);
-        assert_eq!(dialect.capabilities().aborted, AbortedRecovery::NotApplicable);
-        assert!(dialect.probe_sql().is_none(), "SQLite 没有 SQL 层可读的事务状态探针");
+        assert_eq!(
+            dialect.capabilities().duplicate_begin,
+            DuplicateBegin::Rejected
+        );
+        assert_eq!(
+            dialect.capabilities().aborted,
+            AbortedRecovery::NotApplicable
+        );
+        assert!(
+            dialect.probe_sql().is_none(),
+            "SQLite 没有 SQL 层可读的事务状态探针"
+        );
         assert!(dialect.error_may_have_ended_transaction(None, "database or disk is full"));
         assert!(dialect.error_may_have_ended_transaction(Some("10"), "disk I/O error"));
         assert!(!dialect.error_may_have_ended_transaction(Some("1"), "no such table: t"));
         // 重复 BEGIN 由模型在预检阶段拒绝，而不是下发后再猜。
-        let mut machine = crate::transaction::TransactionMachine::new("sqlite", dialect.capabilities());
-        machine.acknowledge(&ControlStatement::Begin { mode: None }, crate::transaction::ControlOutcome::Confirmed).unwrap();
-        assert_eq!(machine.precheck(&ControlStatement::Begin { mode: None }), Err(TransactionError::AlreadyActive));
+        let mut machine =
+            crate::transaction::TransactionMachine::new("sqlite", dialect.capabilities());
+        machine
+            .acknowledge(
+                &ControlStatement::Begin { mode: None },
+                crate::transaction::ControlOutcome::Confirmed,
+            )
+            .unwrap();
+        assert_eq!(
+            machine.precheck(&ControlStatement::Begin { mode: None }),
+            Err(TransactionError::AlreadyActive)
+        );
     }
 }

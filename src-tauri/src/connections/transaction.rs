@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::transaction::{
-    ControlMatch, ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict, SavepointName, StatementFailure, StatementOutcome, TransactionCapabilities,
-    TransactionDialect, TransactionEffect, TransactionError, TransactionMachine, TransactionProbe, TransactionSnapshot, TransactionState, UnknownReason,
-    UnknownResolution, UnknownTransaction,
+    ControlMatch, ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict,
+    SavepointName, StatementFailure, StatementOutcome, TransactionCapabilities, TransactionDialect,
+    TransactionEffect, TransactionError, TransactionMachine, TransactionProbe, TransactionSnapshot,
+    TransactionState, UnknownReason, UnknownResolution, UnknownTransaction,
 };
 
 /// 一条连接的事务协调器。
@@ -34,9 +35,14 @@ pub struct TransactionCoordinator {
 }
 
 impl TransactionCoordinator {
-    pub fn new(connection: impl Into<String>, dialect: Option<&'static dyn TransactionDialect>) -> Self {
+    pub fn new(
+        connection: impl Into<String>,
+        dialect: Option<&'static dyn TransactionDialect>,
+    ) -> Self {
         let connection = connection.into();
-        let capabilities = dialect.map(TransactionDialect::capabilities).unwrap_or(TransactionCapabilities::UNSUPPORTED);
+        let capabilities = dialect
+            .map(TransactionDialect::capabilities)
+            .unwrap_or(TransactionCapabilities::UNSUPPORTED);
         Self {
             machine: Mutex::new(TransactionMachine::new(connection.clone(), capabilities)),
             connection,
@@ -56,7 +62,9 @@ impl TransactionCoordinator {
     }
 
     pub fn capabilities(&self) -> TransactionCapabilities {
-        self.dialect.map(TransactionDialect::capabilities).unwrap_or(TransactionCapabilities::UNSUPPORTED)
+        self.dialect
+            .map(TransactionDialect::capabilities)
+            .unwrap_or(TransactionCapabilities::UNSUPPORTED)
     }
 
     /// 这条连接是否参与用户事务。只有这类连接需要串行业务执行。
@@ -67,7 +75,11 @@ impl TransactionCoordinator {
     /// 同连接所有业务标签共享的事务快照；非关系型连接没有当前事务面。
     /// 引擎变更等情况下，旧会话的未知事务仍会出现在 `unresolved` 中（R10）。
     pub fn snapshot(&self) -> Option<TransactionSnapshot> {
-        let inherited = self.inherited.lock().expect("inherited transaction").clone();
+        let inherited = self
+            .inherited
+            .lock()
+            .expect("inherited transaction")
+            .clone();
         if self.dialect.is_none() && inherited.is_none() {
             return None;
         }
@@ -110,17 +122,24 @@ impl TransactionCoordinator {
         self.dialect?.probe_sql()
     }
 
-    pub fn read_probe(&self, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<TransactionProbe> {
+    pub fn read_probe(
+        &self,
+        columns: &[String],
+        rows: &[Vec<Option<String>>],
+    ) -> Option<TransactionProbe> {
         self.dialect?.read_probe(columns, rows)
     }
 
     pub fn statement_failure(&self, code: Option<&str>, message: &str) -> StatementFailure {
-        self.dialect.map(|dialect| dialect.statement_failure(code, message)).unwrap_or(StatementFailure::TransactionUsable)
+        self.dialect
+            .map(|dialect| dialect.statement_failure(code, message))
+            .unwrap_or(StatementFailure::TransactionUsable)
     }
 
     /// 这条未分类语句是否可能在过程/动态 SQL 内部改变事务边界（T-SQL）。
     pub fn statement_may_change_transaction(&self, body: &str) -> bool {
-        self.dialect.is_some_and(|dialect| dialect.statement_may_change_transaction(body))
+        self.dialect
+            .is_some_and(|dialect| dialect.statement_may_change_transaction(body))
     }
 
     /// 无法确认形态的手写控制语句执行后的登记：可能已经开始或结束了事务（R3、R10）。
@@ -140,17 +159,26 @@ impl TransactionCoordinator {
     }
 
     pub fn error_may_have_ended_transaction(&self, code: Option<&str>, message: &str) -> bool {
-        self.dialect.is_some_and(|dialect| dialect.error_may_have_ended_transaction(code, message))
+        self.dialect
+            .is_some_and(|dialect| dialect.error_may_have_ended_transaction(code, message))
     }
 
-    pub fn control_failure(&self, statement: &ControlStatement, failure: StatementFailure) -> ControlOutcome {
+    pub fn control_failure(
+        &self,
+        statement: &ControlStatement,
+        failure: StatementFailure,
+    ) -> ControlOutcome {
         match self.dialect {
             Some(dialect) => dialect.control_failure(failure, statement),
             None => ControlOutcome::Rejected,
         }
     }
 
-    pub fn control_success(&self, statement: &ControlStatement, command_tag: Option<&str>) -> ControlOutcome {
+    pub fn control_success(
+        &self,
+        statement: &ControlStatement,
+        command_tag: Option<&str>,
+    ) -> ControlOutcome {
         match self.dialect {
             Some(dialect) => dialect.control_success(statement, command_tag),
             None => ControlOutcome::Rejected,
@@ -162,13 +190,17 @@ impl TransactionCoordinator {
     /// 预检并生成一条控制语句的 SQL。返回 `Ok(ControlSql::Unsupported)` 表示方言不接受这个操作：
     /// 调用方不得改为其他会话或静默降级。
     pub fn prepare(&self, statement: &ControlStatement) -> Result<ControlSql, TransactionError> {
-        let dialect = self.dialect.ok_or(TransactionError::TransactionsUnsupported)?;
+        let dialect = self
+            .dialect
+            .ok_or(TransactionError::TransactionsUnsupported)?;
         self.machine().precheck(statement)?;
         Ok(dialect.sql_for(statement))
     }
 
     pub fn begin(&self, mode: Option<&str>) -> Result<ControlCommand, TransactionError> {
-        self.command(ControlStatement::Begin { mode: self.mode_or_recorded(mode) })
+        self.command(ControlStatement::Begin {
+            mode: self.mode_or_recorded(mode),
+        })
     }
 
     pub fn commit(&self) -> Result<ControlCommand, TransactionError> {
@@ -183,20 +215,30 @@ impl TransactionCoordinator {
         self.command(ControlStatement::Savepoint(name.clone()))
     }
 
-    pub fn rollback_to_savepoint(&self, name: &SavepointName) -> Result<ControlCommand, TransactionError> {
+    pub fn rollback_to_savepoint(
+        &self,
+        name: &SavepointName,
+    ) -> Result<ControlCommand, TransactionError> {
         self.command(ControlStatement::RollbackToSavepoint(name.clone()))
     }
 
-    pub fn release_savepoint(&self, name: &SavepointName) -> Result<ControlCommand, TransactionError> {
+    pub fn release_savepoint(
+        &self,
+        name: &SavepointName,
+    ) -> Result<ControlCommand, TransactionError> {
         self.command(ControlStatement::ReleaseSavepoint(name.clone()))
     }
 
     pub fn set_isolation(&self, level: Option<&str>) -> Result<ControlCommand, TransactionError> {
-        self.command(ControlStatement::SetIsolation { level: level.map(str::to_owned) })
+        self.command(ControlStatement::SetIsolation {
+            level: level.map(str::to_owned),
+        })
     }
 
     pub fn set_mode(&self, mode: Option<&str>) -> Result<ControlCommand, TransactionError> {
-        self.command(ControlStatement::SetMode { mode: mode.map(str::to_owned) })
+        self.command(ControlStatement::SetMode {
+            mode: mode.map(str::to_owned),
+        })
     }
 
     /// 命令入口：返回要登记的语句与实际下发的 SQL，执行后把结果交给 [`Self::acknowledge`]。
@@ -206,7 +248,11 @@ impl TransactionCoordinator {
     }
 
     /// 确认一条控制语句的结果并推进共享快照。
-    pub fn acknowledge(&self, statement: &ControlStatement, outcome: ControlOutcome) -> Result<TransactionEffect, TransactionError> {
+    pub fn acknowledge(
+        &self,
+        statement: &ControlStatement,
+        outcome: ControlOutcome,
+    ) -> Result<TransactionEffect, TransactionError> {
         self.machine().acknowledge(statement, outcome)
     }
 
@@ -263,7 +309,13 @@ impl TransactionCoordinator {
     fn mode_or_recorded(&self, mode: Option<&str>) -> Option<String> {
         mode.map(str::to_owned)
             .or_else(|| self.machine().snapshot().settings.mode.clone())
-            .filter(|mode| self.capabilities().mode.options.iter().any(|option| option.id == mode))
+            .filter(|mode| {
+                self.capabilities()
+                    .mode
+                    .options
+                    .iter()
+                    .any(|option| option.id == mode)
+            })
     }
 
     fn machine(&self) -> std::sync::MutexGuard<'_, TransactionMachine> {
@@ -299,12 +351,16 @@ mod tests {
     use crate::adapters::adapter;
     use crate::connections::model::Engine;
     use crate::transaction::{
-        ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict, SavepointName, StatementFailure, TransactionEffect, TransactionError, TransactionProbe,
-        TransactionState, UnknownReason, READ_COMMITTED,
+        ControlOutcome, ControlSql, ControlStatement, ImplicitCommitVerdict, SavepointName,
+        StatementFailure, TransactionEffect, TransactionError, TransactionProbe, TransactionState,
+        UnknownReason, READ_COMMITTED,
     };
 
     fn coordinator(engine: Engine) -> Arc<TransactionCoordinator> {
-        Arc::new(TransactionCoordinator::new("conn", adapter(engine).transaction()))
+        Arc::new(TransactionCoordinator::new(
+            "conn",
+            adapter(engine).transaction(),
+        ))
     }
 
     #[test]
@@ -313,25 +369,51 @@ mod tests {
             let coordinator = coordinator(engine);
             assert!(!coordinator.is_transactional());
             assert!(coordinator.snapshot().is_none());
-            assert!(matches!(coordinator.begin(None), Err(TransactionError::TransactionsUnsupported)));
-            assert_eq!(coordinator.observe_statement(crate::transaction::StatementOutcome::Succeeded), TransactionEffect::Unchanged);
+            assert!(matches!(
+                coordinator.begin(None),
+                Err(TransactionError::TransactionsUnsupported)
+            ));
+            assert_eq!(
+                coordinator.observe_statement(crate::transaction::StatementOutcome::Succeeded),
+                TransactionEffect::Unchanged
+            );
         }
     }
 
     #[test]
     fn control_commands_advance_the_shared_snapshot() {
         let coordinator = coordinator(Engine::Postgres);
-        assert_eq!(coordinator.prepare(&ControlStatement::Begin { mode: None }).unwrap(), ControlSql::Statement("BEGIN".to_owned()));
+        assert_eq!(
+            coordinator
+                .prepare(&ControlStatement::Begin { mode: None })
+                .unwrap(),
+            ControlSql::Statement("BEGIN".to_owned())
+        );
         let begin = coordinator.begin(None).unwrap();
         assert_eq!(begin.statement, ControlStatement::Begin { mode: None });
-        coordinator.acknowledge(&begin.statement, ControlOutcome::Confirmed).unwrap();
-        assert_eq!(coordinator.snapshot().unwrap().state, TransactionState::Active);
+        coordinator
+            .acknowledge(&begin.statement, ControlOutcome::Confirmed)
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().unwrap().state,
+            TransactionState::Active
+        );
         let name = SavepointName::parse("sp").unwrap();
         let savepoint = coordinator.savepoint(&name).unwrap();
         assert!(matches!(savepoint.sql, ControlSql::Statement(_)));
-        coordinator.acknowledge(&savepoint.statement, ControlOutcome::Confirmed).unwrap();
-        assert_eq!(coordinator.snapshot().unwrap().savepoints, vec![name.clone()]);
-        coordinator.acknowledge(&ControlStatement::Commit { chain: false }, ControlOutcome::Confirmed).unwrap();
+        coordinator
+            .acknowledge(&savepoint.statement, ControlOutcome::Confirmed)
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().unwrap().savepoints,
+            vec![name.clone()]
+        );
+        coordinator
+            .acknowledge(
+                &ControlStatement::Commit { chain: false },
+                ControlOutcome::Confirmed,
+            )
+            .unwrap();
         let snapshot = coordinator.snapshot().unwrap();
         assert_eq!(snapshot.state, TransactionState::Idle);
         assert!(snapshot.savepoints.is_empty());
@@ -341,40 +423,76 @@ mod tests {
     fn a_recorded_sqlite_mode_travels_with_the_next_begin_command() {
         let coordinator = coordinator(Engine::Sqlite);
         let mode = coordinator.set_mode(Some("immediate")).unwrap();
-        assert_eq!(mode.sql, ControlSql::NoStatement, "SQLite 的模式随 BEGIN 下发");
-        coordinator.acknowledge(&mode.statement, ControlOutcome::Confirmed).unwrap();
+        assert_eq!(
+            mode.sql,
+            ControlSql::NoStatement,
+            "SQLite 的模式随 BEGIN 下发"
+        );
+        coordinator
+            .acknowledge(&mode.statement, ControlOutcome::Confirmed)
+            .unwrap();
         let begin = coordinator.begin(None).unwrap();
-        assert_eq!(begin.statement, ControlStatement::Begin { mode: Some("immediate".to_owned()) });
-        assert_eq!(begin.sql, ControlSql::Statement("BEGIN IMMEDIATE".to_owned()));
+        assert_eq!(
+            begin.statement,
+            ControlStatement::Begin {
+                mode: Some("immediate".to_owned())
+            }
+        );
+        assert_eq!(
+            begin.sql,
+            ControlSql::Statement("BEGIN IMMEDIATE".to_owned())
+        );
     }
 
     #[test]
     fn implicit_commit_is_only_reported_by_the_mysql_family() {
         let mysql = coordinator(Engine::Mysql);
-        assert!(matches!(mysql.implicit_commit("ALTER TABLE t ADD c INT"), ImplicitCommitVerdict::Yes));
+        assert!(matches!(
+            mysql.implicit_commit("ALTER TABLE t ADD c INT"),
+            ImplicitCommitVerdict::Yes
+        ));
         let postgres = coordinator(Engine::Postgres);
-        assert!(!matches!(postgres.implicit_commit("ALTER TABLE t ADD c INT"), ImplicitCommitVerdict::Yes));
+        assert!(!matches!(
+            postgres.implicit_commit("ALTER TABLE t ADD c INT"),
+            ImplicitCommitVerdict::Yes
+        ));
     }
 
     #[test]
     fn probe_observations_advance_or_mark_unknown() {
         let coordinator = coordinator(Engine::Sqlserver);
         assert!(coordinator.probe_sql().is_some());
-        assert_eq!(coordinator.observe_probe(TransactionProbe::Active { depth: 1 }), TransactionEffect::StillActive);
+        assert_eq!(
+            coordinator.observe_probe(TransactionProbe::Active { depth: 1 }),
+            TransactionEffect::StillActive
+        );
         assert_eq!(coordinator.state(), Some(TransactionState::Active));
-        coordinator.acknowledge(&ControlStatement::Commit { chain: false }, ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed)).unwrap();
+        coordinator
+            .acknowledge(
+                &ControlStatement::Commit { chain: false },
+                ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
+            )
+            .unwrap();
         assert_eq!(coordinator.state(), Some(TransactionState::Unknown));
         assert!(coordinator.snapshot().unwrap().unresolved.is_some());
         coordinator.reconnect(UnknownReason::ConnectionLost);
         let snapshot = coordinator.snapshot().unwrap();
-        assert_eq!(snapshot.state, TransactionState::Idle, "新会话不继承旧事务的活动标记");
+        assert_eq!(
+            snapshot.state,
+            TransactionState::Idle,
+            "新会话不继承旧事务的活动标记"
+        );
         assert!(snapshot.unresolved.is_some(), "旧事务结果未知必须保留");
     }
 
     #[test]
     fn an_inherited_unknown_survives_without_a_new_transaction_surface() {
         let old = coordinator(Engine::Mysql);
-        old.acknowledge(&ControlStatement::Begin { mode: None }, ControlOutcome::Confirmed).unwrap();
+        old.acknowledge(
+            &ControlStatement::Begin { mode: None },
+            ControlOutcome::Confirmed,
+        )
+        .unwrap();
         old.acknowledge(
             &ControlStatement::Commit { chain: false },
             ControlOutcome::Unconfirmed(UnknownReason::ControlUnconfirmed),
@@ -387,21 +505,37 @@ mod tests {
         assert!(new.snapshot().is_none(), "新的非事务连接没有当前事务面");
         new.inherit_unknown(record.clone());
         let snapshot = new.snapshot().expect("旧未知仍要能读到");
-        assert_eq!(snapshot.state, TransactionState::Idle, "新会话不继承旧事务的活动标记");
+        assert_eq!(
+            snapshot.state,
+            TransactionState::Idle,
+            "新会话不继承旧事务的活动标记"
+        );
         assert_eq!(snapshot.unresolved, Some(record));
         assert!(new.begin(None).is_err(), "非事务引擎仍然不能开始事务");
-        assert_eq!(new.resolve_unknown(crate::transaction::UnknownResolution::Committed), Some(snapshot.unresolved.unwrap()));
+        assert_eq!(
+            new.resolve_unknown(crate::transaction::UnknownResolution::Committed),
+            Some(snapshot.unresolved.unwrap())
+        );
         assert!(new.snapshot().is_none(), "核对关闭后非事务连接不再有快照");
     }
 
     #[test]
     fn statement_failure_classification_comes_from_the_dialect() {
         let postgres = coordinator(Engine::Postgres);
-        assert_eq!(postgres.statement_failure(Some("25P02"), "current transaction is aborted"), StatementFailure::TransactionAborted);
+        assert_eq!(
+            postgres.statement_failure(Some("25P02"), "current transaction is aborted"),
+            StatementFailure::TransactionAborted
+        );
         let mysql = coordinator(Engine::Mysql);
-        assert!(mysql.error_may_have_ended_transaction(Some("1213"), "Deadlock found"), "死锁由数据库回滚整个事务");
+        assert!(
+            mysql.error_may_have_ended_transaction(Some("1213"), "Deadlock found"),
+            "死锁由数据库回滚整个事务"
+        );
         let sqlite = coordinator(Engine::Sqlite);
-        assert!(sqlite.error_may_have_ended_transaction(None, "database or disk is full"), "部分 SQLite 错误会自动回滚事务");
+        assert!(
+            sqlite.error_may_have_ended_transaction(None, "database or disk is full"),
+            "部分 SQLite 错误会自动回滚事务"
+        );
     }
 
     #[test]
@@ -409,7 +543,12 @@ mod tests {
         let postgres = coordinator(Engine::Postgres);
         let isolation = postgres.set_isolation(Some(READ_COMMITTED)).unwrap();
         assert!(matches!(isolation.sql, ControlSql::Statement(_)));
-        assert_eq!(isolation.statement, ControlStatement::SetIsolation { level: Some(READ_COMMITTED.to_owned()) });
+        assert_eq!(
+            isolation.statement,
+            ControlStatement::SetIsolation {
+                level: Some(READ_COMMITTED.to_owned())
+            }
+        );
     }
 
     #[tokio::test]
@@ -419,6 +558,10 @@ mod tests {
         let waiting = tokio::time::timeout(Duration::from_millis(40), coordinator.lease()).await;
         assert!(waiting.is_err(), "第二个执行必须等待第一个租约");
         drop(first);
-        assert!(tokio::time::timeout(Duration::from_secs(1), coordinator.lease()).await.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), coordinator.lease())
+                .await
+                .is_ok()
+        );
     }
 }
