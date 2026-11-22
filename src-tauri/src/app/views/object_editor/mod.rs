@@ -856,6 +856,7 @@ mod receipt_tests {
 
     #[gpui_kit::test]
     fn object_editor_scrim_occludes_background_and_escape_closes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::prelude::FluentBuilder as _;
         use gpui_kit::test::TestWindowExt;
         use gpui_kit::{
             AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
@@ -872,8 +873,9 @@ mod receipt_tests {
         }
 
         impl Render for Host {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let hits = self.bg_hits.clone();
+                let open = self.editor.read(cx).is_open();
                 div()
                     .relative()
                     .size_full()
@@ -890,7 +892,7 @@ mod receipt_tests {
                                 hits.fetch_add(1, Ordering::SeqCst);
                             }),
                     )
-                    .child(self.editor.clone())
+                    .when(open, |this| this.child(self.editor.clone()))
             }
         }
 
@@ -996,6 +998,31 @@ mod receipt_tests {
         })
         .unwrap();
         assert!(!cx.update(|cx| editor.read(cx).is_open()), "点击底部关闭按钮应关闭对象编辑器");
+
+        // 5. 条件挂载宿主下（Workbench::render 仅在 is_open() 时挂载）：DROP 执行成功后 settle_after_execute 直接归还焦点。
+        cx.update_window(window, |_, window, cx| {
+            assert!(bg_focus.is_focused(window));
+            editor.update(cx, |pane, cx| {
+                pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+            });
+            window.render_frame(cx);
+            assert!(!bg_focus.is_focused(window), "打开弹窗后焦点应移入弹窗");
+
+            let decision = after_execute(EditorVerb::Drop, Some(&receipt(vec![step(StepStatus::Ok)])));
+            assert!(!decision.keep_draft, "DROP 全部成功应关闭编辑器");
+            editor.update(cx, |pane, cx| {
+                pane.settle_after_execute(
+                    decision,
+                    ("conn-1".to_owned(), "app".to_owned(), ObjectKind::Event, "purge".to_owned()),
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(bg_focus.is_focused(window), "条件挂载宿主下 DROP 完成后焦点应直接归还给原底层控件");
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| editor.read(cx).is_open()), "DROP 完成后对象编辑器应已关闭");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

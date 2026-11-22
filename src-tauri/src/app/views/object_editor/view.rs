@@ -372,7 +372,7 @@ impl ObjectEditorPane {
     }
 
     /// 执行已确认的预览：语句必须与预览时逐字一致（由执行链再核对一次）。
-    pub fn confirm(&mut self, cx: &mut Context<Self>) {
+    pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.executing || self.previewing {
             return;
         }
@@ -409,46 +409,42 @@ impl ObjectEditorPane {
         let kind = self.session.kind;
         let name = self.session.name.trim().to_owned();
         let database = self.session.database.clone();
-        let pane = cx.entity().downgrade();
         self.executing = true;
         cx.notify();
-        cx.spawn(async move |_, cx| {
+        cx.spawn_in(window, async move |pane, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
                 let result = crate::application::ddl::execute_request(&services.connections, &connection, &request, &sql, true).await;
                 let _ = tx.send(result);
             });
             let Ok(result) = rx.await else { return };
-            cx.update(|cx| {
-                let Some(pane) = pane.upgrade() else { return };
-                pane.update(cx, |this, cx| {
-                    if this.epoch != epoch {
-                        return;
-                    }
-                    this.executing = false;
-                    let verb = this.session.verb;
-                    this.session.plan = None;
-                    let target = (changed_connection, database, kind, name);
-                    match result {
-                        Ok(receipt) => {
-                            let decision = super::after_execute(verb, Some(&receipt));
-                            this.session.receipt = Some(receipt);
-                            // 结局自带的文案直接写进提示，读回真实状态时不会被冲掉。
-                            if let Some(key) = decision.outcome.note_key() {
-                                this.session.note = i18n::text(this.session.locale, key);
-                            }
-                            this.settle_after_execute(decision, target, cx);
+            let _ = pane.update_in(cx, |this, window, cx| {
+                if this.epoch != epoch {
+                    return;
+                }
+                this.executing = false;
+                let verb = this.session.verb;
+                this.session.plan = None;
+                let target = (changed_connection, database, kind, name);
+                match result {
+                    Ok(receipt) => {
+                        let decision = super::after_execute(verb, Some(&receipt));
+                        this.session.receipt = Some(receipt);
+                        // 结局自带的文案直接写进提示，读回真实状态时不会被冲掉。
+                        if let Some(key) = decision.outcome.note_key() {
+                            this.session.note = i18n::text(this.session.locale, key);
                         }
-                        Err(message) => {
-                            // 执行链直接报错：一份输入都不丢，原始错误原样留在提示里。
-                            let decision = super::after_execute(verb, None);
-                            this.session.receipt = None;
-                            this.session.note = message;
-                            this.settle_after_execute(decision, target, cx);
-                        }
+                        this.settle_after_execute(decision, target, window, cx);
                     }
-                    cx.notify();
-                });
+                    Err(message) => {
+                        // 执行链直接报错：一份输入都不丢，原始错误原样留在提示里。
+                        let decision = super::after_execute(verb, None);
+                        this.session.receipt = None;
+                        this.session.note = message;
+                        this.settle_after_execute(decision, target, window, cx);
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -458,12 +454,18 @@ impl ObjectEditorPane {
     ///
     /// 决策来自 after_execute（纯函数，单测覆盖）：草稿不该留就意味着窗口收起，
     /// 其余情况一律保留表单与回执，只是再读一次服务器现状。
-    fn settle_after_execute(&mut self, decision: super::AfterExecute, target: (String, String, ObjectKind, String), cx: &mut Context<Self>) {
+    pub(crate) fn settle_after_execute(
+        &mut self,
+        decision: super::AfterExecute,
+        target: (String, String, ObjectKind, String),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if decision.changed {
             self.changed = Some(target);
         }
         if !decision.keep_draft {
-            self.close();
+            self.close_in_window(window, cx);
             return;
         }
         if decision.refresh_detail && !self.session.name.trim().is_empty() {
@@ -898,7 +900,7 @@ impl ObjectEditorPane {
                             "object-editor-confirm",
                             Some(IconName::Check),
                             SharedString::from(i18n::text(locale, "structure.action.confirm")),
-                            move |_, _, cx| owner.update(cx, |pane, cx| pane.confirm(cx)),
+                            move |_, window, cx| owner.update(cx, |pane, cx| pane.confirm(window, cx)),
                         ))
                     }),
             );
