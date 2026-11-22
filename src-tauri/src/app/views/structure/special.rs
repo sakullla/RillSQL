@@ -225,7 +225,7 @@ impl StructurePane {
             .py(px(Space::SM))
             .border_b_1()
             .border_color(p.line_soft)
-            .bg(p.chrome);
+            .bg(p.sunken);
         if column.enum_set.is_some() {
             panel = panel.child(self.enum_set_section(index, column, p, window, cx));
         }
@@ -249,25 +249,31 @@ impl StructurePane {
             return div().into_any_element();
         };
         let entity = cx.entity();
+        let metrics = kit::Metrics::of(cx);
         let encodable = index < ENUM_COLUMN_LIMIT;
-        let mut head = div().flex().items_center().gap(px(Space::SM)).flex_wrap();
-        for kind in EnumSetKind::ALL {
-            let owner = entity.clone();
-            head = head.child(
-                kit::tool_button(
+        let kind_items = EnumSetKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let owner = entity.clone();
+                (
                     SharedString::from(format!("structure-enum-kind-{index}-{}", kind.keyword())),
-                    None,
                     SharedString::from(kind.keyword().to_uppercase()),
-                    move |_, _, cx| {
+                    state.kind == kind,
+                    kit::click(move |_, _, cx| {
                         owner.update(cx, |pane, cx| {
                             pane.set_enum_set_kind(index, kind);
                             cx.notify();
                         });
-                    },
+                    }),
                 )
-                .selected(state.kind == kind),
-            );
-        }
+            })
+            .collect();
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .flex_wrap()
+            .child(kit::segmented_sized(kind_items, p, metrics.control_h));
         let drop_owner = entity.clone();
         head = head
             .child(kit::eyebrow(t("structure.enumSetValues"), p))
@@ -462,6 +468,7 @@ impl StructurePane {
     /// 分区方案表单：方式、操作、表达式或列、数量与分区定义分开输入。
     pub(super) fn partition_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
@@ -470,7 +477,13 @@ impl StructurePane {
         let current = self.snapshot.as_ref().and_then(|snapshot| snapshot.partitions.clone());
         let partition_error = self.snapshot.as_ref().and_then(|snapshot| snapshot.partition_error.clone());
 
-        let mut form = div().id("structure-partition-form").test_support().flex().flex_col().gap(px(Space::MD + Space::XXS));
+        let mut form = kit::card(&p)
+            .id("structure-partition-form")
+            .test_support()
+            .p(px(metrics.card_pad()))
+            .flex()
+            .flex_col()
+            .gap(px(Space::MD + Space::XXS));
 
         // 现状：读回的分区方案（读失败时照实说读不到，不当作未分区）。
         let current_text = match (&current, &partition_error) {
@@ -485,9 +498,12 @@ impl StructurePane {
             (None, None) => i18n::text(locale, "structure.partitionNone"),
         };
         form = form.child(
-            div()
+            kit::sunken(&p)
+                .px(px(Space::MD))
+                .py(px(Space::SM))
                 .flex()
                 .items_center()
+                .flex_wrap()
                 .gap(px(Space::SM))
                 .child(kit::eyebrow(t("structure.partitionCurrent"), &p))
                 .child(div().text_size(px(TypeScale::SM)).text_color(p.text).child(SharedString::from(current_text)))

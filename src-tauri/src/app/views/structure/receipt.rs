@@ -13,7 +13,7 @@ use gpui_kit::{
 use crate::ddl::english::localize;
 use crate::ddl::{Receipt, StepStatus};
 use crate::i18n::Locale;
-use crate::ui::kit::{Palette, Radius, ScrollAreaExt as _, Space, TypeScale};
+use crate::ui::kit::{self, Palette, Radius, ScrollAreaExt as _, Space, TypeScale};
 
 /// 一次执行的结局。判定只在这里做，四个调用方都按它决定关不关预览、读不读回、留不留草稿。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,10 +157,11 @@ pub(crate) fn panel_rows(
         );
     }
     for row in rows {
-        let (fg, bg) = if row.status == StepStatus::Ok {
-            (p.text_muted, p.hover)
+        let ok = row.status == StepStatus::Ok;
+        let (fg, bg, dot) = if ok {
+            (p.text_muted, p.sunken, p.ok)
         } else {
-            (p.danger, p.danger_soft)
+            (p.danger, p.danger_soft, p.danger)
         };
         let head = format!("{} · {}", localize(&row.label, locale), step_text(row.status, locale));
         panel = panel.child(
@@ -174,9 +175,17 @@ pub(crate) fn panel_rows(
                 .py(px(Space::XS))
                 .rounded(px(Radius::PANEL))
                 .bg(bg)
+                .when(ok, |this| this.border_1().border_color(p.line_soft))
                 .text_color(fg)
                 .text_size(px(TypeScale::SM))
-                .child(SharedString::from(head))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Space::XS))
+                        .child(kit::status_dot(dot))
+                        .child(SharedString::from(head)),
+                )
                 .child(
                     div()
                         .id(SharedString::from(format!("{id_prefix}-step-{}-sql", row.label)))

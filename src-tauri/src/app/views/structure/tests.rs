@@ -737,16 +737,32 @@ fn structure_lists_follow_density_in_both_themes(cx: &mut gpui_kit::TestAppConte
 
 #[test]
 fn compact_field_widths_fit_the_narrowest_content_column() {
-    let rail = crate::app::shell::layout::RAIL_WIDTH as f32;
+    use crate::app::shell::layout::{self, SidebarMode};
+    let narrow = layout::layout_with_sidebar(640, true, layout::SIDEBAR_DEFAULT as i32);
+    assert_eq!(narrow.activity_width, 0, "零活动栏外壳左侧不应再预留活动栏宽度");
+    assert_eq!(narrow.sidebar_mode, SidebarMode::Overlay, "640px 窄窗侧栏应为覆盖模式");
+    assert_eq!(narrow.content_width, 640, "640px 窄窗零活动栏下内容宽度应等于视口宽度");
+
+    let docked_900 = layout::layout_with_sidebar(900, true, layout::SIDEBAR_DEFAULT as i32);
+    assert_eq!(docked_900.activity_width, 0);
+    assert_eq!(docked_900.sidebar_mode, SidebarMode::Docked);
+    assert_eq!(docked_900.content_width, 900 - layout::SIDEBAR_DEFAULT as i32);
+
     for metrics in [kit::Metrics::compact(), kit::Metrics::standard(), kit::Metrics::relaxed()] {
-        let content_w = 640. - rail - 2. * metrics.page_pad - 2.;
+        let content_w = narrow.content_width as f32 - 2. * metrics.page_pad - 2.;
         for create in [false, true] {
             let widths = FieldWidths::compact_for(create);
             let needed = widths.min_total(create);
-            assert!(needed <= content_w, "{metrics:?} create={create}: 紧凑行需要 {needed}，640 开侧栏只有 {content_w}");
+            assert!(needed <= content_w, "{metrics:?} create={create}: 紧凑行需要 {needed}，640 零活动栏内容区只有 {content_w}");
         }
         let widths = FieldWidths::compact();
         assert_eq!(FieldWidths::of(content_w, true).min_total(true), widths.min_total(true), "{metrics:?}: 窄内容列应取紧凑档");
+
+        let docked_w = docked_900.content_width as f32 - 2. * metrics.page_pad - 2.;
+        for create in [false, true] {
+            let widths = FieldWidths::of(docked_w, create);
+            assert!(widths.min_total(create) <= docked_w, "{metrics:?} create={create}: 900 停靠侧栏内容区 {docked_w} 放不下");
+        }
     }
     assert!(FieldWidths::wide().min_total(false) > FieldWidths::compact_for(false).min_total(false));
     for (content_w, create) in [(1040., false), (1040., true), (2400., false)] {

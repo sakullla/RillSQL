@@ -464,12 +464,13 @@ impl StructurePane {
                     .child(div().text_size(px(TypeScale::SM)).font_family(cx.theme().mono_font_family.clone()).child(label)),
             );
         }
-        panel = panel.child(grid);
+        let mut options_body = kit::sunken(p).p(px(kit::Space::MD)).flex().flex_col().gap(px(kit::Space::MD)).child(grid);
         if spec.comment {
             let placeholder = i18n::text(locale, "structure.options.commentHint");
             let comment = self.draft_input(7, &options.comment, &placeholder, window, cx);
-            panel = panel.child(div().max_w(px(560.)).child(kit::form_row(t("structure.options.comment"), comment, p)));
+            options_body = options_body.child(div().max_w(px(560.)).child(kit::form_row(t("structure.options.comment"), comment, p)));
         }
+        panel = panel.child(options_body);
         Some(panel.into_any_element())
     }
 
@@ -913,7 +914,7 @@ impl StructurePane {
                         .overflow_hidden()
                         .bg(p.raised)
                         .border_1()
-                        .border_color(p.line)
+                        .border_color(if p.dark { p.line_soft } else { p.line })
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
                         .child(

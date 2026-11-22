@@ -448,12 +448,21 @@ impl ObjectEditorPane {
 
     // ---------------------------------------------------------------- 渲染
 
-    fn heading(&self, p: &Palette) -> AnyElement {
+    fn heading(&self, entity: &Entity<Self>, p: &Palette) -> AnyElement {
         let locale = self.session.locale;
         let title = SharedString::from(i18n::text(locale, title_key(self.session.kind)));
-        let mut head = div().flex().items_center().gap(px(Space::MD)).child(kit::title(title, TypeScale::LG, p));
+        let close_owner = entity.clone();
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .pb(px(Space::SM))
+            .border_b_1()
+            .border_color(p.line_soft)
+            .child(kit::icon(IconName::Code, kit::IconSize::CONTROL, p.accent))
+            .child(kit::title(title, TypeScale::LG, p));
         if !self.session.database.is_empty() {
-            head = head.child(kit::muted(SharedString::from(self.session.database.clone()), p));
+            head = head.child(kit::pill(SharedString::from(self.session.database.clone()), p.text_muted, p.sunken));
         }
         if self.session.is_edit() {
             let metrics = kit::Metrics::compact();
@@ -464,27 +473,39 @@ impl ObjectEditorPane {
                 p,
             ));
         }
-        head.into_any_element()
+        head.child(div().flex_1().min_w_0())
+            .child(
+                kit::icon_button(
+                    "object-editor-header-close",
+                    IconName::X,
+                    SharedString::from(i18n::text(locale, "common.close")),
+                    move |_, _, cx| {
+                        close_owner.update(cx, |pane, cx| {
+                            pane.close();
+                            cx.notify();
+                        });
+                    },
+                )
+                .xsmall(),
+            )
+            .into_any_element()
     }
 
-    fn kind_choices(&self, entity: &Entity<Self>, p: &Palette, locale: Locale) -> AnyElement {
-        let mut row = div().flex().items_center().gap(px(Space::MD));
-        for kind in super::EDITABLE_KINDS {
-            let owner = entity.clone();
-            let selected = self.session.kind == kind;
-            let label = SharedString::from(i18n::text(locale, title_key(kind)));
-            let id = SharedString::from(format!("object-editor-kind-{}", kind_name(kind)));
-            let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
-                owner.update(cx, |pane, cx| pane.choose_kind(kind, cx));
-            };
-            row = row.child(if selected {
-                kit::primary_button(id, None, label, click).small().into_any_element()
-            } else {
-                kit::subtle_button(id, None, label, click).small().into_any_element()
-            });
-        }
-        let _ = p;
-        row.into_any_element()
+    fn kind_choices(&self, entity: &Entity<Self>, p: &Palette, metrics: &kit::Metrics, locale: Locale) -> AnyElement {
+        let items = super::EDITABLE_KINDS
+            .iter()
+            .map(|&kind| {
+                let owner = entity.clone();
+                let selected = self.session.kind == kind;
+                let label = SharedString::from(i18n::text(locale, title_key(kind)));
+                let id = SharedString::from(format!("object-editor-kind-{}", kind_name(kind)));
+                let click = kit::click(move |_, _, cx| {
+                    owner.update(cx, |pane, cx| pane.choose_kind(kind, cx));
+                });
+                (id, label, selected, click)
+            })
+            .collect();
+        kit::segmented_sized(items, p, metrics.control_h)
     }
 
     fn field(&mut self, key: &'static str, label: SharedString, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -512,15 +533,11 @@ impl ObjectEditorPane {
             .gap(px(Space::XXS))
             .child(kit::muted(label, &p))
             .child(
-                div()
+                kit::sunken(&p)
                     .id("object-editor-body")
                     .test_support()
                     .h(px(Space::XXL * 8.))
                     .p(px(Space::SM))
-                    .bg(p.chrome)
-                    .border_1()
-                    .border_color(p.line)
-                    .rounded(px(Radius::CONTROL))
                     .child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(SharedString::from("body"))),
             )
             .into_any_element()
@@ -559,9 +576,27 @@ impl ObjectEditorPane {
         form = form.child(self.field("name", SharedString::from(i18n::text(locale, "catalog.overview.name")), "e.g. purge_sessions", window, cx));
         // 单次 / 周期：只决定下面出现哪几个输入框，语句仍由计划层生成。
         let one_time = self.session.one_time;
-        let mut schedule = div().flex().items_center().gap(px(Space::SM));
-        schedule = schedule.child(self.toggle("object-editor-one-time", one_time, SharedString::from("AT"), entity, EditorToggle::OneTime));
-        schedule = schedule.child(self.toggle("object-editor-recurring", !one_time, SharedString::from("EVERY"), entity, EditorToggle::Recurring));
+        let metrics = kit::Metrics::of(cx);
+        let one_time_owner = entity.clone();
+        let recurring_owner = entity.clone();
+        let schedule = kit::segmented_sized(
+            vec![
+                (
+                    SharedString::from("object-editor-one-time"),
+                    SharedString::from("AT"),
+                    one_time,
+                    kit::click(move |_, _, cx| one_time_owner.update(cx, |pane, cx| pane.apply_toggle(EditorToggle::OneTime, cx))),
+                ),
+                (
+                    SharedString::from("object-editor-recurring"),
+                    SharedString::from("EVERY"),
+                    !one_time,
+                    kit::click(move |_, _, cx| recurring_owner.update(cx, |pane, cx| pane.apply_toggle(EditorToggle::Recurring, cx))),
+                ),
+            ],
+            p,
+            metrics.control_h,
+        );
         form = form.child(schedule);
         if one_time {
             form = form.child(self.field("at", SharedString::from("AT"), "2026-01-01 00:00:00", window, cx));
@@ -641,34 +676,49 @@ impl ObjectEditorPane {
             window,
             cx,
         ));
+        let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
         let before = !self.session.timing_after;
-        let mut timing = div().flex().items_center().gap(px(Space::SM));
-        timing = timing.child(self.toggle(
-            "object-editor-before",
-            before,
-            SharedString::from(TriggerTiming::Before.keyword()),
-            entity,
-            EditorToggle::Before,
-        ));
-        timing = timing.child(self.toggle(
-            "object-editor-after",
-            !before,
-            SharedString::from(TriggerTiming::After.keyword()),
-            entity,
-            EditorToggle::After,
-        ));
-        form = form.child(timing);
-        let mut events = div().flex().items_center().gap(px(Space::SM));
-        for event in [TriggerEvent::Insert, TriggerEvent::Update, TriggerEvent::Delete] {
-            let on = self.session.event_kind == event;
-            let id = match event {
-                TriggerEvent::Insert => "object-editor-insert",
-                TriggerEvent::Update => "object-editor-update",
-                TriggerEvent::Delete => "object-editor-delete",
-            };
-            events = events.child(self.toggle(id, on, SharedString::from(event.keyword()), entity, EditorToggle::Event(event)));
-        }
-        form = form.child(events);
+        let before_owner = entity.clone();
+        let after_owner = entity.clone();
+        let timing = kit::segmented_sized(
+            vec![
+                (
+                    SharedString::from("object-editor-before"),
+                    SharedString::from(TriggerTiming::Before.keyword()),
+                    before,
+                    kit::click(move |_, _, cx| before_owner.update(cx, |pane, cx| pane.apply_toggle(EditorToggle::Before, cx))),
+                ),
+                (
+                    SharedString::from("object-editor-after"),
+                    SharedString::from(TriggerTiming::After.keyword()),
+                    !before,
+                    kit::click(move |_, _, cx| after_owner.update(cx, |pane, cx| pane.apply_toggle(EditorToggle::After, cx))),
+                ),
+            ],
+            &p,
+            metrics.control_h,
+        );
+        let event_items = [TriggerEvent::Insert, TriggerEvent::Update, TriggerEvent::Delete]
+            .into_iter()
+            .map(|event| {
+                let on = self.session.event_kind == event;
+                let id = match event {
+                    TriggerEvent::Insert => "object-editor-insert",
+                    TriggerEvent::Update => "object-editor-update",
+                    TriggerEvent::Delete => "object-editor-delete",
+                };
+                let owner = entity.clone();
+                (
+                    SharedString::from(id),
+                    SharedString::from(event.keyword()),
+                    on,
+                    kit::click(move |_, _, cx| owner.update(cx, |pane, cx| pane.apply_toggle(EditorToggle::Event(event), cx))),
+                )
+            })
+            .collect();
+        let events = kit::segmented_sized(event_items, &p, metrics.control_h);
+        form = form.child(div().flex().flex_wrap().items_center().gap(px(Space::MD)).child(timing).child(events));
         form = form.child(self.body_field(SharedString::from("FOR EACH ROW"), window, cx));
         form.into_any_element()
     }
@@ -765,20 +815,16 @@ impl ObjectEditorPane {
     }
 
     fn preview_panel(&self, entity: &Entity<Self>, p: &Palette, locale: Locale) -> AnyElement {
-        let mut panel = div().flex().flex_col().gap(px(Space::SM));
+        let mut panel = kit::card(p).p(px(Space::MD)).flex().flex_col().gap(px(Space::SM));
         if let Some(plan) = self.session.plan.as_ref() {
             let mono = SharedString::from("monospace");
             for step in &plan.steps {
                 panel = panel.child(
-                    div()
+                    kit::sunken(p)
                         .id(SharedString::from(format!("object-editor-sql-{}", step.label)))
                         .max_h(px(Space::XXL * 8.))
                         .scroll_area_y()
                         .p(px(Space::SM))
-                        .rounded(px(Radius::PANEL))
-                        .bg(p.chrome)
-                        .border_1()
-                        .border_color(p.line)
                         .font_family(mono.clone())
                         .text_size(px(TypeScale::SM))
                         .child(SharedString::from(step.sql.clone())),
@@ -852,7 +898,7 @@ impl ObjectEditorPane {
             // 编辑时对象名是身份，不在这里改：改名要新建再删旧的，不偷偷替换。
             body = body.child(kit::muted(SharedString::from(self.session.name.clone()), &p));
         } else {
-            body = body.child(self.kind_choices(&entity, &p, locale));
+            body = body.child(self.kind_choices(&entity, &p, &metrics, locale));
         }
         if self.loading {
             body = body.child(kit::inline_loading(i18n::text(locale, "ui.structure.loading"), &metrics, &p));
@@ -882,13 +928,12 @@ impl ObjectEditorPane {
         }
         if !self.session.note.is_empty() {
             body = body.child(
-                div()
+                kit::sunken(&p)
                     .id("object-editor-note")
                     .test_support()
                     .p(px(Space::MD))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.hover)
                     .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
                     .child(SharedString::from(self.session.note.clone())),
             );
         }
@@ -904,7 +949,7 @@ impl ObjectEditorPane {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::hsla(0., 0., 0., 0.25))
+            .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
             .child(
                 div()
                     .id("object-editor")
@@ -920,10 +965,10 @@ impl ObjectEditorPane {
                     .gap(px(Space::MD))
                     .bg(p.raised)
                     .border_1()
-                    .border_color(p.line)
+                    .border_color(if p.dark { p.line_soft } else { p.line })
                     .rounded(px(Radius::PANEL))
                     .shadow_lg()
-                    .child(self.heading(&p))
+                    .child(self.heading(&entity, &p))
                     .child(div().id("object-editor-scroll").flex_1().min_h(relative(0.)).scroll_area_y().child(body)),
             )
             .into_any_element()

@@ -794,4 +794,63 @@ mod receipt_tests {
         };
         assert_eq!(ObjectDetail::Routine(routine).scheduler_running(), None, "例程没有调度器");
     }
+
+    #[gpui_kit::test]
+    fn object_editor_renders_segmented_kind_and_form_controls(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::test::TestWindowExt;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rillsql-object-editor-test-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let services = Arc::new(crate::application::AppServices::new(Arc::new(
+            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+        )));
+
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(700.)),
+            };
+            let (window, pane) = gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| {
+                    cx.new(|cx| {
+                        let mut pane = ObjectEditorPane::new(services.clone());
+                        pane.open_request(EditorRequest::blank("conn-1", "app", "", "mysql", ObjectKind::Event), cx);
+                        pane
+                    })
+                },
+            )
+            .expect("object editor window");
+            (window, pane)
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("object-editor-kind-event").visible(), "事件分段页签可见");
+            assert!(window.find("object-editor-kind-trigger").visible(), "触发器分段页签可见");
+            assert!(window.find("object-editor-one-time").visible(), "AT 分段选项可见");
+            assert!(window.find("object-editor-recurring").visible(), "EVERY 分段选项可见");
+            assert!(window.find("object-editor-body").visible(), "主体编辑区可见");
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.choose_kind(ObjectKind::Trigger, cx));
+            window.render_frame(cx);
+            assert!(window.find("object-editor-before").visible(), "BEFORE 分段选项可见");
+            assert!(window.find("object-editor-after").visible(), "AFTER 分段选项可见");
+            assert!(window.find("object-editor-insert").visible(), "INSERT 分段选项可见");
+            assert!(window.find("object-editor-update").visible(), "UPDATE 分段选项可见");
+            assert!(window.find("object-editor-delete").visible(), "DELETE 分段选项可见");
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

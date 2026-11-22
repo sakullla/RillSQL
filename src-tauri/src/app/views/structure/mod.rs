@@ -2748,7 +2748,7 @@ impl StructurePane {
                     .px(px(metrics.page_pad))
                     .py(px(kit::Space::MD))
                     .border_t_1()
-                    .border_color(p.line)
+                    .border_color(p.line_soft)
                     .bg(p.surface)
                     .child(div().id("structure-browse-hint").test_support().flex_1().min_w_0().child(kit::muted(t("structure.columns.browseHint"), p)))
                     .into_any_element(),
@@ -2819,7 +2819,7 @@ impl StructurePane {
                 .px(px(metrics.page_pad))
                 .py(px(8.))
                 .border_t_1()
-                .border_color(p.line)
+                .border_color(p.line_soft)
                 .bg(if pending > 0 { p.warn_soft } else { p.surface })
                 .child(status_node)
                 .when(pending > 0, |this| {
@@ -3015,7 +3015,7 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
         .items_center()
         .bg(p.chrome)
         .border_b_1()
-        .border_color(p.line)
+        .border_color(p.line_soft)
         .text_size(px(TypeScale::XS))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.text_faint);
@@ -3033,7 +3033,7 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
         head = head.child(div().w(px(28.)).flex_none());
     }
     let mut body = div().flex().flex_col();
-    for row in rows {
+    for (row_index, row) in rows.into_iter().enumerate() {
         let owner = entity.clone();
         let quick = quick_of(&row.menu);
         let entries = row.menu;
@@ -3056,6 +3056,7 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
             .items_center()
             .border_b_1()
             .border_color(p.line_soft)
+            .when(row_index % 2 == 1, |this| this.bg(p.zebra))
             .when(row.dim, |this| this.opacity(0.5))
             .hover(|style| style.bg(p.hover))
             .child(cells)
@@ -3397,39 +3398,45 @@ impl StructurePane {
             let name_issue = create::table_issue(&issues)
                 .filter(|_| !self.session.table_name.trim().is_empty() || self.session.kept_columns.len() > 1)
                 .map(|issue| create::issue_line("structure-table-name-issue", &issue.text, &p));
-            editor = editor.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_end()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(200.))
-                            .max_w(px(380.))
-                            .flex()
-                            .flex_col()
-                            .child(kit::form_row(t("structure.action.createTable"), name, &p))
-                            .children(name_issue),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(presets_btn)
-                            .child(kit::secondary_button("structure-add-column-top", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
-                                add_top_entity.update(cx, |pane, cx| {
-                                    pane.add_column();
-                                    cx.notify();
-                                });
-                            })),
-                    ),
-            );
+            let mut create_card = kit::card(&p)
+                .p(px(metrics.card_pad()))
+                .flex()
+                .flex_col()
+                .gap(px(kit::Space::MD))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_end()
+                        .gap(px(kit::Space::LG))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(200.))
+                                .max_w(px(380.))
+                                .flex()
+                                .flex_col()
+                                .child(kit::form_row(t("structure.action.createTable"), name, &p))
+                                .children(name_issue),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(kit::Space::SM))
+                                .child(presets_btn)
+                                .child(kit::secondary_button("structure-add-column-top", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
+                                    add_top_entity.update(cx, |pane, cx| {
+                                        pane.add_column();
+                                        cx.notify();
+                                    });
+                                })),
+                        ),
+                );
             if let Some(options) = self.table_options_panel(&entity, &p, window, cx) {
-                editor = editor.child(options);
+                create_card = create_card.child(options);
             }
+            editor = editor.child(create_card);
             editor = editor.child(kit::muted(t("structure.create.keyboardHint"), &p));
         } else {
             let total_cols = self.session.kept_columns.len();
@@ -3482,7 +3489,7 @@ impl StructurePane {
                                 .px(px(8.))
                                 .rounded(px(Radius::CONTROL))
                                 .border_1()
-                                .border_color(if !filter_val.is_empty() { p.accent } else { p.line })
+                                .border_color(if !filter_val.is_empty() { p.accent } else { p.line_soft })
                                 .bg(p.surface)
                                 .flex()
                                 .items_center()
@@ -3597,7 +3604,7 @@ impl StructurePane {
             .pr(px(FieldWidths::PAD_RIGHT))
             .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .text_size(px(TypeScale::XS))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(p.text_faint)
@@ -3660,9 +3667,11 @@ impl StructurePane {
             .id("structure-add-column-row")
             .flex()
             .items_center()
-            .h(px(row_h + 4.))
-            .px(px(6.))
-            .bg(p.surface)
+            .h(px(row_h + kit::Space::XS))
+            .px(px(kit::Space::SM))
+            .border_t_1()
+            .border_color(p.line_soft)
+            .bg(p.chrome)
             .child(kit::tool_button("structure-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
                 add_entity.update(cx, |pane, cx| {
                     pane.add_column();
@@ -4522,7 +4531,7 @@ impl StructurePane {
                             .h(px(available))
                             .rounded(px(Radius::CONTROL))
                             .border_1()
-                            .border_color(if view_dirty { p.warn } else { p.line })
+                            .border_color(if view_dirty { p.warn } else { p.line_soft })
                             .overflow_hidden()
                             .child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(t("structure.section.viewDef"))),
                     );
@@ -4601,7 +4610,7 @@ impl StructurePane {
                     ));
                 form = form
                     .child(toolbar)
-                    .child(div().h(px(height)).rounded(px(Radius::CONTROL)).border_1().border_color(p.line).overflow_hidden().child(viewer));
+                    .child(div().h(px(height)).rounded(px(Radius::CONTROL)).border_1().border_color(p.line_soft).overflow_hidden().child(viewer));
                 if !missing.is_empty() {
                     let sep = match locale {
                         Locale::ZhCn => "、",
@@ -4610,17 +4619,15 @@ impl StructurePane {
                     let localized_items = missing.iter().map(|item| localize_missing_item(item, locale)).collect::<Vec<_>>().join(sep);
                     let notice = i18n::fill(&i18n::text(locale, "structure.meta.rebuiltHint"), &[("items", &localized_items)]);
                     form = form.child(
-                        div()
+                        kit::sunken(&p)
                             .flex()
                             .items_start()
-                            .gap(px(8.))
-                            .px(px(12.))
-                            .py(px(8.))
-                            .rounded(px(Radius::PANEL))
-                            .bg(p.hover)
+                            .gap(px(kit::Space::MD))
+                            .px(px(kit::Space::LG))
+                            .py(px(kit::Space::MD))
                             .text_size(px(TypeScale::XS))
                             .text_color(p.text_muted)
-                            .child(kit::icon(IconName::Info, 13., p.text_muted))
+                            .child(kit::icon(IconName::Info, kit::IconSize::INLINE, p.text_muted))
                             .child(div().flex_1().min_w_0().child(SharedString::from(notice))),
                     );
                 }
@@ -4693,31 +4700,32 @@ impl StructurePane {
                 let mut form = form;
                 let view = self.session.object_kind == "view";
                 let back_owner = entity.clone();
-                let mut mode_bar = div().flex().flex_wrap().items_center().gap(px(6.));
+                let mut mode_bar = div().flex().flex_wrap().items_center().gap(px(kit::Space::SM));
                 if !view {
-                    for (kind, key) in [
+                    let danger_items = [
                         (DangerKind::Rename, "catalog.tree.renameTable"),
                         (DangerKind::Truncate, "catalog.tree.truncateTable"),
                         (DangerKind::Drop, "catalog.tree.dropTable"),
-                    ] {
+                    ]
+                    .into_iter()
+                    .map(|(kind, key)| {
                         let owner = entity.clone();
                         let active = self.session.danger == kind;
-                        mode_bar = mode_bar.child(
-                            kit::tool_button(
-                                SharedString::from(format!("structure-danger-kind-{kind:?}")),
-                                None,
-                                t(key),
-                                move |_, _, cx| {
-                                    owner.update(cx, |pane, cx| {
-                                        pane.session.danger = kind;
-                                        pane.session.cancel();
-                                        cx.notify();
-                                    });
-                                },
-                            )
-                            .selected(active),
-                        );
-                    }
+                        (
+                            SharedString::from(format!("structure-danger-kind-{kind:?}")),
+                            t(key),
+                            active,
+                            kit::click(move |_, _, cx| {
+                                owner.update(cx, |pane, cx| {
+                                    pane.session.danger = kind;
+                                    pane.session.cancel();
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    })
+                    .collect();
+                    mode_bar = mode_bar.child(kit::segmented_sized(danger_items, &p, metrics.control_h));
                 }
                 mode_bar = mode_bar.child(div().flex_1()).child(kit::tool_button(
                     "structure-danger-back",
@@ -4857,16 +4865,14 @@ impl StructurePane {
             (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len())
         });
         let pending_cols = self.pending_changes();
-        let mut tabs = div()
-            .id("structure-tabs")
-            .test_support()
-            .role(gpui_kit::Role::TabList)
-            .w_full()
-            // 滚动条例外：页签栏单行横向滚动，不占高度绘制滚动条。
-            .overflow_x_scroll()
+        let mut tabs_track = div()
             .flex()
-            .items_end()
-            .gap(px(kit::Space::XS));
+            .flex_none()
+            .items_center()
+            .p(px(kit::Space::XXS))
+            .gap(px(kit::Space::XXS))
+            .rounded(px(Radius::CONTROL))
+            .bg(p.sunken);
         for value in self.session.visible_sections() {
             if value == Section::Danger && section != Section::Danger {
                 continue;
@@ -4890,7 +4896,7 @@ impl StructurePane {
             let danger = value == Section::Danger;
             let dirty_dot = value == Section::Columns && pending_cols > 0;
             let owner = entity.clone();
-            tabs = tabs.child(
+            tabs_track = tabs_track.child(
                 kit::interactive_states(div().id(SharedString::from(key)), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Tab)
@@ -4898,32 +4904,50 @@ impl StructurePane {
                     .aria_selected(selected)
                     .flex_none()
                     .whitespace_nowrap()
-                    .h(px(metrics.tabs_h))
-                    .px(px(10.))
+                    .h(px(metrics.control_h))
+                    .px(px(kit::Space::MD))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .border_b_2()
+                    .gap(px(kit::Space::SM))
+                    .rounded(px(Radius::CONTROL))
                     .text_size(px(TypeScale::SM))
                     .when(selected, |this| {
-                        this.border_color(if danger { p.danger } else { p.accent })
-                            .text_color(if danger { p.danger } else { p.text })
-                            .font_weight(FontWeight::MEDIUM)
+                        this.bg(if danger {
+                            p.danger_soft
+                        } else if p.dark {
+                            p.raised
+                        } else {
+                            p.surface
+                        })
+                        .text_color(if danger { p.danger } else { p.text })
+                        .font_weight(FontWeight::MEDIUM)
+                        .shadow_sm()
                     })
                     .when(!selected, |this| {
-                        this.border_color(gpui_kit::hsla(0., 0., 0., 0.))
-                            .text_color(p.text_muted)
-                            .hover(|style| style.text_color(p.text))
+                        this.text_color(p.text_muted).hover(|style| style.text_color(p.text))
                     })
                     .child(t(key))
                     .when_some(count, |this, count| {
                         this.child(
                             div()
-                                .px(px(5.))
+                                .px(px(kit::Space::XS))
                                 .rounded(px(Radius::TAG))
-                                .bg(if dirty_dot { p.warn_soft } else { p.hover })
+                                .bg(if dirty_dot {
+                                    p.warn_soft
+                                } else if selected {
+                                    p.accent_soft
+                                } else {
+                                    p.hover
+                                })
                                 .text_size(px(TypeScale::XS))
-                                .text_color(if dirty_dot { p.warn } else { p.text_muted })
+                                .text_color(if dirty_dot {
+                                    p.warn
+                                } else if selected {
+                                    p.accent_text
+                                } else {
+                                    p.text_muted
+                                })
+                                .font_features(kit::tabular_figures())
                                 .child(SharedString::from(count.to_string())),
                         )
                     })
@@ -4939,6 +4963,16 @@ impl StructurePane {
                     }),
             );
         }
+        let tabs = div()
+            .id("structure-tabs")
+            .test_support()
+            .role(gpui_kit::Role::TabList)
+            .w_full()
+            // 滚动条例外：页签栏单行横向滚动，不占高度绘制滚动条。
+            .overflow_x_scroll()
+            .flex()
+            .items_center()
+            .child(tabs_track);
 
         let title = if self.session.mode == StructureMode::Create {
             t("structure.action.createTable")
@@ -5211,11 +5245,13 @@ impl StructurePane {
                     .flex_none()
                     .px(px(metrics.page_pad))
                     .pt(px(metrics.page_pad_y))
+                    .pb(px(kit::Space::SM))
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(px(kit::Space::MD))
+                    .bg(p.surface)
                     .border_b_1()
-                    .border_color(p.line)
+                    .border_color(p.line_soft)
                     .child(
                         div()
                             .flex()
@@ -5319,12 +5355,11 @@ impl StructurePane {
         }
         if !self.session.note.is_empty() {
             body = body.child(
-                div()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.hover)
+                kit::sunken(&p)
+                    .px(px(kit::Space::LG))
+                    .py(px(kit::Space::MD))
                     .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
                     .child(SharedString::from(self.session.note())),
             );
         }
@@ -5547,7 +5582,7 @@ impl StructurePane {
                     .overflow_hidden()
                     .bg(p.raised)
                     .border_1()
-                    .border_color(p.line)
+                    .border_color(if p.dark { p.line_soft } else { p.line })
                     .rounded(px(Radius::PANEL))
                     .shadow_lg()
                     .child(
@@ -5632,15 +5667,11 @@ impl StructurePane {
                                                 ),
                                         )
                                         .child(
-                                            div()
+                                            kit::sunken(p)
                                                 .id("structure-preview-sql")
                                                 .max_h(px(240.))
                                                 .scroll_area_y()
-                                                .p(px(12.))
-                                                .rounded(px(Radius::PANEL))
-                                                .bg(p.sunken)
-                                                .border_1()
-                                                .border_color(p.line)
+                                                .p(px(kit::Space::LG))
                                                 .font_family(cx.theme().mono_font_family.clone())
                                                 .text_size(px(TypeScale::SM))
                                                 .child(SharedString::from(sql_display)),
@@ -5656,7 +5687,7 @@ impl StructurePane {
                                     } else if level == "warn" {
                                         (p.warn, p.warn_soft, IconName::CircleAlert)
                                     } else {
-                                        (p.text_muted, p.hover, IconName::Info)
+                                        (p.text_muted, p.sunken, IconName::Info)
                                     };
                                     list = list.child(
                                         div()
@@ -5677,7 +5708,7 @@ impl StructurePane {
                             })
                             .when(!rule.is_empty() && !nothing_to_run, |this| this.child(kit::muted(SharedString::from(rule), p)))
                             .when(!blocked_text.is_empty(), |this| {
-                                let (fg, bg) = if only_unchanged { (p.text_muted, p.hover) } else { (p.danger, p.danger_soft) };
+                                let (fg, bg) = if only_unchanged { (p.text_muted, p.sunken) } else { (p.danger, p.danger_soft) };
                                 this.child(
                                     div()
                                         .id("structure-preview-blocked")

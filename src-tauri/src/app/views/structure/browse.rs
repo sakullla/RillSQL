@@ -308,7 +308,7 @@ impl StructurePane {
             .pr(px(FieldWidths::PAD_RIGHT))
             .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line)
+            .border_color(p.line_soft)
             .text_size(px(TypeScale::XS))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(p.text_faint)
@@ -376,7 +376,7 @@ impl StructurePane {
             .px(px(Space::SM))
             .border_t_1()
             .border_color(p.line_soft)
-            .bg(p.surface)
+            .bg(p.chrome)
             .child(kit::tool_button("structure-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
                 add_entity.update(cx, |pane, cx| {
                     pane.add_column();
@@ -562,6 +562,7 @@ impl StructurePane {
             .border_color(p.line_soft)
             .cursor_pointer()
             .text_size(px(TypeScale::SM))
+            .when(index % 2 == 1 && tint.is_none() && !is_focused, |this| this.bg(p.zebra))
             .when_some(tint, |this, tint| this.bg(tint))
             .when(is_focused, |this| this.bg(p.selection))
             .hover(|style| style.bg(p.hover))
