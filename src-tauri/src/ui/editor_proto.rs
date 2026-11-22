@@ -1218,7 +1218,7 @@ impl ShellOverlayOpen {
         }
     }
 
-    fn is_covered(window: &Window, cx: &App) -> bool {
+    pub fn is_covered(window: &Window, cx: &App) -> bool {
         let id = window.window_handle().window_id();
         cx.try_global::<Self>().is_some_and(|state| state.covered.contains(&id))
     }

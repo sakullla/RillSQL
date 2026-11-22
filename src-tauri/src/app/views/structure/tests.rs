@@ -282,6 +282,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: true,
             auto: true,
             dropped: false,
+            ..ColumnDraft::default()
         },
         ColumnDraft {
             original: Some("name".into()),
@@ -293,6 +294,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         },
         ColumnDraft {
             original: None,
@@ -304,6 +306,7 @@ async fn sqlite_structure_cancel_leaves_the_file_and_confirm_applies_the_preview
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         },
     ];
     let request = session.request().unwrap();
@@ -2088,3 +2091,719 @@ fn suggested_index_names_respect_the_dialect_limit() {
     assert!(sqlite.len() > 128, "SQLite 不截断");
     assert_eq!(suggested_index_name(&naming, "postgres", "orders", false, &[]), "");
 }
+
+
+// ---- ENUM/SET、生成列与分区（T2） ----
+
+use crate::ddl::model::{
+    EnumSetState, GeneratedStorage, GenerationState, PartitionDef, PartitionDefState, PartitionMethod, PartitionOp, PartitionState,
+};
+
+fn mysql_target(table: &str) -> GridTarget {
+    GridTarget {
+        connection_id: String::new(),
+        connection_name: String::new(),
+        database: "app".into(),
+        schema: "app".into(),
+        table: table.into(),
+        engine: "mysql".into(),
+        environment: "dev".into(),
+    }
+}
+
+/// 一张有 ENUM 字段与生成列的 MySQL 表，带着读回的专有形态。
+fn mysql_snapshot(engine: DdlEngine) -> Snapshot {
+    let mut snapshot = Snapshot::bare(engine, "app", "app", "orders");
+    snapshot.server_version = "8.4.13".to_owned();
+    snapshot.columns = vec![column("id", "bigint", true), column("status", "enum('draft','done')", false), column("total", "int", false)];
+    snapshot.enum_sets.insert(
+        "status".to_owned(),
+        EnumSetState { kind: EnumSetKind::Enum, values: vec!["draft".to_owned(), "done".to_owned()] },
+    );
+    snapshot.generation.insert(
+        "total".to_owned(),
+        GenerationState { expression: "id * 2".to_owned(), storage: GeneratedStorage::Virtual, reported_storage: "VIRTUAL".to_owned() },
+    );
+    snapshot.columns[2].generated = true;
+    snapshot
+}
+
+fn pane_with_mysql(services: std::sync::Arc<crate::application::AppServices>, engine: DdlEngine) -> StructurePane {
+    let mut pane = StructurePane::new(services);
+    pane.bind(mysql_target("orders"));
+    let snapshot = mysql_snapshot(engine);
+    pane.session.object_kind = snapshot.kind.clone();
+    pane.session.kept_columns = column_drafts(&snapshot);
+    pane.drafts_ready = true;
+    pane.snapshot = Some(snapshot);
+    pane
+}
+
+/// 读回的 ENUM 候选值要进草稿：只改候选值也能生成完整定义，不会退化成缺类型的普通列。
+#[test]
+fn enum_set_drafts_keep_read_back_values_and_changes_reach_the_statement() {
+    let snapshot = mysql_snapshot(DdlEngine::Mysql);
+    let mut drafts = column_drafts(&snapshot);
+    assert_eq!(drafts[1].enum_set.as_ref().map(|state| state.values.clone()), Some(vec!["draft".to_owned(), "done".to_owned()]));
+    assert_eq!(drafts[2].generated.as_ref().map(|state| state.expression.clone()), Some("id * 2".to_owned()));
+
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = drafts.clone();
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty(), "原样读回不该生成语句：{:?}", session.preview_sql());
+
+    // 候选值改成含空串、单引号、反斜杠、逗号与中文，顺序就是写入顺序。
+    let one = char::from(92);
+    drafts[1].enum_set.as_mut().unwrap().values =
+        vec![String::new(), "it's".to_owned(), format!("a{one}b"), "a,b".to_owned(), "中文".to_owned()];
+    session.kept_columns = drafts;
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("CHANGE COLUMN status"), "{sql}");
+    let quoted = format!("enum('','it''s','a{one}{one}b','a,b','中文')");
+    assert!(sql.contains(&quoted), "{sql}");
+    assert!(session.blocked().is_empty(), "{:?}", session.blocked());
+}
+
+/// 生成列：改表达式与存储方式都进语句；MariaDB 的持久化写法用 PERSISTENT。
+#[test]
+fn generated_column_edits_use_the_dialect_storage_keyword() {
+    for (engine, keyword) in [(DdlEngine::Mysql, "STORED"), (DdlEngine::Mariadb, "PERSISTENT")] {
+        let snapshot = mysql_snapshot(engine);
+        let mut drafts = column_drafts(&snapshot);
+        let generated = drafts[2].generated.as_mut().expect("生成列草稿");
+        generated.expression = "id * 3".to_owned();
+        generated.storage = GeneratedStorage::Stored;
+        let mut session = StructureSession::new(mysql_target("orders"));
+        session.kept_columns = drafts;
+        session.arm_fixture(&snapshot);
+        let sql = session.preview_sql().join("\n");
+        assert!(sql.contains(&format!("GENERATED ALWAYS AS (id * 3) {keyword}")), "{engine:?}: {sql}");
+        assert!(session.blocked().is_empty(), "{engine:?}: {:?}", session.blocked());
+    }
+}
+
+/// 表达式默认值不是生成列：草稿里没有生成属性，也不会被锁成只读。
+#[test]
+fn expression_defaults_do_not_become_generated_columns() {
+    let mut snapshot = Snapshot::bare(DdlEngine::Mysql, "app", "app", "orders");
+    snapshot.server_version = "8.4.13".to_owned();
+    let mut created = column("created_at", "datetime", false);
+    created.default_sql = Some("CURRENT_TIMESTAMP".to_owned());
+    snapshot.columns = vec![column("id", "bigint", true), created];
+    let drafts = column_drafts(&snapshot);
+    assert!(drafts[1].generated.is_none(), "表达式默认值不能变成生成列");
+    assert!(drafts[1].enum_set.is_none());
+    assert!(!snapshot.columns[1].generated);
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = drafts;
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_unchanged(), "{:?}", session.blocked());
+}
+
+/// 四类分区都能从会话草稿走到语句；不适用的操作被阻断而不是生成语句。
+#[test]
+fn partition_drafts_cover_the_four_methods_and_block_what_does_not_apply() {
+    let snapshot = mysql_snapshot(DdlEngine::Mysql);
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![
+            PartitionDef { name: "p0".to_owned(), description: "100".to_owned() },
+            PartitionDef { name: "p1".to_owned(), description: "MAXVALUE".to_owned() },
+        ],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY RANGE(id)"), "{sql}");
+    assert!(sql.contains("PARTITION p1 VALUES LESS THAN (MAXVALUE)"), "{sql}");
+
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::Hash,
+        expression: "id".to_owned(),
+        count: "4".to_owned(),
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().join("\n").contains("PARTITION BY HASH(id) PARTITIONS 4"));
+
+    session.partition_columns = "id, status".to_owned();
+    session.partition = PartitionDraft { op: PartitionOp::Replace, method: PartitionMethod::Key, count: "8".to_owned(), ..PartitionDraft::default() };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY KEY(id, status) PARTITIONS 8"), "{sql}");
+
+    // LIST 方案也走得通：取值列表原样进 VALUES IN。
+    session.partition_columns.clear();
+    session.partition = PartitionDraft {
+        op: PartitionOp::Replace,
+        method: PartitionMethod::List,
+        expression: "status".to_owned(),
+        definitions: vec![PartitionDef { name: "p_draft".to_owned(), description: "'draft'".to_owned() }],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY LIST(status)"), "{sql}");
+    assert!(sql.contains("VALUES IN ('draft')"), "{sql}");
+
+    // 未分区的表不能新增/删除/重组/移除：预览阻断而不是给一条会被服务器拒绝的语句。
+    session.partition = PartitionDraft {
+        op: PartitionOp::Add,
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![PartitionDef { name: "p2".to_owned(), description: "300".to_owned() }],
+        ..PartitionDraft::default()
+    };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty(), "{:?}", session.preview_sql());
+    assert!(session.blocked().iter().any(|text| text.contains("还没有分区方案")), "{:?}", session.blocked());
+}
+
+/// 已有分区方案的表：维护操作按现状走，读回的分区名才可选。
+#[test]
+fn partition_maintenance_follows_the_read_back_scheme() {
+    let mut snapshot = mysql_snapshot(DdlEngine::Mysql);
+    snapshot.partitions = Some(PartitionState {
+        method: PartitionMethod::Range,
+        expression: "id".to_owned(),
+        definitions: vec![
+            PartitionDefState { name: "p0".to_owned(), description: "100".to_owned() },
+            PartitionDefState { name: "p1".to_owned(), description: "MAXVALUE".to_owned() },
+        ],
+    });
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+
+    // 起稿值与读回一致。
+    let dir = std::env::temp_dir().join(format!("rillsql-partition-seed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+        crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+    )));
+    let mut pane = StructurePane::new(services);
+    pane.seed_partition_draft(&snapshot);
+    assert_eq!(pane.session.partition.method, PartitionMethod::Range);
+    assert_eq!(pane.session.partition.definitions.len(), 2);
+
+    session.partition = PartitionDraft { op: PartitionOp::Drop, method: PartitionMethod::Range, targets: vec!["p0".to_owned()], ..PartitionDraft::default() };
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().join("\n").contains("DROP PARTITION p0"), "{:?}", session.preview_sql());
+
+    // 删除一个读不到的分区名：预览阻断。
+    session.partition.targets = vec!["p9".to_owned()];
+    session.arm_fixture(&snapshot);
+    assert!(session.preview_sql().is_empty());
+    assert!(session.blocked().iter().any(|text| text.contains("没有读到分区 p9")), "{:?}", session.blocked());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// KEY 分区的列清单读回时带反引号（两引擎实测都是 `id`,`tenant_id`）：起稿还原成裸列名，
+/// 预览再按方言各包一层，不会拼出 KEY(```id```) 这种服务器拒绝的语句。
+#[test]
+fn key_partition_columns_are_seeded_bare_from_the_read_back_expression() {
+    let mut snapshot = mysql_snapshot(DdlEngine::Mysql);
+    snapshot.partitions = Some(PartitionState {
+        method: PartitionMethod::Key,
+        expression: "`id`,`tenant_id`".to_owned(),
+        definitions: vec![
+            PartitionDefState { name: "p0".to_owned(), description: String::new() },
+            PartitionDefState { name: "p1".to_owned(), description: String::new() },
+            PartitionDefState { name: "p2".to_owned(), description: String::new() },
+        ],
+    });
+    let dir = std::env::temp_dir().join(format!("rillsql-partition-key-seed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+        crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+    )));
+    let mut pane = StructurePane::new(services);
+    pane.seed_partition_draft(&snapshot);
+
+    assert_eq!(pane.session.partition_columns, "id, tenant_id");
+    let action = pane.session.partition_action();
+    assert_eq!(action.method, PartitionMethod::Key);
+    assert_eq!(action.columns, vec!["id".to_owned(), "tenant_id".to_owned()]);
+    assert_eq!(action.count, "3");
+
+    // 同一份草稿走到预览：KEY 的列各包一层引号，数量照读回的分区数重建。
+    let mut session = StructureSession::new(mysql_target("orders"));
+    session.kept_columns = column_drafts(&snapshot);
+    session.section = Section::Partitions;
+    session.partition = action;
+    session.partition_columns = pane.session.partition_columns.clone();
+    session.arm_fixture(&snapshot);
+    let sql = session.preview_sql().join("\n");
+    assert!(sql.contains("PARTITION BY KEY(id, tenant_id) PARTITIONS 3"), "{sql}");
+    assert!(!sql.contains("```"), "{sql}");
+
+    // 界面上手写的反引号（含双写与空格）按同一规则还原，不会二次加引号。
+    pane.session.partition_columns = " `id` , `ten``ant` ".to_owned();
+    assert_eq!(
+        pane.session.partition_action().columns,
+        vec!["id".to_owned(), "ten`ant".to_owned()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 界面：ENUM 行下面出现候选值面板，增删与排序都落在草稿上；生成列面板给出存储方式。
+#[gpui_kit::test]
+fn enum_and_generated_panels_edit_the_draft(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("special");
+    let (window, pane) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = pane_with_mysql(services.clone(), DdlEngine::Mysql);
+                    // 第 1 行是 ENUM 字段，进入编辑后行下面挂候选值面板。
+                    pane.begin_edit_row(1);
+                    pane
+                })
+            },
+        )
+        .expect("structure pane")
+    });
+    let visible = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("structure-special-1").visible(), window.find("structure-enum-add-1").visible())
+        })
+        .unwrap();
+    assert!(visible.0, "ENUM 字段的编辑行下面要有候选值面板");
+    assert!(visible.1, "面板要有添加候选值的按钮");
+
+    cx.update_window(window, |_, _, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.add_enum_value(1);
+            assert_eq!(pane.session.kept_columns[1].enum_set.as_ref().unwrap().values.len(), 3);
+            pane.move_enum_value(1, 2, -1);
+            assert_eq!(
+                pane.session.kept_columns[1].enum_set.as_ref().unwrap().values,
+                vec!["draft".to_owned(), String::new(), "done".to_owned()]
+            );
+            pane.remove_enum_value(1, 1);
+            assert_eq!(pane.session.kept_columns[1].enum_set.as_ref().unwrap().values, vec!["draft".to_owned(), "done".to_owned()]);
+            // 生成列面板：切到存储方式后草稿跟着变。
+            pane.set_generated_storage(2, GeneratedStorage::Stored);
+            assert_eq!(pane.session.kept_columns[2].generated.as_ref().unwrap().storage, GeneratedStorage::Stored);
+            pane.begin_edit_row(2);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    let generated = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("structure-special-2").visible(), window.find("structure-generated-storage-2").visible())
+        })
+        .unwrap();
+    assert!(generated.0 && generated.1, "生成列行要有表达式与存储方式");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 界面：MySQL 表有分区页签，点开后是分区表单；PostgreSQL 表没有这一段。
+#[gpui_kit::test]
+fn partition_section_only_exists_for_the_mysql_family(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("partition-tab");
+    let (window, pane) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(900.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| cx.new(|_| pane_with_mysql(services.clone(), DdlEngine::Mysql)),
+        )
+        .expect("structure pane")
+    });
+    let has_tab = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("structure.section.partitions").visible()
+        })
+        .unwrap();
+    assert!(has_tab, "MySQL 表要有分区页签");
+    let form = cx
+        .update_window(window, |_, window, cx| {
+            window.click("structure.section.partitions", cx);
+            window.render_frame(cx);
+            (window.find("structure-partition-form").visible(), window.find("structure-partition-op").visible())
+        })
+        .unwrap();
+    assert!(form.0 && form.1, "分区页签打开后是分区表单");
+    let _ = pane;
+    let mut postgres = StructurePane::new(services.clone());
+    postgres.bind(target("postgres", "orders"));
+    assert!(!postgres.session.visible_sections().contains(&Section::Partitions), "PostgreSQL 表没有分区这一段");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- 逐步回执（T5）
+
+fn partial_receipt(target: &str, steps: Vec<(&str, crate::ddl::StepStatus, &str)>) -> crate::ddl::Receipt {
+    crate::ddl::Receipt {
+        blocked: Vec::new(),
+        rule: String::new(),
+        steps: steps
+            .into_iter()
+            .map(|(label, status, message)| crate::ddl::model::StepReceipt {
+                sql: format!("ALTER TABLE orders {label};"),
+                label: label.to_owned(),
+                status,
+                message: message.to_owned(),
+            })
+            .collect(),
+        target: target.to_owned(),
+        rebuild: false,
+    }
+}
+
+fn blocked_receipt(target: &str, reasons: &[&str]) -> crate::ddl::Receipt {
+    crate::ddl::Receipt {
+        blocked: reasons.iter().map(|reason| (*reason).to_owned()).collect(),
+        rule: String::new(),
+        steps: Vec::new(),
+        target: target.to_owned(),
+        rebuild: false,
+    }
+}
+
+/// 只有每一条都 Ok 才收起预览；被拦下、没有语句、部分成功都留着预览并写原始原因。
+#[test]
+fn only_all_ok_receipt_closes_the_preview_and_other_outcomes_keep_it() {
+    let mut session = StructureSession::new(target("postgres", "orders"));
+    let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+    snapshot.columns = vec![column("id", "bigint", true)];
+    session.kept_columns = column_drafts(&snapshot);
+    session.arm_fixture(&snapshot);
+    let label = session.preview_target();
+    assert!(!label.is_empty(), "预览有目标");
+
+    // 被拦下：不收起预览，提示就是原始原因，没有逐步行。
+    let outcome = session.apply_receipt(blocked_receipt(&label, &["没有可执行的改动。"])).expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::Blocked);
+    assert!(session.preview_open(), "被拦下不收起预览");
+    assert_eq!(session.note(), "没有可执行的改动。");
+    assert!(receipt::rows(session.receipt().expect("回执留着")).is_empty());
+
+    // 没有被拦下也没有语句：同样不算完成。
+    let outcome = session.apply_receipt(partial_receipt(&label, Vec::new())).expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::NothingRun);
+    assert!(session.preview_open());
+    assert_eq!(session.note(), "没有执行任何语句");
+
+    // 部分成功：预览留着，提示是部分完成，逐步回执行里带着原始错误。
+    let outcome = session
+        .apply_receipt(partial_receipt(
+            &label,
+            vec![("改名", crate::ddl::StepStatus::Ok, ""), ("加列", crate::ddl::StepStatus::Failed, "syntax error near ADD")],
+        ))
+        .expect("同一目标");
+    assert_eq!(outcome, receipt::ReceiptOutcome::Partial);
+    assert!(session.preview_open(), "部分成功不收起预览");
+    assert!(session.note().contains("部分完成"), "{}", session.note());
+    let rows = receipt::rows(session.receipt().unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, crate::ddl::StepStatus::Ok);
+    assert_eq!(rows[1].status, crate::ddl::StepStatus::Failed);
+    assert_eq!(rows[1].message, "syntax error near ADD");
+    assert!(rows[1].sql.contains("ALTER TABLE orders"), "{}", rows[1].sql);
+
+    // 全部成功：收起预览并显示统一的完成。
+    let outcome = session
+        .apply_receipt(partial_receipt(&label, vec![("改名", crate::ddl::StepStatus::Ok, "")]))
+        .expect("同一目标");
+    assert!(outcome.is_success());
+    assert!(!session.preview_open(), "全部成功才收起预览");
+    assert_eq!(session.note(), "已按预览执行。");
+}
+
+/// 目标换了以后的旧回执只提示过期：不覆盖当前目标上的回执，也不关掉当前预览。
+#[test]
+fn a_receipt_for_another_target_only_reports_stale() {
+    let mut session = StructureSession::new(target("postgres", "orders"));
+    let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+    snapshot.columns = vec![column("id", "bigint", true)];
+    session.kept_columns = column_drafts(&snapshot);
+    session.arm_fixture(&snapshot);
+    let stale = partial_receipt("postgres / app.public.customers", vec![("加列", crate::ddl::StepStatus::Ok, "")]);
+    assert!(session.apply_receipt(stale).is_none(), "目标不同的回执不落地");
+    assert_eq!(session.note(), "目标已切换，本次执行结果已丢弃。");
+    assert!(session.receipt().is_none(), "过期回执不覆盖当前目标");
+    assert!(session.preview_open(), "过期回执不动当前预览");
+}
+
+/// 结局参数：只有全部成功不收草稿，其余都要重新读回、留着用户填的草稿。
+#[test]
+fn outcome_rules_for_rereading_and_draft_keeping() {
+    use receipt::ReceiptOutcome;
+    let cases = [
+        (blocked_receipt("t", &["原因"]), ReceiptOutcome::Blocked),
+        (partial_receipt("t", Vec::new()), ReceiptOutcome::NothingRun),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Ok, "")]), ReceiptOutcome::Done),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Skipped, "跳过")]), ReceiptOutcome::Partial),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::Unknown, "")]), ReceiptOutcome::Partial),
+        (partial_receipt("t", vec![("a", crate::ddl::StepStatus::RolledBack, "回滚")]), ReceiptOutcome::Partial),
+    ];
+    for (receipt, expected) in cases {
+        let outcome = ReceiptOutcome::of(&receipt);
+        assert_eq!(outcome, expected);
+        assert_eq!(outcome.rereads_target(), expected == ReceiptOutcome::Done || expected == ReceiptOutcome::Partial);
+        assert_eq!(outcome.keeps_draft(), !outcome.is_success());
+        if outcome.is_success() {
+            assert_eq!(receipt::problems(&receipt), Vec::<String>::new(), "全部成功没有原因");
+        } else {
+            assert!(!receipt::problems(&receipt).is_empty(), "{expected:?} 必须有原因");
+        }
+    }
+    // Failed 步骤没有 message 时退回 SQL，界面不会只剩一个空状态。
+    let bare = partial_receipt("t", vec![("加列", crate::ddl::StepStatus::Failed, "")]);
+    assert!(receipt::problems(&bare)[0].contains("ALTER TABLE"));
+}
+
+/// R8：已有表字段列表支持 Up/Down 选行、Enter/F2 进入编辑、回车确认推进，以及 Delete 标记/撤销删除。
+#[gpui_kit::test]
+fn existing_table_keyboard_flow_selects_edits_advances_and_marks_delete(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-keyboard");
+    let (window, pane) = open_pane(cx, 1000., 700., move || pane_with_snapshot(services, 3));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let focus = pane.update(cx, |pane, cx| pane.focus_handle(cx));
+        window.focus(&focus, cx);
+        window.render_frame(cx);
+
+        // Down 选行：None -> 0 -> 1；Up 回到 0。
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(0));
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(1));
+        window.press("up", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).focused_row(), Some(0));
+
+        // F2 进入第 0 行编辑，输入框出现。
+        window.press("f2", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(0));
+        assert!(window.try_find("structure-draft-10000").is_some());
+
+        // 回车确认并推进到下一行（row 1）。
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_000);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(1));
+        assert_eq!(pane.read(cx).focused_row(), Some(1));
+
+        // 推进到末行（row 2），再回车退出编辑并保留末行焦点。
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_001);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(2));
+
+        pane.update(cx, |pane, cx| {
+            pane.draft_enter(10_002);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), None);
+        assert_eq!(pane.read(cx).focused_row(), Some(2));
+
+        // Delete 标记第 2 行删除，再次 Delete 撤销删除。
+        window.press("delete", cx);
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.kept_columns[2].dropped, "Delete 标记删除");
+        window.press("delete", cx);
+        window.render_frame(cx);
+        assert!(!pane.read(cx).session.kept_columns[2].dropped, "再次 Delete 撤销删除");
+
+        // Enter 同样可以进入当前选中行编辑。
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(pane.read(cx).editing_row(), Some(2));
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R8：已有表编辑态保留就近校验错误提示，且存在阻塞错误时禁用“预览 SQL”按钮。
+#[gpui_kit::test]
+fn existing_table_editing_keeps_inline_issue_and_blocks_preview(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-inline-issue");
+    let (window, pane) = open_pane(cx, 1000., 700., move || pane_with_snapshot(services, 3));
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("structure-row-columns-1", cx);
+        window.render_frame(cx);
+        // 把第 1 行改名成与第 0 行重名，触发阻塞错误。
+        pane.update(cx, |pane, cx| {
+            pane.write_draft(10_001, "col_0".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+
+        assert_eq!(pane.read(cx).editing_row(), Some(1));
+        assert!(pane.read(cx).preview_blocked(), "已有表存在校验错误时阻塞预览");
+        assert!(window.try_find("structure-col-mark-1").is_some(), "编辑行保留错误标记");
+        assert!(window.try_find("structure-editing-row-issue").is_some(), "编辑态保留就近校验错误文本");
+
+        // 试图预览会被拦下，不会打开预览弹窗。
+        pane.update(cx, |pane, cx| pane.preview_current(cx));
+        window.render_frame(cx);
+        assert!(!pane.read(cx).session.preview_open());
+
+        // 修正重名后恢复正常，错误提示消失、预览解锁。
+        pane.update(cx, |pane, cx| {
+            pane.write_draft(10_001, "col_1_fixed".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(!pane.read(cx).preview_blocked());
+        assert!(window.try_find("structure-editing-row-issue").is_none());
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R8：DDL 预览弹窗在非生产环境支持 Enter 触发确认；生产环境禁止 Enter 并自动聚焦表名确认框。
+#[gpui_kit::test]
+fn ddl_preview_enter_executes_non_prod_and_prod_auto_focuses_without_enter(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+
+    // 1. 非生产环境：打开预览后自动聚焦弹窗焦点陷阱，按 Enter 触发确认流程（危险操作先进入二段确认武装）。
+    let (services, dir) = offline_services("r8-preview-enter");
+    let (window, pane) = open_pane(cx, 1000., 700., move || {
+        let mut pane = pane_with_snapshot(services, 3);
+        pane.session.target.environment = "local".into();
+        pane.set_prod_target(false);
+        pane.session.section = Section::Danger;
+        pane.session.danger = DangerKind::Drop;
+        let snap = pane.snapshot.clone().unwrap();
+        pane.session.arm_fixture(&snap);
+        pane
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.preview_open());
+        assert!(window.try_find("structure-preview-dialog").is_some(), "预览弹窗应渲染");
+        assert!(!pane.read(cx).session.armed(), "初始尚未进入二段确认");
+
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(pane.read(cx).session.armed(), "非生产环境预览弹窗按 Enter 应触发 confirm()");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 2. 生产环境危险操作：打开预览后自动聚焦表名确认框，且按 Enter 禁止执行或武装。
+    let (prod_services, prod_dir) = offline_services("r8-prod-preview");
+    let (prod_window, prod_pane) = open_pane(cx, 1000., 700., move || {
+        let mut pane = pane_with_snapshot(prod_services, 3);
+        pane.session.target.environment = "prod".into();
+        pane.set_prod_target(true);
+        pane.session.section = Section::Danger;
+        pane.session.danger = DangerKind::Drop;
+        let snap = pane.snapshot.clone().unwrap();
+        pane.session.arm_fixture(&snap);
+        pane
+    });
+
+    cx.update_window(prod_window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(prod_pane.read(cx).session.preview_open());
+        assert!(prod_pane.read(cx).draft_fields.is_focused(6, window, cx), "生产危险预览打开后应自动聚焦表名确认输入框");
+
+        // 即使输完表名，按 Enter 也绝不执行或进入二段确认。
+        prod_pane.update(cx, |pane, cx| {
+            pane.write_draft(6, "orders".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(prod_pane.read(cx).session.preview_open(), "生产环境按 Enter 不能执行或关闭预览");
+        assert!(!prod_pane.read(cx).session.armed(), "生产环境按 Enter 不能触发二段武装");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&prod_dir);
+}
+
+/// R8：字段少于 5 个及 640px–900px 窄宽下，字段预设可达、“显示全部列”提供横向滚动、
+/// 子页签与页头紧凑适配不溢出，模板管理弹窗响应式堆叠且字段表可横向滚动。
+#[gpui_kit::test]
+fn small_table_and_narrow_viewport_keep_presets_hscroll_and_stacked_templates(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("r8-narrow");
+    let (window, pane) = open_pane(cx, 640., 640., move || {
+        let mut pane = pane_with_snapshot(services, 3);
+        pane.set_content_width(640.);
+        pane.set_data_sink(Arc::new(|_| {}));
+        pane
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 少于 5 列的小表在底部行仍可直接访问字段预设。
+        assert!(window.try_find("structure-column-presets").is_some(), "小表(<5列)也必须保留字段预设入口");
+        // 页头紧凑按钮与子页签栏均可见且不超出 640px 右边界。
+        let tabs_bounds = window.find("structure-tabs").bounds();
+        let data_bounds = window.find("structure-open-data").bounds();
+        assert!(tabs_bounds.right() <= px(640.5), "子页签栏不能超出窗口右边界: {tabs_bounds:?}");
+        assert!(data_bounds.right() <= px(640.5), "窄屏页头数据按钮不能超出窗口右边界: {data_bounds:?}");
+
+        // 开启“显示全部列”：出现横向滚动容器，右缘按钮不裁切。
+        pane.update(cx, |pane, cx| {
+            pane.show_all_columns = true;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("structure-columns-hscroll").is_some(), "显示全部列时应提供横向滚动容器");
+        let cols = browse::BrowseColumns::of(500., true);
+        assert!(cols.min_total() > 500., "强制显示全部列时最小总宽应保留完整列宽");
+
+        // 打开模板管理弹窗并新建草稿：在 <=900px 下上下堆叠（列表在编辑器上方），字段表带横向滚动容器。
+        pane.update(cx, |pane, cx| {
+            pane.open_template_manager();
+            pane.new_template();
+            cx.notify();
+        });
+        window.render_frame(cx);
+        let dialog_bounds = window.find("structure-templates-dialog").bounds();
+        let list_bounds = window.find("structure-templates-list").bounds();
+        let editor_bounds = window.find("structure-template-editor").bounds();
+        assert!(dialog_bounds.right() <= px(640.5), "模板管理弹窗不超出窄屏右边界: {dialog_bounds:?}");
+        assert!(list_bounds.bottom() <= editor_bounds.top() + px(4.), "窄屏(<=900px)下模板列表应堆叠在编辑器上方: list={list_bounds:?}, editor={editor_bounds:?}");
+        assert!(window.try_find("structure-template-columns-hscroll").is_some(), "模板字段表应支持横向滚动");
+    })
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

@@ -5,7 +5,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Sizable as _;
-use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window};
+use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window};
 
 use crate::i18n::{self, Locale};
 use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
@@ -15,12 +15,21 @@ use crate::ui::FormatViewer;
 use super::session::{type_abbr, CellKind, SharedGrid};
 use super::GridPane;
 
+/// 记录面板只读字段值的最大预览高度：避免单条长/多行文本把其余字段挤出可视区。
+const RECORD_VALUE_MAX_H: f32 = 72.;
+
 /// 记录面板的就地暂存状态。非模态：值直接在字段行里改，Enter 暂存、Esc 取消。
 pub struct RecordEdit {
     /// 正在编辑的逻辑列。
     pub column: Option<usize>,
     /// 面板里的文本输入；Enter 由订阅提交，Esc 由网格按键处理。
     pub input: Option<Entity<InputState>>,
+    /// 正在编辑的格的本地校验错误；有错误时不关闭输入，就近提示。
+    pub error: Option<String>,
+    /// 正在编辑的列是否允许 NULL。
+    pub can_null: bool,
+    /// 正在编辑的列是否有默认值。
+    pub can_default: bool,
     /// 目标格可写；不可写时点值只说明原因并打开完整值。
     pub writable: bool,
     /// 选区格子数：大于一格时在面板底部给出适用的批量动作。
@@ -218,11 +227,58 @@ pub fn render_record(
                         )
                         .child(match (edit.column == Some(column), edit.input.as_ref()) {
                             // 就地暂存：值直接变成文本输入，Enter 暂存、Esc 取消，没有弹窗。
-                            (true, Some(input)) => div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(kit::text_input("grid-record-input", input, t("grid.record.editHint")).small())
-                                .into_any_element(),
+                            (true, Some(input)) => {
+                                let set_null = {
+                                    let entity = entity.clone();
+                                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                                        entity.update(cx, |pane, cx| pane.record_set_null(cx));
+                                    }
+                                };
+                                let set_default = {
+                                    let entity = entity.clone();
+                                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                                        entity.update(cx, |pane, cx| pane.record_set_default(cx));
+                                    }
+                                };
+                                let mut editor = div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(kit::Space::XS))
+                                    .child(kit::text_input("grid-record-input", input, t("grid.record.editHint")).small());
+                                if edit.can_null || edit.can_default {
+                                    editor = editor.child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(kit::Space::XS))
+                                            .when(edit.can_null, |this| {
+                                                this.child(kit::tool_button("grid-record-set-null", None, t("grid.value.setNull"), set_null).xsmall())
+                                            })
+                                            .when(edit.can_default, |this| {
+                                                this.child(kit::tool_button("grid-record-set-default", None, t("grid.value.setDefault"), set_default).xsmall())
+                                            }),
+                                    );
+                                }
+                                if let Some(error) = edit.error.clone() {
+                                    editor = editor.child(
+                                        div()
+                                            .id("grid-record-error")
+                                            .debug_selector(|| "grid-record-error".to_owned())
+                                            .test_support()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(kit::Space::XS))
+                                            .text_size(px(TypeScale::XS))
+                                            .text_color(p.danger)
+                                            .child(kit::icon(IconName::CircleAlert, 12., p.danger))
+                                            .child(div().min_w_0().child(SharedString::from(error))),
+                                    );
+                                }
+                                editor.into_any_element()
+                            }
                             _ => {
                                 // 可写时点值就开始暂存；只读时同一处给出原因并打开完整值。
                                 let press = {
@@ -235,7 +291,9 @@ pub fn render_record(
                                     .id(("grid-record-value", column))
                                     .debug_selector(move || format!("grid-record-value-{column}"))
                                     .flex_1()
-                                    .min_w(px(0.))
+                                    .min_w_0()
+                                    .max_h(px(RECORD_VALUE_MAX_H))
+                                    .overflow_hidden()
                                     .font_family(mono.clone())
                                     .text_size(px(TypeScale::SM))
                                     .cursor_pointer()
@@ -282,8 +340,8 @@ pub fn render_record(
         .bg(p.chrome)
         .child(header)
         .child(body);
-    // 选区不止一格时，面板底部给出这些格子适用的批量动作；单格时不占地方。
-    if edit.selected > 1 {
+    // 选区不止一格且可写时，面板底部给出这些格子适用的批量动作；只读态或单格时不占地方。
+    if edit.writable && edit.selected > 1 {
         // 大选区只报"多格"：面板不必为了显示数字把整张表展开成格子。
         let count = if edit.selected == usize::MAX {
             t("grid.record.selectionMany")

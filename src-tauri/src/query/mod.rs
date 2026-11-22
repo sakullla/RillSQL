@@ -12,6 +12,7 @@ mod history;
 pub(crate) mod meta;
 mod saved;
 pub mod plan;
+pub(crate) mod risk;
 pub(crate) mod split;
 pub(crate) mod title;
 pub(crate) mod transaction;
@@ -35,6 +36,7 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&query_saved_rename),
         std::any::type_name_of_val(&query_saved_delete),
         std::any::type_name_of_val(&split_sql),
+        std::any::type_name_of_val(&risk::assess),
         std::any::type_name_of_val(&cancel::deliver_cancel),
         std::any::type_name_of_val(&exec::run_batch),
         std::any::type_name_of_val(&transaction::plan),
@@ -42,6 +44,9 @@ pub fn module_id() -> &'static str {
     let _ = _linked;
     "query"
 }
+
+#[cfg(test)]
+mod risk_live_tests;
 
 #[cfg(test)]
 mod tests;

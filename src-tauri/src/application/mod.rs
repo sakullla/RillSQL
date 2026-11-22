@@ -135,6 +135,10 @@ impl AppServices {
         self.connections.import_file(path, passphrase).await
     }
 
+    pub(crate) async fn insert_imported_connection(&self, draft: &ConnectionDraft) -> Result<crate::connections::store::ImportInsert, ServiceError> {
+        self.connections.insert_imported_connection(draft).await
+    }
+
     pub async fn list_tags(&self) -> Result<Vec<EnvTag>, String> {
         self.connections.list_tags().await
     }

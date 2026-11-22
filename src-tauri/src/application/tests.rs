@@ -386,8 +386,8 @@ async fn sqlite_rebuild_uses_a_savepoint_inside_the_shared_transaction() {
     .await;
     let coordinator = begin_shared(&service).await;
     let columns = vec![
-        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
-        ColumnDraft { original: Some("note".to_owned()), name: "note".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false, ..Default::default() },
+        ColumnDraft { original: Some("note".to_owned()), name: "note".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false, ..Default::default() },
     ];
     let request = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "notes".to_owned(), columns }).unwrap();
     let plan = crate::application::ddl::preview_request(&service, "notes", &request).await.unwrap();
@@ -444,9 +444,9 @@ async fn a_failed_sqlite_rebuild_rolls_back_only_its_savepoint() {
 
     // 重建 child 的 label 列：复制本身成功，最后的 foreign_key_check 发现孤立引用而失败。
     let columns = vec![
-        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
-        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
-        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false, ..Default::default() },
+        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false, ..Default::default() },
+        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false, ..Default::default() },
     ];
     let ddl = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "child".to_owned(), columns }).unwrap();
     let plan = crate::application::ddl::preview_request(&service, "notes", &ddl).await.unwrap();
@@ -490,9 +490,9 @@ async fn a_failed_rebuild_without_a_transaction_is_not_reported_as_applied() {
     )
     .await;
     let columns = vec![
-        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false },
-        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
-        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false },
+        ColumnDraft { original: Some("id".to_owned()), name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: false, default: DefaultSpec::None, comment: String::new(), primary: true, auto: false, dropped: false, ..Default::default() },
+        ColumnDraft { original: Some("parent_id".to_owned()), name: "parent_id".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false, ..Default::default() },
+        ColumnDraft { original: Some("label".to_owned()), name: "label".to_owned(), type_name: "INTEGER".to_owned(), nullable: true, default: DefaultSpec::None, comment: String::new(), primary: false, auto: false, dropped: false, ..Default::default() },
     ];
     let ddl = crate::application::ddl::request("main".to_owned(), String::new(), "sqlite", Action::AlterColumns { table: "child".to_owned(), columns }).unwrap();
     let plan = crate::application::ddl::preview_request(&service, "notes", &ddl).await.unwrap();

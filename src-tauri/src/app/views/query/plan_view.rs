@@ -15,6 +15,9 @@ use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
+/// 诊断建议区最大高度：多条建议时内部滚动，不把下方的执行计划树挤出可视区。
+const FINDINGS_MAX_H: f32 = 120.;
+
 pub struct PlanView<'a> {
     pub plan: &'a Plan,
     pub selected: usize,
@@ -68,6 +71,13 @@ pub fn cost_text(value: f64) -> String {
 
 pub fn rows_text(value: f64) -> String {
     crate::app::views::grid::group_digits(value.round() as i64)
+}
+
+/// 节点代价占总代价的比例（0.0..=1.0）。树列与详情面板统一用同一口径；总代价非正数时安全返回 None。
+pub fn cost_share(node_cost: Option<f64>, total_cost: Option<f64>) -> Option<f32> {
+    let cost = node_cost?;
+    let total = total_cost.filter(|total| *total > 0.)?;
+    Some((cost / total).clamp(0., 1.) as f32)
 }
 
 /// 节点的可读名称（操作 + 对象）：树行与详情面板的无障碍名称用同一份，详情跟着选中节点走。
@@ -147,15 +157,26 @@ impl PlanView<'_> {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let lines = self.plan.lines();
         let selected = self.selected.min(lines.len().saturating_sub(1));
-        let max_cost = self.plan.max_cost().filter(|cost| *cost > 0.);
+        let total_cost = self.plan.total_cost().filter(|cost| *cost > 0.);
+        let has_cost = self.plan.max_cost().filter(|cost| *cost > 0.).is_some();
         // 只有一个节点时代价占比永远是 100%，那根条没有信息量，不画。
-        let show_share = max_cost.is_some() && lines.len() > 1;
+        let show_share = total_cost.is_some() && lines.len() > 1;
+        let max_depth = lines.iter().map(|line| line.depth).max().unwrap_or(0);
+        let min_tree_w = (max_depth as f32 * 18.
+            + 260.
+            + if show_share { 160. } else { 0. }
+            + if has_cost { 82. } else { 0. }
+            + 90.)
+            .max(460.);
 
         let findings = self.plan.findings();
         let advice = (!findings.is_empty()).then(|| {
             let mut list = div()
                 .id("query-plan-findings")
+                .test_support()
                 .flex_none()
+                .max_h(px(FINDINGS_MAX_H))
+                .scroll_area_y()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
@@ -202,11 +223,12 @@ impl PlanView<'_> {
         });
 
         // 滚动区只放列标题和节点行（子元素 0 是列标题，节点 i 是第 i + 1 个），
-        // 焦点与描边在外层容器上，描边不挤占滚动区的可视范围。
-        let mut tree = div().id("query-plan-tree-scroll").flex_1().min_h_0().scroll_area_y().scroll_handle(&self.scroll).flex().flex_col();
+        // 焦点与描边在外层容器上，描边不挤占滚动区的可视范围。支持纵横双轴滚动以浏览深层缩进。
+        let mut tree = div().id("query-plan-tree-scroll").flex_1().min_h_0().scroll_area_xy().scroll_handle(&self.scroll).flex().flex_col();
         tree = tree.child(
             div()
                 .flex_none()
+                .min_w(px(min_tree_w))
                 .h(px(self.metrics.row_h))
                 .px(px(12.))
                 .flex()
@@ -218,9 +240,9 @@ impl PlanView<'_> {
                 .text_size(px(TypeScale::XS))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.text_muted)
-                .child(div().flex_1().child(t("query.plan.colOperation")))
+                .child(div().flex_1().min_w_0().child(t("query.plan.colOperation")))
                 .when(show_share, |this| this.child(div().w(px(150.)).flex_none().child(t("query.plan.colShare"))))
-                .when(max_cost.is_some(), |this| this.child(div().w(px(72.)).flex_none().flex().justify_end().child(t("query.plan.cost"))))
+                .when(has_cost, |this| this.child(div().w(px(72.)).flex_none().flex().justify_end().child(t("query.plan.cost"))))
                 .child(div().w(px(80.)).flex_none().flex().justify_end().child(t("query.plan.colRows"))),
         );
         for (index, line) in lines.iter().enumerate() {
@@ -234,10 +256,7 @@ impl PlanView<'_> {
                 OpKind::Aggregate => (IconName::Sigma, p.info),
                 OpKind::Other => (IconName::Circle, p.text_faint),
             };
-            let share = match (node.cost, max_cost) {
-                (Some(cost), Some(max)) => (cost / max).clamp(0., 1.) as f32,
-                _ => 0.,
-            };
+            let share = cost_share(node.cost, total_cost).unwrap_or(0.);
             let is_selected = index == selected;
             let indent = 12. + line.depth as f32 * 18.;
             let focus = self.focus.clone();
@@ -248,6 +267,7 @@ impl PlanView<'_> {
                 .aria_label(SharedString::from(node_label(&lines, index)))
                 .aria_selected(is_selected)
                 .flex_none()
+                .min_w(px(min_tree_w))
                 .min_h(px(self.metrics.row_h + 4.))
                 .py(px(4.))
                 .pl(px(indent))
@@ -322,7 +342,7 @@ impl PlanView<'_> {
                         .child(div().w(px(34.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(format!("{percent}%")))),
                 );
             }
-            if max_cost.is_some() {
+            if has_cost {
                 row = row.child(div().w(px(72.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(node.cost.map(cost_text).unwrap_or_else(|| "—".into()))));
             }
             row = row.child(div().w(px(80.)).flex_none().flex().justify_end().text_size(px(TypeScale::XS)).font_features(kit::tabular_figures()).text_color(p.text_muted).child(SharedString::from(node.rows.map(rows_text).unwrap_or_else(|| "—".into()))));
@@ -362,11 +382,10 @@ impl PlanView<'_> {
                     .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(label))
                     .child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).font_features(kit::tabular_figures()).text_color(p.text).child(SharedString::from(value)))
             };
-            let total = self.plan.total_cost().filter(|total| *total > 0.);
-            let share = match (node.cost, total) {
-                (Some(cost), Some(total)) if lines.len() > 1 => Some(format!("{}%", ((cost / total) * 100.).round().clamp(0., 100.) as i64)),
-                _ => None,
-            };
+            let share = (lines.len() > 1)
+                .then(|| cost_share(node.cost, total_cost))
+                .flatten()
+                .map(|share| format!("{}%", (share * 100.).round() as i64));
             detail = detail
                 .child(
                     div()

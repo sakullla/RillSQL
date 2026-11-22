@@ -1,0 +1,195 @@
+name: rillsql-mysql-versions
+
+# 按实现差异分组的 MySQL / MariaDB 版本夹具（R1、R9）。
+# 默认的 docker/compose.yaml 仍是 MySQL 8.4 + MariaDB 11.4 的开发夹具；这里的服务都挂在 profile 上，
+# 只有显式 --profile 才会启动，避免日常开发把九个版本一起拉起来。
+#
+# 版本基线（实施时最新稳定版，镜像摘要记录在
+# docs/verification/2026-11-21-mysql-proprietary-support/baseline.md）：
+#   MySQL   5.7.44 / 8.0.46 / 8.4.13 / 9.7.4
+#   MariaDB 10.6.28 / 10.11.19 / 11.4.13 / 11.8.9 / 12.3.3
+#
+# 主机端口从 3406 起，避免与 docker/compose.yaml 的 3306 / 3307 冲突。
+
+services:
+  mysql57:
+    profiles: ["mysql-5.7"]
+    image: mysql:5.7.44
+    ports:
+      - "127.0.0.1:3406:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rillsql_proprietary
+      MYSQL_USER: rillsql
+      MYSQL_PASSWORD: rillsql
+    volumes:
+      - mysql57:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mysql80:
+    profiles: ["mysql-8.0"]
+    image: mysql:8.0.46
+    ports:
+      - "127.0.0.1:3407:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rillsql_proprietary
+      MYSQL_USER: rillsql
+      MYSQL_PASSWORD: rillsql
+    volumes:
+      - mysql80:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mysql84:
+    profiles: ["mysql-8.4"]
+    image: mysql:8.4.13
+    ports:
+      - "127.0.0.1:3408:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rillsql_proprietary
+      MYSQL_USER: rillsql
+      MYSQL_PASSWORD: rillsql
+    volumes:
+      - mysql84:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mysql9:
+    profiles: ["mysql-9"]
+    image: mysql:9.7.4
+    ports:
+      - "127.0.0.1:3409:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rillsql_proprietary
+      MYSQL_USER: rillsql
+      MYSQL_PASSWORD: rillsql
+    volumes:
+      - mysql9:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb106:
+    profiles: ["mariadb-10.6"]
+    image: mariadb:10.6.28
+    ports:
+      - "127.0.0.1:3410:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql_proprietary
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb106:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb1011:
+    profiles: ["mariadb-10.11"]
+    image: mariadb:10.11.19
+    ports:
+      - "127.0.0.1:3411:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql_proprietary
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb1011:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb114:
+    profiles: ["mariadb-11.4"]
+    image: mariadb:11.4.13
+    ports:
+      - "127.0.0.1:3412:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql_proprietary
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb114:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb118:
+    profiles: ["mariadb-11.8"]
+    image: mariadb:11.8.9
+    ports:
+      - "127.0.0.1:3413:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql_proprietary
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb118:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb12:
+    profiles: ["mariadb-12"]
+    image: mariadb:12.3.3
+    ports:
+      - "127.0.0.1:3414:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql_proprietary
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb12:/var/lib/mysql
+      - ./init/mysql-proprietary.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  mysql57:
+  mysql80:
+  mysql84:
+  mysql9:
+  mariadb106:
+  mariadb1011:
+  mariadb114:
+  mariadb118:
+  mariadb12:

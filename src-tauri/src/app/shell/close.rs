@@ -61,6 +61,10 @@ pub fn draft_pending(kind: &str, draft: &str, last_executed: Option<&str>) -> bo
     kind == "query" && !draft.trim().is_empty() && Some(draft) != last_executed
 }
 
+pub fn draft_pending_with_saved(kind: &str, draft: &str, last_executed: Option<&str>, saved_sql: Option<&str>) -> bool {
+    draft_pending(kind, draft, last_executed) && Some(draft) != saved_sql
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

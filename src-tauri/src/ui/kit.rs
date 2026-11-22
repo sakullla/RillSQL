@@ -171,6 +171,27 @@ impl Palette {
     }
 }
 
+/// 将半透明叠色（如 `p.selection`）合成到不透明底色（如 `p.chrome`）上，得到视觉一致且完全不透明的表面色。
+/// 用于浮在文字上方的悬停快捷按钮，避免半透明底透出下方截断的文字。
+pub fn blend_opaque(base: Hsla, overlay: Hsla) -> Hsla {
+    if overlay.a >= 0.999 {
+        return overlay;
+    }
+    let b = base.to_rgb();
+    let o = overlay.to_rgb();
+    let a = o.a.clamp(0., 1.);
+    let inv = 1. - a;
+    let rgb = gpui_kit::Rgba {
+        r: o.r * a + b.r * inv,
+        g: o.g * a + b.g * inv,
+        b: o.b * a + b.b * inv,
+        a: 1.,
+    };
+    let mut out: Hsla = rgb.into();
+    out.a = 1.;
+    out
+}
+
 /// 切换明暗并把品牌色板写进组件库主题。
 pub fn apply_theme(dark: bool, cx: &mut App) {
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
@@ -2923,6 +2944,8 @@ mod token_tests {
         ("app/views/grid", 135),
         ("app/views/history", 0),
         ("app/views/mongo", 41),
+        // 2026-11-21（T1）对象编辑器只登记模块与草稿状态，还没有 GPUI 视图，裸 px 为 0。
+        ("app/views/object_editor", 0),
         ("app/views/overview", 0),
         ("app/views/query", 155),
         ("app/views/redis", 174),

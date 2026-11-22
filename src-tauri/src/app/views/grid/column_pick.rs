@@ -5,12 +5,19 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    anchored, deferred, div, AnyElement, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, Point, SharedString, Styled as _, Subscription, Window,
+    anchored, deferred, div, px, Anchor, AnyElement, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window,
 };
 
 use super::GridPane;
+use crate::i18n;
+use crate::ui::kit::{self, ControlSize, Palette, Radius, ScrollAreaExt as _, Space, Tip as _, TypeScale};
 use crate::ui::picker::{picker_popover, Picker, PickerEvent, PickerItem, PickerMode};
 
 /// 选择器为谁打开。
@@ -20,6 +27,15 @@ pub(crate) enum ColumnPickTarget {
     Filter(usize),
     /// 工具栏“跳到列”。
     Jump,
+    /// 工具栏“列管理”（显隐与顺序）。
+    Manage,
+}
+
+/// 集中式列管理弹层：搜索列、勾选显隐（至少保留一列）、调整顺序与重置。
+pub(crate) struct ColumnManager {
+    pub(crate) search: Entity<InputState>,
+    pub(crate) query: String,
+    _subscription: Subscription,
 }
 
 /// 触发按钮上一帧在窗口里的位置；弹层贴着它弹出。
@@ -67,7 +83,7 @@ impl GridPane {
                 let chosen = self.session.filters().get(index).map(|draft| SharedString::from(draft.column.clone())).into_iter().collect();
                 ((0..names.len()).map(item).collect(), chosen)
             }
-            ColumnPickTarget::Jump => {
+            ColumnPickTarget::Jump | ColumnPickTarget::Manage => {
                 let chosen = self.session.focus_cell().and_then(|(_, column)| names.get(column)).map(|name| SharedString::from(name.clone())).into_iter().collect();
                 (self.session.visible_columns().into_iter().filter(|logical| *logical < names.len()).map(item).collect(), chosen)
             }
@@ -116,7 +132,7 @@ impl GridPane {
     fn column_picked(&mut self, target: ColumnPickTarget, column: &str, cx: &mut Context<Self>) {
         match target {
             ColumnPickTarget::Filter(index) => self.pick_filter_column(index, column, cx),
-            ColumnPickTarget::Jump => {
+            ColumnPickTarget::Jump | ColumnPickTarget::Manage => {
                 self.jump_to_column(column, cx);
             }
         }
@@ -136,7 +152,7 @@ impl GridPane {
             self.session.select(0, logical, false);
             self.session.select(last, logical, true);
         }
-        self.notice.clear();
+        self.clear_notice();
         self.sync_table(cx);
         if display >= self.session.frozen_count() {
             // 表格列号含最左边的行号列。
@@ -186,6 +202,257 @@ impl GridPane {
         )
         .with_priority(2);
         let popover = picker_popover(&picker, anchor, window, cx);
+        Some(div().child(backdrop).child(popover).into_any_element())
+    }
+
+    pub(crate) fn toggle_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_manager.is_some() {
+            self.close_column_manager(window, cx);
+        } else {
+            self.close_column_picker(window, cx);
+            self.open_column_manager(window, cx);
+        }
+    }
+
+    pub(crate) fn open_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = SharedString::from(i18n::text(self.locale, "grid.column.search"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let subscription = cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                if let Some(manager) = this.column_manager.as_mut() {
+                    manager.query = state.read(cx).value().to_string();
+                    cx.notify();
+                }
+            }
+        });
+        search.update(cx, |input, cx| input.focus(window, cx));
+        self.column_manager = Some(ColumnManager { search, query: String::new(), _subscription: subscription });
+        cx.notify();
+    }
+
+    pub(crate) fn close_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.column_manager.take().is_some() {
+            window.focus(&self.grid_focus, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn render_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (search, query) = {
+            let manager = self.column_manager.as_ref()?;
+            (manager.search.clone(), manager.query.clone())
+        };
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let p = Palette::of(cx);
+        let entity = cx.entity();
+        let viewport = window.viewport_size();
+        let anchors = self.picker_anchors.borrow();
+        let anchor = anchors.get(&ColumnPickTarget::Manage).copied().unwrap_or_default();
+        drop(anchors);
+        const MANAGER_W: f32 = 292.;
+        const MANAGER_LIST_MAX_H: f32 = 260.;
+        const MANAGER_ROW_H: f32 = 26.;
+        const MANAGER_TYPE_MAX_W: f32 = 72.;
+        let pos = Point::new(anchor.origin.x, anchor.bottom() + px(Space::XS));
+
+        let ordered = self.session.ordered_columns();
+        let names = self.session.column_names();
+        let needle = query.trim().to_lowercase();
+        let hidden_count = self.session.hidden_columns().len();
+        let reordered = self.session.has_custom_column_order();
+
+        let mut list = div()
+            .id("grid-column-manager-list")
+            .debug_selector(|| "grid-column-manager-list".to_owned())
+            .test_support()
+            .max_h(px(MANAGER_LIST_MAX_H))
+            .scroll_area_y()
+            .flex()
+            .flex_col()
+            .gap(px(Space::XXS));
+        let mut matched = 0usize;
+        let total = ordered.len();
+        for (pos_ix, logical) in ordered.into_iter().enumerate() {
+            let Some(name) = names.get(logical) else { continue };
+            let type_name = self.session.column_type(logical).unwrap_or("");
+            if !needle.is_empty() && !name.to_lowercase().contains(&needle) && !type_name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            matched += 1;
+            let hidden = self.session.column_hidden(logical);
+            let can_hide = self.session.can_hide(logical);
+            let toggle_disabled = !hidden && !can_hide;
+            let toggle_owner = entity.clone();
+            let toggle_cmd = if hidden { "column-show" } else { "column-hide" };
+            let up_owner = entity.clone();
+            let down_owner = entity.clone();
+            let can_up = pos_ix > 0;
+            let can_down = pos_ix + 1 < total;
+            let toggle_tip = if toggle_disabled {
+                t("grid.column.lastVisible")
+            } else if hidden {
+                SharedString::from(i18n::fill(&i18n::text(locale, "grid.column.show"), &[("name", name)]))
+            } else {
+                t("grid.column.hide")
+            };
+            list = list.child(
+                div()
+                    .id(("grid-col-mgr-row", logical))
+                    .debug_selector(move || format!("grid-col-mgr-row-{logical}"))
+                    .test_support()
+                    .h(px(MANAGER_ROW_H))
+                    .px(px(Space::SM))
+                    .rounded(px(Radius::CONTROL))
+                    .hover(|style| style.bg(p.hover))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::SM))
+                    .child(
+                        div()
+                            .id(("grid-col-mgr-toggle", logical))
+                            .debug_selector(move || format!("grid-col-mgr-toggle-{logical}"))
+                            .test_support()
+                            .flex_none()
+                            .size(px(Space::XL))
+                            .rounded(px(Radius::TAG))
+                            .border_1()
+                            .border_color(if hidden { p.line } else { p.accent })
+                            .bg(if hidden { p.surface } else { p.accent })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip_text(toggle_tip)
+                            .when(toggle_disabled, |this| this.opacity(0.45))
+                            .when(!toggle_disabled, |this| {
+                                this.cursor_pointer().on_click(move |_, _, cx| {
+                                    toggle_owner.update(cx, |pane, cx| pane.column_command(logical, toggle_cmd, cx));
+                                })
+                            })
+                            .when(!hidden, |this| this.child(kit::icon(IconName::Check, 11., p.on_accent))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(TypeScale::SM))
+                            .text_color(if hidden { p.text_faint } else { p.text })
+                            .child(SharedString::from(name.clone())),
+                    )
+                    .when(!type_name.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(MANAGER_TYPE_MAX_W))
+                                .truncate()
+                                .text_size(px(TypeScale::XS))
+                                .text_color(p.text_faint)
+                                .child(SharedString::from(type_name.to_owned())),
+                        )
+                    })
+                    .child(
+                        kit::icon_button(("grid-col-mgr-up", logical), IconName::ChevronUp, t("grid.column.moveLeft"), move |_, _, cx| {
+                            up_owner.update(cx, |pane, cx| pane.column_command(logical, "column-move-up", cx));
+                        })
+                        .xsmall()
+                        .disabled(!can_up),
+                    )
+                    .child(
+                        kit::icon_button(("grid-col-mgr-down", logical), IconName::ChevronDown, t("grid.column.moveRight"), move |_, _, cx| {
+                            down_owner.update(cx, |pane, cx| pane.column_command(logical, "column-move-down", cx));
+                        })
+                        .xsmall()
+                        .disabled(!can_down),
+                    ),
+            );
+        }
+        if matched == 0 {
+            list = list.child(div().p(px(Space::MD)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("grid.column.emptySearch")));
+        }
+
+        let show_all_owner = entity.clone();
+        let reset_owner = entity.clone();
+        let key_owner = entity.clone();
+        let backdrop_owner = entity.clone();
+
+        let backdrop = deferred(
+            anchored().position(Point::default()).child(
+                div()
+                    .id("grid-column-manager-backdrop")
+                    .test_support()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, window, cx: &mut App| {
+                        backdrop_owner.update(cx, |pane, cx| pane.close_column_manager(window, cx));
+                    }),
+            ),
+        )
+        .with_priority(2);
+
+        let popover = deferred(
+            anchored()
+                .position(pos)
+                .anchor(Anchor::TopLeft)
+                .snap_to_window_with_margin(px(ControlSize::POPOVER_MARGIN))
+                .child(
+                    div()
+                        .id("grid-column-manager")
+                        .debug_selector(|| "grid-column-manager".to_owned())
+                        .test_support()
+                        .occlude()
+                        .w(px(MANAGER_W))
+                        .p(px(Space::SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::SM))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.line)
+                        .rounded(px(Radius::PANEL))
+                        .shadow_lg()
+                        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key.as_str() == "escape" {
+                                cx.stop_propagation();
+                                key_owner.update(cx, |pane, cx| pane.close_column_manager(window, cx));
+                            }
+                        })
+                        .child(
+                            kit::text_input("grid-column-manager-search", &search, t("grid.column.search"))
+                                .small()
+                                .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
+                                .cleanable(true),
+                        )
+                        .child(list)
+                        .child(
+                            div()
+                                .pt(px(Space::XS))
+                                .border_t_1()
+                                .border_color(p.line_soft)
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(Space::XS))
+                                .child(
+                                    kit::tool_button("grid-col-mgr-show-all", None, t("grid.column.showAll"), move |_, _, cx| {
+                                        show_all_owner.update(cx, |pane, cx| pane.column_command(0, "column-show-all", cx));
+                                    })
+                                    .xsmall()
+                                    .disabled(hidden_count == 0),
+                                )
+                                .child(
+                                    kit::tool_button("grid-col-mgr-reset-order", None, t("grid.column.resetOrder"), move |_, _, cx| {
+                                        reset_owner.update(cx, |pane, cx| pane.column_command(0, "column-reset-order", cx));
+                                    })
+                                    .xsmall()
+                                    .disabled(!reordered),
+                                ),
+                        ),
+                ),
+        )
+        .with_priority(3);
+
         Some(div().child(backdrop).child(popover).into_any_element())
     }
 }

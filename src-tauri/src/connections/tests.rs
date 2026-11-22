@@ -168,6 +168,133 @@ fn remote_draft(engine: Engine) -> ConnectionDraft {
     draft
 }
 
+#[tokio::test]
+async fn imported_profile_conflicts_protect_existing_route_and_credentials() {
+    use super::store::{import_conflict, ImportConflictKind, ImportInsert};
+
+    let dir = temp_workspace();
+    let keyring = Arc::new(MemoryStore::default());
+    let service = Service::new(dir.join("connections.sqlite"), keyring.clone());
+    let mut draft = remote_draft(Engine::Postgres);
+    let existing = service.save(draft.clone(), secrets("existing-secret", "", "")).await.unwrap().connection;
+    let keys_before = keyring.dump();
+    draft.id = Some(existing.id.clone());
+    let result = service.insert_imported_connection(&draft).await.unwrap();
+    assert!(matches!(result, ImportInsert::Conflict(conflict) if conflict.kind == ImportConflictKind::Duplicate));
+
+    draft.host = "other.example.test".to_owned();
+    let preview = model::normalize(&draft, String::new()).unwrap();
+    let expected = import_conflict(&preview, &existing).unwrap();
+    assert_eq!(expected.kind, ImportConflictKind::NameTaken);
+    assert_eq!(expected.existing_target, "db.example.test:5432/app");
+    assert_eq!(service.insert_imported_connection(&draft).await.unwrap(), ImportInsert::Conflict(expected));
+    draft.name = "Second host".to_owned();
+    assert_eq!(service.insert_imported_connection(&draft).await.unwrap(), ImportInsert::Inserted);
+    let rows = service.list().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.saved == existing));
+    let inserted = rows.iter().find(|row| row.saved.name == draft.name).unwrap();
+    assert_ne!(inserted.saved.id, existing.id);
+    assert_eq!(inserted.saved.host.as_deref(), Some("other.example.test"));
+    assert!(!inserted.saved.password_saved);
+    assert_eq!(keyring.dump(), keys_before);
+
+    let mut legacy = existing.clone();
+    legacy.host = Some("mongodb://reader:old-secret@db.internal:27017/db?x=private".to_owned());
+    let conflict = import_conflict(&preview, &legacy).unwrap();
+    assert_eq!(conflict.existing_target, "db.internal:27017/app");
+    assert!(!format!("{conflict:?}").contains("old-secret"));
+
+    let mut unsafe_host = draft.clone();
+    unsafe_host.host = "mongodb://user:sample-secret@host/db".to_owned();
+    let error = service.insert_imported_connection(&unsafe_host).await.unwrap_err();
+    assert!(!error.message().contains("sample-secret"));
+    assert!(!String::from_utf8_lossy(&persisted_bytes(service.config_path())).contains("sample-secret"));
+
+    draft.name = "Other name, same profile".to_owned();
+    assert!(matches!(service.insert_imported_connection(&draft).await.unwrap(), ImportInsert::Conflict(conflict) if conflict.kind == ImportConflictKind::Duplicate));
+    draft.ssh_on = true;
+    draft.ssh_host = "bastion.example.test".to_owned();
+    draft.ssh_user = "tunnel".to_owned();
+    draft.ssh_auth = SshAuthKind::Password;
+    assert_eq!(service.insert_imported_connection(&draft).await.unwrap(), ImportInsert::Inserted);
+}
+
+#[test]
+fn imported_profile_conflict_never_displays_legacy_uri_userinfo() {
+    use super::store::import_conflict;
+
+    let mut candidate = model::normalize(&remote_draft(Engine::Mongodb), String::new()).unwrap();
+    let mut existing = candidate.clone();
+    for (uri, expected) in [
+        ("mongodb://reader:secret-sentinel;part@db.example.test:27017/db", "db.example.test:27017"),
+        ("mongodb://reader:secret-sentinel;part@db.example.test:not-a-port/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel/part@db.example.test/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel?part@db.example.test/db", "（已隐藏连接参数）"),
+        ("mongodb://reader:secret-sentinel;part", "（已隐藏连接参数）"),
+    ] {
+        candidate.name = uri.to_owned();
+        existing.name = uri.to_owned();
+        existing.host = Some(uri.to_owned());
+        let conflict = import_conflict(&candidate, &existing).unwrap();
+        assert_eq!(conflict.existing_name, expected);
+        assert_eq!(conflict.existing_target, format!("{expected}/app"));
+        assert!(!format!("{conflict:?}").contains("secret-sentinel"));
+    }
+}
+
+#[tokio::test]
+async fn imported_profiles_from_concurrent_services_commit_once() {
+    use super::store::{ImportConflictKind, ImportInsert};
+
+    let dir = temp_workspace();
+    let config = dir.join("connections.sqlite");
+    let first = group_service(&config);
+    let second = group_service(&config);
+    first.list().await.unwrap();
+    second.list().await.unwrap();
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    let target = dir.join("never-opened.sqlite");
+    draft.file_path = target.display().to_string();
+    let (one, two) = tokio::join!(first.insert_imported_connection(&draft), second.insert_imported_connection(&draft));
+    let outcomes = [one.unwrap(), two.unwrap()];
+    assert_eq!(outcomes.iter().filter(|result| **result == ImportInsert::Inserted).count(), 1);
+    assert!(outcomes.iter().any(|result| matches!(result, ImportInsert::Conflict(conflict) if conflict.kind == ImportConflictKind::Duplicate)));
+    assert_eq!(first.list().await.unwrap().len(), 1);
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn imported_profile_write_failure_isolated_from_prior_commit_and_retry() {
+    use super::store::ImportInsert;
+
+    let dir = temp_workspace();
+    let config = dir.join("connections.sqlite");
+    let service = group_service(&config);
+    let first = remote_draft(Engine::Postgres);
+    assert_eq!(service.insert_imported_connection(&first).await.unwrap(), ImportInsert::Inserted);
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&config)).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_one BEFORE INSERT ON connections WHEN NEW.name = 'retry' BEGIN SELECT RAISE(ABORT, 'failure'); END")
+        .execute(&pool).await.unwrap();
+    let mut second = first.clone();
+    second.name = "retry".to_owned();
+    second.database = "other".to_owned();
+    assert!(service.insert_imported_connection(&second).await.is_err());
+    assert_eq!(service.list().await.unwrap().len(), 1);
+    sqlx::query("DROP TRIGGER fail_one").execute(&pool).await.unwrap();
+    assert!(matches!(service.insert_imported_connection(&first).await.unwrap(), ImportInsert::Conflict(_)));
+    second.env = "missing-tag".to_owned();
+    assert_eq!(service.insert_imported_connection(&second).await.unwrap(), ImportInsert::MissingEnvironment);
+    second.env = "prod".to_owned();
+    service.save_tag(Some("prod".to_owned()), "原生产标签".to_owned(), "info".to_owned()).await.unwrap();
+    assert_eq!(service.insert_imported_connection(&second).await.unwrap(), ImportInsert::MissingEnvironment);
+    service.save_tag(Some("prod".to_owned()), "生产".to_owned(), "prod".to_owned()).await.unwrap();
+    assert_eq!(service.insert_imported_connection(&second).await.unwrap(), ImportInsert::Inserted);
+    assert_eq!(service.list().await.unwrap().len(), 2);
+}
+
 fn secrets(password: &str, ssh_password: &str, passphrase: &str) -> SecretInput {
     SecretInput {
         password: Some(Secret::new(password)),

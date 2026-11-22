@@ -12,6 +12,7 @@ use super::introspect::{attach_reference, enrich, is_object_action, load, mainte
 use super::model::{Action, Plan, Request, Snapshot, Step, StepReceipt, StepStatus};
 use super::plan;
 
+#[derive(Clone, Debug)]
 pub struct Receipt {
     pub blocked: Vec<String>,
     pub rule: String,

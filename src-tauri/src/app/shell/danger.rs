@@ -8,7 +8,9 @@
 use crate::catalog::hierarchy::ObjectKey;
 use crate::catalog::model::{Engine, ObjectKind};
 use crate::connections::model::{EnvTag, ENV_NONE};
-use crate::ddl::{Action, Plan, Receipt, StepStatus};
+use crate::app::views::structure::receipt as receipt_view;
+use crate::app::views::structure::receipt::ReceiptRow;
+use crate::ddl::{Action, Plan, Receipt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DangerKind {
@@ -75,24 +77,14 @@ impl DangerPlan {
 }
 
 /// 执行结果：被拦下或任何一条语句没有成功都算失败，带上数据库给的原因。
+/// 判定与结构页、管理页、对象编辑器同一处（`receipt::problems`），这里不再自写一套。
 /// 原因逐条给出：英文界面先逐条换成英文再拼起来（拼好的整句不在句型表里）。
 pub fn receipt_problems(receipt: &Receipt) -> Result<(), Vec<String>> {
-    if !receipt.blocked.is_empty() {
-        return Err(receipt.blocked.clone());
-    }
-    let failed: Vec<String> = receipt
-        .steps
-        .iter()
-        .filter(|step| step.status != StepStatus::Ok)
-        .map(|step| if step.message.is_empty() { step.sql.clone() } else { step.message.clone() })
-        .collect();
-    if receipt.steps.is_empty() {
-        return Err(vec!["没有执行任何语句".to_owned()]);
-    }
-    if failed.is_empty() {
+    let problems = receipt_view::problems(receipt);
+    if problems.is_empty() {
         Ok(())
     } else {
-        Err(failed)
+        Err(problems)
     }
 }
 
@@ -127,6 +119,8 @@ pub struct DangerPrompt {
     /// `error` 拆开的各条原因（按界面语言逐条显示）。
     error_parts: Vec<String>,
     request: Option<DangerStep>,
+    /// 最近一次执行的逐步回执。失败时和 error 一起留着：确认层据此逐条列出 label、SQL、状态与原文。
+    receipt: Option<Receipt>,
 }
 
 impl DangerPrompt {
@@ -148,6 +142,7 @@ impl DangerPrompt {
             error: None,
             error_parts: Vec::new(),
             request: None,
+            receipt: None,
         };
         // 重命名要先有新名字才生成计划；其余打开即生成预览。
         if kind != DangerKind::Rename {
@@ -193,9 +188,25 @@ impl DangerPrompt {
     pub fn request_preview(&mut self) {
         self.plan = None;
         self.armed = false;
+        self.receipt = None;
         self.clear_error();
         self.loading = true;
         self.request = Some(DangerStep::Preview);
+    }
+
+    /// 最近一次执行的逐步回执（被拦下、部分成功、全部成功都有）。
+    pub fn receipt(&self) -> Option<&Receipt> {
+        self.receipt.as_ref()
+    }
+
+    /// 逐步回执的行：label、SQL、状态、原始 message。确认层按它逐条渲染，不再只给一句合并后的错误。
+    pub(crate) fn receipt_rows(&self) -> Vec<ReceiptRow> {
+        self.receipt.as_ref().map(receipt_view::rows).unwrap_or_default()
+    }
+
+    /// 回执里被拦下的原因（确认层与逐步行一起显示）。
+    pub(crate) fn receipt_blocked(&self) -> Vec<String> {
+        self.receipt.as_ref().map(|receipt| receipt.blocked.clone()).unwrap_or_default()
     }
 
     /// 标签表到了：按 tone 重新判断是否生产。
@@ -233,6 +244,7 @@ impl DangerPrompt {
         self.new_name = text;
         self.plan = None;
         self.armed = false;
+        self.receipt = None;
         self.clear_error();
     }
 
@@ -263,13 +275,26 @@ impl DangerPrompt {
     }
 
     /// 执行结束。成功返回 true；失败把数据库原因留在确认层里，计划保留可重试。
+    ///
+    /// 回执本身也留着：确认层要逐条显示每一步的状态与原始 message，而不是一句合并后的错误。
     pub fn apply_receipt(&mut self, result: Result<Receipt, String>) -> bool {
         self.running = false;
         self.armed = false;
-        match result.map_err(|message| vec![message]).and_then(|receipt| receipt_problems(&receipt)) {
-            Ok(()) => true,
-            Err(parts) => {
-                self.set_error(parts);
+        self.receipt = None;
+        match result {
+            Ok(receipt) => {
+                let problems = receipt_problems(&receipt);
+                self.receipt = Some(receipt);
+                match problems {
+                    Ok(()) => true,
+                    Err(parts) => {
+                        self.set_error(parts);
+                        false
+                    }
+                }
+            }
+            Err(message) => {
+                self.set_error(vec![message]);
                 false
             }
         }
@@ -424,5 +449,47 @@ mod tests {
         assert_eq!(DangerKind::from_menu("tree-drop-object", ObjectKind::View), Some(DangerKind::DropView));
         assert_eq!(DangerKind::from_menu("tree-truncate-table", ObjectKind::View), None);
         assert_eq!(DangerKind::from_menu("tree-rename-table", ObjectKind::Sequence), None);
+    }
+
+    /// 多步回执：只有没成功的步骤进错误，全部 Ok 才算通过；回执整份留着给确认层逐步显示。
+    #[test]
+    fn multi_step_receipts_keep_every_row_and_only_report_the_failed_ones() {
+        use crate::ddl::StepStatus;
+        let mut prompt = DangerPrompt::new(DangerKind::Truncate, "n", key(Engine::Sqlite, "orders", ObjectKind::Table), "");
+        let target = prompt.object.name.clone();
+        let step = |label: &str, status: StepStatus, message: &str| crate::ddl::model::StepReceipt {
+            sql: format!("DELETE FROM {label};"),
+            label: label.to_owned(),
+            status,
+            message: message.to_owned(),
+        };
+        let done = Receipt {
+            blocked: Vec::new(),
+            rule: String::new(),
+            steps: vec![step("a", StepStatus::Ok, "")],
+            target: target.clone(),
+            rebuild: false,
+        };
+        assert!(prompt.apply_receipt(Ok(done)));
+        assert_eq!(prompt.receipt().map(|kept| kept.steps.len()), Some(1));
+        assert!(prompt.error.is_none());
+
+        let partial = Receipt {
+            blocked: Vec::new(),
+            rule: String::new(),
+            steps: vec![step("a", StepStatus::Ok, ""), step("b", StepStatus::RolledBack, "deadlock found")],
+            target,
+            rebuild: false,
+        };
+        assert!(!prompt.apply_receipt(Ok(partial)));
+        assert_eq!(prompt.error.as_deref(), Some("deadlock found"), "只有失败的步骤进错误");
+        let kept = prompt.receipt().expect("回执整份留着");
+        assert_eq!(kept.steps.len(), 2);
+        assert_eq!(kept.steps[1].status, StepStatus::RolledBack);
+        assert_eq!(prompt.error_text(crate::i18n::Locale::En).as_deref(), Some("deadlock found"));
+
+        // 重新预览会丢掉上一份回执：它不再对应当前计划。
+        prompt.request_preview();
+        assert!(prompt.receipt().is_none());
     }
 }

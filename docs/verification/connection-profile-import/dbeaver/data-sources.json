@@ -1,0 +1,162 @@
+{
+  "folders": {},
+  "connections": {
+    "sqlite_jdbc-1a1fcb54c8d-3f7c85d92067b43d": {
+      "provider": "sqlite",
+      "driver": "sqlite_jdbc",
+      "name": "Import Fixture SQLite",
+      "save-password": true,
+      "configuration": {
+        "database": "C:/Temp/rillsql-import-fixture/rillsql-import-demo.sqlite",
+        "configurationType": "MANUAL",
+        "type": "dev"
+      }
+    },
+    "dbeaver-sample-database-sqlite-1": {
+      "provider": "sqlite",
+      "driver": "sqlite_jdbc",
+      "name": "DBeaver Sample Database (SQLite)",
+      "save-password": true,
+      "show-system-objects": true,
+      "configuration": {
+        "database": "C:/Temp/rillsql-import-fixture/Chinook.db",
+        "url": "jdbc:sqlite:C:/Temp/rillsql-import-fixture/Chinook.db",
+        "configurationType": "MANUAL",
+        "type": "dev"
+      }
+    },
+    "postgres-jdbc-1a1fcb5b11b-1c5ebfb2639654ec": {
+      "provider": "postgresql",
+      "driver": "postgres-jdbc",
+      "name": "Import Fixture PostgreSQL",
+      "save-password": true,
+      "configuration": {
+        "host": "127.0.0.1",
+        "port": "5432",
+        "database": "rillsql",
+        "url": "jdbc:postgresql://127.0.0.1:5432/rillsql",
+        "configurationType": "MANUAL",
+        "type": "dev",
+        "provider-properties": {
+          "@dbeaver-show-non-default-db@": "false"
+        },
+        "auth-model": "native",
+        "handlers": {
+          "ssh_tunnel": {
+            "type": "TUNNEL",
+            "enabled": true,
+            "save-password": true,
+            "properties": {
+              "jumpServer.count": 0.0,
+              "host": "localhost",
+              "port": 22.0,
+              "authType": "PASSWORD",
+              "implementation": "sshj",
+              "shareTunnels": true,
+              "localHost": "",
+              "remoteHost": ""
+            }
+          }
+        }
+      }
+    },
+    "postgres-jdbc-1a1fcb5b331-352f2c2e4172517a": {
+      "provider": "postgresql",
+      "driver": "postgres-jdbc",
+      "name": "Import Fixture PostgreSQL URL Verify",
+      "save-password": true,
+      "configuration": {
+        "host": "discarded.invalid",
+        "port": "5999",
+        "database": "discarded",
+        "url": "jdbc:postgresql://127.0.0.1:5432/rillsql?sslmode=verify-full",
+        "configurationType": "MANUAL",
+        "type": "dev"
+      }
+    },
+    "mysql8-1a1fcb5b543-845fd3c28109530": {
+      "provider": "mysql",
+      "driver": "mysql8",
+      "name": "Import Fixture MySQL",
+      "save-password": true,
+      "read-only": true,
+      "configuration": {
+        "host": "127.0.0.1",
+        "port": "3306",
+        "database": "rillsql",
+        "url": "jdbc:mysql://127.0.0.1:3306/rillsql",
+        "configurationType": "MANUAL",
+        "type": "test",
+        "provider-properties": {
+          "@dbeaver-show-all-dbs@": "true"
+        },
+        "auth-model": "native"
+      }
+    },
+    "postgres-jdbc-1a1fcbc43cc-1b4ef00b04aee11f": {
+      "provider": "postgresql",
+      "driver": "postgres-jdbc",
+      "name": "Import Fixture PostgreSQL URL Plain",
+      "save-password": true,
+      "configuration": {
+        "host": "wrong-target.invalid",
+        "port": "5999",
+        "database": "unused",
+        "url": "jdbc:postgresql://127.0.0.1:5432/rillsql?sslmode=disable&user=postgres&password=RILLSQL_SYNTHETIC_PASSWORD_01",
+        "configurationType": "MANUAL",
+        "type": "dev"
+      }
+    },
+    "oracle_thin-1a1fccf8f8e-213feac451fb5a19": {
+      "provider": "oracle",
+      "driver": "oracle_thin",
+      "name": "Import Fixture Oracle",
+      "save-password": true,
+      "configuration": {
+        "host": "unsupported.example.invalid",
+        "port": "1521",
+        "database": "fixture",
+        "configurationType": "MANUAL",
+        "type": "dev"
+      }
+    }
+  },
+  "connection-types": {
+    "dev": {
+      "name": "Development",
+      "color": "255,255,255",
+      "colorDark": "255,255,255",
+      "description": "Regular development database",
+      "auto-commit": true,
+      "confirm-execute": false,
+      "confirm-data-change": false,
+      "smart-commit": false,
+      "smart-commit-recover": true,
+      "auto-close-transactions": true,
+      "close-transactions-period": 1800,
+      "auto-close-connections": true,
+      "close-connections-period": 14400,
+      "security": {
+        "permission-restrictions": []
+      }
+    },
+    "test": {
+      "name": "Test",
+      "color": "214,250,207",
+      "colorDark": "64,89,66",
+      "description": "Test (QA) database",
+      "auto-commit": true,
+      "confirm-execute": false,
+      "confirm-data-change": true,
+      "smart-commit": false,
+      "smart-commit-recover": true,
+      "auto-close-transactions": true,
+      "close-transactions-period": 900,
+      "auto-close-connections": true,
+      "close-connections-period": 7200,
+      "security": {
+        "permission-restrictions": []
+      }
+    }
+  }
+}

@@ -18,6 +18,9 @@ docs/verification/*
 !docs/verification/2026-11-11-workbench-visual-audit.md
 !docs/verification/workbench-2026-11-11/
 !docs/verification/workbench-2026-11-11/**
+# 2026-11-21 MySQL/MariaDB 专有功能：版本基线与 live 验收报告要进入检查点，供交付评审。
+!docs/verification/2026-11-21-mysql-proprietary-support/
+!docs/verification/2026-11-21-mysql-proprietary-support/**
 # 2026-11-14 桌面端 UI/UX 全量统一：每个任务在自己的子目录放审计、测试回执与主题×密度证据。
 !docs/verification/ui-ux-2026-11-14/
 !docs/verification/ui-ux-2026-11-14/**

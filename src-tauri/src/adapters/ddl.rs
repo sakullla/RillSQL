@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
-use crate::ddl::model::{Action, ColumnDraft, DefaultSpec, ForeignKey, Plan, Request, Risk, Snapshot, StepReceipt, TableOptions};
+use crate::ddl::model::{
+    Action, ColumnDraft, DefaultSpec, EnumSetDraft, ForeignKey, GeneratedColumnDraft, LiteralQuoting, Plan, Request, Risk, Snapshot, StepReceipt, TableOptions,
+};
 use crate::ddl::plan::{Change, Tok};
 
 use super::{adapter, quote_ident, registry};
@@ -458,6 +460,16 @@ pub trait DdlDialect: Sync {
     /// 生成列的定义子句；None 表示不写出生成表达式。
     fn generated_column_clause(&self, _expression: &str) -> Option<String> {
         None
+    }
+
+    /// 草稿里的 ENUM/SET 类型写法。没有 ENUM/SET 的引擎给出原因，不生成半条定义。
+    fn enum_set_type_sql(&self, _draft: &EnumSetDraft, _quoting: LiteralQuoting) -> Result<String, String> {
+        Err("这个引擎没有 ENUM/SET 字段类型，不能生成。".to_owned())
+    }
+
+    /// 草稿里生成列的完整子句（GENERATED ALWAYS AS ... VIRTUAL/STORED）。不支持的引擎给出原因。
+    fn generated_column_sql(&self, _draft: &GeneratedColumnDraft) -> Result<String, String> {
+        Err("这个引擎在这里不支持生成列，不能生成。".to_owned())
     }
 
     /// 重建定义里自增列的子句。

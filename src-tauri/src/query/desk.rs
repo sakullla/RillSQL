@@ -187,6 +187,17 @@ struct PendingSend {
     confirmed: Option<String>,
 }
 
+/// 等待风险确认的这批 SQL；确认过的那一次执行按 confirmed 里的文本放行。
+#[derive(Clone, Debug)]
+struct PendingRisk {
+    /// 原样的待执行 SQL（变量替换后）。
+    prompt: RiskPrompt,
+    sql: String,
+    pick: RunPick,
+    /// 用户确认要执行的文本；与本次 pick 相同就跳过再次确认。
+    confirmed: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 struct TabState {
@@ -212,6 +223,8 @@ struct TabState {
     outline: Vec<OutlineItem>,
     outline_stamp: Option<(u64, u64, String)>,
     pending: Option<PendingSend>,
+    /// 执行前风险确认：有值时执行停在这里，等用户确认或取消。
+    pending_risk: Option<PendingRisk>,
     provider: bool,
     note: String,
     statement: usize,
@@ -394,6 +407,13 @@ impl Desk {
             .unwrap_or_default()
     }
 
+    /// 当前标签等待确认的风险语句；没有等待确认时为 None。
+    pub fn pending_risks(&self) -> Option<RiskPrompt> {
+        self.active_tab()
+            .and_then(|tab| tab.pending_risk.as_ref())
+            .map(|pending| pending.prompt.clone())
+    }
+
     pub fn has_tab(&self, id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.id == id)
     }
@@ -433,6 +453,7 @@ impl Desk {
             outline: Vec::new(),
             outline_stamp: None,
             pending: None,
+            pending_risk: None,
             provider: true,
             note: String::new(),
             statement: 0,
@@ -1336,6 +1357,16 @@ impl Desk {
                 return BeginRun::Variables(variables);
             }
         }
+        // 执行前风险确认：同一批里只有实际有后果的语句会拦下整批，确认前一条都不发送。
+        let confirmed_risk = tab.pending_risk.as_ref().and_then(|pending| pending.confirmed.clone());
+        if confirmed_risk.as_deref() != Some(pick.sql.as_str()) {
+            if let Some(prompt) = risk_prompt(&target, &pick.sql) {
+                if let Some(tab) = self.active_mut() {
+                    tab.pending_risk = Some(PendingRisk { prompt: prompt.clone(), sql: pick.sql.clone(), pick: pick.clone(), confirmed: None });
+                }
+                return BeginRun::Risks(Box::new(prompt));
+            }
+        }
         let tab_id = tab.id.clone();
         let version = tab.version;
         let token = tasks.begin(&owner(&tab_id));
@@ -1346,6 +1377,7 @@ impl Desk {
             tab.token = Some(token);
             tab.status = "running".to_owned();
             tab.pending = None;
+            tab.pending_risk = None;
             tab.draft = original;
             tab.run_origin = Some(origin);
             tab.run_target = Some(target.clone());
@@ -1382,6 +1414,21 @@ impl Desk {
     pub fn cancel_variables(&mut self) {
         if let Some(tab) = self.active_mut() {
             tab.pending = None;
+        }
+    }
+
+    /// 用户确认风险后要执行的文本：原样返回，不走第二套执行链。
+    pub fn confirm_risks(&mut self) -> Option<String> {
+        let pending = self.active_mut()?.pending_risk.as_mut()?;
+        let sql = pending.sql.clone();
+        pending.confirmed = Some(sql.clone());
+        Some(sql)
+    }
+
+    /// 取消风险确认：一条语句都不发送，草稿保持原样。
+    pub fn cancel_risks(&mut self) {
+        if let Some(tab) = self.active_mut() {
+            tab.pending_risk = None;
         }
     }
 
@@ -1706,6 +1753,7 @@ impl Desk {
             outline: Vec::new(),
             outline_stamp: None,
             pending: None,
+            pending_risk: None,
             provider: keep_provider,
             note: String::new(),
             statement: 0,
@@ -1749,7 +1797,33 @@ impl Default for Desk {
 pub enum BeginRun {
     Ready(PreparedRun),
     Variables(Vec<VariableInput>),
+    /// 这批 SQL 里有需要确认的风险语句：确认前一条都不发送。
+    Risks(Box<RiskPrompt>),
     Rejected(String),
+}
+
+/// 执行前风险确认面板要展示的内容：目标、原 SQL 与每条语句的实际后果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RiskPrompt {
+    pub connection_id: String,
+    pub connection_name: String,
+    pub database: String,
+    pub schema: String,
+    pub engine: String,
+    pub environment: String,
+    /// 需要确认的语句（切分后的顺序与原文一致）。
+    pub statements: Vec<super::risk::RiskStatement>,
+    /// 同一批里直通执行的只读/无风险语句数，用来解释「只拦下这几条」。
+    pub passthrough: usize,
+    /// 评估说明，例如 MySQL 多步 DDL 的隐式提交。
+    pub notices: Vec<String>,
+}
+
+impl RiskPrompt {
+    /// 这批 SQL 一共切出几条语句。
+    pub fn total(&self) -> usize {
+        self.statements.len() + self.passthrough
+    }
 }
 
 pub struct PreparedRun {
@@ -2068,6 +2142,29 @@ fn fill_partial_log(tab: &mut TabState) {
 
 /// 这次执行对应草稿里的哪段文本。普通执行就是 pick；变量确认后的执行对应替换前的 pick；
 /// “加载更多”重放上一条结果时对应那条结果在草稿里的范围。都对不上时退回送出的文本本身。
+/// 执行前风险确认：只有关系型工作台（五类 SQL 引擎）走这条判定，
+/// Redis 命令风险与 MongoDB 写守卫留在各自的应用层，不在这里重复。
+fn risk_prompt(target: &Target, sql: &str) -> Option<RiskPrompt> {
+    if crate::adapters::query::workbench_named(&target.engine) != Some(crate::adapters::Workbench::Relational) {
+        return None;
+    }
+    let report = super::risk::assess(&target.engine, sql);
+    if !report.needs_confirmation() {
+        return None;
+    }
+    Some(RiskPrompt {
+        connection_id: target.connection_id.clone(),
+        connection_name: target.connection_name.clone(),
+        database: target.database.clone(),
+        schema: target.schema.clone(),
+        engine: target.engine.clone(),
+        environment: target.environment.clone(),
+        statements: report.statements,
+        passthrough: report.passthrough,
+        notices: report.notices,
+    })
+}
+
 fn run_origin(tab: &TabState, pick: &RunPick, overridden: bool, engine: &str) -> RunOrigin {
     let sent = pick.sql.clone();
     let exact = || RunOrigin { from: pick.from, sql: sent.clone(), sent: sent.clone(), engine: engine.to_owned() };
@@ -2075,6 +2172,10 @@ fn run_origin(tab: &TabState, pick: &RunPick, overridden: bool, engine: &str) ->
         return exact();
     }
     if let Some(pending) = tab.pending.as_ref().filter(|pending| pending.confirmed.as_deref() == Some(sent.as_str())) {
+        return RunOrigin { from: pending.pick.from, sql: pending.pick.sql.clone(), sent, engine: engine.to_owned() };
+    }
+    // 风险确认后的执行：发送的就是确认面板里那份文本，位置沿用原来那次 pick。
+    if let Some(pending) = tab.pending_risk.as_ref().filter(|pending| pending.confirmed.as_deref() == Some(sent.as_str())) {
         return RunOrigin { from: pending.pick.from, sql: pending.pick.sql.clone(), sent, engine: engine.to_owned() };
     }
     let replayed = tab.results.iter().filter(|view| view.sql == sent).find_map(|view| {
@@ -2260,6 +2361,7 @@ mod tests {
                 BeginRun::Rejected(reason) => reason,
                 BeginRun::Variables(_) => "variables".to_owned(),
                 BeginRun::Ready(_) => String::new(),
+                BeginRun::Risks(_) => "risks".to_owned(),
             }),
         };
         let other = desk.new_query();
@@ -2287,7 +2389,7 @@ mod tests {
         let exact = match desk.begin_run(&tasks, RunScope::Auto, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         assert_eq!(exact.sql, "ELECT 2");
         assert_eq!(desk.draft(), sql);
@@ -2296,7 +2398,7 @@ mod tests {
         let prepared = match desk.begin_run(&tasks, RunScope::Current, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         assert_eq!(prepared.sql.trim(), "SELECT 1;");
         let ticket = Ticket { tab_id: prepared.tab_id, token: prepared.token, version: prepared.version };
@@ -2394,7 +2496,7 @@ mod tests {
         let prepared = match desk.begin_run(&tasks, RunScope::Script, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         assert_eq!(prepared.sql, "SELECT label FROM item");
         let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
@@ -2407,7 +2509,7 @@ mod tests {
         let multi = match desk.begin_run(&tasks, RunScope::Script, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         let multi_ticket = Ticket { tab_id: multi.tab_id.clone(), token: multi.token, version: multi.version };
         let multi_done = execute_prepared(&service, &query, &multi).await.unwrap();
@@ -2424,7 +2526,7 @@ mod tests {
         let slow = match desk.begin_run(&tasks, RunScope::Script, None) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         let started = commands::start_run(
             &service,
@@ -2507,6 +2609,7 @@ mod tests {
         match desk.begin_run(&tasks, RunScope::Script, None) {
             BeginRun::Variables(fields) => assert_eq!(fields[0].key, "name"),
             BeginRun::Ready(_) => panic!("should wait for variables"),
+            BeginRun::Risks(_) => panic!("should wait for risk confirmation"),
             BeginRun::Rejected(reason) => panic!("{reason}"),
         }
         assert_eq!(desk.draft(), "SELECT :name");
@@ -2554,7 +2657,7 @@ mod tests {
                 assert_eq!(prepared.database, "main");
             }
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         }
     }
 
@@ -2628,17 +2731,25 @@ mod tests {
         ) {
             BeginRun::Ready(prepared) => prepared,
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         };
         assert_eq!(prepared.limit, 250);
     }
 
     fn ready_ticket(desk: &mut Desk, tasks: &TaskBoard, sql: &str) -> Ticket {
         desk.set_draft(sql);
-        match desk.begin_run(tasks, RunScope::Script, None) {
+        // 有风险语句时按用户确认后的路径重跑一次：执行本身不变，只是先过确认。
+        let begin = match desk.begin_run(tasks, RunScope::Script, None) {
+            BeginRun::Risks(_) => {
+                let confirmed = desk.confirm_risks().expect("确认风险后要执行的文本");
+                desk.begin_run(tasks, RunScope::Script, Some(confirmed))
+            }
+            other => other,
+        };
+        match begin {
             BeginRun::Ready(prepared) => Ticket { tab_id: prepared.tab_id, token: prepared.token, version: prepared.version },
             BeginRun::Rejected(reason) => panic!("{reason}"),
-            BeginRun::Variables(_) => panic!("variables"),
+            BeginRun::Variables(_) | BeginRun::Risks(_) => panic!("variables"),
         }
     }
 
@@ -3386,5 +3497,106 @@ mod tests {
         assert!(!desk.tree_is_empty(), "读取失败不能显示成没有对象");
         desk.set_tree_error("");
         assert!(desk.tree_is_empty());
+    }
+    /// T4：有实际后果的语句必须先确认；确认前一条都不发送。
+    #[test]
+    fn risky_statements_wait_for_confirmation_before_anything_is_sent() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("shop", "商城", "mysql", "shop");
+        desk.set_draft("SELECT 1;\nDROP TABLE orders;\nSELECT 2");
+        match desk.begin_run(&tasks, RunScope::Script, None) {
+            BeginRun::Risks(prompt) => {
+                assert_eq!(prompt.connection_name, "商城");
+                assert_eq!(prompt.database, "shop");
+                assert_eq!(prompt.engine, "mysql");
+                assert_eq!(prompt.statements.len(), 1, "只拦实际有后果的那条");
+                assert_eq!(prompt.statements[0].index, 1);
+                assert_eq!(prompt.passthrough, 2, "只读语句直通");
+                assert_eq!(desk.pending_risks().map(|prompt| prompt.statements.len()), Some(1));
+            }
+            other => panic!("expected a risk prompt: {}", run_label(&other)),
+        }
+        assert_eq!(desk.executions(), 0, "确认前不发送");
+        assert!(!desk.running_ids().iter().any(|_| true), "没有进入执行态");
+
+        // 取消：不发送任何语句，草稿保持原样。
+        desk.cancel_risks();
+        assert!(desk.pending_risks().is_none());
+        assert_eq!(desk.executions(), 0);
+        assert_eq!(desk.draft(), "SELECT 1;\nDROP TABLE orders;\nSELECT 2");
+
+        // 再跑一次并确认：沿原执行路径发送同一份文本，不再问第二遍。
+        assert!(matches!(desk.begin_run(&tasks, RunScope::Script, None), BeginRun::Risks(_)));
+        let sql = desk.confirm_risks().expect("确认后要执行的文本");
+        let prepared = match desk.begin_run(&tasks, RunScope::Script, Some(sql)) {
+            BeginRun::Ready(prepared) => prepared,
+            other => panic!("expected a run after confirmation: {}", run_label(&other)),
+        };
+        assert!(prepared.sql.contains("DROP TABLE orders"));
+        assert!(desk.pending_risks().is_none(), "确认后不再挂着待确认");
+        assert_eq!(desk.executions(), 1);
+    }
+
+    /// T4：只读查询直通；Redis 命令与 MongoDB 写操作仍由各自应用层守卫，不弹 SQL 风险确认。
+    #[test]
+    fn read_only_queries_and_non_sql_engines_do_not_ask_for_risk_confirmation() {
+        let tasks = TaskBoard::new();
+        let mut read_only = Desk::new();
+        read_only.open_database("notes", "笔记", "sqlite", "main");
+        read_only.set_draft("SELECT * FROM thread_items WHERE id = 1");
+        assert!(
+            matches!(read_only.begin_run(&tasks, RunScope::Script, None), BeginRun::Ready(_)),
+            "只读语句不能被风险确认挡住"
+        );
+
+        let mut redis = Desk::new();
+        redis.open_database("cache", "缓存", "redis", "0");
+        redis.set_draft("FLUSHALL");
+        assert!(
+            !matches!(redis.begin_run(&tasks, RunScope::Script, None), BeginRun::Risks(_)),
+            "Redis 的风险语义留在 adapters/redis 与 application/redis"
+        );
+
+        let mut mongo = Desk::new();
+        mongo.open_database("docs", "文档", "mongodb", "app");
+        mongo.set_draft("db.users.deleteMany({})");
+        assert!(
+            !matches!(mongo.begin_run(&tasks, RunScope::Script, None), BeginRun::Risks(_)),
+            "MongoDB 写操作确认留在 application/mongo"
+        );
+    }
+
+    /// T4：当前语句范围也按同一条判定，多语句脚本里只有光标那条会被评估。
+    #[test]
+    fn current_statement_scope_only_assesses_that_statement() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("shop", "商城", "postgres", "shop");
+        desk.set_draft("SELECT 1;\nDELETE FROM orders");
+        // 光标在第 0 条语句上：只评估它。
+        desk.set_selection(0, 0, 0);
+        assert!(
+            matches!(desk.begin_run(&tasks, RunScope::Current, None), BeginRun::Ready(_)),
+            "光标在只读语句上时不该被另一条风险语句挡住"
+        );
+        desk.cancel(&tasks);
+        // 光标移到第 1 条语句上：这条有数据丢失后果。
+        let at = desk.draft().find("DELETE").expect("第二条语句") + "DELETE".len();
+        desk.set_selection(at, at, at);
+        match desk.begin_run(&tasks, RunScope::Current, None) {
+            BeginRun::Risks(prompt) => assert_eq!(prompt.statements.len(), 1),
+            other => panic!("expected a risk prompt: {}", run_label(&other)),
+        }
+    }
+
+    /// 测试里把 BeginRun 描述成一句话。
+    fn run_label(begin: &BeginRun) -> String {
+        match begin {
+            BeginRun::Ready(_) => "ready".to_owned(),
+            BeginRun::Variables(_) => "variables".to_owned(),
+            BeginRun::Risks(_) => "risks".to_owned(),
+            BeginRun::Rejected(reason) => reason.clone(),
+        }
     }
 }

@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, PathPromptOptions, Render, SharedString, Window,
-    WindowAppearance,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window,
+    WindowAppearance, div,
 };
 
 use crate::app::views::admin::AdminPane;
@@ -15,6 +15,7 @@ use crate::app::views::diagram::DiagramPane;
 use crate::app::views::export::{ExchangePane, ExchangeSource, ExchangeSourceKind};
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::mongo::MongoPane;
+use crate::app::views::object_editor::{EditorRequest, ObjectEditorPane};
 use crate::app::views::query::{requires_active_query, QueryPane, SyncEffect, TabSnap};
 use crate::app::views::redis::RedisPane;
 use crate::app::views::settings::SaveState;
@@ -47,6 +48,8 @@ pub struct Workbench {
     pub(super) table: Entity<GridPane>,
     pub(super) structure: Entity<StructurePane>,
     pub(super) admin: Entity<AdminPane>,
+    /// 事件 / 函数 / 存储过程 / 触发器的统一编辑器（覆盖在所有页面之上，按需打开）。
+    pub(super) object_editor: Entity<ObjectEditorPane>,
     pub(super) exchange: Entity<ExchangePane>,
     pub(super) compare: Entity<ComparePane>,
     pub(super) diagram: Entity<DiagramPane>,
@@ -74,6 +77,8 @@ pub struct Workbench {
     pub(super) overview_focus: FocusHandle,
     /// 就地重命名的输入框已拿到焦点（只在打开时聚焦一次）。
     pub(super) tab_rename_focused: bool,
+    /// 通过快捷键请求聚焦对象树搜索框；渲染对象树时消费一次。
+    pub(super) focus_explorer_filter: bool,
     /// 重命名输入框失焦即确认（点到编辑器或别的区域时不让输入框一直挂在标签栏上）。
     pub(super) tab_rename_blur: Option<gpui_kit::Subscription>,
     /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
@@ -288,6 +293,7 @@ impl Workbench {
         let struct_nav_owner = cx.entity().downgrade();
         let structure = cx.new(|_| {
             let mut pane = StructurePane::new(Arc::clone(&services));
+            pane.set_shell_overlay_host(true);
             pane.set_data_sink(Arc::new(move |cx: &mut App| {
                 if let Some(owner) = data_owner.upgrade() {
                     owner.update(cx, |view, cx| view.perform("switch-to-data", cx));
@@ -340,16 +346,19 @@ impl Workbench {
             pane
         });
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
+        let object_editor = cx.new(|_| ObjectEditorPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
         let compare = cx.new(|_| ComparePane::new(Arc::clone(&services)));
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
         let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
+        super::chrome::bind_palette_keys(cx);
         let palette_owner = cx.entity().downgrade();
         let child_subscriptions = vec![
             cx.observe(&query, |_, _, cx| cx.notify()),
             cx.observe(&table, |_, _, cx| cx.notify()),
             cx.observe(&admin, |_, _, cx| cx.notify()),
+            cx.observe(&object_editor, |_, _, cx| cx.notify()),
             cx.observe(&exchange, |_, _, cx| cx.notify()),
             cx.observe(&structure, |_, _, cx| cx.notify()),
             cx.observe(&compare, |_, _, cx| cx.notify()),
@@ -423,6 +432,7 @@ impl Workbench {
             table,
             structure,
             admin,
+            object_editor,
             exchange,
             compare,
             diagram,
@@ -447,6 +457,7 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             overview_focus: cx.focus_handle(),
             tab_rename_focused: false,
+            focus_explorer_filter: false,
             tab_rename_blur: None,
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
@@ -540,7 +551,44 @@ impl Workbench {
         self.settle(cx);
     }
 
+    /// 对象编辑器要编辑的那个对象：右键的那一行优先，其次对象树焦点行。
+    ///
+    /// 只认事件、函数、存储过程与触发器；表与视图仍走结构页和定义页。
+    pub(super) fn object_editor_request(&mut self) -> Option<EditorRequest> {
+        let node_id = self.model.nav_menu_node.clone().or_else(|| self.model.nav.focus().map(str::to_owned));
+        self.model.nav_menu_node = None;
+        let node_id = node_id?;
+        let object = self.model.nav.node(&node_id)?.object()?;
+        if !crate::app::views::object_editor::editable(object.kind) {
+            return None;
+        }
+        Some(EditorRequest {
+            connection_id: object.connection_id,
+            database: object.database,
+            schema: object.schema,
+            engine: object.engine.as_str().to_owned(),
+            kind: object.kind,
+            name: object.name,
+        })
+    }
+
+    /// 编辑器里改成功（或删掉）一个对象后刷新对象树：树里的条目要跟服务器一致。
+    fn consume_object_editor(&mut self, cx: &mut Context<Self>) {
+        // 管理页的事件行要改整份定义：先取走它的请求，再由同一个编辑器打开。
+        if let Some(request) = self.admin.update(cx, |pane, _| pane.take_object_editor_request()) {
+            self.object_editor.update(cx, |pane, cx| pane.open_request(request, cx));
+        }
+        let Some((connection, database, _kind, name)) = self.object_editor.update(cx, |pane, _| pane.take_changed()) else { return };
+        self.model.request_nav_refresh(Some(connection));
+        self.model.notice_key = None;
+        self.model.notice_detail = String::new();
+        let _ = (database, name);
+    }
+
     fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id == "explorer-search" {
+            self.focus_explorer_filter = true;
+        }
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
             let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
@@ -562,6 +610,21 @@ impl Workbench {
         // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
         // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
         if self.model.gate_on_demand(id) {
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        // 对象编辑器：对象树右键、管理页按钮与命令面板都到这一个入口，不另开执行路径。
+        if id == "open-object-editor" {
+            match self.object_editor_request() {
+                Some(request) => {
+                    self.object_editor.update(cx, |pane, cx| pane.open_request(request, cx));
+                }
+                None => {
+                    self.model.notice_key = Some("catalog.tree.noStructure");
+                    self.model.notice_detail = self.model.object_target().map(|target| target.name).unwrap_or_default();
+                }
+            }
             self.persist_if_needed(cx);
             cx.notify();
             return;
@@ -606,6 +669,13 @@ impl Workbench {
                 cx.quit();
             }
             cx.notify();
+            return;
+        }
+        if matches!(id, "conn-import-dbeaver" | "conn-import-navicat") {
+            if self.model.close_prompt.is_none() && matches!(self.model.profile_import, super::conn_import::ImportState::Idle) {
+                use super::conn_import::ProfileFormat;
+                self.prompt_profile_import(if id == "conn-import-navicat" { ProfileFormat::Navicat } else { ProfileFormat::DBeaver }, cx);
+            }
             return;
         }
         if id == "conn-import" || id == "conn-export" {
@@ -831,6 +901,21 @@ impl Workbench {
                 self.diagram.update(cx, |pane, _| pane.set_locale(locale));
                 self.ensure_diagram(cx);
             }
+            self.persist_if_needed(cx);
+            cx.notify();
+            return;
+        }
+        if id == "commit"
+            && self.model.shell.page == AppPage::Workspace
+            && self.model.tool == WorkTool::Query
+            && !self.query.read(cx).grid_uncommitted(cx)
+        {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            self.forward_query("save-sql-file", cx);
             self.persist_if_needed(cx);
             cx.notify();
             return;
@@ -1170,6 +1255,18 @@ impl Workbench {
                 tab.last_executed_sql = Some(sql);
             }
         }
+        for (id, sql) in effect.saved {
+            if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.saved_sql = Some(sql);
+            }
+        }
+    }
+
+    pub(crate) fn mark_query_saved(&mut self, tab_id: &str, sql: String, cx: &mut Context<Self>) {
+        if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.saved_sql = Some(sql);
+            cx.notify();
+        }
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
@@ -1195,6 +1292,8 @@ impl Workbench {
         }
         let table_dirty = self.table.read(cx).uncommitted();
         let query_dirty = self.query.read(cx).grid_uncommitted(cx);
+        let structure_dirty = self.structure.read(cx).pending_changes() > 0;
+        let structure_target = self.structure.read(cx).session.target.clone();
         self.model.grid_dirty = table_dirty || query_dirty;
         self.model.grid_writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
         let active = self.model.active_tab.clone();
@@ -1214,6 +1313,19 @@ impl Workbench {
                         }
                     } else {
                         tab.uncommitted_cells = false;
+                    }
+                }
+                WorkItemKind::Structure => {
+                    let matches_active = active.as_deref() == Some(tab.id.as_str()) && self.model.tool == WorkTool::Structure;
+                    let matches_spec = !structure_target.connection_id.is_empty()
+                        && tab.spec.as_deref().and_then(parse_target).is_some_and(|t| {
+                            t.connection_id == structure_target.connection_id
+                                && t.database == structure_target.database
+                                && t.schema == structure_target.schema
+                                && t.table == structure_target.table
+                        });
+                    if matches_active || matches_spec {
+                        tab.structure_dirty = structure_dirty;
                     }
                 }
                 _ => {}
@@ -2845,6 +2957,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
+            PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
         let token = if owner == "connections" {
@@ -2871,6 +2984,9 @@ impl Workbench {
                     view.update(cx, |this, cx| {
                         if let Ok(done) = done {
                             apply_done(&mut this.model, &this.services, owner, done);
+                            if owner == "profile-import" {
+                                this.pump_jobs(cx);
+                            }
                         }
                         this.model.finish_job();
                         this.persist_if_needed(cx);
@@ -2977,6 +3093,38 @@ impl Workbench {
             .map(|path| path.to_path_buf())
             .filter(|path| path.is_dir())
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn prompt_profile_import(&mut self, format: super::conn_import::ProfileFormat, cx: &mut Context<Self>) {
+        use super::conn_import::ImportState;
+        self.model.profile_import = ImportState::Picking;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.t(format.entry())),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                view.model.queue_profile_preview(format, path);
+                                view.pump_jobs(cx);
+                            } else {
+                                view.model.profile_import = ImportState::Idle;
+                            }
+                        }
+                        Ok(Err(error)) => view.model.profile_import = ImportState::Error(error.to_string()),
+                        _ => view.model.profile_import = ImportState::Idle,
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn prompt_import(&mut self, cx: &mut Context<Self>) {
@@ -3361,6 +3509,9 @@ impl Workbench {
                             Ok(file) => {
                                 view.model.shell.note_opened(path.clone());
                                 view.model.open_sql_file(&path, file.sql);
+                                if let Some(tab_id) = view.model.active_tab.clone() {
+                                    view.query.update(cx, |pane, _| pane.set_tab_file_path(&tab_id, path.clone()));
+                                }
                                 view.query.update(cx, |pane, _| pane.request_focus());
                             }
                             Err(error) => {
@@ -3512,7 +3663,13 @@ impl Render for Workbench {
         // 布尔读取，不遍历、不分配；对比页的按钮直接改它自己的实体，嵌套更新里观察回调还没轮到时，
         // 下一帧仍能拿到交接，关闭窗口的判断也不会读到旧的运行标记。
         self.refresh_compare(cx);
-        self.render_root(window, cx)
+        let root = self.render_root(window, cx);
+        // 对象编辑器覆盖在当前页面上：它自己是一层模态，不替换下面的工作项。
+        if self.object_editor.read(cx).is_open() {
+            let editor = self.object_editor.clone();
+            return div().relative().size_full().child(root).child(editor).into_any_element();
+        }
+        root
     }
 }
 
@@ -3610,6 +3767,7 @@ impl Workbench {
             }
             self.pump_nav(cx);
         }
+        self.consume_object_editor(cx);
         self.sync_view_settings(cx);
         self.sync_density(cx);
         self.sync_query(cx);
@@ -3622,6 +3780,10 @@ impl Workbench {
                 cx.notify();
             });
             self.admin.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.object_editor.update(cx, |pane, cx| {
                 pane.set_locale(locale);
                 cx.notify();
             });
@@ -3761,6 +3923,8 @@ fn query_command(id: &str) -> bool {
             | "expand-star"
             | "toggle-outline"
             | "toggle-side"
+            | "close-side"
+            | "switch-pane-focus"
             | "pin-result"
             | "refresh-tree"
             | "confirm-variables"

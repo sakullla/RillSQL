@@ -1,6 +1,7 @@
 //! 结果区的“消息”页：最近一次执行里每条语句的状态、行数/影响行数、耗时和错误，按执行顺序排列。
 //! 点成功的一条切到它的结果；点失败的一条跳到编辑器里的错误位置。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
@@ -37,9 +38,11 @@ pub fn entry_text(locale: Locale, entry: &LogEntry) -> String {
         None => i18n::text(locale, "query.log.run"),
     });
     if let Some(rows) = entry.rows {
-        parts.push(i18n::fill(&i18n::text(locale, "query.log.rows"), &[("count", &rows.to_string())]));
+        let count = crate::app::views::grid::group_digits(rows as i64);
+        parts.push(i18n::fill(&i18n::text(locale, "query.log.rows"), &[("count", &count)]));
     } else if let Some(affected) = entry.affected {
-        parts.push(i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &affected.to_string())]));
+        let count = crate::app::views::grid::group_digits(affected as i64);
+        parts.push(i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &count)]));
     }
     if let Some(ms) = entry.elapsed_ms {
         parts.push(elapsed_label(ms));
@@ -114,8 +117,16 @@ impl LogPanel<'_> {
             let open = entity.clone();
             let counts = entry
                 .rows
-                .map(|rows| i18n::fill(&i18n::text(locale, "query.log.rows"), &[("count", &rows.to_string())]))
-                .or_else(|| entry.affected.map(|affected| i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &affected.to_string())])))
+                .map(|rows| {
+                    let count = crate::app::views::grid::group_digits(rows as i64);
+                    i18n::fill(&i18n::text(locale, "query.log.rows"), &[("count", &count)])
+                })
+                .or_else(|| {
+                    entry.affected.map(|affected| {
+                        let count = crate::app::views::grid::group_digits(affected as i64);
+                        i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &count)])
+                    })
+                })
                 .unwrap_or_default();
             let title = match entry.statement {
                 Some(statement) => format!("{} {}", i18n::text(locale, "query.results.statement"), statement + 1),
@@ -123,11 +134,13 @@ impl LogPanel<'_> {
             };
             let sql = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
             let full_sql = entry.sql.trim().to_owned();
+            let copy_sql_text = full_sql.clone();
+            let copy_msg_text = entry.message.clone();
             list = list.child(
                 div()
                     .id(SharedString::from(format!("query-log-{index}")))
                     .test_support()
-                    .role(gpui_kit::Role::Button)
+                    .role(if clickable { gpui_kit::Role::Button } else { gpui_kit::Role::ListItem })
                     .aria_label(SharedString::from(label))
                     .flex_none()
                     .min_h(px(self.metrics.row_h))
@@ -182,13 +195,49 @@ impl LogPanel<'_> {
                                             .text_color(p.text_faint)
                                             .when(!full_sql.is_empty(), |this| this.tooltip_text(SharedString::from(full_sql)))
                                             .child(SharedString::from(sql)),
-                                    ),
+                                    )
+                                    .when(!copy_sql_text.is_empty(), |this| {
+                                        let text = copy_sql_text.clone();
+                                        this.child(
+                                            kit::icon_button(
+                                                SharedString::from(format!("query-log-copy-sql-{index}")),
+                                                IconName::Copy,
+                                                SharedString::from(i18n::text(locale, "query.log.copySql")),
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+                                                },
+                                            )
+                                            .xsmall(),
+                                        )
+                                    }),
                             )
                             .when(!entry.message.is_empty() && entry.status != "skipped", |this| {
+                                let text = copy_msg_text.clone();
                                 this.child(
                                     div()
-                                        .text_color(if failed { p.danger } else { p.text_muted })
-                                        .child(SharedString::from(entry.message.clone())),
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(kit::Space::SM))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_color(if failed { p.danger } else { p.text_muted })
+                                                .child(SharedString::from(entry.message.clone())),
+                                        )
+                                        .child(
+                                            kit::icon_button(
+                                                SharedString::from(format!("query-log-copy-msg-{index}")),
+                                                IconName::Copy,
+                                                SharedString::from(i18n::text(locale, "query.log.copyMessage")),
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+                                                },
+                                            )
+                                            .xsmall(),
+                                        ),
                                 )
                             })
                             // 失败且被自动改写时才补说明和实际语句：手写 LIMIT 的报错原文不动，
@@ -197,6 +246,7 @@ impl LogPanel<'_> {
                                 failed.then(|| entry.rewrite.clone()).flatten().zip(entry.sent_sql.clone()),
                                 |this, (rewrite, sent)| {
                                     let note = rewrite_note(locale, &rewrite);
+                                    let sent_copy = sent.clone();
                                     this.child(
                                         div()
                                             .id(SharedString::from(format!("query-log-rewrite-{index}")))
@@ -207,12 +257,32 @@ impl LogPanel<'_> {
                                     )
                                     .child(
                                         div()
-                                            .id(SharedString::from(format!("query-log-sent-{index}")))
-                                            .test_support()
-                                            .aria_label(SharedString::from(sent.clone()))
-                                            .font_family(self.mono.clone())
-                                            .text_color(p.text_muted)
-                                            .child(SharedString::from(sent)),
+                                            .flex()
+                                            .items_start()
+                                            .gap(px(kit::Space::SM))
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!("query-log-sent-{index}")))
+                                                    .test_support()
+                                                    .aria_label(SharedString::from(sent.clone()))
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .font_family(self.mono.clone())
+                                                    .text_color(p.text_muted)
+                                                    .child(SharedString::from(sent)),
+                                            )
+                                            .child(
+                                                kit::icon_button(
+                                                    SharedString::from(format!("query-log-copy-sent-{index}")),
+                                                    IconName::Copy,
+                                                    SharedString::from(i18n::text(locale, "query.log.copySql")),
+                                                    move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(sent_copy.clone()));
+                                                    },
+                                                )
+                                                .xsmall(),
+                                            ),
                                     )
                                 },
                             ),

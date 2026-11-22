@@ -2,6 +2,8 @@
 
 mod chrome;
 mod close;
+mod conn_import;
+mod conn_import_view;
 mod conn_modal;
 mod conn_page;
 mod danger;

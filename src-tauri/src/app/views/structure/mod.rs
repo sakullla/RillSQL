@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -23,6 +24,7 @@ use crate::ddl::english::{localize, localize_missing_item};
 use crate::ddl::naming::{IndexNaming, index_name_limit};
 use crate::adapters::ddl::types_named;
 use crate::ddl::sql::{default_problem, existing_default, valid_name, valid_type};
+use crate::ddl::model::{EnumSetDraft, EnumSetKind, GeneratedColumnDraft, PartitionDraft, PartitionMethod};
 use crate::ddl::templates::{ColumnTemplate, TemplateStore};
 use crate::ddl::{
     Action, ColumnDraft, DdlEngine, DefaultSpec, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot, TableOptions,
@@ -54,6 +56,7 @@ fn default_id(engine: &str) -> ColumnDraft {
         primary: true,
         auto: true,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -71,6 +74,13 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             primary: column.primary,
             auto: column.auto,
             dropped: false,
+            // 专有形态按读回的实际定义起稿：只改候选值、表达式或存储方式时草稿里也有完整定义，
+            // 生成语句不会被写成一条缺定义的普通列。
+            enum_set: snapshot.enum_sets.get(&column.name).map(|state| EnumSetDraft { kind: state.kind, values: state.values.clone() }),
+            generated: snapshot
+                .generation
+                .get(&column.name)
+                .map(|state| GeneratedColumnDraft { expression: state.expression.clone(), storage: state.storage }),
         })
         .collect()
 }
@@ -291,6 +301,12 @@ fn table_columns(section: Section) -> &'static [ColumnSpec] {
     }
 }
 
+/// 分区方案是不是这个引擎的结构能力，由方言的库级段落声明（见 DdlDialect::admin_sections），
+/// 界面不自己判断引擎名字。
+fn supports_partitions(engine: &str) -> bool {
+    crate::adapters::ddl::ddl_named(engine).is_some_and(|dialect| dialect.admin_sections().partitions)
+}
+
 /// 列表三态与内容态的判定：加载优先于错误，错误优先于空态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListState {
@@ -323,6 +339,8 @@ pub enum Section {
     Columns,
     Indexes,
     ForeignKeys,
+    /// 分区方案（RANGE/LIST/HASH/KEY 的建立、修改与移除）。只有 MySQL 与 MariaDB 有这一段。
+    Partitions,
     View,
     Ddl,
     Danger,
@@ -425,6 +443,10 @@ pub struct StructureSession {
     pub fk_on_delete: String,
     pub fk_on_update: String,
     pub view_sql: String,
+    /// 分区方案草稿。方式、操作、表达式、数量与分区定义都在这里，语句由方言生成。
+    pub partition: PartitionDraft,
+    /// KEY 分区的列清单原文（逗号分隔）。原样保留输入，动作前才拆成列名。
+    pub partition_columns: String,
     pub danger: DangerKind,
     pub rename_to: String,
     /// 生产环境确认前要输入的对象名。不写入 SQL。
@@ -437,6 +459,8 @@ pub struct StructureSession {
     armed: bool,
     pub locale: Locale,
     note: Note,
+    /// 最近一次执行的逐步回执。回执留着，成功收起预览后也能回看每一步做了什么。
+    receipt: Option<crate::ddl::Receipt>,
     /// 外壳按连接当前标签与标签表色调算出的生产判断；没有下发时按环境 id 判断。
     pub prod: Option<bool>,
 }
@@ -466,6 +490,8 @@ impl StructureSession {
             fk_on_delete: "NO ACTION".to_owned(),
             fk_on_update: "NO ACTION".to_owned(),
             view_sql: String::new(),
+            partition: PartitionDraft::default(),
+            partition_columns: String::new(),
             danger: DangerKind::Drop,
             rename_to: String::new(),
             danger_name: String::new(),
@@ -476,12 +502,18 @@ impl StructureSession {
             armed: false,
             locale: Locale::ZhCn,
             note: Note::Empty,
+            receipt: None,
             prod: None,
         }
     }
 
     pub fn note(&self) -> String {
         self.note.text(self.locale)
+    }
+
+    /// 最近一次执行的逐步回执（被拦下、部分成功、全部成功都会留着）。
+    pub fn receipt(&self) -> Option<&crate::ddl::Receipt> {
+        self.receipt.as_ref()
     }
 
     pub fn banner(&self) -> String {
@@ -503,7 +535,14 @@ impl StructureSession {
         if self.object_kind == "view" {
             return vec![Section::Columns, Section::View, Section::Danger];
         }
-        vec![Section::Columns, Section::Indexes, Section::ForeignKeys, Section::Ddl, Section::Danger]
+        let mut sections = vec![Section::Columns, Section::Indexes, Section::ForeignKeys];
+        // 分区方案只有 MySQL 家族的表有：别的引擎不给入口，也就不存在“看起来能用”。
+        if supports_partitions(&self.target.engine) {
+            sections.push(Section::Partitions);
+        }
+        sections.push(Section::Ddl);
+        sections.push(Section::Danger);
+        sections
     }
 
     pub fn production(&self) -> bool {
@@ -543,6 +582,7 @@ impl StructureSession {
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             });
         }
         if columns.is_empty() {
@@ -556,9 +596,22 @@ impl StructureSession {
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             });
         }
         columns
+    }
+
+    /// 分区草稿换成动作参数：KEY 的列清单来自输入原文（逗号分隔），其余方式不用列清单。
+    /// 输入里的外层反引号与双写反引号按读回表达式同一规则还原成裸列名，用户手写 `id` 也不会被再包一层。
+    fn partition_action(&self) -> PartitionDraft {
+        let mut draft = self.partition.clone();
+        if draft.method == PartitionMethod::Key {
+            draft.columns = crate::adapters::mysql::table_read::key_columns_from_expression(&self.partition_columns);
+        } else {
+            draft.columns.clear();
+        }
+        draft
     }
 
     fn index_drafts(&self) -> Vec<IndexColumnDraft> {
@@ -610,6 +663,7 @@ impl StructureSession {
                 EditIntent::DropForeignKey { name } => Action::DropForeignKey { table, name: name.clone() },
                 _ => Action::CreateForeignKey { table, foreign_key: self.foreign_key_draft() },
             },
+            Section::Partitions => Action::AlterPartitions { table, partition: self.partition_action() },
             Section::View => Action::ReplaceView { table, definition: self.view_sql.clone() },
             Section::Danger => self.danger_action(),
         }
@@ -621,6 +675,8 @@ impl StructureSession {
         self.live = true;
         self.open = true;
         self.armed = false;
+        // 新的一次预览：上一次的逐步回执不再对应当前计划。
+        self.receipt = None;
     }
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
@@ -630,6 +686,7 @@ impl StructureSession {
         self.live = false;
         self.open = true;
         self.armed = false;
+        self.receipt = None;
     }
 
     pub fn preview_open(&self) -> bool {
@@ -703,6 +760,30 @@ impl StructureSession {
     pub fn cancel(&mut self) {
         self.open = false;
         self.armed = false;
+    }
+
+    /// 落一次执行回执：算结局、留着回执、写提示；只有全部成功才收起预览。
+    ///
+    /// 回执的目标必须还是这份预览的目标：目标换了（用户切了表或重新预览）就只提示过期，
+    /// 不覆盖当前目标上的回执与提示。返回 None 表示已按过期处理。
+    pub(crate) fn apply_receipt(&mut self, receipt: crate::ddl::Receipt) -> Option<receipt::ReceiptOutcome> {
+        self.armed = false;
+        if self.preview_target() != receipt.target {
+            self.note = Note::Key("structure.execute.stale");
+            return None;
+        }
+        let outcome = receipt::ReceiptOutcome::of(&receipt);
+        let problems = receipt::problems(&receipt);
+        self.receipt = Some(receipt);
+        if outcome.is_success() {
+            self.open = false;
+        }
+        self.note = match outcome.note_key() {
+            // 部分成功也有一条说明，后面紧跟逐步回执里的原始错误。
+            Some(key) => Note::Key(key),
+            None => Note::Raw(problems),
+        };
+        Some(outcome)
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
@@ -797,11 +878,21 @@ pub struct StructurePane {
     index_picker: Option<(Entity<Picker>, Subscription)>,
     /// 字段页（已有表）正在编辑的那一行（`kept_columns` 下标）。其余行以文本浏览。
     editing_row: Option<usize>,
+    /// 字段页（已有表）键盘选中的行（`kept_columns` 下标），用于 Up/Down/Enter/F2/Delete。
+    focused_row: Option<usize>,
     /// 下一帧把字段列表滚到这一行（`kept_columns` 下标）。
     scroll_to_column: Option<usize>,
     /// 窄窗口里被按优先级隐藏的列（注释、默认值）强制显示。
     show_all_columns: bool,
     columns_scroll: UniformListScrollHandle,
+    /// DDL 预览弹窗的焦点句柄与焦点陷阱载体。
+    preview_focus: Option<FocusHandle>,
+    /// 预览弹窗打开后是否已执行过首次自动聚焦（避免每帧抢夺输入框焦点）。
+    preview_focused: bool,
+    /// 下一帧将焦点还给 StructurePane 根节点（如退出编辑或关闭弹窗后）。
+    pending_focus_pane: bool,
+    /// 由外壳 Workbench 托管全窗口遮罩与浮层（独立渲染测试时保持 false）。
+    shell_overlay_host: bool,
 }
 
 impl StructurePane {
@@ -855,14 +946,56 @@ impl StructurePane {
             index_naming: IndexNaming::default(),
             index_picker: None,
             editing_row: None,
+            focused_row: None,
             scroll_to_column: None,
             show_all_columns: false,
             columns_scroll: UniformListScrollHandle::new(),
+            preview_focus: None,
+            preview_focused: false,
+            pending_focus_pane: false,
+            shell_overlay_host: false,
         }
     }
 
     pub fn index_naming(&self) -> &IndexNaming {
         &self.index_naming
+    }
+
+    /// 结构页根焦点句柄，供外壳在关闭浮层后把键盘焦点还原回表结构视图。
+    pub fn focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
+    /// 预览弹窗焦点句柄（焦点陷阱与非生产回车确认载体）。
+    pub fn preview_focus_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.preview_focus.get_or_insert_with(|| cx.focus_handle()).clone()
+    }
+
+    /// 声明外壳将负责渲染全窗口遮罩层（覆盖顶栏/侧栏/标签栏并同步 `ShellOverlayOpen`）。
+    pub fn set_shell_overlay_host(&mut self, hosted: bool) {
+        self.shell_overlay_host = hosted;
+    }
+
+    /// 预览弹窗或模板管理弹窗是否处于打开状态。
+    pub fn has_modal_overlay(&self) -> bool {
+        self.session.preview_open() || self.template_manager.is_some()
+    }
+
+    /// DDL 预览弹窗是否打开。
+    pub fn preview_open(&self) -> bool {
+        self.session.preview_open()
+    }
+
+    /// 供外壳在根容器顶层渲染全窗口遮罩与结构模态（预览弹窗或模板管理弹窗）。
+    pub fn render_shell_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
+        let section = self.session.section;
+        let entity = cx.entity();
+        if let Some(preview) = self.render_preview_dialog(&entity, &p, metrics, section, window, cx) {
+            return Some(preview);
+        }
+        self.render_template_manager(&entity, &p, metrics, window, cx)
     }
 
     /// 设置页改了索引命名模板：自动命名中的索引名立即按新模板重算，手动名称不动。
@@ -1031,8 +1164,10 @@ impl StructurePane {
         self.pending_focus_draft = None;
         self.index_picker = None;
         self.editing_row = None;
+        self.focused_row = None;
         self.scroll_to_column = None;
         self.show_all_columns = false;
+        self.preview_focused = false;
         if target.table.is_empty() && !target.connection_id.is_empty() {
             self.enter_create();
         }
@@ -1205,49 +1340,56 @@ impl StructurePane {
                                 cx.notify();
                                 return;
                             }
-                            this.session.note = match result {
-                                Ok(executed) if executed.receipt.blocked.is_empty() => {
-                                    this.session.open = false;
-                                    this.session.armed = false;
-                                    let all_ok = executed.receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
-                                    if all_ok && !executed.receipt.steps.is_empty() {
-                                        if let Some(dropped_view) = drop_kind {
-                                            this.dropped = Some((this.session.target.clone(), dropped_view));
-                                        } else if let Some(new_name) = renamed_to.filter(|name| !name.is_empty()) {
-                                            let old = this.session.target.clone();
-                                            this.session.target.table = new_name.clone();
-                                            this.session.rename_to.clear();
-                                            this.session.danger_name.clear();
-                                            this.session.section = Section::Columns;
-                                            this.renamed = Some((old, new_name));
-                                            this.reload_after_execute();
-                                        } else if let Some(name) = created_name.filter(|name| !name.is_empty()) {
-                                            let mut created = this.session.target.clone();
-                                            created.table = name;
-                                            this.created = Some(created.clone());
-                                            this.session.mode = StructureMode::Existing;
-                                            this.session.target = created;
-                                            this.session.object_kind = "table".into();
-                                            this.session.table_name.clear();
-                                            this.reload_after_execute();
-                                        } else {
-                                            this.modified = Some((this.session.target.clone(), is_view));
-                                            this.composer_open = false;
-                                            this.reset_composer_drafts();
-                                            this.reload_after_execute();
-                                        }
-                                    }
-                                    execution_note(&executed)
-                                }
+                            match result {
                                 Ok(executed) => {
-                                    this.session.armed = false;
-                                    Note::Raw(executed.receipt.blocked)
+                                    let note = execution_note(&executed);
+                                    let transaction_note = executed.applied_not_committed
+                                        || executed.committed
+                                        || executed.implicit_commit
+                                        || executed.transaction_note.as_ref().is_some_and(|note| !note.trim().is_empty());
+                                    match this.session.apply_receipt(executed.receipt) {
+                                        Some(outcome) if outcome.is_success() => {
+                                            // 只有每一条都 Ok 才收起预览：部分成功留着看逐步状态。
+                                            if let Some(dropped_view) = drop_kind {
+                                                this.dropped = Some((this.session.target.clone(), dropped_view));
+                                            } else if let Some(new_name) = renamed_to.filter(|name| !name.is_empty()) {
+                                                let old = this.session.target.clone();
+                                                this.session.target.table = new_name.clone();
+                                                this.session.rename_to.clear();
+                                                this.session.danger_name.clear();
+                                                this.session.section = Section::Columns;
+                                                this.renamed = Some((old, new_name));
+                                                this.reload_after_execute();
+                                            } else if let Some(name) = created_name.filter(|name| !name.is_empty()) {
+                                                let mut created = this.session.target.clone();
+                                                created.table = name;
+                                                this.created = Some(created.clone());
+                                                this.session.mode = StructureMode::Existing;
+                                                this.session.target = created;
+                                                this.session.object_kind = "table".into();
+                                                this.session.table_name.clear();
+                                                this.reload_after_execute();
+                                            } else {
+                                                this.modified = Some((this.session.target.clone(), is_view));
+                                                this.composer_open = false;
+                                                this.reset_composer_drafts();
+                                                this.reload_after_execute();
+                                            }
+                                        }
+                                        // 部分成功：服务器上可能只改了一半，读回真实结构；草稿和已填输入不动。
+                                        Some(outcome) if outcome.rereads_target() => this.reread_after_partial(),
+                                        _ => {}
+                                    }
+                                    if transaction_note {
+                                        this.session.note = note;
+                                    }
                                 }
                                 Err(message) => {
+                                    // 执行链直接报错：逐步回执没有，草稿和已填输入一份都不丢。
                                     this.session.armed = false;
-                                    Note::raw(message)
+                                    this.session.note = Note::raw(message);
                                 }
-                            };
+                            }
                             cx.notify();
                         });
                     }
@@ -1329,9 +1471,12 @@ impl StructurePane {
             self.drafts_ready = true;
             self.session.kept_columns = column_drafts(snapshot);
             self.editing_row = None;
+            self.focused_row = None;
             if self.session.view_sql.is_empty() {
                 self.session.view_sql = snapshot.table_sql.clone();
             }
+            // 分区草稿按读回的实际方案起稿：界面先显示服务器上的现状，用户改的才是改动。
+            self.seed_partition_draft(snapshot);
         }
         let sections = self.session.visible_sections();
         if !sections.contains(&self.session.section) {
@@ -1353,6 +1498,41 @@ impl StructurePane {
         self.ddl_view = None;
         self.ddl_text.clear();
         self.retry_load(cx);
+    }
+
+    /// 分区草稿的起稿值：方式与表达式取读回的分区方案，命名分区按定义顺序填入。
+    /// 读不到分区方案（或读失败）时保留“建立分区方案”的空草稿，不猜现状。
+    fn seed_partition_draft(&mut self, snapshot: &Snapshot) {
+        use crate::ddl::model::{PartitionDef, PartitionDraft};
+        self.session.partition = match snapshot.partitions.as_ref() {
+            Some(current) => PartitionDraft {
+                op: crate::ddl::model::PartitionOp::Replace,
+                method: current.method,
+                expression: if current.method == crate::ddl::model::PartitionMethod::Key {
+                    String::new()
+                } else {
+                    current.expression.clone()
+                },
+                columns: Vec::new(),
+                count: if current.method.named() { String::new() } else { current.definitions.len().to_string() },
+                definitions: current
+                    .definitions
+                    .iter()
+                    .map(|def| PartitionDef { name: def.name.clone(), description: def.description.clone() })
+                    .collect(),
+                targets: Vec::new(),
+            },
+            None => PartitionDraft::default(),
+        };
+        // KEY 分区的读回表达式是反引号包住的列清单，起稿就还原成裸列名：
+        // 加引号是 table_ddl::key_columns 按方言做的事，界面带着引号会把整段再包一层（KEY(```id```)）。
+        // RANGE/LIST/HASH 的表达式不是列清单，原样保留。
+        self.session.partition_columns = match snapshot.partitions.as_ref() {
+            Some(current) if current.method == crate::ddl::model::PartitionMethod::Key => {
+                crate::adapters::mysql::table_read::key_columns_from_expression(&current.expression).join(", ")
+            }
+            _ => String::new(),
+        };
     }
 
     fn reset_composer_drafts(&mut self) {
@@ -1468,10 +1648,50 @@ impl StructurePane {
                 self.write_template_cell(group, index, value);
                 false
             }
+            // ENUM/SET 候选值：key 的低 16 位拆成“字段行 × 值序号”，每个候选值单独一个输入框。
+            9 => {
+                let column = index / Self::ENUM_VALUE_STRIDE;
+                let position = index % Self::ENUM_VALUE_STRIDE;
+                self.edit_column(column, |draft| match draft.enum_set.as_mut().and_then(|state| state.values.get_mut(position)) {
+                    Some(slot) => replace_text(slot, value),
+                    None => false,
+                })
+            }
+            // 生成列表达式：每个字段行一个输入框。
+            10 => self.edit_column(index, |draft| match draft.generated.as_mut() {
+                Some(generated) => replace_text(&mut generated.expression, value),
+                None => false,
+            }),
+            // 分区方案：0/1/2 是表达式、数量、KEY 列清单；10 起是分区定义的名字与边界。
+            11 => self.write_partition_cell(index, value),
             _ => false,
         };
         if changed && key != 6 {
             self.session.cancel();
+        }
+    }
+
+    /// 一个字段行最多容纳的候选值个数（ENUM/SET 的输入框编号按它分段）。
+    const ENUM_VALUE_STRIDE: usize = 64;
+
+    fn write_partition_cell(&mut self, slot: usize, value: String) -> bool {
+        match slot {
+            0 => replace_text(&mut self.session.partition.expression, value),
+            1 => replace_text(&mut self.session.partition.count, value),
+            2 => replace_text(&mut self.session.partition_columns, value),
+            slot if slot >= 10 => {
+                let position = (slot - 10) / 2;
+                let which = (slot - 10) % 2;
+                let Some(def) = self.session.partition.definitions.get_mut(position) else {
+                    return false;
+                };
+                if which == 0 {
+                    replace_text(&mut def.name, value)
+                } else {
+                    replace_text(&mut def.description, value)
+                }
+            }
+            _ => false,
         }
     }
 
@@ -1493,6 +1713,14 @@ impl StructurePane {
         else {
             return;
         };
+        let enum_set = self.snapshot.as_ref().and_then(|snapshot| snapshot.enum_sets.get(&original_name)).map(|state| EnumSetDraft {
+            kind: state.kind,
+            values: state.values.clone(),
+        });
+        let generated = self.snapshot.as_ref().and_then(|snapshot| snapshot.generation.get(&original_name)).map(|state| GeneratedColumnDraft {
+            expression: state.expression.clone(),
+            storage: state.storage,
+        });
         if let Some(draft) = self.session.kept_columns.get_mut(index) {
             draft.name = before.name;
             draft.type_name = before.type_name;
@@ -1501,6 +1729,9 @@ impl StructurePane {
             draft.primary = before.primary;
             draft.auto = before.auto;
             draft.dropped = false;
+            // 还原也要连同专有形态一起还原：否则“还原”之后候选值或表达式还留着上一次的输入。
+            draft.enum_set = enum_set;
+            draft.generated = generated;
             self.session.cancel();
         }
     }
@@ -1589,12 +1820,14 @@ impl StructurePane {
             primary: false,
             auto: false,
             dropped: false,
+            ..ColumnDraft::default()
         });
         self.session.column_name.clear();
         self.only_changed_columns = false;
         if self.session.mode != StructureMode::Create {
             // 已有表：新增的这一行直接进入编辑，并滚到可见处。
             self.editing_row = Some(new_index);
+            self.focused_row = Some(new_index);
             self.scroll_to_column = Some(new_index);
         }
         self.pending_focus_draft = Some(10_000 + new_index as u32);
@@ -1643,6 +1876,7 @@ impl StructurePane {
             self.session.view_sql = snapshot.table_sql.clone();
         }
         self.editing_row = None;
+        self.focused_row = None;
     }
 
     fn sync_auto_index_name(&mut self) {
@@ -2270,6 +2504,15 @@ impl StructurePane {
         self.ddl_text.clear();
     }
 
+    /// 部分成功：只重新读回服务器现状，不重置草稿的起稿状态——用户填的草稿、
+    /// 分区方案和视图定义都还在，能对照逐步回执改了再试。
+    fn reread_after_partial(&mut self) {
+        self.loaded_for.clear();
+        self.snapshot = None;
+        self.ddl_view = None;
+        self.ddl_text.clear();
+    }
+
     pub fn retry_load(&mut self, cx: &mut Context<Self>) {
         let connection = self.session.target.connection_id.clone();
         if !connection.is_empty() && self.services.connections.catalog_session(&connection).is_none() {
@@ -2416,6 +2659,11 @@ impl StructurePane {
         self.session.mode == StructureMode::Create && self.session.section == Section::Columns && !self.draft_issues().is_empty()
     }
 
+    /// 新建表或已有表字段草稿存在阻塞性校验错误时，禁用“预览 SQL”。
+    pub fn preview_blocked(&self) -> bool {
+        self.session.section == Section::Columns && !self.draft_issues().is_empty()
+    }
+
     fn changes_breakdown_text(&self, locale: Locale) -> (usize, String) {
         if self.session.mode == StructureMode::Create {
             return (0, String::new());
@@ -2514,7 +2762,7 @@ impl StructurePane {
         } else {
             kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click)
                 .loading(self.previewing)
-                .disabled(self.create_blocked())
+                .disabled(self.preview_blocked())
                 .tooltip(tip)
                 .into_any_element()
         };
@@ -2975,10 +3223,22 @@ impl StructurePane {
             self.composer_open = false;
             return true;
         }
-        if self.end_edit_row() {
+        self.end_edit_row()
+    }
+
+    pub fn preview_enter(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.session.preview_open() || self.executing {
+            return false;
+        }
+        // 生产环境禁止回车执行，避免误触；吞掉按键不向底层透传。
+        if self.session.production() {
             return true;
         }
-        false
+        if self.session.confirm_blocked() || self.session.preview_sql().join("\n").trim().is_empty() {
+            return true;
+        }
+        self.confirm(cx);
+        true
     }
 
     pub fn trigger_preview_shortcut(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2991,8 +3251,8 @@ impl StructurePane {
 
     fn preview_current(&mut self, cx: &mut Context<Self>) {
         self.session.intent = EditIntent::Apply;
-        if self.create_blocked() {
-            // 新建表草稿有就近标出的问题：不发起预览，也就不能执行。
+        if self.preview_blocked() {
+            // 新建表或已有表字段草稿有就近标出的问题：不发起预览，也就不能执行。
             self.session.note = Note::Key("structure.diag.fixFirst");
             cx.notify();
             return;
@@ -3029,10 +3289,16 @@ impl StructurePane {
         else {
             return ColumnChange::Clean;
         };
+        // ENUM/SET 候选值与生成列定义的变化用计划里的同一份判据，界面与 SQL 不会各说一套。
+        let shape = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| crate::ddl::plan::shape_changed(snapshot, before, column));
         let changed = before.name != column.name
             || !before.type_name.eq_ignore_ascii_case(&column.type_name)
             || before.nullable != column.nullable
-            || existing_default(engine, before.default_sql.as_deref()) != column.default;
+            || existing_default(engine, before.default_sql.as_deref()) != column.default
+            || shape;
         if changed { ColumnChange::Modified } else { ColumnChange::Clean }
     }
 
@@ -3121,6 +3387,7 @@ impl StructurePane {
         let browse_cols = browse::BrowseColumns::of(content_w, self.show_all_columns);
         let hides_columns = !create && (self.show_all_columns || browse::BrowseColumns::hides_any(content_w));
 
+        let mut toolbar_has_presets = false;
         let issues = self.draft_issues();
         if create {
             let name_placeholder = i18n::text(locale, "structure.create.tableNamePlaceholder");
@@ -3178,6 +3445,7 @@ impl StructurePane {
                 |this: &mut Self, field, value, _| this.set_field(field, value),
             );
             let show_toolbar = total_cols >= 5 || !filter_val.is_empty() || self.only_changed_columns || pending > 0 || hides_columns;
+            toolbar_has_presets = show_toolbar && content_w >= 560.;
             if show_toolbar {
                 let clear_entity = entity.clone();
                 let changed_entity = entity.clone();
@@ -3300,8 +3568,21 @@ impl StructurePane {
                     )))
                     .into_any_element();
             }
-            let browser = self.column_browser(visible, browse_cols, window, cx);
-            return editor.flex_1().min_h_0().child(browser).into_any_element();
+            // 正在编辑的那一行下面挂 ENUM/SET 候选值与生成列定义：这两个形态需要多行输入，
+            // 不塞进等高的一行里，免得挤掉整张字段表。
+            let detail = self
+                .editing_row
+                .and_then(|index| self.session.kept_columns.get(index).cloned().map(|column| (index, column)))
+                .and_then(|(index, column)| self.column_special_editor(index, &column, &engine, &p, window, cx));
+            let browser = self.column_browser(visible, browse_cols, !toolbar_has_presets, window, cx);
+            return match detail {
+                Some(panel) => editor
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex().flex_col().flex_1().min_h_0().child(browser).child(panel))
+                    .into_any_element(),
+                None => editor.flex_1().min_h_0().child(browser).into_any_element(),
+            };
         }
 
         let head = div()
@@ -3365,10 +3646,13 @@ impl StructurePane {
         let mut rows = div().flex().flex_col();
         for (index, column, change) in &visible_indices {
             rows = rows.child(stack_frame(|| {
-                self.column_row(*index, column, *change, create, &engine, row_h, widths, &p, &entity, window, cx)
+                self.column_row(*index, column, *change, create, &engine, row_h, widths, None, &p, &entity, window, cx)
             }));
             if let Some(issue) = self.row_issue(&issues, *index, &p) {
                 rows = rows.child(issue);
+            }
+            if let Some(panel) = self.column_special_editor(*index, column, &engine, &p, window, cx) {
+                rows = rows.child(panel);
             }
         }
         let add_entity = entity.clone();
@@ -3429,6 +3713,7 @@ impl StructurePane {
         engine: &str,
         row_h: f32,
         widths: FieldWidths,
+        issue: Option<&str>,
         p: &Palette,
         entity: &Entity<StructurePane>,
         window: &mut Window,
@@ -3471,7 +3756,21 @@ impl StructurePane {
         });
 
         let name = self.draft_input_enter(10_000 + index as u32, &column.name, "name", window, cx);
-        let kind = self.draft_input(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx);
+        // ENUM/SET 的类型写法由候选值生成，不再让人在类型框里手写：这里只显示形态与候选值个数，
+        // 候选值本身在行下面的面板里编辑。
+        let kind: AnyElement = match column.enum_set.as_ref() {
+            Some(state) => div()
+                .id(SharedString::from(format!("structure-col-enum-{index}")))
+                .flex()
+                .items_center()
+                .min_w_0()
+                .truncate()
+                .text_color(p.text_muted)
+                .tooltip_text(t("structure.enumTypePreview"))
+                .child(SharedString::from(format!("{} · {}", state.kind.keyword(), state.values.len())))
+                .into_any_element(),
+            None => self.draft_input_enter(20_000 + index as u32, &column.type_name, default_column_type(engine), window, cx),
+        };
         // 已有字段的注释本轮只读（修改注释不在需求内）：编辑行里仍以文本显示，悬停看全文。
         let comment_input = (widths.comment > 0.).then(|| {
             if create {
@@ -3492,6 +3791,7 @@ impl StructurePane {
 
         let type_entity = entity.clone();
         let type_locked = orig_primary || orig_generated;
+        let generated_flag = column.generated.is_some();
         let menu_engine = engine.to_owned();
         let current_type = column.type_name.clone();
         let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
@@ -3508,13 +3808,33 @@ impl StructurePane {
             })
             .dropdown_menu(move |menu, _, _| {
                 let entity = type_entity.clone();
-                create::type_menu(menu, &menu_engine, &current_type, locale, move |choice, cx| {
-                    entity.update(cx, |pane, cx| {
+                let pick_entity = entity.clone();
+                let mut menu = create::type_menu(menu, &menu_engine, &current_type, locale, move |choice, cx| {
+                    pick_entity.update(cx, |pane, cx| {
                         pane.write_draft(20_000 + index as u32, choice);
                         pane.pending_focus_draft = Some(20_000 + index as u32);
                         cx.notify();
                     });
-                })
+                });
+                // ENUM/SET 与生成列不在“常用类型”里：选中后这一行下面出现候选值或表达式面板。
+                menu = menu.separator().label(i18n::text(locale, "structure.type.proprietary"));
+                for (key, kind) in [("structure.type.enum", EnumSetKind::Enum), ("structure.type.set", EnumSetKind::Set)] {
+                    let owner = entity.clone();
+                    menu = menu.item(PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                        owner.update(cx, |pane, cx| {
+                            pane.set_enum_set_kind(index, kind);
+                            cx.notify();
+                        });
+                    }));
+                }
+                let owner = entity.clone();
+                let label = if generated_flag { "structure.type.generatedOff" } else { "structure.type.generated" };
+                menu.item(PopupMenuItem::new(i18n::text(locale, label)).on_click(move |_, _, cx| {
+                    owner.update(cx, |pane, cx| {
+                        pane.toggle_generated(index);
+                        cx.notify();
+                    });
+                }))
             });
 
         let default_enabled = !orig_generated && !(create && column.auto) && change != ColumnChange::Dropped;
@@ -3601,7 +3921,9 @@ impl StructurePane {
 
         let row_menu_entries = self.column_menu_entries(index, column, change, create);
 
-        let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if column.primary {
+        let slot_icon: Option<(IconName, gpui_kit::Hsla, String)> = if let Some(issue) = issue {
+            Some((IconName::TriangleAlert, p.danger, issue.to_owned()))
+        } else if column.primary {
             let mut tip = i18n::text(locale, "structure.field.primary");
             if orig_auto || (create && column.auto) {
                 tip = format!("{tip} · {}", i18n::text(locale, "structure.field.auto"));
@@ -3671,6 +3993,7 @@ impl StructurePane {
                                 this.child(
                                     div()
                                         .id(SharedString::from(format!("structure-col-mark-{index}")))
+                                        .test_support()
                                         .tooltip_text(SharedString::from(tip))
                                         .child(kit::icon(ic, 12., color)),
                                 )
@@ -4365,6 +4688,7 @@ impl StructurePane {
                 }
                 form
             }),
+            Section::Partitions => div().child(self.partition_form(window, cx)),
             Section::Danger => stack_frame(|| {
                 let mut form = form;
                 let view = self.session.object_kind == "view";
@@ -4496,11 +4820,19 @@ impl Render for StructurePane {
                 }
             }
         }
+        if std::mem::take(&mut self.pending_focus_pane) {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
         let p = Palette::of(cx);
         let metrics = kit::Metrics::of(cx);
         let section = self.session.section;
         let entity = cx.entity();
-        let preview = self.render_preview_dialog(&entity, &p, metrics, section, window, cx);
+        let preview = if self.shell_overlay_host {
+            None
+        } else {
+            self.render_preview_dialog(&entity, &p, metrics, section, window, cx)
+        };
         self.render_page(form, preview, window, cx)
     }
 }
@@ -4525,7 +4857,16 @@ impl StructurePane {
             (snapshot.columns.len(), snapshot.indexes.len(), snapshot.foreign_keys.len())
         });
         let pending_cols = self.pending_changes();
-        let mut tabs = div().id("structure-tabs").role(gpui_kit::Role::TabList).flex().items_end().gap(px(4.));
+        let mut tabs = div()
+            .id("structure-tabs")
+            .test_support()
+            .role(gpui_kit::Role::TabList)
+            .w_full()
+            // 滚动条例外：页签栏单行横向滚动，不占高度绘制滚动条。
+            .overflow_x_scroll()
+            .flex()
+            .items_end()
+            .gap(px(kit::Space::XS));
         for value in self.session.visible_sections() {
             if value == Section::Danger && section != Section::Danger {
                 continue;
@@ -4534,6 +4875,7 @@ impl StructurePane {
                 Section::Columns => "structure.section.columns",
                 Section::Indexes => "structure.section.indexes",
                 Section::ForeignKeys => "structure.section.foreign",
+                Section::Partitions => "structure.section.partitions",
                 Section::View => "structure.section.viewDef",
                 Section::Ddl => "structure.section.ddl",
                 Section::Danger => "structure.section.danger",
@@ -4554,6 +4896,8 @@ impl StructurePane {
                     .role(gpui_kit::Role::Tab)
                     .aria_label(t(key))
                     .aria_selected(selected)
+                    .flex_none()
+                    .whitespace_nowrap()
                     .h(px(metrics.tabs_h))
                     .px(px(10.))
                     .flex()
@@ -4615,6 +4959,9 @@ impl StructurePane {
                 .join(".")
         };
 
+        let effective_w = if self.content_width > 0. { self.content_width } else { f32::from(window.viewport_size().width) };
+        let compact_header = effective_w > 0. && effective_w < 680.;
+
         let more = (self.session.mode != StructureMode::Create && self.session.visible_sections().contains(&Section::Danger)).then(|| {
             let owner = entity.clone();
             let view = self.session.object_kind == "view";
@@ -4622,12 +4969,16 @@ impl StructurePane {
             let target_for_menu = self.session.target.clone();
             let qualified_for_menu = qualified.clone();
             let ddl_for_menu = self.snapshot.as_ref().map(|snap| definition_text(snap).0).unwrap_or_default();
-            Button::new("structure-more")
+            let btn = Button::new("structure-more")
                 .ghost()
                 .small()
-                .icon(IconName::Ellipsis)
-                .label(t("structure.action.more"))
-                .dropdown_menu(move |mut menu, _, cx| {
+                .icon(IconName::Ellipsis);
+            let btn = if compact_header {
+                btn.tooltip(t("structure.action.more"))
+            } else {
+                btn.label(t("structure.action.more"))
+            };
+            btn.dropdown_menu(move |mut menu, _, cx| {
                     let pal = Palette::of(cx);
                     menu = menu.min_w(px(200.));
                     if let (Some(sink), Some(sql)) = (query_sink.clone(), select_sample_sql(&target_for_menu)) {
@@ -4814,12 +5165,32 @@ impl StructurePane {
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
+                if key == "escape" && this.handle_escape() {
+                    let handle = this.focus_handle(cx);
+                    window.focus(&handle, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if key == "enter"
+                    && this.session.preview_open()
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.shift
+                {
+                    if this.preview_enter(cx) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
                 if this.handle_create_key(event, window, cx) {
                     cx.stop_propagation();
                     cx.notify();
                     return;
                 }
-                if key == "escape" && this.handle_escape() {
+                if this.handle_browse_key(event, window, cx) {
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -4851,16 +5222,24 @@ impl StructurePane {
                             .items_center()
                             .gap(px(10.))
                             .child(kit::engine_badge(&self.session.target.engine, 28.))
-                            .child(div().flex_1().min_w(px(120.)).flex().flex_col().child(title_row).child(banner_row))
+                            .child(div().flex_1().min_w_0().flex().flex_col().child(title_row).child(banner_row))
                             .children(refresh_btn)
                             .when_some(
                                 self.data_sink
                                     .clone()
                                     .filter(|_| self.session.mode != StructureMode::Create && !self.session.target.table.is_empty()),
                                 |this, sink| {
-                                    this.child(kit::secondary_button("structure-open-data", Some(IconName::Table), t("ui.table.switchData"), move |_, _, cx| {
-                                        sink(cx);
-                                    }))
+                                    if compact_header {
+                                        this.child(
+                                            kit::icon_button("structure-open-data", IconName::Table, t("ui.table.switchData"), move |_, _, cx| {
+                                                sink(cx);
+                                            }),
+                                        )
+                                    } else {
+                                        this.child(kit::secondary_button("structure-open-data", Some(IconName::Table), t("ui.table.switchData"), move |_, _, cx| {
+                                            sink(cx);
+                                        }))
+                                    }
                                 },
                             )
                             .children(more),
@@ -4899,8 +5278,10 @@ impl StructurePane {
             }
             let ddl_direct = section == Section::Ddl && form.is_some() && self.has_definition();
             let danger_direct = section == Section::Danger && form.is_some() && !self.loading && self.load_error.is_empty();
+            // 分区方案是一张表单，不需要先铺一张定义卡：直接给表单，读回来的现状写在表单顶部。
+            let partitions_direct = section == Section::Partitions && form.is_some() && !self.loading && self.load_error.is_empty();
             let mut form = form;
-            if ddl_direct || danger_direct {
+            if ddl_direct || danger_direct || partitions_direct {
                 if let Some(form) = form.take() {
                     body = body.child(div().id("structure-composer").test_support().child(form));
                 }
@@ -4916,6 +5297,7 @@ impl StructurePane {
                     Section::Indexes => t("structure.index.new"),
                     Section::ForeignKeys => t("structure.fk.new"),
                     Section::Danger => t("structure.section.danger"),
+                    Section::Partitions => t("structure.section.partitions"),
                     _ => t("structure.section.definition"),
                 };
                 body = body.child(
@@ -4945,6 +5327,10 @@ impl StructurePane {
                     .text_size(px(TypeScale::SM))
                     .child(SharedString::from(self.session.note())),
             );
+        }
+        // 逐步回执：成功、部分成功、被拦下都逐条列出 label、SQL、状态与原始 message。
+        if let Some(receipt) = self.session.receipt() {
+            body = body.child(receipt::panel("structure", receipt, &p, self.session.locale));
         }
         let body = if virtual_columns {
             div()
@@ -4977,8 +5363,10 @@ impl StructurePane {
         if let Some(preview) = preview {
             column = column.child(preview);
         }
-        if let Some(manager) = self.render_template_manager(&entity, &p, metrics, window, cx) {
-            column = column.child(manager);
+        if !self.shell_overlay_host {
+            if let Some(manager) = self.render_template_manager(&entity, &p, metrics, window, cx) {
+                column = column.child(manager);
+            }
         }
         column
     }
@@ -4996,8 +5384,10 @@ impl StructurePane {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.session.preview_open() {
+            self.preview_focused = false;
             return None;
         }
+        let preview_focus = self.preview_focus_handle(cx);
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let dangerous = self.session.preview_dangerous();
@@ -5029,7 +5419,8 @@ impl StructurePane {
         let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
         let cancel_label = t("structure.action.cancel");
         let typed_hint = (section == Section::Danger && self.session.production() && confirm_blocked).then(|| t("structure.danger.typeHint"));
-        let danger_field = if section == Section::Danger && self.session.production() {
+        let prod_danger_input = section == Section::Danger && self.session.production();
+        let danger_field = if prod_danger_input {
             Some(kit::form_row(
                 t("structure.danger.typeName"),
                 self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
@@ -5038,6 +5429,14 @@ impl StructurePane {
         } else {
             None
         };
+        if !self.preview_focused {
+            self.preview_focused = true;
+            if prod_danger_input && self.draft_fields.contains(6) {
+                self.draft_fields.focus(6, window, cx);
+            } else {
+                window.focus(&preview_focus, cx);
+            }
+        }
         let confirm = {
             let entity = entity.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
@@ -5048,6 +5447,7 @@ impl StructurePane {
                 entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 })
@@ -5059,12 +5459,14 @@ impl StructurePane {
                 entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 })
             }
         };
         let scrim_entity = entity.clone();
+        let key_entity = entity.clone();
         let copy_entity = entity.clone();
         let copy_sql_text = sql_raw.clone();
         let copied = self.preview_copied;
@@ -5075,6 +5477,7 @@ impl StructurePane {
 
         let dialog = div()
             .id("structure-preview-scrim")
+            .test_support()
             .absolute()
             .inset_0()
             .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
@@ -5085,6 +5488,7 @@ impl StructurePane {
                 scrim_entity.update(cx, |pane, cx| {
                     if !pane.executing {
                         pane.session.cancel();
+                        pane.pending_focus_pane = true;
                         cx.notify();
                     }
                 });
@@ -5096,7 +5500,45 @@ impl StructurePane {
                     .role(gpui_kit::Role::Dialog)
                     .aria_label(preview_title.clone())
                     .occlude()
+                    .track_focus(&preview_focus)
+                    .focus_trap("structure-preview-dialog", &preview_focus)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let key = event.keystroke.key.as_str();
+                        if key == "escape" {
+                            let closed = key_entity.update(cx, |pane, cx| {
+                                if pane.handle_escape() {
+                                    let handle = pane.focus_handle(cx);
+                                    window.focus(&handle, cx);
+                                    cx.notify();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if closed {
+                                cx.stop_propagation();
+                            }
+                            return;
+                        }
+                        if key == "enter"
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.platform
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.shift
+                        {
+                            let handled = key_entity.update(cx, |pane, cx| {
+                                let ok = pane.preview_enter(cx);
+                                if ok {
+                                    cx.notify();
+                                }
+                                ok
+                            });
+                            if handled {
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
                     .w(px(640.))
                     .max_w(relative(0.92))
                     .max_h(relative(0.92))
@@ -5269,6 +5711,10 @@ impl StructurePane {
                                     this.child(kit::muted(SharedString::from(note_text), p))
                                 }
                             })
+                            // 部分成功时预览不收起：逐步回执就显示在这张卡片里，一眼看清哪一步没过。
+                            .when_some(self.session.receipt(), |this, receipt| {
+                                this.child(receipt::panel("structure-dialog", receipt, p, locale))
+                            })
                             .when_some(danger_field, |this, field| this.child(field))
                             .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
                     )
@@ -5304,6 +5750,8 @@ impl StructurePane {
 
 mod browse;
 mod create;
+pub(crate) mod receipt;
+mod special;
 
 #[cfg(test)]
 mod tests;

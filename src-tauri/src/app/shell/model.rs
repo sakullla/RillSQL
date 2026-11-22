@@ -26,7 +26,7 @@ use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 use crate::transaction::{TransactionEffect, TransactionState};
 
-use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
+use super::close::{draft_pending_with_saved, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
 use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl};
 use super::explorer::{focus_rows, ExplorerItem, ExplorerRow};
 use super::layout::{
@@ -144,7 +144,11 @@ pub struct WorkItem {
     pub path: Option<String>,
     pub draft: String,
     pub last_executed_sql: Option<String>,
+    /// 通过 Mod+S 或另存为已落盘的 SQL 基线，用于清掉未保存脏点并避免关闭误报；不覆盖 last_executed_sql 语义。
+    pub saved_sql: Option<String>,
     pub uncommitted_cells: bool,
+    /// 表结构工作项是否有尚未应用的 DDL 变更。
+    pub structure_dirty: bool,
     pub cell_note: String,
     pub running: bool,
     pub connection_id: Option<String>,
@@ -166,7 +170,9 @@ impl WorkItem {
             path: None,
             draft,
             last_executed_sql: None,
+            saved_sql: None,
             uncommitted_cells: false,
+            structure_dirty: false,
             cell_note: String::new(),
             running: false,
             connection_id: None,
@@ -175,6 +181,15 @@ impl WorkItem {
             engine: None,
             pinned: false,
         }
+    }
+
+    pub fn is_draft_dirty(&self) -> bool {
+        draft_pending_with_saved(
+            self.kind.as_str(),
+            &self.draft,
+            self.last_executed_sql.as_deref(),
+            self.saved_sql.as_deref(),
+        )
     }
 }
 
@@ -215,6 +230,7 @@ pub enum DraftField {
     /// 对象概览的关键字过滤（名称或注释）。
     OverviewFilter,
     BundlePassphrase,
+    ImportProfile(usize, super::conn_import::ImportField),
     /// 危险操作确认层：生产环境要求输入的对象名。
     DangerConfirm,
     /// 危险操作确认层：重命名的新名字。
@@ -276,6 +292,16 @@ impl PaletteScope {
             _ => None,
         }
     }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 /// 标签管理对话框：列出全部标签；editing 是正在新建（id 为空）或编辑的那一个。
@@ -332,6 +358,8 @@ pub enum PendingJob {
     Disconnect,
     ExportConnections,
     ImportConnections,
+    ReadProfiles(super::conn_import::ProfileFormat, std::path::PathBuf),
+    SaveProfiles(Box<super::conn_import::ImportPreview>),
     RefreshHistory,
     SaveNamed,
     ClearHistory,
@@ -446,6 +474,8 @@ pub struct WorkbenchModel {
     pub export_path: Option<String>,
     pub import_path: Option<String>,
     pub bundle_passphrase: String,
+    pub(super) bundle_unlock: Option<&'static str>,
+    pub(super) profile_import: super::conn_import::ImportState,
     pub import_notes: Vec<String>,
     pub grid_writable: bool,
     /// 打开网格菜单那一刻从活动网格读到的现场事实。
@@ -506,6 +536,8 @@ pub struct WorkbenchModel {
     pub preview_tab: Option<String>,
     /// 正在就地重命名的查询标签：(标签 id, 输入中的标题)。
     pub tab_rename: Option<(String, String)>,
+    /// 右键打开标签上下文菜单时的目标标签 id；不强制切走当前激活页。
+    pub tab_menu_target: Option<String>,
     /// 用户改过名的查询标签：不再按「查询 n」自动编号；会话里用 `titleKey = custom` 记下。
     pub renamed_tabs: std::collections::BTreeSet<String>,
     /// 每个概览标签（按范围规格）的读取结果、过滤、排序与选择。
@@ -635,6 +667,8 @@ impl WorkbenchModel {
             export_path: None,
             import_path: None,
             bundle_passphrase: String::new(),
+            bundle_unlock: None,
+            profile_import: super::conn_import::ImportState::Idle,
             import_notes: Vec::new(),
             grid_writable: false,
             grid_menu: super::menus::GridMenuFacts::default(),
@@ -668,6 +702,7 @@ impl WorkbenchModel {
             overview_spec: None,
             preview_tab: None,
             tab_rename: None,
+            tab_menu_target: None,
             renamed_tabs: std::collections::BTreeSet::new(),
             overviews: std::collections::BTreeMap::new(),
             redis_running: false,
@@ -782,6 +817,9 @@ impl WorkbenchModel {
         if self.transaction_guard.is_some() && !id.starts_with("tx-guard-") {
             return Some(Effect::None);
         }
+        if id.starts_with("profile-import-") && self.profile_import_action(id) {
+            return Some(Effect::None);
+        }
         let page_before = self.shell.page;
         if let Some(effect) = self.shell.dispatch(id) {
             self.after_shell(id, page_before);
@@ -826,9 +864,24 @@ impl WorkbenchModel {
             "open-exchange" => {
                 self.exchange_open = !self.exchange_open;
             }
-            "close-tab" => self.request_close_active(),
+            "close-tab" => {
+                if let Some(target) = self.tab_menu_target.take() {
+                    self.request_close_tab(&target);
+                } else {
+                    self.request_close_active();
+                }
+            }
             "next-tab" => self.cycle_item(1),
             "prev-tab" => self.cycle_item(-1),
+            id if id.starts_with("select-tab-") => {
+                if let Some(n) = id["select-tab-".len()..].parse::<usize>().ok().filter(|n| (1..=9).contains(n)) {
+                    let _ = self.select_tab_index(n - 1);
+                }
+            }
+            "explorer-search" => {
+                self.shell.sidebar_open = true;
+                self.shell.focus = FocusTarget::Sidebar;
+            }
             "execute-query" | "run-current" | "run-selection" => self.executions += 1,
             "command-palette" | "quick-open" => {
                 self.palette_query.clear();
@@ -1174,6 +1227,17 @@ impl WorkbenchModel {
                     self.notice_key = Some("connections.page.exportButton");
                 }
             }
+            "conn-unlock-import" => {
+                if self.bundle_unlock.is_some() && self.import_path.is_some() && !self.bundle_passphrase.trim().is_empty() {
+                    self.bundle_unlock = None;
+                    self.enqueue(PendingJob::ImportConnections);
+                }
+            }
+            "conn-cancel-unlock" => {
+                self.bundle_unlock = None;
+                self.import_path = None;
+                self.bundle_passphrase.clear();
+            }
             "conn-import" => {
                 if self.import_path.is_some() {
                     self.enqueue(PendingJob::ImportConnections);
@@ -1395,13 +1459,32 @@ impl WorkbenchModel {
                 self.copied = id.to_owned();
                 self.shell.focus = FocusTarget::Grid;
             }
-            "tab-close-others" => self.close_others(),
-            "tab-close-right" => self.close_right(),
-            "tab-close-all" => self.request_close_all(),
-            "tab-close-unmodified" => self.close_unmodified(),
-            "tab-pin" => self.toggle_pin_active(),
+            "tab-close-others" => {
+                let target = self.tab_menu_target.take().or_else(|| self.active_tab.clone());
+                self.close_others_of(target);
+            }
+            "tab-close-right" => {
+                let target = self.tab_menu_target.take().or_else(|| self.active_tab.clone());
+                self.close_right_of(target);
+            }
+            "tab-close-all" => {
+                self.tab_menu_target = None;
+                self.request_close_all();
+            }
+            "tab-close-unmodified" => {
+                self.tab_menu_target = None;
+                self.close_unmodified();
+            }
+            "tab-pin" => {
+                let target = self.tab_menu_target.take().or_else(|| self.active_tab.clone());
+                if let Some(id) = target {
+                    let pinned = !self.is_pinned(&id);
+                    self.set_pinned(&id, pinned);
+                }
+            }
             "tab-rename" => {
-                let _ = self.begin_tab_rename();
+                let target = self.tab_menu_target.take().or_else(|| self.active_tab.clone());
+                let _ = self.begin_tab_rename_for(target.as_deref());
             }
             "tab-rename-confirm" => {
                 let _ = self.confirm_tab_rename();
@@ -1714,6 +1797,46 @@ impl WorkbenchModel {
         if !self.pending.iter().any(|job| matches!(job, PendingJob::RefreshHistory)) {
             self.enqueue(PendingJob::RefreshHistory);
         }
+    }
+
+    pub(super) fn queue_profile_preview(&mut self, format: super::conn_import::ProfileFormat, path: std::path::PathBuf) {
+        self.profile_import = super::conn_import::ImportState::Loading;
+        self.enqueue(PendingJob::ReadProfiles(format, path));
+    }
+
+    fn profile_import_action(&mut self, id: &str) -> bool {
+        use super::conn_import::ImportState;
+        match id {
+            "profile-import-close" => {
+                if !matches!(self.profile_import, ImportState::Saving | ImportState::Picking) {
+                    self.profile_import = ImportState::Idle;
+                }
+            }
+            "profile-import-confirm" => {
+                if matches!(self.profile_import, ImportState::Preview(_)) {
+                    let ImportState::Preview(preview) = std::mem::replace(&mut self.profile_import, ImportState::Saving) else {
+                        unreachable!("profile preview just checked")
+                    };
+                    self.enqueue(PendingJob::SaveProfiles(Box::new(preview)));
+                }
+            }
+            action => {
+                let Some((command, index)) = action.split_once(':') else { return false; };
+                let Ok(index) = index.parse::<usize>() else { return false; };
+                if let ImportState::Preview(preview) = &mut self.profile_import {
+                    if let Some(row) = preview.rows.get_mut(index) {
+                        match command {
+                            "profile-import-toggle" if row.eligible() => row.checked = !row.checked,
+                            "profile-import-edit" if row.draft.is_some() && row.source.blockers.is_empty() => {
+                                preview.editing = (preview.editing != Some(index)).then_some(index);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub(super) fn enqueue(&mut self, job: PendingJob) {
@@ -2302,9 +2425,15 @@ impl WorkbenchModel {
     }
 
     pub fn open_tab_menu(&mut self) {
+        let target = self.active_tab.clone();
+        self.tab_menu_target = target.clone();
+        self.open_tab_menu_for_target(target.as_deref());
+    }
+
+    fn open_tab_menu_for_target(&mut self, target: Option<&str>) {
         self.open_menu(MenuPlace::TabBar, MenuTarget::QueryTab);
         let facts = super::menus::TabMenuFacts {
-            pinned: self.active_tab.as_deref().is_some_and(|id| self.is_pinned(id)),
+            pinned: target.is_some_and(|id| self.is_pinned(id)),
             unmodified: self.unmodified_tabs().len(),
         };
         if let Some(menu) = self.menu.as_mut() {
@@ -2312,12 +2441,13 @@ impl WorkbenchModel {
         }
     }
 
-    /// 标签右键：先激活目标项，再打开菜单；视图、目标与菜单基准保持一致。
+    /// 标签右键：不切换当前激活标签，记录右键目标并打开针对该标签的上下文菜单。
     pub fn tab_menu_for(&mut self, id: &str) -> bool {
-        if !self.activate_item(id) {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
             return false;
         }
-        self.open_tab_menu();
+        self.tab_menu_target = Some(id.to_owned());
+        self.open_tab_menu_for_target(Some(id));
         true
     }
 
@@ -2340,6 +2470,7 @@ impl WorkbenchModel {
     /// 只关右键菜单（滚动、切换标签、窗口失焦、右键点遮罩）：焦点回到打开菜单前的位置，其它浮层不动。
     pub fn close_menu(&mut self) -> bool {
         self.nav_menu_node = None;
+        self.tab_menu_target = None;
         if self.menu.take().is_some() {
             self.shell.focus = self.menu_return;
             return true;
@@ -2361,6 +2492,7 @@ impl WorkbenchModel {
         self.conn_filter_menu = None;
         // 菜单关掉就不再持着右键的那一行，之后的动作回到键盘焦点或当前工作项。
         self.nav_menu_node = None;
+        self.tab_menu_target = None;
         if self.menu.take().is_some() {
             self.shell.focus = self.menu_return;
             return Effect::None;
@@ -3670,6 +3802,27 @@ impl WorkbenchModel {
         items
     }
 
+    /// 过滤对象树时，因未连接或目录尚未加载而被跳过的连接数。
+    pub fn nav_search_skipped_count(&self) -> usize {
+        if !self.nav_searching() {
+            return 0;
+        }
+        self.connections
+            .rows
+            .iter()
+            .filter(|row| {
+                let id = row.saved.id.as_str();
+                let connected = self.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected) == LinkStatus::Connected;
+                if !connected {
+                    return true;
+                }
+                let node_id = crate::catalog::hierarchy::connection_node_id(id);
+                let has_children = self.nav.node(&node_id).is_some_and(|node| !node.children.is_empty());
+                !has_children && self.nav_rows_for(id).is_empty()
+            })
+            .count()
+    }
+
     /// 一条连接在资源管理器里的行（连接行 + 可选错误行 + 树行）。
     /// 返回（行, 是否有筛选命中, 是否被筛选整条隐藏）。
     fn connection_rows(&self, id: &str) -> (Vec<ExplorerItem>, bool, bool) {
@@ -3807,6 +3960,18 @@ impl WorkbenchModel {
                 command.or_else(|| Some(format!("nav-focus:{id}")))
             }
         }
+    }
+
+    /// Shift+Enter：当对象树键盘焦点停在表或视图节点时，直接打开表结构。
+    pub fn explorer_open_structure(&mut self) -> Option<String> {
+        let ExplorerRow::Node(id) = self.explorer_current_row()? else { return None };
+        let node = self.nav.node(&id)?;
+        let object = node.object()?;
+        if !object.opens_data() {
+            return None;
+        }
+        self.sync_object_spec_from_focus();
+        Some(format!("nav-open-structure:{id}"))
     }
 
     /// 左右键：分组折叠/展开，连接展开/收起，树节点沿用展开与回到父节点。
@@ -5017,7 +5182,7 @@ impl WorkbenchModel {
     pub fn facts(&self) -> CloseFacts {
         let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.redis_running || self.mongo_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
-        let draft = self.tabs.iter().any(|tab| draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()));
+        let draft = self.tabs.iter().any(WorkItem::is_draft_dirty);
         CloseFacts { running, uncommitted, draft }
     }
 
@@ -5028,7 +5193,7 @@ impl WorkbenchModel {
         CloseFacts {
             running: tab.running,
             uncommitted: tab.uncommitted_cells,
-            draft: draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()),
+            draft: tab.is_draft_dirty(),
         }
     }
 
@@ -5242,17 +5407,38 @@ impl WorkbenchModel {
     }
 
     // 批量关闭都跳过固定标签：固定就是“别被顺手关掉”。单个关闭（× 按钮、中键、Ctrl+W）不受影响。
-    fn close_others(&mut self) {
-        let Some(id) = self.active_tab.clone() else { return };
+    fn close_others_of(&mut self, target: Option<String>) {
+        let Some(id) = target else { return };
         let others: Vec<String> = self.tabs.iter().filter(|tab| tab.id != id && !tab.pinned).map(|tab| tab.id.clone()).collect();
         self.close_sequence(others);
     }
 
-    fn close_right(&mut self) {
-        let Some(id) = self.active_tab.clone() else { return };
+    fn close_right_of(&mut self, target: Option<String>) {
+        let Some(id) = target else { return };
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
         let right: Vec<String> = self.tabs.iter().skip(index + 1).filter(|tab| !tab.pinned).map(|tab| tab.id.clone()).collect();
         self.close_sequence(right);
+    }
+
+    /// 拖拽重排标签顺序：固定标签只在固定区内移动，普通标签只在普通区内移动，避免破坏固定区边界。
+    pub fn reorder_tab(&mut self, from_id: &str, to_id: &str) -> bool {
+        if from_id == to_id {
+            return false;
+        }
+        let Some(from_index) = self.tabs.iter().position(|tab| tab.id == from_id) else { return false };
+        let Some(to_index) = self.tabs.iter().position(|tab| tab.id == to_id) else { return false };
+        if self.tabs[from_index].pinned != self.tabs[to_index].pinned {
+            return false;
+        }
+        let tab = self.tabs.remove(from_index);
+        self.tabs.insert(to_index, tab);
+        true
+    }
+
+    /// Alt+1..9 按从左到右序号切换标签；越界或无标签时静默忽略。
+    pub fn select_tab_index(&mut self, index: usize) -> bool {
+        let Some(id) = self.tabs.get(index).map(|tab| tab.id.clone()) else { return false };
+        self.activate_item(&id)
     }
 
     fn request_close_all(&mut self) {
@@ -5278,12 +5464,6 @@ impl WorkbenchModel {
 
     pub fn is_pinned(&self, id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.id == id && tab.pinned)
-    }
-
-    fn toggle_pin_active(&mut self) {
-        let Some(id) = self.active_tab.clone() else { return };
-        let pinned = !self.is_pinned(&id);
-        self.set_pinned(&id, pinned);
     }
 
     /// 固定或取消固定。固定标签排在最左侧（固定区内保持固定的先后），取消固定的放在固定区之后的第一个。
@@ -5391,7 +5571,9 @@ impl WorkbenchModel {
             path: None,
             draft: String::new(),
             last_executed_sql: None,
+            saved_sql: None,
             uncommitted_cells: false,
+            structure_dirty: false,
             cell_note: String::new(),
             running: false,
             connection_id,
@@ -5564,7 +5746,13 @@ impl WorkbenchModel {
     }
 
     fn copy_selected_sql(&mut self) {
-        let sql = if self.shell.page == AppPage::History && self.history.multi_selected() {
+        let sql = if let Some(target_id) = self.tab_menu_target.take() {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == target_id)
+                .map(|tab| tab.draft.clone())
+                .unwrap_or_default()
+        } else if self.shell.page == AppPage::History && self.history.multi_selected() {
             // 多选时 ⌘C / 复制得到含表头的 TSV（SQL 在第一列，其余为连接、库、状态、时间等）。
             self.history.copy_text(|key| self.text(key), None).unwrap_or_default()
         } else if self.history.section == HistorySection::Saved {
@@ -5608,7 +5796,7 @@ impl WorkbenchModel {
 
     fn focus_status_target(&mut self) {
         let on_query = self.shell.page == AppPage::Workspace && self.tool == WorkTool::Query;
-        if on_query && !self.connections.rows.is_empty() {
+        if on_query {
             self.shell.focus = FocusTarget::Editor;
             return;
         }
@@ -5909,7 +6097,13 @@ impl WorkbenchModel {
 
     /// 双击查询标签：就地重命名当前查询标签。其他种类的标签标题来自目标，不能改。
     pub fn begin_tab_rename(&mut self) -> bool {
-        let Some(tab) = self.active_tab().filter(|tab| tab.kind.is_query()) else { return false };
+        let active = self.active_tab.clone();
+        self.begin_tab_rename_for(active.as_deref())
+    }
+
+    pub fn begin_tab_rename_for(&mut self, target: Option<&str>) -> bool {
+        let Some(id) = target else { return false };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id && tab.kind.is_query()) else { return false };
         self.tab_rename = Some((tab.id.clone(), tab.title.clone()));
         self.focused_field = Some(DraftField::TabTitle);
         true
@@ -6071,6 +6265,16 @@ impl WorkbenchModel {
                 self.conn_touched();
             }
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
+            DraftField::ImportProfile(index, field) => {
+                if let super::conn_import::ImportState::Preview(preview) = &mut self.profile_import {
+                    if preview.editing == Some(index) {
+                        if let Some(draft) = preview.rows.get_mut(index).and_then(|row| row.draft.as_mut()) {
+                            field.set(draft, value);
+                            preview.refresh();
+                        }
+                    }
+                }
+            }
             DraftField::Url => {
                 // 一次多出好几个字符基本就是粘贴：能完整解析就直接填好下面的字段，省掉再点“解析”。
                 // 逐字输入时不解析，半截地址不会把已经填好的字段冲掉。
@@ -6186,6 +6390,11 @@ impl WorkbenchModel {
             DraftField::SshPassword => self.connections.secrets.ssh_password.clone(),
             DraftField::Passphrase => self.connections.secrets.ssh_passphrase.clone(),
             DraftField::BundlePassphrase => self.bundle_passphrase.clone(),
+            DraftField::ImportProfile(index, field) => match &self.profile_import {
+                super::conn_import::ImportState::Preview(preview) => preview.rows.get(index)
+                    .and_then(|row| row.draft.as_ref()).map(|draft| field.get(draft).to_owned()).unwrap_or_default(),
+                _ => String::new(),
+            },
             DraftField::Url => self.url_buffer.clone(),
             DraftField::Filter => self.connections.filter_text.clone(),
             DraftField::ObjectFilter => self.object_filter.clone(),
@@ -6499,7 +6708,9 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
         path: tab.path.clone(),
         draft: tab.draft.clone(),
         last_executed_sql: tab.last_executed_sql.clone(),
+        saved_sql: None,
         uncommitted_cells: false,
+        structure_dirty: false,
         cell_note: String::new(),
         running: false,
         connection_id: tab.connection_id.clone(),
@@ -6716,7 +6927,12 @@ fn filter_palette(entries: Vec<PaletteEntry>, query: &str, scope: PaletteScope) 
         let score = if query.is_empty() { 1 } else { palette_score(&entry, query) };
         (score > 0).then_some((palette_group_rank(entry.group), std::cmp::Reverse(score), index, entry))
     }).collect();
-    scored.sort_unstable_by_key(|(group, score, index, _)| (*group, *score, *index));
+    if query.is_empty() {
+        scored.sort_unstable_by_key(|(group, score, index, _)| (*group, *score, *index));
+    } else {
+        // 有查询词时匹配度优先于分组顺序，避免高匹配项被压在低匹配分组之后。
+        scored.sort_unstable_by_key(|(group, score, index, _)| (*score, *group, *index));
+    }
     scored.into_iter().map(|(_, _, _, entry)| entry).collect()
 }
 
@@ -6731,7 +6947,13 @@ fn palette_score(entry: &PaletteEntry, query: &str) -> u8 {
 
 fn match_score(text: &str, query: &str) -> u8 {
     let haystack = text.to_lowercase();
+    if haystack == query {
+        return 5;
+    }
     if haystack.starts_with(query) {
+        return 4;
+    }
+    if has_word_boundary_match(&haystack, query) {
         return 3;
     }
     if haystack.contains(query) {
@@ -6743,6 +6965,20 @@ fn match_score(text: &str, query: &str) -> u8 {
         at += found + ch.len_utf8();
     }
     1
+}
+
+fn has_word_boundary_match(haystack: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let mut prev_sep = false;
+    for (idx, ch) in haystack.char_indices() {
+        if prev_sep && haystack[idx..].starts_with(query) {
+            return true;
+        }
+        prev_sep = matches!(ch, '_' | '-' | '.' | '/' | ' ' | ':' | '·');
+    }
+    false
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -220,8 +220,28 @@ impl StructurePane {
         }
     }
 
-    /// 回车：表名 → 第一个字段名；字段名 → 下一行字段名，最后一行时新增字段并聚焦它的名称。
+    /// 回车：新建表时表名 → 第一个字段名、字段名 → 下一行字段名（末行新增字段）；
+    /// 已有表编辑态时确认当前行并推进到下一可见行，末行则退出编辑并保留行焦点。
     pub(super) fn draft_enter(&mut self, key: u32) {
+        if self.session.mode == StructureMode::Existing {
+            if matches!(key / 10_000, 1..=3) {
+                let index = (key % 10_000) as usize;
+                let visible = self.visible_column_indices();
+                let next = visible
+                    .iter()
+                    .position(|&idx| idx == index)
+                    .and_then(|pos| visible.get(pos + 1).copied());
+                if let Some(next_idx) = next {
+                    self.begin_edit_row(next_idx);
+                    self.scroll_to_column = Some(next_idx);
+                } else {
+                    self.end_edit_row();
+                    self.focused_row = Some(index);
+                    self.pending_focus_pane = true;
+                }
+            }
+            return;
+        }
         if self.session.mode != StructureMode::Create {
             return;
         }
@@ -284,7 +304,7 @@ impl StructurePane {
         let value: AnyElement = match current.mode() {
             DefaultMode::Literal | DefaultMode::Expression => {
                 let placeholder = i18n::text(locale, if current.mode() == DefaultMode::Literal { "structure.default.valueHint" } else { "structure.default.expressionHint" });
-                self.draft_input(30_000 + index as u32, current.text(), &placeholder, window, cx)
+                self.draft_input_enter(30_000 + index as u32, current.text(), &placeholder, window, cx)
             }
             DefaultMode::Null => div().px(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child("NULL").into_any_element(),
             DefaultMode::None => div().px(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—").into_any_element(),
@@ -710,9 +730,23 @@ impl StructurePane {
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let engine = self.session.target.engine.clone();
+        let viewport_w = f32::from(window.viewport_size().width);
+        let stacked = (viewport_w > 0. && viewport_w <= 900.) || (self.content_width > 0. && self.content_width <= 900.);
 
-        // 左栏：内置模板与用户模板。
-        let mut list = div().id("structure-templates-list").test_support().flex().flex_col().gap(px(2.)).w(px(240.)).flex_none().scroll_area_y();
+        // 左栏（窄屏时为上栏）：内置模板与用户模板。
+        let mut list = div()
+            .id("structure-templates-list")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap(px(kit::Space::XXS))
+            .flex_none()
+            .when(!stacked, |this| this.w(px(240.)))
+            .when(stacked, |this| {
+                const TEMPLATE_LIST_STACKED_MAX_H: f32 = 180.;
+                this.w_full().max_h(px(TEMPLATE_LIST_STACKED_MAX_H))
+            })
+            .scroll_area_y();
         list = list.child(div().pb(px(4.)).child(kit::eyebrow(t("structure.templates.builtin"), p)));
         for (id, key) in BUILTIN {
             let hidden = self.templates.is_hidden(id);
@@ -906,14 +940,23 @@ impl StructurePane {
                         )
                         .child(
                             div()
+                                .id("structure-templates-body")
+                                .test_support()
                                 .flex_1()
                                 .min_h_0()
                                 .flex()
-                                .gap(px(16.))
+                                .when(stacked, |this| this.flex_col().gap(px(kit::Space::LG)))
+                                .when(!stacked, |this| this.gap(px(kit::Space::XL)))
                                 .px(px(metrics.card_pad()))
                                 .py(px(10.))
                                 .child(list)
-                                .child(div().w(px(1.)).flex_none().bg(p.line_soft))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .bg(p.line_soft)
+                                        .when(stacked, |this| this.h(px(1.)).w_full())
+                                        .when(!stacked, |this| this.w(px(1.))),
+                                )
                                 .child(editor),
                         )
                         .child(
@@ -1118,14 +1161,31 @@ impl StructurePane {
             .scroll_area_y()
             .child(div().max_w(px(360.)).child(kit::form_row(t("structure.templates.name"), name, p)))
             .child(kit::form_row(t("structure.templates.engines"), engines, p))
-            .child(kit::card(p).overflow_hidden().flex().flex_col().child(head).child(rows).child(
-                div().px(px(6.)).py(px(4.)).child(kit::tool_button("structure-template-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
-                    add_owner.update(cx, |pane, cx| {
-                        pane.template_add_column();
-                        cx.notify();
-                    })
-                })),
-            ))
+            .child(
+                kit::card(p)
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("structure-template-columns-hscroll")
+                            .test_support()
+                            .w_full()
+                            .scroll_area_x()
+                            .child({
+                                const TEMPLATE_COLUMNS_MIN_W: f32 = 670.;
+                                div().min_w(px(TEMPLATE_COLUMNS_MIN_W)).w_full().flex().flex_col().child(head).child(rows)
+                            }),
+                    )
+                    .child(
+                        div().px(px(6.)).py(px(4.)).child(kit::tool_button("structure-template-add-column", Some(IconName::Plus), t("structure.field.addColumn"), move |_, _, cx| {
+                            add_owner.update(cx, |pane, cx| {
+                                pane.template_add_column();
+                                cx.notify();
+                            })
+                        })),
+                    ),
+            )
             .when_some(manager.problem, |this, problem| this.child(issue_line("structure-template-problem", &i18n::text(locale, problem.key()), p)))
             .child(
                 div()

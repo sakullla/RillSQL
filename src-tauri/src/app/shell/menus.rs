@@ -560,13 +560,20 @@ fn object_tree_items(target: MenuTarget, facts: Option<ObjectFacts>, selected_ta
     let relational = facts.is_some_and(|facts| facts.engine.is_relational());
     let table = facts.is_some_and(|facts| facts.kind == ObjectKind::Table);
     let view = facts.is_some_and(|facts| facts.kind == ObjectKind::View);
+    // 事件、例程与触发器没有结构页，但有统一对象编辑器：那一格就换成编辑入口。
+    // 用方言自己声明的“事件”能力判断家族（只有 MySQL / MariaDB 声明），主代码不写死引擎变体。
+    let editable_object = facts.is_some_and(|facts| {
+        crate::app::views::object_editor::editable(facts.kind) && crate::app::views::admin::sections_for(facts.engine.as_str()).events
+    });
     let mut items = vec![
         if data_object {
             with_icon(item("tree-open-data", "catalog.tree.openData"), IconName::Table)
         } else {
             disabled("tree-open-data", "catalog.tree.openData", "catalog.tree.noData")
         },
-        if data_object {
+        if editable_object {
+            with_icon(item("open-object-editor", "objectEditor.title"), IconName::SquarePen)
+        } else if data_object {
             with_icon(item("open-structure", "catalog.tree.viewStructure"), IconName::TableProperties)
         } else {
             disabled("open-structure", "catalog.tree.viewStructure", "catalog.tree.noStructure")
@@ -1222,5 +1229,28 @@ mod tests {
         assert!(left + 220. <= 1200. + 0.5, "右侧不够时翻到左侧 {left}");
         let (_, raised) = place_submenu(100., 800., 232., 220., 200., 1360., 900.);
         assert!(raised + 200. <= 900. - 8. + 0.5, "{raised}");
+    }
+
+    /// MySQL / MariaDB 的事件、例程与触发器把“查看结构”那一格换成统一对象编辑器。
+    #[test]
+    fn object_editor_entry_replaces_structure_for_mysql_objects() {
+        for kind in [ObjectKind::Event, ObjectKind::Function, ObjectKind::Procedure, ObjectKind::Trigger] {
+            for engine in [Engine::Mysql, Engine::Mariadb] {
+                let items = tree_menu_items(MenuTarget::NonDataObject, facts(engine, kind));
+                let entry = items.iter().find(|item| item.id == "open-object-editor").unwrap_or_else(|| panic!("{engine:?} {kind:?}"));
+                assert!(entry.enabled && !entry.danger, "{engine:?} {kind:?}");
+                assert!(!ids(&items).contains(&"open-structure"), "结构页不处理这些对象：{engine:?} {kind:?}");
+            }
+        }
+        // 其它引擎的例程仍走定义页，不凭空给出 MySQL 专属入口。
+        let pg = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Function));
+        assert!(!ids(&pg).contains(&"open-object-editor"));
+        assert!(ids(&pg).contains(&"open-structure"));
+        // 表与视图不是对象编辑器的范围。
+        for kind in [ObjectKind::Table, ObjectKind::View] {
+            let items = tree_menu_items(MenuTarget::Object, facts(Engine::Mysql, kind));
+            assert!(!ids(&items).contains(&"open-object-editor"), "{kind:?}");
+            assert!(ids(&items).contains(&"open-structure"), "{kind:?}");
+        }
     }
 }

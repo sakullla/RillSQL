@@ -420,6 +420,8 @@ impl Shell {
             self.last_command = Some(shortcut_static_id(id)?);
         } else if id == "run-current" {
             self.last_command = Some("run-current");
+        } else if id.starts_with("select-tab-") && id["select-tab-".len()..].parse::<usize>().is_ok_and(|n| (1..=9).contains(&n)) {
+            self.last_command = Some("nth-tab");
         } else {
             return None;
         }
@@ -504,6 +506,17 @@ impl Shell {
             }
             "prev-tab" => Effect::None,
             "nth-tab" => Effect::None,
+            id if id.starts_with("select-tab-") => {
+                if let Some(n) = id["select-tab-".len()..].parse::<usize>().ok().filter(|n| (1..=9).contains(n)) {
+                    self.tab_index = n - 1;
+                }
+                Effect::None
+            }
+            "explorer-search" => {
+                self.sidebar_open = true;
+                self.focus = FocusTarget::Sidebar;
+                Effect::None
+            }
             "request-cancel" => {
                 self.cancel_requests += 1;
                 Effect::None

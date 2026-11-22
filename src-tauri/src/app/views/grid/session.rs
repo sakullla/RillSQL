@@ -582,6 +582,8 @@ pub struct SharedGrid {
     sql: String,
     /// 只影响显示的隐藏列（按列名）；复制、导出、筛选和排序仍按全部逻辑列。
     hidden: BTreeSet<String>,
+    /// 会话内列显示顺序（按列名）；空表示保持结构原始顺序。
+    column_order: Vec<String>,
     /// 冻结到哪一列（按列名）；它和它左边的可见列固定在左侧。
     frozen: Option<String>,
     /// 批量暂存替换掉的旧覆盖层及其移除时的下标：撤销整批时按原位置放回去，保持暂存顺序。
@@ -664,6 +666,7 @@ impl SharedGrid {
             token: 0,
             sql: String::new(),
             hidden: BTreeSet::new(),
+            column_order: Vec::new(),
             frozen: None,
             batches: Vec::new(),
             cloned: Vec::new(),
@@ -2269,7 +2272,11 @@ impl SharedGrid {
         let (row, column) = self.focus;
         // 左右和 Home/End 只在可见列之间移动；隐藏列不会接住焦点。
         let visible = self.visible_columns();
-        let position = visible.iter().position(|item| *item >= column).unwrap_or(visible.len().saturating_sub(1));
+        let position = visible
+            .iter()
+            .position(|item| *item == column)
+            .or_else(|| visible.iter().position(|item| *item >= column))
+            .unwrap_or(visible.len().saturating_sub(1));
         let at = |index: usize| visible.get(index).copied().unwrap_or(column);
         // 翻页按当前可视行数整页走；可视行数由外面按窗口高度发布，边界处停在首/末行。
         let page = self.viewport.max(1);
@@ -4186,18 +4193,101 @@ impl SharedGrid {
     }
 }
 
-/// 列显示（隐藏、冻结、自适应）。只改变画哪些列、哪些列固定在左侧；
+/// 列显示（隐藏、重排、冻结、自适应）。只改变画哪些列、显示顺序与哪些列固定在左侧；
 /// 复制、导出、筛选和排序一律按逻辑列，数据范围不变。
 impl SharedGrid {
-    /// 可见的逻辑列（按逻辑顺序）。界面的第 n 个数据列就是这里的第 n 项。
+    /// 全部逻辑列按当前会话显示顺序排列（含隐藏列）。
+    pub fn ordered_columns(&self) -> Vec<usize> {
+        if self.column_order.is_empty() {
+            return (0..self.columns.len()).collect();
+        }
+        let mut order = Vec::with_capacity(self.columns.len());
+        let mut seen = vec![false; self.columns.len()];
+        for name in &self.column_order {
+            if let Some(index) = self.columns.iter().position(|item| &item.name == name) {
+                if !seen[index] {
+                    seen[index] = true;
+                    order.push(index);
+                }
+            }
+        }
+        for (index, already) in seen.into_iter().enumerate() {
+            if !already {
+                order.push(index);
+            }
+        }
+        order
+    }
+
+    /// 可见的逻辑列（按当前会话显示顺序）。界面的第 n 个数据列就是这里的第 n 项。
     pub fn visible_columns(&self) -> Vec<usize> {
-        let visible: Vec<usize> = (0..self.columns.len()).filter(|index| !self.hidden.contains(&self.columns[*index].name)).collect();
+        let ordered = self.ordered_columns();
+        let visible: Vec<usize> = ordered.iter().copied().filter(|index| !self.hidden.contains(&self.columns[*index].name)).collect();
         // 至少保留一个可见列；万一列变了导致全部被藏，就全部显示。
         if visible.is_empty() {
-            (0..self.columns.len()).collect()
+            ordered
         } else {
             visible
         }
+    }
+
+    /// 按显示顺序向左（-1）或向右（+1）移动指定列（与相邻可见列交换位置）。
+    pub fn can_move_column(&self, column: usize, delta: isize) -> bool {
+        let visible = self.visible_columns();
+        let Some(pos) = visible.iter().position(|index| *index == column) else {
+            return false;
+        };
+        let target = pos as isize + delta;
+        target >= 0 && (target as usize) < visible.len()
+    }
+
+    pub fn move_column(&mut self, column: usize, delta: isize) -> bool {
+        let visible = self.visible_columns();
+        let Some(pos) = visible.iter().position(|index| *index == column) else {
+            return false;
+        };
+        let target = pos as isize + delta;
+        if target < 0 || (target as usize) >= visible.len() {
+            return false;
+        }
+        let other = visible[target as usize];
+        let mut names: Vec<String> = self.ordered_columns().into_iter().map(|index| self.columns[index].name.clone()).collect();
+        let Some(a) = names.iter().position(|name| name == &self.columns[column].name) else {
+            return false;
+        };
+        let Some(b) = names.iter().position(|name| name == &self.columns[other].name) else {
+            return false;
+        };
+        names.swap(a, b);
+        self.column_order = names;
+        true
+    }
+
+    /// 在全部列顺序中按相邻位置移动（列管理面板中隐藏列也可调整顺序）。
+    pub fn move_column_in_all(&mut self, column: usize, delta: isize) -> bool {
+        let ordered = self.ordered_columns();
+        let Some(pos) = ordered.iter().position(|index| *index == column) else {
+            return false;
+        };
+        let target = pos as isize + delta;
+        if target < 0 || (target as usize) >= ordered.len() {
+            return false;
+        }
+        let mut names: Vec<String> = ordered.into_iter().map(|index| self.columns[index].name.clone()).collect();
+        names.swap(pos, target as usize);
+        self.column_order = names;
+        true
+    }
+
+    pub fn has_custom_column_order(&self) -> bool {
+        let ordered = self.ordered_columns();
+        ordered.iter().enumerate().any(|(pos, logical)| pos != *logical)
+    }
+
+    pub fn reset_column_order(&mut self) -> bool {
+        let changed = self.has_custom_column_order();
+        self.column_order.clear();
+        changed
     }
 
     pub fn column_hidden(&self, column: usize) -> bool {
@@ -4213,11 +4303,17 @@ impl SharedGrid {
         if !self.can_hide(column) {
             return false;
         }
+        let prev_visible = self
+            .visible_columns()
+            .iter()
+            .position(|index| *index == column)
+            .and_then(|pos| pos.checked_sub(1))
+            .and_then(|prev| self.visible_columns().get(prev).copied());
         let name = self.columns[column].name.clone();
         self.hidden.insert(name.clone());
         if self.frozen.as_deref() == Some(name.as_str()) {
             // 冻结边界列被藏起来时，边界退到它左边最近的可见列。
-            self.frozen = self.visible_columns().into_iter().rfind(|index| *index < column).map(|index| self.columns[index].name.clone());
+            self.frozen = prev_visible.map(|index| self.columns[index].name.clone());
         }
         self.keep_selection_visible();
         true
@@ -4238,7 +4334,11 @@ impl SharedGrid {
 
     /// 当前隐藏的列（逻辑列号、列名），表头菜单用它列出可恢复的列。
     pub fn hidden_columns(&self) -> Vec<(usize, String)> {
-        (0..self.columns.len()).filter(|index| self.column_hidden(*index)).map(|index| (index, self.columns[index].name.clone())).collect()
+        self.ordered_columns()
+            .into_iter()
+            .filter(|index| self.column_hidden(*index))
+            .map(|index| (index, self.columns[index].name.clone()))
+            .collect()
     }
 
     pub fn freeze_to(&mut self, column: usize) -> bool {
@@ -4264,8 +4364,8 @@ impl SharedGrid {
 
     /// 前多少个可见数据列固定在左侧（不含行号列）。
     pub fn frozen_count(&self) -> usize {
-        match self.frozen_column() {
-            Some(frozen) => self.visible_columns().iter().filter(|index| **index <= frozen).count(),
+        match self.frozen_column().and_then(|frozen| self.visible_columns().iter().position(|index| *index == frozen)) {
+            Some(pos) => pos + 1,
             None => 0,
         }
     }
@@ -4280,10 +4380,11 @@ impl SharedGrid {
         self.visible_columns().iter().position(|index| *index == logical)
     }
 
-    /// 列变了（新结果、列被删）时丢掉不再存在的隐藏和冻结设置。
+    /// 列变了（新结果、列被删）时丢掉不再存在的隐藏、顺序和冻结设置。
     fn prune_display(&mut self) {
         let names: BTreeSet<String> = self.columns.iter().map(|item| item.name.clone()).collect();
         self.hidden.retain(|name| names.contains(name));
+        self.column_order.retain(|name| names.contains(name));
         if !self.columns.is_empty() && self.hidden.len() >= names.len() {
             self.hidden.clear();
         }
@@ -4585,6 +4686,18 @@ impl SharedGrid {
             return CellDirty::Updated;
         }
         CellDirty::Clean
+    }
+
+    /// 这一格是否有可撤销的暂存修改（与 `revert_cell` 一致）。
+    pub fn can_revert_cell(&self, row_id: &str, column: usize) -> bool {
+        self.columns
+            .get(column)
+            .is_some_and(|col| self.overlays.iter().any(|item| item.kind == "update" && item.row_id == row_id && item.column_name == col.name))
+    }
+
+    /// 这一行是否有可撤销的暂存修改或新增（与 `revert_row` 一致）。
+    pub fn can_revert_row(&self, row_id: &str) -> bool {
+        self.any_row(row_id).is_some_and(|row| row.inserted) || self.overlays.iter().any(|item| item.row_id == row_id)
     }
 
     /// 去掉这一格的暂存修改。新增行和删除标记不动。
@@ -8572,6 +8685,75 @@ mod filter_model_tests {
         );
         let cols: Vec<_> = grid.columns.iter().map(|c| c.type_name.as_str()).collect();
         assert_eq!(cols, vec!["bigint", "varchar(64)", "decimal(10,2)"]);
+    }
+
+    #[test]
+    fn column_order_reorders_visible_columns_tracks_frozen_and_resets() {
+        let schema = schema_from_parts(
+            "sqlite",
+            "",
+            "people",
+            "table",
+            vec![column_of("id", "integer", true), column_of("name", "text", false), column_of("note", "text", false)],
+            vec!["id".to_owned()],
+        )
+        .unwrap();
+        let columns = columns_from_schema(&schema, true);
+        let rows = vec![
+            GridRow {
+                id: "1".into(),
+                values: vec![Some("1".into()), Some("甲".into()), Some("a".into())],
+                located: true,
+                locator: vec![("id".into(), Some("1".into()))],
+                inserted: false,
+            },
+            GridRow {
+                id: "2".into(),
+                values: vec![Some("2".into()), Some("乙".into()), Some("b".into())],
+                located: true,
+                locator: vec![("id".into(), Some("2".into()))],
+                inserted: false,
+            },
+        ];
+        let mut grid = SharedGrid::new();
+        grid.load_local(columns, rows, Some(2), Some(schema));
+        assert_eq!(grid.visible_columns(), vec![0, 1, 2]);
+        assert!(!grid.has_custom_column_order());
+        assert!(!grid.can_move_column(0, -1));
+        assert!(grid.can_move_column(0, 1));
+        assert!(grid.move_column(2, -1));
+        assert_eq!(grid.visible_columns(), vec![0, 2, 1]);
+        assert!(grid.has_custom_column_order());
+
+        // 键盘左右移动按重排后的可见列顺序走。
+        grid.select(0, 0, false);
+        grid.move_key("right", false);
+        assert_eq!(grid.focus_cell(), Some((0, 2)));
+        grid.move_key("right", false);
+        assert_eq!(grid.focus_cell(), Some((0, 1)));
+        grid.move_key("left", false);
+        assert_eq!(grid.focus_cell(), Some((0, 2)));
+
+        // 冻结边界按显示位置计算。
+        assert!(grid.freeze_to(2));
+        assert_eq!(grid.frozen_count(), 2);
+        // 隐藏冻结边界列时，边界退到重排后左边最近的可见列（0）。
+        assert!(grid.hide_column(2));
+        assert_eq!(grid.frozen_column(), Some(0));
+        assert_eq!(grid.frozen_count(), 1);
+        assert!(grid.show_all_columns());
+        assert!(grid.reset_column_order());
+        assert_eq!(grid.visible_columns(), vec![0, 1, 2]);
+        assert!(!grid.has_custom_column_order());
+
+        // 撤销格/行可用态判定。
+        assert!(!grid.can_revert_cell("1", 1));
+        assert!(!grid.can_revert_row("1"));
+        assert_eq!(grid.stage_text_by_id("1", 1, Some("新值".into())), Gate::Writable);
+        assert!(grid.can_revert_cell("1", 1));
+        assert!(!grid.can_revert_cell("1", 2));
+        assert!(grid.can_revert_row("1"));
+        assert!(!grid.can_revert_row("2"));
     }
 }
 

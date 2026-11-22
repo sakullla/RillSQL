@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
-    fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request,
-    DefaultSpec, SequenceState, Snapshot, Step, StepStatus, TableOptions,
+    fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, ForeignKeyDraft, GeneratedColumnDraft,
+    GeneratedStorage, GenerationState, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request, DefaultSpec, SequenceState, Snapshot, Step, StepStatus,
+    TableOptions,
 };
 use super::plan::plan;
 use crate::connections::{CatalogSession, Service};
@@ -50,6 +51,7 @@ fn draft_for(engine: Engine, column: &Column) -> ColumnDraft {
         primary: column.primary,
         auto: column.auto,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -626,6 +628,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -637,6 +640,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: None,
@@ -648,6 +652,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -672,6 +677,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -683,6 +689,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: None,
@@ -694,6 +701,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -719,6 +727,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: true,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("note".to_owned()),
@@ -730,6 +739,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
                 ColumnDraft {
                     original: Some("extra".to_owned()),
@@ -741,6 +751,7 @@ async fn sqlite_file_applies_add_blocks_unsafe_and_drops_only_the_named_table() 
                     primary: false,
                     auto: false,
                     dropped: false,
+                    ..ColumnDraft::default()
                 },
             ],
         }),
@@ -806,6 +817,7 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 primary: true,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             },
             ColumnDraft {
                 original: Some("note".to_owned()),
@@ -817,6 +829,7 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
                 primary: false,
                 auto: false,
                 dropped: false,
+                ..ColumnDraft::default()
             },
         ],
     };
@@ -894,6 +907,7 @@ fn kept_column(name: &str, type_name: &str, primary: bool) -> ColumnDraft {
         primary,
         auto: false,
         dropped: false,
+        ..ColumnDraft::default()
     }
 }
 
@@ -1127,6 +1141,7 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
                 primary: true,
                 auto: true,
                 dropped: false,
+                ..ColumnDraft::default()
             }],
             options: TableOptions::default(),
         },
@@ -1829,7 +1844,7 @@ async fn object_actions_refuse_sql_that_differs_from_the_preview() {
         // 预览本身不写入。
         assert_eq!(notes_rows(&session).await, 2);
         let tampered = exec::execute(&session, &request(action.clone()), &[format!("{sql} -- changed")]).await;
-        let message = tampered.err().expect("SQL changed since preview");
+        let message = tampered.expect_err("SQL changed since preview");
         assert!(message.contains("预览已过期"), "{message}");
         assert!(exec::execute(&session, &request(action.clone()), &[]).await.is_err(), "{action:?}");
     }
@@ -1884,7 +1899,18 @@ fn untouched_postgres_defaults_do_not_block_other_column_changes() {
 
 /// ADR-7：默认值四态在建表路径上按方言生成（MySQL / PostgreSQL / SQLite / SQL Server）。
 fn new_column(name: &str, type_name: &str, nullable: bool, default: DefaultSpec) -> ColumnDraft {
-    ColumnDraft { original: None, name: name.to_owned(), type_name: type_name.to_owned(), nullable, default, comment: String::new(), primary: false, auto: false, dropped: false }
+    ColumnDraft {
+        original: None,
+        name: name.to_owned(),
+        type_name: type_name.to_owned(),
+        nullable,
+        default,
+        comment: String::new(),
+        primary: false,
+        auto: false,
+        dropped: false,
+        ..ColumnDraft::default()
+    }
 }
 
 fn fresh(engine: Engine) -> Snapshot {
@@ -2223,4 +2249,93 @@ fn existing_defaults_become_valid_default_clauses() {
     assert_eq!(existing_default_sql(Engine::Postgres, "character varying", "'new'::character varying"), "'new'::character varying");
     assert_eq!(existing_default_sql(Engine::Postgres, "integer", "nextval('t_id_seq'::regclass)"), "nextval('t_id_seq'::regclass)");
     assert_eq!(existing_default_sql(Engine::Sqlite, "TEXT", "'x'"), "'x'");
+}
+
+/// 一张带 VIRTUAL 生成列的 MySQL 家族表：读回的生成形态与普通列一起进快照。
+fn generated_orders(engine: Engine) -> Snapshot {
+    let mut snapshot = Snapshot::bare(engine, "app", "", "orders");
+    snapshot.server_version = "8.4.13".to_owned();
+    let mut total = column("total", "int", true, false);
+    total.generated = true;
+    snapshot.columns = vec![column("id", "bigint", false, true), column("price", "int", false, false), total];
+    snapshot.generation.insert(
+        "total".to_owned(),
+        GenerationState { expression: "price * 2".to_owned(), storage: GeneratedStorage::Virtual, reported_storage: "VIRTUAL".to_owned() },
+    );
+    snapshot.row_count = Some(0);
+    snapshot
+}
+
+/// 从读回的快照起完整草稿：生成列带上读回的表达式与存储方式，改一项也不漏掉别的列。
+fn generated_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
+    snapshot
+        .columns
+        .iter()
+        .map(|column| {
+            let mut draft = draft_for(snapshot.engine, column);
+            draft.generated = snapshot
+                .generation
+                .get(&column.name)
+                .map(|state| GeneratedColumnDraft { expression: state.expression.clone(), storage: state.storage });
+            draft
+        })
+        .collect()
+}
+
+/// R3：删除生成列不再被客户端整体拦下。DROP COLUMN 对生成列与普通列是同一条语句，
+/// 只有服务端才知道的问题（例如别的生成列还引用它）留给服务器的原始错误。
+#[test]
+fn generated_column_can_be_dropped() {
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let snapshot = generated_orders(engine);
+        let mut drafts = generated_drafts(&snapshot);
+        drafts[2].dropped = true;
+        let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts });
+        assert!(planned.blocked.is_empty(), "{engine:?}: {:?}", planned.blocked);
+        assert_eq!(
+            planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(),
+            vec!["ALTER TABLE app.orders DROP COLUMN total;"],
+            "{engine:?}"
+        );
+        // 删除整列的提示还在，只是不再因为"是生成列"被阻断。
+        assert!(planned.risks.iter().any(|risk| risk.text.contains("total")), "{engine:?}: {:?}", planned.risks);
+    }
+}
+
+/// 生成列改表达式仍按原有规则走 CHANGE COLUMN：写入完整的新定义，不被阻断。
+#[test]
+fn generated_expression_change_still_goes_through_change_column() {
+    let snapshot = generated_orders(Engine::Mysql);
+    let mut drafts = generated_drafts(&snapshot);
+    drafts[2].generated.as_mut().expect("total 是生成列").expression = "price * 3".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(
+        planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(),
+        vec!["ALTER TABLE app.orders CHANGE COLUMN total total int GENERATED ALWAYS AS (price * 3) VIRTUAL;"]
+    );
+}
+
+/// 只放开"删除"：生成列的改名、改类型、改可空仍按原来的规则阻断。
+#[test]
+fn generated_column_rename_and_retype_stay_blocked() {
+    let snapshot = generated_orders(Engine::Mysql);
+
+    let mut renamed = generated_drafts(&snapshot);
+    renamed[2].name = "sum_total".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: renamed });
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("生成列 total 不能这样修改")), "{:?}", planned.blocked);
+
+    let mut retyped = generated_drafts(&snapshot);
+    retyped[2].type_name = "bigint".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: retyped });
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("生成列 total 不能这样修改")), "{:?}", planned.blocked);
+
+    let mut nulled = generated_drafts(&snapshot);
+    nulled[2].nullable = false;
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: nulled });
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("生成列 total 不能这样修改")), "{:?}", planned.blocked);
 }

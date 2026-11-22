@@ -231,6 +231,53 @@ pub(crate) fn merge_pragmas(
     }
 }
 
+/// 对象编辑器读到的单个对象状态：事件、例程或触发器。三者形状不同，各用自己的快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectDetail {
+    Event(crate::ddl::model::EventState),
+    Routine(crate::ddl::model::RoutineState),
+    Trigger(crate::ddl::model::TriggerState),
+}
+
+impl ObjectDetail {
+    /// 读回来的对象名，用于核对"改的还是打开的那个对象"。
+    pub fn name(&self) -> &str {
+        match self {
+            ObjectDetail::Event(state) => &state.name,
+            ObjectDetail::Routine(state) => &state.name,
+            ObjectDetail::Trigger(state) => &state.name,
+        }
+    }
+
+    /// 事件调度器状态：只有事件有；其余对象为 None（未知不等于"会运行"）。
+    pub fn scheduler_running(&self) -> Option<bool> {
+        match self {
+            ObjectDetail::Event(state) => state.scheduler_running,
+            _ => None,
+        }
+    }
+}
+
+/// 读一个事件/例程/触发器的完整状态（对象编辑器的打开与失败后读回都走这里）。
+///
+/// 只有 MySQL 与 MariaDB 有这些对象；其它引擎给出原因，不编造空对象。读取失败只让这一个对象读不到，
+/// 不影响对象树、普通表结构或其它对象分组。
+pub async fn read_object_detail(
+    session: &CatalogSession,
+    engine: Engine,
+    database: &str,
+    kind: crate::catalog::model::ObjectKind,
+    name: &str,
+) -> Result<ObjectDetail, String> {
+    if session.is_scripted() {
+        return Err(scripted_failure());
+    }
+    if database.trim().is_empty() {
+        return Err("需要数据库名才能读取这个对象。".to_owned());
+    }
+    crate::adapters::mysql::catalog_read::read_object_detail_session(session, engine, database, kind, name).await
+}
+
 /// 读取一个连接上指定库/schema 的对象详情。不适用这一节的引擎返回空清单且不报错，不编造。
 pub async fn read_extras(session: &CatalogSession, engine: Engine, database: &str, schema: &str) -> ExtrasBody {
     if session.is_scripted() {
