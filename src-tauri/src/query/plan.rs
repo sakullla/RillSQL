@@ -305,30 +305,55 @@ fn is_quote(ch: char) -> bool {
     ch.is_ascii_punctuation() && ch != '_' && ch != '$'
 }
 
-/// 语句里的 “表 [AS] 别名”（FROM / JOIN 之后）。只认简单形态，认不出就不改名。
+/// 语句里的 “表 [AS] 别名”（FROM / JOIN 之后，以及 FROM 列表里逗号之后）。逗号结束一个表引用项，
+/// 只在同一项内配对，绝不跨逗号把下一张表当成别名。只认简单形态，认不出就不改名。
 pub(crate) fn alias_map(sql: &str) -> Vec<(String, String)> {
     const STOP: [&str; 18] =
         ["WHERE", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "USING", "NATURAL", "OUTER", "UNION", "HAVING", "STRAIGHT_JOIN", "WINDOW"];
-    let tokens: Vec<String> = sql
-        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '(' || ch == ')' || ch == ';')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.trim_matches(is_quote).to_owned())
-        .collect();
+    /// 这些关键字结束 FROM 列表：之后的逗号不再分隔表引用。
+    const END_FROM: [&str; 13] = ["WHERE", "ON", "USING", "GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "WINDOW", "SELECT", "SET", "VALUES", "RETURNING"];
+    // 逗号单独成为一个记号，作为表引用项的边界。
+    let mut tokens: Vec<String> = Vec::new();
+    for piece in sql.split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')' || ch == ';') {
+        for (n, part) in piece.split(',').enumerate() {
+            if n > 0 {
+                tokens.push(",".to_owned());
+            }
+            let part = part.trim_matches(is_quote);
+            if !part.is_empty() {
+                tokens.push(part.to_owned());
+            }
+        }
+    }
     let mut out = Vec::new();
+    let mut in_from = false;
     for index in 0..tokens.len() {
         let keyword = tokens[index].to_ascii_uppercase();
-        if keyword != "FROM" && keyword != "JOIN" && keyword != "STRAIGHT_JOIN" {
+        let starts_item = match keyword.as_str() {
+            "FROM" | "JOIN" | "STRAIGHT_JOIN" => {
+                in_from = true;
+                true
+            }
+            "," => in_from,
+            other => {
+                if END_FROM.contains(&other) {
+                    in_from = false;
+                }
+                false
+            }
+        };
+        if !starts_item {
             continue;
         }
         let Some(table) = tokens.get(index + 1) else { continue };
-        if table.eq_ignore_ascii_case("SELECT") {
+        if table == "," || table.eq_ignore_ascii_case("SELECT") || STOP.contains(&table.to_ascii_uppercase().as_str()) {
             continue;
         }
         let mut next = index + 2;
         if tokens.get(next).is_some_and(|token| token.eq_ignore_ascii_case("AS")) {
             next += 1;
         }
-        if let Some(alias) = tokens.get(next).filter(|alias| !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
+        if let Some(alias) = tokens.get(next).filter(|alias| *alias != "," && !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
             let table = table.rsplit('.').next().unwrap_or(table).trim_matches(is_quote).to_owned();
             out.push((alias.clone(), table));
         }
@@ -486,6 +511,34 @@ mod tests {
 
     fn columns(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn pairs(sql: &str) -> Vec<(String, String)> {
+        alias_map(sql)
+    }
+
+    fn pair(alias: &str, table: &str) -> (String, String) {
+        (alias.to_owned(), table.to_owned())
+    }
+
+    /// 逗号结束一个表引用项：不带别名的逗号连接不改名，带别名的逗号连接逐项配对；JOIN 写法不变。
+    #[test]
+    fn alias_map_never_pairs_across_a_comma() {
+        assert!(pairs("EXPLAIN select * from orders, customers where orders.customer_id = customers.id").is_empty(), "逗号连接的两张表各用自己的名字");
+        assert!(pairs("EXPLAIN select * from orders,customers").is_empty());
+        assert_eq!(pairs("EXPLAIN select * from orders o, customers c where c.id = o.customer_id"), vec![pair("o", "orders"), pair("c", "customers")]);
+        assert_eq!(pairs("EXPLAIN select * from shop.orders AS o,shop.customers AS c"), vec![pair("o", "orders"), pair("c", "customers")]);
+        assert_eq!(pairs("EXPLAIN select * from orders o, customers where c.id = 1"), vec![pair("o", "orders")], "无别名的项不借用下一项");
+        assert_eq!(
+            pairs("EXPLAIN select c.name, o.total from shop.orders o join shop.customers c on c.id = o.customer_id join shop.order_lines AS l on l.order_id = o.id"),
+            vec![pair("o", "orders"), pair("c", "customers"), pair("l", "order_lines")]
+        );
+        assert!(pairs("EXPLAIN select a, b from orders join customers on f(a, b) = 1 where x in (1, 2)").is_empty(), "ON / WHERE 之后的逗号不是表引用项");
+        let cols = columns(&["id", "select_type", "table", "type", "key", "rows", "filtered", "Extra"]);
+        let data = rows(&[&["1", "SIMPLE", "orders", "ALL", "", "5", "100", ""], &["1", "SIMPLE", "customers", "ALL", "", "3", "100", ""]]);
+        let plan = parse("mysql", "EXPLAIN select * from orders, customers", &cols, &data).expect("plan");
+        let titles: Vec<String> = plan.lines().iter().filter(|line| line.node.node_kind() == NodeKind::Table).map(|line| line.node.title()).collect();
+        assert_eq!(titles, vec!["orders", "customers"]);
     }
 
     /// 真实的 SQLite 3.4x 输出：别名、整数主键查找、临时 B 树、子查询挂在父节点下。

@@ -8124,7 +8124,7 @@ mod tests {
             window.render_frame(cx);
             window.click("plan-view-list", cx);
             window.render_frame(cx);
-            assert_plan_selected(window, 0, "SCAN a");
+            assert_plan_selected(window, 0, "a SCAN");
             assert!(!node_in_view(window, 39), "长计划超出可视区，末节点需要滚动才能看到");
             assert_eq!(window.find("query-plan-tree").role(), Some(gpui_kit::Role::Tree));
 
@@ -8142,21 +8142,21 @@ mod tests {
             // 点节点：焦点交给树，选中同一节点。
             window.click("query-plan-node-1", cx);
             assert_eq!(plan_state(&pane, window, cx), (1, true), "点节点选中它并聚焦计划树");
-            assert_plan_selected(window, 1, "SEARCH t1");
+            assert_plan_selected(window, 1, "t1 SEARCH");
             window.press("down", cx);
-            assert_plan_selected(window, 2, "SEARCH t2");
+            assert_plan_selected(window, 2, "t2 SEARCH");
             window.press("up", cx);
             window.press("up", cx);
-            assert_plan_selected(window, 0, "SCAN a");
+            assert_plan_selected(window, 0, "a SCAN");
             window.press("up", cx);
             assert_eq!(plan_state(&pane, window, cx), (0, true), "首节点再按 Up 不越界");
             window.press("end", cx);
-            assert_plan_selected(window, 39, "SCAN z");
+            assert_plan_selected(window, 39, "z SCAN");
             window.press("down", cx);
             assert_eq!(plan_state(&pane, window, cx), (39, true), "末节点再按 Down 不越界");
             assert!(!node_in_view(window, 0), "到末尾后首节点滚出了视口");
             window.press("home", cx);
-            assert_plan_selected(window, 0, "SCAN a");
+            assert_plan_selected(window, 0, "a SCAN");
             // 带修饰键的组合不是树导航，留给外壳和编辑器的快捷键。
             window.press("shift-down", cx);
             assert_eq!(plan_state(&pane, window, cx), (0, true), "Shift+Down 不移动计划选中");
@@ -8181,7 +8181,7 @@ mod tests {
 
             // 鼠标点建议：跳到末节点并滚进视口；建议行不抢焦点。
             window.click("query-plan-finding-1", cx);
-            assert_plan_selected(window, 39, "SCAN z");
+            assert_plan_selected(window, 39, "z SCAN");
             assert!(!pane.read(cx).plan_focus.is_focused(window), "点建议不把焦点挪到树上");
 
             // 点节点后，Tab 往回一步就是最后一条建议，Enter 激活它，再 Tab 回到树。
@@ -8192,21 +8192,21 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(plan_state(&pane, window, cx), (37, false), "Tab 往回离开计划树");
             window.press("enter", cx);
-            assert_plan_selected(window, 39, "SCAN z");
+            assert_plan_selected(window, 39, "z SCAN");
             assert!(!pane.read(cx).plan_focus.is_focused(window), "键盘激活建议后焦点留在建议上");
             window.focus_prev(cx);
             window.render_frame(cx);
             window.press("space", cx);
-            assert_plan_selected(window, 0, "SCAN a");
+            assert_plan_selected(window, 0, "a SCAN");
             window.focus_next(cx);
             window.render_frame(cx);
             window.press("enter", cx);
-            assert_plan_selected(window, 39, "SCAN z");
+            assert_plan_selected(window, 39, "z SCAN");
             window.focus_next(cx);
             window.render_frame(cx);
             assert_eq!(plan_state(&pane, window, cx), (39, true), "最后一条建议之后紧跟计划树");
             window.press("home", cx);
-            assert_plan_selected(window, 0, "SCAN a");
+            assert_plan_selected(window, 0, "a SCAN");
             window.focus_next(cx);
             window.render_frame(cx);
             assert!(!pane.read(cx).plan_focus.is_focused(window), "再 Tab 一次离开计划树");
@@ -8215,14 +8215,14 @@ mod tests {
             window.click("query-plan-node-1", cx);
             window.press("end", cx);
             window.press("up", cx);
-            assert_plan_selected(window, 38, "SEARCH t38");
+            assert_plan_selected(window, 38, "t38 SEARCH");
             window.click("plan-view-raw", cx);
             window.render_frame(cx);
             assert!(window.try_find("query-plan-tree").is_none(), "原始结果页不画计划树");
             assert_eq!(pane.read(cx).plan_selected, 38);
             window.click("plan-view-list", cx);
             window.render_frame(cx);
-            assert_plan_selected(window, 38, "SEARCH t38");
+            assert_plan_selected(window, 38, "t38 SEARCH");
 
             // 停在原始结果页时来了新结果：视图选择保留（仍是原始结果），选中回到第一个节点。
             window.click("plan-view-raw", cx);
@@ -8233,7 +8233,7 @@ mod tests {
             assert_eq!(pane.read(cx).plan_selected, 0, "新结果从第一个节点开始看");
             window.click("plan-view-list", cx);
             window.render_frame(cx);
-            assert_plan_selected(window, 0, "SCAN only");
+            assert_plan_selected(window, 0, "only SCAN");
             assert!(window.try_find("query-plan-node-1").is_none());
 
             // 单节点：方向键和 Home/End 都留在原位。
@@ -8242,7 +8242,7 @@ mod tests {
                 window.press(key, cx);
                 assert_eq!(plan_state(&pane, window, cx), (0, true), "单节点按 {key} 保持原位");
             }
-            assert_plan_selected(window, 0, "SCAN only");
+            assert_plan_selected(window, 0, "only SCAN");
         })
         .unwrap();
     }
@@ -8328,10 +8328,10 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(plan_state(&pane, window, cx), (2, true));
             assert_eq!(window.find("query-plan-card-2").selected(), Some(true));
-            assert_eq!(window.find("query-plan-detail").label(), Some("SEARCH t2"));
+            assert_eq!(window.find("query-plan-detail").label(), Some("t2 SEARCH"));
             window.press("down", cx);
             window.render_frame(cx);
-            assert_eq!(window.find("query-plan-detail").label(), Some("SCAN v"));
+            assert_eq!(window.find("query-plan-detail").label(), Some("v SCAN"));
 
             // 缩放工具条。
             let zoom = |cx: &App| pane.read(cx).plan_canvas.zoom;

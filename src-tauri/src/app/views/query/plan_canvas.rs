@@ -480,6 +480,42 @@ fn join_pill(node: &PlanNode, style: &CardStyle, locale: Locale, p: &Palette) ->
         .into_any_element()
 }
 
+/// 紧凑行数：千以下原样，其余用 K / M / B 加一位小数（1.2K、3M）。
+pub(super) fn count_text(value: f64) -> String {
+    let value = value.max(0.).round();
+    let (scaled, unit) = if value >= 1e9 {
+        (value / 1e9, "B")
+    } else if value >= 1e6 {
+        (value / 1e6, "M")
+    } else if value >= 1e3 {
+        (value / 1e3, "K")
+    } else {
+        return format!("{value:.0}");
+    };
+    let text = format!("{scaled:.1}");
+    format!("{}{unit}", text.trim_end_matches('0').trim_end_matches('.'))
+}
+
+/// 卡片右上角的行数：有实际行数时显示实际行数；否则显示预估扫描行数，过滤率低于 100% 时
+/// 追加过滤率和产出行数（≈ 行数 × 过滤率 / 100），如 “1.2K 行 · 10% → 120”。
+pub(super) fn rows_badge(node: &PlanNode, locale: Locale) -> Option<String> {
+    if let Some(actual) = node.actual_rows {
+        return Some(i18n::fill(&i18n::text(locale, "query.plan.actualRowsSummary"), &[("rows", &count_text(actual))]));
+    }
+    let rows = node.rows?;
+    match node.filtered.filter(|filtered| *filtered < 100.) {
+        Some(filtered) => {
+            let filtered = filtered.max(0.);
+            let output = rows * filtered / 100.;
+            Some(i18n::fill(
+                &i18n::text(locale, "query.plan.rowsFiltered"),
+                &[("rows", &count_text(rows)), ("filtered", &plan_view::percent_text(filtered)), ("output", &count_text(output))],
+            ))
+        }
+        None => Some(i18n::fill(&i18n::text(locale, "query.plan.estRows"), &[("rows", &count_text(rows))])),
+    }
+}
+
 /// 表、操作与子查询卡片：顶部热度条；左上相对代价、右上行数；标题（表名加别名）与访问类型标签；
 /// 索引或条件一行；底部风险标签。
 #[allow(clippy::too_many_arguments)]
@@ -503,11 +539,7 @@ fn node_card(node: &PlanNode, kind: NodeKind, share: Option<f32>, time_share: bo
         Some(share) => format!("{text} · {}%", (share * 100.).round() as i32),
         None => text,
     });
-    let rows_badge = match (node.actual_rows, node.rows) {
-        (Some(actual), _) => Some(i18n::fill(&i18n::text(locale, "query.plan.actualRowsSummary"), &[("rows", &plan_view::rows_text(actual))])),
-        (None, Some(rows)) => Some(i18n::fill(&i18n::text(locale, "query.plan.estRows"), &[("rows", &plan_view::rows_text(rows))])),
-        _ => None,
-    };
+    let rows_badge = rows_badge(node, locale);
     let hot = share.is_some_and(|share| share > 0.6);
     let badges = div()
         .flex()
@@ -1020,6 +1052,46 @@ mod tests {
             assert!(child.y > parent.bottom(), "连线从上到下：{edge:?}");
         }
         assert_eq!(tree.lines()[2].node.title(), "orders o", "表节点标题是表名加别名");
+    }
+
+    /// 卡片右上角：扫描行数紧凑显示；过滤率低于 100% 时追加过滤率与产出行数；有实际行数时只显示实际行数。
+    #[test]
+    fn rows_badge_shows_filtered_output_compactly() {
+        assert_eq!(count_text(999.), "999");
+        assert_eq!(count_text(1200.), "1.2K");
+        assert_eq!(count_text(1000.), "1K");
+        assert_eq!(count_text(3_450_000.), "3.5M");
+        assert_eq!(count_text(2e9), "2B");
+        let scan = |rows: f64, filtered: Option<f64>| PlanNode { op: "ALL".into(), rows: Some(rows), filtered, ..Default::default() };
+        assert_eq!(rows_badge(&scan(1200., Some(10.)), Locale::ZhCn).as_deref(), Some("1.2K 行 · 10% → 120"));
+        assert_eq!(rows_badge(&scan(1200., Some(10.)), Locale::En).as_deref(), Some("1.2K rows · 10% → 120"));
+        assert_eq!(rows_badge(&scan(3., Some(33.33)), Locale::ZhCn).as_deref(), Some("3 行 · 33.3% → 1"));
+        assert_eq!(rows_badge(&scan(5000., Some(100.)), Locale::ZhCn).as_deref(), Some("预估 5K 行"), "过滤率 100% 不追加");
+        assert_eq!(rows_badge(&scan(5000., None), Locale::ZhCn).as_deref(), Some("预估 5K 行"));
+        let analyzed = PlanNode { actual_rows: Some(42.), ..scan(5000., Some(10.)) };
+        assert_eq!(rows_badge(&analyzed, Locale::ZhCn).as_deref(), Some("实际 42 行"));
+        assert_eq!(rows_badge(&PlanNode::default(), Locale::ZhCn), None);
+    }
+
+    /// 无障碍名称跟卡片一致：标题（表名加别名或操作名）在前，访问类型在后。
+    #[test]
+    fn node_label_is_title_then_access_type() {
+        let table = PlanNode { op: "ALL".into(), object: Some("orders o".into()), access_type: Some("ALL".into()), category: Some(NodeKind::Table), ..Default::default() };
+        let seek = PlanNode { op: "ref".into(), object: Some("customers c".into()), access_type: Some("eq_ref".into()), category: Some(NodeKind::Table), ..Default::default() };
+        let join = PlanNode { op: "Nested loop".into(), children: vec![table, seek], category: Some(NodeKind::Join), ..Default::default() };
+        let sort = PlanNode { op: "Sort".into(), children: vec![join], ..Default::default() };
+        let tree = plan(vec![sort]);
+        let lines = tree.lines();
+        let labels: Vec<String> = (0..lines.len()).map(|index| plan_view::node_label(&lines, index)).collect();
+        assert_eq!(labels, vec!["Sort", "Nested loop", "orders o ALL", "customers c eq_ref"]);
+        assert_eq!(plan_view::node_label(&lines, 99), "", "越界下标没有名称");
+        // 没有访问类型的表节点用操作名，与卡片标签一致；非表节点的对象跟在操作名后。
+        let scan = PlanNode { op: "SCAN".into(), object: Some("orders".into()), ..Default::default() };
+        let block = PlanNode { op: "CO-ROUTINE".into(), object: Some("v".into()), children: vec![scan], ..Default::default() };
+        let tree = plan(vec![block]);
+        let lines = tree.lines();
+        assert_eq!(plan_view::node_label(&lines, 0), "CO-ROUTINE v");
+        assert_eq!(plan_view::node_label(&lines, 1), "orders SCAN");
     }
 
     /// 单节点：内容就是一张卡片加留白；默认视图（平移 0）下卡片中心落在视口中心。

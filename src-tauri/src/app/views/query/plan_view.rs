@@ -180,13 +180,28 @@ pub(super) fn heat_bar_color(share: f32, p: &Palette) -> Hsla {
     }
 }
 
-/// 节点的可读名称（操作 + 对象）：树行与详情面板的无障碍名称用同一份，详情跟着选中节点走。
+/// 节点的可读名称（卡片标题 + 访问类型）：树行、画布卡片与详情面板的无障碍名称用同一份，详情跟着选中节点走。
 pub(super) fn node_label(lines: &[crate::query::plan::PlanLine<'_>], index: usize) -> String {
     lines
         .get(index)
-        .map(|line| match &line.node.object {
-            Some(object) => format!("{} {object}", line.node.op),
-            None => line.node.op.clone(),
+        .map(|line| {
+            let node = line.node;
+            let table = node.node_kind() == crate::query::plan::NodeKind::Table;
+            let mut parts = vec![node.title()];
+            // 非表节点的标题是操作名，对象（如子查询别名）紧跟其后。
+            if !table {
+                parts.extend(node.object.clone());
+            }
+            // 访问类型与卡片标签一致：没有访问类型的表节点用操作名。
+            let access = node.access_type.clone().or_else(|| table.then(|| node.op.clone()));
+            parts.extend(access);
+            let mut label: Vec<String> = Vec::new();
+            for part in parts.into_iter().map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()) {
+                if !label.iter().any(|seen| seen.eq_ignore_ascii_case(&part)) {
+                    label.push(part);
+                }
+            }
+            label.join(" ")
         })
         .unwrap_or_default()
 }

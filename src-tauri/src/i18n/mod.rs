@@ -733,6 +733,7 @@ dict! {
     "query.plan.actualTime" => "实际耗时", "Actual time";
     "query.plan.actualRows" => "实际行数", "Actual rows";
     "query.plan.actualRowsSummary" => "实际 {rows} 行", "{rows} actual rows";
+    "query.plan.rowsFiltered" => "{rows} 行 · {filtered} → {output}", "{rows} rows · {filtered} → {output}";
     "query.plan.noIssues" => "未发现明显问题", "No obvious issues";
     "query.plan.issues" => "{count} 个问题", "{count} issues";
     "query.plan.viewCanvas" => "画布", "Canvas";
