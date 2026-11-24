@@ -3,6 +3,8 @@
 //! 只读语句不经过这里：面板只列出真正会被拦下的语句，并说明同一批里还有几条直通。
 //! 文案按界面语言就地给出（i18n 字典不在本任务范围），consequence 的语义来自 query::risk。
 
+use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AnyElement, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     Styled as _, TestSupportExt as _,
@@ -12,6 +14,7 @@ use crate::i18n::Locale;
 use crate::query::desk::RiskPrompt;
 use crate::query::risk::{Consequence, RiskKind};
 use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::kit::ScrollAreaExt as _;
 
 use super::QueryPane;
 
@@ -167,7 +170,45 @@ fn click(entity: &Entity<QueryPane>, id: &'static str) -> impl Fn(&gpui_kit::Cli
     move |_, _, cx| entity.update(cx, |pane, cx| pane.command(id, cx))
 }
 
-/// 风险确认面板：确认前一条语句都不发送。
+/// 单条语句文本在确认框里的最大高度；更长的语句截断，完整文本在编辑器里。
+const STATEMENT_MAX_H: f32 = 160.;
+
+/// 目标是不是生产环境：模态框头部用危险色强调。
+pub fn production(prompt: &RiskPrompt) -> bool {
+    matches!(prompt.environment.to_ascii_lowercase().as_str(), "prod" | "production")
+}
+
+/// 工具栏运行按钮在等待确认期间的文字。
+pub fn waiting_label(locale: Locale) -> String {
+    pick(locale, "等待确认…", "Awaiting confirmation…")
+}
+
+/// 生产环境的强调说明。
+pub fn production_text(locale: Locale) -> String {
+    pick(locale, "生产环境：确认后会直接作用于线上数据。", "Production: confirming runs these statements against live data.")
+}
+
+/// 存储过程调用的说明：CALL / EXEC 仍然需要确认，但说明比“服务端状态”更贴切。
+fn procedure_call(sql: &str) -> bool {
+    let lead = sql.split_whitespace().next().unwrap_or_default().to_ascii_uppercase();
+    matches!(lead.as_str(), "CALL" | "EXEC" | "EXECUTE")
+}
+
+/// 一项后果的说明；存储过程调用换成“将执行存储过程，可能修改数据”。
+pub fn statement_consequence_text(locale: Locale, sql: &str, consequence: &Consequence) -> String {
+    if consequence.kind == RiskKind::ServerState && procedure_call(sql) {
+        let label = pick(locale, "存储过程", "Stored procedure");
+        let detail = pick(locale, "将执行存储过程，可能修改数据。", "Runs a stored procedure, which may change data.");
+        return match consequence.object.as_deref().filter(|object| !object.is_empty()) {
+            Some(object) => format!("{label}（{object}）：{detail}"),
+            None => format!("{label}：{detail}"),
+        };
+    }
+    consequence_text(locale, consequence)
+}
+
+/// 风险确认模态框：头部（标题、目标连接、环境、库）固定；正文逐条列出语句与后果并独立滚动；
+/// 底部“确认执行 / 取消”固定可见。确认前一条语句都不发送；遮罩点空白处与 Esc 都是取消。
 pub fn render(
     prompt: &RiskPrompt,
     locale: Locale,
@@ -175,32 +216,92 @@ pub fn render(
     metrics: Metrics,
     mono: &SharedString,
     entity: &Entity<QueryPane>,
+    focus: &gpui_kit::FocusHandle,
 ) -> AnyElement {
     let total = prompt.total();
-    let mut body = div().flex().flex_col().gap(px(kit::Space::MD)).min_w_0();
-    body = body.child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(kit::Space::SM))
-            .text_size(px(TypeScale::SM))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(p.danger)
-            .child(kit::icon(gpui_kit::assets::IconName::TriangleAlert, 14., p.danger))
-            .child(SharedString::from(title(locale)))
-            .child(
+    let prod = production(prompt);
+    let tone = p.danger;
+    let engine = crate::adapters::query::label_named(&prompt.engine);
+    let scope = if prompt.schema.is_empty() { prompt.database.clone() } else { format!("{}.{}", prompt.database, prompt.schema) };
+
+    // 头部：标题 + 目标（连接、引擎、环境徽标、库）。
+    let mut target = div()
+        .id("query-risks-target")
+        .test_support()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(kit::Space::SM))
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .child(SharedString::from(format!("{}：", pick(locale, "目标", "Target"))))
+        .child(div().font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(prompt.connection_name.clone())));
+    if !engine.is_empty() {
+        target = target.child(SharedString::from(engine.to_owned()));
+    }
+    if !prompt.environment.is_empty() {
+        target = target.child(kit::env_tag(&prompt.environment.to_ascii_lowercase(), SharedString::from(prompt.environment.clone()), p));
+    }
+    if !scope.is_empty() {
+        target = target.child(div().font_family(mono.clone()).text_color(p.text).child(SharedString::from(scope)));
+    }
+    let head = div()
+        .id("query-risks-head")
+        .test_support()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(kit::Space::SM))
+        .px(px(metrics.card_pad()))
+        .pt(px(metrics.card_pad()))
+        .pb(px(kit::Space::MD))
+        .border_b_1()
+        .border_color(if prod { p.danger } else { p.line_soft })
+        .when(prod, |this| this.bg(p.danger_soft))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(kit::Space::SM))
+                .child(kit::icon(gpui_kit::assets::IconName::TriangleAlert, 16., tone))
+                .child(div().flex_1().min_w_0().child(kit::title(SharedString::from(title(locale)), TypeScale::LG, p)))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(format!("{} / {}", prompt.statements.len(), total))),
+                ),
+        )
+        .child(target)
+        .when(prod, |this| {
+            this.child(
                 div()
-                    .text_size(px(TypeScale::XS))
-                    .text_color(p.text_faint)
-                    .child(SharedString::from(format!("{} / {}", prompt.statements.len(), prompt.total()))),
-            ),
-    );
-    body = body.child(
-        div()
-            .text_size(px(TypeScale::SM))
-            .text_color(p.text_muted)
-            .child(SharedString::from(target_text(locale, prompt))),
-    );
+                    .id("query-risks-production")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(px(kit::Space::SM))
+                    .text_size(px(TypeScale::SM))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.danger)
+                    .child(kit::icon(gpui_kit::assets::IconName::CircleAlert, 14., p.danger))
+                    .child(SharedString::from(production_text(locale))),
+            )
+        });
+
+    // 正文：逐条语句与后果，独立滚动。
+    let mut body = div()
+        .id("query-risks-body")
+        .test_support()
+        .flex_1()
+        .min_h_0()
+        .scroll_area_y()
+        .px(px(metrics.card_pad()))
+        .py(px(kit::Space::MD))
+        .flex()
+        .flex_col()
+        .gap(px(kit::Space::MD));
     for statement in &prompt.statements {
         let mut block = div()
             .flex()
@@ -226,6 +327,7 @@ pub fn render(
                 .font_family(mono.clone())
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text)
+                .max_h(px(STATEMENT_MAX_H))
                 .overflow_hidden()
                 .child(SharedString::from(statement.sql.clone())),
         );
@@ -237,8 +339,8 @@ pub fn render(
                     .gap(px(kit::Space::SM))
                     .text_size(px(TypeScale::XS))
                     .text_color(p.text_muted)
-                    .child(kit::status_dot(p.warn))
-                    .child(SharedString::from(consequence_text(locale, consequence))),
+                    .child(div().pt(px(kit::Space::XS)).flex_none().child(kit::status_dot(p.warn)))
+                    .child(div().flex_1().min_w_0().child(SharedString::from(statement_consequence_text(locale, &statement.sql, consequence)))),
             );
         }
         body = body.child(block);
@@ -259,46 +361,64 @@ pub fn render(
                 .child(SharedString::from(notice.clone())),
         );
     }
-    body = body.child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(kit::Space::MD))
-            .min_h(px(metrics.control_h))
-            .child(kit::danger_button(
-                "query-act-confirm-risks",
-                Some(gpui_kit::assets::IconName::Play),
-                SharedString::from(confirm_label(locale)),
-                click(entity, "confirm-risks"),
-            ))
-            .child(kit::secondary_button(
-                "query-act-cancel-risks",
-                None,
-                SharedString::from(cancel_label(locale)),
-                click(entity, "cancel-risks"),
-            )),
-    );
-    div()
-        .id("query-risks")
+
+    // 底部按钮固定：语句再多也不会被挤出可见范围。
+    let footer = div()
+        .id("query-risks-footer")
         .test_support()
         .flex_none()
-        .p(px(kit::Space::LG))
-        .flex()
-        .flex_col()
-        .gap(px(kit::Space::MD))
-        .bg(p.danger_soft)
-        .border_b_1()
+        .px(px(metrics.card_pad()))
+        .py(px(kit::Space::MD))
+        .border_t_1()
         .border_color(p.line_soft)
-        .on_key_down({
-            let entity = entity.clone();
-            move |event: &gpui_kit::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    cx.stop_propagation();
-                    let entity = entity.clone();
-                    entity.update(cx, |pane, cx| pane.command("cancel-risks", cx));
-                }
-            }
+        .child(
+            kit::modal_actions()
+                .min_h(px(metrics.control_h))
+                .child(kit::secondary_button(
+                    "query-act-cancel-risks",
+                    None,
+                    SharedString::from(cancel_label(locale)),
+                    click(entity, "cancel-risks"),
+                ))
+                .child(kit::danger_button(
+                    "query-act-confirm-risks",
+                    Some(gpui_kit::assets::IconName::Play),
+                    SharedString::from(confirm_label(locale)),
+                    click(entity, "confirm-risks"),
+                )),
+        );
+
+    let scrim_entity = entity.clone();
+    let key_entity = entity.clone();
+    div()
+        .id("query-risks-scrim")
+        .test_support()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(gpui_kit::hsla(0., 0., 0., if p.dark { 0.45 } else { 0.25 }))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+            scrim_entity.update(cx, |pane, cx| pane.command("cancel-risks", cx));
         })
-        .child(body)
+        .child(
+            kit::modal_surface("query-risks", SharedString::from(title(locale)), kit::ModalWidth::PREVIEW, p)
+                .test_support()
+                .track_focus(focus)
+                .focus_trap("query-risks", focus)
+                .when(prod, |this| this.border_2().border_color(p.danger))
+                .overflow_hidden()
+                .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        key_entity.update(cx, |pane, cx| pane.command("cancel-risks", cx));
+                    }
+                })
+                .child(head)
+                .child(body)
+                .child(footer),
+        )
         .into_any_element()
 }

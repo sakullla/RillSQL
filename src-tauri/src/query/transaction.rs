@@ -20,8 +20,8 @@ use crate::transaction::{
 };
 
 use super::exec::{
-    elapsed_ms, AutoRewrite, DriverReport, ErrorAt, Failure, StatementDriver, StatementStop,
-    StatementValue,
+    elapsed_ms, AutoRewrite, DriverReport, ErrorAt, Failure, ResultExtras, StatementDriver,
+    StatementStop, StatementValue,
 };
 
 /// 隐式提交已经发生：此前的修改不能再由原事务回滚（R9）。
@@ -70,6 +70,8 @@ pub(crate) struct StatementTrial {
     pub sent_sql: String,
     pub rewrite: Option<AutoRewrite>,
     pub value: Option<StatementValue>,
+    /// 第一个结果集之外的结果集、警告等（见 ResultExtras）。
+    pub extras: ResultExtras,
     pub elapsed_ms: Option<u64>,
     pub error_at: Option<ErrorAt>,
     pub error_code: Option<String>,
@@ -144,6 +146,7 @@ struct Ran {
     outcome: Result<StatementValue, StatementStop>,
     /// 驱动原始失败（错误码与位置）：按方言判定事务影响时用它，不从文本猜。
     failure: Option<Failure>,
+    extras: ResultExtras,
     spent: Duration,
 }
 
@@ -214,6 +217,7 @@ impl StatementTrial {
             sent_sql: ran.sent,
             rewrite: ran.rewrite,
             value,
+            extras: ran.extras,
             // 被取消的语句只标“已取消”，不报一个不完整的耗时。
             elapsed_ms: if status == "cancelled" {
                 None
@@ -238,6 +242,7 @@ fn refused(message: String) -> StatementTrial {
         sent_sql: String::new(),
         rewrite: None,
         value: None,
+        extras: ResultExtras::default(),
         elapsed_ms: None,
         error_at: None,
         error_code: None,
@@ -265,12 +270,14 @@ async fn run(
         sent,
         outcome,
         failure,
+        extras,
     } = report;
     Ran {
         sent: sent.sql,
         rewrite: sent.rewrite,
         outcome,
         failure,
+        extras,
         spent,
     }
 }
@@ -401,6 +408,7 @@ fn acknowledge(
             sent_sql: String::new(),
             rewrite: None,
             value: None,
+            extras: ResultExtras::default(),
             elapsed_ms: None,
             error_at: None,
             error_code: None,

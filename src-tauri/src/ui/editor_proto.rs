@@ -164,6 +164,15 @@ pub fn object_hints(cx: &App) -> ObjectHints {
     cx.try_global::<ObjectHintsGlobal>().map(|global| global.0).unwrap_or_default()
 }
 
+struct AutoAliasGlobal(bool);
+
+impl gpui_kit::Global for AutoAliasGlobal {}
+
+/// 设置“补全表名时自动添加别名”；没有下发过时按默认开启。
+pub fn completion_auto_alias(cx: &App) -> bool {
+    cx.try_global::<AutoAliasGlobal>().map(|global| global.0).unwrap_or(true)
+}
+
 /// 最近一次按键之后这段时间内不弹悬停卡：边打字边弹卡会挡住正在写的语句。
 pub const HOVER_TYPING_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -400,8 +409,10 @@ pub struct SqlEditor {
     /// 离开其中一个时延迟收起，移到另一个上就保持展开。
     lens_chip_hover: Option<usize>,
     lens_card_hover: Option<usize>,
-    /// 点击标记后固定展开（再点一次收起），不依赖鼠标停留。
+    /// 点击标记后固定展开（再点一次、Esc、点击弹层外或开始编辑时收起），不依赖鼠标停留。
     lens_pinned: Option<usize>,
+    /// 标记错误时的草稿全文；下一次编辑与它比较，只清除被改动语句的标记。
+    marked_text: Option<String>,
     /// 执行错误和静态 lint 的原文，悬停与诊断共用。
     facts: Rc<RefCell<HoverFacts>>,
     stale_lint: u32,
@@ -450,6 +461,58 @@ impl ExecError {
             out.push('…');
         }
         out
+    }
+}
+
+/// 一次编辑之后还成立的错误：与编辑范围相交或相接的语句（没有语句范围时按错误位置）丢掉，
+/// 编辑之后的错误整体平移。编辑范围由前后文本的公共前后缀求出。
+pub fn surviving_errors(before: &str, after: &str, errors: &[ExecError]) -> Vec<ExecError> {
+    let prefix = before.bytes().zip(after.bytes()).take_while(|(left, right)| left == right).count();
+    let mut prefix = prefix.min(before.len()).min(after.len());
+    while prefix > 0 && !(before.is_char_boundary(prefix) && after.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    let room = before.len().min(after.len()) - prefix;
+    let mut suffix = before.bytes().rev().zip(after.bytes().rev()).take_while(|(left, right)| left == right).count().min(room);
+    while suffix > 0 && !(before.is_char_boundary(before.len() - suffix) && after.is_char_boundary(after.len() - suffix)) {
+        suffix -= 1;
+    }
+    if prefix == before.len() && prefix == after.len() {
+        return errors.to_vec();
+    }
+    let edit = prefix..before.len() - suffix;
+    let blank_edit = before[edit.clone()].trim().is_empty() && after[prefix..after.len() - suffix].trim().is_empty();
+    let delta = after.len() as isize - before.len() as isize;
+    let shift = |range: &Range<usize>| {
+        let move_by = |at: usize| (at as isize + delta).max(0) as usize;
+        move_by(range.start)..move_by(range.end)
+    };
+    errors
+        .iter()
+        .filter_map(|error| {
+            let span = error.statement.clone().unwrap_or_else(|| error.range.clone());
+            // 编辑落在语句内部，或贴着语句首尾写入了非空白内容，都算改动了这条语句。
+            let inside = edit.start < span.end && span.start < edit.end;
+            let touches = edit.start <= span.end && span.start <= edit.end;
+            if inside || (touches && !blank_edit) {
+                return None;
+            }
+            if span.end < edit.start {
+                return Some(error.clone());
+            }
+            Some(ExecError { range: shift(&error.range), statement: error.statement.as_ref().map(shift), ..error.clone() })
+        })
+        .collect()
+}
+
+/// 行尾标记的文字：一行一个错误时是“错误码 · 原文首行”；同一行有多个错误时显示“N 个错误”，卡片逐条列出。
+pub fn lens_label(first: &ExecError, count: usize, locale: Locale) -> String {
+    if count > 1 {
+        return i18n::fill(&i18n::text(locale, "query.errors.lineCount"), &[("count", &count.to_string())]);
+    }
+    match first.code.as_deref() {
+        Some(code) => format!("{code} · {}", first.short()),
+        None => first.short(),
     }
 }
 
@@ -536,6 +599,8 @@ struct SqlSuggest {
     locale: Rc<Cell<Locale>>,
     note: Rc<RefCell<Option<String>>>,
     request: Rc<Cell<u64>>,
+    /// 补全表名时是否自动附带别名；每次请求前从全局设置读取。
+    auto_alias: Cell<bool>,
 }
 
 impl SqlEditor {
@@ -565,6 +630,7 @@ impl SqlEditor {
                 locale: locale.clone(),
                 note: note.clone(),
                 request: request.clone(),
+                auto_alias: Cell::new(true),
             }));
             state.lsp_mut().hover_provider =
                 Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone(), facts: facts.clone(), last_key: last_key.clone() }));
@@ -585,8 +651,9 @@ impl SqlEditor {
         let subscription = cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.version.set(this.version.get().wrapping_add(1));
-                // 错误标记属于上一次执行；草稿一改就不再可信。静态诊断的偏移也一起失效。
-                this.clear_errors(cx);
+                // 错误标记属于上一次执行：只清除被改动语句的标记，其余语句的标记随文本平移保留。
+                // 静态诊断的偏移一起失效。
+                this.prune_errors_after_edit(cx);
                 this.facts.borrow_mut().lint.clear();
                 let _ = this.track(cx);
                 cx.notify();
@@ -604,6 +671,11 @@ impl SqlEditor {
                     return;
                 }
                 let _ = this.update(cx, |editor, cx| {
+                    // 错误卡片：Esc 收起（标记保留）。
+                    if editor.error_popover_open().is_some() && !editor.completion_open(cx) {
+                        editor.dismiss_error_popover(cx);
+                        return;
+                    }
                     if editor.signature.is_some() && editor.is_focused(window, cx) && !editor.completion_open(cx) {
                         editor.dismiss_signature(cx);
                     }
@@ -672,6 +744,7 @@ impl SqlEditor {
             lens_chip_hover: None,
             lens_card_hover: None,
             lens_pinned: None,
+            marked_text: None,
             facts,
             stale_lint: 0,
             stale_completion: 0,
@@ -816,9 +889,55 @@ impl SqlEditor {
         let locale = self.locale.get();
         self.facts.borrow_mut().errors = errors.iter().map(|error| (error.range.clone(), exec_error_markdown(error, locale))).collect();
         self.exec_errors = errors;
+        self.marked_text = Some(self.state.read(cx).text().to_string());
         self.reset_lens();
         self.sync_diagnostics(cx);
         cx.notify();
+    }
+
+    /// 草稿变化后：被改动的语句（编辑范围与语句相交或相接）清除标记，其余语句的标记按偏移平移后保留。
+    fn prune_errors_after_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(before) = self.marked_text.take() else {
+            self.clear_errors(cx);
+            return;
+        };
+        if self.exec_errors.is_empty() {
+            self.clear_errors(cx);
+            return;
+        }
+        let after = self.state.read(cx).text().to_string();
+        let kept = surviving_errors(&before, &after, &self.exec_errors);
+        if kept.is_empty() {
+            self.clear_errors(cx);
+        } else {
+            self.mark_exec_errors(kept, cx);
+        }
+    }
+
+    /// 收起错误卡片（Esc、点击外部）；标记本身保留。
+    pub fn dismiss_error_popover(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.error_popover_open().is_none() {
+            return false;
+        }
+        self.lens_open = None;
+        self.lens_pinned = None;
+        self.lens_card_hover = None;
+        cx.notify();
+        true
+    }
+
+    /// 行尾标记的分组：每个出错行一个标记，值是这一行的全部错误序号（按出现顺序）。
+    pub fn error_lines(&self, cx: &App) -> Vec<(usize, Vec<usize>)> {
+        let text = self.state.read(cx).text().clone();
+        let mut lines: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (index, error) in self.exec_errors.iter().enumerate() {
+            let line = text.offset_to_point(error.range.start.min(text.len())).row;
+            match lines.iter_mut().find(|(row, _)| *row == line) {
+                Some((_, items)) => items.push(index),
+                None => lines.push((line, vec![index])),
+            }
+        }
+        lines
     }
 
     pub fn clear_errors(&mut self, cx: &mut Context<Self>) {
@@ -827,6 +946,7 @@ impl SqlEditor {
         }
         self.errors.clear();
         self.exec_errors.clear();
+        self.marked_text = None;
         self.reset_lens();
         self.facts.borrow_mut().errors.clear();
         self.error_gutter.clear(cx);
@@ -907,6 +1027,14 @@ impl SqlEditor {
     /// 设置“编辑器 → 对象提示”变化时由外壳调用；对所有 SQL 编辑器即时生效。
     pub fn publish_object_hints(hints: ObjectHints, cx: &mut App) {
         publish_object_hints(hints, cx);
+    }
+
+    /// 设置“补全表名时自动添加别名”变化时由外壳调用。
+    pub fn publish_auto_alias(enabled: bool, cx: &mut App) {
+        if cx.try_global::<AutoAliasGlobal>().is_some_and(|current| current.0 == enabled) {
+            return;
+        }
+        cx.set_global(AutoAliasGlobal(enabled));
     }
 
     /// 悬停在偏移处会显示的说明（与悬停提供者同一份数据）；没有时为 None。
@@ -1035,7 +1163,8 @@ impl SqlEditor {
             true
         });
         if applied {
-            self.clear_errors(cx);
+            // 只清除被替换范围涉及的语句的错误标记（格式化整篇时就是全部）。
+            self.prune_errors_after_edit(cx);
         }
         applied
     }
@@ -1577,20 +1706,12 @@ impl SqlEditor {
         }
         let p = Palette::of(cx);
         let locale = self.locale.get();
-        let mut seen_lines: Vec<usize> = Vec::new();
-        let text = self.state.read(cx).text().clone();
         let shown = self.error_popover_open();
         let mut out = Vec::new();
-        for (index, error) in self.exec_errors.iter().enumerate() {
-            let line = text.offset_to_point(error.range.start.min(text.len())).row;
-            if seen_lines.contains(&line) {
-                continue;
-            }
-            seen_lines.push(line);
-            let label = match error.code.as_deref() {
-                Some(code) => format!("{code} · {}", error.short()),
-                None => error.short(),
-            };
+        for (_, members) in self.error_lines(cx) {
+            let index = members[0];
+            let error = &self.exec_errors[index];
+            let label = lens_label(error, members.len(), locale);
             let chip = div()
                 .id(("sql-error-lens-chip", index))
                 .test_support()
@@ -1633,7 +1754,8 @@ impl SqlEditor {
             });
             out.push(deferred(floating).with_priority(1).into_any_element());
             if shown == Some(index) {
-                let card = self.error_popover(index, error, locale, cx);
+                let line_errors: Vec<ExecError> = members.iter().map(|at| self.exec_errors[*at].clone()).collect();
+                let card = self.error_popover(index, &line_errors, locale, cx);
                 let statement = error.statement.clone().unwrap_or_else(|| error.range.clone());
                 let floating = Floating::new(("sql-error-popover-anchor", index), self.state.clone(), card, move |state, size| {
                     let geometry = state.prepaint_caret_geometry()?;
@@ -1657,18 +1779,37 @@ impl SqlEditor {
         out
     }
 
-    fn error_popover(&self, index: usize, error: &ExecError, locale: Locale, cx: &mut Context<Self>) -> AnyElement {
+    fn error_popover(&self, index: usize, errors: &[ExecError], locale: Locale, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        let copy_text = error.copy_text();
-        let title = match error.code.as_deref() {
+        let copy_text = errors.iter().map(ExecError::copy_text).collect::<Vec<_>>().join("\n");
+        let title_of = |error: &ExecError| match error.code.as_deref() {
             Some(code) => i18n::fill(&i18n::text(locale, "query.errors.codeTitle"), &[("code", code)]),
             None => i18n::text(locale, "query.log.error"),
         };
+        let mut entries = div().flex().flex_col().gap(px(6.));
+        for (at, error) in errors.iter().enumerate() {
+            let slot = index * 16 + at;
+            entries = entries
+                .child(div().id(("sql-error-popover-title", slot)).font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(SharedString::from(title_of(error))))
+                // 原文可以用鼠标选中复制。
+                .child(
+                    div()
+                        .id(("sql-error-popover-message", slot))
+                        .test_support()
+                        .child(crate::ui::kit::selectable_text(("sql-error-popover-text", slot), error.message.clone())),
+                );
+        }
         div()
             .id(("sql-error-popover", index))
             .test_support()
             .occlude()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.lens_hover(index, true, *hovered, cx)))
+            // 点击卡片和行尾标记以外的地方收起；点在标记上交给标记自己的切换。
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.lens_chip_hover != Some(index) {
+                    this.dismiss_error_popover(cx);
+                }
+            }))
             .flex()
             .flex_col()
             .gap(px(6.))
@@ -1681,15 +1822,24 @@ impl SqlEditor {
             .shadow_md()
             .text_size(px(TypeScale::SM))
             .text_color(p.text)
-            .child(div().id(("sql-error-popover-title", index)).font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(SharedString::from(title)))
-            .child(div().id(("sql-error-popover-message", index)).child(SharedString::from(error.message.clone())))
+            .child(entries)
             .child(
-                div().flex().justify_end().child(crate::ui::kit::secondary_button(
-                    ("sql-error-popover-copy", index),
-                    Some(gpui_kit::assets::IconName::Copy),
-                    i18n::text(locale, "query.errors.copy"),
-                    move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
-                )),
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(6.))
+                    .child(crate::ui::kit::secondary_button(
+                        ("sql-error-popover-clear", index),
+                        Some(gpui_kit::assets::IconName::Close),
+                        i18n::text(locale, "query.errors.clearMarks"),
+                        cx.listener(|this, _, _, cx| this.clear_errors(cx)),
+                    ))
+                    .child(crate::ui::kit::secondary_button(
+                        ("sql-error-popover-copy", index),
+                        Some(gpui_kit::assets::IconName::Copy),
+                        i18n::text(locale, "query.errors.copy"),
+                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
+                    )),
             )
             .into_any_element()
     }
@@ -1775,7 +1925,7 @@ impl SqlSuggest {
             match scope.as_ref() {
                 Some(scope) => {
                     let statement = text.slice(0..text.len()).to_string();
-                    let planned = complete::plan(scope, &statement, offset, locale);
+                    let planned = complete::plan_with(scope, &statement, offset, locale, self.auto_alias.get());
                     *self.note.borrow_mut() = planned.note.clone();
                     // 只替换当前词；限定符和前后文本保持原样。
                     let start = planned.span.start.min(offset);
@@ -1852,6 +2002,7 @@ fn completion_kind(kind: &str) -> Option<CompletionItemKind> {
         "keyword" => CompletionItemKind::KEYWORD,
         "snippet" => CompletionItemKind::SNIPPET,
         "column" => CompletionItemKind::FIELD,
+        "alias" => CompletionItemKind::VARIABLE,
         "condition" => CompletionItemKind::OPERATOR,
         "cte" => CompletionItemKind::CLASS,
         "database" | "schema" => CompletionItemKind::MODULE,
@@ -1988,6 +2139,7 @@ impl CompletionProvider for SqlSuggest {
         cx: &mut App,
     ) -> Task<gpui_kit::Result<CompletionResponse>> {
         let started = self.version.get();
+        self.auto_alias.set(completion_auto_alias(cx));
         let (request, items) = self.respond(text, offset, object_hints(cx));
         let items = self.deliver(started, request, items);
         Task::ready(Ok(CompletionResponse::Array(items)))
@@ -2292,6 +2444,7 @@ mod tests {
             locale: Rc::new(Cell::new(Locale::ZhCn)),
             note: Rc::new(RefCell::new(None)),
             request: Rc::new(Cell::new(0)),
+            auto_alias: Cell::new(false),
         }
     }
 
@@ -2452,7 +2605,8 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(window, |_, _, cx| {
             let value = editor.read(cx).value(cx);
-            assert_eq!(value, "select * from orders", "Tab 应接受当前候选");
+            // 设置默认开启“补全表名时自动添加别名”。
+            assert_eq!(value, "select * from orders o", "Tab 应接受当前候选");
             assert!(!editor.read(cx).completion_open(cx), "接受后弹层收起");
         })
         .unwrap();
@@ -2465,7 +2619,7 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(window, |_, _, cx| {
-            assert_eq!(editor.read(cx).value(cx), "select * from orders");
+            assert_eq!(editor.read(cx).value(cx), "select * from orders o");
             assert!(!editor.read(cx).completion_open(cx));
         })
         .unwrap();
@@ -2823,13 +2977,13 @@ select 1;";
             assert_eq!(followed.borrow().len(), 1);
             assert_eq!(followed.borrow()[0].name, "orders");
 
-            // 错误标记：画上之后，下一次编辑就清掉。
+            // 错误标记：画上之后，编辑出错的这条语句就清掉。
             let failed = text.find("select customer").unwrap()..text.find("orders;").unwrap() + 6;
             editor.update(cx, |editor, cx| editor.mark_errors(vec![failed.clone()], cx));
             window.render_frame(cx);
-            assert_eq!(editor.read(cx).error_ranges(cx), vec![failed]);
+            assert_eq!(editor.read(cx).error_ranges(cx), vec![failed.clone()]);
             editor.update(cx, |editor, cx| {
-                editor.state.update(cx, |state, cx| state.replace_text_in_range(Some(0..0), "-- ", window, cx));
+                editor.replace_bytes(failed.start..failed.start, "-- ", failed.start + 3..failed.start + 3, window, cx);
             });
         })
         .unwrap();
@@ -3090,6 +3244,109 @@ select 1;";
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert_eq!(editor.read(cx).error_popover_open(), None, "再点一次收起");
+        })
+        .unwrap();
+    }
+
+    /// R9：编辑只清除被改动语句的错误；其余语句的错误按偏移平移后保留。
+    #[test]
+    fn an_edit_only_drops_errors_of_the_statement_it_touches() {
+        let before = "select bad1;\nselect bad2;\nselect bad3;";
+        let at = |needle: &str| before.find(needle).unwrap();
+        let error = |needle: &str| {
+            let start = at(needle);
+            let statement = before[..start].rfind('s').unwrap();
+            let end = before[start..].find(';').map(|end| start + end + 1).unwrap();
+            ExecError { range: start..start + needle.len(), statement: Some(statement..end), code: None, message: needle.to_owned() }
+        };
+        let errors = vec![error("bad1"), error("bad2"), error("bad3")];
+        // 改第二条：只丢 bad2；bad3 在编辑之后，平移。
+        let after = before.replacen("bad2", "good_column", 1);
+        let kept = surviving_errors(before, &after, &errors);
+        assert_eq!(kept.iter().map(|error| error.message.as_str()).collect::<Vec<_>>(), vec!["bad1", "bad3"]);
+        let bad3 = after.find("bad3").unwrap();
+        assert_eq!(kept[1].range, bad3..bad3 + 4);
+        assert_eq!(&after[kept[1].statement.clone().unwrap()], "select bad3;");
+        assert_eq!(kept[0], errors[0]);
+        // 在两条语句之间的空白里加空行：没有语句被改动，全部保留并平移。
+        let gap = before.replacen("\n", "\n\n", 1);
+        let kept = surviving_errors(before, &gap, &errors);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(&gap[kept[2].range.clone()], "bad3");
+        // 紧贴语句末尾追加也算改动这条语句。
+        let tail = format!("{before} -- x");
+        let kept = surviving_errors(before, &tail, &errors);
+        assert_eq!(kept.iter().map(|error| error.message.as_str()).collect::<Vec<_>>(), vec!["bad1", "bad2"]);
+        // 文本没变：原样保留。
+        assert_eq!(surviving_errors(before, before, &errors), errors);
+    }
+
+    /// R9：错误卡片 Esc 与点击外部关闭；修改一条语句只清除它的标记；同一行两个错误时标记显示计数；卡片原文可选择。
+    #[gpui_kit::test]
+    fn error_cards_close_on_escape_and_outside_click_and_edits_clear_one_statement(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let sql = "select bad1, bad2 from orders;\nselect 1;\nselect bad3 from orders;";
+        let first = 0..sql.find(';').unwrap() + 1;
+        let third_start = sql.rfind("select").unwrap();
+        let third = third_start..sql.len();
+        let range = |needle: &str| sql.find(needle).unwrap()..sql.find(needle).unwrap() + needle.len();
+        let errors = vec![
+            ExecError { range: range("bad1"), statement: Some(first.clone()), code: Some("1054".to_owned()), message: "Unknown column 'bad1'".to_owned() },
+            ExecError { range: range("bad2"), statement: Some(first.clone()), code: Some("1054".to_owned()), message: "Unknown column 'bad2'".to_owned() },
+            ExecError { range: range("bad3"), statement: Some(third.clone()), code: Some("1054".to_owned()), message: "Unknown column 'bad3'".to_owned() },
+        ];
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+            });
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| editor.mark_exec_errors(errors.clone(), cx));
+            window.render_frame(cx);
+            // 第一行两个错误合成一个标记，显示计数；第三行一个标记。
+            assert_eq!(editor.read(cx).error_lines(cx), vec![(0, vec![0, 1]), (2, vec![2])]);
+            assert_eq!(lens_label(&errors[0], 2, Locale::ZhCn), "2 个错误");
+            assert_eq!(lens_label(&errors[0], 1, Locale::ZhCn), "1054 · Unknown column 'bad1'");
+            assert!(window.try_find(("sql-error-lens-chip", 1usize)).is_none(), "同一行不重复画标记");
+            assert!(window.try_find(("sql-error-lens-chip", 2usize)).is_some());
+            // 点击固定展开：卡片逐条列出两条错误，原文是可选择文本。
+            window.click(("sql-error-lens-chip", 0usize), cx);
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), Some(0));
+            assert!(window.try_find(("sql-error-popover-message", 0usize)).is_some());
+            assert!(window.try_find(("sql-error-popover-message", 1usize)).is_some());
+            // Esc 收起，标记保留。
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), None, "Esc 关闭错误卡片");
+            assert_eq!(editor.read(cx).exec_errors().len(), 3, "关闭卡片不清除标记");
+            // 再次固定展开，点击卡片外部收起。
+            window.click(("sql-error-lens-chip", 2usize), cx);
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), Some(2));
+            window.click("sql-editor-caret", cx);
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_popover_open(), None, "点击外部关闭错误卡片");
+            // 修改第三条语句：只清除它的标记，第一条的两个错误保留。
+            let bad3 = range("bad3");
+            editor.update(cx, |editor, cx| {
+                editor.replace_bytes(bad3.clone(), "id", bad3.start + 2..bad3.start + 2, window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let left: Vec<String> = editor.read(cx).exec_errors().iter().map(|error| error.message.clone()).collect();
+            assert_eq!(left, vec!["Unknown column 'bad1'".to_owned(), "Unknown column 'bad2'".to_owned()]);
+            assert_eq!(editor.read(cx).error_ranges(cx), vec![range("bad1"), range("bad2")]);
+            assert!(window.try_find(("sql-error-lens-chip", 0usize)).is_some());
+            // 清除错误标记按钮清掉其余标记。
+            window.click(("sql-error-lens-chip", 0usize), cx);
+            window.render_frame(cx);
+            window.click(("sql-error-popover-clear", 0usize), cx);
+            window.render_frame(cx);
+            assert!(editor.read(cx).exec_errors().is_empty());
         })
         .unwrap();
     }

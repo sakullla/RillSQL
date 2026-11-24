@@ -3683,6 +3683,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         transaction_manual: false,
         transaction_advanced: false,
         object_hints: "compact".into(),
+        completion_alias: true,
     };
     model.apply_settings(&illegal);
     assert_eq!(model.settings.theme, "system");
@@ -3817,6 +3818,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         transaction_manual: false,
         transaction_advanced: false,
         object_hints: "compact".into(),
+        completion_alias: true,
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -6508,6 +6510,7 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
         error_code: None,
         range: None,
         error_mark: None,
+        result_set: None,
     };
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -6655,6 +6658,7 @@ fn query_workspace_scenario(cx: &mut gpui_kit::TestAppContext) -> [bool; 6] {
         error_code: None,
         range: None,
         error_mark: None,
+        result_set: None,
     };
     let drawn = cx
         .update_window(window, |_, window, cx| {
@@ -15425,4 +15429,61 @@ fn search_more_offset_counts_skipped_rows() {
     let _ = model.dispatch(&action);
     let next = model.take_search_more_request().expect("再次展开");
     assert_eq!(next.offset, 20, "第二页从 10 起读了 10 行");
+}
+
+/// R8：标签溢出列表每项带类型图标、环境徽标（生产为红色）、脏标记、关闭按钮，当前标签常亮；
+/// 点击列表里的关闭按钮关掉那个标签，列表保持打开并刷新。
+#[gpui_kit::test]
+fn tab_overflow_list_shows_icons_env_dirty_close_and_current(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tabpick-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            view.perform("new-query", cx);
+            view.perform("new-query", cx);
+            let mut rec = record_for("demo-prod", "demo-prod", Engine::Postgres);
+            rec.saved.env = "prod".into();
+            view.model.env_tags.push(crate::connections::model::EnvTag { id: "prod".into(), label: "生产".into(), tone: "prod".into(), position: 9 });
+            view.model.connections.rows.push(rec);
+            let first = &mut view.model.tabs[0];
+            first.connection_id = Some("demo-prod".into());
+            first.connection_name = Some("demo-prod".into());
+            first.database = Some("shop".into());
+            first.draft = "SELECT 42".into();
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (first, last, items) = cx
+        .update(|cx| {
+            let view = view.read(cx);
+            (view.model.tabs[0].id.clone(), view.model.tabs[2].id.clone(), view.tab_picker_items())
+        });
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|item| item.icon.is_some() && item.closable), "每项都有类型图标和关闭按钮");
+    let prod = items.iter().find(|item| item.id.as_ref() == first).unwrap();
+    assert_eq!(prod.env.as_ref().map(|(code, _)| code.as_ref()), Some("prod"), "生产连接带红色环境徽标");
+    assert!(prod.dirty.is_some(), "未保存的草稿带脏标记");
+    let current: Vec<&str> = items.iter().filter(|item| item.current).map(|item| item.id.as_ref()).collect();
+    assert_eq!(current, vec![last.as_str()], "只有当前标签高亮");
+    assert!(items.iter().filter(|item| item.id.as_ref() != first).all(|item| item.env.is_none() && item.dirty.is_none()));
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.toggle_tab_picker(window, cx));
+        window.render_frame(cx);
+        assert!(window.find("picker").visible(), "标签列表打开");
+        assert!(window.try_find(("picker-row-dirty", 0usize)).is_some(), "脏标记画在行里");
+        // 关掉最后一个（干净、当前）标签：列表保持打开，只剩两项。
+        window.click(("picker-row-close", 2usize), cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.tabs.len(), 2, "列表里的关闭按钮关掉标签");
+        assert!(!view.read(cx).model.tabs.iter().any(|tab| tab.id == last));
+        assert!(window.try_find("picker").is_some(), "关闭后列表保持打开");
+        assert!(window.try_find(("picker-row", 2usize)).is_none(), "列表刷新为剩下的标签");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
 }

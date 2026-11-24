@@ -10,7 +10,7 @@ use mysql_async::prelude::Queryable;
 use crate::adapters::exec::to_hex;
 use crate::adapters::SqlSyntax;
 use crate::connections::CancelTransport;
-use crate::query::exec::{chunk_rows, database_gate, refuse_message, DatabaseGate, RowSink, StatementValue};
+use crate::query::exec::{chunk_rows, database_gate, refuse_message, DatabaseGate, ResultExtras, RowSink, StatementValue};
 
 /// MySQL / MariaDB 的语法错误写在文本里："... near 'x' at line N"。取最后一处，行号从 1 开始。
 pub(crate) fn mysql_error_line(message: &str) -> Option<usize> {
@@ -66,6 +66,76 @@ fn quote_mysql(name: &str) -> String {
     super::syntax::MYSQL_SYNTAX.quote_ident(name)
 }
 
+/// 语句是不是存储过程调用：CALL 要读完全部结果集，并取 SHOW WARNINGS。
+fn is_call(sql: &str) -> bool {
+    let (tokens, _) = crate::query::complete::tokens(sql);
+    tokens.first().is_some_and(|token| token.word && !token.quoted && token.text.eq_ignore_ascii_case("CALL"))
+}
+
+/// 第一个结果集之后剩下的结果集（存储过程的多个 SELECT、最后的 OK 包）。
+/// 每个带列的结果集最多收 limit 行；超出的行只跳过不保存。OK 包的影响行数记在 extras.affected。
+async fn read_more_sets(
+    result: &mut mysql_async::QueryResult<'_, '_, mysql_async::TextProtocol>,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    extras: &mut ResultExtras,
+) -> Result<(), String> {
+    loop {
+        if result.is_empty() {
+            return Ok(());
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err("已取消".to_owned());
+        }
+        let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
+            .columns_ref()
+            .iter()
+            .map(|column| (column.name_str().into_owned(), column.column_type(), column.character_set()))
+            .collect();
+        if column_meta.is_empty() {
+            extras.affected = Some(result.affected_rows());
+            // 没有行的 OK 包：读一次就前进到下一个结果集。
+            let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
+            continue;
+        }
+        let mut value = StatementValue {
+            columns: column_meta.iter().map(|column| column.0.clone()).collect(),
+            column_types: column_meta.iter().map(|column| mysql_type_name(column.1, column.2).to_owned()).collect(),
+            rows: Vec::new(),
+            truncated: false,
+            affected: None,
+        };
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("已取消".to_owned());
+            }
+            let Some(row) = result.next().await.map_err(|err| crate::error_text::chain(&err))? else {
+                break;
+            };
+            if value.rows.len() >= limit {
+                value.truncated = true;
+                continue;
+            }
+            value.rows.push(
+                (0..value.columns.len())
+                    .map(|cell| mysql_cell(row.as_ref(cell).unwrap_or(&mysql_async::Value::NULL), column_meta[cell].1, column_meta[cell].2))
+                    .collect(),
+            );
+        }
+        extras.more.push(value);
+    }
+}
+
+/// CALL 之后的 SHOW WARNINGS：每条一行“级别 代码：信息”。读不到时不报错，只是没有警告。
+async fn read_warnings(conn: &mut mysql_async::Conn) -> Vec<String> {
+    let rows: Vec<(String, u32, String)> = match conn.query("SHOW WARNINGS").await {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter().map(|(level, code, message)| format!("{level} {code}: {message}")).collect()
+}
+
+/// 执行一条语句。返回第一个结果集（与流式发布的一致），其余结果集、最后的影响行数和警告放在 ResultExtras。
 #[allow(clippy::too_many_arguments)]
 pub(in crate::adapters) async fn mysql_run(
     conn: &mut mysql_async::Conn,
@@ -75,11 +145,50 @@ pub(in crate::adapters) async fn mysql_run(
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
-) -> Result<StatementValue, String> {
+) -> Result<(StatementValue, ResultExtras), String> {
     // 握手包里的线程 id 就是 CONNECTION_ID()；不再为每条语句多走一次网络往返。
     transport.set_mysql_connection_id(u64::from(conn.id()));
-    // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-    let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
+    let call = is_call(bounded);
+    let mut extras = ResultExtras::default();
+    let value = {
+        // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
+        let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
+        let (value, exhausted) = match mysql_first_set(&mut result, limit, cancel, sink, index).await {
+            Ok(first) => first,
+            Err(message) => {
+                if cancel.load(Ordering::SeqCst) {
+                    let _ = result.drop_result().await;
+                }
+                return Err(message);
+            }
+        };
+        // 存储过程可能返回多个结果集：逐个收下，不再丢掉。
+        if exhausted && call {
+            if let Err(message) = read_more_sets(&mut result, limit, cancel, &mut extras).await {
+                // 中途出错：已经收到的结果集保留，错误写进说明。
+                extras.notes.push(message);
+            }
+        }
+        let _ = result.drop_result().await;
+        value
+    };
+    if call {
+        extras.warnings = read_warnings(conn).await;
+    }
+    if call && value.columns.is_empty() && extras.more.is_empty() {
+        extras.no_result_set = true;
+    }
+    Ok((value, extras))
+}
+
+/// 第一个结果集：带列时按块流式发布；返回值和“这个结果集是否已经读完”（读完才能继续读后面的结果集）。
+async fn mysql_first_set(
+    result: &mut mysql_async::QueryResult<'_, '_, mysql_async::TextProtocol>,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<(StatementValue, bool), String> {
     let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
         .columns_ref()
         .iter()
@@ -89,8 +198,8 @@ pub(in crate::adapters) async fn mysql_run(
     let column_types: Vec<String> = column_meta.iter().map(|column| mysql_type_name(column.1, column.2).to_owned()).collect();
     if columns.is_empty() {
         let affected = result.affected_rows();
-        // OK 包没有行。收掉这个结果集，同一条连接才能执行下一条。
-        result.drop_result().await.map_err(|err| crate::error_text::chain(&err))?;
+        // OK 包没有行：读一次前进到下一个结果集（没有就结束），同一条连接才能执行下一条。
+        let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
         let value = StatementValue {
             columns,
             column_types,
@@ -99,7 +208,7 @@ pub(in crate::adapters) async fn mysql_run(
             affected: Some(affected),
         };
         sink.publish(index, &value).await;
-        return Ok(value);
+        return Ok((value, true));
     }
     let mut rows = Vec::new();
     let mut truncated = false;
@@ -107,7 +216,7 @@ pub(in crate::adapters) async fn mysql_run(
     let step = chunk_rows(limit);
     loop {
         if cancel.load(Ordering::SeqCst) {
-            let _ = result.drop_result().await;
+            // 调用方收掉剩余结果（drop_result），同一条连接才能执行下一条。
             return Err("已取消".to_owned());
         }
         let row = if let Some(row) = pending.take() {
@@ -137,10 +246,7 @@ pub(in crate::adapters) async fn mysql_run(
             };
             sink.publish(index, &partial).await;
             match peek {
-                None => {
-                    let _ = result.drop_result().await;
-                    return Ok(partial);
-                }
+                None => return Ok((partial, true)),
                 Some(next) => {
                     sink.pause(cancel).await?;
                     rows = partial.rows;
@@ -149,11 +255,11 @@ pub(in crate::adapters) async fn mysql_run(
             }
         }
     }
+    let mut exhausted = true;
     if truncated {
         // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
-        let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
+        exhausted = result.next().await.map_err(|err| crate::error_text::chain(&err))?.is_none();
     }
-    let _ = result.drop_result().await;
     let value = StatementValue {
         columns,
         column_types,
@@ -162,7 +268,7 @@ pub(in crate::adapters) async fn mysql_run(
         affected: None,
     };
     sink.publish(index, &value).await;
-    Ok(value)
+    Ok((value, exhausted))
 }
 
 const MYSQL_BINARY_CHARSET: u16 = 63;

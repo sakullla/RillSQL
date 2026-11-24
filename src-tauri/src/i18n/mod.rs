@@ -822,6 +822,8 @@ dict! {
     "query.log.run" => "整次执行", "Whole run";
     "query.log.rows" => "{count} 行", "{count} rows";
     "query.log.affected" => "影响 {count} 行", "{count} affected";
+    "query.outcome.showSql" => "完整 SQL", "Full SQL";
+    "query.outcome.hideSql" => "收起 SQL", "Hide SQL";
     "query.log.noPosition" => "草稿在执行后改过，或这条错误没有位置，无法定位。", "The draft changed after the run, or this error has no position, so it can't be located.";
     "query.log.copyMessage" => "复制消息", "Copy message";
     "query.log.copySql" => "复制 SQL", "Copy SQL";
@@ -1265,6 +1267,10 @@ dict! {
     "ui.settings.objectHintsHint" => "补全与悬停中的表/列说明", "Table and column notes in completion and hover";
     "ui.settings.hintsCompact" => "紧凑", "Compact";
     "ui.settings.hintsOff" => "关闭", "Off";
+    "ui.settings.completionAlias" => "补全表名时自动添加别名", "Add alias when completing tables";
+    "ui.settings.completionAliasHint" => "FROM/JOIN 后补全表名时附带别名，例如 order_items oi", "Appends an alias after FROM/JOIN, e.g. order_items oi";
+    "ui.settings.aliasOn" => "开启", "On";
+    "ui.settings.aliasOff" => "关闭", "Off";
     "ui.settings.indexNaming" => "索引命名", "Index naming";
     "ui.settings.indexNormal" => "普通索引模板", "Index template";
     "ui.settings.indexUnique" => "唯一索引模板", "Unique index template";
@@ -1644,6 +1650,8 @@ dict! {
     "query.errors.locate" => "定位到出错位置", "Jump to error";
     "query.errors.copy" => "复制错误", "Copy error";
     "query.errors.codeTitle" => "执行失败 · 错误码 {code}", "Failed · error code {code}";
+    "query.errors.lineCount" => "{count} 个错误", "{count} errors";
+    "query.errors.clearMarks" => "清除错误标记", "Clear error marks";
     "query.errors.copied" => "已复制错误信息", "Error message copied";
     "query.outline.run" => "运行此语句", "Run this statement";
     "query.results.rename" => "重命名固定结果", "Rename pinned result";

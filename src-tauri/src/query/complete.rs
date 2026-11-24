@@ -383,7 +383,29 @@ fn reserved(word: &str) -> bool {
             | "FIRST"
             | "LAST"
             | "USE"
+            // 表名后面可能紧跟的子句/修饰词：不能被当成别名（`FROM orders FOR UPDATE`）。
+            | "FOR"
+            | "NATURAL"
+            | "STRAIGHT_JOIN"
+            | "LATERAL"
+            | "WINDOW"
+            | "PARTITION"
+            | "FORCE"
+            | "IGNORE"
+            | "LOCK"
+            | "SHARE"
+            | "TABLESAMPLE"
+            | "FETCH"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "MINUS"
+            | "QUALIFY"
     )
+}
+
+/// 记号是否是保留字；带引号的标识符永远不是。
+fn reserved_token(token: &Tok) -> bool {
+    !token.quoted && reserved(&token.text.to_ascii_uppercase())
 }
 
 /// 解析当前语句：子句、FROM/JOIN 来源与别名、WITH 定义的 CTE、UPDATE/INSERT 目标。
@@ -561,7 +583,7 @@ fn read_target(tokens: &[Tok], start: usize, depth: usize) -> (Option<TableRef>,
                 alias = named.text.clone();
                 next += 2;
             }
-        } else if after.word && !reserved(&upper) {
+        } else if after.word && !reserved_token(after) {
             alias = after.text.clone();
             next += 1;
         }
@@ -647,8 +669,7 @@ fn read_tables(tokens: &[Tok], start: usize, tables: &mut Vec<TableRef>, depth: 
         if !first.word {
             return index;
         }
-        let upper = first.text.to_ascii_uppercase();
-        if reserved(&upper) {
+        if reserved_token(first) {
             return index;
         }
         let mut schema = String::new();
@@ -669,7 +690,7 @@ fn read_tables(tokens: &[Tok], start: usize, tables: &mut Vec<TableRef>, depth: 
                     alias = named.text.clone();
                     next += 2;
                 }
-            } else if after.word && !reserved(&after_upper) {
+            } else if after.word && !reserved_token(after) {
                 alias = after.text.clone();
                 next += 1;
             }
@@ -973,6 +994,32 @@ impl<'a> Gather<'a> {
                     Some(EntryInfo::Column { source: source.label.clone(), column: column.clone() }),
                 );
             }
+        }
+    }
+
+    /// 语句里显式写出的别名（与表名不同）作为候选，详情标注“→ 表名”。
+    fn push_aliases(&mut self, sources: &[Source]) {
+        for source in sources {
+            if source.alias.is_empty() || source.alias.eq_ignore_ascii_case(&source.name) {
+                continue;
+            }
+            let detail = format!("\u{2192} {}", source.label);
+            self.push(source.alias.clone(), ident(self.engine, &source.alias), "alias", detail, group::COLUMN, false);
+        }
+    }
+
+    /// FROM/JOIN 后补全表名时给表/视图附上自动别名（`order_items oi`）。
+    /// taken 是语句里已经用掉的别名和表名（小写），新生成的别名也会加进去，避免同批候选之外的冲突。
+    fn attach_aliases(&mut self, taken: &HashSet<String>) {
+        for (_, item) in self.items.iter_mut() {
+            if item.group != group::OBJECT || !matches!(item.kind, "table" | "view") {
+                continue;
+            }
+            let Some(EntryInfo::Object { name, .. }) = item.info.as_ref() else {
+                continue;
+            };
+            let alias = auto_alias(name, taken);
+            item.insert = format!("{} {}", item.insert, ident(self.engine, &alias));
         }
     }
 
@@ -1313,8 +1360,66 @@ fn redis_plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale
     }
 }
 
+/// 表名的自动别名：取名字各段（下划线、连字符、驼峰分段）的首字母，`order_items` → `oi`。
+/// 首字母撞上关键字时依次多取末段的字母（`order_notes` → `on` 是关键字 → `ono`）；
+/// 与语句里已有的别名或表名冲突时追加数字（`o` → `o2`）。
+pub fn auto_alias(name: &str, taken: &HashSet<String>) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for ch in name.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        current.push(ch.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    // 段首是数字的不取；名字里没有可用字母时退回 t。
+    segments.retain(|segment| segment.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()));
+    if segments.is_empty() {
+        segments.push("t".to_owned());
+    }
+    let initials: String = segments.iter().filter_map(|segment| segment.chars().next()).collect();
+    let last = segments.last().cloned().unwrap_or_default();
+    let mut options = vec![initials.clone()];
+    for take in 2..=last.len() {
+        let head: String = initials.chars().take(initials.chars().count() - 1).collect();
+        options.push(format!("{head}{}", &last[..take]));
+    }
+    let keyword = |word: &str| {
+        let upper = word.to_ascii_uppercase();
+        reserved(&upper) || BASE_KEYWORDS.contains(&upper.as_str()) || ALIAS_KEYWORDS.contains(&upper.as_str())
+    };
+    let base = options.into_iter().find(|option| !keyword(option)).unwrap_or_else(|| format!("{initials}1"));
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..).map(|n| format!("{base}{n}")).find(|option| !taken.contains(option)).unwrap_or(base)
+}
+
+/// 自动别名额外避开的短关键字（不在保留字表里，但写成别名会改变语义或报错）。
+const ALIAS_KEYWORDS: &[&str] = &[
+    "TO", "DO", "IF", "OF", "AT", "GO", "ADD", "ANY", "KEY", "DIV", "MOD", "XOR", "ROW", "ROWS", "BETWEEN", "LIKE", "CALL", "SHOW",
+    "SOME", "TOP", "OUT", "INOUT", "INT", "BIT", "DEC", "REAL", "CHAR", "DATE", "TIME", "YEAR", "OVER", "ONLY", "OWNER", "NO",
+];
+
 /// 计算一次补全计划。text 是编辑器全文，cursor 是光标字节偏移。
 pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) -> Plan {
+    plan_with(scope, text, cursor, locale, false)
+}
+
+/// 与 plan 相同；auto_alias 为真时，FROM/JOIN 后补全表名会自动附带别名（设置“补全表名时自动添加别名”）。
+pub fn plan_with(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale, auto_alias: bool) -> Plan {
     let end = floor_boundary(text, cursor);
     let mut plan = Plan { span: Span { start: end, end }, ..Default::default() };
     if crate::adapters::query::workbench_named(&scope.engine) == Some(crate::adapters::Workbench::Redis) {
@@ -1374,6 +1479,17 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     let frequency: HashMap<String, u32> = scope.frequency.iter().cloned().collect();
     let mut gather = Gather::new(&scope.engine, &prefix, locale);
     gather.position = position;
+    // 自动别名：只在 FROM/JOIN 的表位置，单表 DELETE/SHOW 之类不加；表名后面已经写了别名或限定点时也不加。
+    let alias_allowed = auto_alias
+        && matches!(clause, Some(Clause::From) | Some(Clause::Join))
+        && alias_statement(local)
+        && !alias_follows(&text[tail_from..tail_to]);
+    let taken: HashSet<String> = statement
+        .tables
+        .iter()
+        .flat_map(|table| [table.alias.to_lowercase(), table.name.to_lowercase()])
+        .filter(|word| !word.is_empty() && !word.eq_ignore_ascii_case(&prefix))
+        .collect();
 
     // 限定符：别名/表名只出该来源的列；模式只出该模式的对象；都不是就不回退无关列。
     if let Some((name, _)) = qualifier {
@@ -1391,6 +1507,9 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
             if !schema_objects.is_empty() {
                 for object in schema_objects {
                     gather.push_object(scope, object, false);
+                }
+                if alias_allowed {
+                    gather.attach_aliases(&taken);
                 }
                 plan.candidates = finalize(gather, &frequency);
                 return plan;
@@ -1483,6 +1602,7 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 }
                 fallback_objects(&mut gather, scope, &statement, metadata_ok);
             }
+            gather.push_aliases(&sources);
         }
         Some(Clause::Set) | Some(Clause::Values) | Some(Clause::Insert) => {
             let mut picked: Vec<Source> = Vec::new();
@@ -1509,6 +1629,9 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
         Some(Clause::From) | Some(Clause::Join) => {
             if metadata_ok {
                 gather.push_objects(scope);
+                if alias_allowed {
+                    gather.attach_aliases(&taken);
+                }
                 gather.push_schemas(scope);
                 gather.push_ctes(&statement);
                 gather.push_from_keywords();
@@ -1518,6 +1641,7 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
             }
         }
         Some(clause) if clause.field_first() => {
+            gather.push_aliases(&sources);
             if metadata_ok {
                 gather.push_columns(&sources);
                 gather.push_objects(scope);
@@ -1563,6 +1687,25 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     };
     plan.note = state_note(&scope.state, locale).or(column_note);
     plan
+}
+
+/// 语句开头允许给表起别名：SELECT / WITH / UPDATE / 括号开头的查询；DELETE、SHOW 等不加。
+fn alias_statement(local: &str) -> bool {
+    let (tokens, _) = lex(local);
+    let Some(first) = tokens.iter().find(|token| token.word || token.text != "(") else {
+        return false;
+    };
+    first.word && matches!(first.text.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "UPDATE" | "INSERT" | "REPLACE" | "CREATE" | "EXPLAIN")
+}
+
+/// 光标后（当前词之后）紧跟的是不是已有的别名、限定点或 AS：是就不再自动加别名。
+fn alias_follows(tail: &str) -> bool {
+    let (tokens, _) = lex(tail);
+    match tokens.first() {
+        Some(token) if !token.word => token.text == ".",
+        Some(token) => token.text.eq_ignore_ascii_case("AS") || !reserved_token(token),
+        None => false,
+    }
 }
 
 /// 光标所在的语法位置。`head` 是当前语句里光标所在词之前的文本。
@@ -2380,5 +2523,99 @@ mod tests {
         assert!(resolve(&other, "SELECT * FROM orders", 16).is_none());
         let sql = "SELECT * FROM orders";
         assert!(resolve(&typed_scope(), sql, 7).is_none(), "星号不是名字");
+    }
+    fn shop_scope() -> CompletionScope {
+        let mut shop = scope("mysql");
+        shop.objects.push(object("order_items", "shop", "table"));
+        shop.objects.push(object("order_notes", "shop", "table"));
+        shop.sources.push(source("shop.order_items", &["id", "order_id", "sku", "qty"]));
+        shop
+    }
+
+    /// R10：表名后面的 FOR / FORCE / PARTITION 等关键字不能被认成别名。
+    #[test]
+    fn trailing_keywords_are_not_read_as_aliases() {
+        let parsed = parse_scope("SELECT * FROM orders for update");
+        assert_eq!(parsed.tables.len(), 1);
+        assert_eq!(parsed.tables[0].alias, "orders");
+        for tail in ["FORCE INDEX (idx)", "PARTITION (p0)", "NATURAL JOIN customers", "LOCK IN SHARE MODE", "WINDOW w AS ()"] {
+            let parsed = parse_scope(&format!("SELECT * FROM orders {tail}"));
+            assert_eq!(parsed.tables[0].alias, "orders", "{tail}");
+        }
+        // 带引号的同名标识符仍然是别名。
+        let quoted = parse_scope("SELECT * FROM orders `for` WHERE ");
+        assert_eq!(quoted.tables[0].alias, "for");
+        // FOR UPDATE 之后的 WHERE 列补全仍然按表名限定。
+        let sql = "SELECT orders. FROM orders for update";
+        let planned = plan(&scope("mysql"), sql, "SELECT orders.".len(), Locale::ZhCn);
+        assert!(labels(&planned).contains(&"status".to_owned()), "{:?}", labels(&planned));
+    }
+
+    /// R10：`oi.` 只给 order_items 的列；WHERE 位置候选里有别名并标注所指的表。
+    #[test]
+    fn alias_qualifier_and_alias_candidates() {
+        let shop = shop_scope();
+        let sql = "SELECT oi. FROM order_items oi JOIN orders o ON o.id = oi.order_id";
+        let cursor = "SELECT oi.".len();
+        let planned = plan(&shop, sql, cursor, Locale::ZhCn);
+        assert_eq!(labels(&planned), vec!["id", "order_id", "sku", "qty"]);
+
+        let sql = "SELECT * FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE ";
+        let planned = plan(&shop, sql, sql.len(), Locale::ZhCn);
+        let alias = planned.candidates.iter().find(|item| item.kind == "alias" && item.label == "oi").expect("别名候选");
+        assert!(alias.detail.contains("order_items"), "{}", alias.detail);
+        assert!(planned.candidates.iter().any(|item| item.kind == "alias" && item.label == "o"));
+        // 没写别名的表不重复出现成别名候选。
+        let sql = "SELECT * FROM orders WHERE ";
+        let planned = plan(&shop, sql, sql.len(), Locale::ZhCn);
+        assert!(!planned.candidates.iter().any(|item| item.kind == "alias"), "{:?}", labels(&planned));
+    }
+
+    /// R10：自动别名取各段首字母，避开关键字与语句里已有的别名。
+    #[test]
+    fn auto_alias_avoids_keywords_and_taken_names() {
+        let none = HashSet::new();
+        assert_eq!(auto_alias("order_items", &none), "oi");
+        assert_eq!(auto_alias("orders", &none), "o");
+        assert_eq!(auto_alias("OrderItems", &none), "oi");
+        // on / as / or / by 都是关键字：换用下一个候选。
+        assert_eq!(auto_alias("order_notes", &none), "ono");
+        assert_eq!(auto_alias("audit_sessions", &none), "ase");
+        let alias = auto_alias("big_ytable", &none);
+        assert_ne!(alias.to_ascii_uppercase(), "BY");
+        let taken: HashSet<String> = ["o".to_owned(), "o2".to_owned()].into_iter().collect();
+        assert_eq!(auto_alias("orders", &taken), "o3");
+        let taken: HashSet<String> = ["oi".to_owned()].into_iter().collect();
+        assert_eq!(auto_alias("order_items", &taken), "oi2");
+    }
+
+    /// R10：FROM/JOIN 后补全表名时自动带别名；设置关闭、已写别名、DELETE 时不带。
+    #[test]
+    fn table_completion_appends_an_alias_when_enabled() {
+        let shop = shop_scope();
+        let insert_of = |planned: &Plan, label: &str| {
+            planned.candidates.iter().find(|item| item.label.ends_with(label)).map(|item| item.insert.clone())
+        };
+        let sql = "SELECT * FROM order_it";
+        let planned = plan_with(&shop, sql, sql.len(), Locale::ZhCn, true);
+        assert_eq!(insert_of(&planned, "order_items").as_deref(), Some("shop.order_items oi"));
+        let planned = plan_with(&shop, sql, sql.len(), Locale::ZhCn, false);
+        assert_eq!(insert_of(&planned, "order_items").as_deref(), Some("shop.order_items"));
+
+        // 已有 o 别名：第二个 orders 用 o2。
+        let sql = "SELECT * FROM orders o JOIN ord";
+        let planned = plan_with(&shop, sql, sql.len(), Locale::ZhCn, true);
+        assert_eq!(insert_of(&planned, "public.orders").as_deref(), Some("public.orders o2"));
+
+        // 光标后已经写了别名：不重复添加。
+        let sql = "SELECT * FROM ord x WHERE x.id = 1";
+        let cursor = "SELECT * FROM ord".len();
+        let planned = plan_with(&shop, sql, cursor, Locale::ZhCn, true);
+        assert_eq!(insert_of(&planned, "public.orders").as_deref(), Some("public.orders"));
+
+        // 单表 DELETE 不加别名。
+        let sql = "DELETE FROM ord";
+        let planned = plan_with(&shop, sql, sql.len(), Locale::ZhCn, true);
+        assert_eq!(insert_of(&planned, "public.orders").as_deref(), Some("public.orders"));
     }
 }

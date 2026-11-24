@@ -69,6 +69,9 @@ pub struct StatementView {
     pub range: Option<(usize, usize)>,
     /// 失败语句在草稿里的错误标记：有驱动位置时给偏移或行，没有时整条语句标错。
     pub error_mark: Option<ErrorMark>,
+    /// 同一条语句返回的第几个结果集（从 0 起）/ 共几个；只有多结果集（存储过程）时有值。
+    /// 序号大于 0 的是同一条语句的后续结果集：与前一个共享草稿范围，不占新的语句位置。
+    pub result_set: Option<(usize, usize)>,
 }
 
 /// 失败语句在草稿里的位置。
@@ -703,6 +706,7 @@ impl Desk {
                 error_code: None,
                 range: None,
                 error_mark: None,
+                result_set: None,
             }];
             // 外部写入的结果说不清来自哪个库：固定后按未定位只读处理。
             tab.results_target = None;
@@ -2112,6 +2116,7 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         error_code: statement.error_code,
         range: None,
         error_mark: None,
+        result_set: statement.result_set,
     }
 }
 
@@ -2195,7 +2200,18 @@ fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementVie
     let drafted = super::split::split_sql(&origin.engine, &origin.sql).pieces;
     let aligned = origin.sent != origin.sql
         && super::split::split_sql(&origin.engine, &origin.sent).pieces.len() == drafted.len();
-    for (view, piece) in results.iter_mut().zip(drafted.iter()) {
+    // 同一条语句的后续结果集不占新的语句位置：沿用前一个结果的草稿范围。
+    let mut pieces = drafted.iter();
+    let mut previous: Option<(usize, usize)> = None;
+    for view in results.iter_mut() {
+        if view.result_set.is_some_and(|(at, _)| at > 0) {
+            view.range = previous;
+            continue;
+        }
+        let Some(piece) = pieces.next() else {
+            break;
+        };
+        previous = None;
         let exact = view.sql == piece.text;
         if !exact && !aligned {
             continue;
@@ -2206,6 +2222,7 @@ fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementVie
             continue;
         }
         view.range = Some((start, end));
+        previous = view.range;
         // 自动插入/替换的位置只落到原草稿这一条语句里；越界时停在语句末尾，不外延。
         // 这里只记录"改写发生在哪"给展示与测试用，定位与错误标记始终走下面的 error_mark。
         view.rewrite_anchor = view.rewrite.as_ref().map(|rewrite| start.saturating_add(rewrite.at).min(end));
@@ -2592,6 +2609,7 @@ mod tests {
                 error_at: None,
                 error_code: None,
                 transaction: None,
+                result_set: None,
             }],
             transaction: None,
             started_at: String::new(),
@@ -2712,6 +2730,7 @@ mod tests {
             error_at: None,
             error_code: None,
             transaction: None,
+            result_set: None,
         });
         assert!(view.truncated, "截断标记必须跟到界面，才能提供加载更多");
     }
@@ -3094,6 +3113,7 @@ mod tests {
             error_code: None,
             range: None,
             error_mark: None,
+            result_set: None,
         }
     }
 

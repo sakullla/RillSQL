@@ -1495,6 +1495,8 @@ impl WorkbenchModel {
             "null-NULL" | "null-empty" | "null-N" => self.settings.null_copy = id.trim_start_matches("null-").to_owned(),
             "empty-hint" | "empty-blank" => self.settings.empty_display = id.trim_start_matches("empty-").to_owned(),
             "hints-compact" | "hints-off" => self.settings.object_hints = id.trim_start_matches("hints-").to_owned(),
+            "alias-on" => self.settings.completion_alias = true,
+            "alias-off" => self.settings.completion_alias = false,
             "page-size-up" => self.settings.step_page_size(50),
             "page-size-down" => self.settings.step_page_size(-50),
             "preview-up" => self.settings.step_preview_kb(1),

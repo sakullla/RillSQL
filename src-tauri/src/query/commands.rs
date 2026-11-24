@@ -87,6 +87,8 @@ pub struct StatementDto {
     pub error_code: Option<String>,
     /// 这一条语句对连接级事务的效果；没有事务面或没有影响时为 None。
     pub transaction: Option<TransactionEffect>,
+    /// 同一条语句的第几个结果集 / 共几个（存储过程返回多个结果集时）；只有一个结果集时为 None。
+    pub result_set: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +194,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             error_at: None,
             error_code: None,
             transaction: None,
+            result_set: None,
         })
         .collect::<Vec<_>>();
     // 批次开始前先取一次共享快照：执行结束前界面看到的是这条连接当前的事务状态。
@@ -310,7 +313,7 @@ fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
         snapshot,
         effect: batch.transaction_effect,
     });
-    let mut statements = batch.statements.into_iter().map(statement_dto).collect::<Vec<_>>();
+    let mut statements = batch.statements.into_iter().flat_map(statement_dtos).collect::<Vec<_>>();
     if let Some(first) = statements.first_mut() {
         if !notices.is_empty() {
             let note = notices.join("");
@@ -331,6 +334,52 @@ fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
     snap.statements = statements;
 }
 
+/// 一条语句的结果页：通常一个；存储过程返回多个结果集时每个结果集一页（结果 1/2…），
+/// 最后 OK 包的影响行数、SHOW WARNINGS 和“未返回结果集”的说明写在最后一页的消息里。
+fn statement_dtos(mut statement: StatementReport) -> Vec<StatementDto> {
+    let extras = std::mem::take(&mut statement.extras);
+    let mut first = statement_dto(statement);
+    if extras.is_empty() {
+        return vec![first];
+    }
+    let total = 1 + extras.more.len();
+    if total > 1 {
+        first.result_set = Some((0, total));
+    }
+    let mut out = vec![first.clone()];
+    for (at, set) in extras.more.into_iter().enumerate() {
+        let mut next = first.clone();
+        next.columns = set.columns;
+        next.column_types = set.column_types;
+        next.rows = set.rows;
+        next.truncated = set.truncated;
+        next.affected = None;
+        next.message = String::new();
+        next.result_set = Some((at + 1, total));
+        out.push(next);
+    }
+    let last = out.last_mut().expect("至少一个结果页");
+    if last.affected.is_none() {
+        last.affected = extras.affected.filter(|_| last.columns.is_empty());
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if extras.no_result_set {
+        notes.push("过程已执行，未返回结果集。".to_owned());
+    }
+    if let Some(affected) = extras.affected.filter(|_| total > 1) {
+        notes.push(format!("影响 {affected} 行。"));
+    }
+    if !extras.warnings.is_empty() {
+        notes.push(format!("警告（{} 条）：{}", extras.warnings.len(), extras.warnings.join("；")));
+    }
+    notes.extend(extras.notes);
+    if !notes.is_empty() {
+        let text = notes.join(" ");
+        last.message = if last.message.trim().is_empty() { text } else { format!("{} {text}", last.message) };
+    }
+    out
+}
+
 fn statement_dto(statement: StatementReport) -> StatementDto {
     // 没有改写时实际语句就是原文，不给前端多一份重复文本；没执行过的语句为空。
     let sent_sql = (!statement.sent_sql.is_empty() && statement.sent_sql != statement.sql).then_some(statement.sent_sql);
@@ -349,6 +398,7 @@ fn statement_dto(statement: StatementReport) -> StatementDto {
         error_at: statement.error_at,
         error_code: statement.error_code,
         transaction: statement.transaction,
+        result_set: None,
     }
 }
 
@@ -414,6 +464,55 @@ fn history_status(status: &str) -> &'static str {
         "unknown" => "unknown",
         "cancelled" => "cancelled",
         _ => "error",
+    }
+}
+
+#[cfg(test)]
+mod result_set_tests {
+    use super::*;
+    use crate::query::exec::{ResultExtras, StatementValue};
+
+    fn report(columns: &[&str], affected: Option<u64>, extras: ResultExtras) -> StatementReport {
+        StatementReport {
+            sql: "CALL p()".to_owned(),
+            sent_sql: "CALL p()".to_owned(),
+            rewrite: None,
+            status: "ok",
+            message: String::new(),
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            column_types: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+            affected,
+            elapsed_ms: Some(2),
+            error_at: None,
+            error_code: None,
+            transaction: None,
+            extras,
+        }
+    }
+
+    /// R14：CALL 的每个结果集一页（结果 1/2…），最后一页的消息带影响行数和警告；没有结果集时给出提示。
+    #[test]
+    fn procedure_result_sets_become_pages_with_warnings_on_the_last() {
+        let set = StatementValue { columns: vec!["id".to_owned()], column_types: Vec::new(), rows: vec![vec![Some("1".to_owned())]], truncated: false, affected: None };
+        let extras = ResultExtras { more: vec![set], affected: Some(0), warnings: vec!["Warning 1642: demo".to_owned()], notes: Vec::new(), no_result_set: false };
+        let pages = statement_dtos(report(&["order_id"], None, extras));
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].result_set, Some((0, 2)));
+        assert_eq!(pages[1].result_set, Some((1, 2)));
+        assert_eq!(pages[1].columns, vec!["id".to_owned()]);
+        assert!(pages[0].message.is_empty());
+        assert!(pages[1].message.contains("警告（1 条）") && pages[1].message.contains("demo"), "{}", pages[1].message);
+
+        let none = statement_dtos(report(&[], Some(0), ResultExtras { no_result_set: true, ..Default::default() }));
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].result_set, None);
+        assert!(none[0].message.contains("未返回结果集"), "{}", none[0].message);
+
+        let plain = statement_dtos(report(&["v"], None, ResultExtras::default()));
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].message.is_empty());
     }
 }
 
@@ -561,6 +660,7 @@ mod resource_tests {
                 rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
                 elapsed_ms: Some(1), error_at: None, error_code: None,
                 transaction: None,
+                result_set: None,
             }],
             transaction: None,
             started_at: String::new(), elapsed_ms: 0,

@@ -22,6 +22,23 @@ pub struct StatementValue {
     pub affected: Option<u64>,
 }
 
+/// 一条语句在第一个结果集之外带回来的东西（目前只有 MySQL / MariaDB 的 CALL 会有）：
+/// 其余结果集、最后 OK 包的影响行数、SHOW WARNINGS 与中途错误说明，以及“过程没有返回结果集”。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResultExtras {
+    pub more: Vec<StatementValue>,
+    pub affected: Option<u64>,
+    pub warnings: Vec<String>,
+    pub notes: Vec<String>,
+    pub no_result_set: bool,
+}
+
+impl ResultExtras {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// 驱动报出的错误位置，相对于出错的那一条语句。
 /// Char 是语句内从 0 开始的字符偏移（PostgreSQL 的 position 换算而来）；
 /// Line 是语句内从 1 开始的行号（MySQL 的 "at line N"、SQL Server 的行号）。
@@ -99,6 +116,8 @@ pub struct StatementReport {
     pub error_code: Option<String>,
     /// 这条语句对连接级事务的效果；非关系型连接或没有影响时为 None。
     pub transaction: Option<TransactionEffect>,
+    /// 第一个结果集之外的结果集与警告（存储过程调用）。
+    pub extras: ResultExtras,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,13 +282,15 @@ pub struct DriverReport {
     /// 驱动原始失败（含结构化错误码）。事务登记用它按方言判定事务影响；
     /// `StatementStop::Unknown` 不会丢掉错误码。
     pub failure: Option<Failure>,
+    /// 第一个结果集之外的东西（存储过程的其余结果集、警告）；没有时为空。
+    pub extras: ResultExtras,
 }
 
 impl DriverReport {
     /// 没有改写、直接发出原语句的结果。给测试替身用：真实驱动都经 cap_result_sql_detail。
     #[cfg(test)]
     pub fn unchanged(sql: &str, outcome: Result<StatementValue, StatementStop>) -> Self {
-        Self { sent: CappedSql::unchanged(sql), outcome, failure: None }
+        Self { sent: CappedSql::unchanged(sql), outcome, failure: None, extras: ResultExtras::default() }
     }
 }
 
@@ -418,6 +439,7 @@ fn statement_report(sql: String, trial: StatementTrial) -> StatementReport {
         error_at: trial.error_at,
         error_code: trial.error_code,
         transaction: trial.transaction,
+        extras: trial.extras,
     }
 }
 
@@ -438,6 +460,7 @@ fn skipped(sql: String, message: &str) -> StatementReport {
         error_at: None,
         error_code: None,
         transaction: None,
+        extras: ResultExtras::default(),
     }
 }
 
@@ -670,7 +693,11 @@ impl StatementDriver for LiveDriver {
         };
         let sent = capped.sql.as_str();
         let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
-        let result: Result<StatementValue, Failure> = attached.run(&self.transport, sent, sql, limit, cancel, &sink, index).await;
+        let result: Result<(StatementValue, ResultExtras), Failure> = attached.run_full(&self.transport, sent, sql, limit, cancel, &sink, index).await;
+        let (result, extras) = match result {
+            Ok((value, extras)) => (Ok(value), extras),
+            Err(failure) => (Err(failure), ResultExtras::default()),
+        };
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。
         match &result {
@@ -687,7 +714,7 @@ impl StatementDriver for LiveDriver {
             StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at, code: failure.code },
             other => other,
         });
-        DriverReport { sent: capped, outcome, failure }
+        DriverReport { sent: capped, outcome, failure, extras }
     }
 
     fn paused(&self) -> Duration {

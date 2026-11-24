@@ -72,6 +72,13 @@ pub struct ShellSettings {
     /// 编辑器对象提示（R8）：`compact` 紧凑（默认），`off` 关闭补全文档与悬停对象卡。旧文件没有这一项时取默认。
     #[serde(default = "default_object_hints")]
     pub object_hints: String,
+    /// 补全表名时自动添加别名（R10），默认开启。旧文件没有这一项时取默认。
+    #[serde(default = "default_completion_alias")]
+    pub completion_alias: bool,
+}
+
+fn default_completion_alias() -> bool {
+    true
 }
 
 fn default_object_hints() -> String {
@@ -101,6 +108,7 @@ impl Default for ShellSettings {
             transaction_manual: false,
             transaction_advanced: false,
             object_hints: default_object_hints(),
+            completion_alias: default_completion_alias(),
         }
     }
 }

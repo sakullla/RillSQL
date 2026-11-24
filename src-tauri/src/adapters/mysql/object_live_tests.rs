@@ -591,3 +591,78 @@ async fn trigger_failure_paths(live: &Live, suffix: &str) {
     println!("object-live: {} 无效触发器主体被拒绝：{}", live.engine_name(), failed.message);
     assert!(live.trigger_state(&broken).await.is_err());
 }
+/// R14：CALL 走查询台真实链路（风险确认 → 执行），返回两个结果集的过程产生两个结果页，
+/// 消息页带 SHOW WARNINGS 的警告；不返回结果集的过程提示“未返回结果集”。
+/// 夹具：docker/compose.yaml 的 mysql 服务（docker/init/mysql-ux-round3.sql 的 shop 库）。
+/// 端口来自 RILLSQL_UX_MYSQL_PORT（默认 3306）。
+#[test]
+#[ignore = "需要 docker compose -f docker/compose.yaml up -d 启动的 MySQL 夹具（shop 库）"]
+fn call_returns_every_result_set_and_warnings_on_the_compose_fixture() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::QueryState;
+    use crate::query::desk::{self, BeginRun, Desk};
+
+    let port = std::env::var("RILLSQL_UX_MYSQL_PORT").unwrap_or_else(|_| "3306".to_owned());
+    crate::app::shell::jobs::runtime().block_on(async move {
+        let dir = std::env::temp_dir().join(format!("rillsql-call-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("临时目录");
+        let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+        let id = "call-live-mysql".to_owned();
+        let mut draft = ConnectionDraft::blank(Engine::Mysql);
+        draft.id = Some(id.clone());
+        draft.name = id.clone();
+        draft.host = "127.0.0.1".into();
+        draft.port = port;
+        draft.username = "root".into();
+        draft.database = "shop".into();
+        draft.tls_mode = TlsMode::Off;
+        draft.save_password = false;
+        services.connections.save(draft, SecretInput::default()).await.expect("保存连接");
+        let opened = services
+            .connections
+            .open(&id, SecretInput { password: Some(Secret::new("root")), ..Default::default() })
+            .await
+            .expect("打开连接");
+        assert!(opened.connected, "{:?}", opened.report);
+        let run = |sql: &'static str| {
+            let services = services.clone();
+            let id = id.clone();
+            let dir = dir.clone();
+            async move {
+                let tasks = TaskBoard::new();
+                let mut desk = Desk::new();
+                desk.open_database(&id, &id, "mysql", "shop");
+                desk.set_draft(sql);
+                // CALL 可能修改数据：仍然先确认，确认后按同一份文本发送。
+                let BeginRun::Risks(prompt) = desk.begin_run(&tasks, RunScope::Script, None) else {
+                    panic!("CALL 需要确认");
+                };
+                assert_eq!(prompt.statements.len(), 1);
+                let confirmed = desk.confirm_risks().expect("确认后的文本");
+                let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, Some(confirmed)) else {
+                    panic!("确认后应能执行");
+                };
+                let query = QueryState::new(dir.join("query-history.sqlite"));
+                desk::execute_prepared(&services.connections, &query, &prepared).await.expect("执行")
+            }
+        };
+
+        let two = run("CALL report_two_sets()").await;
+        let pages: Vec<_> = two.statements.iter().filter(|statement| !statement.columns.is_empty()).collect();
+        assert_eq!(pages.len(), 2, "两个结果集各一页：{:#?}", two.statements);
+        assert_eq!(pages[0].result_set, Some((0, 2)));
+        assert_eq!(pages[1].result_set, Some((1, 2)));
+        assert_eq!(pages[0].columns, vec!["order_id".to_owned(), "line_count".to_owned()]);
+        assert_eq!(pages[1].columns[0], "id");
+        assert!(two.statements.iter().all(|statement| statement.status == "ok"), "{:#?}", two.statements);
+        let last = two.statements.last().expect("最后一页");
+        assert!(last.message.contains("警告") && last.message.contains("report_two_sets: demo warning"), "消息页含警告：{}", last.message);
+
+        let none = run("CALL touch_nothing()").await;
+        assert_eq!(none.statements.len(), 1, "{:#?}", none.statements);
+        assert!(none.statements[0].columns.is_empty());
+        assert!(none.statements[0].message.contains("未返回结果集"), "{}", none.statements[0].message);
+        println!("call-live: report_two_sets {} 页，touch_nothing 提示：{}", pages.len(), none.statements[0].message);
+    });
+}

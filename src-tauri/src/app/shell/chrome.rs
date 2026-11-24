@@ -3001,8 +3001,21 @@ impl Workbench {
     }
 
     /// 标签列表里的条目：标题；说明是连接 / 库，也参与搜索。固定标签在说明里注明。
+    /// 标签的脏 / 待提交说明：表格有未提交改动、查询草稿未保存、结构有待应用改动。没有时为 None。
+    pub(super) fn tab_dirty_tip(&self, tab: &super::model::WorkItem) -> Option<SharedString> {
+        match tab.kind {
+            WorkItemKind::Query if tab.uncommitted_cells => Some(self.t("ui.grid.pending")),
+            WorkItemKind::Query if tab.is_draft_dirty() => Some(self.t("shell.tabs.unsavedDraft")),
+            WorkItemKind::Query => None,
+            WorkItemKind::Structure => tab.structure_dirty.then(|| self.t("shell.tabs.pendingStructure")),
+            _ => tab.uncommitted_cells.then(|| self.t("ui.grid.pending")),
+        }
+    }
+
+    /// 标签列表（溢出“N ▾”）：每项带类型图标、环境徽标（生产为红色）、脏 / 待提交标记、关闭按钮，当前标签常亮。
     pub(super) fn tab_picker_items(&self) -> Vec<crate::ui::picker::PickerItem> {
         let pinned = self.t("shell.tabs.pinned");
+        let work_page = self.model.shell.page == AppPage::Workspace;
         self.model
             .tabs
             .iter()
@@ -3018,7 +3031,23 @@ impl Workbench {
                 if tab.pinned {
                     text = if text.is_empty() { pinned.to_string() } else { format!("{text} · {pinned}") };
                 }
-                let item = crate::ui::picker::PickerItem::new(tab.id.clone(), tab.title.clone());
+                let mut item = crate::ui::picker::PickerItem::new(tab.id.clone(), tab.title.clone())
+                    .icon(item_icon(tab.kind))
+                    .closable(true)
+                    .current(work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str()));
+                if let Some(tip) = self.tab_dirty_tip(tab) {
+                    item = item.dirty(tip);
+                }
+                let env = tab
+                    .connection_id
+                    .as_deref()
+                    .and_then(|conn_id| self.model.connections.rows.iter().find(|row| row.saved.id == conn_id))
+                    .map(|row| row.saved.env.clone())
+                    .unwrap_or_default();
+                if env_shown(&env) {
+                    let tone = env_tone(&env, &self.model.env_tags).to_owned();
+                    item = item.env(tone, self.env_text(&env));
+                }
                 if text.is_empty() { item } else { item.detail(text) }
             })
             .collect()
@@ -3037,6 +3066,14 @@ impl Workbench {
         let chosen: Vec<SharedString> = self.model.active_tab.clone().map(SharedString::from).into_iter().collect();
         let locale = self.model.locale();
         let picker = cx.new(|cx| crate::ui::picker::Picker::new(items, crate::ui::picker::PickerMode::Single, chosen, locale, window, cx));
+        // 列表里的关闭按钮：走与标签 × 相同的关闭流程（脏标签照常弹出确认）；列表留着，刷新剩下的标签。
+        let shell = cx.entity().downgrade();
+        picker.update(cx, |picker, _| {
+            picker.set_close_handler(std::rc::Rc::new(move |id: &SharedString, _window: &mut Window, cx: &mut App| {
+                let id = id.to_string();
+                let _ = shell.update(cx, |this, cx| this.close_tab_from_picker(&id, cx));
+            }));
+        });
         let subscription = cx.subscribe_in(&picker, window, |this, _, event: &crate::ui::picker::PickerEvent, _, cx| match event {
             crate::ui::picker::PickerEvent::Chosen(id) => {
                 let id = id.to_string();
@@ -3048,6 +3085,20 @@ impl Workbench {
         });
         picker.update(cx, |picker, cx| picker.focus_search(window, cx));
         self.tab_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    /// 标签列表里点了某一项的关闭按钮。
+    pub(super) fn close_tab_from_picker(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.model.request_close_tab(id);
+        self.persist_if_needed(cx);
+        // 关闭需要确认（脏标签）时收起列表，让确认框接管键盘；否则刷新列表。
+        let items = self.tab_picker_items();
+        if self.model.has_blocking_dialog() || items.is_empty() {
+            self.close_tab_picker(cx);
+        } else if let Some((picker, _)) = self.tab_picker.as_ref() {
+            picker.update(cx, |picker, cx| picker.set_items(items, cx));
+        }
         cx.notify();
     }
 
@@ -6564,6 +6615,11 @@ impl Workbench {
                     &[("hints-compact", "ui.settings.hintsCompact", s.object_hints != "off"), ("hints-off", "ui.settings.hintsOff", s.object_hints == "off")],
                     cx,
                 );
+                let alias_seg = seg(
+                    self,
+                    &[("alias-on", "ui.settings.aliasOn", s.completion_alias), ("alias-off", "ui.settings.aliasOff", !s.completion_alias)],
+                    cx,
+                );
                 div()
                 .flex()
                 .flex_col()
@@ -6585,6 +6641,7 @@ impl Workbench {
                         (self.t("shell.settings.editorFont"), None, font.into_any_element()),
                         (self.t("shell.settings.editorTheme"), None, editor_theme.into_any_element()),
                         (self.t("ui.settings.objectHints"), Some(self.t("ui.settings.objectHintsHint")), hints_seg),
+                        (self.t("ui.settings.completionAlias"), Some(self.t("ui.settings.completionAliasHint")), alias_seg),
                     ],
                     &p,
                 ))

@@ -214,6 +214,11 @@ pub struct QueryPane {
     plan_canvas: plan_canvas::CanvasState,
     /// 计划树容器的焦点：整棵树只占一个 Tab 停靠点，只有它持有焦点时才处理导航键。
     plan_focus: gpui_kit::FocusHandle,
+    /// 风险确认模态框的焦点；打开时聚焦一次（risk_focused），关闭后焦点回到编辑器。
+    risk_focus: gpui_kit::FocusHandle,
+    risk_focused: bool,
+    /// 展开了完整 SQL 的那一条非查询结果（标签、批次、语句）；换结果后自动回到折叠。
+    outcome_sql_open: Option<(String, u64, usize)>,
     /// 计划树的滚动句柄：跨帧保存，键盘或建议跳转后把选中节点滚进视口。
     plan_scroll: gpui_kit::ScrollHandle,
     /// 下一帧要滚进视口的节点（前序下标）。
@@ -691,6 +696,9 @@ impl QueryPane {
             plan_selected: 0,
             plan_canvas: plan_canvas::CanvasState::default(),
             plan_focus: cx.focus_handle().tab_stop(true),
+            risk_focus: cx.focus_handle(),
+            risk_focused: false,
+            outcome_sql_open: None,
             plan_scroll: gpui_kit::ScrollHandle::new(),
             plan_reveal: None,
             plan_len: 0,
@@ -791,6 +799,8 @@ impl QueryPane {
     /// 把公开设置下发给编辑器和结果网格；无需重启，下一次绘制就生效。
     pub fn apply_public_settings(&mut self, settings: &crate::state::ShellSettings, cx: &mut Context<Self>) {
         let form = crate::app::views::settings::SettingsForm::from_settings(settings);
+        // 自动别名是全局的：所有 SQL 编辑器的补全下一次请求时读取。
+        SqlEditor::publish_auto_alias(form.completion_alias, cx);
         self.editor_font = form.editor_font;
         self.editor_theme = form.editor_theme;
         self.page_size = u64::try_from(form.page_size.max(1)).unwrap_or(1);
@@ -1339,6 +1349,16 @@ impl QueryPane {
             "request-cancel" => self.cancel(cx),
             "query-load-more" => self.load_more(cx),
             "format" => self.format(cx),
+            "toggle-outcome-sql" => {
+                let key = self.outcome_key();
+                self.outcome_sql_open = if self.outcome_sql_open.as_ref() == Some(&key) { None } else { Some(key) };
+                cx.notify();
+            }
+            "clear-error-marks" => {
+                if let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() {
+                    editor.update(cx, |editor, cx| editor.clear_errors(cx));
+                }
+            }
             "autocomplete" => self.complete(cx),
             "explain" => self.explain(cx),
             "expand-star" => self.expand(cx),
@@ -1367,10 +1387,17 @@ impl QueryPane {
             }
             "refresh-tree" => self.refresh_tree(cx),
             "confirm-variables" => self.confirm_variables(cx),
-            "confirm-risks" => self.confirm_risks(cx),
+            "confirm-risks" => {
+                self.risk_focused = false;
+                self.focus_editor = true;
+                self.confirm_risks(cx);
+            }
             "cancel-risks" => {
                 self.desk.cancel_risks();
                 self.desk.set_active_note("");
+                // 取消后焦点回到编辑器，可以直接继续编辑或执行。
+                self.risk_focused = false;
+                self.focus_editor = true;
                 cx.notify();
             }
             "cancel-variables" => {
@@ -3362,13 +3389,16 @@ impl Render for QueryPane {
             }
         };
 
+        let risks = self.render_risks(&p, metrics, &mono, &entity, window, cx);
         div()
             .id("query-pane")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .child(toolbar)
             .child(div().id("query-body").flex_1().min_h_0().child(body))
+            .children(risks)
     }
 }
 
@@ -3393,7 +3423,19 @@ impl QueryPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         // 没有选区时“运行”执行光标所在语句，有选区时只执行选中部分：按钮文字直接说清楚这次会跑什么。
         let selected = self.has_selection(cx);
-        let run: AnyElement = if running {
+        let run: AnyElement = if !running && self.desk.pending_risks().is_some() {
+            // 等待风险确认：运行按钮换成状态，点它把焦点送回确认框。
+            kit::secondary_button("query-act-awaiting-confirm", Some(IconName::TriangleAlert), SharedString::from(risk_panel::waiting_label(locale)), {
+                let entity = entity.clone();
+                move |_, window, cx| {
+                    entity.update(cx, |pane, cx| {
+                        window.focus(&pane.risk_focus, cx);
+                        cx.notify();
+                    })
+                }
+            })
+            .into_any_element()
+        } else if running {
             kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", entity))
                 .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "ui.query.stop"), kit::shortcut("Ctrl+."))))
                 .into_any_element()
@@ -3789,10 +3831,6 @@ impl QueryPane {
             .child(header);
         if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
             results_panel = results_panel.child(row);
-        }
-        // 执行前风险确认：确认或取消之前，这批语句一条都不发送。
-        if let Some(panel) = self.render_risks(p, metrics, mono, entity) {
-            results_panel = results_panel.child(panel);
         }
         results_panel.child(self.render_results_body(running, p, metrics, mono, entity)).into_any_element()
     }
@@ -4285,11 +4323,28 @@ impl QueryPane {
         })
     }
 
-    /// 执行前的风险确认面板；没有等待确认的语句时不占位置。
+    /// 执行前的风险确认模态框（盖在查询页上）；没有等待确认的语句时不画。确认或取消之前，这批语句一条都不发送。
     #[inline(never)]
-    fn render_risks(&self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> Option<AnyElement> {
-        let prompt = self.desk.pending_risks()?;
-        Some(risk_panel::render(&prompt, self.locale, p, metrics, mono, entity))
+    fn render_risks(&mut self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(prompt) = self.desk.pending_risks() else {
+            self.risk_focused = false;
+            return None;
+        };
+        if !self.risk_focused {
+            self.risk_focused = true;
+            window.focus(&self.risk_focus, cx);
+        }
+        Some(risk_panel::render(&prompt, self.locale, p, metrics, mono, entity, &self.risk_focus))
+    }
+
+    /// 当前结果页的身份：标签、执行批次、语句序号。
+    fn outcome_key(&self) -> (String, u64, usize) {
+        (self.desk.active_id().unwrap_or_default().to_owned(), self.desk.log_batch(), self.desk.statement())
+    }
+
+    /// 当前查询标签是否在等待风险确认（工具栏显示“等待确认…”）。
+    pub fn awaiting_risk_confirmation(&self) -> bool {
+        self.desk.pending_risks().is_some()
     }
 
     /// 执行前要填的变量；没有变量时不占位置。
@@ -4397,7 +4452,8 @@ impl QueryPane {
             } else {
                 Progress::Done
             };
-            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity, self.frame_spinner(2));
+            let sql_expanded = self.outcome_sql_open.as_ref() == Some(&self.outcome_key());
+            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity, self.frame_spinner(2), sql_expanded);
         }
         // 结果是执行计划：画成计划视图（摘要、问题与建议、计划树、节点详情）；“原始结果”仍是网格。
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
@@ -4669,6 +4725,121 @@ fn error_copy_button(locale: Locale, _p: &Palette, _metrics: Metrics, entity: &E
     .into_any_element()
 }
 
+/// 非查询语句的摘要：语句类型（如 `CREATE TABLE`）和对象名。认不出对象时只给类型。
+pub fn statement_summary(sql: &str) -> (String, Option<String>) {
+    let (tokens, _) = crate::query::complete::tokens(sql);
+    let words: Vec<&crate::query::complete::Tok> = tokens.iter().collect();
+    let upper = |at: usize| words.get(at).filter(|token| token.word && !token.quoted).map(|token| token.text.to_ascii_uppercase()).unwrap_or_default();
+    // 对象名：从 at 开始，跳过 IF [NOT] EXISTS，读 `a` 或 `a.b`。
+    let object_at = |mut at: usize| -> Option<String> {
+        if upper(at) == "IF" {
+            at += if upper(at + 1) == "NOT" { 3 } else { 2 };
+        }
+        let first = words.get(at).filter(|token| token.word)?;
+        let mut name = first.text.clone();
+        if words.get(at + 1).is_some_and(|token| token.text == ".") {
+            if let Some(second) = words.get(at + 2).filter(|token| token.word) {
+                name = format!("{name}.{}", second.text);
+            }
+        }
+        Some(name)
+    };
+    let lead = upper(0);
+    if lead.is_empty() {
+        return (String::new(), None);
+    }
+    const KINDS: &[&str] = &[
+        "TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "FUNCTION", "PROCEDURE", "TRIGGER", "SEQUENCE", "EVENT", "USER", "ROLE", "TYPE",
+        "EXTENSION",
+    ];
+    match lead.as_str() {
+        "CREATE" | "ALTER" | "DROP" => {
+            // 跳过 OR REPLACE / TEMPORARY / UNIQUE 等修饰词，找到对象类型。
+            let mut at = 1;
+            while at < words.len().min(8) {
+                let word = upper(at);
+                if KINDS.contains(&word.as_str()) {
+                    return (format!("{lead} {word}"), object_at(at + 1));
+                }
+                at += 1;
+            }
+            (lead, None)
+        }
+        "INSERT" | "REPLACE" => (lead, object_at(if upper(1) == "INTO" { 2 } else { 1 })),
+        "UPDATE" => (lead, object_at(1)),
+        "DELETE" => (lead, object_at(if upper(1) == "FROM" { 2 } else { 1 })),
+        "TRUNCATE" => (lead, object_at(if upper(1) == "TABLE" { 2 } else { 1 })),
+        "CALL" | "EXEC" | "EXECUTE" => (lead, object_at(1)),
+        "RENAME" => (format!("{lead} {}", upper(1)), object_at(2)),
+        _ => (lead, None),
+    }
+}
+
+/// 摘要卡片的一行：语句类型 · 对象 · 影响行数 · 耗时。
+pub fn outcome_summary_line(locale: Locale, result: &desk::StatementView) -> String {
+    let (kind, object) = statement_summary(&result.sql);
+    let mut parts: Vec<String> = Vec::new();
+    if !kind.is_empty() {
+        parts.push(kind);
+    }
+    if let Some(object) = object {
+        parts.push(object);
+    }
+    if let Some(affected) = result.affected {
+        let count = crate::app::views::grid::group_digits(affected as i64);
+        parts.push(i18n::fill(&i18n::text(locale, "query.log.affected"), &[("count", &count)]));
+    }
+    if let Some(ms) = result.elapsed_ms {
+        parts.push(elapsed_label(ms));
+    }
+    parts.join(" · ")
+}
+
+/// 完整 SQL 默认折叠成一行（首行，过长截断）；点击展开 / 收起。
+fn collapsible_sql(result: &desk::StatementView, expanded: bool, locale: Locale, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+    let first = result.sql.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    let multi = result.sql.trim().lines().count() > 1 || first.chars().count() > 120;
+    let toggle_label = if expanded { i18n::text(locale, "query.outcome.hideSql") } else { i18n::text(locale, "query.outcome.showSql") };
+    let head = div()
+        .id("query-statement-sql-toggle")
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(SharedString::from(toggle_label.clone()))
+        .aria_expanded(expanded)
+        .flex()
+        .items_center()
+        .gap(px(Space::SM))
+        .min_w_0()
+        .cursor_pointer()
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .hover(|style| style.text_color(p.text))
+        .child(kit::icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }, 13., p.text_faint))
+        .child(SharedString::from(toggle_label))
+        .when(!expanded, |this| {
+            this.child(
+                div()
+                    .id("query-statement-sql-line")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_color(p.text_faint)
+                    .child(SharedString::from(if multi { format!("{first} …") } else { first.to_owned() })),
+            )
+        })
+        .on_click(pane_act("toggle-outcome-sql", entity));
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(Space::SM))
+        .min_w_0()
+        .child(head)
+        .when(expanded, |this| this.child(sql_block("query-statement-sql", result.sql.clone(), mono, p)))
+        .into_any_element()
+}
+
 /// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -4682,6 +4853,7 @@ fn statement_outcome(
     metrics: Metrics,
     entity: &Entity<QueryPane>,
     spinner: Option<AnyElement>,
+    sql_expanded: bool,
 ) -> AnyElement {
     if progress != Progress::Done {
         // 执行中：正在跑的这一条转圈，排在后面的写“等待执行”，都不能画成成功的对勾。
@@ -4737,6 +4909,61 @@ fn statement_outcome(
         }
         parts.join(" · ")
     };
+    if !failed && !skipped && !cancelled {
+        // 成功：摘要卡片（语句类型 · 对象 · 影响行数 · 耗时），完整 SQL 默认折叠。
+        let summary = outcome_summary_line(locale, result);
+        return div()
+            .id("query-statement-outcome")
+            .test_support()
+            .flex_1()
+            .p(px(Space::XL))
+            .flex()
+            .flex_col()
+            .gap(px(Space::LG))
+            .child(
+                div()
+                    .id("query-outcome-card")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::MD))
+                    .p(px(Space::LG))
+                    .rounded(px(Radius::PANEL))
+                    .border_1()
+                    .border_color(p.line_soft)
+                    .bg(p.surface)
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("query-error-message")
+                            .test_support()
+                            .aria_label(SharedString::from(message.clone()))
+                            .flex()
+                            .items_center()
+                            .gap(px(Space::MD))
+                            .text_size(px(TypeScale::MD))
+                            .text_color(color)
+                            .child(kit::icon(IconName::CircleCheck, 16., p.ok))
+                            .child(SharedString::from(message)),
+                    )
+                    .when(!summary.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id("query-outcome-summary")
+                                .test_support()
+                                .aria_label(SharedString::from(summary.clone()))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(TypeScale::SM))
+                                .text_color(p.text)
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .child(SharedString::from(summary)),
+                        )
+                    })
+                    .child(collapsible_sql(result, sql_expanded, locale, mono, p, entity)),
+            )
+            .into_any_element();
+    }
     let icon = if failed {
         kit::icon(IconName::CircleAlert, 16., p.danger).into_any_element()
     } else if skipped || cancelled {
@@ -4966,6 +5193,7 @@ pub fn requires_active_query(id: &str) -> bool {
             | "pin-result"
             | "toggle-side"
             | "jump-error"
+            | "clear-error-marks"
             | "jump-format-error"
             | "copy-error"
     ) || id.starts_with("statement:")
@@ -5087,6 +5315,7 @@ mod tests {
             error_code: None,
             range: None,
             error_mark: None,
+            result_set: None,
         }
     }
 
@@ -5440,6 +5669,59 @@ mod tests {
             database: Some("main".to_owned()),
             engine: Some("sqlite".to_owned()),
         }
+    }
+
+    /// R12：危险语句进入模态确认；期间工具栏显示“等待确认…”；20 条语句时按钮固定在可见区；
+    /// 取消后模态消失、编辑器重新拿到焦点并可以继续执行。
+    #[gpui_kit::test]
+    fn risky_batches_wait_in_a_modal_with_pinned_buttons(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft: String = (0..20).map(|ix| format!("DELETE FROM orders_{ix};\n")).collect();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", &draft)), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation(), "{}", pane.read(cx).note());
+            assert!(!pane.read(cx).running(), "确认前一条都不发送");
+            let modal = window.find("query-risks");
+            assert!(modal.visible(), "风险确认是模态框");
+            assert!(window.find("query-act-awaiting-confirm").visible(), "工具栏显示等待确认");
+            assert!(window.try_find("query-act-execute-query").is_none());
+            // 20 条语句：正文独立滚动，底部按钮完整落在模态框和窗口里。
+            let card = modal.bounds();
+            let viewport = window.viewport_size();
+            for id in ["query-act-confirm-risks", "query-act-cancel-risks"] {
+                let button = window.find(id);
+                assert!(button.visible(), "{id}");
+                let bounds = button.bounds();
+                assert!(bounds.origin.y >= card.origin.y && bounds.origin.y + bounds.size.height <= card.origin.y + card.size.height, "{id} 在模态框内：{bounds:?} / {card:?}");
+                assert!(bounds.origin.y + bounds.size.height <= viewport.height, "{id} 没有被挤出窗口");
+            }
+            let body = window.find("query-risks-body").bounds();
+            let footer = window.find("query-risks-footer").bounds();
+            assert!(body.origin.y + body.size.height <= footer.origin.y + px(0.5), "正文在按钮区之上，不压住按钮");
+            window.click("query-act-cancel-risks", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).awaiting_risk_confirmation());
+            assert!(window.try_find("query-risks").is_none(), "取消后模态框消失");
+            assert!(window.find("query-act-execute-query").visible(), "取消后运行按钮恢复");
+            let editor = pane.read(cx).editors.get("q").cloned().expect("编辑器");
+            assert!(editor.read(cx).is_focused(window, cx), "取消后焦点回到编辑器");
+            // 可以再次执行：再次进入确认。
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation());
+            // Esc 同样取消。
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).awaiting_risk_confirmation(), "Esc 取消确认");
+        })
+        .unwrap();
     }
 
     /// R5：几百个查询标签时只有当前标签和访问过的标签持有 SqlEditor；
@@ -5924,6 +6206,7 @@ mod tests {
                 error_at: None,
                 error_code: None,
                 transaction: None,
+                result_set: None,
             }],
             transaction: None,
             started_at: String::new(),
@@ -6297,7 +6580,7 @@ mod tests {
                 other => panic!("完成后应显示耗时：{other:?}"),
             }
             window.render_frame(cx);
-            // 下一次编辑清掉标记。
+            // 编辑另一条（成功的）语句：失败语句的标记随文本平移保留（R9）。
             editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
             window.press("x", cx);
         })
@@ -6306,7 +6589,26 @@ mod tests {
             window.render_frame(cx);
             let editor = pane.read(cx).editors.get("q").cloned().unwrap();
             assert!(editor.read(cx).value(cx).starts_with('x'));
-            assert!(editor.read(cx).error_ranges(cx).is_empty(), "编辑后错误标记清除");
+            let marks = editor.read(cx).error_ranges(cx);
+            assert_eq!(marks.len(), 1, "只改了别的语句，失败语句的标记保留");
+            assert!(editor.read(cx).value(cx)[marks[0].clone()].contains("missing_table"), "标记随文本平移");
+            window.press("backspace", cx);
+        })
+        .unwrap();
+        // 编辑失败语句本身：它的标记清除。
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).value(cx), draft);
+            let at = draft.find("missing_table").unwrap();
+            editor.update(cx, |editor, cx| editor.select_range(at..at, cx));
+            window.press("x", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert!(editor.read(cx).error_ranges(cx).is_empty(), "编辑失败语句后它的错误标记清除");
             window.press("backspace", cx);
         })
         .unwrap();
@@ -6387,7 +6689,82 @@ mod tests {
             error_code: None,
             range: None,
             error_mark: None,
+            result_set: None,
         }
+    }
+
+    /// R8：非查询语句的摘要：语句类型和对象名。
+    #[test]
+    fn statement_summary_names_the_kind_and_object() {
+        assert_eq!(statement_summary("CREATE TABLE IF NOT EXISTS shop.orders (id int)"), ("CREATE TABLE".to_owned(), Some("shop.orders".to_owned())));
+        assert_eq!(statement_summary("create or replace view v_orders as select 1"), ("CREATE VIEW".to_owned(), Some("v_orders".to_owned())));
+        assert_eq!(statement_summary("CREATE UNIQUE INDEX ix_a ON orders (a)"), ("CREATE INDEX".to_owned(), Some("ix_a".to_owned())));
+        assert_eq!(statement_summary("-- note\nALTER TABLE orders ADD COLUMN note text"), ("ALTER TABLE".to_owned(), Some("orders".to_owned())));
+        assert_eq!(statement_summary("DROP TABLE IF EXISTS `order_items`"), ("DROP TABLE".to_owned(), Some("order_items".to_owned())));
+        assert_eq!(statement_summary("insert into orders values (1)"), ("INSERT".to_owned(), Some("orders".to_owned())));
+        assert_eq!(statement_summary("DELETE FROM orders WHERE id = 1"), ("DELETE".to_owned(), Some("orders".to_owned())));
+        assert_eq!(statement_summary("CALL shop.touch_nothing()"), ("CALL".to_owned(), Some("shop.touch_nothing".to_owned())));
+        assert_eq!(statement_summary("SET @a = 1"), ("SET".to_owned(), None));
+        let mut view = result("CREATE TABLE shop.orders (id int)", "ok", &[], &[], Some(0), "");
+        view.elapsed_ms = Some(12);
+        let line = outcome_summary_line(Locale::En, &view);
+        assert!(line.starts_with("CREATE TABLE · shop.orders · 0 affected · "), "{line}");
+    }
+
+    /// R8：DDL / 非查询成功结果是摘要卡片，完整 SQL 默认折叠成一行，点击展开；失败时 SQL 保持展开。
+    #[gpui_kit::test]
+    fn ddl_results_show_a_summary_card_with_collapsed_sql(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let ddl = "CREATE TABLE shop.orders (\n  id int primary key,\n  note text\n)";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", ddl)), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result(ddl, "ok", &[], &[], Some(0), "")]);
+            });
+            window.render_frame(cx);
+            assert!(window.find("query-outcome-card").visible(), "成功的 DDL 显示摘要卡片");
+            let summary = window.find("query-outcome-summary").label().unwrap_or_default().to_owned();
+            assert!(summary.contains("CREATE TABLE") && summary.contains("shop.orders"), "{summary}");
+            assert!(window.try_find("query-statement-sql").is_none(), "完整 SQL 默认折叠");
+            assert!(window.find("query-statement-sql-line").visible(), "折叠时显示一行");
+            window.click("query-statement-sql-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.find("query-statement-sql").visible(), "点击后展开完整 SQL");
+            window.click("query-statement-sql-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-statement-sql").is_none(), "再点收起");
+            // 失败：保持展开，不出摘要卡片。
+            pane.update(cx, |pane, _| pane.desk.plant_run(vec![result(ddl, "error", &[], &[], None, "table exists")]));
+            window.render_frame(cx);
+            assert!(window.try_find("query-outcome-card").is_none());
+            assert!(window.find("query-statement-sql").visible(), "失败时 SQL 保持展开");
+        })
+        .unwrap();
+    }
+
+    /// R12：CALL 仍然需要确认，说明换成“将执行存储过程，可能修改数据”；生产环境强调。
+    #[test]
+    fn procedure_calls_explain_themselves_and_production_is_flagged() {
+        use crate::query::risk::{Consequence, RiskKind};
+        let call = Consequence { kind: RiskKind::ServerState, object: Some("shop.report_two_sets".to_owned()) };
+        let text = risk_panel::statement_consequence_text(Locale::ZhCn, "CALL shop.report_two_sets()", &call);
+        assert!(text.contains("将执行存储过程，可能修改数据") && text.contains("shop.report_two_sets"), "{text}");
+        let grant = Consequence { kind: RiskKind::ServerState, object: None };
+        assert_eq!(risk_panel::statement_consequence_text(Locale::ZhCn, "GRANT SELECT ON t TO u", &grant), risk_panel::consequence_text(Locale::ZhCn, &grant));
+        let mut prompt = crate::query::desk::RiskPrompt {
+            connection_id: "c".into(),
+            connection_name: "demo-uat".into(),
+            database: "shop".into(),
+            schema: String::new(),
+            engine: "mysql".into(),
+            environment: "prod".into(),
+            statements: Vec::new(),
+            passthrough: 0,
+            notices: Vec::new(),
+        };
+        assert!(risk_panel::production(&prompt));
+        prompt.environment = "dev".into();
+        assert!(!risk_panel::production(&prompt));
     }
 
     #[gpui_kit::test]

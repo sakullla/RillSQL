@@ -1022,6 +1022,7 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
             error_at: None,
             error_code: None,
             transaction: None,
+            result_set: None,
         }],
         transaction: None,
         started_at: String::new(),
@@ -2272,6 +2273,7 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
         error_at: at,
         error_code: None,
         transaction: None,
+        result_set: None,
     };
     let run = RunDto {
         id: "run".to_owned(),
@@ -2324,6 +2326,7 @@ fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
         error_at: at,
         error_code: None,
         transaction: None,
+        result_set: None,
     };
     let run = |status: &str, statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -2456,7 +2459,7 @@ impl StatementDriver for Capping {
         } else {
             Ok(ok_count())
         };
-        exec::DriverReport { sent: capped, outcome, failure: None }
+        exec::DriverReport { sent: capped, outcome, failure: None, extras: Default::default() }
     }
 }
 
@@ -2576,6 +2579,7 @@ fn rewritten_error_maps_back_to_the_draft_statement_boundary() {
         error_at: at,
         error_code: None,
         transaction: None,
+        result_set: None,
     };
     let run = |statements: Vec<StatementDto>| RunDto {
         id: "run".to_owned(),
@@ -2673,6 +2677,7 @@ fn a_stale_run_cannot_write_rewrite_metadata_onto_newer_results() {
         error_at: None,
         error_code: None,
         transaction: None,
+        result_set: None,
     };
     let run = |sql: &str, sent: &str, added: &str| RunDto {
         id: sql.to_owned(),
@@ -2758,6 +2763,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         error_code: None,
         range: None,
         error_mark: None,
+        result_set: None,
     }]);
     let ticket = desk.issue(&tasks).expect("ticket");
     assert!(desk.stop_run("a", ticket.token, "no such column: nope"));
@@ -2792,6 +2798,7 @@ fn the_same_long_error_is_logged_once_in_messages() {
         error_code: None,
         range: None,
         error_mark: None,
+        result_set: None,
     }]);
     let ticket = desk.issue(&tasks).expect("ticket");
     assert!(desk.stop_run("b", ticket.token, "连接中断，无法确认写入是否完成。"));
@@ -3001,4 +3008,82 @@ fn explain_uses_the_target_server_version_and_refuses_ddl_locally() {
         desk.set_draft(refused);
         assert!(desk.explain_active().is_err(), "{refused}");
     }
+}
+
+/// R14：一条语句返回多个结果集时每个结果集一页；后续结果集沿用这条语句的草稿范围，后面的语句不错位。
+#[test]
+fn extra_result_sets_share_their_statement_range() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{BeginRun, Desk, Target, Ticket};
+
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+        server_version: None,
+    };
+    let draft = "select 1;\nselect 2";
+    let pieces = crate::query::split::split_sql("sqlite", draft).pieces;
+    let (one, two) = (pieces[0].text.clone(), pieces[1].text.clone());
+    desk.import_tab("a", draft, Some(target));
+    desk.focus_tab(Some("a"));
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应开始执行");
+    };
+    let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    let dto = |sql: &str, value: &str, set: Option<(usize, usize)>, message: &str| StatementDto {
+        sql: sql.to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        status: "ok".to_owned(),
+        message: message.to_owned(),
+        columns: vec!["v".to_owned()],
+        column_types: vec!["integer".to_owned()],
+        rows: vec![vec![Some(value.to_owned())]],
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(1),
+        error_at: None,
+        error_code: None,
+        transaction: None,
+        result_set: set,
+    };
+    let run = RunDto {
+        id: "run-a".to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: "done".to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements: vec![
+            dto(&one, "a", Some((0, 2)), ""),
+            dto(&one, "b", Some((1, 2)), "警告（1 条）：Warning 1642: demo"),
+            dto(&two, "c", None, ""),
+        ],
+        transaction: None,
+        started_at: String::new(),
+        elapsed_ms: 1,
+    };
+    desk.finish_polled(&tasks, &ticket, Ok(run), "已取消");
+    let results = desk.results();
+    assert_eq!(results.len(), 3, "两个结果集各一页，加上第二条语句");
+    let first = draft.find("select 1").unwrap();
+    let second = draft.find("select 2").unwrap();
+    assert_eq!(results[0].range, Some((first, first + one.len())));
+    assert_eq!(results[1].range, results[0].range, "后续结果集沿用同一条语句的范围");
+    assert_eq!(results[2].range, Some((second, draft.len())), "后面的语句不错位");
+    assert_eq!(results[1].rows[0][0].as_deref(), Some("b"));
+    let log = desk.log();
+    assert!(log.iter().any(|entry| entry.message.contains("警告")), "消息页带警告：{log:?}");
 }

@@ -26,6 +26,7 @@ pub fn is_settings_command(id: &str) -> bool {
         || id.starts_with("null-")
         || id.starts_with("timeout-")
         || id.starts_with("hints-")
+        || id.starts_with("alias-")
 }
 
 /// 设置页的左侧分区导航：设计 S8.3 的三块，右侧只显示当前分区的表单。
@@ -124,6 +125,8 @@ pub struct SettingsForm {
     pub transaction_advanced: bool,
     /// 编辑器对象提示：`compact`（默认）或 `off`。
     pub object_hints: String,
+    /// 补全表名时自动添加别名。
+    pub completion_alias: bool,
 }
 
 /// 设置“编辑器 → 对象提示”：紧凑（默认）时补全附一行对象摘要、悬停显示紧凑对象卡；
@@ -186,6 +189,7 @@ impl SettingsForm {
             transaction_manual: settings.transaction_manual,
             transaction_advanced: settings.transaction_advanced,
             object_hints: normalize_object_hints(&settings.object_hints).to_owned(),
+            completion_alias: settings.completion_alias,
         }
     }
 
@@ -208,6 +212,7 @@ impl SettingsForm {
             transaction_manual: self.transaction_manual,
             transaction_advanced: self.transaction_advanced,
             object_hints: normalize_object_hints(&self.object_hints).to_owned(),
+            completion_alias: self.completion_alias,
         }
     }
 
@@ -230,6 +235,7 @@ impl SettingsForm {
             transaction_manual: form.transaction_manual,
             transaction_advanced: form.transaction_advanced,
             object_hints: form.object_hints,
+            completion_alias: form.completion_alias,
         }
     }
 
@@ -497,6 +503,17 @@ mod tests {
         form.object_hints = "loud".into();
         assert_eq!(form.to_settings().object_hints, "compact");
         assert!(is_settings_command("hints-off") && is_settings_command("hints-compact"));
+        assert!(is_settings_command("alias-on") && is_settings_command("alias-off"));
+        // 旧文件没有 completionAlias 时默认开启自动别名。
+        let legacy: ShellSettings = serde_json::from_str(&stored_without("completionAlias")).unwrap();
+        assert!(legacy.completion_alias);
+        assert!(SettingsForm::from_settings(&legacy).completion_alias);
+    }
+
+    fn stored_without(key: &str) -> String {
+        let mut value = serde_json::to_value(ShellSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove(key);
+        value.to_string()
     }
 
     /// R8：索引命名模板随设置写盘、读回，旧文件缺字段时取默认。
@@ -531,6 +548,7 @@ mod tests {
             transaction_manual: false,
             transaction_advanced: false,
             object_hints: "loud".into(),
+            completion_alias: true,
         };
         let mut form = SettingsForm::from_settings(&illegal);
         assert_eq!(form.theme, "system");

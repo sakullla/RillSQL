@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::connections::{CancelTransport, CatalogSession};
-use crate::query::exec::{attach_failure, refuse_message, database_gate, DatabaseGate, ErrorAt, Failure, RowSink, StatementValue};
+use crate::query::exec::{attach_failure, refuse_message, database_gate, DatabaseGate, ErrorAt, Failure, ResultExtras, RowSink, StatementValue};
 use crate::query::split;
 
 use super::{mysql, postgres, redis, sqlite, sqlserver};
@@ -158,15 +158,31 @@ impl Attached {
         sink: &dyn RowSink,
         index: usize,
     ) -> Result<StatementValue, Failure> {
+        self.run_full(transport, sent, sql, limit, cancel, sink, index).await.map(|(value, _)| value)
+    }
+
+    /// 与 run 相同，另外带回第一个结果集之外的东西（存储过程的其余结果集、警告等，见 ResultExtras）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_full(
+        &mut self,
+        transport: &CancelTransport,
+        sent: &str,
+        sql: &str,
+        limit: usize,
+        cancel: &Arc<AtomicBool>,
+        sink: &dyn RowSink,
+        index: usize,
+    ) -> Result<(StatementValue, ResultExtras), Failure> {
+        let plain = |value: StatementValue| (value, ResultExtras::default());
         match self {
             Self::Scripted => Err(Failure::from("这个连接没有连着可查询的数据库".to_owned())),
-            Self::Sqlite(pool) => sqlite::exec::sqlite_run(pool, sent, limit, cancel, sink, index).await.map_err(Failure::from),
+            Self::Sqlite(pool) => sqlite::exec::sqlite_run(pool, sent, limit, cancel, sink, index).await.map(plain).map_err(Failure::from),
             Self::Mysql(conn) => mysql::exec::mysql_run(conn, transport, sent, limit, cancel, sink, index)
                 .await
                 .map_err(|message| Failure { at: mysql::exec::mysql_error_line(&message).map(ErrorAt::Line), message, code: None }),
-            Self::Postgres(client) => postgres::exec::postgres_run(client, sent, sql, limit, cancel, sink, index).await,
-            Self::Sqlserver(client) => sqlserver::exec::sqlserver_run(client, sent, limit, cancel, sink, index).await,
-            Self::Redis(conn) => redis::console::redis_query_run(conn, sent, limit, cancel, sink, index).await.map_err(Failure::from),
+            Self::Postgres(client) => postgres::exec::postgres_run(client, sent, sql, limit, cancel, sink, index).await.map(plain),
+            Self::Sqlserver(client) => sqlserver::exec::sqlserver_run(client, sent, limit, cancel, sink, index).await.map(plain),
+            Self::Redis(conn) => redis::console::redis_query_run(conn, sent, limit, cancel, sink, index).await.map(plain).map_err(Failure::from),
         }
     }
 

@@ -20,22 +20,72 @@ use crate::i18n::{self, Locale};
 
 // ---------------------------------------------------------------- 模型
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PickerItem {
     /// 稳定标识（列名、标签 id）：回传给页面。
     pub id: SharedString,
     pub label: SharedString,
     /// 右侧弱化说明（类型、连接、库）；也参与搜索。
     pub detail: Option<SharedString>,
+    /// 标题前的类型图标。
+    pub icon: Option<IconName>,
+    /// 环境徽标：（环境代码，显示文字）；生产为红色。
+    pub env: Option<(SharedString, SharedString)>,
+    /// 脏 / 待提交标记的说明；有值时标题旁画一个圆点。
+    pub dirty: Option<SharedString>,
+    /// 行尾显示关闭按钮（点击发出 PickerEvent::Close）。
+    pub closable: bool,
+    /// 当前项（例如当前标签）：常亮强调，不依赖键盘高亮。
+    pub current: bool,
 }
+
+impl PartialEq for PickerItem {
+    fn eq(&self, other: &Self) -> bool {
+        // 图标只影响外观，比较时不看。
+        self.id == other.id
+            && self.label == other.label
+            && self.detail == other.detail
+            && self.env == other.env
+            && self.dirty == other.dirty
+            && self.closable == other.closable
+            && self.current == other.current
+    }
+}
+
+impl Eq for PickerItem {}
 
 impl PickerItem {
     pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), label: label.into(), detail: None }
+        Self { id: id.into(), label: label.into(), detail: None, icon: None, env: None, dirty: None, closable: false, current: false }
     }
 
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn env(mut self, code: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+        self.env = Some((code.into(), label.into()));
+        self
+    }
+
+    pub fn dirty(mut self, tip: impl Into<SharedString>) -> Self {
+        self.dirty = Some(tip.into());
+        self
+    }
+
+    pub fn closable(mut self, closable: bool) -> Self {
+        self.closable = closable;
+        self
+    }
+
+    pub fn current(mut self, current: bool) -> Self {
+        self.current = current;
         self
     }
 }
@@ -238,6 +288,9 @@ pub enum PickerEvent {
     Dismissed,
 }
 
+/// 行尾关闭按钮的处理：页面关闭这一项（例如关闭标签），选择器保持打开。
+pub type CloseHandler = std::rc::Rc<dyn Fn(&SharedString, &mut Window, &mut App)>;
+
 /// 默认列表最多显示的行数（再多就滚动）。
 const VISIBLE_ROWS: usize = 12;
 
@@ -251,6 +304,7 @@ pub struct Picker {
     max_h: Option<f32>,
     /// 上一次滚到的高亮位置：高亮变了才滚动，鼠标滚动不被拉回。
     scrolled_to: Option<usize>,
+    close_handler: Option<CloseHandler>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -273,6 +327,7 @@ impl Picker {
             locale,
             max_h: None,
             scrolled_to: None,
+            close_handler: None,
             _subscriptions: vec![subscription],
         }
     }
@@ -292,6 +347,11 @@ impl Picker {
             self.scrolled_to = None;
             cx.notify();
         }
+    }
+
+    /// 带关闭按钮（PickerItem::closable）的行点击关闭时调用。
+    pub fn set_close_handler(&mut self, handler: CloseHandler) {
+        self.close_handler = Some(handler);
     }
 
     pub fn set_max_height(&mut self, max_h: Option<f32>) {
@@ -342,6 +402,10 @@ impl Picker {
         let highlighted = position == self.model.highlight;
         let checked = self.model.is_chosen(&item.id);
         let multi = self.model.mode == PickerMode::Multi;
+        let current = item.current;
+        let close_id = item.id.clone();
+        let close_handler = self.close_handler.clone();
+        let close_label = SharedString::from(i18n::text(self.locale, "common.close"));
         div()
             .id(("picker-row", position))
             .test_support()
@@ -358,7 +422,14 @@ impl Picker {
             .text_size(px(TypeScale::SM))
             .text_color(p.text)
             .when(highlighted, |this| this.bg(p.selection))
-            .when(!highlighted, |this| this.hover(|s| s.bg(p.hover)))
+            .when(!highlighted && current, |this| this.bg(p.accent_soft))
+            .when(!highlighted && !current, |this| this.hover(|s| s.bg(p.hover)))
+            // 当前项：左侧强调条常亮。
+            .when(current, |this| this.border_l_2().border_color(p.accent))
+            .when(!current, |this| this.border_l_2().border_color(gpui_kit::transparent_black()))
+            .when_some(item.icon, |this, icon| {
+                this.child(div().flex_none().child(kit::icon(icon, IconSize::INLINE, if current { p.accent_text } else { p.text_muted })))
+            })
             .when(multi, |this| {
                 this.child(
                     div()
@@ -375,11 +446,47 @@ impl Picker {
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
-                    .when(checked && !multi, |this| this.font_weight(FontWeight::MEDIUM).text_color(p.accent_text))
+                    .when((checked && !multi) || current, |this| this.font_weight(FontWeight::MEDIUM).text_color(p.accent_text))
                     .child(item.label.clone()),
             )
+            .when_some(item.dirty.clone(), |this, tip| {
+                this.child(
+                    div()
+                        .id(("picker-row-dirty", position))
+                        .test_support()
+                        .flex_none()
+                        .aria_label(tip)
+                        .child(kit::status_dot(p.warn)),
+                )
+            })
+            .when_some(item.env.clone(), |this, (code, label)| this.child(div().flex_none().child(kit::env_tag(&code, label, &p))))
             .when_some(item.detail.clone(), |this, detail| {
                 this.child(div().flex_none().max_w(px(ControlSize::PICKER_MIN_W / 2.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(detail))
+            })
+            .when(item.closable && self.close_handler.is_some(), |this| {
+                this.child(
+                    div()
+                        .id(("picker-row-close", position))
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(close_label)
+                        .flex_none()
+                        .size(px(IconSize::CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(Radius::CONTROL))
+                        .hover(|s| s.bg(p.hover))
+                        .cursor_pointer()
+                        .child(kit::icon(IconName::X, IconSize::INLINE, p.text_muted))
+                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(handler) = close_handler.as_ref() {
+                                handler(&close_id, window, cx);
+                            }
+                        }),
+                )
             })
             .on_click(cx.listener(move |this, _, _, cx| this.choose_at(position, cx)))
             .into_any_element()
