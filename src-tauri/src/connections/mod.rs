@@ -14,8 +14,10 @@ mod service;
 pub(crate) mod stages;
 pub(crate) mod store;
 pub(crate) mod transaction;
+pub(crate) mod vault;
 pub(crate) mod verify;
 
+pub(crate) use service::default_config_path;
 pub use service::{report_failure_text, CancelTransport, CatalogSession, EphemeralRead, Service, SessionCondition, SessionHealth, SessionStatus};
 pub(crate) use service::{ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, ServiceError};
 

@@ -55,5 +55,6 @@ pub fn read_connection_export(bytes: &[u8], passphrase: Option<&str>) -> Result<
 
 #[allow(dead_code)]
 pub fn keyring_store() -> Arc<dyn SecretStore> {
-    Arc::new(crate::connections::secrets::KeyringStore::new())
+    // 与正式运行一致：钥匙串只放主密钥，连接密码在 connections.sqlite 旁的本地保险库里。
+    Arc::new(crate::connections::vault::VaultStore::for_config(&crate::connections::default_config_path()))
 }

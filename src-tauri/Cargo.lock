@@ -8215,6 +8215,7 @@ dependencies = [
  "directories",
  "embed-resource",
  "futures",
+ "getrandom 0.3.4",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-macros",

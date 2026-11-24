@@ -42,6 +42,8 @@ futures = "0.3.34"
 directories = "6.0.0"
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+# 本地保险库的主密钥与 nonce 直接取系统 CSPRNG（0.3.4 已在依赖树里）。
+getrandom = "0.3"
 # gpui-kit 0.9.0 与 gpui-pre / gpui-pre-platform / gpui-pre-macros 0.3.11 一起锁定。
 # 禁止只升其中一个。x11+wayland 给 Linux，font-kit/runtime_shaders 给 macOS；
 # Windows 由 gpui-pre-platform 选择 Win32/DirectWrite。不要启用 gpui-fast。

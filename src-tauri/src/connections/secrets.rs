@@ -7,6 +7,9 @@ use std::sync::Mutex;
 pub enum SecretError {
     #[error("系统凭据库不可用：{0}")]
     Unavailable(String),
+    /// 本地保险库无法解密，原文件已改名保留；重新输入密码即可恢复。
+    #[error("{0}")]
+    Corrupt(String),
 }
 
 pub trait SecretStore: Send + Sync {
