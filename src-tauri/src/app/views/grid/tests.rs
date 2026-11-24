@@ -98,6 +98,45 @@ fn start_edit(window: AnyWindowHandle, pane: &Entity<GridPane>, row: usize, colu
     cx.run_until_parked();
 }
 
+/// 新增行里用户显式设为 NULL 的格子：再进编辑、什么都不输就离开，NULL 暂存保留，不被当成“先不填”撤掉。
+#[gpui_kit::test]
+fn leaving_an_explicit_null_on_a_new_row_keeps_it(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_required(&pane, cx);
+        pane.update(cx, |pane, cx| {
+            let _ = pane.command("grid-insert", cx);
+            pane.cancel_edit();
+            pane.session.select(0, 2, false);
+            let _ = pane.command("grid-set-null", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    let row_id = cx.update(|cx| pane.read(cx).session.row_id(0).map(str::to_owned).expect("新增行"));
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert!(pane.session.can_revert_cell(&row_id, 2), "note 显式暂存为 NULL");
+        assert_eq!(pane.session.raw_value_of(&row_id, 2), Some(None));
+    });
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::DoubleClickedCell(0, 3)));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert_eq!(pane.read(cx).edit_target.as_ref().map(|target| target.column), Some(2)));
+    cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+    settle(cx);
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert!(!pane.editing(), "离开后编辑结束：{}", pane.notice);
+        assert!(pane.session.can_revert_cell(&row_id, 2), "显式 NULL 的暂存仍在");
+        assert_eq!(pane.session.raw_value_of(&row_id, 2), Some(None));
+    });
+}
+
 fn settle(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }

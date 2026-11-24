@@ -3070,8 +3070,9 @@ impl GridPane {
         }
         // 新增行里还没填的格子：什么都没输入就离开（Enter / Tab / 点别处）是“先不填”，保持未赋值，
         // 不把 NULL 当成输入去校验。否则非空列会把编辑框卡在原格，双击别的格子也进不了编辑（R2）。
+        // 这一格已有暂存（用户显式设为 NULL）时同样原样保留：不撤掉暂存，也不重新校验。
+        // 没有暂存时本来就是未赋值，什么都不用动。
         if text.is_empty() && matches!(target.original, Some(None)) && self.session.row_inserted_by_id(&target.row_id) {
-            let _ = self.session.revert_cell(&target.row_id, target.column);
             self.edit_error = None;
             self.pending_edit = None;
             self.refocus = true;
