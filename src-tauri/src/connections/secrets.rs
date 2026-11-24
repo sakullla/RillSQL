@@ -46,6 +46,10 @@ pub enum VaultNotice {
     Corrupt { kept: std::path::PathBuf },
     /// 某个旧钥匙串条目没能迁入。
     MigrationFailed { account: String, reason: String },
+    /// 钥匙串暂时没给出主密钥（拒绝授权、被锁定）；保险库原样保留，下次访问会重试。
+    KeyUnavailable { reason: String },
+    /// 重试迁移后不再失败的账户：界面据此把它们从失败计数里去掉。
+    MigrationRecovered { account: String },
 }
 
 pub trait SecretStore: Send + Sync {

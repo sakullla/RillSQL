@@ -446,6 +446,8 @@ pub enum PendingJob {
     RenameSaved,
     /// 只重读分组与成员关系（启动恢复、导入之后）。
     RefreshGroups,
+    /// R7：重新迁移之前没能迁入保险库的旧钥匙串条目。
+    RetryVaultMigration,
     /// 一次分组命令：新建/重命名、删除、归组、折叠。
     GroupOp,
 }
@@ -468,6 +470,95 @@ pub enum ReorderOp {
     Connections { group: Option<String>, ids: Vec<String> },
     /// 分组按这个顺序排列。
     Groups { ids: Vec<String> },
+}
+
+impl ReorderOp {
+    /// 同一键的后一次请求完整描述了该容器（或分组列表）的最新顺序，可以覆盖前一次。
+    fn key(&self) -> Option<Option<&str>> {
+        match self {
+            ReorderOp::Connections { group, .. } => Some(group.as_deref()),
+            ReorderOp::Groups { .. } => None,
+        }
+    }
+}
+
+/// R6：合并一批按操作顺序排队的落库请求。同一容器（或分组列表）只保留最后一次，
+/// 保留下来的请求维持原先的相对顺序，保证跨容器移动按用户操作的先后提交。
+pub fn coalesce_reorders(ops: Vec<ReorderOp>) -> Vec<ReorderOp> {
+    let mut kept = Vec::with_capacity(ops.len());
+    for (at, op) in ops.iter().enumerate() {
+        if ops[at + 1..].iter().any(|later| later.key() == op.key()) {
+            continue;
+        }
+        kept.push(op.clone());
+    }
+    kept
+}
+
+/// R7：保险库提示条的状态。只来自保险库排出的事件和重试结果，不为了显示它去访问钥匙串。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultAlert {
+    /// 仍未迁入的旧条目账户 → 原因。
+    pub failed: std::collections::BTreeMap<String, String>,
+    /// 钥匙串没给出主密钥的原因（拒绝授权、被锁定）。
+    pub key_unavailable: Option<String>,
+    /// 损坏的保险库已改名保留到这里。
+    pub corrupt_kept: Option<String>,
+    /// 重试迁移在途：按钮显示忙碌，不重复派发。
+    pub retrying: bool,
+    /// 用户收起了提示条；有新的事件时重新出现。
+    pub dismissed: bool,
+}
+
+impl VaultAlert {
+    /// 提示条要不要画出来。
+    pub fn visible(&self) -> bool {
+        !self.dismissed && (!self.failed.is_empty() || self.key_unavailable.is_some() || self.corrupt_kept.is_some())
+    }
+
+    /// 合入保险库排出的事件；有新的问题时取消收起。
+    pub fn absorb(&mut self, notices: Vec<crate::connections::secrets::VaultNotice>) {
+        use crate::connections::secrets::VaultNotice;
+        for notice in notices {
+            match notice {
+                VaultNotice::MigrationFailed { account, reason } => {
+                    self.failed.insert(account, reason);
+                    self.dismissed = false;
+                }
+                VaultNotice::MigrationRecovered { account } => {
+                    self.failed.remove(&account);
+                }
+                VaultNotice::KeyUnavailable { reason } => {
+                    self.key_unavailable = Some(reason);
+                    self.dismissed = false;
+                }
+                VaultNotice::Corrupt { kept } => {
+                    self.corrupt_kept = Some(kept.display().to_string());
+                    self.dismissed = false;
+                }
+            }
+        }
+    }
+
+    /// 重试的结果：成功时以报告为准（仍失败的留着，其余清掉），密钥问题随之解除；失败时记下原因。
+    pub fn apply_retry(&mut self, result: Result<crate::connections::secrets::MigrationReport, String>) {
+        self.retrying = false;
+        match result {
+            Ok(report) => {
+                for account in report.migrated.iter().chain(&report.absent) {
+                    self.failed.remove(account);
+                }
+                for (account, reason) in report.failed {
+                    self.failed.insert(account, reason);
+                }
+                self.key_unavailable = None;
+            }
+            Err(reason) => {
+                self.key_unavailable = Some(reason);
+                self.dismissed = false;
+            }
+        }
+    }
 }
 
 /// 连接缺密码或密码被拒时的输入框：只为这次连接要密码，不改配置、不写凭据库；
@@ -693,6 +784,8 @@ pub struct WorkbenchModel {
     pub pending_group_op: Option<GroupOp>,
     /// R6：等待写入配置库的排序（由视图在后台执行）。
     pub pending_reorder: Option<ReorderOp>,
+    /// R7：本地保险库需要用户知道的状态（迁移失败、密钥暂不可用、损坏后已保留原文件）。
+    pub vault_alert: VaultAlert,
     /// 对象树“新建表”：下一帧交给结构页 `begin_create`。
     pub pending_create: Option<String>,
     /// 从历史预览保存时钉住这一条，避免误存当前查询草稿。
@@ -846,6 +939,7 @@ impl WorkbenchModel {
             explorer_current: None,
             pending_group_op: None,
             pending_reorder: None,
+            vault_alert: VaultAlert::default(),
             pending_create: None,
             preview_save: None,
             conn_filter_menu: None,
@@ -1055,6 +1149,9 @@ impl WorkbenchModel {
         }
         if id.starts_with("password-") {
             return self.password_command(id);
+        }
+        if id.starts_with("vault-") {
+            return self.vault_command(id);
         }
         // 分组命令与连接菜单里的“移动到分组”共用同一批 id。
         if id.starts_with("tags-") || id.starts_with("tag-") {
@@ -3908,7 +4005,13 @@ impl WorkbenchModel {
     }
 
     /// R6：把分组放到第 `index` 位。
+    /// 搜索过滤时与连接一样不排序：看到的分组可能不全，插入位置没有意义。
     pub fn move_group_to(&mut self, group_id: &str, index: usize) -> bool {
+        if self.nav_searching() {
+            self.notice_key = Some("ui.group.reorderWhileSearching");
+            self.notice_detail.clear();
+            return false;
+        }
         let mut ordered = crate::connections::groups::sorted_groups(self.groups.clone());
         let Some(from) = ordered.iter().position(|group| group.id == group_id) else { return false };
         let index = if from < index { index - 1 } else { index }.min(ordered.len() - 1);
@@ -4195,6 +4298,21 @@ impl WorkbenchModel {
         if self.focused_field == Some(DraftField::PromptPassword) {
             self.focused_field = None;
         }
+    }
+
+    /// R7：保险库提示条的命令：重试迁移、收起。
+    fn vault_command(&mut self, id: &str) -> bool {
+        match id {
+            "vault-retry-migration" => {
+                if !self.vault_alert.retrying {
+                    self.vault_alert.retrying = true;
+                    self.enqueue(PendingJob::RetryVaultMigration);
+                }
+            }
+            "vault-alert-dismiss" => self.vault_alert.dismissed = true,
+            _ => return false,
+        }
+        true
     }
 
     /// 分组相关的命令入口。菜单、键盘与拖拽都只发这些 id。

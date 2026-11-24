@@ -1051,6 +1051,8 @@ async fn seven_engines_delete(dir: &std::path::Path, services: &Arc<AppServices>
     assert_eq!(model.connections.rows.len(), kept);
     assert!(!model.import_notes.is_empty(), "{:?}", model.import_notes);
     assert_eq!(model.notice_key, Some("connections.importReport.skippedTitle"));
+    // R6：导入后重读分组，恢复的分组与顺序立刻出现在侧栏。
+    assert!(matches!(model.take_pending(), Some(PendingJob::RefreshGroups)));
 }
 
 #[inline(never)]
@@ -9402,6 +9404,101 @@ fn connections_and_groups_reorder_locally_and_queue_one_store_write() {
     assert_eq!(model.notice_key, Some("ui.group.reorderWhileSearching"));
 }
 
+/// R6：拖到最后一行的下半部插到末尾（连接与分组）；搜索过滤时分组同样拒绝排序。
+#[test]
+fn drops_can_land_after_the_last_row_and_group_reorder_is_blocked_while_searching() {
+    use super::model::ReorderOp;
+    let mut model = grouped_model(
+        vec![
+            record_for("c1", "alpha", Engine::Postgres),
+            record_for("c2", "beta", Engine::Postgres),
+            record_for("c3", "gamma", Engine::Postgres),
+        ],
+        vec![group("g1", "shop", 0, false), group("g2", "demo-uat", 1, false), group("g3", "demo-prod", 2, false)],
+        &[],
+    );
+    // 指针在行的下半部：插到这一行之后。
+    assert!(super::view::drop_lower_half(100., 24., 113.));
+    assert!(!super::view::drop_lower_half(100., 24., 111.));
+    // c1 放到最后一行 c3 的下半部：位置 = c3 的序号 + 1，落到末尾。
+    let _ = model.dispatch("group-conn-drop:c1\u{1}\u{1}3");
+    assert_eq!(model.container_members(None), ["c2", "c3", "c1"]);
+    assert_eq!(model.take_pending_reorder(), Some(ReorderOp::Connections { group: None, ids: vec!["c2".into(), "c3".into(), "c1".into()] }));
+    // g1 放到最后一个分组 g3 的下半部：排到最后。
+    let _ = model.dispatch("group-drop:g1\u{1}3");
+    let order: Vec<String> = model.group_layout().groups.iter().map(|(group, _)| group.id.clone()).collect();
+    assert_eq!(order, ["g2", "g3", "g1"]);
+    assert_eq!(model.take_pending_reorder(), Some(ReorderOp::Groups { ids: vec!["g2".into(), "g3".into(), "g1".into()] }));
+    // 搜索过滤时：分组拖放与菜单上移都不排序，并提示先清除搜索。
+    model.object_filter = "orders".into();
+    model.notice_key = None;
+    let _ = model.dispatch("group-drop:g1\u{1}0");
+    assert!(model.take_pending_reorder().is_none());
+    assert_eq!(model.notice_key, Some("ui.group.reorderWhileSearching"));
+    let _ = model.dispatch("group-move-up:g1");
+    assert!(model.take_pending_reorder().is_none());
+    let order: Vec<String> = model.group_layout().groups.iter().map(|(group, _)| group.id.clone()).collect();
+    assert_eq!(order, ["g2", "g3", "g1"], "顺序保持不变");
+}
+
+/// R6：连续快速移动按操作顺序提交；同一容器只写最后一次，跨容器移动的先后不变。
+#[test]
+fn queued_reorders_keep_the_latest_per_container_in_operation_order() {
+    use super::model::{coalesce_reorders, ReorderOp};
+    let ungrouped = |ids: &[&str]| ReorderOp::Connections { group: None, ids: ids.iter().map(|id| id.to_string()).collect() };
+    let in_g1 = |ids: &[&str]| ReorderOp::Connections { group: Some("g1".into()), ids: ids.iter().map(|id| id.to_string()).collect() };
+    let groups = |ids: &[&str]| ReorderOp::Groups { ids: ids.iter().map(|id| id.to_string()).collect() };
+    let batch = vec![
+        ungrouped(&["c2", "c1"]),
+        groups(&["g2", "g1"]),
+        in_g1(&["c1", "c4"]),
+        ungrouped(&["c2"]),
+        groups(&["g1", "g2"]),
+    ];
+    assert_eq!(coalesce_reorders(batch), vec![in_g1(&["c1", "c4"]), ungrouped(&["c2"]), groups(&["g1", "g2"])]);
+    assert!(coalesce_reorders(Vec::new()).is_empty());
+}
+
+/// R7：保险库排出的事件进提示条；“重试迁移”排一次后台任务，结果回来后按报告更新计数。
+#[test]
+fn vault_alert_counts_failures_and_retry_queues_one_service_job() {
+    use crate::connections::secrets::{MigrationReport, VaultNotice};
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(!model.vault_alert.visible());
+    model.vault_alert.absorb(vec![
+        VaultNotice::MigrationFailed { account: "conn:a:password".into(), reason: "denied".into() },
+        VaultNotice::MigrationFailed { account: "conn:b:password".into(), reason: "denied".into() },
+        VaultNotice::MigrationFailed { account: "conn:a:password".into(), reason: "denied".into() },
+    ]);
+    assert!(model.vault_alert.visible());
+    assert_eq!(model.vault_alert.failed.len(), 2, "同一账户只算一次");
+    let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains('2'), "{lines:?}");
+
+    let _ = model.drain_pending();
+    let _ = model.dispatch("vault-retry-migration");
+    let _ = model.dispatch("vault-retry-migration");
+    let queued = model.drain_pending();
+    assert_eq!(queued.iter().filter(|job| matches!(job, PendingJob::RetryVaultMigration)).count(), 1, "在途时不重复派发");
+    assert!(model.vault_alert.retrying);
+
+    model.vault_alert.apply_retry(Ok(MigrationReport {
+        migrated: vec!["conn:a:password".into()],
+        absent: Vec::new(),
+        failed: vec![("conn:b:password".into(), "still denied".into())],
+    }));
+    assert!(!model.vault_alert.retrying);
+    assert_eq!(model.vault_alert.failed.keys().cloned().collect::<Vec<_>>(), ["conn:b:password"]);
+    model.vault_alert.apply_retry(Err("密钥暂不可用".into()));
+    assert_eq!(model.vault_alert.key_unavailable.as_deref(), Some("密钥暂不可用"));
+    let _ = model.dispatch("vault-alert-dismiss");
+    assert!(!model.vault_alert.visible());
+    // 新的问题让收起的提示条重新出现。
+    model.vault_alert.absorb(vec![VaultNotice::Corrupt { kept: std::path::PathBuf::from("/tmp/secrets.vault.corrupt-1") }]);
+    assert!(model.vault_alert.visible());
+}
+
 #[test]
 fn group_commands_share_one_pending_job_and_reject_empty_or_missing_targets() {
     let mut model = grouped_model(
@@ -15535,5 +15632,111 @@ fn tabs_awaiting_risk_confirmation_are_marked_in_the_strip_and_the_list(cx: &mut
         assert!(item.dirty.is_some() && !item.current, "切走后标签列表仍标出等待确认");
     })
     .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 旧版逐条钥匙串：可以让某些账户读取失败（模拟拒绝授权）。
+#[derive(Default)]
+struct DenyingKeychain {
+    inner: crate::connections::secrets::MemoryStore,
+    denied: std::sync::Mutex<bool>,
+}
+
+impl crate::connections::secrets::SecretStore for DenyingKeychain {
+    fn put(&self, account: &str, secret: &str) -> Result<(), crate::connections::secrets::SecretError> {
+        self.inner.put(account, secret)
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>, crate::connections::secrets::SecretError> {
+        if *self.denied.lock().unwrap() {
+            return Err(crate::connections::secrets::SecretError::Unavailable("authorization denied".into()));
+        }
+        self.inner.get(account)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), crate::connections::secrets::SecretError> {
+        self.inner.delete(account)
+    }
+}
+
+/// R7 全链路：旧条目迁移失败时界面显示失败数量和“重试迁移”；点击后调用服务层重试，成功后提示条消失。
+#[tokio::test]
+async fn vault_migration_failure_surfaces_in_the_ui_and_retry_calls_the_service() {
+    let dir = std::env::temp_dir().join(format!("rillsql-vault-ui-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("connections.sqlite");
+    let legacy = Arc::new(DenyingKeychain::default());
+    // 旧版本：密码逐条存在钥匙串里。
+    let old = AppServices::new(Arc::new(Service::new(config.clone(), legacy.clone())));
+    let mut draft = sample_draft(Engine::Mysql);
+    draft.save_password = true;
+    old.save_connection(draft, Some("pw-demo".into()), None, None).await.unwrap();
+    drop(old);
+
+    *legacy.denied.lock().unwrap() = true;
+    let master: Arc<dyn crate::connections::secrets::SecretStore> = Arc::new(crate::connections::secrets::MemoryStore::default());
+    let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master, Some(legacy.clone()));
+    let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
+    // 保险库在第一次用到时加载并迁移（这里直接读一次失败清单代替打开连接）。
+    assert_eq!(services.connections.secret_migration_failures().await.unwrap().len(), 1);
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("conn-refresh");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(model.vault_alert.visible(), "任务结果回来时收进保险库事件");
+    assert_eq!(model.vault_alert.failed.len(), 1);
+    let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
+    assert!(lines[0].starts_with('1'), "{lines:?}");
+
+    // 授权恢复后点“重试迁移”：排一条后台任务，调用服务层重试。
+    *legacy.denied.lock().unwrap() = false;
+    let _ = model.dispatch("vault-retry-migration");
+    let token = model.begin_owner(&services.tasks, "vault");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::RetryVaultMigration));
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault", done);
+    assert!(!model.vault_alert.retrying);
+    assert!(model.vault_alert.failed.is_empty());
+    assert!(!model.vault_alert.visible());
+    assert_eq!(model.notice_key, Some("ui.vault.retryDone"));
+    assert!(services.connections.secret_migration_failures().await.unwrap().is_empty());
+    assert!(legacy.inner.dump().is_empty(), "迁入后旧条目被删除");
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R6：连接页“导入”走 import_rows：保存连接后恢复文件里的分组与组内顺序。
+#[tokio::test]
+async fn importing_a_file_restores_groups_and_order_through_import_rows() {
+    let dir = std::env::temp_dir().join(format!("rillsql-import-layout-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = AppServices::new(Arc::new(Service::new_for_test(dir.join("source.sqlite"))));
+    let mut ids = Vec::new();
+    for name in ["shop-a", "shop-b", "shop-c"] {
+        let mut draft = sample_draft(Engine::Postgres);
+        draft.name = name.into();
+        draft.save_password = false;
+        ids.push(source.save_connection(draft, None, None, None).await.unwrap().connection.id);
+    }
+    let group = source.connections.save_group(None, "demo-uat".into()).await.unwrap();
+    source.connections.reorder_connections(Some(&group.id), &[ids[2].clone(), ids[0].clone()]).await.unwrap();
+    let file = dir.join("export.json");
+    crate::app::views::connections::export_rows(&source, None, None, &file).await.unwrap();
+
+    let target = AppServices::new(Arc::new(Service::new_for_test(dir.join("target.sqlite"))));
+    let (count, notes) = crate::app::views::connections::import_rows(&target, &file, None).await.unwrap();
+    assert_eq!(count, 3);
+    assert!(notes.is_empty(), "{notes:?}");
+    let (groups, members) = target.connections.groups().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "demo-uat");
+    let rows: Vec<String> = target.list_connections().await.unwrap().into_iter().map(|row| row.saved.id).collect();
+    let layout = crate::connections::groups::layout_groups(&groups, &members, &rows);
+    assert_eq!(layout.groups[0].1, [ids[2].clone(), ids[0].clone()], "组内顺序保留");
+    assert_eq!(layout.ungrouped, [ids[1].clone()]);
+    drop((source, target));
     let _ = std::fs::remove_dir_all(dir);
 }

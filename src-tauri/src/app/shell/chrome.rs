@@ -229,6 +229,7 @@ impl Workbench {
                             .bg(p.surface)
                             .when(docked_sidebar, |this| this.border_l_1().border_color(p.line_soft))
                             .overflow_hidden()
+                            .when_some(self.vault_banner(&p, cx), |this, banner| this.child(banner))
                             .child(content),
                     )
                     .when(overlay_sidebar, |this| {
@@ -1333,6 +1334,56 @@ impl Workbench {
 
     /// 分组标题：折叠箭头、名称、成员数量。拖拽到这里才归组，右键只属于这一个分组。
     /// 搜索时被跳过的未连接关系型连接：单行横幅，附“连接这些连接”，可折叠成一行计数；计数为 0 时不渲染。
+    /// R7：本地保险库的提示条（迁移失败 / 密钥暂不可用 / 损坏已保留），带“重试迁移”与收起。
+    /// 只读模型里的状态，不访问钥匙串。没有问题或已收起时不渲染。
+    pub(super) fn vault_banner(&self, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let alert = &self.model.vault_alert;
+        if !alert.visible() {
+            return None;
+        }
+        let lines = vault_alert_lines(alert, |key| self.model.text(key));
+        let can_retry = !alert.failed.is_empty() || alert.key_unavailable.is_some();
+        let mut text = div().id("vault-alert-text").flex_1().min_w_0().flex().flex_col().gap(px(2.));
+        for (index, line) in lines.into_iter().enumerate() {
+            text = text.child(
+                div()
+                    .id(SharedString::from(format!("vault-alert-line-{index}")))
+                    .test_support()
+                    .min_w_0()
+                    .child(SharedString::from(line)),
+            );
+        }
+        Some(
+            div()
+                .id("vault-alert")
+                .test_support()
+                .role(gpui_kit::Role::Alert)
+                .flex_none()
+                .px(px(Space::LG))
+                .py(px(Space::SM))
+                .flex()
+                .items_center()
+                .gap(px(Space::SM))
+                .bg(p.warn.opacity(0.10))
+                .border_b_1()
+                .border_color(p.warn.opacity(0.35))
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text)
+                .child(kit::icon(IconName::TriangleAlert, 14., p.warn))
+                .child(text)
+                .when(can_retry, |this| {
+                    this.child(
+                        kit::tool_button("vault-retry-migration", Some(IconName::RefreshCw), self.t("ui.vault.retry"), act("vault-retry-migration", cx))
+                            .loading(alert.retrying)
+                            .disabled(alert.retrying)
+                            .small(),
+                    )
+                })
+                .child(kit::icon_button("vault-alert-dismiss", IconName::X, self.t("ui.vault.dismiss"), act("vault-alert-dismiss", cx)).xsmall())
+                .into_any_element(),
+        )
+    }
+
     fn search_skipped_banner(&self, skipped: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let collapsed = self.model.nav_search_skip_collapsed;
         let count = skipped.to_string();
@@ -1468,6 +1519,10 @@ impl Workbench {
         let menu_id = id.to_owned();
         let drop_id = id.to_owned();
         let group_drop_id = id.to_owned();
+        let group_hover_key = format!("group:{id}");
+        let group_drop_key = group_hover_key.clone();
+        let group_after = self.drop_after.as_deref() == Some(group_hover_key.as_str());
+        let searching = self.model.nav_searching();
         let drop_soft = p.accent_soft;
         let drop_line = p.accent;
         let entity = cx.entity().downgrade();
@@ -1489,10 +1544,24 @@ impl Workbench {
             .when(!focused, |this| this.hover(|style| style.bg(p.hover)))
             // R6：分组标题也能拖动：拖到另一个分组标题上，上沿出现插入线，放手排到它前面。
             .on_drag(super::explorer::GroupDrag { group: id.to_owned() }, |_, _, _, cx| cx.new(|_| ConnectionDragGhost))
-            .drag_over::<super::explorer::GroupDrag>(move |style, _, _, _| style.border_t_2().border_color(drop_line))
+            // 指针在下半行时插入线画在下沿，放手排到它后面：最后一个分组之后也能放。
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<super::explorer::GroupDrag>, _, cx| {
+                this.track_drop_half(&group_hover_key, event.bounds, event.event.position, cx);
+            }))
+            .drag_over::<super::explorer::GroupDrag>(move |style, _, _, _| {
+                if searching {
+                    style
+                } else if group_after {
+                    style.border_b_2().border_color(drop_line)
+                } else {
+                    style.border_t_2().border_color(drop_line)
+                }
+            })
             .on_drop(cx.listener(move |this, drag: &super::explorer::GroupDrag, _, cx| {
+                let after = this.take_drop_after(&group_drop_key);
                 let ordered = crate::connections::groups::sorted_groups(this.model.groups.clone());
                 let Some(index) = ordered.iter().position(|group| group.id == group_drop_id) else { return };
+                let index = if after { index + 1 } else { index };
                 let command = format!("group-drop:{}\u{1}{index}", drag.group);
                 this.perform(&command, cx);
                 cx.notify();
@@ -1635,6 +1704,9 @@ impl Workbench {
         let drop_target = id.clone();
         let drop_line = p.accent;
         let searching = self.model.nav_searching();
+        let conn_hover_key = format!("conn:{id}");
+        let conn_drop_key = conn_hover_key.clone();
+        let conn_after = self.drop_after.as_deref() == Some(conn_hover_key.as_str());
         kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
             .group(group.clone())
@@ -1729,15 +1801,26 @@ impl Workbench {
             )
             // R6：拖到另一条连接上时，这一行上沿出现插入线；放手插到这一行之前（同一分组或未分组）。
             // 搜索过滤时不显示插入线，放手只提示先清除搜索。
+            // 指针在下半行时插入线画在下沿，放手插到这一行之后：容器的最后一位也能放。
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<super::explorer::ConnectionDrag>, _, cx| {
+                this.track_drop_half(&conn_hover_key, event.bounds, event.event.position, cx);
+            }))
             .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| {
-                if searching { style } else { style.border_t_2().border_color(drop_line) }
+                if searching {
+                    style
+                } else if conn_after {
+                    style.border_b_2().border_color(drop_line)
+                } else {
+                    style.border_t_2().border_color(drop_line)
+                }
             })
             .on_drop(cx.listener(move |this, drag: &super::explorer::ConnectionDrag, _, cx| {
+                let after = this.take_drop_after(&conn_drop_key);
                 if drag.connection == drop_target {
                     return;
                 }
                 let group = this.model.group_of(&drop_target).map(str::to_owned);
-                let index = this.model.container_members(group.as_deref()).iter().position(|id| id == &drop_target).unwrap_or(usize::MAX);
+                let index = this.model.container_members(group.as_deref()).iter().position(|id| id == &drop_target).map(|at| if after { at + 1 } else { at }).unwrap_or(usize::MAX);
                 let command = format!("group-conn-drop:{}\u{1}{}\u{1}{index}", drag.connection, group.unwrap_or_default());
                 this.model.shell.focus = FocusTarget::Sidebar;
                 this.perform(&command, cx);
@@ -6774,6 +6857,31 @@ impl Workbench {
                 .flex_col()
                 .gap(px(m.section_gap()))
                 .child(self.update_card(updates.into_any_element(), &p, &m, cx))
+                .child({
+                    // R7：钥匙串只保存一把主密钥；授权提示里选“始终允许”，之后不再询问。
+                    let alert = &self.model.vault_alert;
+                    let lines = vault_alert_lines(alert, |key| self.model.text(key));
+                    let status_hint = if lines.is_empty() { self.t("ui.settings.vaultOk") } else { SharedString::from(lines.join("\n")) };
+                    let can_retry = !alert.failed.is_empty() || alert.key_unavailable.is_some();
+                    let retry: AnyElement = if can_retry {
+                        kit::tool_button("settings-vault-retry", Some(IconName::RefreshCw), self.t("ui.vault.retry"), act("vault-retry-migration", cx))
+                            .loading(alert.retrying)
+                            .disabled(alert.retrying)
+                            .small()
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    };
+                    group(
+                        "settings-security",
+                        self.t("ui.settings.security"),
+                        vec![
+                            (self.t("ui.settings.keychainTitle"), Some(self.t("ui.settings.keychainHint")), div().into_any_element()),
+                            (self.t("ui.settings.vaultStatus"), Some(status_hint), retry),
+                        ],
+                        &p,
+                    )
+                })
                 .child(
                     div()
                         .id("settings-local-hint")
@@ -9171,4 +9279,19 @@ pub(super) fn issue_field(name: &str) -> Option<DraftField> {
         "ssh_password" => DraftField::SshPassword,
         _ => return None,
     })
+}
+
+/// R7：保险库提示的逐行文字（迁移失败数、密钥暂不可用、损坏已保留）。提示条与设置页共用。
+pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(&str) -> String) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !alert.failed.is_empty() {
+        lines.push(i18n::fill(&text("ui.vault.migrationFailed"), &[("n", &alert.failed.len().to_string())]));
+    }
+    if let Some(reason) = &alert.key_unavailable {
+        lines.push(i18n::fill(&text("ui.vault.keyUnavailable"), &[("reason", reason)]));
+    }
+    if let Some(path) = &alert.corrupt_kept {
+        lines.push(i18n::fill(&text("ui.vault.corrupt"), &[("path", path)]));
+    }
+    lines
 }

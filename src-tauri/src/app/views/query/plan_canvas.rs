@@ -483,17 +483,19 @@ fn join_pill(node: &PlanNode, style: &CardStyle, locale: Locale, p: &Palette) ->
 /// 紧凑行数：千以下原样，其余用 K / M / B 加一位小数（1.2K、3M）。
 pub(super) fn count_text(value: f64) -> String {
     let value = value.max(0.).round();
-    let (scaled, unit) = if value >= 1e9 {
-        (value / 1e9, "B")
-    } else if value >= 1e6 {
-        (value / 1e6, "M")
-    } else if value >= 1e3 {
-        (value / 1e3, "K")
-    } else {
+    if value < 1e3 {
         return format!("{value:.0}");
-    };
+    }
+    const UNITS: [(f64, &str); 3] = [(1e3, "K"), (1e6, "M"), (1e9, "B")];
+    // 从能用的最大单位往下找起点；按一位小数四舍五入后到 1000 就进位到下一个单位（999_950 → 1M，而不是 1000K）。
+    let mut at = UNITS.iter().rposition(|(scale, _)| value >= *scale).unwrap_or(0);
+    let mut scaled = (value / UNITS[at].0 * 10.).round() / 10.;
+    while scaled >= 1000. && at + 1 < UNITS.len() {
+        at += 1;
+        scaled = (value / UNITS[at].0 * 10.).round() / 10.;
+    }
     let text = format!("{scaled:.1}");
-    format!("{}{unit}", text.trim_end_matches('0').trim_end_matches('.'))
+    format!("{}{}", text.trim_end_matches('0').trim_end_matches('.'), UNITS[at].1)
 }
 
 /// 卡片右上角的行数：有实际行数时显示实际行数；否则显示预估扫描行数，过滤率低于 100% 时
@@ -1062,6 +1064,11 @@ mod tests {
         assert_eq!(count_text(1000.), "1K");
         assert_eq!(count_text(3_450_000.), "3.5M");
         assert_eq!(count_text(2e9), "2B");
+        // 四舍五入后满 1000 进位到下一个单位。
+        assert_eq!(count_text(999_950.), "1M");
+        assert_eq!(count_text(999_949.), "999.9K");
+        assert_eq!(count_text(999_960_000.), "1B");
+        assert_eq!(count_text(999.6), "1K");
         let scan = |rows: f64, filtered: Option<f64>| PlanNode { op: "ALL".into(), rows: Some(rows), filtered, ..Default::default() };
         assert_eq!(rows_badge(&scan(1200., Some(10.)), Locale::ZhCn).as_deref(), Some("1.2K 行 · 10% → 120"));
         assert_eq!(rows_badge(&scan(1200., Some(10.)), Locale::En).as_deref(), Some("1.2K rows · 10% → 120"));

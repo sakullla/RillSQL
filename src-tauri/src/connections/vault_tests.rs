@@ -360,3 +360,77 @@ fn legacy_entries_stay_when_the_vault_cannot_be_written() {
     assert_eq!(legacy.values().get(&a).map(String::as_str), Some("pa"), "vault 没写成就不删旧条目");
     assert_eq!(legacy.deletes.load(Ordering::SeqCst), 0);
 }
+
+/// 旧钥匙串读完就把目录改成只读：模拟“损坏文件已改名保留，随后迁移写盘失败”。
+#[cfg(unix)]
+struct FreezeOnRead {
+    dir: PathBuf,
+    inner: Arc<Counting>,
+    frozen: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(unix)]
+impl SecretStore for FreezeOnRead {
+    fn put(&self, account: &str, secret: &str) -> Result<(), SecretError> {
+        self.inner.put(account, secret)
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+        use std::os::unix::fs::PermissionsExt;
+        if !self.frozen.swap(true, Ordering::SeqCst) {
+            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        self.inner.get(account)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), SecretError> {
+        self.inner.delete(account)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn corrupt_report_is_not_masked_by_a_failed_migration_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("corrupt-masked");
+    let master = Counting::with(&[]);
+    vault(&dir, master.clone(), None).put("x", "y").unwrap();
+    fs::write(dir.join(VAULT_FILE), b"not a vault").unwrap();
+    let a = password_account("a");
+    let legacy = Arc::new(FreezeOnRead { dir: dir.clone(), inner: Counting::with(&[(&a, "pa")]), frozen: Default::default() });
+    let store = vault(&dir, master, Some(legacy.clone()));
+    store.register_legacy(vec![a.clone()]);
+    let first = store.get("x");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(first, Err(SecretError::Corrupt(_))), "损坏说明优先：{first:?}");
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::Corrupt { .. }]));
+    // 迁移没写成：名单仍待迁移，下次访问时再跑并迁入。
+    assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
+    assert!(legacy.inner.values().is_empty());
+}
+
+#[test]
+fn denied_master_key_queues_a_single_key_unavailable_notice() {
+    let dir = temp_dir("denied-notice");
+    let store = vault(&dir, Arc::new(UnavailableStore), None);
+    assert!(store.get("conn:a:password").is_err());
+    assert!(store.get("conn:a:password").is_err());
+    let notices = store.take_notices();
+    assert!(matches!(notices.as_slice(), [VaultNotice::KeyUnavailable { .. }]), "{notices:?}");
+    assert!(store.take_notices().is_empty());
+}
+
+#[test]
+fn retry_reports_recovered_accounts_for_the_ui() {
+    let dir = temp_dir("retry-notice");
+    let a = password_account("a");
+    let legacy = Counting::with(&[(&a, "pa")]);
+    legacy.fail(&a);
+    let store = vault(&dir, Counting::with(&[]), Some(legacy.clone()));
+    store.register_legacy(vec![a.clone()]);
+    assert!(store.get(&a).is_err());
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::MigrationFailed { .. }]));
+    legacy.failing.lock().unwrap().clear();
+    store.retry_failed_migration().unwrap();
+    assert_eq!(store.take_notices(), vec![VaultNotice::MigrationRecovered { account: a.clone() }]);
+}

@@ -17,6 +17,10 @@ use super::kit::{self, HitArea, IconSize, Metrics, Palette, Radius, Space, Tip a
 pub const TAB_MAX_W: f32 = 220.;
 /// 页签最小宽度：标题很短（新建的空查询）也保持可点，关闭动作不与标题挤在一起。
 pub const TAB_MIN_W: f32 = 96.;
+/// 标题的显示宽度预算（半角字符计 1，全角计 2）：约等于最大页签宽度去掉图标、
+/// 间距和关闭动作后，SM 字号能放下的宽度。超出时在中间省略，保留开头和结尾
+/// （`orders_2024_…_backup`），同前缀的多张表仍能靠结尾区分。
+pub const TAB_TITLE_UNITS: usize = 26;
 /// 类型图标、标题与未保存标记之间的间距。
 pub const TAB_GAP: f32 = 7.;
 /// 左侧内边距：图标不贴边。
@@ -162,7 +166,8 @@ impl TabSpec {
 /// 页签主体：高度撑满页签条，图标、标题、未保存标记和关闭动作共用同一条垂直中心。
 /// 返回的元素由调用方继续挂 on_click / 右键 / 中键，再追加 `close_action`。
 pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentElement + gpui_kit::StatefulInteractiveElement {
-    let title = spec.title.clone();
+    // 显示用的标题在中间省略；完整标题仍在 tooltip 与无障碍名称上。
+    let title = SharedString::from(middle_ellipsis(&spec.title, TAB_TITLE_UNITS));
     let hint = spec.hint();
     let tone = if spec.active { p.text } else { p.text_muted };
     let icon_tone = if spec.prod && spec.active {
@@ -264,6 +269,49 @@ pub fn tab(spec: TabSpec, p: &Palette) -> impl IntoElement + gpui_kit::ParentEle
         })
         .when(spec.dirty, |this| this.child(kit::status_dot(p.warn)))
         .test_support()
+}
+
+/// 一个字符的显示宽度单位：全角（CJK、全角符号）计 2，其余计 1。
+fn char_units(ch: char) -> usize {
+    let code = ch as u32;
+    let wide = matches!(code,
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD);
+    if wide { 2 } else { 1 }
+}
+
+/// 超出 `max_units` 显示宽度时在中间省略：开头多留一点，结尾保留足够区分的部分。
+pub fn middle_ellipsis(title: &str, max_units: usize) -> String {
+    let total: usize = title.chars().map(char_units).sum();
+    if total <= max_units || max_units < 3 {
+        return title.to_owned();
+    }
+    let budget = max_units - 1; // 省略号占 1
+    let tail_budget = budget * 2 / 5;
+    let head_budget = budget - tail_budget;
+    let mut head = String::new();
+    let mut used = 0;
+    for ch in title.chars() {
+        let units = char_units(ch);
+        if used + units > head_budget {
+            break;
+        }
+        used += units;
+        head.push(ch);
+    }
+    let mut tail = Vec::new();
+    let mut used = 0;
+    for ch in title.chars().rev() {
+        let units = char_units(ch);
+        if used + units > tail_budget {
+            break;
+        }
+        used += units;
+        tail.push(ch);
+    }
+    tail.reverse();
+    format!("{}…{}", head.trim_end(), tail.into_iter().collect::<String>().trim_start())
 }
 
 /// 页签关闭动作：固定 20px 命中范围、12px 图标，与标题同一垂直中心。
@@ -869,6 +917,23 @@ mod tab_tests {
         let (pending, requests) = cx.update(|cx| (view.read(cx).pending, view.read(cx).requests));
         assert!(pending.is_none(), "确认进入视口后清掉滚动请求");
         assert!(requests <= 4, "只在需要时请求滚动（实际 {requests} 帧）");
+    }
+
+    /// 长标题在中间省略，保留开头与结尾；短标题原样；全角字符按两个单位计。
+    #[test]
+    fn long_titles_are_elided_in_the_middle() {
+        assert_eq!(middle_ellipsis("orders", TAB_TITLE_UNITS), "orders");
+        let long = "shop_search_a.order_items_archive_backup_2024";
+        let shown = middle_ellipsis(long, TAB_TITLE_UNITS);
+        assert!(shown.contains('…'), "{shown}");
+        assert!(shown.starts_with("shop_search_a"), "{shown}");
+        assert!(shown.ends_with("2024"), "{shown}");
+        assert!(shown.chars().count() <= TAB_TITLE_UNITS, "{shown}");
+        let wide = "订单明细归档备份表二零二四年十一月";
+        let shown = middle_ellipsis(wide, TAB_TITLE_UNITS);
+        let units: usize = shown.chars().map(char_units).sum();
+        assert!(units <= TAB_TITLE_UNITS, "{shown}");
+        assert!(shown.starts_with('订') && shown.ends_with('月'), "{shown}");
     }
 
     /// 请求必须自己停下来：几何永远确认不了（零宽视口、列表还没挂载）时，

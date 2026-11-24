@@ -120,6 +120,12 @@ pub struct Workbench {
     last_state: String,
     revision: Arc<AtomicU64>,
     persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// R6：手动排序的落库队列。界面线程按操作顺序入队，后台持闸一次取完、合并后依次写入，
+    /// 快速连续移动不会乱序提交，同一容器只写最新的顺序。
+    reorder_queue: Arc<std::sync::Mutex<std::collections::VecDeque<super::model::ReorderOp>>>,
+    reorder_gate: Arc<tokio::sync::Mutex<()>>,
+    /// R6：拖动排序时指针停在哪一行的下半部（"conn:id" / "group:id"）：插入线画在下沿，放手插到它后面。
+    pub(super) drop_after: Option<String>,
     pub(super) fields: crate::ui::kit::Fields<DraftField>,
     pub(super) menu_at: gpui_kit::Point<gpui_kit::Pixels>,
     /// 启动台筛选浮层的锚点：来自按钮上这一次真实点击。
@@ -198,6 +204,11 @@ impl Drop for Workbench {
         for (_, handle) in self.nav_reads.values() { handle.abort(); }
         for handle in self.nav_refresh_tasks.values() { handle.abort(); }
     }
+}
+
+/// R6：指针纵坐标落在行的下半部时，拖放插到这一行之后。
+pub(super) fn drop_lower_half(top: f32, height: f32, y: f32) -> bool {
+    y > top + height / 2.0
 }
 
 /// 读一个节点所属库的会话。会话绑定到单个库的引擎（PostgreSQL）读别的库时另开一个连到
@@ -476,6 +487,9 @@ impl Workbench {
             last_state: String::new(),
             revision: Arc::new(AtomicU64::new(0)),
             persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            reorder_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            reorder_gate: Arc::new(tokio::sync::Mutex::new(())),
+            drop_after: None,
             fields: crate::ui::kit::Fields::default(),
             menu_at: gpui_kit::Point::default(),
             conn_filter_at: gpui_kit::Point::default(),
@@ -3080,6 +3094,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
+            PendingJob::RetryVaultMigration => "vault",
             PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };
@@ -3651,21 +3666,59 @@ impl Workbench {
         .detach();
     }
 
+    /// R6：拖动经过一行时记下指针在上半还是下半行；只在变化时重绘。
+    pub(super) fn track_drop_half(
+        &mut self,
+        key: &str,
+        bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !bounds.contains(&position) {
+            return;
+        }
+        let after = drop_lower_half(f32::from(bounds.top()), f32::from(bounds.size.height), f32::from(position.y));
+        let next = after.then(|| key.to_owned());
+        if self.drop_after != next {
+            self.drop_after = next;
+            cx.notify();
+        }
+    }
+
+    /// 放手时取出“插到这一行之后”的判断，并清掉悬停状态。
+    pub(super) fn take_drop_after(&mut self, key: &str) -> bool {
+        self.drop_after.take().as_deref() == Some(key)
+    }
+
     /// R6：把模型里已经生效的手动顺序写进配置库。失败时报告原因并从配置库重读，恢复原顺序。
     fn pump_reorder(&mut self, cx: &mut Context<Self>) {
         let Some(op) = self.model.take_pending_reorder() else { return };
+        // 入队在界面线程上完成，顺序就是用户操作的顺序；后台任务的启动顺序不影响提交顺序。
+        if let Ok(mut queue) = self.reorder_queue.lock() {
+            queue.push_back(op);
+        }
         let services = Arc::clone(&self.services);
+        let queue = Arc::clone(&self.reorder_queue);
+        let gate = Arc::clone(&self.reorder_gate);
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(async move {
-            let result = match op {
-                super::model::ReorderOp::Connections { group, ids } => services.connections.reorder_connections(group.as_deref(), &ids).await,
-                super::model::ReorderOp::Groups { ids } => services.connections.reorder_groups(&ids).await,
-            };
-            let _ = tx.send(result);
+            let _guard = gate.lock().await;
+            let batch: Vec<_> = queue.lock().map(|mut queue| queue.drain(..).collect()).unwrap_or_default();
+            let mut failure = None;
+            for op in super::model::coalesce_reorders(batch) {
+                let result = match op {
+                    super::model::ReorderOp::Connections { group, ids } => services.connections.reorder_connections(group.as_deref(), &ids).await,
+                    super::model::ReorderOp::Groups { ids } => services.connections.reorder_groups(&ids).await,
+                };
+                if let Err(detail) = result {
+                    failure.get_or_insert(detail);
+                }
+            }
+            let _ = tx.send(failure);
         });
         cx.spawn(async move |_, cx| {
-            if let Ok(Err(detail)) = rx.await {
+            if let Ok(Some(detail)) = rx.await {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {

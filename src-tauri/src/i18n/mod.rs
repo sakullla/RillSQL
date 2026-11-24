@@ -1873,6 +1873,17 @@ dict! {
     "ui.settings.saveFailedHint" => "改动已生效，但重启后会退回上次保存的值。", "The change applies now but reverts on restart.";
     "ui.settings.retrySave" => "重试保存", "Retry saving";
     "ui.settings.localHint" => "设置与历史只存在这台机器上。", "Settings and history stay on this machine.";
+    "ui.settings.security" => "安全", "Security";
+    "ui.settings.keychainTitle" => "钥匙串授权", "Keychain access";
+    "ui.settings.keychainHint" => "保存的密码加密存放在本机的保险库文件里，系统钥匙串只保存一把主密钥。macOS 第一次询问时请选择“始终允许”，之后启动和连接都不会再弹授权；选“允许”只对本次运行有效。", "Saved passwords are encrypted in a local vault file; the system keychain holds a single master key. When macOS asks the first time, choose \"Always Allow\" so later launches and connections do not prompt again; \"Allow\" lasts only for this run.";
+    "ui.settings.vaultStatus" => "本地保险库", "Local vault";
+    "ui.settings.vaultOk" => "没有待处理的问题。", "No pending issues.";
+    "ui.vault.migrationFailed" => "{n} 条已保存的密码没能迁入本地保险库，旧条目仍在系统钥匙串里。", "{n} saved passwords could not move into the local vault; the old entries remain in the system keychain.";
+    "ui.vault.keyUnavailable" => "保险库密钥暂不可用：{reason}。在钥匙串授权提示中选择“始终允许”后重试。", "The vault key is unavailable: {reason}. Choose \"Always Allow\" in the keychain prompt, then retry.";
+    "ui.vault.corrupt" => "本地保险库无法解密，原文件已保留为 {path}。请重新输入密码并保存。", "The local vault could not be decrypted and was kept as {path}. Re-enter and save the passwords.";
+    "ui.vault.retry" => "重试迁移", "Retry migration";
+    "ui.vault.dismiss" => "收起提示", "Dismiss";
+    "ui.vault.retryDone" => "已迁入本地保险库", "Moved into the local vault";
     "history.page.loading" => "正在读取历史…", "Reading history…";
     "history.page.loadingSaved" => "正在读取保存的查询…", "Reading saved queries…";
     "history.page.retryLoad" => "重新读取", "Reload";

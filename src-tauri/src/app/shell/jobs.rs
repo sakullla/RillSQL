@@ -52,6 +52,8 @@ pub enum JobDone {
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
     /// 分组与成员关系的快照：(分组, 连接 id → 分组 id)。
     Groups(TaskToken, Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String>),
+    /// R7：重试迁移旧钥匙串条目的结果。
+    VaultRetry(TaskToken, Result<crate::connections::secrets::MigrationReport, String>),
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -213,6 +215,7 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
             }
         }
         PendingJob::RefreshGroups => JobDone::Groups(token, services.connections.groups().await),
+        PendingJob::RetryVaultMigration => JobDone::VaultRetry(token, services.connections.retry_failed_migration().await),
         PendingJob::GroupOp => {
             let Some(op) = request.group else {
                 return JobDone::Notice(token, Err("ui.group.new".into()));
@@ -288,7 +291,23 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
     if owner == "connections" && matches!(done, JobDone::Saved(..) | JobDone::Notice(_, Err(_))) {
         model.conn_modal.saving = false;
     }
+    // R7：保险库在打开、保存、测试连接时才加载；它排出的事件（迁移失败、密钥暂不可用、
+    // 损坏已保留）随每个任务结果收进提示条。只取内存里的事件，不访问钥匙串。
+    model.vault_alert.absorb(services.connections.take_secret_notices());
     match done {
+        JobDone::VaultRetry(token, result) => {
+            if accepted(services, owner, token) {
+                let ok = result.is_ok();
+                let failed_left = result.as_ref().map(|report| report.failed.len()).unwrap_or(0);
+                model.vault_alert.apply_retry(result);
+                if ok && failed_left == 0 {
+                    model.notice_key = Some("ui.vault.retryDone");
+                    model.notice_detail.clear();
+                }
+            } else {
+                model.vault_alert.retrying = false;
+            }
+        }
         JobDone::Rows(token, Ok(snapshot)) => {
             if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
                 model.connections.recent_ids = snapshot.recent;
@@ -370,6 +389,7 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.connections.recent_ids = snapshot.recent;
                 model.welcome.has_connections = !model.connections.rows.is_empty();
                 model.import_notes = skipped.clone();
+                model.enqueue(PendingJob::RefreshGroups);
                 model.bundle_unlock = None;
                 model.bundle_passphrase.clear();
                 if skipped.is_empty() {

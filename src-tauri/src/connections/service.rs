@@ -910,7 +910,6 @@ impl Service {
     }
 
     /// 重新迁移之前没能迁入保险库的旧钥匙串条目（界面上的“重试”）。
-    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
     pub async fn retry_failed_migration(&self) -> Result<MigrationReport, String> {
         self.store().await?;
         let report = self.secrets.retry_failed_migration().map_err(|err| err.guidance())?;
@@ -921,14 +920,13 @@ impl Service {
     }
 
     /// 仍未迁入保险库的旧条目（凭据账户、原因）。
-    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
+    #[allow(dead_code)] // 界面只用保险库排出的事件，不为显示提示条而加载保险库（会触发钥匙串授权）。
     pub async fn secret_migration_failures(&self) -> Result<Vec<(String, String)>, String> {
         self.store().await?;
         self.secrets.migration_failures().map_err(|err| err.guidance())
     }
 
     /// 取走待提示的凭据事件（保险库损坏、迁移失败）。
-    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
     pub fn take_secret_notices(&self) -> Vec<VaultNotice> {
         self.secrets.take_notices()
     }

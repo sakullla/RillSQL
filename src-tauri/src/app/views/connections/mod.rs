@@ -809,16 +809,28 @@ pub async fn export_rows(services: &AppServices, ids: Option<Vec<String>>, passp
     services.export_connections(ids, passphrase, path).await
 }
 
+/// 导入报告里“分组与顺序恢复失败”那一行的前缀。
+pub const IMPORT_LAYOUT_LABEL: &str = "分组与顺序";
+
 pub async fn import_rows(services: &AppServices, path: &Path, passphrase: Option<&str>) -> Result<(usize, Vec<String>), String> {
     let parsed = services.import_connections(path, passphrase).await?;
     let mut imported = 0;
     let mut skipped = parsed.skipped.into_iter().map(|row| format!("{}: {}", row.name, row.reason)).collect::<Vec<_>>();
+    let groups = parsed.groups.clone();
+    let mut imported_ids = Vec::new();
     for saved in parsed.connections {
         let draft = draft_from_saved(&saved);
         match save_draft(services, draft, &Secrets::default()).await {
-            Ok(_) => imported += 1,
+            Ok(outcome) => {
+                imported += 1;
+                imported_ids.push(outcome.connection.id.clone());
+            }
             Err(err) => skipped.push(format!("{}: {err}", saved.name)),
         }
+    }
+    // R6：恢复分组与顺序；失败不丢弃，作为一条报告交给界面通知。
+    if let Err(err) = services.connections.restore_import_layout(&groups, &imported_ids).await {
+        skipped.push(format!("{IMPORT_LAYOUT_LABEL}: {err}"));
     }
     Ok((imported, skipped))
 }

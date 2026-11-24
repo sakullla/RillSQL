@@ -146,6 +146,12 @@ impl VaultStore {
             // 已经安全写进 vault；旧条目删不掉只是残留，不影响读取。
             let _ = legacy.delete(account);
         }
+        if retry {
+            let mut notices = self.notices.lock().expect("vault notices");
+            for account in report.migrated.iter().chain(&report.absent) {
+                notices.push(VaultNotice::MigrationRecovered { account: account.clone() });
+            }
+        }
         if !report.failed.is_empty() {
             let mut notices = self.notices.lock().expect("vault notices");
             for (account, reason) in &report.failed {
@@ -206,13 +212,31 @@ impl VaultStore {
     fn ensure_loaded<'a>(&self, guard: &'a mut Option<Loaded>) -> Result<&'a mut Loaded, SecretError> {
         let mut outcome = Ok(());
         if guard.is_none() {
-            let (loaded, load_outcome) = self.load()?;
+            let (loaded, load_outcome) = match self.load() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if let SecretError::Unavailable(reason) = &err {
+                        self.note_key_unavailable(reason);
+                    }
+                    return Err(err);
+                }
+            };
+            // 之前的运行里没迁入的旧条目：重启后也要让界面知道，并提供重试。
+            if !loaded.contents.legacy_failed.is_empty() {
+                let mut notices = self.notices.lock().expect("vault notices");
+                for (account, reason) in &loaded.contents.legacy_failed {
+                    notices.push(VaultNotice::MigrationFailed { account: account.clone(), reason: reason.clone() });
+                }
+            }
             *guard = Some(loaded);
             outcome = load_outcome;
         }
         let loaded = guard.as_mut().expect("vault loaded");
-        self.migrate_scope(loaded)?;
+        // 损坏报告优先：迁移写盘失败不能把“原文件已改名保留”的说明盖掉。
+        // 迁移失败时名单保持未迁移，下次访问再跑。
+        let migrated = self.migrate_scope(loaded);
         outcome?;
+        migrated?;
         Ok(loaded)
     }
 
@@ -260,6 +284,15 @@ impl VaultStore {
                 };
                 Ok((Loaded { key, contents: Contents::default() }, outcome))
             }
+        }
+    }
+
+    /// 同一原因的“密钥暂不可用”只排一条待提示，界面不会被重复的授权失败刷屏。
+    fn note_key_unavailable(&self, reason: &str) {
+        let mut notices = self.notices.lock().expect("vault notices");
+        let duplicate = notices.iter().any(|notice| matches!(notice, VaultNotice::KeyUnavailable { reason: seen } if seen == reason));
+        if !duplicate {
+            notices.push(VaultNotice::KeyUnavailable { reason: reason.to_owned() });
         }
     }
 
