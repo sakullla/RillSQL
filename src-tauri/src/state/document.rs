@@ -69,6 +69,13 @@ pub struct ShellSettings {
     /// 在事务栏显示保存点、隔离级别与事务模式等高级入口。
     #[serde(default)]
     pub transaction_advanced: bool,
+    /// 编辑器对象提示（R8）：`compact` 紧凑（默认），`off` 关闭补全文档与悬停对象卡。旧文件没有这一项时取默认。
+    #[serde(default = "default_object_hints")]
+    pub object_hints: String,
+}
+
+fn default_object_hints() -> String {
+    "compact".to_owned()
 }
 
 fn default_empty_display() -> String {
@@ -93,6 +100,7 @@ impl Default for ShellSettings {
             index_naming: crate::ddl::naming::IndexNaming::default(),
             transaction_manual: false,
             transaction_advanced: false,
+            object_hints: default_object_hints(),
         }
     }
 }

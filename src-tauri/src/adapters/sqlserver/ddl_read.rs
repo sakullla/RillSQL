@@ -7,7 +7,7 @@ use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
-use crate::ddl::model::{Column, ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus};
+use crate::ddl::model::{Column, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexKind, Snapshot, Step, StepReceipt, StepStatus};
 use crate::ddl::sql::qualified_table;
 
 /// 改名前查新名字：SQL Server 看同 schema 的 sys.objects（排除按原名逐字节相同的表自身）。
@@ -87,6 +87,23 @@ pub(crate) struct SqlserverIndexExtra {
     pub type_desc: String,
     pub include: Vec<String>,
     pub filter: Option<String>,
+    /// 非默认的索引选项（FILLFACTOR、IGNORE_DUP_KEY、PAD_INDEX、ALLOW_ROW_LOCKS = OFF、ALLOW_PAGE_LOCKS = OFF）。
+    pub options: Vec<String>,
+}
+
+/// 页面编辑器只会按默认选项建普通非聚集索引；其余类型、INCLUDE 列与非默认选项先删后建会丢掉。
+/// 筛选条件按部分索引另行拦截，不在这里列出。
+pub(crate) fn sqlserver_index_losses(extra: &SqlserverIndexExtra) -> Vec<String> {
+    let mut losses = Vec::new();
+    let kind = extra.type_desc.trim().to_ascii_uppercase();
+    if !kind.is_empty() && kind != "NONCLUSTERED" {
+        losses.push(kind);
+    }
+    if !extra.include.is_empty() {
+        losses.push("INCLUDE".to_owned());
+    }
+    losses.extend(extra.options.iter().cloned());
+    losses
 }
 
 /// 按读到的键列、聚集方式、INCLUDE 列和筛选条件拼出 SQL Server 的 CREATE INDEX 语句。
@@ -182,7 +199,7 @@ pub(super) async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &
         tds_strings(
             client,
             &format!(
-                "SELECT i.name, i.is_primary_key, i.is_unique, ic.is_descending_key, c.name, ic.is_included_column, i.type_desc, i.has_filter, i.filter_definition FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND i.name IS NOT NULL ORDER BY i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id"
+                "SELECT i.name, i.is_primary_key, i.is_unique, ic.is_descending_key, c.name, ic.is_included_column, i.type_desc, i.has_filter, i.filter_definition, i.fill_factor, i.ignore_dup_key, i.is_padded, i.allow_row_locks, i.allow_page_locks FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND i.name IS NOT NULL ORDER BY i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id"
             ),
         )
         .await,
@@ -197,11 +214,29 @@ pub(super) async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &
         let included = flag(5).unwrap_or(false);
         if !extras.iter().any(|extra| extra.name == name) {
             let filter = text(8).trim().to_owned();
+            let mut options = Vec::new();
+            let fill_factor = text(9).trim().parse::<u32>().unwrap_or(0);
+            if fill_factor != 0 && fill_factor != 100 {
+                options.push(format!("FILLFACTOR = {fill_factor}"));
+            }
+            if flag(10) == Some(true) {
+                options.push("IGNORE_DUP_KEY".to_owned());
+            }
+            if flag(11) == Some(true) {
+                options.push("PAD_INDEX".to_owned());
+            }
+            if text(12).trim() == "0" {
+                options.push("ALLOW_ROW_LOCKS = OFF".to_owned());
+            }
+            if text(13).trim() == "0" {
+                options.push("ALLOW_PAGE_LOCKS = OFF".to_owned());
+            }
             extras.push(SqlserverIndexExtra {
                 name: name.clone(),
                 type_desc: text(6).trim().to_owned(),
                 include: Vec::new(),
                 filter: (flag(7).unwrap_or(false) && !filter.is_empty()).then_some(filter),
+                options,
             });
         }
         if included {
@@ -223,22 +258,25 @@ pub(super) async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &
                     partial: false,
                     expression: false,
                     sql: None,
+                    kind: IndexKind::infer(primary, unique),
+                    ..Index::default()
                 });
                 snapshot.indexes.last_mut().expect("just pushed")
             }
         };
         if !included {
-            index.columns.push(IndexColumn { name: text(4), descending: flag(3).unwrap_or(false) });
+            index.columns.push(IndexColumn { name: text(4), descending: flag(3).unwrap_or(false), prefix: None });
         }
     }
     let qualified = qualified_table(Engine::Sqlserver, database, schema, table)?;
     for index in &mut snapshot.indexes {
-        if index.protected {
-            continue;
-        }
         let Some(extra) = extras.iter().find(|extra| extra.name == index.name) else {
             continue;
         };
+        index.rebuild_loses = sqlserver_index_losses(extra);
+        if index.protected {
+            continue;
+        }
         index.partial = extra.filter.is_some();
         index.sql = Some(sqlserver_index_sql(&qualified, index, extra));
     }

@@ -1268,11 +1268,11 @@ mod tests {
     #[test]
     fn round_tripping_through_sqlite_preserves_network_fields_and_unencrypted_tls() {
         let mut draft = blank_draft(Engine::Mysql);
-        draft.name = "qsyn-uat".into();
+        draft.name = "demo-uat".into();
         draft.env = "test".into();
         draft.host = "192.168.92.210".into();
         draft.port = "3306".into();
-        draft.username = "qsyn3_user".into();
+        draft.username = "demo_user".into();
         draft.tls_mode = TlsMode::Off;
         let mut saved = normalize(&draft, "uat".into()).unwrap();
         saved.password_saved = true;
@@ -1292,7 +1292,7 @@ mod tests {
         let restored = page.editor.as_ref().unwrap();
         assert_eq!(restored.host, "192.168.92.210");
         assert_eq!(restored.port, "3306");
-        assert_eq!(restored.username, "qsyn3_user");
+        assert_eq!(restored.username, "demo_user");
         assert_eq!(restored.env, "test");
         assert_eq!(restored.tls_mode, TlsMode::Off);
         assert!(restored.save_password);

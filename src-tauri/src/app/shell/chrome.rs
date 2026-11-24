@@ -1050,7 +1050,29 @@ impl Workbench {
                 list = list.child(div().id("explorer-pad-top").flex_none().h(px(window.pad_top)));
             }
             for item in &items[window.range.clone()] {
-                list = list.child(self.explorer_row(item, &p, cx));
+                let row = self.explorer_row(item, &p, cx);
+                // 定位命中的行短暂描边高亮；不改行高，不挡点击。
+                if self.model.reveal_flash_active(&item.id()) {
+                    list = list.child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(row)
+                            .child(
+                                div()
+                                    .id("explorer-reveal-flash")
+                                    .test_support()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(Radius::CONTROL))
+                                    .border_1()
+                                    .border_color(p.accent)
+                                    .bg(p.accent_soft.opacity(0.5)),
+                            ),
+                    );
+                } else {
+                    list = list.child(row);
+                }
             }
             if window.pad_bottom > 0. {
                 list = list.child(div().id("explorer-pad-bottom").flex_none().h(px(window.pad_bottom)));
@@ -1074,6 +1096,14 @@ impl Workbench {
                         .xsmall()
                         .disabled(!self.model.has_connected()),
                 )
+                .child({
+                    // 定位活动标签；没有可定位的对象时禁用并说明原因。
+                    let can_locate = self.model.can_reveal_active_tab();
+                    kit::icon_button("explorer-locate", IconName::LocateFixed, self.t("ui.explorer.locate"), act("reveal-active-tab", cx))
+                        .xsmall()
+                        .disabled(!can_locate)
+                        .tooltip(if can_locate { self.t("ui.explorer.locate") } else { self.t("ui.explorer.locateNone") })
+                })
             })
             // 分组入口就在树旁边：新建组、右键组改名/删除、拖连接归组。
             .child(kit::icon_button("explorer-group-add", IconName::Folder, self.t("ui.group.new"), act("group-new", cx)).xsmall())
@@ -1165,25 +1195,7 @@ impl Workbench {
                             .border_color(p.line_soft)
                             .child(explorer_header),
                     )
-                    .when(search_skipped > 0, |this| {
-                        let msg = i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &search_skipped.to_string())]);
-                        this.child(
-                            div()
-                                .id("explorer-search-skipped")
-                                .test_support()
-                                .flex_none()
-                                .px(px(Space::LG))
-                                .pb(px(Space::SM))
-                                .flex()
-                                .items_center()
-                                .gap(px(Space::SM))
-                                .text_size(px(TypeScale::XS))
-                                .text_color(p.text_faint)
-                                .tooltip_text(SharedString::from(msg.clone()))
-                                .child(kit::icon(IconName::Info, 12., p.text_faint))
-                                .child(div().flex_1().min_w_0().truncate().child(SharedString::from(msg))),
-                        )
-                    })
+                    .when(search_skipped > 0, |this| this.child(self.search_skipped_banner(search_skipped, &p, cx)))
                     .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
             )
@@ -1309,6 +1321,47 @@ impl Workbench {
     }
 
     /// 分组标题：折叠箭头、名称、成员数量。拖拽到这里才归组，右键只属于这一个分组。
+    /// 搜索时被跳过的未连接关系型连接：单行横幅，附“连接这些连接”，可折叠成一行计数；计数为 0 时不渲染。
+    fn search_skipped_banner(&self, skipped: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let collapsed = self.model.nav_search_skip_collapsed;
+        let count = skipped.to_string();
+        let msg = SharedString::from(i18n::fill(
+            &self.model.text(if collapsed { "ui.explorer.searchSkippedShort" } else { "ui.explorer.searchSkipped" }),
+            &[("n", &count)],
+        ));
+        let full = SharedString::from(i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &count)]));
+        let toggle_label = self.t(if collapsed { "ui.explorer.searchSkippedExpand" } else { "ui.explorer.searchSkippedCollapse" });
+        div()
+            .id("explorer-search-skipped")
+            .test_support()
+            .flex_none()
+            .px(px(Space::LG))
+            .pb(px(Space::XS))
+            .flex()
+            .items_center()
+            .gap(px(Space::XS))
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint)
+            .child(kit::icon(IconName::Info, 12., p.text_faint))
+            .child(div().id("explorer-search-skipped-text").flex_1().min_w_0().truncate().tooltip_text(full).child(msg))
+            .when(!collapsed, |this| {
+                this.child(
+                    kit::tool_button("explorer-connect-skipped", Some(IconName::Plug), self.t("ui.explorer.connectSkipped"), act("nav-connect-skipped", cx))
+                        .xsmall(),
+                )
+            })
+            .child(
+                kit::icon_button(
+                    "explorer-search-skipped-toggle",
+                    if collapsed { IconName::ChevronDown } else { IconName::ChevronUp },
+                    toggle_label,
+                    act("nav-search-skipped-toggle", cx),
+                )
+                .xsmall(),
+            )
+            .into_any_element()
+    }
+
     fn group_row(&self, id: &str, collapsed: bool, members: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let m = self.metrics();
         let name = self.model.group(id).map(|group| group.name.clone()).unwrap_or_default();
@@ -2386,7 +2439,7 @@ impl Workbench {
                     .disabled(in_flight),
             );
         }
-        let mut dialog = dialog_card(
+        let mut dialog = kit::modal_card(
             "transaction-guard",
             IconName::TriangleAlert,
             p.warn,
@@ -3827,7 +3880,7 @@ impl Workbench {
             }
 
             let subbar = if !file_based {
-                let mut tabs = segment_track(&p);
+                let mut tabs = kit::segment_track(&p);
                 for (tab, key, enabled_dot) in [
                     (conn_modal::ModalTab::General, "ui.conn.tab.general", false),
                     (conn_modal::ModalTab::Ssh, "ui.conn.tab.ssh", draft.ssh_on),
@@ -4135,7 +4188,7 @@ impl Workbench {
                         let (ssh_port, _) = self.field_input(DraftField::SshPort, &ssh_port_hint, ssh_port_masked, window, cx);
                         let (ssh_user_hint, ssh_user_masked) = self.field_hint(DraftField::SshUser);
                         let (ssh_user, _) = self.field_input(DraftField::SshUser, &ssh_user_hint, ssh_user_masked, window, cx);
-                        let mut auth_items = segment_track(&p);
+                        let mut auth_items = kit::segment_track(&p);
                         for (kind, key) in [
                             (SshAuthKind::Key, "connections.editor.ssh.authKey"),
                             (SshAuthKind::Password, "connections.editor.ssh.authPassword"),
@@ -4203,7 +4256,7 @@ impl Workbench {
                 }),
                 conn_modal::ModalTab::Tls => stack_frame(|| {
                     let mut security = div().flex().flex_col().gap(px(12.));
-                    let mut tls_items = segment_track(&p);
+                    let mut tls_items = kit::segment_track(&p);
                     for (mode, key) in [
                         (TlsMode::Off, "connections.page.tlsOff"),
                         (TlsMode::Require, "ui.conn.tlsRequire"),
@@ -4232,7 +4285,7 @@ impl Workbench {
                             .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.t(tls_hint))),
                     );
                     if draft.tls_mode == TlsMode::Verify {
-                        let mut ca_items = segment_track(&p);
+                        let mut ca_items = kit::segment_track(&p);
                         for (mode, key) in [
                             (CaMode::System, "connections.editor.tls.caSystem"),
                             (CaMode::File, "connections.editor.tls.caFile"),
@@ -4683,7 +4736,7 @@ impl Workbench {
         let (name_hint, name_masked) = self.field_hint(DraftField::Name);
         let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
         let active_env = env_key(&draft.env);
-        let mut env_items = segment_track(p);
+        let mut env_items = kit::segment_track(p);
         for env in envs {
             let dot = env_shown(env).then(|| {
                 let tone = env_tone(env, &self.model.env_tags);
@@ -6378,6 +6431,11 @@ impl Workbench {
                                 ],
                             )),
                     );
+                let hints_seg = seg(
+                    self,
+                    &[("hints-compact", "ui.settings.hintsCompact", s.object_hints != "off"), ("hints-off", "ui.settings.hintsOff", s.object_hints == "off")],
+                    cx,
+                );
                 div()
                 .flex()
                 .flex_col()
@@ -6398,6 +6456,7 @@ impl Workbench {
                     vec![
                         (self.t("shell.settings.editorFont"), None, font.into_any_element()),
                         (self.t("shell.settings.editorTheme"), None, editor_theme.into_any_element()),
+                        (self.t("ui.settings.objectHints"), Some(self.t("ui.settings.objectHintsHint")), hints_seg),
                     ],
                     &p,
                 ))
@@ -7721,12 +7780,9 @@ impl Workbench {
                 cx.quit();
             }
         });
-        let dialog = dialog_card("close-guard", IconName::TriangleAlert, p.warn, title, self.t(key), &p)
+        let dialog = kit::modal_card("close-guard", IconName::TriangleAlert, p.warn, title, self.t(key), &p)
             .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.))
+                kit::modal_actions()
                     .child(kit::danger_button("cmd-close-leave", None, self.t("shell.closeGuard.leave"), leave))
                     .child(kit::primary_button("cmd-close-stay", None, self.t("shell.closeGuard.stay"), act("close-stay", cx))),
             );
@@ -7753,11 +7809,8 @@ impl Workbench {
         } else {
             self.t("connections.deleteDialog.willKeepDb")
         };
-        let dialog = dialog_card("delete-connection", IconName::Trash, p.danger, title, body, &p).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
+        let dialog = kit::modal_card("delete-connection", IconName::Trash, p.danger, title, body, &p).child(
+            kit::modal_actions()
                 .child(kit::secondary_button("cmd-conn-delete-cancel", None, self.t("common.cancel"), act("conn-delete-cancel", cx)))
                 .child(kit::danger_button("cmd-conn-delete-confirm", Some(IconName::Trash), self.t("connections.deleteDialog.confirm"), act("conn-delete-confirm", cx))),
         );
@@ -7775,11 +7828,8 @@ impl Workbench {
             .map(|group| group.name.clone())
             .unwrap_or_default();
         let body = super::explorer::full_label(&self.t("ui.group.deleteHint"), &name);
-        let dialog = dialog_card("delete-group", IconName::Trash, p.danger, self.t("ui.group.delete"), SharedString::from(body), &p).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
+        let dialog = kit::modal_card("delete-group", IconName::Trash, p.danger, self.t("ui.group.delete"), SharedString::from(body), &p).child(
+            kit::modal_actions()
                 .child(kit::secondary_button("cmd-group-delete-cancel", None, self.t("common.cancel"), act("group-delete-cancel", cx)))
                 .child(kit::danger_button("cmd-group-delete-confirm", Some(IconName::Trash), self.t("ui.group.delete"), act("group-delete-confirm", cx))),
         );
@@ -7797,12 +7847,8 @@ impl Workbench {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let body = i18n::fill(&self.model.text("ui.openFile.askBody"), &[("name", &name)]);
-        let dialog = dialog_card("open-choice", IconName::FolderOpen, p.accent, self.t("ui.openFile.askTitle"), SharedString::from(body), &p).child(
-            div()
-                .flex()
-                .flex_wrap()
-                .justify_end()
-                .gap(px(8.))
+        let dialog = kit::modal_card("open-choice", IconName::FolderOpen, p.accent, self.t("ui.openFile.askTitle"), SharedString::from(body), &p).child(
+            kit::modal_actions()
                 .child(kit::secondary_button("cmd-open-choice-cancel", None, self.t("common.cancel"), act("open-choice-cancel", cx)))
                 .child(kit::secondary_button("cmd-open-as-database", Some(IconName::Database), self.t("ui.openFile.asDatabase"), act("open-as-database", cx)))
                 .child(kit::primary_button("cmd-open-as-sql", Some(IconName::FileText), self.t("ui.openFile.asSql"), act("open-as-sql", cx))),
@@ -7812,11 +7858,8 @@ impl Workbench {
 
     fn clear_history_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        let dialog = dialog_card("clear-history", IconName::Trash, p.danger, self.t("ui.history.clear"), self.t("history.page.clearConfirm"), &p).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
+        let dialog = kit::modal_card("clear-history", IconName::Trash, p.danger, self.t("ui.history.clear"), self.t("history.page.clearConfirm"), &p).child(
+            kit::modal_actions()
                 .child(kit::secondary_button("cmd-history-clear-cancel", None, self.t("common.cancel"), cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.model.history.confirm_clear = false;
                     this.model.notice_key = None;
@@ -7829,11 +7872,8 @@ impl Workbench {
 
     fn delete_saved_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        let dialog = dialog_card("delete-saved", IconName::Trash, p.danger, self.t("history.page.saved"), self.t("history.page.deleteSavedConfirm"), &p).child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
+        let dialog = kit::modal_card("delete-saved", IconName::Trash, p.danger, self.t("history.page.saved"), self.t("history.page.deleteSavedConfirm"), &p).child(
+            kit::modal_actions()
                 .child(kit::secondary_button("cmd-saved-delete-cancel", None, self.t("common.cancel"), act("saved-delete-cancel", cx)))
                 .child(kit::danger_button("cmd-saved-delete-confirm", Some(IconName::Trash), self.t("ui.history.delete"), act("saved-delete", cx))),
         );
@@ -7905,25 +7945,10 @@ impl Workbench {
                 .child(banner(IconName::Info, SharedString::from(text), p.warn, p.warn_soft))
         });
         let has_text = view.text.is_some();
-        let dialog = div()
-            .id("ddl-viewer")
+        let dialog = kit::modal_surface("ddl-viewer", title.clone(), kit::ModalWidth::WIDE, &p)
             .test_support()
-            .role(gpui_kit::Role::Dialog)
-            .aria_label(title.clone())
-            .occlude()
-            .w_full()
-            .max_w(px(760.))
-            .min_w_0()
-            .p(px(20.))
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .bg(p.raised)
-            .border_1()
-            .border_color(p.line)
-            .rounded(px(Radius::PANEL))
-            .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .p(px(Space::XL + Space::XS))
+            .gap(px(Space::LG))
             .child(
                 div()
                     .flex()
@@ -7931,26 +7956,30 @@ impl Workbench {
                     .gap(px(8.))
                     .child(kit::icon(IconName::Code, 16., p.accent))
                     .child(div().flex_1().min_w_0().truncate().child(kit::title(title, TypeScale::LG, &p)))
+                    // 复制与在查询中打开放在头部：只读查看器的主要动作，滚动长定义时也在视线内。
+                    .when(has_text, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(kit::secondary_button(
+                                    "cmd-ddl-open-query",
+                                    Some(IconName::SquarePen),
+                                    self.t("catalog.ddl.openInQuery"),
+                                    act("ddl-open-query", cx),
+                                ))
+                                .child(kit::primary_button("cmd-ddl-copy", Some(IconName::Copy), self.t("catalog.tree.copyDdl"), act("ddl-copy", cx))),
+                        )
+                    })
                     .child(kit::icon_button("ddl-header-close", IconName::X, self.t("common.close"), act("ddl-close", cx))),
             )
             .when_some(rebuilt, |this, rebuilt| this.child(rebuilt))
             .child(body)
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap(px(8.))
-                    .child(kit::secondary_button("cmd-ddl-close", None, self.t("common.close"), act("ddl-close", cx)))
-                    .when(has_text, |this| {
-                        this.child(kit::secondary_button(
-                            "cmd-ddl-open-query",
-                            Some(IconName::SquarePen),
-                            self.t("catalog.ddl.openInQuery"),
-                            act("ddl-open-query", cx),
-                        ))
-                        .child(kit::primary_button("cmd-ddl-copy", Some(IconName::Copy), self.t("catalog.tree.copyDdl"), act("ddl-copy", cx)))
-                    }),
+                kit::modal_actions()
+                    .child(kit::secondary_button("cmd-ddl-close", None, self.t("common.close"), act("ddl-close", cx))),
             );
         backdrop("ddl-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
@@ -8120,15 +8149,12 @@ impl Workbench {
         let ready = prompt.execute_ready();
         let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };
         stack_frame(|| {
-            let dialog = dialog_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
+            let dialog = kit::modal_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
                 .test_support()
-                .max_w(px(560.))
+                .w(px(560.))
                 .child(div().id("danger-body").max_h(px(420.)).scroll_area_y().child(content))
                 .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap(px(8.))
+                    kit::modal_actions()
                         .child(kit::secondary_button("cmd-danger-cancel", None, self.t("common.cancel"), act("danger-cancel", cx)))
                         .child(kit::danger_button("cmd-danger-execute", Some(IconName::TriangleAlert), label, act("danger-execute", cx)).disabled(!ready)),
                 );
@@ -8177,7 +8203,7 @@ impl Workbench {
             .child(div().text_size(px(TypeScale::SM)).text_color(p.text).child(self.t("ui.passwordPrompt.save")))
             .on_click(act("password-toggle-save", cx));
         let ready = !prompt.text.is_empty();
-        let dialog = dialog_card("password-prompt", IconName::KeyRound, p.accent, title, SharedString::from(detail), &p)
+        let dialog = kit::modal_card("password-prompt", IconName::KeyRound, p.accent, title, SharedString::from(detail), &p)
             .test_support()
             .child(div().flex().flex_col().gap(px(10.)).child(input.mask_toggle()).child(save_toggle).child(note))
             .child(
@@ -8673,64 +8699,6 @@ enum ModalBusy {
 
 fn switch_visual(on: bool, p: &Palette) -> AnyElement {
     kit::switch_visual(on, p)
-}
-
-fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: SharedString, body: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Dialog)
-        .aria_label(title.clone())
-        .occlude()
-        .w_full()
-        .max_w(px(440.))
-        .min_w_0()
-        .p(px(20.))
-        .flex()
-        .flex_col()
-        .gap(px(16.))
-        .bg(p.raised)
-        .border_1()
-        .border_color(p.line)
-        .rounded(px(Radius::PANEL))
-        .shadow_lg()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(
-            div()
-                .flex()
-                .gap(px(12.))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(36.))
-                        .rounded(px(Radius::PANEL))
-                        .bg(tone.opacity(0.14))
-                        .border_1()
-                        .border_color(tone.opacity(0.24))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(kit::icon(icon, 17., tone)),
-                )
-                .child(div().flex().flex_col().gap(px(6.)).min_w_0().child(kit::title(title, TypeScale::LG, p)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body))),
-        )
-}
-
-/// 全窗口遮罩；点空白处关闭当前浮层。
-/// 模态里分段选择的槽：浅底圆角，选中项浮起（与 kit::segmented_sized 同一外观）。
-/// 选项多时整槽换行，不被裁切。
-fn segment_track(p: &Palette) -> gpui_kit::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .flex_none()
-        .self_start()
-        .max_w_full()
-        .p(px(2.))
-        .gap(px(2.))
-        .rounded(px(Radius::CONTROL))
-        .bg(p.sunken)
-        .border_1()
-        .border_color(p.line_soft)
 }
 
 /// 右键菜单的遮罩：左键、右键点在菜单外，或在任何位置滚动，菜单都关闭。

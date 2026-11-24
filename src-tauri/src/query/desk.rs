@@ -3350,19 +3350,19 @@ mod tests {
             kind: "table".to_owned(),
         };
         // 资源管理器只翻到了第一页（a 开头的表）。
-        desk.set_objects(vec![object("alarm_dept")], vec!["shop".to_owned()]);
+        desk.set_objects(vec![object("dept")], vec!["shop".to_owned()]);
         let sql = "select * from ta";
         let before = desk.completion_for(sql, sql.len(), Locale::ZhCn);
-        assert!(!before.iter().any(|entry| entry.label == "task_list_info"));
+        assert!(!before.iter().any(|entry| entry.label == "task_info"));
         assert!(!desk.knows_objects("my", "shop"));
-        desk.remember_objects("my", "shop", vec![object("alarm_dept"), object("task_list_info"), object("task_list_track_code")]);
+        desk.remember_objects("my", "shop", vec![object("dept"), object("task_info"), object("task_track_code")]);
         assert!(desk.knows_objects("my", "shop"));
         let after = desk.completion_for(sql, sql.len(), Locale::ZhCn);
-        assert!(after.iter().any(|entry| entry.label == "task_list_info"), "{after:?}");
-        assert!(after.iter().any(|entry| entry.label == "task_list_track_code"));
+        assert!(after.iter().any(|entry| entry.label == "task_info"), "{after:?}");
+        assert!(after.iter().any(|entry| entry.label == "task_track_code"));
         // 同一张表在树上和整库清单里都有时只出一次。
         let scope = desk.completion_scope().expect("有目标");
-        assert_eq!(scope.objects.iter().filter(|object| object.name == "alarm_dept").count(), 1);
+        assert_eq!(scope.objects.iter().filter(|object| object.name == "dept").count(), 1);
         desk.forget_objects(Some("my"));
         assert!(!desk.knows_objects("my", "shop"));
     }

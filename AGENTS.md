@@ -19,6 +19,9 @@ Match existing code: four-space indentation in Rust, snake_case functions and mo
 ## Testing Guidelines
 Rust tests typically live in feature `tests.rs` modules. Add focused regression tests for behavior changes; no coverage threshold is configured. UI behavior is covered by the GPUI application and Rust tests. A release still needs native startup evidence on each platform.
 
+## Privacy
+Never commit the user's real data or identifiers anywhere in the repository: code, tests, fixtures, seed SQL, docs, verification reports, screenshots, commit messages, or release notes. This includes connection names, hosts, accounts and passwords; database, schema, table, column, procedure and Redis key names; table structures; and row data taken from the user's environments or from screenshots they share. When you reproduce a reported issue, rebuild it with generic names (for example `shop`, `orders`, `demo-uat`, `demo_user`) in the `docker/` fixtures. Capture native screenshots only against those generic fixtures. Before you commit, check every image and text file for leaked names. If private data has already landed in unpushed commits, rewrite those commits before pushing, so the data never reaches the remote.
+
 ## Commit & Pull Request Guidelines
 Recent history commonly uses `feat:`, `fix:`, and `docs:` prefixes with short English or Chinese descriptions. Follow that pattern. PRs should describe the behavior change, link relevant issues, list validation performed, and include screenshots for visual changes. Identify whether evidence comes from Rust tests or the native application.
 

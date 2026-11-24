@@ -130,8 +130,8 @@ fn engines_without_sql_quote_with_standard_double_quotes() {
 fn plain_names_stay_bare_in_every_dialect() {
     for engine in SQL_ENGINES {
         assert_eq!(quote_ident(engine, "content"), "content");
-        assert_eq!(quote_ident(engine, "etoe_alarm_rule_set"), "etoe_alarm_rule_set");
-        assert_eq!(quote_ident(engine, "e6yun3_etoe_business"), "e6yun3_etoe_business");
+        assert_eq!(quote_ident(engine, "alert_rule_set"), "alert_rule_set");
+        assert_eq!(quote_ident(engine, "shop_business"), "shop_business");
     }
     for engine in [Engine::Postgres, Engine::Sqlite, Engine::Sqlserver] {
         assert_eq!(quote_ident(engine, "_tmp1"), "_tmp1");
@@ -205,8 +205,8 @@ fn quote_always_and_qualified() {
     assert_eq!(quote_always(Engine::Postgres, "content"), "\"content\"");
     assert_eq!(quote_always(Engine::Sqlserver, "content"), "[content]");
     assert_eq!(
-        qualified(Engine::Mysql, &["e6yun3_etoe_business", "etoe_alarm_rule_set"]),
-        "e6yun3_etoe_business.etoe_alarm_rule_set"
+        qualified(Engine::Mysql, &["shop_business", "alert_rule_set"]),
+        "shop_business.alert_rule_set"
     );
     assert_eq!(qualified(Engine::Postgres, &["public", "User"]), "public.\"User\"");
     assert_eq!(qualified(Engine::Sqlserver, &["dbo", "order"]), "dbo.[order]");

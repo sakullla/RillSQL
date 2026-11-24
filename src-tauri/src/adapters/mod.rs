@@ -611,6 +611,12 @@ pub fn label_named(engine: &str) -> String {
     registry::parse(engine).map(|engine| adapter(engine).meta().label().to_owned()).unwrap_or_else(|| engine.to_owned())
 }
 
+/// 门面：UPDATE 的影响行数是否只计“实际改变的行”。MySQL/MariaDB 默认（未开 CLIENT_FOUND_ROWS）
+/// 对写入与库中相等的值报告 0 行；其他引擎报告匹配行数。
+pub fn update_reports_changed_rows(engine: Engine) -> bool {
+    matches!(engine, Engine::Mysql | Engine::Mariadb)
+}
+
 /// 主机字段是不是整串连接串（按引擎规则）。
 pub fn host_is_uri(engine: Engine, host: &str) -> bool {
     adapter(engine).meta().host_is_uri(host)

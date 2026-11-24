@@ -6,7 +6,7 @@ use crate::adapters::ddl::{paren_list, Comments};
 use crate::connections::model::Engine;
 use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
-use crate::ddl::model::{Column, DependentSql, DomainState, ForeignKey, IncomingForeignKey, Index, IndexColumn, SequenceState, Snapshot, Step, StepReceipt, StepStatus};
+use crate::ddl::model::{Column, DependentSql, DomainState, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexKind, SequenceState, Snapshot, Step, StepReceipt, StepStatus};
 use crate::ddl::sql::{mentions, qualified_table};
 
 /// 改名前查新名字：PostgreSQL 的关系（表、视图、索引、序列）共用 schema 里的名字。
@@ -120,6 +120,135 @@ pub(super) async fn postgres_domain(client: &tokio_postgres::Client, schema: &st
     Ok(DomainState { not_null: row.get::<_, bool>(0), default_sql: row.get::<_, Option<String>>(1) })
 }
 
+/// 从访问方法与 `pg_get_indexdef` 原文里找出页面编辑器表达不了的属性；先删后按普通
+/// `CREATE [UNIQUE] INDEX name ON t (col [DESC], ...)` 重建会丢掉它们。只接受 btree、每一项都是列名加可选 DESC、
+/// 括号后除 WHERE（部分索引另有标记）外没有其他子句的定义；解析不了的原文也算会丢。
+pub(crate) fn postgres_index_losses(method: &str, def: &str) -> Vec<String> {
+    let mut losses = Vec::new();
+    let method = method.trim();
+    if !method.is_empty() && !method.eq_ignore_ascii_case("btree") {
+        losses.push(format!("USING {method}"));
+    }
+    let Some((head, keys, tail)) = split_index_def(def) else {
+        losses.push("pg_get_indexdef".to_owned());
+        return losses;
+    };
+    if head.contains(" ON ONLY ") {
+        losses.push("ON ONLY".to_owned());
+    }
+    for item in split_top_level(keys) {
+        // 单项顺序：列 [COLLATE 规则] [操作符类] [ASC|DESC] [NULLS FIRST|LAST]
+        let mut rest = skip_identifier(item.trim()).trim();
+        let mut found: Vec<&str> = Vec::new();
+        for (suffix, label) in [("NULLS FIRST", "NULLS FIRST"), ("NULLS LAST", "NULLS LAST")] {
+            if let Some(head) = rest.strip_suffix(suffix) {
+                found.push(label);
+                rest = head.trim_end();
+            }
+        }
+        rest = rest.strip_suffix("DESC").or_else(|| rest.strip_suffix("ASC")).unwrap_or(rest).trim_end();
+        if let Some(after) = rest.strip_prefix("COLLATE ") {
+            found.push("COLLATE");
+            let mut name = skip_identifier(after.trim_start());
+            while let Some(next) = name.strip_prefix('.') {
+                name = skip_identifier(next);
+            }
+            rest = name.trim();
+        }
+        if !rest.is_empty() {
+            found.push("OPERATOR CLASS");
+        }
+        for label in found {
+            if !losses.iter().any(|item| item == label) {
+                losses.push(label.to_owned());
+            }
+        }
+    }
+    for (needle, label) in [("NULLS NOT DISTINCT", "NULLS NOT DISTINCT"), ("INCLUDE (", "INCLUDE"), ("WITH (", "WITH"), ("TABLESPACE ", "TABLESPACE")] {
+        if tail.contains(needle) {
+            losses.push(label.to_owned());
+        }
+    }
+    losses
+}
+
+/// 把 `pg_get_indexdef` 拆成「USING 之前」「键列括号内」「括号之后」三段；引号里的内容不参与匹配。
+fn split_index_def(def: &str) -> Option<(&str, &str, &str)> {
+    let bytes = def.as_bytes();
+    let mut quoted = false;
+    let mut using = None;
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b' ' if !quoted && def[at..].starts_with(" USING ") => {
+                using = Some(at);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let using = using?;
+    let open = using + def[using..].find('(')?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    let close = open + offset;
+                    return Some((&def[..using], &def[open + 1..close], &def[close + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 按顶层逗号拆开键列；引号与括号里的逗号不算。
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut depth, mut quoted, mut start) = (0usize, false, 0usize);
+    for (at, byte) in text.bytes().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth = depth.saturating_sub(1),
+            b',' if !quoted && depth == 0 => {
+                items.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&text[start..]);
+    items
+}
+
+/// 跳过开头的一个标识符（普通名字或双引号名字），返回其后的部分。
+fn skip_identifier(item: &str) -> &str {
+    if let Some(rest) = item.strip_prefix('"') {
+        let bytes = rest.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] == b'"' {
+                if bytes.get(at + 1) == Some(&b'"') {
+                    at += 2;
+                    continue;
+                }
+                return &rest[at + 1..];
+            }
+            at += 1;
+        }
+        return "";
+    }
+    let end = item.find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$')).unwrap_or(item.len());
+    &item[end..]
+}
+
 pub(super) async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: &str, table: &str) -> Result<Snapshot, String> {
     if schema.is_empty() {
         return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
@@ -166,11 +295,13 @@ pub(super) async fn load_postgres(client: &tokio_postgres::Client, database: &st
             default_constraint: None,
         });
     }
+    // indkey 与 indoption 都是从 0 起的 int2vector：array_position 给出的就是 indoption 的下标。
+    // 只取前 indnkeyatts 个键列，INCLUDE 列不算键（会丢的属性另记在 rebuild_loses）。
     let indexes = keep_rows(
         &mut snapshot.index_error,
         client
             .query(
-                "SELECT i.relname, ix.indisunique, ix.indisprimary, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, pg_get_indexdef(ix.indexrelid), a.attname, array_position(ix.indkey, a.attnum), COALESCE((ix.indoption[array_position(ix.indkey, a.attnum) - 1] & 1) = 1, false) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ANY (ix.indkey) WHERE ix.indrelid = $1 ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
+                "SELECT i.relname, ix.indisunique, ix.indisprimary, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, pg_get_indexdef(ix.indexrelid), a.attname, array_position(ix.indkey, a.attnum), COALESCE((ix.indoption[array_position(ix.indkey, a.attnum)] & 1) = 1, false), am.amname::text FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid LEFT JOIN pg_am am ON am.oid = i.relam LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ANY (ix.indkey) AND array_position(ix.indkey, a.attnum) < ix.indnkeyatts WHERE ix.indrelid = $1 ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
                 &[&oid],
             )
             .await
@@ -180,7 +311,7 @@ pub(super) async fn load_postgres(client: &tokio_postgres::Client, database: &st
         let name: String = row.get(0);
         let column_name: Option<String> = row.get(6);
         let descending: bool = row.get(8);
-        let column = column_name.map(|name| IndexColumn { name, descending });
+        let column = column_name.map(|name| IndexColumn { name, descending, prefix: None });
         if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == name) {
             if let Some(column) = column {
                 index.columns.push(column);
@@ -190,6 +321,9 @@ pub(super) async fn load_postgres(client: &tokio_postgres::Client, database: &st
         } else {
             let primary: bool = row.get(2);
             let expression = row.get::<_, bool>(4) || column.is_none();
+            let method: Option<String> = row.get(9);
+            let sql: Option<String> = row.get(5);
+            let rebuild_loses = postgres_index_losses(method.as_deref().unwrap_or(""), sql.as_deref().unwrap_or(""));
             snapshot.indexes.push(Index {
                 name,
                 unique: row.get(1),
@@ -198,7 +332,11 @@ pub(super) async fn load_postgres(client: &tokio_postgres::Client, database: &st
                 reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
                 partial: row.get(3),
                 expression,
-                sql: row.get(5),
+                sql,
+                kind: IndexKind::infer(primary, row.get(1)),
+                method,
+                rebuild_loses,
+                ..Index::default()
             });
         }
     }

@@ -135,29 +135,6 @@ pub fn normalize(kind: TemporalKind, input: &str) -> Result<Option<String>, ()> 
     Ok(Some(format!("{out}{zone}")))
 }
 
-/// “现在”：按列类型和已有值的小数秒精度生成本地时间文本。
-pub fn now_text(kind: TemporalKind, sample: &str, now: NaiveDateTime) -> String {
-    let digits = fraction_digits(sample);
-    match kind {
-        TemporalKind::Date => now.format("%Y-%m-%d").to_string(),
-        TemporalKind::Time => format_time(now.time(), digits),
-        TemporalKind::DateTime => format!("{} {}", now.format("%Y-%m-%d"), format_time(now.time(), digits)),
-    }
-}
-
-/// 把日期部分换成 `date`，时间部分（含小数秒与时区）原样保留；纯日期列直接给日期。
-pub fn with_date(kind: TemporalKind, current: &str, date: NaiveDate) -> String {
-    let day = date.format("%Y-%m-%d").to_string();
-    match kind {
-        TemporalKind::Date => day,
-        TemporalKind::Time => current.to_owned(),
-        TemporalKind::DateTime => {
-            let rest = current.trim().split_once([' ', 'T']).map(|(_, rest)| rest.trim().to_owned()).filter(|rest| !rest.is_empty());
-            format!("{day} {}", rest.unwrap_or_else(|| "00:00:00".to_owned()))
-        }
-    }
-}
-
 /// 读出输入里的日期（日历定位用）。
 pub fn date_of(kind: TemporalKind, text: &str) -> Option<NaiveDate> {
     if kind == TemporalKind::Time {
@@ -168,11 +145,183 @@ pub fn date_of(kind: TemporalKind, text: &str) -> Option<NaiveDate> {
     parse_date(date_part)
 }
 
-/// 按天平移；时间部分保留。解析不了时返回 None。
-pub fn shift_days(kind: TemporalKind, text: &str, days: i64) -> Option<String> {
-    let date = date_of(kind, text)?;
-    let moved = date.checked_add_signed(Duration::days(days))?;
-    Some(with_date(kind, text, moved))
+/// 列声明里的小数秒精度：`DATETIME(3)`、`timestamp(6) with time zone`、`TIME(3)`、`datetime2(7)`。
+/// 没有声明 `(n)` 时返回 None，调用方退回已有值的小数位。DATE 列没有时间，精度恒为 0。
+pub fn declared_precision(type_name: &str) -> Option<usize> {
+    let kind = TemporalKind::of(type_name)?;
+    if kind == TemporalKind::Date {
+        return Some(0);
+    }
+    let lower = type_name.trim().to_ascii_lowercase();
+    let open = lower.find('(')?;
+    let close = lower[open..].find(')')? + open;
+    lower[open + 1..close].trim().parse::<usize>().ok().map(|digits| digits.min(9))
+}
+
+/// 编辑时使用的小数秒位数：列声明优先，其次是已有值的位数。
+pub fn precision(type_name: &str, sample: &str) -> usize {
+    declared_precision(type_name).unwrap_or_else(|| fraction_digits(sample))
+}
+
+/// MySQL 的零日期与 PostgreSQL 的无穷值：不是日历上的某一天，但数据库接受，原样保存。
+pub fn special_value(text: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    matches!(text.as_str(), "infinity" | "-infinity" | "+infinity")
+        || (text.starts_with("0000-00-00") && text.chars().all(|ch| ch == '0' || ch == '-' || ch == ':' || ch == ' ' || ch == '.'))
+}
+
+/// 日期时间值拆成的几段：选择器按段修改，再合回一段文本。时区后缀原样带着。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Parts {
+    pub date: Option<NaiveDate>,
+    pub time: NaiveTime,
+    pub zone: String,
+}
+
+/// 时间里可单独调整的一段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeField {
+    Hour,
+    Minute,
+    Second,
+    Fraction,
+}
+
+impl TimeField {
+    pub const ALL: [TimeField; 4] = [TimeField::Hour, TimeField::Minute, TimeField::Second, TimeField::Fraction];
+
+    /// 这一段在给定精度下的取值上限（不含）。
+    pub fn modulus(self, digits: usize) -> u32 {
+        match self {
+            Self::Hour => 24,
+            Self::Minute | Self::Second => 60,
+            Self::Fraction => 10u32.pow(digits.clamp(1, 9) as u32),
+        }
+    }
+}
+
+/// 把输入拆开：能规整的输入才拆得开。空输入或认不出来时返回 None。
+pub fn split(kind: TemporalKind, text: &str) -> Option<Parts> {
+    let normalized = normalize(kind, text).ok().flatten()?;
+    let (body, zone) = match kind {
+        TemporalKind::Date => (normalized.as_str(), ""),
+        _ => match zone_suffix(&normalized) {
+            Some(at) => (&normalized[..at], &normalized[at..]),
+            None => (normalized.as_str(), ""),
+        },
+    };
+    let parts = match kind {
+        TemporalKind::Date => Parts { date: Some(parse_date(body)?), time: NaiveTime::MIN, zone: String::new() },
+        TemporalKind::Time => Parts { date: None, time: parse_time(body)?.0, zone: zone.to_owned() },
+        TemporalKind::DateTime => {
+            let (date, time) = body.split_once(' ')?;
+            Parts { date: Some(parse_date(date)?), time: parse_time(time)?.0, zone: zone.to_owned() }
+        }
+    };
+    Some(parts)
+}
+
+/// 按列类型与精度合成文本：DATE 只有日期，TIME 只有时间，小数秒严格按 `digits` 位。
+pub fn compose(kind: TemporalKind, parts: &Parts, digits: usize) -> String {
+    let date = parts.date.unwrap_or(NaiveDate::MIN).format("%Y-%m-%d").to_string();
+    match kind {
+        TemporalKind::Date => date,
+        TemporalKind::Time => format!("{}{}", format_time(parts.time, digits), parts.zone),
+        TemporalKind::DateTime => format!("{date} {}{}", format_time(parts.time, digits), parts.zone),
+    }
+}
+
+/// 一段时间的当前数值；小数秒按 `digits` 位截取。
+pub fn time_field(time: NaiveTime, field: TimeField, digits: usize) -> u32 {
+    match field {
+        TimeField::Hour => time.hour(),
+        TimeField::Minute => time.minute(),
+        TimeField::Second => time.second(),
+        TimeField::Fraction => {
+            let digits = digits.clamp(1, 9) as u32;
+            time.nanosecond().min(999_999_999) / 10u32.pow(9 - digits)
+        }
+    }
+}
+
+/// 一段时间在输入框里的写法：时分秒两位，小数秒按位数补零。
+pub fn field_text(time: NaiveTime, field: TimeField, digits: usize) -> String {
+    let value = time_field(time, field, digits);
+    match field {
+        TimeField::Fraction => format!("{value:0width$}", width = digits.clamp(1, 9)),
+        _ => format!("{value:02}"),
+    }
+}
+
+/// 把一段改成 `value`（超出范围返回 None），其他段与日期不变。
+pub fn set_time_field(time: NaiveTime, field: TimeField, value: u32, digits: usize) -> Option<NaiveTime> {
+    if value >= field.modulus(digits) {
+        return None;
+    }
+    match field {
+        TimeField::Hour => time.with_hour(value),
+        TimeField::Minute => time.with_minute(value),
+        TimeField::Second => time.with_second(value),
+        TimeField::Fraction => {
+            let digits = digits.clamp(1, 9) as u32;
+            time.with_nanosecond(value * 10u32.pow(9 - digits))
+        }
+    }
+}
+
+/// ↑/↓ 调整一段：在本段内循环（23 时再加一回到 0 时），不进位到其他段。
+pub fn step_time_field(time: NaiveTime, field: TimeField, delta: i64, digits: usize) -> NaiveTime {
+    let modulus = i64::from(field.modulus(digits));
+    let current = i64::from(time_field(time, field, digits));
+    let next = (current + delta).rem_euclid(modulus) as u32;
+    set_time_field(time, field, next, digits).unwrap_or(time)
+}
+
+/// 周一起始的 6×7 月历：第一格是本月 1 日所在那周的周一，前后补齐相邻月份的日期。
+pub fn month_grid(year: i32, month: u32) -> Vec<NaiveDate> {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(NaiveDate::MIN);
+    let lead = i64::from(first.weekday().num_days_from_monday());
+    let start = first - Duration::days(lead);
+    (0..42).map(|offset| start + Duration::days(offset)).collect()
+}
+
+/// 按月平移年月（跨年进位）。
+pub fn shift_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let index = year * 12 + month as i32 - 1 + delta;
+    (index.div_euclid(12), index.rem_euclid(12) as u32 + 1)
+}
+
+/// 年份网格的起始年：十年一页，再补前后各一年凑满 12 格。
+pub fn decade_start(year: i32) -> i32 {
+    year.div_euclid(10) * 10 - 1
+}
+
+/// 周一起始的星期表头。
+pub fn weekday_labels(locale: Locale) -> [&'static str; 7] {
+    match locale {
+        Locale::ZhCn => ["一", "二", "三", "四", "五", "六", "日"],
+        Locale::En => ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+    }
+}
+
+/// 月份名：中文“11月”，英文缩写。
+pub fn month_label(locale: Locale, month: u32) -> String {
+    match locale {
+        Locale::ZhCn => format!("{month}月"),
+        Locale::En => ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            .get(month.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or("")
+            .to_owned(),
+    }
+}
+
+/// 日历头标题：“2026年11月” / “Nov 2026”。
+pub fn month_title(locale: Locale, year: i32, month: u32) -> String {
+    match locale {
+        Locale::ZhCn => format!("{year}年{month}月"),
+        Locale::En => format!("{} {year}", month_label(locale, month)),
+    }
 }
 
 fn weekday(locale: Locale, date: NaiveDate) -> &'static str {
@@ -287,23 +436,76 @@ mod tests {
     }
 
     #[test]
-    fn now_keeps_the_column_precision() {
-        let now = NaiveDateTime::parse_from_str("2026-11-16 19:40:26.123456", "%Y-%m-%d %H:%M:%S%.f").unwrap();
-        assert_eq!(now_text(TemporalKind::DateTime, "2023-07-04 10:45:02", now), "2026-11-16 19:40:26");
-        assert_eq!(now_text(TemporalKind::DateTime, "2023-07-04 10:45:02.000", now), "2026-11-16 19:40:26.123");
-        assert_eq!(now_text(TemporalKind::Date, "", now), "2026-11-16");
-        assert_eq!(now_text(TemporalKind::Time, "", now), "19:40:26");
+    fn precision_comes_from_the_declared_type_then_the_value() {
+        assert_eq!(declared_precision("DATETIME(3)"), Some(3));
+        assert_eq!(declared_precision("timestamp(6) with time zone"), Some(6));
+        assert_eq!(declared_precision("TIME(3)"), Some(3));
+        assert_eq!(declared_precision("datetime2(12)"), Some(9));
+        assert_eq!(declared_precision("date"), Some(0));
+        assert_eq!(declared_precision("datetime"), None);
+        assert_eq!(declared_precision("varchar(3)"), None);
+        assert_eq!(precision("datetime", "2023-07-04 10:45:02.12"), 2);
+        assert_eq!(precision("datetime(3)", "2023-07-04 10:45:02"), 3);
+        assert!(special_value("0000-00-00 00:00:00"));
+        assert!(special_value("infinity"));
+        assert!(!special_value("2023-07-04"));
     }
 
     #[test]
-    fn picking_a_day_keeps_the_time() {
-        let day = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
-        assert_eq!(with_date(TemporalKind::DateTime, "2023-07-04 10:45:02.5", day), "2024-02-29 10:45:02.5");
-        assert_eq!(with_date(TemporalKind::DateTime, "", day), "2024-02-29 00:00:00");
-        assert_eq!(with_date(TemporalKind::Date, "2023-07-04", day), "2024-02-29");
-        assert_eq!(shift_days(TemporalKind::DateTime, "2023-07-04 10:45:02", 1).as_deref(), Some("2023-07-05 10:45:02"));
-        assert_eq!(shift_days(TemporalKind::Date, "2024-03-01", -1).as_deref(), Some("2024-02-29"));
-        assert_eq!(shift_days(TemporalKind::Date, "abc", 1), None);
+    fn month_grid_starts_on_monday_and_spans_six_weeks() {
+        let grid = month_grid(2026, 11);
+        assert_eq!(grid.len(), 42);
+        // 2026-11-01 是周日：第一格是 10 月 26 日（周一）。
+        assert_eq!(grid[0], NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
+        assert_eq!(grid[6], NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert!(grid.iter().all(|day| day.weekday().num_days_from_monday() == (grid.iter().position(|d| d == day).unwrap() % 7) as u32));
+        // 2024-04-01 本身是周一：第一格就是 1 日。
+        assert_eq!(month_grid(2024, 4)[0], NaiveDate::from_ymd_opt(2024, 4, 1).unwrap());
+        assert_eq!(shift_month(2026, 12, 1), (2027, 1));
+        assert_eq!(shift_month(2026, 1, -1), (2025, 12));
+        assert_eq!(shift_month(2026, 5, -12), (2025, 5));
+        assert_eq!(decade_start(2026), 2019);
+        assert_eq!(weekday_labels(Locale::ZhCn)[0], "一");
+        assert_eq!(month_title(Locale::ZhCn, 2026, 11), "2026年11月");
+        assert_eq!(month_title(Locale::En, 2026, 11), "Nov 2026");
+    }
+
+    #[test]
+    fn split_and_compose_keep_the_other_half() {
+        let dt = TemporalKind::DateTime;
+        let parts = split(dt, "2026-11-23 10:45:02.123").unwrap();
+        assert_eq!(parts.date, NaiveDate::from_ymd_opt(2026, 11, 23));
+        assert_eq!(compose(dt, &parts, 3), "2026-11-23 10:45:02.123");
+        // 精度按列：DATETIME(3) 补齐三位，DATETIME 去掉小数。
+        let whole = split(dt, "2026-11-23 10:45:02").unwrap();
+        assert_eq!(compose(dt, &whole, 3), "2026-11-23 10:45:02.000");
+        assert_eq!(compose(dt, &parts, 0), "2026-11-23 10:45:02");
+        // 跨年换日期：时间部分不变。
+        let moved = Parts { date: NaiveDate::from_ymd_opt(2027, 1, 5), ..parts.clone() };
+        assert_eq!(compose(dt, &moved, 3), "2027-01-05 10:45:02.123");
+        // 调时、分：日期不变。
+        let time = set_time_field(parts.time, TimeField::Hour, 8, 3).unwrap();
+        let time = set_time_field(time, TimeField::Minute, 5, 3).unwrap();
+        assert_eq!(compose(dt, &Parts { time, ..parts.clone() }, 3), "2026-11-23 08:05:02.123");
+        assert_eq!(set_time_field(parts.time, TimeField::Hour, 24, 3), None);
+        assert_eq!(time_field(parts.time, TimeField::Fraction, 3), 123);
+        assert_eq!(field_text(parts.time, TimeField::Hour, 3), "10");
+        assert_eq!(field_text(set_time_field(parts.time, TimeField::Fraction, 7, 3).unwrap(), TimeField::Fraction, 3), "007");
+        let time = set_time_field(parts.time, TimeField::Fraction, 7, 3).unwrap();
+        assert_eq!(compose(dt, &Parts { time, ..parts.clone() }, 3), "2026-11-23 10:45:02.007");
+        // ↑/↓ 在本段内循环。
+        let late = NaiveTime::from_hms_opt(23, 59, 0).unwrap();
+        assert_eq!(step_time_field(late, TimeField::Hour, 1, 0).hour(), 0);
+        assert_eq!(step_time_field(late, TimeField::Minute, 1, 0).minute(), 0);
+        assert_eq!(step_time_field(late, TimeField::Minute, -60, 0).minute(), 59);
+        // TIME 列只有时间，DATE 列只有日期；时区后缀原样保留。
+        let clock = split(TemporalKind::Time, "9:5").unwrap();
+        assert_eq!(clock.date, None);
+        assert_eq!(compose(TemporalKind::Time, &clock, 3), "09:05:00.000");
+        assert_eq!(compose(TemporalKind::Date, &split(TemporalKind::Date, "2026/1/2").unwrap(), 3), "2026-01-02");
+        assert_eq!(compose(dt, &split(dt, "2026-11-23 10:00:00+08:00").unwrap(), 0), "2026-11-23 10:00:00+08:00");
+        assert_eq!(split(dt, "不是日期"), None);
+        assert_eq!(split(dt, ""), None);
     }
 
     #[test]

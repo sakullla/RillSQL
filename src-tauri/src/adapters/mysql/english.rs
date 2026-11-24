@@ -49,6 +49,24 @@ pub(in crate::adapters) const MESSAGES_EN: &[(&str, &str)] = &[
     ("MySQL 没有独立的序列、枚举或域", "MySQL has no separate sequences, enums or domains"),
     ("只有表、视图、函数、存储过程、触发器和事件可以读取只读定义", "Only tables, views, functions, stored procedures, triggers and events have a read-only definition"),
     ("元数据列缺失", "A metadata column is missing"),
+    // 例程定义被服务器隐藏或找不到（routine_definition.rs）。
+    (
+        "当前账号 {} 不是例程 {} 的定义者 {}，且缺少 SHOW_ROUTINE 权限（MySQL 8.0.20+）或全局 SELECT 权限，服务器不返回定义。可以请管理员执行：{}",
+        "The current account {0} is not the definer {2} of routine {1} and lacks the SHOW_ROUTINE privilege (MySQL 8.0.20+) or global SELECT, so the server hides the definition. An administrator can run: {3}",
+    ),
+    (
+        "当前账号 {} 不是例程 {} 的定义者，且缺少 SHOW_ROUTINE 权限（MySQL 8.0.20+）或全局 SELECT 权限，服务器不返回定义。可以请管理员执行：{}",
+        "The current account {0} is not the definer of routine {1} and lacks the SHOW_ROUTINE privilege (MySQL 8.0.20+) or global SELECT, so the server hides the definition. An administrator can run: {2}",
+    ),
+    (
+        "当前账号 {} 不是例程 {} 的定义者 {}，且没有 mysql.proc 的 SELECT 权限，服务器不返回定义。可以请管理员执行：{}",
+        "The current account {0} is not the definer {2} of routine {1} and has no SELECT on mysql.proc, so the server hides the definition. An administrator can run: {3}",
+    ),
+    (
+        "当前账号 {} 不是例程 {} 的定义者，且没有 mysql.proc 的 SELECT 权限，服务器不返回定义。可以请管理员执行：{}",
+        "The current account {0} is not the definer of routine {1} and has no SELECT on mysql.proc, so the server hides the definition. An administrator can run: {2}",
+    ),
+    ("找不到例程 {}（当前账号 {} 也可能对它没有任何权限）。", "Routine {0} was not found (the current account {1} may also have no privileges on it)."),
 ];
 
 /// 重建定义“未包含”清单里这个引擎专属的项。

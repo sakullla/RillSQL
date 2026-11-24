@@ -29,6 +29,10 @@ pub struct ObjectDdl {
     pub missing: Vec<String>,
 }
 
+/// 按元数据重建的定义第一行以它开头，后面写明来源（例如 MySQL 例程的 information_schema.ROUTINES）。
+/// 数据库保存的原文不会以这段注释开头，查看器据此标注“按元数据重建”。
+pub const REBUILT_SOURCE_TAG: &str = "-- RillSQL rebuilt from ";
+
 /// 这个引擎的这种对象能不能读到定义。纯函数：菜单用它决定“查看 DDL”是否可点。
 pub fn ddl_available(engine: Engine, kind: ObjectKind) -> bool {
     crate::adapters::catalog_of(engine).definition_available(kind)
@@ -48,7 +52,8 @@ pub async fn object_ddl(session: &CatalogSession, engine: Engine, key: &DdlKey) 
         return rebuilt_table(session, engine, key).await;
     }
     let text = read_definition(session, engine, &key.database, &key.schema, &key.name, kind_name(key.kind), &key.signature, &key.relation).await?;
-    Ok(ObjectDdl { text, rebuilt: false, missing: Vec::new() })
+    let rebuilt = text.starts_with(REBUILT_SOURCE_TAG);
+    Ok(ObjectDdl { text, rebuilt, missing: Vec::new() })
 }
 
 async fn rebuilt_table(session: &CatalogSession, engine: Engine, key: &DdlKey) -> Result<ObjectDdl, String> {

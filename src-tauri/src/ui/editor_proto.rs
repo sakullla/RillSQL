@@ -25,7 +25,7 @@ use lsp_types::{
 };
 
 use crate::app::accept_versioned;
-use crate::app::views::settings;
+use crate::app::views::settings::{self, ObjectHints};
 use crate::i18n::{self, Locale};
 use crate::query::assist::{CompletionScope, EntryInfo};
 use crate::query::complete::{self, Resolved};
@@ -148,7 +148,66 @@ pub fn statement_at(engine: &str, text: &str, cursor: usize) -> Option<Range<usi
     pieces.iter().find(|piece| piece.start <= cursor && cursor <= piece.end).map(|piece| piece.start..piece.end)
 }
 
-/// 补全详情、悬停和对象信息共用的说明文本（Markdown）。只写读到的元数据；读不到的项明说。
+struct ObjectHintsGlobal(ObjectHints);
+
+impl gpui_kit::Global for ObjectHintsGlobal {}
+
+/// 外壳在设置变化时下发（见 SqlEditor::publish_object_hints）；所有 SQL 编辑器的补全与悬停提供者读取同一份值。
+fn publish_object_hints(hints: ObjectHints, cx: &mut App) {
+    if cx.try_global::<ObjectHintsGlobal>().is_some_and(|current| current.0 == hints) {
+        return;
+    }
+    cx.set_global(ObjectHintsGlobal(hints));
+}
+
+pub fn object_hints(cx: &App) -> ObjectHints {
+    cx.try_global::<ObjectHintsGlobal>().map(|global| global.0).unwrap_or_default()
+}
+
+/// 最近一次按键之后这段时间内不弹悬停卡：边打字边弹卡会挡住正在写的语句。
+pub const HOVER_TYPING_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 最近一次按键距今是否还在静默窗口内。
+pub fn typing_recently(last_key: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_key.is_some_and(|last| now.saturating_duration_since(last) < HOVER_TYPING_QUIET)
+}
+
+/// 悬停对象卡最多列出的字段数。
+pub const HOVER_MAX_COLUMNS: usize = 5;
+
+/// 补全项右侧的说明：对象只有一行“名称 · 类型 · 注释 · N 列”，不列字段；列与函数同悬停。
+pub fn completion_markdown(info: &EntryInfo, locale: Locale) -> String {
+    match info {
+        EntryInfo::Object { schema, name, kind, comment, columns } => {
+            let t = |key: &str| i18n::text(locale, key);
+            let qualified = if schema.is_empty() { name.clone() } else { format!("{schema}.{name}") };
+            let mut parts = vec![code_span(&qualified), t(object_kind_key(kind))];
+            if !comment.trim().is_empty() {
+                parts.push(escape_markdown(comment.trim()));
+            }
+            if !columns.is_empty() {
+                parts.push(i18n::fill(&t("query.info.columnCount"), &[("count", &columns.len().to_string())]));
+            }
+            parts.join(" · ")
+        }
+        _ => info_markdown(info, locale),
+    }
+}
+
+fn object_kind_key(kind: &str) -> &'static str {
+    match kind.to_ascii_lowercase().as_str() {
+        "table" => "query.complete.kind.table",
+        "view" | "materialized" => "query.complete.kind.view",
+        "function" => "query.complete.kind.function",
+        "procedure" => "query.complete.kind.procedure",
+        "trigger" => "query.complete.kind.trigger",
+        "sequence" => "query.complete.kind.sequence",
+        _ => "query.complete.kind.object",
+    }
+}
+
+/// 悬停和对象信息共用的说明文本（Markdown）。只写读到的元数据；读不到的项明说。
+/// 对象卡只列前 5 个字段，其余折成一行“还有 N 列”。
 pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
     let t = |key: &str| i18n::text(locale, key);
     let fill = |key: &str, name: &str, value: &str| i18n::fill(&t(key), &[(name, &escape_markdown(value))]);
@@ -178,16 +237,7 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
         }
         EntryInfo::Object { schema, name, kind, comment, columns } => {
             let qualified = if schema.is_empty() { name.clone() } else { format!("{schema}.{name}") };
-            let kind_key = match kind.to_ascii_lowercase().as_str() {
-                "table" => "query.complete.kind.table",
-                "view" | "materialized" => "query.complete.kind.view",
-                "function" => "query.complete.kind.function",
-                "procedure" => "query.complete.kind.procedure",
-                "trigger" => "query.complete.kind.trigger",
-                "sequence" => "query.complete.kind.sequence",
-                _ => "query.complete.kind.object",
-            };
-            lines.push(format!("{} · {}", code_span(&qualified), t(kind_key)));
+            lines.push(format!("{} · {}", code_span(&qualified), t(object_kind_key(kind))));
             if !schema.is_empty() {
                 lines.push(fill("query.info.schema", "schema", schema));
             }
@@ -195,7 +245,7 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
                 lines.push(fill("query.info.comment", "comment", comment));
             }
             if !columns.is_empty() {
-                const MAX_DOC_COLS: usize = 8;
+                const MAX_DOC_COLS: usize = HOVER_MAX_COLUMNS;
                 let mut col_lines = vec![format!("**{}**", i18n::fill(&t("query.info.columnsHeader"), &[("count", &columns.len().to_string())]))];
                 for col in columns.iter().take(MAX_DOC_COLS) {
                     let mut parts = vec![code_span(&col.name)];
@@ -367,6 +417,8 @@ pub struct SqlEditor {
     _dismiss_signature: gpui_kit::Subscription,
     /// 光标移动后重算当前语句高亮和签名提示。
     _track: gpui_kit::Subscription,
+    /// 记录最近一次输入按键（悬停静默窗口）。
+    _typing: gpui_kit::Subscription,
 }
 
 /// 一条执行错误：标记位置、所在语句、错误码与服务器原文。
@@ -415,6 +467,8 @@ struct SqlHover {
     scope: Rc<RefCell<Option<CompletionScope>>>,
     locale: Rc<Cell<Locale>>,
     facts: Rc<RefCell<HoverFacts>>,
+    /// 最近一次在本编辑器里按键的时刻；静默窗口内不弹悬停。
+    last_key: Rc<Cell<Option<std::time::Instant>>>,
 }
 
 fn covers(range: &Range<usize>, offset: usize) -> bool {
@@ -450,11 +504,23 @@ fn exec_error_markdown(error: &ExecError, locale: Locale) -> String {
 
 /// LSP 悬停的内容。诊断（执行错误、静态 lint）只经编辑器的诊断弹层展示：
 /// 悬停在诊断范围里时这里不再给第二个弹层，两个弹层叠在一起、此起彼伏正是闪烁的来源。
-fn hover_markdown(scope: Option<&CompletionScope>, facts: &HoverFacts, text: &str, offset: usize, locale: Locale) -> Option<(Range<usize>, String)> {
-    if diagnostic_at(facts, offset).is_some() {
+/// 正在输入（最近按键在静默窗口内）时没有悬停；对象提示关闭时只保留函数签名。
+fn hover_markdown(
+    scope: Option<&CompletionScope>,
+    facts: &HoverFacts,
+    text: &str,
+    offset: usize,
+    locale: Locale,
+    hints: ObjectHints,
+    typing: bool,
+) -> Option<(Range<usize>, String)> {
+    if typing || diagnostic_at(facts, offset).is_some() {
         return None;
     }
     let (span, info) = hover_info(scope?, text, offset)?;
+    if hints == ObjectHints::Off && !matches!(info, EntryInfo::Function { .. }) {
+        return None;
+    }
     Some((span, info_markdown(&info, locale)))
 }
 
@@ -479,6 +545,7 @@ impl SqlEditor {
         let scope = Rc::new(RefCell::new(None));
         let locale = Rc::new(Cell::new(Locale::ZhCn));
         let facts = Rc::new(RefCell::new(HoverFacts::default()));
+        let last_key: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         let note = Rc::new(RefCell::new(None));
         let request = Rc::new(Cell::new(0));
         let link_target: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -499,7 +566,8 @@ impl SqlEditor {
                 note: note.clone(),
                 request: request.clone(),
             }));
-            state.lsp_mut().hover_provider = Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone(), facts: facts.clone() }));
+            state.lsp_mut().hover_provider =
+                Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone(), facts: facts.clone(), last_key: last_key.clone() }));
             state.lsp_mut().definition_provider = Some(Rc::new(SqlDefinition { scope: scope.clone(), target: link_target.clone() }));
             let sink = object_sink.clone();
             state.lsp_mut().show_document = Some(Rc::new(move |params, _window, cx| follow_uri(&sink, params.uri.as_str(), cx)));
@@ -540,6 +608,21 @@ impl SqlEditor {
                         editor.dismiss_signature(cx);
                     }
                 });
+            }
+        });
+        // 记下本编辑器里最近一次输入按键：悬停在此后 1s 内保持安静。快捷键和 Esc 不算输入。
+        let typing = cx.intercept_keystrokes({
+            let state = state.downgrade();
+            let last_key = last_key.clone();
+            move |event, window, cx| {
+                let modifiers = &event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control || event.keystroke.key == "escape" {
+                    return;
+                }
+                let ours = state.update(cx, |state, cx| state.focus_handle(cx).is_focused(window)).unwrap_or(false);
+                if ours {
+                    last_key.set(Some(std::time::Instant::now()));
+                }
             }
         });
         // 弹层由编辑器自己画，键盘接受原本只绑了 Enter；Tab 在这里补上。
@@ -599,6 +682,7 @@ impl SqlEditor {
             _accept_tab: accept_tab,
             _dismiss_signature: dismiss_signature,
             _track: track,
+            _typing: typing,
         }
     }
 
@@ -820,6 +904,11 @@ impl SqlEditor {
         }
     }
 
+    /// 设置“编辑器 → 对象提示”变化时由外壳调用；对所有 SQL 编辑器即时生效。
+    pub fn publish_object_hints(hints: ObjectHints, cx: &mut App) {
+        publish_object_hints(hints, cx);
+    }
+
     /// 悬停在偏移处会显示的说明（与悬停提供者同一份数据）；没有时为 None。
     /// 执行错误和静态 lint 优先于表、列、函数文档。
     pub fn hover_text(&self, offset: usize, cx: &App) -> Option<String> {
@@ -833,7 +922,7 @@ impl SqlEditor {
     pub fn lsp_hover_text(&self, offset: usize, cx: &App) -> Option<String> {
         let text = self.value(cx);
         let scope = self.scope.borrow();
-        hover_markdown(scope.as_ref(), &self.facts.borrow(), &text, offset, self.locale.get()).map(|(_, markdown)| markdown)
+        hover_markdown(scope.as_ref(), &self.facts.borrow(), &text, offset, self.locale.get(), object_hints(cx), false).map(|(_, markdown)| markdown)
     }
 
     /// 诊断弹层在偏移处显示的内容（编辑器诊断集合里的那一条）。
@@ -1662,13 +1751,17 @@ impl SqlEditor {
 impl SqlSuggest {
     /// 只要候选；测试和单次查询用它，不关心请求代次。
     fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
-        let (_, items) = self.respond(text, offset);
+        self.items_with(text, offset, ObjectHints::Compact)
+    }
+
+    fn items_with(&self, text: &Rope, offset: usize, hints: ObjectHints) -> Vec<CompletionItem> {
+        let (_, items) = self.respond(text, offset, hints);
         items
     }
 
     /// 一次补全请求：整段语句、光标、编辑器版本和元数据快照都参与计算。
     /// 返回请求代次，迟到结果用 deliver 丢弃。
-    fn respond(&self, text: &Rope, offset: usize) -> (u64, Vec<CompletionItem>) {
+    fn respond(&self, text: &Rope, offset: usize, hints: ObjectHints) -> (u64, Vec<CompletionItem>) {
         let request = self.request.get().wrapping_add(1);
         self.request.set(request);
         let offset = offset.min(text.len());
@@ -1705,11 +1798,15 @@ impl SqlSuggest {
                             range.clone(),
                             detail,
                         );
-                        // 详情面板：仅当确实有列结构、注释、模式或函数签名等增值信息时才展开右侧卡片，
+                        // 详情面板：仅当确实有列数、注释、模式或函数签名等增值信息时才展开右侧卡片，
                         // 避免没有任何附加元数据的表重复弹出仅写着 "`logs` · 表" 的冗余空气泡。
-                        item.documentation = entry.info.as_ref().filter(|info| has_meaningful_doc(info)).map(|info| {
-                            Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(info, locale) })
-                        });
+                        // 对象只给一行摘要（不列字段）；设置关闭对象提示时不附任何文档。
+                        item.documentation = match hints {
+                            ObjectHints::Off => None,
+                            ObjectHints::Compact => entry.info.as_ref().filter(|info| has_meaningful_doc(info)).map(|info| {
+                                Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: completion_markdown(info, locale) })
+                            }),
+                        };
                         items.push(item);
                     }
                 }
@@ -1888,10 +1985,10 @@ impl CompletionProvider for SqlSuggest {
         offset: usize,
         _trigger: CompletionContext,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Task<gpui_kit::Result<CompletionResponse>> {
         let started = self.version.get();
-        let (request, items) = self.respond(text, offset);
+        let (request, items) = self.respond(text, offset, object_hints(cx));
         let items = self.deliver(started, request, items);
         Task::ready(Ok(CompletionResponse::Array(items)))
     }
@@ -1903,12 +2000,13 @@ impl CompletionProvider for SqlSuggest {
 }
 
 impl HoverProvider for SqlHover {
-    fn hover(&self, text: &Rope, offset: usize, _window: &mut Window, _cx: &mut App) -> Task<gpui_kit::Result<Option<Hover>>> {
+    fn hover(&self, text: &Rope, offset: usize, _window: &mut Window, cx: &mut App) -> Task<gpui_kit::Result<Option<Hover>>> {
         let locale = self.locale.get();
         let scope = self.scope.borrow();
         let value = text.to_string();
+        let typing = typing_recently(self.last_key.get(), std::time::Instant::now());
         // 诊断范围里没有悬停（诊断弹层已经在显示）；认不出的名字也没有，不弹空气泡。
-        let hover = hover_markdown(scope.as_ref(), &self.facts.borrow(), &value, offset, locale).map(|(span, markdown)| Hover {
+        let hover = hover_markdown(scope.as_ref(), &self.facts.borrow(), &value, offset, locale, object_hints(cx), typing).map(|(span, markdown)| Hover {
             contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: markdown }),
             range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
         });
@@ -2253,16 +2351,16 @@ mod tests {
     fn stale_and_ime_requests_never_clobber_candidates() {
         let provider = suggest(Some(catalog_scope()), Vec::new());
         let first = Rope::from("select * from ord");
-        let (request, items) = provider.respond(&first, first.len());
+        let (request, items) = provider.respond(&first, first.len(), ObjectHints::Compact);
         assert!(!items.is_empty());
         let second = Rope::from("select * from orde");
-        let _ = provider.respond(&second, second.len());
+        let _ = provider.respond(&second, second.len(), ObjectHints::Compact);
         assert!(provider.deliver(1, request, items.clone()).is_empty(), "旧请求的候选必须被丢弃");
-        let (newest_request, newest) = provider.respond(&second, second.len());
+        let (newest_request, newest) = provider.respond(&second, second.len(), ObjectHints::Compact);
         assert!(!provider.deliver(1, newest_request, newest).is_empty(), "最新请求应正常交付");
 
         let ime = Rope::from("select 中文");
-        let (_, items) = provider.respond(&ime, ime.len());
+        let (_, items) = provider.respond(&ime, ime.len(), ObjectHints::Compact);
         assert!(items.is_empty(), "IME/中文正文里不弹候选");
     }
 
@@ -2275,7 +2373,7 @@ mod tests {
         broken.sources.clear();
         let provider = suggest(Some(broken), Vec::new());
         let rope = Rope::from("select * from ");
-        let (_, items) = provider.respond(&rope, rope.len());
+        let (_, items) = provider.respond(&rope, rope.len(), ObjectHints::Compact);
         assert!(items.iter().any(|item| item.label == "SELECT"), "元数据失败时仍给关键字");
         assert!(!items.iter().any(|item| item.label == "orders"));
         let note = provider.note.borrow().clone().expect("失败状态必须说明原因");
@@ -2552,6 +2650,84 @@ mod tests {
         let (_, function) = hover_info(&scope, call, call.find("coalesce").unwrap() + 2).expect("内置函数悬停");
         assert!(matches!(function, EntryInfo::Function { .. }));
         assert!(hover_info(&scope, call, call.find("mystery").unwrap() + 2).is_none());
+    }
+
+    fn wide_object() -> EntryInfo {
+        use crate::query::assist::ColumnMeta;
+        EntryInfo::Object {
+            schema: "app".to_owned(),
+            name: "orders".to_owned(),
+            kind: "table".to_owned(),
+            comment: "订单表".to_owned(),
+            columns: (0..9).map(|index| ColumnMeta::named(format!("field_{index}"))).collect(),
+        }
+    }
+
+    /// R8：补全里的对象文档只有一行“名称 · 类型 · 注释 · N 列”，不列字段；列文档保留类型/可空/注释。
+    #[test]
+    fn completion_object_doc_is_one_line_without_fields() {
+        let doc = completion_markdown(&wide_object(), Locale::ZhCn);
+        assert!(!doc.contains('\n'), "只有一行：{doc}");
+        assert!(doc.contains("app.orders") && doc.contains("表") && doc.contains("订单表") && doc.contains("9 列"), "{doc}");
+        assert!(!doc.contains("field_0"), "不列字段：{doc}");
+        let english = completion_markdown(&wide_object(), Locale::En);
+        assert!(english.contains("9 columns"), "{english}");
+
+        let provider = suggest(Some(typed_scope()), Vec::new());
+        let rope = Rope::from("select * from ord");
+        let items = provider.items(&rope, rope.len());
+        let orders = items.iter().find(|item| item.label == "orders").expect("表候选");
+        match orders.documentation.as_ref() {
+            Some(Documentation::MarkupContent(content)) => {
+                assert!(!content.value.contains('\n') && !content.value.contains("customer"), "{}", content.value)
+            }
+            other => panic!("带注释的表应有一行摘要：{other:?}"),
+        }
+        // 列文档仍然带类型、可空与注释。
+        let columns = provider.items(&Rope::from("select  from orders"), 7);
+        let customer = columns.iter().find(|item| item.label == "customer").and_then(|item| item.documentation.clone());
+        let Some(Documentation::MarkupContent(customer)) = customer else { panic!("列要有文档") };
+        assert!(customer.value.contains("TEXT") && customer.value.contains("下单客户"), "{}", customer.value);
+    }
+
+    /// R8：悬停对象卡最多列 5 个字段，其余折叠。
+    #[test]
+    fn hover_card_lists_at_most_five_columns() {
+        let card = info_markdown(&wide_object(), Locale::ZhCn);
+        assert!(card.contains("field_4") && !card.contains("field_5"), "{card}");
+        assert!(card.contains("还有 4 列"), "{card}");
+    }
+
+    /// R8：对象提示关闭时补全无文档、悬停无对象/列卡，函数签名仍在；正在输入时悬停返回 None。
+    #[test]
+    fn object_hints_off_and_typing_window_silence_object_cards() {
+        assert_eq!(ObjectHints::parse("off"), ObjectHints::Off);
+        assert_eq!(ObjectHints::parse("bogus"), ObjectHints::Compact);
+        assert_eq!(ObjectHints::parse(ObjectHints::Off.code()), ObjectHints::Off);
+
+        let provider = suggest(Some(typed_scope()), Vec::new());
+        let items = provider.items_with(&Rope::from("select  from orders"), 7, ObjectHints::Off);
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|item| item.documentation.is_none()), "关闭后补全不附文档");
+
+        let scope = typed_scope();
+        let facts = HoverFacts::default();
+        let text = "select coalesce(customer, 'x') from orders";
+        let table = text.find("orders").unwrap() + 1;
+        let column = text.find("customer").unwrap() + 1;
+        let function = text.find("coalesce").unwrap() + 2;
+        let hover = |offset, hints, typing| hover_markdown(Some(&scope), &facts, text, offset, Locale::ZhCn, hints, typing);
+        assert!(hover(table, ObjectHints::Compact, false).is_some());
+        assert!(hover(table, ObjectHints::Off, false).is_none(), "关闭后没有对象卡");
+        assert!(hover(column, ObjectHints::Off, false).is_none(), "关闭后没有列卡");
+        assert!(hover(function, ObjectHints::Off, false).is_some(), "函数签名仍在");
+        assert!(hover(table, ObjectHints::Compact, true).is_none(), "正在输入时不弹卡");
+
+        let now = std::time::Instant::now();
+        assert!(!typing_recently(None, now));
+        assert!(typing_recently(Some(now), now));
+        assert!(typing_recently(Some(now), now + std::time::Duration::from_millis(900)));
+        assert!(!typing_recently(Some(now), now + std::time::Duration::from_millis(1100)));
     }
 
     #[test]
@@ -3037,11 +3213,12 @@ select 1;";
         let logs = &items[0];
         assert!(logs.filter_text.is_none());
         assert_eq!(highlight_sql_completion("l", logs).as_slice(), std::slice::from_ref(&(0..1)));
-        let doc = match logs.documentation.as_ref().expect("已读到列的表应展示字段卡片") {
+        let doc = match logs.documentation.as_ref().expect("已读到列的表应展示一行摘要") {
             Documentation::MarkupContent(mc) => &mc.value,
             Documentation::String(s) => s,
         };
-        assert!(doc.contains("`id`") && doc.contains("INTEGER") && doc.contains("`level`") && doc.contains("日志级别"), "{doc}");
+        // R8：补全里的对象文档只有一行“名称 · 类型 · N 列”，字段留给悬停卡。
+        assert!(doc.contains("`logs`") && doc.contains("2 列") && !doc.contains("`level`") && !doc.contains('\n'), "{doc}");
 
         // 没有任何列、模式与注释的对象不弹出重复右侧空卡片。
         let rope_bare = Rope::from("SELECT * FROM bare_emp");

@@ -304,7 +304,7 @@ pub async fn commit_with_preview(
                     return Ok(fail_with(applied, &change.id, sql, message, pending, database_error));
                 }
                 match execute_sql(session, &sql).await {
-                    Ok(1) => applied.push(Applied { id: change.id.clone(), sql }),
+                    Ok(affected) if update_affected_ok(schema.engine, affected) => applied.push(Applied { id: change.id.clone(), sql }),
                     Ok(affected) => {
                         return Ok(fail(applied, &change.id, sql, format!("影响 {affected} 行，已停止。已成功的语句不撤销。"), pending));
                     }
@@ -341,6 +341,18 @@ pub async fn commit_with_preview(
         }
     }
     Ok(CommitReport { applied, failed: None, pending_ids: Vec::new(), rolled_back: false, rule: COMMIT_RULE })
+}
+
+/// UPDATE 的影响行数是否算成功。调用前 expect_one 已确认定位条件恰好命中一行。
+/// MySQL/MariaDB 默认（未开 CLIENT_FOUND_ROWS）报告的是“实际改变的行数”：写入与库中
+/// 相等但写法不同的值（DECIMAL 12.50 写成 12.5、DATETIME(3) 省略 .000、整数写成 01）
+/// 会得到 0，此时行已命中、只是值未变，按成功处理。其他引擎报告的是匹配行数，0 仍是失败。
+fn update_affected_ok(engine: Engine, affected: u64) -> bool {
+    match affected {
+        1 => true,
+        0 => crate::adapters::update_reports_changed_rows(engine),
+        _ => false,
+    }
 }
 
 fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>, pending: Vec<String>) -> CommitReport {
@@ -1185,6 +1197,20 @@ mod order_tests {
             columns: vec![col("id", "integer"), col("amount", "numeric")],
             key: vec!["id".to_owned()],
         }
+    }
+
+    #[test]
+    fn mysql_update_that_leaves_value_unchanged_is_not_a_failure() {
+        // MySQL 未开 CLIENT_FOUND_ROWS：DECIMAL 12.50 写成 12.5 命中 1 行但报告 0 行改变。
+        assert!(update_affected_ok(Engine::Mysql, 0));
+        assert!(update_affected_ok(Engine::Mariadb, 0));
+        assert!(update_affected_ok(Engine::Mysql, 1));
+        assert!(!update_affected_ok(Engine::Mysql, 2));
+        // PostgreSQL / SQLite / SQL Server 报告匹配行数：0 表示没命中，仍要停止。
+        assert!(!update_affected_ok(Engine::Postgres, 0));
+        assert!(!update_affected_ok(Engine::Sqlite, 0));
+        assert!(!update_affected_ok(Engine::Sqlserver, 0));
+        assert!(update_affected_ok(Engine::Postgres, 1));
     }
 
     #[test]

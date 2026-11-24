@@ -2640,26 +2640,26 @@ mod tests {
             total: 250,
             error: None,
         }];
-        let mut conn = NavConnection::new("uat", "qsyn-uat", Engine::Mysql, ConnStatus::Connected);
-        conn.databases = vec![database("tms_business", vec![group])];
+        let mut conn = NavConnection::new("uat", "demo-uat", Engine::Mysql, ConnStatus::Connected);
+        conn.databases = vec![database("sales_business", vec![group])];
 
         let mut tree = NavTree::new();
         tree.apply(&[conn]);
         tree.expand(&connection_node_id("uat"));
-        tree.expand(&database_node_id("uat", "tms_business"));
+        tree.expand(&database_node_id("uat", "sales_business"));
 
         // 第 140 张表尚未分页加载时，合并服务端搜索命中能够立即定位到它，且保留原有的 has_more 标记。
         let hits = vec![(
-            "tms_business".to_owned(),
+            "sales_business".to_owned(),
             String::new(),
             table("workshop_driver_ranking"),
         )];
-        assert!(tree.merge_search_hits("uat", "qsyn-uat", Engine::Mysql, &hits));
+        assert!(tree.merge_search_hits("uat", "demo-uat", Engine::Mysql, &hits));
 
-        let db_id = database_node_id("uat", "tms_business");
+        let db_id = database_node_id("uat", "sales_business");
         let db_node = tree.node(&db_id).expect("库节点");
         assert!(db_node.has_more, "合并搜索命中不能破坏未读完分页的 has_more 标记");
-        let group_id = group_node_id("uat", "tms_business", "", ObjectKind::Table);
+        let group_id = group_node_id("uat", "sales_business", "", ObjectKind::Table);
         tree.expand(&group_id);
         assert!(tree.visible().iter().any(|row| row.label == "workshop_driver_ranking"));
     }

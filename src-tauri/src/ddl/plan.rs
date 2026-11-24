@@ -5,7 +5,7 @@ use crate::adapters::ddl::{ddl_of, no_structure_editing, DdlDialect, ViewModifie
 use crate::adapters::adapter;
 
 use super::model::{
-    fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, LiteralQuoting, Plan, Risk, Snapshot, Step, TableOptions,
+    fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, IndexColumnDraft, IndexDraft, IndexKind, LiteralQuoting, Plan, Risk, Snapshot, Step, TableOptions,
 };
 use super::sql::{default_problem, default_sql, existing_default, mentions, qualified_table, quote_ident, valid_name, valid_type};
 
@@ -13,7 +13,11 @@ pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
     match action {
         Action::CreateTable { name, columns, options } => plan_create(snapshot, name, columns, options),
         Action::AlterColumns { table, columns } => plan_alter(snapshot, table, columns),
-        Action::CreateIndex { table, name, unique, columns } => plan_create_index(snapshot, table, name, *unique, columns),
+        Action::CreateIndex { table, name, unique, columns, index_kind, comment } => {
+            let draft = IndexDraft { name: name.clone(), kind: IndexKind::resolve(*unique, *index_kind), columns: columns.clone(), comment: comment.clone() };
+            plan_create_index(snapshot, table, &draft)
+        }
+        Action::AlterIndex { table, old, new } => plan_alter_index(snapshot, table, old, new),
         Action::DropIndex { table, name } => plan_drop_index(snapshot, table, name),
         Action::CreateForeignKey { table, foreign_key } => plan_create_fk(snapshot, table, foreign_key),
         Action::DropForeignKey { table, name } => plan_drop_fk(snapshot, table, name),
@@ -260,55 +264,201 @@ fn statement_alters(
     Ok(steps)
 }
 
-fn plan_create_index(snapshot: &Snapshot, table: &str, name: &str, unique: bool, columns: &[super::model::IndexColumnDraft]) -> Plan {
-    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
-    if let Some(message) = guard_table(snapshot, table) {
-        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
-    }
+/// 新建或修改索引共用的校验。`replacing` 是被修改的原索引（它自己的名字与主键身份不算冲突）。
+fn validate_index(snapshot: &Snapshot, table: &str, draft: &IndexDraft, replacing: Option<&Index>) -> Vec<String> {
+    let features = ddl_of(snapshot.engine).map(|dialect| dialect.index_features()).unwrap_or_default();
     let mut blocked = Vec::new();
-    if !valid_name(name) {
-        blocked.push("索引名称无效。".to_owned());
+    let name = draft.name.trim();
+    let replaced = |index: &Index| replacing.is_some_and(|old| old.name == index.name);
+    match draft.kind {
+        IndexKind::Primary if !features.primary => blocked.push("这个引擎不能在索引页修改主键，请在字段页设置主键。".to_owned()),
+        IndexKind::Primary => {
+            if let Some(existing) = snapshot.indexes.iter().find(|index| is_primary_index(index) && !replaced(index)) {
+                blocked.push(format!("表已经有主键 {}，不能再加一个。", existing.name));
+            }
+        }
+        IndexKind::Fulltext if !features.fulltext => blocked.push("这个引擎不支持全文索引。".to_owned()),
+        IndexKind::Spatial if !features.spatial => blocked.push("这个引擎不支持空间索引。".to_owned()),
+        _ => {}
     }
-    if snapshot.indexes.iter().any(|index| index.name.eq_ignore_ascii_case(name.trim())) {
-        blocked.push(format!("索引 {name} 已经存在，不会覆盖。"));
+    if draft.kind != IndexKind::Primary {
+        if !valid_name(name) {
+            blocked.push("索引名称无效。".to_owned());
+        }
+        if snapshot.indexes.iter().any(|index| index.name.eq_ignore_ascii_case(name) && !replaced(index)) {
+            blocked.push(format!("索引 {name} 已经存在，不会覆盖。"));
+        }
     }
-    if columns.is_empty() {
+    if draft.columns.is_empty() {
         blocked.push("索引至少需要一列。".to_owned());
     }
     let mut seen = Vec::new();
-    for column in columns {
-        if !snapshot.columns.iter().any(|item| item.name == column.name) {
+    for column in &draft.columns {
+        let found = snapshot.columns.iter().find(|item| item.name == column.name);
+        if found.is_none() {
             blocked.push(format!("列 {} 不在表 {table} 中。", column.name));
         }
         if seen.iter().any(|item: &String| item == &column.name) {
             blocked.push(format!("列 {} 在索引里重复。", column.name));
         }
         seen.push(column.name.clone());
+        if let Some(length) = column.prefix {
+            if !features.prefix {
+                blocked.push("这个引擎不支持索引前缀长度。".to_owned());
+            } else if draft.kind.plain_key_parts() {
+                blocked.push("全文索引和空间索引的列不能带前缀长度。".to_owned());
+            } else if length == 0 {
+                blocked.push(format!("列 {} 的前缀长度必须大于 0。", column.name));
+            } else if found.is_some_and(|item| !prefixable_type(&item.type_name)) {
+                blocked.push(format!("列 {} 不是字符串或二进制类型，不能指定前缀长度。", column.name));
+            }
+        }
+        if column.descending && draft.kind.plain_key_parts() {
+            blocked.push("全文索引和空间索引的列不能指定降序。".to_owned());
+        }
     }
-    let order = columns.iter().map(|column| format!("{} {}", column.name, if column.descending { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(" → ");
-    let mut risks = vec![Risk {
-        level: "info".to_owned(),
-        text: if unique { format!("按 {order} 的顺序创建唯一索引。") } else { format!("按 {order} 的顺序创建普通索引。") },
-    }];
-    if unique {
+    if !draft.comment.trim().is_empty() && !features.comment {
+        blocked.push("这个引擎不支持索引注释。".to_owned());
+    }
+    blocked.dedup();
+    blocked
+}
+
+/// 能写前缀长度的列类型：字符串与二进制（含 TEXT/BLOB）。
+pub(crate) fn prefixable_type(type_name: &str) -> bool {
+    let lower = type_name.to_ascii_lowercase();
+    ["char", "text", "blob", "binary"].iter().any(|word| lower.contains(word))
+}
+
+/// 新建索引的说明：按类型说清楚建的是什么，唯一与主键另说明重复值会失败。
+fn index_risks(draft: &IndexDraft) -> Vec<Risk> {
+    let order = draft
+        .columns
+        .iter()
+        .map(|column| {
+            let name = match column.prefix {
+                Some(length) => format!("{}({length})", column.name),
+                None => column.name.clone(),
+            };
+            if draft.kind.plain_key_parts() {
+                name
+            } else {
+                format!("{name} {}", if column.descending { "DESC" } else { "ASC" })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let text = match draft.kind {
+        IndexKind::Primary => format!("按 {order} 的顺序添加主键。"),
+        IndexKind::Unique => format!("按 {order} 的顺序创建唯一索引。"),
+        IndexKind::Normal => format!("按 {order} 的顺序创建普通索引。"),
+        IndexKind::Fulltext => format!("按 {order} 的顺序创建全文索引。"),
+        IndexKind::Spatial => format!("按 {order} 的顺序创建空间索引。"),
+    };
+    let mut risks = vec![Risk { level: "info".to_owned(), text }];
+    if draft.kind == IndexKind::Primary {
+        risks.push(Risk { level: "warn".to_owned(), text: "主键列会变为 NOT NULL；已有 NULL 或重复值时会失败。不会删除或修改任何数据。".to_owned() });
+    } else if draft.kind.is_unique() {
         risks.push(Risk {
             level: "warn".to_owned(),
             text: "已有重复值时创建会失败。不会删除或修改任何数据。".to_owned(),
         });
     }
+    risks
+}
+
+fn plan_create_index(snapshot: &Snapshot, table: &str, draft: &IndexDraft) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
+    if let Some(message) = guard_table(snapshot, table) {
+        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+    }
+    let blocked = validate_index(snapshot, table, draft, None);
+    let risks = index_risks(draft);
     if !blocked.is_empty() {
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
-    match create_index_sql(snapshot, name.trim(), unique, columns) {
-        Ok(sql) => finish(
+    let label = if draft.kind == IndexKind::Primary { "添加主键".to_owned() } else { format!("创建索引 {}", draft.name.trim()) };
+    match create_index_statement(snapshot, draft) {
+        Ok(sql) => finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label, sql }]),
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+/// 已有索引换成草稿时是否真有变化（名字、类型、列及其顺序/前缀、注释）。
+fn index_unchanged(old: &Index, draft: &IndexDraft) -> bool {
+    let same_name = (draft.kind == IndexKind::Primary && old.kind == IndexKind::Primary) || old.name == draft.name.trim();
+    same_name
+        && old.kind == draft.kind
+        && old.comment.as_deref().unwrap_or("").trim() == draft.comment.trim()
+        && old.columns.len() == draft.columns.len()
+        && old.columns.iter().zip(&draft.columns).all(|(before, after)| {
+            before.name == after.name && before.prefix == after.prefix && (draft.kind.plain_key_parts() || before.descending == after.descending)
+        })
+}
+
+fn plan_alter_index(snapshot: &Snapshot, table: &str, old_name: &str, draft: &IndexDraft) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
+    if let Some(message) = guard_table(snapshot, table) {
+        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+    }
+    let Some(old) = snapshot.indexes.iter().find(|index| index.name == old_name) else {
+        return finish(snapshot.engine, false, target, vec![format!("找不到索引 {old_name}")], Vec::new(), Vec::new());
+    };
+    if old.partial || old.expression {
+        return finish(snapshot.engine, false, target, vec![format!("索引 {old_name} 含表达式或部分条件，不能在这里修改。")], Vec::new(), Vec::new());
+    }
+    let mut blocked = validate_index(snapshot, table, draft, Some(old));
+    if blocked.is_empty() && index_unchanged(old, draft) {
+        blocked.push(format!("索引 {old_name} 没有变化。"));
+    }
+    let mut risks = index_risks(draft);
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    let dialect = match dialect_of(snapshot.engine) {
+        Ok(dialect) => dialect,
+        Err(message) => return finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    };
+    let key_parts = index_key_parts(snapshot.engine, draft);
+    let tail = index_tail(dialect, draft);
+    if let Some(sql) = dialect.alter_index_sql(snapshot, old, draft, &key_parts, &tail) {
+        risks.insert(0, Risk { level: "info".to_owned(), text: format!("在同一条 ALTER TABLE 里删除 {old_name} 并按新定义添加；语句失败时旧索引保留。") });
+        if old.protected && !is_primary_index(old) {
+            risks.push(Risk { level: "warn".to_owned(), text: "外键依赖这个索引；新索引不再覆盖外键列时服务器会拒绝。".to_owned() });
+        }
+        return match sql {
+            Ok(sql) => finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("修改索引 {old_name}"), sql }]),
+            Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+        };
+    }
+    if old.protected {
+        let reason = if old.reason.is_empty() {
+            format!("索引 {old_name} 由约束维护，不能当作普通索引单独删除。")
+        } else {
+            format!("索引 {old_name} 不能单独删除：{}", old.reason)
+        };
+        return finish(snapshot.engine, false, target, vec![reason], risks, Vec::new());
+    }
+    if !old.rebuild_loses.is_empty() {
+        let reason = format!("索引 {old_name} 带有这里不能保留的属性：{}；先删后建会丢掉它们，不能在这里修改。", old.rebuild_loses.join("、"));
+        return finish(snapshot.engine, false, target, vec![reason], risks, Vec::new());
+    }
+    risks.insert(
+        0,
+        Risk { level: "warn".to_owned(), text: "这不是原子操作：先删除旧索引再新建；新建失败时旧索引已经不存在，需要手动补建。".to_owned() },
+    );
+    let drop = dialect.drop_index_sql(snapshot, &quote_ident(snapshot.engine, old_name));
+    let create = create_index_statement(snapshot, draft);
+    match (drop, create) {
+        (Ok(drop), Ok(create)) => finish(
             snapshot.engine,
             false,
             target,
             Vec::new(),
             risks,
-            vec![Step { label: format!("创建索引 {name}"), sql }],
+            vec![Step { label: format!("删除索引 {old_name}"), sql: drop }, Step { label: format!("创建索引 {}", draft.name.trim()), sql: create }],
         ),
-        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+        (Err(message), _) | (_, Err(message)) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
 }
 
@@ -637,7 +787,7 @@ fn display_qualified(snapshot: &Snapshot) -> String {
 }
 
 fn is_primary_index(index: &Index) -> bool {
-    index.protected && index.reason == "由主键约束维护"
+    index.kind == IndexKind::Primary || (index.protected && index.reason == "由主键约束维护")
 }
 
 fn index_definition(snapshot: &Snapshot, index: &Index, qualified: &str) -> Option<String> {
@@ -1126,17 +1276,54 @@ pub(crate) fn column_sql_for(engine: Engine, draft: &ColumnDraft, inline_auto: b
     Ok(sql)
 }
 
-pub(crate) fn create_index_sql(snapshot: &Snapshot, name: &str, unique: bool, columns: &[super::model::IndexColumnDraft]) -> Result<String, String> {
-    let qualified = qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?;
-    let cols = columns
+pub(crate) fn create_index_sql(snapshot: &Snapshot, name: &str, unique: bool, columns: &[IndexColumnDraft]) -> Result<String, String> {
+    let draft = IndexDraft { name: name.to_owned(), kind: IndexKind::infer(false, unique), columns: columns.to_vec(), comment: String::new() };
+    create_index_statement(snapshot, &draft)
+}
+
+/// 键列表：列名、前缀长度、升降序（全文与空间索引不写升降序）。
+pub(crate) fn index_key_parts(engine: Engine, draft: &IndexDraft) -> String {
+    draft
+        .columns
         .iter()
-        .map(|column| format!("{} {}", quote_ident(snapshot.engine, &column.name), if column.descending { "DESC" } else { "ASC" }))
+        .map(|column| {
+            let mut part = quote_ident(engine, &column.name);
+            if let Some(length) = column.prefix {
+                part.push_str(&format!("({length})"));
+            }
+            if !draft.kind.plain_key_parts() {
+                part.push_str(if column.descending { " DESC" } else { " ASC" });
+            }
+            part
+        })
         .collect::<Vec<_>>()
-        .join(", ");
-    let unique = if unique { "UNIQUE " } else { "" };
-    let index = quote_ident(snapshot.engine, name);
+        .join(", ")
+}
+
+/// 键列表之后的子句（索引注释）。方言不支持时为空（校验已经拦下）。
+fn index_tail(dialect: &dyn DdlDialect, draft: &IndexDraft) -> String {
+    let comment = draft.comment.trim();
+    if comment.is_empty() || !dialect.index_features().comment {
+        return String::new();
+    }
+    dialect.index_comment_clause(comment).unwrap_or_default()
+}
+
+/// 新建索引（或主键）的语句。
+pub(crate) fn create_index_statement(snapshot: &Snapshot, draft: &IndexDraft) -> Result<String, String> {
+    let qualified = qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?;
+    let cols = index_key_parts(snapshot.engine, draft);
+    let tail = dialect_of(snapshot.engine).map(|dialect| index_tail(dialect, draft)).unwrap_or_default();
+    let keyword = match draft.kind {
+        IndexKind::Primary => return Ok(format!("ALTER TABLE {qualified} ADD PRIMARY KEY ({cols}){tail};")),
+        IndexKind::Unique => "UNIQUE ",
+        IndexKind::Normal => "",
+        IndexKind::Fulltext => "FULLTEXT ",
+        IndexKind::Spatial => "SPATIAL ",
+    };
+    let index = quote_ident(snapshot.engine, draft.name.trim());
     // PostgreSQL 的索引名不能带 schema，索引建在表所在 schema。
-    Ok(format!("CREATE {unique}INDEX {index} ON {qualified} ({cols});"))
+    Ok(format!("CREATE {keyword}INDEX {index} ON {qualified} ({cols}){tail};"))
 }
 
 fn add_fk_sql(snapshot: &Snapshot, table: &str, foreign_key: &ForeignKeyDraft) -> Result<String, String> {
@@ -1169,7 +1356,7 @@ pub(crate) fn recreate_index_sql(snapshot: &Snapshot, index: &Index, drafts: &[C
                 .find(|draft| draft.original.as_deref() == Some(column.name.as_str()) && !draft.dropped)
                 .map(|draft| draft.name.trim().to_owned())
                 .unwrap_or_else(|| column.name.clone());
-            super::model::IndexColumnDraft { name, descending: column.descending }
+            IndexColumnDraft { name, descending: column.descending, prefix: column.prefix }
         })
         .collect::<Vec<_>>();
     create_index_sql(snapshot, &index.name, index.unique, &columns)

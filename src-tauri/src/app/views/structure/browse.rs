@@ -11,12 +11,12 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollStrategy,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollStrategy,
     SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
 use super::{ColumnChange, FieldWidths, MenuEntry, RowAction, Section, StructureMode, StructurePane, create, row_menu};
-use crate::ddl::{ColumnDraft, IndexColumnDraft};
+use crate::ddl::{ColumnDraft, IndexColumnDraft, IndexKind};
 use crate::i18n;
 use crate::ui::kit::{self, ControlSize, IconSize, Palette, Radius, ScrollAreaExt as _, Space, Tip as _, TypeScale};
 use crate::ui::picker::{Picker, PickerEvent, PickerItem, PickerMode};
@@ -83,6 +83,68 @@ impl BrowseColumns {
             cols += 1;
         }
         total + (cols.saturating_sub(1) as f32) * FieldWidths::GAP + FieldWidths::PAD_LEFT + FieldWidths::PAD_RIGHT
+    }
+}
+
+/// 浏览态字段表的一列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FieldCell {
+    Name,
+    Type,
+    Nullable,
+    Default,
+    Comment,
+    Actions,
+}
+
+/// 一列的宽度规则：名称列占剩余宽度（可收缩到 0，内容截断），其余列定宽。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum CellWidth {
+    Fill,
+    Fixed(f32),
+}
+
+/// 名称列里标记图标槽与名称之间的固定缩进（图标槽宽 + 间隙）；表头的名称标题按同一缩进对齐。
+pub(super) const NAME_INSET: f32 = IconSize::INLINE + Space::XS;
+
+impl BrowseColumns {
+    /// 表头与每一行共用的列序列。行里的自增/生成/索引标记都放在名称列内部，不改变这份序列。
+    pub fn cells(&self) -> Vec<(FieldCell, CellWidth)> {
+        let mut cells = vec![
+            (FieldCell::Name, CellWidth::Fill),
+            (FieldCell::Type, CellWidth::Fixed(self.widths.kind)),
+            (FieldCell::Nullable, CellWidth::Fixed(self.widths.nullable)),
+        ];
+        if self.default {
+            cells.push((FieldCell::Default, CellWidth::Fixed(self.widths.default)));
+        }
+        if self.comment {
+            cells.push((FieldCell::Comment, CellWidth::Fixed(self.widths.comment)));
+        }
+        cells.push((FieldCell::Actions, CellWidth::Fixed(self.widths.drop)));
+        cells
+    }
+}
+
+/// 名称列里的标记（主键/外键/问题图标、自增、生成、索引）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct NameMarks {
+    pub icon: bool,
+    pub auto: bool,
+    pub generated: bool,
+    pub indexed: bool,
+}
+
+/// 一行实际使用的列序列。标记只进名称列，所以与表头序列相同（测试守住）。
+pub(super) fn row_cells(cols: &BrowseColumns, _marks: NameMarks) -> Vec<(FieldCell, CellWidth)> {
+    cols.cells()
+}
+
+/// 按宽度规则生成单元格外框。名称列 `min_w_0 + overflow_hidden`：标记 pill 留在格内，名称先截断，不压到类型列上。
+pub(super) fn cell_frame(width: CellWidth) -> gpui_kit::Div {
+    match width {
+        CellWidth::Fill => div().flex_1().min_w_0().overflow_hidden(),
+        CellWidth::Fixed(w) => div().w(px(w)).flex_none().min_w_0(),
     }
 }
 
@@ -290,13 +352,12 @@ impl StructurePane {
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
-        let widths = cols.widths;
         if let Some(target) = self.scroll_to_column.take() {
             if let Some(position) = visible.iter().position(|index| *index == target) {
                 self.columns_scroll.scroll_to_item(position, ScrollStrategy::Nearest);
             }
         }
-        let head = div()
+        let mut head = div()
             .id("structure-table-head")
             .test_support()
             .flex()
@@ -311,13 +372,18 @@ impl StructurePane {
             .border_color(p.line_soft)
             .text_size(px(TypeScale::XS))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(p.text_faint)
-            .child(div().flex_1().min_w(px(widths.name_min)).pl(px(Space::XL)).child(t("structure.field.column")))
-            .child(div().w(px(widths.kind)).flex_none().child(t("structure.field.type")))
-            .child(div().w(px(widths.nullable)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
-            .when(cols.default, |this| this.child(div().w(px(widths.default)).flex_none().child(t("ui.structure.default"))))
-            .when(cols.comment, |this| this.child(div().id("structure-head-comment").test_support().w(px(widths.comment)).flex_none().child(t("structure.field.comment"))))
-            .child(div().w(px(widths.drop)).flex_none());
+            .text_color(p.text_faint);
+        for (cell, width) in cols.cells() {
+            let frame = cell_frame(width);
+            head = head.child(match cell {
+                FieldCell::Name => frame.pl(px(NAME_INSET)).truncate().child(t("structure.field.column")),
+                FieldCell::Type => frame.truncate().child(t("structure.field.type")),
+                FieldCell::Nullable => frame.flex().justify_center().child(t("ui.structure.nullable")),
+                FieldCell::Default => frame.truncate().child(t("ui.structure.default")),
+                FieldCell::Comment => frame.child(div().id("structure-head-comment").test_support().truncate().child(t("structure.field.comment"))),
+                FieldCell::Actions => frame,
+            });
+        }
 
         // 每帧只算一次：行问题、索引成员，交给虚拟列表的行回调按下标取。
         let issues: HashMap<usize, String> = self.draft_issues().into_iter().filter_map(|issue| issue.row.map(|row| (row, issue.text))).collect();
@@ -441,7 +507,6 @@ impl StructurePane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let metrics = kit::Metrics::of(cx);
         let mono = cx.theme().mono_font_family.clone();
-        let widths = cols.widths;
         let snapshot = self.snapshot.as_ref();
         let before = column.original.as_deref().and_then(|orig| snapshot.and_then(|snap| snap.columns.iter().find(|c| c.name == orig)));
         let generated = before.is_some_and(|c| c.generated);
@@ -543,6 +608,114 @@ impl StructurePane {
             })
             .xsmall()
         });
+        // 悬停名称：全名与标记含义（主键/外键、自增、生成、所在索引）。
+        let mut name_tip = column.name.clone();
+        if let Some((_, _, tip)) = &mark {
+            name_tip.push_str(&format!("\n{tip}"));
+        }
+        if auto {
+            name_tip.push_str(&format!("\n{}", i18n::text(locale, "structure.field.auto")));
+        }
+        if generated {
+            name_tip.push_str(&format!("\n{}", i18n::text(locale, "structure.field.genLocked")));
+        }
+        if !indexes.is_empty() {
+            name_tip.push_str(&format!("\n{}", i18n::fill(&i18n::text(locale, "structure.field.inIndexes"), &[("names", &indexes.join(", "))])));
+        }
+        let marks = NameMarks { icon: mark.is_some(), auto, generated, indexed: !indexes.is_empty() };
+        let mut mark = mark;
+        let mut revert_btn = revert_btn;
+        let mut drop_btn = Some(drop_btn);
+        let mut cells: Vec<AnyElement> = Vec::new();
+        for (cell, width) in row_cells(&cols, marks) {
+            let frame = cell_frame(width);
+            let element = match cell {
+                FieldCell::Name => frame
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .child(
+                        div().w(px(IconSize::INLINE)).flex_none().flex().items_center().justify_center().when_some(mark.take(), |this, (icon, color, tip)| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("structure-col-mark-{index}")))
+                                    .tooltip_text(SharedString::from(tip))
+                                    .child(kit::icon(icon, IconSize::INLINE, color)),
+                            )
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("structure-col-name-{index}")))
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .tooltip_text(SharedString::from(name_tip.clone()))
+                            .when(dropped, |this| this.opacity(0.5).line_through())
+                            .child(SharedString::from(column.name.clone())),
+                    )
+                    .when(marks.auto || marks.generated, |this| {
+                        let key = if generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
+                        this.child(kit::pill(t(key), p.text_muted, p.hover))
+                    })
+                    .when(marks.indexed, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("structure-col-index-{index}")))
+                                .test_support()
+                                .flex_none()
+                                .tooltip_text(SharedString::from(indexes.join(", ")))
+                                .child(kit::pill(t("structure.field.badgeIndex"), p.accent_text, p.accent_soft)),
+                        )
+                    })
+                    .into_any_element(),
+                FieldCell::Type => frame
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_color(p.text_muted)
+                    .when(dropped, |this| this.opacity(0.5))
+                    .child(SharedString::from(column.type_name.clone()))
+                    .into_any_element(),
+                FieldCell::Nullable => frame
+                    .flex()
+                    .justify_center()
+                    .when(column.nullable, |this| this.child(kit::icon(IconName::Check, IconSize::INLINE, p.text_muted)))
+                    .into_any_element(),
+                FieldCell::Default => frame
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("structure-col-default-{index}")))
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_color(if default_text.is_empty() { p.text_faint } else { p.text_muted })
+                            .when(!default_text.is_empty(), |this| this.tooltip_text(SharedString::from(default_text.clone())))
+                            .child(SharedString::from(if default_text.is_empty() { "—".to_owned() } else { default_text.clone() })),
+                    )
+                    .into_any_element(),
+                FieldCell::Comment => frame
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("structure-col-comment-{index}")))
+                            .test_support()
+                            .truncate()
+                            .text_color(p.text_faint)
+                            .when(!comment.is_empty(), |this| this.tooltip_text(SharedString::from(comment.clone())))
+                            .child(SharedString::from(comment.clone())),
+                    )
+                    .into_any_element(),
+                FieldCell::Actions => frame
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(Space::XXS))
+                    .when_some(revert_btn.take(), |this, btn| this.child(btn))
+                    .when_some(drop_btn.take(), |this, btn| this.child(btn))
+                    .into_any_element(),
+            };
+            cells.push(element);
+        }
         let is_focused = self.focused_row == Some(index);
         let edit_owner = entity.clone();
         div()
@@ -551,6 +724,8 @@ impl StructurePane {
             .role(gpui_kit::Role::Row)
             .aria_label(SharedString::from(column.name.clone()))
             .aria_selected(is_focused)
+            // 虚拟列表按内容宽度排版每一行：撑满列表宽度，名称列才和表头一样分到剩余宽度。
+            .w_full()
             .flex()
             .items_center()
             .gap(px(FieldWidths::GAP))
@@ -576,105 +751,7 @@ impl StructurePane {
             .when_some(bar.or_else(|| is_focused.then_some(p.accent)), |this, color| {
                 this.child(div().absolute().left_0().top_0().bottom_0().w(px(Space::XXS + 1.)).bg(color))
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(widths.name_min))
-                    .flex()
-                    .items_center()
-                    .gap(px(Space::XS))
-                    .child(
-                        div().w(px(IconSize::INLINE)).flex_none().flex().items_center().justify_center().when_some(mark, |this, (icon, color, tip)| {
-                            this.child(
-                                div()
-                                    .id(SharedString::from(format!("structure-col-mark-{index}")))
-                                    .tooltip_text(SharedString::from(tip))
-                                    .child(kit::icon(icon, IconSize::INLINE, color)),
-                            )
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_weight(FontWeight::MEDIUM)
-                            .when(dropped, |this| this.opacity(0.5).line_through())
-                            .child(SharedString::from(column.name.clone())),
-                    )
-                    .when(auto || generated, |this| {
-                        let key = if generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
-                        this.child(kit::pill(t(key), p.text_muted, p.hover))
-                    })
-                    .when(!indexes.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .id(SharedString::from(format!("structure-col-index-{index}")))
-                                .test_support()
-                                .flex_none()
-                                .tooltip_text(SharedString::from(indexes.join(", ")))
-                                .child(kit::pill(t("structure.field.badgeIndex"), p.accent_text, p.accent_soft)),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(widths.kind))
-                    .flex_none()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(mono.clone())
-                    .text_color(p.text_muted)
-                    .when(dropped, |this| this.opacity(0.5))
-                    .child(SharedString::from(column.type_name.clone())),
-            )
-            .child(
-                div()
-                    .w(px(widths.nullable))
-                    .flex_none()
-                    .flex()
-                    .justify_center()
-                    .when(column.nullable, |this| this.child(kit::icon(IconName::Check, IconSize::INLINE, p.text_muted))),
-            )
-            .when(cols.default, |this| {
-                this.child(
-                    div()
-                        .id(SharedString::from(format!("structure-col-default-{index}")))
-                        .w(px(widths.default))
-                        .flex_none()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(mono.clone())
-                        .text_color(if default_text.is_empty() { p.text_faint } else { p.text_muted })
-                        .when(!default_text.is_empty(), |this| this.tooltip_text(SharedString::from(default_text.clone())))
-                        .child(SharedString::from(if default_text.is_empty() { "—".to_owned() } else { default_text.clone() })),
-                )
-            })
-            .when(cols.comment, |this| {
-                this.child(
-                    div()
-                        .id(SharedString::from(format!("structure-col-comment-{index}")))
-                        .test_support()
-                        .w(px(widths.comment))
-                        .flex_none()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(p.text_faint)
-                        .when(!comment.is_empty(), |this| this.tooltip_text(SharedString::from(comment.clone())))
-                        .child(SharedString::from(comment.clone())),
-                )
-            })
-            .child(
-                div()
-                    .w(px(widths.drop))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(Space::XXS))
-                    .when_some(revert_btn, |this, btn| this.child(btn))
-                    .child(drop_btn),
-            )
+            .children(cells)
             .into_any_element()
     }
 
@@ -724,7 +801,7 @@ impl StructurePane {
         self.session.index_columns.retain(|column| wanted.contains(&column.name.as_str()));
         for id in &wanted {
             if !self.session.index_columns.iter().any(|column| column.name == *id) {
-                self.session.index_columns.push(IndexColumnDraft { name: (*id).to_owned(), descending: false });
+                self.session.index_columns.push(IndexColumnDraft { name: (*id).to_owned(), descending: false, prefix: None });
             }
         }
         if key(&self.session.index_columns) == before {
@@ -737,8 +814,21 @@ impl StructurePane {
     }
 
     /// 已选列的有序列表：序号、列名、升降序切换、上移、下移、移除。生成的 SQL 按这里的顺序。
-    pub(super) fn index_order_list(&self, entity: &Entity<Self>, selected: &[IndexColumnDraft], p: &Palette, cx: &App) -> AnyElement {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn index_order_list(
+        &mut self,
+        entity: &Entity<Self>,
+        selected: &[IndexColumnDraft],
+        kind: IndexKind,
+        prefix_enabled: bool,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let locale = self.session.locale;
+        let types: HashMap<String, String> =
+            self.snapshot.as_ref().map(|snap| snap.columns.iter().map(|c| (c.name.clone(), c.type_name.clone())).collect()).unwrap_or_default();
+        let prefix_placeholder = i18n::text(locale, "structure.index.prefixHint");
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let metrics = kit::Metrics::of(cx);
         let mono = cx.theme().mono_font_family.clone();
@@ -762,6 +852,20 @@ impl StructurePane {
             let remove_entity = entity.clone();
             let order_name = name.clone();
             let remove_name = name.clone();
+            // 前缀长度只给字符串/二进制列，全文与空间索引不能带前缀；不支持的方言整项隐藏。
+            let prefix_input = (prefix_enabled
+                && !kind.plain_key_parts()
+                && types.get(&name).is_some_and(|kind| crate::ddl::plan::prefixable_type(kind)))
+            .then(|| {
+                let value = column.prefix.map(|length| length.to_string()).unwrap_or_default();
+                div()
+                    .id(SharedString::from(format!("structure-index-prefix-{name}")))
+                    .test_support()
+                    .flex_none()
+                    .w(px(ControlSize::PREFIX_W))
+                    .tooltip_text(t("structure.index.prefix"))
+                    .child(self.draft_input(120_001 + position as u32, &value, &prefix_placeholder, window, cx))
+            });
             list = list.child(
                 div()
                     .id(SharedString::from(format!("structure-index-chip-{name}")))
@@ -778,7 +882,8 @@ impl StructurePane {
                     .text_size(px(TypeScale::SM))
                     .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(format!("{}.", position + 1))))
                     .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).child(SharedString::from(name.clone())))
-                    .child(
+                    .children(prefix_input)
+                    .when(!kind.plain_key_parts(), |this| this.child(
                         div()
                             .id(SharedString::from(format!("structure-index-order-{name}")))
                             .test_support()
@@ -796,7 +901,7 @@ impl StructurePane {
                                     cx.notify();
                                 });
                             }),
-                    )
+                    ))
                     .child(
                         kit::icon_button(SharedString::from(format!("structure-index-up-{name}")), IconName::ChevronUp, t("structure.index.moveLeft"), move |_, _, cx| {
                             up_entity.update(cx, |pane, cx| {

@@ -2,6 +2,7 @@ mod editor_proto;
 mod format_viewer;
 mod foundation;
 mod grid_proto;
+pub mod datetime;
 pub mod kit;
 pub mod loading;
 pub mod picker;

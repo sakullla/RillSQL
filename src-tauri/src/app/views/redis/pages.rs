@@ -9,44 +9,59 @@ impl RedisPane {
     // ------------------------------------------------------------------ 顶栏
 
     pub(super) fn render_top_bar(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
-        let identity = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Redis), 22.))
-            .child(
-                div()
-                    .max_w(px(220.))
-                    .truncate()
-                    .text_size(px(TypeScale::MD))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.text)
-                    .child(SharedString::from(self.connection_name.clone())),
-            )
-            .when(self.prod_target, |this| this.child(kit::pill(SharedString::from(self.text("redis.prod.badge")), p.danger, p.danger_soft)));
+        // 左侧一个区块：引擎徽标 + 连接名（+ 生产标记）与逻辑库 / 集群范围合在一起，读作“在哪个库上工作”。
         let scope = if self.topology.cluster {
             let masters = self.topology.masters().len();
             div()
                 .id("redis-cluster-chip")
                 .test_support()
-                .h(px(24.))
-                .px(px(8.))
+                .h(px(m.chip_h()))
+                .px(px(Space::SM))
                 .flex()
                 .items_center()
-                .gap(px(5.))
-                .rounded(px(Radius::CONTROL))
+                .gap(px(Space::XS))
+                .rounded(px(Radius::TAG))
                 .bg(p.accent_soft)
                 .text_color(p.accent_text)
                 .text_size(px(TypeScale::XS))
                 .font_weight(FontWeight::MEDIUM)
-                .child(kit::icon(IconName::Network, 12., p.accent_text))
+                .child(kit::icon(IconName::Network, IconSize::INLINE, p.accent_text))
                 .child(SharedString::from(i18n::fill(&self.text("redis.cluster.chip"), &[("n", &masters.to_string())])))
                 .into_any_element()
         } else {
-            self.render_db_button(p, entity)
+            self.render_db_button(p, m, entity)
         };
-        let mut tabs = div().flex_1().min_w(px(0.)).flex().items_center().gap(px(Space::XXS)).overflow_hidden();
+        let identity = div()
+            .id("redis-identity")
+            .test_support()
+            .flex_none()
+            .h(px(m.bar_h()))
+            .pl(px(Space::SM))
+            .pr(px(Space::XXS))
+            .flex()
+            .items_center()
+            .gap(px(Space::SM))
+            .rounded(px(Radius::CONTROL))
+            .border_1()
+            .border_color(p.line)
+            .bg(if p.dark { p.raised } else { p.surface })
+            .child(kit::engine_badge(crate::adapters::workbench_badge_id(crate::adapters::Workbench::Redis), IconSize::RAIL))
+            .child(
+                div()
+                    .id("redis-connection-name")
+                    .test_support()
+                    .max_w(px(ControlSize::PICKER_MIN_W * 0.8))
+                    .truncate()
+                    .text_size(px(TypeScale::SM))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.text)
+                    .tooltip_text(SharedString::from(self.connection_name.clone()))
+                    .child(SharedString::from(self.connection_name.clone())),
+            )
+            .when(self.prod_target, |this| this.child(kit::pill(SharedString::from(self.text("redis.prod.badge")), p.danger, p.danger_soft)))
+            .child(div().flex_none().w(px(1.)).h(px(IconSize::CONTROL)).bg(p.line_soft))
+            .child(scope);
+        let mut tabs = div().id("redis-page-tabs").role(gpui_kit::Role::TabList).flex_1().min_w(px(0.)).h_full().flex().items_end().gap(px(Space::XXS)).overflow_hidden();
         for page in Page::ALL {
             if page == Page::Nodes && !self.topology.cluster {
                 continue;
@@ -65,23 +80,8 @@ impl RedisPane {
                 _ => None,
             };
             tabs = tabs.child(
-                kit::interactive_states(div().id(SharedString::from(id.clone())), p, false)
-                    .test_support()
-                    .role(gpui_kit::Role::Tab)
-                    .aria_label(SharedString::from(self.text(page.label_key())))
-                    .aria_selected(active)
-                    .flex_none()
-                    .h(px(m.bar_h() - Space::XS))
-                    .px(px(Space::MD))
-                    .flex()
-                    .items_center()
-                    .gap(px(Space::XS))
-                    .text_size(px(TypeScale::SM))
-                    .border_b_2()
-                    .when(active, |this| this.border_color(p.accent).text_color(p.text).font_weight(FontWeight::MEDIUM))
-                    .when(!active, |this| this.border_color(gpui_kit::transparent_black()).text_color(p.text_muted).hover(|s| s.text_color(p.text)))
+                kit::underline_tab(SharedString::from(id.clone()), SharedString::from(self.text(page.label_key())), active, m, p)
                     .when_some(live_dot, |this, color| this.child(kit::status_dot(color)))
-                    .child(SharedString::from(self.text(page.label_key())))
                     .when_some(badge_count, |this, n| {
                         this.child(
                             div()
@@ -107,11 +107,9 @@ impl RedisPane {
             .border_color(p.line)
             .bg(p.chrome)
             .child(identity)
-            .child(scope)
             .when(self.topology.fallback.is_some(), |this| {
                 this.child(div().id("redis-cluster-fallback").test_support().child(kit::pill(SharedString::from(self.text("redis.cluster.fallbackChip")), p.warn, p.warn_soft)))
             })
-            .child(div().flex_none().w(px(1.)).h(px(IconSize::CONTROL)).bg(p.line))
             .child(tabs)
             .child(self.render_status(p))
             .into_any_element()

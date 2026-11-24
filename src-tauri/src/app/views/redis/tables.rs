@@ -20,36 +20,71 @@ pub(super) struct TableSlot {
     _subscriptions: Vec<Subscription>,
 }
 
-/// 中间截断：放不下时保留开头（键的命名空间）和结尾（区分同前缀键的部分），中间用「…」。
-/// 开头约占保留字数的四成，其余给结尾。`measure` 返回一段文字的实际宽度。
-pub(crate) fn middle_fit(text: &str, available: f32, measure: impl Fn(&str) -> f32) -> String {
-    if available <= 0. {
-        return String::new();
+/// 键名拆成“前缀 + 末段”：末段是最后一个分隔符之后的部分（通常是 ID，区分同前缀键的关键），
+/// 前缀含末尾的分隔符。没有分隔符时前缀为空、整个键名就是末段。
+pub(crate) fn split_key_name<'a>(name: &'a str, separators: &[String]) -> (&'a str, &'a str) {
+    let segments = keyspace::split_segments(name, separators);
+    if segments.len() <= 1 {
+        return ("", name);
     }
-    if measure(text) <= available {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let candidate = |keep: usize| -> String {
-        let head = (keep * 2).div_ceil(5);
-        let tail = keep - head;
-        let mut out: String = chars[..head].iter().collect();
-        out.push('…');
-        out.extend(chars[chars.len() - tail..].iter());
-        out
-    };
-    // 二分找能放下的最多保留字数。
-    let (mut lo, mut hi) = (0usize, chars.len().saturating_sub(1));
+    let last = segments.last().map(|segment| segment.text).unwrap_or(name);
+    name.split_at(name.len() - last.len())
+}
+
+/// 键行的显示：前缀（弱化色，放不下时从左侧省略成「…尾部」）+ 末段（正常色，完整保留）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FittedKey {
+    pub(crate) prefix: String,
+    pub(crate) last: String,
+}
+
+/// 二分找最多保留的字数：`candidate(keep)` 放得下就再多留一些。
+fn longest_fit(len: usize, room: f32, candidate: impl Fn(usize) -> String, measure: &impl Fn(&str) -> f32) -> String {
+    let (mut lo, mut hi) = (0usize, len.saturating_sub(1));
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if measure(&candidate(mid)) <= available {
+        if measure(&candidate(mid)) <= room {
             lo = mid;
         } else {
             hi = mid - 1;
         }
     }
     let fitted = candidate(lo);
-    if measure(&fitted) <= available { fitted } else { String::new() }
+    if measure(&fitted) <= room { fitted } else { String::new() }
+}
+
+/// 按可用宽度排键名：放得下原样；放不下先从左侧省略前缀，末段保持完整；
+/// 末段自己都放不下时前缀整个让出、末段尾部省略。`measure` 返回一段文字的实际宽度。
+pub(crate) fn fit_key_parts(prefix: &str, last: &str, available: f32, measure: impl Fn(&str) -> f32) -> FittedKey {
+    if available <= 0. {
+        return FittedKey::default();
+    }
+    let last_w = measure(last);
+    if measure(prefix) + last_w <= available {
+        return FittedKey { prefix: prefix.to_owned(), last: last.to_owned() };
+    }
+    if last_w > available || prefix.is_empty() {
+        let chars: Vec<char> = last.chars().collect();
+        let last = longest_fit(chars.len(), available, |keep| chars[..keep].iter().collect::<String>() + "…", &measure);
+        return FittedKey { prefix: String::new(), last };
+    }
+    let chars: Vec<char> = prefix.chars().collect();
+    let prefix = longest_fit(chars.len(), available - last_w, |keep| "…".to_owned() + &chars[chars.len() - keep..].iter().collect::<String>(), &measure);
+    FittedKey { prefix, last: last.to_owned() }
+}
+
+/// 键类型的固定宽度短标签（键行、模板行与详情头共用，颜色同类型色）。未知类型取前四个字母大写。
+pub(crate) fn type_short_label(kind: &str) -> String {
+    match kind {
+        "string" => "STR".into(),
+        "hash" => "HASH".into(),
+        "list" => "LIST".into(),
+        "set" => "SET".into(),
+        "zset" => "ZSET".into(),
+        "stream" => "STRM".into(),
+        keys::JSON_TYPE | "json" => "JSON".into(),
+        other => other.chars().take(4).collect::<String>().to_uppercase(),
+    }
 }
 
 impl RedisPane {
@@ -61,6 +96,21 @@ impl RedisPane {
         stamp: u64,
         build: impl FnOnce(&Self) -> (Vec<ReadColumn>, Vec<Vec<SharedString>>),
         empty: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ReadTable> {
+        self.table_slot_with(key, stamp, build, empty, false, window, cx)
+    }
+
+    /// 同 [`Self::table_slot`]；`keep_view` 时换数据保持滚动位置与选中（加载更多追加的一页）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn table_slot_with(
+        &mut self,
+        key: &str,
+        stamp: u64,
+        build: impl FnOnce(&Self) -> (Vec<ReadColumn>, Vec<Vec<SharedString>>),
+        empty: Option<SharedString>,
+        keep_view: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ReadTable> {
@@ -80,7 +130,11 @@ impl RedisPane {
             let locale = self.locale;
             table.update(cx, |table, cx| {
                 table.set_locale(locale, cx);
-                table.set_data(columns, ReadRows::Static(rows), cx);
+                if keep_view {
+                    table.set_data_keep_view(columns, ReadRows::Static(rows), cx);
+                } else {
+                    table.set_data(columns, ReadRows::Static(rows), cx);
+                }
                 table.set_empty_text(empty, cx);
             });
             if let Some(slot) = self.tables.get_mut(key) {
@@ -172,16 +226,21 @@ impl RedisPane {
         f32::from(window.text_system().shape_line(SharedString::from(text.to_owned()), px(size), &[run], None).width)
     }
 
-    /// 键名按实际宽度截断（保留开头和结尾），结果按（键名, 宽度）缓存。
-    pub(super) fn fit_key_name(&mut self, window: &Window, font: &Font, size: f32, text: &str, available: f32) -> String {
+    /// 键名按实际宽度拆成前缀 + 末段（见 [`fit_key_parts`]），结果按（键名, 宽度）缓存。
+    pub(super) fn fit_key_name(&mut self, window: &Window, font: &Font, size: f32, text: &str, available: f32) -> FittedKey {
         let bucket = available.max(0.).round() as u32;
+        if self.fit_cache_seps != self.prefs.separators {
+            self.fit_cache.clear();
+            self.fit_cache_seps = self.prefs.separators.clone();
+        }
         if let Some(hit) = self.fit_cache.get(&(text.to_owned(), bucket)) {
             return hit.clone();
         }
         if self.fit_cache.len() > 4096 {
             self.fit_cache.clear();
         }
-        let fitted = middle_fit(text, bucket as f32, |candidate| Self::measure_ui(window, font, size, candidate));
+        let (prefix, last) = split_key_name(text, &self.prefs.separators);
+        let fitted = fit_key_parts(prefix, last, bucket as f32, |candidate| Self::measure_ui(window, font, size, candidate));
         self.fit_cache.insert((text.to_owned(), bucket), fitted.clone());
         fitted
     }
@@ -192,17 +251,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn middle_fit_keeps_both_ends_of_long_keys() {
+    fn key_names_split_into_a_prefix_and_a_complete_last_segment() {
+        let seps = vec![":".to_owned()];
+        assert_eq!(split_key_name("a:b:c:12345", &seps), ("a:b:c:", "12345"));
+        assert_eq!(split_key_name("plain", &seps), ("", "plain"));
+        assert_eq!(split_key_name("trailing:", &seps), ("trailing:", ""));
+        let multi = vec![":".to_owned(), "_".to_owned()];
+        assert_eq!(split_key_name("cache_item:9582544418737", &multi), ("cache_item:", "9582544418737"));
+
         let measure = |text: &str| text.chars().count() as f32 * 7.;
-        assert_eq!(middle_fit("user:1", 100., measure), "user:1", "放得下原样显示");
-        let key = "gpsdroppedtask_alarm_9582544418737_9582544418737240";
-        let fitted = middle_fit(key, 140., measure);
-        assert!(measure(&fitted) <= 140., "{fitted}");
-        let (head, tail) = fitted.split_once('…').expect("中间有省略号");
-        assert!(key.starts_with(head) && key.ends_with(tail), "{fitted}");
-        assert!(head.starts_with("gpsdr") && tail.ends_with("7240"), "开头和结尾都在：{fitted}");
-        assert_eq!(middle_fit("中文键名很长很长", 30., |text| text.chars().count() as f32 * 12.), "中…");
-        assert_eq!(middle_fit("abc", 0., measure), "");
-        assert_eq!(middle_fit("abcdef", 5., measure), "");
+        assert_eq!(fit_key_parts("a:b:c:", "12345", 200., measure), FittedKey { prefix: "a:b:c:".into(), last: "12345".into() }, "放得下原样显示");
+        // 放不下：末段完整，前缀从左侧省略、保留靠近末段的部分。
+        let prefix = "session:tenant-alpha:region-east:";
+        let fitted = fit_key_parts(prefix, "12345", 140., measure);
+        assert_eq!(fitted.last, "12345", "末段完整保留");
+        let kept = fitted.prefix.strip_prefix('…').expect("前缀左侧省略");
+        assert!(!kept.is_empty() && prefix.ends_with(kept), "{fitted:?}");
+        assert!(measure(&fitted.prefix) + measure(&fitted.last) <= 140.);
+        // 末段本身也放不下：前缀让出，末段尾部省略。
+        let fitted = fit_key_parts("a:", "0123456789abcdef", 70., measure);
+        assert_eq!(fitted.prefix, "");
+        let head = fitted.last.strip_suffix('…').expect("末段尾部省略");
+        assert!(!head.is_empty() && "0123456789abcdef".starts_with(head), "{fitted:?}");
+        assert!(measure(&fitted.last) <= 70.);
+        assert_eq!(fit_key_parts("a:", "b", 0., measure), FittedKey::default());
+    }
+
+    #[test]
+    fn type_labels_are_short_and_fixed() {
+        for (kind, label) in [("string", "STR"), ("hash", "HASH"), ("list", "LIST"), ("set", "SET"), ("zset", "ZSET"), ("stream", "STRM"), (keys::JSON_TYPE, "JSON"), ("module", "MODU"), ("", "")] {
+            assert_eq!(type_short_label(kind), label, "{kind}");
+        }
     }
 }

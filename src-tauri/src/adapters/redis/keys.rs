@@ -72,6 +72,10 @@ pub struct RedisKeyDetail {
     pub total: Option<u64>,
     /// 下一页的位置（HSCAN/SSCAN 游标、ZRANGE/LRANGE 偏移、XRANGE 起点）；None 表示已读完。
     pub next: Option<String>,
+    /// MEMORY USAGE 估算的字节数；服务端不支持或被 ACL 拒绝时为 None。
+    pub memory: Option<u64>,
+    /// OBJECT ENCODING（listpack、hashtable…）；拿不到时为 None。
+    pub encoding: Option<String>,
 }
 
 /// 大集合每页读取的条目数。
@@ -249,10 +253,22 @@ pub async fn read_key(conn: &mut super::conn::RedisConn, key: &str) -> Result<Re
             cmd.arg(arg);
         }
         let raw: redis::Value = cmd.query_async(conn).await?;
-        return Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: RedisValue::String { text: bulk_text(raw) }, total, next: None });
+        let (memory, encoding) = read_footprint(conn, key, &key_type).await;
+        return Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: RedisValue::String { text: bulk_text(raw) }, total, next: None, memory, encoding });
     }
     let page = read_page(conn, key, &key_type, None, VALUE_PAGE_SIZE).await?;
-    Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: page.value, total, next: page.next })
+    let (memory, encoding) = read_footprint(conn, key, &key_type).await;
+    Ok(RedisKeyDetail { key_type, ttl_ms: Some(ttl_ms), value: page.value, total, next: page.next, memory, encoding })
+}
+
+/// 详情头的元信息：内存估算与内部编码。尽力而为：服务端不支持、被 ACL 拒绝或键已消失时都只是不显示。
+async fn read_footprint(conn: &mut super::conn::RedisConn, key: &str, key_type: &str) -> (Option<u64>, Option<String>) {
+    if key_type == "none" {
+        return (None, None);
+    }
+    let memory = redis::cmd("MEMORY").arg("USAGE").arg(key).arg("SAMPLES").arg(5).query_async::<Option<u64>>(conn).await.ok().flatten();
+    let encoding = redis::cmd("OBJECT").arg("ENCODING").arg(key).query_async::<Option<String>>(conn).await.ok().flatten();
+    (memory, encoding)
 }
 
 /// 写回前核对的那一个值：整个字符串 / JSON 文档、Hash 的一个字段、List 的一个下标。

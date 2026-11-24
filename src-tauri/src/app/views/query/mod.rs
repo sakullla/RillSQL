@@ -2,6 +2,7 @@
 //! 方言规则在 query::assist / query::desk；这里只提交任务和显示。
 
 mod log;
+mod plan_canvas;
 mod plan_view;
 mod risk_panel;
 mod side;
@@ -14,7 +15,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Sizable as _, Size};
@@ -206,9 +206,12 @@ pub struct QueryPane {
     marks_seen: HashMap<String, u64>,
     /// 正在重命名的固定结果页签。
     pin_rename: Option<PinRename>,
-    /// 执行计划视图：看计划树还是引擎原始结果；树上选中的节点（前序下标）。
-    plan_raw: bool,
+    /// 执行计划视图：用户在本会话里选过的视图（画布 / 列表 / 原始），没选过时按节点数取默认；
+    /// 选择跨结果保留。树上选中的节点（前序下标）由画布与列表共享。
+    plan_mode: Option<plan_view::PlanMode>,
     plan_selected: usize,
+    /// 计划画布的缩放与平移。
+    plan_canvas: plan_canvas::CanvasState,
     /// 计划树容器的焦点：整棵树只占一个 Tab 停靠点，只有它持有焦点时才处理导航键。
     plan_focus: gpui_kit::FocusHandle,
     /// 计划树的滚动句柄：跨帧保存，键盘或建议跳转后把选中节点滚进视口。
@@ -684,8 +687,9 @@ impl QueryPane {
             definition_sink: None,
             marks_seen: HashMap::new(),
             pin_rename: None,
-            plan_raw: false,
+            plan_mode: None,
             plan_selected: 0,
+            plan_canvas: plan_canvas::CanvasState::default(),
             plan_focus: cx.focus_handle().tab_stop(true),
             plan_scroll: gpui_kit::ScrollHandle::new(),
             plan_reveal: None,
@@ -1122,10 +1126,21 @@ impl QueryPane {
     fn command_impl(&mut self, id: &str, cx: &mut Context<Self>) {
         // 执行计划视图：切换计划树 / 原始结果、选中计划节点。只改视图状态。
         // 建议跳转、鼠标点节点和树内方向键都只改 plan_selected 这一份选中，并把它滚进视口。
-        if let Some(view) = id.strip_prefix("plan-view:") {
-            self.plan_raw = view == "raw";
-            if !self.plan_raw {
+        if let Some(mode) = id.strip_prefix("plan-view:").and_then(plan_view::PlanMode::parse) {
+            self.plan_mode = Some(mode);
+            if mode != plan_view::PlanMode::Raw {
                 self.plan_reveal = Some(self.plan_selected);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(action) = id.strip_prefix("plan-canvas:") {
+            match action {
+                "fit" => self.plan_canvas.fit(),
+                "reset" => self.plan_canvas.zoom_reset(),
+                "in" => self.plan_canvas.zoom_in(),
+                "out" => self.plan_canvas.zoom_out(),
+                _ => {}
             }
             cx.notify();
             return;
@@ -2236,6 +2251,11 @@ impl QueryPane {
         cx.notify();
     }
 
+    /// 当前生效的计划视图：会话里选过就用选择，否则多节点画布、单节点列表。
+    fn plan_mode_now(&self) -> plan_view::PlanMode {
+        plan_view::PlanMode::resolve(self.plan_mode, self.plan_len)
+    }
+
     fn explain(&mut self, cx: &mut Context<Self>) {
         if let Some(connection_id) = self.desk.target().map(|target| target.connection_id) {
             let version = self.services.connections.server_version(&connection_id);
@@ -2243,8 +2263,7 @@ impl QueryPane {
         }
         match self.desk.explain_active() {
             Ok(sql) => {
-                // 新的计划从树视图、第一个节点开始看。
-                self.plan_raw = false;
+                // 新的计划从第一个节点开始看；视图选择（画布 / 列表 / 原始）在会话里保留。
                 self.plan_selected = 0;
                 self.start(RunScope::Script, Some(sql), cx)
             }
@@ -3178,7 +3197,7 @@ impl QueryPane {
                 let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
                 let in_editor = editor.as_ref().is_some_and(|editor| editor.read(cx).is_focused(window, cx));
                 if in_editor {
-                    if !self.plan_raw && self.plan_len > 0 {
+                    if self.plan_mode_now() != plan_view::PlanMode::Raw && self.plan_len > 0 {
                         window.focus(&self.plan_focus, cx);
                     } else {
                         self.grid.update(cx, |grid, cx| {
@@ -3450,6 +3469,7 @@ impl QueryPane {
             .bg(p.surface)
             .border_b_1()
             .border_color(p.line_soft)
+            // 分组：执行 | 目标（含事务） | 编辑辅助 | 视图，组间用竖线分隔、组内间距一致。
             .child(run_slot)
             // 第二个按钮是“运行全部”：执行期间保持占位并禁用，避免工具栏按钮横向跳动。
             .when(!self.narrow, |this| {
@@ -3460,12 +3480,21 @@ impl QueryPane {
                         .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "query.run.allTip"), kit::shortcut(chord)))),
                 )
             })
+            .child(kit::vline(p))
             .children(pickers)
             .children(tx_controls)
             .child(div().flex_1().min_w(px(Space::XS)))
-            .child(div().flex_none().child(format_btn))
-            .child(div().flex_none().child(explain_btn))
-            .when(!compact_tools, |this| {
+            .child(
+                div()
+                    .id("query-toolbar-assist")
+                    .test_support()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .child(format_btn)
+                    .child(explain_btn)
+                    .when(!compact_tools, |this| {
                 this.child(
                     div().flex_none().child(
                         kit::icon_button("query-act-open-sql", IconName::FolderOpen, t("shell.command.openFile"), pane_act("open-sql-file", entity))
@@ -3476,8 +3505,9 @@ impl QueryPane {
                             ))),
                     ),
                 )
-            })
-            .child(div().flex_none().child(more))
+                    })
+                    .child(more),
+            )
             .child(kit::vline(p))
             // 右侧面板开关：命中范围、图标与四态走共享的纯图标动作；面板打开时是选中态。
             .child(
@@ -3576,9 +3606,7 @@ impl QueryPane {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let more_entity = entity.clone();
-        Button::new("query-more")
-            .ghost()
-            .small()
+        kit::menu_button("query-more")
             .icon(IconName::Ellipsis)
             .tooltip(t("ui.query.more"))
             .accessibility_label(t("ui.query.more"))
@@ -3795,7 +3823,7 @@ impl QueryPane {
             .child(div().flex_initial().min_w_0().h_full().child(tabs))
             .child(log_tab)
             .children(self.render_head_status(running, p, metrics, entity))
-            .child(div().flex_none().w(px(1.)).h(px(14.)).mx(px(Space::XS)).bg(p.line_soft))
+            .child(kit::vline(p))
             .children(view_actions)
             .into_any_element()
     }
@@ -4336,7 +4364,7 @@ impl QueryPane {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(16.))
+                    .gap(px(Space::XL))
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(i18n::text(locale, key)))
@@ -4352,10 +4380,10 @@ impl QueryPane {
                 .child(
                     kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), p).child(
                         div()
-                            .mt(px(4.))
+                            .mt(px(Space::XS))
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(px(Space::SM))
                             .child(hint("query.empty.run", "Ctrl+Enter"))
                             .child(hint("query.empty.runCurrent", "Ctrl+Shift+Enter"))
                             .child(hint("query.empty.runAll", "Ctrl+Alt+Enter")),
@@ -4375,27 +4403,40 @@ impl QueryPane {
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
         let sent = result.sent_sql.clone().unwrap_or_else(|| result.sql.clone());
         if let Some(plan) = crate::query::plan::parse(&engine, &sent, &result.columns, &result.rows) {
-            // 新的结果（换标签、再次执行、换语句或固定页）从树视图第一个节点开始看；
-            // 同一份结果里切原始结果再回来保留选中。选中始终钳制在有效节点上。
+            // 新的结果（换标签、再次执行、换语句或固定页）从第一个节点开始看，画布重新适配；
+            // 视图选择在会话里保留，同一份结果里切换视图保留选中。选中始终钳制在有效节点上。
             let key = (self.desk.active_id().map(str::to_owned), self.desk.log_batch(), self.desk.statement(), self.desk.result_view());
             if self.plan_key.as_ref() != Some(&key) {
                 self.plan_key = Some(key);
-                self.plan_raw = false;
                 self.plan_selected = 0;
                 self.plan_reveal = Some(0);
+                self.plan_canvas.reset();
             }
             self.plan_len = plan.lines().len();
             self.plan_selected = self.plan_selected.min(self.plan_len.saturating_sub(1));
-            if !self.plan_raw {
+            let mode = self.plan_mode_now();
+            let layout = (mode == plan_view::PlanMode::Canvas).then(|| plan_canvas::layout(&plan));
+            if let Some(layout) = &layout {
+                self.plan_canvas.sync(layout.width, layout.height);
+            }
+            if mode != plan_view::PlanMode::Raw {
                 if let Some(index) = self.plan_reveal.take() {
-                    // 子元素 0 是列标题行，节点 i 是第 i + 1 个子元素。
-                    self.plan_scroll.scroll_to_item(index.min(self.plan_len.saturating_sub(1)) + 1);
+                    let index = index.min(self.plan_len.saturating_sub(1));
+                    match &layout {
+                        Some(layout) => {
+                            if let Some(node) = layout.nodes.get(index) {
+                                self.plan_canvas.reveal(node);
+                            }
+                        }
+                        // 子元素 0 是列标题行，节点 i 是第 i + 1 个子元素。
+                        None => self.plan_scroll.scroll_to_item(index + 1),
+                    }
                 }
             }
             let view = plan_view::PlanView {
                 plan: &plan,
                 selected: self.plan_selected,
-                raw: self.plan_raw,
+                mode,
                 locale,
                 metrics,
                 mono: mono.clone(),
@@ -4404,10 +4445,22 @@ impl QueryPane {
                 scroll: self.plan_scroll.clone(),
             };
             let header = view.header(p, entity);
-            let body = if self.plan_raw {
-                div().id("query-grid").test_support().flex_1().min_h_0().child(self.grid.clone()).into_any_element()
-            } else {
-                view.body(p, entity)
+            let body = match mode {
+                plan_view::PlanMode::Raw => div().id("query-grid").test_support().flex_1().min_h_0().child(self.grid.clone()).into_any_element(),
+                plan_view::PlanMode::List => view.body(p, entity, None),
+                plan_view::PlanMode::Canvas => {
+                    let canvas = plan_canvas::CanvasView {
+                        plan: &plan,
+                        layout: layout.as_ref().expect("canvas layout"),
+                        state: &self.plan_canvas,
+                        selected: self.plan_selected,
+                        locale,
+                        mono: mono.clone(),
+                        focus: self.plan_focus.clone(),
+                    }
+                    .render(p, entity);
+                    view.body(p, entity, Some(canvas))
+                }
             };
             return div().flex_1().min_h_0().flex().flex_col().child(header).child(body).into_any_element();
         }
@@ -4643,10 +4696,10 @@ fn statement_outcome(
             .id("query-statement-outcome")
             .test_support()
             .flex_1()
-            .p(px(16.))
+            .p(px(Space::XL))
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(Space::LG))
             .child(
                 div()
                     .id("query-statement-progress")
@@ -4654,7 +4707,7 @@ fn statement_outcome(
                     .aria_label(SharedString::from(text.clone()))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .text_size(px(TypeScale::MD))
                     .text_color(p.text_muted)
                     .child(indicator)
@@ -4695,10 +4748,10 @@ fn statement_outcome(
         .id("query-statement-outcome")
         .test_support()
         .flex_1()
-        .p(px(16.))
+        .p(px(Space::XL))
         .flex()
         .flex_col()
-        .gap(px(10.))
+        .gap(px(Space::LG))
         .child(
             div()
                 .id("query-error-message")
@@ -4706,7 +4759,7 @@ fn statement_outcome(
                 .aria_label(SharedString::from(message.clone()))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(Space::MD))
                 .text_size(px(TypeScale::MD))
                 .text_color(color)
                 .child(icon)
@@ -4718,7 +4771,7 @@ fn statement_outcome(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(Space::MD))
                     .child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity))
                     .child(error_copy_button(locale, p, metrics, entity)),
             )
@@ -7564,6 +7617,8 @@ mod tests {
                 pane.desk.plant_run(vec![long_plan()]);
             });
             window.render_frame(cx);
+            window.click("plan-view-list", cx);
+            window.render_frame(cx);
             assert_plan_selected(window, 0, "SCAN a");
             assert!(!node_in_view(window, 39), "长计划超出可视区，末节点需要滚动才能看到");
             assert_eq!(window.find("query-plan-tree").role(), Some(gpui_kit::Role::Tree));
@@ -7615,6 +7670,8 @@ mod tests {
                 pane.desk.plant_run(vec![long_plan()]);
             });
             window.render_frame(cx);
+            window.click("plan-view-list", cx);
+            window.render_frame(cx);
             assert!(window.try_find("query-plan-finding-1").is_some(), "两条建议：a 与 z 的全表扫描");
 
             // 鼠标点建议：跳到末节点并滚进视口；建议行不抢焦点。
@@ -7658,15 +7715,19 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("query-plan-tree").is_none(), "原始结果页不画计划树");
             assert_eq!(pane.read(cx).plan_selected, 38);
-            window.click("plan-view-tree", cx);
+            window.click("plan-view-list", cx);
             window.render_frame(cx);
             assert_plan_selected(window, 38, "SEARCH t38");
 
-            // 停在原始结果页时来了新结果：回到树视图第一个节点。
+            // 停在原始结果页时来了新结果：视图选择保留（仍是原始结果），选中回到第一个节点。
             window.click("plan-view-raw", cx);
             pane.update(cx, |pane, _| pane.desk.plant_run(vec![plan_sheet(&["SCAN only"])]));
             window.render_frame(cx);
-            assert!(!pane.read(cx).plan_raw, "新结果从树视图开始看");
+            assert_eq!(pane.read(cx).plan_mode_now(), plan_view::PlanMode::Raw, "原始结果的选择在会话里保留");
+            assert!(window.try_find("query-plan-tree").is_none());
+            assert_eq!(pane.read(cx).plan_selected, 0, "新结果从第一个节点开始看");
+            window.click("plan-view-list", cx);
+            window.render_frame(cx);
             assert_plan_selected(window, 0, "SCAN only");
             assert!(window.try_find("query-plan-node-1").is_none());
 
@@ -7677,6 +7738,113 @@ mod tests {
                 assert_eq!(plan_state(&pane, window, cx), (0, true), "单节点按 {key} 保持原位");
             }
             assert_plan_selected(window, 0, "SCAN only");
+        })
+        .unwrap();
+    }
+
+    /// 带嵌套的计划：CO-ROUTINE 下挂两个子节点，再并列一个根节点（共 4 个节点、2 条连线）。
+    fn join_plan() -> desk::StatementView {
+        let mut view = result("EXPLAIN QUERY PLAN select * from v join t1", "ok", &["id", "parent", "notused", "detail"], &[], None, "");
+        view.rows = [("2", "0", "CO-ROUTINE v"), ("5", "2", "SCAN t1"), ("9", "2", "SEARCH t2 USING INTEGER PRIMARY KEY (rowid=?)"), ("20", "0", "SCAN v")]
+            .iter()
+            .map(|(id, parent, detail)| vec![Some((*id).to_owned()), Some((*parent).to_owned()), Some("0".to_owned()), Some((*detail).to_owned())])
+            .collect();
+        view
+    }
+
+    /// 多节点计划默认显示画布：卡片可见、点卡片同步右侧详情并聚焦画布，方向键沿用同一选中；
+    /// 缩放按钮钳制在 0.4–2.0、100% 复位、适配后整棵树放进视口；拖拽平移后松开不选中节点；
+    /// 切到列表或原始后再次出结果保持所选视图；没选过视图时单节点计划默认列表，画布中单节点居中。
+    #[gpui_kit::test]
+    fn plan_canvas_is_the_default_for_multi_node_plans_and_the_choice_is_remembered(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![join_plan()]);
+            });
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).plan_mode_now(), plan_view::PlanMode::Canvas, "多节点默认画布");
+            assert_eq!(window.find("plan-view-canvas").selected(), Some(true));
+            assert!(window.try_find("query-plan-tree").is_none(), "画布模式不画列表树");
+            let canvas = window.find("query-plan-canvas").bounds();
+            for index in 0..4 {
+                let card = window.find(SharedString::from(format!("query-plan-card-{index}"))).bounds();
+                assert!(card.left() >= canvas.left() && card.right() <= canvas.right() && card.top() >= canvas.top() && card.bottom() <= canvas.bottom(), "适配后卡片 {index} 在视口内");
+            }
+            assert_eq!(window.find("query-plan-card-0").selected(), Some(true));
+            assert_eq!(window.find("query-plan-detail").label(), Some("CO-ROUTINE v"));
+            let fitted = pane.read(cx).plan_canvas.zoom;
+            assert!(fitted <= 1., "自动适配不放大");
+
+            // 点卡片：选中同步到详情，画布持有焦点，方向键照常导航。
+            window.click("query-plan-card-2", cx);
+            window.render_frame(cx);
+            assert_eq!(plan_state(&pane, window, cx), (2, true));
+            assert_eq!(window.find("query-plan-card-2").selected(), Some(true));
+            assert_eq!(window.find("query-plan-detail").label(), Some("SEARCH t2"));
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("query-plan-detail").label(), Some("SCAN v"));
+
+            // 缩放工具条。
+            let zoom = |cx: &App| pane.read(cx).plan_canvas.zoom;
+            window.click("plan-canvas-reset", cx);
+            assert_eq!(zoom(cx), 1.);
+            for _ in 0..8 {
+                window.click("plan-canvas-zoom-in", cx);
+            }
+            assert_eq!(zoom(cx), plan_canvas::ZOOM_MAX);
+            for _ in 0..12 {
+                window.click("plan-canvas-zoom-out", cx);
+            }
+            assert_eq!(zoom(cx), plan_canvas::ZOOM_MIN);
+            window.click("plan-canvas-fit", cx);
+            window.render_frame(cx);
+            assert!((zoom(cx) - fitted).abs() < 1e-4, "适配回到能放下整棵树的比例：{} vs {fitted}", zoom(cx));
+
+            // 滚轮平移；拖拽平移后松开不算点击。
+            let before = (pane.read(cx).plan_canvas.pan_x, pane.read(cx).plan_canvas.pan_y);
+            window.scroll("query-plan-canvas", gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-30.))), cx);
+            assert_eq!(pane.read(cx).plan_canvas.pan_y, before.1 - 30., "滚轮上下平移画布");
+            let card = window.find("query-plan-card-0").bounds();
+            let from = card.center();
+            window.drag(from, from + gpui_kit::point(px(40.), px(25.)), cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).plan_canvas.pan_x, before.0 + 40., "拖拽平移");
+            assert_eq!(pane.read(cx).plan_selected, 3, "拖拽松开不改选中");
+
+            // 切到列表：再次出结果保持列表；切到原始同理。
+            window.click("plan-view-list", cx);
+            pane.update(cx, |pane, _| pane.desk.plant_run(vec![join_plan()]));
+            window.render_frame(cx);
+            assert!(window.try_find("query-plan-tree").is_some(), "列表的选择在新结果上保留");
+            assert!(window.try_find("query-plan-canvas").is_none());
+            window.click("plan-view-canvas", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-plan-canvas").is_some());
+        })
+        .unwrap();
+
+        // 新的面板（没选过视图）：单节点计划默认列表；切到画布后单节点居中。
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![plan_sheet(&["SCAN only"])]);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).plan_mode_now(), plan_view::PlanMode::List, "单节点默认列表");
+            assert!(window.try_find("query-plan-tree").is_some());
+            window.click("plan-view-canvas", cx);
+            window.render_frame(cx);
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+            let canvas = window.find("query-plan-canvas").bounds();
+            let card = window.find("query-plan-card-0").bounds();
+            assert!((card.center().x - canvas.center().x).abs().as_f32() < 2. && (card.center().y - canvas.center().y).abs().as_f32() < 2., "单节点在画布中居中：{card:?} {canvas:?}");
         })
         .unwrap();
     }

@@ -434,9 +434,22 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 }
             }
             model.fail_pending_intents();
+            // 对象搜索期间有连接连上：按当前词重新检索，新连接的命中在目录读回后合入。
+            let opened = model
+                .connections
+                .selected
+                .as_deref()
+                .is_some_and(|id| model.connections.row_status(id) == crate::app::views::connections::LinkStatus::Connected);
+            if opened {
+                model.rerun_nav_search();
+            }
             // 缺密码或密码被拒：直接问密码，而不是只留一个必然再失败的“重试”。
+            // 此时停掉“连接这些连接”的队列，不在密码框下面继续连别的。
             if let Some((id, rejected)) = model.connections.credential_prompt.take() {
+                model.connect_queue.clear();
                 model.open_password_prompt(&id, rejected);
+            } else {
+                model.advance_connect_queue();
             }
         }
         JobDone::Disconnect(token, id) => {

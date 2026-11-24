@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::FocusTrapElement as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
@@ -27,11 +26,11 @@ use crate::ddl::sql::{default_problem, existing_default, valid_name, valid_type}
 use crate::ddl::model::{EnumSetDraft, EnumSetKind, GeneratedColumnDraft, PartitionDraft, PartitionMethod};
 use crate::ddl::templates::{ColumnTemplate, TemplateStore};
 use crate::ddl::{
-    Action, ColumnDraft, DdlEngine, DefaultSpec, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot, TableOptions,
+    Action, ColumnDraft, DdlEngine, DefaultSpec, ForeignKeyDraft, IndexColumnDraft, IndexDraft, IndexKind, Plan, Request, Snapshot, TableOptions,
     fk_sql_for_display, index_sql_for_display, preview_plan,
 };
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
+use crate::ui::kit::{self, ControlSize, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale, stack_frame};
 use crate::ui::kit::ScrollAreaExt as _;
 use crate::ui::picker::Picker;
 use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
@@ -274,10 +273,13 @@ const FIELDS_TABLE: [ColumnSpec; 4] = [
     ColumnSpec { key: "ui.structure.default", weight: 1.4, min_w: 80. },
 ];
 
-const INDEXES_TABLE: [ColumnSpec; 3] = [
-    ColumnSpec { key: "structure.field.index", weight: 1.8, min_w: 96. },
-    ColumnSpec { key: "structure.section.columns", weight: 2.2, min_w: 104. },
-    ColumnSpec { key: "structure.index.kind", weight: 0.9, min_w: 68. },
+/// 索引页：名称 | 类型 | 字段 | 注释 | 可见性（行尾是编辑/删除）。
+const INDEXES_TABLE: [ColumnSpec; 5] = [
+    ColumnSpec { key: "structure.field.index", weight: 1.4, min_w: 96. },
+    ColumnSpec { key: "structure.index.kind", weight: 0.8, min_w: 72. },
+    ColumnSpec { key: "structure.section.columns", weight: 2.2, min_w: 120. },
+    ColumnSpec { key: "structure.field.comment", weight: 1.2, min_w: 72. },
+    ColumnSpec { key: "structure.index.visible", weight: 0.6, min_w: 56. },
 ];
 
 const FOREIGN_TABLE: [ColumnSpec; 4] = [
@@ -435,6 +437,12 @@ pub struct StructureSession {
     pub index_column: String,
     pub index_unique: bool,
     pub index_columns: Vec<IndexColumnDraft>,
+    /// 索引类型。只有唯一开关的引擎由 `index_unique` 决定（见 `IndexKind::resolve`）。
+    pub index_kind: IndexKind,
+    /// 索引注释（方言支持时才显示输入框）。
+    pub index_comment: String,
+    /// 正在修改的已有索引名；None 表示新建。
+    pub index_editing: Option<String>,
     pub fk_name: String,
     pub fk_column: String,
     pub fk_ref_schema: String,
@@ -482,6 +490,9 @@ impl StructureSession {
             index_column: String::new(),
             index_unique: false,
             index_columns: Vec::new(),
+            index_kind: IndexKind::Normal,
+            index_comment: String::new(),
+            index_editing: None,
             fk_name: String::new(),
             fk_column: String::new(),
             fk_ref_schema: String::new(),
@@ -621,7 +632,29 @@ impl StructureSession {
         if self.index_column.trim().is_empty() {
             return Vec::new();
         }
-        vec![IndexColumnDraft { name: self.index_column.clone(), descending: false }]
+        vec![IndexColumnDraft { name: self.index_column.clone(), descending: false, prefix: None }]
+    }
+
+    /// 当前索引草稿（新建与修改共用）。
+    pub fn index_draft(&self) -> IndexDraft {
+        IndexDraft {
+            name: self.index_name.clone(),
+            kind: IndexKind::resolve(self.index_unique, self.index_kind),
+            columns: self.index_drafts(),
+            comment: self.index_comment.clone(),
+        }
+    }
+
+    /// 选索引类型：唯一开关跟着类型走，两者不会互相矛盾。
+    pub fn set_index_kind(&mut self, kind: IndexKind) {
+        self.index_kind = kind;
+        self.index_unique = kind == IndexKind::Unique;
+        if kind.plain_key_parts() {
+            for column in &mut self.index_columns {
+                column.descending = false;
+                column.prefix = None;
+            }
+        }
     }
 
     fn foreign_key_draft(&self) -> ForeignKeyDraft {
@@ -657,7 +690,17 @@ impl StructureSession {
             Section::Columns | Section::Ddl => Action::AlterColumns { table, columns: self.column_drafts_for_action() },
             Section::Indexes => match &self.intent {
                 EditIntent::DropIndex { name } => Action::DropIndex { table, name: name.clone() },
-                _ => Action::CreateIndex { table, name: self.index_name.clone(), unique: self.index_unique, columns: self.index_drafts() },
+                _ => match &self.index_editing {
+                    Some(old) => Action::AlterIndex { table, old: old.clone(), new: self.index_draft() },
+                    None => Action::CreateIndex {
+                        table,
+                        name: self.index_name.clone(),
+                        unique: self.index_unique,
+                        columns: self.index_drafts(),
+                        index_kind: self.index_kind,
+                        comment: self.index_comment.clone(),
+                    },
+                },
             },
             Section::ForeignKeys => match &self.intent {
                 EditIntent::DropForeignKey { name } => Action::DropForeignKey { table, name: name.clone() },
@@ -1010,7 +1053,8 @@ impl StructurePane {
     }
 
     fn suggested_index_name(&self) -> String {
-        suggested_index_name(&self.index_naming, &self.session.target.engine, &self.session.target.table, self.session.index_unique, &self.session.index_columns)
+        let unique = IndexKind::resolve(self.session.index_unique, self.session.index_kind).is_unique();
+        suggested_index_name(&self.index_naming, &self.session.target.engine, &self.session.target.table, unique, &self.session.index_columns)
     }
 
     /// 新建索引的名字与当前表已有索引重名（大小写不敏感）。提交前就地提示，预览也会拦下。
@@ -1540,6 +1584,9 @@ impl StructurePane {
         self.session.index_column.clear();
         self.session.index_unique = false;
         self.session.index_columns.clear();
+        self.session.index_kind = IndexKind::Normal;
+        self.session.index_comment.clear();
+        self.session.index_editing = None;
         self.index_name_auto = true;
         self.session.fk_name.clear();
         self.session.fk_column.clear();
@@ -1664,6 +1711,11 @@ impl StructurePane {
             }),
             // 分区方案：0/1/2 是表达式、数量、KEY 列清单；10 起是分区定义的名字与边界。
             11 => self.write_partition_cell(index, value),
+            // 索引草稿：0 是索引注释，1 起是已选列的前缀长度（按列序号）。
+            12 => match index {
+                0 => replace_text(&mut self.session.index_comment, value),
+                position => self.set_index_prefix(position - 1, &value),
+            },
             _ => false,
         };
         if changed && key != 6 {
@@ -1896,7 +1948,7 @@ impl StructurePane {
         if let Some(index) = self.session.index_columns.iter().position(|column| column.name == name) {
             self.session.index_columns.remove(index);
         } else {
-            self.session.index_columns.push(IndexColumnDraft { name: name.to_owned(), descending: false });
+            self.session.index_columns.push(IndexColumnDraft { name: name.to_owned(), descending: false, prefix: None });
         }
         self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
         self.sync_auto_index_name();
@@ -1914,6 +1966,58 @@ impl StructurePane {
         self.sync_auto_index_name();
         self.session.intent = EditIntent::Apply;
         self.session.cancel();
+    }
+
+    /// 打开某个已有索引的编辑：把它的类型、列（含前缀与升降序）与注释填进草稿，预览时生成修改语句。
+    pub fn begin_edit_index(&mut self, name: &str) -> bool {
+        let Some(index) = self.snapshot.as_ref().and_then(|snapshot| snapshot.indexes.iter().find(|index| index.name == name)).cloned() else {
+            return false;
+        };
+        self.reset_composer_drafts();
+        self.session.index_editing = Some(index.name.clone());
+        self.session.index_name = index.name.clone();
+        let kind = display_kind(&index);
+        self.session.index_kind = kind;
+        self.session.index_unique = kind == IndexKind::Unique;
+        self.session.index_columns = index
+            .columns
+            .iter()
+            .map(|column| IndexColumnDraft { name: column.name.clone(), descending: column.descending, prefix: column.prefix })
+            .collect();
+        self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
+        self.session.index_comment = index.comment.clone().unwrap_or_default();
+        self.index_name_auto = false;
+        self.index_picker = None;
+        self.composer_open = true;
+        self.session.section = Section::Indexes;
+        self.session.intent = EditIntent::Apply;
+        self.session.cancel();
+        true
+    }
+
+    /// 选索引类型（界面上的分段选择）。
+    pub fn choose_index_kind(&mut self, kind: IndexKind) {
+        if IndexKind::resolve(self.session.index_unique, self.session.index_kind) == kind {
+            return;
+        }
+        self.session.set_index_kind(kind);
+        self.sync_auto_index_name();
+        self.session.intent = EditIntent::Apply;
+        self.session.cancel();
+    }
+
+    /// 已选第 `position` 列的前缀长度。空或不是正整数时不写前缀。
+    pub fn set_index_prefix(&mut self, position: usize, text: &str) -> bool {
+        let Some(column) = self.session.index_columns.get_mut(position) else {
+            return false;
+        };
+        let prefix = text.trim().parse::<u32>().ok().filter(|length| *length > 0);
+        if column.prefix == prefix {
+            return false;
+        }
+        column.prefix = prefix;
+        self.session.intent = EditIntent::Apply;
+        true
     }
 
     fn toggle_index_order(&mut self, name: &str) {
@@ -2198,53 +2302,12 @@ impl StructurePane {
                     }
                 })
                 .collect(),
-            Section::Indexes => snapshot
-                .indexes
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
+            Section::Indexes => index_display_order(&snapshot.indexes)
+                .into_iter()
+                .map(|index| {
+                    let row = &snapshot.indexes[index];
                     let reason = localize(&row.reason, locale);
-                    let is_pk = row.protected && row.reason == "由主键约束维护";
-                    let cols_display = if !row.columns.is_empty() {
-                        row.columns
-                            .iter()
-                            .map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    } else {
-                        extract_index_target_expr(row.sql.as_deref())
-                    };
-                    let mut kind_badges = div().flex().items_center().gap(px(4.)).min_w_0();
-                    if is_pk {
-                        kind_badges = kind_badges.child(kit::pill(text("structure.index.primaryBadge"), p.warn, p.warn_soft));
-                    } else if row.unique {
-                        kind_badges = kind_badges.child(kit::pill(text("structure.index.uniqueBadge"), p.accent_text, p.accent_soft));
-                    } else {
-                        kind_badges = kind_badges.child(kit::pill(text("structure.index.normalBadge"), p.text_muted, p.hover));
-                    }
-                    if row.partial {
-                        kind_badges = kind_badges.child(kit::pill(text("structure.index.partialBadge"), p.info, p.accent_soft));
-                    } else if row.expression {
-                        kind_badges = kind_badges.child(kit::pill(text("structure.index.exprBadge"), p.info, p.accent_soft));
-                    }
-                    let name_cell = div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .min_w_0()
-                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.name.clone())))
-                        .when(row.protected, |this| {
-                            let tip = if reason.is_empty() { text("structure.index.primaryBadge") } else { reason.clone() };
-                            this.child(
-                                div()
-                                    .id(SharedString::from(format!("structure-index-lock-{index}")))
-                                    .test_support()
-                                    .flex_none()
-                                    .tooltip_text(SharedString::from(tip))
-                                    .child(kit::icon(if is_pk { IconName::Key } else { IconName::Lock }, 12., if is_pk { p.warn } else { p.text_faint })),
-                            )
-                        })
-                        .into_any_element();
+                    let editable = self.index_editable(row);
                     let mut menu = vec![MenuEntry {
                         id: format!("copy-index-{index}"),
                         label: text("structure.menu.copyName"),
@@ -2262,16 +2325,29 @@ impl StructurePane {
                         });
                     }
                     menu.push(MenuEntry {
+                        id: format!("edit-index-{index}"),
+                        label: text("structure.index.edit"),
+                        action: RowAction::EditIndex(row.name.clone()),
+                        disabled: editable.is_some(),
+                        reason: editable,
+                    });
+                    menu.push(MenuEntry {
                         id: format!("drop-index-{index}"),
                         label: text("structure.index.delete"),
                         action: RowAction::DropIndex(row.name.clone()),
                         disabled: row.protected,
-                        reason: (row.protected && !reason.is_empty()).then_some(reason),
+                        reason: (row.protected && !reason.is_empty()).then_some(reason.clone()),
                     });
                     RowSpec {
                         id: format!("indexes-{index}"),
-                        dim: false,
-                        cells: vec![name_cell, cell_mono(cols_display, mono, p), kind_badges.into_any_element()],
+                        dim: row.visible == Some(false),
+                        cells: vec![
+                            index_name_cell(index, row, &reason, p),
+                            index_kind_cell(index, row, locale, p),
+                            index_columns_cell(row, mono, p),
+                            index_comment_cell(index, row, p),
+                            index_visible_cell(row, locale, p),
+                        ],
                         menu,
                     }
                 })
@@ -2373,6 +2449,30 @@ impl StructurePane {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// 方言的索引能力（新建/修改索引表单按它隐藏不支持的项）。
+    fn index_features(&self) -> crate::adapters::ddl::IndexFeatures {
+        crate::adapters::ddl::ddl_named(&self.session.target.engine).map(|dialect| dialect.index_features()).unwrap_or_default()
+    }
+
+    /// 这个索引能不能在索引页修改；不能时给出原因的 i18n 键。
+    /// 不能在页面上修改时给出原因（已按界面语言）。
+    fn index_editable(&self, row: &crate::ddl::Index) -> Option<String> {
+        let locale = self.session.locale;
+        if row.partial || row.expression {
+            return Some(i18n::text(locale, "structure.index.editExpr"));
+        }
+        // 能在一条语句里删了再加的方言（MySQL 家族）连主键与外键依赖的索引也能改；其余引擎要先删，受约束维护的不行。
+        let single_statement = self.index_features().primary;
+        if row.protected && !single_statement {
+            return Some(i18n::text(locale, "structure.index.editLocked"));
+        }
+        // 先删后建只能按普通定义重建；带访问方法、INCLUDE、聚集等属性的索引会被悄悄改掉，不让改。
+        if !single_statement && !row.rebuild_loses.is_empty() {
+            return Some(i18n::text(locale, "structure.index.editLoses").replace("{props}", &row.rebuild_loses.join(", ")));
+        }
+        None
     }
 
     fn incoming_fk_card(&self, entity: &Entity<StructurePane>, p: &Palette, cx: &App) -> Option<AnyElement> {
@@ -2566,6 +2666,9 @@ impl StructurePane {
             RowAction::ToggleColumnDrop(index) => self.toggle_column(index, "drop"),
             RowAction::RevertColumn(index) => self.revert_column(index),
             RowAction::AddColumn => self.add_column(),
+            RowAction::EditIndex(name) => {
+                self.begin_edit_index(&name);
+            }
             RowAction::DropIndex(name) => self.preview_drop_index(name, cx),
             RowAction::DropForeignKey(name) => self.preview_drop_fk(name, cx),
             RowAction::OpenTable { schema, table } => {
@@ -2999,6 +3102,7 @@ enum RowAction {
     ToggleColumnDrop(usize),
     RevertColumn(usize),
     AddColumn,
+    EditIndex(String),
     DropIndex(String),
     DropForeignKey(String),
     OpenTable { schema: String, table: String },
@@ -3022,15 +3126,18 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
     for column in columns {
         head = head.child(table_cell(*column, div().truncate().child(SharedString::from(i18n::text(locale, column.key)))));
     }
+    // 行尾快捷按钮：编辑（索引）与删除。各行按钮个数取最多的一行，表头留同样宽度，列才对得齐。
     let quick_of = |entries: &[MenuEntry]| {
         entries
             .iter()
-            .find(|entry| matches!(entry.action, RowAction::DropIndex(_) | RowAction::DropForeignKey(_)))
+            .filter(|entry| matches!(entry.action, RowAction::EditIndex(_) | RowAction::DropIndex(_) | RowAction::DropForeignKey(_)))
             .cloned()
+            .collect::<Vec<_>>()
     };
-    let has_quick = rows.iter().any(|row| quick_of(&row.menu).is_some());
-    if has_quick {
-        head = head.child(div().w(px(28.)).flex_none());
+    let quick_count = rows.iter().map(|row| quick_of(&row.menu).len()).max().unwrap_or(0);
+    let quick_w = QUICK_W * quick_count as f32;
+    if quick_count > 0 {
+        head = head.child(div().w(px(quick_w)).flex_none());
     }
     let mut body = div().flex().flex_col();
     for (row_index, row) in rows.into_iter().enumerate() {
@@ -3060,31 +3167,190 @@ fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows:
             .when(row.dim, |this| this.opacity(0.5))
             .hover(|style| style.bg(p.hover))
             .child(cells)
-            .when_some(quick, |this, entry| {
-                let owner = entity.clone();
-                let action = entry.action.clone();
-                let button = kit::icon_button(
-                    SharedString::from(format!("structure-quick-{}", entry.id)),
-                    IconName::Trash,
-                    SharedString::from(entry.label.clone()),
-                    move |_, _, cx| {
-                        owner.update(cx, |pane, cx| {
-                            pane.apply_row_action(action.clone(), cx);
-                            cx.notify();
-                        });
-                    },
-                )
-                .xsmall()
-                .disabled(entry.disabled);
-                let button = match entry.reason.clone() {
-                    Some(reason) if entry.disabled => button.tooltip(SharedString::from(reason)),
-                    _ => button,
-                };
-                this.child(div().w(px(28.)).flex_none().flex().justify_center().child(button))
+            .when(quick_count > 0, |this| {
+                let mut slot = div().w(px(quick_w)).flex_none().flex().items_center().justify_end();
+                for entry in quick {
+                    let owner = entity.clone();
+                    let action = entry.action.clone();
+                    let icon = if matches!(entry.action, RowAction::EditIndex(_)) { IconName::SquarePen } else { IconName::Trash };
+                    let button = kit::icon_button(
+                        SharedString::from(format!("structure-quick-{}", entry.id)),
+                        icon,
+                        SharedString::from(entry.label.clone()),
+                        move |_, _, cx| {
+                            owner.update(cx, |pane, cx| {
+                                pane.apply_row_action(action.clone(), cx);
+                                cx.notify();
+                            });
+                        },
+                    )
+                    .xsmall()
+                    .disabled(entry.disabled);
+                    let button = match entry.reason.clone() {
+                        Some(reason) if entry.disabled => button.tooltip(SharedString::from(reason)),
+                        _ => button,
+                    };
+                    slot = slot.child(div().w(px(QUICK_W)).flex_none().flex().justify_center().child(button));
+                }
+                this.child(slot)
             });
         body = body.child(line);
     }
     div().flex().flex_col().child(head).child(body).into_any_element()
+}
+
+/// 行尾每个快捷按钮占的宽度。
+const QUICK_W: f32 = 28.;
+
+/// 界面上显示的索引类型。读取层没填类型（旧快照、测试夹具）时按主键原因与唯一标记推出。
+fn display_kind(row: &crate::ddl::Index) -> IndexKind {
+    if row.kind == IndexKind::Primary || (row.protected && row.reason == "由主键约束维护") {
+        IndexKind::Primary
+    } else {
+        IndexKind::resolve(row.unique, row.kind)
+    }
+}
+
+/// 索引的显示顺序：主键置顶，其余保持读取顺序。返回 `indexes` 的下标。
+fn index_display_order(indexes: &[crate::ddl::Index]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..indexes.len()).collect();
+    order.sort_by_key(|position| display_kind(&indexes[*position]) != IndexKind::Primary);
+    order
+}
+
+/// 索引类型的显示键与配色。
+fn index_kind_key(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Primary => "structure.index.primaryBadge",
+        IndexKind::Unique => "structure.index.uniqueBadge",
+        IndexKind::Normal => "structure.index.normalBadge",
+        IndexKind::Fulltext => "structure.index.fulltextBadge",
+        IndexKind::Spatial => "structure.index.spatialBadge",
+    }
+}
+
+/// 一个索引列在字段 chips 里的文字：列名、前缀长度与降序标记。
+fn index_column_label(column: &crate::ddl::IndexColumn) -> String {
+    let mut label = column.name.clone();
+    if let Some(length) = column.prefix {
+        label.push_str(&format!("({length})"));
+    }
+    if column.descending {
+        label.push_str(" DESC");
+    }
+    label
+}
+
+fn index_name_cell(index: usize, row: &crate::ddl::Index, reason: &str, p: &Palette) -> AnyElement {
+    let is_pk = display_kind(row) == IndexKind::Primary;
+    let mut tip = row.name.clone();
+    if row.protected && !reason.is_empty() {
+        tip = format!("{tip}\n{reason}");
+    }
+    div()
+        .id(SharedString::from(format!("structure-index-name-{index}")))
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(kit::Space::SM))
+        .min_w_0()
+        .overflow_hidden()
+        .tooltip_text(SharedString::from(tip))
+        .when(row.protected, |this| {
+            let icon = if is_pk { IconName::Key } else { IconName::Lock };
+            this.child(
+                div()
+                    .id(SharedString::from(format!("structure-index-lock-{index}")))
+                    .test_support()
+                    .flex_none()
+                    .child(kit::icon(icon, kit::IconSize::INLINE, if is_pk { p.warn } else { p.text_faint })),
+            )
+        })
+        .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.name.clone())))
+        .into_any_element()
+}
+
+fn index_kind_cell(index: usize, row: &crate::ddl::Index, locale: Locale, p: &Palette) -> AnyElement {
+    let text = |key: &str| i18n::text(locale, key);
+    let kind = display_kind(row);
+    let (fg, bg) = match kind {
+        IndexKind::Primary => (p.warn, p.warn_soft),
+        IndexKind::Unique => (p.accent_text, p.accent_soft),
+        IndexKind::Fulltext | IndexKind::Spatial => (p.info, p.accent_soft),
+        IndexKind::Normal => (p.text_muted, p.hover),
+    };
+    let mut badges = div()
+        .id(SharedString::from(format!("structure-index-type-{index}")))
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(kit::Space::XS))
+        .min_w_0()
+        .overflow_hidden()
+        .child(kit::pill(text(index_kind_key(kind)), fg, bg));
+    if row.partial {
+        badges = badges.child(kit::pill(text("structure.index.partialBadge"), p.info, p.accent_soft));
+    } else if row.expression {
+        badges = badges.child(kit::pill(text("structure.index.exprBadge"), p.info, p.accent_soft));
+    }
+    match row.method.clone().filter(|method| !method.trim().is_empty()) {
+        Some(method) => badges.tooltip_text(SharedString::from(method)).into_any_element(),
+        None => badges.into_any_element(),
+    }
+}
+
+fn index_columns_cell(row: &crate::ddl::Index, mono: &SharedString, p: &Palette) -> AnyElement {
+    if row.columns.is_empty() {
+        return cell_mono(extract_index_target_expr(row.sql.as_deref()), mono, p);
+    }
+    let full = row.columns.iter().map(index_column_label).collect::<Vec<_>>().join(", ");
+    let mut chips = div().flex().items_center().gap(px(kit::Space::XS)).min_w_0().overflow_hidden();
+    for (position, column) in row.columns.iter().enumerate() {
+        chips = chips.child(
+            div()
+                .flex()
+                .flex_shrink(1.)
+                .min_w_0()
+                .items_center()
+                .gap(px(kit::Space::XXS))
+                .px(px(kit::Space::XS))
+                .rounded(px(Radius::TAG))
+                .bg(p.hover)
+                .text_size(px(TypeScale::XS))
+                .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{}", position + 1))))
+                .child(div().min_w_0().truncate().font_family(mono.clone()).text_color(p.text_muted).child(SharedString::from(index_column_label(column)))),
+        );
+    }
+    div()
+        .id(SharedString::from(format!("structure-index-cols-{}", row.name)))
+        .min_w_0()
+        .overflow_hidden()
+        .tooltip_text(SharedString::from(full))
+        .child(chips)
+        .into_any_element()
+}
+
+fn index_comment_cell(index: usize, row: &crate::ddl::Index, p: &Palette) -> AnyElement {
+    let comment = row.comment.clone().unwrap_or_default();
+    if comment.trim().is_empty() {
+        return cell_text("—".into(), p);
+    }
+    div()
+        .id(SharedString::from(format!("structure-index-comment-{index}")))
+        .min_w_0()
+        .truncate()
+        .text_color(p.text_muted)
+        .tooltip_text(SharedString::from(comment.clone()))
+        .child(SharedString::from(comment))
+        .into_any_element()
+}
+
+fn index_visible_cell(row: &crate::ddl::Index, locale: Locale, p: &Palette) -> AnyElement {
+    match row.visible {
+        Some(true) => cell_text(i18n::text(locale, "structure.index.visibleYes"), p),
+        Some(false) => kit::pill(i18n::text(locale, "structure.index.visibleNo"), p.warn, p.warn_soft),
+        None => cell_text("—".into(), p),
+    }
 }
 
 fn table_cell(cell: ColumnSpec, child: impl IntoElement) -> gpui_kit::Div {
@@ -3341,7 +3607,8 @@ impl StructurePane {
             (StructureMode::Existing, Section::Indexes) => {
                 let snap = self.snapshot.as_ref()?;
                 let plan = preview_plan(snap, &self.session.action());
-                plan.steps.first().map(|step| step.sql.clone())
+                // 修改索引在不能一条语句完成的引擎上是删除 + 新建两条：两条都显示。
+                (!plan.steps.is_empty()).then(|| plan.steps.iter().map(|step| step.sql.clone()).collect::<Vec<_>>().join("\n"))
             }
             (StructureMode::Existing, Section::ForeignKeys) => {
                 let snap = self.snapshot.as_ref()?;
@@ -3608,7 +3875,7 @@ impl StructurePane {
             .text_size(px(TypeScale::XS))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(p.text_faint)
-            .child(div().flex_1().min_w(px(widths.name_min)).pl(px(16.)).child(t("structure.field.column")))
+            .child(div().flex_1().min_w_0().overflow_hidden().pl(px(browse::NAME_INSET)).truncate().child(t("structure.field.column")))
             .child(div().w(px(widths.kind)).flex_none().child(t("structure.field.type")))
             .child(div().w(px(widths.nullable)).flex_none().flex().justify_center().child(t("ui.structure.nullable")))
             .child(div().w(px(widths.default)).flex_none().child(t("ui.structure.default")))
@@ -3803,9 +4070,7 @@ impl StructurePane {
         let generated_flag = column.generated.is_some();
         let menu_engine = engine.to_owned();
         let current_type = column.type_name.clone();
-        let type_menu = Button::new(SharedString::from(format!("structure-types-{index}")))
-            .ghost()
-            .xsmall()
+        let type_menu = kit::inline_menu_button(SharedString::from(format!("structure-types-{index}")))
             .icon(IconName::ChevronDown)
             .disabled(type_locked)
             .tooltip(if orig_primary {
@@ -3961,6 +4226,7 @@ impl StructurePane {
         let mut row = div()
             .id(SharedString::from(format!("structure-row-columns-{index}")))
             .test_support()
+            .w_full()
             .flex()
             .items_center()
             .gap(px(FieldWidths::GAP))
@@ -3987,7 +4253,8 @@ impl StructurePane {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(widths.name_min))
+                    .min_w_0()
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .gap(px(4.))
@@ -4178,17 +4445,52 @@ impl StructurePane {
                     });
                 let selected = self.session.index_columns.clone();
                 let unique = self.session.index_unique;
-                let name = self.field("index_name", "structure.field.index", "idx_table_column", window, cx);
+                let features = self.index_features();
+                let kind = IndexKind::resolve(unique, self.session.index_kind);
+                // 主键在 MySQL 家族里固定叫 PRIMARY：选主键时不显示名称输入。
+                let name = (kind != IndexKind::Primary).then(|| self.field("index_name", "structure.field.index", "idx_table_column", window, cx));
                 let unique_entity = entity.clone();
                 let auto_entity = entity.clone();
+                let many_kinds = features.fulltext || features.spatial || features.primary;
+                let kind_choice = many_kinds.then(|| {
+                    let mut kinds = Vec::new();
+                    if features.primary {
+                        kinds.push(IndexKind::Primary);
+                    }
+                    kinds.extend([IndexKind::Unique, IndexKind::Normal]);
+                    if features.fulltext {
+                        kinds.push(IndexKind::Fulltext);
+                    }
+                    if features.spatial {
+                        kinds.push(IndexKind::Spatial);
+                    }
+                    let items = kinds
+                        .into_iter()
+                        .map(|choice| {
+                            let owner = entity.clone();
+                            (
+                                SharedString::from(format!("structure-index-kind-{choice:?}").to_lowercase()),
+                                t(index_kind_key(choice)),
+                                kind == choice,
+                                kit::click(move |_, _, cx| {
+                                    owner.update(cx, |pane, cx| {
+                                        pane.choose_index_kind(choice);
+                                        cx.notify();
+                                    });
+                                }),
+                            )
+                        })
+                        .collect();
+                    kit::form_row(t("structure.index.kind"), kit::segmented_sized(items, &p, metrics.control_h), &p)
+                });
                 form = form.child(
                     div()
                         .flex()
                         .flex_wrap()
                         .items_end()
-                        .gap(px(12.))
-                        .child(div().flex_1().min_w(px(200.)).max_w(px(360.)).child(name))
-                        .when(!self.index_name_auto && !selected.is_empty(), |this| {
+                        .gap(px(kit::Space::LG))
+                        .when_some(name, |this, name| this.child(div().flex_1().min_w(px(ControlSize::FORM_MIN_W)).max_w(px(ControlSize::FORM_MAX_W)).child(name)))
+                        .when(!self.index_name_auto && !selected.is_empty() && kind != IndexKind::Primary, |this| {
                             this.child(kit::tool_button("structure-index-autoname", Some(IconName::Sparkles), t("structure.index.autoName"), move |_, _, cx| {
                                 auto_entity.update(cx, |pane, cx| {
                                     pane.apply_auto_index_name();
@@ -4196,9 +4498,11 @@ impl StructurePane {
                                 });
                             }))
                         })
-                        .child(
+                        .when_some(kind_choice, |this, choice| this.child(choice))
+                        .when(!many_kinds, |this| this.child(
                             div()
                                 .id("structure-index-unique")
+                                .test_support()
                                 .h(px(metrics.control_h))
                                 .flex()
                                 .items_center()
@@ -4208,17 +4512,15 @@ impl StructurePane {
                                 .child(div().text_size(px(TypeScale::SM)).child(t("structure.index.unique")))
                                 .on_click(move |_, _, cx| {
                                     unique_entity.update(cx, |pane, cx| {
-                                        pane.session.index_unique = !pane.session.index_unique;
-                                        pane.sync_auto_index_name();
-                                        pane.session.intent = EditIntent::Apply;
-                                        pane.session.cancel();
+                                        let next = if pane.session.index_unique { IndexKind::Normal } else { IndexKind::Unique };
+                                        pane.choose_index_kind(next);
                                         cx.notify();
                                     });
                                 }),
-                        ),
+                        )),
                 );
                 let picker = self.ensure_index_picker(&names, window, cx);
-                let ordered = self.index_order_list(&entity, &selected, &p, cx);
+                let ordered = self.index_order_list(&entity, &selected, kind, features.prefix, &p, window, cx);
                 form = form.child(kit::form_row(
                     t("structure.section.columns"),
                     div()
@@ -4232,7 +4534,13 @@ impl StructurePane {
                         .child(ordered),
                     &p,
                 ));
-                if self.index_name_conflict() {
+                if features.comment {
+                    let comment_value = self.session.index_comment.clone();
+                    let placeholder = i18n::text(locale, "structure.index.commentHint");
+                    let comment = self.draft_input(120_000, &comment_value, &placeholder, window, cx);
+                    form = form.child(kit::form_row(t("structure.field.comment"), div().max_w(px(ControlSize::FORM_MAX_W)).child(comment), &p));
+                }
+                if self.index_name_conflict() && self.session.index_editing.is_none() {
                     form = form.child(create::issue_line(
                         "structure-index-name-conflict",
                         &i18n::fill(&i18n::text(locale, "structure.index.nameTaken"), &[("name", self.session.index_name.trim())]),
@@ -4273,9 +4581,7 @@ impl StructurePane {
                 let column_entity = entity.clone();
                 let ref_entity = entity.clone();
                 let local_button = stack_frame(|| {
-                    Button::new("structure-fk-local")
-                        .ghost()
-                        .small()
+                    kit::menu_button("structure-fk-local")
                         .icon(IconName::ChevronDown)
                         .tooltip(t("structure.field.column"))
                         .accessibility_label(t("structure.field.column"))
@@ -4291,9 +4597,7 @@ impl StructurePane {
                         .into_any_element()
                 });
                 let tables_button = stack_frame(|| {
-                    Button::new("structure-fk-tables")
-                        .ghost()
-                        .small()
+                    kit::menu_button("structure-fk-tables")
                         .icon(IconName::ChevronDown)
                         .tooltip(t("ui.structure.refTable"))
                         .accessibility_label(t("ui.structure.refTable"))
@@ -4309,9 +4613,7 @@ impl StructurePane {
                         .into_any_element()
                 });
                 let columns_button = stack_frame(|| {
-                    Button::new("structure-fk-ref-cols")
-                        .ghost()
-                        .small()
+                    kit::menu_button("structure-fk-ref-cols")
                         .icon(IconName::ChevronDown)
                         .tooltip(t("ui.structure.refColumn"))
                         .accessibility_label(t("ui.structure.refColumn"))
@@ -4356,9 +4658,7 @@ impl StructurePane {
                             .gap(px(4.))
                             .child(div().flex_1().min_w_0().child(schema))
                             .child(
-                                Button::new("structure-fk-schemas")
-                                    .ghost()
-                                    .small()
+                                kit::menu_button("structure-fk-schemas")
                                     .icon(IconName::ChevronDown)
                                     .tooltip(t("structure.fk.refSchema"))
                                     .accessibility_label(t("structure.fk.refSchema"))
@@ -4409,9 +4709,7 @@ impl StructurePane {
                 let delete_checked = delete_now.clone();
                 let update_checked = update_now.clone();
                 let delete_button = stack_frame(|| {
-                    Button::new("structure-fk-on-delete")
-                        .outline()
-                        .small()
+                    kit::field_menu_button("structure-fk-on-delete")
                         .icon(IconName::ChevronDown)
                         .label(SharedString::from(format!("{}: {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
                         .dropdown_menu(move |mut menu, _, _| {
@@ -4435,9 +4733,7 @@ impl StructurePane {
                 });
                 let update_button = stack_frame(|| {
                     let actions = fk_action_choices(&self.session.target.engine);
-                    Button::new("structure-fk-on-update")
-                        .outline()
-                        .small()
+                    kit::field_menu_button("structure-fk-on-update")
                         .icon(IconName::ChevronDown)
                         .label(SharedString::from(format!("{}: {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
                         .dropdown_menu(move |mut menu, _, _| {
@@ -5003,9 +5299,7 @@ impl StructurePane {
             let target_for_menu = self.session.target.clone();
             let qualified_for_menu = qualified.clone();
             let ddl_for_menu = self.snapshot.as_ref().map(|snap| definition_text(snap).0).unwrap_or_default();
-            let btn = Button::new("structure-more")
-                .ghost()
-                .small()
+            let btn = kit::menu_button("structure-more")
                 .icon(IconName::Ellipsis);
             let btn = if compact_header {
                 btn.tooltip(t("structure.action.more"))
@@ -5305,6 +5599,11 @@ impl StructurePane {
                         move |_, _, cx| {
                             owner.update(cx, |pane, cx| {
                                 pane.composer_open = !pane.composer_open;
+                                // 关掉“编辑索引”后再打开是新建：不把被编辑索引的草稿带过去。
+                                if !pane.composer_open && pane.session.index_editing.is_some() {
+                                    pane.reset_composer_drafts();
+                                    pane.index_picker = None;
+                                }
                                 pane.session.cancel();
                                 cx.notify();
                             });
@@ -5330,7 +5629,10 @@ impl StructurePane {
                 }
             } else if let Some(form) = form.filter(|_| !composer_section || self.composer_open) {
                 let heading = match section {
-                    Section::Indexes => t("structure.index.new"),
+                    Section::Indexes => match &self.session.index_editing {
+                        Some(name) => SharedString::from(i18n::fill(&i18n::text(locale, "structure.index.editing"), &[("name", name)])),
+                        None => t("structure.index.new"),
+                    },
                     Section::ForeignKeys => t("structure.fk.new"),
                     Section::Danger => t("structure.section.danger"),
                     Section::Partitions => t("structure.section.partitions"),
@@ -5529,15 +5831,10 @@ impl StructurePane {
                 });
             })
             .child(
-                div()
-                    .id("structure-preview-dialog")
+                kit::modal_surface("structure-preview-dialog", preview_title.clone(), kit::ModalWidth::PREVIEW, p)
                     .test_support()
-                    .role(gpui_kit::Role::Dialog)
-                    .aria_label(preview_title.clone())
-                    .occlude()
                     .track_focus(&preview_focus)
                     .focus_trap("structure-preview-dialog", &preview_focus)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
                         if key == "escape" {
@@ -5574,17 +5871,7 @@ impl StructurePane {
                             }
                         }
                     })
-                    .w(px(640.))
-                    .max_w(relative(0.92))
-                    .max_h(relative(0.92))
-                    .flex()
-                    .flex_col()
                     .overflow_hidden()
-                    .bg(p.raised)
-                    .border_1()
-                    .border_color(if p.dark { p.line_soft } else { p.line })
-                    .rounded(px(Radius::PANEL))
-                    .shadow_lg()
                     .child(
                         div()
                             .flex_none()

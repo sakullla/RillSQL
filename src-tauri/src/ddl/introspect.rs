@@ -115,6 +115,7 @@ pub fn table_of(action: &Action) -> Option<&str> {
         | Action::DropTrigger { .. } => None,
         Action::AlterColumns { table, .. }
         | Action::CreateIndex { table, .. }
+        | Action::AlterIndex { table, .. }
         | Action::DropIndex { table, .. }
         | Action::CreateForeignKey { table, .. }
         | Action::DropForeignKey { table, .. }

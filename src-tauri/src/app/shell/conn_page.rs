@@ -2,9 +2,8 @@
 //! 窄窗口只留列表，操作跟在选中行上。标签由用户自己维护（新建、改名、换色、删除）。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AnyElement, AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
@@ -277,9 +276,7 @@ impl Workbench {
         let export_rill = self.model.text("conn.page.exportRill");
         let label = self.t("conn.page.transfer");
         let entity = cx.entity().downgrade();
-        Button::new(id)
-            .ghost()
-            .small()
+        kit::menu_button(id)
             .tooltip(label.clone())
             .child(
                 div()
@@ -1180,9 +1177,7 @@ impl Workbench {
                 .into_any_element()
         } else {
             let current_for_menu = current_group_id.clone();
-            Button::new("conn-detail-group")
-                .ghost()
-                .xsmall()
+            kit::inline_menu_button("conn-detail-group")
                 .label(self.t("conn.page.changeGroup"))
                 .dropdown_menu(move |mut menu, _, _| {
                     menu = menu.min_w(px(180.));

@@ -1,13 +1,13 @@
 //! MySQL 家族（MySQL / MariaDB）的 DDL 方言：按库限定、CHANGE COLUMN 改字段、AUTO_INCREMENT、InnoDB 表选项、
 //! RENAME TABLE，以及事件启停的库级动作。MariaDB 复用同一实现，按 `engine` 区分。
 
-use crate::adapters::ddl::{AdminSections, DdlDialect, TableOptionSpec, ViewModifier};
+use crate::adapters::ddl::{AdminSections, DdlDialect, IndexFeatures, TableOptionSpec, ViewModifier};
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{
-    Action, ColumnDraft, EnumSetDraft, GeneratedColumnDraft, LiteralQuoting, Plan, Request, Risk, Snapshot, Step, TableOptions,
+    Action, ColumnDraft, EnumSetDraft, GeneratedColumnDraft, Index, IndexDraft, IndexKind, LiteralQuoting, Plan, Request, Risk, Snapshot, Step, TableOptions,
 };
 use crate::ddl::plan::{column_sql_for, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
 use crate::ddl::sql::{qualified_table, valid_name};
@@ -108,6 +108,24 @@ impl DdlDialect for MysqlDdl {
 
     fn drop_index_sql(&self, snapshot: &Snapshot, index: &str) -> Result<String, String> {
         Ok(format!("DROP INDEX {index} ON {};", self.qualified_table(&snapshot.database, &snapshot.schema, &snapshot.name)?))
+    }
+
+    fn index_features(&self) -> IndexFeatures {
+        IndexFeatures { fulltext: true, spatial: true, primary: true, prefix: true, comment: true }
+    }
+
+    fn index_comment_clause(&self, comment: &str) -> Option<String> {
+        Some(format!(" COMMENT {}", mysql_text(comment)))
+    }
+
+    /// 一条 ALTER TABLE：DROP INDEX/PRIMARY KEY 与 ADD … 一起执行，失败时整条不生效。
+    /// 原索引不可见时新索引保持不可见（MySQL 写 INVISIBLE，MariaDB 写 IGNORED），主键没有可见性。
+    fn alter_index_sql(&self, snapshot: &Snapshot, old: &Index, new: &IndexDraft, key_parts: &str, tail: &str) -> Option<Result<String, String>> {
+        let qualified = match self.qualified_table(&snapshot.database, &snapshot.schema, &snapshot.name) {
+            Ok(qualified) => qualified,
+            Err(message) => return Some(Err(message)),
+        };
+        Some(Ok(mysql_alter_index(self.engine, &qualified, old, new, key_parts, tail)))
     }
 
     fn drop_foreign_key_clause(&self) -> &'static str {
@@ -293,6 +311,30 @@ impl MysqlDdl {
         }
         None
     }
+}
+
+/// 改索引的 ALTER TABLE：先删原索引（主键用 DROP PRIMARY KEY），再按新定义添加。
+pub(crate) fn mysql_alter_index(engine: Engine, qualified: &str, old: &Index, new: &IndexDraft, key_parts: &str, tail: &str) -> String {
+    let drop = if old.kind == IndexKind::Primary || old.name.eq_ignore_ascii_case("PRIMARY") {
+        "DROP PRIMARY KEY".to_owned()
+    } else {
+        format!("DROP INDEX {}", quote_ident(engine, &old.name))
+    };
+    let name = quote_ident(engine, new.name.trim());
+    let add = match new.kind {
+        IndexKind::Primary => format!("ADD PRIMARY KEY ({key_parts}){tail}"),
+        IndexKind::Unique => format!("ADD UNIQUE INDEX {name} ({key_parts}){tail}"),
+        IndexKind::Normal => format!("ADD INDEX {name} ({key_parts}){tail}"),
+        IndexKind::Fulltext => format!("ADD FULLTEXT INDEX {name} ({key_parts}){tail}"),
+        IndexKind::Spatial => format!("ADD SPATIAL INDEX {name} ({key_parts}){tail}"),
+    };
+    let hidden = old.visible == Some(false) && new.kind != IndexKind::Primary;
+    let visibility = match (hidden, engine) {
+        (false, _) => "",
+        (true, Engine::Mariadb) => " IGNORED",
+        (true, _) => " INVISIBLE",
+    };
+    format!("ALTER TABLE {qualified} {drop}, {add}{visibility};")
 }
 
 /// MySQL 字符串字面量：单引号翻倍，反斜杠也要翻倍（默认 sql_mode 下反斜杠是转义符）。

@@ -320,6 +320,14 @@ pub enum RangeScope {
     LoadedSubset,
 }
 
+/// 一处查找命中：稳定行 id、当前显示行号与逻辑列。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FindHit {
+    row_id: String,
+    row: usize,
+    column: usize,
+}
+
 /// 查找只覆盖已经读取的行；服务器范围才把关键字下发到数据库。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FindScope {
@@ -506,6 +514,14 @@ pub struct SharedGrid {
     schema: Option<TableSchema>,
     search: String,
     find_scope: FindScope,
+    /// 查找命中的格子（R4）：按显示行、可见列顺序排列，含暂存的新值。查找不再筛掉行，只高亮与导航。
+    find_hits: Vec<FindHit>,
+    /// 当前命中在 `find_hits` 里的位置；还没定位到任何一处时为 None。
+    find_current: Option<usize>,
+    /// 上一次计算命中时的输入指纹：行、暂存、列显隐和关键字都没变时不重算。
+    find_key: u64,
+    /// 本地重排（排序、筛选、换页）的次数，作为命中指纹的一部分。
+    view_serial: u64,
     /// 目标表所在连接是否仍然可用（已打开且未失联）；会话自己拿不到服务，由 GridPane 同步。
     target_live: bool,
     filters: Vec<FilterDraft>,
@@ -598,6 +614,89 @@ pub struct SharedGrid {
     /// 查询结果的唯一键已在后台读到并定位了行（外键与完整值读取因此可用），但写入仍锁着，
     /// 直到用户点“解锁编辑”；点了以后不必再读一次结构。
     query_located: bool,
+    /// 最近一次“预览并提交”被校验拦下后显示的问题；修正暂存时自动重新计算，全部消失后收起。
+    problems: Vec<SubmitProblem>,
+    problems_shown: bool,
+    /// 最近一次确认写入失败的原因：预览保持打开，失败语句与数据库错误显示在顶部。
+    commit_error: Option<CommitFailure>,
+}
+
+/// 提交前校验发现的一处问题：按稳定行 id 与逻辑列定位，界面据此画红框并逐个定位。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitProblem {
+    pub row_id: String,
+    pub column: usize,
+    pub kind: ProblemKind,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProblemKind {
+    /// 新增行里 NOT NULL、无默认、非自增的列没有赋值。
+    Required,
+    /// 把 NOT NULL 列显式设成了 NULL。
+    NotNull,
+    /// 类型不符（数字、布尔、JSON、二进制……）或暂存时已被拦下的值。
+    Invalid,
+    /// 日期 / 时间认不出来。
+    Temporal,
+    /// 超出 char/varchar/binary 声明长度。
+    Length,
+    /// 超出 decimal 声明的整数位数。
+    Precision,
+}
+
+/// 一次确认写入失败的说明：失败的那条语句（事务层整体拒绝时没有）、数据库错误、失败之前的语句落到了哪里。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFailure {
+    pub statement: Option<String>,
+    pub message: String,
+    pub written: WrittenScope,
+}
+
+impl CommitFailure {
+    /// 一条都没写进去：暂存全部原样可重试。
+    pub fn nothing_written(&self) -> bool {
+        self.written == WrittenScope::Nothing
+    }
+}
+
+/// 部分失败时，失败之前已执行的语句按事务模式落到了哪里（R2：说明哪些已写入、哪些未写入）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrittenScope {
+    /// 一条都没执行。
+    Nothing,
+    /// 自动提交：这些语句已写入并成为最终结果。
+    Committed(usize),
+    /// 手动事务：这些语句已在当前事务中执行、尚未提交，需要提交事务才会生效。
+    InTransaction(usize),
+    /// 已执行，但事务结果无法确认（中止、未知）。
+    Unconfirmed(usize),
+}
+
+impl WrittenScope {
+    pub fn of(report: &CommitDto) -> Self {
+        let count = report.applied.len();
+        if count == 0 {
+            Self::Nothing
+        } else if report.applied_not_committed {
+            Self::InTransaction(count)
+        } else if report.committed {
+            Self::Committed(count)
+        } else {
+            Self::Unconfirmed(count)
+        }
+    }
+
+    /// 这一种落点的说明文案键与已执行条数。
+    pub fn text_key(self) -> (&'static str, usize) {
+        match self {
+            Self::Nothing => ("grid.preview.nothingWritten", 0),
+            Self::Committed(count) => ("grid.preview.partlyCommitted", count),
+            Self::InTransaction(count) => ("grid.preview.partlyInTransaction", count),
+            Self::Unconfirmed(count) => ("grid.preview.partlyUnconfirmed", count),
+        }
+    }
 }
 
 impl Default for SharedGrid {
@@ -618,6 +717,10 @@ impl SharedGrid {
             schema: None,
             search: String::new(),
             find_scope: FindScope::Loaded,
+            find_hits: Vec::new(),
+            find_current: None,
+            find_key: 0,
+            view_serial: 0,
             target_live: true,
             filters: Vec::new(),
             applied_filters: Vec::new(),
@@ -673,6 +776,9 @@ impl SharedGrid {
             pristine: HashSet::new(),
             query_located: false,
             empty_hint: true,
+            problems: Vec::new(),
+            problems_shown: false,
+            commit_error: None,
         }
     }
 
@@ -1157,10 +1263,108 @@ impl SharedGrid {
         self.find_scope
     }
 
-    /// 查找只筛当前已读取的行，不发查询。
+    /// 查找（R4）：已读取范围内不再筛掉行，只算出命中的格子供高亮与“i / n”导航；
+    /// 关键字一变，当前命中回到第一处。服务器范围是整表筛选，行由服务器筛过，调用方随后重读。
     pub fn set_search(&mut self, text: &str) {
+        let changed = self.search != text;
         self.search = text.to_owned();
-        self.recompute();
+        if self.find_scope == FindScope::Server {
+            self.recompute();
+        } else {
+            self.refresh_find();
+        }
+        if changed {
+            self.find_current = (!self.find_hits.is_empty()).then_some(0);
+        }
+    }
+
+    /// 命中输入的指纹：关键字、行视图、暂存值、可见列与已读到的原值。
+    fn find_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.search.hash(&mut hasher);
+        self.view_serial.hash(&mut hasher);
+        self.sheet_serial.hash(&mut hasher);
+        self.rows.len().hash(&mut hasher);
+        self.visible_columns().hash(&mut hasher);
+        self.full.values().map(HashMap::len).sum::<usize>().hash(&mut hasher);
+        self.pristine.len().hash(&mut hasher);
+        for overlay in &self.overlays {
+            overlay.row_id.hash(&mut hasher);
+            overlay.column_name.hash(&mut hasher);
+            overlay.value.hash(&mut hasher);
+            overlay.kind.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// 数据或暂存变了才重算命中；界面每次同步表格时调用，没有变化时只算一个指纹。
+    pub fn sync_find(&mut self) {
+        if self.find_fingerprint() != self.find_key {
+            self.refresh_find();
+        }
+    }
+
+    /// 重算命中：逐行、按可见列顺序比较格子里显示的文字（暂存的新值优先于原值；NULL、默认/自动生成占位与二进制不算）。
+    /// 当前命中尽量停在原来那一格；那一格不再命中时保留同一序号（越界则退到末尾）。
+    pub fn refresh_find(&mut self) {
+        let previous = self.find_current.and_then(|index| self.find_hits.get(index)).map(|hit| (hit.row_id.clone(), hit.column));
+        let previous_index = self.find_current;
+        self.find_hits.clear();
+        let needle = self.search.trim().to_lowercase();
+        if !needle.is_empty() {
+            let columns = self.visible_columns();
+            for row in 0..self.rows.len() {
+                for &column in &columns {
+                    let shown = self.show_cell_raw(row, column, false);
+                    if matches!(shown.kind, CellKind::Text | CellKind::Large) && shown.label.to_lowercase().contains(&needle) {
+                        self.find_hits.push(FindHit { row_id: self.rows[row].id.clone(), row, column });
+                    }
+                }
+            }
+        }
+        self.find_current = match previous {
+            _ if self.find_hits.is_empty() => None,
+            Some((row_id, column)) => self
+                .find_hits
+                .iter()
+                .position(|hit| hit.row_id == row_id && hit.column == column)
+                .or_else(|| previous_index.map(|index| index.min(self.find_hits.len() - 1))),
+            None => None,
+        };
+        self.find_key = self.find_fingerprint();
+    }
+
+    /// 命中的格子（显示行、逻辑列）。
+    pub fn find_hit_cells(&self) -> Vec<(usize, usize)> {
+        self.find_hits.iter().map(|hit| (hit.row, hit.column)).collect()
+    }
+
+    /// 当前命中的格子。
+    pub fn find_current_cell(&self) -> Option<(usize, usize)> {
+        self.find_current.and_then(|index| self.find_hits.get(index)).map(|hit| (hit.row, hit.column))
+    }
+
+    /// 查找栏上的“i / n”：当前是第几处（从 1 起，未定位时为 None）与命中总数。
+    pub fn find_status(&self) -> (Option<usize>, usize) {
+        (self.find_current.map(|index| index + 1), self.find_hits.len())
+    }
+
+    /// 下一处 / 上一处（首尾相接），返回要跳到的格子；没有命中时为 None。
+    pub fn find_step(&mut self, forward: bool) -> Option<(usize, usize)> {
+        let count = self.find_hits.len();
+        if count == 0 {
+            self.find_current = None;
+            return None;
+        }
+        let next = match (self.find_current, forward) {
+            (None, true) => 0,
+            (None, false) => count - 1,
+            (Some(index), true) => (index + 1) % count,
+            (Some(index), false) => (index + count - 1) % count,
+        };
+        self.find_current = Some(next);
+        self.find_current_cell()
     }
 
     /// 目标连接是否仍可用：只有它为真时整表筛选才可能重新读表。
@@ -1680,10 +1884,11 @@ impl SharedGrid {
         true
     }
 
-    /// 全清：可视化条件、直接表达式和查找一起清掉，来源显式回到无条件。
+    /// 全清筛选：可视化条件与直接表达式清掉，来源显式回到无条件。查找文本保留（R4）；
+    /// 整表筛选（服务器范围的关键字）也是筛选，退回已读取范围，关键字继续用来高亮。
     pub fn clear_filters(&mut self) {
         self.reset_filter_state();
-        self.search.clear();
+        self.find_scope = FindScope::Loaded;
         self.recompute();
     }
 
@@ -1887,7 +2092,7 @@ impl SharedGrid {
         if !self.rows.is_empty() {
             return SheetEmptiness::Rows;
         }
-        let narrowing = !self.search.trim().is_empty()
+        let narrowing = (self.find_scope == FindScope::Server && !self.search.trim().is_empty())
             || match self.applied {
                 FilterSource::Sql => !self.applied_sql.trim().is_empty(),
                 FilterSource::Visual => !self.applied_filters.is_empty(),
@@ -3051,25 +3256,23 @@ impl SharedGrid {
             return Gate::Readonly;
         }
         if inserted {
+            // 新增行与修改行同一模型：用户输入进覆盖层，显示、预览和 INSERT 都只读这一份。
+            // 覆盖层就是“用户显式赋过值”的记号（包括明确设成的 NULL）；新增行上的值不单独提交，
+            // 所以没有提交编号，由那条 INSERT 带上。撤销这一步后格子自然回到“默认 / 未赋值”。
             let message = self.validation_message(column, value.as_deref());
             let gate = if message.is_some() { Gate::Validation } else { Gate::Writable };
             self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
-            if gate == Gate::Writable {
-                // 用户动过这一格：之后写进 INSERT 的是这个值（包括明确设成的 NULL），不再交给默认值。
-                self.pristine.remove(&(row_id.to_owned(), column_name.clone()));
-                if let Some(origin) = self.source.iter_mut().find(|item| item.id == row_id) {
-                    if let Some(slot) = Arc::make_mut(origin).values.get_mut(column) {
-                        *slot = value.clone();
-                    }
-                }
-                if let Some(slot) = display.and_then(|row| self.rows.get_mut(row)).and_then(|item| Arc::make_mut(item).values.get_mut(column)) {
-                    *slot = value;
-                }
-            } else {
-                self.overlays.push(overlay(draw_row, row_id.to_owned(), column, column_name, value, Gate::Validation, message.unwrap_or_else(|| "grid.status.validation".to_owned()), None, "update"));
-            }
+            self.revive_row(row_id);
+            self.overlays.push(overlay(draw_row, row_id.to_owned(), column, column_name, value, gate, message.unwrap_or_default(), None, "update"));
             self.close_preview();
             return gate;
+        }
+        // 改回数据库里的原值就是撤销这一格的修改：不留一条“待提交”。否则 MySQL 对未变化的 UPDATE 报告影响 0 行，
+        // 写入失败后用户把值改回原样重试会被当成“影响 0 行，已停止”。原值只是预览信封时不判定相等。
+        if self.matches_source_value(row_id, column, value.as_deref()) {
+            self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
+            self.close_preview();
+            return self.gate_for_edit(display, column, value.as_deref());
         }
         let gate = self.gate_for_edit(display, column, value.as_deref());
         let message = match gate {
@@ -3086,9 +3289,25 @@ impl SharedGrid {
         self.seq += 1;
         let change_id = if gate == Gate::Writable { Some(format!("u:{}", self.seq)) } else { None };
         self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
+        self.revive_row(row_id);
         self.overlays.push(overlay(draw_row, row_id.to_owned(), column, column_name, value, gate, message, change_id, "update"));
         self.close_preview();
         gate
+    }
+
+    /// 已有行这一格从数据库读到的原值是否就是 `value`（不看暂存）。原值是长文本 / 二进制的预览信封时返回 false。
+    fn matches_source_value(&self, row_id: &str, column: usize, value: Option<&str>) -> bool {
+        let Some(row) = self.any_row(row_id).filter(|row| !row.inserted) else {
+            return false;
+        };
+        let Some(original) = row.values.get(column) else {
+            return false;
+        };
+        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
+        if original.as_deref().is_some_and(|text| crate::grid::preview_envelope(text, type_name, self.sheet_preview_bytes).is_some()) {
+            return false;
+        }
+        original.as_deref() == value
     }
 
     /// 撤销最近一次暂存的修改（更新、插入或删除）。没有可撤销的内容时返回 false。
@@ -3204,11 +3423,12 @@ impl SharedGrid {
     }
 
     pub fn open_preview(&mut self) -> Result<Vec<String>, String> {
+        self.commit_error = None;
         let schema = self.schema.clone().ok_or_else(|| i18n::text(self.locale, "grid.status.readonly"))?;
         let staged = self.overlays.clone();
         let planned = staged
             .iter()
-            .filter(|item| item.gate == Gate::Writable && item.change_id.is_some())
+            .filter(|item| pending_change(item))
             .filter_map(|overlay| {
                 let row = self.row_for(overlay)?;
                 Some((
@@ -3269,24 +3489,42 @@ impl SharedGrid {
         &self.sql
     }
 
+    /// 整批写入在执行任何语句之前就被拒绝（事务已中止、连接断开、结构读取失败……）：
+    /// 一条都没写进去，暂存全部保留为可重试；预览保持打开并在顶部说明原因。
     pub fn keep_failure(&mut self, message: &str) {
-        for overlay in &mut self.overlays {
-            if overlay.gate == Gate::Writable {
-                overlay.gate = Gate::Execution;
-                overlay.message = message.to_owned();
-            }
+        let failure = CommitFailure { statement: None, message: message.to_owned(), written: WrittenScope::Nothing };
+        if self.preview_open {
+            let _ = self.open_preview();
         }
-        self.close_preview();
+        self.commit_error = Some(failure);
+    }
+
+    /// 最近一次确认写入失败的说明；重新修改、取消或成功后清除。
+    pub fn commit_error(&self) -> Option<&CommitFailure> {
+        self.commit_error.as_ref()
+    }
+
+    /// 写入后的重读换掉了整页（会关掉预览）：部分失败的说明要跟着剩下的暂存重新打开，
+    /// 失败语句、数据库错误和已写入范围都不能因为刷新而消失。
+    pub fn reopen_failure(&mut self, failure: CommitFailure) {
+        if self.open_preview().is_ok() {
+            self.commit_error = Some(failure);
+        }
     }
 
     pub fn cancel_preview(&mut self) {
         self.preview_open = false;
+        self.commit_error = None;
     }
 
+    /// 暂存每变一次都会关掉预览（预览里的 SQL 已经不是当前暂存）；顺带重算已显示的校验问题，
+    /// 修正一格后红框和改动条上的问题数立刻跟着变。
     pub fn close_preview(&mut self) {
         self.preview_open = false;
         self.preview_sql.clear();
         self.preview_ids.clear();
+        self.commit_error = None;
+        self.refresh_problems();
     }
 
     /// 只有预览仍打开时才给出提交请求。调用方还必须把 confirmed 传给 application::grid::commit。
@@ -3314,13 +3552,7 @@ impl SharedGrid {
             };
             let applied = self.overlays.remove(index);
             match applied.kind {
-                "insert" => {
-                    self.source.retain(|row| row.id != applied.row_id);
-                    self.retained.retain(|row| row.id != applied.row_id);
-                    // 新增行上没有提交编号的批量值已经随 INSERT 写入，不能留下来冒充未提交。
-                    self.overlays.retain(|item| item.row_id != applied.row_id);
-                    self.cloned.retain(|item| item != &applied.row_id);
-                }
+                "insert" => self.settle_inserted_row(&applied.row_id),
                 "delete" => {
                     self.source.retain(|row| row.id != applied.row_id);
                     self.rows.retain(|row| row.id != applied.row_id);
@@ -3329,6 +3561,13 @@ impl SharedGrid {
                 _ => self.set_row_value(&applied.row_id, &applied.column_name, applied.value.clone()),
             }
         }
+        // 失败的那条标成执行失败（格子红框 + 原因），但仍是待提交的暂存：修正或直接重试都会再次进预览。
+        // 没执行到的其余暂存保持原样。
+        let failure = report.failed.as_ref().map(|failed| CommitFailure {
+            statement: Some(failed.sql.clone()).filter(|sql| !sql.trim().is_empty()),
+            message: failed.message.clone(),
+            written: WrittenScope::of(report),
+        });
         if let Some(failed) = &report.failed {
             if let Some(overlay) = self.overlays.iter_mut().find(|item| item.change_id.as_deref() == Some(failed.id.as_str())) {
                 overlay.gate = Gate::Execution;
@@ -3350,6 +3589,12 @@ impl SharedGrid {
         self.invalidate_previews();
         self.close_preview();
         self.recompute();
+        // 有一条被数据库拒绝：预览按剩下的暂存重建并保持打开，已成功的语句不再出现，
+        // 顶部写明失败语句与数据库错误。
+        if let Some(failure) = failure {
+            let _ = self.open_preview();
+            self.commit_error = Some(failure);
+        }
     }
 
     pub fn column_names(&self) -> Vec<String> {
@@ -3746,6 +3991,40 @@ impl SharedGrid {
         self.retained = keep;
     }
 
+    /// 新增行已经写进数据库：它不再是待提交的新增，但也不能从网格里消失。
+    /// 把用户赋的值落到行上，转成普通的已读取行；数据库给的值（默认、自增）还不知道，
+    /// 也没有定位列，所以在重读之前保持不可定位（只读），表模式随后的重读会换成数据库里的真实行。
+    fn settle_inserted_row(&mut self, row_id: &str) {
+        let assigned: Vec<(String, Option<String>)> = self
+            .overlays
+            .iter()
+            .filter(|item| item.row_id == row_id && item.kind == "update")
+            .map(|item| (item.column_name.clone(), item.value.clone()))
+            .collect();
+        let names: Vec<String> = self.columns.iter().map(|column| column.name.clone()).collect();
+        if !self.source.iter().any(|row| row.id == row_id) {
+            if let Some(row) = self.retained.iter().find(|row| row.id == row_id).cloned() {
+                self.source.push(row);
+            }
+        }
+        for row in self.source.iter_mut().chain(self.rows.iter_mut()).filter(|row| row.id == row_id) {
+            let row = Arc::make_mut(row);
+            row.inserted = false;
+            row.located = false;
+            row.locator.clear();
+            for (name, value) in &assigned {
+                if let Some(slot) = names.iter().position(|item| item == name).and_then(|index| row.values.get_mut(index)) {
+                    *slot = value.clone();
+                }
+            }
+        }
+        self.retained.retain(|row| row.id != row_id);
+        // 新增行上没有提交编号的批量值已经随 INSERT 写入，不能留下来冒充未提交。
+        self.overlays.retain(|item| item.row_id != row_id);
+        self.cloned.retain(|item| item != row_id);
+        self.pristine.retain(|(id, _)| id != row_id);
+    }
+
     fn prune_retained(&mut self) {
         self.retained.retain(|row| self.overlays.iter().any(|overlay| overlay.row_id == row.id));
     }
@@ -3772,15 +4051,9 @@ impl SharedGrid {
         // 直接 SQL 条件已经由服务器筛过，这里不再套用可视化条件（它们不是当前来源）。
         let visual = self.applied == FilterSource::Visual;
         let applied = if visual { self.applied_filters.len() } else { 0 };
-        let filtering = !self.search.is_empty() || applied > 0 || self.sort.is_some();
-        // 已读取范围的查找在本地筛；服务器范围的行已经是服务器筛过的，不再重复筛。
-        if self.find_scope == FindScope::Loaded && !self.search.is_empty() {
-            let needle = self.search.to_lowercase();
-            rows.retain(|row| {
-                row.values.iter().any(|value| value.as_deref().unwrap_or("").to_lowercase().contains(&needle))
-                    || row.locator.iter().any(|(_, value)| value.as_deref().unwrap_or("").to_lowercase().contains(&needle))
-            });
-        }
+        // 已读取范围的查找只高亮不筛行（R4）；服务器范围的关键字是整表筛选，行已经由服务器筛过。
+        let server_search = self.find_scope == FindScope::Server && !self.search.is_empty();
+        let filtering = server_search || applied > 0 || self.sort.is_some();
         // 还在编辑、没有应用的草稿不改变可见行；非法条件也不改变可见行，
         // 否则一个漏填的上界会让整张表突然变空。
         let drafts: Vec<FilterDraft> = if visual {
@@ -3821,6 +4094,9 @@ impl SharedGrid {
         self.clamp_scroll();
         // 重排后不再存在的行不能留着它的完整值；查看面板也跟着关闭。
         self.prune_full();
+        // 行序或行集合变了：查找命中的显示行号跟着重算。
+        self.view_serial = self.view_serial.wrapping_add(1);
+        self.refresh_find();
     }
 
     /// 选择的锚点和焦点按行 id 找回；原来那一行真的消失时才清空选择。
@@ -4014,7 +4290,7 @@ impl SharedGrid {
         let mut changes = Vec::new();
         let staged = self.overlays.clone();
         for overlay in &staged {
-            if overlay.gate != Gate::Writable {
+            if !pending_change(overlay) {
                 continue;
             }
             let Some(id) = overlay.change_id.clone() else { continue };
@@ -4032,21 +4308,7 @@ impl SharedGrid {
                     kind: "insert".to_owned(),
                     sets: Vec::new(),
                     locator: Vec::new(),
-                    values: self
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, column)| {
-                            if self.pristine_value(&row.id, column) {
-                                return None;
-                            }
-                            let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
-                            if value.is_none() && self.unassigned(&row.id, column) {
-                                return None;
-                            }
-                            Some(ValueArg { column: column.name.clone(), value, resolved: false })
-                        })
-                        .collect(),
+                    values: self.insert_cells(&row).into_iter().map(|(column, value)| ValueArg { column, value, resolved: false }).collect(),
                 }),
                 _ => {
                     if overlay.column_name.is_empty() {
@@ -4066,6 +4328,14 @@ impl SharedGrid {
     }
 
     fn insert_values(&self, row: &GridRow) -> Vec<(String, Cell)> {
+        self.insert_cells(row).into_iter().map(|(column, value)| (column, cell_of(value))).collect()
+    }
+
+    /// 新增行写进 INSERT 的列（预览与提交同源）：只有用户显式赋过值的列（含显式 NULL）。
+    /// 没碰过的列一律省略，交给数据库默认值处理，不再替用户写一个 NULL。
+    /// “复制为新行”的行沿用原行的值（主键、自增、生成列除外）。
+    fn insert_cells(&self, row: &GridRow) -> Vec<(String, Option<String>)> {
+        let cloned = self.cloned.iter().any(|item| item == &row.id);
         self.columns
             .iter()
             .enumerate()
@@ -4073,13 +4343,25 @@ impl SharedGrid {
                 if self.pristine_value(&row.id, column) {
                     return None;
                 }
-                let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
+                let value = match self.writable_overlay(&row.id, &column.name) {
+                    Some(value) => value,
+                    None if cloned => row.values.get(index).cloned()?,
+                    None => return None,
+                };
                 if value.is_none() && self.unassigned(&row.id, column) {
                     return None;
                 }
-                Some((column.name.clone(), cell_of(value)))
+                Some((column.name.clone(), value))
             })
             .collect()
+    }
+
+    /// 改了一格就把这一行上次写入失败的标记去掉：新增/删除本身回到待提交，等下一次预览再试。
+    fn revive_row(&mut self, row_id: &str) {
+        for item in self.overlays.iter_mut().filter(|item| item.row_id == row_id && item.kind != "update" && item.gate == Gate::Execution) {
+            item.gate = Gate::Writable;
+            item.message.clear();
+        }
     }
 
     /// 新增行里留空就不写进 INSERT 的列：自增列总是如此；"复制为新行"的主键列也一样，
@@ -4670,7 +4952,7 @@ impl SharedGrid {
 
     /// 暂存里有多少条将要进预览的变更（按提交编号计）。
     pub fn staged_count(&self) -> usize {
-        self.overlays.iter().filter(|item| item.gate == Gate::Writable && item.change_id.is_some()).count()
+        self.overlays.iter().filter(|item| pending_change(item)).count()
     }
 
     /// 新增行、修改格、删除行分开计数。只算能进预览的暂存。
@@ -4678,8 +4960,18 @@ impl SharedGrid {
         let mut inserts = BTreeSet::new();
         let mut updates = BTreeSet::new();
         let mut deletes = BTreeSet::new();
+        let mut blocked = 0;
+        let mut failed = 0;
         for item in &self.overlays {
-            if item.gate != Gate::Writable || item.change_id.is_none() {
+            if item.gate == Gate::Execution {
+                failed += 1;
+            }
+            // 被校验拦下、没有提交编号的已有行修改：仍是未提交的改动（标签也标着待提交），改动条不能消失。
+            // 新增行上的格子已经算在那一行的新增里。
+            if item.gate == Gate::Validation && item.kind == "update" && !self.any_row(&item.row_id).is_some_and(|row| row.inserted) {
+                blocked += 1;
+            }
+            if !pending_change(item) {
                 continue;
             }
             match item.kind {
@@ -4695,7 +4987,168 @@ impl SharedGrid {
                 _ => {}
             }
         }
-        StagedSummary { inserts: inserts.len(), updates: updates.len(), deletes: deletes.len() }
+        StagedSummary {
+            inserts: inserts.len(),
+            updates: updates.len(),
+            deletes: deletes.len(),
+            blocked,
+            failed,
+            invalid: if self.problems_shown { self.problems.len() } else { 0 },
+        }
+    }
+
+    /// 提交前校验：必填、非空列的显式 NULL、类型、日期时间、长度与精度。无法从结构确定的约束
+    /// （唯一、外键、CHECK）交给数据库，失败时由预览保留并说明。结果按显示位置排序。
+    pub fn submit_problems(&self) -> Vec<SubmitProblem> {
+        let mut problems: Vec<SubmitProblem> = Vec::new();
+        if self.schema.is_none() {
+            return problems;
+        }
+        let push = |problems: &mut Vec<SubmitProblem>, row_id: &str, column: usize, kind: ProblemKind, message: String| {
+            if !problems.iter().any(|item| item.row_id == row_id && item.column == column) {
+                problems.push(SubmitProblem { row_id: row_id.to_owned(), column, kind, message });
+            }
+        };
+        // 暂存时已经被拦下的值先列：它们的原因最具体。
+        for item in self.overlays.iter().filter(|item| item.kind == "update" && item.gate == Gate::Validation) {
+            let Some(column) = self.columns.iter().position(|column| column.name == item.column_name) else { continue };
+            let message = if item.message.is_empty() {
+                i18n::text(self.locale, "grid.status.validation")
+            } else if item.message.starts_with("grid.") {
+                i18n::text(self.locale, &item.message)
+            } else {
+                item.message.clone()
+            };
+            push(&mut problems, &item.row_id, column, ProblemKind::Invalid, message);
+        }
+        for insert in self.overlays.iter().filter(|item| item.kind == "insert" && pending_change(item)) {
+            let Some(row) = self.any_row(&insert.row_id) else { continue };
+            let cells = self.insert_cells(row);
+            for (index, column) in self.columns.iter().enumerate() {
+                if column.generated || column.auto || self.pristine_value(&row.id, column) {
+                    continue;
+                }
+                match cells.iter().find(|(name, _)| *name == column.name) {
+                    None if !column.nullable && column.default.is_none() && !self.unassigned(&row.id, column) => {
+                        let message = i18n::fill(&i18n::text(self.locale, "grid.check.required"), &[("column", &column.name)]);
+                        push(&mut problems, &row.id, index, ProblemKind::Required, message);
+                    }
+                    Some((_, None)) if !column.nullable => {
+                        let message = i18n::fill(&i18n::text(self.locale, "grid.check.notNull"), &[("column", &column.name)]);
+                        push(&mut problems, &row.id, index, ProblemKind::NotNull, message);
+                    }
+                    Some((_, Some(text))) => {
+                        if let Some((kind, message)) = self.submit_check(index, text) {
+                            push(&mut problems, &row.id, index, kind, message);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for item in self.overlays.iter().filter(|item| item.kind == "update" && item.change_id.is_some() && pending_change(item)) {
+            let Some(index) = self.columns.iter().position(|column| column.name == item.column_name) else { continue };
+            let column = &self.columns[index];
+            match &item.value {
+                None if !column.nullable => {
+                    let message = i18n::fill(&i18n::text(self.locale, "grid.check.notNull"), &[("column", &column.name)]);
+                    push(&mut problems, &item.row_id, index, ProblemKind::NotNull, message);
+                }
+                Some(text) => {
+                    if let Some((kind, message)) = self.submit_check(index, text) {
+                        push(&mut problems, &item.row_id, index, kind, message);
+                    }
+                }
+                None => {}
+            }
+        }
+        problems.sort_by_key(|item| (self.row_index(&item.row_id).unwrap_or(usize::MAX), self.logical_to_display(item.column).unwrap_or(item.column)));
+        problems
+    }
+
+    /// 一个已显式赋值的文本能不能写进这一列：与暂存同一套类型检查，再加上日期时间、长度与精度。
+    fn submit_check(&self, column: usize, text: &str) -> Option<(ProblemKind, String)> {
+        if text.contains('\u{1}') {
+            return None;
+        }
+        if let Some(message) = self.validation_message(column, Some(text)) {
+            return Some((ProblemKind::Invalid, message));
+        }
+        let type_name = self.columns.get(column)?.type_name.as_str();
+        if let Some(kind) = super::temporal::TemporalKind::of(type_name) {
+            if !text.trim().is_empty() && super::temporal::normalize(kind, text).is_err() {
+                let message = i18n::fill(&i18n::text(self.locale, "grid.check.temporal"), &[("value", text.trim()), ("format", kind.format_hint())]);
+                return Some((ProblemKind::Temporal, message));
+            }
+        }
+        check_declared_size(self.locale, type_name, text)
+    }
+
+    /// “预览并提交”前的校验：有问题就记下并显示（红框、改动条上的问题数），返回问题数。
+    pub fn check_submit(&mut self) -> usize {
+        self.problems = self.submit_problems();
+        self.problems_shown = !self.problems.is_empty();
+        self.problems.len()
+    }
+
+    /// 已显示的问题随暂存重算；全部修正后收起。
+    fn refresh_problems(&mut self) {
+        if !self.problems_shown {
+            return;
+        }
+        self.problems = self.submit_problems();
+        self.problems_shown = !self.problems.is_empty();
+    }
+
+    /// 当前显示的校验问题（按显示位置排序）。
+    pub fn problems(&self) -> &[SubmitProblem] {
+        if self.problems_shown { &self.problems } else { &[] }
+    }
+
+    /// 焦点之后的下一处校验问题（显示行、逻辑列）；到末尾回到第一处。
+    pub fn next_problem_cell(&self) -> Option<(usize, usize)> {
+        let cells: Vec<(usize, usize)> = self.problems().iter().filter_map(|item| Some((self.row_index(&item.row_id)?, item.column))).collect();
+        let focus = self.focus_cell();
+        let order = |cell: &(usize, usize)| (cell.0, self.logical_to_display(cell.1).unwrap_or(cell.1));
+        if let Some(focus) = focus {
+            if let Some(next) = cells.iter().copied().find(|cell| order(cell) > order(&focus)) {
+                return Some(next);
+            }
+        }
+        cells.first().copied()
+    }
+
+    /// 这一格要画成“有问题”的原因：提交前校验、暂存校验或写入失败。没有问题时为空。
+    /// 新增/删除整行失败时，这一行的每一格（含行号，column 为 None）都带上原因。
+    pub fn cell_issue(&self, row: usize, column: Option<usize>) -> Option<String> {
+        let row_id = self.rows.get(row)?.id.as_str();
+        if let Some(column) = column {
+            if let Some(problem) = self.problems().iter().find(|item| item.row_id == row_id && item.column == column) {
+                return Some(problem.message.clone());
+            }
+            let name = self.columns.get(column)?.name.as_str();
+            if let Some(item) = self
+                .overlays
+                .iter()
+                .find(|item| item.kind == "update" && item.row_id == row_id && item.column_name == name && matches!(item.gate, Gate::Validation | Gate::Execution))
+            {
+                return Some(self.overlay_text(item));
+            }
+        }
+        self.overlays
+            .iter()
+            .find(|item| item.kind != "update" && item.row_id == row_id && item.gate == Gate::Execution)
+            .map(|item| self.overlay_text(item))
+    }
+
+    fn overlay_text(&self, item: &Overlay) -> String {
+        if item.message.is_empty() {
+            self.gate_text(item.gate)
+        } else if item.message.starts_with("grid.") {
+            i18n::text(self.locale, &item.message)
+        } else {
+            item.message.clone()
+        }
     }
 
     /// 这一格相对已读取原值的暂存状态。删除盖过修改，新增行整行都算新增。
@@ -4783,7 +5236,7 @@ impl SharedGrid {
     pub fn next_staged_cell(&self) -> Option<(usize, usize)> {
         let mut cells = Vec::new();
         for item in &self.overlays {
-            if item.gate != Gate::Writable || item.change_id.is_none() {
+            if !pending_change(item) {
                 continue;
             }
             let Some(row) = self.rows.iter().position(|row| row.id == item.row_id) else {
@@ -4889,6 +5342,73 @@ pub struct StagedSummary {
     pub inserts: usize,
     pub updates: usize,
     pub deletes: usize,
+    /// 被校验拦下、还不能进预览的已有行修改。
+    pub blocked: usize,
+    /// 上次写入被数据库拒绝、等待修正或重试的暂存。
+    pub failed: usize,
+    /// “预览并提交”时发现、尚未修正的校验问题。
+    pub invalid: usize,
+}
+
+impl StagedSummary {
+    /// 未提交改动的总数：与 `SharedGrid::uncommitted` 同一判定，改动条与标签的待提交标记同时出现、同时消失。
+    pub fn total(&self) -> usize {
+        self.inserts + self.updates + self.deletes + self.blocked
+    }
+}
+
+/// 仍在等待写入的暂存：可写的，或上次写入失败、保留下来可重试的。
+fn pending_change(item: &Overlay) -> bool {
+    item.change_id.is_some() && matches!(item.gate, Gate::Writable | Gate::Execution)
+}
+
+/// 声明长度与精度校验：char/varchar 按字符数，binary/varbinary 按字节数，decimal(p,s) 的整数位不超过 p-s。
+/// 小数位超出时数据库按规则舍入，不当作错误。
+pub fn check_declared_size(locale: Locale, type_name: &str, text: &str) -> Option<(ProblemKind, String)> {
+    let lower = type_name.trim().to_ascii_lowercase();
+    let open = lower.find('(')?;
+    let close = lower[open..].find(')').map(|at| open + at)?;
+    let base = lower[..open].trim().trim_start_matches("national ").trim();
+    let args: Vec<&str> = lower[open + 1..close].split(',').map(str::trim).collect();
+    let first = args.first().and_then(|value| value.parse::<usize>().ok())?;
+    match base {
+        "char" | "varchar" | "character" | "character varying" | "nchar" | "nvarchar" | "varchar2" | "nvarchar2" | "bpchar" | "char varying" => {
+            let length = text.chars().count();
+            (length > first).then(|| {
+                let message = i18n::fill(&i18n::text(locale, "grid.check.tooLong"), &[("max", &first.to_string()), ("length", &length.to_string())]);
+                (ProblemKind::Length, message)
+            })
+        }
+        "binary" | "varbinary" => {
+            let trimmed = text.trim();
+            let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).or_else(|| trimmed.strip_prefix("\\x"));
+            let bytes = match hex {
+                Some(digits) => digits.len().div_ceil(2),
+                None => trimmed.len(),
+            };
+            (bytes > first).then(|| {
+                let message = i18n::fill(&i18n::text(locale, "grid.check.tooLongBytes"), &[("max", &first.to_string()), ("length", &bytes.to_string())]);
+                (ProblemKind::Length, message)
+            })
+        }
+        "decimal" | "numeric" | "dec" | "number" => {
+            let scale = args.get(1).and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+            let trimmed = text.trim().trim_start_matches(['+', '-']);
+            if trimmed.contains(['e', 'E']) || !crate::grid::decimal_text(text.trim()) {
+                return None;
+            }
+            let integer = trimmed.split('.').next().unwrap_or("").trim_start_matches('0');
+            let allowed = first.saturating_sub(scale);
+            (integer.len() > allowed).then(|| {
+                let message = i18n::fill(
+                    &i18n::text(locale, "grid.check.precision"),
+                    &[("precision", &first.to_string()), ("scale", &scale.to_string()), ("digits", &allowed.to_string())],
+                );
+                (ProblemKind::Precision, message)
+            })
+        }
+        _ => None,
+    }
 }
 
 /// 格子相对已读取原值的暂存标记。
@@ -5633,6 +6153,14 @@ mod tests {
         assert_eq!(grid.unresolved_previews(), 3);
     }
 
+    /// 测试用：在本地应用一条“列 = 值”的可视化筛选（查找不再筛行，需要隐藏行时用筛选）。
+    fn narrow(grid: &mut SharedGrid, column: &str, value: &str) {
+        let index = grid.add_filter(column);
+        assert!(grid.set_filter_op(index, "eq") || grid.filters()[index].op == "eq");
+        assert!(grid.update_filter_text(index, true, value));
+        assert!(grid.apply_filters(false).is_ok());
+    }
+
     #[test]
     fn fit_candidates_match_stable_unicode_sort_and_keep_staged_values() {
         let mut grid = SharedGrid::new();
@@ -5650,7 +6178,7 @@ mod tests {
         expected.truncate(64);
         assert_eq!(grid.fit_column_labels(1), expected, "包含同长度项的稳定顺序");
         assert!(grid.fit_column_labels(2).is_empty());
-        grid.set_search("missing");
+        narrow(&mut grid, "name", "missing");
         assert!(grid.fit_column_labels(1).is_empty());
     }
 
@@ -5715,7 +6243,7 @@ mod tests {
         grid.recompute();
         assert_eq!(grid.rows[0].id, "2");
         assert!(Arc::ptr_eq(&grid.source[1], &grid.rows[0]));
-        grid.set_search("alpha");
+        narrow(&mut grid, "name", "alpha");
         assert_eq!(grid.rows.len(), 1);
         assert!(Arc::ptr_eq(&original, &grid.rows[0]));
         assert_eq!(grid.stage_text_by_id("1", 1, Some("staged".into())), Gate::Writable);
@@ -5724,7 +6252,7 @@ mod tests {
         grid.set_row_value("1", "name", Some("committed".into()));
         assert_eq!(original.values[1].as_deref(), Some("alpha"), "共享的旧快照不被写回修改");
         assert_eq!(grid.retained[0].values[1].as_deref(), Some("committed"));
-        grid.set_search("");
+        grid.clear_filters();
         for view in &grid.rows {
             let source = grid.source.iter().find(|row| row.id == view.id).unwrap();
             assert!(Arc::ptr_eq(source, view));
@@ -5810,12 +6338,13 @@ mod tests {
         let tsv = grid.tsv();
         assert!(tsv.contains("NULL") || tsv.contains('0'));
         assert!(!tsv.lines().any(|line| line.split('\t').count() > 2));
-        grid.set_search("甲");
+        narrow(&mut grid, "name", "甲");
         assert_eq!(grid.scope(), RangeScope::LoadedSubset);
         grid.select_all_loaded();
         assert_eq!(grid.selection_count(), 200);
         assert_ne!(grid.selection_count() as i64, grid.full_count().unwrap());
-        grid.set_search("没有");
+        grid.clear_filters();
+        narrow(&mut grid, "name", "没有");
         grid.select_all_loaded();
         assert_eq!(grid.selection_count(), 0);
         assert_eq!(grid.full_count(), Some(1000));
@@ -5863,8 +6392,8 @@ mod tests {
             Some(2),
             Some(schema()),
         );
-        grid.set_search("1");
-        assert_eq!(grid.loaded_len(), 1, "本地查找只显示匹配行");
+        narrow(&mut grid, "id", "1");
+        assert_eq!(grid.loaded_len(), 1, "本地筛选只显示匹配行");
         assert_eq!(grid.unresolved_previews(), 2, "被隐藏的 id=2 也会被导出写出");
         assert_eq!(grid.unresolved_cells(), vec![(0, 1)], "视图里只看得到一行");
         let reads = grid.begin_unresolved_full();
@@ -5985,15 +6514,17 @@ mod tests {
         assert!(!grid.needs_full(0, 1), "4 KB 上限下这段文本没被截断");
         grid.select(0, 1, false);
         assert_eq!(grid.copy_cell(), shaped, "复制拿到原值");
-        // 暂存用同一个上限判断：这段原值能保存，不会被当成预览挡下。
-        assert_eq!(grid.stage_text(0, 1, Some(shaped.clone())), Gate::Writable, "4 KB 上限下原值可编辑");
+        // 暂存用同一个上限判断：同样形状的协议文本能保存，不会被当成预览挡下。
+        // （改回一模一样的原值等于撤销，不产生修改，所以这里换一段同形状的文本。）
+        let edited = format!("\u{1}t:3000:{}", "b".repeat(17));
+        assert_eq!(grid.stage_text(0, 1, Some(edited.clone())), Gate::Writable, "4 KB 上限下协议形状文本可编辑");
         assert_eq!(grid.overlay_message(0, 1), "");
         // 提交请求带着读出这份行列时的上限，写回前判断与暂存一致。
         let sql = grid.open_preview().expect("暂存的修改可以预览");
-        assert!(sql.iter().any(|line| line.contains(&shaped)), "{sql:?}");
+        assert!(sql.iter().any(|line| line.contains(&edited)), "{sql:?}");
         let request = grid.confirm_request().expect("暂存的修改可以提交");
         assert_eq!(request.preview_bytes, 4096);
-        assert_eq!(request.changes[0].sets[0].value.as_deref(), Some(shaped.as_str()), "写回的是原值");
+        assert_eq!(request.changes[0].sets[0].value.as_deref(), Some(edited.as_str()), "写回的是输入的文本");
 
         // 真的超过 4 KB 的预览信封仍不能暂存：信封不会写进数据库。
         let envelope = format!("\u{1}t:5000:{}", "c".repeat(16));
@@ -6111,6 +6642,39 @@ mod tests {
         assert_eq!(bad.cell_label(0, 1), "zz");
         assert_eq!(bad.gate_at(0, 1), Some(Gate::Validation));
         assert!(bad.confirm_request().is_err());
+    }
+
+    /// R2：写入失败后把格子改回数据库原值，等于撤销这一格：不再留待提交、失败说明与预览一起清掉，
+    /// 不会发出一条“影响 0 行”的 UPDATE。新增行不受影响。
+    #[test]
+    fn editing_back_to_the_original_value_drops_the_staged_change() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("10", vec![Some("10"), Some("甲")], true), row("11", vec![Some("11"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        assert_eq!(grid.stage_text(0, 1, Some("乙".into())), Gate::Writable);
+        assert!(grid.uncommitted());
+        assert!(grid.open_preview().is_ok());
+        grid.keep_failure("Duplicate entry");
+        assert!(grid.commit_error().is_some());
+        // 改回原值：暂存、预览与失败说明都消失，格子显示原值。
+        assert_eq!(grid.stage_text(0, 1, Some("甲".into())), Gate::Writable);
+        assert!(!grid.uncommitted(), "改回原值不留待提交");
+        assert!(!grid.preview_open());
+        assert!(grid.commit_error().is_none());
+        assert_eq!(grid.cell_label(0, 1), "甲");
+        assert!(grid.open_preview().is_err() || grid.preview_sql().is_empty(), "没有要写的语句");
+        // 原值是 NULL 时显式设回 NULL 同样算撤销；改成其它值仍是一条修改。
+        let mut nulls = SharedGrid::new();
+        nulls.load_local(vec![text_column("id"), text_column("name")], vec![row("10", vec![Some("10"), None], true)], Some(1), Some(schema()));
+        assert_eq!(nulls.stage_text(0, 1, Some("丙".into())), Gate::Writable);
+        assert_eq!(nulls.stage_text(0, 1, None), Gate::Writable);
+        assert!(!nulls.uncommitted());
+        assert_eq!(nulls.stage_text(0, 1, Some(String::new())), Gate::Writable);
+        assert!(nulls.uncommitted(), "空串不是 NULL，仍是修改");
     }
 
     #[test]
@@ -6420,16 +6984,22 @@ mod tests {
             Some(2),
             Some(schema()),
         );
-        // 默认查找只筛已读取行，不下发关键字。
+        // 默认查找只高亮已读取行（R4）：行全部保留，不下发关键字。
         grid.set_search("乙");
         assert_eq!(grid.find_scope(), FindScope::Loaded);
-        assert_eq!(grid.loaded_len(), 1);
-        assert_eq!(grid.scope(), RangeScope::LoadedSubset);
+        assert_eq!(grid.loaded_len(), 2);
+        assert_eq!(grid.scope(), RangeScope::Fetched);
+        assert_eq!(grid.find_status(), (Some(1), 1));
         assert_eq!(grid.page_request().unwrap().search, None);
-        // 无命中不是表为空。
+        // 无命中也不改行：网格不是空的。
         grid.set_search("没有");
+        assert_eq!(grid.find_status(), (None, 0));
+        assert_eq!(grid.emptiness(), SheetEmptiness::Rows);
+        // 筛选无命中不是表为空。
+        narrow(&mut grid, "name", "没有");
         assert_eq!(grid.emptiness(), SheetEmptiness::NoMatch);
         assert_eq!(grid.state_text(false), i18n::text(Locale::ZhCn, "grid.state.noMatch"));
+        grid.clear_filters();
         let mut empty = SharedGrid::new();
         empty.load_local(vec![text_column("id")], Vec::new(), Some(0), Some(schema()));
         assert_eq!(empty.emptiness(), SheetEmptiness::TableEmpty);
@@ -6439,10 +7009,66 @@ mod tests {
         assert!(grid.set_find_scope(FindScope::Server).is_ok());
         assert_eq!(grid.page_request().unwrap().search.as_deref(), Some("乙"));
         assert_eq!(grid.loaded_len(), 2, "服务器范围的行已经是服务器筛过的");
-        // 切回来又变成本地查找。
+        // 切回来又变成本地查找：只高亮，行全部保留。
         assert!(grid.set_find_scope(FindScope::Loaded).is_ok());
         assert_eq!(grid.page_request().unwrap().search, None);
-        assert_eq!(grid.loaded_len(), 1);
+        assert_eq!(grid.loaded_len(), 2);
+        assert_eq!(grid.find_hit_cells(), vec![(1, 1)]);
+        // 清除筛选把整表筛选退回已读取范围，但不清空查找文本。
+        assert!(grid.set_find_scope(FindScope::Server).is_ok());
+        grid.clear_filters();
+        assert_eq!(grid.find_scope(), FindScope::Loaded);
+        assert_eq!(grid.find_text(), "乙");
+        assert_eq!(grid.page_request().unwrap().search, None);
+    }
+
+    #[test]
+    fn find_highlights_matches_including_staged_values_and_navigates() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), Some("alpha")], true),
+                row("2", vec![Some("2"), Some("beta")], true),
+                row("3", vec![Some("3"), Some("Alpine")], true),
+                row("4", vec![Some("4"), None], true),
+            ],
+            Some(4),
+            Some(schema()),
+        );
+        grid.set_viewport(2);
+        grid.scroll_to(2);
+        // 不区分大小写，行全部保留，滚动位置不变；当前命中从第一处开始。
+        grid.set_search("alp");
+        assert_eq!(grid.loaded_len(), 4);
+        assert_eq!(grid.visible_bounds().0, 2, "查找不重置滚动");
+        assert_eq!(grid.find_hit_cells(), vec![(0, 1), (2, 1)]);
+        assert_eq!(grid.find_status(), (Some(1), 2));
+        // 下一处 / 上一处首尾相接。
+        assert_eq!(grid.find_step(true), Some((2, 1)));
+        assert_eq!(grid.find_status(), (Some(2), 2));
+        assert_eq!(grid.find_step(true), Some((0, 1)));
+        assert_eq!(grid.find_step(false), Some((2, 1)));
+        // 暂存的新值参与匹配，旧值不再算命中；数据没变时只比指纹不重算。
+        assert_eq!(grid.stage_text(1, 1, Some("ALPS".to_owned())), Gate::Writable);
+        assert_eq!(grid.stage_text(0, 1, Some("gamma".to_owned())), Gate::Writable);
+        grid.sync_find();
+        assert_eq!(grid.find_hit_cells(), vec![(1, 1), (2, 1)]);
+        assert_eq!(grid.find_current_cell(), Some((2, 1)), "当前命中仍停在原来那一格");
+        // NULL 不按 "NULL" 字样命中；数字列按显示文本命中。
+        grid.set_search("null");
+        assert_eq!(grid.find_status(), (None, 0));
+        assert_eq!(grid.find_step(true), None);
+        grid.set_search("3");
+        assert_eq!(grid.find_hit_cells(), vec![(2, 0)]);
+        // 隐藏列不参与查找；排序后命中跟着新的显示行。
+        grid.set_search("a");
+        grid.sort = Some(("id".into(), true));
+        grid.recompute();
+        assert_eq!(grid.find_hit_cells().first(), Some(&(1, 1)), "id=3 排到第 1 行（倒序），Alpine 命中");
+        grid.set_search("");
+        assert!(grid.find_hit_cells().is_empty());
+        assert_eq!(grid.find_status(), (None, 0));
     }
 
     #[test]
@@ -7748,10 +8374,10 @@ mod tests {
         assert_eq!(grid.cell_kind_at(0, total), CellKind::Auto, "生成列由数据库算出");
         assert_eq!(grid.cell_kind_at(0, note), CellKind::Null, "没有默认值的可空列是 NULL");
         let sql = insert_statement(&mut grid);
-        for column in ["id", "created_time", "status", "total"] {
+        // 没碰过的列（包括没有默认值的可空列）一律省略，交给数据库处理。
+        for column in ["id", "created_time", "status", "total", "note"] {
             assert!(!sql.contains(column), "INSERT 不应写 {column}：{sql}");
         }
-        assert!(sql.contains("note"), "{sql}");
 
         // INT 列输入 abc：就地给出类型错误，不进入暂存（INSERT 不变）。
         let row_id = grid.row_id(0).unwrap().to_owned();
@@ -7954,7 +8580,6 @@ mod tests {
         assert_eq!(grid.cell_label(2, 1), "NULL", "文本 NULL 原样显示");
         assert_ne!(grid.cell_label(1, 1), grid.cell_label(0, 1), "空字符串与 NULL 的显示不同");
     }
-
 }
 
 /// 多格式复制、列显示和批量写入（R2/R3/R4）。
@@ -8826,5 +9451,390 @@ mod selection_performance_tests {
     fn billion_cell_selection_counts_without_allocating_per_cell() {
         assert_eq!(selected_cell_count(&[(0, 0, 999_999, 999)], &[], 1_000_000, 1000), 1_000_000_000);
         assert_eq!(selected_cell_count(&[(0, 0, 999_999, 999)], &[(0, 0, 499_999, 499)], 1_000_000, 1000), 750_000_000);
+    }
+}
+
+/// R1–R3：新增行与修改行同走覆盖层、INSERT 只含显式赋值的列、提交前校验、写入失败可重试、
+/// 改动条与标签的待提交判定一致。
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+    use crate::grid::commands::{FailedDto, StepDto};
+
+    fn col(name: &str, type_name: &str, nullable: bool) -> Column {
+        Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable, ..Column::default() }
+    }
+
+    fn accounts() -> SharedGrid {
+        let columns = vec![
+            Column { primary: true, unique: true, auto: true, ..col("id", "int", false) },
+            col("code", "varchar(4)", false),
+            col("name", "varchar(10)", true),
+            Column { default: Some("0".to_owned()), ..col("qty", "int", false) },
+            col("born", "datetime", true),
+            col("price", "decimal(5,2)", true),
+        ];
+        let schema = schema_from_parts("mysql", "", "accounts", "table", columns, vec!["id".to_owned()]).unwrap();
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "mysql".into();
+        grid.target.connection_id = "shop".into();
+        grid.target.database = "shop".into();
+        grid.target.table = "accounts".into();
+        let row = GridRow {
+            id: "1".into(),
+            values: vec![Some("1".into()), Some("A1".into()), Some("甲".into()), Some("3".into()), None, Some("1.00".into())],
+            located: true,
+            locator: vec![("id".into(), Some("1".into()))],
+            inserted: false,
+        };
+        grid.load_local(columns_from_schema(&schema, true), vec![row], Some(1), Some(schema));
+        grid
+    }
+
+    fn report(applied: &[&str], failed: Option<(&str, &str)>) -> CommitDto {
+        CommitDto {
+            applied: applied.iter().map(|id| StepDto { id: (*id).to_owned(), sql: String::new(), label: String::new() }).collect(),
+            failed: failed.map(|(id, message)| FailedDto { id: id.to_owned(), sql: "INSERT INTO accounts (code) VALUES ('A1')".into(), label: String::new(), message: message.to_owned() }),
+            pending_ids: Vec::new(),
+            rolled_back: false,
+            rule: String::new(),
+            effect: crate::transaction::TransactionEffect::Unchanged,
+            transaction: None,
+            applied_not_committed: false,
+            committed: true,
+        }
+    }
+
+    fn consistent(grid: &SharedGrid) {
+        assert_eq!(grid.staged_summary().total() > 0, grid.uncommitted(), "改动条与标签的待提交标记必须同一判定");
+    }
+
+    fn new_row(grid: &mut SharedGrid) -> String {
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        grid.rows.iter().find(|row| row.inserted).map(|row| row.id.clone()).unwrap()
+    }
+
+    #[test]
+    fn new_row_cells_show_what_was_typed_and_insert_only_assigned_columns() {
+        let mut grid = accounts();
+        let row_id = new_row(&mut grid);
+        let row = grid.row_index(&row_id).unwrap();
+        assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("B2".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id(&row_id, 4, None), Gate::Writable, "显式 NULL 也算赋值");
+        // 单元格显示的就是输入的值，而不是 NULL。
+        assert_eq!(grid.cell_label(row, 1), "B2");
+        assert_eq!(grid.cell_kind_at(row, 4), CellKind::Null);
+        assert_eq!(grid.cell_label(row, 3), "默认: 0", "没碰过的默认列仍交给数据库");
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql, vec!["INSERT INTO accounts (code, born) VALUES ('B2', NULL)".to_owned()]);
+        // 提交集合与预览同源：只带显式赋值的两列。
+        let request = grid.confirm_request().unwrap();
+        let columns: Vec<&str> = request.changes[0].values.iter().map(|value| value.column.as_str()).collect();
+        assert_eq!(columns, vec!["code", "born"]);
+        // 撤销最后一步：born 回到未赋值，INSERT 里随之消失。
+        assert!(grid.undo_last_stage());
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql, vec!["INSERT INTO accounts (code) VALUES ('B2')".to_owned()]);
+        consistent(&grid);
+    }
+
+    #[test]
+    fn required_columns_block_the_preview_until_filled() {
+        let mut grid = accounts();
+        let row_id = new_row(&mut grid);
+        let problems = grid.submit_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, ProblemKind::Required);
+        assert_eq!(problems[0].column, 1);
+        assert!(problems[0].message.contains("code"), "{}", problems[0].message);
+        assert_eq!(grid.check_submit(), 1);
+        assert_eq!(grid.staged_summary().invalid, 1);
+        let row = grid.row_index(&row_id).unwrap();
+        assert!(grid.cell_issue(row, Some(1)).is_some(), "必填格画红框并给出原因");
+        grid.select(row, 0, false);
+        assert_eq!(grid.next_problem_cell(), Some((row, 1)), "可以定位到问题格");
+        // 填上之后问题自动消失，改动条不再显示问题数。
+        assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("C3".into())), Gate::Writable);
+        assert_eq!(grid.staged_summary().invalid, 0);
+        assert!(grid.cell_issue(row, Some(1)).is_none());
+        assert!(grid.problems().is_empty());
+        consistent(&grid);
+    }
+
+    #[test]
+    fn explicit_null_types_length_and_precision_are_checked_before_submit() {
+        let mut grid = accounts();
+        // 修改行：把 NOT NULL 列显式设为 NULL。
+        assert_eq!(grid.stage_text_by_id("1", 1, None), Gate::Writable);
+        // VARCHAR(10) 超长、DATETIME 非法、DECIMAL(5,2) 整数位超出。
+        assert_eq!(grid.stage_text_by_id("1", 2, Some("一二三四五六七八九十一".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 4, Some("2024-13-45 99:00".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 5, Some("1234.5".into())), Gate::Writable);
+        // INT 列非数字在暂存时就被拦下，也算一处问题。
+        assert_eq!(grid.stage_text_by_id("1", 3, Some("abc".into())), Gate::Validation);
+        let problems = grid.submit_problems();
+        let kinds: Vec<(usize, ProblemKind)> = problems.iter().map(|item| (item.column, item.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![(1, ProblemKind::NotNull), (2, ProblemKind::Length), (3, ProblemKind::Invalid), (4, ProblemKind::Temporal), (5, ProblemKind::Precision)]
+        );
+        assert!(problems[1].message.contains("10"), "{}", problems[1].message);
+        assert!(problems[3].message.contains("2024-13-45"), "{}", problems[3].message);
+        // 被拦下的修改仍算未提交：改动条与标签一致。
+        consistent(&grid);
+        assert_eq!(grid.staged_summary().blocked, 1);
+        // 合法写法都通过：长度正好、日期规整、精度内。
+        assert_eq!(grid.stage_text_by_id("1", 1, Some("ABCD".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 2, Some("一二三四五六七八九十".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 4, Some("2024-02-29 10:00:00".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 5, Some("-999.999".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id("1", 3, Some("7".into())), Gate::Writable);
+        assert!(grid.submit_problems().is_empty(), "{:?}", grid.submit_problems());
+    }
+
+    #[test]
+    fn declared_sizes_cover_char_binary_and_decimal() {
+        let zh = Locale::ZhCn;
+        assert_eq!(check_declared_size(zh, "char(2)", "abc").map(|item| item.0), Some(ProblemKind::Length));
+        assert!(check_declared_size(zh, "character varying(3)", "汉字三").is_none());
+        assert_eq!(check_declared_size(zh, "varbinary(2)", "0x010203").map(|item| item.0), Some(ProblemKind::Length));
+        assert!(check_declared_size(zh, "binary(2)", "0x0102").is_none());
+        assert_eq!(check_declared_size(zh, "decimal(4,2)", "123").map(|item| item.0), Some(ProblemKind::Precision));
+        assert!(check_declared_size(zh, "numeric(4,2)", "12.345").is_none(), "小数位由数据库舍入");
+        assert!(check_declared_size(zh, "decimal(10)", "0001234567890").is_none(), "前导零不计");
+        assert!(check_declared_size(zh, "varchar(max)", "x").is_none());
+        assert!(check_declared_size(zh, "text", "x").is_none());
+    }
+
+    #[test]
+    fn a_rejected_insert_stays_retryable_and_the_preview_explains_the_failure() {
+        let mut grid = accounts();
+        assert_eq!(grid.stage_text_by_id("1", 2, Some("乙".into())), Gate::Writable);
+        let row_id = new_row(&mut grid);
+        assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("A1".into())), Gate::Writable);
+        grid.open_preview().unwrap();
+        let request = grid.confirm_request().unwrap();
+        let ids: Vec<String> = request.changes.iter().map(|change| change.id.clone()).collect();
+        assert_eq!(ids.len(), 2);
+        let (update_id, insert_id) = (ids[0].clone(), ids[1].clone());
+        // 修改成功、新增违反唯一约束：成功部分移出，失败的留着、标红，预览保持打开并写明语句与错误。
+        grid.apply_commit(&report(&[&update_id], Some((&insert_id, "Duplicate entry 'A1' for key 'code'"))));
+        assert!(grid.preview_open(), "失败时预览保持打开");
+        let failure = grid.commit_error().cloned().expect("失败说明");
+        assert!(failure.message.contains("Duplicate"));
+        assert!(failure.statement.as_deref().is_some_and(|sql| sql.starts_with("INSERT")));
+        assert!(!failure.nothing_written());
+        assert_eq!(grid.preview_sql().len(), 1, "已成功的修改不再出现在预览里");
+        assert!(grid.preview_sql()[0].starts_with("INSERT"));
+        let row = grid.row_index(&row_id).unwrap();
+        assert!(grid.cell_issue(row, Some(1)).is_some_and(|text| text.contains("Duplicate")), "失败行标红并给出原因");
+        let summary = grid.staged_summary();
+        assert_eq!((summary.inserts, summary.updates, summary.failed), (1, 0, 1));
+        consistent(&grid);
+        // 修正后再提交：失败标记清除，同一条 INSERT 带新值。
+        assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("Z9".into())), Gate::Writable);
+        assert!(!grid.preview_open() && grid.commit_error().is_none(), "修改后预览按新暂存重建");
+        assert_eq!(grid.staged_summary().failed, 0);
+        assert_eq!(grid.open_preview().unwrap(), vec!["INSERT INTO accounts (code) VALUES ('Z9')".to_owned()]);
+        let retry = grid.confirm_request().unwrap();
+        grid.apply_commit(&report(&[&retry.changes[0].id], None));
+        assert!(!grid.preview_open());
+        assert!(!grid.uncommitted(), "全部写入后不再有待提交修改");
+        assert_eq!(grid.staged_summary().total(), 0);
+        consistent(&grid);
+    }
+
+    #[test]
+    fn a_written_insert_stays_visible_as_a_plain_row_until_the_page_is_reread() {
+        let mut grid = accounts();
+        let before = grid.loaded_len();
+        let row_id = new_row(&mut grid);
+        assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("N1".into())), Gate::Writable);
+        assert_eq!(grid.stage_text_by_id(&row_id, 2, Some("新人".into())), Gate::Writable);
+        grid.open_preview().unwrap();
+        let request = grid.confirm_request().unwrap();
+        grid.apply_commit(&report(&[&request.changes[0].id], None));
+        // 写入成功后这一行不能从网格里消失：它以普通行显示用户赋的值，不再算待提交。
+        assert_eq!(grid.loaded_len(), before + 1, "新增的行写入后仍在网格里");
+        let row = grid.row_index(&row_id).expect("写入的行仍可定位到显示位置");
+        assert_eq!(grid.cell_label(row, 1), "N1");
+        assert_eq!(grid.cell_label(row, 2), "新人");
+        assert!(!grid.rows[row].inserted, "不再是待提交的新增");
+        assert!(!grid.uncommitted());
+        assert_eq!(grid.staged_summary().total(), 0);
+        consistent(&grid);
+        // 表模式随后的重读用数据库里的真实行换掉它。
+        let columns = grid.columns.clone();
+        let schema = grid.schema.clone();
+        let reread = vec![GridRow { id: "9".into(), values: vec![Some("9".into()), Some("N1".into()), Some("新人".into()), Some("0".into()), None, None], located: true, locator: vec![("id".into(), Some("9".into()))], inserted: false }];
+        grid.replace_fetched(columns, reread, 0, Some(1), false, schema);
+        assert!(grid.row_index(&row_id).is_none(), "重读后由数据库里的行取代");
+        assert_eq!(grid.cell_label(0, 3), "0", "默认值是数据库给的");
+    }
+
+    #[test]
+    fn a_partial_failure_says_where_the_earlier_statements_landed() {
+        let partial = |not_committed: bool, committed: bool| {
+            let mut grid = accounts();
+            assert_eq!(grid.stage_text_by_id("1", 2, Some("乙".into())), Gate::Writable);
+            let row_id = new_row(&mut grid);
+            assert_eq!(grid.stage_text_by_id(&row_id, 1, Some("A1".into())), Gate::Writable);
+            grid.open_preview().unwrap();
+            let ids: Vec<String> = grid.confirm_request().unwrap().changes.iter().map(|change| change.id.clone()).collect();
+            let mut dto = report(&[&ids[0]], Some((&ids[1], "Duplicate entry")));
+            dto.applied_not_committed = not_committed;
+            dto.committed = committed;
+            grid.apply_commit(&dto);
+            grid.commit_error().cloned().expect("失败说明").written
+        };
+        // 手动事务：已执行的语句还在事务里，文案提醒提交事务。
+        let manual = partial(true, false);
+        assert_eq!(manual, WrittenScope::InTransaction(1));
+        assert_eq!(manual.text_key().0, "grid.preview.partlyInTransaction");
+        assert!(i18n::text(Locale::ZhCn, manual.text_key().0).contains("提交事务"));
+        // 自动提交：已写入并生效。
+        assert_eq!(partial(false, true), WrittenScope::Committed(1));
+        // 事务状态无法确认：不假装已提交或仍在事务中。
+        assert_eq!(partial(false, false), WrittenScope::Unconfirmed(1));
+        let keys = crate::i18n::catalog_keys();
+        for key in ["grid.preview.nothingWritten", "grid.preview.partlyCommitted", "grid.preview.partlyInTransaction", "grid.preview.partlyUnconfirmed"] {
+            assert!(keys.contains(&key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_level_rejection_keeps_every_edit_and_the_preview_open() {
+        let mut grid = accounts();
+        assert_eq!(grid.stage_text_by_id("1", 2, Some("乙".into())), Gate::Writable);
+        grid.open_preview().unwrap();
+        grid.keep_failure("事务已中止");
+        assert!(grid.preview_open());
+        assert_eq!(grid.commit_error().map(|failure| failure.nothing_written()), Some(true));
+        assert_eq!(grid.gate_at(0, 2), Some(Gate::Writable), "未写入任何数据：修改原样可重试");
+        assert!(grid.confirm_request().is_ok(), "直接再次确认即可重试");
+        grid.cancel_preview();
+        assert!(grid.commit_error().is_none());
+        consistent(&grid);
+    }
+    /// docker/compose.yaml 的 MySQL：只填必填列的新增行能写入（其余列交给默认值），
+    /// 违反唯一约束时修改保留、预览说明原因，修正后再次提交成功。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the MySQL service in docker/compose.yaml"]
+    async fn mysql_live_required_only_insert_and_retry_after_unique_violation() {
+        use crate::connections::model::{ConnectionDraft, Engine as ConnEngine, Secret, SecretInput, TlsMode};
+        use mysql_async::prelude::Queryable;
+
+        let port: u16 = std::env::var("RILLSQL_MYSQL_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(3306);
+        let table = format!("grid_t1_{}", uuid::Uuid::new_v4().simple());
+        let opts = mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(port)
+            .user(Some("rillsql"))
+            .pass(Some("rillsql"))
+            .db_name(Some("rillsql"));
+        let mut admin = mysql_async::Conn::new(opts).await.unwrap_or_else(|error| panic!("MySQL 夹具不可用（端口 {port}）: {error}"));
+        admin
+            .query_drop(format!(
+                "CREATE TABLE `{table}` (id INT AUTO_INCREMENT PRIMARY KEY, code VARCHAR(8) NOT NULL UNIQUE, note VARCHAR(20) NULL, \
+                 qty INT NOT NULL DEFAULT 0, created DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            ))
+            .await
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = crate::connections::Service::new_for_test(dir.join("connections.sqlite"));
+        let mut draft = ConnectionDraft::blank(ConnEngine::Mysql);
+        draft.id = Some("mysql".into());
+        draft.name = "mysql".into();
+        draft.host = "127.0.0.1".into();
+        draft.port = port.to_string();
+        draft.tls_mode = TlsMode::Off;
+        draft.save_password = false;
+        draft.username = "rillsql".into();
+        draft.database = "rillsql".into();
+        service.save(draft, SecretInput::default()).await.unwrap();
+        let opened = service.open("mysql", SecretInput { password: Some(Secret::new("rillsql")), ..Default::default() }).await.unwrap();
+        assert!(opened.connected, "{:?}", opened.report);
+
+        let reference = TableRef {
+            connection_id: "mysql".into(),
+            database: "rillsql".into(),
+            schema: String::new(),
+            table: table.clone(),
+            engine: "mysql".into(),
+            include_foreign_keys: false,
+        };
+        let schema = schema_from_dto(&crate::application::grid::describe(&service, &reference).await.unwrap()).unwrap();
+        let mut grid = SharedGrid::new();
+        grid.target = GridTarget {
+            connection_id: "mysql".into(),
+            connection_name: "mysql".into(),
+            database: "rillsql".into(),
+            table: table.clone(),
+            engine: "mysql".into(),
+            environment: "dev".into(),
+            ..GridTarget::default()
+        };
+        grid.load_local(columns_from_schema(&schema, true), Vec::new(), Some(0), Some(schema));
+        let code = grid.column_names().iter().position(|name| name == "code").unwrap();
+
+        // 只填必填列：校验通过，INSERT 只含 code，默认值列交给数据库。
+        let first = new_row(&mut grid);
+        assert_eq!(grid.check_submit(), 1, "code 必填");
+        assert_eq!(grid.stage_text_by_id(&first, code, Some("A1".into())), Gate::Writable);
+        assert_eq!(grid.check_submit(), 0);
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].contains("(code) VALUES ('A1')"), "{sql:?}");
+        let commit = crate::application::grid::commit(&service, &grid.confirm_request().unwrap(), true).await.unwrap();
+        assert!(commit.failed.is_none(), "{:?}", commit.failed.as_ref().map(|failed| failed.message.clone()));
+        grid.apply_commit(&commit);
+        assert!(!grid.uncommitted() && !grid.preview_open());
+
+        // 同一个 code 再插一次：唯一约束拒绝，修改保留、预览保持打开并说明原因。
+        let second = new_row(&mut grid);
+        assert_eq!(grid.stage_text_by_id(&second, code, Some("A1".into())), Gate::Writable);
+        grid.open_preview().unwrap();
+        let rejected = crate::application::grid::commit(&service, &grid.confirm_request().unwrap(), true).await.unwrap();
+        assert!(rejected.failed.is_some(), "唯一约束应当拒绝");
+        grid.apply_commit(&rejected);
+        assert!(grid.preview_open());
+        assert!(grid.commit_error().is_some_and(|failure| failure.message.contains("Duplicate")), "{:?}", grid.commit_error());
+        assert!(grid.uncommitted());
+        consistent(&grid);
+        // 修正后再提交成功。
+        assert_eq!(grid.stage_text_by_id(&second, code, Some("A2".into())), Gate::Writable);
+        grid.open_preview().unwrap();
+        let retried = crate::application::grid::commit(&service, &grid.confirm_request().unwrap(), true).await.unwrap();
+        assert!(retried.failed.is_none(), "{:?}", retried.failed.as_ref().map(|failed| failed.message.clone()));
+        grid.apply_commit(&retried);
+        assert!(!grid.uncommitted() && !grid.preview_open());
+
+        let rows: Vec<(String, i32)> = admin.query(format!("SELECT code, qty FROM `{table}` ORDER BY code")).await.unwrap();
+        assert_eq!(rows, vec![("A1".to_owned(), 0), ("A2".to_owned(), 0)], "默认值由数据库填入");
+
+        // 与库中相等但写法不同的值（qty 0 写成 "00"、DECIMAL 12.50 写成 "12.5"）：MySQL 报告 0 行改变，
+        // 行已由 expect_one 确认命中，不能当成“影响 0 行”失败。
+        admin.query_drop(format!("ALTER TABLE `{table}` ADD COLUMN amount DECIMAL(10,2) NOT NULL DEFAULT 12.50")).await.unwrap();
+        let id: i64 = admin.query_first(format!("SELECT id FROM `{table}` WHERE code = 'A1'")).await.unwrap().unwrap();
+        let value = |column: &str, value: &str| ValueArg { column: column.into(), value: Some(value.into()), resolved: false };
+        let unchanged = crate::grid::commands::CommitRequest {
+            table: reference.clone(),
+            changes: vec![ChangeArg {
+                id: format!("u:{id}"),
+                kind: "update".into(),
+                sets: vec![value("qty", "00"), value("amount", "12.5")],
+                locator: vec![value("id", &id.to_string())],
+                values: Vec::new(),
+            }],
+            preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES as u64,
+        };
+        let same = crate::application::grid::commit(&service, &unchanged, true).await.unwrap();
+        assert!(same.failed.is_none(), "{:?}", same.failed.as_ref().map(|failed| failed.message.clone()));
+        assert_eq!(same.applied.len(), 1);
+        admin.query_drop(format!("DROP TABLE `{table}`")).await.unwrap();
+        let _ = admin.disconnect().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

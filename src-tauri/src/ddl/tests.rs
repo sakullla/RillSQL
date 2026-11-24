@@ -5,7 +5,7 @@ use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
     fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, ForeignKeyDraft, GeneratedColumnDraft,
-    GeneratedStorage, GenerationState, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request, DefaultSpec, SequenceState, Snapshot, Step, StepStatus,
+    GeneratedStorage, GenerationState, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, IndexDraft, IndexKind, Request, DefaultSpec, SequenceState, Snapshot, Step, StepStatus,
     TableOptions,
 };
 use super::plan::plan;
@@ -139,12 +139,13 @@ fn protected_index_is_not_a_plain_drop() {
     snapshot.indexes.push(Index {
         name: "sqlite_autoindex_notes_1".to_owned(),
         unique: true,
-        columns: vec![IndexColumn { name: "id".to_owned(), descending: false }],
+        columns: vec![IndexColumn { name: "id".to_owned(), descending: false, prefix: None }],
         protected: true,
         reason: "由主键约束维护".to_owned(),
         partial: false,
         expression: false,
         sql: None,
+        ..Default::default()
     });
     let planned = plan(
         &snapshot,
@@ -482,23 +483,23 @@ fn mysql_and_postgres_alters_are_not_wrapped_in_a_transaction() {
 
 #[test]
 fn alter_previews_leave_safe_identifiers_bare_and_quote_reserved_or_cased_names() {
-    let mut mysql = Snapshot::bare(Engine::Mysql, "e6yun3_etoe_business", "", "etoe_alarm_rule_set");
+    let mut mysql = Snapshot::bare(Engine::Mysql, "shop_business", "", "alert_rule_set");
     mysql.columns = vec![column("id", "bigint", false, true), column("content", "varchar(1000)", false, false), column("order", "int", true, false)];
     mysql.row_count = Some(0);
     let mut drafts = mysql.columns.iter().map(draft_of).collect::<Vec<_>>();
     drafts.iter_mut().find(|column| column.name == "content").unwrap().type_name = "varchar(2000)".to_owned();
-    let planned = plan(&mysql, &Action::AlterColumns { table: "etoe_alarm_rule_set".to_owned(), columns: drafts });
+    let planned = plan(&mysql, &Action::AlterColumns { table: "alert_rule_set".to_owned(), columns: drafts });
     assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
     assert_eq!(
         planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(),
-        vec!["ALTER TABLE e6yun3_etoe_business.etoe_alarm_rule_set CHANGE COLUMN content content varchar(2000) NOT NULL;"]
+        vec!["ALTER TABLE shop_business.alert_rule_set CHANGE COLUMN content content varchar(2000) NOT NULL;"]
     );
 
     let mut drafts = mysql.columns.iter().map(draft_of).collect::<Vec<_>>();
     drafts.iter_mut().find(|column| column.name == "order").unwrap().type_name = "bigint".to_owned();
-    let reserved = plan(&mysql, &Action::AlterColumns { table: "etoe_alarm_rule_set".to_owned(), columns: drafts });
+    let reserved = plan(&mysql, &Action::AlterColumns { table: "alert_rule_set".to_owned(), columns: drafts });
     assert!(reserved.blocked.is_empty(), "{:?}", reserved.blocked);
-    assert_eq!(reserved.steps[0].sql, "ALTER TABLE e6yun3_etoe_business.etoe_alarm_rule_set CHANGE COLUMN `order` `order` bigint;");
+    assert_eq!(reserved.steps[0].sql, "ALTER TABLE shop_business.alert_rule_set CHANGE COLUMN `order` `order` bigint;");
 
     let mut postgres = Snapshot::bare(Engine::Postgres, "app", "public", "accounts");
     postgres.columns = vec![column("id", "integer", false, true), column("User", "text", true, false)];
@@ -855,10 +856,10 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
 fn postgres_create_index_name_is_not_schema_qualified() {
     let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "notes");
     snapshot.columns = vec![column("id", "integer", false, true), column("note", "text", true, false)];
-    let columns = vec![IndexColumnDraft { name: "note".to_owned(), descending: false }];
+    let columns = vec![IndexColumnDraft { name: "note".to_owned(), descending: false, prefix: None }];
     let plain = plan(
         &snapshot,
-        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: false, columns: columns.clone() },
+        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: false, columns: columns.clone(), index_kind: Default::default(), comment: String::new() },
     );
     assert!(plain.blocked.is_empty(), "{:?}", plain.blocked);
     assert_eq!(plain.steps.len(), 1);
@@ -866,7 +867,7 @@ fn postgres_create_index_name_is_not_schema_qualified() {
     assert!(!plain.steps[0].sql.contains("public.idx"));
     let unique = plan(
         &snapshot,
-        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: true, columns },
+        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: true, columns, index_kind: Default::default(), comment: String::new() },
     );
     assert!(unique.blocked.is_empty(), "{:?}", unique.blocked);
     assert_eq!(unique.steps[0].sql, "CREATE UNIQUE INDEX idx ON public.notes (note ASC);");
@@ -1684,12 +1685,13 @@ fn index(name: &str, column: &str, primary: bool, descending: bool, sql: Option<
     Index {
         name: name.to_owned(),
         unique: primary,
-        columns: vec![IndexColumn { name: column.to_owned(), descending }],
+        columns: vec![IndexColumn { name: column.to_owned(), descending, prefix: None }],
         protected: primary,
         reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
         partial: false,
         expression: false,
         sql: sql.map(str::to_owned),
+        ..Default::default()
     }
 }
 
@@ -1741,12 +1743,13 @@ fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
 fn sqlserver_index_sql_keeps_include_columns_out_of_the_key_and_writes_clustering_and_filter() {
     use crate::adapters::sqlserver::ddl_read::{sqlserver_index_sql, SqlserverIndexExtra};
     let mut covering = index("IX_orders_customer", "customer_id", false, false, None);
-    covering.columns.push(IndexColumn { name: "created_at".to_owned(), descending: true });
+    covering.columns.push(IndexColumn { name: "created_at".to_owned(), descending: true, prefix: None });
     let extra = SqlserverIndexExtra {
         name: "IX_orders_customer".to_owned(),
         type_desc: "NONCLUSTERED".to_owned(),
         include: vec!["total".to_owned(), "status".to_owned()],
         filter: Some("([status]<>(0))".to_owned()),
+        options: Vec::new(),
     };
     assert_eq!(
         sqlserver_index_sql("dbo.orders", &covering, &extra),
@@ -1760,7 +1763,7 @@ fn sqlserver_index_sql_keeps_include_columns_out_of_the_key_and_writes_clusterin
 
     let mut columnstore = index("NCCI_orders", "total", false, false, None);
     columnstore.columns.clear();
-    let extra = SqlserverIndexExtra { name: columnstore.name.clone(), type_desc: "NONCLUSTERED COLUMNSTORE".to_owned(), include: vec!["total".to_owned(), "status".to_owned()], filter: None };
+    let extra = SqlserverIndexExtra { name: columnstore.name.clone(), type_desc: "NONCLUSTERED COLUMNSTORE".to_owned(), include: vec!["total".to_owned(), "status".to_owned()], filter: None, options: Vec::new() };
     assert_eq!(sqlserver_index_sql("dbo.orders", &columnstore, &extra), "CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_orders ON dbo.orders (total, status);");
 
     let xml = index("XML_orders_doc", "doc", false, false, None);
@@ -2338,4 +2341,290 @@ fn generated_column_rename_and_retype_stay_blocked() {
     let planned = plan(&snapshot, &Action::AlterColumns { table: "orders".to_owned(), columns: nulled });
     assert!(planned.steps.is_empty());
     assert!(planned.blocked.iter().any(|item| item.contains("生成列 total 不能这样修改")), "{:?}", planned.blocked);
+}
+
+// ---- 索引类型、前缀、注释与修改索引（R11） ----
+
+fn mysql_orders(engine: Engine) -> Snapshot {
+    let mut snapshot = Snapshot::bare(engine, "app", "", "orders");
+    snapshot.columns = vec![
+        column("id", "int", false, true),
+        column("title", "varchar(200)", true, false),
+        column("body", "text", true, false),
+        column("created_at", "datetime", true, false),
+        column("geo", "point", false, false),
+    ];
+    snapshot.indexes = vec![
+        Index {
+            name: "PRIMARY".to_owned(),
+            unique: true,
+            columns: vec![IndexColumn { name: "id".to_owned(), descending: false, prefix: None }],
+            protected: true,
+            reason: "由主键约束维护".to_owned(),
+            kind: IndexKind::Primary,
+            method: Some("BTREE".to_owned()),
+            visible: Some(true),
+            ..Default::default()
+        },
+        Index {
+            name: "idx_title".to_owned(),
+            columns: vec![IndexColumn { name: "title".to_owned(), descending: false, prefix: Some(20) }],
+            kind: IndexKind::Normal,
+            method: Some("BTREE".to_owned()),
+            comment: Some("old".to_owned()),
+            visible: Some(true),
+            ..Default::default()
+        },
+    ];
+    snapshot
+}
+
+fn key(name: &str, descending: bool, prefix: Option<u32>) -> IndexColumnDraft {
+    IndexColumnDraft { name: name.to_owned(), descending, prefix }
+}
+
+fn draft(name: &str, kind: IndexKind, columns: Vec<IndexColumnDraft>, comment: &str) -> IndexDraft {
+    IndexDraft { name: name.to_owned(), kind, columns, comment: comment.to_owned() }
+}
+
+fn alter(snapshot: &Snapshot, old: &str, new: IndexDraft) -> super::model::Plan {
+    plan(snapshot, &Action::AlterIndex { table: snapshot.name.clone(), old: old.to_owned(), new })
+}
+
+fn create(snapshot: &Snapshot, new: IndexDraft) -> super::model::Plan {
+    plan(
+        snapshot,
+        &Action::CreateIndex {
+            table: snapshot.name.clone(),
+            name: new.name,
+            unique: false,
+            columns: new.columns,
+            index_kind: new.kind,
+            comment: new.comment,
+        },
+    )
+}
+
+#[test]
+fn mysql_alter_index_is_one_alter_table_for_every_kind() {
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let snapshot = mysql_orders(engine);
+        let cases = [
+            (draft("idx_title", IndexKind::Normal, vec![key("title", false, Some(40))], "old"), "ALTER TABLE app.orders DROP INDEX idx_title, ADD INDEX idx_title (title(40) ASC) COMMENT 'old';"),
+            (draft("uq_title", IndexKind::Unique, vec![key("title", false, None), key("id", true, None)], ""), "ALTER TABLE app.orders DROP INDEX idx_title, ADD UNIQUE INDEX uq_title (title ASC, id DESC);"),
+            (draft("ft_body", IndexKind::Fulltext, vec![key("title", false, None), key("body", false, None)], "search"), "ALTER TABLE app.orders DROP INDEX idx_title, ADD FULLTEXT INDEX ft_body (title, body) COMMENT 'search';"),
+            (draft("sp_geo", IndexKind::Spatial, vec![key("geo", false, None)], ""), "ALTER TABLE app.orders DROP INDEX idx_title, ADD SPATIAL INDEX sp_geo (geo);"),
+            (draft("idx_title", IndexKind::Normal, vec![key("title", true, Some(10))], "it's"), "ALTER TABLE app.orders DROP INDEX idx_title, ADD INDEX idx_title (title(10) DESC) COMMENT 'it''s';"),
+        ];
+        for (new, sql) in cases {
+            let planned = alter(&snapshot, "idx_title", new);
+            assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+            assert_eq!(planned.steps.len(), 1, "MySQL 家族一条语句");
+            assert_eq!(planned.steps[0].sql, sql);
+            assert!(planned.risks.iter().all(|risk| !risk.text.contains("不是原子操作")));
+        }
+        // 主键：DROP PRIMARY KEY, ADD PRIMARY KEY。
+        let primary = alter(&snapshot, "PRIMARY", draft("PRIMARY", IndexKind::Primary, vec![key("id", false, None), key("created_at", false, None)], ""));
+        assert!(primary.blocked.is_empty(), "{:?}", primary.blocked);
+        assert_eq!(primary.steps[0].sql, "ALTER TABLE app.orders DROP PRIMARY KEY, ADD PRIMARY KEY (id ASC, created_at ASC);");
+        // 普通索引改成主键：已有主键时拒绝。
+        let second = alter(&snapshot, "idx_title", draft("idx_title", IndexKind::Primary, vec![key("title", false, None)], ""));
+        assert!(second.blocked.iter().any(|item| item.contains("已经有主键")), "{:?}", second.blocked);
+    }
+}
+
+#[test]
+fn mysql_alter_index_keeps_an_invisible_index_invisible() {
+    let mut mysql = mysql_orders(Engine::Mysql);
+    mysql.indexes[1].visible = Some(false);
+    let planned = alter(&mysql, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("title", false, None)], ""));
+    assert_eq!(planned.steps[0].sql, "ALTER TABLE app.orders DROP INDEX idx_title, ADD INDEX idx_title (title ASC) INVISIBLE;");
+    let mut maria = mysql_orders(Engine::Mariadb);
+    maria.indexes[1].visible = Some(false);
+    let planned = alter(&maria, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("title", false, None)], ""));
+    assert_eq!(planned.steps[0].sql, "ALTER TABLE app.orders DROP INDEX idx_title, ADD INDEX idx_title (title ASC) IGNORED;");
+}
+
+#[test]
+fn alter_index_blocks_unchanged_and_invalid_shapes() {
+    let snapshot = mysql_orders(Engine::Mysql);
+    let same = alter(&snapshot, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("title", false, Some(20))], "old"));
+    assert!(same.blocked.iter().any(|item| item.contains("没有变化")), "{:?}", same.blocked);
+    assert!(same.steps.is_empty());
+    let missing = alter(&snapshot, "nope", draft("x", IndexKind::Normal, vec![key("title", false, None)], ""));
+    assert!(missing.blocked.iter().any(|item| item.contains("找不到索引")));
+    let prefix_on_int = alter(&snapshot, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("id", false, Some(4))], ""));
+    assert!(prefix_on_int.blocked.iter().any(|item| item.contains("不能指定前缀长度")), "{:?}", prefix_on_int.blocked);
+    let zero = alter(&snapshot, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("title", false, Some(0))], ""));
+    assert!(zero.blocked.iter().any(|item| item.contains("必须大于 0")));
+    let fulltext_desc = alter(&snapshot, "idx_title", draft("ft", IndexKind::Fulltext, vec![key("body", true, None)], ""));
+    assert!(fulltext_desc.blocked.iter().any(|item| item.contains("不能指定降序")));
+    let fulltext_prefix = alter(&snapshot, "idx_title", draft("ft", IndexKind::Fulltext, vec![key("body", false, Some(10))], ""));
+    assert!(fulltext_prefix.blocked.iter().any(|item| item.contains("不能带前缀长度")));
+    // 改名到已有名字被拒绝；保留自己的名字不算冲突。
+    let clash = alter(&snapshot, "idx_title", draft("PRIMARY", IndexKind::Normal, vec![key("title", false, None)], ""));
+    assert!(clash.blocked.iter().any(|item| item.contains("已经存在")), "{:?}", clash.blocked);
+    for item in same.blocked.iter().chain(clash.blocked.iter()).chain(prefix_on_int.blocked.iter()) {
+        assert!(!super::english::has_cjk(&super::english::english(item)), "{item}");
+    }
+}
+
+#[test]
+fn other_engines_alter_index_as_drop_then_create_with_a_non_atomic_warning() {
+    let mut postgres = Snapshot::bare(Engine::Postgres, "app", "public", "notes");
+    postgres.columns = vec![column("id", "integer", false, true), column("note", "text", true, false)];
+    postgres.indexes = vec![Index { name: "idx_note".to_owned(), columns: vec![IndexColumn { name: "note".to_owned(), ..Default::default() }], ..Default::default() }];
+    let planned = alter(&postgres, "idx_note", draft("uq_note", IndexKind::Unique, vec![key("note", true, None)], ""));
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(
+        planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(),
+        vec!["DROP INDEX public.idx_note;", "CREATE UNIQUE INDEX uq_note ON public.notes (note DESC);"]
+    );
+    let warning = planned.risks.iter().find(|risk| risk.text.contains("不是原子操作")).expect("非原子提示");
+    assert_eq!(warning.level, "warn");
+    assert!(!super::english::has_cjk(&super::english::english(&warning.text)));
+
+    let mut sqlite = notes("3.51.3");
+    sqlite.indexes = vec![Index { name: "idx_note".to_owned(), columns: vec![IndexColumn { name: "note".to_owned(), ..Default::default() }], ..Default::default() }];
+    let planned = alter(&sqlite, "idx_note", draft("idx_note", IndexKind::Normal, vec![key("note", true, None)], ""));
+    assert_eq!(planned.steps.len(), 2, "{:?}", planned.blocked);
+    assert!(planned.steps[0].sql.starts_with("DROP INDEX"));
+    assert!(planned.steps[1].sql.starts_with("CREATE INDEX"));
+    assert!(planned.risks.iter().any(|risk| risk.text.contains("不是原子操作")));
+
+    // 不支持的类型、前缀与注释在其他引擎上被拦下，不生成语句。
+    for new in [
+        draft("ft", IndexKind::Fulltext, vec![key("note", false, None)], ""),
+        draft("idx_note", IndexKind::Normal, vec![key("note", false, Some(5))], ""),
+        draft("idx_note", IndexKind::Normal, vec![key("note", false, None)], "c"),
+        draft("PRIMARY", IndexKind::Primary, vec![key("note", false, None)], ""),
+    ] {
+        let planned = alter(&postgres, "idx_note", new.clone());
+        assert!(!planned.blocked.is_empty() && planned.steps.is_empty(), "{new:?}");
+    }
+    // 受约束维护的索引在只能先删后建的引擎上不能修改。
+    let mut protected = postgres.clone();
+    protected.indexes[0].protected = true;
+    protected.indexes[0].reason = "由唯一约束维护".to_owned();
+    let planned = alter(&protected, "idx_note", draft("idx_note", IndexKind::Normal, vec![key("note", true, None)], ""));
+    assert!(planned.steps.is_empty() && !planned.blocked.is_empty());
+}
+
+#[test]
+fn postgres_index_losses_find_what_a_plain_btree_rebuild_would_drop() {
+    use crate::adapters::postgres::ddl_read::postgres_index_losses;
+    let none: Vec<String> = Vec::new();
+    assert_eq!(postgres_index_losses("btree", "CREATE INDEX idx_note ON public.notes USING btree (note)"), none);
+    assert_eq!(postgres_index_losses("btree", r#"CREATE UNIQUE INDEX "Odd USING (" ON public."My T" USING btree ("a, b" DESC, id)"#), none);
+    assert_eq!(postgres_index_losses("btree", "CREATE INDEX p ON public.t USING btree (a) WHERE (a > 0)"), none, "部分索引另有标记");
+    assert_eq!(postgres_index_losses("gin", "CREATE INDEX g ON public.t USING gin (tags)"), vec!["USING gin"]);
+    assert_eq!(
+        postgres_index_losses("btree", r#"CREATE INDEX i ON public.t USING btree (a COLLATE "C", b text_pattern_ops, c DESC NULLS LAST, d NULLS FIRST) INCLUDE (e) WITH (fillfactor='70') TABLESPACE fast"#),
+        vec!["COLLATE", "OPERATOR CLASS", "NULLS LAST", "NULLS FIRST", "INCLUDE", "WITH", "TABLESPACE"]
+    );
+    assert_eq!(postgres_index_losses("btree", "CREATE UNIQUE INDEX u ON public.t USING btree (a) NULLS NOT DISTINCT"), vec!["NULLS NOT DISTINCT"]);
+    assert_eq!(postgres_index_losses("btree", "CREATE INDEX o ON ONLY public.t USING btree (a)"), vec!["ON ONLY"]);
+    assert_eq!(postgres_index_losses("btree", r#"CREATE INDEX c ON public.t USING btree (a COLLATE pg_catalog."default" DESC)"#), vec!["COLLATE"]);
+    assert_eq!(postgres_index_losses("btree", ""), vec!["pg_get_indexdef"]);
+}
+
+#[test]
+fn sqlserver_index_losses_keep_only_plain_nonclustered_indexes_editable() {
+    use crate::adapters::sqlserver::ddl_read::{sqlserver_index_losses, SqlserverIndexExtra};
+    let plain = SqlserverIndexExtra { name: "ix".to_owned(), type_desc: "NONCLUSTERED".to_owned(), ..Default::default() };
+    assert!(sqlserver_index_losses(&plain).is_empty());
+    let clustered = SqlserverIndexExtra { type_desc: "CLUSTERED".to_owned(), ..plain.clone() };
+    assert_eq!(sqlserver_index_losses(&clustered), vec!["CLUSTERED"]);
+    let covering = SqlserverIndexExtra { include: vec!["total".to_owned()], options: vec!["FILLFACTOR = 80".to_owned()], ..plain.clone() };
+    assert_eq!(sqlserver_index_losses(&covering), vec!["INCLUDE", "FILLFACTOR = 80"]);
+    let xml = SqlserverIndexExtra { type_desc: "XML".to_owned(), ..plain };
+    assert_eq!(sqlserver_index_losses(&xml), vec!["XML"]);
+}
+
+#[test]
+fn alter_index_refuses_drop_and_create_when_the_rebuild_would_lose_properties() {
+    let mut postgres = Snapshot::bare(Engine::Postgres, "app", "public", "notes");
+    postgres.columns = vec![column("id", "integer", false, true), column("tags", "text[]", true, false)];
+    postgres.indexes = vec![Index {
+        name: "g".to_owned(),
+        columns: vec![IndexColumn { name: "tags".to_owned(), ..Default::default() }],
+        method: Some("gin".to_owned()),
+        sql: Some("CREATE INDEX g ON public.notes USING gin (tags)".to_owned()),
+        rebuild_loses: vec!["USING gin".to_owned()],
+        ..Default::default()
+    }];
+    let planned = alter(&postgres, "g", draft("g2", IndexKind::Normal, vec![key("tags", false, None)], ""));
+    assert!(planned.steps.is_empty(), "{:?}", planned.steps);
+    let reason = planned.blocked.iter().find(|item| item.contains("USING gin")).expect("说明会丢失的属性");
+    let english = super::english::english(reason);
+    assert!(!super::english::has_cjk(&english) && english.contains("USING gin"), "{english}");
+
+    let mut sqlserver = Snapshot::bare(Engine::Sqlserver, "app", "dbo", "orders");
+    sqlserver.columns = vec![column("id", "int", false, true), column("created_at", "datetime2", true, false)];
+    sqlserver.indexes = vec![Index {
+        name: "CIX_created".to_owned(),
+        columns: vec![IndexColumn { name: "created_at".to_owned(), ..Default::default() }],
+        rebuild_loses: vec!["CLUSTERED".to_owned(), "INCLUDE".to_owned()],
+        ..Default::default()
+    }];
+    let planned = alter(&sqlserver, "CIX_created", draft("CIX_created", IndexKind::Normal, vec![key("created_at", true, None)], ""));
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("CLUSTERED、INCLUDE")), "{:?}", planned.blocked);
+    assert!(super::english::english(&planned.blocked[0]).contains("CLUSTERED, INCLUDE"));
+
+    // MySQL 家族在同一条 ALTER TABLE 里改，不受这条限制。
+    let mut mysql = mysql_orders(Engine::Mysql);
+    mysql.indexes[1].rebuild_loses = vec!["anything".to_owned()];
+    let planned = alter(&mysql, "idx_title", draft("idx_title", IndexKind::Normal, vec![key("title", false, None)], ""));
+    assert_eq!(planned.steps.len(), 1, "{:?}", planned.blocked);
+}
+
+#[test]
+fn mysql_create_index_writes_kind_prefix_order_and_comment() {
+    let snapshot = mysql_orders(Engine::Mysql);
+    let cases = [
+        (draft("idx_t", IndexKind::Normal, vec![key("title", false, Some(12)), key("id", true, None)], "lookup"), "CREATE INDEX idx_t ON app.orders (title(12) ASC, id DESC) COMMENT 'lookup';"),
+        (draft("uq_t", IndexKind::Unique, vec![key("title", false, None)], ""), "CREATE UNIQUE INDEX uq_t ON app.orders (title ASC);"),
+        (draft("ft_b", IndexKind::Fulltext, vec![key("body", false, None)], ""), "CREATE FULLTEXT INDEX ft_b ON app.orders (body);"),
+        (draft("sp_g", IndexKind::Spatial, vec![key("geo", false, None)], ""), "CREATE SPATIAL INDEX sp_g ON app.orders (geo);"),
+    ];
+    for (new, sql) in cases {
+        let planned = create(&snapshot, new);
+        assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+        assert_eq!(planned.steps[0].sql, sql);
+    }
+    // 没有主键的表可以在索引页加主键。
+    let mut bare = snapshot.clone();
+    bare.indexes.remove(0);
+    let planned = create(&bare, draft("", IndexKind::Primary, vec![key("id", false, None)], ""));
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "ALTER TABLE app.orders ADD PRIMARY KEY (id ASC);");
+    assert!(planned.risks.iter().any(|risk| risk.level == "warn" && risk.text.contains("NOT NULL")));
+    // 旧调用方只给 unique 开关：仍按唯一索引。
+    let legacy = plan(
+        &snapshot,
+        &Action::CreateIndex { table: "orders".to_owned(), name: "uq".to_owned(), unique: true, columns: vec![key("title", false, None)], index_kind: IndexKind::Normal, comment: String::new() },
+    );
+    assert_eq!(legacy.steps[0].sql, "CREATE UNIQUE INDEX uq ON app.orders (title ASC);");
+    for risk in planned.risks.iter().chain(legacy.risks.iter()) {
+        assert!(!super::english::has_cjk(&super::english::english(&risk.text)), "{}", risk.text);
+    }
+}
+
+#[test]
+fn create_index_action_deserializes_old_and_new_shapes() {
+    let old: Action = serde_json::from_str(r#"{"kind":"createIndex","table":"t","name":"i","unique":true,"columns":[{"name":"a","descending":false}]}"#).unwrap();
+    assert!(matches!(old, Action::CreateIndex { unique: true, index_kind: IndexKind::Normal, ref comment, ref columns, .. } if comment.is_empty() && columns[0].prefix.is_none()));
+    let new: Action = serde_json::from_str(
+        r#"{"kind":"alterIndex","table":"t","old":"i","new":{"name":"i2","kind":"fulltext","columns":[{"name":"a","descending":false,"prefix":8}],"comment":"x"}}"#,
+    )
+    .unwrap();
+    match new {
+        Action::AlterIndex { old, new, .. } => {
+            assert_eq!(old, "i");
+            assert_eq!(new.kind, IndexKind::Fulltext);
+            assert_eq!(new.columns[0].prefix, Some(8));
+        }
+        other => panic!("{other:?}"),
+    }
 }

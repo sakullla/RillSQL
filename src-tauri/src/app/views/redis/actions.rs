@@ -738,6 +738,7 @@ impl RedisPane {
             return;
         }
         self.value_loading = true;
+        self.value_more_error = None;
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         let key = self.selected.clone();
@@ -745,22 +746,33 @@ impl RedisPane {
         self.run_bg(
             cx,
             async move { crate::application::redis::read_page(connections.as_ref(), &connection_id, key.clone(), key_type, Some(token)).await.map(|page| (key, page)) },
-            |pane, result: Result<(String, ValuePage), String>, _| {
-                pane.value_loading = false;
-                match result {
-                    Ok((key, page)) if key == pane.selected => {
-                        if let Some(detail) = pane.detail.as_deref() {
-                            let mut next = detail.clone();
-                            keys::append_page(&mut next.value, page.value);
-                            next.next = page.next;
-                            pane.detail = Some(Arc::new(next));
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(message) => pane.show_error_from(ErrorSource::Detail, message),
-                }
-            },
+            |pane, result: Result<(String, ValuePage), String>, _| pane.finish_value_page(result),
         );
+    }
+
+    /// 「加载更多」的结果：仍是当前键就把这一页接到已读条目后面（条目表按追加处理，滚动与选中不动）；
+    /// 失败只记在页脚（原因 + 重试），已读到的条目照常显示。
+    pub(super) fn finish_value_page(&mut self, result: Result<(String, ValuePage), String>) {
+        self.value_loading = false;
+        match result {
+            Ok((key, page)) if key == self.selected => {
+                if let Some(current) = self.detail.clone() {
+                    let mut next = (*current).clone();
+                    keys::append_page(&mut next.value, page.value);
+                    next.next = page.next;
+                    let next = Arc::new(next);
+                    // 两页在一次渲染之间先后落地：起点仍是表上最后画出的那份详情。
+                    let base = match self.entry_append.take() {
+                        Some((base, landed)) if Arc::ptr_eq(&landed, &current) => base,
+                        _ => current,
+                    };
+                    self.entry_append = Some((base, Arc::clone(&next)));
+                    self.detail = Some(next);
+                }
+            }
+            Ok(_) => {}
+            Err(message) => self.value_more_error = Some(message),
+        }
     }
 
     /// 集群里多键命令跨槽：发送前就拦下并说明（不静默失败）。返回 true 表示已拦下。

@@ -4,7 +4,7 @@ use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
-use crate::ddl::model::{ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus};
+use crate::ddl::model::{ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexKind, Snapshot, Step, StepReceipt, StepStatus};
 use crate::ddl::sql::qualified_table;
 
 /// 改名前查新名字：MySQL 看同库的表与视图（名字逐字节比较，排除被改名的表自身）。
@@ -88,11 +88,15 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
         Ok(partitions) => snapshot.partitions = partitions,
         Err(message) => snapshot.partition_error = Some(message),
     }
+    let visibility = statistics_visibility(&mut conn).await;
     let indexes: Vec<mysql_async::Row> = keep_rows(
         &mut snapshot.index_error,
         mysql_async::prelude::Queryable::exec(
             &mut conn,
-            "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            format!(
+                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION, INDEX_TYPE, SUB_PART, INDEX_COMMENT, {} FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                visibility.select_expr()
+            ),
             (database.to_owned(), table.to_owned()),
         )
         .await
@@ -160,23 +164,106 @@ pub(super) async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, databas
     Ok(snapshot)
 }
 
-/// statistics 的一行（INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION 从 `at` 起）并入索引列表。
+/// information_schema.statistics 里表示索引可见性的列：MySQL 8.0+ 是 IS_VISIBLE，MariaDB 10.6+ 是 IGNORED（含义相反），
+/// 更早的版本都没有。按列是否存在选择，不按版本号猜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatisticsVisibility {
+    IsVisible,
+    Ignored,
+    Missing,
+}
+
+impl StatisticsVisibility {
+    /// 选出 'YES'（可见）/'NO'（不可见）/NULL（没有这项）的表达式。
+    pub(crate) fn select_expr(self) -> &'static str {
+        match self {
+            StatisticsVisibility::IsVisible => "IS_VISIBLE",
+            StatisticsVisibility::Ignored => "CASE WHEN IGNORED = 'YES' THEN 'NO' ELSE 'YES' END",
+            StatisticsVisibility::Missing => "NULL",
+        }
+    }
+
+    pub(crate) fn of_columns<S: AsRef<str>>(names: &[S]) -> Self {
+        if names.iter().any(|name| name.as_ref().eq_ignore_ascii_case("IS_VISIBLE")) {
+            StatisticsVisibility::IsVisible
+        } else if names.iter().any(|name| name.as_ref().eq_ignore_ascii_case("IGNORED")) {
+            StatisticsVisibility::Ignored
+        } else {
+            StatisticsVisibility::Missing
+        }
+    }
+}
+
+/// 读不到列清单时按没有可见性处理：索引其余信息照常读。
+async fn statistics_visibility(conn: &mut mysql_async::Conn) -> StatisticsVisibility {
+    let names: Result<Vec<String>, _> = mysql_async::prelude::Queryable::query(
+        conn,
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'information_schema' AND TABLE_NAME = 'STATISTICS' AND COLUMN_NAME IN ('IS_VISIBLE', 'IGNORED')",
+    )
+    .await;
+    names.map(|names| StatisticsVisibility::of_columns(&names)).unwrap_or(StatisticsVisibility::Missing)
+}
+
+/// INDEX_TYPE 与 NON_UNIQUE 推出的索引类型。主键按名字 PRIMARY 认。
+pub(crate) fn mysql_index_kind(name: &str, non_unique: &str, index_type: &str) -> IndexKind {
+    if name.eq_ignore_ascii_case("PRIMARY") {
+        IndexKind::Primary
+    } else if index_type.eq_ignore_ascii_case("FULLTEXT") {
+        IndexKind::Fulltext
+    } else if index_type.eq_ignore_ascii_case("SPATIAL") {
+        IndexKind::Spatial
+    } else if non_unique == "0" {
+        IndexKind::Unique
+    } else {
+        IndexKind::Normal
+    }
+}
+
+/// 'YES'/'NO'/空 换成可见性。
+pub(crate) fn mysql_visibility(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_uppercase().as_str() {
+        "YES" => Some(true),
+        "NO" => Some(false),
+        _ => None,
+    }
+}
+
+/// statistics 的一行（INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION, INDEX_TYPE, SUB_PART, INDEX_COMMENT, 可见性 从 `at` 起）并入索引列表。
 fn push_mysql_index(indexes: &mut Vec<Index>, row: &mysql_async::Row, at: usize) {
     let name = mysql_string(row, at);
-    let column = IndexColumn { name: mysql_string(row, at + 2), descending: mysql_string(row, at + 3).eq_ignore_ascii_case("D") };
+    let column_name = mysql_string(row, at + 2);
+    // 8.0.13+ 的函数索引键：COLUMN_NAME 为 NULL（表达式在 EXPRESSION 列），按表达式索引处理，不当成空列名。
+    let functional = column_name.is_empty();
+    let column = IndexColumn {
+        name: column_name,
+        descending: mysql_string(row, at + 3).eq_ignore_ascii_case("D"),
+        prefix: mysql_string(row, at + 5).trim().parse::<u32>().ok().filter(|length| *length > 0),
+    };
     if let Some(index) = indexes.iter_mut().find(|index| index.name == name) {
-        index.columns.push(column);
+        if functional {
+            index.expression = true;
+        } else {
+            index.columns.push(column);
+        }
     } else {
         let primary = name.eq_ignore_ascii_case("PRIMARY");
+        let non_unique = mysql_string(row, at + 1);
+        let method = mysql_string(row, at + 4);
+        let comment = mysql_string(row, at + 6);
         indexes.push(Index {
+            kind: mysql_index_kind(&name, &non_unique, &method),
             name,
-            unique: mysql_string(row, at + 1) == "0",
-            columns: vec![column],
+            unique: non_unique == "0",
+            columns: if functional { Vec::new() } else { vec![column] },
             protected: primary,
             reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
             partial: false,
-            expression: false,
+            expression: functional,
             sql: None,
+            method: Some(method).filter(|text| !text.trim().is_empty()),
+            comment: Some(comment).filter(|text| !text.trim().is_empty()),
+            visible: mysql_visibility(&mysql_string(row, at + 7)),
+            rebuild_loses: Vec::new(),
         });
     }
 }
@@ -234,10 +321,15 @@ pub(super) async fn load_mysql_tables(pool: &mysql_async::Pool, engine: Engine, 
         }
     }
     let mut index_error = None;
+    // 与逐表读取同一组字段（含可见性），对比时两条路径读到的索引一致。
+    let visibility = statistics_visibility(&mut conn).await;
     let indexes = keep_rows(
         &mut index_error,
         conn.exec(
-            "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION FROM information_schema.statistics WHERE table_schema = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            format!(
+                "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION, INDEX_TYPE, SUB_PART, INDEX_COMMENT, {} FROM information_schema.statistics WHERE table_schema = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+                visibility.select_expr()
+            ),
             (database.to_owned(),),
         )
         .await
@@ -399,4 +491,27 @@ pub(in crate::adapters) async fn run_steps(pool: &mysql_async::Pool, steps: &[St
         }
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mysql_index_kind, mysql_visibility, StatisticsVisibility};
+    use crate::ddl::model::IndexKind;
+
+    #[test]
+    fn mysql_statistics_values_map_to_kind_and_visibility() {
+        assert_eq!(mysql_index_kind("PRIMARY", "0", "BTREE"), IndexKind::Primary);
+        assert_eq!(mysql_index_kind("uq", "0", "BTREE"), IndexKind::Unique);
+        assert_eq!(mysql_index_kind("idx", "1", "HASH"), IndexKind::Normal);
+        assert_eq!(mysql_index_kind("ft", "1", "FULLTEXT"), IndexKind::Fulltext);
+        assert_eq!(mysql_index_kind("sp", "1", "SPATIAL"), IndexKind::Spatial);
+        assert_eq!(mysql_visibility("YES"), Some(true));
+        assert_eq!(mysql_visibility("NO"), Some(false));
+        assert_eq!(mysql_visibility(""), None);
+        assert_eq!(StatisticsVisibility::of_columns(&["IS_VISIBLE"]), StatisticsVisibility::IsVisible);
+        assert_eq!(StatisticsVisibility::of_columns(&["IGNORED"]), StatisticsVisibility::Ignored);
+        assert_eq!(StatisticsVisibility::of_columns::<&str>(&[]), StatisticsVisibility::Missing);
+        assert!(StatisticsVisibility::Ignored.select_expr().contains("IGNORED"));
+        assert_eq!(StatisticsVisibility::Missing.select_expr(), "NULL");
+    }
 }

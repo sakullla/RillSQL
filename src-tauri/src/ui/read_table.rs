@@ -535,7 +535,8 @@ impl ReadTable {
     pub fn set_data(&mut self, columns: Vec<ReadColumn>, rows: ReadRows, cx: &mut Context<Self>) {
         self.table.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
-            let column_shape_changed = delegate.columns.len() != columns.len() || delegate.columns.iter().zip(&columns).any(|(a, b)| a.title != b.title);
+            let column_shape_changed = delegate.columns.len() != columns.len()
+                || delegate.columns.iter().zip(&columns).any(|(a, b)| a.title != b.title || (a.width - b.width).abs() > 0.5);
             delegate.columns = columns;
             delegate.rows = rows;
             let (rows, cols) = (delegate.rows.len(), delegate.cols());
@@ -548,6 +549,53 @@ impl ReadTable {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// 换数据但保持视图：纵向、横向滚动位置与选中都不动，也不把选中行滚回可见。
+    /// 用于“加载更多”这类在原数据后追加的刷新（Redis 集合分页、继续读取），不让列表回弹到顶部或选中行。
+    pub fn set_data_keep_view(&mut self, columns: Vec<ReadColumn>, rows: ReadRows, cx: &mut Context<Self>) {
+        let (vertical, horizontal) = self.scroll_offsets(cx);
+        self.set_data(columns, rows, cx);
+        self.table.update(cx, |state, cx| {
+            {
+                let mut scroll = state.vertical_scroll_handle.0.borrow_mut();
+                scroll.deferred_scroll_to_item = None;
+                scroll.base_handle.set_offset(vertical);
+            }
+            state.horizontal_scroll_handle.set_offset(horizontal);
+            cx.notify();
+        });
+    }
+
+    /// 在静态行后追加若干行，保持滚动位置与选中（见 [`Self::set_data_keep_view`]）。
+    /// 按需取值（Lazy）的表没有可追加的存储，调用方应整体换数据。
+    pub fn append_rows(&mut self, more: Vec<Vec<SharedString>>, cx: &mut Context<Self>) {
+        let (columns, rows) = {
+            let delegate = self.table.read(cx).delegate();
+            let ReadRows::Static(existing) = &delegate.rows else { return };
+            let mut rows = existing.clone();
+            rows.extend(more);
+            (delegate.columns.clone(), rows)
+        };
+        self.set_data_keep_view(columns, ReadRows::Static(rows), cx);
+    }
+
+    /// 当前（纵向, 横向）滚动偏移。
+    pub fn scroll_offsets(&self, cx: &App) -> (Point<Pixels>, Point<Pixels>) {
+        let state = self.table.read(cx);
+        let vertical = state.vertical_scroll_handle.0.borrow().base_handle.offset();
+        (vertical, state.horizontal_scroll_handle.offset())
+    }
+
+    /// 设置纵向滚动偏移（测试与恢复视图用）。
+    pub fn set_vertical_offset(&mut self, offset: Point<Pixels>, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let mut scroll = state.vertical_scroll_handle.0.borrow_mut();
+            scroll.deferred_scroll_to_item = None;
+            scroll.base_handle.set_offset(offset);
+            drop(scroll);
+            cx.notify();
+        });
     }
 
     /// 空表时显示的文字；None 用默认的“没有数据”。
@@ -565,6 +613,11 @@ impl ReadTable {
 
     pub fn table(&self) -> &Entity<TableState<ReadDelegate>> {
         &self.table
+    }
+
+    /// 各列当前的定义宽度（页面按内容测量、填满剩余宽度之后的结果）。
+    pub fn column_widths(&self, cx: &App) -> Vec<f32> {
+        self.table.read(cx).delegate().columns.iter().map(|column| column.width).collect()
     }
 
     pub fn rows_len(&self, cx: &App) -> usize {
@@ -593,6 +646,21 @@ impl ReadTable {
         self.apply_selection(row, 0, SelectionMode::Rows, extend, cx);
         self.echo = Some((SelectionMode::Rows, row, 0));
         self.table.update(cx, |state, cx| state.set_selected_row(row, cx));
+    }
+
+    /// 选中一行但不滚动：加载更多后排序视图里同一条目换了行号时，选中跟过去，视口不动。
+    pub fn select_row_keep_view(&mut self, row: usize, cx: &mut Context<Self>) {
+        let (vertical, horizontal) = self.scroll_offsets(cx);
+        self.select_row(row, false, cx);
+        self.table.update(cx, |state, cx| {
+            {
+                let mut scroll = state.vertical_scroll_handle.0.borrow_mut();
+                scroll.deferred_scroll_to_item = None;
+                scroll.base_handle.set_offset(vertical);
+            }
+            state.horizontal_scroll_handle.set_offset(horizontal);
+            cx.notify();
+        });
     }
 
     fn on_table_event(&mut self, event: &TableEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1097,5 +1165,41 @@ mod tests {
         step(cx, window, |_, cx| table.update(cx, |table, cx| table.set_data(columns(), ReadRows::default(), cx)));
         assert_eq!(cx.update(|cx| table.read(cx).selection(cx)), None);
         assert!(!events.borrow().iter().any(|e| matches!(e, ReadTableEvent::Activate(_))));
+    }
+
+    fn numbered(from: usize, to: usize) -> Vec<Vec<SharedString>> {
+        (from..to).map(|i| vec![SharedString::from(i.to_string()), SharedString::from(format!("n{i}")), SharedString::default()]).collect()
+    }
+
+    /// 加载更多：追加后条目变多，选中行与纵向滚动偏移都不变（不回弹到顶部，也不滚回选中行）。
+    #[gpui_kit::test]
+    fn appending_rows_keeps_selection_and_scroll_offset(cx: &mut TestAppContext) {
+        let (window, table, _) = open(cx, ReadRows::Static(numbered(0, 120)));
+        step(cx, window, |_, cx| table.update(cx, |table, cx| table.select_row(2, false, cx)));
+        step(cx, window, |_, _| {});
+        // 用户滚到列表底部去点「加载更多」：选中行已经不在视口里。
+        let scrolled = Point { x: px(0.), y: px(-1500.) };
+        step(cx, window, |_, cx| table.update(cx, |table, cx| table.set_vertical_offset(scrolled, cx)));
+        step(cx, window, |_, _| {});
+        let before = cx.update(|cx| table.read(cx).scroll_offsets(cx).0);
+        assert!(before.y < px(-1000.), "已滚动到下面：{before:?}");
+        step(cx, window, |_, cx| table.update(cx, |table, cx| table.append_rows(numbered(120, 240), cx)));
+        step(cx, window, |_, _| {});
+        step(cx, window, |_, _| {});
+        let (rows, selection, after) = cx.update(|cx| {
+            let table = table.read(cx);
+            (table.rows_len(cx), table.selection(cx), table.scroll_offsets(cx).0)
+        });
+        assert_eq!(rows, 240, "条目数增加");
+        assert_eq!(selection, Some(ReadSelection { anchor: (2, 0), focus: (2, 0), mode: SelectionMode::Rows }), "选中行不变");
+        assert_eq!(after, before, "滚动偏移不变");
+        // 整体替换数据的保持视图版本同样不动滚动与选中。
+        step(cx, window, |_, cx| table.update(cx, |table, cx| table.set_data_keep_view(columns(), ReadRows::Static(numbered(0, 300)), cx)));
+        step(cx, window, |_, _| {});
+        let (rows, selection, again) = cx.update(|cx| {
+            let table = table.read(cx);
+            (table.rows_len(cx), table.selection(cx).map(|s| s.focus), table.scroll_offsets(cx).0)
+        });
+        assert_eq!((rows, selection, again), (300, Some((2, 0)), before));
     }
 }

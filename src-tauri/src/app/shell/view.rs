@@ -580,9 +580,40 @@ impl Workbench {
         let _ = (database, name);
     }
 
+    /// 对象编辑器盖在当前标签上：打开着并指向已有对象时，侧栏定位指向这个例程/事件/触发器。
+    fn sync_object_editor_target(&mut self, cx: &mut Context<Self>) {
+        let target = {
+            let pane = self.object_editor.read(cx);
+            let session = &pane.session;
+            (pane.is_open() && !session.name.trim().is_empty() && !session.connection_id.is_empty()).then(|| super::model::RevealTarget::Object {
+                connection_id: session.connection_id.clone(),
+                database: session.database.clone(),
+                schema: session.schema.clone(),
+                name: session.name.clone(),
+                kinds: vec![session.kind],
+            })
+        };
+        if self.model.object_editor_target != target {
+            self.model.object_editor_target = target;
+        }
+    }
+
     fn perform_command(&mut self, id: &str, cx: &mut Context<Self>) {
         if id == "explorer-search" {
             self.focus_explorer_filter = true;
+        }
+        if id == "reveal-active-tab" {
+            // 定位高亮到时自动淡出：到点重绘一次。
+            let view = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(super::model::REVEAL_FLASH + std::time::Duration::from_millis(50)).await;
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |_, cx| cx.notify());
+                    }
+                });
+            })
+            .detach();
         }
         if id == "menu-grid" {
             // 网格菜单的条目取决于此刻的格子：表数据页或查询结果里那张网格现报事实。
@@ -1155,6 +1186,8 @@ impl Workbench {
     /// 公开设置只在这里下发；每个工作项打开或新建时沿用当前值，不需要重启。
     fn sync_view_settings(&mut self, cx: &mut Context<Self>) {
         let settings = self.model.settings.to_settings();
+        // 对象提示是全局的：所有 SQL 编辑器的补全与悬停提供者下一次请求时读取。
+        crate::ui::SqlEditor::publish_object_hints(crate::app::views::settings::ObjectHints::parse(&settings.object_hints), cx);
         self.query.update(cx, |pane, cx| pane.apply_public_settings(&settings, cx));
         if self.structure.read(cx).index_naming() != &settings.index_naming {
             let naming = settings.index_naming.clone();
@@ -1588,6 +1621,11 @@ impl Workbench {
     }
 
     #[cfg(test)]
+    pub fn commit_table_for_test(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |pane, cx| pane.commit_all_for_test(cx));
+    }
+
+    #[cfg(test)]
     pub fn mark_table_dirty(&mut self, cx: &mut Context<Self>) {
         self.table.update(cx, |pane, cx| {
             pane.stage_sample_edit();
@@ -1995,6 +2033,10 @@ impl Workbench {
                 name: node.name.clone(), kind: crate::catalog::model::kind_name(node.object_kind.unwrap_or(crate::catalog::model::ObjectKind::Table)).to_owned(),
             }).collect();
         self.query.update(cx, |pane, cx| pane.adopt_navigation(&self.model.nav_source, objects, cx));
+        // 定位在等这次目录读取：读回后再定位一次（可能继续按需读取下一层）。
+        if self.model.pending_reveal.is_some() && self.model.retry_pending_reveal() {
+            self.pump_nav(cx);
+        }
     }
 
     /// 库节点展开：读这个库的 schema 清单。加载态已由模型标在这个库上。
@@ -3796,6 +3838,7 @@ impl Workbench {
             self.pump_nav(cx);
         }
         self.consume_object_editor(cx);
+        self.sync_object_editor_target(cx);
         self.sync_view_settings(cx);
         self.sync_density(cx);
         self.sync_query(cx);

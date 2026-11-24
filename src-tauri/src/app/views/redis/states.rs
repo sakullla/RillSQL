@@ -427,6 +427,107 @@ fn redis_pane_holds_both_themes_both_densities_and_three_widths(cx: &mut gpui_ki
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn hash_detail(fields: &[&str], next: Option<&str>) -> RedisKeyDetail {
+    RedisKeyDetail {
+        key_type: "hash".into(),
+        ttl_ms: Some(-1),
+        value: RedisValue::Hash { entries: fields.iter().map(|f| keys::KeyValuePair { field: (*f).into(), value: "{\"a\":1}".into() }).collect() },
+        total: Some(fields.len() as u64),
+        next: next.map(str::to_owned),
+        memory: Some(2048),
+        encoding: Some("listpack".into()),
+    }
+}
+
+/// R12：详情头分两层（标题行：键名 + 复制、右侧一组图标操作；元信息行：类型标签、TTL、条数、内存、编码），
+/// 顶栏把连接名与逻辑库合成一个区块；条目表首列按内容量宽（上限 360），值列填满；空集合与只读条目都用统一状态块。
+#[gpui_kit::test]
+fn detail_header_layers_and_entry_table_widths_follow_content(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = test_services("layout");
+    cx.update(gpui_kit::init);
+    let (window, pane) = open_pane_at(cx, services.clone(), 1360., 800., |pane| {
+        pane.connection_name = "订单缓存".into();
+        pane.plant_key("h");
+        pane.selected = "h".into();
+        pane.detail_key = "h".into();
+        pane.entry_focus = Some(0);
+        pane.detail = Some(std::sync::Arc::new(hash_detail(&["id", "name"], None)));
+    });
+    let probe = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            (
+                window.find("redis-detail-title-row").bounds(),
+                window.find("redis-detail-meta").bounds(),
+                window.within("redis-detail-title-row").try_find("redis-copy-key").is_some(),
+                window.within("redis-detail-title-row").try_find("redis-detail-actions").is_some(),
+                window.within("redis-detail-meta").try_find("redis-type-tag").is_some(),
+                window.within("redis-detail-meta").try_find("redis-memory-chip").is_some(),
+                window.within("redis-detail-meta").try_find("redis-encoding-chip").is_some(),
+                window.within("redis-identity").try_find("redis-db-toggle").is_some(),
+                window.within("redis-identity").try_find("redis-connection-name").is_some(),
+                window.try_find("redis-value-all-loaded").is_some(),
+            )
+        })
+        .unwrap();
+    let (title, meta, copy, actions, tag, memory, encoding, db, name, all) = probe;
+    assert!(meta.origin.y >= title.origin.y + title.size.height - gpui_kit::px(0.5), "元信息行在标题行下面：{title:?} {meta:?}");
+    assert!(copy && actions, "标题行有复制键名与一组键操作");
+    assert!(tag && memory && encoding, "元信息行给类型标签、内存与编码");
+    assert!(db && name, "连接名与逻辑库在同一个区块");
+    assert!(all, "一次读完的集合页脚说明已全部加载");
+    let inspector = cx.update(|cx| pane.read(cx).entry_viewer.as_ref().map(|viewer| viewer.read(cx).format()));
+    assert_eq!(inspector, Some(crate::ui::DataFormat::Json), "宽屏默认展开右栏，JSON 值按格式化视图显示");
+    let widths = cx.update(|cx| {
+        let table = pane.read(cx).tables.get(tables::ENTRY_TABLE).map(|slot| slot.table.clone()).expect("条目表");
+        table.read(cx).column_widths(cx)
+    });
+    let table_w = cx.update(|cx| {
+        let pane = pane.read(cx);
+        let detail_w = pane.viewport_w - pane.sidebar_w;
+        pane.value_left_w(detail_w)
+    });
+    assert!(widths[0] < 160., "短字段名的首列按内容收窄：{widths:?}");
+    assert!(widths[0] + widths[1] >= table_w - 48. && widths[0] + widths[1] <= table_w, "值列填满剩余宽度：{widths:?} / {table_w}");
+
+    // 超长字段名：首列封顶 360。
+    let long = "x".repeat(400);
+    cx.update(|cx| pane.update(cx, |pane, _| pane.detail = Some(std::sync::Arc::new(hash_detail(&[long.as_str(), "b"], Some("9"))))));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    let first = cx.update(|cx| pane.read(cx).tables.get(tables::ENTRY_TABLE).map(|slot| slot.table.read(cx).column_widths(cx)[0]).unwrap());
+    assert!((first - 360.).abs() < 0.5, "首列上限 360：{first}");
+
+    // 空集合：条目区换成统一的空态块；只读条目（Set 成员）给只读提示；没选条目时右栏是待选状态块。
+    cx.update(|cx| pane.update(cx, |pane, _| pane.detail = Some(std::sync::Arc::new(hash_detail(&[], None)))));
+    let empty = cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("redis-entries-state").try_find("empty-state").is_some()
+    });
+    assert_eq!(empty.ok(), Some(true), "空集合画空态块");
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            pane.entry_focus = Some(0);
+            pane.detail = Some(std::sync::Arc::new(RedisKeyDetail {
+                key_type: "set".into(),
+                ttl_ms: Some(-1),
+                value: RedisValue::Set { items: vec!["a".into()] },
+                total: Some(1),
+                next: None,
+                memory: None,
+                encoding: None,
+            }));
+        })
+    });
+    let read_only = cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find("redis-entry-readonly").is_some()
+    });
+    assert_eq!(read_only.ok(), Some(true), "只读条目给只读提示");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 本文件里用到的 redis.* / common.* 文案键必须真的在字典里（未知键会原样显示成键名）。
 #[test]
 fn every_redis_copy_key_used_in_the_source_exists_in_the_catalog() {

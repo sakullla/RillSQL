@@ -2,7 +2,6 @@
 //! 常用字段菜单与模板管理面板。方言差异（类型候选、表达式白名单、表级选项）只经适配器的类型规则与 DDL 方言取得。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -285,9 +284,7 @@ impl StructurePane {
         let expressions = types_named(engine).expression_choices();
         let current_menu = current.clone();
         let label = i18n::text(locale, mode_key(current.mode(), true));
-        let mode_button = Button::new(SharedString::from(format!("structure-default-mode-{index}")))
-            .ghost()
-            .xsmall()
+        let mode_button = kit::inline_menu_button(SharedString::from(format!("structure-default-mode-{index}")))
             .label(label)
             .icon(IconName::ChevronDown)
             .disabled(!enabled)
@@ -415,9 +412,7 @@ impl StructurePane {
             }
             let owner = entity.clone();
             let shown = if current.trim().is_empty() { i18n::text(locale, "structure.options.default") } else { current.clone() };
-            let button = Button::new(SharedString::from(format!("structure-option-{field}")))
-                .outline()
-                .small()
+            let button = kit::field_menu_button(SharedString::from(format!("structure-option-{field}")))
                 .label(shown)
                 .icon(IconName::ChevronDown)
                 .dropdown_menu(move |menu, _, _| {
@@ -487,9 +482,7 @@ impl StructurePane {
         let locale = self.session.locale;
         let templates = self.available_templates();
         let owner = entity.clone();
-        Button::new("structure-column-presets")
-            .ghost()
-            .small()
+        kit::menu_button("structure-column-presets")
             .icon(IconName::Sparkles)
             .label(i18n::text(locale, "structure.field.presets"))
             .dropdown_menu(move |menu, _, _| {
@@ -1048,9 +1041,7 @@ impl StructurePane {
             let type_owner = entity.clone();
             let current_type = column.type_name.clone();
             let menu_engine = engine.clone();
-            let type_button = Button::new(SharedString::from(format!("structure-template-types-{index}")))
-                .ghost()
-                .xsmall()
+            let type_button = kit::inline_menu_button(SharedString::from(format!("structure-template-types-{index}")))
                 .icon(IconName::ChevronDown)
                 .dropdown_menu(move |menu, _, _| {
                     let owner = type_owner.clone();
@@ -1064,9 +1055,7 @@ impl StructurePane {
             let default_owner = entity.clone();
             let current_default = column.default.clone();
             let nullable = column.nullable;
-            let mode_button = Button::new(SharedString::from(format!("structure-template-default-{index}")))
-                .ghost()
-                .xsmall()
+            let mode_button = kit::inline_menu_button(SharedString::from(format!("structure-template-default-{index}")))
                 .label(i18n::text(locale, mode_key(column.default.mode(), true)))
                 .icon(IconName::ChevronDown)
                 .dropdown_menu(move |menu, _, _| {

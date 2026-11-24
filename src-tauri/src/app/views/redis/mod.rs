@@ -474,6 +474,17 @@ pub struct RedisPane {
     entry_rows: Vec<usize>,
     /// 条目表当前对应的详情：换了详情（换键或重读）时，表里的选中重新对齐到当前条目。
     entry_rows_detail: Option<Arc<RedisKeyDetail>>,
+    /// 条目表当前对应的（键, 类型, 筛选, 排序）：同一视图下只多了一页时按追加处理，保持滚动与选中。
+    entry_rows_view: Option<(String, String, String, u8)>,
+    /// 条目表当前详情已读到的条目数：同一视图下条目数变多，即为“加载更多”的追加页。
+    entry_rows_loaded: usize,
+    /// 「加载更多」落地的追加页：(追加前的详情, 追加后的详情)。只有它能让条目表按追加处理；
+    /// 其它任何换详情（换键、刷新、写后重读）都按重建处理，选中重新对齐到当前条目。
+    entry_append: Option<(Arc<RedisKeyDetail>, Arc<RedisKeyDetail>)>,
+    /// 条目表首列宽的测量缓存：(数据戳, 宽度)。
+    entry_first_w: Option<(u64, f32)>,
+    /// 「加载更多」失败的原因：页脚显示并给出重试，不把整个值区换成错误态。
+    value_more_error: Option<String>,
     /// 条目表排序：0 原顺序，1 升序，2 降序（按主列）。
     entry_sort: u8,
     /// 值区分隔条拖动：(起点 x, 起始宽度)。
@@ -483,7 +494,9 @@ pub struct RedisPane {
     /// 上一次失败是「值已被别人修改」：错误条给出刷新。
     stale_value: bool,
     /// 键名截断缓存：(键名, 可用宽度) → 显示文本。
-    fit_cache: HashMap<(String, u32), String>,
+    fit_cache: HashMap<(String, u32), tables::FittedKey>,
+    /// 生成 `fit_cache` 时的分隔符：分隔符一变（改偏好、换连接载入偏好），拆分结果全部作废。
+    fit_cache_seps: Vec<String>,
     /// 诊断信息页收起的分组。
     info_query: String,
     /// 请求外壳在新标签中固定打开的键（规格 `连接|名称|库|键`）。
@@ -605,11 +618,17 @@ impl RedisPane {
             tables: HashMap::new(),
             entry_rows: Vec::new(),
             entry_rows_detail: None,
+            entry_rows_view: None,
+            entry_rows_loaded: 0,
+            entry_append: None,
+            entry_first_w: None,
+            value_more_error: None,
             entry_sort: 0,
             value_drag_start: None,
             guard_generation: 0,
             stale_value: false,
             fit_cache: HashMap::new(),
+            fit_cache_seps: Vec::new(),
             info_query: String::new(),
             open_requests: Vec::new(),
         }
@@ -761,6 +780,8 @@ impl RedisPane {
             value: RedisValue::String { text: "hello".into() },
             total: Some(5),
             next: None,
+            memory: None,
+            encoding: None,
         }));
     }
 
@@ -872,6 +893,11 @@ impl RedisPane {
         self.tables.clear();
         self.entry_rows.clear();
         self.entry_rows_detail = None;
+        self.entry_rows_view = None;
+        self.entry_rows_loaded = 0;
+        self.entry_append = None;
+        self.entry_first_w = None;
+        self.value_more_error = None;
         self.entry_sort = 0;
         self.value_drag_start = None;
         self.guard_generation = self.guard_generation.wrapping_add(1);
@@ -1785,6 +1811,7 @@ impl RedisPane {
         }
         self.selected = name.clone();
         self.value_loading = false;
+        self.value_more_error = None;
         self.placement = self.topology.cluster.then(|| cluster::placement(&self.topology.nodes, &name));
         self.stream_focus = None;
         if self.viewport_w < kit::NARROW_PAGE_WIDTH {
@@ -1872,7 +1899,9 @@ impl RedisPane {
                     _ => None,
                 };
                 self.detail = Some(Arc::new(detail));
+                self.entry_append = None;
                 self.detail_key = name;
+                self.value_more_error = None;
                 self.reload_viewer = true;
                 self.entry_viewer_tag.clear();
                 if self.error_source == ErrorSource::Detail {
@@ -3317,6 +3346,8 @@ mod tests {
                     value: RedisValue::ZSet { entries: Vec::new() },
                     total: Some(0),
                     next: None,
+                    memory: None,
+                    encoding: None,
                 }));
                 pane.entry_score = "nope".into();
                 pane.entry_member = "张伟".into();

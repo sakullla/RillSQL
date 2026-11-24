@@ -60,6 +60,7 @@ actions!(
         SelectTab8,
         SelectTab9,
         FocusExplorerSearch,
+        RevealActiveTab,
         RequestCancel,
         ShowAutocomplete,
         ToggleComment,
@@ -259,6 +260,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(SelectTab8, "select-tab-8");
     bind!(SelectTab9, "select-tab-9");
     bind!(FocusExplorerSearch, "explorer-search");
+    bind!(RevealActiveTab, "reveal-active-tab");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
@@ -354,6 +356,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(SelectTab8, "select-tab-8");
     bind!(SelectTab9, "select-tab-9");
     bind!(FocusExplorerSearch, "explorer-search");
+    bind!(RevealActiveTab, "reveal-active-tab");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");

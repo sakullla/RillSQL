@@ -25,6 +25,7 @@ pub fn is_settings_command(id: &str) -> bool {
         || id.starts_with("object-page-")
         || id.starts_with("null-")
         || id.starts_with("timeout-")
+        || id.starts_with("hints-")
 }
 
 /// 设置页的左侧分区导航：设计 S8.3 的三块，右侧只显示当前分区的表单。
@@ -121,6 +122,35 @@ pub struct SettingsForm {
     pub index_naming: IndexNaming,
     pub transaction_manual: bool,
     pub transaction_advanced: bool,
+    /// 编辑器对象提示：`compact`（默认）或 `off`。
+    pub object_hints: String,
+}
+
+/// 设置“编辑器 → 对象提示”：紧凑（默认）时补全附一行对象摘要、悬停显示紧凑对象卡；
+/// 关闭时补全不附文档、悬停不显示对象/列卡，函数签名照常。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectHints {
+    #[default]
+    Compact,
+    Off,
+}
+
+impl ObjectHints {
+    /// 设置里存的文本：`compact` / `off`；认不出的按默认紧凑。
+    pub fn parse(value: &str) -> Self {
+        if value == "off" { ObjectHints::Off } else { ObjectHints::Compact }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ObjectHints::Compact => "compact",
+            ObjectHints::Off => "off",
+        }
+    }
+}
+
+pub fn normalize_object_hints(value: &str) -> &'static str {
+    ObjectHints::parse(value).code()
 }
 
 /// 空字符串的两种画法：弱化提示（默认）或留空。
@@ -155,6 +185,7 @@ impl SettingsForm {
             index_naming: settings.index_naming.clone(),
             transaction_manual: settings.transaction_manual,
             transaction_advanced: settings.transaction_advanced,
+            object_hints: normalize_object_hints(&settings.object_hints).to_owned(),
         }
     }
 
@@ -176,6 +207,7 @@ impl SettingsForm {
             index_naming: self.index_naming.clone(),
             transaction_manual: self.transaction_manual,
             transaction_advanced: self.transaction_advanced,
+            object_hints: normalize_object_hints(&self.object_hints).to_owned(),
         }
     }
 
@@ -197,6 +229,7 @@ impl SettingsForm {
             index_naming: form.index_naming,
             transaction_manual: form.transaction_manual,
             transaction_advanced: form.transaction_advanced,
+            object_hints: form.object_hints,
         }
     }
 
@@ -446,6 +479,26 @@ mod tests {
         assert_eq!(form.to_settings().empty_display, "hint");
     }
 
+    /// R8：编辑器对象提示默认紧凑，可关闭并随设置写盘；旧文件缺字段与非法值都归一为紧凑。
+    #[test]
+    fn object_hints_default_compact_round_trip_and_survive_old_files() {
+        assert_eq!(ShellSettings::default().object_hints, "compact");
+        let old: ShellSettings = serde_json::from_str(
+            r#"{"theme":"system","density":"compact","editorFont":13,"editorTheme":"auto","locale":"zh-CN","pageSize":100,"previewKb":1,"objectPage":500,"nullCopy":"NULL","queryTimeoutSec":0,"autoCheckUpdates":true}"#,
+        )
+        .expect("旧文件仍能读入");
+        assert_eq!(old.object_hints, "compact");
+        let mut form = SettingsForm::from_settings(&old);
+        form.object_hints = "off".into();
+        let stored = serde_json::to_string(&form.to_settings()).unwrap();
+        assert!(stored.contains(r#""objectHints":"off""#), "{stored}");
+        let back: ShellSettings = serde_json::from_str(&stored).unwrap();
+        assert_eq!(SettingsForm::from_settings(&back).object_hints, "off");
+        form.object_hints = "loud".into();
+        assert_eq!(form.to_settings().object_hints, "compact");
+        assert!(is_settings_command("hints-off") && is_settings_command("hints-compact"));
+    }
+
     /// R8：索引命名模板随设置写盘、读回，旧文件缺字段时取默认。
     #[test]
     fn index_naming_round_trips_through_settings() {
@@ -477,6 +530,7 @@ mod tests {
             index_naming: IndexNaming::default(),
             transaction_manual: false,
             transaction_advanced: false,
+            object_hints: "loud".into(),
         };
         let mut form = SettingsForm::from_settings(&illegal);
         assert_eq!(form.theme, "system");

@@ -461,13 +461,15 @@ fn paged_values_show_total_and_json_writes_use_json_set() {
         value: RedisValue::Hash { entries: vec![keys::KeyValuePair { field: "a".into(), value: "1".into() }] },
         total: Some(5000),
         next: Some("17".into()),
+        memory: None,
+        encoding: None,
     };
     let label = pane.count_label(&detail);
     assert!(label.contains("5000"), "{label}");
     let mut value = detail.value.clone();
     keys::append_page(&mut value, RedisValue::Hash { entries: vec![keys::KeyValuePair { field: "b".into(), value: String::new() }] });
     assert!(matches!(&value, RedisValue::Hash { entries } if entries.len() == 2));
-    pane.detail = Some(Arc::new(RedisKeyDetail { key_type: keys::JSON_TYPE.into(), ttl_ms: Some(-1), value: RedisValue::Json { text: "{}".into() }, total: None, next: None }));
+    pane.detail = Some(Arc::new(RedisKeyDetail { key_type: keys::JSON_TYPE.into(), ttl_ms: Some(-1), value: RedisValue::Json { text: "{}".into() }, total: None, next: None, memory: None, encoding: None }));
     pane.stage_if_key(RedisMutation::JsonSet { key: "h".into(), value: "{\"a\":1}".into() });
     assert!(pane.confirm_open());
     assert_eq!(pane.confirm_preview(), "JSON.SET h $ {\"a\":1}");

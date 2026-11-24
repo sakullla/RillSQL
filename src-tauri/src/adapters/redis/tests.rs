@@ -504,7 +504,7 @@ fn large_strings_read_a_prefix_and_writes_probe_the_current_value() {
     assert_eq!(string_read_command("k", None), vec!["GET", "k"]);
     assert_eq!(string_read_command("k", Some(STRING_PREVIEW_BYTES)), vec!["GET", "k"], "正好 1 MiB 仍整段读");
     assert_eq!(string_read_command("k", Some(STRING_PREVIEW_BYTES + 1)), vec!["GETRANGE", "k", "0", "1048575"]);
-    let detail = |text: &str, total: u64| RedisKeyDetail { key_type: "string".into(), ttl_ms: None, value: RedisValue::String { text: text.into() }, total: Some(total), next: None };
+    let detail = |text: &str, total: u64| RedisKeyDetail { key_type: "string".into(), ttl_ms: None, value: RedisValue::String { text: text.into() }, total: Some(total), next: None, memory: None, encoding: None };
     assert!(string_is_preview(&detail("abc", STRING_PREVIEW_BYTES * 2)));
     assert!(!string_is_preview(&detail("abc", 3)));
     assert_eq!(probe_command(&ValueProbe::Json { key: "j".into() }), vec!["JSON.GET", "j"]);

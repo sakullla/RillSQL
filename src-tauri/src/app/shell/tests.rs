@@ -1900,6 +1900,44 @@ fn explicit_null_and_copy_go_through_the_shared_shell_grid(cx: &mut gpui_kit::Te
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// R2：确认写入成功后，改动条与标签上的“待提交”标记同时清除（写入回执落地时网格会 notify 外壳）。
+#[gpui_kit::test]
+fn a_successful_grid_commit_clears_the_tab_pending_mark(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-commit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-table:{spec}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.mark_table_dirty(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let table = view.read(cx).model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).cloned().expect("table item");
+        assert!(table.uncommitted_cells, "先有待提交标记");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.commit_table_for_test(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.table_uncommitted(cx), "写入成功后网格没有待提交修改");
+        assert!(!view.table_preview(cx).0, "写入成功后预览关闭");
+        let table = view.model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).cloned().expect("table item");
+        assert!(!table.uncommitted_cells, "标签上的待提交标记随之清除");
+        assert!(!view.model.grid_dirty);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[gpui_kit::test]
 fn staged_table_survives_switching_to_structure_and_back(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();
@@ -3644,6 +3682,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         index_naming: crate::ddl::naming::IndexNaming::default(),
         transaction_manual: false,
         transaction_advanced: false,
+        object_hints: "compact".into(),
     };
     model.apply_settings(&illegal);
     assert_eq!(model.settings.theme, "system");
@@ -3777,6 +3816,7 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
         index_naming: crate::ddl::naming::IndexNaming::default(),
         transaction_manual: false,
         transaction_advanced: false,
+        object_hints: "compact".into(),
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4474,6 +4514,13 @@ fn failed_settings_write_is_visible_then_retry_persists(cx: &mut gpui_kit::TestA
 
     std::fs::remove_dir_all(&state_path).unwrap();
     cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 重试行贴着表单末尾：编辑器分组变长后先滚到底，再点它。
+        window.scroll(
+            "settings-form",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::Point::new(gpui_kit::px(0.), gpui_kit::px(-2000.))),
+            cx,
+        );
         window.render_frame(cx);
         window.click("settings-retry-save", cx);
     })
@@ -7468,6 +7515,12 @@ fn sqlite_tree_ddl_viewer_and_drop_go_through_the_confirm_layer(cx: &mut gpui_ki
     })
     .unwrap();
     assert!(f32::from(shown.size.height) > 0., "查看器没有画出来");
+    // 复制与在查询中打开在头部：位于只读高亮编辑区上方。
+    let (copy, open) = cx
+        .update_window(window, |_, window, _| (window.find("cmd-ddl-copy").bounds(), window.find("cmd-ddl-open-query").bounds()))
+        .unwrap();
+    assert!(copy.bottom() <= shown.top() && open.bottom() <= shown.top(), "复制/在查询中打开应在头部：{copy:?} {open:?} {shown:?}");
+    assert!(f32::from(copy.size.width) > 0. && f32::from(open.size.width) > 0.);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| view.perform("ddl-copy", cx));
         window.render_frame(cx);
@@ -12096,13 +12149,13 @@ fn portal_dialog_failure_falls_back_to_sqlite_modal_with_friendly_guidance(cx: &
 
 #[test]
 fn opening_sql_file_preserves_filename_title_and_connection_target() {
-    let mut model = seeded_model(vec![record_for("uat", "qsyn-uat", Engine::Mysql)]);
+    let mut model = seeded_model(vec![record_for("uat", "demo-uat", Engine::Mysql)]);
     model.connections.status.insert("uat".into(), LinkStatus::Connected);
     let _ = model.dispatch("new-query");
     if let Some(tab) = model.tabs.last_mut() {
         tab.connection_id = Some("uat".into());
-        tab.connection_name = Some("qsyn-uat".into());
-        tab.database = Some("qsyn3_tms_business2".into());
+        tab.connection_name = Some("demo-uat".into());
+        tab.database = Some("demo_business2".into());
     }
 
     model.open_sql_file(
@@ -12114,7 +12167,7 @@ fn opening_sql_file_preserves_filename_title_and_connection_target() {
     assert_eq!(opened.title, "driver_ranking_report.sql");
     assert_eq!(opened.path.as_deref(), Some("/tmp/driver_ranking_report.sql"));
     assert_eq!(opened.connection_id.as_deref(), Some("uat"), "继承当前活动数据库目标");
-    assert_eq!(opened.database.as_deref(), Some("qsyn3_tms_business2"));
+    assert_eq!(opened.database.as_deref(), Some("demo_business2"));
 
     // 重复打开同一个路径的 .sql 文件只聚焦并刷新内容，不产生重复标签页；切换语言也不抹掉文件名。
     let tabs_before = model.tabs.len();
@@ -12138,19 +12191,19 @@ fn nav_search_opens_small_branches_collapses_large_ones_and_stays_toggleable() {
     use crate::catalog::model::{ObjectKind, ObjectRow};
     let mut model = seeded_model(vec![record_for("main", "Main", Engine::Mysql)]);
     model.connections.status.insert("main".into(), LinkStatus::Connected);
-    let few: Vec<ObjectRow> = vec![ObjectRow::fresh("waybill_info", ObjectKind::Table), ObjectRow::fresh("orders", ObjectKind::Table)];
-    let many: Vec<ObjectRow> = (0..SEARCH_AUTO_OPEN + 5).map(|i| ObjectRow::fresh(format!("waybill_log_{i}"), ObjectKind::Table)).collect();
+    let few: Vec<ObjectRow> = vec![ObjectRow::fresh("invoice_info", ObjectKind::Table), ObjectRow::fresh("orders", ObjectKind::Table)];
+    let many: Vec<ObjectRow> = (0..SEARCH_AUTO_OPEN + 5).map(|i| ObjectRow::fresh(format!("invoice_log_{i}"), ObjectKind::Table)).collect();
     model.apply_navigation(&[nav_connection(Engine::Mysql, "main", "Main", vec![nav_database("small", few), nav_database("big", many)])], false);
     let conn = crate::catalog::hierarchy::connection_node_id("main");
-    model.nav_search("waybill");
+    model.nav_search("invoice");
     let rows = model.nav_rows_for("main");
     let small = rows.iter().find(|row| row.label == "small").expect("命中少的库在结果里");
     let big = rows.iter().find(|row| row.label == "big").expect("命中多的库在结果里");
     assert!(small.expanded, "命中少的库默认展开");
     assert!(!big.expanded, "命中多的库默认收起");
     assert_eq!(big.search_hits, SEARCH_AUTO_OPEN + 5, "收起的库标出命中数");
-    assert!(rows.iter().any(|row| row.label == "waybill_info"));
-    assert!(!rows.iter().any(|row| row.label.starts_with("waybill_log_")), "收起的库不把几十张表铺出来");
+    assert!(rows.iter().any(|row| row.label == "invoice_info"));
+    assert!(!rows.iter().any(|row| row.label.starts_with("invoice_log_")), "收起的库不把几十张表铺出来");
 
     // 搜索期间可以折叠展开的库、展开收起的库。
     let small_id = small.id.clone();
@@ -12158,8 +12211,8 @@ fn nav_search_opens_small_branches_collapses_large_ones_and_stays_toggleable() {
     let _ = model.dispatch(&format!("nav-toggle:{small_id}"));
     let _ = model.dispatch(&format!("nav-toggle:{big_id}"));
     let rows = model.nav_rows_for("main");
-    assert!(!rows.iter().any(|row| row.label == "waybill_info"), "搜索中折叠生效");
-    assert!(rows.iter().any(|row| row.label.starts_with("waybill_log_")), "搜索中展开生效");
+    assert!(!rows.iter().any(|row| row.label == "invoice_info"), "搜索中折叠生效");
+    assert!(rows.iter().any(|row| row.label.starts_with("invoice_log_")), "搜索中展开生效");
     assert!(model.nav_connection_expanded("main"), "连接在搜索中默认展开");
     model.toggle_nav_connection("main");
     assert!(model.nav_rows_for("main").is_empty(), "搜索中连接也能收起");
@@ -12292,11 +12345,11 @@ fn object_tree_workbench(
     let dir = std::env::temp_dir().join(format!("rillsql-shell-tree-hover-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 800.);
-    let long_name = format!("{}waybill", "customer_order_settlement_archive_history_".repeat(2));
+    let long_name = format!("{}invoice", "customer_order_settlement_archive_history_".repeat(2));
     let long = ObjectRow::table(long_name.clone(), Some(12));
     let orders = ObjectRow::table("orders", Some(4));
     let recent = ObjectRow::view("recent");
-    let audit = ObjectRow::table("waybill_audit", Some(1));
+    let audit = ObjectRow::table("invoice_audit", Some(1));
     let ids = ObjectTreeIds {
         long: nav_id("pg", "shop", "public", &long),
         long_name,
@@ -12324,7 +12377,7 @@ fn object_tree_workbench(
             for id in &expand {
                 assert!(view.model.dispatch(&format!("nav-toggle:{id}")).is_some(), "{id} 没有接受展开命令");
             }
-            assert!(view.model.nav.set_error(&audit_id, "permission denied for table waybill_audit"));
+            assert!(view.model.nav.set_error(&audit_id, "permission denied for table invoice_audit"));
             view.model.shell.sidebar_open = true;
             if dark {
                 view.sync_window_appearance(gpui_kit::WindowAppearance::Dark, cx);
@@ -12435,7 +12488,7 @@ fn object_tree_hover_actions_open_the_hovered_object(cx: &mut gpui_kit::TestAppC
                 .filter_map(|tab| tab.spec.clone())
                 .collect();
             assert_eq!(opened.len(), 2, "{tag}: 两次点击只开两个对应工作项：{opened:?}");
-            assert!(!opened.iter().any(|spec| spec.contains("|recent|") || spec.contains("|waybill_audit|")), "{tag}: 没有误开其他对象");
+            assert!(!opened.iter().any(|spec| spec.contains("|recent|") || spec.contains("|invoice_audit|")), "{tag}: 没有误开其他对象");
         });
         let _ = cx.update_window(window, |_, window, _| window.remove_window());
         let _ = std::fs::remove_dir_all(dir);
@@ -12486,11 +12539,11 @@ fn object_tree_search_hits_loading_errors_and_long_names_coexist_with_hover_acti
             assert!(window.try_find(format!("nav-quick-data-{}", ids.audit)).is_none(), "{tag}: 失败对象没有快捷打开");
 
             window.click("field-ObjectFilter", cx);
-            window.input("waybill", cx);
+            window.input("invoice", cx);
             window.render_frame(cx);
         })
         .unwrap();
-        assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill", "{tag}: 筛选框输入进入树搜索");
+        assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "invoice", "{tag}: 筛选框输入进入树搜索");
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             let sidebar = window.find("sidebar").bounds();
@@ -12635,17 +12688,17 @@ fn connections_page_renders_failure_callout_and_supports_group_drag_and_modal_gr
     let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1280., 800.);
     cx.update(|cx| {
         view.update(cx, |view, _| {
-            let mut r1 = record_for("uat", "qsyn-uat", Engine::Mysql);
+            let mut r1 = record_for("uat", "demo-uat", Engine::Mysql);
             r1.saved.host = Some("192.168.92.210".into());
             r1.saved.port = Some(3306);
-            r1.saved.username = Some("qsyn3_user".into());
+            r1.saved.username = Some("demo_user".into());
             r1.saved.env = "test".into();
             let r2 = record_for("logs", "logs_2", Engine::Sqlite);
             view.model.connections.rows = vec![r1, r2];
             view.model.connections.selected = Some("uat".into());
             view.model.connections.status.insert("uat".into(), LinkStatus::Failed);
             view.model.connections.failures.insert("uat".into(), "Input/output error: invalid peer certificate: UnknownIssuer".into());
-            view.model.apply_groups(vec![group("g_qs", "青山", 0, false)], Default::default());
+            view.model.apply_groups(vec![group("g_demo", "演示分组", 0, false)], Default::default());
             view.model.shell.page = AppPage::Connections;
         });
     });
@@ -12653,25 +12706,25 @@ fn connections_page_renders_failure_callout_and_supports_group_drag_and_modal_gr
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("conn-detail-failure").visible(), "右侧详情栏直接展示连接失败原因");
-        assert!(window.find("launcher-group-empty-g_qs").visible(), "空分组展示拖放区与快捷新建入口");
+        assert!(window.find("launcher-group-empty-g_demo").visible(), "空分组展示拖放区与快捷新建入口");
 
         // 在空分组上点「在此分组新建连接」，模态打开且默认选中该分组，控件登记与 Tab 停靠点完全一致。
-        window.click("launcher-group-empty-add-g_qs", cx);
+        window.click("launcher-group-empty-add-g_demo", cx);
         window.render_frame(cx);
         {
             let v = view.read(cx);
             assert!(v.model.conn_modal.open);
-            assert_eq!(v.model.conn_modal.draft_group.as_deref(), Some("g_qs"));
+            assert_eq!(v.model.conn_modal.draft_group.as_deref(), Some("g_demo"));
             let expected: Vec<String> = v.model.modal_stops().iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
             assert_eq!(v.model.conn_modal.rendered.len(), expected.len(), "{:?} vs {:?}", v.model.conn_modal.rendered, expected);
-            assert!(v.model.conn_modal.rendered.iter().any(|id| id == "conn-group-opt-g_qs"));
+            assert!(v.model.conn_modal.rendered.iter().any(|id| id == "conn-group-opt-g_demo"));
             assert!(v.model.conn_modal.rendered.iter().any(|id| id == "conn-env-none"));
         }
         window.click("conn-cancel", cx);
         window.render_frame(cx);
 
         // 将未分组连接卡片拖入空分组区，触发归组任务。
-        window.drag_to("conn-row-uat", "launcher-group-empty-g_qs", cx);
+        window.drag_to("conn-row-uat", "launcher-group-empty-g_demo", cx);
     })
     .unwrap();
     let op = cx.update(|cx| view.update(cx, |view, _| view.model.take_pending_group_op()));
@@ -12679,7 +12732,7 @@ fn connections_page_renders_failure_callout_and_supports_group_drag_and_modal_gr
         op,
         Some(crate::app::shell::model::GroupOp::Assign {
             connection: "uat".into(),
-            group: Some("g_qs".into()),
+            group: Some("g_demo".into()),
         })
     );
     let _ = cx.update_window(window, |_, window, _| window.remove_window());
@@ -12851,6 +12904,80 @@ fn nodes_loaded_normally_during_search_survive_clearing() {
     assert!(model.nav_node(&cold).is_some(), "正常读取过的库在清除后保留");
 }
 
+/// R9：连接刚连上、根节点还未入树时到达的检索命中不丢：暂存，目录读回后按当前代数合入；过期的丢弃。
+#[test]
+fn search_hits_for_a_connection_not_yet_in_the_tree_merge_after_refresh() {
+    use crate::catalog::hierarchy::connection_node_id;
+    use crate::catalog::model::ObjectRow;
+    let (mut model, _, _, _) = search_clear_model();
+    model.connections.rows.push(record_for("pg2", "报表库", Engine::Postgres));
+    model.connections.status.insert("pg2".to_owned(), LinkStatus::Connected);
+    assert!(model.nav_node(&connection_node_id("pg2")).is_none(), "目录尚未读回");
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let generation = model.nav_search_generation;
+    let report = ObjectRow::table("order_report", Some(1));
+    let report_id = nav_id("pg2", "bi", "public", &report);
+    let batch = vec![(
+        "pg2".to_owned(),
+        "报表库".to_owned(),
+        Engine::Postgres,
+        vec![("bi".to_owned(), "public".to_owned(), report.clone())],
+    )];
+    assert!(!model.apply_search_hits(generation, "ord", batch.clone()), "根节点不在树上时不合入");
+    assert!(model.pending_search_hits.contains_key("pg2"), "命中暂存而不是丢弃");
+    assert!(model.nav_node(&report_id).is_none());
+
+    // 这条连接的目录读回：暂存的命中合入。
+    let pg2 = nav_connection(Engine::Postgres, "pg2", "报表库", vec![nav_database("main", Vec::new())]);
+    model.request_nav_refresh(Some("pg2".to_owned()));
+    assert!(model.apply_navigation(std::slice::from_ref(&pg2), true));
+    assert!(model.nav_node(&report_id).is_some(), "目录刷新后命中出现在树上");
+    assert!(model.nav_rows().iter().any(|row| row.label == "order_report"));
+    assert!(model.pending_search_hits.is_empty());
+
+    // 过期代数的暂存命中在刷新时丢弃。
+    let _ = model.dispatch("explorer-clear-filter");
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let stale = model.nav_search_generation;
+    model.pending_search_hits.insert("pg3".to_owned(), (stale, "ord".to_owned(), batch[0].clone()));
+    model.set_field(DraftField::ObjectFilter, "orde".into());
+    model.request_nav_refresh(Some("pg2".to_owned()));
+    let _ = model.apply_navigation(&[pg2], true);
+    assert!(model.pending_search_hits.is_empty(), "代数或检索词不符的暂存命中被丢弃");
+}
+
+/// R9：跳过计数只计未连接的关系型连接；已连接但目录未读完的、Redis/MongoDB 都不计；未搜索时为 0。
+/// “连接这些连接”逐条连接被跳过的连接，折叠开关只改横幅形态。
+#[test]
+fn search_skipped_count_only_counts_disconnected_relational_connections() {
+    let (mut model, _, _, _) = search_clear_model();
+    model.connections.rows.push(record_for("pg-loading", "加载中", Engine::Postgres));
+    model.connections.status.insert("pg-loading".to_owned(), LinkStatus::Connected);
+    model.connections.rows.push(record_for("off-1", "离线一", Engine::Mysql));
+    model.connections.rows.push(record_for("off-2", "离线二", Engine::Postgres));
+    model.connections.rows.push(record_for("cache", "缓存", Engine::Redis));
+    model.connections.rows.push(record_for("docs", "文档", Engine::Mongodb));
+    model.connections.status.insert("docs".to_owned(), LinkStatus::Connected);
+    assert_eq!(model.nav_search_skipped_count(), 0, "未搜索时不计数");
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    assert_eq!(model.nav_search_skipped_ids(), vec!["off-1".to_owned(), "off-2".to_owned()]);
+    assert_eq!(model.nav_search_skipped_count(), 2);
+
+    assert!(!model.nav_search_skip_collapsed);
+    let _ = model.dispatch("nav-search-skipped-toggle");
+    assert!(model.nav_search_skip_collapsed, "横幅可折叠");
+
+    let _ = model.dispatch("nav-connect-skipped");
+    assert_eq!(model.connections.row_status("off-1"), LinkStatus::Connecting, "先连第一条");
+    assert_eq!(model.connect_queue, std::collections::VecDeque::from(vec!["off-2".to_owned()]), "其余排队");
+    assert_eq!(model.nav_search_skipped_count(), 1, "正在连接的不再计为跳过");
+    model.connections.status.insert("off-1".to_owned(), LinkStatus::Connected);
+    model.advance_connect_queue();
+    assert_eq!(model.connections.row_status("off-2"), LinkStatus::Connecting);
+    model.connections.status.insert("off-2".to_owned(), LinkStatus::Connected);
+    assert_eq!(model.nav_search_skipped_count(), 0, "全部连上后不再显示横幅");
+}
+
 #[test]
 fn twenty_type_and_clear_cycles_always_restore_the_tree() {
     let (mut model, before, hits, provisional) = search_clear_model();
@@ -12889,11 +13016,11 @@ fn escape_and_no_match_button_clear_the_object_filter_in_the_window(cx: &mut gpu
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window.click("field-ObjectFilter", cx);
-        window.input("waybill", cx);
+        window.input("invoice", cx);
         window.render_frame(cx);
     })
     .unwrap();
-    assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "waybill");
+    assert_eq!(cx.update(|cx| view.read(cx).model.nav.query().to_owned()), "invoice");
     cx.update_window(window, |_, window, cx| {
         window.press("escape", cx);
         window.render_frame(cx);
@@ -13464,7 +13591,7 @@ fn query_result_cell_and_row_header_menus_differ_and_explain_readonly(cx: &mut g
         window.render_frame(cx);
         view.update(cx, |view, cx| view.plant_query_result(vec!["id".into(), "name".into()], vec![vec!["1".into(), "a".into()], vec!["2".into(), "b".into()]], cx));
         window.render_frame(cx);
-        window.right_click(gpui_kit::ElementId::named_usize("grid-cell-1", 1), cx);
+        window.right_click(crate::app::views::grid::cell_element_id("q1", 1), cx);
         window.render_frame(cx);
         let cell: Vec<(String, bool, Option<String>)> = view
             .read(cx)
@@ -13486,7 +13613,7 @@ fn query_result_cell_and_row_header_menus_differ_and_explain_readonly(cx: &mut g
             view.model.close_menu();
         });
         window.render_frame(cx);
-        window.right_click(gpui_kit::ElementId::named_usize("grid-cell-0", 0), cx);
+        window.right_click(crate::app::views::grid::cell_element_id("q0", 0), cx);
         window.render_frame(cx);
         let row: Vec<&str> = view.read(cx).model.menu.as_ref().expect("行头菜单").items.iter().map(|item| item.id).collect();
         assert!(row.contains(&"grid-record-toggle") && row.contains(&"mark-delete"), "{row:?}");
@@ -14468,6 +14595,18 @@ fn object_tree_filter_focus_protection_skipped_notice_and_shift_enter_structure(
         .unwrap();
     assert!(skipped_count >= 1, "应统计被跳过的未连接连接");
     assert!(has_skipped_banner, "应渲染跳过未连接连接的明确提示");
+    // 被跳过的连接连上后计数为 0：横幅不再渲染。
+    let banner_after_connect = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.model.connections.status.insert("offline-1".to_owned(), LinkStatus::Connected);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            (view.read(cx).model.nav_search_skipped_count(), window.try_find("explorer-search-skipped").is_some())
+        })
+        .unwrap();
+    assert_eq!(banner_after_connect, (0, false), "计数为 0 时不渲染横幅");
 
     // 清除过滤，焦点停在表节点，按 Shift+Enter 直接打开表结构。
     cx.update_window(window, |_, window, cx| {
@@ -14910,3 +15049,134 @@ fn query_toolbar_compacts_for_docked_sidebar_at_900px(cx: &mut gpui_kit::TestApp
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
+// ---------------------------------------------------------------- R10 侧栏定位活动标签
+
+/// 已读到 shop/public 的 PG 连接 + 一个 Redis 连接；树全部折叠、没有焦点。
+fn reveal_model() -> WorkbenchModel {
+    use crate::catalog::model::ObjectRow;
+    let pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![nav_database("shop", vec![ObjectRow::table("orders", Some(1)), ObjectRow::table("people", Some(1))])],
+    );
+    let redis = nav_connection(Engine::Redis, "cache", "缓存", Vec::new());
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.connections.rows = vec![record_for("pg", "销售库", Engine::Postgres), record_for("cache", "缓存", Engine::Redis)];
+    model.connections.status.insert("pg".to_owned(), LinkStatus::Connected);
+    model.connections.status.insert("cache".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[pg, redis], false);
+    model
+}
+
+fn assert_revealed(model: &WorkbenchModel, node_id: &str, label: &str) {
+    assert_eq!(model.explorer_current, Some(super::explorer::ExplorerRow::Node(node_id.to_owned())), "{label}: 键盘当前行落在目标上");
+    assert_eq!(model.nav.focus(), Some(node_id), "{label}: 树焦点");
+    assert_eq!(model.reveal_row.as_deref(), Some(format!("nav:{node_id}").as_str()), "{label}: 下一帧滚进视口");
+    assert!(model.reveal_flash_active(&format!("nav:{node_id}")), "{label}: 短暂高亮");
+    assert!(model.nav_rows().iter().any(|row| row.id == node_id), "{label}: 祖先展开后目标可见");
+    assert!(model.shell.sidebar_open, "{label}: 侧栏打开");
+}
+
+#[test]
+fn reveal_active_tab_maps_each_tab_kind_to_its_tree_node() {
+    use crate::catalog::hierarchy::{database_node_id, keyspace_node_id};
+    use crate::catalog::model::ObjectRow;
+    let orders = nav_id("pg", "shop", "public", &ObjectRow::table("orders", Some(1)));
+    let target = crate::app::model::ObjectTarget::new("pg", "销售库", "shop", "public", "orders", "postgres", "");
+
+    // 表数据标签 → 表节点。
+    let mut model = reveal_model();
+    model.open_item(WorkItemKind::Table, target.spec());
+    assert!(model.can_reveal_active_tab());
+    let _ = model.dispatch("reveal-active-tab");
+    assert_revealed(&model, &orders, "表数据");
+
+    // 结构标签 → 同一个表节点。
+    let mut model = reveal_model();
+    model.open_item(WorkItemKind::Structure, target.spec());
+    let _ = model.dispatch("reveal-active-tab");
+    assert_revealed(&model, &orders, "结构");
+
+    // 库概览 → 库节点。
+    let mut model = reveal_model();
+    let overview = crate::app::views::overview::OverviewTarget::new("pg", "销售库", "shop", "", Engine::Postgres, "");
+    model.open_item(WorkItemKind::Overview, overview.spec());
+    let _ = model.dispatch("reveal-active-tab");
+    assert_revealed(&model, &database_node_id("pg", "shop"), "库概览");
+
+    // Redis 键浏览 → 连接下的 db 节点。
+    let mut model = reveal_model();
+    model.open_item(WorkItemKind::Redis, super::nav::redis_spec("cache", "缓存", "db0"));
+    let _ = model.dispatch("reveal-active-tab");
+    assert_revealed(&model, &keyspace_node_id("cache", "0"), "Redis");
+
+    // 查询标签 → 目标连接下的库。
+    let mut model = reveal_model();
+    let _ = model.dispatch("new-query");
+    if let Some(tab) = model.tabs.iter_mut().find(|tab| Some(&tab.id) == model.active_tab.as_ref()) {
+        tab.connection_id = Some("pg".to_owned());
+        tab.database = Some("shop".to_owned());
+    }
+    let _ = model.dispatch("reveal-active-tab");
+    assert_revealed(&model, &database_node_id("pg", "shop"), "查询");
+}
+
+#[test]
+fn reveal_active_tab_clears_the_search_filter_first_and_is_disabled_without_a_target() {
+    use crate::catalog::model::ObjectRow;
+    let mut model = reveal_model();
+    // 没有连接目标的查询标签：命令禁用，执行时说明原因。
+    let _ = model.dispatch("new-query");
+    assert!(!model.can_reveal_active_tab(), "没有对应对象时禁用");
+    let _ = model.dispatch("reveal-active-tab");
+    assert_eq!(model.notice_key, Some("ui.explorer.locateNone"));
+    assert!(model.explorer_current.is_none());
+
+    // 有搜索过滤时先清除，再定位。
+    let orders = nav_id("pg", "shop", "public", &ObjectRow::table("orders", Some(1)));
+    model.open_item(WorkItemKind::Table, crate::app::model::ObjectTarget::new("pg", "销售库", "shop", "public", "orders", "postgres", "").spec());
+    model.set_field(DraftField::ObjectFilter, "peo".into());
+    assert!(model.nav_searching());
+    let _ = model.dispatch("reveal-active-tab");
+    assert!(!model.nav_searching() && model.nav.query().is_empty(), "定位前清除搜索过滤");
+    assert_revealed(&model, &orders, "清除搜索后");
+}
+
+/// 对象编辑器盖在标签上：定位指向它的例程；例程所在分组还没读时按需读取，读回后再定位。
+#[test]
+fn reveal_object_editor_routine_lazy_loads_its_group_then_reveals() {
+    use crate::catalog::hierarchy::group_node_id;
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let mut model = reveal_model();
+    // 只读了目录轮廓的连接：各类分组都在、对象按需读取。
+    let mut outline = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", Vec::new())]);
+    outline.outline_only = true;
+    model.request_nav_refresh(Some("pg".to_owned()));
+    let _ = model.apply_navigation(&[outline], true);
+    let group = group_node_id("pg", "shop", "public", ObjectKind::Function);
+    model.object_editor_target = Some(super::model::RevealTarget::Object {
+        connection_id: "pg".to_owned(),
+        database: "shop".to_owned(),
+        schema: "public".to_owned(),
+        name: "calc_total".to_owned(),
+        kinds: vec![ObjectKind::Function],
+    });
+    assert!(model.can_reveal_active_tab(), "对象编辑器打开时可以定位");
+    while model.take_nav_request().is_some() {}
+    let _ = model.dispatch("reveal-active-tab");
+    assert!(model.nav.node(&group).is_some(), "PG 模式下有函数分组（未读）");
+    assert!(model.pending_reveal.is_some(), "分组未读：等读回后再定位");
+    assert!(
+        model.nav_requests.iter().any(|req| matches!(req, super::nav::NavRequest::Group(id) if *id == group)),
+        "按需读取例程分组"
+    );
+    // 分组读回：例程出现后再定位一次就落在它上面。
+    let routine = ObjectRow { kind: ObjectKind::Function, ..ObjectRow::table("calc_total", None) };
+    let _ = model.nav.set_kind_page(&group, std::slice::from_ref(&routine), 1, None);
+    assert!(model.retry_pending_reveal());
+    let id = nav_id("pg", "shop", "public", &routine);
+    assert_revealed(&model, &id, "对象编辑器例程");
+    assert!(model.pending_reveal.is_none());
+}

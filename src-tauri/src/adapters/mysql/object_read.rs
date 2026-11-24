@@ -203,6 +203,11 @@ pub(super) async fn load_routine(pool: &mysql_async::Pool, database: &str, kind:
         .map(|row| (mysql_string(row, 0), mysql_string(row, 1), mysql_string(row, 2), mysql_string(row, 3), mysql_string(row, 4)))
         .collect();
     let (params, returns) = routine_params(&tuples, kind);
+    // 非定义者且缺少 SHOW_ROUTINE（或 MariaDB 的 mysql.proc 读权限）时服务器把定义返回为 NULL：
+    // 不能当成空主体交给编辑器，给出与只读定义查看器相同的权限原因（R6）。
+    if matches!(row.as_ref(2), None | Some(mysql_async::Value::NULL)) {
+        return Err(super::routine_definition::hidden_definition_error(&mut conn, database, name, &mysql_string(&row, 3)).await);
+    }
     let reported_returns = mysql_string(&row, 1);
     Ok(RoutineState {
         kind,

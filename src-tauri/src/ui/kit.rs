@@ -532,6 +532,16 @@ impl ControlSize {
     pub const PICKER_MAX_W: f32 = 420.;
     /// 选择器弹层与窗口边缘之间至少留的距离。
     pub const POPOVER_MARGIN: f32 = 8.;
+    /// 日期时间选择器里一格日期的边长；7 格一行即选择器宽度，月份/年份网格按同一宽度三等分。
+    /// 32 时 7 格宽 224，时间行（图标 + 3×36 + 54 + 分隔）放得下。
+    pub const DATE_CELL: f32 = 32.;
+    /// 时间段（时/分/秒）输入框宽度；毫秒段按位数加宽。小号输入框左右内边距后要放下两位宽数字（30 会把 09 截成 0…）。
+    pub const TIME_SEGMENT_W: f32 = 36.;
+    /// 表单里单个名称类输入框的最小 / 最大宽度（索引名、注释）。
+    pub const FORM_MIN_W: f32 = 200.;
+    pub const FORM_MAX_W: f32 = 360.;
+    /// 索引列 chip 里前缀长度输入框的宽度（四五位数字）。
+    pub const PREFIX_W: f32 = 56.;
 }
 
 // ---------------------------------------------------------------- 四态
@@ -1890,6 +1900,142 @@ pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p:
     div().flex().child(row).into_any_element()
 }
 
+/// 模态里分段选择的槽：浅底圆角，选中项浮起（与 `segmented_sized` 同一外观）。选项多时整槽换行，不被裁切。
+/// 调用方往里放各自的分段项（带图标、说明或禁用态），槽本身的外观只在这里定义。
+pub fn segment_track(p: &Palette) -> gpui_kit::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .flex_none()
+        .self_start()
+        .max_w_full()
+        .p(px(Space::XXS))
+        .gap(px(Space::XXS))
+        .rounded(px(Radius::CONTROL))
+        .bg(p.sunken)
+        .border_1()
+        .border_color(p.line_soft)
+}
+
+// ---------------------------------------------------------------- 模态
+
+/// 模态卡片的宽度档位：确认框、变更预览、长文本（对象定义、放大编辑）。
+pub struct ModalWidth;
+
+impl ModalWidth {
+    /// 确认框、密码提示：一段说明 + 一排按钮。
+    pub const CONFIRM: f32 = 440.;
+    /// 变更预览（表数据、结构）：SQL 列表 + 说明 + 按钮。
+    pub const PREVIEW: f32 = 640.;
+    /// 对象定义、放大编辑：整段代码或长文本。
+    pub const WIDE: f32 = 760.;
+}
+
+/// 全应用模态卡片的外壳：对话框角色、遮挡、宽度档位（窄窗口按 92% 收缩）、浮层底色、描边、面板圆角与投影；
+/// 卡片内的点击不冒泡到遮罩（遮罩点空白处关闭）。内边距与布局由调用方决定：
+/// 简单确认用 `modal_card`，带独立滚动区的预览在外壳里自己分头、体、脚。
+pub fn modal_surface(id: impl Into<ElementId>, label: impl Into<SharedString>, width: f32, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Dialog)
+        .aria_label(label.into())
+        .occlude()
+        .w(px(width))
+        .max_w(gpui_kit::relative(0.92))
+        .max_h(gpui_kit::relative(0.92))
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .bg(p.raised)
+        .border_1()
+        .border_color(if p.dark { p.line_soft } else { p.line })
+        .rounded(px(Radius::PANEL))
+        .shadow_lg()
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
+/// 带语气图标的确认卡：图标块（提示 / 警告 / 危险着色）+ 标题 + 说明；调用方再追加 `modal_actions`。
+pub fn modal_card(id: impl Into<ElementId>, icon_name: IconName, tone: Hsla, title_text: SharedString, body: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
+    modal_surface(id, title_text.clone(), ModalWidth::CONFIRM, p)
+        .p(px(Space::XL + Space::XS))
+        .gap(px(Space::XL))
+        .child(
+            div()
+                .flex()
+                .gap(px(Space::LG))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(HitArea::RAIL - Space::XXS))
+                        .rounded(px(Radius::PANEL))
+                        .bg(tone.opacity(0.14))
+                        .border_1()
+                        .border_color(tone.opacity(0.24))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(icon_name, IconSize::RAIL, tone)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::SM))
+                        .min_w_0()
+                        .child(title(title_text, TypeScale::LG, p))
+                        .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body)),
+                ),
+        )
+}
+
+/// 模态底部的按钮行：右对齐，按钮间距统一。
+pub fn modal_actions() -> gpui_kit::Div {
+    div().flex().flex_wrap().items_center().justify_end().gap(px(Space::MD))
+}
+
+// ---------------------------------------------------------------- 下拉触发按钮
+
+/// 下拉菜单的触发按钮。`dropdown_menu` 的锚定、键盘与焦点行为由 gpui-kit `Button` 提供，
+/// 视图不直接 `Button::new`：外观与尺寸只在这三个变体里取。
+/// 工具条档（幽灵、标准高度）：“更多”、模板、外键列选择等。
+pub fn menu_button(id: impl Into<ElementId>) -> gpui_kit::component::button::Button {
+    use gpui_kit::component::button::ButtonVariants as _;
+    gpui_kit::component::button::Button::new(id).ghost().small()
+}
+
+/// 行内档（幽灵、紧凑高度）：表格行、筛选条里的类型 / 列 / 运算符选择。
+pub fn inline_menu_button(id: impl Into<ElementId>) -> gpui_kit::component::button::Button {
+    use gpui_kit::component::button::ButtonVariants as _;
+    gpui_kit::component::button::Button::new(id).ghost().xsmall()
+}
+
+/// 表单档（描边、标准高度）：表单里像选择框一样的取值按钮。
+pub fn field_menu_button(id: impl Into<ElementId>) -> gpui_kit::component::button::Button {
+    gpui_kit::component::button::Button::new(id).outline().small()
+}
+
+/// 统一的下划线功能标签（页签条里的一项）：高度跟密度的工具条，选中项底边 2px 强调色、文字加重，
+/// 未选中项弱化、悬停变亮。调用方在返回值上继续追加状态点、计数与点击。
+pub fn underline_tab(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool, layout: &Metrics, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::StatefulInteractiveElement + gpui_kit::Styled + IntoElement {
+    let label = label.into();
+    interactive_states(div().id(id), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Tab)
+        .aria_label(label.clone())
+        .aria_selected(active)
+        .flex_none()
+        .h(px(layout.bar_h() - Space::XS))
+        .px(px(Space::MD))
+        .flex()
+        .items_center()
+        .gap(px(Space::XS))
+        .text_size(px(TypeScale::SM))
+        .border_b_2()
+        .when(active, |this| this.border_color(p.accent).text_color(p.text).font_weight(FontWeight::MEDIUM))
+        .when(!active, |this| this.border_color(gpui_kit::transparent_black()).text_color(p.text_muted).hover(|s| s.text_color(p.text)))
+        .child(label)
+}
+
 /// 统一筛选胶囊/标签项：用于连接环境筛选、命令面板范围、Redis 类型筛选等。
 #[allow(clippy::too_many_arguments)]
 pub fn filter_chip(
@@ -2854,6 +3000,10 @@ mod token_tests {
         ("ui/kit.rs", "px(size)", "kit::title 与 kit::control_text 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
         ("ui/editor_proto.rs", "px(self.font_size)", "SQL 编辑器字号来自用户设置（规范 S4.1：编辑器字号由设置控制）"),
         ("app/shell/chrome.rs", "px(size * 0.28)", "品牌标记的圆角随尺寸等比缩放，属于图形"),
+        ("app/views/query/plan_canvas.rs", "px(text_sm)", "计划画布节点卡片随画布缩放：字号为 TypeScale::SM × 缩放"),
+        ("app/views/query/plan_canvas.rs", "px(text_xs)", "计划画布节点卡片随画布缩放：字号为 TypeScale::XS × 缩放"),
+        ("app/views/query/plan_canvas.rs", "px(radius)", "计划画布节点卡片随画布缩放：圆角为 Radius::PANEL × 缩放"),
+        ("app/views/query/plan_canvas.rs", "px(tag_radius)", "计划画布访问方式标签随画布缩放：圆角为 Radius::TAG × 缩放"),
     ];
 
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -2990,24 +3140,27 @@ mod token_tests {
     /// 上限起始于 2026-11-20 建档时的计数（外壳 590、对比 94、表数据 153、Mongo 58、查询 190、Redis 267、结构 236），只许下降。改到某个目录、换成 `Space` / `Metrics` /
     /// `ControlSize` 等 token 后，把这里的数字一起改小；新增视图目录必须在这里登记。
     pub(super) const PX_CEILINGS: &[(&str, usize)] = &[
+        // 2026-11-23（T8）kit::modal_surface / modal_card / segment_track / 下拉触发按钮收口后按当前计数下调：
+        // 外壳 495 → 414、表数据 135 → 88、查询 155 → 36、Redis 169 → 165、结构 189 → 163、导出 44 → 39。
         // 2026-11-21（T8）按当前计数下调：改到的目录（外壳、对比、表数据、Mongo、查询、Redis、结构）都比建档时少。
-        ("app/shell", 495),
+        ("app/shell", 414),
         ("app/views", 0),
         ("app/views/admin", 35),
         ("app/views/compare", 69),
         ("app/views/connections", 0),
         ("app/views/diagram", 32),
-        ("app/views/export", 44),
-        ("app/views/grid", 135),
+        ("app/views/export", 39),
+        ("app/views/grid", 88),
         ("app/views/history", 0),
         ("app/views/mongo", 41),
         // 2026-11-21（T1）对象编辑器只登记模块与草稿状态，还没有 GPUI 视图，裸 px 为 0。
         ("app/views/object_editor", 0),
         ("app/views/overview", 0),
-        ("app/views/query", 155),
-        ("app/views/redis", 174),
+        ("app/views/query", 36),
+        // 2026-11-23（T7）Redis 顶栏、详情头与类型标签改用令牌，174 → 169；（T8）确认框改用 kit::modal_surface，→ 165。
+        ("app/views/redis", 165),
         ("app/views/settings", 0),
-        ("app/views/structure", 189),
+        ("app/views/structure", 163),
         ("app/views/welcome", 0),
     ];
 

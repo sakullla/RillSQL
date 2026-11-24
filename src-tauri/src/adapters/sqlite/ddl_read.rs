@@ -10,7 +10,7 @@ use crate::connections::model::Engine;
 use crate::ddl::exec::receipt;
 use crate::ddl::introspect::keep_rows;
 use crate::ddl::model::{
-    Action, AttachedDatabase, Column, DependentSql, ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot, Step, StepReceipt, StepStatus,
+    Action, AttachedDatabase, Column, DependentSql, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexKind, Snapshot, Step, StepReceipt, StepStatus,
     SQLITE_REBUILD_RELEASE_SQL, SQLITE_REBUILD_SAVEPOINT, SQLITE_REBUILD_SAVEPOINT_SQL,
 };
 use crate::ddl::sql::{mentions, valid_name};
@@ -196,7 +196,7 @@ pub(super) async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: 
         let mut expression = false;
         for column in &info {
             match sqlite_optional(column, 2) {
-                Some(name) if !name.is_empty() => columns.push(IndexColumn { descending: sqlite_i64(column, 3).unwrap_or(0) != 0, name }),
+                Some(name) if !name.is_empty() => columns.push(IndexColumn { descending: sqlite_i64(column, 3).unwrap_or(0) != 0, name, prefix: None }),
                 _ => expression = true,
             }
         }
@@ -222,7 +222,8 @@ pub(super) async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: 
                 break;
             }
         };
-        snapshot.indexes.push(Index { name, unique, columns, protected, reason, partial, expression, sql });
+        let kind = IndexKind::infer(reason == "由主键约束维护", unique);
+        snapshot.indexes.push(Index { name, unique, columns, protected, reason, partial, expression, sql, kind, ..Index::default() });
     }
     let fk_rows = keep_rows(
         &mut snapshot.foreign_key_error,

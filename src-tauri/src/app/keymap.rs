@@ -9,7 +9,7 @@ use gpui_kit::KeyBinding;
 
 use super::{
     CloseTab, CommandPalette, CommitEdit, Dismiss, ExecuteCurrent, ExecuteQuery, ExecuteScript, ExplainSql, FocusExplorerSearch, FormatSql, NewQuery,
-    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    NextTab, OpenFile, OpenSettings, PrevTab, QuickOpen, RequestCancel, RevealActiveTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
     SelectTab7, SelectTab8, SelectTab9, ShowAutocomplete, ShowHelp, SwitchPaneFocus, ToggleBlockComment, ToggleComment, ToggleResults, ToggleSidebar,
 };
 
@@ -152,6 +152,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut::new("explorer-search", "explorer", "Mod+Shift+L", "shell.shortcuts.explorerSearch")
         .command("explorer-search")
         .binds(&[global!(FocusExplorerSearch)]),
+    // 在对象树中定位活动标签：⌥⌘L（macOS）/ Alt+Shift+L（其它平台）；⌘⇧L 已是对象树搜索。
+    Shortcut::new("reveal-active-tab", "explorer", "", "shell.shortcuts.revealActiveTab")
+        .split("Mod+Alt+L", "Alt+Shift+L")
+        .command("reveal-active-tab")
+        .binds(&[global!(RevealActiveTab)]),
     Shortcut::new("explorer-quick-search", "explorer", "/", "shell.shortcuts.explorerQuickSearch"),
     Shortcut::new("explorer-clear-search", "explorer", "Esc", "shell.shortcuts.explorerClearSearch"),
     // 键空间工作台（R4）：由工作台自己的按键处理与输入框回车解析，这里只登记用于面板展示。

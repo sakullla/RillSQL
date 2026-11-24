@@ -1,5 +1,5 @@
 use super::*;
-use crate::ddl::{Column, ColumnDraft, DdlEngine, ForeignKey, IncomingForeignKey, Index, IndexColumn, Snapshot};
+use crate::ddl::{Column, ColumnDraft, DdlEngine, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexKind, Snapshot};
 
 fn column(name: &str, type_name: &str, primary: bool) -> Column {
     Column {
@@ -16,13 +16,13 @@ fn column(name: &str, type_name: &str, primary: bool) -> Column {
 
 #[test]
 fn ddl_tab_never_shows_the_placeholder_comment_as_the_definition() {
-    let mut mysql = Snapshot::bare(DdlEngine::Mysql, "shop", "", "task_list_track_code");
+    let mut mysql = Snapshot::bare(DdlEngine::Mysql, "shop", "", "order_track_code");
     mysql.columns = vec![column("id", "bigint(20) unsigned", true), column("track_code", "varchar(128)", false)];
-    mysql.table_sql = "-- shop.task_list_track_code".to_owned();
+    mysql.table_sql = "-- shop.order_track_code".to_owned();
     let (text, _) = definition_text(&mysql);
     assert!(text.contains("CREATE TABLE"), "{text}");
     assert!(text.contains("track_code"), "{text}");
-    mysql.table_sql = "CREATE TABLE `task_list_track_code` (\n  `id` bigint unsigned NOT NULL\n);".to_owned();
+    mysql.table_sql = "CREATE TABLE `order_track_code` (\n  `id` bigint unsigned NOT NULL\n);".to_owned();
     assert_eq!(definition_text(&mysql).0, mysql.table_sql);
     assert!(is_placeholder_definition("-- a.b\n\n-- c"));
     assert!(!is_placeholder_definition("-- note\nCREATE TABLE t (id int)"));
@@ -441,8 +441,8 @@ fn indexes_and_foreign_keys_preview_drops_unique_order_and_actions() {
     session.index_name = "ix_note".into();
     session.index_unique = true;
     session.index_columns = vec![
-        IndexColumnDraft { name: "note".into(), descending: false },
-        IndexColumnDraft { name: "id".into(), descending: true },
+        IndexColumnDraft { name: "note".into(), descending: false, prefix: None },
+        IndexColumnDraft { name: "id".into(), descending: true, prefix: None },
     ];
     match session.action() {
         Action::CreateIndex { unique, columns, .. } => {
@@ -1362,22 +1362,24 @@ fn index_composer_auto_names_reorders_columns_and_renders_index_badges(cx: &mut 
                             Index {
                                 name: "orders_pkey".into(),
                                 unique: true,
-                                columns: vec![IndexColumn { name: "col_0".into(), descending: false }],
+                                columns: vec![IndexColumn { name: "col_0".into(), descending: false, prefix: None }],
                                 protected: true,
                                 reason: "由主键约束维护".into(),
                                 partial: false,
                                 expression: false,
                                 sql: None,
+                                ..Default::default()
                             },
                             Index {
                                 name: "idx_orders_active".into(),
                                 unique: false,
-                                columns: vec![IndexColumn { name: "col_1".into(), descending: true }],
+                                columns: vec![IndexColumn { name: "col_1".into(), descending: true, prefix: None }],
                                 protected: false,
                                 reason: String::new(),
                                 partial: true,
                                 expression: false,
                                 sql: Some("CREATE INDEX idx_orders_active ON public.orders (col_1 DESC) WHERE col_2 > 0".into()),
+                                ..Default::default()
                             },
                         ];
                     }
@@ -1987,12 +1989,13 @@ fn index_picker_orders_columns_and_names_follow_the_template(cx: &mut gpui_kit::
             snap.indexes = vec![Index {
                 name: "idx_orders_col_4".into(),
                 unique: false,
-                columns: vec![IndexColumn { name: "col_4".into(), descending: false }],
+                columns: vec![IndexColumn { name: "col_4".into(), descending: false, prefix: None }],
                 protected: false,
                 reason: String::new(),
                 partial: false,
                 expression: false,
                 sql: None,
+                ..Default::default()
             }];
         }
         pane.session.section = Section::Indexes;
@@ -2097,7 +2100,7 @@ fn index_picker_orders_columns_and_names_follow_the_template(cx: &mut gpui_kit::
 fn suggested_index_names_respect_the_dialect_limit() {
     let naming = crate::ddl::naming::IndexNaming::default();
     let columns: Vec<IndexColumnDraft> =
-        (0..8).map(|ix| IndexColumnDraft { name: format!("a_rather_long_column_name_{ix}"), descending: false }).collect();
+        (0..8).map(|ix| IndexColumnDraft { name: format!("a_rather_long_column_name_{ix}"), descending: false, prefix: None }).collect();
     for (engine, limit) in [("postgres", 63), ("mysql", 64), ("mariadb", 64), ("sqlserver", 128)] {
         let name = suggested_index_name(&naming, engine, "orders", false, &columns);
         assert_eq!(name.len(), limit, "{engine}: {name}");
@@ -2823,3 +2826,249 @@ fn small_table_and_narrow_viewport_keep_presets_hscroll_and_stacked_templates(cx
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// R11：表头与每一行（含自增/生成/索引标记）用同一份列宽序列；标记只进名称列。
+#[test]
+fn field_header_and_rows_share_one_width_sequence() {
+    use super::browse::{row_cells, BrowseColumns, CellWidth, FieldCell, NameMarks};
+    for content_w in [0., 380., 500., 534., 640., 900., 1400.] {
+        for show_all in [false, true] {
+            let cols = BrowseColumns::of(content_w, show_all);
+            let head = cols.cells();
+            assert_eq!(head.first(), Some(&(FieldCell::Name, CellWidth::Fill)), "名称列在最前并占剩余宽度");
+            assert_eq!(head.last().map(|cell| cell.0), Some(FieldCell::Actions));
+            assert_eq!(head.iter().any(|cell| cell.0 == FieldCell::Default), cols.default);
+            assert_eq!(head.iter().any(|cell| cell.0 == FieldCell::Comment), cols.comment);
+            for bits in 0..16u8 {
+                let marks = NameMarks { icon: bits & 1 != 0, auto: bits & 2 != 0, generated: bits & 4 != 0, indexed: bits & 8 != 0 };
+                assert_eq!(row_cells(&cols, marks), head, "{content_w} {show_all} {marks:?}：行与表头列宽序列不一致");
+            }
+            // 定宽列加上间隙与内边距，给名称列至少留下最小宽度（放不下时由“显示全部列”横向滚动）。
+            let fixed: f32 = head.iter().map(|(_, width)| if let CellWidth::Fixed(w) = width { *w } else { 0. }).sum();
+            let chrome = (head.len() - 1) as f32 * FieldWidths::GAP + FieldWidths::PAD_LEFT + FieldWidths::PAD_RIGHT;
+            assert!((fixed + chrome + cols.widths.name_min - cols.min_total()).abs() < 0.01, "{content_w}: min_total 与列序列一致");
+        }
+    }
+    assert_eq!(super::browse::NAME_INSET, kit::IconSize::INLINE + kit::Space::XS, "表头名称缩进等于行里的标记槽");
+}
+
+/// R11：长字段名带自增与索引标记时，名称格只在自己的宽度里截断，注释列与表头对齐。
+#[gpui_kit::test]
+fn long_field_names_with_badges_stay_inside_the_name_cell(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("long-names");
+    let (window, _pane) = open_pane(cx, 900., 600., move || {
+        let mut pane = pane_with_snapshot(services, 4);
+        if let Some(snap) = pane.snapshot.as_mut() {
+            let long = "a_really_really_long_column_name_that_never_fits_in_the_name_cell_at_all";
+            snap.columns[1].name = long.into();
+            snap.columns[1].auto = true;
+            snap.columns[2].generated = true;
+            snap.indexes = vec![Index { name: "idx_long".into(), columns: vec![IndexColumn { name: long.into(), ..Default::default() }], ..Default::default() }];
+            pane.session.kept_columns = column_drafts(snap);
+        }
+        pane
+    });
+    let (head_comment, rows) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let head = window.find("structure-head-comment").bounds();
+            let rows: Vec<_> = (0..4)
+                .map(|ix| {
+                    (
+                        window.find(SharedString::from(format!("structure-col-name-{ix}"))).bounds(),
+                        window.find(SharedString::from(format!("structure-col-comment-{ix}"))).bounds(),
+                        window.try_find(SharedString::from(format!("structure-col-index-{ix}"))).map(|item| item.bounds()),
+                    )
+                })
+                .collect();
+            (head, rows)
+        })
+        .unwrap();
+    for (ix, (name, comment, badge)) in rows.iter().enumerate() {
+        assert_eq!(comment.origin.x, head_comment.origin.x, "第 {ix} 行注释列与表头对齐");
+        assert!(name.origin.x + name.size.width <= comment.origin.x, "第 {ix} 行名称没有压到右侧列");
+        if let Some(badge) = badge {
+            assert!(badge.origin.x + badge.size.width <= comment.origin.x, "索引标记留在名称格内");
+        }
+    }
+    assert!(rows[1].2.is_some(), "长名称的行带索引标记");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn mysql_index_pane(services: std::sync::Arc<crate::application::AppServices>) -> StructurePane {
+    let mut pane = StructurePane::new(services);
+    let mut target = offline_target("orders");
+    target.engine = "mysql".into();
+    target.schema = String::new();
+    pane.bind(target);
+    let mut snapshot = Snapshot::bare(DdlEngine::Mysql, "app", "", "orders");
+    snapshot.kind = "table".into();
+    snapshot.columns = vec![column("id", "bigint", true), column("title", "varchar(200)", false), column("body", "text", false)];
+    snapshot.indexes = vec![
+        Index {
+            name: "idx_title".into(),
+            columns: vec![IndexColumn { name: "title".into(), descending: true, prefix: Some(20) }],
+            method: Some("BTREE".into()),
+            comment: Some("按标题".into()),
+            visible: Some(true),
+            ..Default::default()
+        },
+        Index {
+            name: "PRIMARY".into(),
+            unique: true,
+            columns: vec![IndexColumn { name: "id".into(), ..Default::default() }],
+            protected: true,
+            reason: "由主键约束维护".into(),
+            kind: IndexKind::Primary,
+            visible: Some(true),
+            ..Default::default()
+        },
+        Index {
+            name: "ft_body".into(),
+            columns: vec![IndexColumn { name: "body".into(), ..Default::default() }],
+            kind: IndexKind::Fulltext,
+            method: Some("FULLTEXT".into()),
+            visible: Some(false),
+            ..Default::default()
+        },
+    ];
+    pane.session.object_kind = snapshot.kind.clone();
+    pane.session.kept_columns = column_drafts(&snapshot);
+    pane.drafts_ready = true;
+    pane.snapshot = Some(snapshot);
+    pane.session.section = Section::Indexes;
+    pane
+}
+
+/// R11：索引页 PRIMARY 置顶，列出类型/字段/注释/可见性；编辑按钮把索引填进编辑器（类型、前缀、注释），
+/// 预览生成一条 ALTER TABLE。
+#[gpui_kit::test]
+fn index_page_lists_kind_columns_comment_visibility_and_edits_in_place(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("index-page");
+    let (window, pane) = open_pane(cx, 1100., 800., move || mysql_index_pane(services));
+    let (primary_y, title_y, ft_y, type_cell, edit_disabled, primary_edit_disabled) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.find("structure-row-indexes-1").bounds().origin.y,
+                window.find("structure-row-indexes-0").bounds().origin.y,
+                window.find("structure-row-indexes-2").bounds().origin.y,
+                window.try_find("structure-index-type-2").is_some(),
+                window.find("structure-quick-edit-index-0").disabled(),
+                window.find("structure-quick-edit-index-1").disabled(),
+            )
+        })
+        .unwrap();
+    assert!(primary_y < title_y && primary_y < ft_y, "PRIMARY 置顶");
+    assert!(type_cell);
+    assert_ne!(edit_disabled, Some(true), "普通索引可以编辑");
+    assert_ne!(primary_edit_disabled, Some(true), "MySQL 主键也能在一条 ALTER TABLE 里改");
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("structure-quick-edit-index-0", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (kind_fulltext, prefix_input, comment_input) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.try_find("structure-index-kind-fulltext").is_some(),
+                window.try_find("structure-index-prefix-title").is_some(),
+                window.try_find("structure-draft-120000").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(kind_fulltext && prefix_input && comment_input, "MySQL 编辑器有类型、前缀与注释");
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            assert_eq!(pane.session.index_editing.as_deref(), Some("idx_title"));
+            assert_eq!(pane.session.index_columns, vec![IndexColumnDraft { name: "title".into(), descending: true, prefix: Some(20) }]);
+            assert_eq!(pane.session.index_comment, "按标题");
+            pane.set_index_prefix(0, "32");
+            pane.session.index_comment = "新注释".into();
+            assert!(matches!(pane.session.action(), Action::AlterIndex { ref old, .. } if old == "idx_title"));
+            let snapshot = pane.snapshot.clone().unwrap();
+            pane.session.arm_fixture(&snapshot);
+            let sql = pane.session.preview_sql();
+            assert_eq!(sql, vec!["ALTER TABLE app.orders DROP INDEX idx_title, ADD INDEX idx_title (title(32) DESC) COMMENT '新注释';".to_owned()]);
+            // 换成全文索引：降序与前缀被清掉，键列表不写升降序。
+            pane.session.cancel();
+            pane.choose_index_kind(IndexKind::Fulltext);
+            assert!(pane.session.index_columns.iter().all(|column| !column.descending && column.prefix.is_none()));
+        })
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R11：只有唯一开关的引擎不显示类型分段、前缀与注释；受约束维护的索引不能编辑。
+#[gpui_kit::test]
+fn engines_without_index_options_hide_them(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("index-postgres");
+    let (window, pane) = open_pane(cx, 1100., 800., move || {
+        let mut pane = pane_with_snapshot(services, 3);
+        if let Some(snap) = pane.snapshot.as_mut() {
+            snap.indexes = vec![
+                Index {
+                    name: "orders_pkey".into(),
+                    unique: true,
+                    columns: vec![IndexColumn { name: "col_0".into(), ..Default::default() }],
+                    protected: true,
+                    reason: "由主键约束维护".into(),
+                    kind: IndexKind::Primary,
+                    ..Default::default()
+                },
+                Index { name: "idx_col_1".into(), columns: vec![IndexColumn { name: "col_1".into(), ..Default::default() }], ..Default::default() },
+                Index {
+                    name: "idx_gin".into(),
+                    columns: vec![IndexColumn { name: "col_1".into(), ..Default::default() }],
+                    method: Some("gin".into()),
+                    rebuild_loses: vec!["USING gin".into()],
+                    ..Default::default()
+                },
+            ];
+        }
+        pane.session.section = Section::Indexes;
+        pane
+    });
+    let (pk_edit_disabled, plain_edit_disabled, gin_edit_disabled) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.find("structure-quick-edit-index-0").disabled(),
+                window.find("structure-quick-edit-index-1").disabled(),
+                window.find("structure-quick-edit-index-2").disabled(),
+            )
+        })
+        .unwrap();
+    assert_eq!(pk_edit_disabled, Some(true), "PostgreSQL 主键索引不能在索引页修改");
+    assert_ne!(plain_edit_disabled, Some(true));
+    assert_eq!(gin_edit_disabled, Some(true), "先删后建会丢掉访问方法的索引不能修改");
+    cx.update_window(window, |_, window, cx| {
+        window.click("structure-quick-edit-index-1", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            assert_eq!(pane.session.index_editing.as_deref(), Some("idx_col_1"), "点编辑打开这条索引");
+            assert!(pane.composer_open);
+        })
+    });
+    let (segments, unique_box, prefix, comment) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.try_find("structure-index-kind-fulltext").is_some(),
+                window.try_find("structure-index-unique").is_some(),
+                window.try_find("structure-index-prefix-col_1").is_some(),
+                window.try_find("structure-draft-120000").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(!segments && unique_box && !prefix && !comment, "不支持的项隐藏，只留唯一开关 {segments} {unique_box} {prefix} {comment}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

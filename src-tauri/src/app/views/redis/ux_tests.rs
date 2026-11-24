@@ -19,7 +19,7 @@ fn key(name: &str, key_type: &str) -> RedisKeyInfo {
 }
 
 fn string_detail(text: &str) -> RedisKeyDetail {
-    RedisKeyDetail { key_type: "string".into(), ttl_ms: Some(-1), value: RedisValue::String { text: text.into() }, total: Some(text.len() as u64), next: None }
+    RedisKeyDetail { key_type: "string".into(), ttl_ms: Some(-1), value: RedisValue::String { text: text.into() }, total: Some(text.len() as u64), next: None, memory: None, encoding: None }
 }
 
 fn hash_detail(pairs: &[(&str, &str)]) -> RedisKeyDetail {
@@ -29,6 +29,8 @@ fn hash_detail(pairs: &[(&str, &str)]) -> RedisKeyDetail {
         value: RedisValue::Hash { entries: pairs.iter().map(|(f, v)| KeyValuePair { field: (*f).into(), value: (*v).into() }).collect() },
         total: Some(pairs.len() as u64 + 300),
         next: Some("7".into()),
+        memory: None,
+        encoding: None,
     }
 }
 
@@ -182,7 +184,7 @@ fn a_key_found_missing_is_explained_and_struck_through(cx: &mut gpui_kit::TestAp
         view.update(cx, |pane, cx| {
             pane.selected = "gone:1".into();
             let generation = pane.begin_read();
-            let missing = RedisKeyDetail { key_type: "none".into(), ttl_ms: Some(-2), value: RedisValue::None {}, total: None, next: None };
+            let missing = RedisKeyDetail { key_type: "none".into(), ttl_ms: Some(-2), value: RedisValue::None {}, total: None, next: None, memory: None, encoding: None };
             pane.deliver_read(generation, "gone:1".into(), Ok(missing), cx);
             assert!(pane.key_gone("gone:1"));
             assert_eq!(listed(pane), vec!["gone:1", "kept"], "键留在列表里，只是标记为已不存在");
@@ -205,28 +207,41 @@ fn a_key_found_missing_is_explained_and_struck_through(cx: &mut gpui_kit::TestAp
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R10/R18：键行是类型圆点 + 界面字体键名（实测中间截断、保留开头和结尾、悬停全名）；
+/// R10/R18 → R12：键行是固定宽度的类型标签 + 界面字体键名（前缀弱化、从左侧省略，末段完整；悬停给全名、类型与 TTL）；
 /// 搜索一行在上，类型筛选在下，类型多时折行而不是被横向裁掉。
 #[gpui_kit::test]
-fn key_rows_use_type_dots_and_middle_truncation(cx: &mut gpui_kit::TestAppContext) {
-    let long = "session:tenant-alpha:region-east:user:0000000000000000000000000000000123456789";
+fn key_rows_use_type_tags_and_keep_the_last_segment(cx: &mut gpui_kit::TestAppContext) {
+    let long = "session:tenant-alpha-production:region-east-1:user:profile:cache:v2:shard-0042:123456789";
     let (window, view, dir) = open(cx, 1280., move |pane| {
         pane.set_keys(vec![key(long, "hash"), key("short", "zset")]);
         pane.done = true;
+        pane.view_mode = ViewMode::Flat;
     });
-    let (search, types, row_label) = cx
+    let (search, types, row_label, tag_w, short_w) = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
-            (window.find("redis-tools-search").bounds(), window.find("redis-tools-types").bounds(), window.find("redis-select:0").label().map(str::to_owned))
+            (
+                window.find("redis-tools-search").bounds(),
+                window.find("redis-tools-types").bounds(),
+                window.find("redis-select:0").label().map(str::to_owned),
+                window.within("redis-select:0").find("redis-type-tag").bounds().size.width,
+                window.within("redis-select:1").find("redis-type-tag").bounds().size.width,
+            )
         })
         .unwrap();
     assert!(search.origin.y < types.origin.y, "搜索与图标按钮一行，类型筛选与视图切换在下面");
-    assert!(row_label.unwrap_or_default().contains(long), "无障碍标签与悬停给完整键名");
-    let fitted: Vec<String> = cx.update(|cx| view.read(cx).fit_cache.values().cloned().collect());
+    assert!(row_label.unwrap_or_default().contains(long), "无障碍标签给完整键名");
+    assert_eq!(tag_w, short_w, "类型标签固定宽度，上下对齐");
+    let fitted: Vec<tables::FittedKey> = cx.update(|cx| view.read(cx).fit_cache.values().cloned().collect());
     assert!(
-        fitted.iter().any(|text| text.split_once('…').is_some_and(|(head, tail)| !head.is_empty() && long.starts_with(head) && long.ends_with(tail))),
-        "长键名截断时保留开头和结尾：{fitted:?}"
+        fitted.iter().any(|fit| fit.last == "123456789" && fit.prefix.strip_prefix('…').is_some_and(|kept| !kept.is_empty() && long.ends_with(&format!("{kept}123456789")))),
+        "末段完整保留，前缀从左侧省略：{fitted:?}"
     );
+    // 前缀与末段分开着色：前缀弱化，末段正常色。
+    let (prefix, last) = cx
+        .update_window(window, |_, window, _| (window.try_find("redis-key-prefix:0").is_some(), window.try_find("redis-key-last:0").is_some()))
+        .unwrap();
+    assert!(prefix && last, "键名拆成前缀与末段两段");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -365,6 +380,8 @@ fn large_strings_open_as_a_preview_with_load_full(cx: &mut gpui_kit::TestAppCont
             value: RedisValue::String { text: preview },
             total: Some(3 * keys::STRING_PREVIEW_BYTES),
             next: None,
+            memory: None,
+            encoding: None,
         }));
     });
     let load = cx
@@ -662,6 +679,66 @@ fn entry_table_selection_follows_the_detail_across_same_shaped_keys(cx: &mut gpu
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 回看 A → 字符串键 B → 再回 A（期间 A 多了条目）：这是换键后的重读，不是「加载更多」的追加页，
+/// 表里的选中必须回到右栏的当前条目（第一行），不能沿用上次在 A 上的第 7 行。
+#[gpui_kit::test]
+fn returning_to_a_grown_key_realigns_the_entry_selection(cx: &mut gpui_kit::TestAppContext) {
+    let fields: Vec<(String, String)> = (0..10).map(|i| (format!("f{i}"), i.to_string())).collect();
+    let grown: Vec<(String, String)> = (0..12).map(|i| (format!("f{i}"), i.to_string())).collect();
+    let first = fields;
+    let (window, view, dir) = open(cx, 1360., move |pane| {
+        pane.set_keys(vec![key("a", "hash"), key("b", "string")]);
+        pane.done = true;
+        pane.selected = "a".into();
+        pane.detail_key = "a".into();
+        pane.entry_focus = Some(0);
+        let refs: Vec<(&str, &str)> = first.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        pane.detail = Some(Arc::new(hash_detail(&refs)));
+    });
+    let render = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap()
+    };
+    render(cx);
+    cx.update(|cx| view.update(cx, |pane, cx| pane.select_table_row(ENTRY_TABLE, 7, cx)));
+    render(cx);
+    assert_eq!(cx.update(|cx| view.read(cx).entry_focus), Some(7));
+    // 换到字符串键 B。
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.selected = "b".into();
+            let generation = pane.begin_read();
+            assert!(pane.deliver_read(generation, "b".into(), Ok(string_detail("hello")), cx));
+        })
+    });
+    render(cx);
+    // 回到 A，A 期间多了两个字段。
+    let second = grown;
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.selected = "a".into();
+            let generation = pane.begin_read();
+            let refs: Vec<(&str, &str)> = second.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            assert!(pane.deliver_read(generation, "a".into(), Ok(hash_detail(&refs)), cx));
+            assert_eq!(pane.entry_focus, Some(0), "换键回来默认第一条");
+        })
+    });
+    render(cx);
+    let (focus, rows, selected_row) = cx.update(|cx| {
+        let pane = view.read(cx);
+        let table = pane.tables.get(ENTRY_TABLE).map(|slot| slot.table.clone()).unwrap();
+        let position = pane.entry_focus.and_then(|index| pane.entry_rows.iter().position(|row| *row == index));
+        (position, table.read(cx).rows_len(cx), table.read(cx).selection(cx).map(|selection| selection.focus.0))
+    });
+    assert_eq!(rows, 12);
+    assert_eq!(focus, Some(0));
+    assert_eq!(selected_row, focus, "表里高亮的行就是右栏当前条目所在的行");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 用户反馈：集合类键右侧的值面板可以关掉（工具栏按钮或面板右上角的关闭），关掉后条目表占满，状态随偏好保存。
 #[gpui_kit::test]
 fn value_panel_can_be_closed_and_reopened(cx: &mut gpui_kit::TestAppContext) {
@@ -891,3 +968,249 @@ fn clients_filter_maps_kill_index_and_pubsub_supports_channel_reply(cx: &mut gpu
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
+fn hash_entries(range: std::ops::Range<usize>) -> Vec<KeyValuePair> {
+    range.map(|i| KeyValuePair { field: format!("field:{i:04}"), value: format!("{{\"n\":{i}}}") }).collect()
+}
+
+/// R13：加载更多是同一个键的追加页：条目数增加，表里选中的行与滚动位置都不变（不回弹到顶部或选中行）；
+/// 读完后页脚说明“已全部加载 N 项”；失败在页脚给原因与重试，已读到的条目不被错误态替换。
+#[gpui_kit::test]
+fn loading_more_entries_keeps_the_view_and_reports_the_end_or_the_failure(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1360., |pane| {
+        pane.set_keys(vec![key("big", "hash")]);
+        pane.done = true;
+        pane.selected = "big".into();
+        pane.detail_key = "big".into();
+        pane.entry_focus = Some(0);
+        pane.detail = Some(Arc::new(RedisKeyDetail {
+            key_type: "hash".into(),
+            ttl_ms: Some(-1),
+            value: RedisValue::Hash { entries: hash_entries(0..200) },
+            total: Some(450),
+            next: Some("200".into()),
+            memory: Some(40_960),
+            encoding: Some("hashtable".into()),
+        }));
+    });
+    let render = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap()
+    };
+    render(cx);
+    let table = cx.update(|cx| view.read(cx).tables.get(ENTRY_TABLE).map(|slot| slot.table.clone()).expect("条目表"));
+    // 选中第 3 行，再滚到表尾去点「加载更多」：选中行已不在视口里。
+    cx.update(|cx| view.update(cx, |pane, cx| pane.select_table_row(ENTRY_TABLE, 3, cx)));
+    render(cx);
+    let scrolled = gpui_kit::Point { x: px(0.), y: px(-2400.) };
+    cx.update(|cx| table.update(cx, |table, cx| table.set_vertical_offset(scrolled, cx)));
+    render(cx);
+    let before = cx.update(|cx| table.read(cx).scroll_offsets(cx).0);
+    assert!(before.y < px(-1000.), "已滚到表的下部：{before:?}");
+    let more = cx.update_window(window, |_, window, _| window.find("redis-value-more").label().map(str::to_owned)).unwrap();
+    assert_eq!(more.as_deref(), Some("加载更多"));
+
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            pane.value_loading = true;
+            pane.finish_value_page(Ok(("big".into(), ValuePage { value: RedisValue::Hash { entries: hash_entries(200..400) }, next: Some("400".into()) })));
+        })
+    });
+    render(cx);
+    let (rows, selected, after, focus) = cx.update(|cx| {
+        let table = table.read(cx);
+        (table.rows_len(cx), table.selection(cx).map(|selection| selection.focus.0), table.scroll_offsets(cx).0, view.read(cx).entry_focus)
+    });
+    assert_eq!(rows, 400, "条目数增加");
+    assert_eq!(selected, Some(3), "选中行不变，不回到第一行");
+    assert_eq!(focus, Some(3), "右栏仍是同一个条目");
+    assert_eq!(after, before, "滚动位置不回弹");
+
+    // 读取失败：页脚给原因与重试，条目仍在，值区不换成错误态。
+    cx.update(|cx| view.update(cx, |pane, _| pane.finish_value_page(Err("连接已断开".into()))));
+    render(cx);
+    let (error, retry, state, rows) = cx
+        .update_window(window, |_, window, cx| {
+            (
+                window.try_find("redis-value-more-error").is_some(),
+                window.find("redis-value-more").label().map(str::to_owned),
+                window.within("redis-value").try_find("error-state").is_some(),
+                table.read(cx).rows_len(cx),
+            )
+        })
+        .unwrap();
+    assert!(error, "页脚说明加载失败的原因");
+    assert_eq!(retry.as_deref(), Some("重试"), "失败后按钮变成重试");
+    assert!(!state, "已读到的条目不被错误态替换");
+    assert_eq!(rows, 400);
+
+    // 最后一页：没有下一页时说明已全部加载，不再有加载按钮。
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            pane.value_more_error = None;
+            pane.finish_value_page(Ok(("big".into(), ValuePage { value: RedisValue::Hash { entries: hash_entries(400..450) }, next: None })));
+        })
+    });
+    render(cx);
+    let (all, more, rows, selected) = cx
+        .update_window(window, |_, window, cx| {
+            (
+                window.try_find("redis-value-all-loaded").and_then(|node| node.label().map(str::to_owned)),
+                window.try_find("redis-value-more").is_some(),
+                table.read(cx).rows_len(cx),
+                table.read(cx).selection(cx).map(|selection| selection.focus.0),
+            )
+        })
+        .unwrap();
+    assert_eq!(rows, 450);
+    assert_eq!(selected, Some(3));
+    assert!(!more, "读完后没有加载按钮");
+    assert_eq!(all.as_deref(), Some("已全部加载 450 项"), "读完后页脚说明已全部加载");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R13：有筛选时新一页一条都不匹配（可见行不变）、有排序时新行插到选中行之前，
+/// 都仍是追加页：滚动位置不动，选中跟着同一条目，不回弹到选中行。
+#[gpui_kit::test]
+fn loading_more_under_a_filter_or_sort_keeps_the_view(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1360., |pane| {
+        pane.set_keys(vec![key("big", "hash")]);
+        pane.done = true;
+        pane.selected = "big".into();
+        pane.detail_key = "big".into();
+        pane.entry_focus = Some(3);
+        pane.hash_query = "field:00".into();
+        pane.detail = Some(Arc::new(RedisKeyDetail {
+            key_type: "hash".into(),
+            ttl_ms: Some(-1),
+            value: RedisValue::Hash { entries: hash_entries(0..200) },
+            total: Some(600),
+            next: Some("200".into()),
+            memory: None,
+            encoding: None,
+        }));
+    });
+    let render = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap()
+    };
+    render(cx);
+    let table = cx.update(|cx| view.read(cx).tables.get(ENTRY_TABLE).map(|slot| slot.table.clone()).expect("条目表"));
+    let state = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update(|cx| {
+            let table = table.read(cx);
+            (table.rows_len(cx), table.selection(cx).map(|selection| selection.focus.0), table.scroll_offsets(cx).0, view.read(cx).entry_focus)
+        })
+    };
+    let (rows, selected, _, _) = state(cx);
+    assert_eq!((rows, selected), (100, Some(3)), "筛选后 field:0000–0099，选中第 3 行");
+    let scrolled = gpui_kit::Point { x: px(0.), y: px(-1200.) };
+    cx.update(|cx| table.update(cx, |table, cx| table.set_vertical_offset(scrolled, cx)));
+    render(cx);
+    let before = state(cx).2;
+    assert!(before.y < px(-600.), "已滚到表的下部：{before:?}");
+
+    // 筛选下新一页 field:0200–0399 一条都不匹配：可见行不变，但视图也不能跳回选中行。
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            pane.value_loading = true;
+            pane.finish_value_page(Ok(("big".into(), ValuePage { value: RedisValue::Hash { entries: hash_entries(200..400) }, next: Some("400".into()) })));
+        })
+    });
+    render(cx);
+    let (rows, selected, after, focus) = state(cx);
+    assert_eq!(rows, 100, "新一页没有匹配项");
+    assert_eq!(selected, Some(3));
+    assert_eq!(focus, Some(3));
+    assert_eq!(after, before, "筛选下加载更多不回弹");
+
+    // 换成降序、去掉筛选（视图变了，选中对齐到当前条目），再滚到表尾加载更多。
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            pane.hash_query.clear();
+            pane.entry_sort = 2;
+        })
+    });
+    render(cx);
+    let (rows, selected, _, focus) = state(cx);
+    assert_eq!((rows, focus), (400, Some(3)));
+    assert_eq!(selected, Some(396), "降序后 field:0003 在倒数第 4 行");
+    let scrolled = gpui_kit::Point { x: px(0.), y: px(-3000.) };
+    cx.update(|cx| table.update(cx, |table, cx| table.set_vertical_offset(scrolled, cx)));
+    render(cx);
+    let before = state(cx).2;
+
+    // 新一页 field:0400–0599 降序排在最前：同一条目的行号后移 200，选中跟过去，视口不动。
+    cx.update(|cx| {
+        view.update(cx, |pane, _| {
+            pane.value_loading = true;
+            pane.finish_value_page(Ok(("big".into(), ValuePage { value: RedisValue::Hash { entries: hash_entries(400..600) }, next: None })));
+        })
+    });
+    render(cx);
+    let (rows, selected, after, focus) = state(cx);
+    assert_eq!(rows, 600);
+    assert_eq!(focus, Some(3), "右栏仍是同一个条目");
+    assert_eq!(selected, Some(596), "选中跟着同一条目换行");
+    assert_eq!(after, before, "排序下加载更多不回弹");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 改分隔符后，键名拆分缓存作废：平铺行按新分隔符拆前缀与末段。
+#[gpui_kit::test]
+fn changing_separators_resplits_flat_key_names(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.set_keys(vec![key("alpha:beta_gamma", "string")]);
+        pane.done = true;
+        pane.view_mode = ViewMode::Flat;
+    });
+    let lasts = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| view.read(cx).fit_cache.values().map(|fit| fit.last.to_string()).collect::<Vec<_>>())
+    };
+    assert_eq!(lasts(cx), vec!["beta_gamma".to_owned()]);
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.prefs.separators = vec![":".to_owned(), "_".to_owned()];
+            pane.invalidate_rows();
+            cx.notify();
+        })
+    });
+    assert_eq!(lasts(cx), vec!["gamma".to_owned()], "分隔符一变，旧的拆分结果不再使用");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R13：键列表「继续扫描」追加的一批键不让列表回弹：滚动位置与选中键都不变。
+#[gpui_kit::test]
+fn continuing_the_scan_keeps_the_key_list_view(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = open(cx, 1280., |pane| {
+        pane.set_keys((0..300).map(|i| key(&format!("user:{i:04}"), "string")).collect());
+        pane.view_mode = ViewMode::Flat;
+        pane.selected = "user:0002".into();
+    });
+    let render = |cx: &mut gpui_kit::TestAppContext| cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    render(cx);
+    let offset = |cx: &mut gpui_kit::TestAppContext| cx.update(|cx| view.read(cx).key_scroll.0.borrow().base_handle.offset());
+    cx.update(|cx| view.update(cx, |pane, _| pane.key_scroll.0.borrow().base_handle.set_offset(gpui_kit::Point { x: px(0.), y: px(-3000.) })));
+    render(cx);
+    let before = offset(cx);
+    assert!(before.y < px(-1000.), "已滚到下面：{before:?}");
+    cx.update(|cx| {
+        view.update(cx, |pane, cx| {
+            pane.apply_scan_events(vec![(pane.scan.epoch, ScanEvent::Batch((300..600).map(|i| key(&format!("user:{i:04}"), "string")).collect()))], cx);
+        })
+    });
+    render(cx);
+    render(cx);
+    let (after, count, selected) = (offset(cx), cx.update(|cx| view.read(cx).keys().len()), cx.update(|cx| view.read(cx).selected().to_owned()));
+    assert_eq!(count, 600, "追加了一批键");
+    assert_eq!(after, before, "列表不回弹");
+    assert_eq!(selected, "user:0002", "选中键不变");
+    let _ = std::fs::remove_dir_all(dir);
+}

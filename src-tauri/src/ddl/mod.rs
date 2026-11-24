@@ -15,7 +15,7 @@ pub(crate) use introspect::{load, load_comments, load_partial};
 #[allow(unused_imports)]
 pub(crate) use model::{
     Action, Column, ColumnDraft, DefaultMode, DefaultSpec, DependentSql, Engine as DdlEngine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index,
-    IndexColumn, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus, TableOptions,
+    IndexColumn, IndexColumnDraft, IndexDraft, IndexKind, Plan, Request, SequenceState, Snapshot, StepStatus, TableOptions,
 };
 pub(crate) use plan::plan as preview_plan;
 pub(crate) use plan::{fk_sql_for_display, index_sql_for_display, is_no_change, rebuilt_definition};

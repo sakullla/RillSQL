@@ -193,6 +193,42 @@ impl WorkItem {
     }
 }
 
+/// 定位命中行的高亮时长。
+pub const REVEAL_FLASH: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// 侧栏“定位”要找的树位置：由活动标签或对象编辑器推出。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevealTarget {
+    Connection { connection_id: String },
+    Database { connection_id: String, database: String },
+    Schema { connection_id: String, database: String, schema: String },
+    Keyspace { connection_id: String, keyspace: String },
+    Object { connection_id: String, database: String, schema: String, name: String, kinds: Vec<crate::catalog::model::ObjectKind> },
+}
+
+impl RevealTarget {
+    pub fn connection_id(&self) -> &str {
+        match self {
+            RevealTarget::Connection { connection_id }
+            | RevealTarget::Database { connection_id, .. }
+            | RevealTarget::Schema { connection_id, .. }
+            | RevealTarget::Keyspace { connection_id, .. }
+            | RevealTarget::Object { connection_id, .. } => connection_id,
+        }
+    }
+
+    /// 定位不到时提示里用的名字。
+    pub fn name(&self) -> &str {
+        match self {
+            RevealTarget::Connection { connection_id } => connection_id,
+            RevealTarget::Database { database, .. } => database,
+            RevealTarget::Schema { schema, .. } => schema,
+            RevealTarget::Keyspace { keyspace, .. } => keyspace,
+            RevealTarget::Object { name, .. } => name,
+        }
+    }
+}
+
 /// 一条连接的服务端搜索命中：(连接 id, 连接名, 引擎, [(库, 模式, 对象)])。
 pub type SearchBatch = (String, String, crate::catalog::Engine, Vec<(String, String, crate::catalog::model::ObjectRow)>);
 
@@ -464,6 +500,12 @@ pub struct WorkbenchModel {
     pub reveal_node: Option<String>,
     /// 键盘移动到的资源管理器行（group:/conn:/nav: 前缀）：下一帧滚进视口一次。
     pub reveal_row: Option<String>,
+    /// 打开着的对象编辑器指向的对象（视图每帧同步）；它盖在当前标签上，定位优先指向它。
+    pub object_editor_target: Option<RevealTarget>,
+    /// 定位时目标所在的分组/库还没读：读回后再定位一次。
+    pub pending_reveal: Option<RevealTarget>,
+    /// 定位命中的行（item id）与时刻：短暂高亮。
+    pub reveal_flash: Option<(String, std::time::Instant)>,
     pub copied: String,
     pub executions: u32,
     pub loads: u32,
@@ -493,6 +535,13 @@ pub struct WorkbenchModel {
     pub object_filter: String,
     /// 对象搜索代数：每次改词或清除都递增，异步检索带着发起时的代数回来，不一致就丢弃。
     pub nav_search_generation: u64,
+    /// 连接根节点还没入树时到达的检索命中：按连接暂存（连同发起时的代数与检索词），
+    /// 这条连接的目录读完后若代数与检索词仍是当前的就合入，否则丢弃。
+    pub pending_search_hits: std::collections::HashMap<String, (u64, String, SearchBatch)>,
+    /// 侧栏“已跳过 N 个未连接连接”横幅是否折叠成一行计数。
+    pub nav_search_skip_collapsed: bool,
+    /// “连接这些连接”排队的连接：一次连一条，上一条结束后再连下一条。
+    pub connect_queue: VecDeque<String>,
     /// 最近一次从查询页同步的对象索引；资源管理器、对象筛选和快速打开共用这一份。
     pub catalog: Vec<TreeObject>,
     /// 最近一次对象读取的错误；与空目录、筛选无命中分开呈现。
@@ -657,6 +706,9 @@ impl WorkbenchModel {
             notice_detail: String::new(),
             reveal_node: None,
             reveal_row: None,
+            object_editor_target: None,
+            pending_reveal: None,
+            reveal_flash: None,
             copied: String::new(),
             executions: 0,
             loads: 0,
@@ -680,6 +732,9 @@ impl WorkbenchModel {
             object_spec: None,
             object_filter: String::new(),
             nav_search_generation: 0,
+            pending_search_hits: std::collections::HashMap::new(),
+            nav_search_skip_collapsed: false,
+            connect_queue: VecDeque::new(),
             catalog: Vec::new(),
             catalog_error: String::new(),
             nav: NavTree::new(),
@@ -881,6 +936,9 @@ impl WorkbenchModel {
             "explorer-search" => {
                 self.shell.sidebar_open = true;
                 self.shell.focus = FocusTarget::Sidebar;
+            }
+            "reveal-active-tab" => {
+                let _ = self.reveal_active_tab();
             }
             "execute-query" | "run-current" | "run-selection" => self.executions += 1,
             "command-palette" | "quick-open" => {
@@ -1374,6 +1432,7 @@ impl WorkbenchModel {
             "timeout-60" => self.settings.query_timeout_sec = 60,
             "null-NULL" | "null-empty" | "null-N" => self.settings.null_copy = id.trim_start_matches("null-").to_owned(),
             "empty-hint" | "empty-blank" => self.settings.empty_display = id.trim_start_matches("empty-").to_owned(),
+            "hints-compact" | "hints-off" => self.settings.object_hints = id.trim_start_matches("hints-").to_owned(),
             "page-size-up" => self.settings.step_page_size(50),
             "page-size-down" => self.settings.step_page_size(-50),
             "preview-up" => self.settings.step_preview_kb(1),
@@ -2899,7 +2958,8 @@ impl WorkbenchModel {
             self.sync_object_spec_from_focus();
         }
         self.fill_single_database_targets();
-        changed
+        let merged = self.merge_pending_search_hits();
+        changed || merged
     }
 
     /// 查询标签只选了连接、没选库（恢复的旧会话、或建标签时还没读到库列表）：
@@ -3123,6 +3183,7 @@ impl WorkbenchModel {
             || self.nav_requests.iter().any(|req| matches!(req, NavRequest::Search(_)));
         self.object_filter.clear();
         self.nav_search_generation = self.nav_search_generation.wrapping_add(1);
+        self.pending_search_hits.clear();
         self.nav_requests.retain(|req| !matches!(req, NavRequest::Search(_) | NavRequest::CancelSearch));
         if active {
             self.nav_requests.push_back(NavRequest::CancelSearch);
@@ -3143,11 +3204,96 @@ impl WorkbenchModel {
         }
         let mut changed = false;
         for (conn_id, conn_name, engine, hits) in batches {
+            // 连接刚连上、目录还没读回来：根节点不在树上，先暂存，目录读完后再合入。
+            if self.nav.node(&crate::catalog::hierarchy::connection_node_id(&conn_id)).is_none() {
+                self.pending_search_hits.insert(conn_id.clone(), (generation, query.trim().to_owned(), (conn_id, conn_name, engine, hits)));
+                continue;
+            }
             if self.nav.merge_search_hits(&conn_id, &conn_name, engine, &hits) {
                 changed = true;
             }
         }
         changed
+    }
+
+    /// 目录刷新后合入暂存的检索命中：根节点已入树、代数与检索词仍是当前的才合入；过期的直接丢弃。
+    pub fn merge_pending_search_hits(&mut self) -> bool {
+        if self.pending_search_hits.is_empty() {
+            return false;
+        }
+        let current = self.nav_search_generation;
+        let query = self.object_filter.trim().to_owned();
+        self.pending_search_hits.retain(|_, (generation, asked, _)| *generation == current && *asked == query);
+        if query.is_empty() || self.nav.query().is_empty() {
+            self.pending_search_hits.clear();
+            return false;
+        }
+        let ready: Vec<String> = self
+            .pending_search_hits
+            .keys()
+            .filter(|id| self.nav.node(&crate::catalog::hierarchy::connection_node_id(id)).is_some())
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for id in ready {
+            if let Some((_, _, (conn_id, conn_name, engine, hits))) = self.pending_search_hits.remove(&id) {
+                if self.nav.merge_search_hits(&conn_id, &conn_name, engine, &hits) {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// 检索期间有连接新连上：按当前词重新发起一次检索（新代数），新连接的命中也能进树。
+    pub fn rerun_nav_search(&mut self) {
+        if !self.nav_searching() {
+            return;
+        }
+        self.nav_search_generation = self.nav_search_generation.wrapping_add(1);
+        let query = self.object_filter.trim().to_owned();
+        self.nav_requests.retain(|req| !matches!(req, NavRequest::Search(_)));
+        self.nav_requests.push_back(NavRequest::Search(query));
+    }
+
+    /// 搜索时被跳过、需要先连接的关系型连接（未连接或连接失败）；Redis/MongoDB 不支持对象搜索，不计入。
+    pub fn nav_search_skipped_ids(&self) -> Vec<String> {
+        if !self.nav_searching() {
+            return Vec::new();
+        }
+        self.connections
+            .rows
+            .iter()
+            .filter(|row| row.saved.engine.is_relational())
+            .filter(|row| {
+                !matches!(self.connections.row_status(&row.saved.id), LinkStatus::Connected | LinkStatus::Connecting)
+            })
+            .map(|row| row.saved.id.clone())
+            .collect()
+    }
+
+    /// 横幅上的“连接这些连接”：逐条连接被跳过的连接，连上后检索自动覆盖它们。
+    pub fn connect_skipped(&mut self) {
+        let ids = self.nav_search_skipped_ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.connect_queue = ids.into_iter().collect();
+        self.advance_connect_queue();
+    }
+
+    /// 连下一条排队的连接；已经连上（或正在连）的跳过。
+    pub fn advance_connect_queue(&mut self) {
+        while let Some(id) = self.connect_queue.pop_front() {
+            if !self.connections.rows.iter().any(|row| row.saved.id == id) {
+                continue;
+            }
+            if matches!(self.connections.row_status(&id), LinkStatus::Connected | LinkStatus::Connecting) {
+                continue;
+            }
+            self.queue_connect(super::conn_modal::ConnectIntent::new(id, super::conn_modal::ConnectAction::Expand, None));
+            return;
+        }
     }
 
     fn sync_object_spec_from_focus(&mut self) {
@@ -3806,25 +3952,10 @@ impl WorkbenchModel {
         items
     }
 
-    /// 过滤对象树时，因未连接或目录尚未加载而被跳过的连接数。
+    /// 过滤对象树时因未连接而被跳过的关系型连接数。已连接的连接无论目录是否读完都会发起服务端检索，
+    /// 不算跳过；Redis/MongoDB 不支持对象搜索，也不计入。
     pub fn nav_search_skipped_count(&self) -> usize {
-        if !self.nav_searching() {
-            return 0;
-        }
-        self.connections
-            .rows
-            .iter()
-            .filter(|row| {
-                let id = row.saved.id.as_str();
-                let connected = self.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected) == LinkStatus::Connected;
-                if !connected {
-                    return true;
-                }
-                let node_id = crate::catalog::hierarchy::connection_node_id(id);
-                let has_children = self.nav.node(&node_id).is_some_and(|node| !node.children.is_empty());
-                !has_children && self.nav_rows_for(id).is_empty()
-            })
-            .count()
+        self.nav_search_skipped_ids().len()
     }
 
     /// 一条连接在资源管理器里的行（连接行 + 可选错误行 + 树行）。
@@ -4123,6 +4254,186 @@ impl WorkbenchModel {
         true
     }
 
+    /// 活动标签（或盖在上面的对象编辑器）在对象树里对应的位置；没有可定位的对象时为 None。
+    pub fn active_reveal_target(&self) -> Option<RevealTarget> {
+        if let Some(target) = &self.object_editor_target {
+            return Some(target.clone());
+        }
+        let tab = self.active_tab()?;
+        let fallback = || {
+            let connection_id = tab.connection_id.clone().filter(|id| !id.is_empty())?;
+            Some(match tab.database.clone().filter(|db| !db.is_empty()) {
+                Some(database) => RevealTarget::Database { connection_id, database },
+                None => RevealTarget::Connection { connection_id },
+            })
+        };
+        match tab.kind {
+            WorkItemKind::Table | WorkItemKind::Structure => {
+                match tab.spec.as_deref().and_then(ObjectTarget::parse) {
+                    Some(target) => Some(RevealTarget::Object {
+                        connection_id: target.connection_id,
+                        database: target.database,
+                        schema: target.schema,
+                        name: target.name,
+                        kinds: vec![crate::catalog::model::ObjectKind::Table, crate::catalog::model::ObjectKind::View],
+                    }),
+                    None => fallback(),
+                }
+            }
+            WorkItemKind::Overview => {
+                let target = crate::app::views::overview::OverviewTarget::parse(tab.spec.as_deref()?)?;
+                let connection_id = target.connection_id;
+                Some(if target.database.is_empty() {
+                    RevealTarget::Connection { connection_id }
+                } else if target.schema.is_empty() || !target.engine.shows_schemas() {
+                    RevealTarget::Database { connection_id, database: target.database }
+                } else {
+                    RevealTarget::Schema { connection_id, database: target.database, schema: target.schema }
+                })
+            }
+            WorkItemKind::Redis => {
+                let spec = tab.spec.as_deref()?;
+                let mut parts = spec.split('|');
+                let connection_id = parts.next().filter(|id| !id.is_empty())?.to_owned();
+                let keyspace = parts.nth(1).map(|db| db.trim().trim_start_matches("db")).filter(|db| !db.is_empty()).unwrap_or("0").to_owned();
+                Some(RevealTarget::Keyspace { connection_id, keyspace })
+            }
+            WorkItemKind::Query | WorkItemKind::Admin | WorkItemKind::Mongo => fallback(),
+        }
+    }
+
+    /// 侧栏定位按钮与命令是否可用。
+    pub fn can_reveal_active_tab(&self) -> bool {
+        self.active_reveal_target().is_some()
+    }
+
+    /// 在对象树里定位活动标签：先清除搜索过滤，展开祖先并按需懒加载，聚焦、滚动并短暂高亮。
+    /// 目标所在的分组/库还没读时先定位到最近的已知祖先，读回后再定位一次。
+    pub fn reveal_active_tab(&mut self) -> bool {
+        let Some(target) = self.active_reveal_target() else {
+            self.notice_key = Some("ui.explorer.locateNone");
+            self.notice_detail.clear();
+            return false;
+        };
+        if self.nav_searching() || !self.nav.query().is_empty() {
+            self.clear_object_filter();
+        }
+        self.pending_reveal = None;
+        self.reveal_target(&target)
+    }
+
+    /// 目录读回后：定位还在等这次读取就再走一次。
+    pub fn retry_pending_reveal(&mut self) -> bool {
+        let Some(target) = self.pending_reveal.take() else { return false };
+        self.reveal_target(&target)
+    }
+
+    fn reveal_target(&mut self, target: &RevealTarget) -> bool {
+        use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, keyspace_node_id, schema_node_id};
+        let connection_id = target.connection_id().to_owned();
+        if !self.connections.rows.iter().any(|row| row.saved.id == connection_id) {
+            self.notice_key = Some("ui.explorer.locateNone");
+            self.notice_detail.clear();
+            return false;
+        }
+        let engine = self.nav.node(&connection_node_id(&connection_id)).map(|node| node.engine);
+        // 由深到浅的候选：第一个在树上存在的就是落点。
+        let mut chain: Vec<String> = Vec::new();
+        let mut exact: Option<String> = None;
+        match target {
+            RevealTarget::Connection { .. } => {}
+            RevealTarget::Keyspace { keyspace, .. } => chain.push(keyspace_node_id(&connection_id, keyspace)),
+            RevealTarget::Database { database, .. } => {
+                if engine.is_none_or(|engine| engine.shows_databases()) {
+                    chain.push(database_node_id(&connection_id, database));
+                }
+            }
+            RevealTarget::Schema { database, schema, .. } => {
+                chain.push(schema_node_id(&connection_id, database, schema));
+                chain.push(database_node_id(&connection_id, database));
+            }
+            RevealTarget::Object { database, schema, name, kinds, .. } => {
+                exact = kinds
+                    .iter()
+                    .find_map(|kind| self.nav.object_by_key(&connection_id, database, schema, name, *kind))
+                    .or_else(|| {
+                        self.nav.nodes().find(|node| {
+                            node.kind == NavKind::Object
+                                && !node.stale
+                                && node.connection_id == connection_id
+                                && node.database == *database
+                                && node.schema.eq_ignore_ascii_case(schema)
+                                && node.name.eq_ignore_ascii_case(name)
+                                && node.object_kind.is_some_and(|kind| kinds.contains(&kind))
+                        })
+                    })
+                    .map(|node| node.id.clone());
+                for kind in kinds {
+                    chain.push(group_node_id(&connection_id, database, schema, *kind));
+                }
+                if !schema.is_empty() {
+                    chain.push(schema_node_id(&connection_id, database, schema));
+                }
+                chain.push(database_node_id(&connection_id, database));
+            }
+        }
+        let object_target = matches!(target, RevealTarget::Object { .. });
+        // 库/模式/键空间本身就是目标：最深的候选在树上即命中。
+        let exact_hit = match target {
+            RevealTarget::Connection { .. } => true,
+            RevealTarget::Object { .. } => exact.is_some(),
+            _ => chain.first().is_some_and(|id| self.nav.node(id).is_some()),
+        };
+        let landing = exact.or_else(|| chain.iter().find(|id| self.nav.node(id).is_some()).cloned());
+        // 对象还没读到：所在分组或库没读过就按需读取（或正在读），读回后再定位。
+        let mut waiting = false;
+        if object_target && !exact_hit {
+            if let Some(id) = &landing {
+                if self.nav.needs_group(id) || self.nav.needs_database(id) {
+                    self.request_lazy_read(id);
+                    waiting = true;
+                } else if self.nav.node(id).is_some_and(|node| node.loading) {
+                    waiting = true;
+                }
+            }
+        }
+        if waiting {
+            self.pending_reveal = Some(target.clone());
+        }
+        self.shell.sidebar_open = true;
+        self.shell.focus = FocusTarget::Sidebar;
+        let row = match landing {
+            Some(id) => {
+                self.expand_nav_connection(&connection_id);
+                if let Some(parent) = self.nav.node(&id).and_then(|node| node.parent.clone()) {
+                    let _ = self.nav.expand(&parent);
+                }
+                // 正在为定位读取的分组/库展开着，读回的对象直接可见。
+                if waiting {
+                    let _ = self.nav.expand(&id);
+                }
+                ExplorerRow::Node(id)
+            }
+            None => ExplorerRow::Connection(connection_id.clone()),
+        };
+        let item = row.item_id();
+        self.set_explorer_current(row);
+        self.reveal_row = Some(item.clone());
+        self.reveal_flash = Some((item, std::time::Instant::now()));
+        if !exact_hit && !waiting {
+            self.notice_key = Some("query.definition.notInTree");
+            self.notice_detail = target.name().to_owned();
+        }
+        true
+    }
+
+    /// 定位高亮是否还在显示期内。
+    pub fn reveal_flash_active(&self, item_id: &str) -> bool {
+        self.reveal_flash
+            .as_ref()
+            .is_some_and(|(id, at)| id == item_id && at.elapsed() < REVEAL_FLASH)
+    }
+
     /// 对象/列/索引动作的规格。菜单、键盘和右键都从这里取同一份身份。
     fn nav_spec(&self, node_id: &str) -> Option<String> {
         let node = self.nav.node(node_id)?;
@@ -4166,6 +4477,14 @@ impl WorkbenchModel {
     fn nav_command(&mut self, id: &str) -> bool {
         if id == "nav-refresh" {
             self.request_nav_refresh(None);
+            return true;
+        }
+        if id == "nav-connect-skipped" {
+            self.connect_skipped();
+            return true;
+        }
+        if id == "nav-search-skipped-toggle" {
+            self.nav_search_skip_collapsed = !self.nav_search_skip_collapsed;
             return true;
         }
         // 资源管理器里连接失败那一行的两个出口：再连一次，或打开这条连接的编辑表单改配置。

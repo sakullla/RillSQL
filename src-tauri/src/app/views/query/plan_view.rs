@@ -37,10 +37,34 @@ const DETAIL_NARROW_MAX_H: f32 = 240.;
 const TREE_MIN_OP_W: f32 = 280.;
 const TREE_MIN_TOTAL_W: f32 = 460.;
 
+/// 计划头的视图切换：画布（节点卡片与连线）、列表（缩进树）、原始（引擎原文网格）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanMode {
+    Canvas,
+    List,
+    Raw,
+}
+
+impl PlanMode {
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "canvas" => Some(Self::Canvas),
+            "list" => Some(Self::List),
+            "raw" => Some(Self::Raw),
+            _ => None,
+        }
+    }
+
+    /// 用户没选过时的默认：多节点看画布，单节点看列表。
+    pub fn resolve(choice: Option<Self>, nodes: usize) -> Self {
+        choice.unwrap_or(if nodes > 1 { Self::Canvas } else { Self::List })
+    }
+}
+
 pub struct PlanView<'a> {
     pub plan: &'a Plan,
     pub selected: usize,
-    pub raw: bool,
+    pub mode: PlanMode,
     pub locale: Locale,
     pub metrics: Metrics,
     pub mono: SharedString,
@@ -121,7 +145,7 @@ pub fn cost_share(node_cost: Option<f64>, total_cost: Option<f64>) -> Option<f32
 }
 
 /// 访问类型语义配色：点查/主键绿色、范围/索引扫描蓝色、全表扫描红色。
-fn access_type_colors(access: &str, p: &Palette) -> (Hsla, Hsla) {
+pub(super) fn access_type_colors(access: &str, p: &Palette) -> (Hsla, Hsla) {
     match access.to_ascii_lowercase().as_str() {
         "const" | "system" | "eq_ref" | "ref" => (p.ok, p.ok_soft),
         "range" | "index" | "ref_or_null" | "index_merge" | "fulltext" | "unique_subquery" | "index_subquery" => (p.info, p.accent_soft),
@@ -131,7 +155,7 @@ fn access_type_colors(access: &str, p: &Palette) -> (Hsla, Hsla) {
 }
 
 /// 热力占比条配色：>60% 危险红、>30% 告警橙、其余主色蓝。
-fn heat_bar_color(share: f32, p: &Palette) -> Hsla {
+pub(super) fn heat_bar_color(share: f32, p: &Palette) -> Hsla {
     if share > 0.6 {
         p.danger
     } else if share > 0.3 {
@@ -142,7 +166,7 @@ fn heat_bar_color(share: f32, p: &Palette) -> Hsla {
 }
 
 /// 节点的可读名称（操作 + 对象）：树行与详情面板的无障碍名称用同一份，详情跟着选中节点走。
-fn node_label(lines: &[crate::query::plan::PlanLine<'_>], index: usize) -> String {
+pub(super) fn node_label(lines: &[crate::query::plan::PlanLine<'_>], index: usize) -> String {
     lines
         .get(index)
         .map(|line| match &line.node.object {
@@ -200,10 +224,14 @@ impl PlanView<'_> {
         } else {
             chip(i18n::fill(&i18n::text(locale, "query.plan.issues"), &[("count", &findings.len().to_string())]), p.warn, p.warn_soft)
         });
+        let segment = |mode: PlanMode, id: &str, key: &str| {
+            (SharedString::from(format!("plan-view-{id}")), t(key), self.mode == mode, kit::click(click(entity, format!("plan-view:{id}"))))
+        };
         let toggle = kit::segmented_sized(
             vec![
-                (SharedString::from("plan-view-tree"), t("query.plan.viewTree"), !self.raw, kit::click(click(entity, "plan-view:tree".into()))),
-                (SharedString::from("plan-view-raw"), t("query.plan.viewRaw"), self.raw, kit::click(click(entity, "plan-view:raw".into()))),
+                segment(PlanMode::Canvas, "canvas", "query.plan.viewCanvas"),
+                segment(PlanMode::List, "list", "query.plan.viewList"),
+                segment(PlanMode::Raw, "raw", "query.plan.viewRaw"),
             ],
             p,
             self.metrics.control_h - Space::SM,
@@ -238,7 +266,9 @@ impl PlanView<'_> {
     /// 计划主体：问题与建议、计划树、详情面板。
     ///
     /// 同一条建议只完整说一遍（顶部建议条）；树行与详情只用标签点出“这里有问题”，点建议直接跳到对应节点。
-    pub fn body(&self, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+    ///
+    /// 画布模式由调用方传入画布元素，占据列表树的位置；建议条与详情面板两种模式共用。
+    pub fn body(&self, p: &Palette, entity: &Entity<QueryPane>, canvas: Option<AnyElement>) -> AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let lines = self.plan.lines();
@@ -341,7 +371,8 @@ impl PlanView<'_> {
                 .child(div().w(px(COL_ROWS_W)).flex_none().flex().justify_end().child(t("query.plan.colRows"))),
         );
 
-        for (index, line) in lines.iter().enumerate() {
+        let list_lines: &[crate::query::plan::PlanLine<'_>] = if canvas.is_some() { &[] } else { &lines };
+        for (index, line) in list_lines.iter().enumerate() {
             let node = line.node;
             let warn = !node.issues.is_empty();
             let (icon, tone) = match node.kind() {
@@ -726,7 +757,10 @@ impl PlanView<'_> {
         }
         let ring = p.accent;
         let nav = entity.clone();
-        let tree = div()
+        let tree = if let Some(canvas) = canvas {
+            canvas
+        } else {
+            div()
             .id("query-plan-tree")
             .test_support()
             .role(gpui_kit::Role::Tree)
@@ -748,7 +782,9 @@ impl PlanView<'_> {
             .when(!self.narrow, |this| this.h_full())
             .flex()
             .flex_col()
-            .child(tree);
+            .child(tree)
+            .into_any_element()
+        };
         let main = div()
             .flex_1()
             .min_h_0()

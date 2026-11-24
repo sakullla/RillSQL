@@ -278,6 +278,12 @@ pub(super) async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engi
     if database.is_empty() {
         return Err(definition_failure("需要数据库名"));
     }
+    // 函数与存储过程：SHOW CREATE 读不到时回退元数据重建，仍读不到给出权限原因（R6）。
+    match statement {
+        "FUNCTION" => return super::routine_definition::read_routine_definition(pool, engine, database, name, crate::ddl::model::RoutineKind::Function).await,
+        "PROCEDURE" => return super::routine_definition::read_routine_definition(pool, engine, database, name, crate::ddl::model::RoutineKind::Procedure).await,
+        _ => {}
+    }
     let sql = format!("SHOW CREATE {statement} {}.{}", quote_mysql(database), quote_mysql(name));
     let mut conn = pool.get_conn().await.map_err(definition_failure)?;
     let row: Option<mysql_async::Row> = conn.query_first(sql).await.map_err(definition_failure)?;

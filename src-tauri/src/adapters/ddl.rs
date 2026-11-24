@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::model::{
-    Action, ColumnDraft, DefaultSpec, EnumSetDraft, ForeignKey, GeneratedColumnDraft, LiteralQuoting, Plan, Request, Risk, Snapshot, StepReceipt, TableOptions,
+    Action, ColumnDraft, DefaultSpec, EnumSetDraft, ForeignKey, GeneratedColumnDraft, Index, IndexDraft, LiteralQuoting, Plan, Request, Risk, Snapshot, StepReceipt, TableOptions,
 };
 use crate::ddl::plan::{Change, Tok};
 
@@ -189,6 +189,21 @@ pub trait TypeRules: Sync {
     }
 }
 
+/// 索引的方言能力：新建/修改索引时可以选的类型与选项。界面按这里隐藏不支持的项，计划按这里阻断。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexFeatures {
+    /// 全文索引。
+    pub fulltext: bool,
+    /// 空间索引。
+    pub spatial: bool,
+    /// 在索引页上新建或修改主键。
+    pub primary: bool,
+    /// 字符串列的前缀长度。
+    pub prefix: bool,
+    /// 索引注释。
+    pub comment: bool,
+}
+
 /// 建表页表级选项的方言描述：哪些选项显示，以及可选值。空列表表示不显示该选项。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableOptionSpec {
@@ -331,6 +346,22 @@ pub trait DdlDialect: Sync {
 
     /// 删除索引的语句。`index` 已按方言引用。
     fn drop_index_sql(&self, snapshot: &Snapshot, index: &str) -> Result<String, String>;
+
+    /// 这个方言能建的索引类型与选项（唯一与普通索引所有方言都有）。
+    fn index_features(&self) -> IndexFeatures {
+        IndexFeatures::default()
+    }
+
+    /// 键列表之后的索引注释子句。只在 `index_features().comment` 为真时调用。
+    fn index_comment_clause(&self, _comment: &str) -> Option<String> {
+        None
+    }
+
+    /// 一条语句修改索引（同一条 ALTER TABLE 里先删后加）。`key_parts` 是已按方言写好的键列表，
+    /// `tail` 是键列表之后的子句（注释等）。None 表示方言没有这种写法：计划拆成删除再新建两条，并说明不是原子操作。
+    fn alter_index_sql(&self, _snapshot: &Snapshot, _old: &Index, _new: &IndexDraft, _key_parts: &str, _tail: &str) -> Option<Result<String, String>> {
+        None
+    }
 
     /// 删除外键约束用的子句。
     fn drop_foreign_key_clause(&self) -> &'static str {

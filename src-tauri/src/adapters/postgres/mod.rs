@@ -5,7 +5,9 @@ pub(crate) mod catalog_read;
 pub(crate) mod connect;
 pub(crate) mod diagram;
 mod ddl;
-pub(in crate::adapters) mod ddl_read;
+pub(crate) mod ddl_read;
+#[cfg(test)]
+mod index_live_tests;
 mod english;
 pub(crate) mod extras;
 pub(crate) mod exec;

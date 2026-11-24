@@ -1789,7 +1789,7 @@ mod tests {
         values.insert("?1".to_owned(), String::new());
         assert_eq!(substitute_variables("select :name, ?", &values), "select 'O''Hare', NULL");
         // 键名里的命名空间冒号、时间字面量、冒号后接数字都不是命名参数，不能弹出「填写变量」。
-        assert!(find_variables("hget analyzerAreaInOutCity209831:1269820826354053120").is_empty());
+        assert!(find_variables("hget areaStats1001:1269820826354053120").is_empty());
         assert!(find_variables("select * from t where at = 12:30 or v = :1").is_empty());
         assert_eq!(find_variables("select a from t where id=:id").len(), 1);
         assert_eq!(

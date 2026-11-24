@@ -18,6 +18,9 @@ docs/verification/*
 !docs/verification/2026-11-11-workbench-visual-audit.md
 !docs/verification/workbench-2026-11-11/
 !docs/verification/workbench-2026-11-11/**
+# 2026-11-23 表数据编辑闭环与 UI/UX 打磨：原生巡检截图与 R1–R14 对照报告进入检查点，供交付评审。
+!docs/verification/2026-11-23-grid-editing-and-ux-polish/
+!docs/verification/2026-11-23-grid-editing-and-ux-polish/**
 # 2026-11-21 MySQL/MariaDB 专有功能：版本基线与 live 验收报告要进入检查点，供交付评审。
 !docs/verification/2026-11-21-mysql-proprietary-support/
 !docs/verification/2026-11-21-mysql-proprietary-support/**

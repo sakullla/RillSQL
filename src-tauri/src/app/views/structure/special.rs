@@ -5,8 +5,7 @@
 //! 不会因为界面上有个按钮就假装可用。
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Sizable as _};
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -396,9 +395,7 @@ impl StructurePane {
         let label = storage_label(generated.storage);
         let current = generated.storage;
         let storage_entity = entity.clone();
-        let storage = Button::new(SharedString::from(format!("structure-generated-storage-{index}")))
-            .ghost()
-            .xsmall()
+        let storage = kit::inline_menu_button(SharedString::from(format!("structure-generated-storage-{index}")))
             .label(SharedString::from(label))
             .dropdown_menu(move |menu, _, _| {
                 let menu_owner = storage_entity.clone();
@@ -513,9 +510,7 @@ impl StructurePane {
         // 操作：哪些操作有意义由预览判定，这里只列出这一轮支持的操作。
         let op_owner = entity.clone();
         let op_label = partition_op_label(op, locale);
-        let op_menu = Button::new("structure-partition-op")
-            .ghost()
-            .small()
+        let op_menu = kit::menu_button("structure-partition-op")
             .label(SharedString::from(op_label.clone()))
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu.min_w(px(MENU_MAX_W));
@@ -538,17 +533,13 @@ impl StructurePane {
         let method_text = method.keyword().to_owned();
         let locked_hint = t("structure.partitionMethodLocked");
         let method_button: AnyElement = if method_locked {
-            Button::new("structure-partition-method")
-                .ghost()
-                .small()
+            kit::menu_button("structure-partition-method")
                 .label(SharedString::from(method_text))
                 .disabled(true)
                 .tooltip(locked_hint)
                 .into_any_element()
         } else {
-            Button::new("structure-partition-method")
-                .ghost()
-                .small()
+            kit::menu_button("structure-partition-method")
                 .label(SharedString::from(method_text))
                 .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu.min_w(px(NAME_FIELD_W));

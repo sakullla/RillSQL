@@ -17,13 +17,58 @@ pub struct Column {
     pub default_constraint: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct IndexColumn {
     pub name: String,
     pub descending: bool,
+    /// 前缀长度（MySQL/MariaDB 的 SUB_PART）。整列进索引或引擎没有前缀索引时为 None。
+    pub prefix: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+/// 索引类型。PostgreSQL、SQLite、SQL Server 只区分主键/唯一/普通；全文与空间只有 MySQL 家族读得到也建得了。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexKind {
+    Primary,
+    Unique,
+    #[default]
+    Normal,
+    Fulltext,
+    Spatial,
+}
+
+impl IndexKind {
+    /// 只区分主键/唯一/普通的引擎按这两个标记推出类型。
+    pub fn infer(primary: bool, unique: bool) -> Self {
+        if primary {
+            IndexKind::Primary
+        } else if unique {
+            IndexKind::Unique
+        } else {
+            IndexKind::Normal
+        }
+    }
+
+    /// 旧的 `unique` 开关与新的类型合在一起：类型是普通而开关为真时按唯一。
+    pub fn resolve(unique: bool, kind: IndexKind) -> Self {
+        if kind == IndexKind::Normal && unique {
+            IndexKind::Unique
+        } else {
+            kind
+        }
+    }
+
+    pub fn is_unique(self) -> bool {
+        matches!(self, IndexKind::Primary | IndexKind::Unique)
+    }
+
+    /// 全文与空间索引的键不能带升降序与前缀长度。
+    pub fn plain_key_parts(self) -> bool {
+        matches!(self, IndexKind::Fulltext | IndexKind::Spatial)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Index {
     pub name: String,
     pub unique: bool,
@@ -33,6 +78,17 @@ pub struct Index {
     pub partial: bool,
     pub expression: bool,
     pub sql: Option<String>,
+    /// 索引类型。只区分主键/唯一/普通的引擎按 `IndexKind::infer` 填。
+    pub kind: IndexKind,
+    /// 存储方法（MySQL 的 INDEX_TYPE：BTREE/HASH/FULLTEXT/SPATIAL）。没读到为 None。
+    pub method: Option<String>,
+    /// 索引注释。没有注释或引擎没有索引注释时为 None。
+    pub comment: Option<String>,
+    /// 可见性（MySQL 8.0+ 的 IS_VISIBLE、MariaDB 10.6+ 的 IGNORED 取反）。服务器没有这项时为 None。
+    pub visible: Option<bool>,
+    /// 页面编辑器表达不了、先删后建会丢掉的属性（SQL 关键字形式，如 `USING gin`、`INCLUDE`、`CLUSTERED`）。
+    /// 非空时不能用 drop+create 修改这个索引。MySQL 家族在同一条 ALTER TABLE 里改，不填。
+    pub rebuild_loses: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -740,11 +796,27 @@ pub struct ColumnDraft {
     pub generated: Option<GeneratedColumnDraft>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexColumnDraft {
     pub name: String,
     pub descending: bool,
+    /// 前缀长度。只有 MySQL 家族的字符串列可以填。
+    #[serde(default)]
+    pub prefix: Option<u32>,
+}
+
+/// 新建或修改后的索引。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexDraft {
+    pub name: String,
+    #[serde(default)]
+    pub kind: IndexKind,
+    pub columns: Vec<IndexColumnDraft>,
+    /// 索引注释。空串表示不写注释。
+    #[serde(default)]
+    pub comment: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -769,7 +841,20 @@ pub enum Action {
         options: TableOptions,
     },
     AlterColumns { table: String, columns: Vec<ColumnDraft> },
-    CreateIndex { table: String, name: String, unique: bool, columns: Vec<IndexColumnDraft> },
+    /// 新建索引。`kind` 为普通而 `unique` 为真时按唯一索引（兼容只有唯一开关的调用方）。
+    CreateIndex {
+        table: String,
+        name: String,
+        unique: bool,
+        columns: Vec<IndexColumnDraft>,
+        /// 动作本身的标签叫 kind（见 serde tag），索引类型换名字。
+        #[serde(default)]
+        index_kind: IndexKind,
+        #[serde(default)]
+        comment: String,
+    },
+    /// 修改已有索引：MySQL 家族一条 ALTER TABLE 先删后加；其他引擎删除再新建两条语句，中途失败时旧索引已经不在。
+    AlterIndex { table: String, old: String, new: IndexDraft },
     DropIndex { table: String, name: String },
     CreateForeignKey { table: String, foreign_key: ForeignKeyDraft },
     DropForeignKey { table: String, name: String },
