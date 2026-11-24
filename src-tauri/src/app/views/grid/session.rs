@@ -811,7 +811,9 @@ impl SharedGrid {
 
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
         self.mode = GridMode::Table;
-        self.columns = merge_widths(&self.columns, columns, &rows);
+        // 换了表：旧表同名列（如 id）的宽度不带过来，新表的列宽只来自估宽和它自己记住的布局。
+        let previous = if self.target_changed { Vec::new() } else { std::mem::take(&mut self.columns) };
+        self.columns = merge_widths(&previous, columns, &rows);
         self.apply_pending_layout();
         self.source = rows.into_iter().map(Arc::new).collect();
         self.source.shrink_to_fit();
@@ -853,7 +855,9 @@ impl SharedGrid {
     /// 选择和完整值查看也按行 id 重新挂回；只有那一行真的不在新窗口里才消失。
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
         self.retain_staged_rows();
-        self.columns = merge_widths(&self.columns, columns, &rows);
+        // 换了表：旧表同名列（如 id）的宽度不带过来，新表的列宽只来自估宽和它自己记住的布局。
+        let previous = if self.target_changed { Vec::new() } else { std::mem::take(&mut self.columns) };
+        self.columns = merge_widths(&previous, columns, &rows);
         self.apply_pending_layout();
         self.source = rows.into_iter().map(Arc::new).collect();
         self.source.shrink_to_fit();

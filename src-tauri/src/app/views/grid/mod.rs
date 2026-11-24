@@ -1443,6 +1443,8 @@ impl GridPane {
 
     /// open_table 的同步部分：换目标、换页、复位视图；读取由调用方发起。
     fn prepare_table(&mut self, target: GridTarget, limit: u64, cx: &mut Context<Self>) {
+        // 换表前先记下当前表的列布局：拖宽、自适应等只改了列宽的变化可能还没经过 sync_table。
+        self.persist_column_layout();
         self.session.mode = GridMode::Table;
         let switched = self.session.switch_target(target);
         self.session.locale = self.locale;
@@ -3594,6 +3596,8 @@ impl GridPane {
                         self.session.set_column_width(logical, f32::from(*width));
                     }
                 }
+                // 拖宽与自适应（双击分隔柄、菜单/面板里的自适应）都经由这条事件落定宽度：立即记下列布局。
+                self.persist_column_layout();
             }
             TableEvent::SelectCell(row, col) | TableEvent::RightClickedCell(row, col) => {
                 // 行号列不是数据列：点它不能落到第一列数据上，只把表格的选中状态复位。
@@ -4464,7 +4468,9 @@ impl Render for GridPane {
             delegate.edit_actions = edit_actions;
         });
         // 自适应列宽要用窗口量字宽：表格量完发出列宽事件，会话按逻辑列记下新宽度。
-        for logical in std::mem::take(&mut self.pending_fit) {
+        let fits = std::mem::take(&mut self.pending_fit);
+        let fitted = !fits.is_empty();
+        for logical in fits {
             if let Some(display) = self.session.logical_to_display(logical) {
                 // 此时 GridPane 正在 render，delegate 不能再读 owner；先准备有界候选。
                 let texts = self.session.fit_column_labels(logical);
@@ -4474,6 +4480,10 @@ impl Render for GridPane {
                     state.delegate_mut().fit_labels = None;
                 });
             }
+        }
+        if fitted {
+            // 量出的宽度经列宽事件送回 apply_table_event 并在那里落盘；这里先把同一轮里已有的布局变化记下（相同则跳过）。
+            self.persist_column_layout();
         }
         // 行号列的事件只把表格切进列/行模式就返回了；事件回调不能重入表格，这里在绘制前
         // 按会话焦点复位，本帧的 # 列、行头和键盘模式都回到单元格选择。
@@ -7785,6 +7795,7 @@ impl GridPane {
             })
             .collect::<Vec<_>>();
         let count = grid_rows.len() as i64;
+        self.persist_column_layout();
         self.session.mode = GridMode::Table;
         if self.session.switch_target(target) {
             self.restore_column_layout();

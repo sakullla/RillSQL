@@ -1423,6 +1423,7 @@ dict! {
     "grid.column.fitAll" => "自适应全部列宽", "Auto-fit all columns";
     "grid.column.openPanel" => "列设置…", "Column settings…";
     "grid.column.dragHint" => "拖动调整顺序", "Drag to reorder";
+    "grid.column.moreActions" => "更多操作：排序、自适应列宽、复制列名", "More: sort, auto-fit width, copy name";
     "grid.column.jumpHint" => "跳到这一列", "Go to this column";
     "grid.column.panelHint" => "勾选显隐，拖动排序，点列名跳到该列；布局按表记住", "Check to show, drag to reorder, click a name to jump; layout is remembered per table";
     "grid.edit.expand" => "展开多行编辑", "Expand editor";

@@ -891,3 +891,188 @@ fn header_menu_and_panel_commands_change_the_layout(cx: &mut TestAppContext) {
     .unwrap();
     assert_eq!(visible_names(&pane, cx), vec!["note", "id", "name"]);
 }
+
+/// 只拖宽一列（表格发来列宽事件），不经过 sync_table 就换表：列宽仍记住，回到这张表时恢复。
+/// 换表前的布局由 prepare_table 先记下：只在会话里改过的列宽也不会因为换表丢失。
+#[gpui_kit::test]
+fn width_only_changes_are_remembered_across_table_switches(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    let store = cx.update(|cx| Arc::clone(pane.read(cx).services.state.column_layouts()));
+    // 拖宽 name（表格列 2 = 行号列之后的第二列）。
+    cx.update(|cx| {
+        pane.update(cx, |pane, _| {
+            pane.apply_table_event(&TableEvent::ColumnWidthsChanged(vec![px(56.), px(80.), px(240.), px(140.)]));
+        })
+    });
+    let stored = store.get(&layout_key("people")).expect("拖宽后立即记下");
+    assert_eq!(stored.widths.get("name"), Some(&240.0));
+    // 换表，不手动 sync_table。
+    cx.update_window(window, |_, window, cx| {
+        plant_orders(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert_eq!(pane.read(cx).session.column_width(1), 240.0, "回到 people 时列宽恢复"));
+
+    // 只改了会话里的列宽（例如自适应的量宽结果刚写回）就经 prepare_table 换表：换表前先落下。
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            pane.session.set_column_width(2, 260.);
+            pane.prepare_table(target("orders"), 200, cx);
+        })
+    });
+    let stored = store.get(&layout_key("people")).expect("换表前记下");
+    assert_eq!(stored.widths.get("note"), Some(&260.0));
+    assert_eq!(stored.widths.get("name"), Some(&240.0));
+}
+
+/// 换表时同名列（id）的宽度不从上一张表带过来：新表的列宽只来自估宽和它自己的记忆。
+#[gpui_kit::test]
+fn same_named_column_width_does_not_leak_into_another_table(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_orders(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    let fresh = cx.update(|cx| pane.read(cx).session.column_width(0));
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        pane.update(cx, |pane, _| {
+            pane.apply_table_event(&TableEvent::ColumnWidthsChanged(vec![px(56.), px(333.), px(80.), px(140.)]));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert_eq!(pane.read(cx).session.column_width(0), 333.0));
+    cx.update_window(window, |_, window, cx| {
+        plant_orders(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.session.column_width(0), fresh, "orders.id 用自己的估宽，不是 people.id 的 333");
+        assert!(pane.session.column_layout().widths.is_empty());
+    });
+    let store = cx.update(|cx| Arc::clone(pane.read(cx).services.state.column_layouts()));
+    assert_eq!(store.get(&layout_key("orders")), None);
+}
+
+/// 插入线与落点一致：往下拖画在目标下沿，往上拖画在上沿，拖回自身不画。
+#[test]
+fn drop_indicator_matches_where_the_column_lands() {
+    use super::column_pick::{drop_edge, DropEdge};
+    let ordered = [2, 0, 1];
+    assert_eq!(drop_edge(&ordered, 2, 1), Some(DropEdge::Bottom), "往下拖：落在目标之后");
+    assert_eq!(drop_edge(&ordered, 1, 0), Some(DropEdge::Top), "往上拖：落在目标之前");
+    assert_eq!(drop_edge(&ordered, 0, 0), None);
+    assert_eq!(drop_edge(&ordered, 7, 0), None);
+}
+
+/// 插入线所示与 move_column_to 的实际落点一致。
+#[gpui_kit::test]
+fn drop_indicator_side_agrees_with_move_column_to(cx: &mut TestAppContext) {
+    use super::column_pick::{drop_edge, DropEdge};
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let ordered = cx.update(|cx| pane.read(cx).session.ordered_columns());
+    assert_eq!(drop_edge(&ordered, 0, 1), Some(DropEdge::Bottom));
+    cx.update(|cx| pane.update(cx, |pane, cx| pane.column_move_to(0, 1, cx)));
+    assert_eq!(visible_names(&pane, cx), vec!["name", "id", "note"], "id 往下拖到 name：落在 name 之后（下沿）");
+    let ordered = cx.update(|cx| pane.read(cx).session.ordered_columns());
+    assert_eq!(drop_edge(&ordered, 2, 0), Some(DropEdge::Top));
+    cx.update(|cx| pane.update(cx, |pane, cx| pane.column_move_to(2, 0, cx)));
+    assert_eq!(visible_names(&pane, cx), vec!["name", "note", "id"], "note 往上拖到 id：落在 id 之前（上沿）");
+}
+
+/// 列面板每行的“更多”：升序/降序/取消排序、自适应此列与全部列宽、复制列名，与列头菜单同一组命令。
+#[gpui_kit::test]
+fn column_panel_rows_offer_sort_fit_and_copy_name(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        pane.update(cx, |pane, cx| pane.column_command(1, "column-open-panel", cx));
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.try_find(("grid-col-mgr-more", 1usize)).is_some());
+        assert!(window.try_find(("grid-col-mgr-actions", 1usize)).is_none(), "默认收起");
+        window.click(("grid-col-mgr-more", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.try_find(("grid-col-mgr-actions", 1usize)).is_some(), "展开操作条");
+        for (command, _, _) in super::column_pick::MANAGER_ROW_ACTIONS {
+            assert!(window.try_find((*command, 1usize)).is_some(), "{command} 可见");
+        }
+        window.click(("column-copy-name", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(clipboard(cx).as_deref(), Some("name"));
+    cx.update_window(window, |_, window, cx| {
+        window.click(("column-sort-desc", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert_eq!(pane.read(cx).session.sort_index(), Some((1, true))));
+    cx.update_window(window, |_, window, cx| {
+        window.click(("column-clear-sort", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert_eq!(pane.read(cx).session.sort_index(), None));
+    // 自适应：点击后的那一帧就量宽，量出的列宽经列宽事件记进这张表的布局；面板仍开着。
+    let store = cx.update(|cx| Arc::clone(pane.read(cx).services.state.column_layouts()));
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, _| pane.session.set_column_width(1, 400.));
+        window.click(("column-fit", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert!(pane.pending_fit.is_empty(), "量完清空");
+        assert!(pane.session.column_width(1) < 400., "按内容收窄：{}", pane.session.column_width(1));
+        assert!(pane.column_manager.is_some(), "操作后面板仍开着");
+    });
+    let fitted = cx.update(|cx| pane.read(cx).session.column_width(1));
+    assert_eq!(store.get(&layout_key("people")).and_then(|layout| layout.widths.get("name").copied()), Some(fitted), "自适应的列宽被记住");
+    cx.update_window(window, |_, window, cx| {
+        window.click(("column-fit-all", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    cx.update(|cx| assert!(pane.read(cx).pending_fit.is_empty()));
+}
