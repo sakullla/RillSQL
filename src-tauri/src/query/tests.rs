@@ -3133,3 +3133,136 @@ async fn a_procedure_failing_midway_is_an_error_that_keeps_its_result_sets() {
     assert!(call.extras.partial.is_none(), "partial 已经并入语句本身");
     assert_eq!(report.statements[1].status, "skipped", "失败之后的语句不执行");
 }
+
+// ---------------------------------------------------------------- 执行计划画布（R11）：JOIN 建模与节点类型
+
+mod plan_join_model {
+    use crate::query::plan::{self, NodeKind, Plan, PlanNode};
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn row(cells: &[Option<&str>]) -> Vec<Option<String>> {
+        cells.iter().map(|cell| cell.map(str::to_owned)).collect()
+    }
+
+    fn count(plan: &Plan, kind: NodeKind) -> usize {
+        plan.lines().iter().filter(|line| line.node.node_kind() == kind).count()
+    }
+
+    fn edges(plan: &Plan) -> usize {
+        fn walk(node: &PlanNode) -> usize {
+            node.children.len() + node.children.iter().map(walk).sum::<usize>()
+        }
+        plan.roots.iter().map(walk).sum()
+    }
+
+    const SQL: &str = "EXPLAIN select c.name, o.total, l.qty from shop.orders o join shop.customers c on c.id = o.customer_id join shop.order_lines AS l on l.order_id = o.id";
+
+    /// 传统表格格式：同一 (id, select_type) 块的三张表构成左深 Nested loop：2 个 JOIN、3 个表节点、4 条边，标题是表名加别名。
+    #[test]
+    fn tabular_three_table_join_becomes_left_deep_nested_loops() {
+        let columns = cols(&["id", "select_type", "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows", "filtered", "Extra"]);
+        let rows = vec![
+            row(&[Some("1"), Some("SIMPLE"), Some("o"), None, Some("ALL"), Some("PRIMARY"), None, None, None, Some("3"), Some("33.33"), Some("Using where")]),
+            row(&[Some("1"), Some("SIMPLE"), Some("c"), None, Some("eq_ref"), Some("PRIMARY"), Some("PRIMARY"), Some("4"), Some("shop.o.customer_id"), Some("1"), Some("100.00"), None]),
+            row(&[Some("1"), Some("SIMPLE"), Some("l"), None, Some("ref"), Some("PRIMARY"), Some("PRIMARY"), Some("4"), Some("shop.o.id"), Some("3"), Some("100.00"), None]),
+        ];
+        let plan = plan::parse("mysql", SQL, &columns, &rows).expect("plan");
+        assert_eq!(plan.roots.len(), 1, "一棵树，画布上一定有连线");
+        assert_eq!(count(&plan, NodeKind::Join), 2);
+        assert_eq!(count(&plan, NodeKind::Table), 3);
+        assert_eq!(edges(&plan), 4);
+
+        let root = &plan.roots[0];
+        assert_eq!(root.op, "Nested loop");
+        assert_eq!(root.children[1].title(), "order_lines l", "右输入是最后连接的表");
+        let inner = &root.children[0];
+        assert_eq!(inner.node_kind(), NodeKind::Join);
+        let titles: Vec<String> = inner.children.iter().map(PlanNode::title).collect();
+        assert_eq!(titles, vec!["orders o", "customers c"]);
+        assert_eq!(inner.children[0].access_type.as_deref(), Some("ALL"));
+        assert_eq!(inner.rows, Some(1.), "JOIN 产出行数：3 × 33.33% × 1");
+        assert_eq!(root.rows, Some(3.));
+        let lines = plan.lines();
+        let depths: Vec<usize> = lines.iter().map(|line| line.depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 2, 1]);
+    }
+
+    /// 哈希连接（MySQL 8.0.18+ 表格格式的 `Using join buffer (hash join)`）显示为 Hash join。
+    #[test]
+    fn tabular_join_buffer_hash_join_is_named() {
+        let columns = cols(&["id", "select_type", "table", "type", "key", "rows", "filtered", "Extra"]);
+        let rows = vec![
+            row(&[Some("1"), Some("SIMPLE"), Some("a"), Some("ALL"), None, Some("10"), Some("100.00"), None]),
+            row(&[Some("1"), Some("SIMPLE"), Some("b"), Some("ALL"), None, Some("20"), Some("10.00"), Some("Using where; Using join buffer (hash join)")]),
+        ];
+        let plan = plan::parse("mysql", "EXPLAIN select * from a join b on a.x = b.x", &columns, &rows).expect("plan");
+        assert_eq!(plan.roots[0].op, "Hash join");
+        assert_eq!(plan.roots[0].rows, Some(20.));
+    }
+
+    /// JSON：nested_loop 保留成层级（左深 JOIN），产出行数与累计代价取右表的 rows_produced_per_join / prefix_cost。
+    #[test]
+    fn json_nested_loop_keeps_the_join_hierarchy() {
+        let json = r#"{"query_block": {"select_id": 1, "cost_info": {"query_cost": "1.45"}, "nested_loop": [
+            {"table": {"table_name": "o", "access_type": "ALL", "rows_examined_per_scan": 3, "rows_produced_per_join": 1, "filtered": "33.33",
+                       "cost_info": {"read_cost": "0.45", "eval_cost": "0.10", "prefix_cost": "0.55"}}},
+            {"table": {"table_name": "c", "access_type": "eq_ref", "key": "PRIMARY", "rows_examined_per_scan": 1, "rows_produced_per_join": 1, "filtered": "100.00",
+                       "cost_info": {"read_cost": "0.25", "eval_cost": "0.10", "prefix_cost": "0.90"}}},
+            {"table": {"table_name": "l", "access_type": "ref", "key": "PRIMARY", "rows_examined_per_scan": 3, "rows_produced_per_join": 3, "filtered": "100.00",
+                       "using_join_buffer": "hash join", "cost_info": {"read_cost": "0.25", "eval_cost": "0.30", "prefix_cost": "1.45"}}}]}}"#;
+        let plan = plan::parse("mysql", &SQL.replace("EXPLAIN", "EXPLAIN FORMAT=JSON"), &cols(&["EXPLAIN"]), &[vec![Some(json.to_owned())]]).expect("plan");
+        let ops: Vec<String> = plan.lines().iter().map(|line| line.node.title()).collect();
+        assert_eq!(ops, vec!["Query block #1", "Hash join", "Nested loop", "orders o", "customers c", "order_lines l"]);
+        let depths: Vec<usize> = plan.lines().iter().map(|line| line.depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 3, 3, 2]);
+        let lines = plan.lines();
+        assert_eq!((lines[1].node.rows, lines[1].node.cost), (Some(3.), Some(1.45)));
+        assert_eq!((lines[2].node.rows, lines[2].node.cost), (Some(1.), Some(0.9)));
+        assert_eq!(count(&plan, NodeKind::Join), 2);
+        assert_eq!(edges(&plan), 5);
+    }
+
+    /// MariaDB 的 block-nl-join 包装拆开，连接方式（BNLH）落在 JOIN 节点上。
+    #[test]
+    fn mariadb_block_nl_join_unwraps_into_a_join_node() {
+        let json = r#"{"query_block": {"select_id": 1, "nested_loop": [
+            {"table": {"table_name": "a", "access_type": "ALL", "rows": 10, "filtered": 100}},
+            {"block-nl-join": {"table": {"table_name": "b", "access_type": "hash_ALL", "rows": 20, "filtered": 100}, "buffer_type": "flat", "join_type": "BNLH"}}]}}"#;
+        let plan = plan::parse("mariadb", "EXPLAIN FORMAT=JSON select * from a join b", &cols(&["EXPLAIN"]), &[vec![Some(json.to_owned())]]).expect("plan");
+        let lines = plan.lines();
+        assert_eq!(lines[1].node.op, "Hash join");
+        assert_eq!(lines[3].node.title(), "b");
+        assert!(lines.iter().all(|line| line.node.op != "block-nl-join"));
+    }
+
+    /// 只有一张表的计划不造 JOIN：一个表节点，没有边。
+    #[test]
+    fn single_table_plan_is_one_table_node() {
+        let columns = cols(&["id", "select_type", "table", "type", "key", "rows", "filtered", "Extra"]);
+        let rows = vec![row(&[Some("1"), Some("SIMPLE"), Some("o"), Some("const"), Some("PRIMARY"), Some("1"), Some("100.00"), None])];
+        let plan = plan::parse("mysql", "EXPLAIN select * from orders o where id = 1", &columns, &rows).expect("plan");
+        assert_eq!(plan.lines().len(), 1);
+        assert_eq!(plan.roots[0].node_kind(), NodeKind::Table);
+        assert_eq!(plan.roots[0].title(), "orders o");
+        assert_eq!(edges(&plan), 0);
+    }
+
+    /// `->` 缩进树：缩进回退到比第一层还浅时不丢行（以前在这里提前结束循环）。
+    #[test]
+    fn arrow_tree_keeps_rows_after_indentation_falls_back() {
+        let tree = "    -> Sort: o.total  (cost=2 rows=3)\n        -> Table scan on o  (cost=1 rows=3)\n-> Select #2 (subquery in condition; run only once)\n    -> Index lookup on c using PRIMARY (id=1)  (cost=0.35 rows=1)\n  -> Filter: (l.qty > 1)  (cost=0.5 rows=1)\n      -> Table scan on l  (cost=0.5 rows=3)";
+        let plan = plan::parse("mysql", "EXPLAIN FORMAT=TREE select", &cols(&["EXPLAIN"]), &[vec![Some(tree.to_owned())]]).expect("plan");
+        let lines = plan.lines();
+        assert_eq!(lines.len(), 6, "六行全部保留");
+        assert_eq!(plan.roots.len(), 2);
+        assert_eq!(plan.roots[1].node_kind(), NodeKind::Subquery);
+        assert_eq!(plan.roots[1].children.len(), 2, "回退后浅一些的行挂到最近的上层");
+        let depths: Vec<usize> = lines.iter().map(|line| line.depth).collect();
+        assert_eq!(depths, vec![0, 1, 0, 1, 1, 2]);
+        assert_eq!(lines[1].node.title(), "o");
+        assert_eq!(lines[1].node.node_kind(), NodeKind::Table);
+    }
+}

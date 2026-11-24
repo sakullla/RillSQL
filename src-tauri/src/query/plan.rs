@@ -57,6 +57,21 @@ pub enum OpKind {
     Other,
 }
 
+/// 节点在画布上的类型（参照 MySQL Workbench Visual Explain）：表是方框、JOIN 是胶囊、
+/// 排序/分组等操作是圆角框、子查询是带框区域。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NodeKind {
+    /// 读一张表（或派生表引用）：标题是表名加别名，访问类型作为彩色标签。
+    Table,
+    /// 连接：Nested loop / Hash join 等，标注产出行数。
+    Join,
+    /// 排序、分组、过滤、物化等其它操作。
+    #[default]
+    Operation,
+    /// 子查询或查询块（DERIVED / SUBQUERY / UNION / Select #n）。
+    Subquery,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlanNode {
     /// 操作名（引擎原文，如 Seq Scan / SEARCH / Table scan on）。
@@ -87,11 +102,43 @@ pub struct PlanNode {
     pub props: Vec<(String, String)>,
     pub issues: Vec<Issue>,
     pub children: Vec<PlanNode>,
+    /// 解析器明确知道的节点类型；None 时按操作名与对象推断（见 [`PlanNode::node_kind`]）。
+    pub category: Option<NodeKind>,
 }
 
 impl PlanNode {
     pub(crate) fn new(op: impl Into<String>) -> Self {
         Self { op: op.into(), ..Self::default() }
+    }
+
+    pub(crate) fn with_category(mut self, category: NodeKind) -> Self {
+        self.category = Some(category);
+        self
+    }
+
+    /// 节点类型：解析器给定的优先；否则 JOIN 类操作是 Join，带对象的扫描/查找是 Table，
+    /// 查询块、派生表、子查询是 Subquery，其余是 Operation。
+    pub fn node_kind(&self) -> NodeKind {
+        if let Some(category) = self.category {
+            return category;
+        }
+        let op = self.op.to_ascii_lowercase();
+        match self.kind() {
+            OpKind::Join => NodeKind::Join,
+            _ if op.contains("subquery") || op.contains("derived") || op.starts_with("select #") || op.starts_with("query block") || op.starts_with("subplan") || op.starts_with("initplan") => {
+                NodeKind::Subquery
+            }
+            OpKind::Scan | OpKind::Seek if self.object.is_some() => NodeKind::Table,
+            _ => NodeKind::Operation,
+        }
+    }
+
+    /// 卡片标题：表节点用表名（加别名），其它节点用操作名。
+    pub fn title(&self) -> String {
+        match (self.node_kind(), &self.object) {
+            (NodeKind::Table, Some(object)) if !object.trim().is_empty() => object.clone(),
+            _ => self.op.clone(),
+        }
     }
 
     pub fn kind(&self) -> OpKind {
@@ -223,12 +270,80 @@ pub fn parse(engine: &str, sql: &str, columns: &[String], rows: &[Vec<Option<Str
         || (starts_with_keyword(&upper, "ANALYZE") && !upper.starts_with("ANALYZE TABLE"))
         || starts_with_keyword(&upper, "DESC")
         || starts_with_keyword(&upper, "DESCRIBE");
-    let roots = crate::adapters::query::syntax_named(engine)?.parse_plan(sql, explained, columns, rows)?;
+    let mut roots = crate::adapters::query::syntax_named(engine)?.parse_plan(sql, explained, columns, rows)?;
+    // 有的引擎在计划里只写别名（table: o）：从语句里对回表名，表节点标题写成 “orders o”。
+    // 已经带表名的对象（“orders o”“o（orders）”“orders.PK_orders”）不会与单个别名相等，不受影响。
+    let aliases = alias_map(sql);
+    if !aliases.is_empty() {
+        for root in &mut roots {
+            name_tables(root, &aliases);
+        }
+    }
     let plan = Plan { engine: engine.to_owned(), roots };
     if plan.roots.is_empty() {
         return None;
     }
     Some(plan)
+}
+
+/// 表节点的对象如果是语句里的别名，改写成 “表名 别名”。
+fn name_tables(node: &mut PlanNode, aliases: &[(String, String)]) {
+    if node.node_kind() == NodeKind::Table {
+        if let Some(object) = node.object.as_mut() {
+            if let Some((_, table)) = aliases.iter().find(|(alias, table)| alias.eq_ignore_ascii_case(object) && !table.eq_ignore_ascii_case(object)) {
+                *object = format!("{table} {object}");
+            }
+        }
+    }
+    for child in &mut node.children {
+        name_tables(child, aliases);
+    }
+}
+
+/// 标识符两侧的引号或括号（各方言的引用写法都去掉）：既不是字母数字也不是 `_` / `$` 的 ASCII 标点。
+fn is_quote(ch: char) -> bool {
+    ch.is_ascii_punctuation() && ch != '_' && ch != '$'
+}
+
+/// 语句里的 “表 [AS] 别名”（FROM / JOIN 之后）。只认简单形态，认不出就不改名。
+pub(crate) fn alias_map(sql: &str) -> Vec<(String, String)> {
+    const STOP: [&str; 18] =
+        ["WHERE", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "USING", "NATURAL", "OUTER", "UNION", "HAVING", "STRAIGHT_JOIN", "WINDOW"];
+    let tokens: Vec<String> = sql
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '(' || ch == ')' || ch == ';')
+        .filter(|token| !token.is_empty())
+        .map(|token| token.trim_matches(is_quote).to_owned())
+        .collect();
+    let mut out = Vec::new();
+    for index in 0..tokens.len() {
+        let keyword = tokens[index].to_ascii_uppercase();
+        if keyword != "FROM" && keyword != "JOIN" && keyword != "STRAIGHT_JOIN" {
+            continue;
+        }
+        let Some(table) = tokens.get(index + 1) else { continue };
+        if table.eq_ignore_ascii_case("SELECT") {
+            continue;
+        }
+        let mut next = index + 2;
+        if tokens.get(next).is_some_and(|token| token.eq_ignore_ascii_case("AS")) {
+            next += 1;
+        }
+        if let Some(alias) = tokens.get(next).filter(|alias| !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
+            let table = table.rsplit('.').next().unwrap_or(table).trim_matches(is_quote).to_owned();
+            out.push((alias.clone(), table));
+        }
+    }
+    out
+}
+
+/// 数字的紧凑文本：整数不带小数，其余最多两位小数。
+pub(crate) fn trim_number(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        let text = format!("{value:.2}");
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    }
 }
 
 pub(crate) fn cell(row: &[Option<String>], index: Option<usize>) -> Option<&str> {
@@ -318,26 +433,28 @@ pub(crate) fn arrow_tree(text: &str, node_of: fn(&str) -> PlanNode) -> Vec<PlanN
             }
         }
     }
-    fn build(flat: &[(usize, PlanNode)], start: usize) -> (Vec<PlanNode>, usize) {
-        let mut out = Vec::new();
-        let mut index = start;
-        let level = flat.get(start).map(|item| item.0).unwrap_or(0);
-        while index < flat.len() && flat[index].0 >= level {
-            if flat[index].0 > level {
-                let (children, next) = build(flat, index);
-                if let Some(parent) = out.last_mut() {
-                    let parent: &mut PlanNode = parent;
-                    parent.children.extend(children);
-                }
-                index = next;
-                continue;
+    // 用栈建树：每个节点挂到栈里缩进比它小的最近节点下；缩进回退到比第一层还浅时成为新的根，
+    // 不会提前结束而丢掉后面的行。
+    let mut roots: Vec<PlanNode> = Vec::new();
+    let mut stack: Vec<(usize, PlanNode)> = Vec::new();
+    fn pop_into(stack: &mut Vec<(usize, PlanNode)>, roots: &mut Vec<PlanNode>) {
+        if let Some((_, node)) = stack.pop() {
+            match stack.last_mut() {
+                Some((_, parent)) => parent.children.push(node),
+                None => roots.push(node),
             }
-            out.push(flat[index].1.clone());
-            index += 1;
         }
-        (out, index)
     }
-    build(&flat, 0).0
+    for (indent, node) in flat {
+        while stack.last().is_some_and(|(top, _)| *top >= indent) {
+            pop_into(&mut stack, &mut roots);
+        }
+        stack.push((indent, node));
+    }
+    while !stack.is_empty() {
+        pop_into(&mut stack, &mut roots);
+    }
+    roots
 }
 
 /// `head  (cost=… rows=… width=…)` → (head, 括号里的统计)；没有统计时第二项为空。
@@ -472,9 +589,12 @@ mod tests {
             vec![Some("1".into()), Some("SIMPLE".into()), Some("c".into()), Some("eq_ref".into()), Some("PRIMARY".into()), Some("PRIMARY".into()), Some("1".into()), Some("100.00".into()), None],
         ];
         let plan = parse("mysql", "EXPLAIN select", &cols, &data).unwrap();
-        assert_eq!(plan.roots[0].issues, vec![Issue::FullScan, Issue::TempSort, Issue::TempTable]);
-        assert!(plan.roots[1].issues.is_empty());
-        assert_eq!(plan.roots[1].detail, "key PRIMARY");
+        assert_eq!(plan.roots.len(), 1, "同一块的两张表连成一个 JOIN");
+        assert_eq!(plan.roots[0].node_kind(), NodeKind::Join);
+        let join = &plan.roots[0].children;
+        assert_eq!(join[0].issues, vec![Issue::FullScan, Issue::TempSort, Issue::TempTable]);
+        assert!(join[1].issues.is_empty());
+        assert_eq!(join[1].detail, "key PRIMARY");
     }
 
     #[test]
@@ -485,10 +605,12 @@ mod tests {
         let plan = parse("mariadb", "EXPLAIN FORMAT=JSON select", &columns(&["EXPLAIN"]), &rows(&[&[json]])).expect("plan");
         let lines = plan.lines();
         let ops: Vec<&str> = lines.iter().map(|line| line.node.op.as_str()).collect();
-        assert_eq!(ops, vec!["Query block #1", "filesort", "temporary table", "ALL", "eq_ref"]);
-        assert_eq!(lines[3].node.issues, vec![Issue::FullScan]);
-        assert_eq!(lines[4].node.detail, "key PRIMARY");
-        assert_eq!(lines[3].depth, 3, "nested_loop 只是容器，不单独占一层");
+        assert_eq!(ops, vec!["Query block #1", "filesort", "temporary table", "Nested loop", "ALL", "eq_ref"]);
+        assert_eq!(lines[3].node.node_kind(), NodeKind::Join, "nested_loop 保留为 JOIN 节点");
+        assert_eq!(lines[4].node.issues, vec![Issue::FullScan]);
+        assert_eq!(lines[5].node.detail, "key PRIMARY");
+        assert_eq!((lines[4].depth, lines[5].depth), (4, 4), "两张表是 JOIN 的左右输入");
+        assert_eq!(lines[4].node.title(), "o");
     }
 
     #[test]
@@ -572,7 +694,10 @@ mod tests {
         assert_eq!(lines[1].node.cost, Some(12.0));
         assert_eq!(lines[1].node.issues, vec![Issue::TempSort, Issue::TempTable]);
 
-        let orders = lines[2].node;
+        let join = lines[2].node;
+        assert_eq!(join.op, "Nested loop");
+        assert_eq!(join.cost, Some(125.50), "JOIN 的代价是右表的累计 prefix_cost");
+        let orders = lines[3].node;
         assert_eq!(orders.object.as_deref(), Some("orders"));
         assert_eq!(orders.access_type.as_deref(), Some("range"));
         assert_eq!(orders.key_used.as_deref(), Some("idx_created"));
@@ -580,13 +705,14 @@ mod tests {
         assert_eq!(orders.rows, Some(400.0));
         assert_eq!(orders.filtered, Some(50.0));
         assert_eq!(orders.cost, Some(60.25));
+        assert_eq!(orders.title(), "orders");
 
-        let customers = lines[3].node;
+        let customers = lines[4].node;
         assert_eq!(customers.object.as_deref(), Some("customers"));
         assert_eq!(customers.access_type.as_deref(), Some("eq_ref"));
         assert_eq!(customers.key_used.as_deref(), Some("PRIMARY"));
         assert!(!customers.covering_index);
-        assert_eq!(customers.cost, Some(125.50));
+        assert_eq!(customers.cost, Some(65.25), "表自身的代价是 read_cost + eval_cost");
     }
 
     #[test]
@@ -684,13 +810,15 @@ mod tests {
         assert_eq!(plan.roots.len(), 1);
         assert_eq!(plan.roots[0].op, "PRIMARY #1");
         let lines = plan.lines();
-        // PRIMARY #1 -> <derived2> -> DERIVED #2 -> orders; c; SUBQUERY #3 -> vip
-        assert_eq!(lines[1].node.object.as_deref(), Some("<derived2>"));
-        assert_eq!(lines[2].node.op, "DERIVED #2");
-        assert_eq!(lines[2].depth, 2);
-        assert_eq!(lines[3].node.object.as_deref(), Some("orders"));
-        assert_eq!(lines[3].node.filtered, Some(25.0));
-        assert!(!lines[3].node.covering_index, "Using index condition 不是覆盖索引");
+        // PRIMARY #1 -> Nested loop -> (<derived2> -> DERIVED #2 -> orders; c); SUBQUERY #3 -> vip
+        assert_eq!(lines[1].node.op, "Nested loop");
+        assert_eq!(lines[2].node.object.as_deref(), Some("<derived2>"));
+        assert_eq!(lines[3].node.op, "DERIVED #2");
+        assert_eq!(lines[3].node.node_kind(), NodeKind::Subquery);
+        assert_eq!(lines[3].depth, 3);
+        assert_eq!(lines[4].node.object.as_deref(), Some("orders"));
+        assert_eq!(lines[4].node.filtered, Some(25.0));
+        assert!(!lines[4].node.covering_index, "Using index condition 不是覆盖索引");
         let c_node = lines.iter().find(|l| l.node.object.as_deref() == Some("c")).unwrap().node;
         assert!(c_node.covering_index, "Using index 是覆盖索引");
         assert_eq!(c_node.key_used.as_deref(), Some("PRIMARY"));

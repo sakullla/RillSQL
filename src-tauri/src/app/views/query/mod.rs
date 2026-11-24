@@ -585,6 +585,8 @@ impl QueryPane {
 
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
+        // 上次选的计划视图（画布 / 列表 / 原始）：跨会话记住。
+        let remembered_plan_mode = services.state.ui_prefs().get().plan_view.as_deref().and_then(plan_view::PlanMode::parse);
         let weak = cx.entity().downgrade();
         let target_tab_sub = cx.intercept_keystrokes(move |event, window, cx| {
             let key = event.keystroke.key.as_str();
@@ -696,7 +698,7 @@ impl QueryPane {
             definition_sink: None,
             marks_seen: HashMap::new(),
             pin_rename: None,
-            plan_mode: None,
+            plan_mode: remembered_plan_mode,
             plan_selected: 0,
             plan_canvas: plan_canvas::CanvasState::default(),
             plan_focus: cx.focus_handle().tab_stop(true),
@@ -1144,6 +1146,12 @@ impl QueryPane {
         // 建议跳转、鼠标点节点和树内方向键都只改 plan_selected 这一份选中，并把它滚进视口。
         if let Some(mode) = id.strip_prefix("plan-view:").and_then(plan_view::PlanMode::parse) {
             self.plan_mode = Some(mode);
+            let store = Arc::clone(self.services.state.ui_prefs());
+            if let Some((revision, bytes)) = store.update(|prefs| prefs.plan_view = Some(mode.id().to_owned())) {
+                runtime().spawn_blocking(move || {
+                    let _ = store.write_revision(revision, &bytes);
+                });
+            }
             if mode != plan_view::PlanMode::Raw {
                 self.plan_reveal = Some(self.plan_selected);
             }
@@ -5491,7 +5499,12 @@ mod tests {
     /// 指定窗口尺寸的查询工作台，供 1360/900/640 三档宽度验证使用。
     fn open_sized(cx: &mut TestAppContext, width: f32, height: f32) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {
         let dir = std::env::temp_dir().join(format!("rillsql-pane-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        open_in(cx, &dir, width, height)
+    }
+
+    /// 在指定数据目录打开查询工作台：同一目录的两个面板共用磁盘上的界面偏好。
+    fn open_in(cx: &mut TestAppContext, dir: &std::path::Path, width: f32, height: f32) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {
+        std::fs::create_dir_all(dir).unwrap();
         let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
         cx.update(gpui_kit::init);
         cx.update(|cx| {
@@ -8242,6 +8255,45 @@ mod tests {
             .map(|(id, parent, detail)| vec![Some((*id).to_owned()), Some((*parent).to_owned()), Some("0".to_owned()), Some((*detail).to_owned())])
             .collect();
         view
+    }
+
+    /// 计划视图的选择记入界面偏好：同一数据目录新开的面板沿用上次的选择（单节点计划也不再回到默认列表）。
+    #[gpui_kit::test]
+    fn plan_view_choice_is_remembered_across_panes(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-pane-{}", uuid::Uuid::new_v4()));
+        let (window, pane) = open_in(cx, &dir, 1100., 720.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![join_plan()]);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).plan_mode_now(), plan_view::PlanMode::Canvas);
+            window.click("plan-view-raw", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).services.state.ui_prefs().get().plan_view.as_deref(), Some("raw"), "选择写进界面偏好");
+        })
+        .unwrap();
+        // 后台写盘：等文件落地（最多 2 秒）。
+        let path = dir.join(crate::state::UI_PREFS_FILE);
+        for _ in 0..200 {
+            if std::fs::read_to_string(&path).is_ok_and(|text| text.contains("raw")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (window, pane) = open_in(cx, &dir, 1100., 720.);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 1")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![plan_sheet(&["SCAN only"])]);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).plan_mode_now(), plan_view::PlanMode::Raw, "新面板沿用上次的计划视图");
+            assert_eq!(window.find("plan-view-raw").selected(), Some(true));
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 多节点计划默认显示画布：卡片可见、点卡片同步右侧详情并聚焦画布，方向键沿用同一选中；

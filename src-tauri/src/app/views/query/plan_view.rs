@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{div, px, relative, AnyElement, Entity, FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _};
 
 use crate::i18n::{self, Locale};
-use crate::query::plan::{OpKind, Plan, PlanNode};
+use crate::query::plan::{NodeKind, OpKind, Plan, PlanNode};
 use crate::ui::kit::{self, Metrics, Palette, Radius, Space, TypeScale};
 use crate::ui::kit::ScrollAreaExt as _;
 
@@ -52,6 +52,15 @@ impl PlanMode {
             "list" => Some(Self::List),
             "raw" => Some(Self::Raw),
             _ => None,
+        }
+    }
+
+    /// 与 [`PlanMode::parse`] 对应的标识，记入界面偏好。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Canvas => "canvas",
+            Self::List => "list",
+            Self::Raw => "raw",
         }
     }
 
@@ -144,12 +153,18 @@ pub fn cost_share(node_cost: Option<f64>, total_cost: Option<f64>) -> Option<f32
     Some((cost / total).clamp(0., 1.) as f32)
 }
 
-/// 访问类型语义配色：点查/主键绿色、范围/索引扫描蓝色、全表扫描红色。
+/// 访问类型语义配色，沿用 MySQL Workbench Visual Explain：SYSTEM/CONST 蓝；EQ_REF/REF/REF_OR_NULL/INDEX_MERGE 绿；
+/// RANGE、子查询查找、全文检索橙；INDEX（全索引扫描）与 ALL（全表扫描）红。
 pub(super) fn access_type_colors(access: &str, p: &Palette) -> (Hsla, Hsla) {
-    match access.to_ascii_lowercase().as_str() {
-        "const" | "system" | "eq_ref" | "ref" => (p.ok, p.ok_soft),
-        "range" | "index" | "ref_or_null" | "index_merge" | "fulltext" | "unique_subquery" | "index_subquery" => (p.info, p.accent_soft),
-        "all" => (p.danger, p.danger_soft),
+    let access = access.to_ascii_lowercase();
+    match access.as_str() {
+        "const" | "system" => (p.info, p.accent_soft),
+        "eq_ref" | "ref" | "ref_or_null" | "index_merge" => (p.ok, p.ok_soft),
+        "range" | "fulltext" | "unique_subquery" | "index_subquery" => (p.warn, p.warn_soft),
+        "index" | "all" => (p.danger, p.danger_soft),
+        // MariaDB 的 hash_ALL / hash_index 等组合按后半部分着色。
+        other if other.ends_with("_all") || other.ends_with("_index") => (p.danger, p.danger_soft),
+        other if other.starts_with("hash_") => (p.warn, p.warn_soft),
         _ => (p.text_muted, p.badge),
     }
 }
@@ -436,9 +451,14 @@ impl PlanView<'_> {
                 .gap(px(Space::SM))
                 .min_w_0()
                 .child(kit::icon(icon, 14., tone))
-                .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(node.op.clone())));
-            if let Some(object) = &node.object {
+                .child(div().flex_none().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(SharedString::from(node.title())));
+            // 表节点的标题已经是表名，不再重复对象。
+            if let Some(object) = node.object.as_ref().filter(|_| node.node_kind() != NodeKind::Table) {
                 head = head.child(div().min_w_0().truncate().font_family(self.mono.clone()).text_size(px(TypeScale::SM)).text_color(p.accent_text).child(SharedString::from(object.clone())));
+            }
+            if node.node_kind() == NodeKind::Table && node.access_type.is_none() {
+                // 没有访问类型的引擎（PostgreSQL、SQLite…）：操作名作为辅助标签。
+                head = head.child(kit::pill(SharedString::from(node.op.clone()), p.text_muted, p.badge));
             }
             if let Some(access) = &node.access_type {
                 // 若 op 本身与 access_type 不同（例如 TREE 格式 `Table scan` + `ALL`），显示彩色访问类型徽标；

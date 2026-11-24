@@ -3,7 +3,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::query::plan::{arrow_tree, cell, json_inline, number, stat, Issue, PlanNode};
+use crate::query::plan::{arrow_tree, cell, json_inline, number, stat, Issue, NodeKind, PlanNode};
 
 pub(super) fn parse_mysql_family(columns: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<PlanNode>> {
     // 传统表格格式：每张表一行（id, select_type, table, type, key, rows, filtered, Extra…）。
@@ -176,7 +176,7 @@ fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<Pla
             let id = cell(row, at("id")).unwrap_or("").trim().to_owned();
             let select_type = cell(row, at("select_type")).unwrap_or("SIMPLE").trim().to_owned();
             let access = cell(row, at("type")).unwrap_or("").trim().to_owned();
-            let mut node = PlanNode::new(if access.is_empty() { select_type.clone() } else { access.clone() });
+            let mut node = PlanNode::new(if access.is_empty() { select_type.clone() } else { access.clone() }).with_category(NodeKind::Table);
             node.access_type = (!access.is_empty()).then_some(access.clone());
             node.object = cell(row, at("table")).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
             let key_raw = cell(row, at("key")).map(str::trim).filter(|s| !s.is_empty());
@@ -210,7 +210,7 @@ fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<Pla
         })
         .collect();
 
-    // 按 (id, select_type) 分组；只有单块（例如单 id 的 SIMPLE）时保持扁平列表。
+    // 按 (id, select_type) 分组；同一块里的多张表按出现顺序构成左深 JOIN 树。
     let mut blocks: Vec<(String, String, Vec<PlanNode>)> = Vec::new();
     for item in parsed {
         if let Some(existing) = blocks.iter_mut().find(|(id, st, _)| *id == item.id && *st == item.select_type) {
@@ -221,7 +221,7 @@ fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<Pla
     }
 
     if blocks.len() <= 1 {
-        return blocks.into_iter().flat_map(|(_, _, nodes)| nodes).collect();
+        return blocks.into_iter().filter_map(|(_, _, nodes)| left_deep_join(nodes, false)).collect();
     }
 
     // 多块执行计划（PRIMARY / DERIVED / SUBQUERY / UNION / UNION RESULT）构造成清晰的层次树。
@@ -238,11 +238,13 @@ fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<Pla
             let node = if st_upper == "UNION RESULT" && children.len() == 1 {
                 let mut single = children.remove(0);
                 single.op = select_type.clone();
+                single.category = Some(NodeKind::Operation);
                 single
             } else {
                 let op = if id.is_empty() { select_type.clone() } else { format!("{select_type} #{id}") };
-                let mut block = PlanNode::new(op);
-                block.children = children;
+                let category = if matches!(st_upper.as_str(), "PRIMARY" | "SIMPLE" | "UNION RESULT") { NodeKind::Operation } else { NodeKind::Subquery };
+                let mut block = PlanNode::new(op).with_category(category);
+                block.children = left_deep_join(children, false).into_iter().collect();
                 block
             };
             BlockNode { id, select_type: st_upper, node }
@@ -298,6 +300,68 @@ fn mysql_table_rows(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<Pla
     }
 
     block_nodes.into_iter().map(|b| b.node).collect()
+}
+
+/// 节点的某个原始属性。
+fn prop<'a>(node: &'a PlanNode, key: &str) -> Option<&'a str> {
+    node.props.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// 这张表用哈希连接接入（MySQL `Using join buffer (hash join)` / `using_join_buffer: hash join`，MariaDB BNLH）。
+fn joins_by_hash(node: &PlanNode) -> bool {
+    node.props.iter().any(|(key, value)| {
+        let value = value.to_ascii_lowercase();
+        (matches!(key.as_str(), "Extra" | "using_join_buffer") && value.contains("hash join")) || (key == "join_type" && value.contains("bnlh"))
+    })
+}
+
+/// 这张表用块嵌套循环（MariaDB BNL / 旧版 `Block Nested Loop`）接入。
+fn joins_by_block_loop(node: &PlanNode) -> bool {
+    node.props.iter().any(|(key, value)| {
+        let value = value.to_ascii_lowercase();
+        (matches!(key.as_str(), "Extra" | "using_join_buffer") && value.contains("block nested loop")) || (key == "join_type" && value == "bnl")
+    })
+}
+
+/// 一张表（或一个已连接的结果）经过过滤后产出的预估行数。
+fn output_rows(node: &PlanNode) -> Option<f64> {
+    if node.node_kind() == NodeKind::Join {
+        return node.rows;
+    }
+    node.rows.map(|rows| rows * node.filtered.unwrap_or(100.).clamp(0., 100.) / 100.)
+}
+
+/// 同一查询块里按连接顺序排列的表构造成左深 JOIN 树：((t1 ⋈ t2) ⋈ t3)…
+/// 只有一张表时原样返回。`exact` 为 true 时（JSON），JOIN 的产出行数和累计代价取右表的
+/// `rows_produced_per_join` / `prefix_cost`；否则按 “左侧产出 × 右表每次查找 × 过滤率” 估算。
+fn left_deep_join(tables: Vec<PlanNode>, exact: bool) -> Option<PlanNode> {
+    let mut iter = tables.into_iter();
+    let mut acc = iter.next()?;
+    for right in iter {
+        let op = if joins_by_hash(&right) {
+            "Hash join"
+        } else if joins_by_block_loop(&right) {
+            "Block nested loop"
+        } else {
+            "Nested loop"
+        };
+        let mut join = PlanNode::new(op).with_category(NodeKind::Join);
+        let produced = if exact { prop(&right, "rows_produced_per_join").and_then(number) } else { None };
+        join.rows = produced.or_else(|| match (output_rows(&acc), output_rows(&right)) {
+            (Some(left), Some(right)) => Some((left * right).max(if left > 0. && right > 0. { 1. } else { 0. }).round()),
+            _ => None,
+        });
+        join.cost = prop(&right, "cost_info.prefix_cost").and_then(number);
+        if let Some(rows) = join.rows {
+            join.props.push(("rows".into(), crate::query::plan::trim_number(rows)));
+        }
+        if let Some(cost) = join.cost {
+            join.props.push(("prefix_cost".into(), crate::query::plan::trim_number(cost)));
+        }
+        join.children = vec![acc, right];
+        acc = join;
+    }
+    Some(acc)
 }
 
 fn attach_to_table_ref(root: &mut PlanNode, derived_tag: &str, subq_tag: &str, child: &PlanNode) -> bool {
@@ -380,6 +444,32 @@ fn push_issue_once(node: &mut PlanNode, issue: Issue) {
 fn mysql_json(value: &Value) -> Vec<PlanNode> {
     fn walk(key: &str, value: &Value) -> Vec<PlanNode> {
         match value {
+            // nested_loop（MySQL / MariaDB）与 hash_join：数组里是按连接顺序排列的表，构造成左深 JOIN 树。
+            Value::Array(items) if key == "nested_loop" || key == "hash_join" => {
+                let tables: Vec<PlanNode> = items
+                    .iter()
+                    .flat_map(|item| walk("nested_loop", item))
+                    .map(|mut node| {
+                        // MariaDB 把用了连接缓冲的表包一层 block-nl-join：拆开，把连接方式记在表上。
+                        if node.op == "block-nl-join" && node.children.len() == 1 {
+                            let mut table = node.children.remove(0);
+                            table.props.extend(node.props);
+                            for issue in node.issues {
+                                push_issue_once(&mut table, issue);
+                            }
+                            return table;
+                        }
+                        node
+                    })
+                    .map(|mut node| {
+                        if key == "hash_join" && !joins_by_hash(&node) {
+                            node.props.push(("using_join_buffer".into(), "hash join".into()));
+                        }
+                        node
+                    })
+                    .collect();
+                left_deep_join(tables, true).into_iter().collect()
+            }
             Value::Array(items) => items.iter().flat_map(|item| walk(key, item)).collect(),
             Value::Object(map) => {
                 // attached_subqueries / query_specifications 的每一项都是 { dependent, cacheable, query_block } 包装。
@@ -396,11 +486,22 @@ fn mysql_json(value: &Value) -> Vec<PlanNode> {
                 }
 
                 let mut node = match key {
-                    "query_block" => PlanNode::new(format!("Query block #{}", map.get("select_id").map(json_inline).unwrap_or_default())),
+                    "query_block" => {
+                        let select_id = map.get("select_id").map(json_inline).unwrap_or_default();
+                        let category = if select_id == "1" || select_id.is_empty() { NodeKind::Operation } else { NodeKind::Subquery };
+                        PlanNode::new(format!("Query block #{select_id}")).with_category(category)
+                    }
                     "table" => {
                         let access = map.get("access_type").map(json_inline).unwrap_or_default();
-                        let mut node = PlanNode::new(if access.is_empty() { "table".to_owned() } else { access.clone() });
+                        let mut node = PlanNode::new(if access.is_empty() { "table".to_owned() } else { access.clone() }).with_category(NodeKind::Table);
                         node.access_type = (!access.is_empty()).then_some(access.clone());
+                        // 表自身的代价是读取加计算；累计的 prefix_cost 记在它上面的 JOIN 节点上。
+                        if let Some(Value::Object(ci)) = map.get("cost_info") {
+                            node.cost = match (ci.get("read_cost").and_then(json_f64), ci.get("eval_cost").and_then(json_f64)) {
+                                (Some(read), Some(eval)) => Some(read + eval),
+                                (read, eval) => read.or(eval),
+                            };
+                        }
                         node.object = map.get("table_name").map(json_inline);
                         let key_raw = map.get("key").map(json_inline).filter(|k| !k.is_empty() && k != "null");
                         node.key_used = key_raw.clone();
@@ -429,7 +530,7 @@ fn mysql_json(value: &Value) -> Vec<PlanNode> {
                         node.access_type = (!access.is_empty()).then_some(access);
                         node
                     }
-                    "materialized_from_subquery" => PlanNode::new("materialized subquery"),
+                    "materialized_from_subquery" => PlanNode::new("materialized subquery").with_category(NodeKind::Subquery),
                     "filesort" => {
                         let mut node = PlanNode::new("filesort");
                         node.detail = map.get("sort_key").map(json_inline).unwrap_or_default();
@@ -454,7 +555,7 @@ fn mysql_json(value: &Value) -> Vec<PlanNode> {
                     push_issue_once(&mut node, Issue::TempTable);
                 }
 
-                node.cost = map.get("cost").and_then(json_f64).or_else(|| map.get("query_cost").and_then(json_f64));
+                node.cost = node.cost.or_else(|| map.get("cost").and_then(json_f64)).or_else(|| map.get("query_cost").and_then(json_f64));
                 apply_cost_info(map, &mut node);
                 apply_mariadb_analyze_metrics(map, &mut node);
 

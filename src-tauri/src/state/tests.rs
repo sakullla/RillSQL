@@ -650,3 +650,19 @@ fn column_layout_aligns_with_dropped_and_added_columns() {
     let all_hidden = super::ColumnLayout { order: columns.clone(), hidden: columns.clone(), ..Default::default() }.aligned(&columns);
     assert!(all_hidden.is_default());
 }
+
+/// 界面偏好（R11 计划视图）：写盘后重开仍在；坏文件按默认读、只读时不动原文件。
+#[test]
+fn ui_prefs_remember_the_plan_view_across_restarts() {
+    let dir = temp_dir("ui-prefs");
+    let store = StateStore::new(&dir);
+    assert_eq!(store.ui_prefs().get().plan_view, None, "没选过时为空");
+    store.ui_prefs().update_and_write(|prefs| prefs.plan_view = Some("list".into())).unwrap();
+    assert!(store.ui_prefs().update(|prefs| prefs.plan_view = Some("list".into())).is_none(), "没有变化不写盘");
+    assert_eq!(StateStore::new(&dir).ui_prefs().get().plan_view.as_deref(), Some("list"));
+
+    let path = dir.join(super::UI_PREFS_FILE);
+    fs::write(&path, b"{not json").unwrap();
+    assert_eq!(StateStore::new(&dir).ui_prefs().get(), super::UiPrefs::default());
+    assert_eq!(fs::read(&path).unwrap(), b"{not json");
+}

@@ -743,6 +743,7 @@ dict! {
     "query.plan.canvas.resetTip" => "实际大小", "Actual size";
     "query.plan.canvas.zoomIn" => "放大", "Zoom in";
     "query.plan.canvas.zoomOut" => "缩小", "Zoom out";
+    "query.plan.canvas.root" => "查询", "Query";
     "query.plan.colOperation" => "操作", "Operation";
     "query.plan.colRows" => "预估行数", "Est. rows";
     "query.plan.colShare" => "代价占比", "Cost share";

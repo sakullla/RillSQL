@@ -6,6 +6,7 @@ mod compat;
 mod document;
 mod legacy;
 mod leveldb;
+mod ui_prefs;
 
 use atomic::write_atomic_off_ui;
 #[allow(unused_imports)]
@@ -16,6 +17,8 @@ pub use column_layout::{ColumnLayout, ColumnLayoutKey, ColumnLayoutStore};
 pub use document::{parse_stored, to_bytes, AppState, SessionState, SessionTab, ShellSettings, StateError, APP_STATE_FILE};
 use legacy::import_legacy;
 pub use legacy::{ImportReport, Platform};
+#[allow(unused_imports)]
+pub use ui_prefs::{UiPrefs, UiPrefsStore, UI_PREFS_FILE};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,16 +28,22 @@ pub struct StateStore {
     path: PathBuf,
     /// 表格列布局（R3）：克隆的 StateStore 共用同一份。
     column_layouts: Arc<ColumnLayoutStore>,
+    /// 界面小偏好（R11 计划视图等）：克隆的 StateStore 共用同一份。
+    ui_prefs: Arc<UiPrefsStore>,
 }
 
 impl StateStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         let dir = data_dir.as_ref();
-        Self { path: dir.join(APP_STATE_FILE), column_layouts: Arc::new(ColumnLayoutStore::new(dir)) }
+        Self { path: dir.join(APP_STATE_FILE), column_layouts: Arc::new(ColumnLayoutStore::new(dir)), ui_prefs: Arc::new(UiPrefsStore::new(dir)) }
     }
 
     pub fn column_layouts(&self) -> &Arc<ColumnLayoutStore> {
         &self.column_layouts
+    }
+
+    pub fn ui_prefs(&self) -> &Arc<UiPrefsStore> {
+        &self.ui_prefs
     }
 
     pub fn path(&self) -> &Path {
