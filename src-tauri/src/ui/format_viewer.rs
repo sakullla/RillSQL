@@ -290,6 +290,12 @@ impl FormatViewer {
         self.draft != self.source
     }
 
+    /// 测试用：放大编辑器里真正接键盘的代码编辑器（换行、⌘F 查找、全选复制都在它身上）。
+    #[cfg(test)]
+    pub fn editor(&self) -> &Entity<EditorState> {
+        &self.editor
+    }
+
     #[cfg(test)]
     pub fn title(&self) -> Option<&SharedString> {
         self.title.as_ref()

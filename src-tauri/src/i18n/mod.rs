@@ -189,7 +189,8 @@ dict! {
     "shell.shortcuts.cancelEdit" => "取消编辑；未编辑时离开表格", "Cancel editing; leave the grid when not editing";
     "shell.shortcuts.markDelete" => "标记删除选中的行（暂存）", "Mark selected rows for deletion (staged)";
     "shell.shortcuts.commit" => "预览并提交变更", "Preview and commit changes";
-    "shell.shortcuts.copyRegion" => "复制选中区域（TSV）", "Copy the selection (TSV)";
+    "shell.shortcuts.copyRegion" => "复制选中区域（TSV，不含表头）", "Copy the selection (TSV, no header)";
+    "shell.shortcuts.copyRegionHeader" => "复制选中区域（含表头）", "Copy the selection with the header row";
     "shell.shortcuts.nextCell" => "提交并移到下一格 / 上一格", "Save and move to the next / previous cell";
     "shell.shortcuts.undoStage" => "撤销最近一次暂存的修改", "Undo the last staged change";
     "shell.shortcuts.undo" => "撤销", "Undo";
@@ -201,7 +202,7 @@ dict! {
     "shell.command.paste" => "粘贴", "Paste";
     "shell.command.selectAll" => "全选", "Select all";
     "shell.shortcuts.copySqlValue" => "复制为 SQL 值（区分 NULL）", "Copy as SQL values (NULL-aware)";
-    "shell.shortcuts.pasteCells" => "从焦点格粘贴 TSV（整批暂存，越界或只读整批拒绝）", "Paste TSV from the focused cell (staged as one batch; rejected whole if out of range or read-only)";
+    "shell.shortcuts.pasteCells" => "从焦点格粘贴 TSV（整批暂存；选中整行或超出已加载行时作为新增行，只读整批拒绝）", "Paste TSV from the focused cell (staged as one batch; whole-row selections and rows past the end become new rows; rejected whole if read-only)";
     "common.save" => "保存", "Save";
     "common.cancel" => "取消", "Cancel";
     "common.close" => "关闭", "Close";
@@ -1417,6 +1418,7 @@ dict! {
     "grid.column.notSorted" => "当前未排序", "No active sort";
     "grid.edit.expand" => "展开多行编辑", "Expand editor";
     "grid.edit.expandShort" => "展开", "Expand";
+    "grid.edit.statusHint" => "编辑中 · Enter 保存 · Esc 取消 · Tab 下一格 · ⇧Enter 放大", "Editing · Enter saves · Esc cancels · Tab next cell · ⇧Enter expands";
     "grid.record.open" => "记录视图", "Record view";
     "grid.record.title" => "第 {row} 行", "Row {row}";
     "grid.record.prev" => "上一行", "Previous row";
@@ -1444,7 +1446,12 @@ dict! {
     "grid.batch.empty" => "剪贴板为空或不是文本，整次未生效", "The clipboard is empty or not text; nothing was staged";
     "grid.batch.noFocus" => "先选中要写入的单元格", "Select the cells to write first";
     "grid.batch.noRow" => "先选中一行", "Select a row first";
-    "grid.batch.outOfRange" => "超出了可见列数或已加载的行数，整次未生效", "The block goes past the visible columns or the loaded rows; nothing was staged";
+    "grid.batch.outOfRange" => "超出了已加载的行数，查询结果不能新增行，整次未生效", "The block goes past the loaded rows and query results can't take new rows; nothing was staged";
+    "grid.batch.extraColumn" => "粘贴内容的第 {position} 列没有对应的列（最后一列是 {last}），整次未生效", "Pasted column {position} has no target column (the last one is {last}); nothing was staged";
+    "grid.batch.missingColumn" => "粘贴内容只有 {pasted} 列，缺少第 {position} 列 {column} 的值，整次未生效", "The pasted rows have only {pasted} columns; column {position} ({column}) has no value; nothing was staged";
+    "grid.write.pastedRows" => "已粘贴为 {count} 条新增行，预览并确认后才写库", "Pasted as {count} new rows; nothing is written until you preview and confirm";
+    "grid.row.new" => "新", "New";
+    "grid.row.undoNew" => "撤销这条新增行", "Discard this new row";
     "grid.batch.readonly" => "{reason}，整次未生效", "{reason}; nothing was staged";
     "grid.batch.keyColumn" => "目标区域包含主键或自增列 {column}，整次未生效", "The target includes the primary-key or auto-increment column {column}; nothing was staged";
     "grid.batch.blocked" => "列 {column} 不可写：{reason}，整次未生效", "Column {column} can't be written: {reason}; nothing was staged";

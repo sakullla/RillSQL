@@ -244,8 +244,12 @@ pub enum BatchReject {
     Empty,
     /// 没有焦点格或选区，不知道从哪里开始。
     NoFocus,
-    /// 超出可见列或已加载行；不会自动新增行。
+    /// 超出已加载行且这里不能新增行（查询结果），或目标列不存在。
     OutOfRange,
+    /// 粘贴内容的第 `position` 列（1 起）没有对应的目标列；`last` 是表的最后一个目标列。
+    ExtraColumn { position: usize, last: String },
+    /// 整行粘贴时列数不够：只有 `pasted` 列，第 `position` 列 `column` 没有值。
+    MissingColumn { position: usize, column: String, pasted: usize },
     /// 整个网格只读，原因沿用现有的只读文案。
     Readonly(String),
     /// 目标区域含主键或自增列。
@@ -260,6 +264,13 @@ impl BatchReject {
             BatchReject::Empty => i18n::text(locale, "grid.batch.empty"),
             BatchReject::NoFocus => i18n::text(locale, "grid.batch.noFocus"),
             BatchReject::OutOfRange => i18n::text(locale, "grid.batch.outOfRange"),
+            BatchReject::ExtraColumn { position, last } => {
+                i18n::fill(&i18n::text(locale, "grid.batch.extraColumn"), &[("position", &position.to_string()), ("last", last)])
+            }
+            BatchReject::MissingColumn { position, column, pasted } => i18n::fill(
+                &i18n::text(locale, "grid.batch.missingColumn"),
+                &[("position", &position.to_string()), ("column", column), ("pasted", &pasted.to_string())],
+            ),
             BatchReject::Readonly(reason) => i18n::fill(&i18n::text(locale, "grid.batch.readonly"), &[("reason", reason)]),
             BatchReject::KeyColumn(column) => i18n::fill(&i18n::text(locale, "grid.batch.keyColumn"), &[("column", column)]),
             BatchReject::Blocked { column, reason } => {
@@ -2592,9 +2603,19 @@ impl SharedGrid {
         self.tsv_grid(&points)
     }
 
-    /// 复制到剪贴板的文本：单格复制值本身，多格复制含表头的 TSV。
+    /// ⌘C 复制到剪贴板的文本：单格复制值本身，多格复制不带表头的 TSV（R1）。
+    /// 不带表头，粘贴回表格时第一行就是数据；需要表头用 [`Self::copy_text_with_header`]（⇧⌘C）。
     /// 多格式复制（grid-copy-as-*）仍然各写各的格式，长值和二进制的原值保护照旧。
     pub fn copy_text(&self) -> String {
+        self.copy_text_inner(false)
+    }
+
+    /// ⇧⌘C：多格复制时第一行是列名；单格仍只复制值本身。
+    pub fn copy_text_with_header(&self) -> String {
+        self.copy_text_inner(true)
+    }
+
+    fn copy_text_inner(&self, header: bool) -> String {
         let Some((rows, column_start, column_end)) = self.selection_block() else {
             return String::new();
         };
@@ -2605,7 +2626,11 @@ impl SharedGrid {
         if rows.len() == 1 && column_start == column_end {
             return self.tsv_field(rows[0], column_start);
         }
-        format!("{}\n{}", self.header_tsv(column_start, column_end), self.tsv_grid(&points))
+        if header {
+            format!("{}\n{}", self.header_tsv(column_start, column_end), self.tsv_grid(&points))
+        } else {
+            self.tsv_grid(&points)
+        }
     }
 
     /// 复制块的表头：列名按逻辑列顺序，和正文同一套 TSV 转义。
@@ -3317,6 +3342,15 @@ impl SharedGrid {
         };
         // 批量暂存整批回退：同批的其它格子一起去掉，被它替换的旧暂存放回来。
         if let Some(batch) = last.batch {
+            // 同一批里粘贴出来的新增行：行本身也跟着这一批一起撤掉。
+            let mut rows: Vec<String> = self.overlays.iter().filter(|item| item.batch == Some(batch) && item.kind == "insert").map(|item| item.row_id.clone()).collect();
+            if last.kind == "insert" {
+                rows.push(last.row_id.clone());
+            }
+            if !rows.is_empty() {
+                self.drop_inserted_rows(&rows);
+                self.recompute();
+            }
             self.overlays.retain(|item| item.batch != Some(batch));
             if let Some(index) = self.batches.iter().position(|(id, _)| *id == batch) {
                 let (_, replaced) = self.batches.remove(index);
@@ -3348,21 +3382,57 @@ impl SharedGrid {
             }
             return Gate::Readonly;
         }
-        let id = format!("i:{}", self.seq + 1);
+        // R2：有选中行时插在它下方，否则插在顶部；插入后焦点落在第一个可编辑列。
+        let after = if self.selected { self.focused_row_id().map(str::to_owned) } else { None };
+        let id = self.insert_blank_row(after.as_deref());
+        self.recompute();
+        self.close_preview();
+        if let Some(row) = self.row_index(&id) {
+            let column = self.first_editable_column();
+            self.select(row, column, false);
+            self.follow_focus();
+        }
+        Gate::Writable
+    }
+
+    /// 新增行里第一个用户要填的可见列：跳过自增、生成和不可写的列；都不行时取第一个可见列。
+    pub fn first_editable_column(&self) -> usize {
+        let visible = self.visible_columns();
+        visible
+            .iter()
+            .copied()
+            .find(|index| self.columns.get(*index).is_some_and(|column| column.editable && !column.auto && !column.generated))
+            .or_else(|| visible.first().copied())
+            .unwrap_or(0)
+    }
+
+    /// 在来源里放一条空的新增行并登记它的 INSERT 暂存：`after` 是插在哪一行下方，空时放在顶部。
+    /// 不重算显示、不动选择，调用方自己收尾。返回新行 id。
+    fn insert_blank_row(&mut self, after: Option<&str>) -> String {
         self.seq += 1;
+        let id = format!("i:{}", self.seq);
         let values = vec![None; self.columns.len()];
-        self.source.push(Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
+        let position = after.and_then(|after| self.source.iter().position(|row| row.id == after)).map(|index| index + 1).unwrap_or(0);
+        self.source.insert(position, Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
         // 有默认值、自增或生成的列先交给数据库：显示“默认 / 自动生成”而不是 NULL，INSERT 里不写。
         for column in self.columns.iter().filter(|column| column.auto || column.generated || column.default.is_some()) {
             self.pristine.insert((id.clone(), column.name.clone()));
         }
-        self.recompute();
         // 新增行在筛选/查找下可能不在显示快照里，身份必须始终用新行自己的 id，
-        // 不能退化成最后一行，否则预览会把别人的行当成新增内容。
-        let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len());
-        self.overlays.push(overlay(row, id.clone(), 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
-        self.close_preview();
-        Gate::Writable
+        // 不能退化成最后一行，否则预览会把别人的行当成新增内容。显示位置由 reattach_overlays 重新挂回。
+        self.overlays.push(overlay(usize::MAX, id.clone(), 0, String::new(), None, Gate::Writable, String::new(), Some(id.clone()), "insert"));
+        id
+    }
+
+    /// 把刚放进来、还没有任何值的新增行整行去掉（粘贴整次被拒绝时回滚用）。
+    fn drop_inserted_rows(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.source.retain(|row| !ids.contains(&row.id));
+        self.overlays.retain(|item| !ids.contains(&item.row_id));
+        self.pristine.retain(|(row_id, _)| !ids.contains(row_id));
+        self.cloned.retain(|row_id| !ids.contains(row_id));
     }
 
     pub fn stage_delete(&mut self, row: usize) -> Gate {
@@ -3937,9 +4007,20 @@ impl SharedGrid {
         line
     }
 
+    /// 这一行（按稳定 id）是不是还没提交的新增行。
+    pub fn row_inserted_by_id(&self, row_id: &str) -> bool {
+        self.any_row(row_id).is_some_and(|row| row.inserted)
+    }
+
+    /// 这一显示行是不是还没提交的新增行。
+    pub fn row_inserted(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|item| item.inserted)
+    }
+
     pub fn row_number(&self, row: usize) -> String {
         if self.rows.get(row).is_some_and(|item| item.inserted) {
-            "+".to_owned()
+            // R2：新增行的行号区直接写“新”，和整行底色、左侧色条一起一眼可辨。
+            i18n::text(self.locale, "grid.row.new")
         } else {
             (self.offset as usize + row + 1).to_string()
         }
@@ -4805,7 +4886,8 @@ impl SharedGrid {
             let Some(row) = self.any_row(row_id) else {
                 return Err(BatchReject::OutOfRange);
             };
-            if origin.primary || origin.auto {
+            // 已有行不改主键和自增列；新增行还没有主键，由用户填（和逐格编辑一致）。
+            if !row.inserted && (origin.primary || origin.auto) {
                 return Err(BatchReject::KeyColumn(origin.name.clone()));
             }
             if origin.generated {
@@ -4863,7 +4945,14 @@ impl SharedGrid {
         Ok(count)
     }
 
-    /// 从焦点格开始按行列铺开剪贴板里的 TSV。只铺到可见列和已加载行上，越界就整次拒绝，不新增行。
+    /// 粘贴剪贴板里的 TSV（R1）。
+    /// - 选中的是整行（点行号）：每一行都作为新增行插在选中行下方，列按全部列或可见列对齐；
+    ///   列数都对不上时说出具体是哪一列。
+    /// - 否则从焦点格开始按可见列铺开，覆盖已有格子；超出已加载行的部分作为新增行接在末尾。
+    ///   超出最后一个可见列时说出粘贴内容的第几列越界。
+    ///
+    /// 第一行和目标列名完全一致时当作表头跳过。新增行上的自增、生成列不写，仍交给数据库。
+    /// 整次校验通过才生效；任何一格不行就整次拒绝，刚放进来的新增行一起去掉。一次撤销回退整次粘贴。
     pub fn paste_tsv(&mut self, text: Option<&str>) -> Result<usize, BatchReject> {
         let Some(text) = text.filter(|text| !text.trim_matches(['\r', '\n']).is_empty()) else {
             return Err(BatchReject::Empty);
@@ -4874,24 +4963,153 @@ impl SharedGrid {
         let Some((anchor_row, anchor_column)) = self.focus_cell() else {
             return Err(BatchReject::NoFocus);
         };
-        let block = parse_tsv(text, &self.null_copy);
+        let mut block = parse_tsv(text, &self.null_copy);
         let visible = self.visible_columns();
-        let Some(start) = visible.iter().position(|index| *index == anchor_column) else {
-            return Err(BatchReject::NoFocus);
-        };
-        let mut cells = Vec::new();
-        for (offset, line) in block.into_iter().enumerate() {
-            let Some(row_id) = self.rows.get(anchor_row + offset).map(|row| row.id.clone()) else {
-                return Err(BatchReject::OutOfRange);
+        let all: Vec<usize> = (0..self.columns.len()).collect();
+        let can_insert = self.mode == GridMode::Table;
+        // 每一行要写到哪里：已有行的 id，或第几条新增行。
+        enum Target {
+            Existing(String),
+            New(usize),
+        }
+        let whole_rows = self.whole_rows_selected().filter(|_| can_insert);
+        let (targets, mapping, insert_after): (Vec<Target>, Vec<Vec<usize>>, Option<String>) = if let Some((_, last_row)) = whole_rows {
+            // 表头：第一行恰好是全部列名或可见列名。
+            if (block.len() > 1 || block.first().is_some_and(|line| line.len() > 1))
+                && block.first().is_some_and(|line| self.line_is_header(line, &all) || self.line_is_header(line, &visible))
+            {
+                block.remove(0);
+            }
+            let mut mapping = Vec::with_capacity(block.len());
+            for line in &block {
+                let width = line.len();
+                if width == all.len() {
+                    mapping.push(all.clone());
+                } else if width == visible.len() {
+                    mapping.push(visible.clone());
+                } else if width > all.len() {
+                    let last = self.columns.last().map(|column| column.name.clone()).unwrap_or_default();
+                    return Err(BatchReject::ExtraColumn { position: all.len() + 1, last });
+                } else {
+                    // 列数不够：按可见列（不够可见列时）或全部列指出第一个没有值的列。
+                    let reference = if width < visible.len() { &visible } else { &all };
+                    let column = reference.get(width).and_then(|index| self.columns.get(*index)).map(|column| column.name.clone()).unwrap_or_default();
+                    return Err(BatchReject::MissingColumn { position: width + 1, column, pasted: width });
+                }
+            }
+            let after = self.rows.get(last_row).map(|row| row.id.clone());
+            ((0..block.len()).map(Target::New).collect(), mapping, after)
+        } else {
+            let Some(start) = visible.iter().position(|index| *index == anchor_column) else {
+                return Err(BatchReject::NoFocus);
             };
-            for (step, value) in line.into_iter().enumerate() {
-                let Some(column) = visible.get(start + step).copied() else {
-                    return Err(BatchReject::OutOfRange);
-                };
+            if block.len() > 1 || block.first().is_some_and(|line| line.len() > 1) {
+                let width = block.first().map(Vec::len).unwrap_or(0);
+                let names: Vec<usize> = visible.iter().skip(start).take(width).copied().collect();
+                if block.first().is_some_and(|line| line.len() == names.len() && self.line_is_header(line, &names)) {
+                    block.remove(0);
+                }
+            }
+            let mut mapping = Vec::with_capacity(block.len());
+            let mut targets = Vec::with_capacity(block.len());
+            let mut fresh = 0;
+            for (offset, line) in block.iter().enumerate() {
+                if start + line.len() > visible.len() {
+                    let last = visible.last().and_then(|index| self.columns.get(*index)).map(|column| column.name.clone()).unwrap_or_default();
+                    return Err(BatchReject::ExtraColumn { position: visible.len() - start + 1, last });
+                }
+                mapping.push(visible[start..start + line.len()].to_vec());
+                match self.rows.get(anchor_row + offset) {
+                    Some(row) => targets.push(Target::Existing(row.id.clone())),
+                    None if can_insert => {
+                        targets.push(Target::New(fresh));
+                        fresh += 1;
+                    }
+                    None => return Err(BatchReject::OutOfRange),
+                }
+            }
+            (targets, mapping, self.rows.last().map(|row| row.id.clone()))
+        };
+        if targets.is_empty() {
+            return Err(BatchReject::Empty);
+        }
+        // 新增行先放进来（按顺序一条接一条），整批校验失败时再去掉。
+        let fresh_count = targets.iter().filter(|target| matches!(target, Target::New(_))).count();
+        let mut created: Vec<String> = Vec::with_capacity(fresh_count);
+        let mut after = insert_after;
+        for _ in 0..fresh_count {
+            let id = self.insert_blank_row(after.as_deref());
+            after = Some(id.clone());
+            created.push(id);
+        }
+        let mut cells = Vec::new();
+        for ((target, line), columns) in targets.iter().zip(block).zip(mapping) {
+            let (row_id, fresh) = match target {
+                Target::Existing(id) => (id.clone(), false),
+                Target::New(index) => (created[*index].clone(), true),
+            };
+            for (value, column) in line.into_iter().zip(columns) {
+                // 新增行上的自增、生成列交给数据库：复制来的旧 id 不能跟着写进 INSERT。
+                if fresh && self.columns.get(column).is_some_and(|origin| origin.auto || origin.generated) {
+                    continue;
+                }
                 cells.push((row_id.clone(), column, value));
             }
         }
-        self.stage_batch(cells)
+        if created.is_empty() {
+            return self.stage_batch(cells);
+        }
+        self.recompute();
+        let result = if cells.is_empty() {
+            // 只有自增/生成列的值：新行本身就是这一批。
+            self.seq += 1;
+            self.batches.push((self.seq, Vec::new()));
+            Ok(0)
+        } else {
+            self.stage_batch(cells)
+        };
+        match result {
+            Ok(count) => {
+                // 新增行和它们的值是同一批：一次撤销把行和值一起去掉。
+                let batch = self.batches.last().map(|(batch, _)| *batch);
+                for item in self.overlays.iter_mut().filter(|item| item.kind == "insert" && created.contains(&item.row_id)) {
+                    item.batch = batch;
+                }
+                self.close_preview();
+                // 整行粘贴后选中新增的这几行，一眼看得到粘到了哪里；按格粘贴的焦点留在原处。
+                if whole_rows.is_some() {
+                    let first = self.row_index(&created[0]);
+                    let last = created.last().and_then(|id| self.row_index(id));
+                    if let (Some(first), Some(last)) = (first, last) {
+                        self.select(first, 0, false);
+                        self.select(last, self.columns.len().saturating_sub(1), true);
+                        self.follow_focus();
+                    }
+                }
+                Ok(count.max(created.len()))
+            }
+            Err(reject) => {
+                self.drop_inserted_rows(&created);
+                self.recompute();
+                Err(reject)
+            }
+        }
+    }
+
+    /// 选区是不是若干整行（从第一列到最后一列的一个矩形）；是就返回首末显示行。
+    pub fn whole_rows_selected(&self) -> Option<(usize, usize)> {
+        if self.columns.is_empty() || self.regions.len() > 1 || !self.minus.is_empty() {
+            return None;
+        }
+        let (row_start, column_start, row_end, column_end) = self.selection_bounds()?;
+        (column_start == 0 && column_end + 1 == self.columns.len()).then_some((row_start, row_end))
+    }
+
+    /// 一行粘贴内容是不是这组列的列名（逐个完全相同，不含 NULL）。
+    fn line_is_header(&self, line: &[Option<String>], columns: &[usize]) -> bool {
+        !line.is_empty()
+            && line.len() == columns.len()
+            && line.iter().zip(columns).all(|(value, index)| value.as_deref().is_some_and(|text| self.columns.get(*index).is_some_and(|column| column.name == text)))
     }
 
     /// 选区里的每个可见格子暂存为同一个值（None 是数据库 NULL）。隐藏列不在写入范围里。
@@ -4941,12 +5159,20 @@ impl SharedGrid {
         }
         self.seq += 1;
         let id = format!("i:{}", self.seq);
-        self.source.push(Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
+        // 和“新增行”同一条规则：克隆出来的行紧贴在原行下方，焦点跟过去。
+        let after = self.rows.get(row).map(|item| item.id.clone());
+        let position = after.and_then(|after| self.source.iter().position(|item| item.id == after)).map(|index| index + 1).unwrap_or(self.source.len());
+        self.source.insert(position, Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
         self.cloned.push(id.clone());
         self.recompute();
         let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len());
         self.overlays.push(overlay(row, id.clone(), 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
         self.close_preview();
+        if row < self.rows.len() {
+            let column = self.focus.1;
+            self.select(row, column, false);
+            self.follow_focus();
+        }
         Ok(())
     }
 
@@ -8768,12 +8994,12 @@ mod batch_tests {
         let mut grid = people("sqlite", 3);
         assert_eq!(grid.stage_text(2, 2, Some("已有".into())), Gate::Writable);
         let before = (grid.staged_count(), grid.cell_label(2, 2), grid.cell_label(0, 1));
-        // 焦点在最后一列：第二列越界。
+        // 焦点在最后一列：粘贴内容的第二列没有目标列，说出是第几列、最后一列是哪一列。
         grid.select(2, 2, false);
-        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::OutOfRange));
-        // 超出已加载的行，不自动新增行。
-        grid.select(2, 1, false);
-        assert_eq!(grid.paste_tsv(Some("a\nb")), Err(BatchReject::OutOfRange));
+        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::ExtraColumn { position: 2, last: "note".into() }));
+        // 越界的行会变成新增行；但其中一格不合法时整次拒绝，刚放进来的新增行一起去掉。
+        grid.select(2, 0, false);
+        assert_eq!(grid.paste_tsv(Some("3\nabc")), Err(BatchReject::KeyColumn("id".into())));
         assert_eq!(grid.loaded_len(), 3);
         // 目标含主键列。
         grid.select(0, 0, false);
@@ -8786,9 +9012,16 @@ mod batch_tests {
         // 隐藏列不算在可铺开的列里。
         assert!(grid.hide_column(2));
         grid.select(0, 1, false);
-        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::OutOfRange));
+        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::ExtraColumn { position: 2, last: "name".into() }));
         assert_eq!((grid.staged_count(), grid.cell_label(2, 2), grid.cell_label(0, 1)), before);
-        for reject in [BatchReject::Empty, BatchReject::OutOfRange, BatchReject::KeyColumn("id".into())] {
+        assert_eq!(grid.loaded_len(), 3, "被拒绝的粘贴不留下新增行");
+        for reject in [
+            BatchReject::Empty,
+            BatchReject::OutOfRange,
+            BatchReject::KeyColumn("id".into()),
+            BatchReject::ExtraColumn { position: 2, last: "note".into() },
+            BatchReject::MissingColumn { position: 3, column: "note".into(), pasted: 2 },
+        ] {
             assert!(!reject.message(Locale::En).is_empty());
             assert_ne!(reject.message(Locale::ZhCn), reject.message(Locale::En));
         }
@@ -8984,17 +9217,19 @@ mod batch_tests {
     fn staged_counts_revert_one_cell_or_row_and_sql_stays_off_previews() {
         let mut grid = people("sqlite", 2);
         assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        // 没有选中行：新增行插在顶部，原来的两行各往下挪一格。
         assert_eq!(grid.stage_insert(), Gate::Writable);
-        assert_eq!(grid.stage_delete(1), Gate::Writable);
+        assert_eq!(grid.rows.iter().position(|row| row.inserted), Some(0));
+        assert_eq!(grid.stage_delete(2), Gate::Writable);
         let summary = grid.staged_summary();
         assert_eq!((summary.inserts, summary.updates, summary.deletes), (1, 1, 1));
-        assert_eq!(grid.cell_dirty_state(0, 1), CellDirty::Updated);
-        assert_eq!(grid.cell_dirty_state(1, 0), CellDirty::Deleted);
+        assert_eq!(grid.cell_dirty_state(1, 1), CellDirty::Updated);
+        assert_eq!(grid.cell_dirty_state(2, 0), CellDirty::Deleted);
         let inserted = grid.rows.iter().position(|row| row.inserted).expect("新增行");
         assert_eq!(grid.cell_dirty_state(inserted, 1), CellDirty::Inserted);
-        let id = SharedGrid::row_id(&grid, 0).unwrap().to_owned();
+        let id = SharedGrid::row_id(&grid, 1).unwrap().to_owned();
         assert!(grid.revert_cell(&id, 1));
-        assert_eq!(grid.cell_label(0, 1), "名1");
+        assert_eq!(grid.cell_label(1, 1), "名1");
         assert_eq!(grid.staged_summary().updates, 0);
         assert!(!grid.revert_cell(&id, 1));
         let next = grid.next_staged_cell().expect("还有暂存");

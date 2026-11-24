@@ -134,7 +134,9 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut::new("mark-delete", "table", "Delete", "shell.shortcuts.markDelete"),
     Shortcut::new("commit", "table", "Mod+S", "shell.shortcuts.commit").command("commit").binds(&[global!(CommitEdit)]),
     Shortcut::new("copy-region", "table", "Mod+C", "shell.shortcuts.copyRegion"),
-    Shortcut::new("copy-sql-value", "table", "Mod+Shift+C", "shell.shortcuts.copySqlValue"),
+    // R1：⌘C 默认不带表头；需要表头时用 ⇧⌘C。SQL 值复制让出 ⇧⌘C，改为 ⌥⇧⌘C（菜单里仍可点）。
+    Shortcut::new("grid-copy-with-header", "table", "Mod+Shift+C", "shell.shortcuts.copyRegionHeader"),
+    Shortcut::new("copy-sql-value", "table", "Mod+Alt+Shift+C", "shell.shortcuts.copySqlValue"),
     Shortcut::new("paste-cells", "table", "Mod+V", "shell.shortcuts.pasteCells"),
     Shortcut::new("grid-undo", "table", "Mod+Z", "shell.shortcuts.undoStage"),
     // 结果区查找（R10）：网格（含其中的输入框）有焦点时展开查找栏并聚焦，编辑器里的 ⌘F 仍是编辑器自己的查找。
