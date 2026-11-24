@@ -9,7 +9,7 @@ use crate::ddl::model::{
 };
 use crate::ddl::plan::{
     changed_names, column_referenced, column_sql, create_statement, drafts_change_shape, finish, identity_drafts, index_touches_change, default_changed,
-    preservable_indexes, push_fk_status, recreate_index_sql, renamed_any, same_type, Change,
+    preservable_indexes, primary_key_change, push_fk_status, recreate_index_sql, renamed_any, same_type, Change,
 };
 use crate::ddl::sql::{mentions, valid_name};
 
@@ -96,7 +96,18 @@ impl DdlDialect for SqliteDdl {
         TableOptionSpec { without_rowid: Some("WITHOUT ROWID"), strict: Some("STRICT"), ..TableOptionSpec::default() }
     }
 
-    fn alter_plan(&self, snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
+    fn alter_plan(&self, snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft], changes: &[Change], target: String, mut risks: Vec<Risk>) -> Plan {
+        // SQLite 不能用 ALTER TABLE 改主键：主键变了一律走重建，按新主键顺序建新表再复制数据。
+        if primary_key_change(snapshot, drafts).is_some() {
+            risks.insert(
+                0,
+                Risk {
+                    level: "danger".to_owned(),
+                    text: "改主键要重建整张表：按新定义建表、复制全部数据、删除旧表再改回原名。表越大耗时越长。".to_owned(),
+                },
+            );
+            return sqlite_rebuild(snapshot, drafts, target, risks);
+        }
         match sqlite_direct_alters(snapshot, table, changes) {
             SqlitePath::Direct(steps) => finish(snapshot.engine, false, target, Vec::new(), risks, steps),
             SqlitePath::Rebuild => sqlite_rebuild(snapshot, drafts, target, risks),

@@ -1596,6 +1596,9 @@ dict! {
     "structure.danger.truncateDetail" => "删除表里的全部行，表结构保留；无法撤销。", "Deletes every row but keeps the table; this can't be undone.";
     "structure.index.pickHint" => "还没有选列。在左边的列表里搜索并勾选索引包含的列，勾选顺序就是索引列顺序。", "No columns yet. Search and check the indexed columns on the left; the check order is the column order.";
     "structure.index.nameTaken" => "这张表已经有名为 {name} 的索引，换一个名字再预览。", "This table already has an index named {name}. Choose another name before previewing.";
+    "structure.index.available" => "可选字段", "Available columns";
+    "structure.index.selected" => "已选字段（{count}）· 按顺序", "Selected columns ({count}) · in order";
+    "structure.index.dragHint" => "拖动调整索引列顺序", "Drag to reorder index columns";
     "structure.index.toggleOrder" => "切换升序 / 降序", "Toggle ascending / descending";
     "structure.index.removeColumn" => "移除这一列", "Remove this column";
     "structure.index.addColumn" => "添加列", "Add column";
@@ -2271,6 +2274,13 @@ dict! {
     "structure.diag.emptyTable" => "请填写表名", "Enter a table name";
     "structure.diag.invalidTable" => "表名无效", "The table name is not valid";
     "structure.diag.autoNotPk" => "字段 {name} 自增时必须是主键", "Column {name} must be the primary key to auto-increment";
+    "structure.pk.none" => "未设主键", "no primary key";
+    "structure.pk.add" => "加入主键", "Add to key";
+    "structure.pk.remove" => "移出主键", "Remove from primary key";
+    "structure.pk.makePrimary" => "设为主键", "Make primary key";
+    "structure.pk.dragHint" => "拖动调整主键顺序", "Drag to reorder the primary key";
+    "structure.pk.notNullNote" => "主键列不能为空，勾选主键时自动设为 NOT NULL。", "Primary key columns can't be NULL, so they are set to NOT NULL automatically.";
+    "structure.pk.changed" => "主键将改变：预览时生成 DROP PRIMARY KEY / ADD PRIMARY KEY，需要再次确认；数据库会重写整张表。", "The primary key will change: the preview drops and re-adds it and needs a second confirmation; the database rewrites the whole table.";
     "structure.diag.fixFirst" => "先修正字段旁标出的问题，再预览 SQL。", "Fix the problems marked next to the fields before previewing SQL.";
     "structure.default.mode" => "默认值类型", "Default kind";
     "structure.default.none" => "无默认值", "No default";

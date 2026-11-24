@@ -120,6 +120,7 @@ fn plain_column(name: &str, type_name: &str) -> ColumnDraft {
         default: DefaultSpec::None,
         comment: String::new(),
         primary: false,
+        pk_order: None,
         auto: false,
         dropped: false,
         enum_set: None,
@@ -148,6 +149,7 @@ fn drafts_of(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             default: crate::ddl::sql::existing_default(snapshot.engine, column.default_sql.as_deref()),
             comment: String::new(),
             primary: column.primary,
+            pk_order: None,
             auto: column.auto,
             dropped: false,
             enum_set: snapshot

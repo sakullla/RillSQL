@@ -21,6 +21,13 @@ use crate::i18n;
 use crate::ui::kit::{self, ControlSize, IconSize, Palette, Radius, ScrollAreaExt as _, Space, Tip as _, TypeScale};
 use crate::ui::picker::{Picker, PickerEvent, PickerItem, PickerMode};
 
+/// 拖动索引已选列时携带的源位置。
+#[derive(Clone, Debug)]
+pub(super) struct IndexColumnDrag {
+    pub position: usize,
+    pub label: SharedString,
+}
+
 /// 浏览态字段表的可见列与列宽。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct BrowseColumns {
@@ -301,6 +308,15 @@ impl StructurePane {
                 id: format!("edit-revert-col-{index}"),
                 label: i18n::text(locale, "structure.field.revert"),
                 action: RowAction::RevertColumn(index),
+                disabled: false,
+                reason: None,
+            });
+        }
+        if !dropped && !orig_generated && column.generated.is_none() {
+            entries.push(MenuEntry {
+                id: format!("edit-pk-col-{index}"),
+                label: i18n::text(locale, if column.primary { "structure.pk.remove" } else { "structure.pk.makePrimary" }),
+                action: RowAction::TogglePrimary(index),
                 disabled: false,
                 reason: None,
             });
@@ -623,6 +639,7 @@ impl StructurePane {
             name_tip.push_str(&format!("\n{}", i18n::fill(&i18n::text(locale, "structure.field.inIndexes"), &[("names", &indexes.join(", "))])));
         }
         let marks = NameMarks { icon: mark.is_some(), auto, generated, indexed: !indexes.is_empty() };
+        let pk_badge = self.primary_key_position(index).filter(|_| self.primary_key_order().len() > 1);
         let mut mark = mark;
         let mut revert_btn = revert_btn;
         let mut drop_btn = Some(drop_btn);
@@ -656,6 +673,15 @@ impl StructurePane {
                             .when(dropped, |this| this.opacity(0.5).line_through())
                             .child(SharedString::from(column.name.clone())),
                     )
+                    .when_some(pk_badge, |this, position| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("structure-col-pk-{index}")))
+                                .test_support()
+                                .flex_none()
+                                .child(kit::pill(SharedString::from(format!("PK{position}")), p.warn, p.warn_soft)),
+                        )
+                    })
                     .when(marks.auto || marks.generated, |this| {
                         let key = if generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
                         this.child(kit::pill(t(key), p.text_muted, p.hover))
@@ -836,7 +862,7 @@ impl StructurePane {
             .id("structure-index-order")
             .test_support()
             .flex_1()
-            .min_w(px(ControlSize::PICKER_MIN_W))
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(Space::XS));
@@ -866,12 +892,23 @@ impl StructurePane {
                     .tooltip_text(t("structure.index.prefix"))
                     .child(self.draft_input(120_001 + position as u32, &value, &prefix_placeholder, window, cx))
             });
+            let accent = p.accent;
             list = list.child(
                 div()
                     .id(SharedString::from(format!("structure-index-chip-{name}")))
                     .test_support()
                     .h(px(metrics.control_h))
-                    .pl(px(Space::MD))
+                    .pl(px(Space::SM))
+                    .border_1()
+                    .border_color(p.accent_soft)
+                    .on_drag(IndexColumnDrag { position, label: SharedString::from(name.clone()) }, |drag, _, _, cx| {
+                        cx.new(|_| create::ColumnDragGhost { label: drag.label.clone() })
+                    })
+                    .drag_over::<IndexColumnDrag>(move |style, _, _, _| style.border_color(accent))
+                    .on_drop(cx.listener(move |pane, drag: &IndexColumnDrag, _, cx| {
+                        pane.move_index_column_to(drag.position, position);
+                        cx.notify();
+                    }))
                     .pr(px(Space::XXS))
                     .flex()
                     .items_center()
@@ -880,6 +917,15 @@ impl StructurePane {
                     .bg(p.accent_soft)
                     .text_color(p.accent_text)
                     .text_size(px(TypeScale::SM))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("structure-index-grip-{name}")))
+                            .test_support()
+                            .flex_none()
+                            .cursor_grab()
+                            .tooltip_text(t("structure.index.dragHint"))
+                            .child(kit::icon(IconName::GripVertical, IconSize::INLINE, p.text_faint)),
+                    )
                     .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(format!("{}.", position + 1))))
                     .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).child(SharedString::from(name.clone())))
                     .children(prefix_input)

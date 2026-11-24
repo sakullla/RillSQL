@@ -191,6 +191,39 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("没能完成列 {} 的 NULL 预检查，没有生成变更。", "The NULL pre-check of column {0} couldn't finish, so no change was generated."),
     ("不能在这里改变主键组成。", "The primary key columns can't be changed here."),
+    // 主键变更
+    ("主键列 {} 不能允许 NULL。", "Primary key column {0} can't allow NULL."),
+    ("字段 {} 自增时主键只能有这一列。", "Column {0} auto-increments, so the primary key can only have this column."),
+    ("没有读到主键约束的名字，不能删除旧主键。", "The primary key constraint name wasn't read, so the old primary key can't be dropped."),
+    (
+        "添加主键 {}。数据库会重建主键索引并重写整张表，大表耗时较长并锁表。",
+        "Adds primary key {0}. The database rebuilds the primary key index and rewrites the whole table; on a large table this takes long and locks the table.",
+    ),
+    (
+        "删除主键 {}。数据库会重写整张表，大表耗时较长并锁表。",
+        "Drops primary key {0}. The database rewrites the whole table; on a large table this takes long and locks the table.",
+    ),
+    (
+        "主键由 {} 改为 {}。数据库会重建主键索引并重写整张表，大表耗时较长并锁表。",
+        "The primary key changes from {0} to {1}. The database rebuilds the primary key index and rewrites the whole table; on a large table this takes long and locks the table.",
+    ),
+    ("去掉主键后，不能在表格里修改或删除已有行。", "Without a primary key, existing rows can't be edited or deleted in the grid."),
+    ("其他表的外键引用现在的主键；数据库可能拒绝删除旧主键。", "Foreign keys in other tables reference the current primary key; the database may refuse to drop it."),
+    (
+        "自增列 {} 不在主键的第一位，也没有别的索引以它开头；服务器会拒绝这种定义。可以把它拖到主键最前面。",
+        "Auto-increment column {0} isn't first in the primary key and no other index starts with it; the server rejects this definition. Drag it to the front of the primary key.",
+    ),
+    (
+        "这不是原子操作：先删除旧主键，再改字段，最后添加新主键；中途失败时表可能暂时没有主键，需要手动补上。",
+        "This is not atomic: the old primary key is dropped first, then the columns change, then the new primary key is added. If it fails midway the table may be left without a primary key; add it back by hand.",
+    ),
+    (
+        "改主键要重建整张表：按新定义建表、复制全部数据、删除旧表再改回原名。表越大耗时越长。",
+        "Changing the primary key rebuilds the whole table: a new table is created, all data is copied, the old table is dropped and the new one renamed back. The larger the table, the longer it takes.",
+    ),
+    ("删除旧主键", "Drop old primary key"),
+    ("修改字段并调整主键", "Change columns and primary key"),
+    ("修改主键", "Change primary key"),
     ("删除字段 {} 会永久丢掉该列的数据。", "Dropping column {0} permanently loses the data in that column."),
     (
         "字段 {} 的类型由 {} 改为 {}。无法转换的值会使执行失败；RillSQL 不会自动截断或清空数据。",

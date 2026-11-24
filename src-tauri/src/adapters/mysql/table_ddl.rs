@@ -6,9 +6,9 @@
 use crate::adapters::quote_ident;
 use crate::connections::model::Engine;
 use crate::ddl::model::{
-    EnumSetDraft, GeneratedColumnDraft, GeneratedStorage, LiteralQuoting, PartitionDef, PartitionDraft, PartitionMethod, PartitionOp, Plan, Risk, Snapshot, Step,
+    ColumnDraft, EnumSetDraft, GeneratedColumnDraft, GeneratedStorage, LiteralQuoting, PartitionDef, PartitionDraft, PartitionMethod, PartitionOp, Plan, Risk, Snapshot, Step,
 };
-use crate::ddl::plan::{finish, target_label};
+use crate::ddl::plan::{column_sql_for, finish, primary_key_drafts, target_label, Change, PrimaryKeyChange, PK_ALTER_LABEL, PK_ALTER_WITH_COLUMNS_LABEL};
 use crate::ddl::sql::{qualified_table, valid_name};
 
 use super::literal;
@@ -30,6 +30,48 @@ pub(super) fn generated_clause(draft: &GeneratedColumnDraft, stored_keyword: &st
         GeneratedStorage::Stored => stored_keyword,
     };
     Ok(format!(" GENERATED ALWAYS AS ({expression}) {keyword}"))
+}
+
+/// 字段变更连同主键调整写成一条 ALTER TABLE：新增、删除、CHANGE COLUMN 在前，
+/// 然后 DROP PRIMARY KEY（原来有主键时）与 ADD PRIMARY KEY（按新主键顺序，用改名后的列名）。
+pub(super) fn mysql_alter_with_primary_key(engine: Engine, snapshot: &Snapshot, table: &str, changes: &[Change], primary: &PrimaryKeyChange) -> Result<Step, String> {
+    let qualified = qualified_table(engine, &snapshot.database, &snapshot.schema, table)?;
+    let quoting = snapshot.literal_quoting();
+    let mut clauses = Vec::new();
+    for change in changes {
+        match change {
+            Change::Add(draft) => clauses.push(format!("ADD COLUMN {}", column_sql_for(engine, draft, false, quoting)?)),
+            Change::Drop(column) => clauses.push(format!("DROP COLUMN {}", quote_ident(engine, &column.name))),
+            Change::Modify { original, draft } => {
+                clauses.push(format!("CHANGE COLUMN {} {}", quote_ident(engine, &original.name), column_sql_for(engine, draft, false, quoting)?))
+            }
+        }
+    }
+    if !primary.before.is_empty() {
+        clauses.push("DROP PRIMARY KEY".to_owned());
+    }
+    if !primary.after.is_empty() {
+        let names = primary.after.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
+        clauses.push(format!("ADD PRIMARY KEY ({names})"));
+    }
+    let label = if changes.is_empty() { PK_ALTER_LABEL } else { PK_ALTER_WITH_COLUMNS_LABEL }.to_owned();
+    Ok(Step { sql: format!("ALTER TABLE {qualified} {};", clauses.join(", ")), label })
+}
+
+/// InnoDB 要求自增列是某个索引的第一列：自增列排在联合主键后面、又没有别的索引以它开头时服务器会拒绝。
+/// 只给提示，不替用户改顺序。
+pub(super) fn auto_not_leading_risk(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Option<Risk> {
+    let column = primary_key_drafts(drafts).into_iter().skip(1).find(|draft| draft.auto)?;
+    let led_elsewhere = column.original.as_deref().is_some_and(|name| {
+        snapshot
+            .indexes
+            .iter()
+            .any(|index| !index.name.eq_ignore_ascii_case("PRIMARY") && index.columns.first().is_some_and(|first| first.name == name))
+    });
+    (!led_elsewhere).then(|| Risk {
+        level: "warn".to_owned(),
+        text: format!("自增列 {} 不在主键的第一位，也没有别的索引以它开头；服务器会拒绝这种定义。可以把它拖到主键最前面。", column.name.trim()),
+    })
 }
 
 /// PARTITION BY 子句（用于重建整张表的分区方案）。

@@ -201,7 +201,9 @@ pub(super) async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: 
             }
         }
         let protected = origin == "pk" || origin == "u" || name.starts_with("sqlite_autoindex");
-        let reason = if origin == "pk" || name.starts_with("sqlite_autoindex") {
+        // 唯一约束的自动索引也叫 sqlite_autoindex_*：先按 origin 区分，只有主键的那一个算主键索引，
+        // 它的列顺序就是主键顺序。
+        let reason = if origin == "pk" || (origin != "u" && name.starts_with("sqlite_autoindex")) {
             "由主键约束维护".to_owned()
         } else if origin == "u" {
             "由唯一约束维护".to_owned()

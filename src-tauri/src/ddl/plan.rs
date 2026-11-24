@@ -77,6 +77,8 @@ pub fn display_sql(snapshot: &Snapshot) -> String {
             ..ColumnDraft::default()
 })
         .collect();
+    let mut columns = columns;
+    assign_pk_order(snapshot, &mut columns);
     let options = TableOptions { without_rowid: snapshot.without_rowid, strict: snapshot.strict, ..TableOptions::default() };
     match create_statement_for(
         snapshot.engine,
@@ -203,11 +205,18 @@ fn plan_alter(snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft]) -> Plan 
         return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
     }
     let changes = diff_columns(snapshot, drafts);
-    if changes.is_empty() {
+    if changes.is_empty() && primary_key_change(snapshot, drafts).is_none() {
         return finish(snapshot.engine, false, target, vec![NO_COLUMN_CHANGE.to_owned()], risks, Vec::new());
     }
     match dialect_of(snapshot.engine) {
-        Ok(dialect) => dialect.alter_plan(snapshot, table, drafts, &changes, target, risks),
+        Ok(dialect) => {
+            let mut planned = dialect.alter_plan(snapshot, table, drafts, &changes, target, risks);
+            if planned.blocked.is_empty() && primary_key_change(snapshot, drafts).is_some() && !handles_primary_key(&planned) {
+                planned.blocked.push("不能在这里改变主键组成。".to_owned());
+                planned.steps.clear();
+            }
+            planned
+        }
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
 }
@@ -733,7 +742,7 @@ pub fn rebuilt_definition(snapshot: &Snapshot) -> (String, Vec<String>) {
         }
         lines.push(sql);
     }
-    let primary: Vec<String> = snapshot.columns.iter().filter(|column| column.primary).map(|column| quote_ident(engine, &column.name)).collect();
+    let primary: Vec<String> = primary_key_names(snapshot).iter().map(|name| quote_ident(engine, name)).collect();
     let primary_index = snapshot.indexes.iter().find(|index| is_primary_index(index));
     if !primary.is_empty() {
         match primary_index {
@@ -924,9 +933,7 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
             continue;
         }
         let Some(original) = original_of(snapshot, draft) else {
-            if draft.primary {
-                blocked.push(format!("不能给已有表追加主键列 {}。", draft.name.trim()));
-            }
+
             if !draft.nullable && !draft.default.has_value() {
                 if let Some(message) = ddl_of(snapshot.engine).and_then(|dialect| dialect.add_not_null_without_default(draft.name.trim())) {
                     blocked.push(message);
@@ -950,11 +957,9 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
         if original.primary && !same_type(&draft.type_name, &original.type_name) {
             blocked.push(format!("不能在这里修改主键列 {} 的类型。", original.name));
         }
-        if original.primary && draft.nullable != original.nullable {
-            blocked.push(format!("不能在这里修改主键列 {} 的空值约束。", original.name));
-        }
-        if !original.primary && draft.primary {
-            blocked.push(format!("不能把 {} 改成主键。", original.name));
+        // 主键列必须 NOT NULL；移出主键的列可以另改空值约束。读到时就允许 NULL 的旧主键列（SQLite 允许）维持原样。
+        if draft.primary && draft.nullable && !(original.primary && original.nullable) {
+            blocked.push(format!("主键列 {} 不能允许 NULL。", draft.name.trim()));
         }
         if !draft.nullable && original.nullable {
             match snapshot.null_counts.get(&original.name) {
@@ -964,16 +969,37 @@ fn alter_precheck(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<String> {
             }
         }
     }
-    let pk_now: Vec<&str> = snapshot.columns.iter().filter(|column| column.primary).map(|column| column.name.as_str()).collect();
-    let pk_draft: Vec<&str> = drafts.iter().filter(|draft| draft.primary && !draft.dropped).filter_map(|draft| draft.original.as_deref()).collect();
-    if pk_now.len() != pk_draft.len() || pk_now.iter().any(|name| !pk_draft.contains(name)) {
-        blocked.push("不能在这里改变主键组成。".to_owned());
-    }
     blocked
 }
 
+/// 主键变化的说明：新旧主键各是什么，以及会重写整张表、可能失败的情况。
+fn primary_key_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
+    let Some(change) = primary_key_change(snapshot, drafts) else {
+        return Vec::new();
+    };
+    let show = |names: &[String]| format!("({})", names.join(", "));
+    let text = if change.before.is_empty() {
+        format!("添加主键 {}。数据库会重建主键索引并重写整张表，大表耗时较长并锁表。", show(&change.after))
+    } else if change.after.is_empty() {
+        format!("删除主键 {}。数据库会重写整张表，大表耗时较长并锁表。", show(&change.before))
+    } else {
+        format!("主键由 {} 改为 {}。数据库会重建主键索引并重写整张表，大表耗时较长并锁表。", show(&change.before), show(&change.after))
+    };
+    let mut risks = vec![Risk { level: "danger".to_owned(), text }];
+    if !change.after.is_empty() {
+        risks.push(Risk { level: "warn".to_owned(), text: "主键列会变为 NOT NULL；已有 NULL 或重复值时会失败。不会删除或修改任何数据。".to_owned() });
+    }
+    if change.after.is_empty() {
+        risks.push(Risk { level: "warn".to_owned(), text: "去掉主键后，不能在表格里修改或删除已有行。".to_owned() });
+    }
+    if !change.before.is_empty() && snapshot.incoming.iter().any(|key| key.ref_columns.iter().any(|name| change.before.contains(name))) {
+        risks.push(Risk { level: "warn".to_owned(), text: "其他表的外键引用现在的主键；数据库可能拒绝删除旧主键。".to_owned() });
+    }
+    risks
+}
+
 fn alter_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
-    let mut risks = Vec::new();
+    let mut risks = primary_key_risks(snapshot, drafts);
     for draft in drafts {
         if draft.dropped {
             if let Some(original) = original_of(snapshot, draft) {
@@ -1029,6 +1055,9 @@ fn alter_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
 fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) -> Vec<String> {
     let engine = snapshot.engine;
     let mut blocked = Vec::new();
+    // 只把单列整数主键写成自增的方言：联合主键里的自增会被静默丢掉，先拦下。
+    let single_column_auto_key = ddl_of(engine).is_some_and(|dialect| dialect.inline_autoincrement_primary_key());
+    let primary_count = primary_key_drafts(columns).len();
     let mut names = Vec::new();
     for (index, column) in columns.iter().enumerate() {
         if column.dropped {
@@ -1057,8 +1086,11 @@ fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) 
                 blocked.push(problem);
             }
         }
-        if create && column.auto && !column.primary {
+        if column.auto && !column.primary && !auto_keyed_elsewhere(snapshot, column, create) {
             blocked.push(format!("字段 {name} 只有主键才能自增。"));
+        }
+        if column.auto && column.primary && single_column_auto_key && primary_count > 1 {
+            blocked.push(format!("字段 {name} 自增时主键只能有这一列。"));
         }
         // 专有形态在预览前就能判断的问题：生成列缺表达式、生成列同时自增或带默认值、ENUM/SET 没有候选值。
         if let Some(generated) = &column.generated {
@@ -1079,6 +1111,31 @@ fn validate_columns(snapshot: &Snapshot, columns: &[ColumnDraft], create: bool) 
         }
     }
     blocked
+}
+
+/// 已有自增列移出主键（或本来就不在主键里）时能否保留自增。新建表、新加的列和刚打开自增的列都必须在主键里。
+/// 已经不在主键里的自增列维持现状；把自增列移出主键时，它还得是另一个索引的第一列（有的引擎要求自增列是键的开头）。
+pub(crate) fn auto_keyed_elsewhere(snapshot: &Snapshot, column: &ColumnDraft, create: bool) -> bool {
+    if create {
+        return false;
+    }
+    let Some(original) = original_of(snapshot, column) else {
+        return false;
+    };
+    if !original.auto {
+        return false;
+    }
+    if !original.primary {
+        return true;
+    }
+    // 只把单列整数主键写成自增的方言：移出主键就保不住自增。
+    if ddl_of(snapshot.engine).is_some_and(|dialect| dialect.inline_autoincrement_primary_key()) {
+        return false;
+    }
+    snapshot
+        .indexes
+        .iter()
+        .any(|index| !is_primary_index(index) && index.columns.first().is_some_and(|first| first.name == original.name))
 }
 
 fn validate_fk(snapshot: &Snapshot, foreign_key: &ForeignKeyDraft) -> Vec<String> {
@@ -1192,7 +1249,7 @@ pub(crate) fn create_statement_for(
     let dialect = dialect_of(engine)?;
     let qualified = dialect.create_table_name(database, schema, table)?;
     let kept: Vec<&ColumnDraft> = drafts.iter().filter(|draft| !draft.dropped).collect();
-    let pk: Vec<&ColumnDraft> = kept.iter().copied().filter(|draft| draft.primary).collect();
+    let pk: Vec<&ColumnDraft> = primary_key_drafts(drafts);
     let single_auto = dialect.inline_autoincrement_primary_key()
         && pk.len() == 1
         && (pk[0].auto || autoincrement)
@@ -1424,7 +1481,7 @@ pub(crate) fn renamed_any(drafts: &[ColumnDraft]) -> bool {
 }
 
 pub(crate) fn identity_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
-    snapshot
+    let mut drafts: Vec<ColumnDraft> = snapshot
         .columns
         .iter()
         .map(|column| ColumnDraft {
@@ -1439,7 +1496,79 @@ pub(crate) fn identity_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             dropped: false,
             ..ColumnDraft::default()
 })
-        .collect()
+        .collect();
+    assign_pk_order(snapshot, &mut drafts);
+    drafts
+}
+
+/// 草稿里保留下来的主键列，按主键顺序：先按 `pk_order`，没有设置的按字段顺序排在后面。
+pub(crate) fn primary_key_drafts(drafts: &[ColumnDraft]) -> Vec<&ColumnDraft> {
+    let mut pk: Vec<&ColumnDraft> = drafts.iter().filter(|draft| draft.primary && !draft.dropped).collect();
+    // 稳定排序：同序号（含都没设）的列保持字段顺序。
+    pk.sort_by_key(|draft| draft.pk_order.unwrap_or(u16::MAX));
+    pk
+}
+
+/// 已有表的主键列名，按主键顺序。读到的主键索引与列上的主键标记一致时按索引的列顺序，否则按字段顺序。
+pub(crate) fn primary_key_names(snapshot: &Snapshot) -> Vec<String> {
+    let flagged: Vec<&str> = snapshot.columns.iter().filter(|column| column.primary).map(|column| column.name.as_str()).collect();
+    if let Some(index) = snapshot.indexes.iter().find(|index| is_primary_index(index)) {
+        let ordered: Vec<&str> = index.columns.iter().map(|column| column.name.as_str()).collect();
+        if !ordered.is_empty() && same_set(&ordered, &flagged) {
+            return ordered.into_iter().map(str::to_owned).collect();
+        }
+    }
+    flagged.into_iter().map(str::to_owned).collect()
+}
+
+/// 按快照起稿的草稿填上主键顺序（按 `original` 对应）。
+pub(crate) fn assign_pk_order(snapshot: &Snapshot, drafts: &mut [ColumnDraft]) {
+    let order = primary_key_names(snapshot);
+    for draft in drafts.iter_mut() {
+        draft.pk_order = draft
+            .original
+            .as_deref()
+            .filter(|_| draft.primary)
+            .and_then(|name| order.iter().position(|item| item == name))
+            .and_then(|position| u16::try_from(position).ok());
+    }
+}
+
+/// 改表草稿相对现状的主键变化。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrimaryKeyChange {
+    /// 现在的主键列（原列名，按主键顺序）。为空表示表上还没有主键。
+    pub before: Vec<String>,
+    /// 改完后的主键列（新列名，按主键顺序）。为空表示去掉主键。
+    pub after: Vec<String>,
+    /// 现有主键约束（或索引）的名字；没有读到时为 None。
+    pub constraint: Option<String>,
+}
+
+/// 草稿改变了主键的组成或顺序时给出变化；只是给主键列改名不算。
+pub(crate) fn primary_key_change(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Option<PrimaryKeyChange> {
+    let before = primary_key_names(snapshot);
+    let wanted = primary_key_drafts(drafts);
+    let same = wanted.len() == before.len() && wanted.iter().zip(&before).all(|(draft, name)| draft.original.as_deref() == Some(name.as_str()));
+    if same {
+        return None;
+    }
+    Some(PrimaryKeyChange {
+        before,
+        after: wanted.iter().map(|draft| draft.name.trim().to_owned()).collect(),
+        constraint: snapshot.indexes.iter().find(|index| is_primary_index(index)).map(|index| index.name.clone()),
+    })
+}
+
+/// 改主键步骤的名字。方言在字段页改主键时用这几个名字标出步骤；计划里没有它们（也不是重建）时，
+/// 说明这个方言没有处理主键变化，计划层按“不能在这里改主键”拦下，不生成只改了字段的半套语句。
+pub(crate) const PK_ALTER_LABEL: &str = "修改主键";
+pub(crate) const PK_ALTER_WITH_COLUMNS_LABEL: &str = "修改字段并调整主键";
+pub(crate) const PK_DROP_LABEL: &str = "删除旧主键";
+pub(crate) const PK_ADD_LABEL: &str = "添加主键";
+
+fn handles_primary_key(plan: &Plan) -> bool {
+    plan.rebuild || plan.steps.iter().any(|step| [PK_ALTER_LABEL, PK_ALTER_WITH_COLUMNS_LABEL, PK_DROP_LABEL, PK_ADD_LABEL].contains(&step.label.as_str()))
 }
 
 fn fk_from_draft(draft: &ForeignKeyDraft) -> ForeignKey {

@@ -786,6 +786,9 @@ pub struct ColumnDraft {
     #[serde(default)]
     pub comment: String,
     pub primary: bool,
+    /// 这一列在主键里的位置（从 0 起）。None 时按字段顺序排在设了位置的列之后。
+    #[serde(default)]
+    pub pk_order: Option<u16>,
     pub auto: bool,
     pub dropped: bool,
     /// ENUM/SET 字段的候选值。None 表示这列不是 ENUM/SET，类型仍按 `type_name` 原文。

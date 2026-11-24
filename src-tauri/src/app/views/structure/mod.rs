@@ -60,7 +60,7 @@ fn default_id(engine: &str) -> ColumnDraft {
 }
 
 fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
-    snapshot
+    let mut drafts: Vec<ColumnDraft> = snapshot
         .columns
         .iter()
         .map(|column| ColumnDraft {
@@ -71,6 +71,7 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
             default: existing_default(snapshot.engine, column.default_sql.as_deref()),
             comment: String::new(),
             primary: column.primary,
+            pk_order: None,
             auto: column.auto,
             dropped: false,
             // 专有形态按读回的实际定义起稿：只改候选值、表达式或存储方式时草稿里也有完整定义，
@@ -81,7 +82,9 @@ fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
                 .get(&column.name)
                 .map(|state| GeneratedColumnDraft { expression: state.expression.clone(), storage: state.storage }),
         })
-        .collect()
+        .collect();
+    crate::ddl::plan::assign_pk_order(snapshot, &mut drafts);
+    drafts
 }
 
 /// 外键可以引用另一个模式里的表时，结构页显示目标模式。
@@ -1781,9 +1784,17 @@ impl StructurePane {
             draft.primary = before.primary;
             draft.auto = before.auto;
             draft.dropped = false;
+            // 主键位置回到原来的序号；其余主键列随后重新排号。
+            draft.pk_order = self
+                .snapshot
+                .as_ref()
+                .filter(|_| before.primary)
+                .and_then(|snapshot| crate::ddl::plan::primary_key_names(snapshot).iter().position(|name| *name == original_name))
+                .and_then(|position| u16::try_from(position).ok());
             // 还原也要连同专有形态一起还原：否则“还原”之后候选值或表达式还留着上一次的输入。
             draft.enum_set = enum_set;
             draft.generated = generated;
+            primary_key::normalize_pk_order(&mut self.session.kept_columns);
             self.session.cancel();
         }
     }
@@ -1799,19 +1810,20 @@ impl StructurePane {
                 return;
             }
         }
+        if which == "primary" {
+            // 新建表与已有表都可以勾选主键：顺序记在 pk_order 里，勾上时自动设为 NOT NULL。
+            let Some(on) = self.session.kept_columns.get(index).map(|column| !column.primary) else {
+                return;
+            };
+            if self.session.kept_columns.get(index).is_some_and(|column| column.dropped || column.generated.is_some()) {
+                return;
+            }
+            self.set_primary(index, on);
+            return;
+        }
         let changed = self.edit_column(index, |column| match which {
             "null" => {
                 column.nullable = !column.nullable;
-                true
-            }
-            "primary" if create => {
-                column.primary = !column.primary;
-                if column.primary {
-                    column.nullable = false;
-                    if column.default == DefaultSpec::Null {
-                        column.default = DefaultSpec::None;
-                    }
-                }
                 true
             }
             "auto" if create => {
@@ -1950,6 +1962,20 @@ impl StructurePane {
         } else {
             self.session.index_columns.push(IndexColumnDraft { name: name.to_owned(), descending: false, prefix: None });
         }
+        self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
+        self.sync_auto_index_name();
+        self.session.intent = EditIntent::Apply;
+        self.session.cancel();
+    }
+
+    /// 拖放：把已选的第 `from` 列移到第 `to` 个位置。
+    pub fn move_index_column_to(&mut self, from: usize, to: usize) {
+        let len = self.session.index_columns.len();
+        if from == to || from >= len || to >= len {
+            return;
+        }
+        let column = self.session.index_columns.remove(from);
+        self.session.index_columns.insert(to, column);
         self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
         self.sync_auto_index_name();
         self.session.intent = EditIntent::Apply;
@@ -2664,6 +2690,7 @@ impl StructurePane {
         match action {
             RowAction::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             RowAction::ToggleColumnDrop(index) => self.toggle_column(index, "drop"),
+            RowAction::TogglePrimary(index) => self.toggle_column(index, "primary"),
             RowAction::RevertColumn(index) => self.revert_column(index),
             RowAction::AddColumn => self.add_column(),
             RowAction::EditIndex(name) => {
@@ -2738,7 +2765,7 @@ impl StructurePane {
                     }
                 }
             }
-            if create && col.auto && !col.primary {
+            if col.auto && !col.primary && !self.snapshot.as_ref().is_some_and(|snap| crate::ddl::plan::auto_keyed_elsewhere(snap, col, create)) {
                 let text = i18n::fill(&i18n::text(locale, "structure.diag.autoNotPk"), &[("name", trimmed)]);
                 issues.push(DraftIssue { row, field: IssueField::Auto, text });
                 continue;
@@ -3100,6 +3127,7 @@ struct MenuEntry {
 enum RowAction {
     Copy(String),
     ToggleColumnDrop(usize),
+    TogglePrimary(usize),
     RevertColumn(usize),
     AddColumn,
     EditIndex(String),
@@ -3564,6 +3592,7 @@ impl StructurePane {
         let changed = before.name != column.name
             || !before.type_name.eq_ignore_ascii_case(&column.type_name)
             || before.nullable != column.nullable
+            || before.primary != column.primary
             || existing_default(engine, before.default_sql.as_deref()) != column.default
             || shape;
         if changed { ColumnChange::Modified } else { ColumnChange::Clean }
@@ -3573,7 +3602,9 @@ impl StructurePane {
         if self.session.mode == StructureMode::Create {
             return 0;
         }
-        self.session.kept_columns.iter().filter(|column| self.column_change(column) != ColumnChange::Clean).count()
+        let changed = self.session.kept_columns.iter().filter(|column| self.column_change(column) != ColumnChange::Clean).count();
+        // 只调了主键顺序时没有哪一列算“已改”，但仍是一处待应用的变更。
+        if changed == 0 && self.primary_key_changed() { 1 } else { changed }
     }
 
     fn column_matches_filter(&self, column: &ColumnDraft, change: ColumnChange) -> bool {
@@ -3813,6 +3844,9 @@ impl StructurePane {
                 );
             }
         }
+
+        // 主键条：PRIMARY KEY (a, b)，可拖动调整主键顺序；新建表与已有表都显示。
+        editor = editor.child(self.primary_key_strip(&entity, &p, cx));
 
         if !create {
             // 已有表：先读后改。虚拟列表只渲染可见行，点哪一行就只编辑哪一行。
@@ -4221,6 +4255,9 @@ impl StructurePane {
         };
 
         let show_inline_badge = !create && widths.name_min >= 130. && (orig_auto || orig_generated);
+        let slot_icon_missing = slot_icon.is_none();
+        // 联合主键时在名称旁标出这一列在主键里的序号。
+        let pk_badge = self.primary_key_position(index).filter(|_| self.primary_key_order().len() > 1);
         let menu_owner = entity.clone();
 
         let mut row = div()
@@ -4266,12 +4303,54 @@ impl StructurePane {
                             .items_center()
                             .justify_center()
                             .when_some(slot_icon.filter(|_| !create), |this, (ic, color, tip)| {
+                                // 已有表编辑行：图标槽就是主键开关，点一下加入或移出主键。
+                                let pk_owner = entity.clone();
+                                let can_toggle = !dropped && !orig_generated;
+                                let (ic, color) = if column.primary { (IconName::Key, p.warn) } else if issue.is_some() { (ic, color) } else { (IconName::Key, p.text_faint) };
+                                let pk_tip = if column.primary { i18n::text(locale, "structure.pk.remove") } else { i18n::text(locale, "structure.pk.makePrimary") };
                                 this.child(
                                     div()
                                         .id(SharedString::from(format!("structure-col-mark-{index}")))
                                         .test_support()
-                                        .tooltip_text(SharedString::from(tip))
+                                        .role(gpui_kit::Role::CheckBox)
+                                        .aria_selected(column.primary)
+                                        .aria_label(SharedString::from(pk_tip.clone()))
+                                        .when(can_toggle, |this| this.cursor_pointer())
+                                        .tooltip_text(SharedString::from(format!("{pk_tip}\n{tip}")))
+                                        .when(can_toggle, |this| {
+                                            this.on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                pk_owner.update(cx, |pane, cx| {
+                                                    pane.toggle_column(index, "primary");
+                                                    cx.notify();
+                                                });
+                                            })
+                                        })
                                         .child(kit::icon(ic, 12., color)),
+                                )
+                            })
+                            .when(!create && slot_icon_missing, |this| {
+                                let pk_owner = entity.clone();
+                                let can_toggle = !dropped && !orig_generated;
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!("structure-col-mark-{index}")))
+                                        .test_support()
+                                        .role(gpui_kit::Role::CheckBox)
+                                        .aria_selected(false)
+                                        .aria_label(t("structure.pk.makePrimary"))
+                                        .when(can_toggle, |this| this.cursor_pointer())
+                                        .tooltip_text(t("structure.pk.makePrimary"))
+                                        .when(can_toggle, |this| {
+                                            this.on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                pk_owner.update(cx, |pane, cx| {
+                                                    pane.toggle_column(index, "primary");
+                                                    cx.notify();
+                                                });
+                                            })
+                                        })
+                                        .child(kit::icon(IconName::Key, 12., p.text_faint)),
                                 )
                             })
                             .when(create, |this| {
@@ -4289,6 +4368,7 @@ impl StructurePane {
                             }),
                     )
                     .child(div().flex_1().min_w_0().when(dropped, |this| this.opacity(0.5).line_through()).child(name))
+                    .when_some(pk_badge, |this, position| this.child(kit::pill(SharedString::from(format!("PK{position}")), p.warn, p.warn_soft)))
                     .when(show_inline_badge, |this| {
                         let key = if orig_generated { "structure.field.badgeGen" } else { "structure.field.badgeAuto" };
                         this.child(kit::pill(t(key), p.text_muted, p.hover))
@@ -4521,19 +4601,42 @@ impl StructurePane {
                 );
                 let picker = self.ensure_index_picker(&names, window, cx);
                 let ordered = self.index_order_list(&entity, &selected, kind, features.prefix, &p, window, cx);
-                form = form.child(kit::form_row(
-                    t("structure.section.columns"),
+                // 左右两栏：左边是可搜索的可选字段，右边是已选字段（可拖动排序，设方向与前缀长度）。
+                // 两栏都在表单里原地展开，不弹浮层；底部的预览操作栏固定在滚动区之外。
+                let selected_label = i18n::fill(&i18n::text(locale, "structure.index.selected"), &[("count", &selected.len().to_string())]);
+                form = form.child(
                     div()
                         .id("structure-index-columns")
                         .test_support()
+                        .w_full()
                         .flex()
-                        .flex_wrap()
                         .items_start()
                         .gap(px(kit::Space::LG))
-                        .child(div().flex_none().child(picker))
-                        .child(ordered),
-                    &p,
-                ));
+                        .child(
+                            div()
+                                .id("structure-index-available")
+                                .test_support()
+                                .flex_none()
+                                .w(px(ControlSize::PICKER_MIN_W))
+                                .flex()
+                                .flex_col()
+                                .gap(px(kit::Space::XS))
+                                .child(kit::eyebrow(t("structure.index.available"), &p))
+                                .child(picker),
+                        )
+                        .child(
+                            div()
+                                .id("structure-index-selected")
+                                .test_support()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(kit::Space::XS))
+                                .child(kit::eyebrow(SharedString::from(selected_label), &p))
+                                .child(ordered),
+                        ),
+                );
                 if features.comment {
                     let comment_value = self.session.index_comment.clone();
                     let placeholder = i18n::text(locale, "structure.index.commentHint");
@@ -6068,6 +6171,7 @@ impl StructurePane {
 
 mod browse;
 mod create;
+mod primary_key;
 pub(crate) mod receipt;
 mod special;
 

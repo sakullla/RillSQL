@@ -9,7 +9,9 @@ use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{
     Action, ColumnDraft, EnumSetDraft, GeneratedColumnDraft, Index, IndexDraft, IndexKind, LiteralQuoting, Plan, Request, Risk, Snapshot, Step, TableOptions,
 };
-use crate::ddl::plan::{column_sql_for, finish, is_word, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind};
+use crate::ddl::plan::{
+    column_sql_for, finish, is_word, primary_key_change, statement_alter_plan, symbol_is, target_label, word_is, Change, Tok, TokKind,
+};
 use crate::ddl::sql::{qualified_table, valid_name};
 
 use super::{ddl_read, object_ddl, object_read, profile::MysqlProfile, table_ddl};
@@ -95,6 +97,16 @@ impl DdlDialect for MysqlDdl {
         // 服务器版本不支持草稿里的专有形态时在预览前阻断，不生成会被服务器拒绝的语句。
         if let Some(problem) = self.shape_capability_problem(snapshot, drafts) {
             return finish(engine, false, target, vec![problem], risks, Vec::new());
+        }
+        // 主键变了：字段变更与 DROP PRIMARY KEY, ADD PRIMARY KEY 合成一条 ALTER TABLE。
+        // 自增列不会在中间暂时没有键，语句失败时整条不生效。
+        if let Some(change) = primary_key_change(snapshot, drafts) {
+            let mut risks = risks;
+            risks.extend(table_ddl::auto_not_leading_risk(snapshot, drafts));
+            return match table_ddl::mysql_alter_with_primary_key(engine, snapshot, table, changes, &change) {
+                Ok(step) => finish(engine, false, target, Vec::new(), risks, vec![step]),
+                Err(message) => finish(engine, false, target, vec![message], risks, Vec::new()),
+            };
         }
         statement_alter_plan(snapshot, table, changes, target, risks, "ADD COLUMN", &|qualified, original, draft| {
             // CHANGE COLUMN 按完整的新定义一次改名、改类型、改可空、默认值与专有形态。

@@ -196,3 +196,74 @@ async fn round_trip(live: Live) {
     live.run(Action::DropTable { table }).await;
     println!("index-live: {} 全部用例完成", live.engine_name());
 }
+
+/// 联合主键（R13）：用通用夹具 shop.order_lines 的副本，把单列主键经预览改成联合主键、再调换顺序；
+/// 读回后字段页（列上的主键标记与主键序号）和索引页（PRIMARY 的列顺序）都显示联合主键。
+#[test]
+#[ignore = "需要 docker/compose.yaml 的 MySQL（3306）与 MariaDB（3307），以及 mysql-ux-round3.sql 的 shop.order_lines"]
+fn composite_primary_key_change_goes_through_preview_on_real_servers() {
+    let wanted = std::env::var("RILLSQL_INDEX_LIVE_ENGINES").unwrap_or_else(|_| "mysql,mariadb".to_owned());
+    let mut engines = Vec::new();
+    if wanted.contains("mysql") {
+        engines.push((Engine::Mysql, std::env::var("RILLSQL_LIVE_MYSQL_PORT").unwrap_or_else(|_| "3306".to_owned())));
+    }
+    if wanted.contains("mariadb") {
+        engines.push((Engine::Mariadb, std::env::var("RILLSQL_LIVE_MARIADB_PORT").unwrap_or_else(|_| "3307".to_owned())));
+    }
+    assert!(!engines.is_empty(), "RILLSQL_INDEX_LIVE_ENGINES 没有选中任何引擎");
+    crate::app::shell::jobs::runtime().block_on(async move {
+        for (engine, port) in engines {
+            composite_primary_key(Live::connect(engine, port).await).await;
+        }
+    });
+}
+
+fn with_primary_key(snapshot: &Snapshot, order: &[&str]) -> Vec<ColumnDraft> {
+    let mut drafts = crate::ddl::plan::identity_drafts(snapshot);
+    for draft in &mut drafts {
+        let position = order.iter().position(|name| *name == draft.name);
+        draft.primary = position.is_some();
+        draft.pk_order = position.map(|value| value as u16);
+    }
+    drafts
+}
+
+fn primary_columns(snapshot: &Snapshot) -> Vec<String> {
+    snapshot.indexes.iter().find(|index| index.name == "PRIMARY").map(|index| index.columns.iter().map(|column| column.name.clone()).collect()).unwrap_or_default()
+}
+
+async fn composite_primary_key(live: Live) {
+    let table = format!("order_lines_pk_{}_{}", live.engine.as_str(), std::process::id());
+    live.raw(&format!("DROP TABLE IF EXISTS `{table}`")).await;
+    live.raw(&format!("CREATE TABLE `{table}` LIKE shop.order_lines")).await;
+    live.raw(&format!("INSERT INTO `{table}` SELECT * FROM shop.order_lines")).await;
+    // 起点：单列主键 sku。
+    live.raw(&format!("ALTER TABLE `{table}` DROP PRIMARY KEY, ADD PRIMARY KEY (sku)")).await;
+    let single = live.describe(&table).await;
+    assert_eq!(primary_columns(&single), vec!["sku"]);
+
+    // 单列主键改成联合主键：一条 DROP PRIMARY KEY, ADD PRIMARY KEY，带危险确认的风险说明。
+    let plan = live.run(Action::AlterColumns { table: table.clone(), columns: with_primary_key(&single, &["order_id", "line_no"]) }).await;
+    assert_eq!(plan.steps.len(), 1);
+    assert!(plan.steps[0].sql.ends_with("DROP PRIMARY KEY, ADD PRIMARY KEY (order_id, line_no);"), "{}", plan.steps[0].sql);
+    assert!(plan.risks.iter().any(|risk| risk.level == "danger"), "{:?}", plan.risks);
+    let composite = live.describe(&table).await;
+    assert_eq!(primary_columns(&composite), vec!["order_id", "line_no"], "索引页：PRIMARY 按新顺序");
+    let flagged: Vec<&str> = composite.columns.iter().filter(|column| column.primary).map(|column| column.name.as_str()).collect();
+    assert_eq!(flagged, vec!["order_id", "line_no"], "字段页：两列都标为主键");
+    let drafts = crate::ddl::plan::identity_drafts(&composite);
+    let orders: Vec<(&str, Option<u16>)> = drafts.iter().filter(|draft| draft.primary).map(|draft| (draft.name.as_str(), draft.pk_order)).collect();
+    assert_eq!(orders, vec![("order_id", Some(0)), ("line_no", Some(1))], "字段页的主键序号");
+
+    // 只调换主键顺序。
+    let plan = live.run(Action::AlterColumns { table: table.clone(), columns: with_primary_key(&composite, &["line_no", "order_id"]) }).await;
+    assert!(plan.steps[0].sql.ends_with("DROP PRIMARY KEY, ADD PRIMARY KEY (line_no, order_id);"), "{}", plan.steps[0].sql);
+    let swapped = live.describe(&table).await;
+    assert_eq!(primary_columns(&swapped), vec!["line_no", "order_id"]);
+    let drafts = crate::ddl::plan::identity_drafts(&swapped);
+    let orders: Vec<(&str, Option<u16>)> = drafts.iter().filter(|draft| draft.primary).map(|draft| (draft.name.as_str(), draft.pk_order)).collect();
+    assert_eq!(orders, vec![("order_id", Some(1)), ("line_no", Some(0))]);
+
+    live.run(Action::DropTable { table }).await;
+    println!("pk-live: {} 联合主键用例完成", live.engine_name());
+}

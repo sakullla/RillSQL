@@ -6,7 +6,7 @@ use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::ddl::introspect::SESSION_MISMATCH;
 use crate::ddl::model::{Action, Column, ColumnDraft, Plan, Request, Risk, SequenceState, Snapshot, Step};
-use crate::ddl::plan::{default_changed, finish, same_type, statement_alter_plan, target_label, word_is, Change, Tok};
+use crate::ddl::plan::{default_changed, finish, primary_key_change, same_type, statement_alter_plan, target_label, word_is, Change, PrimaryKeyChange, Tok, PK_ADD_LABEL, PK_DROP_LABEL};
 use crate::ddl::sql::{default_sql, qualified_table, valid_default, valid_name};
 
 use super::ddl_read;
@@ -38,8 +38,35 @@ impl DdlDialect for PostgresDdl {
         }
     }
 
-    fn alter_plan(&self, snapshot: &Snapshot, table: &str, _drafts: &[ColumnDraft], changes: &[Change], target: String, risks: Vec<Risk>) -> Plan {
-        statement_alter_plan(snapshot, table, changes, target, risks, "ADD COLUMN", &|qualified, original, draft| modify_column(qualified, original, draft))
+    fn alter_plan(&self, snapshot: &Snapshot, table: &str, drafts: &[ColumnDraft], changes: &[Change], target: String, mut risks: Vec<Risk>) -> Plan {
+        let primary = primary_key_change(snapshot, drafts);
+        if primary.as_ref().is_some_and(|change| !change.before.is_empty()) {
+            risks.insert(
+                0,
+                Risk {
+                    level: "warn".to_owned(),
+                    text: "这不是原子操作：先删除旧主键，再改字段，最后添加新主键；中途失败时表可能暂时没有主键，需要手动补上。".to_owned(),
+                },
+            );
+        }
+        let mut plan =
+            statement_alter_plan(snapshot, table, changes, target, risks, "ADD COLUMN", &|qualified, original, draft| modify_column(qualified, original, draft));
+        let Some(change) = primary.filter(|_| plan.blocked.is_empty()) else {
+            return plan;
+        };
+        match primary_key_steps(snapshot, table, &change) {
+            Ok((drop, add)) => {
+                if let Some(step) = drop {
+                    plan.steps.insert(0, step);
+                }
+                plan.steps.extend(add);
+            }
+            Err(message) => {
+                plan.blocked.push(message);
+                plan.steps.clear();
+            }
+        }
+        plan
     }
 
     fn drop_index_sql(&self, snapshot: &Snapshot, index: &str) -> Result<String, String> {
@@ -431,4 +458,23 @@ fn plan_alter_domain(snapshot: &Snapshot, domain: &str, default_sql: Option<&str
         }
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
+}
+
+/// 改主键的两步：删除旧主键约束（原来有主键时）与按新顺序添加主键（沿用原约束名）。
+fn primary_key_steps(snapshot: &Snapshot, table: &str, change: &PrimaryKeyChange) -> Result<(Option<Step>, Option<Step>), String> {
+    let qualified = qualified_table(Engine::Postgres, &snapshot.database, &snapshot.schema, table)?;
+    let drop = if change.before.is_empty() {
+        None
+    } else {
+        let Some(name) = change.constraint.as_deref() else {
+            return Err("没有读到主键约束的名字，不能删除旧主键。".to_owned());
+        };
+        Some(Step { sql: format!("ALTER TABLE {qualified} DROP CONSTRAINT {};", quote_ident(Engine::Postgres, name)), label: PK_DROP_LABEL.to_owned() })
+    };
+    let add = (!change.after.is_empty()).then(|| {
+        let names = change.after.iter().map(|name| quote_ident(Engine::Postgres, name)).collect::<Vec<_>>().join(", ");
+        let constraint = change.constraint.as_deref().map(|name| format!("CONSTRAINT {} ", quote_ident(Engine::Postgres, name))).unwrap_or_default();
+        Step { sql: format!("ALTER TABLE {qualified} ADD {constraint}PRIMARY KEY ({names});"), label: PK_ADD_LABEL.to_owned() }
+    });
+    Ok((drop, add))
 }

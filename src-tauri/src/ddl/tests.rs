@@ -2628,3 +2628,273 @@ fn create_index_action_deserializes_old_and_new_shapes() {
         other => panic!("{other:?}"),
     }
 }
+
+// ---- 主键与联合主键（R13） ----
+
+fn pk_index(name: &str, columns: &[&str]) -> Index {
+    Index {
+        name: name.to_owned(),
+        unique: true,
+        columns: columns.iter().map(|column| IndexColumn { name: (*column).to_owned(), descending: false, prefix: None }).collect(),
+        protected: true,
+        reason: "由主键约束维护".to_owned(),
+        kind: IndexKind::Primary,
+        ..Default::default()
+    }
+}
+
+/// 通用夹具 order_lines：单列主键 id 起步，另有 order_id、line_no 两列。
+fn order_lines(engine: Engine) -> Snapshot {
+    let (database, schema) = match engine {
+        Engine::Postgres => ("shop", "public"),
+        Engine::Sqlite => ("main", ""),
+        _ => ("shop", ""),
+    };
+    let mut snapshot = Snapshot::bare(engine, database, schema, "order_lines");
+    snapshot.columns = vec![column("id", "int", false, true), column("order_id", "int", false, false), column("line_no", "int", false, false)];
+    let pk_name = match engine {
+        Engine::Postgres => "order_lines_pkey",
+        Engine::Sqlite => "sqlite_autoindex_order_lines_1",
+        _ => "PRIMARY",
+    };
+    snapshot.indexes = vec![pk_index(pk_name, &["id"])];
+    snapshot.table_sql = "CREATE TABLE order_lines (id int NOT NULL, order_id int NOT NULL, line_no int NOT NULL, PRIMARY KEY (id))".to_owned();
+    snapshot.row_count = Some(3);
+    snapshot
+}
+
+/// 还不存在的新表。
+fn fresh_table(engine: Engine) -> Snapshot {
+    let mut snapshot = Snapshot::bare(engine, "shop", "", "order_lines");
+    snapshot.object_exists = false;
+    snapshot
+}
+
+fn drafts_of_snapshot(snapshot: &Snapshot) -> Vec<ColumnDraft> {
+    super::plan::identity_drafts(snapshot)
+}
+
+fn set_pk(drafts: &mut [ColumnDraft], order: &[&str]) {
+    for draft in drafts.iter_mut() {
+        let position = order.iter().position(|name| *name == draft.name);
+        draft.primary = position.is_some();
+        draft.pk_order = position.map(|value| value as u16);
+        if draft.primary {
+            draft.nullable = false;
+        }
+    }
+}
+
+#[test]
+fn mysql_create_table_writes_the_primary_key_in_pk_order() {
+    let snapshot = fresh_table(Engine::Mysql);
+    let mut columns = vec![new_column("a", "int", false, DefaultSpec::None), new_column("b", "int", false, DefaultSpec::None)];
+    columns[0].primary = true;
+    columns[0].pk_order = Some(1);
+    columns[1].primary = true;
+    columns[1].pk_order = Some(0);
+    let planned = plan(&snapshot, &Action::CreateTable { name: "order_lines".to_owned(), columns, options: TableOptions::default() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert!(planned.steps[0].sql.contains("PRIMARY KEY (`b`, `a`)") || planned.steps[0].sql.contains("PRIMARY KEY (b, a)"), "{}", planned.steps[0].sql);
+}
+
+#[test]
+fn create_table_without_pk_order_keeps_column_order() {
+    let snapshot = fresh_table(Engine::Mysql);
+    let mut columns = vec![new_column("a", "int", false, DefaultSpec::None), new_column("b", "int", false, DefaultSpec::None)];
+    columns[0].primary = true;
+    columns[1].primary = true;
+    let planned = plan(&snapshot, &Action::CreateTable { name: "order_lines".to_owned(), columns, options: TableOptions::default() });
+    assert!(planned.steps[0].sql.contains("PRIMARY KEY (a, b)"), "{}", planned.steps[0].sql);
+}
+
+#[test]
+fn mysql_single_primary_key_to_composite_is_one_alter_with_drop_and_add() {
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        let snapshot = order_lines(engine);
+        let mut drafts = drafts_of_snapshot(&snapshot);
+        set_pk(&mut drafts, &["order_id", "line_no"]);
+        let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+        assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+        assert_eq!(planned.steps.len(), 1);
+        assert_eq!(planned.steps[0].sql, "ALTER TABLE shop.order_lines DROP PRIMARY KEY, ADD PRIMARY KEY (order_id, line_no);");
+        // 改主键要走危险确认，并说明会重写整张表。
+        assert!(planned.risks.iter().any(|risk| risk.level == "danger" && risk.text.contains("重写整张表")), "{:?}", planned.risks);
+    }
+}
+
+#[test]
+fn mysql_reordering_the_primary_key_is_a_change() {
+    let mut snapshot = order_lines(Engine::Mysql);
+    for column in &mut snapshot.columns {
+        column.primary = column.name != "id";
+    }
+    snapshot.indexes = vec![pk_index("PRIMARY", &["order_id", "line_no"])];
+    let drafts = drafts_of_snapshot(&snapshot);
+    assert_eq!(drafts.iter().map(|draft| draft.pk_order).collect::<Vec<_>>(), vec![None, Some(0), Some(1)]);
+    // 不动主键：没有变更。
+    let same = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts.clone() });
+    assert!(same.blocked.iter().any(|item| super::plan::is_no_change(item)), "{:?}", same.blocked);
+    // 只换主键顺序。
+    let mut swapped = drafts;
+    set_pk(&mut swapped, &["line_no", "order_id"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: swapped });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "ALTER TABLE shop.order_lines DROP PRIMARY KEY, ADD PRIMARY KEY (line_no, order_id);");
+}
+
+#[test]
+fn mysql_primary_key_change_rides_with_column_changes_in_one_statement() {
+    let snapshot = order_lines(Engine::Mysql);
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    drafts[1].name = "order_ref".to_owned();
+    let mut added = new_column("batch", "int", false, DefaultSpec::Literal("0".to_owned()));
+    added.primary = true;
+    drafts.push(added);
+    set_pk(&mut drafts, &["order_ref", "batch"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps.len(), 1);
+    let sql = &planned.steps[0].sql;
+    assert!(sql.starts_with("ALTER TABLE shop.order_lines CHANGE COLUMN order_id order_ref int NOT NULL, ADD COLUMN batch int NOT NULL DEFAULT"), "{sql}");
+    assert!(sql.ends_with("DROP PRIMARY KEY, ADD PRIMARY KEY (order_ref, batch);"), "{sql}");
+}
+
+#[test]
+fn auto_increment_inside_a_composite_primary_key_passes_validation() {
+    // 新建表：自增列在联合主键里。
+    let snapshot = fresh_table(Engine::Mysql);
+    let mut id = new_column("id", "bigint", false, DefaultSpec::None);
+    id.primary = true;
+    id.auto = true;
+    id.pk_order = Some(0);
+    let mut line = new_column("line_no", "int", false, DefaultSpec::None);
+    line.primary = true;
+    line.pk_order = Some(1);
+    let planned = plan(&snapshot, &Action::CreateTable { name: "order_lines".to_owned(), columns: vec![id.clone(), line.clone()], options: TableOptions::default() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert!(planned.steps[0].sql.contains("PRIMARY KEY (id, line_no)"));
+    // 自增列排在后面的联合主键也通过校验（顺序由用户决定）。
+    id.pk_order = Some(1);
+    line.pk_order = Some(0);
+    let later = plan(&snapshot, &Action::CreateTable { name: "order_lines".to_owned(), columns: vec![id, line], options: TableOptions::default() });
+    assert!(later.blocked.is_empty(), "{:?}", later.blocked);
+    assert!(later.steps[0].sql.contains("PRIMARY KEY (line_no, id)"));
+    // 改表：自增主键 id 扩成 (id, line_no)。
+    let mut existing = order_lines(Engine::Mysql);
+    existing.columns[0].auto = true;
+    let mut drafts = drafts_of_snapshot(&existing);
+    set_pk(&mut drafts, &["id", "line_no"]);
+    let altered = plan(&existing, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(altered.blocked.is_empty(), "{:?}", altered.blocked);
+    assert_eq!(altered.steps[0].sql, "ALTER TABLE shop.order_lines DROP PRIMARY KEY, ADD PRIMARY KEY (id, line_no);");
+    assert!(altered.risks.iter().all(|risk| !risk.text.contains("不在主键的第一位")));
+    // 改表时自增列排到主键后面：通过校验，但提示服务器会拒绝。
+    let mut drafts = drafts_of_snapshot(&existing);
+    set_pk(&mut drafts, &["line_no", "id"]);
+    let later = plan(&existing, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(later.blocked.is_empty(), "{:?}", later.blocked);
+    assert!(later.risks.iter().any(|risk| risk.text.contains("不在主键的第一位")), "{:?}", later.risks);
+}
+
+#[test]
+fn auto_increment_outside_the_primary_key_is_blocked() {
+    let snapshot = fresh_table(Engine::Mysql);
+    let mut id = new_column("id", "bigint", false, DefaultSpec::None);
+    id.auto = true;
+    let mut line = new_column("line_no", "int", false, DefaultSpec::None);
+    line.primary = true;
+    let planned = plan(&snapshot, &Action::CreateTable { name: "order_lines".to_owned(), columns: vec![id, line], options: TableOptions::default() });
+    assert!(planned.blocked.iter().any(|item| item.contains("只有主键才能自增")), "{:?}", planned.blocked);
+    // 改表：把自增主键列移出主键、又没有别的索引以它开头。
+    let mut existing = order_lines(Engine::Mysql);
+    existing.columns[0].auto = true;
+    let mut drafts = drafts_of_snapshot(&existing);
+    set_pk(&mut drafts, &["order_id", "line_no"]);
+    let altered = plan(&existing, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(altered.blocked.iter().any(|item| item.contains("只有主键才能自增")), "{:?}", altered.blocked);
+}
+
+#[test]
+fn postgres_primary_key_change_drops_the_constraint_and_adds_it_back() {
+    let snapshot = order_lines(Engine::Postgres);
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["order_id", "line_no"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    let sql: Vec<&str> = planned.steps.iter().map(|step| step.sql.as_str()).collect();
+    assert_eq!(
+        sql,
+        vec![
+            "ALTER TABLE public.order_lines DROP CONSTRAINT order_lines_pkey;",
+            "ALTER TABLE public.order_lines ADD CONSTRAINT order_lines_pkey PRIMARY KEY (order_id, line_no);",
+        ]
+    );
+    assert!(planned.risks.iter().any(|risk| risk.level == "danger"));
+    assert!(planned.risks.iter().any(|risk| risk.text.contains("不是原子操作")));
+}
+
+#[test]
+fn postgres_adding_a_primary_key_to_a_table_without_one() {
+    let mut snapshot = order_lines(Engine::Postgres);
+    snapshot.columns[0].primary = false;
+    snapshot.indexes.clear();
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["id"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>(), vec!["ALTER TABLE public.order_lines ADD PRIMARY KEY (id);"]);
+}
+
+#[test]
+fn sqlite_primary_key_change_goes_through_the_rebuild() {
+    let mut snapshot = order_lines(Engine::Sqlite);
+    snapshot.sqlite_version = "3.45.0".to_owned();
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["line_no", "order_id"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert!(planned.rebuild);
+    assert!(planned.steps.iter().any(|step| step.sql.contains("CREATE TABLE _rill_new_order_lines") && step.sql.contains("PRIMARY KEY (line_no, order_id)")), "{:?}", planned.steps);
+    assert!(planned.risks.iter().any(|risk| risk.level == "danger" && risk.text.contains("重建整张表")), "{:?}", planned.risks);
+    // 读不到建表原文时给出预检提示，不生成语句。
+    let mut unread = order_lines(Engine::Sqlite);
+    unread.table_sql.clear();
+    let mut drafts = drafts_of_snapshot(&unread);
+    set_pk(&mut drafts, &["line_no", "order_id"]);
+    let blocked = plan(&unread, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(!blocked.blocked.is_empty() && blocked.steps.is_empty());
+}
+
+#[test]
+fn sqlite_autoincrement_cannot_join_a_composite_primary_key() {
+    let mut snapshot = order_lines(Engine::Sqlite);
+    snapshot.columns[0].auto = true;
+    snapshot.autoincrement = true;
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["id", "line_no"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.iter().any(|item| item.contains("主键只能有这一列")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn engines_without_primary_key_editing_still_block_the_change() {
+    let mut snapshot = order_lines(Engine::Sqlserver);
+    snapshot.schema = "dbo".to_owned();
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["order_id", "line_no"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    assert!(planned.blocked.iter().any(|item| item == "不能在这里改变主键组成。"), "{:?}", planned.blocked);
+}
+
+#[test]
+fn primary_key_plan_texts_have_english_forms() {
+    let snapshot = order_lines(Engine::Postgres);
+    let mut drafts = drafts_of_snapshot(&snapshot);
+    set_pk(&mut drafts, &["order_id", "line_no"]);
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "order_lines".to_owned(), columns: drafts });
+    for text in planned.risks.iter().map(|risk| risk.text.clone()).chain(planned.steps.iter().map(|step| step.label.clone())) {
+        let en = super::english::localize(&text, crate::i18n::Locale::En);
+        assert!(!en.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)), "{text} -> {en}");
+    }
+}

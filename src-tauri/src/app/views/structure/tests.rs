@@ -3072,3 +3072,180 @@ fn engines_without_index_options_hide_them(cx: &mut gpui_kit::TestAppContext) {
     assert!(!segments && unique_box && !prefix && !comment, "不支持的项隐藏，只留唯一开关 {segments} {unique_box} {prefix} {comment}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- R13：主键条与联合主键 / R8：索引编辑左右两栏 ----
+
+fn pk_snapshot() -> Snapshot {
+    let mut snapshot = snapshot_with(3);
+    snapshot.indexes = vec![Index {
+        name: "orders_pkey".into(),
+        unique: true,
+        columns: vec![IndexColumn { name: "col_0".into(), descending: false, prefix: None }],
+        protected: true,
+        reason: "由主键约束维护".into(),
+        kind: IndexKind::Primary,
+        ..Default::default()
+    }];
+    snapshot
+}
+
+#[test]
+fn existing_table_primary_key_can_be_extended_reordered_and_previewed() {
+    let (services, dir) = offline_services("pk-existing");
+    let mut pane = pane_with_snapshot(services, 3);
+    let mut snapshot = pk_snapshot();
+    // 预检查读到的 NULL 个数（真实连接由 introspect 补上）。
+    snapshot.null_counts.insert("col_1".into(), 0);
+    pane.snapshot = Some(snapshot.clone());
+    pane.session.kept_columns = column_drafts(&snapshot);
+    assert_eq!(pane.primary_key_order(), vec![0]);
+    assert_eq!(pane.pending_changes(), 0);
+    // 改表模式也能勾主键：加入的列排在末尾，并自动设为 NOT NULL。
+    pane.toggle_column(1, "primary");
+    assert_eq!(pane.primary_key_order(), vec![0, 1]);
+    assert!(!pane.session.kept_columns[1].nullable);
+    assert!(pane.primary_key_changed());
+    assert_eq!(pane.primary_key_position(1), Some(2));
+    // 拖动主键条：col_1 到最前。
+    pane.move_primary_key(1, 0);
+    assert_eq!(pane.primary_key_order(), vec![1, 0]);
+    pane.session.arm_fixture(&snapshot);
+    assert!(pane.session.blocked().is_empty(), "{:?}", pane.session.blocked());
+    assert_eq!(
+        pane.session.preview_sql(),
+        vec![
+            "ALTER TABLE public.orders DROP CONSTRAINT orders_pkey;".to_owned(),
+            "ALTER TABLE public.orders ALTER COLUMN col_1 SET NOT NULL;".to_owned(),
+            "ALTER TABLE public.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (col_1, col_0);".to_owned(),
+        ]
+    );
+    assert!(pane.session.requires_second_confirm(), "改主键要再次确认");
+    // 只调换顺序也算一处待应用的变更。
+    pane.session.kept_columns[1].nullable = false;
+    pane.revert_column(1);
+    assert_eq!(pane.primary_key_order(), vec![0]);
+    assert!(!pane.primary_key_changed());
+    assert_eq!(pane.pending_changes(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reordering_an_existing_composite_key_counts_as_a_pending_change() {
+    let (services, dir) = offline_services("pk-reorder");
+    let mut pane = pane_with_snapshot(services, 3);
+    let mut snapshot = pk_snapshot();
+    snapshot.columns[1].primary = true;
+    snapshot.columns[1].nullable = false;
+    snapshot.indexes[0].columns.push(IndexColumn { name: "col_1".into(), descending: false, prefix: None });
+    pane.snapshot = Some(snapshot.clone());
+    pane.session.kept_columns = column_drafts(&snapshot);
+    assert_eq!(pane.primary_key_order(), vec![0, 1]);
+    assert_eq!(pane.pending_changes(), 0);
+    pane.move_primary_key(0, 1);
+    assert_eq!(pane.pending_changes(), 1);
+    assert!(pane.preview_button_visible() || pane.session.section != Section::Columns);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_table_primary_key_follows_the_strip_order_and_offers_make_primary() {
+    let (services, dir) = offline_services("pk-create");
+    let mut pane = StructurePane::new(services);
+    pane.begin_create(target("mysql", ""));
+    pane.session.table_name = "order_lines".into();
+    pane.add_column();
+    pane.session.kept_columns[1].name = "line_no".into();
+    pane.session.kept_columns[1].type_name = "int".into();
+    pane.toggle_column(1, "primary");
+    assert_eq!(pane.primary_key_order(), vec![0, 1]);
+    pane.move_primary_key(1, 0);
+    let sql = pane.live_composer_sql().expect("建表语句");
+    assert!(sql.contains("PRIMARY KEY (line_no, id)"), "{sql}");
+    // 自增列移出主键：提示并给出一键“设为主键”。
+    pane.toggle_column(0, "primary");
+    assert_eq!(pane.auto_outside_primary_key(), vec![0]);
+    assert!(pane.draft_issues().iter().any(|issue| issue.field == IssueField::Auto && issue.row == Some(0)));
+    pane.set_primary(0, true);
+    assert!(pane.auto_outside_primary_key().is_empty());
+    assert_eq!(pane.primary_key_order(), vec![1, 0], "一键设为主键时排在末尾");
+    assert!(pane.draft_issues().is_empty(), "{:?}", pane.draft_issues());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn index_columns_move_by_drag_position() {
+    let (services, dir) = offline_services("index-drag");
+    let mut pane = pane_with_snapshot(services, 4);
+    pane.session.section = Section::Indexes;
+    pane.toggle_index_column("col_1");
+    pane.toggle_index_column("col_2");
+    pane.toggle_index_column("col_3");
+    pane.move_index_column_to(2, 0);
+    let names: Vec<&str> = pane.session.index_columns.iter().map(|column| column.name.as_str()).collect();
+    assert_eq!(names, vec!["col_3", "col_1", "col_2"]);
+    assert_eq!(pane.session.index_column, "col_3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 字段页上方有主键条；索引编辑是左右两栏，已选列带拖动柄。
+#[gpui_kit::test]
+fn primary_key_strip_and_two_pane_index_editor_render(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = offline_services("pk-render");
+    cx.update(gpui_kit::init);
+    let (window, pane) = cx.update(|cx| {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(800.)) };
+        gpui_kit::open_window(
+            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+            cx,
+            |_window, cx| {
+                cx.new(|_| {
+                    let mut pane = pane_with_snapshot(services.clone(), 4);
+                    pane.snapshot = Some({
+                        let mut snapshot = pk_snapshot();
+                        snapshot.columns.push(column("col_3", "integer", false));
+                        snapshot
+                    });
+                    pane.toggle_column(1, "primary");
+                    pane
+                })
+            },
+        )
+        .unwrap()
+    });
+    let found = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.try_find("structure-pk-strip").is_some(),
+                window.try_find("structure-pk-chip-0").is_some(),
+                window.try_find("structure-pk-chip-1").is_some(),
+                window.try_find("structure-pk-changed").is_some(),
+            )
+        })
+        .unwrap();
+    assert_eq!(found, (true, true, true, true));
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            pane.session.section = Section::Indexes;
+            pane.composer_open = true;
+            pane.toggle_index_column("col_2");
+            pane.toggle_index_column("col_3");
+            cx.notify();
+        })
+    });
+    let found = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.try_find("structure-index-available").is_some(),
+                window.try_find("structure-index-selected").is_some(),
+                window.try_find("structure-index-grip-col_2").is_some(),
+                window.try_find("structure-actions").is_some() || window.try_find("structure-preview").is_some(),
+            )
+        })
+        .unwrap();
+    assert_eq!(found, (true, true, true, true));
+    let _ = std::fs::remove_dir_all(&dir);
+}
