@@ -13,19 +13,92 @@ pub enum SecretError {
     /// 旧版逐条钥匙串条目没能迁入保险库（原因来自钥匙串）；旧条目原样保留，可重试。
     #[error("旧凭据没能迁入保险库：{0}")]
     MigrationFailed(String),
+    /// 本地保险库本身用不了（文件读写失败、版本过新等），原因只带底层信息。
+    #[error("{}", problem.describe(reason))]
+    Vault { problem: VaultProblem, reason: String },
+}
+
+/// 保险库加载或写盘失败的类别：界面按类别给出不同的提示和恢复指引。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultProblem {
+    /// 钥匙串没给出主密钥（拒绝授权、被锁定、服务未运行）。
+    KeyUnavailable,
+    /// 保险库文件读不出或写不进（权限、磁盘）。
+    FileAccess,
+    /// 文件由更新版本的 RillSQL 写入。
+    NewerVersion,
+    /// 文件无法解密，而且没能改名保留。
+    CorruptNotKept,
+    /// 随机数、序列化、加密等内部步骤失败。
+    Internal,
+}
+
+impl VaultProblem {
+    /// 日志与连接错误里用的中文说明（界面提示条另走 i18n）。
+    fn describe(self, reason: &str) -> String {
+        match self {
+            VaultProblem::KeyUnavailable => format!("保险库密钥暂不可用：{reason}"),
+            VaultProblem::FileAccess => format!("读写不了本地保险库文件：{reason}"),
+            VaultProblem::NewerVersion => "本地保险库由更新版本的 RillSQL 写入，当前版本无法读取".to_owned(),
+            VaultProblem::CorruptNotKept => format!("本地保险库无法解密，也没能改名保留：{reason}"),
+            VaultProblem::Internal => format!("本地保险库暂时无法准备：{reason}"),
+        }
+    }
+
+    /// 提示条用的 i18n 模板键（模板里可用 `{reason}`）。
+    pub fn message_key(self) -> &'static str {
+        match self {
+            VaultProblem::KeyUnavailable => "ui.vault.keyUnavailable",
+            VaultProblem::FileAccess => "ui.vault.fileAccess",
+            VaultProblem::NewerVersion => "ui.vault.newerVersion",
+            VaultProblem::CorruptNotKept => "ui.vault.corruptNotKept",
+            VaultProblem::Internal => "ui.vault.internal",
+        }
+    }
+}
+
+/// 分好类的保险库失败：类别加底层原因（不含任何说明性前缀）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultFailure {
+    pub problem: VaultProblem,
+    pub reason: String,
 }
 
 impl SecretError {
+    /// 底层原因本身，不带变体的说明前缀。
+    pub fn reason(&self) -> &str {
+        match self {
+            SecretError::Unavailable(reason) | SecretError::Corrupt(reason) | SecretError::MigrationFailed(reason) => reason,
+            SecretError::Vault { reason, .. } => reason,
+        }
+    }
+
+    /// 归入提示条的保险库失败类别；损坏（已由事件报告）与单条迁移失败不在此列。
+    pub fn vault_failure(&self) -> Option<VaultFailure> {
+        match self {
+            SecretError::Unavailable(reason) => Some(VaultFailure { problem: VaultProblem::KeyUnavailable, reason: reason.clone() }),
+            SecretError::Vault { problem, reason } => Some(VaultFailure { problem: *problem, reason: reason.clone() }),
+            SecretError::Corrupt(_) | SecretError::MigrationFailed(_) => None,
+        }
+    }
+
     /// 给用户看的完整说明：原因加恢复指引。连接打开失败、保存密码失败时都用它。
     pub fn guidance(&self) -> String {
         match self {
-            SecretError::Unavailable(_) => format!(
-                "保存的密码暂时取不到（{self}）。请在系统钥匙串的授权提示中允许 RillSQL 访问后重试，或这次手动输入密码。"
+            SecretError::Unavailable(reason) => format!(
+                "保存的密码暂时取不到，保险库密钥暂不可用（{reason}）。请在系统钥匙串的授权提示中选择“始终允许”后重试，或这次手动输入密码。"
             ),
             SecretError::Corrupt(_) => format!("{self} 这次请手动输入密码并勾选“保存密码”，会写进新的保险库。"),
             SecretError::MigrationFailed(_) => format!(
                 "{self}。旧条目仍在系统钥匙串里：允许钥匙串访问后可重试迁移，或这次手动输入密码并保存。"
             ),
+            SecretError::Vault { problem, .. } => match problem {
+                VaultProblem::KeyUnavailable => format!("{self}。请在钥匙串授权提示中选择“始终允许”后重试，或这次手动输入密码。"),
+                VaultProblem::FileAccess => format!("{self}。请检查文件权限和磁盘空间后重试，或这次手动输入密码。"),
+                VaultProblem::NewerVersion => format!("{self}，文件原样保留。请升级 RillSQL，或这次手动输入密码。"),
+                VaultProblem::CorruptNotKept => format!("{self}。请退出 RillSQL，把 secrets.vault 移到别处后重试，或这次手动输入密码。"),
+                VaultProblem::Internal => format!("{self}。请重试；一直失败时重启 RillSQL，或这次手动输入密码。"),
+            },
         }
     }
 }
@@ -46,8 +119,14 @@ pub enum VaultNotice {
     Corrupt { kept: std::path::PathBuf },
     /// 某个旧钥匙串条目没能迁入。
     MigrationFailed { account: String, reason: String },
-    /// 钥匙串暂时没给出主密钥（拒绝授权、被锁定）；保险库原样保留，下次访问会重试。
-    KeyUnavailable { reason: String },
+    /// 保险库这次没能加载（钥匙串没给出主密钥、文件读不出、版本过新等）；文件原样保留，下次访问会重试。
+    /// `reason` 只是底层原因，提示文字按 `problem` 走 i18n。
+    LoadFailed { problem: VaultProblem, reason: String },
+    /// 之前加载失败的保险库这次加载成功：界面据此收起加载失败的提示。
+    LoadRecovered,
+    /// 钥匙串里的主密钥格式或长度无效：已换成新主密钥，原保险库改名保留在 `kept`。
+    /// 没有原文件时不会排出这条事件（没有已保存的密码会丢）。
+    KeyInvalid { kept: std::path::PathBuf },
     /// 重试迁移后不再失败的账户：界面据此把它们从失败计数里去掉。
     MigrationRecovered { account: String },
 }

@@ -17,7 +17,7 @@ use crate::connections::model::{
     SshAuthKind, SshSettings, TlsMode, ENV_NONE,
 };
 use crate::connections::route::{self, Route};
-use crate::connections::secrets::{MigrationReport, SecretStore, VaultNotice};
+use crate::connections::secrets::{MigrationReport, SecretStore, VaultFailure, VaultNotice, VaultProblem};
 use crate::connections::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestReport, TestStatus};
 use crate::connections::store::{self, Store};
 use crate::connections::transaction::{ExecutionLease, TransactionCoordinator};
@@ -910,9 +910,25 @@ impl Service {
     }
 
     /// 重新迁移之前没能迁入保险库的旧钥匙串条目（界面上的“重试”）。
-    pub async fn retry_failed_migration(&self) -> Result<MigrationReport, String> {
-        self.store().await?;
-        let report = self.secrets.retry_failed_migration().map_err(|err| err.guidance())?;
+    /// 失败时返回分好类的原因（只带底层信息），界面按类别给出提示；
+    /// 保险库损坏已由事件报告，此时保险库已从空库继续，按“没有可重试的条目”处理。
+    pub async fn retry_failed_migration(&self) -> Result<MigrationReport, VaultFailure> {
+        self.store()
+            .await
+            .map_err(|reason| VaultFailure { problem: VaultProblem::Internal, reason })?;
+        let report = match self.secrets.retry_failed_migration() {
+            Ok(report) => report,
+            Err(err) => match err.vault_failure() {
+                Some(failure) => {
+                    self.log(format!("重试迁移失败：{err}"));
+                    return Err(failure);
+                }
+                None => {
+                    self.log(format!("重试迁移：{err}"));
+                    MigrationReport::default()
+                }
+            },
+        };
         if !report.migrated.is_empty() {
             self.log(format!("已把 {} 条旧凭据迁入本地保险库", report.migrated.len()));
         }

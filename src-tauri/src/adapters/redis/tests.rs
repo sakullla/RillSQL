@@ -1,5 +1,5 @@
 //! Redis 专项模块的纯逻辑测试：SCAN/值读取/TTL 命令组装、RESP 结构化分类、危险命令确认语义。
-//! 不依赖 docker；真库端到端（含密码认证/SCAN 实际游标推进）由 docker 夹具人工/集成验证。
+//! 不依赖 docker；真库全流程（含密码认证/SCAN 实际游标推进）由 docker 夹具人工/集成验证。
 
 use super::exec::{classify_reply, command_risk, expand_command, guard_command, guard_invocation, invocation_word, CommandRisk};
 use super::keys::{

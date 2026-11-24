@@ -1880,6 +1880,11 @@ dict! {
     "ui.settings.vaultOk" => "没有待处理的问题。", "No pending issues.";
     "ui.vault.migrationFailed" => "{n} 条已保存的密码没能迁入本地保险库，旧条目仍在系统钥匙串里。", "{n} saved passwords could not move into the local vault; the old entries remain in the system keychain.";
     "ui.vault.keyUnavailable" => "保险库密钥暂不可用：{reason}。在钥匙串授权提示中选择“始终允许”后重试。", "The vault key is unavailable: {reason}. Choose \"Always Allow\" in the keychain prompt, then retry.";
+    "ui.vault.keyInvalid" => "钥匙串里的保险库主密钥无效，已换成新的主密钥，原保险库已保留为 {path}。请重新输入密码并保存。", "The vault master key in the keychain was invalid and has been replaced; the old vault was kept as {path}. Re-enter and save the passwords.";
+    "ui.vault.fileAccess" => "读写不了本地保险库文件：{reason}。文件原样保留，请检查文件权限和磁盘空间后重试。", "The local vault file could not be read or written: {reason}. The file was left unchanged; check its permissions and free disk space, then retry.";
+    "ui.vault.newerVersion" => "本地保险库由更新版本的 RillSQL 写入，当前版本读不了。文件原样保留，请升级 RillSQL 后重试。", "The local vault was written by a newer version of RillSQL and this version cannot read it. The file was left unchanged; update RillSQL, then retry.";
+    "ui.vault.corruptNotKept" => "本地保险库无法解密，也没能改名保留：{reason}。请退出 RillSQL，把 secrets.vault 移到别处后重试。", "The local vault could not be decrypted, and renaming it to keep a copy failed: {reason}. Quit RillSQL, move secrets.vault elsewhere, then retry.";
+    "ui.vault.internal" => "本地保险库暂时无法准备：{reason}。请重试；如果一直失败，请重启 RillSQL。", "The local vault could not be prepared: {reason}. Retry; if it keeps failing, restart RillSQL.";
     "ui.vault.corrupt" => "本地保险库无法解密，原文件已保留为 {path}。请重新输入密码并保存。", "The local vault could not be decrypted and was kept as {path}. Re-enter and save the passwords.";
     "ui.vault.retry" => "重试迁移", "Retry migration";
     "ui.vault.dismiss" => "收起提示", "Dismiss";

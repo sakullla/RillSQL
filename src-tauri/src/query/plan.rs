@@ -312,9 +312,9 @@ pub(crate) fn alias_map(sql: &str) -> Vec<(String, String)> {
         ["WHERE", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "USING", "NATURAL", "OUTER", "UNION", "HAVING", "STRAIGHT_JOIN", "WINDOW"];
     /// 这些关键字结束 FROM 列表：之后的逗号不再分隔表引用。
     const END_FROM: [&str; 13] = ["WHERE", "ON", "USING", "GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "WINDOW", "SELECT", "SET", "VALUES", "RETURNING"];
-    // 逗号单独成为一个记号，作为表引用项的边界。
+    // 逗号与括号各自单独成为一个记号：逗号是表引用项的边界，括号界定子查询的范围。
     let mut tokens: Vec<String> = Vec::new();
-    for piece in sql.split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')' || ch == ';') {
+    let push_piece = |piece: &str, tokens: &mut Vec<String>| {
         for (n, part) in piece.split(',').enumerate() {
             if n > 0 {
                 tokens.push(",".to_owned());
@@ -324,12 +324,35 @@ pub(crate) fn alias_map(sql: &str) -> Vec<(String, String)> {
                 tokens.push(part.to_owned());
             }
         }
+    };
+    let mut rest = sql;
+    while let Some(at) = rest.find(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')' || ch == ';') {
+        push_piece(&rest[..at], &mut tokens);
+        let ch = rest[at..].chars().next().unwrap_or(' ');
+        if ch == '(' || ch == ')' {
+            tokens.push(ch.to_string());
+        }
+        rest = &rest[at + ch.len_utf8()..];
     }
+    push_piece(rest, &mut tokens);
+    let is_paren = |token: &str| token == "(" || token == ")";
     let mut out = Vec::new();
     let mut in_from = false;
+    // 进入括号时保存外层的 FROM 状态，括号里从头判断；出括号时恢复。
+    // 这样 SELECT 列表里标量子查询的 FROM 不会让外层后面的逗号被当成表引用项。
+    let mut outer: Vec<bool> = Vec::new();
     for index in 0..tokens.len() {
         let keyword = tokens[index].to_ascii_uppercase();
         let starts_item = match keyword.as_str() {
+            "(" => {
+                outer.push(in_from);
+                in_from = false;
+                false
+            }
+            ")" => {
+                in_from = outer.pop().unwrap_or(false);
+                false
+            }
             "FROM" | "JOIN" | "STRAIGHT_JOIN" => {
                 in_from = true;
                 true
@@ -346,14 +369,14 @@ pub(crate) fn alias_map(sql: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some(table) = tokens.get(index + 1) else { continue };
-        if table == "," || table.eq_ignore_ascii_case("SELECT") || STOP.contains(&table.to_ascii_uppercase().as_str()) {
+        if table == "," || is_paren(table) || table.eq_ignore_ascii_case("SELECT") || STOP.contains(&table.to_ascii_uppercase().as_str()) {
             continue;
         }
         let mut next = index + 2;
         if tokens.get(next).is_some_and(|token| token.eq_ignore_ascii_case("AS")) {
             next += 1;
         }
-        if let Some(alias) = tokens.get(next).filter(|alias| *alias != "," && !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
+        if let Some(alias) = tokens.get(next).filter(|alias| *alias != "," && !is_paren(alias) && !STOP.contains(&alias.to_ascii_uppercase().as_str())) {
             let table = table.rsplit('.').next().unwrap_or(table).trim_matches(is_quote).to_owned();
             out.push((alias.clone(), table));
         }
@@ -534,6 +557,18 @@ mod tests {
             vec![pair("o", "orders"), pair("c", "customers"), pair("l", "order_lines")]
         );
         assert!(pairs("EXPLAIN select a, b from orders join customers on f(a, b) = 1 where x in (1, 2)").is_empty(), "ON / WHERE 之后的逗号不是表引用项");
+        // SELECT 列表里的标量子查询：它的 FROM 只在括号里有效，外层后面的逗号不是表引用项。
+        assert!(pairs("SELECT (SELECT max(x) FROM u), name AS customers FROM customers").is_empty(), "列别名不会让表节点改名");
+        assert_eq!(
+            pairs("EXPLAIN select (select max(l.qty) from order_lines l where l.order_id = o.id), o.total AS orders from orders o"),
+            vec![pair("l", "order_lines"), pair("o", "orders")]
+        );
+        assert_eq!(pairs("EXPLAIN select * from (select id from orders) s, customers c"), vec![pair("c", "customers")], "派生表之后的逗号仍分隔表引用项");
+        let cols = columns(&["id", "select_type", "table", "type", "key", "rows", "filtered", "Extra"]);
+        let data = rows(&[&["1", "PRIMARY", "customers", "ALL", "", "3", "100", ""], &["2", "SUBQUERY", "u", "ALL", "", "5", "100", ""]]);
+        let plan = parse("mysql", "EXPLAIN SELECT (SELECT max(x) FROM u), name AS customers FROM customers", &cols, &data).expect("plan");
+        let titles: Vec<String> = plan.lines().iter().filter(|line| line.node.node_kind() == NodeKind::Table).map(|line| line.node.title()).collect();
+        assert!(titles.contains(&"customers".to_owned()) && !titles.iter().any(|title| title.contains("name")), "{titles:?}");
         let cols = columns(&["id", "select_type", "table", "type", "key", "rows", "filtered", "Extra"]);
         let data = rows(&[&["1", "SIMPLE", "orders", "ALL", "", "5", "100", ""], &["1", "SIMPLE", "customers", "ALL", "", "3", "100", ""]]);
         let plan = parse("mysql", "EXPLAIN select * from orders, customers", &cols, &data).expect("plan");

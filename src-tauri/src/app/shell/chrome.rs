@@ -1342,7 +1342,7 @@ impl Workbench {
             return None;
         }
         let lines = vault_alert_lines(alert, |key| self.model.text(key));
-        let can_retry = !alert.failed.is_empty() || alert.key_unavailable.is_some();
+        let can_retry = alert.can_retry();
         let mut text = div().id("vault-alert-text").flex_1().min_w_0().flex().flex_col().gap(px(2.));
         for (index, line) in lines.into_iter().enumerate() {
             text = text.child(
@@ -6862,7 +6862,7 @@ impl Workbench {
                     let alert = &self.model.vault_alert;
                     let lines = vault_alert_lines(alert, |key| self.model.text(key));
                     let status_hint = if lines.is_empty() { self.t("ui.settings.vaultOk") } else { SharedString::from(lines.join("\n")) };
-                    let can_retry = !alert.failed.is_empty() || alert.key_unavailable.is_some();
+                    let can_retry = alert.can_retry();
                     let retry: AnyElement = if can_retry {
                         kit::tool_button("settings-vault-retry", Some(IconName::RefreshCw), self.t("ui.vault.retry"), act("vault-retry-migration", cx))
                             .loading(alert.retrying)
@@ -9281,14 +9281,17 @@ pub(super) fn issue_field(name: &str) -> Option<DraftField> {
     })
 }
 
-/// R7：保险库提示的逐行文字（迁移失败数、密钥暂不可用、损坏已保留）。提示条与设置页共用。
+/// R7：保险库提示的逐行文字（迁移失败数、按类别的加载失败、主密钥无效已更换、损坏已保留）。提示条与设置页共用。
 pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(&str) -> String) -> Vec<String> {
     let mut lines = Vec::new();
     if !alert.failed.is_empty() {
         lines.push(i18n::fill(&text("ui.vault.migrationFailed"), &[("n", &alert.failed.len().to_string())]));
     }
-    if let Some(reason) = &alert.key_unavailable {
-        lines.push(i18n::fill(&text("ui.vault.keyUnavailable"), &[("reason", reason)]));
+    if let Some(failure) = &alert.load_problem {
+        lines.push(i18n::fill(&text(failure.problem.message_key()), &[("reason", &failure.reason)]));
+    }
+    if let Some(path) = &alert.key_invalid_kept {
+        lines.push(i18n::fill(&text("ui.vault.keyInvalid"), &[("path", path)]));
     }
     if let Some(path) = &alert.corrupt_kept {
         lines.push(i18n::fill(&text("ui.vault.corrupt"), &[("path", path)]));

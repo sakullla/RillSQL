@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(data_order_clause(&loose), "");
     }
 
-    /// 真实 SQLite 会话的端到端对拍：导出文件在空库上直执行，行数与二进制值往返一致。
+    /// 真实 SQLite 会话的完整流程对拍：导出文件在空库上直执行，行数与二进制值往返一致。
     /// docker seed 在本环境不可用，SQLite 用同一套 dump 通路覆盖“可空库直执行”验收。
     #[tokio::test]
     async fn sqlite_dump_executes_on_an_empty_database_and_rows_round_trip() {

@@ -405,7 +405,8 @@ async fn old_sqlite_keyring_and_export_fixture_are_readable() {
     secrets.put(&ssh_password_account("keep-id"), "ssh-secret").unwrap();
     assert_eq!(KEYRING_SERVICE, "app.rillsql.desktop");
     assert_eq!(KeyringStore::new().service_name(), KEYRING_SERVICE);
-    let _live_keyring = super::compat::keyring_store();
+    let live_vault = super::compat::vault_store();
+    assert_eq!(live_vault.vault_path(), Some(crate::connections::vault::vault_path_for(&crate::connections::default_config_path()).as_path()));
     assert_eq!(super::keyring_service(), KEYRING_SERVICE);
     assert_eq!(read_secret(secrets.as_ref(), &super::password_account_for("keep-id")).unwrap().as_deref(), Some("db-secret-不会进文件"));
     assert_eq!(read_secret(secrets.as_ref(), &super::ssh_password_account_for("keep-id")).unwrap().as_deref(), Some("ssh-secret"));

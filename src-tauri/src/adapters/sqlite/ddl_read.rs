@@ -194,7 +194,9 @@ pub(super) async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: 
         };
         let mut columns = Vec::new();
         let mut expression = false;
-        for column in &info {
+        // index_xinfo 也列出辅助列（key=0：普通索引的 rowid、WITHOUT ROWID 表主键索引里的其余列），
+        // 只有 key=1 的才是索引自己的列，顺序即声明顺序。
+        for column in info.iter().filter(|column| sqlite_i64(column, 5).unwrap_or(1) != 0) {
             match sqlite_optional(column, 2) {
                 Some(name) if !name.is_empty() => columns.push(IndexColumn { descending: sqlite_i64(column, 3).unwrap_or(0) != 0, name, prefix: None }),
                 _ => expression = true,
@@ -658,4 +660,43 @@ pub(super) fn pragma_foreign_keys_is(sql: &str, enabled: bool) -> bool {
 fn sqlite_unknown(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
     text.contains("pool closed") || text.contains("connection closed") || text.contains("broken pipe")
+}
+
+#[cfg(test)]
+mod index_xinfo_tests {
+    use super::load_sqlite;
+
+    async fn memory(setup: &[&str]) -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        for sql in setup {
+            sqlx::query(sqlx::AssertSqlSafe((*sql).to_owned())).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// WITHOUT ROWID 表的主键索引在 index_xinfo 里还列出其余列（key=0）：只取 key=1，
+    /// 主键按声明顺序 (b, a) 读回；普通索引的 rowid 辅助列也不算索引列、不被当成表达式。
+    #[tokio::test]
+    async fn without_rowid_primary_key_keeps_declared_order() {
+        let pool = memory(&[
+            "CREATE TABLE order_lines (a INTEGER NOT NULL, b INTEGER NOT NULL, qty INTEGER, note TEXT, PRIMARY KEY (b, a)) WITHOUT ROWID",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)",
+            "CREATE INDEX idx_orders_total ON orders (total DESC)",
+        ])
+        .await;
+        let snapshot = load_sqlite(&pool, "main", "order_lines", None).await.unwrap();
+        assert!(snapshot.without_rowid);
+        let primary = snapshot.indexes.iter().find(|index| index.reason == "由主键约束维护").expect("primary key index");
+        let names: Vec<&str> = primary.columns.iter().map(|column| column.name.as_str()).collect();
+        assert_eq!(names, ["b", "a"], "only key=1 columns, in declared order");
+        assert!(!primary.expression);
+        assert_eq!(crate::ddl::plan::primary_key_names(&snapshot), ["b", "a"]);
+
+        let snapshot = load_sqlite(&pool, "main", "orders", None).await.unwrap();
+        let index = snapshot.indexes.iter().find(|index| index.name == "idx_orders_total").expect("plain index");
+        let names: Vec<&str> = index.columns.iter().map(|column| column.name.as_str()).collect();
+        assert_eq!(names, ["total"]);
+        assert!(index.columns[0].descending);
+        assert!(!index.expression, "the rowid auxiliary column is not an expression");
+    }
 }

@@ -1370,7 +1370,7 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
     let _calls = AtomicUsize::new(0);
 }
 
-/// 手写事务、跨批次保留与共享快照：真实 SQLite 文件上的端到端检查（R2、R3、R5）。
+/// 手写事务、跨批次保留与共享快照：真实 SQLite 文件上的完整流程检查（R2、R3、R5）。
 #[tokio::test]
 async fn a_handwritten_transaction_survives_batches_and_reports_the_shared_snapshot() {
     use crate::connections::Service;

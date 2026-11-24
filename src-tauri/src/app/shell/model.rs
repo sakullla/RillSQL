@@ -500,8 +500,10 @@ pub fn coalesce_reorders(ops: Vec<ReorderOp>) -> Vec<ReorderOp> {
 pub struct VaultAlert {
     /// 仍未迁入的旧条目账户 → 原因。
     pub failed: std::collections::BTreeMap<String, String>,
-    /// 钥匙串没给出主密钥的原因（拒绝授权、被锁定）。
-    pub key_unavailable: Option<String>,
+    /// 保险库这次没能加载：类别（决定提示与恢复指引）和底层原因。之后加载成功时清掉。
+    pub load_problem: Option<crate::connections::secrets::VaultFailure>,
+    /// 钥匙串里的主密钥无效、已更换，原保险库改名保留到这里。
+    pub key_invalid_kept: Option<String>,
     /// 损坏的保险库已改名保留到这里。
     pub corrupt_kept: Option<String>,
     /// 重试迁移在途：按钮显示忙碌，不重复派发。
@@ -513,12 +515,18 @@ pub struct VaultAlert {
 impl VaultAlert {
     /// 提示条要不要画出来。
     pub fn visible(&self) -> bool {
-        !self.dismissed && (!self.failed.is_empty() || self.key_unavailable.is_some() || self.corrupt_kept.is_some())
+        !self.dismissed
+            && (!self.failed.is_empty() || self.load_problem.is_some() || self.key_invalid_kept.is_some() || self.corrupt_kept.is_some())
+    }
+
+    /// “重试”按钮有没有意义：还有没迁入的旧条目，或保险库还没加载成功。
+    pub fn can_retry(&self) -> bool {
+        !self.failed.is_empty() || self.load_problem.is_some()
     }
 
     /// 合入保险库排出的事件；有新的问题时取消收起。
     pub fn absorb(&mut self, notices: Vec<crate::connections::secrets::VaultNotice>) {
-        use crate::connections::secrets::VaultNotice;
+        use crate::connections::secrets::{VaultFailure, VaultNotice};
         for notice in notices {
             match notice {
                 VaultNotice::MigrationFailed { account, reason } => {
@@ -528,8 +536,15 @@ impl VaultAlert {
                 VaultNotice::MigrationRecovered { account } => {
                     self.failed.remove(&account);
                 }
-                VaultNotice::KeyUnavailable { reason } => {
-                    self.key_unavailable = Some(reason);
+                VaultNotice::LoadFailed { problem, reason } => {
+                    self.load_problem = Some(VaultFailure { problem, reason });
+                    self.dismissed = false;
+                }
+                VaultNotice::LoadRecovered => {
+                    self.load_problem = None;
+                }
+                VaultNotice::KeyInvalid { kept } => {
+                    self.key_invalid_kept = Some(kept.display().to_string());
                     self.dismissed = false;
                 }
                 VaultNotice::Corrupt { kept } => {
@@ -540,8 +555,9 @@ impl VaultAlert {
         }
     }
 
-    /// 重试的结果：成功时以报告为准（仍失败的留着，其余清掉），密钥问题随之解除；失败时记下原因。
-    pub fn apply_retry(&mut self, result: Result<crate::connections::secrets::MigrationReport, String>) {
+    /// 重试的结果：成功时以报告为准（仍失败的留着，其余清掉），加载问题随之解除；
+    /// 失败时记下分好类的原因（不是整句说明），提示文字由界面按类别本地化。
+    pub fn apply_retry(&mut self, result: Result<crate::connections::secrets::MigrationReport, crate::connections::secrets::VaultFailure>) {
         self.retrying = false;
         match result {
             Ok(report) => {
@@ -551,10 +567,10 @@ impl VaultAlert {
                 for (account, reason) in report.failed {
                     self.failed.insert(account, reason);
                 }
-                self.key_unavailable = None;
+                self.load_problem = None;
             }
-            Err(reason) => {
-                self.key_unavailable = Some(reason);
+            Err(failure) => {
+                self.load_problem = Some(failure);
                 self.dismissed = false;
             }
         }

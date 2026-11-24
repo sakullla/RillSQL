@@ -53,7 +53,7 @@ pub enum JobDone {
     /// 分组与成员关系的快照：(分组, 连接 id → 分组 id)。
     Groups(TaskToken, Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String>),
     /// R7：重试迁移旧钥匙串条目的结果。
-    VaultRetry(TaskToken, Result<crate::connections::secrets::MigrationReport, String>),
+    VaultRetry(TaskToken, Result<crate::connections::secrets::MigrationReport, crate::connections::secrets::VaultFailure>),
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -297,10 +297,10 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
     match done {
         JobDone::VaultRetry(token, result) => {
             if accepted(services, owner, token) {
-                let ok = result.is_ok();
-                let failed_left = result.as_ref().map(|report| report.failed.len()).unwrap_or(0);
+                // 只有真的迁入了旧条目、且没有剩下失败时才提示“已迁入”；什么都没迁时不报成功。
+                let moved_all = result.as_ref().is_ok_and(|report| !report.migrated.is_empty() && report.failed.is_empty());
                 model.vault_alert.apply_retry(result);
-                if ok && failed_left == 0 {
+                if moved_all {
                     model.notice_key = Some("ui.vault.retryDone");
                     model.notice_detail.clear();
                 }

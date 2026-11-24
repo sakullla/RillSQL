@@ -8,7 +8,11 @@
 //! - 钥匙串拒绝授权或不可用：返回错误，不生成新密钥，也不改写已有的 vault；下次调用会重新尝试。
 //! - vault 无法解密或格式损坏：原文件改名为 `secrets.vault.corrupt-时间戳` 保留，本次返回可恢复的错误，
 //!   之后从空保险库继续，用户重新输入密码即可。
-//! - 版本比当前程序新：不改名也不改写，只报错。
+//! - 钥匙串里的主密钥格式或长度无效：换成新主密钥，原 vault 同样改名保留，引导重新输入密码。
+//! - 文件读不出、版本比当前程序新：不改名也不改写，只报错。
+//!
+//! 加载失败按类别（`VaultProblem`）排一条 `VaultNotice::LoadFailed`，原因只带底层信息；
+//! 之后某次加载成功时排 `VaultNotice::LoadRecovered`，界面据此收起旧提示。
 //!
 //! 旧版逐条钥匙串条目（`conn:{id}:password` 等）的迁移：服务层打开连接库时按 password_saved /
 //! ssh_password_saved 登记可能有旧条目的账户，保险库首次加载时一次性迁移整份名单；vault 写入成功后
@@ -19,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -27,7 +32,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 
 pub use crate::connections::secrets::{MigrationReport, VaultNotice};
-use crate::connections::secrets::{KeyringStore, SecretError, SecretStore};
+use crate::connections::secrets::{KeyringStore, SecretError, SecretStore, VaultFailure, VaultProblem};
 
 pub const VAULT_FILE: &str = "secrets.vault";
 /// 钥匙串里唯一的一条条目（service 仍是 `app.rillsql.desktop`）。
@@ -76,6 +81,23 @@ pub struct VaultStore {
     scope: Mutex<Option<LegacyScope>>,
     state: Mutex<Option<Loaded>>,
     notices: Mutex<Vec<VaultNotice>>,
+    /// 上一次加载失败过：下次加载成功时排一条 `LoadRecovered`。
+    load_failed: AtomicBool,
+}
+
+/// 原 vault 为什么被改名保留，决定报给调用方的说明。
+#[derive(Clone, Copy)]
+enum CorruptCause {
+    /// 主密钥在，但文件解不开或格式不对。
+    Undecryptable,
+    /// 钥匙串里找不到主密钥。
+    KeyMissing,
+    /// 钥匙串里的主密钥格式或长度无效。
+    KeyInvalid,
+}
+
+fn vault_error(problem: VaultProblem, reason: impl Into<String>) -> SecretError {
+    SecretError::Vault { problem, reason: reason.into() }
 }
 
 impl VaultStore {
@@ -87,6 +109,7 @@ impl VaultStore {
             scope: Mutex::new(None),
             state: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
+            load_failed: AtomicBool::new(false),
         }
     }
 
@@ -195,6 +218,16 @@ impl VaultStore {
         Ok(())
     }
 
+    /// 写入新值或删除后落盘；之前迁移失败的账户因此不再失败时，告诉界面把它从失败计数里去掉。
+    fn commit_retiring(&self, loaded: &mut Loaded, next: Contents, account: &str) -> Result<(), SecretError> {
+        let recovered = loaded.contents.legacy_failed.contains_key(account) && !next.legacy_failed.contains_key(account);
+        self.commit(loaded, next)?;
+        if recovered {
+            self.notices.lock().expect("vault notices").push(VaultNotice::MigrationRecovered { account: account.to_owned() });
+        }
+        Ok(())
+    }
+
     /// 新值或删除取代了旧条目：清掉旧钥匙串条目，只做一次。
     /// 从来没有旧条目的账户（新建连接等）不访问旧钥匙串，返回 false。
     fn retire_legacy(&self, next: &mut Contents, account: &str) -> bool {
@@ -215,12 +248,15 @@ impl VaultStore {
             let (loaded, load_outcome) = match self.load() {
                 Ok(pair) => pair,
                 Err(err) => {
-                    if let SecretError::Unavailable(reason) = &err {
-                        self.note_key_unavailable(reason);
+                    if let Some(failure) = err.vault_failure() {
+                        self.note_load_failed(failure);
                     }
                     return Err(err);
                 }
             };
+            if self.load_failed.swap(false, Ordering::SeqCst) {
+                self.notices.lock().expect("vault notices").push(VaultNotice::LoadRecovered);
+            }
             // 之前的运行里没迁入的旧条目：重启后也要让界面知道，并提供重试。
             if !loaded.contents.legacy_failed.is_empty() {
                 let mut notices = self.notices.lock().expect("vault notices");
@@ -246,40 +282,41 @@ impl VaultStore {
         let file = match fs::read(&self.path) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(SecretError::Unavailable(format!("读不了保险库文件：{err}"))),
+            Err(err) => return Err(vault_error(VaultProblem::FileAccess, err.to_string())),
         };
         if let Some(bytes) = file.as_deref() {
             // 更新版本写的文件：既不能解也不能覆盖。
             if bytes.len() >= HEADER_LEN && bytes.starts_with(MAGIC) && bytes[MAGIC.len()] > VERSION {
-                return Err(SecretError::Unavailable("保险库由更新版本的 RillSQL 写入，请升级后再试。".to_owned()));
+                return Err(vault_error(VaultProblem::NewerVersion, format!("format {}", bytes[MAGIC.len()])));
             }
         }
-        let stored = self
-            .master
-            .get(MASTER_KEY_ACCOUNT)
-            .map_err(|err| SecretError::Unavailable(format!("密钥暂不可用：{err}")))?;
-        let key = match stored {
-            Some(text) => Some(decode_key(&text)?),
-            None => None,
+        // 原因只取钥匙串给出的底层信息，提示文字的前缀由界面按类别补上。
+        let stored = self.master.get(MASTER_KEY_ACCOUNT).map_err(|err| SecretError::Unavailable(err.reason().to_owned()))?;
+        let (key, cause) = match stored {
+            Some(text) => match decode_key(&text) {
+                Some(key) => (Some(key), CorruptCause::Undecryptable),
+                None => (None, CorruptCause::KeyInvalid),
+            },
+            None => (None, CorruptCause::KeyMissing),
         };
         match (key, file) {
             (Some(key), Some(bytes)) => match open_vault(&bytes, &key) {
                 Some(contents) => Ok((Loaded { key, contents }, Ok(()))),
                 None => {
-                    let kept = self.keep_corrupt()?;
-                    Ok((Loaded { key, contents: Contents::default() }, Err(self.corrupt_error(kept, false))))
+                    let kept = self.keep_corrupt(cause)?;
+                    Ok((Loaded { key, contents: Contents::default() }, Err(self.corrupt_error(kept, cause))))
                 }
             },
             (Some(key), None) => Ok((Loaded { key, contents: Contents::default() }, Ok(()))),
             (None, file) => {
-                // 主密钥不存在：首次运行，或钥匙串条目被删掉（此时旧 vault 已无法解密）。
+                // 主密钥不存在（首次运行，或钥匙串条目被删掉）或无效：旧 vault 已无法解密。
                 // 先把新密钥写进钥匙串，成功后才动旧文件。
                 let key = random_key()?;
                 self.master
                     .put(MASTER_KEY_ACCOUNT, &base64::engine::general_purpose::STANDARD.encode(key))
-                    .map_err(|err| SecretError::Unavailable(format!("密钥暂不可用：{err}")))?;
+                    .map_err(|err| SecretError::Unavailable(err.reason().to_owned()))?;
                 let outcome = match file {
-                    Some(_) => Err(self.corrupt_error(self.keep_corrupt()?, true)),
+                    Some(_) => Err(self.corrupt_error(self.keep_corrupt(cause)?, cause)),
                     None => Ok(()),
                 };
                 Ok((Loaded { key, contents: Contents::default() }, outcome))
@@ -287,16 +324,21 @@ impl VaultStore {
         }
     }
 
-    /// 同一原因的“密钥暂不可用”只排一条待提示，界面不会被重复的授权失败刷屏。
-    fn note_key_unavailable(&self, reason: &str) {
+    /// 同一类别、同一原因的加载失败只排一条待提示，界面不会被重复的授权失败刷屏。
+    fn note_load_failed(&self, failure: VaultFailure) {
+        self.load_failed.store(true, Ordering::SeqCst);
         let mut notices = self.notices.lock().expect("vault notices");
-        let duplicate = notices.iter().any(|notice| matches!(notice, VaultNotice::KeyUnavailable { reason: seen } if seen == reason));
+        let duplicate = notices.iter().any(
+            |notice| matches!(notice, VaultNotice::LoadFailed { problem, reason } if *problem == failure.problem && *reason == failure.reason),
+        );
         if !duplicate {
-            notices.push(VaultNotice::KeyUnavailable { reason: reason.to_owned() });
+            notices.push(VaultNotice::LoadFailed { problem: failure.problem, reason: failure.reason });
         }
     }
 
-    fn keep_corrupt(&self) -> Result<PathBuf, SecretError> {
+    /// 把解不开的 vault 改名保留，并排出对应的事件（损坏，或主密钥无效已更换）。
+    /// 改名失败时返回 `CorruptNotKept`，由加载失败的提示告诉用户手动挪开文件。
+    fn keep_corrupt(&self, cause: CorruptCause) -> Result<PathBuf, SecretError> {
         let stamp = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
         let name = self.path.file_name().and_then(|name| name.to_str()).unwrap_or(VAULT_FILE).to_owned();
         let mut kept = self.path.with_file_name(format!("{name}.corrupt-{stamp}"));
@@ -305,13 +347,23 @@ impl VaultStore {
             kept = self.path.with_file_name(format!("{name}.corrupt-{stamp}-{suffix}"));
             suffix += 1;
         }
-        fs::rename(&self.path, &kept).map_err(|err| SecretError::Corrupt(format!("保险库无法解密，且没能改名保留：{err}")))?;
-        self.notices.lock().expect("vault notices").push(VaultNotice::Corrupt { kept: kept.clone() });
+        fs::rename(&self.path, &kept).map_err(|err| vault_error(VaultProblem::CorruptNotKept, err.to_string()))?;
+        let notice = match cause {
+            CorruptCause::KeyInvalid => VaultNotice::KeyInvalid { kept: kept.clone() },
+            CorruptCause::Undecryptable | CorruptCause::KeyMissing => VaultNotice::Corrupt { kept: kept.clone() },
+        };
+        self.notices.lock().expect("vault notices").push(notice);
         Ok(kept)
     }
 
-    fn corrupt_error(&self, kept: PathBuf, key_missing: bool) -> SecretError {
-        if key_missing {
+    fn corrupt_error(&self, kept: PathBuf, cause: CorruptCause) -> SecretError {
+        if let CorruptCause::KeyInvalid = cause {
+            return SecretError::Corrupt(format!(
+                "钥匙串里的保险库主密钥无效，已换成新的主密钥，原保险库已保留为 {}。",
+                kept.display()
+            ));
+        }
+        if let CorruptCause::KeyMissing = cause {
             // 主密钥条目找不到：文件本身可能完好，只是钥匙串暂时没给出密钥。
             return SecretError::Corrupt(format!(
                 "钥匙串里找不到保险库主密钥，原保险库已保留为 {}。如果主密钥能从钥匙串备份中恢复，退出 RillSQL 后把它改回 {} 即可找回已保存的密码。",
@@ -330,7 +382,7 @@ impl SecretStore for VaultStore {
         let mut next = loaded.contents.clone();
         next.secrets.insert(account.to_owned(), secret.to_owned());
         self.retire_legacy(&mut next, account);
-        self.commit(loaded, next)
+        self.commit_retiring(loaded, next, account)
     }
 
     fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
@@ -361,7 +413,7 @@ impl SecretStore for VaultStore {
         if !removed && !retired {
             return Ok(());
         }
-        self.commit(loaded, next)
+        self.commit_retiring(loaded, next, account)
     }
 
     fn register_legacy(&self, accounts: Vec<String>) {
@@ -401,18 +453,15 @@ pub fn vault_path_for(config_path: &Path) -> PathBuf {
     }
 }
 
-fn decode_key(text: &str) -> Result<[u8; KEY_LEN], SecretError> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(text.trim())
-        .map_err(|_| SecretError::Unavailable("钥匙串里的保险库主密钥格式无效。".to_owned()))?;
-    bytes
-        .try_into()
-        .map_err(|_| SecretError::Unavailable("钥匙串里的保险库主密钥长度无效。".to_owned()))
+/// 钥匙串里的主密钥：base64 解不开或长度不是 32 字节时为 None（视为无效，由调用方更换）。
+fn decode_key(text: &str) -> Option<[u8; KEY_LEN]> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(text.trim()).ok()?;
+    bytes.try_into().ok()
 }
 
 fn random_key() -> Result<[u8; KEY_LEN], SecretError> {
     let mut key = [0u8; KEY_LEN];
-    getrandom::fill(&mut key).map_err(|err| SecretError::Unavailable(format!("系统随机数不可用：{err}")))?;
+    getrandom::fill(&mut key).map_err(|err| vault_error(VaultProblem::Internal, format!("random: {err}")))?;
     Ok(key)
 }
 
@@ -425,14 +474,14 @@ fn aad() -> [u8; HEADER_LEN] {
 
 #[allow(deprecated)] // XNonce 仍来自 generic-array 0.14，与 export.rs 相同。
 fn seal(key: &[u8; KEY_LEN], contents: &Contents) -> Result<Vec<u8>, SecretError> {
-    let plain = serde_json::to_vec(contents).map_err(|err| SecretError::Unavailable(format!("序列化保险库失败：{err}")))?;
+    let plain = serde_json::to_vec(contents).map_err(|err| vault_error(VaultProblem::Internal, format!("serialize: {err}")))?;
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(|err| SecretError::Unavailable(format!("系统随机数不可用：{err}")))?;
+    getrandom::fill(&mut nonce).map_err(|err| vault_error(VaultProblem::Internal, format!("random: {err}")))?;
     let header = aad();
     let cipher = XChaCha20Poly1305::new(key.into());
     let sealed = cipher
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plain, aad: &header })
-        .map_err(|_| SecretError::Unavailable("加密保险库失败。".to_owned()))?;
+        .map_err(|_| vault_error(VaultProblem::Internal, "encrypt"))?;
     let mut file = Vec::with_capacity(HEADER_LEN + NONCE_LEN + sealed.len());
     file.extend_from_slice(&header);
     file.extend_from_slice(&nonce);
@@ -457,7 +506,7 @@ fn open_vault(file: &[u8], key: &[u8; KEY_LEN]) -> Option<Contents> {
 fn write_vault(path: &Path, key: &[u8; KEY_LEN], contents: &Contents) -> Result<(), SecretError> {
     let bytes = seal(key, contents)?;
     let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    fs::create_dir_all(dir).map_err(|err| SecretError::Unavailable(format!("建不了保险库目录：{err}")))?;
+    fs::create_dir_all(dir).map_err(|err| vault_error(VaultProblem::FileAccess, err.to_string()))?;
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(VAULT_FILE);
     let tmp = dir.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
@@ -476,7 +525,7 @@ fn write_vault(path: &Path, key: &[u8; KEY_LEN], contents: &Contents) -> Result<
     })();
     if let Err(err) = result {
         let _ = fs::remove_file(&tmp);
-        return Err(SecretError::Unavailable(format!("写不了保险库文件：{err}")));
+        return Err(vault_error(VaultProblem::FileAccess, err.to_string()));
     }
     Ok(())
 }

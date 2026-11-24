@@ -583,7 +583,7 @@ async fn migrate_body(
     dto_of("done", true, lead, &tally, warnings)
 }
 
-// ---------------------------------------------------------------- 测试（SQLite 真库端到端，不依赖 docker）
+// ---------------------------------------------------------------- 测试（SQLite 真库全流程，不依赖 docker）
 
 #[cfg(test)]
 mod tests;

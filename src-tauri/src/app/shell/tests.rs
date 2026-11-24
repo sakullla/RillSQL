@@ -9462,7 +9462,7 @@ fn queued_reorders_keep_the_latest_per_container_in_operation_order() {
 /// R7：保险库排出的事件进提示条；“重试迁移”排一次后台任务，结果回来后按报告更新计数。
 #[test]
 fn vault_alert_counts_failures_and_retry_queues_one_service_job() {
-    use crate::connections::secrets::{MigrationReport, VaultNotice};
+    use crate::connections::secrets::{MigrationReport, VaultFailure, VaultNotice, VaultProblem};
     let mut model = WorkbenchModel::new(Shell::default());
     assert!(!model.vault_alert.visible());
     model.vault_alert.absorb(vec![
@@ -9490,13 +9490,85 @@ fn vault_alert_counts_failures_and_retry_queues_one_service_job() {
     }));
     assert!(!model.vault_alert.retrying);
     assert_eq!(model.vault_alert.failed.keys().cloned().collect::<Vec<_>>(), ["conn:b:password"]);
-    model.vault_alert.apply_retry(Err("密钥暂不可用".into()));
-    assert_eq!(model.vault_alert.key_unavailable.as_deref(), Some("密钥暂不可用"));
+    model.vault_alert.apply_retry(Err(VaultFailure { problem: VaultProblem::KeyUnavailable, reason: "denied".into() }));
+    assert_eq!(model.vault_alert.load_problem, Some(VaultFailure { problem: VaultProblem::KeyUnavailable, reason: "denied".into() }));
     let _ = model.dispatch("vault-alert-dismiss");
     assert!(!model.vault_alert.visible());
     // 新的问题让收起的提示条重新出现。
     model.vault_alert.absorb(vec![VaultNotice::Corrupt { kept: std::path::PathBuf::from("/tmp/secrets.vault.corrupt-1") }]);
     assert!(model.vault_alert.visible());
+}
+
+/// R7：加载失败按类别给出各自的提示与恢复指引；原因不重复前缀，英文界面不夹中文前缀；
+/// 之后加载成功时提示收起。
+#[test]
+fn vault_load_failures_show_category_specific_guidance_in_both_locales() {
+    use crate::connections::secrets::{VaultNotice, VaultProblem};
+    let cases = [
+        (VaultProblem::KeyUnavailable, "Always Allow", "始终允许"),
+        (VaultProblem::FileAccess, "permissions", "文件权限"),
+        (VaultProblem::NewerVersion, "update RillSQL", "升级 RillSQL"),
+        (VaultProblem::CorruptNotKept, "move secrets.vault", "移到别处"),
+        (VaultProblem::Internal, "restart RillSQL", "重启 RillSQL"),
+    ];
+    let mut seen_en = std::collections::BTreeSet::new();
+    for (problem, en_hint, zh_hint) in cases {
+        for locale in [Locale::En, Locale::ZhCn] {
+            let mut model = WorkbenchModel::new(Shell::default());
+            model.shell.locale = locale;
+            model.vault_alert.absorb(vec![VaultNotice::LoadFailed { problem, reason: "os error 13".into() }]);
+            assert!(model.vault_alert.visible());
+            assert!(model.vault_alert.can_retry());
+            let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            match locale {
+                Locale::En => {
+                    assert!(line.contains(en_hint), "{problem:?}: {line}");
+                    assert!(!line.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)), "英文界面不夹中文：{line}");
+                    seen_en.insert(line.clone());
+                }
+                _ => {
+                    assert!(line.contains(zh_hint), "{problem:?}: {line}");
+                    assert_eq!(line.matches("不可用").count().max(1), 1, "前缀不重复：{line}");
+                }
+            }
+            if problem != VaultProblem::NewerVersion {
+                assert_eq!(line.matches("os error 13").count(), 1, "原因只出现一次：{line}");
+            }
+        }
+    }
+    assert_eq!(seen_en.len(), cases.len(), "每个类别的提示各不相同");
+
+    // 主密钥无效已更换：引导重新输入密码，并说明原文件保留在哪里。
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.locale = Locale::En;
+    model.vault_alert.absorb(vec![VaultNotice::KeyInvalid { kept: std::path::PathBuf::from("/tmp/secrets.vault.corrupt-1") }]);
+    let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("Re-enter") && lines[0].contains("/tmp/secrets.vault.corrupt-1"), "{lines:?}");
+    assert!(!model.vault_alert.can_retry(), "已换新主密钥，没有可重试的加载问题");
+
+    // 之后加载成功：加载失败的提示收起。
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.vault_alert.absorb(vec![VaultNotice::LoadFailed { problem: VaultProblem::KeyUnavailable, reason: "denied".into() }]);
+    model.vault_alert.absorb(vec![VaultNotice::LoadRecovered]);
+    assert!(model.vault_alert.load_problem.is_none());
+    assert!(!model.vault_alert.visible());
+}
+
+/// R7：重试时没有迁入任何条目（只是加载恢复）就不提示“已迁入”。
+#[test]
+fn vault_retry_without_migrated_entries_does_not_claim_success() {
+    use crate::connections::secrets::{MigrationReport, VaultFailure, VaultProblem};
+    let services = AppServices::new(Arc::new(Service::new(std::path::PathBuf::from("unused.sqlite"), Arc::new(crate::connections::secrets::MemoryStore::default()))));
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.vault_alert.load_problem = Some(VaultFailure { problem: VaultProblem::KeyUnavailable, reason: "denied".into() });
+    let _ = model.dispatch("vault-retry-migration");
+    let token = model.begin_owner(&services.tasks, "vault");
+    apply_done(&mut model, &services, "vault", jobs::JobDone::VaultRetry(token, Ok(MigrationReport::default())));
+    assert!(model.vault_alert.load_problem.is_none());
+    assert_ne!(model.notice_key, Some("ui.vault.retryDone"));
 }
 
 #[test]

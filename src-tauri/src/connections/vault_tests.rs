@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::connections::model::{password_account, ssh_password_account};
-use crate::connections::secrets::{MemoryStore, UnavailableStore};
+use crate::connections::secrets::{MemoryStore, UnavailableStore, VaultProblem};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rillsql-vault-{name}-{}", uuid::Uuid::new_v4()));
@@ -356,7 +356,7 @@ fn legacy_entries_stay_when_the_vault_cannot_be_written() {
     store.register_legacy(vec![a.clone()]);
     let result = store.get(&a);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(result, Err(SecretError::Unavailable(_))), "{result:?}");
+    assert!(matches!(result, Err(SecretError::Vault { problem: VaultProblem::FileAccess, .. })), "{result:?}");
     assert_eq!(legacy.values().get(&a).map(String::as_str), Some("pa"), "vault 没写成就不删旧条目");
     assert_eq!(legacy.deletes.load(Ordering::SeqCst), 0);
 }
@@ -416,8 +416,128 @@ fn denied_master_key_queues_a_single_key_unavailable_notice() {
     assert!(store.get("conn:a:password").is_err());
     assert!(store.get("conn:a:password").is_err());
     let notices = store.take_notices();
-    assert!(matches!(notices.as_slice(), [VaultNotice::KeyUnavailable { .. }]), "{notices:?}");
+    // 原因只是钥匙串给出的底层信息，不带“密钥暂不可用”之类的前缀（前缀由界面模板按语言补）。
+    assert_eq!(
+        notices,
+        vec![VaultNotice::LoadFailed { problem: VaultProblem::KeyUnavailable, reason: "Secret Service 未运行".to_owned() }]
+    );
     assert!(store.take_notices().is_empty());
+}
+
+/// 三类加载失败各归各的类别：钥匙串不可用、文件读不出、更新版本写入；文件都原样保留。
+#[test]
+fn load_failures_are_classified_and_leave_the_file_alone() {
+    // 文件读不出：vault 路径是个目录。
+    let dir = temp_dir("unreadable");
+    fs::create_dir_all(dir.join(VAULT_FILE)).unwrap();
+    let master = Counting::with(&[]);
+    let store = vault(&dir, master.clone(), None);
+    let err = store.get("x").unwrap_err();
+    assert!(matches!(err, SecretError::Vault { problem: VaultProblem::FileAccess, .. }), "{err:?}");
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::LoadFailed { problem: VaultProblem::FileAccess, .. }]));
+    assert_eq!(master.puts.load(Ordering::SeqCst), 0, "读不出文件时不生成新主密钥");
+    assert!(dir.join(VAULT_FILE).is_dir());
+
+    // 更新版本写入：魔数相同、版本更高。
+    let dir = temp_dir("newer");
+    let mut newer = b"RILLSQLV".to_vec();
+    newer.push(VERSION + 1);
+    newer.extend_from_slice(&[0u8; 64]);
+    fs::write(dir.join(VAULT_FILE), &newer).unwrap();
+    let master = Counting::with(&[]);
+    let store = vault(&dir, master.clone(), None);
+    let err = store.put("x", "y").unwrap_err();
+    assert!(matches!(err, SecretError::Vault { problem: VaultProblem::NewerVersion, .. }), "{err:?}");
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::LoadFailed { problem: VaultProblem::NewerVersion, .. }]));
+    assert_eq!(fs::read(dir.join(VAULT_FILE)).unwrap(), newer, "不改名也不改写");
+    assert_eq!(master.gets.load(Ordering::SeqCst) + master.puts.load(Ordering::SeqCst), 0, "不访问钥匙串");
+
+    // 钥匙串不可用：类别是 KeyUnavailable，原因不带前缀。
+    let dir = temp_dir("key-unavailable");
+    let store = vault(&dir, Arc::new(UnavailableStore), None);
+    let err = store.get("x").unwrap_err();
+    assert_eq!(err.reason(), "Secret Service 未运行");
+    assert_eq!(err.vault_failure().map(|failure| failure.problem), Some(VaultProblem::KeyUnavailable));
+}
+
+/// 钥匙串里的主密钥格式或长度无效：换成新主密钥，原保险库改名保留，提示重新输入密码。
+#[test]
+fn invalid_master_key_is_replaced_and_the_old_vault_kept() {
+    for bad in ["not base64 !!", "c2hvcnQ="] {
+        let dir = temp_dir("invalid-key");
+        let master = Counting::with(&[]);
+        vault(&dir, master.clone(), None).put("conn:a:password", "s").unwrap();
+        let before = fs::read(dir.join(VAULT_FILE)).unwrap();
+        master.inner.put(MASTER_KEY_ACCOUNT, bad).unwrap();
+
+        let store = vault(&dir, master.clone(), None);
+        let err = store.get("conn:a:password").unwrap_err();
+        assert!(matches!(err, SecretError::Corrupt(_)), "{err:?}");
+        let kept = match store.take_notices().as_slice() {
+            [VaultNotice::KeyInvalid { kept }] => kept.clone(),
+            other => panic!("unexpected notices {other:?}"),
+        };
+        assert_eq!(fs::read(&kept).unwrap(), before, "原保险库原样保留");
+        let replaced = master.values().get(MASTER_KEY_ACCOUNT).cloned().unwrap();
+        assert_ne!(replaced, bad);
+        assert!(decode_key(&replaced).is_some(), "换上的是有效主密钥");
+        // 重新输入的密码能写进新保险库。
+        store.put("conn:a:password", "new").unwrap();
+        assert_eq!(vault(&dir, master, None).get("conn:a:password").unwrap().as_deref(), Some("new"));
+    }
+}
+
+/// 加载失败后某次访问成功：排出 LoadRecovered，界面据此收起旧提示。
+#[test]
+fn later_successful_load_reports_recovery() {
+    let dir = temp_dir("recovered");
+    let master = Counting::with(&[]);
+    master.fail(MASTER_KEY_ACCOUNT);
+    let store = vault(&dir, master.clone(), None);
+    assert!(store.get("x").is_err());
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::LoadFailed { problem: VaultProblem::KeyUnavailable, .. }]));
+    master.failing.lock().unwrap().clear();
+    store.put("x", "y").unwrap();
+    assert_eq!(store.take_notices(), vec![VaultNotice::LoadRecovered]);
+    // 一直成功时不再排。
+    let fresh = vault(&dir, master, None);
+    assert_eq!(fresh.get("x").unwrap().as_deref(), Some("y"));
+    assert!(fresh.take_notices().is_empty());
+}
+
+/// 损坏的 vault 改名失败：仍排出加载失败事件（CorruptNotKept），不会悄无声息。
+#[cfg(unix)]
+#[test]
+fn corrupt_vault_that_cannot_be_renamed_is_still_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("corrupt-not-kept");
+    let master = Counting::with(&[]);
+    vault(&dir, master.clone(), None).put("x", "y").unwrap();
+    fs::write(dir.join(VAULT_FILE), b"not a vault").unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let store = vault(&dir, master, None);
+    let result = store.get("x");
+    let notices = store.take_notices();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(result, Err(SecretError::Vault { problem: VaultProblem::CorruptNotKept, .. })), "{result:?}");
+    assert!(matches!(notices.as_slice(), [VaultNotice::LoadFailed { problem: VaultProblem::CorruptNotKept, .. }]), "{notices:?}");
+    assert_eq!(fs::read(dir.join(VAULT_FILE)).unwrap(), b"not a vault");
+}
+
+/// 迁移失败的账户被用户重新保存后不再算失败：排出 MigrationRecovered。
+#[test]
+fn saving_over_a_failed_migration_reports_it_recovered() {
+    let dir = temp_dir("retire-recovered");
+    let a = password_account("a");
+    let legacy = Counting::with(&[(&a, "pa")]);
+    legacy.fail(&a);
+    let store = vault(&dir, Counting::with(&[]), Some(legacy.clone()));
+    store.register_legacy(vec![a.clone()]);
+    assert!(store.get(&a).is_err());
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::MigrationFailed { .. }]));
+    store.put(&a, "typed").unwrap();
+    assert_eq!(store.take_notices(), vec![VaultNotice::MigrationRecovered { account: a.clone() }]);
+    assert!(store.migration_failures().unwrap().is_empty());
 }
 
 #[test]

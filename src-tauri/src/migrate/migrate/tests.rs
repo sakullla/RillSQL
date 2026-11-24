@@ -1,4 +1,4 @@
-//! 迁移执行器的测试：SQLite 真库做端到端（不依赖 docker），纯函数做矩阵判定。
+//! 迁移执行器的测试：SQLite 真库跑全流程（不依赖 docker），纯函数做矩阵判定。
 
 use super::*;
 use crate::connections::Service;
