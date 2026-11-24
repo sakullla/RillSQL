@@ -1956,3 +1956,153 @@ async fn reopening_waits_for_a_running_business_lease() {
     assert!(service.open("notes", SecretInput::default()).await.unwrap().connected);
     let _ = std::fs::remove_dir_all(dir);
 }
+/// 旧钥匙串的替身：记录访问次数，可指定某些账户读取失败。
+#[derive(Default)]
+struct LegacyKeychain {
+    inner: MemoryStore,
+    calls: AtomicUsize,
+    failing: Mutex<Vec<String>>,
+}
+
+impl super::secrets::SecretStore for LegacyKeychain {
+    fn put(&self, account: &str, secret: &str) -> Result<(), super::secrets::SecretError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(account, secret)
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>, super::secrets::SecretError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.lock().unwrap().iter().any(|item| item == account) {
+            return Err(super::secrets::SecretError::Unavailable("用户拒绝了钥匙串授权".to_owned()));
+        }
+        self.inner.get(account)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), super::secrets::SecretError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete(account)
+    }
+}
+
+fn vault_service(config_path: &Path, master: Arc<dyn super::secrets::SecretStore>, legacy: Arc<LegacyKeychain>) -> Service {
+    let vault = super::vault::VaultStore::new(super::vault::vault_path_for(config_path), master, Some(legacy));
+    Service::new(config_path.to_path_buf(), Arc::new(vault))
+}
+
+#[test]
+fn the_default_connections_state_keeps_secrets_in_the_vault() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let state = super::commands::ConnectionsState::with_path(config_path.clone());
+    assert_eq!(state.service.secret_vault_path(), Some(dir.join(super::vault::VAULT_FILE)));
+    assert!(!dir.join(super::vault::VAULT_FILE).exists(), "构造时不碰钥匙串也不建文件");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn first_vault_load_migrates_every_saved_legacy_entry_and_reports_failures() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let legacy = Arc::new(LegacyKeychain::default());
+    // 旧版本：密码逐条存在钥匙串里。
+    let old = Service::new(config_path.clone(), legacy.clone());
+    let one = old.save(remote_draft(Engine::Mysql), secrets("pw-one", "", "")).await.unwrap().connection;
+    let two = old.save(remote_draft(Engine::Postgres), secrets("pw-two", "", "")).await.unwrap().connection;
+    let mut plain = remote_draft(Engine::Mysql);
+    plain.save_password = false;
+    let three = old.save(plain, SecretInput::default()).await.unwrap().connection;
+    assert!(one.password_saved && two.password_saved && !three.password_saved);
+    drop(old);
+    legacy.failing.lock().unwrap().push(model::password_account(&two.id));
+    legacy.calls.store(0, Ordering::SeqCst);
+
+    let master: Arc<dyn super::secrets::SecretStore> = Arc::new(MemoryStore::default());
+    let service = vault_service(&config_path, master.clone(), legacy.clone());
+    let failures = service.secret_migration_failures().await.unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, model::password_account(&two.id));
+    // 每个已保存的账户读一次；迁入的一条随后删除。没保存过密码的连接不访问旧钥匙串。
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 3);
+    let left = legacy.inner.dump();
+    assert!(left.iter().all(|(account, _)| account != &model::password_account(&one.id)), "迁入后旧条目被删除");
+    assert!(left.iter().any(|(account, _)| account == &model::password_account(&two.id)), "失败的旧条目原样保留");
+    assert!(matches!(
+        service.take_secret_notices().as_slice(),
+        [super::secrets::VaultNotice::MigrationFailed { .. }]
+    ));
+
+    // 迁移失败的连接：打开时给出原因和恢复指引，而不是静默当成没有密码。
+    let err = service.open(&two.id, SecretInput::default()).await.unwrap_err();
+    assert!(err.contains("旧凭据没能迁入保险库"), "{err}");
+    assert!(err.contains("重试"), "{err}");
+
+    // 重启：不再读旧条目。
+    let calls = legacy.calls.load(Ordering::SeqCst);
+    let restarted = vault_service(&config_path, master.clone(), legacy.clone());
+    assert_eq!(restarted.secret_migration_failures().await.unwrap().len(), 1);
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), calls);
+
+    // 授权恢复后，服务层的重试入口把它迁进来。
+    legacy.failing.lock().unwrap().clear();
+    let report = restarted.retry_failed_migration().await.unwrap();
+    assert_eq!(report.migrated, vec![model::password_account(&two.id)]);
+    assert!(legacy.inner.dump().is_empty());
+    assert!(restarted.secret_migration_failures().await.unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn new_and_deleted_connections_without_legacy_entries_never_touch_the_old_keychain() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let legacy = Arc::new(LegacyKeychain::default());
+    let master = Arc::new(LegacyKeychain::default());
+    let service = vault_service(&config_path, master.clone(), legacy.clone());
+
+    // 不保存密码的新连接：保存和删除都不访问任何钥匙串。
+    let mut plain = remote_draft(Engine::Mysql);
+    plain.save_password = false;
+    let plain = service.save(plain, SecretInput::default()).await.unwrap().connection;
+    service.delete(&plain.id).await.unwrap();
+    assert_eq!(master.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 0);
+
+    // 保存密码的新连接：只写 vault（钥匙串里只有主密钥），旧钥匙串不被访问。
+    let saved = service.save(remote_draft(Engine::Mysql), secrets("fresh-pw", "", "")).await.unwrap().connection;
+    assert!(saved.password_saved);
+    service.delete(&saved.id).await.unwrap();
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 0);
+    let keys: Vec<String> = master.inner.dump().into_iter().map(|(account, _)| account).collect();
+    assert_eq!(keys, vec![super::vault::MASTER_KEY_ACCOUNT.to_owned()]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_denied_keychain_or_corrupt_vault_explains_how_to_recover_when_opening() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let master = Arc::new(MemoryStore::default());
+    let service = vault_service(&config_path, master.clone(), Arc::new(LegacyKeychain::default()));
+    let saved = service.save(remote_draft(Engine::Mysql), secrets("vault-pw", "", "")).await.unwrap().connection;
+    assert!(saved.password_saved);
+    drop(service);
+
+    // 钥匙串拒绝授权：说明密钥暂不可用，可以授权后重试或手动输入。
+    let denied = vault_service(&config_path, Arc::new(UnavailableStore), Arc::new(LegacyKeychain::default()));
+    let err = denied.open(&saved.id, SecretInput::default()).await.unwrap_err();
+    assert!(err.contains("密钥暂不可用") && err.contains("重试") && err.contains("手动输入"), "{err}");
+    assert!(!err.contains("vault-pw"));
+
+    // 保险库损坏：原文件保留，提示重新输入密码。
+    let vault_file = dir.join(super::vault::VAULT_FILE);
+    std::fs::write(&vault_file, b"not a vault").unwrap();
+    let broken = vault_service(&config_path, master, Arc::new(LegacyKeychain::default()));
+    let err = broken.open(&saved.id, SecretInput::default()).await.unwrap_err();
+    assert!(err.contains("保险库无法解密") && err.contains("手动输入密码"), "{err}");
+    let kept = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name().to_string_lossy().starts_with("secrets.vault.corrupt-"));
+    assert!(kept, "损坏的文件改名保留");
+    let _ = std::fs::remove_dir_all(dir);
+}

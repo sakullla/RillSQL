@@ -10,8 +10,10 @@
 //!   之后从空保险库继续，用户重新输入密码即可。
 //! - 版本比当前程序新：不改名也不改写，只报错。
 //!
-//! 旧版逐条钥匙串条目（`conn:{id}:password` 等）按需迁移：vault 里没有某个账户且元数据没记过它时，
-//! 读一次旧条目，迁入并删除旧条目；失败的逐个记进元数据并报告，不会每次启动都重复迁移。
+//! 旧版逐条钥匙串条目（`conn:{id}:password` 等）的迁移：服务层打开连接库时按 password_saved /
+//! ssh_password_saved 登记可能有旧条目的账户，保险库首次加载时一次性迁移整份名单；vault 写入成功后
+//! 才删除已迁入的旧条目。失败的逐个记进元数据并报告（`SecretError::MigrationFailed`），不会每次启动
+//! 都重复读取，用户可通过 `retry_failed_migration` 重试。名单之外的账户（新建连接等）不访问旧钥匙串。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,6 +26,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 
+pub use crate::connections::secrets::{MigrationReport, VaultNotice};
 use crate::connections::secrets::{KeyringStore, SecretError, SecretStore};
 
 pub const VAULT_FILE: &str = "secrets.vault";
@@ -55,21 +58,11 @@ struct Loaded {
     contents: Contents,
 }
 
-/// 需要在界面上汇总提示的事件。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VaultNotice {
-    /// 保险库无法解密，原文件已改名保留。
-    Corrupt { kept: PathBuf },
-    /// 某个旧钥匙串条目没能迁入。
-    MigrationFailed { account: String, reason: String },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MigrationReport {
-    pub migrated: Vec<String>,
-    /// 旧钥匙串里没有这个条目，无需迁移。
-    pub absent: Vec<String>,
-    pub failed: Vec<(String, String)>,
+/// 可能还有旧钥匙串条目的账户名单（由服务层按 password_saved / ssh_password_saved 登记）。
+struct LegacyScope {
+    accounts: BTreeSet<String>,
+    /// 本进程里已经对名单跑过一次迁移。
+    migrated: bool,
 }
 
 pub struct VaultStore {
@@ -78,6 +71,9 @@ pub struct VaultStore {
     master: Arc<dyn SecretStore>,
     /// 旧版逐条条目所在的后端；没有则不迁移。
     legacy: Option<Arc<dyn SecretStore>>,
+    /// None：没人登记过名单，按需迁移任意缺失账户（兼容独立使用）。
+    /// Some：只有名单里的账户可能有旧条目，其余账户不访问旧钥匙串。
+    scope: Mutex<Option<LegacyScope>>,
     state: Mutex<Option<Loaded>>,
     notices: Mutex<Vec<VaultNotice>>,
 }
@@ -88,6 +84,7 @@ impl VaultStore {
             path,
             master,
             legacy,
+            scope: Mutex::new(None),
             state: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
         }
@@ -100,59 +97,36 @@ impl VaultStore {
         Self::new(vault_path_for(config_path), keyring.clone(), Some(keyring))
     }
 
-    /// 取走待提示的事件（损坏、迁移失败）。
-    #[allow(dead_code)] // 界面汇总与“重试”入口；正式运行目前靠 get 按需迁移。
-    pub fn take_notices(&self) -> Vec<VaultNotice> {
-        std::mem::take(&mut *self.notices.lock().expect("vault notices"))
-    }
-
-    /// 元数据里记录的迁移失败（跨重启保留），供界面汇总。
-    #[allow(dead_code)] // 界面汇总与“重试”入口；正式运行目前靠 get 按需迁移。
-    pub fn migration_failures(&self) -> Result<Vec<(String, String)>, SecretError> {
-        let mut guard = self.state.lock().expect("vault state");
-        let loaded = self.ensure_loaded(&mut guard)?;
-        Ok(loaded.contents.legacy_failed.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-    }
-
-    /// 清掉失败记录，下次按需迁移时重新尝试这些账户（界面上的“重试”）。
-    #[allow(dead_code)] // 界面汇总与“重试”入口；正式运行目前靠 get 按需迁移。
-    pub fn retry_failed_migration(&self) -> Result<(), SecretError> {
-        let mut guard = self.state.lock().expect("vault state");
-        let loaded = self.ensure_loaded(&mut guard)?;
-        if loaded.contents.legacy_failed.is_empty() {
-            return Ok(());
-        }
-        let mut next = loaded.contents.clone();
-        next.legacy_failed.clear();
-        self.commit(loaded, next)
-    }
-
     /// 批量迁移旧钥匙串条目：每个账户最多读一次旧条目。
     /// vault 写入成功后才删除已迁入的旧条目；失败的逐个报告并记进元数据。
-    #[allow(dead_code)] // 界面汇总与“重试”入口；正式运行目前靠 get 按需迁移。
+    #[cfg(test)]
     pub fn migrate(&self, accounts: &[String]) -> Result<MigrationReport, SecretError> {
         let mut guard = self.state.lock().expect("vault state");
         let loaded = self.ensure_loaded(&mut guard)?;
-        self.migrate_locked(loaded, accounts)
+        self.migrate_locked(loaded, accounts, false)
     }
 
-    fn migrate_locked(&self, loaded: &mut Loaded, accounts: &[String]) -> Result<MigrationReport, SecretError> {
+    /// `retry` 为 true 时连之前失败过的账户也重新读一次。
+    fn migrate_locked(&self, loaded: &mut Loaded, accounts: &[String], retry: bool) -> Result<MigrationReport, SecretError> {
         let mut report = MigrationReport::default();
         let Some(legacy) = self.legacy.as_ref() else {
             return Ok(report);
         };
         let mut next = loaded.contents.clone();
         for account in accounts {
-            if next.secrets.contains_key(account) || next.legacy_done.contains(account) || next.legacy_failed.contains_key(account) {
+            let failed_before = next.legacy_failed.contains_key(account);
+            if next.secrets.contains_key(account) || next.legacy_done.contains(account) || (failed_before && !retry) {
                 continue;
             }
             match legacy.get(account) {
                 Ok(Some(secret)) => {
                     next.secrets.insert(account.clone(), secret);
+                    next.legacy_failed.remove(account);
                     next.legacy_done.insert(account.clone());
                     report.migrated.push(account.clone());
                 }
                 Ok(None) => {
+                    next.legacy_failed.remove(account);
                     next.legacy_done.insert(account.clone());
                     report.absent.push(account.clone());
                 }
@@ -166,6 +140,7 @@ impl VaultStore {
         if report.migrated.is_empty() && report.absent.is_empty() && report.failed.is_empty() {
             return Ok(report);
         }
+        // 先落盘；写失败时旧条目一个都不删，内存也保持旧状态。
         self.commit(loaded, next)?;
         for account in &report.migrated {
             // 已经安全写进 vault；旧条目删不掉只是残留，不影响读取。
@@ -180,6 +155,33 @@ impl VaultStore {
         Ok(report)
     }
 
+    /// 名单登记后、保险库加载后：对名单跑一次迁移（本进程只跑一次，跨重启靠元数据去重）。
+    fn migrate_scope(&self, loaded: &mut Loaded) -> Result<(), SecretError> {
+        let accounts: Vec<String> = match self.scope.lock().expect("vault scope").as_ref() {
+            Some(scope) if !scope.migrated => scope.accounts.iter().cloned().collect(),
+            _ => return Ok(()),
+        };
+        self.migrate_locked(loaded, &accounts, false)?;
+        if let Some(scope) = self.scope.lock().expect("vault scope").as_mut() {
+            scope.migrated = true;
+        }
+        Ok(())
+    }
+
+    /// 这个账户在旧钥匙串里可能还有条目吗：处理过的没有；登记过名单时只认名单。
+    fn may_have_legacy(&self, contents: &Contents, account: &str) -> bool {
+        if self.legacy.is_none() || contents.legacy_done.contains(account) {
+            return false;
+        }
+        if contents.legacy_failed.contains_key(account) {
+            return true;
+        }
+        match self.scope.lock().expect("vault scope").as_ref() {
+            Some(scope) => scope.accounts.contains(account),
+            None => true,
+        }
+    }
+
     /// 先写文件再更新内存：写失败时内存仍是磁盘上的旧状态。
     fn commit(&self, loaded: &mut Loaded, next: Contents) -> Result<(), SecretError> {
         write_vault(&self.path, &loaded.key, &next)?;
@@ -187,25 +189,31 @@ impl VaultStore {
         Ok(())
     }
 
-    /// 新值或删除取代了旧条目：顺手清掉旧钥匙串条目，只做一次。
-    fn retire_legacy(&self, next: &mut Contents, account: &str) {
-        if next.legacy_done.contains(account) {
-            return;
+    /// 新值或删除取代了旧条目：清掉旧钥匙串条目，只做一次。
+    /// 从来没有旧条目的账户（新建连接等）不访问旧钥匙串，返回 false。
+    fn retire_legacy(&self, next: &mut Contents, account: &str) -> bool {
+        if !self.may_have_legacy(next, account) {
+            return false;
         }
         if let Some(legacy) = self.legacy.as_ref() {
             let _ = legacy.delete(account);
         }
         next.legacy_failed.remove(account);
         next.legacy_done.insert(account.to_owned());
+        true
     }
 
     fn ensure_loaded<'a>(&self, guard: &'a mut Option<Loaded>) -> Result<&'a mut Loaded, SecretError> {
+        let mut outcome = Ok(());
         if guard.is_none() {
-            let (loaded, outcome) = self.load()?;
+            let (loaded, load_outcome) = self.load()?;
             *guard = Some(loaded);
-            outcome?;
+            outcome = load_outcome;
         }
-        Ok(guard.as_mut().expect("vault loaded"))
+        let loaded = guard.as_mut().expect("vault loaded");
+        self.migrate_scope(loaded)?;
+        outcome?;
+        Ok(loaded)
     }
 
     /// 读主密钥和 vault 文件。外层 Err 表示没有可用状态（不缓存，下次重试）；
@@ -235,7 +243,7 @@ impl VaultStore {
                 Some(contents) => Ok((Loaded { key, contents }, Ok(()))),
                 None => {
                     let kept = self.keep_corrupt()?;
-                    Ok((Loaded { key, contents: Contents::default() }, Err(self.corrupt_error(kept))))
+                    Ok((Loaded { key, contents: Contents::default() }, Err(self.corrupt_error(kept, false))))
                 }
             },
             (Some(key), None) => Ok((Loaded { key, contents: Contents::default() }, Ok(()))),
@@ -247,7 +255,7 @@ impl VaultStore {
                     .put(MASTER_KEY_ACCOUNT, &base64::engine::general_purpose::STANDARD.encode(key))
                     .map_err(|err| SecretError::Unavailable(format!("密钥暂不可用：{err}")))?;
                 let outcome = match file {
-                    Some(_) => Err(self.corrupt_error(self.keep_corrupt()?)),
+                    Some(_) => Err(self.corrupt_error(self.keep_corrupt()?, true)),
                     None => Ok(()),
                 };
                 Ok((Loaded { key, contents: Contents::default() }, outcome))
@@ -269,8 +277,16 @@ impl VaultStore {
         Ok(kept)
     }
 
-    fn corrupt_error(&self, kept: PathBuf) -> SecretError {
-        SecretError::Corrupt(format!("保险库无法解密，原文件已保留为 {}。请重新输入密码。", kept.display()))
+    fn corrupt_error(&self, kept: PathBuf, key_missing: bool) -> SecretError {
+        if key_missing {
+            // 主密钥条目找不到：文件本身可能完好，只是钥匙串暂时没给出密钥。
+            return SecretError::Corrupt(format!(
+                "钥匙串里找不到保险库主密钥，原保险库已保留为 {}。如果主密钥能从钥匙串备份中恢复，退出 RillSQL 后把它改回 {} 即可找回已保存的密码。",
+                kept.display(),
+                VAULT_FILE
+            ));
+        }
+        SecretError::Corrupt(format!("保险库无法解密，原文件已保留为 {}。", kept.display()))
     }
 }
 
@@ -291,11 +307,14 @@ impl SecretStore for VaultStore {
             return Ok(Some(secret.clone()));
         }
         if let Some(reason) = loaded.contents.legacy_failed.get(account) {
-            return Err(SecretError::Unavailable(format!("旧凭据没能迁入保险库：{reason}")));
+            return Err(SecretError::MigrationFailed(reason.clone()));
         }
-        let report = self.migrate_locked(loaded, std::slice::from_ref(&account.to_owned()))?;
+        if !self.may_have_legacy(&loaded.contents, account) {
+            return Ok(None);
+        }
+        let report = self.migrate_locked(loaded, std::slice::from_ref(&account.to_owned()), false)?;
         if let Some((_, reason)) = report.failed.first() {
-            return Err(SecretError::Unavailable(format!("旧凭据没能迁入保险库：{reason}")));
+            return Err(SecretError::MigrationFailed(reason.clone()));
         }
         Ok(loaded.contents.secrets.get(account).cloned())
     }
@@ -305,12 +324,40 @@ impl SecretStore for VaultStore {
         let loaded = self.ensure_loaded(&mut guard)?;
         let mut next = loaded.contents.clone();
         let removed = next.secrets.remove(account).is_some();
-        let pending_legacy = !next.legacy_done.contains(account);
-        if !removed && !pending_legacy {
+        let retired = self.retire_legacy(&mut next, account);
+        if !removed && !retired {
             return Ok(());
         }
-        self.retire_legacy(&mut next, account);
         self.commit(loaded, next)
+    }
+
+    fn register_legacy(&self, accounts: Vec<String>) {
+        *self.scope.lock().expect("vault scope") = Some(LegacyScope { accounts: accounts.into_iter().collect(), migrated: false });
+    }
+
+    /// 重新读取之前失败的旧条目，迁入成功的写进 vault 并删除旧条目。
+    fn retry_failed_migration(&self) -> Result<MigrationReport, SecretError> {
+        let mut guard = self.state.lock().expect("vault state");
+        let loaded = self.ensure_loaded(&mut guard)?;
+        let accounts: Vec<String> = loaded.contents.legacy_failed.keys().cloned().collect();
+        if accounts.is_empty() {
+            return Ok(MigrationReport::default());
+        }
+        self.migrate_locked(loaded, &accounts, true)
+    }
+
+    fn migration_failures(&self) -> Result<Vec<(String, String)>, SecretError> {
+        let mut guard = self.state.lock().expect("vault state");
+        let loaded = self.ensure_loaded(&mut guard)?;
+        Ok(loaded.contents.legacy_failed.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    fn take_notices(&self) -> Vec<VaultNotice> {
+        std::mem::take(&mut *self.notices.lock().expect("vault notices"))
+    }
+
+    fn vault_path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 }
 

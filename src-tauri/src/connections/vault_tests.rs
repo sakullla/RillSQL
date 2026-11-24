@@ -286,3 +286,77 @@ fn vault_sits_next_to_the_connection_store() {
     assert_eq!(vault_path_for(&config), PathBuf::from("/data/RillSQL").join(VAULT_FILE));
     assert_eq!(vault_path_for(std::path::Path::new("connections.sqlite")), PathBuf::from(VAULT_FILE));
 }
+
+#[test]
+fn registered_accounts_migrate_eagerly_on_first_load_and_only_once() {
+    let dir = temp_dir("eager");
+    let master = Counting::with(&[]);
+    let a = password_account("a");
+    let b = ssh_password_account("a");
+    let c = password_account("c");
+    let legacy = Counting::with(&[(&a, "pa"), (&b, "sa"), (&c, "pc")]);
+    legacy.fail(&c);
+
+    let store = vault(&dir, master.clone(), Some(legacy.clone()));
+    store.register_legacy(vec![a.clone(), b.clone(), c.clone()]);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 0, "登记不访问钥匙串");
+    // 第一次用到保险库（读一个不相干的账户）就把整份名单迁完。
+    assert_eq!(store.get("conn:other:password").unwrap(), None);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3);
+    let left = legacy.values();
+    assert!(!left.contains_key(&a) && !left.contains_key(&b), "写入 vault 后才删旧条目");
+    assert_eq!(left.get(&c).map(String::as_str), Some("pc"), "失败的旧条目保留");
+    assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
+    assert!(matches!(store.get(&c), Err(SecretError::MigrationFailed(_))));
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::MigrationFailed { account, .. }] if account == &c));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3, "失败的账户不自动反复重试");
+
+    // 重启后再次登记：不再读旧条目。
+    let restarted = vault(&dir, master.clone(), Some(legacy.clone()));
+    restarted.register_legacy(vec![a.clone(), b.clone(), c.clone()]);
+    assert_eq!(restarted.get(&b).unwrap().as_deref(), Some("sa"));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3);
+    assert_eq!(restarted.migration_failures().unwrap().len(), 1);
+
+    // 授权恢复后重试：迁入并删除旧条目。
+    legacy.failing.lock().unwrap().clear();
+    let report = restarted.retry_failed_migration().unwrap();
+    assert_eq!(report.migrated, vec![c.clone()]);
+    assert_eq!(restarted.get(&c).unwrap().as_deref(), Some("pc"));
+    assert!(legacy.values().is_empty());
+    assert!(restarted.migration_failures().unwrap().is_empty());
+}
+
+#[test]
+fn accounts_outside_the_registered_list_never_touch_the_legacy_keychain() {
+    let dir = temp_dir("scope");
+    let legacy = Counting::with(&[]);
+    let store = vault(&dir, Counting::with(&[]), Some(legacy.clone()));
+    store.register_legacy(Vec::new());
+    let fresh = password_account("fresh");
+    store.put(&fresh, "s").unwrap();
+    assert_eq!(store.get(&fresh).unwrap().as_deref(), Some("s"));
+    store.delete(&fresh).unwrap();
+    assert_eq!(store.get(&fresh).unwrap(), None);
+    store.delete(&password_account("never-saved")).unwrap();
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy.puts.load(Ordering::SeqCst), 0);
+    assert_eq!(legacy.deletes.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_entries_stay_when_the_vault_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("readonly");
+    let a = password_account("a");
+    let legacy = Counting::with(&[(&a, "pa")]);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let store = vault(&dir, Counting::with(&[]), Some(legacy.clone()));
+    store.register_legacy(vec![a.clone()]);
+    let result = store.get(&a);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(result, Err(SecretError::Unavailable(_))), "{result:?}");
+    assert_eq!(legacy.values().get(&a).map(String::as_str), Some("pa"), "vault 没写成就不删旧条目");
+    assert_eq!(legacy.deletes.load(Ordering::SeqCst), 0);
+}

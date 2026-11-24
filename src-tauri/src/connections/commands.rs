@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::connections::export::ParsedImport;
 use crate::connections::model::{ConnectionDraft, EnvTag, FieldError, Secret, SecretInput};
-use crate::connections::secrets::KeyringStore;
 use crate::connections::service::{self, ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, Service, ServiceError};
 use crate::connections::stages::TestReport;
+use crate::connections::vault::VaultStore;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,8 +43,9 @@ impl ConnectionsState {
     }
 
     pub fn with_path(path: PathBuf) -> Self {
+        let secrets = Arc::new(VaultStore::for_config(&path));
         Self {
-            service: Arc::new(Service::new(path, Arc::new(KeyringStore::new()))),
+            service: Arc::new(Service::new(path, secrets)),
         }
     }
 }

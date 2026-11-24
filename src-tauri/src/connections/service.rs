@@ -17,7 +17,7 @@ use crate::connections::model::{
     SshAuthKind, SshSettings, TlsMode, ENV_NONE,
 };
 use crate::connections::route::{self, Route};
-use crate::connections::secrets::SecretStore;
+use crate::connections::secrets::{MigrationReport, SecretStore, VaultNotice};
 use crate::connections::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestReport, TestStatus};
 use crate::connections::store::{self, Store};
 use crate::connections::transaction::{ExecutionLease, TransactionCoordinator};
@@ -594,8 +594,17 @@ impl Service {
         self.retired.lock().expect("retired transactions").remove(id);
         let store = self.store().await?;
         let existing = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
-        let _ = self.secrets.delete(&password_account(id));
-        let _ = self.secrets.delete(&ssh_password_account(id));
+        // 只清理确实保存过的机密；没有保存过的连接不访问凭据库。删不掉只留下加密残留，不阻止删除配置。
+        for (account, saved) in [
+            (password_account(id), existing.password_saved),
+            (ssh_password_account(id), existing.ssh_password_saved),
+        ] {
+            if saved {
+                if let Err(err) = self.secrets.delete(&account) {
+                    self.log(format!("删除已保存的密码失败：{}", err.guidance()));
+                }
+            }
+        }
         self.forget_typed(id);
         store.delete(id).await.map_err(db_err)?;
         if let Some(ssh) = &existing.ssh {
@@ -665,8 +674,8 @@ impl Service {
             Some(ssh) => store.host_key(&ssh.host, ssh.port).await.map_err(db_err)?,
             None => None,
         };
-        let password = self.resolve_secret(&password_account(&config.id), None, config.password_saved);
-        let ssh_password = self.resolve_secret(&ssh_password_account(&config.id), None, config.ssh_password_saved);
+        let password = self.resolve_secret(&password_account(&config.id), None, config.password_saved)?;
+        let ssh_password = self.resolve_secret(&ssh_password_account(&config.id), None, config.ssh_password_saved)?;
         let stages = stages::planned_stages(&config);
         let mut attempt = Attempt {
             config: config.clone(),
@@ -761,8 +770,8 @@ impl Service {
         };
         match self.secrets.put(account, secret.expose()) {
             Ok(()) => true,
-            Err(_) => {
-                push_note(notes, "系统凭据库不可用：密码只用于本次连接，没有写入配置。");
+            Err(err) => {
+                push_note(notes, &format!("密码没有保存，只用于本次连接，没有写入配置。{}", err.guidance()));
                 false
             }
         }
@@ -770,28 +779,69 @@ impl Service {
 
     fn clear_secret(&self, account: &str, previous: bool, notes: &mut Vec<String>) -> bool {
         if !previous {
-            let _ = self.secrets.delete(account);
+            // 从没保存过：不访问凭据库（新建连接不触发钥匙串授权）。
             return false;
         }
         match self.secrets.delete(account) {
             Ok(()) => false,
-            Err(_) => {
-                push_note(notes, "凭据库不可用，已保存的密码可能仍在系统凭据库中。配置文件里没有密码。");
+            Err(err) => {
+                push_note(notes, &format!("已保存的密码没能清除，可能仍在凭据库中。配置文件里没有密码。{}", err.guidance()));
                 true
             }
         }
     }
 
-    fn resolve_secret(&self, account: &str, typed: Option<&Secret>, saved: bool) -> Option<Secret> {
+    /// 本次输入 > 凭据库里保存的 > 本次运行手输过的。凭据库读取失败且没有手输机密可用时，
+    /// 返回带恢复指引的错误文字（钥匙串被拒、保险库损坏、旧条目迁移失败），而不是当成“没有密码”。
+    fn resolve_secret(&self, account: &str, typed: Option<&Secret>, saved: bool) -> Result<Option<Secret>, String> {
         if let Some(secret) = typed.filter(|item| !item.is_empty()) {
-            return Some(secret.clone());
+            return Ok(Some(secret.clone()));
         }
-        if saved {
-            if let Ok(Some(value)) = self.secrets.get(account) {
-                return Some(Secret::new(value));
+        let remembered = self.typed.lock().expect("typed secrets").get(account).cloned();
+        if !saved {
+            return Ok(remembered);
+        }
+        match self.secrets.get(account) {
+            Ok(Some(value)) => Ok(Some(Secret::new(value))),
+            Ok(None) => Ok(remembered),
+            Err(err) => {
+                self.log(format!("读取已保存的密码失败：{err}"));
+                match remembered {
+                    Some(secret) => Ok(Some(secret)),
+                    None => Err(err.guidance()),
+                }
             }
         }
-        self.typed.lock().expect("typed secrets").get(account).cloned()
+    }
+
+    /// 重新迁移之前没能迁入保险库的旧钥匙串条目（界面上的“重试”）。
+    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
+    pub async fn retry_failed_migration(&self) -> Result<MigrationReport, String> {
+        self.store().await?;
+        let report = self.secrets.retry_failed_migration().map_err(|err| err.guidance())?;
+        if !report.migrated.is_empty() {
+            self.log(format!("已把 {} 条旧凭据迁入本地保险库", report.migrated.len()));
+        }
+        Ok(report)
+    }
+
+    /// 仍未迁入保险库的旧条目（凭据账户、原因）。
+    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
+    pub async fn secret_migration_failures(&self) -> Result<Vec<(String, String)>, String> {
+        self.store().await?;
+        self.secrets.migration_failures().map_err(|err| err.guidance())
+    }
+
+    /// 取走待提示的凭据事件（保险库损坏、迁移失败）。
+    #[allow(dead_code)] // 界面入口在 T9（设置页/提示条）接入。
+    pub fn take_secret_notices(&self) -> Vec<VaultNotice> {
+        self.secrets.take_notices()
+    }
+
+    /// 本地保险库文件位置；凭据后端不是保险库时为 None。
+    #[allow(dead_code)]
+    pub fn secret_vault_path(&self) -> Option<PathBuf> {
+        self.secrets.vault_path().map(Path::to_path_buf)
     }
 
     /// 这次运行里是否记着这条连接手动输入过的数据库密码。
@@ -918,12 +968,12 @@ impl Service {
             epoch,
         } = request;
         let session_id = session_id.as_str();
-        let password = self.resolve_secret(&password_account(&config.id), input.password.as_ref(), config.password_saved);
+        let password = self.resolve_secret(&password_account(&config.id), input.password.as_ref(), config.password_saved)?;
         let ssh_password = self.resolve_secret(
             &ssh_password_account(&config.id),
             input.ssh_password.as_ref(),
             config.ssh_password_saved,
-        );
+        )?;
         let passphrase = input.ssh_passphrase.filter(|item| !item.is_empty());
         let stages = stages::planned_stages(&config);
         let mut attempt = Attempt {
@@ -1020,7 +1070,13 @@ impl Service {
                     .password
                     .as_ref()
                     .filter(|item| !item.is_empty())
-                    .is_some_and(|secret| self.secrets.put(&password_account(&config.id), secret.expose()).is_ok());
+                    .is_some_and(|secret| match self.secrets.put(&password_account(&config.id), secret.expose()) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            self.log(format!("密码没有保存：{}", err.guidance()));
+                            false
+                        }
+                    });
             // 只有真的打开了会话才记最近使用时间：保存连接、测试草稿都不写这一行。
             match self.store().await {
                 Ok(store) => {
@@ -1048,8 +1104,17 @@ impl Service {
 
     async fn store(&self) -> Result<Store, String> {
         let path = self.path.clone();
+        let secrets = Arc::clone(&self.secrets);
         self.cell
-            .get_or_try_init(|| store::Store::open(path))
+            .get_or_try_init(|| async move {
+                let store = store::Store::open(path).await?;
+                // 保险库首次加载时要迁移的旧钥匙串条目：只有标记过已保存密码的账户才可能有。
+                // 读不出列表时不登记，保险库退回按需迁移。
+                if let Ok(rows) = store.list().await {
+                    secrets.register_legacy(legacy_secret_accounts(&rows));
+                }
+                Ok::<_, sqlx::Error>(store)
+            })
             .await
             .cloned()
             .map_err(|err| format!("打不开连接配置：{err}"))
@@ -1582,6 +1647,20 @@ pub fn default_config_path() -> PathBuf {
     directories::ProjectDirs::from("app", "RillSQL", "RillSQL")
         .map(|dirs| dirs.data_dir().join("connections.sqlite"))
         .unwrap_or_else(|| PathBuf::from("connections.sqlite"))
+}
+
+/// 按 password_saved / ssh_password_saved 枚举可能存有旧版钥匙串条目的凭据账户。
+fn legacy_secret_accounts(rows: &[SavedConnection]) -> Vec<String> {
+    let mut accounts = Vec::new();
+    for row in rows {
+        if row.password_saved {
+            accounts.push(password_account(&row.id));
+        }
+        if row.ssh_password_saved {
+            accounts.push(ssh_password_account(&row.id));
+        }
+    }
+    accounts
 }
 
 fn push_note(notes: &mut Vec<String>, text: &str) {
