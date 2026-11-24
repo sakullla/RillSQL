@@ -2,8 +2,8 @@
 
 use crate::catalog::model::{known_row_estimate, parse_kind, DatabaseNode, ObjectKind, ObjectRow, SchemaNode};
 use crate::catalog::read::{
-    assemble_postgres, definition_failure, empty_page, finish_kinds, other_database_message, read_failure, requested_limit, ObjectPageBody,
-    ObjectWindow,
+    assemble_postgres, definition_failure, empty_page, finish_kinds, other_database_message, read_failure, requested_limit, CatalogSearch,
+    ObjectPageBody, ObjectWindow, SEARCH_PER_DATABASE,
 };
 
 use super::catalog::{kind_sql, listed_kinds, metadata_sql};
@@ -145,45 +145,76 @@ pub(super) async fn read_postgres_kind_slice(
     Ok((total, objects))
 }
 
+const POSTGRES_SEARCH_FROM: &str = "FROM pg_catalog.pg_class c \
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+      AND n.nspname NOT LIKE 'pg_toast%' \
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
+      AND c.relname ILIKE $1 ESCAPE '\\'";
+
 /// 资源管理器全局搜索：当前库里所有用户模式的表、视图、物化视图、外部表与序列。
-pub(super) async fn search(client: &tokio_postgres::Client, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-    let Ok(db) = current_database(client).await else {
-        return Vec::new();
+/// 会话只能读自己所在的库：同一连接的其他库列在 `unsearched` 里由界面说明，不假装搜过。
+pub(super) async fn search(client: &tokio_postgres::Client, pattern: &str) -> CatalogSearch {
+    let db = match current_database(client).await {
+        Ok(db) => db,
+        Err(message) => return CatalogSearch::failed("", message),
     };
-    let sql = "SELECT n.nspname, c.relname, \
-        CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' WHEN 'S' THEN 'sequence' ELSE 'table' END, \
-        (c.relkind = 'm') \
-        FROM pg_catalog.pg_class c \
-        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
-          AND n.nspname NOT LIKE 'pg_toast%' \
-          AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
-          AND c.relname ILIKE $1 ESCAPE '\\' \
-        ORDER BY n.nspname, c.relname LIMIT 300";
-    let Ok(rows) = client.query(sql, &[&pattern]).await else {
-        return Vec::new();
+    let mut result = search_database(client, &db, pattern, 0, SEARCH_PER_DATABASE).await;
+    let others = "SELECT datname FROM pg_catalog.pg_database WHERE datallowconn AND NOT datistemplate AND datname <> current_database() ORDER BY datname";
+    // 读不到库清单不影响当前库的命中；只是无法说明还有哪些库没搜。
+    if let Ok(rows) = client.query(others, &[]).await {
+        result.unsearched = rows.iter().filter_map(|row| row.try_get::<_, String>(0).ok()).collect();
+    }
+    result
+}
+
+/// 当前库里按名字顺序从 `offset` 起取 `limit` 条命中，并报告之后还剩多少。别的库读不到，直接说明原因。
+pub(super) async fn search_database(client: &tokio_postgres::Client, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+    let current = match current_database(client).await {
+        Ok(db) => db,
+        Err(message) => return CatalogSearch::failed(database, message),
     };
-    rows.into_iter()
-        .map(|row| {
-            let schema: String = row.get(0);
-            let name: String = row.get(1);
-            let kind: String = row.get(2);
-            let materialized: bool = row.get(3);
-            (
-                db.clone(),
-                schema,
-                ObjectRow {
-                    kind: parse_kind(&kind),
-                    name,
-                    estimated_rows: None,
-                    stale: false,
-                    signature: String::new(),
-                    relation: String::new(),
-                    materialized,
-                },
-            )
-        })
-        .collect()
+    if current != database {
+        return CatalogSearch::failed(database, read_failure(other_database_message(&current, database)));
+    }
+    let total = match client.query_one(&format!("SELECT COUNT(*) {POSTGRES_SEARCH_FROM}"), &[&pattern]).await {
+        Ok(row) => usize::try_from(row.get::<_, i64>(0)).unwrap_or(0),
+        Err(error) => return CatalogSearch::failed(database, read_failure(error)),
+    };
+    let mut result = CatalogSearch::default();
+    if offset >= total {
+        return result;
+    }
+    let take = limit.min(total - offset);
+    let sql = format!(
+        "SELECT n.nspname, c.relname, \
+         CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' WHEN 'S' THEN 'sequence' ELSE 'table' END, \
+         (c.relkind = 'm') {POSTGRES_SEARCH_FROM} ORDER BY n.nspname, c.relname LIMIT {take} OFFSET {offset}"
+    );
+    let rows = match client.query(&sql, &[&pattern]).await {
+        Ok(rows) => rows,
+        Err(error) => return CatalogSearch::failed(database, read_failure(error)),
+    };
+    let mut undecodable = 0usize;
+    for row in rows {
+        let (Ok(schema), Ok(name), Ok(kind), Ok(materialized)) =
+            (row.try_get::<_, String>(0), row.try_get::<_, String>(1), row.try_get::<_, String>(2), row.try_get::<_, bool>(3))
+        else {
+            undecodable += 1;
+            continue;
+        };
+        let mut object = ObjectRow::fresh(name, parse_kind(&kind));
+        object.materialized = materialized;
+        result.hits.push((database.to_owned(), schema, object));
+    }
+    if undecodable > 0 {
+        result.failures.push((database.to_owned(), read_failure(format!("{undecodable} 个对象名无法读取，已跳过"))));
+    }
+    let remaining = total - offset - take;
+    if remaining > 0 {
+        result.truncated.push((database.to_owned(), Some(remaining)));
+    }
+    result
 }
 
 pub(super) async fn read_postgres_definition(

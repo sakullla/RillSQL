@@ -999,3 +999,18 @@ async fn unavailable_engines_report_no_definition_without_a_query() {
     let extension = object_ddl(&CatalogSession::Scripted, Engine::Postgres, &ddl_key("pgcrypto", ObjectKind::Extension)).await.unwrap_err();
     assert!(extension.contains("没有可读的定义"), "{extension}");
 }
+
+/// R4：搜索名额按库分配，库按名字顺序；每库上限与连接上限都生效。
+#[test]
+fn search_quota_is_per_database_with_a_connection_cap() {
+    use crate::catalog::read::search_quota;
+    let counts = vec![("a".to_owned(), 3), ("b".to_owned(), 250), ("c".to_owned(), 40), ("d".to_owned(), 5)];
+    assert_eq!(
+        search_quota(&counts, 200, 2_000),
+        vec![("a".to_owned(), 3), ("b".to_owned(), 200), ("c".to_owned(), 40), ("d".to_owned(), 5)]
+    );
+    assert_eq!(
+        search_quota(&counts, 200, 230),
+        vec![("a".to_owned(), 3), ("b".to_owned(), 200), ("c".to_owned(), 27), ("d".to_owned(), 0)]
+    );
+}

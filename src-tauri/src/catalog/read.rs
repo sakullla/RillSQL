@@ -141,19 +141,63 @@ fn escape_like(value: &str) -> String {
     out
 }
 
+/// 侧栏搜索每个库最多先给出的命中数；超出的库带截断标记，用户展开时再按库分页取回。
+pub const SEARCH_PER_DATABASE: usize = 200;
+/// 一个连接一次搜索最多给出的命中数（所有库合计）。
+pub const SEARCH_PER_CONNECTION: usize = 2_000;
+
+/// 一个连接的一次侧栏搜索结果。命中、截断和失败分开报告：出错或超时不再变成“没有命中”。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CatalogSearch {
+    /// (库, 模式, 对象)。
+    pub hits: Vec<(String, String, ObjectRow)>,
+    /// 命中超过名额、还有更多没给出的库：(库, 还剩多少；None 表示数量未知)。
+    pub truncated: Vec<(String, Option<usize>)>,
+    /// 按库报告的失败：(库, 原因)；库为空表示整个连接的搜索失败。
+    pub failures: Vec<(String, String)>,
+    /// 这次没有搜索到的库（例如会话只能读自己所在的库），由界面说明。
+    pub unsearched: Vec<String>,
+}
+
+impl CatalogSearch {
+    pub fn failed(database: &str, message: impl Into<String>) -> Self {
+        Self { failures: vec![(database.to_owned(), message.into())], ..Self::default() }
+    }
+}
+
+/// 按库分配名额：库按名字顺序，每库最多 `per_database`，合计最多 `per_connection`。
+/// 输入是每个库的命中总数，返回每个库这次取多少条。
+pub fn search_quota(counts: &[(String, usize)], per_database: usize, per_connection: usize) -> Vec<(String, usize)> {
+    let mut left = per_connection;
+    counts
+        .iter()
+        .map(|(database, count)| {
+            let take = (*count).min(per_database).min(left);
+            left -= take;
+            (database.clone(), take)
+        })
+        .collect()
+}
+
 /// 资源管理器全局搜索：跨未展开的库与超过第一页的对象直接向数据库检索匹配名字，
 /// 解决库里有几百上千张表时“前 100 张以外的表搜不出来”的问题。
-pub async fn search_catalog_objects(
-    session: &CatalogSession,
-    engine: Engine,
-    query: &str,
-) -> Vec<(String, String, ObjectRow)> {
+pub async fn search_catalog_objects(session: &CatalogSession, engine: Engine, query: &str) -> CatalogSearch {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return CatalogSearch::default();
     }
     let pattern = escape_like(trimmed);
     catalog_of(engine).search_objects(session, &pattern).await
+}
+
+/// 展开截断的库：在一个库里从 `offset` 起再取一页命中。
+pub async fn search_catalog_database(session: &CatalogSession, engine: Engine, query: &str, database: &str, offset: usize) -> CatalogSearch {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return CatalogSearch::default();
+    }
+    let pattern = escape_like(trimmed);
+    catalog_of(engine).search_database_objects(session, database, &pattern, offset, SEARCH_PER_DATABASE).await
 }
 
 pub async fn read_object_page(session: &CatalogSession, engine: Engine, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {

@@ -1735,6 +1735,9 @@ impl Workbench {
                 super::nav::NavRequest::Definition(id) => self.spawn_definition(id, cx),
             }
         }
+        while let Some(request) = self.model.take_search_more_request() {
+            self.spawn_search_more(request, cx);
+        }
     }
 
     /// 库/模式“刷新此节点”：从第一页重读这个范围。加载态已由模型标好。
@@ -2269,6 +2272,7 @@ impl Workbench {
             })
             .map(|row| (row.saved.id.clone(), row.saved.name.clone(), row.saved.engine))
             .collect();
+        self.model.begin_nav_search(generation, &targets);
         if targets.is_empty() {
             return;
         }
@@ -2277,36 +2281,85 @@ impl Workbench {
         let services = Arc::clone(&self.services);
         let gate = Arc::clone(&self.nav_gate);
         let view = cx.entity().downgrade();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let needle = trimmed.clone();
+        // 连接之间并发（最多 4 条），每条完成就送回界面合并；失败、超时、会话丢失都按连接报告。
         jobs::runtime().spawn(futures::future::Abortable::new(async move {
-            let mut batches = Vec::new();
-            for (conn_id, conn_name, engine) in targets {
-                let Some(session) = services.connections.catalog_session(&conn_id) else { continue };
-                let needle_clone = needle.clone();
-                if let Ok(hits) = crate::catalog::nav_read::limited_metadata(
-                    Arc::clone(&gate),
-                    &conn_id,
-                    async move { crate::catalog::read::search_catalog_objects(&session, engine, &needle_clone).await },
-                )
-                .await
-                {
-                    if !hits.is_empty() {
-                        batches.push((conn_id, conn_name, engine, hits));
-                    }
+            use futures::StreamExt;
+            let reads = futures::stream::iter(targets).map(|(conn_id, conn_name, engine)| {
+                let services = Arc::clone(&services);
+                let gate = Arc::clone(&gate);
+                let needle = needle.clone();
+                async move {
+                    let result = match services.connections.catalog_session(&conn_id) {
+                        None => crate::catalog::read::CatalogSearch::failed("", crate::catalog::read::read_failure("连接已断开，重新连接后再搜索")),
+                        Some(session) => {
+                            let read = async move { crate::catalog::read::search_catalog_objects(&session, engine, &needle).await };
+                            crate::catalog::nav_read::limited_metadata(gate, &conn_id, read)
+                                .await
+                                .unwrap_or_else(|error| crate::catalog::read::CatalogSearch::failed("", error))
+                        }
+                    };
+                    (conn_id, conn_name, engine, result)
+                }
+            });
+            let reads = reads.buffer_unordered(4);
+            futures::pin_mut!(reads);
+            while let Some(item) = reads.next().await {
+                if tx.send(item).await.is_err() {
+                    return;
                 }
             }
-            let _ = tx.send(batches);
         }, abort));
         cx.spawn(async move |_, cx| {
-            let Ok(batches) = rx.await else { return };
+            while let Some((conn_id, conn_name, engine, result)) = rx.recv().await {
+                let mut alive = false;
+                cx.update(|cx| {
+                    let Some(view) = view.upgrade() else { return };
+                    alive = true;
+                    view.update(cx, |this, cx| {
+                        if handle.is_aborted() {
+                            return;
+                        }
+                        if this.model.apply_search_result(generation, &trimmed, (conn_id, conn_name, engine), result) {
+                            this.sync_navigation_index(cx);
+                            cx.notify();
+                        }
+                    });
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// “还有更多，展开”：对一个截断的库按库再取一页命中。
+    fn spawn_search_more(&mut self, request: super::model::SearchMoreRequest, cx: &mut Context<Self>) {
+        let services = Arc::clone(&self.services);
+        let gate = Arc::clone(&self.nav_gate);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ask = request.clone();
+        jobs::runtime().spawn(async move {
+            let result = match services.connections.catalog_session(&ask.connection_id) {
+                None => crate::catalog::read::CatalogSearch::failed(&ask.database, crate::catalog::read::read_failure("连接已断开，重新连接后再搜索")),
+                Some(session) => {
+                    let read = async { crate::catalog::read::search_catalog_database(&session, ask.engine, &ask.query, &ask.database, ask.offset).await };
+                    crate::catalog::nav_read::limited_metadata(gate, &ask.connection_id, read)
+                        .await
+                        .unwrap_or_else(|error| crate::catalog::read::CatalogSearch::failed(&ask.database, error))
+                }
+            };
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(result) = rx.await else { return };
             cx.update(|cx| {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
-                    if handle.is_aborted() {
-                        return;
-                    }
-                    if this.model.apply_search_hits(generation, &trimmed, batches) {
+                    if this.model.apply_search_more(&request, result) {
                         this.sync_navigation_index(cx);
                         cx.notify();
                     }

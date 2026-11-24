@@ -1196,6 +1196,7 @@ impl Workbench {
                             .child(explorer_header),
                     )
                     .when(search_skipped > 0, |this| this.child(self.search_skipped_banner(search_skipped, &p, cx)))
+                    .when_some(self.search_status_banner(&p, cx), |this, banner| this.child(banner))
                     .when_some(group_prompt, |this, prompt| this.child(prompt))
                     .child(list),
             )
@@ -1360,6 +1361,91 @@ impl Workbench {
                 .xsmall(),
             )
             .into_any_element()
+    }
+
+    /// 搜索状态条：搜索中的连接数、按连接 / 库的失败（可重试）、命中超出名额的库（可展开）、没能搜索的库。
+    /// 没有内容时不渲染。
+    fn search_status_banner(&self, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use super::model::SearchNotice;
+        let notices = self.model.nav_search_notices();
+        if notices.is_empty() {
+            return None;
+        }
+        let mut column = div()
+            .id("explorer-search-status")
+            .test_support()
+            .flex_none()
+            .px(px(Space::LG))
+            .pb(px(Space::XS))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint);
+        let mut retry_shown = false;
+        for (index, notice) in notices.into_iter().enumerate() {
+            let (icon, color, text, button): (IconName, _, String, Option<AnyElement>) = match notice {
+                SearchNotice::InFlight(n) => (
+                    IconName::Loader,
+                    p.text_faint,
+                    i18n::fill(&self.model.text("ui.explorer.searchInFlight"), &[("n", &n.to_string())]),
+                    None,
+                ),
+                SearchNotice::Failed { target, reason } => {
+                    let button = (!retry_shown).then(|| {
+                        kit::tool_button("explorer-search-retry", Some(IconName::RefreshCw), self.t("ui.explorer.searchRetry"), act("nav-search-retry", cx))
+                            .xsmall()
+                            .into_any_element()
+                    });
+                    retry_shown = true;
+                    (
+                        IconName::TriangleAlert,
+                        p.danger,
+                        i18n::fill(&self.model.text("ui.explorer.searchFailed"), &[("target", &target), ("reason", &reason)]),
+                        button,
+                    )
+                }
+                SearchNotice::More { target, remaining, loading, action } => {
+                    let text = match remaining {
+                        Some(n) => i18n::fill(&self.model.text("ui.explorer.searchMore"), &[("target", &target), ("n", &n.to_string())]),
+                        None => i18n::fill(&self.model.text("ui.explorer.searchMoreUnknown"), &[("target", &target)]),
+                    };
+                    let label = self.t(if loading { "ui.explorer.searchMoreLoading" } else { "ui.explorer.searchMoreExpand" });
+                    let button = kit::tool_button(SharedString::from(format!("explorer-search-more-{index}")), Some(IconName::ChevronDown), label, act(&action, cx))
+                        .xsmall()
+                        .disabled(loading)
+                        .into_any_element();
+                    (IconName::Info, p.text_faint, text, Some(button))
+                }
+                SearchNotice::Unsearched { target, count } => (
+                    IconName::Info,
+                    p.text_faint,
+                    i18n::fill(&self.model.text("ui.explorer.searchUnsearched"), &[("target", &target), ("n", &count.to_string())]),
+                    None,
+                ),
+            };
+            let text = SharedString::from(text);
+            column = column.child(
+                div()
+                    .id(SharedString::from(format!("explorer-search-status-{index}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(Space::XS))
+                    .child(kit::icon(icon, 12., color))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("explorer-search-status-text-{index}")))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(color)
+                            .tooltip_text(text.clone())
+                            .child(text),
+                    )
+                    .when_some(button, |this, button| this.child(button)),
+            );
+        }
+        Some(column.into_any_element())
     }
 
     fn group_row(&self, id: &str, collapsed: bool, members: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {

@@ -1155,6 +1155,14 @@ dict! {
     "shell.shortcuts.revealActiveTab" => "在对象树中定位当前标签", "Reveal active tab in explorer";
     "ui.explorer.searchSkipped" => "已跳过 {n} 个未连接的连接", "{n} disconnected connections skipped";
     "ui.explorer.searchSkippedShort" => "跳过 {n} 个", "{n} skipped";
+    "ui.explorer.searchInFlight" => "正在搜索 {n} 个连接…", "Searching {n} connections…";
+    "ui.explorer.searchFailed" => "{target} 搜索失败：{reason}", "Search failed in {target}: {reason}";
+    "ui.explorer.searchRetry" => "重试搜索", "Retry search";
+    "ui.explorer.searchMore" => "{target} 还有 {n} 个匹配", "{n} more matches in {target}";
+    "ui.explorer.searchMoreUnknown" => "{target} 还有更多匹配", "More matches in {target}";
+    "ui.explorer.searchMoreExpand" => "展开", "Show more";
+    "ui.explorer.searchMoreLoading" => "正在取回…", "Loading…";
+    "ui.explorer.searchUnsearched" => "{target} 只搜索了当前库，另有 {n} 个库未搜索（会话不能跨库读取）", "{target}: only the current database was searched; {n} other databases were not (the session cannot read across databases)";
     "ui.explorer.searchSkippedExpand" => "展开说明", "Show details";
     "ui.explorer.searchSkippedCollapse" => "折叠说明", "Collapse";
     "ui.explorer.connectSkipped" => "连接这些连接", "Connect them";

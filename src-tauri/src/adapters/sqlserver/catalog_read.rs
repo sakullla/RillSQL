@@ -2,7 +2,10 @@
 //! tiberius 句柄经互斥锁串行使用；别的库用三段名在同一条会话上读。
 
 use crate::catalog::model::{known_row_estimate, parse_kind, DatabaseNode, ObjectKind, ObjectRow, SchemaNode};
-use crate::catalog::read::{definition_failure, finish_kinds, read_failure, requested_limit, unloaded_database, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{
+    definition_failure, finish_kinds, read_failure, requested_limit, search_quota, unloaded_database, CatalogSearch, ObjectPageBody, ObjectWindow,
+    SEARCH_PER_CONNECTION, SEARCH_PER_DATABASE,
+};
 
 use super::catalog::{kind_sql, listed_kinds, metadata_sql, sqlserver_qualified};
 
@@ -200,54 +203,114 @@ fn sqlserver_object(row: &tiberius::Row) -> Result<ObjectRow, String> {
     })
 }
 
-/// 资源管理器全局搜索：当前库里的用户对象。
-pub(super) async fn search(client: &TdsHandle, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-    const LIMIT: usize = 300;
-    let Ok(db) = sqlserver_current_database(client).await else {
-        return Vec::new();
-    };
+fn sqlserver_bracket(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
+/// 一个库里名字命中的用户对象；`select` 是 SELECT 列表，库名用三段名限定，在同一条会话上读别的库。
+fn sqlserver_search_sql(database: &str, pattern: &str, select: &str, tail: &str) -> String {
+    let db = sqlserver_bracket(database);
     let escaped = pattern.replace('\'', "''");
-    let sql = format!(
-        "SELECT TOP {LIMIT} s.name, o.name, \
-         CASE o.type WHEN 'V' THEN 'view' WHEN 'P' THEN 'procedure' WHEN 'SO' THEN 'sequence' WHEN 'TR' THEN 'trigger' \
-         WHEN 'FN' THEN 'function' WHEN 'IF' THEN 'function' WHEN 'TF' THEN 'function' ELSE 'table' END \
-         FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+    format!(
+        "SELECT {select} FROM {db}.sys.objects o JOIN {db}.sys.schemas s ON s.schema_id = o.schema_id \
          WHERE o.is_ms_shipped = 0 AND o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF', 'TR', 'SO') \
-           AND LOWER(o.name) LIKE LOWER(N'{escaped}') ESCAPE '\\' \
-         ORDER BY s.name, o.name"
-    );
-    let Ok((_, rows)) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, &sql).await else {
-        return Vec::new();
+           AND LOWER(o.name) LIKE LOWER(N'{escaped}') ESCAPE '\\' {tail}"
+    )
+}
+
+const SQLSERVER_SEARCH_COLUMNS: &str = "s.name, o.name, \
+    CASE o.type WHEN 'V' THEN 'view' WHEN 'P' THEN 'procedure' WHEN 'SO' THEN 'sequence' WHEN 'TR' THEN 'trigger' \
+    WHEN 'FN' THEN 'function' WHEN 'IF' THEN 'function' WHEN 'TF' THEN 'function' ELSE 'table' END";
+
+fn cell_text(cell: Option<&crate::grid::Cell>) -> Option<String> {
+    match cell? {
+        crate::grid::Cell::Text(text) => Some(text.clone()),
+        crate::grid::Cell::Null => None,
+    }
+}
+
+async fn sqlserver_search_count(client: &TdsHandle, database: &str, pattern: &str) -> Result<usize, String> {
+    let sql = sqlserver_search_sql(database, pattern, "COUNT(*)", "");
+    let (_, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, &sql).await.map_err(read_failure)?;
+    Ok(rows.first().and_then(|row| cell_text(row.first())).and_then(|text| text.trim().parse().ok()).unwrap_or(0))
+}
+
+async fn sqlserver_search_fetch(client: &TdsHandle, database: &str, pattern: &str, offset: usize, take: usize, result: &mut CatalogSearch) -> Result<(), String> {
+    let tail = format!("ORDER BY s.name, o.name OFFSET {offset} ROWS FETCH NEXT {take} ROWS ONLY");
+    let sql = sqlserver_search_sql(database, pattern, SQLSERVER_SEARCH_COLUMNS, &tail);
+    let (_, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, &sql).await.map_err(read_failure)?;
+    let mut undecodable = 0usize;
+    for row in rows {
+        let (Some(schema), Some(name)) = (cell_text(row.first()), cell_text(row.get(1))) else {
+            undecodable += 1;
+            continue;
+        };
+        let kind = cell_text(row.get(2)).unwrap_or_else(|| "table".to_owned());
+        result.hits.push((database.to_owned(), schema, ObjectRow::fresh(name, parse_kind(&kind))));
+    }
+    if undecodable > 0 {
+        result.failures.push((database.to_owned(), read_failure(format!("{undecodable} 个对象名无法读取，已跳过"))));
+    }
+    Ok(())
+}
+
+/// 资源管理器全局搜索：当前库和同一连接上可访问的其他用户库，按库分配名额，失败按库报告。
+pub(super) async fn search(client: &TdsHandle, pattern: &str) -> CatalogSearch {
+    let current = match sqlserver_current_database(client).await {
+        Ok(db) => db,
+        Err(message) => return CatalogSearch::failed("", message),
     };
-    rows.into_iter()
-        .filter_map(|row| {
-            let schema = match row.first()? {
-                crate::grid::Cell::Text(text) => text.clone(),
-                crate::grid::Cell::Null => return None,
-            };
-            let name = match row.get(1)? {
-                crate::grid::Cell::Text(text) => text.clone(),
-                crate::grid::Cell::Null => return None,
-            };
-            let kind = match row.get(2)? {
-                crate::grid::Cell::Text(text) => text.clone(),
-                crate::grid::Cell::Null => "table".to_owned(),
-            };
-            Some((
-                db.clone(),
-                schema,
-                ObjectRow {
-                    kind: parse_kind(&kind),
-                    name,
-                    estimated_rows: None,
-                    stale: false,
-                    signature: String::new(),
-                    relation: String::new(),
-                    materialized: false,
-                },
-            ))
-        })
-        .collect()
+    let list = "SELECT name FROM sys.databases WHERE state = 0 AND (database_id > 4 OR name = DB_NAME()) AND HAS_DBACCESS(name) = 1 ORDER BY name";
+    let mut result = CatalogSearch::default();
+    let databases = match crate::adapters::sqlserver::grid_read::sqlserver_rows(client, list).await {
+        Ok((_, rows)) => rows.iter().filter_map(|row| cell_text(row.first())).collect::<Vec<_>>(),
+        Err(error) => {
+            // 读不到库清单时至少搜当前库，并说明原因。
+            result.failures.push((String::new(), read_failure(error)));
+            vec![current.clone()]
+        }
+    };
+    let mut counts = Vec::new();
+    for database in &databases {
+        match sqlserver_search_count(client, database, pattern).await {
+            Ok(0) => {}
+            Ok(count) => counts.push((database.clone(), count)),
+            Err(message) => result.failures.push((database.clone(), message)),
+        }
+    }
+    for ((database, count), (_, take)) in counts.iter().zip(search_quota(&counts, SEARCH_PER_DATABASE, SEARCH_PER_CONNECTION)) {
+        if take > 0 {
+            if let Err(message) = sqlserver_search_fetch(client, database, pattern, 0, take, &mut result).await {
+                result.failures.push((database.clone(), message));
+                continue;
+            }
+        }
+        if take < *count {
+            result.truncated.push((database.clone(), Some(count - take)));
+        }
+    }
+    result
+}
+
+/// 展开截断的库：按名字顺序从 `offset` 起再取 `limit` 条，并给出之后还剩多少。
+pub(super) async fn search_database(client: &TdsHandle, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+    let total = match sqlserver_search_count(client, database, pattern).await {
+        Ok(total) => total,
+        Err(message) => return CatalogSearch::failed(database, message),
+    };
+    let mut result = CatalogSearch::default();
+    if offset >= total {
+        return result;
+    }
+    let take = limit.min(total - offset);
+    if let Err(message) = sqlserver_search_fetch(client, database, pattern, offset, take, &mut result).await {
+        return CatalogSearch::failed(database, message);
+    }
+    let remaining = total - offset - take;
+    if remaining > 0 {
+        result.truncated.push((database.to_owned(), Some(remaining)));
+    }
+    result
 }
 
 /// SQL Server 的只读定义：函数/过程/触发器/视图走 OBJECT_DEFINITION，序列按 sys.sequences 重建。

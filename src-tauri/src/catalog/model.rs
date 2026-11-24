@@ -110,7 +110,7 @@ pub(crate) fn known_row_estimate(value: Option<i64>) -> Option<i64> {
 }
 
 impl ObjectRow {
-    #[cfg(test)]
+    /// 只有名字和种类的对象行（搜索命中等没有统计信息的来源）。
     pub fn fresh(name: impl Into<String>, kind: ObjectKind) -> Self {
         Self {
             name: name.into(),

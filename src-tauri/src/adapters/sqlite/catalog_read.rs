@@ -3,7 +3,10 @@
 use sqlx::Row as _;
 
 use crate::catalog::model::{kind_name, parse_kind, DatabaseNode, KindReport, ObjectKind, ObjectRow, SchemaNode};
-use crate::catalog::read::{definition_failure, empty_page, read_failure, requested_limit, ConnectionBody, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{
+    definition_failure, empty_page, read_failure, requested_limit, CatalogSearch, ConnectionBody, ObjectPageBody, ObjectWindow, SEARCH_PER_CONNECTION,
+    SEARCH_PER_DATABASE,
+};
 
 use super::catalog::{listed_kinds, quote_sqlite, sqlite_kind_count_sql, sqlite_kind_page_sql, sqlite_object_page_sql};
 
@@ -154,31 +157,58 @@ pub(super) async fn read_sqlite_objects(pool: &sqlx::SqlitePool, database: &str,
     })
 }
 
-/// 资源管理器全局搜索：逐个库（main 与附加库）检索表、视图与触发器的名字。
-pub(super) async fn search(pool: &sqlx::SqlitePool, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-    const LIMIT: usize = 300;
-    let Ok(dbs) = sqlite_database_names(pool).await else {
-        return Vec::new();
-    };
-    let mut hits = Vec::new();
-    for db in dbs {
-        let db_name = sqlite_database_or_main(&db.name);
-        let sql = format!(
-            "SELECT name, type, '' AS sig, COALESCE(tbl_name, '') AS rel FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' AND LOWER(name) LIKE LOWER(?1) ESCAPE '\\' ORDER BY name LIMIT ?2",
-            quote_sqlite(db_name)
-        );
-        let rows: Result<Vec<(String, String, String, String)>, _> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(pattern).bind(LIMIT as i64).fetch_all(pool).await;
-        if let Ok(rows) = rows {
-            for (name, kind, signature, relation) in rows {
-                hits.push((db.name.clone(), String::new(), object_from(name, kind, signature, relation)));
-                if hits.len() >= LIMIT {
-                    return hits;
-                }
+fn sqlite_search_sql(database: &str, tail: &str) -> String {
+    format!(
+        "SELECT name, type, '' AS sig, COALESCE(tbl_name, '') AS rel FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' AND LOWER(name) LIKE LOWER(?1) ESCAPE '\\' {tail}",
+        quote_sqlite(sqlite_database_or_main(database))
+    )
+}
+
+/// 一个库里从 `offset` 起取 `limit` 条命中（多取一条判断是否还有更多）。
+async fn sqlite_search_one(pool: &sqlx::SqlitePool, database: &str, pattern: &str, offset: usize, limit: usize, result: &mut CatalogSearch) {
+    let sql = sqlite_search_sql(database, "ORDER BY name LIMIT ?2 OFFSET ?3");
+    let rows: Result<Vec<(String, String, String, String)>, _> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(pattern)
+        .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
+        .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await;
+    match rows {
+        Ok(rows) => {
+            let more = rows.len() > limit;
+            for (name, kind, signature, relation) in rows.into_iter().take(limit) {
+                result.hits.push((database.to_owned(), String::new(), object_from(name, kind, signature, relation)));
+            }
+            if more {
+                result.truncated.push((database.to_owned(), None));
             }
         }
+        Err(error) => result.failures.push((database.to_owned(), read_failure(error))),
     }
-    hits
+}
+
+/// 资源管理器全局搜索：逐个库（main 与附加库）检索表、视图与触发器的名字，名额按库分配，失败按库报告。
+pub(super) async fn search(pool: &sqlx::SqlitePool, pattern: &str) -> CatalogSearch {
+    let dbs = match sqlite_database_names(pool).await {
+        Ok(dbs) => dbs,
+        Err(message) => return CatalogSearch::failed("", message),
+    };
+    let mut result = CatalogSearch::default();
+    for db in dbs {
+        let left = SEARCH_PER_CONNECTION.saturating_sub(result.hits.len());
+        if left == 0 {
+            result.truncated.push((db.name.clone(), None));
+            continue;
+        }
+        sqlite_search_one(pool, &db.name, pattern, 0, SEARCH_PER_DATABASE.min(left), &mut result).await;
+    }
+    result
+}
+
+pub(super) async fn search_database(pool: &sqlx::SqlitePool, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+    let mut result = CatalogSearch::default();
+    sqlite_search_one(pool, database, pattern, offset, limit, &mut result).await;
+    result
 }
 
 pub(super) async fn read_sqlite_definition(pool: &sqlx::SqlitePool, database: &str, name: &str, kind: &str) -> Result<String, String> {

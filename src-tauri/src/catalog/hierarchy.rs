@@ -471,8 +471,9 @@ impl NavTree {
         }
         let Some(node) = self.nodes.get(id) else { return false };
         // 只在库这一层按命中数决定收不收：库展开后，模式与“表 / 视图”分组跟着展开，不用再点一层。
+        // 用户搜索前已经展开的库（正在用的库）不收起：否则子串命中一多，这个库的命中反而一个都看不到（R4）。
         match node.kind {
-            NavKind::Database => self.subtree_hit_count(id, &self.needle()) <= SEARCH_AUTO_OPEN,
+            NavKind::Database => self.expanded.contains(id) || self.subtree_hit_count(id, &self.needle()) <= SEARCH_AUTO_OPEN,
             _ => true,
         }
     }

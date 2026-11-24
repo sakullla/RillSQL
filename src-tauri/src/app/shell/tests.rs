@@ -15180,3 +15180,136 @@ fn reveal_object_editor_routine_lazy_loads_its_group_then_reveals() {
     assert_revealed(&model, &id, "对象编辑器例程");
     assert!(model.pending_reveal.is_none());
 }
+
+// ---------------------------------------------------------------- T3 / R4 侧栏搜索：子串搜不全
+
+/// 夹具 shop_search_a 中名称含 map 的表（docker/init/mysql-ux-round3.sql）。
+const SEARCH_A_MAP: [&str; 25] = [
+    "invoices_map_00", "invoices_map_05", "invoices_map_10", "items_map_04", "items_map_09", "map_events_00", "map_events_05",
+    "map_prices_02", "map_prices_07", "map_shipments_03", "map_shipments_08", "map_vendors_04", "map_vendors_09", "reviews_map_01",
+    "reviews_map_06", "sa_audits_mapping_04", "sa_audits_mapping_09", "sa_carts_mapping_03", "sa_carts_mapping_08",
+    "sa_payments_mapping_02", "sa_payments_mapping_07", "sa_stock_mapping_01", "sa_stock_mapping_06", "tags_map_02", "tags_map_07",
+];
+
+/// 已连接的 MySQL：shop_search_a 已展开并读了第一页 100 张表；服务端检索返回该库全部 25 张含 map 的表。
+fn loaded_mysql_search_model() -> (WorkbenchModel, Vec<super::model::SearchBatch>) {
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let mut all: Vec<String> = SEARCH_A_MAP.iter().map(|name| (*name).to_owned()).collect();
+    all.extend((0..185).map(|i| format!("sa_filler_{i:03}")));
+    all.sort();
+    let first_page: Vec<ObjectRow> = all.iter().take(100).map(|name| ObjectRow::table(name, Some(1))).collect();
+    let mut database = nav_database("shop_search_a", first_page);
+    database.schemas[0].total = all.len();
+    let conn = nav_connection(Engine::Mysql, "demo", "demo-uat", vec![database, nav_database("shop_search_b", Vec::new())]);
+    let mut model = seeded_model(vec![record_for("demo", "demo-uat", Engine::Mysql)]);
+    model.connections.status.insert("demo".to_owned(), LinkStatus::Connected);
+    model.apply_navigation(&[conn], false);
+    expand_all(
+        &mut model,
+        &[
+            connection_node_id("demo"),
+            database_node_id("demo", "shop_search_a"),
+            group_node_id("demo", "shop_search_a", "", ObjectKind::Table),
+        ],
+    );
+    let hits = SEARCH_A_MAP.iter().map(|name| ("shop_search_a".to_owned(), String::new(), ObjectRow::table(*name, None))).collect();
+    (model, vec![("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql, hits)])
+}
+
+/// 复现：库已展开加载，搜完整表名能看到，搜子串 map 时这个库的命中一个都看不到。
+#[test]
+fn substring_search_in_a_loaded_database_shows_every_match() {
+    let (mut model, batches) = loaded_mysql_search_model();
+    model.set_field(DraftField::ObjectFilter, "map_events_05".into());
+    let generation = model.nav_search_generation;
+    let _ = model.apply_search_hits(generation, "map_events_05", vec![(batches[0].0.clone(), batches[0].1.clone(), Engine::Mysql, vec![batches[0].3[6].clone()])]);
+    assert!(model.nav_rows().iter().any(|row| row.label == "map_events_05"), "完整表名能搜到");
+
+    model.set_field(DraftField::ObjectFilter, "map".into());
+    let generation = model.nav_search_generation;
+    let _ = model.apply_search_hits(generation, "map", batches);
+    let rows = model.nav_rows();
+    let shown: Vec<&str> = rows.iter().filter(|row| row.kind == crate::catalog::hierarchy::NavKind::Object).map(|row| row.label.as_str()).collect();
+    for name in SEARCH_A_MAP {
+        assert!(shown.contains(&name), "子串搜索应显示 {name}；实际：{shown:?}");
+    }
+}
+
+/// 单个连接搜索失败时，其余连接的结果照常合入；失败的连接与原因出现在状态条，可重试；
+/// 已连接但搜索失败的连接不算进“跳过”，跳过只计未连接的连接。
+#[test]
+fn one_failed_connection_does_not_hide_other_results_and_reports_its_reason() {
+    use super::model::SearchNotice;
+    use crate::catalog::read::CatalogSearch;
+    let (mut model, batches) = loaded_mysql_search_model();
+    model.connections.rows.push(record_for("broken", "demo-dev", Engine::Mysql));
+    model.connections.status.insert("broken".to_owned(), LinkStatus::Connected);
+    model.connections.rows.push(record_for("off", "demo-off", Engine::Mysql));
+    model.set_field(DraftField::ObjectFilter, "map".into());
+    let generation = model.nav_search_generation;
+    let targets = vec![
+        ("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql),
+        ("broken".to_owned(), "demo-dev".to_owned(), Engine::Mysql),
+    ];
+    model.begin_nav_search(generation, &targets);
+    assert_eq!(model.nav_search_notices(), vec![SearchNotice::InFlight(2)], "结果到达前显示搜索中");
+
+    // 失败的连接先回来：不影响另一条连接。
+    let failed = CatalogSearch::failed("", "目录读取失败：Lock wait timeout");
+    assert!(model.apply_search_result(generation, "map", ("broken".to_owned(), "demo-dev".to_owned(), Engine::Mysql), failed));
+    assert_eq!(
+        model.nav_search_notices(),
+        vec![SearchNotice::InFlight(1), SearchNotice::Failed { target: "demo-dev".into(), reason: "目录读取失败：Lock wait timeout".into() }]
+    );
+    let ok = CatalogSearch { hits: batches[0].3.clone(), ..CatalogSearch::default() };
+    assert!(model.apply_search_result(generation, "map", ("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql), ok));
+    let shown: Vec<String> = model.nav_rows().into_iter().filter(|row| row.kind == crate::catalog::hierarchy::NavKind::Object).map(|row| row.label).collect();
+    for name in SEARCH_A_MAP {
+        assert!(shown.iter().any(|label| label == name), "{name}");
+    }
+    let notices = model.nav_search_notices();
+    assert!(!notices.iter().any(|notice| matches!(notice, SearchNotice::InFlight(_))), "全部完成");
+    assert!(notices.iter().any(|notice| matches!(notice, SearchNotice::Failed { target, .. } if target == "demo-dev")));
+    assert_eq!(model.nav_search_skipped_ids(), vec!["off".to_owned()], "只统计未连接的连接");
+
+    // 重试：新一轮搜索，旧报告作废。
+    let _ = model.dispatch("nav-search-retry");
+    assert_ne!(model.nav_search_generation, generation);
+    assert!(model.nav_search_notices().is_empty());
+    assert!(model.nav_requests.iter().any(|req| matches!(req, super::nav::NavRequest::Search(query) if query == "map")));
+    // 旧一轮迟到的结果被丢弃。
+    assert!(!model.apply_search_result(generation, "map", ("broken".to_owned(), "demo-dev".to_owned(), Engine::Mysql), CatalogSearch::default()));
+}
+
+/// 命中超过名额的库带截断标记，状态条给出“还有 N 个”；展开后按已取回的位置继续取，取完移除标记。
+#[test]
+fn truncated_database_shows_more_and_expanding_fetches_the_rest() {
+    use super::model::SearchNotice;
+    use crate::catalog::model::ObjectRow;
+    use crate::catalog::read::CatalogSearch;
+    let (mut model, _) = loaded_mysql_search_model();
+    model.set_field(DraftField::ObjectFilter, "map".into());
+    let generation = model.nav_search_generation;
+    model.begin_nav_search(generation, &[("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql)]);
+    let first: Vec<_> = (0..10).map(|i| ("shop_search_b".to_owned(), String::new(), ObjectRow::table(format!("map_b_{i:02}"), None))).collect();
+    let result = CatalogSearch { hits: first, truncated: vec![("shop_search_b".to_owned(), Some(14))], ..CatalogSearch::default() };
+    assert!(model.apply_search_result(generation, "map", ("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql), result));
+    let notices = model.nav_search_notices();
+    let SearchNotice::More { target, remaining, loading, action } = &notices[0] else { panic!("{notices:?}") };
+    assert_eq!((target.as_str(), *remaining, *loading), ("demo-uat / shop_search_b", Some(14), false));
+    let _ = model.dispatch(action);
+    let request = model.take_search_more_request().expect("展开排队一次按库检索");
+    assert_eq!((request.database.as_str(), request.offset), ("shop_search_b", 10));
+    let _ = model.dispatch(action);
+    assert!(model.take_search_more_request().is_none(), "取回中不重复请求");
+    assert!(matches!(&model.nav_search_notices()[0], SearchNotice::More { loading: true, .. }));
+
+    let rest: Vec<_> = (10..24).map(|i| ("shop_search_b".to_owned(), String::new(), ObjectRow::table(format!("map_b_{i:02}"), None))).collect();
+    assert!(model.apply_search_more(&request, CatalogSearch { hits: rest, ..CatalogSearch::default() }));
+    assert!(model.nav_search_notices().is_empty(), "取完后不再显示还有更多");
+    let open_b = crate::catalog::hierarchy::database_node_id("demo", "shop_search_b");
+    let _ = model.dispatch(&format!("nav-toggle:{open_b}"));
+    let rows = model.nav_rows();
+    assert_eq!(rows.iter().filter(|row| row.label.starts_with("map_b_")).count(), 24, "展开后取回其余结果");
+}

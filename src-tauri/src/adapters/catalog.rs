@@ -7,7 +7,7 @@
 use crate::catalog::hierarchy::{ColumnInfo, IndexInfo};
 use crate::catalog::model::{KindSql, MetadataSql, ObjectKind, ObjectRow, SchemaNode};
 use crate::catalog::objects::ExtrasBody;
-use crate::catalog::read::{empty_page, read_failure, ConnectionBody, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{empty_page, read_failure, CatalogSearch, ConnectionBody, ObjectPageBody, ObjectWindow};
 use crate::connections::CatalogSession;
 use crate::diagram::Diagram;
 use crate::query::assist::ColumnMeta;
@@ -294,9 +294,15 @@ pub trait CatalogDialect: Sync {
         None
     }
 
-    /// 全局搜索：`pattern` 是已转义、两端带 `%` 的 LIKE 模式。返回 (库, 模式, 对象)。
-    async fn search_objects(&self, _session: &CatalogSession, _pattern: &str) -> Vec<(String, String, ObjectRow)> {
-        Vec::new()
+    /// 全局搜索：`pattern` 是已转义、两端带 `%` 的 LIKE 模式。命中为 (库, 模式, 对象)；
+    /// 名额按库分配，超出的库带截断标记，出错按库报告。
+    async fn search_objects(&self, _session: &CatalogSession, _pattern: &str) -> CatalogSearch {
+        CatalogSearch::default()
+    }
+
+    /// 展开截断的库：在一个库里按名字顺序从 `offset` 起取 `limit` 条命中。
+    async fn search_database_objects(&self, _session: &CatalogSession, database: &str, _pattern: &str, _offset: usize, _limit: usize) -> CatalogSearch {
+        CatalogSearch::failed(database, read_failure("这种连接不支持按库展开搜索结果"))
     }
 
     /// 只读定义原文。

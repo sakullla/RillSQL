@@ -232,6 +232,48 @@ impl RevealTarget {
 /// 一条连接的服务端搜索命中：(连接 id, 连接名, 引擎, [(库, 模式, 对象)])。
 pub type SearchBatch = (String, String, crate::catalog::Engine, Vec<(String, String, crate::catalog::model::ObjectRow)>);
 
+/// 一个库的搜索命中超过名额：已经取回多少、还剩多少（未知为 None）、是否正在展开。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTruncation {
+    pub database: String,
+    pub fetched: usize,
+    pub remaining: Option<usize>,
+    pub loading: bool,
+}
+
+/// 一条连接在本轮侧栏搜索里的结果：是否完成、按库的失败、截断的库与没能搜索的库。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavSearchReport {
+    pub connection_id: String,
+    pub connection_name: String,
+    pub engine: crate::catalog::Engine,
+    pub done: bool,
+    /// (库, 原因)；库为空表示整条连接的搜索失败。
+    pub failures: Vec<(String, String)>,
+    pub truncated: Vec<SearchTruncation>,
+    pub unsearched: Vec<String>,
+}
+
+/// 侧栏搜索状态条的一行：搜索中、按连接 / 库的失败、截断的库（可展开）、没能搜索的库。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchNotice {
+    InFlight(usize),
+    Failed { target: String, reason: String },
+    More { target: String, remaining: Option<usize>, loading: bool, action: String },
+    Unsearched { target: String, count: usize },
+}
+
+/// 展开截断库的按库检索：由视图取走并执行，结果经 `apply_search_more` 回到模型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMoreRequest {
+    pub generation: u64,
+    pub query: String,
+    pub connection_id: String,
+    pub engine: crate::catalog::Engine,
+    pub database: String,
+    pub offset: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DraftField {
     Name,
@@ -540,6 +582,11 @@ pub struct WorkbenchModel {
     pub pending_search_hits: std::collections::HashMap<String, (u64, String, SearchBatch)>,
     /// 侧栏“已跳过 N 个未连接连接”横幅是否折叠成一行计数。
     pub nav_search_skip_collapsed: bool,
+    /// 本轮搜索各连接的进度、失败与截断；只在代数与 `nav_search_report_generation` 一致时有效。
+    pub nav_search_reports: Vec<NavSearchReport>,
+    pub nav_search_report_generation: u64,
+    /// 等待视图执行的“展开更多命中”。
+    pub search_more_requests: VecDeque<SearchMoreRequest>,
     /// “连接这些连接”排队的连接：一次连一条，上一条结束后再连下一条。
     pub connect_queue: VecDeque<String>,
     /// 最近一次从查询页同步的对象索引；资源管理器、对象筛选和快速打开共用这一份。
@@ -734,6 +781,9 @@ impl WorkbenchModel {
             nav_search_generation: 0,
             pending_search_hits: std::collections::HashMap::new(),
             nav_search_skip_collapsed: false,
+            nav_search_reports: Vec::new(),
+            nav_search_report_generation: 0,
+            search_more_requests: VecDeque::new(),
             connect_queue: VecDeque::new(),
             catalog: Vec::new(),
             catalog_error: String::new(),
@@ -3216,6 +3266,183 @@ impl WorkbenchModel {
         changed
     }
 
+    /// 视图发起一轮搜索：登记要搜的连接，结果到达前显示为“搜索中”。
+    pub fn begin_nav_search(&mut self, generation: u64, targets: &[(String, String, crate::catalog::Engine)]) {
+        self.nav_search_report_generation = generation;
+        self.search_more_requests.clear();
+        self.nav_search_reports = targets
+            .iter()
+            .map(|(id, name, engine)| NavSearchReport {
+                connection_id: id.clone(),
+                connection_name: name.clone(),
+                engine: *engine,
+                done: false,
+                failures: Vec::new(),
+                truncated: Vec::new(),
+                unsearched: Vec::new(),
+            })
+            .collect();
+    }
+
+    /// 本轮搜索的各连接结果；没在搜索或已经换了一轮时为空。
+    pub fn nav_search_reports(&self) -> &[NavSearchReport] {
+        if !self.nav_searching() || self.nav_search_report_generation != self.nav_search_generation {
+            return &[];
+        }
+        &self.nav_search_reports
+    }
+
+    /// 状态条内容：按连接顺序列出失败、截断与未搜索的库，最前面是仍在搜索的连接数。
+    pub fn nav_search_notices(&self) -> Vec<SearchNotice> {
+        let reports = self.nav_search_reports();
+        let mut notices = Vec::new();
+        let pending = reports.iter().filter(|report| !report.done).count();
+        if pending > 0 {
+            notices.push(SearchNotice::InFlight(pending));
+        }
+        let target = |report: &NavSearchReport, database: &str| {
+            if database.is_empty() {
+                report.connection_name.clone()
+            } else {
+                format!("{} / {database}", report.connection_name)
+            }
+        };
+        for (index, report) in reports.iter().enumerate() {
+            for (database, reason) in &report.failures {
+                notices.push(SearchNotice::Failed { target: target(report, database), reason: reason.clone() });
+            }
+            for (at, entry) in report.truncated.iter().enumerate() {
+                notices.push(SearchNotice::More {
+                    target: target(report, &entry.database),
+                    remaining: entry.remaining,
+                    loading: entry.loading,
+                    action: format!("nav-search-more:{index}:{at}"),
+                });
+            }
+            if !report.unsearched.is_empty() {
+                notices.push(SearchNotice::Unsearched { target: report.connection_name.clone(), count: report.unsearched.len() });
+            }
+        }
+        notices
+    }
+
+    /// 一条连接的搜索结果回到模型：每条连接完成就合入，不等其它连接。
+    /// 失败、截断与没能搜索的库记在本轮报告里；代数或检索词不符就丢弃。
+    pub fn apply_search_result(
+        &mut self,
+        generation: u64,
+        query: &str,
+        connection: (String, String, crate::catalog::Engine),
+        result: crate::catalog::read::CatalogSearch,
+    ) -> bool {
+        if generation != self.nav_search_generation || self.object_filter.trim() != query.trim() || self.nav.query().is_empty() {
+            return false;
+        }
+        let (conn_id, conn_name, engine) = connection;
+        if self.nav_search_report_generation != generation {
+            self.begin_nav_search(generation, &[]);
+        }
+        let mut fetched: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (database, _, _) in &result.hits {
+            *fetched.entry(database.as_str()).or_default() += 1;
+        }
+        let truncated = result
+            .truncated
+            .iter()
+            .map(|(database, remaining)| SearchTruncation {
+                database: database.clone(),
+                fetched: fetched.get(database.as_str()).copied().unwrap_or(0),
+                remaining: *remaining,
+                loading: false,
+            })
+            .collect();
+        let report = NavSearchReport {
+            connection_id: conn_id.clone(),
+            connection_name: conn_name.clone(),
+            engine,
+            done: true,
+            failures: result.failures,
+            truncated,
+            unsearched: result.unsearched,
+        };
+        match self.nav_search_reports.iter_mut().find(|item| item.connection_id == conn_id) {
+            Some(item) => *item = report,
+            None => self.nav_search_reports.push(report),
+        }
+        if !result.hits.is_empty() {
+            self.apply_search_hits(generation, query, vec![(conn_id, conn_name, engine, result.hits)]);
+        }
+        true
+    }
+
+    /// “还有更多，展开”：对这个库从已取回的位置起再取一页；同一个库一次只发一个请求。
+    pub fn request_search_more(&mut self, report: usize, database: usize) -> bool {
+        if !self.nav_searching() || self.nav_search_report_generation != self.nav_search_generation {
+            return false;
+        }
+        let generation = self.nav_search_generation;
+        let query = self.object_filter.trim().to_owned();
+        let Some(item) = self.nav_search_reports.get_mut(report) else { return false };
+        let (connection_id, engine) = (item.connection_id.clone(), item.engine);
+        let Some(entry) = item.truncated.get_mut(database) else { return false };
+        if entry.loading {
+            return false;
+        }
+        entry.loading = true;
+        self.search_more_requests.push_back(SearchMoreRequest {
+            generation,
+            query,
+            connection_id,
+            engine,
+            database: entry.database.clone(),
+            offset: entry.fetched,
+        });
+        true
+    }
+
+    pub fn take_search_more_request(&mut self) -> Option<SearchMoreRequest> {
+        self.search_more_requests.pop_front()
+    }
+
+    /// 展开结果回到模型：合入命中，更新这个库的截断状态；取完就移除截断标记。
+    pub fn apply_search_more(&mut self, request: &SearchMoreRequest, result: crate::catalog::read::CatalogSearch) -> bool {
+        if request.generation != self.nav_search_generation
+            || self.nav_search_report_generation != request.generation
+            || self.object_filter.trim() != request.query.trim()
+            || self.nav.query().is_empty()
+        {
+            return false;
+        }
+        let Some(report) = self.nav_search_reports.iter_mut().find(|item| item.connection_id == request.connection_id) else { return false };
+        let added = result.hits.iter().filter(|(database, _, _)| *database == request.database).count();
+        let remaining = result.truncated.iter().find(|(database, _)| *database == request.database).map(|(_, remaining)| *remaining);
+        for (database, message) in &result.failures {
+            if !report.failures.iter().any(|(db, text)| db == database && text == message) {
+                report.failures.push((database.clone(), message.clone()));
+            }
+        }
+        let failed = result.failures.iter().any(|(database, _)| *database == request.database || database.is_empty());
+        if let Some(at) = report.truncated.iter().position(|entry| entry.database == request.database) {
+            let entry = &mut report.truncated[at];
+            entry.loading = false;
+            entry.fetched += added;
+            match remaining {
+                Some(left) => entry.remaining = left,
+                // 没有再报截断：取完了。失败时留着入口，可以再试。
+                None if !failed => {
+                    report.truncated.remove(at);
+                }
+                None => {}
+            }
+        }
+        let name = report.connection_name.clone();
+        let engine = report.engine;
+        if !result.hits.is_empty() {
+            self.apply_search_hits(request.generation, &request.query, vec![(request.connection_id.clone(), name, engine, result.hits)]);
+        }
+        true
+    }
+
     /// 目录刷新后合入暂存的检索命中：根节点已入树、代数与检索词仍是当前的才合入；过期的直接丢弃。
     pub fn merge_pending_search_hits(&mut self) -> bool {
         if self.pending_search_hits.is_empty() {
@@ -4485,6 +4712,16 @@ impl WorkbenchModel {
         }
         if id == "nav-search-skipped-toggle" {
             self.nav_search_skip_collapsed = !self.nav_search_skip_collapsed;
+            return true;
+        }
+        if id == "nav-search-retry" {
+            self.rerun_nav_search();
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-search-more:") {
+            if let Some((report, database)) = rest.split_once(':').and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))) {
+                self.request_search_more(report, database);
+            }
             return true;
         }
         // 资源管理器里连接失败那一行的两个出口：再连一次，或打开这条连接的编辑表单改配置。
