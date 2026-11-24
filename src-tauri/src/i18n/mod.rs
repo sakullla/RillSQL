@@ -249,6 +249,7 @@ dict! {
     "shell.tabs.pinned" => "已固定", "Pinned";
     "shell.tabs.list" => "标签列表", "Tab list";
     "shell.tabs.unsavedDraft" => "有未保存的查询草稿", "Unsaved query draft";
+    "shell.tabs.awaitingConfirm" => "等待执行确认：这批语句还没有发送", "Awaiting run confirmation: nothing has been sent yet";
     "shell.tabs.pendingStructure" => "表结构有待应用的变更", "Pending structure changes";
     "shell.tabs.pendingCells" => "先提交或撤销当前表格的暂存修改", "Commit or discard the staged grid changes first";
     "shell.tabs.needObject" => "先在对象树里选择表或视图。", "Choose a table or view in the object tree first.";

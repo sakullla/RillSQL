@@ -3087,3 +3087,49 @@ fn extra_result_sets_share_their_statement_range() {
     let log = desk.log();
     assert!(log.iter().any(|entry| entry.message.contains("警告")), "消息页带警告：{log:?}");
 }
+
+/// 存储过程中途失败（SELECT 之后 SIGNAL）：驱动带回已经读到的结果集。
+struct FailingCall;
+
+#[async_trait::async_trait]
+impl StatementDriver for FailingCall {
+    async fn run(&self, sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> exec::DriverReport {
+        let set = |name: &str, value: &str| exec::StatementValue {
+            columns: vec![name.to_owned()],
+            column_types: vec!["INT".to_owned()],
+            rows: vec![vec![Some(value.to_owned())]],
+            truncated: false,
+            affected: None,
+        };
+        if !sql.starts_with("CALL") {
+            return exec::DriverReport::unchanged(sql, Ok(ok_count()));
+        }
+        let message = "ERROR 1644 (45000): order check failed".to_owned();
+        let extras = exec::ResultExtras { partial: Some(set("first", "1")), more: vec![set("second", "2")], ..Default::default() };
+        exec::DriverReport {
+            sent: exec::CappedSql::unchanged(sql),
+            outcome: Err(StatementStop::Error { message: message.clone(), at: None, code: Some("1644".to_owned()) }),
+            failure: Some(exec::Failure { message, at: None, code: Some("1644".to_owned()) }),
+            extras,
+        }
+    }
+}
+
+/// R14：过程中途失败时语句按失败登记（批次失败、后续语句不执行、错误码与原文保留），
+/// 已经读到的结果集照样保留在报告里。
+#[tokio::test]
+async fn a_procedure_failing_midway_is_an_error_that_keeps_its_result_sets() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("CALL shop.check_orders()"), piece("SELECT 2")];
+    let report = run_batch(&parts, 100, &flag, false, &FailingCall, None).await;
+    assert_eq!(report.status, "error", "批次按失败结束");
+    let call = &report.statements[0];
+    assert_eq!(call.status, "error");
+    assert!(call.message.contains("order check failed"), "{}", call.message);
+    assert_eq!(call.error_code.as_deref(), Some("1644"));
+    assert_eq!(call.columns, vec!["first".to_owned()], "第一个结果集保留");
+    assert_eq!(call.rows, vec![vec![Some("1".to_owned())]]);
+    assert_eq!(call.extras.more.len(), 1, "其余已读到的结果集保留");
+    assert!(call.extras.partial.is_none(), "partial 已经并入语句本身");
+    assert_eq!(report.statements[1].status, "skipped", "失败之后的语句不执行");
+}

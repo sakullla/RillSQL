@@ -82,6 +82,9 @@ async fn read_more_sets(
 ) -> Result<(), String> {
     loop {
         if result.is_empty() {
+            // 过程在某个结果集之后失败（例如 SIGNAL）时，驱动把服务端错误挂在待读结果上，
+            // is_empty 看不到它：再读一次把错误取出来，不能让 drop_result 静默吞掉。
+            result.next().await.map_err(|err| crate::error_text::chain(&err))?;
             return Ok(());
         }
         if cancel.load(Ordering::SeqCst) {
@@ -136,6 +139,8 @@ async fn read_warnings(conn: &mut mysql_async::Conn) -> Vec<String> {
 }
 
 /// 执行一条语句。返回第一个结果集（与流式发布的一致），其余结果集、最后的影响行数和警告放在 ResultExtras。
+/// 失败时同样带回 ResultExtras：CALL 中途失败（例如 SELECT 之后 SIGNAL），已经读到的结果集放在
+/// partial（第一个）与 more（其余）里，语句本身按失败登记，错误原文照旧。
 #[allow(clippy::too_many_arguments)]
 pub(in crate::adapters) async fn mysql_run(
     conn: &mut mysql_async::Conn,
@@ -145,50 +150,79 @@ pub(in crate::adapters) async fn mysql_run(
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
-) -> Result<(StatementValue, ResultExtras), String> {
+) -> Result<(StatementValue, ResultExtras), (String, Box<ResultExtras>)> {
     // 握手包里的线程 id 就是 CONNECTION_ID()；不再为每条语句多走一次网络往返。
     transport.set_mysql_connection_id(u64::from(conn.id()));
     let call = is_call(bounded);
     let mut extras = ResultExtras::default();
-    let value = {
+    let outcome: Result<StatementValue, String> = {
         // 读取上限已由 LiveDriver 改写过，这里发出去的就是实际语句。
-        let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| crate::error_text::chain(&err))?;
-        let (value, exhausted) = match mysql_first_set(&mut result, limit, cancel, sink, index).await {
-            Ok(first) => first,
-            Err(message) => {
-                if cancel.load(Ordering::SeqCst) {
-                    let _ = result.drop_result().await;
+        let mut result = conn.query_iter(bounded.to_owned()).await.map_err(|err| (crate::error_text::chain(&err), Box::default()))?;
+        // 第一个结果集就失败时只在取消后收尾（与此前一致）；读完第一个结果集之后总是收掉剩余结果。
+        let mut drain = true;
+        let outcome = match mysql_first_set(&mut result, limit, cancel, sink, index, call).await {
+            Ok((value, exhausted)) => {
+                // 存储过程可能返回多个结果集：逐个收下，不再丢掉。第一个结果集被截断时也已读完（见 mysql_first_set）。
+                if exhausted && call {
+                    match read_more_sets(&mut result, limit, cancel, &mut extras).await {
+                        Ok(()) => Ok(value),
+                        Err(message) => {
+                            // 中途出错：已经收到的结果集保留，语句按失败登记。
+                            extras.partial = Some(value);
+                            Err(message)
+                        }
+                    }
+                } else {
+                    Ok(value)
                 }
-                return Err(message);
+            }
+            Err((message, partial)) => {
+                extras.partial = partial;
+                drain = cancel.load(Ordering::SeqCst);
+                Err(message)
             }
         };
-        // 存储过程可能返回多个结果集：逐个收下，不再丢掉。
-        if exhausted && call {
-            if let Err(message) = read_more_sets(&mut result, limit, cancel, &mut extras).await {
-                // 中途出错：已经收到的结果集保留，错误写进说明。
-                extras.notes.push(message);
-            }
+        if drain {
+            let _ = result.drop_result().await;
         }
-        let _ = result.drop_result().await;
-        value
+        outcome
     };
     if call {
+        // 驱动可能在最后一个结果集之后自行收下过程的 OK 包：影响行数此时记在连接上。
+        if outcome.is_ok() && extras.affected.is_none() && conn.affected_rows() > 0 {
+            extras.affected = Some(conn.affected_rows());
+        }
         extras.warnings = read_warnings(conn).await;
     }
-    if call && value.columns.is_empty() && extras.more.is_empty() {
-        extras.no_result_set = true;
+    match outcome {
+        Ok(value) => {
+            if call && value.columns.is_empty() && extras.more.is_empty() {
+                extras.no_result_set = true;
+            }
+            Ok((value, extras))
+        }
+        Err(message) => {
+            if !call {
+                extras = ResultExtras::default();
+            }
+            // 失败时 SHOW WARNINGS 会把这条错误再列一遍：错误已经按失败登记，这里只留真正的警告。
+            extras.warnings.retain(|warning| !warning.starts_with("Error "));
+            Err((message, Box::new(extras)))
+        }
     }
-    Ok((value, extras))
 }
 
 /// 第一个结果集：带列时按块流式发布；返回值和“这个结果集是否已经读完”（读完才能继续读后面的结果集）。
+/// CALL 不会被改写加 LIMIT：超出上限时把这个结果集剩余的行读完丢弃（只标截断），后面的结果集才能接着读。
+/// 失败时带回已经读到的行（只对 CALL；普通语句由流式快照保留）。
 async fn mysql_first_set(
     result: &mut mysql_async::QueryResult<'_, '_, mysql_async::TextProtocol>,
     limit: usize,
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
-) -> Result<(StatementValue, bool), String> {
+    call: bool,
+) -> Result<(StatementValue, bool), (String, Option<StatementValue>)> {
     let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
         .columns_ref()
         .iter()
@@ -199,7 +233,7 @@ async fn mysql_first_set(
     if columns.is_empty() {
         let affected = result.affected_rows();
         // OK 包没有行：读一次前进到下一个结果集（没有就结束），同一条连接才能执行下一条。
-        let _ = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
+        let _ = result.next().await.map_err(|err| (crate::error_text::chain(&err), None))?;
         let value = StatementValue {
             columns,
             column_types,
@@ -210,6 +244,16 @@ async fn mysql_first_set(
         sink.publish(index, &value).await;
         return Ok((value, true));
     }
+    let snapshot = |rows: &[Vec<Option<String>>], truncated: bool| StatementValue {
+        columns: columns.clone(),
+        column_types: column_types.clone(),
+        rows: rows.to_vec(),
+        truncated,
+        affected: None,
+    };
+    let fail = |err: mysql_async::Error, rows: &[Vec<Option<String>>], truncated: bool| {
+        (crate::error_text::chain(&err), call.then(|| snapshot(rows, truncated)))
+    };
     let mut rows = Vec::new();
     let mut truncated = false;
     let mut pending: Option<mysql_async::Row> = None;
@@ -217,14 +261,15 @@ async fn mysql_first_set(
     loop {
         if cancel.load(Ordering::SeqCst) {
             // 调用方收掉剩余结果（drop_result），同一条连接才能执行下一条。
-            return Err("已取消".to_owned());
+            return Err(("已取消".to_owned(), None));
         }
         let row = if let Some(row) = pending.take() {
             row
         } else {
-            match result.next().await.map_err(|err| crate::error_text::chain(&err))? {
-                Some(row) => row,
-                None => break,
+            match result.next().await {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(err) => return Err(fail(err, &rows, false)),
             }
         };
         if rows.len() >= limit {
@@ -236,7 +281,10 @@ async fn mysql_first_set(
             .collect();
         rows.push(cells);
         if rows.len() < limit && rows.len() % step == 0 {
-            let peek = result.next().await.map_err(|err| crate::error_text::chain(&err))?;
+            let peek = match result.next().await {
+                Ok(peek) => peek,
+                Err(err) => return Err(fail(err, &rows, false)),
+            };
             let partial = StatementValue {
                 columns: columns.clone(),
                 column_types: column_types.clone(),
@@ -248,7 +296,7 @@ async fn mysql_first_set(
             match peek {
                 None => return Ok((partial, true)),
                 Some(next) => {
-                    sink.pause(cancel).await?;
+                    sink.pause(cancel).await.map_err(|message| (message, None))?;
                     rows = partial.rows;
                     pending = Some(next);
                 }
@@ -257,8 +305,22 @@ async fn mysql_first_set(
     }
     let mut exhausted = true;
     if truncated {
-        // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
-        exhausted = result.next().await.map_err(|err| crate::error_text::chain(&err))?.is_none();
+        if call {
+            // CALL 没有 LIMIT：剩余的行读完丢弃，后面的结果集与最后的 OK 包才能接着读。
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(("已取消".to_owned(), None));
+                }
+                match result.next().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => return Err(fail(err, &rows, true)),
+                }
+            }
+        } else {
+            // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
+            exhausted = result.next().await.map_err(|err| fail(err, &rows, true))?.is_none();
+        }
     }
     let value = StatementValue {
         columns,

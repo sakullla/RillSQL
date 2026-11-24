@@ -183,6 +183,11 @@ pub fn waiting_label(locale: Locale) -> String {
     pick(locale, "等待确认…", "Awaiting confirmation…")
 }
 
+/// 取消确认后的提示：明确告诉用户这批语句一条都没有执行。
+pub fn cancelled_note(locale: Locale) -> String {
+    pick(locale, "已取消：未执行任何语句", "Cancelled: no statements were run")
+}
+
 /// 生产环境的强调说明。
 pub fn production_text(locale: Locale) -> String {
     pick(locale, "生产环境：确认后会直接作用于线上数据。", "Production: confirming runs these statements against live data.")
@@ -208,7 +213,9 @@ pub fn statement_consequence_text(locale: Locale, sql: &str, consequence: &Conse
 }
 
 /// 风险确认模态框：头部（标题、目标连接、环境、库）固定；正文逐条列出语句与后果并独立滚动；
-/// 底部“确认执行 / 取消”固定可见。确认前一条语句都不发送；遮罩点空白处与 Esc 都是取消。
+/// 底部“确认执行 / 取消”固定可见。确认前一条语句都不发送；只有“取消”按钮与 Esc 会取消。
+/// 点遮罩（含被盖住的工具栏）不取消，只把焦点送回确认框并闪一下强调边框（flash）。
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     prompt: &RiskPrompt,
     locale: Locale,
@@ -217,6 +224,7 @@ pub fn render(
     mono: &SharedString,
     entity: &Entity<QueryPane>,
     focus: &gpui_kit::FocusHandle,
+    flash: bool,
 ) -> AnyElement {
     let total = prompt.total();
     let prod = production(prompt);
@@ -401,7 +409,7 @@ pub fn render(
         .items_center()
         .justify_center()
         .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
-            scrim_entity.update(cx, |pane, cx| pane.command("cancel-risks", cx));
+            scrim_entity.update(cx, |pane, cx| pane.command("attend-risks", cx));
         })
         .child(
             kit::modal_surface("query-risks", SharedString::from(title(locale)), kit::ModalWidth::PREVIEW, p)
@@ -409,6 +417,7 @@ pub fn render(
                 .track_focus(focus)
                 .focus_trap("query-risks", focus)
                 .when(prod, |this| this.border_2().border_color(p.danger))
+                .when(flash, |this| this.border_2().border_color(p.accent))
                 .overflow_hidden()
                 .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {

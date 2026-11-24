@@ -625,7 +625,7 @@ fn call_returns_every_result_set_and_warnings_on_the_compose_fixture() {
             .await
             .expect("打开连接");
         assert!(opened.connected, "{:?}", opened.report);
-        let run = |sql: &'static str| {
+        let run_limited = |sql: &'static str, limit: u64| {
             let services = services.clone();
             let id = id.clone();
             let dir = dir.clone();
@@ -635,12 +635,12 @@ fn call_returns_every_result_set_and_warnings_on_the_compose_fixture() {
                 desk.open_database(&id, &id, "mysql", "shop");
                 desk.set_draft(sql);
                 // CALL 可能修改数据：仍然先确认，确认后按同一份文本发送。
-                let BeginRun::Risks(prompt) = desk.begin_run(&tasks, RunScope::Script, None) else {
+                let BeginRun::Risks(prompt) = desk.begin_run_limited(&tasks, RunScope::Script, None, limit) else {
                     panic!("CALL 需要确认");
                 };
                 assert_eq!(prompt.statements.len(), 1);
                 let confirmed = desk.confirm_risks().expect("确认后的文本");
-                let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, Some(confirmed)) else {
+                let BeginRun::Ready(prepared) = desk.begin_run_limited(&tasks, RunScope::Script, Some(confirmed), limit) else {
                     panic!("确认后应能执行");
                 };
                 let query = QueryState::new(dir.join("query-history.sqlite"));
@@ -648,6 +648,7 @@ fn call_returns_every_result_set_and_warnings_on_the_compose_fixture() {
             }
         };
 
+        let run = |sql: &'static str| run_limited(sql, 1000);
         let two = run("CALL report_two_sets()").await;
         let pages: Vec<_> = two.statements.iter().filter(|statement| !statement.columns.is_empty()).collect();
         assert_eq!(pages.len(), 2, "两个结果集各一页：{:#?}", two.statements);
@@ -664,5 +665,53 @@ fn call_returns_every_result_set_and_warnings_on_the_compose_fixture() {
         assert!(none.statements[0].columns.is_empty());
         assert!(none.statements[0].message.contains("未返回结果集"), "{}", none.statements[0].message);
         println!("call-live: report_two_sets {} 页，touch_nothing 提示：{}", pages.len(), none.statements[0].message);
+
+        // 这两个过程只给本用例用（夹具 SQL 不在本任务范围）：直接在 shop 库里建，名称通用。
+        let session = services.connections.catalog_session(&id).expect("已打开的会话");
+        let crate::connections::CatalogSession::Mysql(pool) = session else {
+            panic!("夹具不是 MySQL 会话");
+        };
+        let mut conn = pool.get_conn().await.expect("夹具连接");
+        for statement in [
+            "DROP PROCEDURE IF EXISTS shop.demo_many_rows",
+            "CREATE PROCEDURE shop.demo_many_rows() BEGIN \
+               SELECT n FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 120) SELECT n FROM seq) s; \
+               SELECT 'tail' AS label; \
+               CREATE TEMPORARY TABLE IF NOT EXISTS demo_scratch (n INT); \
+               INSERT INTO demo_scratch VALUES (1), (2), (3); \
+             END",
+            "DROP PROCEDURE IF EXISTS shop.demo_fail_midway",
+            "CREATE PROCEDURE shop.demo_fail_midway() BEGIN \
+               SELECT 1 AS opening_value; \
+               SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'demo failure after first set'; \
+             END",
+        ] {
+            conn.query_drop(statement).await.expect(statement);
+        }
+        drop(conn);
+
+        // 第一个结果集超过读取上限（CALL 不加 LIMIT）：第 1 页标截断，后面的结果集与影响行数照样读到。
+        // 上限不超过 8 时不分块暂停（chunk_rows），本用例的轮询不需要模拟界面“继续读取”。
+        let many = run_limited("CALL demo_many_rows()", 8).await;
+        let pages: Vec<_> = many.statements.iter().filter(|statement| !statement.columns.is_empty()).collect();
+        assert_eq!(pages.len(), 2, "截断之后仍读到第二个结果集：{:#?}", many.statements);
+        assert_eq!(pages[0].rows.len(), 8, "第 1 页按上限截断");
+        assert!(pages[0].truncated, "第 1 页带截断标记");
+        assert_eq!(pages[1].columns, vec!["label".to_owned()]);
+        assert_eq!(pages[1].rows, vec![vec![Some("tail".to_owned())]]);
+        assert!(many.statements.iter().all(|statement| statement.status == "ok"), "{:#?}", many.statements);
+        let last = many.statements.last().expect("最后一页");
+        assert!(last.message.contains("影响 3 行"), "最后的影响行数：{}", last.message);
+
+        // 过程中途失败：已经返回的结果集保留，语句与整次执行都按失败登记，错误原文保留。
+        let failed = run("CALL demo_fail_midway()").await;
+        assert_eq!(failed.status, "error", "整次执行失败：{:#?}", failed.statements);
+        let first = &failed.statements[0];
+        assert_eq!(first.status, "error", "{:#?}", failed.statements);
+        assert!(first.message.contains("demo failure after first set"), "错误原文：{}", first.message);
+        assert_eq!(first.columns, vec!["opening_value".to_owned()], "已经返回的结果集保留：{:#?}", failed.statements);
+        assert_eq!(first.rows, vec![vec![Some("1".to_owned())]]);
+        assert!(!first.message.contains("警告"), "错误不再作为警告重复一遍：{}", first.message);
+        println!("call-live: demo_many_rows 第 1 页 {} 行（截断），demo_fail_midway：{}", pages[0].rows.len(), first.message);
     });
 }

@@ -215,8 +215,12 @@ pub struct QueryPane {
     /// 计划树容器的焦点：整棵树只占一个 Tab 停靠点，只有它持有焦点时才处理导航键。
     plan_focus: gpui_kit::FocusHandle,
     /// 风险确认模态框的焦点；打开时聚焦一次（risk_focused），关闭后焦点回到编辑器。
+    /// 切换活动标签时重置 risk_focused：回到仍在等待确认的标签，焦点重新落在模态框而不是被盖住的编辑器。
     risk_focus: gpui_kit::FocusHandle,
     risk_focused: bool,
+    /// 点遮罩后模态框强调边框闪一下；代数用来让旧的定时器不覆盖新的闪烁。
+    risk_flash: bool,
+    risk_flash_gen: u64,
     /// 展开了完整 SQL 的那一条非查询结果（标签、批次、语句）；换结果后自动回到折叠。
     outcome_sql_open: Option<(String, u64, usize)>,
     /// 计划树的滚动句柄：跨帧保存，键盘或建议跳转后把选中节点滚进视口。
@@ -698,6 +702,8 @@ impl QueryPane {
             plan_focus: cx.focus_handle().tab_stop(true),
             risk_focus: cx.focus_handle(),
             risk_focused: false,
+            risk_flash: false,
+            risk_flash_gen: 0,
             outcome_sql_open: None,
             plan_scroll: gpui_kit::ScrollHandle::new(),
             plan_reveal: None,
@@ -1392,9 +1398,36 @@ impl QueryPane {
                 self.focus_editor = true;
                 self.confirm_risks(cx);
             }
+            // 点遮罩：不取消，只把焦点送回确认框并闪一下边框，提醒还有一批语句在等确认。
+            "attend-risks" => {
+                if self.desk.pending_risks().is_none() {
+                    return;
+                }
+                self.risk_focused = false;
+                self.focus_editor = false;
+                self.risk_flash = true;
+                self.risk_flash_gen += 1;
+                if !cfg!(test) {
+                    let generation = self.risk_flash_gen;
+                    cx.spawn(async move |view, cx| {
+                        cx.background_executor().timer(std::time::Duration::from_millis(600)).await;
+                        let _ = view.update(cx, |pane, cx| {
+                            if pane.risk_flash_gen == generation {
+                                pane.risk_flash = false;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                cx.notify();
+            }
             "cancel-risks" => {
+                let had = self.desk.pending_risks().is_some();
                 self.desk.cancel_risks();
-                self.desk.set_active_note("");
+                self.risk_flash = false;
+                let note = if had { risk_panel::cancelled_note(self.locale) } else { String::new() };
+                self.desk.set_active_note(&note);
                 // 取消后焦点回到编辑器，可以直接继续编辑或执行。
                 self.risk_focused = false;
                 self.focus_editor = true;
@@ -1447,6 +1480,8 @@ impl QueryPane {
         let previous = self.seen_active.clone();
         if next != self.seen_active {
             self.seen_active = next;
+            // 活动标签变了（含切到表格、结构等不画查询页的标签再回来）：确认框需要重新取焦点。
+            self.risk_focused = false;
             if self.seen_active.is_some() {
                 self.focus_editor = true;
             }
@@ -3241,6 +3276,13 @@ impl QueryPane {
         if !self.focus_editor {
             return;
         }
+        // 当前标签还在等待风险确认：编辑器被模态框盖住，焦点给确认框，不给编辑器。
+        if self.desk.pending_risks().is_some() {
+            self.focus_editor = false;
+            self.risk_focused = true;
+            window.focus(&self.risk_focus, cx);
+            return;
+        }
         let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() else {
             return;
         };
@@ -3425,15 +3467,8 @@ impl QueryPane {
         let selected = self.has_selection(cx);
         let run: AnyElement = if !running && self.desk.pending_risks().is_some() {
             // 等待风险确认：运行按钮换成状态，点它把焦点送回确认框。
-            kit::secondary_button("query-act-awaiting-confirm", Some(IconName::TriangleAlert), SharedString::from(risk_panel::waiting_label(locale)), {
-                let entity = entity.clone();
-                move |_, window, cx| {
-                    entity.update(cx, |pane, cx| {
-                        window.focus(&pane.risk_focus, cx);
-                        cx.notify();
-                    })
-                }
-            })
+            // 按钮被模态遮罩盖住，点击落在遮罩上（attend-risks：聚焦确认框并闪烁），自身只是状态。
+            kit::secondary_button("query-act-awaiting-confirm", Some(IconName::TriangleAlert), SharedString::from(risk_panel::waiting_label(locale)), |_, _, _| {})
             .into_any_element()
         } else if running {
             kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", entity))
@@ -4328,18 +4363,24 @@ impl QueryPane {
     fn render_risks(&mut self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(prompt) = self.desk.pending_risks() else {
             self.risk_focused = false;
+            self.risk_flash = false;
             return None;
         };
         if !self.risk_focused {
             self.risk_focused = true;
             window.focus(&self.risk_focus, cx);
         }
-        Some(risk_panel::render(&prompt, self.locale, p, metrics, mono, entity, &self.risk_focus))
+        Some(risk_panel::render(&prompt, self.locale, p, metrics, mono, entity, &self.risk_focus, self.risk_flash))
     }
 
     /// 当前结果页的身份：标签、执行批次、语句序号。
     fn outcome_key(&self) -> (String, u64, usize) {
         (self.desk.active_id().unwrap_or_default().to_owned(), self.desk.log_batch(), self.desk.statement())
+    }
+
+    /// 指定的查询标签是否在等待风险确认：外壳在标签栏和标签列表里标出，切走后也不会被忽略。
+    pub fn tab_awaits_risk(&self, tab_id: &str) -> bool {
+        self.desk.tab_awaits_risk(tab_id)
     }
 
     /// 当前查询标签是否在等待风险确认（工具栏显示“等待确认…”）。
@@ -5720,6 +5761,80 @@ mod tests {
             window.press("escape", cx);
             window.render_frame(cx);
             assert!(!pane.read(cx).awaiting_risk_confirmation(), "Esc 取消确认");
+            assert_eq!(pane.read(cx).note(), "已取消：未执行任何语句", "取消后明确提示没有执行");
+        })
+        .unwrap();
+    }
+
+    /// R12：点模态框外的遮罩（含被盖住的工具栏）不取消这批语句：焦点回到确认框并闪烁提醒；
+    /// 只有“取消”按钮会取消，并留下“未执行任何语句”的提示。
+    #[gpui_kit::test]
+    fn clicking_the_risk_scrim_keeps_the_batch_and_focuses_the_modal(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "DELETE FROM orders;")), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation(), "{}", pane.read(cx).note());
+            // 焦点先挨到编辑器，再点遮罩左上角（工具栏位置，在确认框外）。
+            let editor = pane.read(cx).editors.get("q").cloned().expect("编辑器");
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+            window.click_at("query-risks-scrim", gpui_kit::point(px(6.), px(6.)), cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation(), "点遮罩不取消");
+            assert!(window.find("query-risks").visible(), "确认框仍在");
+            assert!(pane.read(cx).risk_flash, "确认框闪烁提醒");
+            assert!(pane.read(cx).risk_focus.is_focused(window), "焦点回到确认框");
+            assert!(!editor.read(cx).is_focused(window, cx));
+            assert!(!pane.read(cx).running(), "一条都没有发送");
+            window.click("query-act-cancel-risks", cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).awaiting_risk_confirmation());
+            assert_eq!(pane.read(cx).note(), "已取消：未执行任何语句");
+            assert!(!pane.read(cx).risk_flash);
+        })
+        .unwrap();
+    }
+
+    /// R12：等待确认时切到不画查询页的标签（表格、结构）再切回来，焦点落在确认框，
+    /// 不落在被盖住的编辑器；Esc 仍然取消。
+    #[gpui_kit::test]
+    fn returning_to_a_tab_awaiting_confirmation_focuses_the_modal(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snaps = vec![bound("q", "DELETE FROM orders;")];
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation());
+            assert!(pane.read(cx).risk_focus.is_focused(window));
+            // 切到表格标签：外壳不画查询页，只对齐活动标签。焦点被别处拿走。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.prepare(&snaps, Some("table-orders"), Locale::ZhCn, false, cx);
+            });
+            window.blur(cx);
+            // 切回来。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&snaps, Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation(), "确认仍在等待");
+            let editor = pane.read(cx).editors.get("q").cloned().expect("编辑器");
+            assert!(!editor.read(cx).is_focused(window, cx), "焦点不落在被盖住的编辑器");
+            assert!(pane.read(cx).risk_focus.is_focused(window), "焦点回到确认框");
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(!pane.read(cx).awaiting_risk_confirmation(), "Esc 取消");
         })
         .unwrap();
     }

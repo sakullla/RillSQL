@@ -1788,7 +1788,7 @@ impl SqlEditor {
         };
         let mut entries = div().flex().flex_col().gap(px(6.));
         for (at, error) in errors.iter().enumerate() {
-            let slot = index * 16 + at;
+            let slot = error_slot(index, at);
             entries = entries
                 .child(div().id(("sql-error-popover-title", slot)).font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(SharedString::from(title_of(error))))
                 // 原文可以用鼠标选中复制。
@@ -2249,9 +2249,26 @@ fn long_sql() -> (String, Range<usize>) {
     (sql, range)
 }
 
+/// 错误卡片里第 at 条错误的元素序号：卡片序号（index）放在高位，同一行再多错误也不会和下一张卡片撞号。
+fn error_slot(index: usize, at: usize) -> usize {
+    const PER_LINE: usize = 1 << 20;
+    index.saturating_mul(PER_LINE).saturating_add(at.min(PER_LINE - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_popover_ids_do_not_collide_with_many_errors_on_one_line() {
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..3 {
+            for at in 0..40 {
+                assert!(seen.insert(error_slot(index, at)), "第 {index} 张卡片第 {at} 条撞号");
+            }
+        }
+        assert_eq!(error_slot(0, 1), 1);
+    }
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 

@@ -23,7 +23,9 @@ pub struct StatementValue {
 }
 
 /// 一条语句在第一个结果集之外带回来的东西（目前只有 MySQL / MariaDB 的 CALL 会有）：
-/// 其余结果集、最后 OK 包的影响行数、SHOW WARNINGS 与中途错误说明，以及“过程没有返回结果集”。
+/// 其余结果集、最后 OK 包的影响行数、SHOW WARNINGS 与说明，以及“过程没有返回结果集”。
+/// 语句中途失败时（例如存储过程 SELECT 之后 SIGNAL），已经读到的第一个结果集放在 partial，
+/// 其余已读到的结果集仍在 more；语句本身按失败登记。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultExtras {
     pub more: Vec<StatementValue>,
@@ -31,6 +33,7 @@ pub struct ResultExtras {
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
     pub no_result_set: bool,
+    pub partial: Option<StatementValue>,
 }
 
 impl ResultExtras {
@@ -693,10 +696,12 @@ impl StatementDriver for LiveDriver {
         };
         let sent = capped.sql.as_str();
         let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
-        let result: Result<(StatementValue, ResultExtras), Failure> = attached.run_full(&self.transport, sent, sql, limit, cancel, &sink, index).await;
+        let result: Result<(StatementValue, ResultExtras), (Failure, Box<ResultExtras>)> =
+            attached.run_full(&self.transport, sent, sql, limit, cancel, &sink, index).await;
+        // 失败时也可能带回已经读到的结果集（存储过程中途失败）。
         let (result, extras) = match result {
             Ok((value, extras)) => (Ok(value), extras),
-            Err(failure) => (Err(failure), ResultExtras::default()),
+            Err((failure, extras)) => (Err(failure), *extras),
         };
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。

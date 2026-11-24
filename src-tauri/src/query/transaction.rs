@@ -204,10 +204,13 @@ impl StatementTrial {
     fn new(ran: Ran) -> Self {
         let status = ran.status();
         let message = ran.message();
+        let mut extras = ran.extras;
         let (error_at, error_code, value) = match ran.outcome {
             Ok(value) => (None, None, Some(value)),
-            Err(StatementStop::Error { at, code, .. }) => (at, code, None),
+            // 中途失败：语句按失败登记，已经读到的结果集照样保留。
+            Err(StatementStop::Error { at, code, .. }) => (at, code, extras.partial.take()),
             Err(StatementStop::Unknown { .. } | StatementStop::Cancelled { .. }) => {
+                extras = ResultExtras::default();
                 (None, None, None)
             }
         };
@@ -217,7 +220,7 @@ impl StatementTrial {
             sent_sql: ran.sent,
             rewrite: ran.rewrite,
             value,
-            extras: ran.extras,
+            extras,
             // 被取消的语句只标“已取消”，不报一个不完整的耗时。
             elapsed_ms: if status == "cancelled" {
                 None

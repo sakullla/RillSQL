@@ -496,7 +496,7 @@ mod result_set_tests {
     #[test]
     fn procedure_result_sets_become_pages_with_warnings_on_the_last() {
         let set = StatementValue { columns: vec!["id".to_owned()], column_types: Vec::new(), rows: vec![vec![Some("1".to_owned())]], truncated: false, affected: None };
-        let extras = ResultExtras { more: vec![set], affected: Some(0), warnings: vec!["Warning 1642: demo".to_owned()], notes: Vec::new(), no_result_set: false };
+        let extras = ResultExtras { more: vec![set], affected: Some(0), warnings: vec!["Warning 1642: demo".to_owned()], notes: Vec::new(), no_result_set: false, partial: None };
         let pages = statement_dtos(report(&["order_id"], None, extras));
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].result_set, Some((0, 2)));
@@ -513,6 +513,25 @@ mod result_set_tests {
         let plain = statement_dtos(report(&["v"], None, ResultExtras::default()));
         assert_eq!(plain.len(), 1);
         assert!(plain[0].message.is_empty());
+    }
+
+    /// R14：过程中途失败时，已经读到的结果集仍是一页一个，但每页都按失败显示；
+    /// 错误原文与错误码在第一页（错误标记与“跳到错误”按第一页定位）。
+    #[test]
+    fn a_failed_procedure_keeps_its_pages_marked_as_failed() {
+        let set = StatementValue { columns: vec!["id".to_owned()], column_types: Vec::new(), rows: vec![vec![Some("2".to_owned())]], truncated: false, affected: None };
+        let mut failed = report(&["order_id"], None, ResultExtras { more: vec![set], ..Default::default() });
+        failed.status = "error";
+        failed.message = "order check failed".to_owned();
+        failed.error_code = Some("1644".to_owned());
+        failed.rows = vec![vec![Some("1".to_owned())]];
+        let pages = statement_dtos(failed);
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| page.status == "error"), "每一页都按失败显示");
+        assert_eq!(pages[0].message, "order check failed");
+        assert_eq!(pages[0].error_code.as_deref(), Some("1644"));
+        assert_eq!(pages[0].rows, vec![vec![Some("1".to_owned())]], "已读到的第一个结果集保留");
+        assert_eq!(pages[1].rows, vec![vec![Some("2".to_owned())]], "已读到的第二个结果集保留");
     }
 }
 

@@ -1009,7 +1009,8 @@ impl<'a> Gather<'a> {
     }
 
     /// FROM/JOIN 后补全表名时给表/视图附上自动别名（`order_items oi`）。
-    /// taken 是语句里已经用掉的别名和表名（小写），新生成的别名也会加进去，避免同批候选之外的冲突。
+    /// taken 是语句里已经用掉的别名和表名（小写）。每个候选各自避开 taken 生成别名，彼此之间不去重：
+    /// 一次补全只插入一个表，同批候选的别名不会同时出现在语句里。
     fn attach_aliases(&mut self, taken: &HashSet<String>) {
         for (_, item) in self.items.iter_mut() {
             if item.group != group::OBJECT || !matches!(item.kind, "table" | "view") {

@@ -2769,6 +2769,7 @@ impl Workbench {
         let dirty_table_text = self.t("ui.grid.pending");
         let dirty_query_text = self.t("shell.tabs.unsavedDraft");
         let dirty_structure_text = self.t("shell.tabs.pendingStructure");
+        let awaiting_text = self.t("shell.tabs.awaitingConfirm");
         let pinned_text = self.t("shell.tabs.pinned");
         let renaming = self.model.tab_rename.as_ref().map(|(id, _)| id.clone());
         if renaming.is_none() {
@@ -2797,6 +2798,8 @@ impl Workbench {
                 WorkItemKind::Structure => (tab.structure_dirty, Some(dirty_structure_text.clone())),
                 _ => (tab.uncommitted_cells, Some(dirty_table_text.clone())),
             };
+            // 等待风险确认的查询标签：沿用脏标记的位置，提示文字说明还在等确认（切走后也看得到）。
+            let (dirty, dirty_tip) = if self.tab_awaits_risk(&tab, cx) { (true, Some(awaiting_text.clone())) } else { (dirty, dirty_tip) };
             let title = SharedString::from(tab.title.clone());
             let (is_prod, context_hint) = tab
                 .connection_id
@@ -3013,7 +3016,12 @@ impl Workbench {
     }
 
     /// 标签列表（溢出“N ▾”）：每项带类型图标、环境徽标（生产为红色）、脏 / 待提交标记、关闭按钮，当前标签常亮。
-    pub(super) fn tab_picker_items(&self) -> Vec<crate::ui::picker::PickerItem> {
+    /// 查询标签是否在等待执行前的风险确认。
+    pub(super) fn tab_awaits_risk(&self, tab: &super::model::WorkItem, cx: &App) -> bool {
+        tab.kind == WorkItemKind::Query && self.query.read(cx).tab_awaits_risk(&tab.id)
+    }
+
+    pub(super) fn tab_picker_items(&self, cx: &App) -> Vec<crate::ui::picker::PickerItem> {
         let pinned = self.t("shell.tabs.pinned");
         let work_page = self.model.shell.page == AppPage::Workspace;
         self.model
@@ -3035,7 +3043,9 @@ impl Workbench {
                     .icon(item_icon(tab.kind))
                     .closable(true)
                     .current(work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str()));
-                if let Some(tip) = self.tab_dirty_tip(tab) {
+                if self.tab_awaits_risk(tab, cx) {
+                    item = item.dirty(self.t("shell.tabs.awaitingConfirm"));
+                } else if let Some(tip) = self.tab_dirty_tip(tab) {
                     item = item.dirty(tip);
                 }
                 let env = tab
@@ -3059,7 +3069,7 @@ impl Workbench {
             self.close_tab_picker(cx);
             return;
         }
-        let items = self.tab_picker_items();
+        let items = self.tab_picker_items(cx);
         if items.is_empty() {
             return;
         }
@@ -3093,7 +3103,7 @@ impl Workbench {
         self.model.request_close_tab(id);
         self.persist_if_needed(cx);
         // 关闭需要确认（脏标签）时收起列表，让确认框接管键盘；否则刷新列表。
-        let items = self.tab_picker_items();
+        let items = self.tab_picker_items(cx);
         if self.model.has_blocking_dialog() || items.is_empty() {
             self.close_tab_picker(cx);
         } else if let Some((picker, _)) = self.tab_picker.as_ref() {

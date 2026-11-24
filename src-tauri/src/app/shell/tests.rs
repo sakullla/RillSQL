@@ -15460,7 +15460,7 @@ fn tab_overflow_list_shows_icons_env_dirty_close_and_current(cx: &mut gpui_kit::
     let (first, last, items) = cx
         .update(|cx| {
             let view = view.read(cx);
-            (view.model.tabs[0].id.clone(), view.model.tabs[2].id.clone(), view.tab_picker_items())
+            (view.model.tabs[0].id.clone(), view.model.tabs[2].id.clone(), view.tab_picker_items(cx))
         });
     assert_eq!(items.len(), 3);
     assert!(items.iter().all(|item| item.icon.is_some() && item.closable), "每项都有类型图标和关闭按钮");
@@ -15483,6 +15483,56 @@ fn tab_overflow_list_shows_icons_env_dirty_close_and_current(cx: &mut gpui_kit::
         assert!(!view.read(cx).model.tabs.iter().any(|tab| tab.id == last));
         assert!(window.try_find("picker").is_some(), "关闭后列表保持打开");
         assert!(window.try_find(("picker-row", 2usize)).is_none(), "列表刷新为剩下的标签");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R12：等待风险确认的查询标签切走以后，标签栏和标签列表仍然标出它在等确认（沿用脏标记位置，提示文字说明原因）。
+#[gpui_kit::test]
+fn tabs_awaiting_risk_confirmation_are_marked_in_the_strip_and_the_list(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-riskmark-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            let query = view.model.active_tab.clone().expect("query item");
+            view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
+            view.model.tabs.iter_mut().find(|tab| tab.id == query).unwrap().draft = "DELETE FROM orders".to_owned();
+            view.settle(cx);
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.perform("run-script", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (waiting, awaiting, items) = cx.update(|cx| {
+        let view = view.read(cx);
+        let tab = view.model.active_tab().expect("当前标签");
+        let id = tab.id.clone();
+        let awaiting = view.tab_awaits_risk(tab, cx);
+        (id, awaiting, view.tab_picker_items(cx))
+    });
+    assert!(awaiting, "查询标签在等待风险确认");
+    let item = items.iter().find(|item| item.id.as_ref() == waiting).unwrap();
+    assert_eq!(item.dirty.as_ref().map(|tip| tip.to_string()), Some("等待执行确认：这批语句还没有发送".to_owned()), "标签列表标出等待确认");
+
+    // 切到另一个标签：等待确认的标签在标签栏里仍有标记。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_ne!(view.read(cx).model.active_tab.as_deref(), Some(waiting.as_str()));
+        assert!(view.read(cx).query.read(cx).tab_awaits_risk(&waiting), "切走后确认仍在等待");
+        let view = view.read(cx);
+        let tab = view.model.tabs.iter().find(|tab| tab.id == waiting).expect("等待确认的标签");
+        assert!(view.tab_awaits_risk(tab, cx), "标签栏按同一判断画出等待标记");
+        let items = view.tab_picker_items(cx);
+        let item = items.iter().find(|item| item.id.as_ref() == waiting).unwrap();
+        assert!(item.dirty.is_some() && !item.current, "切走后标签列表仍标出等待确认");
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(dir);

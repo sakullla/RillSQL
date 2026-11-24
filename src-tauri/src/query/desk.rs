@@ -417,6 +417,11 @@ impl Desk {
             .map(|pending| pending.prompt.clone())
     }
 
+    /// 某个标签是否在等待风险确认（不论是否为当前标签）：标签栏与标签列表据此标出。
+    pub fn tab_awaits_risk(&self, id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.pending_risk.is_some())
+    }
+
     pub fn has_tab(&self, id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.id == id)
     }
