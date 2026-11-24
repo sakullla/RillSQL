@@ -472,6 +472,80 @@ impl Service {
         store.assign_group(connection_id, group).await.map_err(db_err)
     }
 
+    /// R6：重排一个容器（分组；None 为未分组）里的连接。列表里的连接一并归入这个容器，
+    /// 所以“拖到另一个分组的某个位置”也是这一条命令。未知的连接或分组整体拒绝。
+    pub async fn reorder_connections(&self, group: Option<&str>, ordered_ids: &[String]) -> Result<(), String> {
+        let store = self.store().await?;
+        if let Some(group) = group {
+            if store.group(group).await.map_err(db_err)?.is_none() {
+                return Err("找不到这个分组".to_owned());
+            }
+        }
+        let known: std::collections::BTreeSet<String> = store.list().await.map_err(db_err)?.into_iter().map(|row| row.id).collect();
+        if ordered_ids.iter().any(|id| !known.contains(id)) {
+            return Err("找不到这个连接".to_owned());
+        }
+        store.reorder_connections(group, ordered_ids).await.map_err(db_err)
+    }
+
+    /// R6：按给定顺序重排分组；未知分组整体拒绝。
+    pub async fn reorder_groups(&self, ordered_ids: &[String]) -> Result<(), String> {
+        let store = self.store().await?;
+        let known: std::collections::BTreeSet<String> = store.list_groups().await.map_err(db_err)?.into_iter().map(|group| group.id).collect();
+        if ordered_ids.iter().any(|id| !known.contains(id)) {
+            return Err("找不到这个分组".to_owned());
+        }
+        store.reorder_groups(ordered_ids).await.map_err(db_err)
+    }
+
+    /// R6：导入保存完连接后调用一次，恢复文件里的分组与顺序。
+    /// `groups` 为 `ParsedImport::groups`，`imported_ids` 为实际导入成功的连接 id（按文件顺序）。
+    /// 同 id 或同名的分组复用，没有的新建并排到最后；导入的连接依次接到各自容器的末尾。
+    /// 旧格式文件（没有分组信息）只保持文件顺序，不改动已有的成员关系。
+    pub async fn restore_import_layout(&self, groups: &[super::export::ExportGroup], imported_ids: &[String]) -> Result<(), String> {
+        let store = self.store().await?;
+        let imported: std::collections::BTreeSet<&str> = imported_ids.iter().map(String::as_str).collect();
+        let mut existing = store.list_groups().await.map_err(db_err)?;
+        let mut ordered: Vec<&super::export::ExportGroup> = groups.iter().collect();
+        ordered.sort_by_key(|group| group.position);
+        let mut placed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for incoming in ordered {
+            let members: Vec<String> = incoming
+                .members
+                .iter()
+                .filter(|id| imported.contains(id.as_str()) && !placed.contains(*id))
+                .cloned()
+                .collect();
+            let reuse = existing
+                .iter()
+                .find(|group| group.id == incoming.id)
+                .or_else(|| existing.iter().find(|group| group.name == incoming.name))
+                .map(|group| group.id.clone());
+            let group_id = match reuse {
+                Some(id) => id,
+                None => {
+                    let Ok(name) = validate_group_name(&incoming.name) else { continue };
+                    let position = store.next_group_position().await.map_err(db_err)?;
+                    let id = if incoming.id.trim().is_empty() { uuid::Uuid::new_v4().to_string() } else { incoming.id.clone() };
+                    let group = ConnectionGroup { id, name, position, collapsed: incoming.collapsed };
+                    store.upsert_group(&group).await.map_err(db_err)?;
+                    existing.push(group.clone());
+                    group.id
+                }
+            };
+            store.append_in_order(Some(&group_id), &members).await.map_err(db_err)?;
+            placed.extend(members);
+        }
+        let rest: Vec<String> = imported_ids.iter().filter(|id| !placed.contains(*id)).cloned().collect();
+        if !groups.is_empty() {
+            // 文件带分组信息：没在任何分组里的连接就是未分组。
+            for id in &rest {
+                store.assign_group(id, None).await.map_err(db_err)?;
+            }
+        }
+        store.append_in_order(None, &rest).await.map_err(db_err)
+    }
+
     /// 迁入新连接只处理本地配置，不访问驱动或钥匙串。
     pub(crate) async fn insert_imported_connection(&self, draft: &ConnectionDraft) -> Result<store::ImportInsert, ServiceError> {
         for (field, host) in [("host", draft.host.as_str()), ("ssh_host", draft.ssh_host.as_str())] {
@@ -554,6 +628,7 @@ impl Service {
     ) -> Result<usize, String> {
         let store = self.store().await?;
         let rows = store.list().await.map_err(db_err)?;
+        let ids_was_none = ids.is_none();
         let selected = match ids {
             None => rows,
             Some(wanted) => {
@@ -571,7 +646,27 @@ impl Service {
                 picked
             }
         };
-        let bytes = super::export::encode_export(&selected, passphrase)?;
+        // R6：分组与组内顺序一起导出（只含被导出的连接；导出全部时空分组也带上）。
+        let all = ids_was_none;
+        let mut groups = Vec::new();
+        let members: std::collections::BTreeMap<String, String> = store.memberships().await.map_err(db_err)?.into_iter().collect();
+        for group in store.list_groups().await.map_err(db_err)? {
+            let inside: Vec<String> = selected
+                .iter()
+                .filter(|row| members.get(&row.id) == Some(&group.id))
+                .map(|row| row.id.clone())
+                .collect();
+            if all || !inside.is_empty() {
+                groups.push(super::export::ExportGroup {
+                    id: group.id,
+                    name: group.name,
+                    position: group.position,
+                    collapsed: group.collapsed,
+                    members: inside,
+                });
+            }
+        }
+        let bytes = super::export::encode_export_with_groups(&selected, &groups, passphrase)?;
         tokio::fs::write(path, &bytes)
             .await
             .map_err(|err| format!("写入导出文件失败：{err}"))?;

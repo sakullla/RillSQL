@@ -68,6 +68,12 @@ pub struct ConnectionDrag {
     pub connection: String,
 }
 
+/// R6：拖拽中的分组标题。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupDrag {
+    pub group: String,
+}
+
 /// 键盘当前行。分组、连接与树节点三种身份都来自这里的稳定 id。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorerRow {

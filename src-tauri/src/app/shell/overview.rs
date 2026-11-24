@@ -402,6 +402,26 @@ impl WorkbenchModel {
             self.clipboard_out = Some(text);
             return true;
         }
+        if id == "overview-copy-names" || id == "overview-copy-full-names" {
+            let full = id == "overview-copy-full-names";
+            let Some(state) = self.active_overview() else { return true };
+            let target = state.target.clone();
+            let names: Vec<String> = state
+                .selected_rows()
+                .iter()
+                .map(|row| {
+                    if full && row.kind.is_some() {
+                        crate::adapters::qualified_object(target.engine, &target.object_database(), &target.schema, &row.name)
+                    } else {
+                        row.name.clone()
+                    }
+                })
+                .collect();
+            if !names.is_empty() {
+                self.copy_to_clipboard(names.join("\n"));
+            }
+            return true;
+        }
         if let Some(name) = id.strip_prefix("overview-copy-name:") {
             let Some((target, row)) = self.overview_row(name) else { return true };
             let text = if row.kind.is_some() {
@@ -600,10 +620,11 @@ impl Workbench {
             // R14：回车 = 双击（库/模式进入下一层，表/视图打开数据）；上下方向键移动选中。都不触发破坏性操作。
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 let mods = event.keystroke.modifiers;
-                if event.keystroke.key == "c" && mods.secondary(cx) && !mods.shift && !mods.alt {
+                // R5：⌘C 复制选中对象的名称（多选时每行一个），⌥⌘C 复制完整名称；行数据走右键“复制为 TSV”。
+                if event.keystroke.key == "c" && mods.secondary(cx) && !mods.shift {
                     if this.model.active_overview().is_some_and(|state| state.selected.is_some()) {
                         cx.stop_propagation();
-                        this.perform("overview-copy-selected", cx);
+                        this.perform(if mods.alt { "overview-copy-full-names" } else { "overview-copy-names" }, cx);
                     }
                     return;
                 }

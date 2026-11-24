@@ -537,6 +537,16 @@ impl Workbench {
                 cx.notify();
                 return;
             }
+            // R5：⌘C 复制当前行名称，⌥⌘C 复制完整名称（库.表）。
+            if key == "c" && mods.secondary(cx) && !mods.shift {
+                if let Some(command) = self.model.explorer_copy_name(mods.alt) {
+                    self.perform(&command, cx);
+                } else {
+                    self.flush_clipboard(cx);
+                }
+                cx.notify();
+                return;
+            }
             let command = match key {
                 "up" => self.model.nav_key(super::menus::NavKey::ArrowUp),
                 "down" => self.model.nav_key(super::menus::NavKey::ArrowDown),
@@ -1457,7 +1467,9 @@ impl Workbench {
         let click_id = id.to_owned();
         let menu_id = id.to_owned();
         let drop_id = id.to_owned();
+        let group_drop_id = id.to_owned();
         let drop_soft = p.accent_soft;
+        let drop_line = p.accent;
         let entity = cx.entity().downgrade();
         kit::row_states(div().id(SharedString::from(format!("side-group-{id}"))), p)
             .test_support()
@@ -1475,6 +1487,16 @@ impl Workbench {
             .rounded(px(Radius::CONTROL))
             .when(focused, |this| this.bg(p.selection))
             .when(!focused, |this| this.hover(|style| style.bg(p.hover)))
+            // R6：分组标题也能拖动：拖到另一个分组标题上，上沿出现插入线，放手排到它前面。
+            .on_drag(super::explorer::GroupDrag { group: id.to_owned() }, |_, _, _, cx| cx.new(|_| ConnectionDragGhost))
+            .drag_over::<super::explorer::GroupDrag>(move |style, _, _, _| style.border_t_2().border_color(drop_line))
+            .on_drop(cx.listener(move |this, drag: &super::explorer::GroupDrag, _, cx| {
+                let ordered = crate::connections::groups::sorted_groups(this.model.groups.clone());
+                let Some(index) = ordered.iter().position(|group| group.id == group_drop_id) else { return };
+                let command = format!("group-drop:{}\u{1}{index}", drag.group);
+                this.perform(&command, cx);
+                cx.notify();
+            }))
             // 拖拽悬停：拖连接经过这一行时整行高亮，放手才真的移动。
             .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| style.bg(drop_soft))
             .on_drop::<super::explorer::ConnectionDrag>(move |drag, _, cx| {
@@ -1567,9 +1589,9 @@ impl Workbench {
                 }))
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(px(Space::SM))
                 .px(px(10.))
-                .pb(px(8.))
+                .pb(px(Space::MD))
                 .child(kit::eyebrow(self.t(title), &p))
                 .child(input.cleanable(true))
                 .when_some(prompt.error.clone(), |this, error| {
@@ -1610,6 +1632,9 @@ impl Workbench {
         let query_id = id.clone();
         let group = SharedString::from(format!("side-conn-group-{id}"));
         let supports_query = row.saved.engine.workbench().has_query_editor();
+        let drop_target = id.clone();
+        let drop_line = p.accent;
+        let searching = self.model.nav_searching();
         kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
             .group(group.clone())
@@ -1702,6 +1727,22 @@ impl Workbench {
                 super::explorer::ConnectionDrag { connection: id.clone() },
                 |_, _, _, cx| cx.new(|_| ConnectionDragGhost),
             )
+            // R6：拖到另一条连接上时，这一行上沿出现插入线；放手插到这一行之前（同一分组或未分组）。
+            // 搜索过滤时不显示插入线，放手只提示先清除搜索。
+            .drag_over::<super::explorer::ConnectionDrag>(move |style, _, _, _| {
+                if searching { style } else { style.border_t_2().border_color(drop_line) }
+            })
+            .on_drop(cx.listener(move |this, drag: &super::explorer::ConnectionDrag, _, cx| {
+                if drag.connection == drop_target {
+                    return;
+                }
+                let group = this.model.group_of(&drop_target).map(str::to_owned);
+                let index = this.model.container_members(group.as_deref()).iter().position(|id| id == &drop_target).unwrap_or(usize::MAX);
+                let command = format!("group-conn-drop:{}\u{1}{}\u{1}{index}", drag.connection, group.unwrap_or_default());
+                this.model.shell.focus = FocusTarget::Sidebar;
+                this.perform(&command, cx);
+                cx.notify();
+            }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.model.set_explorer_current(super::explorer::ExplorerRow::Connection(click_id.clone()));
                 this.click_connection(&click_id, event.click_count() >= 2, cx);
@@ -3389,9 +3430,10 @@ impl Workbench {
             } else {
                 format!("{} · {name}: {head}", self.model.text("connections.status.error"))
             };
-            kit::banner(
+            kit::banner_selectable(
                 kit::BannerTone::Danger,
                 IconName::CircleAlert,
+                "welcome-connect-retry-text",
                 SharedString::from(label),
                 Some(
                     div()

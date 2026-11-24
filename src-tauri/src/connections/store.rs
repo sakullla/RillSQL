@@ -128,6 +128,25 @@ impl Store {
                 return Err(err);
             }
         }
+        // R6：连接的手动顺序。旧库补列时按名称（同名按 id）初始化，保持升级前看到的顺序。
+        // 同一个 position 在每个容器（某个分组或未分组）内比较，跨容器重复无妨。
+        match sqlx::query("ALTER TABLE connections ADD COLUMN position INTEGER").execute(&self.pool).await {
+            Ok(_) => {
+                sqlx::query(
+                    "UPDATE connections SET position = (
+                        SELECT COUNT(*) FROM connections AS other
+                        WHERE other.name < connections.name OR (other.name = connections.name AND other.id < connections.id)
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Err(err) => {
+                if !err.to_string().contains("duplicate column") {
+                    return Err(err);
+                }
+            }
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS ssh_host_keys (
                 ssh_host TEXT NOT NULL,
@@ -559,7 +578,100 @@ impl Store {
             .collect()
     }
 
+    /// R6：把一个容器（分组，或 None 表示未分组）里的连接按给定顺序重排。
+    /// 列表里的连接一并归入这个容器：拖到别的分组某个位置也是这一条命令。
+    pub async fn reorder_connections(&self, group: Option<&str>, ordered_ids: &[String]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for (position, id) in ordered_ids.iter().enumerate() {
+            sqlx::query("UPDATE connections SET position = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(i64::try_from(position).unwrap_or(i64::MAX))
+                .execute(&mut *tx)
+                .await?;
+            match group {
+                Some(group) => {
+                    sqlx::query(
+                        "INSERT INTO connection_group_members (connection_id, group_id) VALUES (?1, ?2)
+                         ON CONFLICT(connection_id) DO UPDATE SET group_id = excluded.group_id",
+                    )
+                    .bind(id)
+                    .bind(group)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                None => {
+                    sqlx::query("DELETE FROM connection_group_members WHERE connection_id = ?1").bind(id).execute(&mut *tx).await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// R6：分组按给定顺序重排；没列出的分组保持原位置、排在后面。
+    pub async fn reorder_groups(&self, ordered_ids: &[String]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let count = i64::try_from(ordered_ids.len()).unwrap_or(i64::MAX);
+        sqlx::query("UPDATE connection_groups SET position = position + ?1").bind(count).execute(&mut *tx).await?;
+        for (position, id) in ordered_ids.iter().enumerate() {
+            sqlx::query("UPDATE connection_groups SET position = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(i64::try_from(position).unwrap_or(i64::MAX))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// R6（导入）：按给定顺序把连接接到容器末尾；`group` 为 None 时只排序、不改成员关系。
+    pub async fn append_in_order(&self, group: Option<&str>, ids: &[String]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for id in ids {
+            sqlx::query(
+                "UPDATE connections SET position = (SELECT COALESCE(MAX(position), -1) + 1 FROM connections) WHERE id = ?1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if let Some(group) = group {
+                sqlx::query(
+                    "INSERT INTO connection_group_members (connection_id, group_id) VALUES (?1, ?2)
+                     ON CONFLICT(connection_id) DO UPDATE SET group_id = excluded.group_id",
+                )
+                .bind(id)
+                .bind(group)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// 移到某个容器的末尾：位置取全部连接的最大值 + 1。
+    async fn move_to_end(&self, connection_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE connections SET position = (SELECT COALESCE(MAX(position), -1) + 1 FROM connections) WHERE id = ?1",
+        )
+        .bind(connection_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn assign_group(&self, connection_id: &str, group: Option<&str>) -> Result<(), sqlx::Error> {
+        // 换了分组就排到新分组的末尾；没换（重复拖到同一组）位置不动。
+        let current: Option<String> = sqlx::query_scalar("SELECT group_id FROM connection_group_members WHERE connection_id = ?1")
+            .bind(connection_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if current.as_deref() != group {
+            self.move_to_end(connection_id).await?;
+        }
         match group {
             Some(group) => {
                 sqlx::query(
@@ -621,8 +733,9 @@ async fn write_connection(
                 id, name, engine, env, host, port, database_name, username, file_path,
                 tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
                 ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                password_saved, ssh_password_saved, replica_set
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                password_saved, ssh_password_saved, replica_set, position
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                (SELECT COALESCE(MAX(position), -1) + 1 FROM connections))",
     );
     if update_existing {
         statement.push(
@@ -694,7 +807,8 @@ async fn list_connections(db: &mut sqlx::SqliteConnection, candidate: Option<&Sa
             .push(" AND host IS ").push_bind(&profile.host)
             .push(" AND file_path IS ").push_bind(&profile.file_path).push(")");
     }
-    query.push(" ORDER BY name");
+    // R6：按手动顺序列出；位置相同（或旧数据缺位置）时按名称、id 兜底。
+    query.push(" ORDER BY COALESCE(position, 0), name, id");
     let rows = query.build().fetch_all(db).await?;
     rows.iter().map(row_to_connection).collect()
 }

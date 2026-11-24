@@ -241,7 +241,11 @@ impl LogPanel<'_> {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .text_color(if failed { p.danger } else { p.text_muted })
-                                                .child(SharedString::from(entry.message.clone())),
+                                                // R5：日志消息可以选中复制，复制按钮保留。
+                                                .child(kit::selectable_text(
+                                                    SharedString::from(format!("query-log-msg-text-{index}")),
+                                                    SharedString::from(entry.message.clone()),
+                                                )),
                                         )
                                         .child(
                                             kit::icon_button(

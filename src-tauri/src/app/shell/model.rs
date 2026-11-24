@@ -461,6 +461,15 @@ pub enum GroupOp {
     Collapsed { id: String, collapsed: bool },
 }
 
+/// R6：手动排序的落库请求。界面先按新顺序改本地状态，视图再在后台写入配置库。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReorderOp {
+    /// 一个容器（分组；None 为未分组）里的连接按这个顺序排列，列出的连接一并归入该容器。
+    Connections { group: Option<String>, ids: Vec<String> },
+    /// 分组按这个顺序排列。
+    Groups { ids: Vec<String> },
+}
+
 /// 连接缺密码或密码被拒时的输入框：只为这次连接要密码，不改配置、不写凭据库；
 /// 连上后服务在本次运行内记住它，切换数据库与自动重连不再重复询问。
 #[derive(Clone, PartialEq, Eq)]
@@ -682,6 +691,8 @@ pub struct WorkbenchModel {
     pub explorer_current: Option<ExplorerRow>,
     /// 排队的一次分组命令，随任务交给后台。
     pub pending_group_op: Option<GroupOp>,
+    /// R6：等待写入配置库的排序（由视图在后台执行）。
+    pub pending_reorder: Option<ReorderOp>,
     /// 对象树“新建表”：下一帧交给结构页 `begin_create`。
     pub pending_create: Option<String>,
     /// 从历史预览保存时钉住这一条，避免误存当前查询草稿。
@@ -834,6 +845,7 @@ impl WorkbenchModel {
             group_delete: None,
             explorer_current: None,
             pending_group_op: None,
+            pending_reorder: None,
             pending_create: None,
             preview_save: None,
             conn_filter_menu: None,
@@ -1771,7 +1783,10 @@ impl WorkbenchModel {
                 self.notice_detail = self.nav.focus_node().map(|node| node.name.clone()).unwrap_or_default();
             }
             "tree-copy-name" => match self.object_target() {
-                Some(target) => self.copied = Self::qualified_name(&target),
+                Some(target) => {
+                    let text = Self::qualified_name(&target);
+                    self.copy_to_clipboard(text);
+                }
                 None => {
                     self.copied.clear();
                     self.notice_key = Some("shell.tabs.needObject");
@@ -2429,11 +2444,16 @@ impl WorkbenchModel {
         }
         let current = self.group_of(&connection).map(str::to_owned);
         let entry = super::menus::move_to_group_branch(&connection, &self.groups, current.as_deref());
+        let members = self.container_members(current.as_deref());
+        let first = members.first() == Some(&connection);
+        let last = members.last() == Some(&connection);
+        let mut entries = super::menus::move_step_items(&connection, first, last);
+        entries.push(entry);
         if let Some(menu) = self.menu.as_mut() {
             // 放在删除之前：删除始终是菜单最后一项。
-            match menu.items.iter().position(|item| item.id == "conn-delete") {
-                Some(index) => menu.items.insert(index, entry),
-                None => menu.items.push(entry),
+            let at = menu.items.iter().position(|item| item.id == "conn-delete").unwrap_or(menu.items.len());
+            for (offset, entry) in entries.into_iter().enumerate() {
+                menu.items.insert(at + offset, entry);
             }
         }
     }
@@ -3814,6 +3834,112 @@ impl WorkbenchModel {
         true
     }
 
+    /// R6：容器（分组或未分组）里连接的当前顺序。
+    pub fn container_members(&self, group: Option<&str>) -> Vec<String> {
+        let layout = self.group_layout();
+        match group {
+            Some(group) => layout.groups.into_iter().find(|(entry, _)| entry.id == group).map(|(_, ids)| ids).unwrap_or_default(),
+            None => layout.ungrouped,
+        }
+    }
+
+    /// R6：把连接放到某个容器的第 `index` 位（超出则放到末尾）。先改本地顺序与成员关系，再排进后台落库。
+    /// 搜索过滤时不排序：看到的只是部分连接，插入位置没有意义。
+    pub fn move_connection_to(&mut self, connection_id: &str, group: Option<&str>, index: usize) -> bool {
+        if self.nav_searching() {
+            self.notice_key = Some("ui.group.reorderWhileSearching");
+            self.notice_detail.clear();
+            return false;
+        }
+        let Some(from) = self.connections.rows.iter().position(|row| row.saved.id == connection_id) else { return false };
+        if group.is_some_and(|group| self.group(group).is_none()) {
+            return false;
+        }
+        let mut members = self.container_members(group);
+        let old_index = members.iter().position(|id| id == connection_id);
+        members.retain(|id| id != connection_id);
+        // 同一容器里往后拖：插入位置按移除自己之前的序号算，要减一。
+        let index = match old_index {
+            Some(old) if old < index => index - 1,
+            _ => index,
+        }
+        .min(members.len());
+        if old_index == Some(index) && self.group_of(connection_id) == group {
+            return false;
+        }
+        // 全局行序：把这一行挪到目标位置，各容器的相对顺序由此得出。
+        let row = self.connections.rows.remove(from);
+        let slot = match members.get(index) {
+            Some(next) => self.connections.rows.iter().position(|row| &row.saved.id == next).unwrap_or(self.connections.rows.len()),
+            None => members
+                .last()
+                .and_then(|last| self.connections.rows.iter().position(|row| &row.saved.id == last))
+                .map(|at| at + 1)
+                .unwrap_or(self.connections.rows.len()),
+        };
+        self.connections.rows.insert(slot, row);
+        members.insert(index, connection_id.to_owned());
+        match group {
+            Some(group) => {
+                self.group_members.insert(connection_id.to_owned(), group.to_owned());
+            }
+            None => {
+                self.group_members.remove(connection_id);
+            }
+        }
+        self.pending_reorder = Some(ReorderOp::Connections { group: group.map(str::to_owned), ids: members });
+        true
+    }
+
+    /// R6：菜单“上移 / 下移”：在所在容器里移动一格。
+    pub fn step_connection(&mut self, connection_id: &str, delta: isize) -> bool {
+        let group = self.group_of(connection_id).map(str::to_owned);
+        let members = self.container_members(group.as_deref());
+        let Some(at) = members.iter().position(|id| id == connection_id) else { return false };
+        let target = at as isize + delta;
+        if target < 0 || target as usize >= members.len() {
+            return false;
+        }
+        // 往下移一格 = 插到下一项之后（插入位置按移除前的序号）。
+        let index = if delta > 0 { target as usize + 1 } else { target as usize };
+        self.move_connection_to(connection_id, group.as_deref(), index)
+    }
+
+    /// R6：把分组放到第 `index` 位。
+    pub fn move_group_to(&mut self, group_id: &str, index: usize) -> bool {
+        let mut ordered = crate::connections::groups::sorted_groups(self.groups.clone());
+        let Some(from) = ordered.iter().position(|group| group.id == group_id) else { return false };
+        let index = if from < index { index - 1 } else { index }.min(ordered.len() - 1);
+        if from == index {
+            return false;
+        }
+        let group = ordered.remove(from);
+        ordered.insert(index, group);
+        for (position, group) in ordered.iter_mut().enumerate() {
+            group.position = position as i64;
+        }
+        let ids = ordered.iter().map(|group| group.id.clone()).collect();
+        self.groups = ordered;
+        self.pending_reorder = Some(ReorderOp::Groups { ids });
+        true
+    }
+
+    /// R6：分组菜单“上移 / 下移”。
+    pub fn step_group(&mut self, group_id: &str, delta: isize) -> bool {
+        let ordered = crate::connections::groups::sorted_groups(self.groups.clone());
+        let Some(at) = ordered.iter().position(|group| group.id == group_id) else { return false };
+        let target = at as isize + delta;
+        if target < 0 || target as usize >= ordered.len() {
+            return false;
+        }
+        let index = if delta > 0 { target as usize + 1 } else { target as usize };
+        self.move_group_to(group_id, index)
+    }
+
+    pub fn take_pending_reorder(&mut self) -> Option<ReorderOp> {
+        self.pending_reorder.take()
+    }
+
     /// 删除分组：连接回到顶层，连接配置与机密一个都不动。
     pub fn take_pending_group_op(&mut self) -> Option<GroupOp> {
         self.pending_group_op.take()
@@ -4088,6 +4214,31 @@ impl WorkbenchModel {
             }
             "group-delete-cancel" => self.group_delete = None,
             _ => {
+                if let Some(rest) = id.strip_prefix("group-conn-up:") {
+                    return self.step_connection(rest, -1);
+                }
+                if let Some(rest) = id.strip_prefix("group-conn-down:") {
+                    return self.step_connection(rest, 1);
+                }
+                if let Some(rest) = id.strip_prefix("group-move-up:") {
+                    return self.step_group(rest, -1);
+                }
+                if let Some(rest) = id.strip_prefix("group-move-down:") {
+                    return self.step_group(rest, 1);
+                }
+                if let Some(rest) = id.strip_prefix("group-conn-drop:") {
+                    // 连接 id \u{1} 分组 id（空为未分组） \u{1} 插入位置。
+                    let mut parts = rest.split('\u{1}');
+                    let (Some(connection), Some(group), Some(index)) = (parts.next(), parts.next(), parts.next()) else { return true };
+                    let Ok(index) = index.parse::<usize>() else { return true };
+                    let group = if group.is_empty() { None } else { Some(group) };
+                    return self.move_connection_to(connection, group, index);
+                }
+                if let Some(rest) = id.strip_prefix("group-drop:") {
+                    let (group, index) = rest.split_once('\u{1}').unwrap_or((rest, ""));
+                    let Ok(index) = index.parse::<usize>() else { return true };
+                    return self.move_group_to(group, index);
+                }
                 if let Some(rest) = id.strip_prefix("group-toggle:") {
                     return self.toggle_group(rest);
                 }
@@ -4322,6 +4473,30 @@ impl WorkbenchModel {
     }
 
     /// Shift+Enter：当对象树键盘焦点停在表或视图节点时，直接打开表结构。
+    /// R5：对象树里 ⌘C 复制当前行的名称，⌥⌘C（`full`）复制完整名称（库.表）。
+    /// 分组和连接行复制自己的名字；没有当前行时不动作。
+    pub fn explorer_copy_name(&mut self, full: bool) -> Option<String> {
+        match self.explorer_current_row()? {
+            ExplorerRow::Node(id) => {
+                let node = self.nav.node(&id)?;
+                match node.kind {
+                    NavKind::Object if full => Some(format!("nav-copy-name:{id}")),
+                    _ => Some(format!("nav-copy-short:{id}")),
+                }
+            }
+            ExplorerRow::Connection(id) => {
+                let name = self.connections.rows.iter().find(|row| row.saved.id == id)?.saved.name.clone();
+                self.copy_to_clipboard(name);
+                None
+            }
+            ExplorerRow::Group(id) => {
+                let name = self.group(&id)?.name.clone();
+                self.copy_to_clipboard(name);
+                None
+            }
+        }
+    }
+
     pub fn explorer_open_structure(&mut self) -> Option<String> {
         let ExplorerRow::Node(id) = self.explorer_current_row()? else { return None };
         let node = self.nav.node(&id)?;
@@ -4880,7 +5055,7 @@ impl WorkbenchModel {
                 _ => None,
             };
             match text {
-                Some(text) => self.copied = text,
+                Some(text) => self.copy_to_clipboard(text),
                 None => {
                     self.copied.clear();
                     self.notice_key = Some("catalog.tree.staleObject");
@@ -4889,9 +5064,26 @@ impl WorkbenchModel {
             }
             return true;
         }
+        if let Some(rest) = id.strip_prefix("nav-copy-short:") {
+            // ⌘C：只复制这一行自己的名字（对象不带库/模式前缀）。
+            match self.nav.node(rest) {
+                Some(node) if !node.stale && !node.name.is_empty() => {
+                    let name = node.name.clone();
+                    self.copy_to_clipboard(name);
+                }
+                _ => {
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
         if let Some(rest) = id.strip_prefix("nav-copy-column:") {
             match self.nav.node(rest) {
-                Some(node) if !node.stale => self.copied = node.name.clone(),
+                Some(node) if !node.stale => {
+                    let name = node.name.clone();
+                    self.copy_to_clipboard(name);
+                }
                 _ => {
                     self.copied.clear();
                     self.notice_key = Some("catalog.tree.staleObject");
@@ -5093,6 +5285,14 @@ impl WorkbenchModel {
     /// 视图把编辑器当前的光标/选区（字节偏移）交给模型；SQL 模板按它插入。
     pub fn set_draft_cursor(&mut self, tab_id: &str, from: usize, to: usize) {
         self.draft_cursor = Some((tab_id.to_owned(), from, to));
+    }
+
+    /// 复制到系统剪贴板：记下 copied、交给视图写剪贴板，并提示“已复制”。
+    pub(crate) fn copy_to_clipboard(&mut self, text: String) {
+        self.copied = text.clone();
+        self.clipboard_out = Some(text);
+        self.notice_key = Some("ui.copied");
+        self.notice_detail.clear();
     }
 
     /// 视图取走要写进系统剪贴板的文本。

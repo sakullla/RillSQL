@@ -1240,7 +1240,15 @@ fn state_block(kind: StateKind, icon_name: IconName, heading: impl Into<SharedSt
                 .max_w(px(STATE_DETAIL_MAX_W))
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
-                .child(detail.into()),
+                // R5：错误说明可以用鼠标选中并 ⌘C 复制（其余空态仍是普通文字）。
+                .map(|this| {
+                    let detail: SharedString = detail.into();
+                    if kind == StateKind::Error {
+                        this.child(selectable_text("state-detail-text", detail))
+                    } else {
+                        this.child(detail)
+                    }
+                }),
         );
     if let Some(action) = action {
         // 行容器按内容宽排列按钮：主操作是一个按钮，不被拉成整行宽的横条。
@@ -1273,6 +1281,12 @@ pub fn no_match_state(icon_name: IconName, heading: impl Into<SharedString>, det
 #[allow(dead_code)]
 pub fn no_match_state_with_action(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, action: impl IntoElement, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
     state_block(StateKind::NoMatch, icon_name, heading, detail, p, Some(action.into_any_element()))
+}
+
+/// 可用鼠标选中、⌘C 复制的只读文字（错误、日志）：字号与颜色继承外层。
+/// `id` 只需在最近的带 id 祖先内唯一。
+pub fn selectable_text(id: impl Into<ElementId>, text: impl Into<SharedString>) -> gpui_kit::base::SelectableText {
+    gpui_kit::base::SelectableText::new(id, text)
 }
 
 /// 错误态：与空态同一排版，图标块换危险色。
@@ -2256,6 +2270,15 @@ impl BannerTone {
 
 /// 统一提示条（柔和底色 + 细描边 + 图标 + 文案 + 可选右侧动作）。
 pub fn banner(tone: BannerTone, icon_name: IconName, text: impl Into<SharedString>, action: Option<AnyElement>, p: &Palette) -> gpui_kit::Div {
+    banner_with(tone, icon_name, text.into().into_any_element(), action, p)
+}
+
+/// 文字可选中复制的提示条（错误条）：`id` 在最近的带 id 祖先内唯一。
+pub fn banner_selectable(tone: BannerTone, icon_name: IconName, id: impl Into<ElementId>, text: impl Into<SharedString>, action: Option<AnyElement>, p: &Palette) -> gpui_kit::Div {
+    banner_with(tone, icon_name, selectable_text(id, text).into_any_element(), action, p)
+}
+
+fn banner_with(tone: BannerTone, icon_name: IconName, text: AnyElement, action: Option<AnyElement>, p: &Palette) -> gpui_kit::Div {
     let (fg, bg, border) = tone.colors(p);
     let mut row = div()
         .px(px(12.))
@@ -2270,7 +2293,7 @@ pub fn banner(tone: BannerTone, icon_name: IconName, text: impl Into<SharedStrin
         .text_size(px(TypeScale::SM))
         .text_color(fg)
         .child(div().flex_none().child(icon(icon_name, IconSize::CONTROL, fg)))
-        .child(div().flex_1().min_w(px(0.)).child(text.into()));
+        .child(div().flex_1().min_w(px(0.)).child(text));
     if let Some(action) = action {
         row = row.child(div().flex_none().child(action));
     }

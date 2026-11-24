@@ -31,8 +31,26 @@ pub struct SkippedRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedImport {
+    /// 文件里的顺序就是导出时的手动顺序（R6）。
     pub connections: Vec<SavedConnection>,
     pub skipped: Vec<SkippedRow>,
+    /// R6：导出时的分组与组内顺序；旧格式文件没有这一项，为空。
+    #[serde(default)]
+    pub groups: Vec<ExportGroup>,
+}
+
+/// R6：导出文件里的一个分组。成员是连接 id，按组内顺序排列；只是组织信息，不含机密。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +58,9 @@ struct ExportEnvelope {
     format: String,
     version: u64,
     connections: Vec<SavedConnection>,
+    /// 可选字段：旧版本读不到也不影响导入，旧文件没有它时按空处理，版本号不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<ExportGroup>,
 }
 
 /// 逐条松散解析用的信封：connections 保持原始 JSON，未知引擎的行才能进报告而不是炸掉整个文件。
@@ -48,6 +69,8 @@ struct RawEnvelope {
     format: String,
     version: u64,
     connections: Vec<serde_json::Value>,
+    #[serde(default)]
+    groups: Option<serde_json::Value>,
 }
 
 /// 导出与导入都过这一步：文件里没有任何机密，导入后密码需重填。
@@ -58,16 +81,24 @@ fn strip_credentials(connection: &SavedConnection) -> SavedConnection {
     clean
 }
 
-fn envelope(connections: &[SavedConnection]) -> ExportEnvelope {
+fn envelope(connections: &[SavedConnection], groups: &[ExportGroup]) -> ExportEnvelope {
     ExportEnvelope {
         format: EXPORT_FORMAT.to_owned(),
         version: EXPORT_VERSION,
         connections: connections.iter().map(strip_credentials).collect(),
+        groups: groups.to_vec(),
     }
 }
 
+/// 只导连接、不带分组（测试与旧调用的形状）。
+#[cfg(test)]
 pub fn encode_export(connections: &[SavedConnection], passphrase: Option<&str>) -> Result<Vec<u8>, String> {
-    let envelope = envelope(connections);
+    encode_export_with_groups(connections, &[], passphrase)
+}
+
+/// R6：连同分组与顺序导出；`connections` 的顺序即手动顺序。
+pub fn encode_export_with_groups(connections: &[SavedConnection], groups: &[ExportGroup], passphrase: Option<&str>) -> Result<Vec<u8>, String> {
+    let envelope = envelope(connections, groups);
     match passphrase.map(str::trim).filter(|value| !value.is_empty()) {
         None => serde_json::to_vec_pretty(&envelope).map_err(|err| format!("序列化导出内容失败：{err}")),
         Some(passphrase) => encrypt(&envelope, passphrase),
@@ -184,7 +215,12 @@ fn parse_payload(payload: &[u8]) -> Result<ParsedImport, String> {
             }),
         }
     }
-    Ok(ParsedImport { connections, skipped })
+    // 分组信息坏了不挡连接导入：认不出就当没有分组。
+    let groups = raw
+        .groups
+        .and_then(|value| serde_json::from_value::<Vec<ExportGroup>>(value).ok())
+        .unwrap_or_default();
+    Ok(ParsedImport { connections, skipped, groups })
 }
 
 fn skip_reason(row: &serde_json::Value) -> String {
@@ -350,6 +386,31 @@ mod tests {
         assert_eq!(parsed.skipped.len(), 1);
         assert_eq!(parsed.skipped[0].name, "报表库");
         assert!(parsed.skipped[0].reason.contains("clickhouse"), "{}", parsed.skipped[0].reason);
+    }
+
+    #[test]
+    fn groups_and_order_survive_a_round_trip_and_old_files_still_import() {
+        let rows = vec![sqlite_row("lite-1"), postgres_row("pg-1")];
+        let groups = vec![ExportGroup { id: "g1".into(), name: "demo-uat".into(), position: 0, collapsed: true, members: vec!["pg-1".into()] }];
+        for passphrase in [None, Some("fixture-unlock")] {
+            let file = encode_export_with_groups(&rows, &groups, passphrase).unwrap();
+            let parsed = parse_import(&file, passphrase).unwrap();
+            let ids: Vec<&str> = parsed.connections.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, ["lite-1", "pg-1"], "文件里保留手动顺序");
+            assert_eq!(parsed.groups, groups);
+        }
+        // 旧格式（没有 groups 字段）照常导入，分组为空。
+        let old = format!("{{\"format\":\"{EXPORT_FORMAT}\",\"version\":1,\"connections\":[{}]}}", serde_json::to_string(&sqlite_row("lite-1")).unwrap());
+        let parsed = parse_import(old.as_bytes(), None).unwrap();
+        assert_eq!(parsed.connections.len(), 1);
+        assert!(parsed.groups.is_empty());
+        // 没有分组时不写这个字段：旧版本读到的仍是原来的形状。
+        let plain = String::from_utf8(encode_export(&rows, None).unwrap()).unwrap();
+        assert!(!plain.contains("\"groups\""));
+        // 分组字段损坏不挡连接导入。
+        let broken = format!("{{\"format\":\"{EXPORT_FORMAT}\",\"version\":1,\"connections\":[{}],\"groups\":42}}", serde_json::to_string(&sqlite_row("lite-1")).unwrap());
+        let parsed = parse_import(broken.as_bytes(), None).unwrap();
+        assert_eq!((parsed.connections.len(), parsed.groups.len()), (1, 0));
     }
 
     #[test]

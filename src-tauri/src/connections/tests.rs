@@ -140,6 +140,145 @@ async fn unknown_group_ids_read_as_ungrouped_and_deleted_connections_drop_member
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// R6：保存三条 SQLite 连接（名称按文件名：a/b/c.sqlite），返回 id。
+async fn three_connections(service: &Service, dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for name in ["a", "b", "c"] {
+        let db = dir.join(format!("{name}.sqlite"));
+        sqlite_fixture(&db).await;
+        let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+        draft.file_path = db.display().to_string();
+        ids.push(service.save(draft, SecretInput::default()).await.unwrap().connection.id);
+    }
+    ids
+}
+
+fn listed(rows: &[super::ConnectionRecord]) -> Vec<String> {
+    rows.iter().map(|row| row.saved.id.clone()).collect()
+}
+
+#[tokio::test]
+async fn reordered_connections_and_groups_keep_their_order_after_reopening() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let service = group_service(&path);
+    let ids = three_connections(&service, &dir).await;
+    assert_eq!(listed(&service.list().await.unwrap()), ids, "新建的连接排在最后");
+    let (a, b, c) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+    service.reorder_connections(None, &[c.clone(), a.clone(), b.clone()]).await.unwrap();
+    assert_eq!(listed(&service.list().await.unwrap()), [c.clone(), a.clone(), b.clone()]);
+
+    let first = service.save_group(None, "shop".into()).await.unwrap();
+    let second = service.save_group(None, "demo-uat".into()).await.unwrap();
+    // 拖到分组里的某个位置：归入该组并按给定顺序排列。
+    service.reorder_connections(Some(&second.id), &[b.clone(), c.clone()]).await.unwrap();
+    service.reorder_groups(&[second.id.clone(), first.id.clone()]).await.unwrap();
+    // 移到另一个分组时排到它的末尾。
+    service.assign_group(&a, Some(&second.id)).await.unwrap();
+
+    let reopened = group_service(&path);
+    let (groups, members) = reopened.groups().await.unwrap();
+    let group_ids: Vec<&str> = groups.iter().map(|group| group.id.as_str()).collect();
+    assert_eq!(group_ids, [second.id.as_str(), first.id.as_str()], "分组顺序重开后保持");
+    let rows = listed(&reopened.list().await.unwrap());
+    let layout = super::groups::layout_groups(&groups, &members, &rows);
+    assert_eq!(layout.groups[0].1, [b.clone(), c.clone(), a.clone()], "组内顺序重开后保持");
+    assert!(layout.groups[1].1.is_empty() && layout.ungrouped.is_empty());
+
+    assert!(reopened.reorder_connections(None, &["missing".to_owned()]).await.is_err(), "未知连接整体拒绝");
+    assert!(reopened.reorder_connections(Some("missing"), std::slice::from_ref(&a)).await.is_err());
+    assert!(reopened.reorder_groups(&["missing".to_owned()]).await.is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn legacy_store_without_positions_is_migrated_in_name_order() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    // 旧版配置库：connections 没有 position 列，插入顺序与名称顺序不同。
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE connections (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, engine TEXT NOT NULL, env TEXT NOT NULL,
+                host TEXT, port INTEGER, database_name TEXT, username TEXT, file_path TEXT,
+                tls_mode TEXT, tls_server_name TEXT, ca_mode TEXT, ca_file TEXT, client_cert TEXT, client_key TEXT,
+                ssh_host TEXT, ssh_port INTEGER, ssh_user TEXT, ssh_auth TEXT, ssh_key_path TEXT,
+                password_saved INTEGER NOT NULL, ssh_password_saved INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, name) in [("x1", "orders"), ("x2", "billing"), ("x3", "shop")] {
+            sqlx::query("INSERT INTO connections (id, name, engine, env, file_path, password_saved, ssh_password_saved) VALUES (?1, ?2, 'sqlite', 'none', '/tmp/x.sqlite', 0, 0)")
+                .bind(id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    }
+    let service = group_service(&path);
+    assert_eq!(listed(&service.list().await.unwrap()), ["x2", "x1", "x3"], "按名称初始化顺序");
+    // 再次打开不会重新初始化：手动顺序保持。
+    service.reorder_connections(None, &["x3".to_owned(), "x2".to_owned(), "x1".to_owned()]).await.unwrap();
+    let reopened = group_service(&path);
+    assert_eq!(listed(&reopened.list().await.unwrap()), ["x3", "x2", "x1"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn export_then_import_restores_groups_and_order() {
+    let dir = temp_workspace();
+    let source_path = dir.join("source.sqlite");
+    let service = group_service(&source_path);
+    let ids = three_connections(&service, &dir).await;
+    let (a, b, c) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+    let group = service.save_group(None, "demo-uat".into()).await.unwrap();
+    service.reorder_connections(Some(&group.id), &[c.clone(), a.clone()]).await.unwrap();
+    service.set_group_collapsed(&group.id, true).await.unwrap();
+    let export_path = dir.join("export.json");
+    service.export_connections(None, None, &export_path).await.unwrap();
+
+    let target = group_service(&dir.join("target.sqlite"));
+    let parsed = target.import_file(&export_path, None).await.unwrap();
+    assert_eq!(parsed.groups.len(), 1);
+    let mut imported = Vec::new();
+    for row in &parsed.connections {
+        let outcome = target.save(redraft(row), SecretInput::default()).await.unwrap();
+        imported.push(outcome.connection.id);
+    }
+    target.restore_import_layout(&parsed.groups, &imported).await.unwrap();
+    let (groups, members) = target.groups().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "demo-uat");
+    assert!(groups[0].collapsed);
+    let layout = super::groups::layout_groups(&groups, &members, &listed(&target.list().await.unwrap()));
+    assert_eq!(layout.groups[0].1, [c.clone(), a.clone()], "组内顺序保留");
+    assert_eq!(layout.ungrouped, [b]);
+
+    // 旧格式导出文件（没有分组）：仍能导入，按文件顺序排列，不改已有分组。
+    let old = format!(
+        "{{\"format\":\"rillsql-connections\",\"version\":1,\"connections\":[{}]}}",
+        serde_json::to_string(&parsed.connections[1]).unwrap()
+    );
+    let old_path = dir.join("old.json");
+    std::fs::write(&old_path, old).unwrap();
+    let legacy = group_service(&dir.join("legacy.sqlite"));
+    let parsed = legacy.import_file(&old_path, None).await.unwrap();
+    assert!(parsed.groups.is_empty());
+    let saved = legacy.save(redraft(&parsed.connections[0]), SecretInput::default()).await.unwrap();
+    legacy.restore_import_layout(&parsed.groups, std::slice::from_ref(&saved.connection.id)).await.unwrap();
+    assert_eq!(listed(&legacy.list().await.unwrap()), [saved.connection.id]);
+    assert!(legacy.groups().await.unwrap().0.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn temp_workspace() -> PathBuf {
     let path = std::env::temp_dir().join(format!("rillsql-conn-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();

@@ -159,6 +159,9 @@ pub const SHORTCUTS: &[Shortcut] = &[
         .split("Mod+Alt+L", "Alt+Shift+L")
         .command("reveal-active-tab")
         .binds(&[global!(RevealActiveTab)]),
+    // R5：对象树与库概览里 ⌘C 复制名称（多选时每行一个），⌥⌘C 复制完整名称（库.表）；由列表自己的按键处理。
+    Shortcut::new("explorer-copy-name", "explorer", "Mod+C", "shell.shortcuts.explorerCopyName").command("tree-copy-column"),
+    Shortcut::new("explorer-copy-full-name", "explorer", "Mod+Alt+C", "shell.shortcuts.explorerCopyFullName").command("tree-copy-name"),
     Shortcut::new("explorer-quick-search", "explorer", "/", "shell.shortcuts.explorerQuickSearch"),
     Shortcut::new("explorer-clear-search", "explorer", "Esc", "shell.shortcuts.explorerClearSearch"),
     // 键空间工作台（R4）：由工作台自己的按键处理与输入框回车解析，这里只登记用于面板展示。

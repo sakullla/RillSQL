@@ -711,7 +711,9 @@ pub fn overview_menu_items(name: &str, object: bool, relational: bool) -> Vec<Me
             IconName::SquareTerminal,
         )));
     }
-    items.push(with_icon(targeted("overview-copy-name", "catalog.tree.copyFullName", format!("overview-copy-name:{name}")), IconName::Copy));
+    let mut copy_name = with_icon(targeted("overview-copy-name", "catalog.tree.copyFullName", format!("overview-copy-name:{name}")), IconName::Copy);
+    copy_name.shortcut = command_chord("tree-copy-name");
+    items.push(copy_name);
     items
 }
 
@@ -758,12 +760,24 @@ pub fn group_menu_items(group_id: &str, collapsed: bool) -> Vec<MenuItem> {
         with_icon(item("group-new", "ui.group.new"), IconName::FolderPlus),
         with_icon(targeted("group-toggle", toggle_key, format!("group-toggle:{group_id}")), IconName::ChevronDown),
         with_icon(targeted("group-rename", "ui.group.rename", format!("group-rename:{group_id}")), IconName::SquarePen),
+        sep(with_icon(targeted("group-move-up", "ui.group.moveUp", format!("group-move-up:{group_id}")), IconName::ChevronUp)),
+        with_icon(targeted("group-move-down", "ui.group.moveDown", format!("group-move-down:{group_id}")), IconName::ChevronDown),
         MenuItem {
             danger: true,
             separator_before: true,
             ..targeted("group-delete", "ui.group.delete", format!("group-delete:{group_id}"))
         },
     ]
+}
+
+/// R6：连接菜单里的“上移 / 下移”：在所在分组（或未分组）里移动一格；已在两端的那一项禁用。
+pub fn move_step_items(connection_id: &str, first: bool, last: bool) -> Vec<MenuItem> {
+    let mut up = with_icon(targeted("group-conn-up", "ui.group.moveUp", format!("group-conn-up:{connection_id}")), IconName::ChevronUp);
+    up.enabled = !first;
+    up.separator_before = true;
+    let mut down = with_icon(targeted("group-conn-down", "ui.group.moveDown", format!("group-conn-down:{connection_id}")), IconName::ChevronDown);
+    down.enabled = !last;
+    vec![up, down]
 }
 
 /// 连接菜单里的“移动到分组”子菜单。拖拽与这条菜单落同一个 Store 命令。

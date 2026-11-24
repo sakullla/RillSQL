@@ -1296,6 +1296,8 @@ dict! {
     "shell.shortcuts.explorerOpen" => "打开对象（表打开数据）", "Open the object (tables open their data)";
     "shell.shortcuts.explorerOpenStructure" => "直接打开表结构（对象树中）", "Open table structure directly (in object tree)";
     "shell.shortcuts.explorerSearch" => "聚焦对象树搜索框", "Focus object tree search";
+    "shell.shortcuts.explorerCopyName" => "复制名称（对象树、库概览；多选时每行一个）", "Copy name (object tree, overview; one per line when several are selected)";
+    "shell.shortcuts.explorerCopyFullName" => "复制完整名称（库.表）", "Copy full name (database.table)";
     "shell.shortcuts.explorerQuickSearch" => "快速聚焦对象树搜索框（侧栏聚焦时）", "Quick-focus object tree search (in sidebar)";
     "shell.shortcuts.explorerClearSearch" => "在搜索框中清除对象搜索", "Clear the object search in the search box";
     "shell.shortcuts.keyspaceFilter" => "在模式框中按模式重新扫描键", "Rescan keys with the pattern in the pattern box";
@@ -1837,6 +1839,10 @@ dict! {
     "ui.group.deleteHint" => "删除分组，连接保留并回到顶层", "Delete this group; its connections stay and return to the top level";
     "ui.group.moveTo" => "移动到分组", "Move to group";
     "ui.group.moveOut" => "移出分组（回到顶层）", "Remove from group (top level)";
+    "ui.group.moveUp" => "上移", "Move up";
+    "ui.group.moveDown" => "下移", "Move down";
+    "ui.group.reorderWhileSearching" => "搜索过滤时不能拖动排序，请先清除搜索", "Clear the search before reordering";
+    "ui.group.reorderFailed" => "保存顺序失败，已恢复原顺序", "Could not save the order; it was restored";
     "ui.group.alreadyHere" => "已经在这个分组里", "Already in this group";
     "ui.group.none" => "还没有分组", "No groups yet";
     "ui.group.noneHint" => "先用侧栏的分组按钮新建一个", "Create one with the group button in the sidebar first";

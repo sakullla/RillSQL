@@ -264,6 +264,40 @@ fn row_menu_reuses_the_object_tree_menu_or_falls_back_and_new_query_binds_the_da
     let _ = model.activate_item(&model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Overview).unwrap().id.clone());
     model.dispatch("overview-copy-name:ghost");
     assert!(model.copied.contains("ghost"));
+    assert_eq!(model.take_clipboard().as_deref(), Some("shop.ghost"), "写入系统剪贴板");
+}
+
+/// R5：库概览里已在对象树中的行，右键“复制完整名称”走对象树命令，也必须写进系统剪贴板（库.表）；
+/// ⌘C 复制选中对象的名称（多选时每行一个），⌥⌘C 复制完整名称。
+#[test]
+fn overview_copy_name_reaches_the_system_clipboard_and_copies_one_name_per_line() {
+    let mut model = model();
+    model.overview_click_node(&database_node_id("my", "shop"), false);
+    let (target, generation) = model.overview_read_request().unwrap();
+    let rows = vec![
+        StatRow::named("orders", Some(ObjectKind::Table)),
+        StatRow::named("items", Some(ObjectKind::Table)),
+        StatRow::named("paid", Some(ObjectKind::View)),
+    ];
+    model.finish_overview_read(&target.spec(), generation, Ok(body(StatsLevel::Objects, rows, None)));
+    model.dispatch("overview-menu:orders");
+    let item = model.menu.as_ref().unwrap().items.iter().find(|item| item.id == "tree-copy-name").cloned().expect("复制完整名称");
+    assert_eq!(item.shortcut, crate::app::keymap::command_chord("tree-copy-name"), "菜单项显示快捷键");
+    assert!(item.shortcut.is_some());
+    model.menu = None;
+    let _ = model.dispatch("tree-copy-name");
+    assert_eq!(model.take_clipboard().as_deref(), Some("shop.orders"));
+    assert_eq!(model.notice_key, Some("ui.copied"), "给出已复制反馈");
+
+    // 多选两行：⌘C 每行一个名称，⌥⌘C 每行一个完整名称；行数据仍在右键“复制为 TSV”。
+    model.dispatch("overview-select:items");
+    model.dispatch("overview-select-extend:orders");
+    model.dispatch("overview-copy-names");
+    assert_eq!(model.take_clipboard().as_deref(), Some("items\norders"));
+    model.dispatch("overview-copy-full-names");
+    assert_eq!(model.take_clipboard().as_deref(), Some("shop.items\nshop.orders"));
+    model.dispatch("overview-copy:tsv");
+    assert!(model.take_clipboard().is_some_and(|text| text.lines().count() == 3), "TSV 含表头");
 }
 
 #[test]
@@ -393,20 +427,19 @@ fn clicking_a_real_sqlite_connection_renders_its_overview_and_double_click_opens
     cx.update_window(window, |_, window, cx| window.click("overview-row-0", cx)).unwrap();
     cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
     cx.update(|cx| assert_eq!(view.read(cx).model.active_overview().and_then(|state| state.selected.clone()).as_deref(), Some("item_labels"), "↓ 移动选中"));
-    // R13：⌘C 复制选中行（制表符分隔）。
+    // R5：⌘C 复制选中对象的名称，并写进系统剪贴板。
     cx.update_window(window, |_, window, cx| window.press(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, cx)).unwrap();
     cx.update(|cx| {
         let copied = view.read(cx).model.copied.clone();
-        assert!(copied.starts_with("item_labels\t"), "⌘C 复制选中行：{copied:?}");
+        assert_eq!(copied, "item_labels", "⌘C 复制名称");
     });
-    // R13：Shift+↑ 扩展到两行，⌘C 得到含表头的 TSV；普通 ↓ 结束多选。
+    assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("item_labels"), "写进系统剪贴板");
+    // Shift+↑ 扩展到两行，⌘C 每行一个名称；普通 ↓ 结束多选。
     cx.update_window(window, |_, window, cx| window.press("shift-up", cx)).unwrap();
     cx.update_window(window, |_, window, cx| window.press(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, cx)).unwrap();
     cx.update(|cx| {
         let copied = view.read(cx).model.copied.clone();
-        let lines: Vec<&str> = copied.lines().collect();
-        assert_eq!(lines.len(), 3, "表头 + 两行：{copied:?}");
-        assert!(lines[1].starts_with("item\t") && lines[2].starts_with("item_labels\t"), "{copied:?}");
+        assert_eq!(copied, "item\nitem_labels", "多选时每行一个");
     });
     cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
     cx.update(|cx| {

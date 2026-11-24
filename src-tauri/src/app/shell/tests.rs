@@ -5071,6 +5071,15 @@ fn tree_actions_bind_to_the_row_and_routines_never_open_a_data_page() {
     let _ = model.dispatch(&format!("nav-focus:{orders_id}"));
     let _ = model.dispatch("tree-copy-name");
     assert_eq!(model.copied, "public.orders");
+    assert_eq!(model.take_clipboard().as_deref(), Some("public.orders"), "R5：复制完整名称写进系统剪贴板");
+    // R5：对象树 ⌘C 复制名称，⌥⌘C 复制完整名称。
+    let short = model.explorer_copy_name(false).expect("⌘C 命令");
+    let _ = model.dispatch(&short);
+    assert_eq!(model.take_clipboard().as_deref(), Some("orders"));
+    let full = model.explorer_copy_name(true).expect("⌥⌘C 命令");
+    let _ = model.dispatch(&full);
+    assert_eq!(model.take_clipboard().as_deref(), Some("public.orders"));
+    assert_eq!(model.notice_key, Some("ui.copied"));
 
     // 打开数据页用的是这一行的完整目标。
     let _ = model.dispatch(&format!("nav-open-data:{orders_id}"));
@@ -9327,6 +9336,66 @@ fn explorer_ids_are_stable_and_dense_under_hundreds_of_connections() {
         "视图元素数量与连接总数无关（300 条 {created}，20 条 {}）",
         small_window.range.len()
     );
+}
+
+/// R6：拖到连接行之间、菜单上移/下移、拖分组都先改本地顺序，再交给后台落库一次；搜索过滤时拒绝排序。
+#[test]
+fn connections_and_groups_reorder_locally_and_queue_one_store_write() {
+    use super::model::ReorderOp;
+    let mut model = grouped_model(
+        vec![
+            record_for("c1", "alpha", Engine::Postgres),
+            record_for("c2", "beta", Engine::Postgres),
+            record_for("c3", "gamma", Engine::Postgres),
+            record_for("c4", "delta", Engine::Postgres),
+        ],
+        vec![group("g1", "shop", 0, false), group("g2", "demo-uat", 1, false)],
+        &[("c4", "g1")],
+    );
+    assert_eq!(model.container_members(None), ["c1", "c2", "c3"]);
+    // 把 c3 拖到 c1 上：插到 c1 之前。
+    let _ = model.dispatch("group-conn-drop:c3\u{1}\u{1}0");
+    assert_eq!(model.container_members(None), ["c3", "c1", "c2"]);
+    assert_eq!(model.take_pending_reorder(), Some(ReorderOp::Connections { group: None, ids: vec!["c3".into(), "c1".into(), "c2".into()] }));
+    // 同一容器往后拖：插到目标之前。
+    let _ = model.dispatch("group-conn-drop:c3\u{1}\u{1}2");
+    assert_eq!(model.container_members(None), ["c1", "c3", "c2"]);
+    let _ = model.take_pending_reorder();
+    // 拖进分组里的某个位置：归入该组。
+    let _ = model.dispatch("group-conn-drop:c2\u{1}g1\u{1}0");
+    assert_eq!(model.container_members(Some("g1")), ["c2", "c4"]);
+    assert_eq!(model.group_of("c2"), Some("g1"));
+    assert_eq!(model.take_pending_reorder(), Some(ReorderOp::Connections { group: Some("g1".into()), ids: vec!["c2".into(), "c4".into()] }));
+    // 菜单下移 / 上移；已在末尾时不动。
+    let _ = model.dispatch("group-conn-down:c2");
+    assert_eq!(model.container_members(Some("g1")), ["c4", "c2"]);
+    let _ = model.take_pending_reorder();
+    let _ = model.dispatch("group-conn-down:c2");
+    assert!(model.take_pending_reorder().is_none(), "末尾再下移不落库");
+    let _ = model.dispatch("group-conn-up:c2");
+    assert_eq!(model.container_members(Some("g1")), ["c2", "c4"]);
+    let _ = model.take_pending_reorder();
+    // 菜单里有上移 / 下移和移动到分组。
+    model.connections.selected = Some("c2".into());
+    let _ = model.dispatch("menu-explorer-connection");
+    let ids: Vec<&str> = model.menu.as_ref().map(|menu| menu.items.iter().map(|item| item.id).collect()).unwrap_or_default();
+    assert!(ids.contains(&"group-conn-up") && ids.contains(&"group-conn-down") && ids.contains(&"submenu-move-group"), "{ids:?}");
+    let up = model.menu.as_ref().unwrap().items.iter().find(|item| item.id == "group-conn-up").unwrap();
+    assert!(!up.enabled, "第一项不能再上移");
+    model.menu = None;
+    // 分组排序：拖 g2 到 g1 前；菜单下移。
+    let _ = model.dispatch("group-drop:g2\u{1}0");
+    let order: Vec<String> = model.group_layout().groups.iter().map(|(group, _)| group.id.clone()).collect();
+    assert_eq!(order, ["g2", "g1"]);
+    assert_eq!(model.take_pending_reorder(), Some(ReorderOp::Groups { ids: vec!["g2".into(), "g1".into()] }));
+    let _ = model.dispatch("group-move-down:g2");
+    assert_eq!(model.group_layout().groups[0].0.id, "g1");
+    let _ = model.take_pending_reorder();
+    // 搜索过滤时禁止拖动排序，并提示先清除搜索。
+    model.object_filter = "orders".into();
+    let _ = model.dispatch("group-conn-drop:c1\u{1}\u{1}0");
+    assert!(model.take_pending_reorder().is_none());
+    assert_eq!(model.notice_key, Some("ui.group.reorderWhileSearching"));
 }
 
 #[test]

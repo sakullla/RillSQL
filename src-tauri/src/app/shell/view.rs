@@ -3651,6 +3651,38 @@ impl Workbench {
         .detach();
     }
 
+    /// R6：把模型里已经生效的手动顺序写进配置库。失败时报告原因并从配置库重读，恢复原顺序。
+    fn pump_reorder(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.model.take_pending_reorder() else { return };
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let result = match op {
+                super::model::ReorderOp::Connections { group, ids } => services.connections.reorder_connections(group.as_deref(), &ids).await,
+                super::model::ReorderOp::Groups { ids } => services.connections.reorder_groups(&ids).await,
+            };
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Err(detail)) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            this.model.notice_key = Some("ui.group.reorderFailed");
+                            this.model.notice_detail = detail;
+                            let _ = this.model.dispatch("group-refresh");
+                            let _ = this.model.dispatch("conn-refresh");
+                            this.settle(cx);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     fn load_env_tags(&mut self, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
@@ -3853,6 +3885,7 @@ impl Workbench {
         self.boot_state(cx);
         self.monitor_connections(cx);
         self.pump_jobs(cx);
+        self.pump_reorder(cx);
         self.pump_transactions(cx);
         self.sync_transaction_views(cx);
         self.pump_nav(cx);
