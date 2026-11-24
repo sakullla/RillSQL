@@ -53,7 +53,7 @@ ignored 的 7 条全部是既有需要外部 fixture/平台的用例（sqlite fi
 ## 4. 未执行 / 未取得
 
 - **未运行原生应用**：本环境没有图形会话，`cargo run --bin rillsql` 无法打开窗口，因此没有原生启动、Tab 走查、
-  IME、菜单与截图证据。R6 的四流程端到端由 Delivery Owner 在集成 candidate 上补。
+  IME、菜单与截图证据。R6 的四流程完整流程由 Delivery Owner 在集成 candidate 上补。
 - **未做重启验证**：重启持久化只在 headless 里以"真实写盘 + `load_state()` 读回"证明（见 2.2 第 4 条），
   没有第二进程重启的原生证据。
 - 本任务未改动 `src-tauri/Cargo.toml` / `Cargo.lock`，也未新增 ignored 用例。

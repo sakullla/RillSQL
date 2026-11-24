@@ -94,7 +94,7 @@ T10 的 `DiagramPane::take_back()` 原本没有消费者（页头返回点了没
   1360/900/640 或双主题双密度的图片。Delivery Owner 需在集成 candidate 上补。
 - **真实输入法与实体 Tab 键**：headless 窗口能断言焦点落点（`FocusHandle::is_focused`）与停靠序列，
   不能证明原生输入法组合键与系统 Tab 焦点环的实际像素表现。
-- **数据库 fixture**：本任务的连接端到端用本地 SQLite 文件；PostgreSQL/MySQL/MariaDB 的真实连接未在本任务内跑
+- **数据库 fixture**：本任务的连接完整流程用本地 SQLite 文件；PostgreSQL/MySQL/MariaDB 的真实连接未在本任务内跑
   （ignored 的 fixture 用例不计通过）。
 
 ## 8. 修复轮 A2 的回执（review 四条 blocking）

@@ -18,7 +18,7 @@
 | Enter/F2 写编辑、Esc 取消、只读原因与完整值入口、双击分隔柄自适应 | 已实现 | `enter_edits_the_cell_and_ctrl_enter_opens_the_full_value`、`keyboard_editing_uses_a_real_text_input_and_commits_or_cancels`、`double_clicking_a_column_divider_fits_that_column` |
 | 记录视图非模态整行字段暂存、选区批量动作、排序/筛选状态、命令路由完整 | 已实现 | `record_panel_stages_a_field_in_place_and_offers_batch_actions`、`record_panel_explains_readonly_fields_instead_of_staging`、`record_view_shows_the_focused_row_and_disables_the_ends` |
 | 预览确认、只读边界、批量原子拒绝、失败保留暂存、生产危险二次确认保持 | 未回退 | `grid-flow-audit.md` 第 14 条回归对照表 |
-| 1360/900/640 端到端 + 双主题双密度 + 失败证据 | headless 布局级通过，原生像素未取得 | `widths-themes-densities.md`、`grid_flow_runs_at_three_widths_in_both_themes`、`test-receipts.md` 的未取得项 |
+| 1360/900/640 完整流程 + 双主题双密度 + 失败证据 | headless 布局级通过，原生像素未取得 | `widths-themes-densities.md`、`grid_flow_runs_at_three_widths_in_both_themes`、`test-receipts.md` 的未取得项 |
 
 ## 文件
 

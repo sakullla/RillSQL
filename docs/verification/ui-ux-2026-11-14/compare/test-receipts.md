@@ -9,7 +9,7 @@
 | # | 命令 | 结果 |
 | --- | --- | --- |
 | 1 | `cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets` | 退出码 0（在含本任务改动的快照上） |
-| 2 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::compare -- --nocapture` | ok：**14 passed / 0 failed / 0 ignored**（本模块全部用例，含端到端与三档宽度矩阵） |
+| 2 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::compare -- --nocapture` | ok：**14 passed / 0 failed / 0 ignored**（本模块全部用例，含完整流程与三档宽度矩阵） |
 | 3 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib` | ok：**930 passed / 0 failed / 7 ignored** |
 | 4 | `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --lib --tests` | 退出码 0（含本任务最终改动，全 crate 无 error、`app/views/compare/**` 无 warning） |
 | 4b | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 首次全量运行退出码 0（当时 `app/views/compare` 还有一条 `assertions_on_constants` 提示，已改为常量处的编译期断言消除）；其后两次复跑分别被 T12（`views/export`）、T13（`views/redis`）未落盘改动挡住，与本任务文件无关 |

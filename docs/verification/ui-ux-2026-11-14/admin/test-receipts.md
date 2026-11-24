@@ -83,4 +83,4 @@ git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock
 | 原生像素截图（浅/深 × 紧凑/标准 × 1360/900/640） | **未取得** | 运行环境没有原生窗口与截屏通道。`states-and-widths.md` 给的是 headless 无头窗口里的实际边界，不等于像素证据；按执行计划由 Delivery Owner 在集成 candidate 上补取 |
 | 真机 sqlite 附加库空态 / postgres 序列空态的显式截图 | 未取得 | 需要真实 PostgreSQL fixture；本任务用 `inventory_from_extras` 构造同形态清单做 headless 验证，模型侧读取路径由既有用例覆盖 |
 | 原生应用里点「重试」后的真实重读 | 未在原生窗口验证 | headless 用例断言了重试按钮存在且文案已翻译，但没有点击触发真实重读（会拉起视图运行时去连库）；重读路径本身沿用未改动的 `refresh` / `read_inventory` |
-| 真实网络/远程引擎上点「立即连接」直到连上并重读清单 | 未跑 | 外壳用例只验证到"进入共享按需连接流程（Connecting + 一条 Expand 续接）"；真正连上依赖真实引擎 fixture，按执行计划归 Delivery 的端到端场景 |
+| 真实网络/远程引擎上点「立即连接」直到连上并重读清单 | 未跑 | 外壳用例只验证到"进入共享按需连接流程（Connecting + 一条 Expand 续接）"；真正连上依赖真实引擎 fixture，按执行计划归 Delivery 的完整流程场景 |

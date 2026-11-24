@@ -23,5 +23,5 @@
 ## 未解决事实
 
 - **无原生像素证据**：长名称截断后的实际像素、tooltip 出现位置、分组拖拽高亮在真机上的手感都没有截图；本轮只给出 headless 边界与断言。
-- **多库/多模式端到端未跑**：PostgreSQL/MySQL 的“库/模式/对象按层展开”需要 docker fixture。当前实现的读取分层是：连接建立时读库清单（PG/SQL Server 另附当前库的 schema 清单）；**会话当前库以外的库现在是可展开的库行**，展开时按库读一次（PostgreSQL 另开临时会话，SQL Server 用三段名），先显示加载态再出现模式/分组/对象，见 `database-lazy-loading.md`。端到端仍只在 SQLite 真实会话上验证，PostgreSQL/SQL Server 只有模型级与源码级断言。
+- **多库/多模式完整流程未跑**：PostgreSQL/MySQL 的“库/模式/对象按层展开”需要 docker fixture。当前实现的读取分层是：连接建立时读库清单（PG/SQL Server 另附当前库的 schema 清单）；**会话当前库以外的库现在是可展开的库行**，展开时按库读一次（PostgreSQL 另开临时会话，SQL Server 用三段名），先显示加载态再出现模式/分组/对象，见 `database-lazy-loading.md`。完整流程仍只在 SQLite 真实会话上验证，PostgreSQL/SQL Server 只有模型级与源码级断言。
 - **分组输入面板不自动聚焦**：打开后需要点一下输入框或 Tab 过去；Esc 取消、保存按钮与命令都可用。

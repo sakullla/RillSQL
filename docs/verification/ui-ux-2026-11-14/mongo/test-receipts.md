@@ -10,7 +10,7 @@
 cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::mongo
 ```
 
-结果：**16 passed; 0 failed; 0 ignored; 957 filtered out**（其中 1 个是夹具端到端用例，实际跳过，见第 4 节）。
+结果：**16 passed; 0 failed; 0 ignored; 957 filtered out**（其中 1 个是夹具完整流程用例，实际跳过，见第 4 节）。
 
 | 用例 | 覆盖 |
 | --- | --- |
@@ -65,7 +65,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib i18n::tests      
 
 ## 4. 未取得项（不能算通过）
 
-1. **MongoDB 夹具端到端**：`live::live_mongo_pages_filters_inserts_replaces_and_deletes` 需要本机 MongoDB 夹具（`docker/compose.yaml`）。本机没有 `docker` 命令（`command not found: docker`），用例输出：
+1. **MongoDB 夹具完整流程**：`live::live_mongo_pages_filters_inserts_replaces_and_deletes` 需要本机 MongoDB 夹具（`docker/compose.yaml`）。本机没有 `docker` 命令（`command not found: docker`），用例输出：
 
    ```
    跳过：MongoDB 夹具没有连上：MongoDB 会话没有建立

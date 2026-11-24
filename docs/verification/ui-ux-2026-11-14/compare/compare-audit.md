@@ -29,7 +29,7 @@
 ## 保持不变的边界（回归约束）
 
 - 比较请求、引擎门禁、schema 门禁、选择表/唯一键、过期结果与取消标记都没改；
-- 脚本仍只经 `pending_place → confirm → take_place` 进查询编辑器，不执行（既有端到端用例继续断言目标库未被改写）；
+- 脚本仍只经 `pending_place → confirm → take_place` 进查询编辑器，不执行（既有完整流程用例继续断言目标库未被改写）；
 - `compare-*` 命令 id 全部保留，新增的只有 `compare-retry` 与 `compare-guide-start`（后者是控件 id，不是命令）；
 - `lines()`（对比页的文字投影，外壳与测试据此读屏）同步了新状态的文字，没有删掉任何既有可读文案。
 

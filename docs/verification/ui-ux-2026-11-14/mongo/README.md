@@ -21,7 +21,7 @@
 - **源码级**：`DocsState` 六态判定（`docs_state`）、`cell_key` 的键盘语义、单元格四态取值来自 `kit::interaction_style`，由 `cargo test` 纯断言覆盖（`docs_states_separate_empty_no_match_and_error`、`document_cells_take_their_states_from_the_kit`）。
 - **headless 布局级**：GPUI 测试窗口里真实渲染出来的元素与可访问名称，按 1360/900/640 × 浅/深色 × 紧凑/标准 逐格断言（`docs_states_and_cells_hold_at_1360 / _900 / _640`、`narrow_pane_keeps_document_columns_readable`、`narrow_navigation_overlays_instead_of_squeezing_the_table`）。
 - **无夹具回归级**：不需要数据库的既有行为用例（`rendered_controls_keep_invalid_json_and_unconfirmed_delete`、`mongo_write_is_previewed_and_target_switch_drops_it`）覆盖无效 JSON、未确认删除、未确认写入、目标切换丢弃旧预览与 FormatViewer 查看。
-- **未取得：MongoDB 夹具端到端**。本机没有 `docker` 命令，`live_mongo_pages_filters_inserts_replaces_and_deletes` 打印「跳过：MongoDB 夹具没有连上：MongoDB 会话没有建立」后返回。该用例在测试结果里计为 ok，但**不算通过**，见 `test-receipts.md` 的「未取得项」。
+- **未取得：MongoDB 夹具完整流程**。本机没有 `docker` 命令，`live_mongo_pages_filters_inserts_replaces_and_deletes` 打印「跳过：MongoDB 夹具没有连上：MongoDB 会话没有建立」后返回。该用例在测试结果里计为 ok，但**不算通过**，见 `test-receipts.md` 的「未取得项」。
 - **未取得：原生像素截图**。本轮没有原生窗口与截屏通道的使用授权，未生成 PNG。按计划由交付阶段在最终集成 candidate 上采集，不用历史截图替代。
 
 ## 结论摘要
