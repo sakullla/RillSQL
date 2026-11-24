@@ -195,21 +195,17 @@ pub(super) async fn search_database(client: &tokio_postgres::Client, database: &
         Ok(rows) => rows,
         Err(error) => return CatalogSearch::failed(database, read_failure(error)),
     };
-    let mut undecodable = 0usize;
-    for row in rows {
+    // 解不出的行记在 skipped 里：它们也占了 OFFSET 窗口，展开下一页时要算上。
+    result.push_page(database, rows, |row| {
         let (Ok(schema), Ok(name), Ok(kind), Ok(materialized)) =
             (row.try_get::<_, String>(0), row.try_get::<_, String>(1), row.try_get::<_, String>(2), row.try_get::<_, bool>(3))
         else {
-            undecodable += 1;
-            continue;
+            return None;
         };
         let mut object = ObjectRow::fresh(name, parse_kind(&kind));
         object.materialized = materialized;
-        result.hits.push((database.to_owned(), schema, object));
-    }
-    if undecodable > 0 {
-        result.failures.push((database.to_owned(), read_failure(format!("{undecodable} 个对象名无法读取，已跳过"))));
-    }
+        Some((schema, object))
+    });
     let remaining = total - offset - take;
     if remaining > 0 {
         result.truncated.push((database.to_owned(), Some(remaining)));

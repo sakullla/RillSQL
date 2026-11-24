@@ -7,7 +7,7 @@ use crate::adapters::catalog::{
 use crate::catalog::hierarchy::IndexInfo;
 use crate::catalog::model::{KindSql, MetadataSql, ObjectKind, ObjectRow};
 use crate::catalog::objects::ExtrasBody;
-use crate::catalog::read::{definition_failure, empty_page, read_failure, read_limit, ConnectionBody, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{definition_failure, empty_page, read_failure, read_limit, CatalogSearch, ConnectionBody, ObjectPageBody, ObjectWindow};
 use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::diagram::Diagram;
@@ -235,9 +235,14 @@ impl CatalogDialect for MysqlCatalog {
         read::read_mysql_page(pool, self.engine, database, offset, limit).await
     }
 
-    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-        let CatalogSession::Mysql(pool) = session else { return Vec::new() };
+    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> CatalogSearch {
+        let CatalogSession::Mysql(pool) = session else { return CatalogSearch::failed("", mismatch()) };
         read::search(pool, pattern).await
+    }
+
+    async fn search_database_objects(&self, session: &CatalogSession, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+        let CatalogSession::Mysql(pool) = session else { return CatalogSearch::failed(database, mismatch()) };
+        read::search_database(pool, database, pattern, offset, limit).await
     }
 
     async fn read_definition(

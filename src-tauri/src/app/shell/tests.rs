@@ -15313,3 +15313,47 @@ fn truncated_database_shows_more_and_expanding_fetches_the_rest() {
     let rows = model.nav_rows();
     assert_eq!(rows.iter().filter(|row| row.label.starts_with("map_b_")).count(), 24, "展开后取回其余结果");
 }
+
+/// 一页里有解不出而被跳过的行：展开的偏移按读到的行数前进（命中 + 跳过），下一页不与本页重叠。
+#[test]
+fn search_more_offset_counts_skipped_rows() {
+    use crate::catalog::model::ObjectRow;
+    use crate::catalog::read::CatalogSearch;
+    let (mut model, _) = loaded_mysql_search_model();
+    model.set_field(DraftField::ObjectFilter, "map".into());
+    let generation = model.nav_search_generation;
+    model.begin_nav_search(generation, &[("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql)]);
+    // 第一页读了 10 行：8 条命中，2 行解不出。
+    let first: Vec<_> = (0..8).map(|i| ("shop_search_b".to_owned(), String::new(), ObjectRow::table(format!("map_b_{i:02}"), None))).collect();
+    let result = CatalogSearch {
+        hits: first,
+        truncated: vec![("shop_search_b".to_owned(), Some(14))],
+        skipped: vec![("shop_search_b".to_owned(), 2)],
+        ..CatalogSearch::default()
+    };
+    assert!(model.apply_search_result(generation, "map", ("demo".to_owned(), "demo-uat".to_owned(), Engine::Mysql), result));
+    let notices = model.nav_search_notices();
+    let action = notices
+        .iter()
+        .find_map(|notice| match notice {
+            super::model::SearchNotice::More { action, .. } => Some(action.clone()),
+            _ => None,
+        })
+        .expect("还有更多");
+    let _ = model.dispatch(&action);
+    let request = model.take_search_more_request().expect("展开排队");
+    assert_eq!(request.offset, 10, "偏移含跳过的 2 行");
+
+    // 第二页读了 10 行：9 条命中，1 行跳过；还剩 4。
+    let second: Vec<_> = (10..19).map(|i| ("shop_search_b".to_owned(), String::new(), ObjectRow::table(format!("map_b_{i:02}"), None))).collect();
+    let page = CatalogSearch {
+        hits: second,
+        truncated: vec![("shop_search_b".to_owned(), Some(4))],
+        skipped: vec![("shop_search_b".to_owned(), 1)],
+        ..CatalogSearch::default()
+    };
+    assert!(model.apply_search_more(&request, page));
+    let _ = model.dispatch(&action);
+    let next = model.take_search_more_request().expect("再次展开");
+    assert_eq!(next.offset, 20, "第二页从 10 起读了 10 行");
+}

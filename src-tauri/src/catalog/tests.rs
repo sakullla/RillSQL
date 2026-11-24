@@ -1014,3 +1014,25 @@ fn search_quota_is_per_database_with_a_connection_cap() {
         vec![("a".to_owned(), 3), ("b".to_owned(), 200), ("c".to_owned(), 27), ("d".to_owned(), 0)]
     );
 }
+
+/// 一页里有解不出的行：命中照常给出，跳过的行按库计入 skipped 并报告失败；
+/// 这一库消耗的窗口按读到的行数算，下一页偏移不会与本页重叠。
+#[test]
+fn search_page_counts_undecodable_rows_toward_the_window() {
+    use super::model::ObjectRow;
+    use super::read::CatalogSearch;
+    let rows = vec![Some("map_a"), None, Some("map_c"), None, Some("map_e")];
+    let mut result = CatalogSearch::default();
+    result.push_page("shop", rows, |row| row.map(|name| ("public".to_owned(), ObjectRow::table(name.to_owned(), None))));
+    assert_eq!(result.hits.len(), 3);
+    assert_eq!(result.skipped, vec![("shop".to_owned(), 2)]);
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures[0].0, "shop");
+    assert_eq!(result.consumed("shop"), 5, "偏移按读到的 5 行前进，而不是 3 条命中");
+    assert_eq!(result.consumed("other"), 0);
+
+    let mut clean = CatalogSearch::default();
+    clean.push_page("shop", vec!["map_f"], |name| Some(("public".to_owned(), ObjectRow::table(name.to_owned(), None))));
+    assert!(clean.skipped.is_empty() && clean.failures.is_empty());
+    assert_eq!(clean.consumed("shop"), 1);
+}

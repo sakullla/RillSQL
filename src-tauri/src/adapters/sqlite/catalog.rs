@@ -2,9 +2,9 @@
 
 use crate::adapters::catalog::{cell, diagram_session_error, group_index_rows, mismatch, mismatch_body, yes, CatalogDialect};
 use crate::catalog::hierarchy::{ColumnInfo, IndexInfo};
-use crate::catalog::model::{KindSql, MetadataSql, ObjectKind, ObjectRow};
+use crate::catalog::model::{KindSql, MetadataSql, ObjectKind};
 use crate::catalog::objects::ExtrasBody;
-use crate::catalog::read::{definition_failure, empty_page, ConnectionBody, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{definition_failure, empty_page, CatalogSearch, ConnectionBody, ObjectPageBody, ObjectWindow};
 use crate::connections::CatalogSession;
 use crate::diagram::Diagram;
 use crate::query::assist::ColumnMeta;
@@ -216,9 +216,14 @@ impl CatalogDialect for SqliteCatalog {
         }
     }
 
-    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-        let CatalogSession::Sqlite { pool, .. } = session else { return Vec::new() };
+    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> CatalogSearch {
+        let CatalogSession::Sqlite { pool, .. } = session else { return CatalogSearch::failed("", mismatch()) };
         read::search(pool, pattern).await
+    }
+
+    async fn search_database_objects(&self, session: &CatalogSession, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+        let CatalogSession::Sqlite { pool, .. } = session else { return CatalogSearch::failed(database, mismatch()) };
+        read::search_database(pool, database, pattern, offset, limit).await
     }
 
     async fn read_definition(

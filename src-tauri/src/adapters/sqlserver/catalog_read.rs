@@ -239,18 +239,13 @@ async fn sqlserver_search_fetch(client: &TdsHandle, database: &str, pattern: &st
     let tail = format!("ORDER BY s.name, o.name OFFSET {offset} ROWS FETCH NEXT {take} ROWS ONLY");
     let sql = sqlserver_search_sql(database, pattern, SQLSERVER_SEARCH_COLUMNS, &tail);
     let (_, rows) = crate::adapters::sqlserver::grid_read::sqlserver_rows(client, &sql).await.map_err(read_failure)?;
-    let mut undecodable = 0usize;
-    for row in rows {
+    result.push_page(database, rows, |row| {
         let (Some(schema), Some(name)) = (cell_text(row.first()), cell_text(row.get(1))) else {
-            undecodable += 1;
-            continue;
+            return None;
         };
         let kind = cell_text(row.get(2)).unwrap_or_else(|| "table".to_owned());
-        result.hits.push((database.to_owned(), schema, ObjectRow::fresh(name, parse_kind(&kind))));
-    }
-    if undecodable > 0 {
-        result.failures.push((database.to_owned(), read_failure(format!("{undecodable} 个对象名无法读取，已跳过"))));
-    }
+        Some((schema, ObjectRow::fresh(name, parse_kind(&kind))))
+    });
     Ok(())
 }
 

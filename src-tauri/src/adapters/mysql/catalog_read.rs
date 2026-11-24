@@ -290,6 +290,10 @@ fn mysql_search_rows(rows: &[mysql_async::Row], result: &mut CatalogSearch) {
         result.hits.push((database, String::new(), ObjectRow::fresh(name, parse_kind(&kind))));
     }
     for (database, count) in undecodable {
+        // 这些行也占了分页窗口：展开下一页时偏移要算上。
+        if !database.is_empty() {
+            result.skipped.push((database.clone(), count));
+        }
         result.failures.push((database, read_failure(format!("{count} 个对象名无法按 UTF-8 读取，已跳过"))));
     }
 }

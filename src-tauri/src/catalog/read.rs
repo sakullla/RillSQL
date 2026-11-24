@@ -157,11 +157,36 @@ pub struct CatalogSearch {
     pub failures: Vec<(String, String)>,
     /// 这次没有搜索到的库（例如会话只能读自己所在的库），由界面说明。
     pub unsearched: Vec<String>,
+    /// 按库计数：读到了但名字解不出、没有作为命中给出的行 (库, 行数)。
+    /// 这些行同样占了分页窗口，展开“还有更多”时偏移要算上它们，否则下一页会和这一页重叠。
+    pub skipped: Vec<(String, usize)>,
 }
 
 impl CatalogSearch {
     pub fn failed(database: &str, message: impl Into<String>) -> Self {
         Self { failures: vec![(database.to_owned(), message.into())], ..Self::default() }
+    }
+
+    /// 这一库消耗的分页窗口：给出的命中加上跳过的行。
+    pub fn consumed(&self, database: &str) -> usize {
+        let hits = self.hits.iter().filter(|(db, _, _)| db == database).count();
+        let skipped: usize = self.skipped.iter().filter(|(db, _)| db == database).map(|(_, count)| count).sum();
+        hits + skipped
+    }
+
+    /// 记下一个库里一页命中行：解得出的进 `hits`，解不出的计入 `skipped` 并作为该库的失败报告。
+    pub fn push_page<R>(&mut self, database: &str, rows: impl IntoIterator<Item = R>, mut decode: impl FnMut(R) -> Option<(String, ObjectRow)>) {
+        let mut undecodable = 0usize;
+        for row in rows {
+            match decode(row) {
+                Some((schema, object)) => self.hits.push((database.to_owned(), schema, object)),
+                None => undecodable += 1,
+            }
+        }
+        if undecodable > 0 {
+            self.skipped.push((database.to_owned(), undecodable));
+            self.failures.push((database.to_owned(), read_failure(format!("{undecodable} 个对象名无法读取，已跳过"))));
+        }
     }
 }
 

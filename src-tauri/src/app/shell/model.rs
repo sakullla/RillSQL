@@ -3342,16 +3342,13 @@ impl WorkbenchModel {
         if self.nav_search_report_generation != generation {
             self.begin_nav_search(generation, &[]);
         }
-        let mut fetched: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for (database, _, _) in &result.hits {
-            *fetched.entry(database.as_str()).or_default() += 1;
-        }
+        // 已取回的位置按消耗的窗口算（含解不出而跳过的行），展开时从这里接着取。
         let truncated = result
             .truncated
             .iter()
             .map(|(database, remaining)| SearchTruncation {
                 database: database.clone(),
-                fetched: fetched.get(database.as_str()).copied().unwrap_or(0),
+                fetched: result.consumed(database),
                 remaining: *remaining,
                 loading: false,
             })
@@ -3414,7 +3411,7 @@ impl WorkbenchModel {
             return false;
         }
         let Some(report) = self.nav_search_reports.iter_mut().find(|item| item.connection_id == request.connection_id) else { return false };
-        let added = result.hits.iter().filter(|(database, _, _)| *database == request.database).count();
+        let added = result.consumed(&request.database);
         let remaining = result.truncated.iter().find(|(database, _)| *database == request.database).map(|(_, remaining)| *remaining);
         for (database, message) in &result.failures {
             if !report.failures.iter().any(|(db, text)| db == database && text == message) {

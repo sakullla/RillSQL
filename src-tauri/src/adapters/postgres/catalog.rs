@@ -1,9 +1,9 @@
 //! PostgreSQL 目录方言：库 → 模式 → 对象，元数据走 pg_catalog；会话只连着一个库。
 
 use crate::adapters::catalog::{diagram_session_error, information_schema_primary_key_sql, literal, mismatch, mismatch_body, CatalogDialect};
-use crate::catalog::model::{KindSql, MetadataSql, ObjectKind, ObjectRow, SchemaNode};
+use crate::catalog::model::{KindSql, MetadataSql, ObjectKind, SchemaNode};
 use crate::catalog::objects::ExtrasBody;
-use crate::catalog::read::{definition_failure, empty_page, other_database_message, read_failure, ConnectionBody, ObjectPageBody, ObjectWindow};
+use crate::catalog::read::{definition_failure, empty_page, other_database_message, read_failure, CatalogSearch, ConnectionBody, ObjectPageBody, ObjectWindow};
 use crate::connections::CatalogSession;
 use crate::diagram::Diagram;
 
@@ -213,9 +213,14 @@ impl CatalogDialect for PostgresCatalog {
         read::read_postgres_page(client, database, schema, offset, limit).await
     }
 
-    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> Vec<(String, String, ObjectRow)> {
-        let CatalogSession::Postgres(client) = session else { return Vec::new() };
+    async fn search_objects(&self, session: &CatalogSession, pattern: &str) -> CatalogSearch {
+        let CatalogSession::Postgres(client) = session else { return CatalogSearch::failed("", mismatch()) };
         read::search(client, pattern).await
+    }
+
+    async fn search_database_objects(&self, session: &CatalogSession, database: &str, pattern: &str, offset: usize, limit: usize) -> CatalogSearch {
+        let CatalogSession::Postgres(client) = session else { return CatalogSearch::failed(database, mismatch()) };
+        read::search_database(client, database, pattern, offset, limit).await
     }
 
     /// pg_catalog 只覆盖会话自己的库：读别的库的定义会安静地读到同名的另一个对象，宁可报出原因，也不返回错误的 DDL。
