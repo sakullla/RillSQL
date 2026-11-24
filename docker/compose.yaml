@@ -31,6 +31,7 @@ services:
       - mysql:/var/lib/mysql
       - ./init/mysql.sql:/docker-entrypoint-initdb.d/01.sql:ro
       - ./init/mysql-routines.sql:/docker-entrypoint-initdb.d/02.sql:ro
+      - ./init/mysql-ux-round3.sql:/docker-entrypoint-initdb.d/03.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 3s
