@@ -9557,6 +9557,58 @@ fn vault_load_failures_show_category_specific_guidance_in_both_locales() {
     assert!(!model.vault_alert.visible());
 }
 
+/// R7（修订 5）：只有还有旧条目没迁入时按钮才叫“重试迁移”；保险库读写失败或密钥暂不可用时叫“重试”，中英文一致。
+#[test]
+fn vault_retry_button_names_migration_only_when_legacy_entries_failed() {
+    use crate::connections::secrets::{VaultNotice, VaultProblem};
+    let label = |model: &WorkbenchModel| model.text(model.vault_alert.retry_label_key());
+    for (locale, plain, migration) in [(Locale::ZhCn, "重试", "重试迁移"), (Locale::En, "Retry", "Retry migration")] {
+        for problem in [VaultProblem::FileAccess, VaultProblem::KeyUnavailable] {
+            let mut model = WorkbenchModel::new(Shell::default());
+            model.shell.locale = locale;
+            model.vault_alert.absorb(vec![VaultNotice::LoadFailed { problem, reason: "os error 13".into() }]);
+            assert!(model.vault_alert.can_retry());
+            assert_eq!(label(&model), plain, "{locale:?} {problem:?}");
+        }
+        let mut model = WorkbenchModel::new(Shell::default());
+        model.shell.locale = locale;
+        model.vault_alert.absorb(vec![VaultNotice::MigrationFailed { account: "conn:a:password".into(), reason: "denied".into() }]);
+        assert_eq!(label(&model), migration, "{locale:?}");
+        // 迁移失败且加载也失败：仍有旧条目要迁，按钮说“重试迁移”。
+        model.vault_alert.absorb(vec![VaultNotice::LoadFailed { problem: VaultProblem::KeyUnavailable, reason: "denied".into() }]);
+        assert_eq!(label(&model), migration, "{locale:?}");
+    }
+}
+
+/// R8（修订 5）：标签列表弹层比通用选择器宽（360–480），窄窗口里不超出窗口。
+#[test]
+fn tab_picker_is_wide_but_stays_inside_the_window() {
+    use super::chrome::tab_picker_width;
+    assert_eq!(tab_picker_width(800.), 360.);
+    assert_eq!(tab_picker_width(1100.), 440.);
+    assert_eq!(tab_picker_width(2400.), 480.);
+    assert_eq!(tab_picker_width(300.), 284., "窄窗口：两侧留边距");
+    assert!(tab_picker_width(1280.) > crate::ui::kit::ControlSize::PICKER_MIN_W + 100.);
+}
+
+/// R7（修订 5）：密码框和连接表单的“保存密码”说法与本地保险库一致，不再说写进系统钥匙串。
+#[test]
+fn password_save_wording_names_the_local_vault() {
+    for locale in [Locale::ZhCn, Locale::En] {
+        let mut model = WorkbenchModel::new(Shell::default());
+        model.shell.locale = locale;
+        for key in ["ui.passwordPrompt.save", "ui.passwordPrompt.missing", "ui.conn.savePasswordOn", "ui.conn.savePasswordDrop", "ui.conn.block.authHint", "conn.page.passwordSaved"] {
+            let text = model.text(key);
+            assert!(!text.contains("钥匙串") && !text.to_lowercase().contains("keychain"), "{locale:?} {key}: {text}");
+            assert!(text.contains("保险库") || text.contains("local vault"), "{locale:?} {key}: {text}");
+        }
+    }
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.locale = Locale::ZhCn;
+    assert!(model.text("ui.passwordPrompt.save").starts_with("记住密码"));
+    assert!(model.text("ui.passwordPrompt.save").contains("加密"));
+}
+
 /// R7：重试时没有迁入任何条目（只是加载恢复）就不提示“已迁入”。
 #[test]
 fn vault_retry_without_migrated_entries_does_not_claim_success() {
@@ -11797,9 +11849,9 @@ async fn a_missing_password_prompts_and_reconnects_with_the_typed_one() {
 
     model.set_field(DraftField::PromptPassword, "typed-secret".into());
     assert_eq!(model.field_value(DraftField::PromptPassword), "typed-secret");
-    assert!(!model.password_prompt.as_ref().unwrap().save_password, "默认不写入钥匙串");
+    assert!(!model.password_prompt.as_ref().unwrap().save_password, "默认不保存到本机保险库");
     let _ = model.dispatch("password-toggle-save");
-    assert!(model.password_prompt.as_ref().unwrap().save_password, "可一键勾选记住到系统钥匙串");
+    assert!(model.password_prompt.as_ref().unwrap().save_password, "可一键勾选记住密码（加密保存在本机保险库）");
     assert!(!format!("{:?}", model.password_prompt).contains("typed-secret"), "调试输出不带密码");
     let _ = model.dispatch("password-submit");
     assert!(model.password_prompt.is_none());

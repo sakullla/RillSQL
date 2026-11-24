@@ -305,6 +305,8 @@ pub struct Picker {
     /// 上一次滚到的高亮位置：高亮变了才滚动，鼠标滚动不被拉回。
     scrolled_to: Option<usize>,
     close_handler: Option<CloseHandler>,
+    /// 固定宽度：设定时弹层按这个宽度排版（标签列表等需要更宽的场合），否则按内容在最小 / 最大宽度之间。
+    width: Option<f32>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -328,6 +330,7 @@ impl Picker {
             max_h: None,
             scrolled_to: None,
             close_handler: None,
+            width: None,
             _subscriptions: vec![subscription],
         }
     }
@@ -352,6 +355,16 @@ impl Picker {
     /// 带关闭按钮（PickerItem::closable）的行点击关闭时调用。
     pub fn set_close_handler(&mut self, handler: CloseHandler) {
         self.close_handler = Some(handler);
+    }
+
+    /// 设定弹层宽度；`None` 时按默认最小 / 最大宽度。
+    pub fn set_width(&mut self, width: Option<f32>) {
+        self.width = width;
+    }
+
+    /// 行尾说明（路径、类型）最多占的宽度：宽弹层给得多一些，放不下时在关闭按钮之前省略。
+    fn detail_max_w(&self) -> f32 {
+        self.width.map_or(ControlSize::PICKER_MIN_W / 2., |width| width * 0.4)
     }
 
     pub fn set_max_height(&mut self, max_h: Option<f32>) {
@@ -406,6 +419,7 @@ impl Picker {
         let close_id = item.id.clone();
         let close_handler = self.close_handler.clone();
         let close_label = SharedString::from(i18n::text(self.locale, "common.close"));
+        let detail_max_w = self.detail_max_w();
         div()
             .id(("picker-row", position))
             .test_support()
@@ -461,7 +475,19 @@ impl Picker {
             })
             .when_some(item.env.clone(), |this, (code, label)| this.child(div().flex_none().child(kit::env_tag(&code, label, &p))))
             .when_some(item.detail.clone(), |this, detail| {
-                this.child(div().flex_none().max_w(px(ControlSize::PICKER_MIN_W / 2.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(detail))
+                // 可收缩：行里放不下时说明先省略，不会挤到关闭按钮底下。
+                this.child(
+                    div()
+                        .id(("picker-row-detail", position))
+                        .test_support()
+                        .flex_shrink(1.)
+                        .min_w(px(0.))
+                        .max_w(px(detail_max_w))
+                        .truncate()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(detail),
+                )
             })
             .when(item.closable && self.close_handler.is_some(), |this| {
                 this.child(
@@ -550,8 +576,9 @@ impl Render for Picker {
             .test_support()
             .track_focus(&self.focus)
             .role(gpui_kit::Role::List)
-            .min_w(px(ControlSize::PICKER_MIN_W))
-            .max_w(px(ControlSize::PICKER_MAX_W))
+            .min_w(px(self.width.unwrap_or(ControlSize::PICKER_MIN_W)))
+            .max_w(px(self.width.unwrap_or(ControlSize::PICKER_MAX_W)))
+            .when_some(self.width, |this, width| this.w(px(width)))
             .max_h(px(total_max))
             .flex()
             .flex_col()
@@ -723,6 +750,44 @@ mod tests {
         step(cx, window, |window, _| assert!(window.try_find("picker-empty").is_some(), "没有匹配项时显示空态"));
         step(cx, window, |window, cx| window.press("escape", cx));
         assert_eq!(events.borrow().last(), Some(&PickerEvent::Dismissed));
+    }
+
+    /// R8（修订 5）：加宽的标签列表里，很长的“连接 / 库”路径在关闭按钮之前省略，不压到关闭按钮下面。
+    #[gpui_kit::test]
+    fn wide_picker_keeps_long_detail_clear_of_the_close_button(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, picker) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(640.), px(420.)) };
+            gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+                let items = (0..3)
+                    .map(|ix| {
+                        let mut item = PickerItem::new(format!("tab_{ix}"), format!("orders_query_with_a_long_title_{ix}"))
+                            .detail("demo-uat-connection-with-a-long-name / shop_database_with_a_long_name");
+                        item.closable = true;
+                        item
+                    })
+                    .collect();
+                cx.new(|cx| {
+                    let mut picker = Picker::new(items, PickerMode::Single, Vec::new(), Locale::ZhCn, window, cx);
+                    picker.set_width(Some(400.));
+                    picker.set_close_handler(Rc::new(|_: &SharedString, _: &mut Window, _: &mut App| {}));
+                    picker
+                })
+            })
+            .expect("picker window")
+        });
+        step(cx, window, |window, _| {
+            assert_eq!(f32::from(window.find("picker").bounds().size.width), 400., "按设定的宽度排版");
+            for position in 0..3usize {
+                let detail = window.find(("picker-row-detail", position)).bounds();
+                let close = window.find(("picker-row-close", position)).bounds();
+                let row = window.find(("picker-row", position)).bounds();
+                assert!(f32::from(detail.right()) <= f32::from(close.left()), "路径不压到关闭按钮：{detail:?} {close:?}");
+                assert!(f32::from(close.right()) <= f32::from(row.right()), "关闭按钮留在行内：{close:?} {row:?}");
+                assert!(f32::from(detail.size.width) > 0., "路径仍然显示一部分");
+            }
+        });
+        let _ = picker;
     }
 
     #[gpui_kit::test]

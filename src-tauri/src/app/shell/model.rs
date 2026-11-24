@@ -524,6 +524,12 @@ impl VaultAlert {
         !self.failed.is_empty() || self.load_problem.is_some()
     }
 
+    /// 重试按钮的文案：只有还有旧条目没迁入时才叫“重试迁移”；
+    /// 保险库读写失败或密钥暂不可用（没有失败的迁移）时用中性的“重试”。
+    pub fn retry_label_key(&self) -> &'static str {
+        if self.failed.is_empty() { "ui.vault.retryPlain" } else { "ui.vault.retry" }
+    }
+
     /// 合入保险库排出的事件；有新的问题时取消收起。
     pub fn absorb(&mut self, notices: Vec<crate::connections::secrets::VaultNotice>) {
         use crate::connections::secrets::{VaultFailure, VaultNotice};
@@ -585,7 +591,7 @@ pub struct PasswordPrompt {
     pub text: String,
     /// 上一次的密码被服务端拒绝（而不是没有密码）。
     pub rejected: bool,
-    /// 连接成功后顺带把密码存入系统钥匙串，省去再去编辑表单重填一次。
+    /// 连接成功后顺带把密码加密存入本机保险库，省去再去编辑表单重填一次。
     pub save_password: bool,
     /// 每次打开递增：视图据此只在新打开时聚焦一次输入框。
     pub epoch: u64,
@@ -1560,7 +1566,7 @@ impl WorkbenchModel {
             "conn-layout-list" => {
                 self.conn_board_cards = false;
             }
-            // 密码存不存进系统钥匙串：以前表单上没有这个选择，复制或导入的连接永远存不上密码。
+            // 密码存不存进本机保险库：以前表单上没有这个选择，复制或导入的连接永远存不上密码。
             "conn-save-password-toggle" => {
                 if let Some(draft) = self.connections.editor.as_mut() {
                     draft.save_password = !draft.save_password;

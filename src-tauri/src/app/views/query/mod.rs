@@ -4228,6 +4228,8 @@ impl QueryPane {
             items.push(
                 div()
                     .id("query-note")
+                    .test_support()
+                    .aria_label(SharedString::from(note.clone()))
                     .min_w_0()
                     .max_w(px(520.))
                     .truncate()
@@ -4502,7 +4504,10 @@ impl QueryPane {
                 Progress::Done
             };
             let sql_expanded = self.outcome_sql_open.as_ref() == Some(&self.outcome_key());
-            return statement_outcome(result, progress, &self.desk.active_note(), locale, mono, p, metrics, entity, self.frame_spinner(2), sql_expanded);
+            // “已取消：未执行任何语句”只说这次没执行，不属于上一条语句的结果：单独显示在状态里，不当作卡片说明。
+            let note = self.desk.active_note();
+            let note = if note == risk_panel::cancelled_note(locale) { String::new() } else { note };
+            return statement_outcome(result, progress, &note, locale, mono, p, metrics, entity, self.frame_spinner(2), sql_expanded);
         }
         // 结果是执行计划：画成计划视图（摘要、问题与建议、计划树、节点详情）；“原始结果”仍是网格。
         let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
@@ -4941,7 +4946,8 @@ fn statement_outcome(
     let skipped = result.status == "skipped";
     let cancelled = result.status == "cancelled";
     let color = if failed { p.danger } else if skipped || cancelled { p.warn } else { p.ok };
-    let message = if result.message.is_empty() && !skipped { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
+    // 面板说明只在失败、取消的语句没有原文时补位；成功卡片只写驱动回的原文，不拼接面板上的临时说明。
+    let message = if result.message.is_empty() && (failed || cancelled) { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
     let message = if message.is_empty() { result.status.clone() } else { message };
     // 成功语句的标题统一为“执行成功”，影响行数跟在后面；驱动只回了 ok 之类的原文时不再照搬。
     let message = if failed || skipped || cancelled {
@@ -5810,6 +5816,37 @@ mod tests {
             assert!(!pane.read(cx).awaiting_risk_confirmation());
             assert_eq!(pane.read(cx).note(), "已取消：未执行任何语句");
             assert!(!pane.read(cx).risk_flash);
+        })
+        .unwrap();
+    }
+
+    /// R12（修订 5）：取消危险确认后，“已取消：未执行任何语句”单独显示在状态里，
+    /// 不拼到上一条语句的结果摘要（“执行成功 · 影响 0 行”）后面。
+    #[gpui_kit::test]
+    fn cancelled_risk_note_stays_out_of_the_previous_result_card(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "DELETE FROM orders;")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("UPDATE orders SET note = note WHERE id = 0", "ok", &[], &[], Some(0), "")]);
+            });
+            window.render_frame(cx);
+            let before = window.find("query-error-message").label().unwrap_or_default().to_owned();
+            assert!(before.starts_with("成功"), "{before}");
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(pane.read(cx).awaiting_risk_confirmation(), "{}", pane.read(cx).note());
+            window.click("query-act-cancel-risks", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).note(), "已取消：未执行任何语句");
+            let headline = window.find("query-error-message").label().unwrap_or_default().to_owned();
+            assert_eq!(headline, before, "上一条结果的摘要不变");
+            assert!(!headline.contains("已取消"), "取消提示不拼进结果摘要：{headline}");
+            let note = window.find("query-note");
+            assert!(note.visible(), "取消提示单独显示");
+            assert_eq!(note.label(), Some("已取消：未执行任何语句"));
         })
         .unwrap();
     }

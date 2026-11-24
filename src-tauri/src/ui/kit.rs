@@ -530,6 +530,9 @@ impl ControlSize {
     /// 选择器弹层的最小 / 最大宽度。
     pub const PICKER_MIN_W: f32 = 240.;
     pub const PICKER_MAX_W: f32 = 420.;
+    /// 标签列表弹层的最小 / 最大宽度：标题、环境与“连接 / 库”路径放得下，路径在关闭按钮前省略。
+    pub const TAB_PICKER_MIN_W: f32 = 360.;
+    pub const TAB_PICKER_MAX_W: f32 = 480.;
     /// 选择器弹层与窗口边缘之间至少留的距离。
     pub const POPOVER_MARGIN: f32 = 8.;
     /// 日期时间选择器里一格日期的边长；7 格一行即选择器宽度，月份/年份网格按同一宽度三等分。

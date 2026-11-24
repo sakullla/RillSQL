@@ -676,7 +676,7 @@ dict! {
     "conn.page.tls" => "加密", "Encryption";
     "conn.page.ssh" => "SSH 隧道", "SSH tunnel";
     "conn.page.password" => "密码", "Password";
-    "conn.page.passwordSaved" => "已保存在系统钥匙串", "Saved in the system keychain";
+    "conn.page.passwordSaved" => "已加密保存在本机保险库", "Saved encrypted in the local vault";
     "conn.page.passwordAsk" => "未保存，连接时询问", "Not saved; asked when connecting";
     "conn.page.group" => "分组", "Group";
     "conn.page.tag" => "标签", "Tag";
@@ -1841,7 +1841,7 @@ dict! {
     // 连接分组：分组只是组织元数据，删除分组不删连接。
     // 连接缺密码或密码被拒时的输入框。
     "ui.passwordPrompt.title" => "输入 {name} 的密码", "Password for {name}";
-    "ui.passwordPrompt.missing" => "没有保存这条连接的密码。输入后连接；本次运行内记住，不写入配置和钥匙串。", "No password is saved for this connection. It is kept for this session only, not written to settings or the keychain.";
+    "ui.passwordPrompt.missing" => "没有保存这条连接的密码。输入后连接；只在本次运行内记住，不写入配置和本机保险库。", "No password is saved for this connection. It is kept for this session only, not written to settings or the local vault.";
     "ui.passwordPrompt.rejected" => "服务器拒绝了这个密码，请重新输入。", "The server rejected this password. Enter it again.";
     "ui.passwordPrompt.connect" => "连接", "Connect";
     "ui.passwordPrompt.edit" => "编辑连接…", "Edit connection…";
@@ -1887,6 +1887,7 @@ dict! {
     "ui.vault.internal" => "本地保险库暂时无法准备：{reason}。请重试；如果一直失败，请重启 RillSQL。", "The local vault could not be prepared: {reason}. Retry; if it keeps failing, restart RillSQL.";
     "ui.vault.corrupt" => "本地保险库无法解密，原文件已保留为 {path}。请重新输入密码并保存。", "The local vault could not be decrypted and was kept as {path}. Re-enter and save the passwords.";
     "ui.vault.retry" => "重试迁移", "Retry migration";
+    "ui.vault.retryPlain" => "重试", "Retry";
     "ui.vault.dismiss" => "收起提示", "Dismiss";
     "ui.vault.retryDone" => "已迁入本地保险库", "Moved into the local vault";
     "history.page.loading" => "正在读取历史…", "Reading history…";
@@ -1927,13 +1928,13 @@ dict! {
     "ui.conn.block.serverHint" => "数据库服务的地址与端口", "Address and port of the database server";
     "ui.conn.block.fileHint" => "本机上的 .sqlite / .db 文件", "A local .sqlite / .db file";
     "ui.conn.block.auth" => "身份验证", "Authentication";
-    "ui.conn.block.authHint" => "可选是否存入系统钥匙串；默认库可留空", "Choose whether to save passwords in the keychain; default database is optional";
+    "ui.conn.block.authHint" => "可选是否把密码加密保存在本机保险库；默认库可留空", "Choose whether to save passwords encrypted in the local vault; default database is optional";
     "ui.conn.block.securityHint" => "TLS 加密与 SSH 跳板机", "TLS encryption and SSH bastion";
     "ui.conn.copyName" => "{name} 副本", "{name} copy";
     "ui.conn.savePassword" => "保存密码", "Save password";
-    "ui.conn.savePasswordOn" => "存入系统钥匙串，以后直接连接", "Kept in the system keychain; connects without asking";
+    "ui.conn.savePasswordOn" => "加密保存在本机保险库，以后直接连接", "Kept encrypted in the local vault; connects without asking";
     "ui.conn.savePasswordOff" => "不保存；每次启动后第一次连接时询问", "Not kept; asked on the first connection of each run";
-    "ui.conn.savePasswordDrop" => "不保存；保存后会删除钥匙串里已存的密码", "Not kept; saving removes the password stored in the keychain";
+    "ui.conn.savePasswordDrop" => "不保存；保存后会删除本机保险库里已存的密码", "Not kept; saving removes the password stored in the local vault";
     "ui.conn.discard.title" => "有未保存的修改，要放弃吗？", "Discard unsaved changes?";
     "ui.conn.discard.keep" => "继续编辑", "Keep editing";
     "ui.conn.discard.confirm" => "放弃修改", "Discard";
@@ -1966,7 +1967,7 @@ dict! {
     "ui.status.shortcutsHint" => "查看键盘快捷键", "Keyboard shortcuts";
     "grid.selection.summary" => "已选 {count} 格", "{count} selected";
     "grid.selection.stats" => "求和 {sum} · 均值 {avg}", "Sum {sum} · Avg {avg}";
-    "ui.passwordPrompt.save" => "记住到系统钥匙串", "Save to system keychain";
+    "ui.passwordPrompt.save" => "记住密码（加密保存在本机保险库）", "Remember password (encrypted in the local vault)";
     "ui.sqlite.portalFallback" => "系统文件对话框不可用，请直接填写 SQLite 文件路径", "System file dialog is unavailable; enter the SQLite file path directly";
     "ui.filePicker.portalUnavailable" => "系统文件对话框不可用（未检测到桌面 Portal 服务）", "System file dialog is unavailable (desktop portal service not found)";
     "ui.conn.tab.general" => "常规", "General";

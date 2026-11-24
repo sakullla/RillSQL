@@ -1373,7 +1373,7 @@ impl Workbench {
                 .child(text)
                 .when(can_retry, |this| {
                     this.child(
-                        kit::tool_button("vault-retry-migration", Some(IconName::RefreshCw), self.t("ui.vault.retry"), act("vault-retry-migration", cx))
+                        kit::tool_button("vault-retry-migration", Some(IconName::RefreshCw), self.t(alert.retry_label_key()), act("vault-retry-migration", cx))
                             .loading(alert.retrying)
                             .disabled(alert.retrying)
                             .small(),
@@ -3016,7 +3016,8 @@ impl Workbench {
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.tabs.list"))
-                    .tooltip_text(self.t("shell.tabs.list"))
+                    // 列表打开时不挂提示气泡，免得气泡压住弹层里的搜索框。
+                    .when(self.tab_picker.is_none(), |this| this.tooltip_text(self.t("shell.tabs.list")))
                     .h(px(kit::HitArea::CONTROL))
                     .min_w(px(kit::HitArea::CONTROL))
                     .px(px(if tab_count > 1 { 6. } else { 0. }))
@@ -3230,6 +3231,8 @@ impl Workbench {
             ),
         )
         .with_priority(2);
+        let width = tab_picker_width(f32::from(viewport.width));
+        picker.update(cx, |picker, _| picker.set_width(Some(width)));
         let popover = crate::ui::picker::picker_popover(&picker, anchor, window, cx);
         Some(div().child(backdrop).child(popover).into_any_element())
     }
@@ -6864,7 +6867,7 @@ impl Workbench {
                     let status_hint = if lines.is_empty() { self.t("ui.settings.vaultOk") } else { SharedString::from(lines.join("\n")) };
                     let can_retry = alert.can_retry();
                     let retry: AnyElement = if can_retry {
-                        kit::tool_button("settings-vault-retry", Some(IconName::RefreshCw), self.t("ui.vault.retry"), act("vault-retry-migration", cx))
+                        kit::tool_button("settings-vault-retry", Some(IconName::RefreshCw), self.t(alert.retry_label_key()), act("vault-retry-migration", cx))
                             .loading(alert.retrying)
                             .disabled(alert.retrying)
                             .small()
@@ -9282,6 +9285,12 @@ pub(super) fn issue_field(name: &str) -> Option<DraftField> {
 }
 
 /// R7：保险库提示的逐行文字（迁移失败数、按类别的加载失败、主密钥无效已更换、损坏已保留）。提示条与设置页共用。
+/// 标签列表弹层的宽度：按窗口宽度在 360–480 之间取，窄窗口里不超出窗口（两侧留边距）。
+pub(super) fn tab_picker_width(viewport_w: f32) -> f32 {
+    let fit = (viewport_w - 2. * kit::ControlSize::POPOVER_MARGIN).max(kit::ControlSize::PICKER_MIN_W);
+    (viewport_w * 0.4).clamp(kit::ControlSize::TAB_PICKER_MIN_W, kit::ControlSize::TAB_PICKER_MAX_W).min(fit)
+}
+
 pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(&str) -> String) -> Vec<String> {
     let mut lines = Vec::new();
     if !alert.failed.is_empty() {

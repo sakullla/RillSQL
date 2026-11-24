@@ -257,11 +257,15 @@ pub struct CanvasState {
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 当前内容尺寸（未缩放）。
     content: (f32, f32),
+    /// 用户手动缩放过（按钮、⌘/Ctrl 滚轮）：之后视口尺寸变化不再自动适配，保留用户的缩放。
+    user_zoomed: bool,
+    /// 最近一次适配时的视口尺寸；没手动缩放时，视口尺寸变了（如结果区最大化）就按新尺寸重新适配。
+    fitted_for: Option<(f32, f32)>,
 }
 
 impl Default for CanvasState {
     fn default() -> Self {
-        Self { zoom: 1., pan_x: 0., pan_y: 0., drag: None, suppress_click: false, fit_pending: true, viewport: Rc::new(Cell::new(None)), content: (0., 0.) }
+        Self { zoom: 1., pan_x: 0., pan_y: 0., drag: None, suppress_click: false, fit_pending: true, viewport: Rc::new(Cell::new(None)), content: (0., 0.), user_zoomed: false, fitted_for: None }
     }
 }
 
@@ -278,6 +282,13 @@ impl CanvasState {
         self.drag = None;
         self.suppress_click = false;
         self.fit_pending = true;
+        self.user_zoomed = false;
+        self.fitted_for = None;
+    }
+
+    /// 视口尺寸变化时是否自动重新适配：用户没有手动缩放过。
+    pub fn auto_fit(&self) -> bool {
+        self.fit_pending || !self.user_zoomed
     }
 
     fn viewport_size(&self) -> Option<(f32, f32)> {
@@ -285,10 +296,11 @@ impl CanvasState {
     }
 
     /// 每帧渲染前同步内容尺寸；视口已知且有待适配时执行适配。
+    /// 用户没手动缩放时，视口尺寸与上次适配时不同（结果区最大化、拖动分隔条）也重新适配。
     pub fn sync(&mut self, content_w: f32, content_h: f32) {
         self.content = (content_w, content_h);
-        if self.fit_pending {
-            if let Some((w, h)) = self.viewport_size() {
+        if let Some((w, h)) = self.viewport_size() {
+            if self.fit_pending || (!self.user_zoomed && self.fitted_for != Some((w, h))) {
                 self.fit_to(w, h);
                 self.fit_pending = false;
             }
@@ -297,6 +309,7 @@ impl CanvasState {
 
     /// 适配视口：整体缩小到能放下（不放大超过 100%），放不下的高度从顶部开始看。
     pub fn fit_to(&mut self, viewport_w: f32, viewport_h: f32) {
+        self.fitted_for = Some((viewport_w, viewport_h));
         let (w, h) = self.content;
         if w <= 1. || h <= 1. {
             self.zoom = 1.;
@@ -312,7 +325,9 @@ impl CanvasState {
         self.pan_y = if scaled_h > viewport_h { (scaled_h - viewport_h) / 2. } else { 0. };
     }
 
+    /// “适配”按钮：回到自动适配，之后视口尺寸变化也跟着重新适配。
     pub fn fit(&mut self) {
+        self.user_zoomed = false;
         match self.viewport_size() {
             Some((w, h)) => {
                 self.fit_to(w, h);
@@ -325,6 +340,7 @@ impl CanvasState {
     /// 以视口内某点（相对视口中心）为不动点缩放。
     pub fn zoom_at(&mut self, zoom: f32, at_x: f32, at_y: f32) {
         let next = clamp_zoom(zoom);
+        self.user_zoomed = true;
         let ratio = next / self.zoom;
         self.pan_x = at_x - (at_x - self.pan_x) * ratio;
         self.pan_y = at_y - (at_y - self.pan_y) * ratio;
@@ -684,14 +700,14 @@ impl CanvasView<'_> {
         }
         let (wire, hot_wire) = (p.line_strong, p.accent);
         let viewport = self.state.viewport_cell();
-        let fit_pending = self.state.fit_pending;
+        let auto_fit = self.state.auto_fit();
         let notify_entity = entity.clone();
         let wires_layer = canvas(
             move |bounds, window, _| {
                 let previous = viewport.get();
                 viewport.set(Some(bounds));
-                // 第一次拿到视口尺寸（或尺寸变了）且还在等适配：下一帧按真实尺寸重画。
-                if fit_pending && previous.map(|old| old.size) != Some(bounds.size) {
+                // 第一次拿到视口尺寸（或尺寸变了）且需要自动适配：下一帧按真实尺寸重画。
+                if auto_fit && previous.map(|old| old.size) != Some(bounds.size) {
                     let entity = notify_entity.clone();
                     window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
                 }
@@ -1177,5 +1193,60 @@ mod tests {
         assert_eq!(state.zoom, ZOOM_MIN);
         let top = state.pan_y + (0. - 10_000. / 2.) * state.zoom;
         assert!((top + 300.).abs() < 0.01, "内容顶部对齐视口顶部：{top}");
+    }
+
+    fn set_viewport(state: &CanvasState, w: f32, h: f32) {
+        state.viewport.set(Some(Bounds { origin: gpui_kit::point(px(0.), px(0.)), size: gpui_kit::size(px(w), px(h)) }));
+    }
+
+    /// R11（修订 5）：结果区尺寸变化（如最大化）后，用户没手动缩放就按新视口重新适配；
+    /// 手动缩放后保留用户的缩放，点“适配”后又回到自动适配。
+    #[test]
+    fn viewport_resize_refits_until_the_user_zooms() {
+        let mut state = CanvasState::default();
+        set_viewport(&state, 798., 400.);
+        state.sync(1500., 400.);
+        let small = state.zoom;
+        assert!((small - 0.5).abs() < 0.01, "小结果区里先适配：{small}");
+        assert!(state.auto_fit());
+
+        // 最大化：视口变大，没手动缩放 → 重新适配到更大的缩放。
+        set_viewport(&state, 1548., 800.);
+        state.sync(1500., 400.);
+        assert!((state.zoom - 1.).abs() < 0.01, "最大化后重新适配：{}", state.zoom);
+        // 尺寸不变时不重复适配：平移保持。
+        state.pan_x = 40.;
+        state.sync(1500., 400.);
+        assert_eq!(state.pan_x, 40., "视口没变就不动用户的平移");
+
+        // 手动放大后再改尺寸：保留用户的缩放。
+        state.zoom_in();
+        let manual = state.zoom;
+        assert!(!state.auto_fit());
+        set_viewport(&state, 798., 400.);
+        state.sync(1500., 400.);
+        assert_eq!(state.zoom, manual, "手动缩放后不被重新适配覆盖");
+
+        // ⌘/Ctrl 滚轮缩放也算手动。
+        let mut wheel = CanvasState::default();
+        set_viewport(&wheel, 798., 400.);
+        wheel.sync(1500., 400.);
+        wheel.wheel(0., 2., true, (0., 0.));
+        let zoomed = wheel.zoom;
+        set_viewport(&wheel, 1548., 800.);
+        wheel.sync(1500., 400.);
+        assert_eq!(wheel.zoom, zoomed);
+
+        // “适配”按钮：按当前视口适配，之后尺寸变化又自动跟随。
+        state.fit();
+        assert!((state.zoom - 0.5).abs() < 0.01, "{}", state.zoom);
+        set_viewport(&state, 1548., 800.);
+        state.sync(1500., 400.);
+        assert!((state.zoom - 1.).abs() < 0.01, "{}", state.zoom);
+
+        // 换了一份计划：手动缩放的标记一并清掉。
+        state.zoom_in();
+        state.reset();
+        assert!(state.auto_fit());
     }
 }
