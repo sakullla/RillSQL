@@ -593,3 +593,60 @@ async fn column_templates_migrate_from_v1_and_survive_a_restart() {
     assert_eq!(reloaded.column_templates, templates, "重启后模板仍在");
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------- R3 列布局记忆
+
+fn layout_key(table: &str) -> super::ColumnLayoutKey {
+    super::ColumnLayoutKey { connection_id: "demo".into(), database: "shop".into(), schema: String::new(), table: table.into() }
+}
+
+#[test]
+fn column_layouts_round_trip_through_the_file_and_are_kept_per_table() {
+    let dir = temp_dir("column-layouts");
+    let store = StateStore::new(&dir);
+    let layout = super::ColumnLayout {
+        order: vec!["total".into(), "id".into()],
+        hidden: vec!["note".into()],
+        frozen: Some("total".into()),
+        widths: [("total".to_owned(), 180.0)].into_iter().collect(),
+    };
+    store.column_layouts().put_and_write(layout_key("orders"), layout.clone()).unwrap();
+    // 默认布局不留记录。
+    store.column_layouts().put_and_write(layout_key("customers"), super::ColumnLayout::default()).unwrap();
+    let reopened = StateStore::new(&dir);
+    assert_eq!(reopened.column_layouts().get(&layout_key("orders")), Some(layout));
+    assert_eq!(reopened.column_layouts().get(&layout_key("customers")), None);
+    assert_eq!(reopened.column_layouts().count(), 1);
+    // 改回默认即删除记录，文件随之更新。
+    reopened.column_layouts().put_and_write(layout_key("orders"), super::ColumnLayout::default()).unwrap();
+    assert_eq!(StateStore::new(&dir).column_layouts().get(&layout_key("orders")), None);
+}
+
+#[test]
+fn a_corrupt_column_layout_file_reads_as_empty_and_is_left_until_the_next_change() {
+    let dir = temp_dir("column-layouts-corrupt");
+    let path = dir.join(super::column_layout::COLUMN_LAYOUTS_FILE);
+    fs::write(&path, b"{not json").unwrap();
+    let store = StateStore::new(&dir);
+    assert_eq!(store.column_layouts().count(), 0);
+    assert_eq!(fs::read(&path).unwrap(), b"{not json", "只读时不改动原文件");
+}
+
+#[test]
+fn column_layout_aligns_with_dropped_and_added_columns() {
+    let columns: Vec<String> = ["id", "name", "added_at"].iter().map(|name| name.to_string()).collect();
+    let layout = super::ColumnLayout {
+        order: vec!["name".into(), "legacy_code".into(), "id".into()],
+        hidden: vec!["legacy_code".into(), "id".into()],
+        frozen: Some("legacy_code".into()),
+        widths: [("legacy_code".to_owned(), 300.0), ("name".to_owned(), 150.0)].into_iter().collect(),
+    };
+    let aligned = layout.aligned(&columns);
+    assert_eq!(aligned.order, vec!["name", "id", "added_at"], "删除的列被忽略，新增列追加到末尾");
+    assert_eq!(aligned.hidden, vec!["id"]);
+    assert_eq!(aligned.frozen, None);
+    assert_eq!(aligned.widths.keys().cloned().collect::<Vec<_>>(), vec!["name".to_string()]);
+    // 全部隐藏时恢复全部显示；顺序与原始一致时视为默认。
+    let all_hidden = super::ColumnLayout { order: columns.clone(), hidden: columns.clone(), ..Default::default() }.aligned(&columns);
+    assert!(all_hidden.is_default());
+}

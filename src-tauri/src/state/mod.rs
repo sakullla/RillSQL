@@ -1,6 +1,7 @@
 //! 版本化应用状态，以及旧 SQLite / keyring / localStorage 的兼容读取。
 
 mod atomic;
+mod column_layout;
 mod compat;
 mod document;
 mod legacy;
@@ -11,20 +12,29 @@ use atomic::write_atomic_off_ui;
 pub use compat::{
     keyring_service, password_account_for, read_connection_export, read_connections, read_env_tags, read_history, read_secret, ssh_password_account_for,
 };
+pub use column_layout::{ColumnLayout, ColumnLayoutKey, ColumnLayoutStore};
 pub use document::{parse_stored, to_bytes, AppState, SessionState, SessionTab, ShellSettings, StateError, APP_STATE_FILE};
 use legacy::import_legacy;
 pub use legacy::{ImportReport, Platform};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct StateStore {
     path: PathBuf,
+    /// 表格列布局（R3）：克隆的 StateStore 共用同一份。
+    column_layouts: Arc<ColumnLayoutStore>,
 }
 
 impl StateStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
-        Self { path: data_dir.as_ref().join(APP_STATE_FILE) }
+        let dir = data_dir.as_ref();
+        Self { path: dir.join(APP_STATE_FILE), column_layouts: Arc::new(ColumnLayoutStore::new(dir)) }
+    }
+
+    pub fn column_layouts(&self) -> &Arc<ColumnLayoutStore> {
+        &self.column_layouts
     }
 
     pub fn path(&self) -> &Path {

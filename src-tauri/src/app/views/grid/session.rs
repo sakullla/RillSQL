@@ -9,6 +9,7 @@ use crate::grid::commands::{ChangeArg, ColumnDto, CommitDto, PageDto, PageReques
 use crate::grid::{delete_sql, insert_sql, locate_sheet, qualified_name, quote_ident, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
 use crate::i18n::{self, Locale};
 use crate::query::split_sql;
+use crate::state::ColumnLayout;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SelectionStats {
@@ -613,6 +614,10 @@ pub struct SharedGrid {
     column_order: Vec<String>,
     /// 冻结到哪一列（按列名）；它和它左边的可见列固定在左侧。
     frozen: Option<String>,
+    /// 用户拖过或自适应过宽度的列（按列名）：列布局只记这些列宽，其余每次按内容估宽。
+    user_widths: BTreeSet<String>,
+    /// 换表后等列读回来再套用的已保存列布局（R3）。
+    pending_layout: Option<ColumnLayout>,
     /// 批量暂存替换掉的旧覆盖层及其移除时的下标：撤销整批时按原位置放回去，保持暂存顺序。
     batches: Vec<(u64, Vec<(usize, Overlay)>)>,
     /// 由"复制为新行"产生的新增行：它们的主键和自增列留空时不写进 INSERT。
@@ -782,6 +787,8 @@ impl SharedGrid {
             hidden: BTreeSet::new(),
             column_order: Vec::new(),
             frozen: None,
+            user_widths: BTreeSet::new(),
+            pending_layout: None,
             batches: Vec::new(),
             cloned: Vec::new(),
             pristine: HashSet::new(),
@@ -805,6 +812,7 @@ impl SharedGrid {
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
         self.mode = GridMode::Table;
         self.columns = merge_widths(&self.columns, columns, &rows);
+        self.apply_pending_layout();
         self.source = rows.into_iter().map(Arc::new).collect();
         self.source.shrink_to_fit();
         // 清理已离开当前页且未被暂存引用的大字段完整值缓存，避免翻页后内存持续上涨。
@@ -846,6 +854,7 @@ impl SharedGrid {
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
         self.retain_staged_rows();
         self.columns = merge_widths(&self.columns, columns, &rows);
+        self.apply_pending_layout();
         self.source = rows.into_iter().map(Arc::new).collect();
         self.source.shrink_to_fit();
         // 清理已离开当前页且未被暂存引用的大字段完整值缓存，避免翻页后内存持续上涨。
@@ -1157,9 +1166,12 @@ impl SharedGrid {
             self.batches.clear();
             self.cloned.clear();
             self.pristine.clear();
-            // 换了表：隐藏和冻结属于旧表的列，不带到新表上。
+            // 换了表：隐藏、顺序、冻结和调过的列宽属于旧表的列，不带到新表上；新表的已保存布局由调用方另行套用。
             self.hidden.clear();
+            self.column_order.clear();
             self.frozen = None;
+            self.user_widths.clear();
+            self.pending_layout = None;
             self.retained.clear();
             self.retained.shrink_to_fit();
             self.failures.clear();
@@ -2264,7 +2276,12 @@ impl SharedGrid {
 
     pub fn set_column_width(&mut self, index: usize, width: f32) {
         if let Some(column) = self.columns.get_mut(index) {
-            column.width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH);
+            let width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH);
+            // 表格每次报全部可见列宽：只有真的变了的列才算用户调过。
+            if (column.width - width).abs() > 0.5 {
+                self.user_widths.insert(column.name.clone());
+            }
+            column.width = width;
         }
     }
 
@@ -4770,11 +4787,124 @@ impl SharedGrid {
         self.visible_columns().iter().position(|index| *index == logical)
     }
 
+    /// 拖动排序：把 `column` 放到 `target` 当前所在的位置（全部列顺序，含隐藏列）。
+    /// 向下拖时落在目标之后，向上拖时落在目标之前。
+    pub fn move_column_to(&mut self, column: usize, target: usize) -> bool {
+        let ordered = self.ordered_columns();
+        let (Some(from), Some(to)) = (ordered.iter().position(|index| *index == column), ordered.iter().position(|index| *index == target)) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        let mut names: Vec<String> = ordered.into_iter().map(|index| self.columns[index].name.clone()).collect();
+        let name = names.remove(from);
+        names.insert(to, name);
+        self.column_order = names;
+        true
+    }
+
+    /// 仅显示此列：其余列全部隐藏；冻结边界不在这一列时取消冻结。
+    pub fn show_only_column(&mut self, column: usize) -> bool {
+        let Some(keep) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return false;
+        };
+        let hidden: BTreeSet<String> = self.columns.iter().map(|item| item.name.clone()).filter(|name| *name != keep).collect();
+        let changed = hidden != self.hidden;
+        self.hidden = hidden;
+        if self.frozen.as_ref().is_some_and(|name| *name != keep) {
+            self.frozen = None;
+        }
+        self.keep_selection_visible();
+        changed
+    }
+
+    /// 列面板的“全不选”：至少保留一列，留下当前显示顺序里的第一个可见列。
+    pub fn hide_all_columns(&mut self) -> bool {
+        match self.visible_columns().first().copied() {
+            Some(first) => self.show_only_column(first),
+            None => false,
+        }
+    }
+
+    /// 这一列是否在冻结区（冻结边界及其左侧的可见列）。
+    pub fn column_pinned(&self, column: usize) -> bool {
+        self.logical_to_display(column).is_some_and(|display| display < self.frozen_count())
+    }
+
+    /// 列面板的固定开关：没固定的列固定到此列；已固定的列取消固定，边界退到它左边的可见列。
+    pub fn toggle_column_pin(&mut self, column: usize) -> bool {
+        if !self.column_pinned(column) {
+            return self.freeze_to(column);
+        }
+        let visible = self.visible_columns();
+        let previous = self.logical_to_display(column).and_then(|display| display.checked_sub(1)).and_then(|display| visible.get(display).copied());
+        self.frozen = previous.map(|index| self.columns[index].name.clone());
+        true
+    }
+
+    /// 当前列布局（按列名），按“连接 + 库 + 表”记忆用。默认状态的各项都为空。
+    pub fn column_layout(&self) -> ColumnLayout {
+        let order = if self.has_custom_column_order() {
+            self.ordered_columns().into_iter().map(|index| self.columns[index].name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let hidden = self.hidden_columns().into_iter().map(|(_, name)| name).collect();
+        let frozen = self.frozen_column().filter(|index| !self.column_hidden(*index)).map(|index| self.columns[index].name.clone());
+        let widths = self.columns.iter().filter(|column| self.user_widths.contains(&column.name)).map(|column| (column.name.clone(), column.width)).collect();
+        ColumnLayout { order, hidden, frozen, widths }
+    }
+
+    /// 换表后记下已保存的布局：列读回来（load_local / replace_fetched）时按新列对齐再套用。
+    pub fn stage_column_layout(&mut self, layout: Option<ColumnLayout>) {
+        self.pending_layout = layout;
+    }
+
+    /// 还有没套用的已保存布局：这时的列不是这张表的最终布局，不能拿去覆盖记忆。
+    pub fn layout_pending(&self) -> bool {
+        self.pending_layout.is_some()
+    }
+
+    fn apply_pending_layout(&mut self) {
+        let Some(layout) = self.pending_layout.take() else {
+            return;
+        };
+        let layout = layout.aligned(&self.column_names());
+        self.column_order = layout.order;
+        self.hidden = layout.hidden.into_iter().collect();
+        self.frozen = layout.frozen;
+        self.user_widths.clear();
+        for column in self.columns.iter_mut() {
+            if let Some(width) = layout.widths.get(&column.name) {
+                column.width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH);
+                self.user_widths.insert(column.name.clone());
+            }
+        }
+    }
+
+    /// 恢复默认：结构原始顺序、全部显示、不冻结，调过的列宽按内容重新估。
+    pub fn reset_column_layout(&mut self) -> bool {
+        let changed = !self.column_layout().is_default();
+        self.column_order.clear();
+        self.hidden.clear();
+        self.frozen = None;
+        for index in 0..self.columns.len() {
+            if self.user_widths.contains(&self.columns[index].name) {
+                let width = estimate_width(&self.columns[index], self.source.iter().take(COLUMN_SAMPLE_ROWS).map(|row| row.values.get(index).and_then(|value| value.as_deref())));
+                self.columns[index].width = width;
+            }
+        }
+        self.user_widths.clear();
+        changed
+    }
+
     /// 列变了（新结果、列被删）时丢掉不再存在的隐藏、顺序和冻结设置。
     fn prune_display(&mut self) {
         let names: BTreeSet<String> = self.columns.iter().map(|item| item.name.clone()).collect();
         self.hidden.retain(|name| names.contains(name));
         self.column_order.retain(|name| names.contains(name));
+        self.user_widths.retain(|name| names.contains(name));
         if !self.columns.is_empty() && self.hidden.len() >= names.len() {
             self.hidden.clear();
         }

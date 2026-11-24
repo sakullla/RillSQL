@@ -1,5 +1,7 @@
-//! 字段选择器（R4）：筛选条件的字段与工具栏“跳到列”共用一个 `ui::picker` 弹层。
-//! 几百列的表上可以按名字或类型搜索；弹层按窗口剩余空间限高，内部滚动，不超出窗口。
+//! 字段选择器（R4）：筛选条件的字段用 `ui::picker` 弹层，几百列的表上可以按名字或类型搜索；
+//! 弹层按窗口剩余空间限高，内部滚动，不超出窗口。
+//! 列面板（R3）：工具栏唯一的“列”入口。搜索、勾选显隐、拖动排序、固定、全选/全不选、恢复默认；
+//! 点列名跳到该列。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     anchored, deferred, div, px, Anchor, AnyElement, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    KeyDownEvent, ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
     Window,
 };
 
@@ -25,13 +27,11 @@ use crate::ui::picker::{picker_popover, Picker, PickerEvent, PickerItem, PickerM
 pub(crate) enum ColumnPickTarget {
     /// 第 n 条筛选条件的字段。
     Filter(usize),
-    /// 工具栏“跳到列”。
-    Jump,
-    /// 工具栏“列管理”（显隐与顺序）。
+    /// 工具栏“列”面板（搜索、显隐、排序、固定；点列名跳到列）。
     Manage,
 }
 
-/// 集中式列管理弹层：搜索列、勾选显隐（至少保留一列）、调整顺序与重置。
+/// 列面板：搜索列、勾选显隐（至少保留一列）、拖动排序、固定与恢复默认。
 pub(crate) struct ColumnManager {
     pub(crate) search: Entity<InputState>,
     pub(crate) query: String,
@@ -66,7 +66,7 @@ impl GridPane {
         self.column_picker.as_ref().map(|open| open.target).or(self.picker_request)
     }
 
-    /// 选择器里的列：筛选列出全部列（隐藏列也能筛），跳到列只列出界面上看得见的列。
+    /// 选择器里的列：筛选列出全部列（隐藏列也能筛）；列面板的快速定位只列出界面上看得见的列。
     /// 说明栏写类型，搜索同样能按类型找。
     pub(crate) fn column_picker_items(&self, target: ColumnPickTarget) -> (Vec<PickerItem>, Vec<SharedString>) {
         let names = self.session.column_names();
@@ -83,7 +83,7 @@ impl GridPane {
                 let chosen = self.session.filters().get(index).map(|draft| SharedString::from(draft.column.clone())).into_iter().collect();
                 ((0..names.len()).map(item).collect(), chosen)
             }
-            ColumnPickTarget::Jump | ColumnPickTarget::Manage => {
+            ColumnPickTarget::Manage => {
                 let chosen = self.session.focus_cell().and_then(|(_, column)| names.get(column)).map(|name| SharedString::from(name.clone())).into_iter().collect();
                 (self.session.visible_columns().into_iter().filter(|logical| *logical < names.len()).map(item).collect(), chosen)
             }
@@ -132,7 +132,7 @@ impl GridPane {
     fn column_picked(&mut self, target: ColumnPickTarget, column: &str, cx: &mut Context<Self>) {
         match target {
             ColumnPickTarget::Filter(index) => self.pick_filter_column(index, column, cx),
-            ColumnPickTarget::Jump | ColumnPickTarget::Manage => {
+            ColumnPickTarget::Manage => {
                 self.jump_to_column(column, cx);
             }
         }
@@ -179,7 +179,7 @@ impl GridPane {
             None => {
                 window.request_animation_frame();
                 anchors
-                    .get(&ColumnPickTarget::Jump)
+                    .get(&ColumnPickTarget::Manage)
                     .copied()
                     .unwrap_or_default()
             }
@@ -215,6 +215,7 @@ impl GridPane {
     }
 
     pub(crate) fn open_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.manager_request = false;
         let placeholder = SharedString::from(i18n::text(self.locale, "grid.column.search"));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscription = cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _, cx| {
@@ -237,7 +238,29 @@ impl GridPane {
         }
     }
 
+    /// 列面板里点列名：关掉面板，整列选中并滚进视野（原“跳到列”）。
+    pub(crate) fn column_manager_jump(&mut self, logical: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.session.column_names().get(logical).cloned() else {
+            return;
+        };
+        self.close_column_manager(window, cx);
+        self.jump_to_column(&name, cx);
+    }
+
+    /// 拖动排序落下：把 `column` 放到 `target` 的位置。
+    pub(crate) fn column_move_to(&mut self, column: usize, target: usize, cx: &mut Context<Self>) {
+        if self.session.move_column_to(column, target) {
+            self.sync_table(cx);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn render_column_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if std::mem::take(&mut self.manager_request) && self.column_manager.is_none() {
+            // 表头菜单的“列设置…”：菜单回调里拿不到窗口，到绘制阶段再打开。
+            self.close_column_picker(window, cx);
+            self.open_column_manager(window, cx);
+        }
         let (search, query) = {
             let manager = self.column_manager.as_ref()?;
             (manager.search.clone(), manager.query.clone())
@@ -250,8 +273,8 @@ impl GridPane {
         let anchors = self.picker_anchors.borrow();
         let anchor = anchors.get(&ColumnPickTarget::Manage).copied().unwrap_or_default();
         drop(anchors);
-        const MANAGER_W: f32 = 292.;
-        const MANAGER_LIST_MAX_H: f32 = 260.;
+        const MANAGER_W: f32 = 312.;
+        const MANAGER_LIST_MAX_H: f32 = 300.;
         const MANAGER_ROW_H: f32 = 26.;
         const MANAGER_TYPE_MAX_W: f32 = 72.;
         let pos = Point::new(anchor.origin.x, anchor.bottom() + px(Space::XS));
@@ -262,7 +285,7 @@ impl GridPane {
         let hidden_count = self.session.hidden_columns().len();
         let total = ordered.len();
         let visible_count = total.saturating_sub(hidden_count);
-        let reordered = self.session.has_custom_column_order();
+        let customized = !self.session.column_layout().is_default();
 
         let mut list = div()
             .id("grid-column-manager-list")
@@ -274,7 +297,7 @@ impl GridPane {
             .flex_col()
             .gap(px(Space::XXS));
         let mut matched = 0usize;
-        for (pos_ix, logical) in ordered.into_iter().enumerate() {
+        for logical in ordered {
             let Some(name) = names.get(logical) else { continue };
             let type_name = self.session.column_type(logical).unwrap_or("");
             if !needle.is_empty() && !name.to_lowercase().contains(&needle) && !type_name.to_lowercase().contains(&needle) {
@@ -283,13 +306,13 @@ impl GridPane {
             matched += 1;
             let hidden = self.session.column_hidden(logical);
             let can_hide = self.session.can_hide(logical);
+            let pinned = self.session.column_pinned(logical);
             let toggle_disabled = !hidden && !can_hide;
             let toggle_owner = entity.clone();
             let toggle_cmd = if hidden { "column-show" } else { "column-hide" };
-            let up_owner = entity.clone();
-            let down_owner = entity.clone();
-            let can_up = pos_ix > 0;
-            let can_down = pos_ix + 1 < total;
+            let pin_owner = entity.clone();
+            let jump_owner = entity.clone();
+            let drop_owner = entity.clone();
             let toggle_tip = if toggle_disabled {
                 t("grid.column.lastVisible")
             } else if hidden {
@@ -297,18 +320,40 @@ impl GridPane {
             } else {
                 t("grid.column.hide")
             };
+            let drag = ColumnMoveDrag { logical, label: SharedString::from(name.clone()) };
+            let drop_line = p.accent;
             list = list.child(
                 div()
                     .id(("grid-col-mgr-row", logical))
                     .debug_selector(move || format!("grid-col-mgr-row-{logical}"))
                     .test_support()
                     .h(px(MANAGER_ROW_H))
-                    .px(px(Space::SM))
+                    .flex_none()
+                    .px(px(Space::XS))
                     .rounded(px(Radius::CONTROL))
+                    .border_t_2()
+                    .border_color(gpui_kit::transparent_black())
                     .hover(|style| style.bg(p.hover))
                     .flex()
                     .items_center()
                     .gap(px(Space::SM))
+                    // 插入线：拖到哪一行，就在哪一行上方画一条强调色线。
+                    .drag_over::<ColumnMoveDrag>(move |style, _, _, _| style.border_color(drop_line))
+                    .on_drop(move |drag: &ColumnMoveDrag, _, cx: &mut App| {
+                        let from = drag.logical;
+                        drop_owner.update(cx, |pane, cx| pane.column_move_to(from, logical, cx));
+                    })
+                    .child(
+                        div()
+                            .id(("grid-col-mgr-grip", logical))
+                            .debug_selector(move || format!("grid-col-mgr-grip-{logical}"))
+                            .test_support()
+                            .flex_none()
+                            .cursor_grab()
+                            .tooltip_text(t("grid.column.dragHint"))
+                            .on_drag(drag, |drag, _, _, cx| cx.new(|_| ColumnMoveGhost { label: drag.label.clone() }))
+                            .child(kit::icon(IconName::GripVertical, 12., p.text_faint)),
+                    )
                     .child(
                         div()
                             .id(("grid-col-mgr-toggle", logical))
@@ -334,11 +379,19 @@ impl GridPane {
                     )
                     .child(
                         div()
+                            .id(("grid-col-mgr-name", logical))
+                            .debug_selector(move || format!("grid-col-mgr-name-{logical}"))
+                            .test_support()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_size(px(TypeScale::SM))
                             .text_color(if hidden { p.text_faint } else { p.text })
+                            .when(!hidden, |this| {
+                                this.cursor_pointer().tooltip_text(t("grid.column.jumpHint")).on_click(move |_, window, cx| {
+                                    jump_owner.update(cx, |pane, cx| pane.column_manager_jump(logical, window, cx));
+                                })
+                            })
                             .child(SharedString::from(name.clone())),
                     )
                     .when(!type_name.is_empty(), |this| {
@@ -353,18 +406,17 @@ impl GridPane {
                         )
                     })
                     .child(
-                        kit::icon_button(("grid-col-mgr-up", logical), IconName::ChevronUp, t("grid.column.moveLeft"), move |_, _, cx| {
-                            up_owner.update(cx, |pane, cx| pane.column_command(logical, "column-move-up", cx));
-                        })
+                        kit::icon_button(
+                            ("grid-col-mgr-pin", logical),
+                            if pinned { IconName::PinOff } else { IconName::Pin },
+                            if pinned { t("grid.column.unpin") } else { t("grid.column.pin") },
+                            move |_, _, cx| {
+                                pin_owner.update(cx, |pane, cx| pane.column_command(logical, "column-pin-toggle", cx));
+                            },
+                        )
                         .xsmall()
-                        .disabled(!can_up),
-                    )
-                    .child(
-                        kit::icon_button(("grid-col-mgr-down", logical), IconName::ChevronDown, t("grid.column.moveRight"), move |_, _, cx| {
-                            down_owner.update(cx, |pane, cx| pane.column_command(logical, "column-move-down", cx));
-                        })
-                        .xsmall()
-                        .disabled(!can_down),
+                        .selected(pinned)
+                        .disabled(hidden),
                     ),
             );
         }
@@ -373,6 +425,7 @@ impl GridPane {
         }
 
         let show_all_owner = entity.clone();
+        let hide_all_owner = entity.clone();
         let reset_owner = entity.clone();
         let key_owner = entity.clone();
         let backdrop_owner = entity.clone();
@@ -444,6 +497,7 @@ impl GridPane {
                                 .prefix(kit::input_prefix(IconName::Search, 13., p.text_faint))
                                 .cleanable(true),
                         )
+                        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(t("grid.column.panelHint")))
                         .child(list)
                         .child(
                             div()
@@ -452,21 +506,28 @@ impl GridPane {
                                 .border_color(p.line_soft)
                                 .flex()
                                 .items_center()
-                                .justify_between()
                                 .gap(px(Space::XS))
                                 .child(
-                                    kit::tool_button("grid-col-mgr-show-all", None, t("grid.column.showAll"), move |_, _, cx| {
+                                    kit::tool_button("grid-col-mgr-show-all", None, t("grid.column.selectAll"), move |_, _, cx| {
                                         show_all_owner.update(cx, |pane, cx| pane.column_command(0, "column-show-all", cx));
                                     })
                                     .xsmall()
                                     .disabled(hidden_count == 0),
                                 )
                                 .child(
-                                    kit::tool_button("grid-col-mgr-reset-order", None, t("grid.column.resetOrder"), move |_, _, cx| {
-                                        reset_owner.update(cx, |pane, cx| pane.column_command(0, "column-reset-order", cx));
+                                    kit::tool_button("grid-col-mgr-hide-all", None, t("grid.column.selectNone"), move |_, _, cx| {
+                                        hide_all_owner.update(cx, |pane, cx| pane.column_command(0, "column-hide-all", cx));
                                     })
                                     .xsmall()
-                                    .disabled(!reordered),
+                                    .disabled(visible_count <= 1),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    kit::tool_button("grid-col-mgr-reset", Some(IconName::RotateCcw), t("grid.column.resetLayout"), move |_, _, cx| {
+                                        reset_owner.update(cx, |pane, cx| pane.column_command(0, "column-reset-layout", cx));
+                                    })
+                                    .xsmall()
+                                    .disabled(!customized),
                                 ),
                         ),
                 ),
@@ -474,5 +535,33 @@ impl GridPane {
         .with_priority(3);
 
         Some(div().child(backdrop).child(popover).into_any_element())
+    }
+}
+
+/// 列面板拖动排序时携带的源列。
+#[derive(Clone, Debug)]
+pub(crate) struct ColumnMoveDrag {
+    pub(crate) logical: usize,
+    pub(crate) label: SharedString,
+}
+
+/// 拖动时跟随指针的列名标签。
+pub(crate) struct ColumnMoveGhost {
+    label: SharedString,
+}
+
+impl Render for ColumnMoveGhost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        div()
+            .px(px(Space::SM))
+            .py(px(Space::XXS))
+            .rounded(px(Radius::TAG))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.accent)
+            .text_size(px(TypeScale::SM))
+            .text_color(p.text)
+            .child(self.label.clone())
     }
 }

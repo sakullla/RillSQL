@@ -7333,6 +7333,8 @@ pub struct Startup {
 }
 
 pub async fn load_startup(services: &AppServices, legacy: Option<&Path>, platform: Platform) -> Startup {
+    // 表格列布局（R3）在后台预读：第一次打开表时不在界面线程读盘。
+    services.state.column_layouts().preload().await;
     let path = services.state.path();
     if path.exists() {
         return match services.load_state().await {

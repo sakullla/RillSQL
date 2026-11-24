@@ -642,3 +642,252 @@ fn tab_through_a_wide_new_row_keeps_the_cell_fully_visible(cx: &mut TestAppConte
         assert_eq!(pane.cell(row, 1), "v1");
     });
 }
+
+// ---------------------------------------------------------------- R3 列操作与列布局记忆
+
+fn layout_key(table: &str) -> crate::state::ColumnLayoutKey {
+    let target = target(table);
+    crate::state::ColumnLayoutKey { connection_id: target.connection_id, database: target.database, schema: target.schema, table: target.table }
+}
+
+fn visible_names(pane: &Entity<GridPane>, cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        let names = pane.session.column_names();
+        pane.session.visible_columns().into_iter().map(|index| names[index].clone()).collect()
+    })
+}
+
+/// orders(id, total)：另一张表，用来确认布局按表区分。
+fn plant_orders(pane: &Entity<GridPane>, cx: &mut App) {
+    pane.update(cx, |pane, cx| {
+        pane.plant_writable(target("orders"), vec![("id", "integer"), ("total", "text")], vec![vec![Some("7"), Some("9.50")]], "id", cx);
+    });
+}
+
+/// 调整顺序、隐藏、冻结、拉宽后换表再回来：布局保持；文件里也记下了同一份；恢复默认后清掉记忆。
+#[gpui_kit::test]
+fn column_layout_round_trips_per_table_and_restore_default_clears_it(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        pane.update(cx, |pane, cx| {
+            pane.column_move_to(1, 0, cx);
+            pane.column_command(2, "column-hide", cx);
+            pane.column_command(1, "column-pin-toggle", cx);
+            pane.session.set_column_width(0, 210.);
+            pane.sync_table(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    let expected = crate::state::ColumnLayout {
+        order: vec!["name".into(), "id".into(), "note".into()],
+        hidden: vec!["note".into()],
+        frozen: Some("name".into()),
+        widths: [("id".to_owned(), 210.0)].into_iter().collect(),
+    };
+    let store = cx.update(|cx| Arc::clone(pane.read(cx).services.state.column_layouts()));
+    assert_eq!(store.get(&layout_key("people")), Some(expected.clone()), "内存里按表记住");
+    assert_eq!(visible_names(&pane, cx), vec!["name", "id"]);
+
+    // 换到另一张表：那张表是默认布局，不带上一张表的设置。
+    cx.update_window(window, |_, window, cx| {
+        plant_orders(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(visible_names(&pane, cx), vec!["id", "total"]);
+    cx.update(|cx| assert_eq!(pane.read(cx).session.frozen_count(), 0));
+    assert_eq!(store.get(&layout_key("orders")), None, "默认布局不留记录");
+
+    // 回到 people：顺序、隐藏、冻结和列宽都回来了。
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(visible_names(&pane, cx), vec!["name", "id"]);
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.session.frozen_count(), 1);
+        assert_eq!(pane.session.column_width(0), 210.);
+        assert_eq!(pane.session.column_layout(), expected);
+    });
+
+    // 后台写盘：同目录新开一份存储读到同样的布局（往返一致）。
+    let path = store.path().to_path_buf();
+    let mut reread = None;
+    for _ in 0..100 {
+        let fresh = crate::state::ColumnLayoutStore::new(path.parent().unwrap());
+        reread = fresh.get(&layout_key("people"));
+        if reread.as_ref() == Some(&expected) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(reread, Some(expected), "文件往返一致");
+
+    // 恢复默认：全部显示、原始顺序、不冻结，记忆被清除。
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| pane.column_command(0, "column-reset-layout", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(visible_names(&pane, cx), vec!["id", "name", "note"]);
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.session.frozen_count(), 0);
+        assert!(pane.session.column_layout().is_default());
+    });
+    assert_eq!(store.get(&layout_key("people")), None);
+}
+
+/// 表结构变化：已删除的列被忽略，新增的列追加到末尾并显示。
+#[gpui_kit::test]
+fn remembered_layout_aligns_with_added_and_dropped_columns(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    let store = cx.update(|cx| Arc::clone(pane.read(cx).services.state.column_layouts()));
+    store
+        .put_and_write(
+            layout_key("people"),
+            crate::state::ColumnLayout {
+                order: vec!["note".into(), "legacy_code".into(), "name".into(), "id".into()],
+                hidden: vec!["legacy_code".into(), "name".into()],
+                frozen: Some("legacy_code".into()),
+                widths: [("legacy_code".to_owned(), 300.0), ("note".to_owned(), 222.0)].into_iter().collect(),
+            },
+        )
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target("people"),
+                vec![("id", "integer"), ("name", "text"), ("note", "text"), ("added_at", "text")],
+                vec![vec![Some("1"), Some("甲"), Some("一"), Some("2026-01-01")]],
+                "id",
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(visible_names(&pane, cx), vec!["note", "id", "added_at"], "name 仍隐藏，新增列在末尾显示");
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.session.frozen_count(), 0, "冻结的列已不存在");
+        assert_eq!(pane.session.column_width(2), 222.);
+        let layout = pane.session.column_layout();
+        assert_eq!(layout.order, vec!["note", "name", "id", "added_at"]);
+        assert_eq!(layout.hidden, vec!["name"]);
+        assert!(!layout.widths.contains_key("legacy_code"));
+    });
+    // 对齐后的布局写回记忆，不再带着已删除的列。
+    let stored = store.get(&layout_key("people")).expect("对齐后的布局");
+    assert!(!stored.order.iter().any(|name| name == "legacy_code"));
+    assert_eq!(stored.frozen, None);
+}
+
+/// 隐藏主键列只影响显示：改一格后预览的 UPDATE 仍按主键定位。
+#[gpui_kit::test]
+fn hidden_primary_key_still_locates_the_preview_update(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        pane.update(cx, |pane, cx| pane.column_command(0, "column-hide", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(visible_names(&pane, cx), vec!["name", "note"]);
+    let sql = cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            let row_id = pane.session.row_id(1).map(str::to_owned).expect("第二行");
+            let _ = pane.session.stage_text_by_id(&row_id, 1, Some("改".into()));
+            pane.preview(cx)
+        })
+    });
+    let sql = sql.expect("可以预览").join("\n");
+    assert!(sql.contains("UPDATE"), "{sql}");
+    assert!(sql.contains("WHERE id = 2"), "隐藏主键后仍按主键定位：{sql}");
+    assert!(!sql.contains("note ="), "只写改过的列：{sql}");
+}
+
+/// 列头菜单：仅显示此列、全不选保留一列、固定开关、自适应全部列宽、打开列面板。
+#[gpui_kit::test]
+fn header_menu_and_panel_commands_change_the_layout(cx: &mut TestAppContext) {
+    let (window, pane) = open(cx, 1100., 720.);
+    cx.update_window(window, |_, window, cx| {
+        plant_people(&pane, cx);
+        pane.update(cx, |pane, cx| pane.column_command(1, "column-show-only", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(visible_names(&pane, cx), vec!["name"]);
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.column_command(0, "column-show-all", cx);
+            pane.column_command(0, "column-hide-all", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(visible_names(&pane, cx), vec!["id"], "全不选时保留第一列");
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.column_command(0, "column-show-all", cx);
+            pane.column_command(1, "column-pin-toggle", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = pane.read(cx);
+        assert_eq!(pane.session.frozen_count(), 2, "固定到 name：id 与 name 都固定");
+        assert!(pane.session.column_pinned(0) && pane.session.column_pinned(1));
+    });
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| pane.column_command(1, "column-pin-toggle", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(pane.read(cx).session.frozen_count(), 1, "取消固定 name 后边界退到 id"));
+    // 自适应全部列宽：排进全部可见列，下一帧量完清空。
+    cx.update(|cx| {
+        pane.update(cx, |pane, cx| {
+            pane.column_command(0, "column-fit-all", cx);
+            assert_eq!(pane.pending_fit, vec![0, 1, 2]);
+        })
+    });
+    // 打开列面板：菜单回调没有窗口，下一帧打开。
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| pane.column_command(1, "column-open-panel", cx));
+        window.render_frame(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert!(pane.read(cx).pending_fit.is_empty()));
+    cx.update_window(window, |_, window, cx| {
+        assert!(pane.read(cx).column_manager.is_some(), "列面板已打开");
+        for id in ["grid-col-mgr-grip", "grid-col-mgr-pin", "grid-col-mgr-name", "grid-col-mgr-toggle"] {
+            assert!(window.try_find((id, 1usize)).is_some(), "{id}-1 可见");
+        }
+        for id in ["grid-col-mgr-show-all", "grid-col-mgr-hide-all", "grid-col-mgr-reset"] {
+            assert!(window.try_find(id).is_some(), "{id} 可见");
+        }
+        assert!(window.try_find("grid-jump-column").is_none(), "工具栏不再有单独的跳到列图标");
+    })
+    .unwrap();
+    // 拖动排序：把 note 拖到 id 的位置。
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |pane, cx| pane.column_move_to(2, 0, cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(visible_names(&pane, cx), vec!["note", "id", "name"]);
+}

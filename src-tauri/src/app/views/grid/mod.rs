@@ -520,8 +520,12 @@ pub struct GridPane {
     format_subscription: Option<gpui_kit::Subscription>,
     /// 行 id、列名、阶段、语言。阶段没变就不重建，避免清掉编辑草稿。
     format_stamp: Option<(String, String, CellPhase, Locale)>,
-    /// 表头菜单"自适应列宽"要用窗口量字宽，绘制前再执行（逻辑列）。
-    pending_fit: Option<usize>,
+    /// 表头菜单"自适应列宽"要用窗口量字宽，绘制前再执行（逻辑列；“自适应全部列宽”一次排入全部可见列）。
+    pending_fit: Vec<usize>,
+    /// 表头菜单“列设置…”：菜单回调拿不到窗口，绘制阶段再打开列面板。
+    manager_request: bool,
+    /// 最近一次已记下（或从记忆读到）的列布局与它的归属；没变就不重复写盘（R3）。
+    saved_layout: Option<(crate::state::ColumnLayoutKey, crate::state::ColumnLayout)>,
     /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
     pending_batch: bool,
     search_subscription: Option<gpui_kit::Subscription>,
@@ -844,7 +848,9 @@ impl GridPane {
             format_viewer: None,
             format_subscription: None,
             format_stamp: None,
-            pending_fit: None,
+            pending_fit: Vec::new(),
+            manager_request: false,
+            saved_layout: None,
             pending_batch: false,
             search_subscription: None,
             find_open: false,
@@ -1442,6 +1448,7 @@ impl GridPane {
         self.session.locale = self.locale;
         self.session.set_page(0, limit);
         if switched {
+            self.restore_column_layout();
             // 所有表标签共用这一个网格：换了表要从左上角开始，不能沿用上一张表的滚动位置。
             self.session.reset_page_view();
             self.reset_table_scroll(cx);
@@ -3491,6 +3498,30 @@ impl GridPane {
                 self.session.reset_column_order();
                 None
             }
+            "column-show-only" => {
+                self.session.show_only_column(column);
+                None
+            }
+            "column-hide-all" => {
+                self.session.hide_all_columns();
+                None
+            }
+            "column-pin-toggle" => {
+                self.session.toggle_column_pin(column);
+                None
+            }
+            "column-reset-layout" => {
+                self.session.reset_column_layout();
+                None
+            }
+            "column-fit-all" => {
+                self.pending_fit = self.session.visible_columns();
+                None
+            }
+            "column-open-panel" => {
+                self.manager_request = true;
+                None
+            }
             "column-freeze" => {
                 self.session.freeze_to(column);
                 None
@@ -3501,7 +3532,7 @@ impl GridPane {
             }
             "column-fit" => {
                 // 量字宽要用窗口的文字系统，留到下一次绘制。
-                self.pending_fit = Some(column);
+                self.pending_fit = vec![column];
                 None
             }
             // 列头的整列复制与整列 WHERE 走单元格菜单同名动作的同一条原值读取：
@@ -4180,6 +4211,52 @@ impl GridPane {
             let drop = self.echo_cells.len() - 8;
             self.echo_cells.drain(..drop);
         }
+        // 列的显隐、顺序、冻结与列宽改变后都会走到这里：顺手按表记下列布局。
+        self.persist_column_layout();
+    }
+
+    /// 列布局的归属：只有表数据页按“连接 + 库 + schema + 表”记忆，查询结果不记。
+    fn layout_key(&self) -> Option<crate::state::ColumnLayoutKey> {
+        let target = &self.session.target;
+        (self.session.mode == GridMode::Table && !target.table.is_empty()).then(|| crate::state::ColumnLayoutKey {
+            connection_id: target.connection_id.clone(),
+            database: target.database.clone(),
+            schema: target.schema.clone(),
+            table: target.table.clone(),
+        })
+    }
+
+    /// 换到另一张表：读出它记住的列布局，等列读回来时按新列对齐套用。
+    fn restore_column_layout(&mut self) {
+        let Some(key) = self.layout_key() else {
+            self.saved_layout = None;
+            return;
+        };
+        let stored = self.services.state.column_layouts().get(&key);
+        self.saved_layout = Some((key, stored.clone().unwrap_or_default()));
+        self.session.stage_column_layout(stored);
+    }
+
+    /// 当前列布局变了就记下来：内存立即更新，文件在后台原子写入。
+    /// 换表后列还没读回来（快照仍是上一张表）或已保存布局还没套用时不记，免得用旧列覆盖记忆。
+    fn persist_column_layout(&mut self) {
+        let Some(key) = self.layout_key() else {
+            return;
+        };
+        if self.session.layout_pending() || self.session.stale_target() || self.session.column_names().is_empty() {
+            return;
+        }
+        let layout = self.session.column_layout();
+        if self.saved_layout.as_ref().is_some_and(|(saved_key, saved)| *saved_key == key && *saved == layout) {
+            return;
+        }
+        self.saved_layout = Some((key.clone(), layout.clone()));
+        let store = Arc::clone(self.services.state.column_layouts());
+        if let Some((revision, bytes)) = store.put(key, layout) {
+            runtime().spawn_blocking(move || {
+                let _ = store.write_revision(revision, &bytes);
+            });
+        }
     }
 }
 
@@ -4387,7 +4464,7 @@ impl Render for GridPane {
             delegate.edit_actions = edit_actions;
         });
         // 自适应列宽要用窗口量字宽：表格量完发出列宽事件，会话按逻辑列记下新宽度。
-        if let Some(logical) = self.pending_fit.take() {
+        for logical in std::mem::take(&mut self.pending_fit) {
             if let Some(display) = self.session.logical_to_display(logical) {
                 // 此时 GridPane 正在 render，delegate 不能再读 owner；先准备有界候选。
                 let texts = self.session.fit_column_labels(logical);
@@ -4797,33 +4874,16 @@ impl GridPane {
             );
         }
         left = left.child(filter_slot);
-        // 跳到列（R4）与列管理（R7）：跳到列收束为紧凑图标按名字快速定位；列管理集中控制显隐与顺序，隐藏列时显示计数提示。
+        // 列（R3）：工具栏唯一的列入口。面板里搜索、显隐、拖动排序、固定、恢复默认，点列名跳到该列；
+        // 隐藏了列时按钮保持激活并在角上显示隐藏数。
         if !self.session.column_names().is_empty() {
-            let jumping = self.column_picker_target() == Some(column_pick::ColumnPickTarget::Jump);
-            let jump = {
-                let entity = entity.clone();
-                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                    entity.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Jump, window, cx));
-                }
-            };
-            let jump_button = kit::icon_button("grid-jump-column", IconName::Columns3, t("grid.action.jumpColumn"), jump)
-                .tooltip(t("grid.action.jumpColumnHint"))
-                .selected(jumping);
-            left = left.child(
-                div()
-                    .id("grid-jump-column-slot")
-                    .relative()
-                    .flex_none()
-                    .child(jump_button)
-                    .child(column_pick::anchor_probe(&self.picker_anchors, column_pick::ColumnPickTarget::Jump)),
-            );
-
             let hidden_count = self.session.hidden_columns().len();
             let managing = self.column_manager.is_some();
-            let manage_label = if hidden_count > 0 {
+            let manage_label = t("grid.column.manage");
+            let manage_tip = if hidden_count > 0 {
                 SharedString::from(i18n::fill(&i18n::text(locale, "grid.column.hiddenCount"), &[("count", &hidden_count.to_string())]))
             } else {
-                t("grid.column.manage")
+                t("grid.column.manageHint")
             };
             let manage = {
                 let entity = entity.clone();
@@ -4831,7 +4891,7 @@ impl GridPane {
                     entity.update(cx, |pane, cx| pane.toggle_column_manager(window, cx));
                 }
             };
-            let mut manage_button = kit::tool_button("grid-columns-manage", Some(IconName::SlidersHorizontal), manage_label, manage).tooltip(t("grid.column.manageHint"));
+            let mut manage_button = kit::tool_button("grid-columns-manage", Some(IconName::Columns3), manage_label, manage).tooltip(manage_tip);
             if managing || hidden_count > 0 {
                 manage_button = manage_button.selected(true);
             }
@@ -6816,11 +6876,14 @@ const COLUMN_MENU: &[(&str, &str)] = &[
     ("column-copy-where", "grid.menu.copyColumnWhere"),
     ("column-copy-name", "grid.menu.copyColumnName"),
     ("", ""),
+    ("column-pin-toggle", "grid.column.pin"),
+    ("column-pin-toggle", "grid.column.unpin"),
     ("column-hide", "grid.column.hide"),
+    ("column-show-only", "grid.column.showOnly"),
     ("column-show-all", "grid.column.showAll"),
-    ("column-freeze", "grid.column.freeze"),
-    ("column-unfreeze", "grid.column.unfreeze"),
     ("column-fit", "grid.column.fit"),
+    ("column-fit-all", "grid.column.fitAll"),
+    ("column-open-panel", "grid.column.openPanel"),
     ("", ""),
     ("column-clear-filters", "grid.menu.clearFilters"),
 ];
@@ -6848,18 +6911,18 @@ fn menu_label(locale: Locale, key: &str, id: &str) -> SharedString {
     }
 }
 
-/// 表头菜单需要的状态：当前排序方向、是否有活动排序、能不能再藏一列、有没有冻结、是否已冻结到此列、能否左右移动、是否重排过、哪些列被藏了。
+/// 表头菜单需要的状态：当前排序方向、是否有活动排序、能不能再藏一列、能否左右移动、是否重排过、哪些列被藏了、这一列是否已固定。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ColumnMenuState {
     sorted: Option<bool>,
     any_sorted: bool,
     can_hide: bool,
-    frozen: bool,
-    is_frozen_boundary: bool,
     can_move_left: bool,
     can_move_right: bool,
     reordered: bool,
     hidden: Vec<(usize, String)>,
+    /// 这一列在冻结区里：菜单给“取消固定”，否则给“固定到此列”。
+    pinned: bool,
 }
 
 /// 表头菜单条目是否禁用：只剩一列可见时不能再藏；没有冻结时不能取消；已冻结到此列时不再重复冻结；
@@ -6868,9 +6931,7 @@ struct ColumnMenuState {
 fn column_item_disabled(id: &str, state: &ColumnMenuState) -> bool {
     match id {
         "column-clear-sort" => !state.any_sorted,
-        "column-freeze" => state.is_frozen_boundary,
         "column-hide" => !state.can_hide,
-        "column-unfreeze" => !state.frozen,
         "column-move-left" => !state.can_move_left,
         "column-move-right" => !state.can_move_right,
         "column-reset-order" => !state.reordered,
@@ -6890,58 +6951,47 @@ fn column_menu(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let mut menu = menu;
-    for (id, key) in [
-        ("column-sort-asc", "grid.menu.sortAsc"),
-        ("column-sort-desc", "grid.menu.sortDesc"),
-        ("column-clear-sort", "grid.menu.clearSort"),
-        ("column-filter", "grid.menu.filterColumn"),
-        ("column-fit", "grid.column.fit"),
-        ("column-copy-name", "grid.menu.copyColumnName"),
-    ] {
-        let item_owner = owner.clone();
+    let click = |id: &'static str, label: SharedString, owner: Option<gpui_kit::WeakEntity<GridPane>>| {
+        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
+            }
+        })
+    };
+    // 排序与筛选。
+    for (id, key) in [("column-sort-asc", "grid.menu.sortAsc"), ("column-sort-desc", "grid.menu.sortDesc"), ("column-clear-sort", "grid.menu.clearSort")] {
         if id == "column-clear-sort" && !state.any_sorted {
-            menu = menu.item(column_disabled_item(
-                locale,
-                key,
-                id,
-                true,
-                Some(i18n::text(locale, "grid.column.notSorted")),
-                item_owner,
-                column,
-            ));
+            menu = menu.item(column_disabled_item(locale, key, id, true, Some(i18n::text(locale, "grid.column.notSorted")), owner.clone(), column));
             continue;
         }
         let current = matches!((id, state.sorted), ("column-sort-asc", Some(false)) | ("column-sort-desc", Some(true)));
         let label = if current { SharedString::from(format!("✓ {}", i18n::text(locale, key))) } else { menu_label(locale, key, id) };
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-            if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
-                owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
-            }
-        }));
+        menu = menu.item(click(id, label, owner.clone()));
     }
+    menu = menu.item(click("column-filter", menu_label(locale, "grid.menu.filterColumn", "column-filter"), owner.clone()));
+    // 固定与显隐。
+    let pin_key = if state.pinned { "grid.column.unpin" } else { "grid.column.pin" };
+    menu = menu.separator().item(click("column-pin-toggle", menu_label(locale, pin_key, "column-pin-toggle"), owner.clone()));
+    let hide_reason = (!state.can_hide).then(|| i18n::text(locale, "grid.column.lastVisible"));
+    menu = menu.item(column_disabled_item(locale, "grid.column.hide", "column-hide", !state.can_hide, hide_reason, owner.clone(), column));
+    menu = menu.item(column_disabled_item(locale, "grid.column.showOnly", "column-show-only", !state.can_hide, None, owner.clone(), column));
+    // 列宽与复制。
+    menu = menu
+        .separator()
+        .item(click("column-fit", menu_label(locale, "grid.column.fit", "column-fit"), owner.clone()))
+        .item(click("column-fit-all", menu_label(locale, "grid.column.fitAll", "column-fit-all"), owner.clone()))
+        .item(click("column-copy-name", menu_label(locale, "grid.menu.copyColumnName", "column-copy-name"), owner.clone()))
+        .separator()
+        .item(click("column-open-panel", menu_label(locale, "grid.column.openPanel", "column-open-panel"), owner.clone()));
     let hidden = state.hidden.clone();
-    let can_hide = state.can_hide;
-    let frozen = state.frozen;
-    let is_frozen_boundary = state.is_frozen_boundary;
     let can_move_left = state.can_move_left;
     let can_move_right = state.can_move_right;
     let reordered = state.reordered;
     menu.submenu(SharedString::from(i18n::text(locale, "grid.column.menu")), window, cx, move |menu, _, _| {
         let mut menu = menu;
-        let owner_left = owner.clone();
-        menu = menu.item(column_disabled_item(locale, "grid.column.moveLeft", "column-move-left", !can_move_left, None, owner_left, column));
-        let owner_right = owner.clone();
-        menu = menu.item(column_disabled_item(locale, "grid.column.moveRight", "column-move-right", !can_move_right, None, owner_right, column));
-        let owner_reset = owner.clone();
-        menu = menu.item(column_disabled_item(locale, "grid.column.resetOrder", "column-reset-order", !reordered, None, owner_reset, column));
-        let owner_freeze = owner.clone();
-        let freeze_reason = is_frozen_boundary.then(|| i18n::text(locale, "grid.column.alreadyFrozen"));
-        menu = menu.item(column_disabled_item(locale, "grid.column.freeze", "column-freeze", is_frozen_boundary, freeze_reason, owner_freeze, column));
-        let owner_unfreeze = owner.clone();
-        menu = menu.item(column_disabled_item(locale, "grid.column.unfreeze", "column-unfreeze", !frozen, None, owner_unfreeze, column));
-        let owner_hide = owner.clone();
-        let hide_reason = (!can_hide).then(|| i18n::text(locale, "grid.column.lastVisible"));
-        menu = menu.item(column_disabled_item(locale, "grid.column.hide", "column-hide", !can_hide, hide_reason, owner_hide, column));
+        menu = menu.item(column_disabled_item(locale, "grid.column.moveLeft", "column-move-left", !can_move_left, None, owner.clone(), column));
+        menu = menu.item(column_disabled_item(locale, "grid.column.moveRight", "column-move-right", !can_move_right, None, owner.clone(), column));
+        menu = menu.item(column_disabled_item(locale, "grid.column.resetOrder", "column-reset-order", !reordered, None, owner.clone(), column));
         for (hidden_index, name) in hidden.iter().cloned() {
             let owner_show = owner.clone();
             let label = SharedString::from(i18n::fill(&i18n::text(locale, "grid.column.show"), &[("name", &name)]));
@@ -6951,8 +7001,7 @@ fn column_menu(
                 }
             }));
         }
-        let owner_all = owner.clone();
-        menu.item(column_disabled_item(locale, "grid.column.showAll", "column-show-all", hidden.is_empty(), None, owner_all, column))
+        menu.item(column_disabled_item(locale, "grid.column.showAll", "column-show-all", hidden.is_empty(), None, owner.clone(), column))
     })
 }
 
@@ -7526,12 +7575,11 @@ impl TableDelegate for SheetDelegate {
             sorted,
             any_sorted: self.sort.is_some(),
             can_hide: self.visible.len() > 1,
-            frozen: self.columns.iter().skip(1).any(|(_, _, fixed)| *fixed),
-            is_frozen_boundary: self.frozen_column == Some(logical),
             can_move_left: display_pos.is_some_and(|pos| pos > 0),
             can_move_right: display_pos.is_some_and(|pos| pos + 1 < self.visible.len()),
             reordered: self.reordered,
             hidden: self.hidden.clone(),
+            pinned: self.frozen_column.is_some() && frozen,
         };
         header
             .context_menu(move |menu, window, cx| column_menu(menu, owner.clone(), locale, logical, state.clone(), window, cx))
@@ -7738,7 +7786,9 @@ impl GridPane {
             .collect::<Vec<_>>();
         let count = grid_rows.len() as i64;
         self.session.mode = GridMode::Table;
-        self.session.switch_target(target);
+        if self.session.switch_target(target) {
+            self.restore_column_layout();
+        }
         self.session.locale = self.locale;
         self.session.load_local(grid_columns, grid_rows, Some(count), Some(schema));
         self.sync_table(cx);
@@ -10984,12 +11034,11 @@ mod workbench_tests {
                 sorted: None,
                 any_sorted: delegate.sort.is_some(),
                 can_hide: delegate.visible.len() > 1,
-                frozen: false,
-                is_frozen_boundary: delegate.frozen_column.is_some(),
                 can_move_left: false,
                 can_move_right: delegate.visible.len() > 1,
                 reordered: delegate.reordered,
                 hidden: delegate.hidden.clone(),
+                pinned: delegate.frozen_column.is_some(),
             }
         });
         assert!(column_item_disabled("column-hide", &state));
@@ -12362,7 +12411,7 @@ mod filter_ui_tests {
         // 筛选字段：300 项都在，搜索后回车选到最后一列。
         visual.update(|window, cx| {
             pane.update(cx, |pane, cx| {
-                let (items, _) = pane.column_picker_items(column_pick::ColumnPickTarget::Jump);
+                let (items, _) = pane.column_picker_items(column_pick::ColumnPickTarget::Manage);
                 assert_eq!(items.len(), 300);
                 pane.filters_open = true;
                 let index = pane.new_filter(cx).expect("新条件");
@@ -12384,17 +12433,22 @@ mod filter_ui_tests {
         visual.update(|_, cx| {
             assert_eq!(pane.read(cx).session.filters()[0].column, "col_299");
         });
-        // 跳到列：打开、搜索、回车。
+        // 跳到列（R3 合并进“列”面板）：打开面板、搜索、点列名。
         visual.update(|window, cx| {
-            pane.update(cx, |pane, cx| pane.toggle_column_picker(column_pick::ColumnPickTarget::Jump, window, cx));
+            pane.update(cx, |pane, cx| pane.toggle_column_manager(window, cx));
             window.render_frame(cx);
         });
         visual.update(|window, cx| window.input("col_298", cx));
-        visual.update(|window, cx| window.press("enter", cx));
+        visual.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("grid-col-mgr-name", 298usize)).is_some(), "搜索后列出目标列");
+            assert!(window.try_find(("grid-col-mgr-name", 10usize)).is_none(), "不匹配的列被筛掉");
+            pane.update(cx, |pane, cx| pane.column_manager_jump(298, window, cx));
+        });
         visual.update(|window, cx| {
             window.render_frame(cx);
             let pane_ref = pane.read(cx);
-            assert!(pane_ref.column_picker.is_none());
+            assert!(pane_ref.column_manager.is_none(), "点列名后面板关闭");
             let last = pane_ref.loaded_len() - 1;
             assert_eq!(pane_ref.session.selection_bounds(), Some((0, 298, last, 298)), "整列选中");
             assert_eq!(pane_ref.session.focus_cell().map(|(_, column)| column), Some(298));
@@ -12999,15 +13053,14 @@ mod filter_ui_tests {
                 sorted: None,
                 any_sorted: false,
                 can_hide: true,
-                frozen: true,
-                is_frozen_boundary: true,
                 can_move_left: false,
                 can_move_right: true,
                 reordered: false,
                 hidden: Vec::new(),
+                pinned: true,
             };
             assert!(column_item_disabled("column-clear-sort", &unsorted), "未排序时禁用清除排序");
-            assert!(column_item_disabled("column-freeze", &unsorted), "已冻结到此列时禁用冻结");
+            assert!(!column_item_disabled("column-pin-toggle", &unsorted), "固定开关始终可用");
             assert!(column_item_disabled("column-move-left", &unsorted), "首列禁用左移");
             assert!(!column_item_disabled("column-move-right", &unsorted));
             assert!(column_item_disabled("column-reset-order", &unsorted), "未重排时禁用重置顺序");
@@ -13353,7 +13406,8 @@ mod filter_ui_tests {
                     pane.set_prod_target(true);
                 });
                 window.render_frame(cx);
-                for id in ["grid-find-toggle", "grid-filter-add", "grid-jump-column", "grid-columns-manage", "grid-range-label", "grid-insert", "grid-refresh", "grid-record-toggle"] {
+                assert!(window.try_find("grid-jump-column").is_none(), "dark={dark} 工具栏只保留一个“列”入口");
+                for id in ["grid-find-toggle", "grid-filter-add", "grid-columns-manage", "grid-range-label", "grid-insert", "grid-refresh", "grid-record-toggle"] {
                     let el = window.find(id);
                     assert!(el.visible(), "dark={dark} {id} 应可见");
                     let b = el.bounds();
