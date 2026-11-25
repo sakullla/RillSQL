@@ -2138,8 +2138,10 @@ fn the_default_connections_state_keeps_secrets_in_the_vault() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 修订 6：保险库首次加载只读主密钥，不读任何旧条目；某个连接第一次取密码时只读它自己的旧条目一次，
+/// 迁入后删除旧条目，之后不再读钥匙串。
 #[tokio::test]
-async fn first_vault_load_migrates_every_saved_legacy_entry_and_reports_failures() {
+async fn first_vault_load_reads_no_legacy_entry_and_each_connection_migrates_on_first_use() {
     let dir = temp_workspace();
     let config_path = dir.join("connections.sqlite");
     let legacy = Arc::new(LegacyKeychain::default());
@@ -2155,25 +2157,38 @@ async fn first_vault_load_migrates_every_saved_legacy_entry_and_reports_failures
     legacy.failing.lock().unwrap().push(model::password_account(&two.id));
     legacy.calls.store(0, Ordering::SeqCst);
 
-    let master: Arc<dyn super::secrets::SecretStore> = Arc::new(MemoryStore::default());
+    // 主密钥和旧条目都在同一个钥匙串里：数清楚每一次访问。
+    let master = Arc::new(LegacyKeychain::default());
     let service = vault_service(&config_path, master.clone(), legacy.clone());
-    let failures = service.secret_migration_failures().await.unwrap();
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].0, model::password_account(&two.id));
-    // 每个已保存的账户读一次；迁入的一条随后删除。没保存过密码的连接不访问旧钥匙串。
-    assert_eq!(legacy.calls.load(Ordering::SeqCst), 3);
-    let left = legacy.inner.dump();
-    assert!(left.iter().all(|(account, _)| account != &model::password_account(&one.id)), "迁入后旧条目被删除");
-    assert!(left.iter().any(|(account, _)| account == &model::password_account(&two.id)), "失败的旧条目原样保留");
+    assert_eq!(service.pending_legacy_count(), None, "保险库没加载前不知道，也不为计数去加载");
+    // 第一次加载保险库：钥匙串只读主密钥一次，旧条目一个都不读。
+    assert!(service.secret_migration_failures().await.unwrap().is_empty());
+    assert_eq!(master.calls.load(Ordering::SeqCst), 2, "读主密钥一次（首次运行再写一次）");
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 0, "启动不读旧条目");
+    assert_eq!(service.pending_legacy_count(), Some(2));
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 0, "计数不访问钥匙串");
+
+    // 连接一第一次取密码：只读它自己的旧条目一次，写进保险库后删除旧条目。
+    let account = model::password_account(&one.id);
+    let secret = service.resolve_secret(&account, None, true).unwrap();
+    assert_eq!(secret.map(|item| item.expose().to_owned()).as_deref(), Some("pw-one"));
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 2, "读一次 + 删一次");
+    assert!(legacy.inner.dump().iter().all(|(item, _)| item != &account), "迁入后旧条目被删除");
+    for _ in 0..3 {
+        service.resolve_secret(&account, None, true).unwrap();
+    }
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 2, "之后不再读钥匙串");
+    assert_eq!(service.pending_legacy_count(), Some(1));
+    assert_eq!(master.calls.load(Ordering::SeqCst), 2, "主密钥缓存在进程内");
+
+    // 连接二读取被拒：给出原因和恢复指引，而不是静默当成没有密码。
+    let err = service.open(&two.id, SecretInput::default()).await.unwrap_err();
+    assert!(err.contains("旧凭据没能迁入保险库"), "{err}");
     assert!(matches!(
         service.take_secret_notices().as_slice(),
         [super::secrets::VaultNotice::MigrationFailed { .. }]
     ));
-
-    // 迁移失败的连接：打开时给出原因和恢复指引，而不是静默当成没有密码。
-    let err = service.open(&two.id, SecretInput::default()).await.unwrap_err();
-    assert!(err.contains("旧凭据没能迁入保险库"), "{err}");
-    assert!(err.contains("重试"), "{err}");
+    assert_eq!(service.pending_legacy_count(), Some(0), "失败的单独计入失败，不算待迁移");
 
     // 重启：不再读旧条目。
     let calls = legacy.calls.load(Ordering::SeqCst);
@@ -2187,6 +2202,51 @@ async fn first_vault_load_migrates_every_saved_legacy_entry_and_reports_failures
     assert_eq!(report.migrated, vec![model::password_account(&two.id)]);
     assert!(legacy.inner.dump().is_empty());
     assert!(restarted.secret_migration_failures().await.unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 修订 6：设置页的“现在全部迁入”逐个报告失败；“不再迁移”只清除待迁移标记。
+#[tokio::test]
+async fn migrate_all_reports_each_failure_and_dismiss_clears_the_pending_marks() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let legacy = Arc::new(LegacyKeychain::default());
+    let old = Service::new(config_path.clone(), legacy.clone());
+    let one = old.save(remote_draft(Engine::Mysql), secrets("pw-one", "", "")).await.unwrap().connection;
+    let two = old.save(remote_draft(Engine::Postgres), secrets("pw-two", "", "")).await.unwrap().connection;
+    let three = old.save(remote_draft(Engine::Mysql), secrets("pw-three", "", "")).await.unwrap().connection;
+    drop(old);
+    legacy.failing.lock().unwrap().push(model::password_account(&two.id));
+    legacy.failing.lock().unwrap().push(model::password_account(&three.id));
+    legacy.calls.store(0, Ordering::SeqCst);
+
+    let master: Arc<dyn super::secrets::SecretStore> = Arc::new(MemoryStore::default());
+    let service = vault_service(&config_path, master.clone(), legacy.clone());
+    service.secret_migration_failures().await.unwrap();
+    assert_eq!(service.pending_legacy_count(), Some(3));
+    let report = service.migrate_all_legacy().await.unwrap();
+    assert_eq!(report.migrated, vec![model::password_account(&one.id)]);
+    let mut failed: Vec<String> = report.failed.iter().map(|(account, _)| account.clone()).collect();
+    failed.sort();
+    let mut expected = vec![model::password_account(&two.id), model::password_account(&three.id)];
+    expected.sort();
+    assert_eq!(failed, expected, "失败逐个报告");
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), 4, "三条各读一次，迁入的一条删除一次");
+    assert_eq!(service.pending_legacy_count(), Some(0));
+
+    // 不再迁移：失败标记清掉，之后取密码不再读旧条目，改为要求重新输入。
+    let calls = legacy.calls.load(Ordering::SeqCst);
+    assert_eq!(service.dismiss_legacy().await.unwrap(), 2);
+    assert!(service.secret_migration_failures().await.unwrap().is_empty());
+    assert_eq!(service.resolve_secret(&model::password_account(&two.id), None, true).unwrap().map(|s| s.expose().to_owned()), None);
+    assert_eq!(legacy.calls.load(Ordering::SeqCst), calls, "不再迁移后不访问旧钥匙串");
+    // 已迁入的密码不受影响，旧条目也没被删除。
+    let restarted = vault_service(&config_path, master, legacy.clone());
+    assert_eq!(
+        restarted.resolve_secret(&model::password_account(&one.id), None, true).unwrap().map(|s| s.expose().to_owned()).as_deref(),
+        Some("pw-one")
+    );
+    assert_eq!(legacy.inner.dump().len(), 2, "不再迁移不删除旧条目");
     let _ = std::fs::remove_dir_all(dir);
 }
 

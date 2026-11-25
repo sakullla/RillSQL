@@ -32,6 +32,9 @@ plans/
 # 2026-11-08 桌面体验改造：原生验收报告与 native/ 截图需要进入检查点，供交付评审。
 !docs/verification/2026-11-08-desktop-ux-rework/
 !docs/verification/2026-11-08-desktop-ux-rework/**
+# 2026-11-24 第三轮体验修复：原生巡检截图与 R1–R15 对照说明进入检查点，供交付评审（已做敏感名称扫描）。
+!docs/verification/2026-11-24-ux-round3/
+!docs/verification/2026-11-24-ux-round3/**
 # 2026-11-21 事务完全支持：交付需要实库、故障代理与原生证据进入检查点。
 !docs/verification/2026-11-21-transaction.md
 !docs/verification/2026-11-21-transaction/

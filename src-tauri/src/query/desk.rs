@@ -1579,7 +1579,39 @@ impl Desk {
                 },
                 columns: self.marked_columns(&object.connection_id, &object.database, &object.schema, &object.name),
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(self.cross_database_sources(target))
             .collect()
+    }
+
+    /// 修订 6：名字第一段是库的引擎（MySQL）里，`其他库.表 别名` 的列按需读到后也参与补全，
+    /// 标签写成 `库.表`，只认带库名的限定引用，不和当前库的同名表混在一起。
+    fn cross_database_sources(&self, target: &Target) -> Vec<CompletionSource> {
+        let qualifier_is_database = crate::catalog::Engine::parse(&target.engine)
+            .map(|engine| crate::adapters::catalog_of(engine).qualifier_is_database())
+            .unwrap_or(false);
+        if !qualifier_is_database {
+            return Vec::new();
+        }
+        let mut found: Vec<CompletionSource> = self
+            .columns
+            .keys()
+            .filter_map(|key| {
+                let mut parts = key.split('\u{1}');
+                let (connection, database, schema, table) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+                if connection != target.connection_id || database == target.database || !schema.is_empty() {
+                    return None;
+                }
+                Some(CompletionSource {
+                    alias: String::new(),
+                    label: format!("{database}.{table}"),
+                    columns: self.marked_columns(connection, database, schema, table),
+                })
+            })
+            .collect();
+        found.sort_by(|left, right| left.label.cmp(&right.label));
+        found
     }
 
     /// 一次补全请求：语句全文和光标由编辑器传入，补全计划只读快照。
@@ -3291,6 +3323,35 @@ mod tests {
         let sql = "select o. from orders o";
         let entries = desk.completion_for(sql, "select o.".len(), Locale::En);
         assert!(entries.iter().any(|entry| entry.label.contains("order_id")), "{entries:?}");
+    }
+
+    /// 修订 6：跨库限定名 `其他库.表 别名` 的别名列补全：列按需读到后，`别名.` 给出该库该表的列，
+    /// 不再被当前库里同名表的列顶替。
+    #[test]
+    fn cross_database_alias_completes_the_qualified_table_columns() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("my", "shop", "mysql", "shop");
+        desk.set_provider(true);
+        desk.remember_objects("my", "shop", vec![TreeObject {
+            connection_id: "my".into(), connection_name: "shop".into(), engine: "mysql".into(),
+            database: "shop".into(), schema: String::new(), name: "orders".into(), kind: "table".into(),
+        }]);
+        desk.remember_columns("my", "shop", "orders", vec!["order_id".into()]);
+        let sql = "select a. from shop_archive.orders a";
+        let cursor = "select a.".len();
+        // 编辑器按语句里的表请求列（见 QueryPane::request_statement_metadata，`库.表` 读那个库）；读到后补全该表的列。
+        desk.remember_columns("my", "shop_archive", "orders", vec!["archived_at".into()]);
+        let entries = desk.completion_for(sql, cursor, Locale::En);
+        assert!(entries.iter().any(|entry| entry.label.contains("archived_at")), "{entries:?}");
+        assert!(!entries.iter().any(|entry| entry.label.contains("order_id")), "{entries:?}");
+        // 当前库的同名表照常。
+        let entries = desk.completion_for("select o. from orders o", "select o.".len(), Locale::En);
+        assert!(entries.iter().any(|entry| entry.label.contains("order_id")), "{entries:?}");
+        // 其他连接的缓存不混进来。
+        desk.remember_columns("other", "shop_archive", "orders", vec!["foreign_col".into()]);
+        let entries = desk.completion_for(sql, cursor, Locale::En);
+        assert!(!entries.iter().any(|entry| entry.label.contains("foreign_col")), "{entries:?}");
     }
 
     #[test]

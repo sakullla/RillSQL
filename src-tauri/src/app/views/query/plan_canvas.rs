@@ -51,6 +51,8 @@ const WHEEL_LINE_PX: f32 = 40.;
 const DRAG_SLOP: f32 = 3.;
 /// 适配视口时四周保留的距离。
 const FIT_PAD: f32 = 24.;
+/// 自动适配的可读下限（修订 6）：结果区很小时也不缩到看不清，放不下的部分平移查看。
+pub const FIT_MIN_ZOOM: f32 = 0.7;
 /// 缩放低于该值时卡片只保留标题两行，避免文字挤成一团。
 const COMPACT_ZOOM: f32 = 0.6;
 const HEAT_BAR_H: f32 = 3.;
@@ -113,12 +115,30 @@ impl Layout {
     }
 }
 
-/// 卡片尺寸：JOIN 是紧凑胶囊，其余占满槽位。
+/// 卡片尺寸：JOIN 是紧凑胶囊（按标题和行数加宽，最宽不超过槽位），其余占满槽位。
 pub fn card_size(node: &PlanNode) -> (f32, f32) {
     match node.node_kind() {
-        NodeKind::Join => (PILL_W, PILL_H),
+        NodeKind::Join => (pill_width(node), PILL_H),
         _ => (NODE_W, NODE_H),
     }
+}
+
+/// 估算一段文字在 100% 缩放下的宽度：CJK 等宽字符按一个字号，其余按约 0.62 个字号。
+fn text_width(text: &str, size: f32) -> f32 {
+    text.chars().map(|ch| if (ch as u32) >= 0x2E80 { size } else { size * 0.62 }).sum()
+}
+
+/// JOIN 胶囊宽度（修订 6）：有空间时放下完整标题和行数，不早早截成“Nested loo…”；
+/// 至少 `PILL_W`，最多一个槽位宽（`NODE_W`），更长的标题才截断。行数按中文模板估（较宽的一种）。
+pub fn pill_width(node: &PlanNode) -> f32 {
+    let title = text_width(&node.title(), TypeScale::SM);
+    let rows = node
+        .actual_rows
+        .or(node.rows)
+        .map(|rows| text_width(&format!("预估 {} 行", plan_view::rows_text(rows)), TypeScale::XS) + Space::XS)
+        .unwrap_or(0.);
+    let chrome = CARD_PAD * 1.5 * 2. + 14. + Space::XS + 4.;
+    (chrome + title + rows).ceil().clamp(PILL_W, NODE_W)
 }
 
 /// 确定性整齐树布局：同一份计划总得到同一组坐标。
@@ -307,7 +327,8 @@ impl CanvasState {
         }
     }
 
-    /// 适配视口：整体缩小到能放下（不放大超过 100%），放不下的高度从顶部开始看。
+    /// 适配视口：整体缩小到能放下（不放大超过 100%，也不低于可读下限 `FIT_MIN_ZOOM`）；
+    /// 缩到下限仍放不下时从左上角开始看，其余部分拖动或滚轮平移。
     pub fn fit_to(&mut self, viewport_w: f32, viewport_h: f32) {
         self.fitted_for = Some((viewport_w, viewport_h));
         let (w, h) = self.content;
@@ -319,8 +340,9 @@ impl CanvasState {
         }
         let zx = (viewport_w - FIT_PAD * 2.).max(1.) / w;
         let zy = (viewport_h - FIT_PAD * 2.).max(1.) / h;
-        self.zoom = zx.min(zy).clamp(ZOOM_MIN, 1.);
-        self.pan_x = 0.;
+        self.zoom = zx.min(zy).clamp(FIT_MIN_ZOOM, 1.);
+        let scaled_w = w * self.zoom;
+        self.pan_x = if scaled_w > viewport_w { (scaled_w - viewport_w) / 2. } else { 0. };
         let scaled_h = h * self.zoom;
         self.pan_y = if scaled_h > viewport_h { (scaled_h - viewport_h) / 2. } else { 0. };
     }
@@ -1062,7 +1084,7 @@ mod tests {
         assert_no_overlap(&layout);
         for node in &layout.nodes {
             let kind = tree.lines()[node.index].node.node_kind();
-            let expected = if kind == NodeKind::Join { (PILL_W, PILL_H) } else { (NODE_W, NODE_H) };
+            let expected = if kind == NodeKind::Join { (pill_width(tree.lines()[node.index].node), PILL_H) } else { (NODE_W, NODE_H) };
             assert_eq!((node.w, node.h), expected, "节点 {} 的卡片尺寸按类型", node.index);
         }
         for edge in &layout.edges {
@@ -1181,18 +1203,53 @@ mod tests {
     #[test]
     fn fit_shrinks_to_the_viewport_without_enlarging() {
         let mut state = CanvasState::default();
-        state.sync(2000., 400.);
-        state.fit_to(1048., 600.);
-        assert!((state.zoom - 0.5).abs() < 0.01, "{}", state.zoom);
-        assert_eq!((state.pan_x, state.pan_y), (0., 0.));
+        state.sync(1200., 400.);
+        state.fit_to(888., 600.);
+        assert!((state.zoom - 0.7).abs() < 0.01, "{}", state.zoom);
+        assert!(state.pan_x.abs() < 0.5 && state.pan_y == 0., "放得下时居中：{} {}", state.pan_x, state.pan_y);
         state.sync(200., 100.);
         state.fit_to(1000., 600.);
         assert_eq!(state.zoom, 1., "小计划不被放大");
         state.sync(300., 10_000.);
         state.fit_to(800., 600.);
-        assert_eq!(state.zoom, ZOOM_MIN);
+        assert_eq!(state.zoom, FIT_MIN_ZOOM);
         let top = state.pan_y + (0. - 10_000. / 2.) * state.zoom;
         assert!((top + 300.).abs() < 0.01, "内容顶部对齐视口顶部：{top}");
+    }
+
+    /// 修订 6：JOIN 胶囊按标题加宽，有空间时不截断“Nested loop”；最宽不超过槽位，短标题保持紧凑。
+    #[test]
+    fn join_pill_grows_to_fit_its_title_within_the_slot() {
+        let join = |op: &str, rows: Option<f64>| PlanNode { op: op.into(), rows, category: Some(NodeKind::Join), ..Default::default() };
+        let nested = join("Nested loop", Some(12_345.));
+        let need = CARD_PAD * 3. + 14. + Space::XS + text_width(&nested.title(), TypeScale::SM);
+        let width = pill_width(&nested);
+        assert!(width >= need, "放得下完整标题：{width} < {need}");
+        assert!(width <= NODE_W);
+        assert_eq!(pill_width(&join("Hash", None)), PILL_W, "短标题保持紧凑");
+        let long = join(&"Nested loop left semi join ".repeat(4), Some(1e9));
+        assert_eq!(pill_width(&long), NODE_W, "超长标题最多一个槽位宽，再截断");
+        let (w, h) = card_size(&nested);
+        assert_eq!((w, h), (width, PILL_H));
+    }
+
+    /// 修订 6：结果区很小时自动适配不低于可读下限，放不下的部分从左上角开始，平移查看。
+    #[test]
+    fn small_viewport_fit_keeps_a_readable_zoom_and_starts_at_the_top_left() {
+        let mut state = CanvasState::default();
+        set_viewport(&state, 400., 220.);
+        state.sync(2000., 800.);
+        assert_eq!(state.zoom, FIT_MIN_ZOOM, "小视口里不缩到看不清");
+        assert!(state.zoom >= 0.7);
+        let left = state.pan_x + (0. - 2000. / 2.) * state.zoom;
+        let top = state.pan_y + (0. - 800. / 2.) * state.zoom;
+        assert!((left + 200.).abs() < 0.01, "内容左边对齐视口左边：{left}");
+        assert!((top + 110.).abs() < 0.01, "内容顶部对齐视口顶部：{top}");
+        // 仍可平移查看其余部分。
+        let before = state.pan_x;
+        state.wheel(-120., 0., false, (0., 0.));
+        assert_eq!(state.pan_x, before - 120.);
+        assert_eq!(state.zoom, FIT_MIN_ZOOM, "平移不改缩放");
     }
 
     fn set_viewport(state: &CanvasState, w: f32, h: f32) {
@@ -1207,7 +1264,7 @@ mod tests {
         set_viewport(&state, 798., 400.);
         state.sync(1500., 400.);
         let small = state.zoom;
-        assert!((small - 0.5).abs() < 0.01, "小结果区里先适配：{small}");
+        assert!((small - FIT_MIN_ZOOM).abs() < 0.01, "小结果区里先适配，不低于可读下限：{small}");
         assert!(state.auto_fit());
 
         // 最大化：视口变大，没手动缩放 → 重新适配到更大的缩放。
@@ -1239,7 +1296,7 @@ mod tests {
 
         // “适配”按钮：按当前视口适配，之后尺寸变化又自动跟随。
         state.fit();
-        assert!((state.zoom - 0.5).abs() < 0.01, "{}", state.zoom);
+        assert!((state.zoom - FIT_MIN_ZOOM).abs() < 0.01, "{}", state.zoom);
         set_viewport(&state, 1548., 800.);
         state.sync(1500., 400.);
         assert!((state.zoom - 1.).abs() < 0.01, "{}", state.zoom);

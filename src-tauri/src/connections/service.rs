@@ -888,7 +888,7 @@ impl Service {
 
     /// 本次输入 > 凭据库里保存的 > 本次运行手输过的。凭据库读取失败且没有手输机密可用时，
     /// 返回带恢复指引的错误文字（钥匙串被拒、保险库损坏、旧条目迁移失败），而不是当成“没有密码”。
-    fn resolve_secret(&self, account: &str, typed: Option<&Secret>, saved: bool) -> Result<Option<Secret>, String> {
+    pub(super) fn resolve_secret(&self, account: &str, typed: Option<&Secret>, saved: bool) -> Result<Option<Secret>, String> {
         if let Some(secret) = typed.filter(|item| !item.is_empty()) {
             return Ok(Some(secret.clone()));
         }
@@ -933,6 +933,51 @@ impl Service {
             self.log(format!("已把 {} 条旧凭据迁入本地保险库", report.migrated.len()));
         }
         Ok(report)
+    }
+
+    /// 修订 6：名单里还没迁入的旧密码个数。只看已加载保险库的元数据，不访问钥匙串，也不为此加载保险库；
+    /// 保险库还没加载时为 None。
+    pub fn pending_legacy_count(&self) -> Option<usize> {
+        self.secrets.pending_legacy()
+    }
+
+    /// 修订 6：设置页“现在全部迁入”。每个待迁移的旧条目各读一次（macOS 可能逐条询问授权），
+    /// 失败的逐个出现在报告里。失败分类与重试相同。
+    pub async fn migrate_all_legacy(&self) -> Result<MigrationReport, VaultFailure> {
+        self.store()
+            .await
+            .map_err(|reason| VaultFailure { problem: VaultProblem::Internal, reason })?;
+        let report = match self.secrets.migrate_all_legacy() {
+            Ok(report) => report,
+            Err(err) => match err.vault_failure() {
+                Some(failure) => {
+                    self.log(format!("全部迁入失败：{err}"));
+                    return Err(failure);
+                }
+                None => {
+                    self.log(format!("全部迁入：{err}"));
+                    MigrationReport::default()
+                }
+            },
+        };
+        if !report.migrated.is_empty() {
+            self.log(format!("已把 {} 条旧凭据迁入本地保险库", report.migrated.len()));
+        }
+        Ok(report)
+    }
+
+    /// 修订 6：设置页“不再迁移”。只清除待迁移标记，之后这些连接用到时重新输入密码；不删除保险库数据。
+    pub async fn dismiss_legacy(&self) -> Result<usize, VaultFailure> {
+        self.store()
+            .await
+            .map_err(|reason| VaultFailure { problem: VaultProblem::Internal, reason })?;
+        match self.secrets.dismiss_legacy() {
+            Ok(count) => Ok(count),
+            Err(err) => {
+                self.log(format!("清除待迁移标记失败：{err}"));
+                Err(err.vault_failure().unwrap_or(VaultFailure { problem: VaultProblem::Internal, reason: err.reason().to_owned() }))
+            }
+        }
     }
 
     /// 仍未迁入保险库的旧条目（凭据账户、原因）。
@@ -1217,8 +1262,8 @@ impl Service {
         self.cell
             .get_or_try_init(|| async move {
                 let store = store::Store::open(path).await?;
-                // 保险库首次加载时要迁移的旧钥匙串条目：只有标记过已保存密码的账户才可能有。
-                // 读不出列表时不登记，保险库退回按需迁移。
+                // 可能还有旧钥匙串条目的账户：只有标记过已保存密码的才可能有，用到时按需迁移。
+                // 读不出列表时不登记，保险库退回对任意缺失账户按需迁移。
                 if let Ok(rows) = store.list().await {
                     secrets.register_legacy(legacy_secret_accounts(&rows));
                 }

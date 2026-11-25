@@ -1393,33 +1393,57 @@ impl Workbench {
         ));
         let full = SharedString::from(i18n::fill(&self.model.text("ui.explorer.searchSkipped"), &[("n", &count)]));
         let toggle_label = self.t(if collapsed { "ui.explorer.searchSkippedExpand" } else { "ui.explorer.searchSkippedCollapse" });
-        div()
+        let toggle = kit::icon_button(
+            "explorer-search-skipped-toggle",
+            if collapsed { IconName::ChevronDown } else { IconName::ChevronUp },
+            toggle_label,
+            act("nav-search-skipped-toggle", cx),
+        )
+        .xsmall();
+        let banner = div()
             .id("explorer-search-skipped")
             .test_support()
             .flex_none()
             .px(px(Space::LG))
             .pb(px(Space::XS))
-            .flex()
-            .items_center()
-            .gap(px(Space::XS))
             .text_size(px(TypeScale::XS))
-            .text_color(p.text_faint)
-            .child(kit::icon(IconName::Info, 12., p.text_faint))
-            .child(div().id("explorer-search-skipped-text").flex_1().min_w_0().truncate().tooltip_text(full).child(msg))
-            .when(!collapsed, |this| {
-                this.child(
-                    kit::tool_button("explorer-connect-skipped", Some(IconName::Plug), self.t("ui.explorer.connectSkipped"), act("nav-connect-skipped", cx))
-                        .xsmall(),
-                )
-            })
+            .text_color(p.text_faint);
+        if collapsed {
+            // 收起时一行短文字（“跳过 N 个”），放不下才截断，完整说明在悬停提示里。
+            return banner
+                .flex()
+                .items_center()
+                .gap(px(Space::XS))
+                .child(kit::icon(IconName::Info, 12., p.text_faint))
+                .child(div().id("explorer-search-skipped-text").flex_1().min_w_0().truncate().tooltip_text(full).child(msg))
+                .child(toggle)
+                .into_any_element();
+        }
+        // 展开时说明独占一行并允许换行（修订 6：窄侧栏里不再截成“已跳过 2…”），按钮放到下一行。
+        banner
+            .flex()
+            .flex_col()
+            .gap(px(Space::XXS))
             .child(
-                kit::icon_button(
-                    "explorer-search-skipped-toggle",
-                    if collapsed { IconName::ChevronDown } else { IconName::ChevronUp },
-                    toggle_label,
-                    act("nav-search-skipped-toggle", cx),
-                )
-                .xsmall(),
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(Space::XS))
+                    .child(div().flex_none().child(kit::icon(IconName::Info, 12., p.text_faint)))
+                    .child(div().id("explorer-search-skipped-text").test_support().flex_1().min_w_0().whitespace_normal().child(msg)),
+            )
+            .child(
+                div()
+                    .id("explorer-search-skipped-actions")
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(Space::XS))
+                    .child(
+                        kit::tool_button("explorer-connect-skipped", Some(IconName::Plug), self.t("ui.explorer.connectSkipped"), act("nav-connect-skipped", cx))
+                            .xsmall(),
+                    )
+                    .child(toggle),
             )
             .into_any_element()
     }
@@ -6875,15 +6899,36 @@ impl Workbench {
                     } else {
                         div().into_any_element()
                     };
-                    group(
-                        "settings-security",
-                        self.t("ui.settings.security"),
-                        vec![
-                            (self.t("ui.settings.keychainTitle"), Some(self.t("ui.settings.keychainHint")), div().into_any_element()),
-                            (self.t("ui.settings.vaultStatus"), Some(status_hint), retry),
-                        ],
-                        &p,
-                    )
+                    let mut rows = vec![
+                        (self.t("ui.settings.keychainTitle"), Some(self.t("ui.settings.keychainHint")), div().into_any_element()),
+                        (self.t("ui.settings.vaultStatus"), Some(status_hint), retry),
+                    ];
+                    // 修订 6：旧密码按需迁入；这里给出待迁入数量（只看本地元数据），可以全部迁入或不再迁移。
+                    let pending = alert.pending_count();
+                    if pending > 0 {
+                        let busy = alert.migrating_all || alert.retrying;
+                        let actions = div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(Space::SM))
+                            .child(
+                                kit::tool_button("vault-migrate-all", Some(IconName::Download), self.t("ui.settings.legacyMigrateAll"), act("vault-migrate-all", cx))
+                                    .loading(alert.migrating_all)
+                                    .disabled(busy)
+                                    .small(),
+                            )
+                            .child(
+                                kit::tool_button("vault-dismiss-legacy", None, self.t("ui.settings.legacyDismiss"), act("vault-dismiss-legacy", cx))
+                                    .disabled(busy)
+                                    .small(),
+                            );
+                        rows.push((
+                            self.t("ui.settings.legacyTitle"),
+                            Some(SharedString::from(legacy_pending_line(pending, |key| self.model.text(key)))),
+                            actions.into_any_element(),
+                        ));
+                    }
+                    group("settings-security", self.t("ui.settings.security"), rows, &p)
                 })
                 .child(
                     div()
@@ -9284,13 +9329,13 @@ pub(super) fn issue_field(name: &str) -> Option<DraftField> {
     })
 }
 
-/// R7：保险库提示的逐行文字（迁移失败数、按类别的加载失败、主密钥无效已更换、损坏已保留）。提示条与设置页共用。
 /// 标签列表弹层的宽度：按窗口宽度在 360–480 之间取，窄窗口里不超出窗口（两侧留边距）。
 pub(super) fn tab_picker_width(viewport_w: f32) -> f32 {
     let fit = (viewport_w - 2. * kit::ControlSize::POPOVER_MARGIN).max(kit::ControlSize::PICKER_MIN_W);
     (viewport_w * 0.4).clamp(kit::ControlSize::TAB_PICKER_MIN_W, kit::ControlSize::TAB_PICKER_MAX_W).min(fit)
 }
 
+/// R7：保险库提示的逐行文字（迁移失败数、按类别的加载失败、主密钥无效已更换、损坏已保留）。提示条与设置页共用。
 pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(&str) -> String) -> Vec<String> {
     let mut lines = Vec::new();
     if !alert.failed.is_empty() {
@@ -9306,4 +9351,9 @@ pub(super) fn vault_alert_lines(alert: &super::model::VaultAlert, text: impl Fn(
         lines.push(i18n::fill(&text("ui.vault.corrupt"), &[("path", path)]));
     }
     lines
+}
+
+/// 修订 6：设置页“旧密码待迁入”的说明文字（含 macOS 可能逐条询问授权的提醒）。
+pub(super) fn legacy_pending_line(pending: usize, text: impl Fn(&str) -> String) -> String {
+    i18n::fill(&text("ui.settings.legacyPending"), &[("n", &pending.to_string())])
 }

@@ -49,7 +49,7 @@ pub fn entry_text(locale: Locale, entry: &LogEntry) -> String {
     }
     // 没执行到的语句只说状态：执行层写的说明与状态词重复，而且不随界面语言变化。
     if !entry.message.is_empty() && entry.status != "skipped" {
-        parts.push(entry.message.clone());
+        parts.push(crate::query::commands::localize_call_notes(&entry.message, locale));
     }
     // 失败且被自动改写时，读屏也要听到“语句被执行前改过”。
     if entry.failed() {
@@ -135,7 +135,7 @@ impl LogPanel<'_> {
             let sql = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
             let full_sql = entry.sql.trim().to_owned();
             let copy_sql_text = full_sql.clone();
-            let copy_msg_text = entry.message.clone();
+            let copy_msg_text = crate::query::commands::localize_call_notes(&entry.message, locale);
             list = list.child(
                 div()
                     .id(SharedString::from(format!("query-log-{index}")))
@@ -244,7 +244,7 @@ impl LogPanel<'_> {
                                                 // R5：日志消息可以选中复制，复制按钮保留。
                                                 .child(kit::selectable_text(
                                                     SharedString::from(format!("query-log-msg-text-{index}")),
-                                                    SharedString::from(entry.message.clone()),
+                                                    SharedString::from(crate::query::commands::localize_call_notes(&entry.message, locale)),
                                                 )),
                                         )
                                         .child(

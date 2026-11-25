@@ -718,14 +718,20 @@ struct Source {
 fn source_columns<'a>(scope: &'a CompletionScope, table: &TableRef) -> Option<&'a CompletionSource> {
     let name = table.name.to_lowercase();
     let tail = format!(".{name}");
-    scope.sources.iter().find(|source| {
-        let label = source.label.to_lowercase();
-        if table.schema.is_empty() {
+    if table.schema.is_empty() {
+        return scope.sources.iter().find(|source| {
+            let label = source.label.to_lowercase();
             label == name || label.ends_with(&tail)
-        } else {
-            label == format!("{}.{}", table.schema.to_lowercase(), name) || (label == name && !label.contains('.'))
-        }
-    })
+        });
+    }
+    // 带限定名时先找完全一致的 `库/模式.表`（跨库限定表的列按需读到后就是这一种）；
+    // 没有时才退回不带限定的同名来源（只知道表名的旧数据）。
+    let qualified = format!("{}.{}", table.schema.to_lowercase(), name);
+    scope
+        .sources
+        .iter()
+        .find(|source| source.label.to_lowercase() == qualified)
+        .or_else(|| scope.sources.iter().find(|source| source.label.to_lowercase() == name))
 }
 
 fn schema_of(label: &str) -> String {

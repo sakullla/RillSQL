@@ -4890,18 +4890,17 @@ impl GridPane {
             let hidden_count = self.session.hidden_columns().len();
             let managing = self.column_manager.is_some();
             let manage_label = t("grid.column.manage");
-            let manage_tip = if hidden_count > 0 {
-                SharedString::from(i18n::fill(&i18n::text(locale, "grid.column.hiddenCount"), &[("count", &hidden_count.to_string())]))
-            } else {
-                t("grid.column.manageHint")
-            };
+            let manage_tip = column_manage_tooltip(locale, managing, hidden_count);
             let manage = {
                 let entity = entity.clone();
                 move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
                     entity.update(cx, |pane, cx| pane.toggle_column_manager(window, cx));
                 }
             };
-            let mut manage_button = kit::tool_button("grid-columns-manage", Some(IconName::Columns3), manage_label, manage).tooltip(manage_tip);
+            let mut manage_button = kit::tool_button("grid-columns-manage", Some(IconName::Columns3), manage_label, manage);
+            if let Some(tip) = manage_tip {
+                manage_button = manage_button.tooltip(tip);
+            }
             if managing || hidden_count > 0 {
                 manage_button = manage_button.selected(true);
             }
@@ -7968,6 +7967,19 @@ mod shortcut_tests {
     }
 }
 
+
+/// “列”按钮的提示气泡：面板已经打开时不显示（修订 6，气泡会盖住面板顶部）；
+/// 有隐藏列时说明隐藏了几列，否则说明按钮用途。
+fn column_manage_tooltip(locale: Locale, managing: bool, hidden_count: usize) -> Option<SharedString> {
+    if managing {
+        return None;
+    }
+    Some(SharedString::from(if hidden_count > 0 {
+        i18n::fill(&i18n::text(locale, "grid.column.hiddenCount"), &[("count", &hidden_count.to_string())])
+    } else {
+        i18n::text(locale, "grid.column.manageHint")
+    }))
+}
 
 #[cfg(test)]
 mod tests;
@@ -11089,6 +11101,16 @@ mod workbench_tests {
         assert_eq!(visual.debug_bounds("grid-th-2"), Some(second), "冻结的第 2 列不随横向滚动移动");
         let third = visual.debug_bounds("grid-th-3");
         assert!(third.is_none_or(|bounds| bounds.origin.x != second.origin.x + second.size.width), "未冻结的列滚走了：{third:?}");
+    }
+
+    /// 修订 6：列面板打开时“列”按钮不显示提示气泡；关着时照常说明用途或隐藏数。
+    #[test]
+    fn column_button_tooltip_is_hidden_while_the_panel_is_open() {
+        assert_eq!(super::column_manage_tooltip(Locale::ZhCn, true, 0), None);
+        assert_eq!(super::column_manage_tooltip(Locale::ZhCn, true, 3), None);
+        assert_eq!(super::column_manage_tooltip(Locale::En, false, 0).map(|tip| tip.to_string()), Some(i18n::text(Locale::En, "grid.column.manageHint")));
+        let hidden = super::column_manage_tooltip(Locale::ZhCn, false, 3).expect("有提示").to_string();
+        assert!(hidden.contains('3'), "{hidden}");
     }
 
     #[gpui_kit::test]

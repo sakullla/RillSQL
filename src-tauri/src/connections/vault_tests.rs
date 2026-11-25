@@ -287,9 +287,10 @@ fn vault_sits_next_to_the_connection_store() {
     assert_eq!(vault_path_for(std::path::Path::new("connections.sqlite")), PathBuf::from(VAULT_FILE));
 }
 
+/// 修订 6：加载保险库只读主密钥；名单里的账户第一次取密码时才读它自己的旧条目，每个最多一次。
 #[test]
-fn registered_accounts_migrate_eagerly_on_first_load_and_only_once() {
-    let dir = temp_dir("eager");
+fn registered_accounts_migrate_lazily_one_entry_per_first_use() {
+    let dir = temp_dir("lazy-scope");
     let master = Counting::with(&[]);
     let a = password_account("a");
     let b = ssh_password_account("a");
@@ -300,31 +301,101 @@ fn registered_accounts_migrate_eagerly_on_first_load_and_only_once() {
     let store = vault(&dir, master.clone(), Some(legacy.clone()));
     store.register_legacy(vec![a.clone(), b.clone(), c.clone()]);
     assert_eq!(legacy.gets.load(Ordering::SeqCst), 0, "登记不访问钥匙串");
-    // 第一次用到保险库（读一个不相干的账户）就把整份名单迁完。
+    assert_eq!(store.pending_legacy(), None, "没加载时不知道待迁移数，也不为此加载");
+    // 第一次用到保险库（读一个不相干的账户）：只读主密钥，旧条目一个都不读。
     assert_eq!(store.get("conn:other:password").unwrap(), None);
-    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3);
-    let left = legacy.values();
-    assert!(!left.contains_key(&a) && !left.contains_key(&b), "写入 vault 后才删旧条目");
-    assert_eq!(left.get(&c).map(String::as_str), Some("pc"), "失败的旧条目保留");
-    assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
-    assert!(matches!(store.get(&c), Err(SecretError::MigrationFailed(_))));
-    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::MigrationFailed { account, .. }] if account == &c));
-    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3, "失败的账户不自动反复重试");
+    assert_eq!(master.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 0);
+    assert_eq!(store.pending_legacy(), Some(3));
+    assert_eq!(master.gets.load(Ordering::SeqCst) + legacy.gets.load(Ordering::SeqCst), 1, "计数不访问钥匙串");
 
-    // 重启后再次登记：不再读旧条目。
+    // a 第一次取密码：只读 a 的旧条目一次，写进 vault 后删除。
+    assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 1);
+    assert!(!legacy.values().contains_key(&a), "写入 vault 后才删旧条目");
+    assert_eq!(legacy.values().get(&b).map(String::as_str), Some("sa"), "别的账户还没用到，不动");
+    for _ in 0..3 {
+        assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
+    }
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 1, "之后不再读钥匙串");
+    assert_eq!(store.pending_legacy(), Some(2));
+
+    // c 读取被拒：如实报错并记下，不自动反复重试。
+    assert!(matches!(store.get(&c), Err(SecretError::MigrationFailed(_))));
+    assert!(matches!(store.get(&c), Err(SecretError::MigrationFailed(_))));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 2);
+    assert!(matches!(store.take_notices().as_slice(), [VaultNotice::MigrationFailed { account, .. }] if account == &c));
+    assert_eq!(store.pending_legacy(), Some(1));
+    assert_eq!(master.gets.load(Ordering::SeqCst), 1, "主密钥只读一次");
+
+    // 重启后再次登记：已迁入的不再读，失败的跨重启保留，还没用到的仍待迁移。
     let restarted = vault(&dir, master.clone(), Some(legacy.clone()));
     restarted.register_legacy(vec![a.clone(), b.clone(), c.clone()]);
-    assert_eq!(restarted.get(&b).unwrap().as_deref(), Some("sa"));
-    assert_eq!(legacy.gets.load(Ordering::SeqCst), 3);
+    assert_eq!(restarted.get(&a).unwrap().as_deref(), Some("pa"));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 2);
     assert_eq!(restarted.migration_failures().unwrap().len(), 1);
+    assert_eq!(restarted.pending_legacy(), Some(1));
 
     // 授权恢复后重试：迁入并删除旧条目。
     legacy.failing.lock().unwrap().clear();
     let report = restarted.retry_failed_migration().unwrap();
     assert_eq!(report.migrated, vec![c.clone()]);
     assert_eq!(restarted.get(&c).unwrap().as_deref(), Some("pc"));
-    assert!(legacy.values().is_empty());
     assert!(restarted.migration_failures().unwrap().is_empty());
+    assert_eq!(restarted.get(&b).unwrap().as_deref(), Some("sa"));
+    assert!(legacy.values().is_empty());
+    assert_eq!(restarted.pending_legacy(), Some(0));
+}
+
+/// 修订 6：“现在全部迁入”每个待迁移和失败的账户各读一次，失败逐个报告；“不再迁移”只清标记。
+#[test]
+fn migrate_all_reads_each_pending_entry_once_and_dismiss_only_clears_marks() {
+    let dir = temp_dir("migrate-all");
+    let master = Counting::with(&[]);
+    let a = password_account("a");
+    let b = password_account("b");
+    let c = password_account("c");
+    let d = password_account("d");
+    let legacy = Counting::with(&[(&a, "pa"), (&b, "pb"), (&c, "pc"), (&d, "pd")]);
+    legacy.fail(&b);
+    legacy.fail(&c);
+    let store = vault(&dir, master.clone(), Some(legacy.clone()));
+    store.register_legacy(vec![a.clone(), b.clone(), c.clone(), d.clone()]);
+    store.put("conn:x:password", "x").unwrap();
+    assert!(store.get(&d).is_ok());
+    assert_eq!(store.pending_legacy(), Some(3));
+
+    let report = store.migrate_all_legacy().unwrap();
+    assert_eq!(report.migrated, vec![a.clone()]);
+    assert_eq!(report.failed.iter().map(|(account, _)| account.clone()).collect::<Vec<_>>(), vec![b.clone(), c.clone()]);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 4, "d 一次 + 三个待迁移各一次");
+    let notices = store.take_notices();
+    assert_eq!(notices.iter().filter(|notice| matches!(notice, VaultNotice::MigrationFailed { .. })).count(), 2);
+    assert_eq!(store.pending_legacy(), Some(0));
+
+    // 再点一次：只重读失败的两个。
+    legacy.failing.lock().unwrap().remove(&b);
+    let report = store.migrate_all_legacy().unwrap();
+    assert_eq!(report.migrated, vec![b.clone()]);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 6);
+    store.take_notices();
+
+    // 不再迁移：c 不再算失败，之后取它的密码不读旧钥匙串，返回 None 让用户重新输入。
+    let reads = legacy.gets.load(Ordering::SeqCst);
+    assert_eq!(store.dismiss_legacy().unwrap(), 1);
+    assert_eq!(store.take_notices(), vec![VaultNotice::MigrationRecovered { account: c.clone() }]);
+    assert!(store.migration_failures().unwrap().is_empty());
+    assert_eq!(store.get(&c).unwrap(), None);
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), reads);
+    assert_eq!(legacy.values().get(&c).map(String::as_str), Some("pc"), "旧条目原样保留");
+    assert_eq!(store.get("conn:x:password").unwrap().as_deref(), Some("x"), "保险库里的数据不动");
+    // 重启后仍不再迁移。
+    let restarted = vault(&dir, master, Some(legacy.clone()));
+    restarted.register_legacy(vec![a.clone(), b.clone(), c.clone(), d.clone()]);
+    assert_eq!(restarted.get(&c).unwrap(), None);
+    assert_eq!(restarted.pending_legacy(), Some(0));
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), reads);
+    assert_eq!(restarted.dismiss_legacy().unwrap(), 0);
 }
 
 #[test]
@@ -361,52 +432,23 @@ fn legacy_entries_stay_when_the_vault_cannot_be_written() {
     assert_eq!(legacy.deletes.load(Ordering::SeqCst), 0);
 }
 
-/// 旧钥匙串读完就把目录改成只读：模拟“损坏文件已改名保留，随后迁移写盘失败”。
-#[cfg(unix)]
-struct FreezeOnRead {
-    dir: PathBuf,
-    inner: Arc<Counting>,
-    frozen: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(unix)]
-impl SecretStore for FreezeOnRead {
-    fn put(&self, account: &str, secret: &str) -> Result<(), SecretError> {
-        self.inner.put(account, secret)
-    }
-
-    fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
-        use std::os::unix::fs::PermissionsExt;
-        if !self.frozen.swap(true, Ordering::SeqCst) {
-            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o500)).unwrap();
-        }
-        self.inner.get(account)
-    }
-
-    fn delete(&self, account: &str) -> Result<(), SecretError> {
-        self.inner.delete(account)
-    }
-}
-
-#[cfg(unix)]
+/// 保险库损坏：加载只报告损坏，不读旧条目；名单里的账户之后照常按需迁入新保险库。
 #[test]
-fn corrupt_report_is_not_masked_by_a_failed_migration_write() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir("corrupt-masked");
+fn corrupt_vault_load_reads_no_legacy_entry_and_lazy_migration_still_works() {
+    let dir = temp_dir("corrupt-lazy");
     let master = Counting::with(&[]);
     vault(&dir, master.clone(), None).put("x", "y").unwrap();
     fs::write(dir.join(VAULT_FILE), b"not a vault").unwrap();
     let a = password_account("a");
-    let legacy = Arc::new(FreezeOnRead { dir: dir.clone(), inner: Counting::with(&[(&a, "pa")]), frozen: Default::default() });
+    let legacy = Counting::with(&[(&a, "pa")]);
     let store = vault(&dir, master, Some(legacy.clone()));
     store.register_legacy(vec![a.clone()]);
     let first = store.get("x");
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(first, Err(SecretError::Corrupt(_))), "损坏说明优先：{first:?}");
+    assert!(matches!(first, Err(SecretError::Corrupt(_))), "{first:?}");
     assert!(matches!(store.take_notices().as_slice(), [VaultNotice::Corrupt { .. }]));
-    // 迁移没写成：名单仍待迁移，下次访问时再跑并迁入。
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 0);
     assert_eq!(store.get(&a).unwrap().as_deref(), Some("pa"));
-    assert!(legacy.inner.values().is_empty());
+    assert!(legacy.values().is_empty());
 }
 
 #[test]

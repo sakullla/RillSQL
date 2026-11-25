@@ -3094,7 +3094,7 @@ impl Workbench {
             | PendingJob::DeleteSaved => "history",
             // 分组用自己的任务板：分组的读写不能顶掉正在读取的连接列表。
             PendingJob::RefreshGroups | PendingJob::GroupOp => "groups",
-            PendingJob::RetryVaultMigration => "vault",
+            PendingJob::RetryVaultMigration | PendingJob::MigrateAllLegacy | PendingJob::DismissLegacy => "vault",
             PendingJob::ReadProfiles(..) | PendingJob::SaveProfiles(_) => "profile-import",
             _ => "connections",
         };

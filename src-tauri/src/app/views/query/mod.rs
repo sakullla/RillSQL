@@ -392,7 +392,8 @@ pub fn statement_message(locale: Locale, status: &str, message: &str) -> String 
     if status == "skipped" {
         i18n::text(locale, "query.log.skipped")
     } else {
-        message.to_owned()
+        // 修订 6：CALL 的额外说明按界面语言显示。
+        crate::query::commands::localize_call_notes(message, locale)
     }
 }
 
@@ -575,6 +576,33 @@ impl Drop for QueryPane {
         for handle in self.metadata_reads.values() { handle.abort(); }
         for read in self.object_reads.values() { read.abort(); }
     }
+}
+
+/// 语句里引用的表要按需读取的列元数据：(键, 连接, 库, 模式, 表)。
+/// 名字第一段是库的引擎（MySQL）里，`其他库.表` 读那个库的表（修订 6：跨库限定表的别名列补全靠它）。
+fn statement_metadata_requests(
+    draft: &str,
+    target: &desk::Target,
+    engine: crate::catalog::Engine,
+    objects: &[TreeObject],
+) -> Vec<(String, String, String, String, String)> {
+    let parsed = crate::query::complete::parse_scope(draft);
+    let mut requests = Vec::new();
+    for table in parsed.tables.into_iter().chain(parsed.target) {
+        if parsed.ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&table.name)) { continue; }
+        // 名字第一段是库（而不是模式）的引擎：`库.表` 指向另一个库。
+        let mysql = crate::adapters::catalog_of(engine).qualifier_is_database();
+        let database = if mysql && !table.schema.is_empty() { table.schema.clone() } else { target.database.clone() };
+        let mut schema = if mysql { String::new() } else if table.schema.is_empty() { target.schema.clone() } else { table.schema };
+        if schema.is_empty() && crate::adapters::adapter(engine).capabilities().shows_schemas {
+            let candidates: Vec<_> = objects.iter().filter(|object| object.connection_id == target.connection_id && object.database == database && object.name.eq_ignore_ascii_case(&table.name)).collect();
+            if candidates.len() == 1 { schema = candidates[0].schema.clone(); }
+        }
+        let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", target.connection_id, database, schema, table.name);
+        if requests.iter().any(|request: &(String, String, String, String, String)| request.0 == key) { continue; }
+        requests.push((key, target.connection_id.clone(), database, schema, table.name));
+    }
+    requests
 }
 
 impl QueryPane {
@@ -2764,21 +2792,7 @@ impl QueryPane {
         }
         let Ok(engine) = crate::catalog::Engine::parse(&target.engine) else { return };
         if !engine.is_relational() { return; }
-        let parsed = crate::query::complete::parse_scope(&self.desk.draft());
-        let mut requests = Vec::new();
-        for table in parsed.tables.into_iter().chain(parsed.target) {
-            if parsed.ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&table.name)) { continue; }
-            // 名字第一段是库（而不是模式）的引擎：`库.表` 指向另一个库。
-            let mysql = crate::adapters::catalog_of(engine).qualifier_is_database();
-            let database = if mysql && !table.schema.is_empty() { table.schema.clone() } else { target.database.clone() };
-            let mut schema = if mysql { String::new() } else if table.schema.is_empty() { target.schema.clone() } else { table.schema };
-            if schema.is_empty() && crate::adapters::adapter(engine).capabilities().shows_schemas {
-                let candidates: Vec<_> = self.desk.objects().iter().filter(|object| object.connection_id == target.connection_id && object.database == database && object.name.eq_ignore_ascii_case(&table.name)).collect();
-                if candidates.len() == 1 { schema = candidates[0].schema.clone(); }
-            }
-            let key = format!("{}\u{1}{}\u{1}{}\u{1}{}", target.connection_id, database, schema, table.name);
-            requests.push((key, target.connection_id.clone(), database, schema, table.name));
-        }
+        let requests = statement_metadata_requests(&self.desk.draft(), &target, engine, self.desk.objects());
         let wanted: HashSet<&str> = requests.iter().map(|request| request.0.as_str()).collect();
         let seen = &mut self.metadata_seen;
         self.metadata_reads.retain(|key, handle| {
@@ -8334,7 +8348,7 @@ mod tests {
     }
 
     /// 多节点计划默认显示画布：卡片可见、点卡片同步右侧详情并聚焦画布，方向键沿用同一选中；
-    /// 缩放按钮钳制在 0.4–2.0、100% 复位、适配后整棵树放进视口；拖拽平移后松开不选中节点；
+    /// 缩放按钮钳制在 0.4–2.0、100% 复位、适配后整棵树按不低于可读下限的比例放进视口（放不下的平移）；拖拽平移后松开不选中节点；
     /// 切到列表或原始后再次出结果保持所选视图；没选过视图时单节点计划默认列表，画布中单节点居中。
     #[gpui_kit::test]
     fn plan_canvas_is_the_default_for_multi_node_plans_and_the_choice_is_remembered(cx: &mut TestAppContext) {
@@ -8351,16 +8365,26 @@ mod tests {
             assert_eq!(window.find("plan-view-canvas").selected(), Some(true));
             assert!(window.try_find("query-plan-tree").is_none(), "画布模式不画列表树");
             let canvas = window.find("query-plan-canvas").bounds();
+            // 修订 6：结果区较矮时适配停在可读下限：宽度放得下的卡片都在视口内，根卡片从顶部开始可见，
+            // 下面放不下的层级平移查看。
             for index in 0..4 {
                 let card = window.find(SharedString::from(format!("query-plan-card-{index}"))).bounds();
-                assert!(card.left() >= canvas.left() && card.right() <= canvas.right() && card.top() >= canvas.top() && card.bottom() <= canvas.bottom(), "适配后卡片 {index} 在视口内");
+                assert!(card.left() >= canvas.left() && card.right() <= canvas.right(), "适配后卡片 {index} 水平在视口内 {card:?} {canvas:?}");
             }
+            let root = window.find("query-plan-card-0").bounds();
+            assert!(root.top() >= canvas.top() && root.bottom() <= canvas.bottom(), "根卡片可见 {root:?} {canvas:?}");
             assert_eq!(window.find("query-plan-card-0").selected(), Some(true));
             assert_eq!(window.find("query-plan-detail").label(), Some("CO-ROUTINE v"));
             let fitted = pane.read(cx).plan_canvas.zoom;
             assert!(fitted <= 1., "自动适配不放大");
+            assert!(fitted >= plan_canvas::FIT_MIN_ZOOM, "自动适配不低于可读下限：{fitted}");
 
-            // 点卡片：选中同步到详情，画布持有焦点，方向键照常导航。
+            // 点卡片：选中同步到详情，画布持有焦点，方向键照常导航。下层卡片先用滚轮平移到视口里。
+            let below = (window.find("query-plan-card-2").bounds().bottom() - canvas.bottom()).as_f32() + 8.;
+            if below > 0. {
+                window.scroll("query-plan-canvas", gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-below))), cx);
+                window.render_frame(cx);
+            }
             window.click("query-plan-card-2", cx);
             window.render_frame(cx);
             assert_eq!(plan_state(&pane, window, cx), (2, true));
@@ -8428,6 +8452,24 @@ mod tests {
             assert!((card.center().x - canvas.center().x).abs().as_f32() < 2. && (card.center().y - canvas.center().y).abs().as_f32() < 2., "单节点在画布中居中：{card:?} {canvas:?}");
         })
         .unwrap();
+    }
+
+    /// 修订 6：跨库限定表 `其他库.表 别名` 会请求加载那个库那张表的列，别名列补全因此能用。
+    #[test]
+    fn cross_database_qualified_tables_request_their_columns() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("my", "shop", "mysql", "shop");
+        let target = desk.target().unwrap();
+        let requests = super::statement_metadata_requests(
+            "select a. from shop_archive.orders a join customers c on c.id = a.customer_id",
+            &target,
+            crate::catalog::Engine::Mysql,
+            &[],
+        );
+        let wanted: Vec<(&str, &str, &str)> = requests.iter().map(|(_, _, database, schema, table)| (database.as_str(), schema.as_str(), table.as_str())).collect();
+        assert!(wanted.contains(&("shop_archive", "", "orders")), "跨库限定表读那个库：{wanted:?}");
+        assert!(wanted.contains(&("shop", "", "customers")), "{wanted:?}");
     }
 
     /// 导航步进是纯钳制：空计划没有可选节点，越界的旧选中先收回到末节点。

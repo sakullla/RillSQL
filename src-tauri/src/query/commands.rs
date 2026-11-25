@@ -362,20 +362,66 @@ fn statement_dtos(mut statement: StatementReport) -> Vec<StatementDto> {
     if last.affected.is_none() {
         last.affected = extras.affected.filter(|_| last.columns.is_empty());
     }
+    // 执行层不知道界面语言：按中文模板写进消息，显示时由 `localize_call_notes` 换成界面语言。
+    let zh = crate::i18n::Locale::ZhCn;
     let mut notes: Vec<String> = Vec::new();
     if extras.no_result_set {
-        notes.push("过程已执行，未返回结果集。".to_owned());
+        notes.push(crate::i18n::text(zh, "query.call.noResultSet"));
     }
     if let Some(affected) = extras.affected.filter(|_| total > 1) {
-        notes.push(format!("影响 {affected} 行。"));
+        notes.push(crate::i18n::fill(&crate::i18n::text(zh, "query.call.affected"), &[("n", &affected.to_string())]));
     }
     if !extras.warnings.is_empty() {
-        notes.push(format!("警告（{} 条）：{}", extras.warnings.len(), extras.warnings.join("；")));
+        let head = crate::i18n::fill(&crate::i18n::text(zh, "query.call.warnings"), &[("n", &extras.warnings.len().to_string())]);
+        notes.push(format!("{head}{}", extras.warnings.join(&crate::i18n::text(zh, "query.call.warningSep"))));
     }
     notes.extend(extras.notes);
     if !notes.is_empty() {
         let text = notes.join(" ");
         last.message = if last.message.trim().is_empty() { text } else { format!("{} {text}", last.message) };
+    }
+    out
+}
+
+/// 修订 6：CALL 额外说明（未返回结果集、影响行数、警告）按界面语言显示。执行层按中文模板写入消息，
+/// 这里把认得出的模板片段换成界面语言的同一条模板；其余文字（服务器原文）原样保留。
+pub fn localize_call_notes(message: &str, locale: crate::i18n::Locale) -> String {
+    use crate::i18n::{fill, text, Locale};
+    if locale == Locale::ZhCn || message.is_empty() {
+        return message.to_owned();
+    }
+    let zh = Locale::ZhCn;
+    let mut out = message.replace(&text(zh, "query.call.noResultSet"), &text(locale, "query.call.noResultSet"));
+    // 带 {n} 的模板：按占位符前后的固定文字找出数字，再按界面语言的模板重填。
+    let swap_numbered = |input: &str, key: &str| -> (String, Option<usize>) {
+        let template = text(zh, key);
+        let Some((before, after)) = template.split_once("{n}") else { return (input.to_owned(), None) };
+        let mut result = String::new();
+        let mut rest = input;
+        let mut tail_at = None;
+        while let Some(at) = rest.find(before) {
+            let digits_start = at + before.len();
+            let digits: String = rest[digits_start..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if digits.is_empty() || !rest[digits_start + digits.len()..].starts_with(after) {
+                result.push_str(&rest[..digits_start]);
+                rest = &rest[digits_start..];
+                continue;
+            }
+            result.push_str(&rest[..at]);
+            result.push_str(&fill(&text(locale, key), &[("n", &digits)]));
+            rest = &rest[digits_start + digits.len() + after.len()..];
+            tail_at = Some(result.len());
+        }
+        result.push_str(rest);
+        (result, tail_at)
+    };
+    out = swap_numbered(&out, "query.call.affected").0;
+    let (swapped, warnings_at) = swap_numbered(&out, "query.call.warnings");
+    out = swapped;
+    // 警告清单之间的分隔符也换成界面语言的写法。
+    if let Some(at) = warnings_at {
+        let (head, list) = out.split_at(at);
+        out = format!("{head}{}", list.replace(&text(zh, "query.call.warningSep"), &text(locale, "query.call.warningSep")));
     }
     out
 }
@@ -513,6 +559,35 @@ mod result_set_tests {
         let plain = statement_dtos(report(&["v"], None, ResultExtras::default()));
         assert_eq!(plain.len(), 1);
         assert!(plain[0].message.is_empty());
+    }
+
+    /// 修订 6：CALL 提示文字走 i18n，中英文都有；英文界面不残留中文模板，服务器原文保留。
+    #[test]
+    fn procedure_notes_follow_the_interface_language() {
+        use crate::i18n::Locale;
+        let set = StatementValue { columns: vec!["id".to_owned()], column_types: Vec::new(), rows: Vec::new(), truncated: false, affected: None };
+        let extras = ResultExtras {
+            more: vec![set],
+            affected: Some(3),
+            warnings: vec!["Warning 1642: demo".to_owned(), "Note 1051: other".to_owned()],
+            notes: Vec::new(),
+            no_result_set: false,
+            partial: None,
+        };
+        let pages = statement_dtos(report(&["order_id"], None, extras));
+        let zh = localize_call_notes(&pages[1].message, Locale::ZhCn);
+        assert!(zh.contains("影响 3 行。") && zh.contains("警告（2 条）："), "{zh}");
+        let en = localize_call_notes(&pages[1].message, Locale::En);
+        assert!(en.contains("3 rows affected.") && en.contains("Warnings (2): Warning 1642: demo; Note 1051: other"), "{en}");
+        assert!(!crate::ddl::english::has_cjk(&en), "{en}");
+
+        let none = statement_dtos(report(&[], Some(0), ResultExtras { no_result_set: true, ..Default::default() }));
+        assert_eq!(localize_call_notes(&none[0].message, Locale::En), "The procedure ran and returned no result set.");
+        for key in ["query.call.noResultSet", "query.call.affected", "query.call.warnings", "query.call.warningSep"] {
+            assert_ne!(crate::i18n::text(Locale::ZhCn, key), crate::i18n::text(Locale::En, key), "{key}");
+        }
+        // 不是模板的文字原样保留。
+        assert_eq!(localize_call_notes("影响 x 行。", Locale::En), "影响 x 行。");
     }
 
     /// R14：过程中途失败时，已经读到的结果集仍是一页一个，但每页都按失败显示；

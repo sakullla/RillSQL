@@ -821,6 +821,10 @@ dict! {
     "query.log.ok" => "成功", "Succeeded";
     "query.log.error" => "失败", "Failed";
     "query.log.skipped" => "未执行", "Skipped";
+    "query.call.noResultSet" => "过程已执行，未返回结果集。", "The procedure ran and returned no result set.";
+    "query.call.affected" => "影响 {n} 行。", "{n} rows affected.";
+    "query.call.warnings" => "警告（{n} 条）：", "Warnings ({n}): ";
+    "query.call.warningSep" => "；", "; ";
     "query.log.unknown" => "状态未知", "Unknown";
     "query.log.run" => "整次执行", "Whole run";
     "query.log.rows" => "{count} 行", "{count} rows";
@@ -1890,6 +1894,11 @@ dict! {
     "ui.vault.retryPlain" => "重试", "Retry";
     "ui.vault.dismiss" => "收起提示", "Dismiss";
     "ui.vault.retryDone" => "已迁入本地保险库", "Moved into the local vault";
+    "ui.vault.legacyDismissed" => "不再迁移旧密码，用到这些连接时请重新输入密码", "Old passwords will no longer be moved; re-enter them when those connections need one";
+    "ui.settings.legacyTitle" => "旧密码迁移", "Old saved passwords";
+    "ui.settings.legacyPending" => "还有 {n} 个旧密码未迁入本地保险库，用到对应连接时会自动迁入。点“现在全部迁入”时，macOS 可能对每一条各询问一次授权；也可以选择不再迁移，之后用到这些连接时重新输入密码。", "{n} old saved passwords have not moved into the local vault yet; each moves automatically the first time its connection needs it. \"Move all now\" may make macOS ask once per entry. You can also stop moving them and re-enter those passwords when needed.";
+    "ui.settings.legacyMigrateAll" => "现在全部迁入", "Move all now";
+    "ui.settings.legacyDismiss" => "不再迁移", "Stop moving";
     "history.page.loading" => "正在读取历史…", "Reading history…";
     "history.page.loadingSaved" => "正在读取保存的查询…", "Reading saved queries…";
     "history.page.retryLoad" => "重新读取", "Reload";

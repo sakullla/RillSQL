@@ -137,8 +137,23 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), SecretError>;
 
     /// 登记可能还有旧版逐条钥匙串条目的账户（按 password_saved / ssh_password_saved 枚举）。
-    /// 保险库首次加载时一次性迁移这些账户；不在名单里的账户不再访问旧钥匙串。
+    /// 名单里的账户第一次取密码时才按需迁移；不在名单里的账户不再访问旧钥匙串。
     fn register_legacy(&self, _accounts: Vec<String>) {}
+
+    /// 名单里还没迁入的旧条目数：只看已加载的元数据，不访问钥匙串；保险库还没加载时为 None。
+    fn pending_legacy(&self) -> Option<usize> {
+        None
+    }
+
+    /// 现在全部迁入：每个待迁移（含之前失败）的账户各读一次旧条目。
+    fn migrate_all_legacy(&self) -> Result<MigrationReport, SecretError> {
+        Ok(MigrationReport::default())
+    }
+
+    /// 不再迁移：清掉待迁移标记，返回清掉的个数。
+    fn dismiss_legacy(&self) -> Result<usize, SecretError> {
+        Ok(0)
+    }
 
     /// 重新尝试迁移之前失败的旧条目。
     fn retry_failed_migration(&self) -> Result<MigrationReport, SecretError> {

@@ -54,6 +54,10 @@ pub enum JobDone {
     Groups(TaskToken, Result<(Vec<ConnectionGroup>, std::collections::BTreeMap<String, String>), String>),
     /// R7：重试迁移旧钥匙串条目的结果。
     VaultRetry(TaskToken, Result<crate::connections::secrets::MigrationReport, crate::connections::secrets::VaultFailure>),
+    /// 修订 6：“现在全部迁入”的结果（失败逐个在报告里）。
+    VaultMigrateAll(TaskToken, Result<crate::connections::secrets::MigrationReport, crate::connections::secrets::VaultFailure>),
+    /// 修订 6：“不再迁移”清掉的标记数。
+    VaultDismissed(TaskToken, Result<usize, crate::connections::secrets::VaultFailure>),
 }
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -216,6 +220,8 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
         }
         PendingJob::RefreshGroups => JobDone::Groups(token, services.connections.groups().await),
         PendingJob::RetryVaultMigration => JobDone::VaultRetry(token, services.connections.retry_failed_migration().await),
+        PendingJob::MigrateAllLegacy => JobDone::VaultMigrateAll(token, services.connections.migrate_all_legacy().await),
+        PendingJob::DismissLegacy => JobDone::VaultDismissed(token, services.connections.dismiss_legacy().await),
         PendingJob::GroupOp => {
             let Some(op) = request.group else {
                 return JobDone::Notice(token, Err("ui.group.new".into()));
@@ -294,7 +300,34 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
     // R7：保险库在打开、保存、测试连接时才加载；它排出的事件（迁移失败、密钥暂不可用、
     // 损坏已保留）随每个任务结果收进提示条。只取内存里的事件，不访问钥匙串。
     model.vault_alert.absorb(services.connections.take_secret_notices());
+    // 修订 6：待迁入的旧密码数只看已加载保险库的元数据，不访问钥匙串。
+    model.vault_alert.pending = services.connections.pending_legacy_count();
     match done {
+        JobDone::VaultMigrateAll(token, result) => {
+            model.vault_alert.migrating_all = false;
+            if accepted(services, owner, token) {
+                let moved_all = result.as_ref().is_ok_and(|report| !report.migrated.is_empty() && report.failed.is_empty());
+                let keep_busy = model.vault_alert.retrying;
+                model.vault_alert.apply_retry(result);
+                model.vault_alert.retrying = keep_busy;
+                if moved_all {
+                    model.notice_key = Some("ui.vault.retryDone");
+                    model.notice_detail.clear();
+                }
+            }
+        }
+        JobDone::VaultDismissed(token, result) => {
+            if accepted(services, owner, token) {
+                let ok = result.is_ok();
+                model.vault_alert.apply_dismiss(result);
+                if ok {
+                    model.notice_key = Some("ui.vault.legacyDismissed");
+                    model.notice_detail.clear();
+                }
+            } else {
+                model.vault_alert.migrating_all = false;
+            }
+        }
         JobDone::VaultRetry(token, result) => {
             if accepted(services, owner, token) {
                 // 只有真的迁入了旧条目、且没有剩下失败时才提示“已迁入”；什么都没迁时不报成功。

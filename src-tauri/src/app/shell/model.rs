@@ -448,6 +448,10 @@ pub enum PendingJob {
     RefreshGroups,
     /// R7：重新迁移之前没能迁入保险库的旧钥匙串条目。
     RetryVaultMigration,
+    /// 修订 6：设置页“现在全部迁入”：待迁移和失败的旧条目各读一次。
+    MigrateAllLegacy,
+    /// 修订 6：设置页“不再迁移”：只清除待迁移标记。
+    DismissLegacy,
     /// 一次分组命令：新建/重命名、删除、归组、折叠。
     GroupOp,
 }
@@ -508,6 +512,10 @@ pub struct VaultAlert {
     pub corrupt_kept: Option<String>,
     /// 重试迁移在途：按钮显示忙碌，不重复派发。
     pub retrying: bool,
+    /// 修订 6：名单里还没迁入的旧密码数；只来自已加载保险库的元数据（不访问钥匙串），没加载时为 None。
+    pub pending: Option<usize>,
+    /// 修订 6：“现在全部迁入”或“不再迁移”在途。
+    pub migrating_all: bool,
     /// 用户收起了提示条；有新的事件时重新出现。
     pub dismissed: bool,
 }
@@ -528,6 +536,26 @@ impl VaultAlert {
     /// 保险库读写失败或密钥暂不可用（没有失败的迁移）时用中性的“重试”。
     pub fn retry_label_key(&self) -> &'static str {
         if self.failed.is_empty() { "ui.vault.retryPlain" } else { "ui.vault.retry" }
+    }
+
+    /// 修订 6：设置页要不要显示“旧密码待迁入”一行（全部迁入 / 不再迁移）。
+    pub fn pending_count(&self) -> usize {
+        self.pending.unwrap_or(0)
+    }
+
+    /// 修订 6：“不再迁移”的结果：失败清单也一并清掉（它们同样不再迁移）。
+    pub fn apply_dismiss(&mut self, result: Result<usize, crate::connections::secrets::VaultFailure>) {
+        self.migrating_all = false;
+        match result {
+            Ok(_) => {
+                self.failed.clear();
+                self.pending = Some(0);
+            }
+            Err(failure) => {
+                self.load_problem = Some(failure);
+                self.dismissed = false;
+            }
+        }
     }
 
     /// 合入保险库排出的事件；有新的问题时取消收起。
@@ -4322,13 +4350,25 @@ impl WorkbenchModel {
         }
     }
 
-    /// R7：保险库提示条的命令：重试迁移、收起。
+    /// R7：保险库提示条的命令：重试迁移、收起；修订 6 加上设置页的“现在全部迁入”“不再迁移”。
     fn vault_command(&mut self, id: &str) -> bool {
         match id {
             "vault-retry-migration" => {
-                if !self.vault_alert.retrying {
+                if !self.vault_alert.retrying && !self.vault_alert.migrating_all {
                     self.vault_alert.retrying = true;
                     self.enqueue(PendingJob::RetryVaultMigration);
+                }
+            }
+            "vault-migrate-all" => {
+                if !self.vault_alert.migrating_all && !self.vault_alert.retrying {
+                    self.vault_alert.migrating_all = true;
+                    self.enqueue(PendingJob::MigrateAllLegacy);
+                }
+            }
+            "vault-dismiss-legacy" => {
+                if !self.vault_alert.migrating_all && !self.vault_alert.retrying {
+                    self.vault_alert.migrating_all = true;
+                    self.enqueue(PendingJob::DismissLegacy);
                 }
             }
             "vault-alert-dismiss" => self.vault_alert.dismissed = true,

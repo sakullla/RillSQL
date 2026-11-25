@@ -14889,6 +14889,14 @@ fn object_tree_filter_focus_protection_skipped_notice_and_shift_enter_structure(
         .unwrap();
     assert!(skipped_count >= 1, "应统计被跳过的未连接连接");
     assert!(has_skipped_banner, "应渲染跳过未连接连接的明确提示");
+    // 修订 6：展开时说明独占一行、可换行，按钮在下一行，关键信息不被按钮挤得截断。
+    cx.update_window(window, |_, window, _| {
+        let text = window.find("explorer-search-skipped-text").bounds();
+        let connect = window.find("explorer-connect-skipped").bounds();
+        assert!(connect.top() >= text.bottom(), "按钮在说明下面：{text:?} {connect:?}");
+        assert!(text.size.width.as_f32() > 120., "说明有整行宽度：{text:?}");
+    })
+    .unwrap();
     // 被跳过的连接连上后计数为 0：横幅不再渲染。
     let banner_after_connect = cx
         .update_window(window, |_, window, cx| {
@@ -15764,6 +15772,7 @@ fn tabs_awaiting_risk_confirmation_are_marked_in_the_strip_and_the_list(cx: &mut
 struct DenyingKeychain {
     inner: crate::connections::secrets::MemoryStore,
     denied: std::sync::Mutex<bool>,
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 impl crate::connections::secrets::SecretStore for DenyingKeychain {
@@ -15772,6 +15781,7 @@ impl crate::connections::secrets::SecretStore for DenyingKeychain {
     }
 
     fn get(&self, account: &str) -> Result<Option<String>, crate::connections::secrets::SecretError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if *self.denied.lock().unwrap() {
             return Err(crate::connections::secrets::SecretError::Unavailable("authorization denied".into()));
         }
@@ -15801,15 +15811,30 @@ async fn vault_migration_failure_surfaces_in_the_ui_and_retry_calls_the_service(
     let master: Arc<dyn crate::connections::secrets::SecretStore> = Arc::new(crate::connections::secrets::MemoryStore::default());
     let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master, Some(legacy.clone()));
     let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
-    // 保险库在第一次用到时加载并迁移（这里直接读一次失败清单代替打开连接）。
-    assert_eq!(services.connections.secret_migration_failures().await.unwrap().len(), 1);
+    // 保险库在第一次用到时加载，只读主密钥，不读旧条目（这里直接读一次失败清单代替打开连接）。
+    assert!(services.connections.secret_migration_failures().await.unwrap().is_empty());
+    assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), 0, "加载保险库不读旧条目");
 
     let mut model = WorkbenchModel::new(Shell::default());
     let _ = model.dispatch("conn-refresh");
     let token = model.prepare_list_token(&services.tasks);
     let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
     apply_done(&mut model, &services, "connections", done);
-    assert!(model.vault_alert.visible(), "任务结果回来时收进保险库事件");
+    // 修订 6：设置页显示待迁入数量（只看本地元数据），点“现在全部迁入”。
+    assert_eq!(model.vault_alert.pending, Some(1));
+    assert!(!model.vault_alert.visible(), "待迁入不是问题，不弹提示条");
+    let line = super::chrome::legacy_pending_line(model.vault_alert.pending_count(), |key| model.text(key));
+    assert!(line.contains('1') && line.contains("macOS"), "{line}");
+    let _ = model.dispatch("vault-migrate-all");
+    assert!(model.vault_alert.migrating_all);
+    let token = model.begin_owner(&services.tasks, "vault");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::MigrateAllLegacy));
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault", done);
+    assert!(!model.vault_alert.migrating_all);
+    assert_eq!(model.vault_alert.pending, Some(0));
+    assert!(model.vault_alert.visible(), "逐个报告失败");
     assert_eq!(model.vault_alert.failed.len(), 1);
     let lines = super::chrome::vault_alert_lines(&model.vault_alert, |key| model.text(key));
     assert!(lines[0].starts_with('1'), "{lines:?}");
@@ -15828,6 +15853,48 @@ async fn vault_migration_failure_surfaces_in_the_ui_and_retry_calls_the_service(
     assert_eq!(model.notice_key, Some("ui.vault.retryDone"));
     assert!(services.connections.secret_migration_failures().await.unwrap().is_empty());
     assert!(legacy.inner.dump().is_empty(), "迁入后旧条目被删除");
+    drop(services);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 修订 6：设置页“不再迁移”：排一条后台任务，只清待迁移标记；之后不再读旧条目。
+#[tokio::test]
+async fn vault_dismiss_legacy_clears_pending_marks_through_the_service() {
+    let dir = std::env::temp_dir().join(format!("rillsql-vault-dismiss-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("connections.sqlite");
+    let legacy = Arc::new(DenyingKeychain::default());
+    let old = AppServices::new(Arc::new(Service::new(config.clone(), legacy.clone())));
+    let mut draft = sample_draft(Engine::Mysql);
+    draft.save_password = true;
+    old.save_connection(draft, Some("pw-demo".into()), None, None).await.unwrap();
+    drop(old);
+    legacy.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let master: Arc<dyn crate::connections::secrets::SecretStore> = Arc::new(crate::connections::secrets::MemoryStore::default());
+    let vault = crate::connections::vault::VaultStore::new(crate::connections::vault::vault_path_for(&config), master, Some(legacy.clone()));
+    let services = AppServices::new(Arc::new(Service::new(config.clone(), Arc::new(vault))));
+    services.connections.secret_migration_failures().await.unwrap();
+
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("conn-refresh");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.vault_alert.pending, Some(1));
+
+    let _ = model.dispatch("vault-dismiss-legacy");
+    let _ = model.dispatch("vault-migrate-all");
+    let token = model.begin_owner(&services.tasks, "vault");
+    let request = request_of(&mut model, token);
+    assert!(matches!(request.job, PendingJob::DismissLegacy));
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "vault", done);
+    assert!(!model.vault_alert.migrating_all);
+    assert_eq!(model.vault_alert.pending, Some(0));
+    assert_eq!(model.notice_key, Some("ui.vault.legacyDismissed"));
+    assert_eq!(legacy.reads.load(std::sync::atomic::Ordering::SeqCst), 0, "不再迁移不读旧条目");
+    assert_eq!(legacy.inner.dump().len(), 1, "旧条目以外的数据都不删，旧条目本身也原样保留");
     drop(services);
     let _ = std::fs::remove_dir_all(dir);
 }

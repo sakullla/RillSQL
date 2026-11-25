@@ -14,10 +14,12 @@
 //! 加载失败按类别（`VaultProblem`）排一条 `VaultNotice::LoadFailed`，原因只带底层信息；
 //! 之后某次加载成功时排 `VaultNotice::LoadRecovered`，界面据此收起旧提示。
 //!
-//! 旧版逐条钥匙串条目（`conn:{id}:password` 等）的迁移：服务层打开连接库时按 password_saved /
-//! ssh_password_saved 登记可能有旧条目的账户，保险库首次加载时一次性迁移整份名单；vault 写入成功后
-//! 才删除已迁入的旧条目。失败的逐个记进元数据并报告（`SecretError::MigrationFailed`），不会每次启动
-//! 都重复读取，用户可通过 `retry_failed_migration` 重试。名单之外的账户（新建连接等）不访问旧钥匙串。
+//! 旧版逐条钥匙串条目（`conn:{id}:password` 等）的迁移按需进行（修订 6）：服务层打开连接库时按
+//! password_saved / ssh_password_saved 登记可能有旧条目的账户；加载保险库只读主密钥，不读任何旧条目
+//! （macOS 对每个旧条目各弹一次授权）。某个账户第一次取密码而保险库里没有时，才读它自己的旧条目一次，
+//! 写进 vault 后删除旧条目。失败的逐个记进元数据并报告（`SecretError::MigrationFailed`），不会每次启动
+//! 都重复读取，用户可通过 `retry_failed_migration` 重试。设置页可“现在全部迁入”（`migrate_all_legacy`）
+//! 或“不再迁移”（`dismiss_legacy`）。名单之外的账户（新建连接等）不访问旧钥匙串。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -50,7 +52,7 @@ const HEADER_LEN: usize = MAGIC.len() + 1;
 struct Contents {
     #[serde(default)]
     secrets: BTreeMap<String, String>,
-    /// 已处理过旧钥匙串条目的账户（迁入成功、旧条目不存在或已被新值取代）。
+    /// 已处理过旧钥匙串条目的账户（迁入成功、旧条目不存在、已被新值取代或用户选择不再迁移）。
     #[serde(default)]
     legacy_done: BTreeSet<String>,
     /// 迁移失败的账户和原因；不自动重试，避免每次启动都弹授权。
@@ -66,8 +68,6 @@ struct Loaded {
 /// 可能还有旧钥匙串条目的账户名单（由服务层按 password_saved / ssh_password_saved 登记）。
 struct LegacyScope {
     accounts: BTreeSet<String>,
-    /// 本进程里已经对名单跑过一次迁移。
-    migrated: bool,
 }
 
 pub struct VaultStore {
@@ -184,19 +184,6 @@ impl VaultStore {
         Ok(report)
     }
 
-    /// 名单登记后、保险库加载后：对名单跑一次迁移（本进程只跑一次，跨重启靠元数据去重）。
-    fn migrate_scope(&self, loaded: &mut Loaded) -> Result<(), SecretError> {
-        let accounts: Vec<String> = match self.scope.lock().expect("vault scope").as_ref() {
-            Some(scope) if !scope.migrated => scope.accounts.iter().cloned().collect(),
-            _ => return Ok(()),
-        };
-        self.migrate_locked(loaded, &accounts, false)?;
-        if let Some(scope) = self.scope.lock().expect("vault scope").as_mut() {
-            scope.migrated = true;
-        }
-        Ok(())
-    }
-
     /// 这个账户在旧钥匙串里可能还有条目吗：处理过的没有；登记过名单时只认名单。
     fn may_have_legacy(&self, contents: &Contents, account: &str) -> bool {
         if self.legacy.is_none() || contents.legacy_done.contains(account) {
@@ -267,13 +254,9 @@ impl VaultStore {
             *guard = Some(loaded);
             outcome = load_outcome;
         }
-        let loaded = guard.as_mut().expect("vault loaded");
-        // 损坏报告优先：迁移写盘失败不能把“原文件已改名保留”的说明盖掉。
-        // 迁移失败时名单保持未迁移，下次访问再跑。
-        let migrated = self.migrate_scope(loaded);
+        // 加载只读主密钥：旧条目一个都不读，留到各账户第一次取密码时按需迁移。
         outcome?;
-        migrated?;
-        Ok(loaded)
+        Ok(guard.as_mut().expect("vault loaded"))
     }
 
     /// 读主密钥和 vault 文件。外层 Err 表示没有可用状态（不缓存，下次重试）；
@@ -356,6 +339,26 @@ impl VaultStore {
         Ok(kept)
     }
 
+    /// 名单里仍待迁移的账户：不在 vault、没处理过、也没失败过。只看内存里的元数据。
+    fn pending_accounts(&self, contents: &Contents) -> Vec<String> {
+        if self.legacy.is_none() {
+            return Vec::new();
+        }
+        match self.scope.lock().expect("vault scope").as_ref() {
+            Some(scope) => scope
+                .accounts
+                .iter()
+                .filter(|account| {
+                    !contents.secrets.contains_key(*account)
+                        && !contents.legacy_done.contains(*account)
+                        && !contents.legacy_failed.contains_key(*account)
+                })
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     fn corrupt_error(&self, kept: PathBuf, cause: CorruptCause) -> SecretError {
         if let CorruptCause::KeyInvalid = cause {
             return SecretError::Corrupt(format!(
@@ -417,7 +420,49 @@ impl SecretStore for VaultStore {
     }
 
     fn register_legacy(&self, accounts: Vec<String>) {
-        *self.scope.lock().expect("vault scope") = Some(LegacyScope { accounts: accounts.into_iter().collect(), migrated: false });
+        *self.scope.lock().expect("vault scope") = Some(LegacyScope { accounts: accounts.into_iter().collect() });
+    }
+
+    /// 只按内存里的元数据计数，不访问钥匙串；保险库还没加载时不知道（None）。
+    fn pending_legacy(&self) -> Option<usize> {
+        let guard = self.state.lock().expect("vault state");
+        let loaded = guard.as_ref()?;
+        Some(self.pending_accounts(&loaded.contents).len())
+    }
+
+    /// 现在全部迁入：待迁移的和之前失败的都各读一次旧条目（macOS 可能逐条询问授权）。
+    fn migrate_all_legacy(&self) -> Result<MigrationReport, SecretError> {
+        let mut guard = self.state.lock().expect("vault state");
+        let loaded = self.ensure_loaded(&mut guard)?;
+        let mut accounts = self.pending_accounts(&loaded.contents);
+        accounts.extend(loaded.contents.legacy_failed.keys().cloned());
+        if accounts.is_empty() {
+            return Ok(MigrationReport::default());
+        }
+        self.migrate_locked(loaded, &accounts, true)
+    }
+
+    /// 不再迁移：待迁移和失败的账户都记为已处理，之后不再读旧条目，用到时重新输入密码。
+    /// 只改迁移标记；vault 里已有的密码和旧钥匙串条目都不动。
+    fn dismiss_legacy(&self) -> Result<usize, SecretError> {
+        let mut guard = self.state.lock().expect("vault state");
+        let loaded = self.ensure_loaded(&mut guard)?;
+        let pending = self.pending_accounts(&loaded.contents);
+        let failed: Vec<String> = loaded.contents.legacy_failed.keys().cloned().collect();
+        if pending.is_empty() && failed.is_empty() {
+            return Ok(0);
+        }
+        let mut next = loaded.contents.clone();
+        for account in pending.iter().chain(&failed) {
+            next.legacy_failed.remove(account);
+            next.legacy_done.insert(account.clone());
+        }
+        self.commit(loaded, next)?;
+        let mut notices = self.notices.lock().expect("vault notices");
+        for account in &failed {
+            notices.push(VaultNotice::MigrationRecovered { account: account.clone() });
+        }
+        Ok(pending.len() + failed.len())
     }
 
     /// 重新读取之前失败的旧条目，迁入成功的写进 vault 并删除旧条目。
