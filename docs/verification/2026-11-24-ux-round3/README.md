@@ -4,7 +4,7 @@
 
 ## 结论
 
-- **Rust 测试**：`cargo test --manifest-path src-tauri/Cargo.toml --locked` 全部通过（T12 后 2065 个通过，0 个失败）；`cargo clippy --all-targets --locked` 无警告。
+- **Rust 测试**：`cargo test --manifest-path src-tauri/Cargo.toml --locked` 全部通过（T13 后 2077 个通过，0 个失败）；`cargo clippy --all-targets --locked` 无警告。
 - **原生截图（2026-11-25 补拍）**：在解锁的 macOS 会话里，用 debug 构建和隔离资料目录（`RILLSQL_DEBUG_DATA_DIR`）对 docker 通用夹具逐页操作并截图，共 33 张，见下表。连接只用临时账号 `demo_user`（拍完即删除），密码只在本次运行内记住，没有写入保险库或系统钥匙串。
 - **R15 逐页巡检**：覆盖侧栏、标签栏、表数据、查询、结构、执行计划、对话框、设置。巡检发现的 5 处细节已由 T12 修复，并在修复后补拍（07b、07c、07e、08b、11c、12c）。
 - **未实测**：R7“升级后钥匙串最多授权一次”需要用户本人在正式安装包和真实钥匙串上点击系统授权，本轮没有实测；对应行为由 Rust 测试覆盖。
@@ -49,9 +49,14 @@
 
 ## 已知限制（原生巡检记录）
 
-- 跨库限定的表（如 `shop_a.orders o`），在该表的列尚未加载时，输入 `o.` 不弹出列补全；当前库内的表按需加载，R10 验收场景通过。
 - MySQL TREE 计划的节点名（如 “Nested loop inner join”“Single-row index lookup”）原样显示英文。
-- 结果区较小时画布适配比例约 40%，文字偏小；最大化后自动适配到可读比例。
+- 以下问题在截图后由 T13 修复，现有截图拍摄于修复前：跨库限定表（如 `shop_a.orders o`）的别名列补全改为按需加载；结果区较小时画布自动适配不低于 70%，可平移查看。
+- 08-query-ddl-summary-card 与 09b-query-error-card-closed-by-esc 是同一帧：DDL 摘要卡片折叠、按 Esc 后错误卡片已关闭，两种状态都在这张图里。
+- 方案修订 6 之后，设置 → 安全卡片新增的“还有 N 个旧密码未迁入 / 现在全部迁入 / 不再迁移”没有原生截图，由 Rust 测试覆盖。
+
+## R7 升级迁移（方案修订 6）
+
+旧版本的逐连接钥匙串条目，其访问控制绑定在旧的 ad-hoc 签名上，macOS 读取每个旧条目都会单独授权一次。因此改为按需迁移：启动和加载保险库只读一次主密钥，不读旧条目；某个连接第一次需要密码时才读它自己的旧条目（最多一次），迁入后删除旧条目。测试：`connections::vault::tests::registered_accounts_migrate_lazily_one_entry_per_first_use`（加载时主密钥 1 次、旧条目 0 次；首次取用时旧条目恰好 1 次）、`migrate_all_reads_each_pending_entry_once_and_dismiss_only_clears_marks`、`app::shell::tests::dismiss_stays_reachable_after_migrate_all_is_denied`、`opening_the_security_card_loads_the_vault_once_without_legacy_reads`。
 
 ## Rust 测试覆盖（按需求）
 
